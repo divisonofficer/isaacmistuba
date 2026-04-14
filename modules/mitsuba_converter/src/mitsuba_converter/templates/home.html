@@ -1,0 +1,149 @@
+{% extends "base.html" %}
+
+{% block content %}
+  <section class="grid gap-4 lg:grid-cols-4">
+    <article class="panel metric-card metric-card-scenes">
+      <div class="panel-label">Scenes</div>
+      <div class="metric">{{ summary.scene_count }}</div>
+      <div class="muted text-sm">Scenes with at least one observation bundle</div>
+    </article>
+    <article class="panel metric-card metric-card-queued">
+      <div class="panel-label">Queued Jobs</div>
+      <div class="metric">{{ summary.queued_jobs }}</div>
+      <div class="muted text-sm">Pending jobs waiting on the single warm worker</div>
+    </article>
+    <article class="panel metric-card metric-card-running">
+      <div class="panel-label">Running Jobs</div>
+      <div class="metric">{{ summary.running_jobs }}</div>
+      <div class="muted text-sm">Current worker stage: {{ summary.active_stage or "idle" }}</div>
+    </article>
+    <article class="panel metric-card metric-card-failed">
+      <div class="panel-label">Failed Jobs</div>
+      <div class="metric">{{ summary.failed_jobs }}</div>
+      <div class="muted text-sm">Latest failure: {{ summary.latest_failure_job_id or "none" }}</div>
+    </article>
+  </section>
+
+  <section class="grid gap-4 lg:grid-cols-[1.4fr,1fr] mt-6">
+    <article class="panel">
+      <div class="panel-header">
+        <div>
+          <h2 class="section-title">Recent Jobs</h2>
+          <p class="muted text-sm">Queue, progress, and last known manifest path.</p>
+        </div>
+        <a href="/jobs" class="button button-subtle">Open Jobs</a>
+      </div>
+      {% if recent_jobs %}
+        <div class="table-wrap mt-4">
+          <table class="table">
+            <thead>
+              <tr>
+                <th>Job</th>
+                <th>Status</th>
+                <th>Stage</th>
+                <th>Scene</th>
+                <th>Submitted</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for job in recent_jobs %}
+                <tr>
+                  <td class="mono text-xs">{{ job.job_id }}</td>
+                  <td><span class="badge badge-{{ job.status }}">{{ job.status }}</span></td>
+                  <td>{{ job.progress_stage }}</td>
+                  <td>{{ job.scene_id or "unknown" }}</td>
+                  <td>{{ job.submitted_at or "-" }}</td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      {% else %}
+        <div class="empty-state mt-4">No render jobs yet.</div>
+      {% endif %}
+    </article>
+
+    <article class="panel">
+      <div class="panel-header">
+        <div>
+          <h2 class="section-title">Quick Actions</h2>
+          <p class="muted text-sm">Smoke tests and links for day-to-day operations.</p>
+        </div>
+      </div>
+      <div class="stack-sm mt-4 quick-actions-list">
+        <a href="/integrations/isaac" class="button button-primary">Open Isaac Guide</a>
+        <a href="/system" class="button button-subtle">System Overview</a>
+        <a href="/api/render-jobs" class="button button-subtle">Render Jobs API</a>
+        {% if latest_scene_id %}
+          <button class="button button-subtle js-smoke-render" data-scene-id="{{ latest_scene_id }}">Smoke Render Latest Scene</button>
+        {% endif %}
+      </div>
+      <div class="divider"></div>
+      <div class="panel-label">Scene Cache</div>
+      {% if summary.scene_cache_stats %}
+        <div class="stack-xs mt-3">
+          {% for item in summary.scene_cache_stats[:4] %}
+            <div class="subpanel">
+              <div class="mono text-xs text-slate-300">{{ item.key }}</div>
+              <div class="muted text-xs mt-2">submissions {{ item.submissions }} · runs {{ item.runs }}</div>
+            </div>
+          {% endfor %}
+        </div>
+      {% else %}
+        <div class="empty-state mt-3">No cached scene activity yet.</div>
+      {% endif %}
+    </article>
+  </section>
+
+  <section class="grid gap-4 lg:grid-cols-[1.1fr,1fr] mt-6">
+    <article class="panel">
+      <div class="panel-header">
+        <div>
+          <h2 class="section-title">Scene Explorer</h2>
+          <p class="muted text-sm">Latest scenes derived from observation bundles.</p>
+        </div>
+        <a href="/scenes" class="button button-subtle">Open Scenes</a>
+      </div>
+      {% if scenes %}
+        <div class="scene-grid mt-4">
+          {% for scene in scenes %}
+            <a href="/scenes/{{ scene.scene_id }}" class="scene-card scene-card-soft">
+              <div class="eyebrow">{{ scene.scene_version or "scene" }}</div>
+              <div class="scene-card-title">{{ scene.scene_id }}</div>
+              <div class="muted text-sm mt-2">
+                captures {{ scene.capture_count }} · cameras {{ scene.camera_count }}
+              </div>
+              <div class="muted text-xs mt-2">{{ scene.latest_timestamp or "-" }}</div>
+            </a>
+          {% endfor %}
+        </div>
+      {% else %}
+        <div class="empty-state mt-4">No scenes have produced observation bundles yet.</div>
+      {% endif %}
+    </article>
+
+    <article class="panel">
+      <div class="panel-header">
+        <div>
+          <h2 class="section-title">Recent Failures</h2>
+          <p class="muted text-sm">Helpful when the worker is blocked or scene refs drift.</p>
+        </div>
+      </div>
+      {% if failed_jobs %}
+        <div class="stack-sm mt-4">
+          {% for job in failed_jobs %}
+            <div class="subpanel">
+              <div class="flex items-center justify-between gap-3">
+                <span class="mono text-xs">{{ job.job_id }}</span>
+                <span class="badge badge-failed">failed</span>
+              </div>
+              <div class="muted text-xs mt-2">{{ job.error or "No error payload captured." }}</div>
+            </div>
+          {% endfor %}
+        </div>
+      {% else %}
+        <div class="empty-state mt-4">No failed jobs recorded.</div>
+      {% endif %}
+    </article>
+  </section>
+{% endblock %}

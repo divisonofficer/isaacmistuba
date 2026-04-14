@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{{ page_title }} · Robomituba Control Plane</title>
+    <link rel="stylesheet" href="/static/tailwind.css">
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div>
+          <div class="eyebrow">Robomituba</div>
+          <div class="brand-title">Control Plane</div>
+          <p class="muted mt-3">
+            Warm Mitsuba daemon, scene explorer, render jobs, and Isaac handoff in one place.
+          </p>
+        </div>
+        <nav class="nav-list mt-8">
+          {% for item in nav_items %}
+            <a href="{{ item.href }}" class="nav-link {% if item.key == nav_key %}nav-link-active{% endif %}">
+              <span>{{ item.label }}</span>
+            </a>
+          {% endfor %}
+        </nav>
+        <div class="panel mt-8">
+          <div class="panel-label">Runtime</div>
+          <div class="mt-3 stack-sm">
+            <div class="mono text-xs text-slate-300">{{ base_url }}</div>
+            <div class="flex items-center gap-2">
+              <span class="status-dot {% if summary.worker_state == 'running' %}status-amber{% else %}status-green{% endif %}"></span>
+              <span class="text-sm">{{ summary.worker_state|capitalize }}</span>
+            </div>
+            <div class="muted text-sm">Queue {{ summary.queue_length }} · Variant {{ summary.variant }}</div>
+          </div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <header class="topbar">
+          <div>
+            <h1 class="page-title">{{ page_title }}</h1>
+            {% if page_subtitle %}
+              <p class="muted mt-2">{{ page_subtitle }}</p>
+            {% endif %}
+          </div>
+          <div class="topbar-actions">
+            <a href="/health" class="button button-subtle">Health JSON</a>
+            <a href="/api/summary" class="button button-subtle">Summary API</a>
+            {% if latest_scene_id %}
+              <button class="button button-primary js-smoke-render" data-scene-id="{{ latest_scene_id }}">Smoke Render</button>
+            {% endif %}
+          </div>
+        </header>
+
+        {% if flash_message %}
+          <div class="flash-banner" id="flash-banner">{{ flash_message }}</div>
+        {% else %}
+          <div class="flash-banner hidden" id="flash-banner"></div>
+        {% endif %}
+
+        {% block content %}{% endblock %}
+      </main>
+    </div>
+
+    <script>
+      (() => {
+        const flash = document.getElementById("flash-banner");
+        async function submitSmoke(sceneId) {
+          try {
+            const response = await fetch("/api/tests/smoke-render", {
+              method: "POST",
+              headers: {"Content-Type": "application/json"},
+              body: JSON.stringify(sceneId ? {scene_id: sceneId} : {}),
+            });
+            const payload = await response.json();
+            flash.classList.remove("hidden");
+            if (!response.ok) {
+              flash.textContent = payload.error || "Smoke render request failed.";
+              flash.classList.add("flash-error");
+              return;
+            }
+            flash.textContent = `Queued ${payload.job_id} (${payload.frame_id})`;
+            flash.classList.remove("flash-error");
+          } catch (error) {
+            flash.classList.remove("hidden");
+            flash.classList.add("flash-error");
+            flash.textContent = `Smoke render request failed: ${error}`;
+          }
+        }
+        for (const button of document.querySelectorAll(".js-smoke-render")) {
+          button.addEventListener("click", () => submitSmoke(button.dataset.sceneId || null));
+        }
+      })();
+    </script>
+  </body>
+</html>

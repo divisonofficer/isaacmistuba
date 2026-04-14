@@ -1,0 +1,106 @@
+{% extends "base.html" %}
+
+{% block content %}
+  {% if scene %}
+    <section class="grid gap-4 xl:grid-cols-[1.35fr,1fr]">
+      <article class="panel">
+        <div class="panel-header">
+          <div>
+            <h2 class="section-title">Scene Inspector</h2>
+            <p class="muted text-sm">
+              {{ scene.scene_version or "scene" }} · {{ scene.capture_count }} capture bundle(s)
+            </p>
+          </div>
+          <div class="topbar-actions">
+            <button class="button button-subtle js-smoke-render" data-scene-id="{{ scene.scene_id }}">Smoke Render</button>
+            <a href="/api/scenes/{{ scene.scene_id }}/floorplan" class="button button-subtle">Floorplan JSON</a>
+          </div>
+        </div>
+        {% if floorplan and floorplan.artifact_href %}
+          <div class="image-frame mt-4">
+            <img src="{{ floorplan.artifact_href }}" alt="Scene floorplan for {{ scene.scene_id }}">
+          </div>
+          <div class="muted text-xs mt-3">
+            Request cameras {{ floorplan.request_camera_count }} · Snapshot cameras {{ floorplan.snapshot_camera_count }} · Lights {{ floorplan.snapshot_light_count }}
+          </div>
+        {% else %}
+          <div class="empty-state mt-4">No floorplan available yet for this scene.</div>
+        {% endif %}
+      </article>
+
+      <article class="panel">
+        <div class="panel-header">
+          <div>
+            <h2 class="section-title">Latest Capture</h2>
+            <p class="muted text-sm">Most recent camera/modality bundle for this scene.</p>
+          </div>
+        </div>
+        {% if latest_capture %}
+          <div class="stack-sm mt-4">
+            <div class="subpanel capture-summary-card">
+              <div class="eyebrow">{{ latest_capture.timestamp }}</div>
+              <div class="scene-card-title mt-2">{{ latest_capture.camera_id }}</div>
+              <div class="muted text-sm mt-2">modalities {{ latest_capture.modalities|join(", ") }}</div>
+              <div class="muted text-xs mt-2">
+                manifest <a href="{{ latest_capture.manifest_href }}" class="link mono">{{ latest_capture.manifest_path }}</a>
+              </div>
+            </div>
+            <div class="kv-list metadata-grid">
+              <div><span>Sync group</span><span>{{ latest_capture.sensor_sync_group or "-" }}</span></div>
+              <div><span>Calibration</span><span>{{ latest_capture.calibration_ref or "-" }}</span></div>
+              <div><span>Scene ref</span><span class="mono text-xs">{{ latest_capture.scene_ref }}</span></div>
+            </div>
+          </div>
+        {% else %}
+          <div class="empty-state mt-4">No captures yet.</div>
+        {% endif %}
+      </article>
+    </section>
+
+    <section class="panel mt-6">
+      <div class="panel-header">
+        <div>
+          <h2 class="section-title">Result Explorer</h2>
+          <p class="muted text-sm">Capture bundles and modality thumbnails.</p>
+        </div>
+      </div>
+      {% if captures %}
+        <div class="stack-lg mt-4">
+          {% for capture in captures %}
+            <div class="subpanel capture-bundle-card">
+              <div class="flex items-center justify-between gap-3">
+                <div>
+                  <div class="eyebrow">{{ capture.timestamp }}</div>
+                  <div class="scene-card-title mt-2">{{ capture.camera_id }}</div>
+                </div>
+                <div class="badge badge-succeeded">{{ capture.modalities|length }} modalities</div>
+              </div>
+              <div class="thumb-grid mt-4">
+                {% for item in capture.preview_items %}
+                  <a href="{{ item.href }}" class="thumb-card">
+                    <div class="thumb-label">{{ item.modality }}</div>
+                    {% if item.href %}
+                      <img src="{{ item.href }}" alt="{{ item.modality }}">
+                    {% else %}
+                      <div class="thumb-empty">no preview</div>
+                    {% endif %}
+                  </a>
+                {% endfor %}
+              </div>
+              <div class="mt-4 flex flex-wrap gap-3">
+                <a href="{{ capture.manifest_href }}" class="button button-subtle">Manifest</a>
+                <a href="/api/scenes/{{ scene.scene_id }}/captures" class="button button-subtle">Captures API</a>
+              </div>
+            </div>
+          {% endfor %}
+        </div>
+      {% else %}
+        <div class="empty-state mt-4">No observation captures are available for this scene.</div>
+      {% endif %}
+    </section>
+  {% else %}
+    <section class="panel">
+      <div class="empty-state">Unknown scene.</div>
+    </section>
+  {% endif %}
+{% endblock %}

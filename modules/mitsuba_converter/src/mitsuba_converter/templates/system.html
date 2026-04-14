@@ -1,0 +1,58 @@
+{% extends "base.html" %}
+
+{% block content %}
+  <section class="grid gap-4 lg:grid-cols-3">
+    <article class="panel">
+      <div class="panel-label">Base URL</div>
+      <div class="mono text-xs mt-3">{{ base_url }}</div>
+    </article>
+    <article class="panel">
+      <div class="panel-label">Variant</div>
+      <div class="metric-sm mt-3">{{ summary.variant }}</div>
+    </article>
+    <article class="panel">
+      <div class="panel-label">Repo Root</div>
+      <div class="mono text-xs mt-3">{{ summary.repo_root }}</div>
+    </article>
+  </section>
+
+  <section class="grid gap-4 lg:grid-cols-[1fr,1.2fr] mt-6">
+    <article class="panel">
+      <div class="panel-header">
+        <div>
+          <h2 class="section-title">Worker</h2>
+          <p class="muted text-sm">Single-worker queue runtime.</p>
+        </div>
+      </div>
+      <div class="kv-list mt-4">
+        <div><span>Worker state</span><span>{{ summary.worker_state }}</span></div>
+        <div><span>Queue length</span><span>{{ summary.queue_length }}</span></div>
+        <div><span>Running jobs</span><span>{{ summary.running_jobs }}</span></div>
+        <div><span>Queued jobs</span><span>{{ summary.queued_jobs }}</span></div>
+      </div>
+    </article>
+
+    <article class="panel">
+      <div class="panel-header">
+        <div>
+          <h2 class="section-title">Scene Cache Stats</h2>
+          <p class="muted text-sm">Recent scene ref submissions and runs.</p>
+        </div>
+      </div>
+      {% if summary.scene_cache_stats %}
+        <div class="stack-sm mt-4">
+          {% for item in summary.scene_cache_stats %}
+            <div class="subpanel">
+              <div class="mono text-xs">{{ item.key }}</div>
+              <div class="muted text-xs mt-2">
+                submissions {{ item.submissions }} · runs {{ item.runs }} · last {{ item.last_started_at or item.last_submitted_at or "-" }}
+              </div>
+            </div>
+          {% endfor %}
+        </div>
+      {% else %}
+        <div class="empty-state mt-4">No scene cache activity yet.</div>
+      {% endif %}
+    </article>
+  </section>
+{% endblock %}

@@ -1,0 +1,90 @@
+{% extends "base.html" %}
+
+{% block content %}
+  {# ── Blocked mode (new) ───────────────────────────────────────────── #}
+  <section class="grid gap-4 lg:grid-cols-[1.1fr,1fr] mb-6">
+    <article class="panel">
+      <div class="panel-header">
+        <div>
+          <h2 class="section-title">Blocked Render — Isaac Extension</h2>
+          <p class="muted text-sm">
+            Capture live stage state (transforms + BSDF overrides) and receive
+            rendered artifacts in a single synchronous call via
+            <span class="mono">POST /isaac/render</span>.
+          </p>
+        </div>
+      </div>
+      <div class="stack-lg mt-4">
+        <div>
+          <div class="panel-label">1. Import extension helpers</div>
+          <pre class="code-block mt-2">{{ guide.extension_import_snippet }}</pre>
+        </div>
+        <div>
+          <div class="panel-label">2. Capture state and render (blocked)</div>
+          <pre class="code-block mt-2">{{ guide.extension_render_snippet }}</pre>
+        </div>
+      </div>
+    </article>
+
+    <article class="panel">
+      <div class="panel-header">
+        <div>
+          <h2 class="section-title">Checklist</h2>
+          <p class="muted text-sm">Common issues worth checking before blaming the queue.</p>
+        </div>
+      </div>
+      <div class="stack-sm mt-4">
+        {% for item in guide.checklist %}
+          <div class="subpanel">{{ item }}</div>
+        {% endfor %}
+      </div>
+      <div class="divider"></div>
+      <div class="panel-label">Endpoint</div>
+      <div class="muted text-sm mt-2">
+        <span class="mono">POST {{ guide.daemon_url }}/isaac/render</span><br>
+        Body: <span class="mono">{"isaac_state": &lt;IsaacStateSnapshot&gt;, "timeout_s": 120}</span><br>
+        Returns: <span class="mono">{"status":"completed","artifacts":{…}}</span>
+      </div>
+      <a href="/api/integrations/isaac" class="button button-subtle mt-4">Guide API (JSON)</a>
+    </article>
+  </section>
+
+  {# ── Queue mode (legacy) ──────────────────────────────────────────── #}
+  <section class="grid gap-4 lg:grid-cols-[1.1fr,1fr]">
+    <article class="panel">
+      <div class="panel-header">
+        <div>
+          <h2 class="section-title">Queue Mode — Current Viewport Capture</h2>
+          <p class="muted text-sm">Legacy flow: submit a RenderRequest job and poll for completion.</p>
+        </div>
+      </div>
+      <div class="stack-lg mt-4">
+        <div>
+          <div class="panel-label">1. Import helper script</div>
+          <pre class="code-block mt-2">{{ guide.import_snippet }}</pre>
+        </div>
+        <div>
+          <div class="panel-label">2. Capture viewport and submit</div>
+          <pre class="code-block mt-2">{{ guide.submit_snippet }}</pre>
+        </div>
+        <div>
+          <div class="panel-label">3. Poll status and open manifest</div>
+          <pre class="code-block mt-2">{{ guide.poll_snippet }}</pre>
+        </div>
+      </div>
+    </article>
+
+    <article class="panel">
+      <div class="panel-header">
+        <div>
+          <h2 class="section-title">Artifacts location</h2>
+          <p class="muted text-sm">Where queue-mode renders land on disk.</p>
+        </div>
+      </div>
+      <div class="muted text-sm mt-4">
+        Completed renders are written to<br>
+        <span class="mono">out/bridge_jobs/&lt;job_id&gt;/observations/&lt;frame_id&gt;</span>
+      </div>
+    </article>
+  </section>
+{% endblock %}

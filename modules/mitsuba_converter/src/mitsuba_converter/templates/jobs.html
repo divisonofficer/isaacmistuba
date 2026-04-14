@@ -1,0 +1,50 @@
+{% extends "base.html" %}
+
+{% block content %}
+  <section class="panel">
+    <div class="panel-header">
+      <div>
+        <h2 class="section-title">Render Jobs</h2>
+        <p class="muted text-sm">Daemon queue, status, manifest links, and recent failures.</p>
+      </div>
+      <a href="/api/render-jobs" class="button button-subtle">Jobs API</a>
+    </div>
+    {% if jobs %}
+      <div class="table-wrap mt-4">
+        <table class="table">
+          <thead>
+            <tr>
+              <th>Job</th>
+              <th>Status</th>
+              <th>Stage</th>
+              <th>Scene</th>
+              <th>Queue</th>
+              <th>Submitted</th>
+              <th>Finished</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for job in jobs %}
+              <tr>
+                <td class="mono text-xs">{{ job.job_id }}</td>
+                <td><span class="badge badge-{{ job.status }}">{{ job.status }}</span></td>
+                <td>{{ job.progress_stage }}</td>
+                <td>{{ job.scene_id or "-" }}</td>
+                <td>{{ job.queue_position or "-" }}</td>
+                <td>{{ job.submitted_at or "-" }}</td>
+                <td>{{ job.finished_at or "-" }}</td>
+              </tr>
+              {% if job.error %}
+                <tr>
+                  <td colspan="7" class="error-row">{{ job.error }}</td>
+                </tr>
+              {% endif %}
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% else %}
+      <div class="empty-state mt-4">No jobs recorded.</div>
+    {% endif %}
+  </section>
+{% endblock %}

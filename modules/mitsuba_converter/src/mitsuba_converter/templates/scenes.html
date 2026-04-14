@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+
+{% block content %}
+  <section class="panel">
+    <div class="panel-header">
+      <div>
+        <h2 class="section-title">Scenes</h2>
+        <p class="muted text-sm">Grouped by observation bundles, not raw files.</p>
+      </div>
+    </div>
+    {% if scenes %}
+      <div class="table-wrap mt-4">
+        <table class="table">
+          <thead>
+            <tr>
+              <th>Scene</th>
+              <th>Version</th>
+              <th>Illumination</th>
+              <th>Captures</th>
+              <th>Cameras</th>
+              <th>Latest</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for scene in scenes %}
+              <tr>
+                <td><a href="/scenes/{{ scene.scene_id }}" class="link">{{ scene.scene_id }}</a></td>
+                <td>{{ scene.scene_version or "-" }}</td>
+                <td>{{ scene.illumination_setup or "-" }}</td>
+                <td>{{ scene.capture_count }}</td>
+                <td>{{ scene.camera_count }}</td>
+                <td>{{ scene.latest_timestamp or "-" }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% else %}
+      <div class="empty-state mt-4">No scene bundles found in <span class="mono">out/bridge_jobs</span>.</div>
+    {% endif %}
+  </section>
+{% endblock %}
