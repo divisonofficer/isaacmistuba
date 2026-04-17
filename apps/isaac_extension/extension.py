@@ -1,6 +1,6 @@
 """Robomituba Isaac Extension — omni.ext entry point.
 
-Register via Isaac Sim's extension manager or add the apps/isaac_extension
+Register via Isaac Sim's extension manager or add the apps/
 directory to the extension search paths in kit configuration.
 
 Extension ID: robomituba.isaac_extension
@@ -31,7 +31,10 @@ if _OMNI_AVAILABLE:
         """
 
         def on_startup(self, ext_id: str) -> None:  # noqa: N802
-            from ui_panel import RobomitubaPanel
+            try:
+                from isaac_extension.ui_panel import RobomitubaPanel
+            except ImportError:  # pragma: no cover - Isaac runtime fallback
+                from ui_panel import RobomitubaPanel
             self._panel = RobomitubaPanel()
 
         def on_shutdown(self) -> None:  # noqa: N802

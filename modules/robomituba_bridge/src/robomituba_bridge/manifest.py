@@ -88,6 +88,8 @@ def validate_scene_snapshot(snapshot: SceneSnapshot) -> None:
     for material in snapshot.materials:
         for texture_path in material.textures.values():
             validate_repo_relative_path(texture_path)
+    if snapshot.robot_state is not None:
+        validate_robot_state(snapshot.robot_state)
 
 
 def validate_scene_state(scene_state: SceneState) -> None:

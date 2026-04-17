@@ -20,7 +20,12 @@ from .types import (
     CameraSpec,
     DepthApproxSpec,
     FrameRecord,
+    IsaacCaptureRequest,
     IsaacObjectState,
+    IsaacMaterialPatch,
+    IsaacSensorSpec,
+    IsaacSessionOpen,
+    IsaacStatePatch,
     IsaacStateSnapshot,
     JobManifest,
     JobPaths,
@@ -109,13 +114,16 @@ def _render_job_status_from_dict(payload: Dict[str, Any]) -> RenderJobStatus:
 
 
 def scene_snapshot_to_payload(snapshot: SceneSnapshot) -> Dict[str, Any]:
-    return {
+    payload = {
         "scene_id": snapshot.scene_id,
         "frame": asdict(snapshot.frame),
         "usd_stage_path": snapshot.usd_stage_path,
         "meshes": [asdict(mesh) for mesh in snapshot.meshes],
         "extras": snapshot.extras,
     }
+    if snapshot.robot_state is not None:
+        payload["robot_state"] = robot_state_to_payload(snapshot.robot_state)
+    return payload
 
 
 def scene_snapshot_from_payload(
@@ -133,6 +141,7 @@ def scene_snapshot_from_payload(
         materials=[_material_from_dict(item) for item in materials],
         cameras=[_camera_from_dict(item) for item in cameras],
         lights=[_light_from_dict(item) for item in lights],
+        robot_state=robot_state_from_payload(payload["robot_state"]) if payload.get("robot_state") else None,
         extras=payload.get("extras", {}),
     )
 
@@ -486,5 +495,109 @@ def isaac_state_snapshot_from_payload(payload: Dict[str, Any]) -> IsaacStateSnap
         modalities=list(payload.get("modalities", ["rgb"])),
         submit_mode=str(payload.get("submit_mode", "blocking")),
         render_settings=payload.get("render_settings", {}),
+        extras=payload.get("extras", {}),
+    )
+
+
+def isaac_session_open_to_payload(session_open: IsaacSessionOpen) -> Dict[str, Any]:
+    return asdict(session_open)
+
+
+def isaac_session_open_from_payload(payload: Dict[str, Any]) -> IsaacSessionOpen:
+    return IsaacSessionOpen(
+        scene_id=str(payload["scene_id"]),
+        mitsuba_scene_ref=str(payload["mitsuba_scene_ref"]),
+        shape_map_ref=str(payload["shape_map_ref"]),
+        scene_snapshot_ref=payload.get("scene_snapshot_ref"),
+        extras=payload.get("extras", {}),
+    )
+
+
+def isaac_state_patch_to_payload(state_patch: IsaacStatePatch) -> Dict[str, Any]:
+    result: Dict[str, Any] = {
+        "objects": [isaac_object_state_to_payload(obj) for obj in state_patch.objects],
+    }
+    if state_patch.timestamp is not None:
+        result["timestamp"] = state_patch.timestamp
+    if state_patch.extras:
+        result["extras"] = state_patch.extras
+    return result
+
+
+def isaac_state_patch_from_payload(payload: Dict[str, Any]) -> IsaacStatePatch:
+    return IsaacStatePatch(
+        objects=[isaac_object_state_from_payload(item) for item in payload.get("objects", [])],
+        timestamp=payload.get("timestamp"),
+        extras=payload.get("extras", {}),
+    )
+
+
+def isaac_material_patch_to_payload(material_patch: IsaacMaterialPatch) -> Dict[str, Any]:
+    result: Dict[str, Any] = {
+        "overrides": {prim_path: bsdf_override_to_payload(bsdf) for prim_path, bsdf in material_patch.overrides.items()},
+    }
+    if material_patch.timestamp is not None:
+        result["timestamp"] = material_patch.timestamp
+    if material_patch.extras:
+        result["extras"] = material_patch.extras
+    return result
+
+
+def isaac_material_patch_from_payload(payload: Dict[str, Any]) -> IsaacMaterialPatch:
+    overrides_payload = payload.get("overrides", {})
+    return IsaacMaterialPatch(
+        overrides={
+            str(prim_path): bsdf_override_from_payload(bsdf_payload)
+            for prim_path, bsdf_payload in overrides_payload.items()
+            if isinstance(bsdf_payload, dict)
+        },
+        timestamp=payload.get("timestamp"),
+        extras=payload.get("extras", {}),
+    )
+
+
+def isaac_sensor_spec_to_payload(sensor_spec: IsaacSensorSpec) -> Dict[str, Any]:
+    return asdict(sensor_spec)
+
+
+def isaac_sensor_spec_from_payload(payload: Dict[str, Any]) -> IsaacSensorSpec:
+    return IsaacSensorSpec(
+        sensor_id=str(payload["sensor_id"]),
+        name=str(payload.get("name") or payload["sensor_id"]),
+        modalities=list(payload.get("modalities", ["rgb"])),
+        calibration_ref=payload.get("calibration_ref"),
+        camera_to_world=list(payload["camera_to_world"]) if payload.get("camera_to_world") is not None else None,
+        fov_deg=float(payload["fov_deg"]) if payload.get("fov_deg") is not None else None,
+        resolution=list(payload["resolution"]) if payload.get("resolution") is not None else None,
+        sensor_sync_group=str(payload.get("sensor_sync_group", "default")),
+        pose_source=payload.get("pose_source"),
+        extras=payload.get("extras", {}),
+    )
+
+
+def isaac_capture_request_to_payload(capture_request: IsaacCaptureRequest) -> Dict[str, Any]:
+    result: Dict[str, Any] = {
+        "submit_mode": capture_request.submit_mode,
+        "render_settings": dict(capture_request.render_settings),
+    }
+    if capture_request.sensor_id is not None:
+        result["sensor_id"] = capture_request.sensor_id
+    if capture_request.camera is not None:
+        result["camera"] = camera_spec_to_payload(capture_request.camera)
+    if capture_request.modalities:
+        result["modalities"] = list(capture_request.modalities)
+    if capture_request.extras:
+        result["extras"] = capture_request.extras
+    return result
+
+
+def isaac_capture_request_from_payload(payload: Dict[str, Any]) -> IsaacCaptureRequest:
+    camera_payload = payload.get("camera")
+    return IsaacCaptureRequest(
+        sensor_id=payload.get("sensor_id"),
+        camera=camera_spec_from_payload(camera_payload) if camera_payload else None,
+        modalities=list(payload.get("modalities", [])),
+        submit_mode=str(payload.get("submit_mode", "blocking")),
+        render_settings=dict(payload.get("render_settings", {})),
         extras=payload.get("extras", {}),
     )

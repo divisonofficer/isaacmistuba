@@ -1,0 +1,113 @@
+datasets:
+  - id: pbrdf_2020
+    enabled: true
+    source_role: canonical_baseline
+    local_root: data/pbrdf_2020
+    kind: measured_polarized
+    format: pbsdf
+    direct_mitsuba_support: true
+    requires_patch: false
+    spectral_range_nm: [450, 650]
+    spectral_bands: 5
+    polarization: full_mueller
+    representative_materials:
+      - gold
+      - fake_gold
+      - white_silicone
+      - spectralon
+
+  - id: hpbrdf_2025
+    enabled: true
+    source_role: canonical_nir_polarization
+    local_root: data/hpbrdf_2025
+    kind: measured_polarized
+    format: hpbrdf
+    direct_mitsuba_support: true
+    requires_patch: true
+    patch_source: third_party/hpbrdf_patch/measured_polarized.cpp
+    spectral_range_nm: [414, 950]
+    spectral_bands: 68
+    polarization: full_mueller
+    representative_materials:
+      - Aluminum
+      - Black_glass
+      - SUJ2
+      - White_smooth_plastic
+
+  - id: rgl_material_db
+    enabled: true
+    source_role: nir_material_bank
+    local_root: data/rgl_bsdf
+    kind: measured_spectral
+    format: bsdf
+    direct_mitsuba_support: true
+    requires_patch: false
+    spectral_range_nm: [360, 1000]
+    polarization: none_measured
+    representative_classes:
+      - metal
+      - paper
+      - car_paint
+      - fabric
+
+  - id: utia
+    enabled: true
+    source_role: conversion_target
+    local_root: data/utia
+    kind: raw_brdf
+    format: unknown
+    direct_mitsuba_support: false
+    requires_patch: false
+    polarization: none_measured
+    category_counts:
+      fabric: 96
+      leather: 16
+      wood: 16
+      plastic: 6
+      carpets: 6
+      other: 10
+
+  - id: merl
+    enabled: true
+    source_role: conversion_target
+    local_root: data/merl
+    kind: raw_brdf
+    format: merl
+    direct_mitsuba_support: false
+    requires_patch: false
+    polarization: none_measured
+    material_count: 100
+
+  - id: opensvbrdf
+    enabled: true
+    source_role: svbrdf_asset_bank
+    local_root: data/opensvbrdf
+    kind: svbrdf_maps
+    format: texture_maps
+    direct_mitsuba_support: false
+    requires_patch: false
+    polarization: none_measured
+    sample_count: 1000_plus
+    categories: 9
+    maps:
+      - diffuse_albedo
+      - specular_albedo
+      - anisotropic_roughness
+      - normal
+      - tangent
+      - transparency
+
+mitsuba:
+  preferred_python_variant: llvm_ad_spectral_polarized
+  fallback_variant: scalar_spectral_polarized
+  source_build_required_for:
+    - hpbrdf_2025
+  required_integrator_for_polarization: stokes
+  exr_output_required: true
+
+priorities:
+  - native_measured_polarized
+  - patched_native_measured_polarized
+  - native_measured_spectral
+  - conversion_or_fitting_target
+  - svbrdf_asset_bank

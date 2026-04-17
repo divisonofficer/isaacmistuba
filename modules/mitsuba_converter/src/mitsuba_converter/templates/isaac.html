@@ -1,90 +1,684 @@
 {% extends "base.html" %}
 
 {% block content %}
-  {# ── Blocked mode (new) ───────────────────────────────────────────── #}
-  <section class="grid gap-4 lg:grid-cols-[1.1fr,1fr] mb-6">
-    <article class="panel">
-      <div class="panel-header">
-        <div>
-          <h2 class="section-title">Blocked Render — Isaac Extension</h2>
-          <p class="muted text-sm">
-            Capture live stage state (transforms + BSDF overrides) and receive
-            rendered artifacts in a single synchronous call via
-            <span class="mono">POST /isaac/render</span>.
-          </p>
-        </div>
-      </div>
-      <div class="stack-lg mt-4">
-        <div>
-          <div class="panel-label">1. Import extension helpers</div>
-          <pre class="code-block mt-2">{{ guide.extension_import_snippet }}</pre>
-        </div>
-        <div>
-          <div class="panel-label">2. Capture state and render (blocked)</div>
-          <pre class="code-block mt-2">{{ guide.extension_render_snippet }}</pre>
-        </div>
-      </div>
-    </article>
+  <article class="panel">
+    {# ── Tab bar ── #}
+    <div class="tab-bar">
+      <button class="tab active" data-tab="quickstart"><span data-lang="en">Quick Start</span><span data-lang="kr" class="hidden">빠른 시작</span></button>
+      <button class="tab" data-tab="control-plane"><span data-lang="en">Use from Control Plane</span><span data-lang="kr" class="hidden">Control Plane에서 사용</span></button>
+      <button class="tab" data-tab="script"><span data-lang="en">Script / Extension</span><span data-lang="kr" class="hidden">스크립트 / 확장</span></button>
+      <button class="tab" data-tab="queue"><span data-lang="en">Queue Render</span><span data-lang="kr" class="hidden">큐 렌더</span></button>
+      <button class="tab" data-tab="troubleshoot"><span data-lang="en">Troubleshooting</span><span data-lang="kr" class="hidden">문제 해결</span></button>
+      <button class="tab" data-tab="windows"><span data-lang="en">Windows Launcher</span><span data-lang="kr" class="hidden">Windows 실행</span></button>
+    </div>
 
-    <article class="panel">
+    {# ══════════════════════════════════════════════════════════════
+       탭 1 — Quick Start
+    ══════════════════════════════════════════════════════════════ #}
+    <div class="tab-panel" data-panel="quickstart">
       <div class="panel-header">
         <div>
-          <h2 class="section-title">Checklist</h2>
-          <p class="muted text-sm">Common issues worth checking before blaming the queue.</p>
+          <h2 class="section-title"><span data-lang="en">Quick Start</span><span data-lang="kr" class="hidden">빠른 시작</span></h2>
+          <p class="muted text-sm"><span data-lang="en">Choose your workflow, follow the steps, then jump to the right tab.</span><span data-lang="kr" class="hidden">작업 방식을 고르고, 단계를 따라가세요.</span></p>
         </div>
+        <a href="/api/integrations/isaac" class="button button-subtle"><span data-lang="en">Guide API (JSON)</span><span data-lang="kr" class="hidden">가이드 API (JSON)</span></a>
       </div>
-      <div class="stack-sm mt-4">
-        {% for item in guide.checklist %}
-          <div class="subpanel">{{ item }}</div>
+
+      {# 섹션 A: 의사결정 카드 #}
+      <div class="mt-4" style="display:flex;gap:0.75rem;flex-wrap:wrap;">
+        {% for choice in guide.quickstart_choices %}
+          <div class="guide-choice-card" onclick="document.querySelector('.tab[data-tab=&quot;{{ choice.tab }}&quot;]').click()">
+            <div class="gc-icon">{{ choice.icon }}</div>
+            <div class="gc-title"><span data-lang="en">{{ choice.title_en }}</span><span data-lang="kr" class="hidden">{{ choice.title_kr }}</span></div>
+            <div class="gc-desc"><span data-lang="en">{{ choice.desc_en }}</span><span data-lang="kr" class="hidden">{{ choice.desc_kr }}</span></div>
+            <div class="gc-dest"><span data-lang="en">→ {{ choice.tab }} tab</span><span data-lang="kr" class="hidden">→ {{ choice.tab }} 탭</span></div>
+          </div>
         {% endfor %}
       </div>
-      <div class="divider"></div>
-      <div class="panel-label">Endpoint</div>
-      <div class="muted text-sm mt-2">
-        <span class="mono">POST {{ guide.daemon_url }}/isaac/render</span><br>
-        Body: <span class="mono">{"isaac_state": &lt;IsaacStateSnapshot&gt;, "timeout_s": 120}</span><br>
-        Returns: <span class="mono">{"status":"completed","artifacts":{…}}</span>
-      </div>
-      <a href="/api/integrations/isaac" class="button button-subtle mt-4">Guide API (JSON)</a>
-    </article>
-  </section>
 
-  {# ── Queue mode (legacy) ──────────────────────────────────────────── #}
-  <section class="grid gap-4 lg:grid-cols-[1.1fr,1fr]">
-    <article class="panel">
-      <div class="panel-header">
-        <div>
-          <h2 class="section-title">Queue Mode — Current Viewport Capture</h2>
-          <p class="muted text-sm">Legacy flow: submit a RenderRequest job and poll for completion.</p>
+      {# 섹션 B: 권장 흐름 stepper #}
+      <div class="subpanel mt-6" style="padding:1.2rem;">
+        <div class="panel-label"><span data-lang="en">Recommended flow</span><span data-lang="kr" class="hidden">권장 흐름</span></div>
+        <div class="guide-stepper mt-4">
+          {% for step in guide.quickstart_steps %}
+            <div class="guide-step">
+              <div class="guide-step-badge">{{ loop.index }}</div>
+              <div class="guide-step-label"><span data-lang="en">{{ step.en }}</span><span data-lang="kr" class="hidden">{{ step.kr }}</span></div>
+            </div>
+          {% endfor %}
         </div>
       </div>
+
+      {# 섹션 C: Quick Links #}
+      <div class="mt-4">
+        <div class="panel-label"><span data-lang="en">Quick Links</span><span data-lang="kr" class="hidden">빠른 링크</span></div>
+        <div class="topbar-actions gap-2 mt-3" style="justify-content:flex-start;flex-wrap:wrap;">
+          <a href="/health" target="_blank" class="button button-subtle" style="font-size:0.8rem;">Health JSON</a>
+          <a href="/system" class="button button-subtle" style="font-size:0.8rem;"><span data-lang="en">System</span><span data-lang="kr" class="hidden">시스템</span></a>
+          <a href="/scenes" class="button button-subtle" style="font-size:0.8rem;"><span data-lang="en">Scene Explorer</span><span data-lang="kr" class="hidden">장면 탐색기</span></a>
+          <a href="/api/integrations/isaac" target="_blank" class="button button-subtle" style="font-size:0.8rem;">Guide API JSON</a>
+          {% if latest_scene_id %}
+            <button class="button button-subtle js-smoke-render" data-scene-id="{{ latest_scene_id }}" style="font-size:0.8rem;"><span data-lang="en">Smoke Render Test</span><span data-lang="kr" class="hidden">스모크 렌더 테스트</span></button>
+          {% endif %}
+        </div>
+      </div>
+    </div>
+
+    {# ══════════════════════════════════════════════════════════════
+       탭 2 — Control Plane에서 사용
+    ══════════════════════════════════════════════════════════════ #}
+    <div class="tab-panel hidden" data-panel="control-plane">
+      <div class="panel-header">
+        <div>
+          <h2 class="section-title"><span data-lang="en">Use from Control Plane</span><span data-lang="kr" class="hidden">Control Plane에서 사용</span></h2>
+          <p class="muted text-sm"><span data-lang="en">Trigger daemon actions directly from this page. Isaac remains the live scene authority — transforms and sensor placement happen in Isaac.</span><span data-lang="kr" class="hidden">이 페이지에서 daemon 액션을 직접 실행합니다. live scene의 기준은 Isaac이며 transform/sensor 배치는 Isaac에서 합니다.</span></p>
+        </div>
+        <a href="/api/integrations/isaac" class="button button-subtle">Guide API</a>
+      </div>
+
+      {# 상태 바 #}
+      <div class="cp-status-bar mt-4" id="cp-status-bar">
+        <span class="cp-status-chip cp-chip-ok" id="cp-chip-daemon"><span class="cp-chip-dot"></span>Daemon</span>
+        <span class="cp-status-chip cp-chip-none" id="cp-chip-session"><span class="cp-chip-dot"></span><span data-lang="en">No Session</span><span data-lang="kr" class="hidden">세션 없음</span></span>
+        <span class="cp-status-chip cp-chip-none" id="cp-chip-scene"><span class="cp-chip-dot"></span><span data-lang="en">No Scene</span><span data-lang="kr" class="hidden">장면 없음</span></span>
+        <span class="cp-status-chip cp-chip-none" id="cp-chip-capture"><span class="cp-chip-dot"></span><span data-lang="en">No Capture</span><span data-lang="kr" class="hidden">캡처 없음</span></span>
+      </div>
+
+      {# 2열 레이아웃: 좌 액션 + 우 Inspector #}
+      <div class="grid mt-4" style="grid-template-columns:1fr 320px;gap:1rem;align-items:start;">
+
+        {# ── 왼쪽: 액션 섹션 A~E ── #}
+        <div class="stack-sm">
+
+          {# A. Scene 준비 / 등록 #}
+          <div class="cp-action-section">
+            <div class="cp-action-label"><span data-lang="en">A. Scene Prepare / Register</span><span data-lang="kr" class="hidden">A. Scene 준비 / 등록</span></div>
+            <div class="muted text-xs mt-1"><span data-lang="en">Use a registered scene or open a new USD path.</span><span data-lang="kr" class="hidden">등록된 scene을 쓰거나 새 USD 경로를 엽니다.</span></div>
+            <div class="mt-3 stack-sm">
+              <div>
+                <div class="panel-label" style="font-size:0.72rem;"><span data-lang="en">Registered scene</span><span data-lang="kr" class="hidden">등록된 scene</span></div>
+                <div class="cp-action-row">
+                  <select id="cp-scene-select" class="search-input" style="flex:1;min-width:0;">
+                    <option value=""><span data-lang="en">Loading scenes…</span></option>
+                  </select>
+                  <button class="button button-primary" style="font-size:0.8rem;" onclick="cpLoadScene()"><span data-lang="en">Load Scene</span><span data-lang="kr" class="hidden">Scene 불러오기</span></button>
+                </div>
+              </div>
+              <details class="subpanel" style="padding:0.75rem 1rem;">
+                <summary style="cursor:pointer;font-size:0.78rem;font-weight:600;list-style:none;"><span data-lang="en">▸ Register new scene</span><span data-lang="kr" class="hidden">▸ 새 scene 등록</span></summary>
+                <div class="stack-sm mt-3">
+                  <input id="cp-reg-scene-id" class="search-input" placeholder="scene_id (optional)">
+                  <input id="cp-reg-usd" class="search-input" placeholder="usd_stage_path (Windows path)">
+                  <input id="cp-reg-mitsuba" class="search-input" placeholder="mitsuba_scene_ref (optional)">
+                  <input id="cp-reg-shapemap" class="search-input" placeholder="shape_map_ref (optional)">
+                  <button class="button button-subtle" style="font-size:0.8rem;" onclick="cpRegisterScene()"><span data-lang="en">Register Scene</span><span data-lang="kr" class="hidden">Scene 등록</span></button>
+                </div>
+              </details>
+            </div>
+          </div>
+
+          {# B. Session 연결 / 동기화 #}
+          <div class="cp-action-section">
+            <div class="cp-action-label"><span data-lang="en">B. Session Connect / Sync</span><span data-lang="kr" class="hidden">B. Session 연결 / 동기화</span></div>
+            <div class="muted text-xs mt-1"><span data-lang="en">Scene must be open in Isaac before connecting. If the scene is open-only, prepare render-ready first to auto-generate the missing shape map.</span><span data-lang="kr" class="hidden">연결 전에 Isaac에서 scene이 열려 있어야 합니다. scene이 open-only 상태라면 먼저 렌더 준비를 눌러 누락된 shape map을 자동 생성하세요.</span></div>
+            <div class="cp-action-row mt-3">
+              <button class="button button-primary" style="font-size:0.8rem;" onclick="cpCommand('prepare_render_ready')"><span data-lang="en">Prepare Render-Ready</span><span data-lang="kr" class="hidden">렌더 준비</span></button>
+              <button class="button button-subtle" style="font-size:0.8rem;" onclick="cpCommand('connect_session')"><span data-lang="en">Connect Session</span><span data-lang="kr" class="hidden">Session 연결</span></button>
+              <button class="button button-subtle" style="font-size:0.8rem;" onclick="cpCommand('sync_session')"><span data-lang="en">Sync Stage</span><span data-lang="kr" class="hidden">Stage 동기화</span></button>
+              <button class="button button-subtle" style="font-size:0.8rem;" onclick="cpSessionStatus()"><span data-lang="en">Session Status</span><span data-lang="kr" class="hidden">Session 상태</span></button>
+            </div>
+          </div>
+
+          {# C. 현재 뷰 렌더 #}
+          <div class="cp-action-section">
+            <div class="cp-action-label"><span data-lang="en">C. Render Current View</span><span data-lang="kr" class="hidden">C. 현재 뷰 렌더</span></div>
+            <div class="mt-3">
+              <div class="panel-label" style="font-size:0.72rem;"><span data-lang="en">Modalities</span><span data-lang="kr" class="hidden">Modality</span></div>
+              <div class="cp-action-row mt-1">
+                {% for m in ['rgb', 'depth', 'normal', 'albedo'] %}
+                  <label style="display:flex;align-items:center;gap:0.3rem;font-size:0.78rem;cursor:pointer;">
+                    <input type="checkbox" name="cp-modality" value="{{ m }}" {% if m in ['rgb','depth'] %}checked{% endif %}> {{ m }}
+                  </label>
+                {% endfor %}
+              </div>
+              <div class="cp-action-row mt-2">
+                <div>
+                  <div class="panel-label" style="font-size:0.72rem;">Mode</div>
+                  <select id="cp-submit-mode" class="search-input" style="width:110px;margin-top:0.2rem;">
+                    <option value="blocking">blocking</option>
+                    <option value="async">queue</option>
+                  </select>
+                </div>
+                <button class="button button-primary" style="font-size:0.8rem;margin-top:auto;" onclick="cpRenderCurrentView()"><span data-lang="en">Render Current View</span><span data-lang="kr" class="hidden">현재 뷰 렌더</span></button>
+              </div>
+            </div>
+          </div>
+
+          {# D. 결과 확인 #}
+          <div class="cp-action-section">
+            <div class="cp-action-label"><span data-lang="en">D. View Results</span><span data-lang="kr" class="hidden">D. 결과 확인</span></div>
+            <div class="cp-action-row mt-2">
+              <button class="button button-subtle" style="font-size:0.8rem;" onclick="cpLatestCapture()"><span data-lang="en">Latest Capture</span><span data-lang="kr" class="hidden">최신 Capture</span></button>
+              <span id="cp-capture-link" class="muted text-xs"></span>
+            </div>
+          </div>
+
+          {# E. Material Apply (접힘) #}
+          <details class="cp-action-section" style="padding:0.8rem 1rem;">
+            <summary style="cursor:pointer;font-size:0.78rem;font-weight:700;list-style:none;"><span data-lang="en">▸ E. Material Apply (advanced)</span><span data-lang="kr" class="hidden">▸ E. 머티리얼 적용 (고급)</span></summary>
+            <div class="stack-sm mt-3">
+              <input id="cp-bsdf-prim" class="search-input" placeholder="/World/Object (prim path)">
+              <select id="cp-bsdf-type" class="search-input">
+                <option value="diffuse">diffuse</option>
+                <option value="roughplastic">roughplastic</option>
+                <option value="conductor">conductor</option>
+                <option value="dielectric">dielectric</option>
+                <option value="mirror_black_enamel">mirror_black_enamel</option>
+              </select>
+              <button class="button button-subtle" style="font-size:0.8rem;" onclick="cpApplyBsdf()"><span data-lang="en">Queue Material Apply</span><span data-lang="kr" class="hidden">재질 적용 요청</span></button>
+            </div>
+          </details>
+
+        </div>{# /왼쪽 #}
+
+        {# ── 오른쪽: Response Inspector ── #}
+        <div class="cp-response-panel">
+          <div class="panel-label"><span data-lang="en">Response Inspector</span><span data-lang="kr" class="hidden">응답 인스펙터</span></div>
+
+          <div class="mt-3">
+            <div class="muted" style="font-size:0.68rem;text-transform:uppercase;letter-spacing:0.06em;font-weight:700;"><span data-lang="en">Last action</span><span data-lang="kr" class="hidden">마지막 액션</span></div>
+            <div id="cp-last-route" class="mono text-xs mt-1 muted">—</div>
+            <div id="cp-last-status" class="text-xs mt-1 muted">—</div>
+          </div>
+
+          <div class="divider mt-3"></div>
+
+          <div class="mt-3">
+            <div class="muted" style="font-size:0.68rem;text-transform:uppercase;letter-spacing:0.06em;font-weight:700;"><span data-lang="en">Response</span><span data-lang="kr" class="hidden">응답</span></div>
+            <div id="cp-response-summary" class="cp-response-kv mt-2" style="max-height:180px;overflow-y:auto;">—</div>
+            <details class="mt-2" id="cp-raw-json-wrap" style="display:none;">
+              <summary style="font-size:0.72rem;cursor:pointer;color:var(--brand);">Raw JSON</summary>
+              <pre id="cp-raw-json" class="code-block mt-1" style="font-size:0.65rem;max-height:160px;overflow:auto;"></pre>
+            </details>
+          </div>
+
+          <div class="divider mt-3"></div>
+
+          <div class="mt-3">
+            <div class="muted" style="font-size:0.68rem;text-transform:uppercase;letter-spacing:0.06em;font-weight:700;"><span data-lang="en">Common errors</span><span data-lang="kr" class="hidden">흔한 오류</span></div>
+            <div class="stack-sm mt-2" style="font-size:0.72rem;color:var(--muted);">
+              <div>• <strong>daemon unreachable</strong> — check URL &amp; WSL service</div>
+              <div>• <strong>scene not loaded</strong> — load scene first</div>
+              <div>• <strong>missing shape_map_ref</strong> — prepare render-ready first</div>
+              <div>• <strong>timeout</strong> — use queue mode</div>
+            </div>
+          </div>
+
+          <div class="divider mt-3"></div>
+
+          <div class="mt-3" style="display:flex;flex-wrap:wrap;gap:0.4rem;">
+            <a href="/health" target="_blank" class="button button-subtle" style="font-size:0.72rem;">Health</a>
+            <a href="/system" class="button button-subtle" style="font-size:0.72rem;">System</a>
+            <a href="/api/integrations/isaac" target="_blank" class="button button-subtle" style="font-size:0.72rem;">API Docs</a>
+          </div>
+        </div>{# /오른쪽 #}
+
+      </div>{# /grid #}
+
+      <script>
+      (() => {
+        /* ── Control Plane fetch helper ── */
+        async function cpFetch(route, method, body) {
+          const t0 = Date.now();
+          document.getElementById('cp-last-route').textContent = method + ' ' + route;
+          document.getElementById('cp-last-status').textContent = '…';
+          document.getElementById('cp-response-summary').textContent = '…';
+          try {
+            const res = await fetch(route, {
+              method: method || 'GET',
+              headers: body ? {'Content-Type': 'application/json'} : {},
+              body: body ? JSON.stringify(body) : undefined,
+            });
+            const data = await res.json();
+            const ms = Date.now() - t0;
+            const ok = res.ok;
+            document.getElementById('cp-last-status').innerHTML =
+              `<span class="${ok ? 'cp-response-ok' : 'cp-response-err'}">${res.status} ${ok ? 'OK' : 'Error'}</span> · ${ms}ms`;
+            /* Summary */
+            const lines = Object.entries(data).slice(0, 10).map(([k, v]) =>
+              `${k}: ${typeof v === 'object' ? JSON.stringify(v).slice(0, 60) : String(v)}`
+            ).join('\n');
+            document.getElementById('cp-response-summary').textContent = lines || '(empty)';
+            /* Raw JSON */
+            const rawWrap = document.getElementById('cp-raw-json-wrap');
+            rawWrap.style.display = '';
+            document.getElementById('cp-raw-json').textContent = JSON.stringify(data, null, 2);
+            return data;
+          } catch(e) {
+            document.getElementById('cp-last-status').innerHTML = '<span class="cp-response-err">Network Error</span>';
+            document.getElementById('cp-response-summary').textContent = String(e);
+            return null;
+          }
+        }
+
+        /* ── Populate scene dropdown on panel load ── */
+        async function loadSceneList() {
+          try {
+            const res = await fetch('/api/scenes');
+            const data = await res.json();
+            const scenes = Array.isArray(data) ? data : (data.scenes || []);
+            const sel = document.getElementById('cp-scene-select');
+            sel.innerHTML = scenes.length
+              ? scenes.map(s => `<option value="${s.scene_id}">${s.scene_id}</option>`).join('')
+              : '<option value="">No scenes registered</option>';
+          } catch(_) {}
+        }
+
+        /* ── Refresh status bar from /health ── */
+        async function refreshStatusBar() {
+          try {
+            const res = await fetch('/health');
+            const data = await res.json();
+            /* Daemon chip */
+            document.getElementById('cp-chip-daemon').className = 'cp-status-chip cp-chip-ok';
+            document.getElementById('cp-chip-daemon').innerHTML = '<span class="cp-chip-dot"></span>Daemon OK';
+            /* Session chip */
+            const sessionChip = document.getElementById('cp-chip-session');
+            if (data.isaac_connected) {
+              sessionChip.className = 'cp-status-chip cp-chip-ok';
+              sessionChip.innerHTML = `<span class="cp-chip-dot"></span>${data.isaac_scene_id || 'Session'}`;
+            } else {
+              sessionChip.className = 'cp-status-chip cp-chip-none';
+              sessionChip.innerHTML = '<span class="cp-chip-dot"></span>No Session';
+            }
+          } catch(_) {
+            document.getElementById('cp-chip-daemon').className = 'cp-status-chip cp-chip-err';
+            document.getElementById('cp-chip-daemon').innerHTML = '<span class="cp-chip-dot"></span>Daemon unreachable';
+          }
+        }
+
+        /* ── Action handlers ── */
+        window.cpLoadScene = async function() {
+          const sceneId = document.getElementById('cp-scene-select').value;
+          if (!sceneId) return;
+          await cpFetch('/api/isaac/commands', 'POST', {command_type: 'load_scene', scene_id: sceneId});
+          await refreshStatusBar();
+        };
+
+        window.cpRegisterScene = async function() {
+          const body = {};
+          const sid = document.getElementById('cp-reg-scene-id').value.trim();
+          const usd = document.getElementById('cp-reg-usd').value.trim();
+          const mit = document.getElementById('cp-reg-mitsuba').value.trim();
+          const shp = document.getElementById('cp-reg-shapemap').value.trim();
+          if (sid) body.scene_id = sid;
+          if (usd) body.usd_stage_path = usd;
+          if (mit) body.mitsuba_scene_ref = mit;
+          if (shp) body.shape_map_ref = shp;
+          const data = await cpFetch('/api/isaac/scenes/register', 'POST', body);
+          if (data) loadSceneList();
+        };
+
+        window.cpCommand = async function(type) {
+          const sceneId = document.getElementById('cp-scene-select').value;
+          await cpFetch('/api/isaac/commands', 'POST', {command_type: type, scene_id: sceneId || undefined});
+          await refreshStatusBar();
+        };
+
+        window.cpSessionStatus = async function() {
+          await cpFetch('/isaac/session', 'GET');
+          await refreshStatusBar();
+        };
+
+        window.cpRenderCurrentView = async function() {
+          const modalities = [...document.querySelectorAll('input[name="cp-modality"]:checked')].map(c => c.value);
+          const submitMode = document.getElementById('cp-submit-mode').value;
+          const sceneId = document.getElementById('cp-scene-select').value;
+          const body = {
+            scene_id: sceneId || undefined,
+            modalities,
+            submit_mode: submitMode,
+          };
+          if (submitMode === 'blocking') {
+            await cpFetch('/isaac/capture', 'POST', body);
+          } else {
+            await cpFetch('/isaac/render/submit', 'POST', body);
+          }
+        };
+
+        window.cpLatestCapture = async function() {
+          const data = await cpFetch('/api/isaac/captures/latest', 'GET');
+          if (data && data.latest_capture) {
+            const cap = data.latest_capture;
+            const el = document.getElementById('cp-capture-link');
+            const path = cap.manifest_path || '';
+            el.innerHTML = path ? `<span class="mono">${path}</span>` : '';
+          }
+        };
+
+        window.cpApplyBsdf = async function() {
+          const prim = document.getElementById('cp-bsdf-prim').value.trim();
+          const bsdfType = document.getElementById('cp-bsdf-type').value;
+          const sceneId = document.getElementById('cp-scene-select').value;
+          if (!prim) return;
+          await cpFetch('/api/isaac/commands', 'POST', {
+            command_type: 'apply_material_override',
+            scene_id: sceneId || undefined,
+            payload: {
+              prim_paths: [prim],
+              bsdf_type: bsdfType,
+            }
+          });
+        };
+
+        /* Init */
+        loadSceneList();
+        refreshStatusBar();
+      })();
+      </script>
+    </div>
+
+    {# ══════════════════════════════════════════════════════════════
+       탭 3 — Script / Extension
+    ══════════════════════════════════════════════════════════════ #}
+    <div class="tab-panel hidden" data-panel="script">
+      <div class="panel-header">
+        <div>
+          <h2 class="section-title"><span data-lang="en">Script / Extension</span><span data-lang="kr" class="hidden">스크립트 / 확장</span></h2>
+          <p class="muted text-sm"><span data-lang="en">Use from Isaac Script Editor or load the full extension panel via the launcher.</span><span data-lang="kr" class="hidden">Isaac Script Editor에서 사용하거나 런처로 extension 패널을 로드합니다.</span></p>
+        </div>
+        <a href="/api/integrations/isaac" class="button button-subtle">Guide API</a>
+      </div>
+
+      {# 섹션 A: 방식 선택 카드 2개 #}
+      <div class="mt-4" style="display:flex;gap:0.75rem;flex-wrap:wrap;">
+        <div class="subpanel" style="flex:1;min-width:0;padding:1rem;">
+          <div class="panel-label">📝 <span data-lang="en">Script Editor</span><span data-lang="kr" class="hidden">Script Editor</span></div>
+          <div class="muted text-sm mt-2"><span data-lang="en">Import helpers directly in Isaac's Script Editor. No launcher required. Best for quick tests and debugging.</span><span data-lang="kr" class="hidden">Isaac Script Editor에서 helper를 바로 import합니다. 런처 없이 사용 가능. 빠른 테스트와 디버깅에 적합합니다.</span></div>
+        </div>
+        <div class="subpanel" style="flex:1;min-width:0;padding:1rem;">
+          <div class="panel-label">🔌 <span data-lang="en">Isaac Extension</span><span data-lang="kr" class="hidden">Isaac Extension</span></div>
+          <div class="muted text-sm mt-2"><span data-lang="en">Launch Isaac with the provided <code>.bat</code>. The Robomituba panel auto-loads. Best for regular workflows. See the Windows Launcher tab.</span><span data-lang="kr" class="hidden">제공된 <code>.bat</code>으로 Isaac을 실행하면 Robomituba 패널이 자동 로드됩니다. 정기적인 작업 흐름에 적합합니다. Windows 실행 탭을 참고하세요.</span></div>
+        </div>
+      </div>
+
+      {# 섹션 B: 최소 스니펫 #}
       <div class="stack-lg mt-4">
         <div>
-          <div class="panel-label">1. Import helper script</div>
+          <div class="panel-label"><span data-lang="en">0. Create one daemon object</span><span data-lang="kr" class="hidden">0. daemon 객체 하나 만들기</span></div>
+          <pre class="code-block mt-2">{{ guide.helper_import_snippet }}</pre>
+        </div>
+        <div>
+          <div class="panel-label"><span data-lang="en">1. Load scene, adjust state, render current view, open latest capture</span><span data-lang="kr" class="hidden">1. scene 열기, 상태 조정, 현재 시점 렌더, 최신 결과 열기</span></div>
+          <pre class="code-block mt-2">{{ guide.helper_render_snippet }}</pre>
+        </div>
+      </div>
+
+      {# 섹션 C: Extension 패키지 정보 #}
+      <div class="subpanel mt-4" style="padding:1.1rem;">
+        <div class="panel-label"><span data-lang="en">Extension info</span><span data-lang="kr" class="hidden">Extension 정보</span></div>
+        <div class="kv-list mt-3">
+          <div><span>Extension ID</span><span class="mono text-xs">robomituba.isaac_extension</span></div>
+          <div><span><span data-lang="en">ext-folder</span><span data-lang="kr" class="hidden">ext-folder</span></span><span class="mono text-xs">%ROBOMITUBA_APPS%</span></div>
+          <div><span><span data-lang="en">Enable flag</span><span data-lang="kr" class="hidden">활성화 플래그</span></span><span class="mono text-xs">--enable robomituba.isaac_extension</span></div>
+          <div><span><span data-lang="en">Panel title</span><span data-lang="kr" class="hidden">패널 이름</span></span><span class="mono text-xs">Robomituba Isaac Extension</span></div>
+        </div>
+      </div>
+
+      {# 섹션 D: 설치 검증 체크 #}
+      <div class="subpanel mt-4" style="padding:1.1rem;">
+        <div class="panel-label"><span data-lang="en">Verification checklist</span><span data-lang="kr" class="hidden">설치 검증 체크</span></div>
+        <div class="stack-sm mt-3" style="font-size:0.82rem;color:var(--muted);">
+          <div>☐ <span data-lang="en">Extension Manager shows <code>robomituba.isaac_extension</code></span><span data-lang="kr" class="hidden">Extension Manager에 <code>robomituba.isaac_extension</code>이 표시됨</span></div>
+          <div>☐ <span data-lang="en"><code>from isaac_extension import connect_daemon</code> works in Script Editor</span><span data-lang="kr" class="hidden">Script Editor에서 <code>from isaac_extension import connect_daemon</code>이 동작함</span></div>
+          <div>☐ <span data-lang="en">Robomituba panel is visible in Isaac UI</span><span data-lang="kr" class="hidden">Isaac UI에 Robomituba 패널이 표시됨</span></div>
+        </div>
+      </div>
+
+      {# 섹션 E: MooreLane 예시 #}
+      <div class="stack-sm mt-4">
+        <div class="subpanel" style="padding:1rem;">
+          <div class="panel-label"><span data-lang="en">MooreLane: open-only quick start</span><span data-lang="kr" class="hidden">MooreLane: scene 열기만 빠르게</span></div>
+          <div class="muted text-sm mt-2"><span data-lang="en">No daemon catalog registration required — just opens the USD in Isaac.</span><span data-lang="kr" class="hidden">daemon catalog 등록 없이 USD를 Isaac에서 엽니다.</span></div>
+          <pre class="code-block mt-3">{{ guide.moorelane_open_only_snippet }}</pre>
+        </div>
+        <div class="subpanel" style="padding:1rem;">
+          <div class="panel-label"><span data-lang="en">MooreLane: register for full render session</span><span data-lang="kr" class="hidden">MooreLane: 전체 렌더 세션용 등록</span></div>
+          <div class="muted text-sm mt-2"><span data-lang="en">Requires both <code>mitsuba_scene_ref</code> and <code>shape_map_ref</code>. If <code>shape_map.json</code> is missing, the scene is registered but not render-ready.</span><span data-lang="kr" class="hidden"><code>mitsuba_scene_ref</code>와 <code>shape_map_ref</code>가 둘 다 필요합니다. <code>shape_map.json</code>이 없으면 등록은 되지만 렌더 준비가 되지 않습니다.</span></div>
+          <pre class="code-block mt-3">{{ guide.moorelane_register_snippet }}</pre>
+        </div>
+      </div>
+
+      {# Low-level session snippets (접힘) #}
+      <details class="subpanel mt-4" style="padding:0;">
+        <summary style="cursor:pointer;padding:0.9rem 1rem;font-size:0.83rem;font-weight:600;list-style:none;"><span data-lang="en">▸ Low-level session API snippets</span><span data-lang="kr" class="hidden">▸ 저수준 session API 스니펫</span></summary>
+        <div class="stack-lg" style="padding:0 1rem 1rem;">
+          <div>
+            <div class="panel-label"><span data-lang="en">Import session helpers</span><span data-lang="kr" class="hidden">session helper import</span></div>
+            <pre class="code-block mt-2">{{ guide.session_import_snippet }}</pre>
+          </div>
+          <div>
+            <div class="panel-label"><span data-lang="en">Open session, sync, and render current view</span><span data-lang="kr" class="hidden">session 열기, 동기화, 현재 시점 렌더</span></div>
+            <pre class="code-block mt-2">{{ guide.session_render_snippet }}</pre>
+          </div>
+        </div>
+      </details>
+    </div>
+
+    {# ══════════════════════════════════════════════════════════════
+       탭 4 — Queue Render
+    ══════════════════════════════════════════════════════════════ #}
+    <div class="tab-panel hidden" data-panel="queue">
+      <div class="panel-header">
+        <div>
+          <h2 class="section-title"><span data-lang="en">Queue Render</span><span data-lang="kr" class="hidden">큐 렌더</span></h2>
+          <p class="muted text-sm"><span data-lang="en">Submit a RenderRequest job and poll for completion. Best for long or batch renders.</span><span data-lang="kr" class="hidden">RenderRequest 작업을 제출하고 완료될 때까지 polling합니다. 긴 작업이나 대량 처리에 적합합니다.</span></p>
+        </div>
+      </div>
+
+      {# 섹션 A: 언제 쓰는가 #}
+      <div class="mt-4" style="display:flex;gap:0.75rem;flex-wrap:wrap;">
+        {% for item_en, item_kr in [
+          ('Render time is long (> 2 min)', '렌더 시간이 길 때 (2분 이상)'),
+          ('Processing many scenes or captures', '다수 scene/capture 처리할 때'),
+          ('Need polling-based status tracking', 'polling 기반 상태 추적이 필요할 때'),
+        ] %}
+          <div class="subpanel" style="flex:1;min-width:160px;padding:0.9rem 1rem;">
+            <div class="muted text-sm"><span data-lang="en">{{ item_en }}</span><span data-lang="kr" class="hidden">{{ item_kr }}</span></div>
+          </div>
+        {% endfor %}
+      </div>
+
+      {# 섹션 B: 핵심 API #}
+      <div class="subpanel mt-4" style="padding:1.1rem;">
+        <div class="panel-label"><span data-lang="en">Core endpoints</span><span data-lang="kr" class="hidden">핵심 엔드포인트</span></div>
+        <div class="kv-list mt-3">
+          <div><span class="mono text-xs">POST /render</span><span class="muted text-xs"><span data-lang="en">Submit a render job</span><span data-lang="kr" class="hidden">렌더 작업 제출</span></span></div>
+          <div><span class="mono text-xs">GET /jobs/{id}</span><span class="muted text-xs"><span data-lang="en">Poll job status</span><span data-lang="kr" class="hidden">작업 상태 polling</span></span></div>
+          <div><span class="mono text-xs">GET /jobs/{id}/manifest</span><span class="muted text-xs"><span data-lang="en">Fetch observation bundle</span><span data-lang="kr" class="hidden">관찰 번들 조회</span></span></div>
+        </div>
+      </div>
+
+      {# 섹션 C: 예제 코드 #}
+      <div class="stack-lg mt-4">
+        <div>
+          <div class="panel-label"><span data-lang="en">1. Import helper script</span><span data-lang="kr" class="hidden">1. helper 스크립트 import</span></div>
           <pre class="code-block mt-2">{{ guide.import_snippet }}</pre>
         </div>
         <div>
-          <div class="panel-label">2. Capture viewport and submit</div>
+          <div class="panel-label"><span data-lang="en">2. Capture viewport and submit</span><span data-lang="kr" class="hidden">2. viewport 캡처 후 제출</span></div>
           <pre class="code-block mt-2">{{ guide.submit_snippet }}</pre>
         </div>
         <div>
-          <div class="panel-label">3. Poll status and open manifest</div>
+          <div class="panel-label"><span data-lang="en">3. Poll status and open manifest</span><span data-lang="kr" class="hidden">3. 상태 polling 후 manifest 열기</span></div>
           <pre class="code-block mt-2">{{ guide.poll_snippet }}</pre>
         </div>
       </div>
-    </article>
 
-    <article class="panel">
+      {# 섹션 D: Jobs 페이지 연결 #}
+      <div class="subpanel mt-4" style="padding:1.1rem;">
+        <div class="panel-label"><span data-lang="en">Monitor in Jobs page</span><span data-lang="kr" class="hidden">Jobs 페이지에서 모니터링</span></div>
+        <div class="muted text-sm mt-2"><span data-lang="en">Completed renders are written to <span class="mono">out/bridge_jobs/&lt;job_id&gt;/observations/&lt;frame_id&gt;</span></span><span data-lang="kr" class="hidden">완료된 렌더 결과는 <span class="mono">out/bridge_jobs/&lt;job_id&gt;/observations/&lt;frame_id&gt;</span>에 저장됩니다.</span></div>
+        <a href="/jobs" class="button button-subtle mt-3" style="font-size:0.82rem;"><span data-lang="en">→ Jobs page</span><span data-lang="kr" class="hidden">→ Jobs 페이지</span></a>
+      </div>
+    </div>
+
+    {# ══════════════════════════════════════════════════════════════
+       탭 5 — Troubleshooting
+    ══════════════════════════════════════════════════════════════ #}
+    <div class="tab-panel hidden" data-panel="troubleshoot">
       <div class="panel-header">
         <div>
-          <h2 class="section-title">Artifacts location</h2>
-          <p class="muted text-sm">Where queue-mode renders land on disk.</p>
+          <h2 class="section-title"><span data-lang="en">Troubleshooting</span><span data-lang="kr" class="hidden">문제 해결</span></h2>
+          <p class="muted text-sm"><span data-lang="en">Common issues — check these before blaming the queue.</span><span data-lang="kr" class="hidden">queue를 의심하기 전에 먼저 확인할 공통 이슈들.</span></p>
         </div>
       </div>
-      <div class="muted text-sm mt-4">
-        Completed renders are written to<br>
-        <span class="mono">out/bridge_jobs/&lt;job_id&gt;/observations/&lt;frame_id&gt;</span>
+
+      {# 섹션 A: 흔한 문제 (checklist) #}
+      <div class="stack-sm mt-4">
+        {% for item in guide.checklist %}
+          <details class="subpanel" style="padding:0;">
+            <summary style="cursor:pointer;padding:0.9rem;font-size:0.86rem;font-weight:600;list-style:none;display:flex;align-items:center;gap:0.5rem;">
+              <span style="color:var(--brand);font-size:0.8rem;">▸</span>
+              <span data-lang="en">{{ item.en | striptags | truncate(80) }}</span>
+              <span data-lang="kr" class="hidden">{{ item.kr | striptags | truncate(80) }}</span>
+            </summary>
+            <div class="muted text-sm" style="padding:0 0.9rem 0.9rem;">
+              <span data-lang="en">{{ item.en | safe }}</span>
+              <span data-lang="kr" class="hidden">{{ item.kr | safe }}</span>
+            </div>
+          </details>
+        {% endfor %}
       </div>
-    </article>
-  </section>
+
+      {# 섹션 B: 증상 기준 분류 #}
+      <div class="subpanel mt-4" style="padding:1.1rem;">
+        <div class="panel-label"><span data-lang="en">Symptom guide</span><span data-lang="kr" class="hidden">증상별 가이드</span></div>
+        <div class="kv-list mt-3">
+          <div><span><span data-lang="en">Can't connect</span><span data-lang="kr" class="hidden">연결 안 됨</span></span><span class="muted text-xs"><span data-lang="en">Check daemon URL and WSL service</span><span data-lang="kr" class="hidden">daemon URL 및 WSL 서비스 확인</span></span></div>
+          <div><span><span data-lang="en">No render output</span><span data-lang="kr" class="hidden">렌더 안 나옴</span></span><span class="muted text-xs"><span data-lang="en">Check mitsuba_scene_ref and shape_map_ref exist</span><span data-lang="kr" class="hidden">mitsuba_scene_ref와 shape_map_ref 존재 여부 확인</span></span></div>
+          <div><span><span data-lang="en">No artifacts</span><span data-lang="kr" class="hidden">artifact 없음</span></span><span class="muted text-xs"><span data-lang="en">Check out/bridge_jobs/ directory</span><span data-lang="kr" class="hidden">out/bridge_jobs/ 디렉터리 확인</span></span></div>
+          <div><span><span data-lang="en">Sync fails</span><span data-lang="kr" class="hidden">sync 안 됨</span></span><span class="muted text-xs"><span data-lang="en">Open scene first, then connect session</span><span data-lang="kr" class="hidden">scene을 먼저 열고 session 연결</span></span></div>
+          <div><span><span data-lang="en">Windows path error</span><span data-lang="kr" class="hidden">Windows 경로 오류</span></span><span class="muted text-xs"><span data-lang="en">Use UNC or mapped drive path, avoid spaces</span><span data-lang="kr" class="hidden">UNC 또는 mapped drive 경로 사용, 공백 주의</span></span></div>
+        </div>
+      </div>
+
+      {# 섹션 C: 복구 액션 #}
+      <div class="mt-4">
+        <div class="panel-label"><span data-lang="en">Recovery actions</span><span data-lang="kr" class="hidden">복구 액션</span></div>
+        <div class="topbar-actions gap-2 mt-3" style="justify-content:flex-start;flex-wrap:wrap;">
+          <a href="/health" target="_blank" class="button button-subtle" style="font-size:0.8rem;">Health JSON</a>
+          {% if latest_scene_id %}
+            <button class="button button-subtle js-smoke-render" data-scene-id="{{ latest_scene_id }}" style="font-size:0.8rem;">Smoke Test</button>
+          {% endif %}
+          <a href="/system" class="button button-subtle" style="font-size:0.8rem;"><span data-lang="en">System</span><span data-lang="kr" class="hidden">시스템</span></a>
+          <a href="/api/integrations/isaac" target="_blank" class="button button-subtle" style="font-size:0.8rem;">API Docs</a>
+        </div>
+      </div>
+    </div>
+
+    {# ══════════════════════════════════════════════════════════════
+       탭 6 — Windows Launcher
+    ══════════════════════════════════════════════════════════════ #}
+    <div class="tab-panel hidden" data-panel="windows">
+      <div class="panel-header">
+        <div>
+          <h2 class="section-title"><span data-lang="en">Windows Launcher</span><span data-lang="kr" class="hidden">Windows 실행</span></h2>
+          <p class="muted text-sm"><span data-lang="en">Launch Isaac Sim on Windows with the Robomituba extension loaded. Two approaches: ad-hoc via <code>.bat</code>, or permanent via <code>extsUser</code>.</span><span data-lang="kr" class="hidden">Windows에서 Robomituba extension을 로드한 채 Isaac Sim을 실행합니다. .bat 즉시 실행 또는 extsUser 영구 등록, 두 가지 방식을 제공합니다.</span></p>
+        </div>
+      </div>
+
+      {# 방식 선택 카드 #}
+      <div class="mt-4" style="display:flex;gap:0.75rem;flex-wrap:wrap;">
+        <div class="subpanel" style="flex:1;min-width:0;padding:1rem;border-top:3px solid var(--brand);">
+          <div class="panel-label">🚀 <span data-lang="en">A. Runtime — .bat launcher</span><span data-lang="kr" class="hidden">A. 런타임 — .bat 런처</span></div>
+          <div class="muted text-sm mt-2"><span data-lang="en">Run the <code>.bat</code> from the repo once. No installation step. Best for quick testing.</span><span data-lang="kr" class="hidden">repo의 <code>.bat</code>을 한 번 실행합니다. 설치 단계 없음. 빠른 테스트에 적합합니다.</span></div>
+        </div>
+        <div class="subpanel" style="flex:1;min-width:0;padding:1rem;">
+          <div class="panel-label">📦 <span data-lang="en">B. Permanent — extsUser registration</span><span data-lang="kr" class="hidden">B. 영구 등록 — extsUser</span></div>
+          <div class="muted text-sm mt-2"><span data-lang="en">Copy the extension folder to <code>extsUser</code>. Isaac auto-discovers it on every launch. Best for regular use.</span><span data-lang="kr" class="hidden">extension 폴더를 <code>extsUser</code>에 복사합니다. Isaac이 실행마다 자동으로 인식합니다. 정기 사용에 적합합니다.</span></div>
+        </div>
+      </div>
+
+      {# 섹션 A: .bat 런처 #}
+      <div class="subpanel mt-4" style="padding:1.1rem;">
+        <div class="panel-header">
+          <div class="panel-label"><span data-lang="en">A. Runtime launcher (.bat)</span><span data-lang="kr" class="hidden">A. 런타임 런처 (.bat)</span></div>
+          <a href="/api/integrations/isaac" target="_blank" class="button button-subtle" style="font-size:0.75rem;">Guide API</a>
+        </div>
+        <div class="callout-info mt-3">
+          <span data-lang="en">This launcher adds Robomituba Python modules to <code>PYTHONPATH</code>, registers the extension search path via <code>--ext-folder</code>, and auto-enables the Isaac panel with <code>--enable robomituba.isaac_extension</code>.</span>
+          <span data-lang="kr" class="hidden">이 런처는 Robomituba Python 모듈을 <code>PYTHONPATH</code>에 추가하고, <code>--ext-folder</code>로 extension 검색 경로를 등록하며, <code>--enable robomituba.isaac_extension</code>으로 Isaac 패널을 자동 활성화합니다.</span>
+        </div>
+        <pre class="code-block mt-3">{{ guide.windows_launcher_snippet }}</pre>
+        <div class="muted text-sm mt-3">
+          <span data-lang="en">File location: <span class="mono">{{ guide.windows_launcher_path }}</span><br>Modify <span class="mono">ROBOMITUBA_ROOT</span> if your repo is on a local drive instead of UNC.</span>
+          <span data-lang="kr" class="hidden">파일 위치: <span class="mono">{{ guide.windows_launcher_path }}</span><br>repo가 UNC 대신 로컬 드라이브에 있으면 <span class="mono">ROBOMITUBA_ROOT</span>만 수정하세요.</span>
+        </div>
+      </div>
+
+      {# 섹션 B: 영구 등록 #}
+      <div class="subpanel mt-4" style="padding:1.1rem;">
+        <div class="panel-label"><span data-lang="en">B. Permanent registration (extsUser)</span><span data-lang="kr" class="hidden">B. 영구 등록 (extsUser)</span></div>
+        <ol class="muted text-sm mt-3" style="padding-left:1.15rem;line-height:1.9;">
+          <li>
+            <span data-lang="en">Copy <span class="mono">apps/isaac_extension/</span> to:</span>
+            <span data-lang="kr" class="hidden"><span class="mono">apps/isaac_extension/</span>을 아래 경로로 복사:</span>
+            <div class="kv-list mt-1">
+              <div><span class="muted text-xs">Windows</span><span class="mono text-xs">{{ guide.windows_exts_user_path }}</span></div>
+              <div><span class="muted text-xs">WSL</span><span class="mono text-xs">{{ guide.windows_wsl_exts_path }}</span></div>
+            </div>
+          </li>
+          <li><span data-lang="en">Launch Isaac Sim normally (<span class="mono">{{ guide.windows_isaac_sim_root }}\isaac-sim.bat</span>).</span><span data-lang="kr" class="hidden">Isaac Sim을 평소대로 실행합니다 (<span class="mono">{{ guide.windows_isaac_sim_root }}\isaac-sim.bat</span>).</span></li>
+          <li><span data-lang="en">Open Extension Manager → search <span class="mono">robomituba</span> → enable <span class="mono">robomituba.isaac_extension</span>.</span><span data-lang="kr" class="hidden">Extension Manager 열기 → <span class="mono">robomituba</span> 검색 → <span class="mono">robomituba.isaac_extension</span> 활성화.</span></li>
+        </ol>
+      </div>
+
+      {# 섹션 C: 경로 모델 도식 #}
+      <div class="subpanel mt-4" style="padding:1.1rem;">
+        <div class="panel-label"><span data-lang="en">Path model</span><span data-lang="kr" class="hidden">경로 모델</span></div>
+        <pre class="code-block mt-3" style="font-size:0.75rem;">Isaac Sim (Windows) ──[UNC or local]──▶ repo / assets
+Daemon      (WSL)   ──[/jarvis/...]  ──▶ render output
+
+DEFAULT_REPO_ROOT = \\jarvis.postech.ac.kr\workspace\jinnyeong\project\robomituba
+Isaac Sim root    = {{ guide.windows_isaac_sim_root }}
+extsUser path     = {{ guide.windows_exts_user_path }}</pre>
+      </div>
+
+      {# 섹션 D: 경로 팁 #}
+      <div class="grid gap-3 mt-4" style="grid-template-columns:1fr 1fr;">
+        <div class="subpanel" style="padding:1rem;">
+          <div class="panel-label">UNC <span class="muted" style="font-size:0.75rem;font-weight:400;">\\server\share</span></div>
+          <div class="muted text-sm mt-2">
+            <span data-lang="en">✅ WSL↔Windows sync is automatic<br>⚠️ Texture streaming may be slow — use mapped drive or local SSD mirror if textures fail to load.</span>
+            <span data-lang="kr" class="hidden">✅ WSL↔Windows 동기화 자동<br>⚠️ 텍스처 스트리밍이 느릴 수 있음 — 텍스처 로드 실패 시 mapped drive 또는 로컬 SSD mirror 사용 권장.</span>
+          </div>
+        </div>
+        <div class="subpanel" style="padding:1rem;">
+          <div class="panel-label"><span data-lang="en">Local / Mapped Drive</span><span data-lang="kr" class="hidden">로컬 / Mapped Drive</span></div>
+          <div class="muted text-sm mt-2">
+            <span data-lang="en">✅ Fast texture loading<br>⚠️ Need to keep two locations in sync — copy or symlink from WSL source.</span>
+            <span data-lang="kr" class="hidden">✅ 빠른 텍스처 로딩<br>⚠️ 두 위치를 동기화해야 함 — WSL 소스에서 복사 또는 symlink 사용.</span>
+          </div>
+        </div>
+      </div>
+
+      {# 섹션 E: 테스트 체크 #}
+      <div class="subpanel mt-4" style="padding:1.1rem;">
+        <div class="panel-label"><span data-lang="en">Post-launch verification</span><span data-lang="kr" class="hidden">실행 후 검증</span></div>
+        <div class="stack-sm mt-3" style="font-size:0.82rem;color:var(--muted);">
+          <div>☐ <span data-lang="en">Extension Manager shows <span class="mono">robomituba.isaac_extension</span> as enabled</span><span data-lang="kr" class="hidden">Extension Manager에 <span class="mono">robomituba.isaac_extension</span>이 활성화 상태로 표시됨</span></div>
+          <div>☐ <span data-lang="en"><span class="mono">GET /health</span> → daemon reachable from Isaac host</span><span data-lang="kr" class="hidden">Isaac host에서 <span class="mono">GET /health</span> → daemon reachable</span></div>
+          <div>☐ <span data-lang="en">Smoke render succeeds (at least 1 frame)</span><span data-lang="kr" class="hidden">Smoke render 1회 이상 성공</span></div>
+        </div>
+        <div class="topbar-actions gap-2 mt-3" style="justify-content:flex-start;">
+          <a href="/health" target="_blank" class="button button-subtle" style="font-size:0.8rem;">Health JSON</a>
+          {% if latest_scene_id %}
+            <button class="button button-subtle js-smoke-render" data-scene-id="{{ latest_scene_id }}" style="font-size:0.8rem;">Smoke Test</button>
+          {% endif %}
+        </div>
+      </div>
+    </div>
+
+  </article>
 {% endblock %}

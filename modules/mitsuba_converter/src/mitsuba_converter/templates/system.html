@@ -3,15 +3,15 @@
 {% block content %}
   <section class="grid gap-4 lg:grid-cols-3">
     <article class="panel">
-      <div class="panel-label">Base URL</div>
+      <div class="panel-label"><span data-lang="en">Base URL</span><span data-lang="kr" class="hidden">기본 URL</span></div>
       <div class="mono text-xs mt-3">{{ base_url }}</div>
     </article>
     <article class="panel">
-      <div class="panel-label">Variant</div>
+      <div class="panel-label"><span data-lang="en">Variant</span><span data-lang="kr" class="hidden">변형</span></div>
       <div class="metric-sm mt-3">{{ summary.variant }}</div>
     </article>
     <article class="panel">
-      <div class="panel-label">Repo Root</div>
+      <div class="panel-label"><span data-lang="en">Repo Root</span><span data-lang="kr" class="hidden">저장소 루트</span></div>
       <div class="mono text-xs mt-3">{{ summary.repo_root }}</div>
     </article>
   </section>
@@ -20,23 +20,26 @@
     <article class="panel">
       <div class="panel-header">
         <div>
-          <h2 class="section-title">Worker</h2>
-          <p class="muted text-sm">Single-worker queue runtime.</p>
+          <h2 class="section-title"><span data-lang="en">Worker</span><span data-lang="kr" class="hidden">워커</span></h2>
+          <p class="muted text-sm"><span data-lang="en">Single-worker queue runtime.</span><span data-lang="kr" class="hidden">단일 워커 큐 런타임.</span></p>
         </div>
       </div>
       <div class="kv-list mt-4">
-        <div><span>Worker state</span><span>{{ summary.worker_state }}</span></div>
-        <div><span>Queue length</span><span>{{ summary.queue_length }}</span></div>
-        <div><span>Running jobs</span><span>{{ summary.running_jobs }}</span></div>
-        <div><span>Queued jobs</span><span>{{ summary.queued_jobs }}</span></div>
+        <div><span><span data-lang="en">Worker state</span><span data-lang="kr" class="hidden">워커 상태</span></span><span>{% if summary.worker_state == "running" %}<span data-lang="en">running</span><span data-lang="kr" class="hidden">실행 중</span>{% elif summary.worker_state == "blocked" %}<span data-lang="en">blocked</span><span data-lang="kr" class="hidden">차단됨</span>{% else %}<span data-lang="en">{{ summary.worker_state }}</span><span data-lang="kr" class="hidden">유휴</span>{% endif %}</span></div>
+        <div><span><span data-lang="en">Queue length</span><span data-lang="kr" class="hidden">큐 길이</span></span><span>{{ summary.queue_length }}</span></div>
+        <div><span><span data-lang="en">Running jobs</span><span data-lang="kr" class="hidden">실행 중 작업</span></span><span>{{ summary.running_jobs }}</span></div>
+        <div><span><span data-lang="en">Queued jobs</span><span data-lang="kr" class="hidden">대기 작업</span></span><span>{{ summary.queued_jobs }}</span></div>
+        {% if summary.health_status is defined %}
+          <div><span><span data-lang="en">Health</span><span data-lang="kr" class="hidden">상태</span></span><span>{{ summary.health_status }}</span></div>
+        {% endif %}
       </div>
     </article>
 
     <article class="panel">
       <div class="panel-header">
         <div>
-          <h2 class="section-title">Scene Cache Stats</h2>
-          <p class="muted text-sm">Recent scene ref submissions and runs.</p>
+          <h2 class="section-title"><span data-lang="en">Scene Cache Stats</span><span data-lang="kr" class="hidden">장면 캐시 통계</span></h2>
+          <p class="muted text-sm"><span data-lang="en">Recent scene ref submissions and runs.</span><span data-lang="kr" class="hidden">최근 scene ref 제출과 실행 기록.</span></p>
         </div>
       </div>
       {% if summary.scene_cache_stats %}
@@ -45,14 +48,117 @@
             <div class="subpanel">
               <div class="mono text-xs">{{ item.key }}</div>
               <div class="muted text-xs mt-2">
-                submissions {{ item.submissions }} · runs {{ item.runs }} · last {{ item.last_started_at or item.last_submitted_at or "-" }}
+                <span data-lang="en">submissions {{ item.submissions }} · runs {{ item.runs }} · last {{ item.last_started_at or item.last_submitted_at or "-" }}</span>
+                <span data-lang="kr" class="hidden">제출 {{ item.submissions }} · 실행 {{ item.runs }} · 마지막 {{ item.last_started_at or item.last_submitted_at or "-" }}</span>
               </div>
             </div>
           {% endfor %}
         </div>
       {% else %}
-        <div class="empty-state mt-4">No scene cache activity yet.</div>
+        <div class="empty-state-illustrated mt-4">
+          <div class="empty-icon">📊</div>
+          <div class="empty-title"><span data-lang="en">No cache activity yet</span><span data-lang="kr" class="hidden">아직 캐시 활동이 없습니다</span></div>
+          <div class="empty-desc"><span data-lang="en">Scene cache stats appear after the first render completes.</span><span data-lang="kr" class="hidden">첫 렌더가 끝나면 장면 캐시 통계가 여기에 표시됩니다.</span></div>
+        </div>
       {% endif %}
+    </article>
+  </section>
+
+  {# ── Environment Checks ──────────────────────────────────────── #}
+  {% if env_checks %}
+    <section class="panel mt-6">
+      <div class="panel-header">
+        <div>
+          <h2 class="section-title"><span data-lang="en">Environment Checks</span><span data-lang="kr" class="hidden">환경 점검</span></h2>
+          <p class="muted text-sm"><span data-lang="en">Runtime prerequisites for GPU rendering.</span><span data-lang="kr" class="hidden">GPU 렌더를 위한 런타임 선행 조건입니다.</span></p>
+        </div>
+      </div>
+      <div class="mt-4">
+        {% for check in env_checks %}
+          <div class="env-check env-check-{{ check.status }}">
+            <span class="env-check-icon">{{ check.icon }}</span>
+            <span class="env-check-label">{{ check.label }}</span>
+            <span class="env-check-detail mono">{{ check.detail }}</span>
+          </div>
+        {% endfor %}
+      </div>
+    </section>
+  {% endif %}
+
+  <section class="grid gap-4 lg:grid-cols-[1.2fr,1fr] mt-6">
+    <article class="panel">
+      <div class="panel-header">
+        <div>
+          <h2 class="section-title"><span data-lang="en">Isaac Telemetry Timeline</span><span data-lang="kr" class="hidden">Isaac 텔레메트리 타임라인</span></h2>
+          <p class="muted text-sm"><span data-lang="en">Recent command events recorded in daemon telemetry.</span><span data-lang="kr" class="hidden">daemon telemetry에 기록된 최근 command 이벤트입니다.</span></p>
+        </div>
+      </div>
+      {% if telemetry_recent %}
+        <div class="stack-sm mt-4">
+          {% for event in telemetry_recent %}
+            <div class="subpanel">
+              <div class="flex items-center justify-between gap-3">
+                <div class="mono text-xs">{{ event.command_type or event.kind }}</div>
+                <div class="muted text-xs">{{ event.timestamp }}</div>
+              </div>
+              <div class="muted text-sm mt-2">{{ event.scene_id or "-" }} · {{ event.progress_stage or event.status or "-" }}</div>
+              <div class="muted text-xs mt-2">{{ event.progress_message or "-" }}</div>
+            </div>
+          {% endfor %}
+        </div>
+      {% else %}
+        <div class="empty-state-illustrated mt-4">
+          <div class="empty-icon">📝</div>
+          <div class="empty-title"><span data-lang="en">No telemetry yet</span><span data-lang="kr" class="hidden">아직 텔레메트리가 없습니다</span></div>
+          <div class="empty-desc"><span data-lang="en">Isaac command events will appear after the first command is queued.</span><span data-lang="kr" class="hidden">첫 Isaac command가 실행되면 여기에 이벤트가 표시됩니다.</span></div>
+        </div>
+      {% endif %}
+    </article>
+
+    <article class="panel">
+      <div class="panel-header">
+        <div>
+          <h2 class="section-title"><span data-lang="en">Telemetry Summary</span><span data-lang="kr" class="hidden">텔레메트리 요약</span></h2>
+          <p class="muted text-sm"><span data-lang="en">Stage timing baseline, path modes, and failure patterns.</span><span data-lang="kr" class="hidden">stage timing 기준값, path mode, 실패 패턴 요약입니다.</span></p>
+        </div>
+      </div>
+      <div class="stack-sm mt-4">
+        <div class="subpanel">
+          <div class="panel-label"><span data-lang="en">Path Modes</span><span data-lang="kr" class="hidden">경로 모드</span></div>
+          <div class="kv-list mt-3">
+            {% for item in telemetry_stats.path_mode_summary %}
+              <div><span>{{ item.windows_path_mode }}</span><span>{{ item.count }}</span></div>
+            {% else %}
+              <div><span data-lang="en">none</span><span data-lang="kr" class="hidden">없음</span></div>
+            {% endfor %}
+          </div>
+        </div>
+        <div class="subpanel">
+          <div class="panel-label"><span data-lang="en">Failure Patterns</span><span data-lang="kr" class="hidden">실패 패턴</span></div>
+          <div class="kv-list mt-3">
+            {% for item in telemetry_stats.error_summary %}
+              <div><span>{{ item.error_kind }}</span><span>{{ item.count }}</span></div>
+            {% else %}
+              <div><span data-lang="en">none</span><span data-lang="kr" class="hidden">없음</span></div>
+            {% endfor %}
+          </div>
+        </div>
+        <div class="subpanel">
+          <div class="panel-label"><span data-lang="en">Stage Baselines</span><span data-lang="kr" class="hidden">Stage 기준값</span></div>
+          {% if telemetry_stats.stage_stats %}
+            <div class="stack-sm mt-3">
+              {% for item in telemetry_stats.stage_stats[:8] %}
+                <div class="kv-list">
+                  <div><span class="mono text-xs">{{ item.scene_id }} · {{ item.command_type }} · {{ item.progress_stage }}</span><span>{{ item.count }}</span></div>
+                  <div><span><span data-lang="en">median / p90</span><span data-lang="kr" class="hidden">중앙값 / p90</span></span><span>{{ item.median_duration_s or "-" }} / {{ item.p90_duration_s or "-" }}s</span></div>
+                </div>
+              {% endfor %}
+            </div>
+          {% else %}
+            <div class="muted text-sm mt-3"><span data-lang="en">Stage timing baselines appear after commands complete.</span><span data-lang="kr" class="hidden">command가 완료되면 stage timing 기준값이 표시됩니다.</span></div>
+          {% endif %}
+        </div>
+      </div>
     </article>
   </section>
 {% endblock %}

@@ -8,7 +8,9 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import mimetypes
+import os
 from pathlib import Path
+import math
 import tempfile
 import threading
 from typing import Any, Callable, Mapping
@@ -19,7 +21,14 @@ from jinja2 import Environment, FileSystemLoader, select_autoescape
 
 from robomituba_bridge import (
     AssistLightSpec,
+    BsdfOverride,
     CameraSpec,
+    IsaacCaptureRequest,
+    IsaacMaterialPatch,
+    IsaacObjectState,
+    IsaacSensorSpec,
+    IsaacSessionOpen,
+    IsaacStatePatch,
     ObservationBundleManifest,
     RenderArtifactManifest,
     RenderJobAccepted,
@@ -30,6 +39,11 @@ from robomituba_bridge import (
     SceneState,
     SceneSnapshot,
     isaac_state_snapshot_from_payload,
+    isaac_capture_request_from_payload,
+    isaac_material_patch_from_payload,
+    isaac_sensor_spec_from_payload,
+    isaac_session_open_from_payload,
+    isaac_state_patch_from_payload,
     read_shape_mapping,
     make_job_id,
     observation_bundle_manifest_to_payload,
@@ -45,7 +59,7 @@ from robomituba_bridge import (
 )
 from robomituba_bridge.io import scene_snapshot_from_payload
 
-from .multimodal import camera_to_world_to_lookat
+from .multimodal import SUPPORTED_MODALITIES, camera_to_world_to_lookat, normalize_mat4_storage
 from .observation_bridge import render_timestep_bundle_split_lighting
 from .scene_floorplan import CameraOverlay, LightOverlay, render_scene_floorplan
 
@@ -125,6 +139,144 @@ class _QueuedJob:
     runtime_overrides: dict[str, Any]
 
 
+@dataclass
+class _IsaacActiveSession:
+    scene_id: str
+    mitsuba_scene_ref: str
+    shape_map_ref: str
+    scene_snapshot_ref: str | None
+    prim_to_shape_ids: dict[str, list[str]]
+    objects: dict[str, IsaacObjectState]
+    material_overrides: dict[str, BsdfOverride]
+    sensors: dict[str, IsaacSensorSpec]
+    selected_prim_paths: list[str]
+    opened_at: str
+    updated_at: str
+
+
+def _object_transform_translation(transform: list[float] | None) -> list[float] | None:
+    if not isinstance(transform, list) or len(transform) != 16:
+        return None
+    try:
+        matrix = normalize_mat4_storage(transform)
+    except Exception:
+        return None
+    return [float(matrix[0, 3]), float(matrix[1, 3]), float(matrix[2, 3])]
+
+
+MATERIAL_PRESETS: list[dict[str, Any]] = [
+    {
+        "bsdf_type": "none",
+        "category": "special",
+        "title_en": "No Override",
+        "title_kr": "오버라이드 없음",
+        "description_en": "Keep the material that already comes from the scene.",
+        "description_kr": "scene에 이미 들어 있는 재질을 그대로 사용합니다.",
+        "swatch": "preset-none",
+    },
+    {
+        "bsdf_type": "diffuse",
+        "category": "paint",
+        "title_en": "Diffuse",
+        "title_kr": "디퓨즈",
+        "description_en": "Soft matte surface with broad, even shading.",
+        "description_kr": "부드러운 무광 표면입니다.",
+        "swatch": "preset-diffuse",
+    },
+    {
+        "bsdf_type": "roughplastic",
+        "category": "plastic",
+        "title_en": "Rough Plastic",
+        "title_kr": "거친 플라스틱",
+        "description_en": "Plastic body with a gentle glossy lobe.",
+        "description_kr": "약한 glossy가 있는 플라스틱 느낌입니다.",
+        "swatch": "preset-roughplastic",
+    },
+    {
+        "bsdf_type": "pplastic",
+        "category": "plastic",
+        "title_en": "Polar Plastic",
+        "title_kr": "편광 플라스틱",
+        "description_en": "Polarization-aware plastic preset.",
+        "description_kr": "편광 특성을 함께 보는 플라스틱 preset입니다.",
+        "swatch": "preset-pplastic",
+    },
+    {
+        "bsdf_type": "conductor",
+        "category": "metal",
+        "title_en": "Conductor",
+        "title_kr": "금속",
+        "description_en": "Clean metallic reflection with strong highlights.",
+        "description_kr": "강한 하이라이트가 있는 금속 표면입니다.",
+        "swatch": "preset-conductor",
+    },
+    {
+        "bsdf_type": "roughconductor",
+        "category": "metal",
+        "title_en": "Rough Conductor",
+        "title_kr": "거친 금속",
+        "description_en": "Metal with wider, softer reflections.",
+        "description_kr": "반사가 조금 더 넓고 부드러운 금속입니다.",
+        "swatch": "preset-roughconductor",
+    },
+    {
+        "bsdf_type": "dielectric",
+        "category": "glass",
+        "title_en": "Dielectric",
+        "title_kr": "유전체",
+        "description_en": "Glass-like transmissive material.",
+        "description_kr": "유리 같은 투명 재질입니다.",
+        "swatch": "preset-dielectric",
+    },
+    {
+        "bsdf_type": "principled",
+        "category": "paint",
+        "title_en": "Principled",
+        "title_kr": "프린시플드",
+        "description_en": "General-purpose surface for quick look-dev.",
+        "description_kr": "범용 look-dev용 preset입니다.",
+        "swatch": "preset-principled",
+    },
+    {
+        "bsdf_type": "glossy_black_lacquer",
+        "category": "paint",
+        "title_en": "Glossy Black Lacquer",
+        "title_kr": "검정 래커",
+        "description_en": "Dark glossy finish for painted pieces.",
+        "description_kr": "도장된 부품에 어울리는 짙은 glossy finish입니다.",
+        "swatch": "preset-glossy-black",
+    },
+    {
+        "bsdf_type": "mirror_black_enamel",
+        "category": "special",
+        "title_en": "Mirror Black Enamel",
+        "title_kr": "미러 블랙 에나멜",
+        "description_en": "Highly reflective dark enamel look.",
+        "description_kr": "매우 반사적인 짙은 에나멜 느낌입니다.",
+        "swatch": "preset-mirror-black",
+    },
+]
+
+
+@dataclass
+class _IsaacRemoteCommand:
+    command_id: str
+    command_type: str
+    scene_id: str | None
+    payload: dict[str, Any]
+    status: str
+    created_at: str
+    dispatched_at: str | None = None
+    completed_at: str | None = None
+    updated_at: str | None = None
+    progress_stage: str | None = None
+    progress_message: str | None = None
+    progress_origin: str | None = None
+    progress_counts: dict[str, int] | None = None
+    result: dict[str, Any] | None = None
+    error: str | None = None
+
+
 class RenderDaemon:
     def __init__(
         self,
@@ -145,6 +297,13 @@ class RenderDaemon:
         self._pending: deque[str] = deque()
         self._jobs: dict[str, _QueuedJob] = {}
         self._scene_cache_stats: dict[str, dict[str, Any]] = {}
+        self._path_size_cache: dict[str, dict[str, Any]] = {}
+        self._telemetry_cache: dict[str, Any] = {"path": None, "mtime_ns": None, "rows": []}
+        self._isaac_session: _IsaacActiveSession | None = None
+        self._isaac_commands_pending: deque[str] = deque()
+        self._isaac_commands: dict[str, _IsaacRemoteCommand] = {}
+        self._debug_events: deque[dict[str, Any]] = deque(maxlen=50)
+        self._debug_event_counter: int = 0
         self._shutdown = False
         self._server: ThreadingHTTPServer | None = None
         self._server_thread: threading.Thread | None = None
@@ -157,6 +316,680 @@ class RenderDaemon:
             loader=FileSystemLoader(str(self._templates_dir)),
             autoescape=select_autoescape(("html", "xml")),
         )
+
+    def _isaac_scene_catalog_path(self) -> Path:
+        return self.repo_root / "out" / "control_plane_cache" / "isaac_scene_catalog.json"
+
+    def _isaac_command_telemetry_path(self) -> Path:
+        return self.repo_root / "out" / "control_plane_cache" / "isaac_command_telemetry.jsonl"
+
+    def _render_options_path(self, scene_id: str) -> Path:
+        return self.repo_root / "out" / "control_plane_cache" / "scene_render_options" / f"{scene_id}.json"
+
+    def _push_debug_event(self, kind: str, message: str, data: dict[str, Any] | None = None) -> None:
+        """Append a real-time debug event visible in the daemon UI toast feed."""
+        with self._condition:
+            self._debug_event_counter += 1
+            self._debug_events.append({
+                "id": self._debug_event_counter,
+                "kind": kind,
+                "message": message,
+                "data": data or {},
+                "ts": _utc_now_iso(),
+            })
+            self._condition.notify_all()
+
+    def _load_scene_render_options(self, scene_id: str | None) -> dict[str, Any]:
+        if not scene_id:
+            return {"modalities": ["rgb", "depth"], "spp": 64, "width": 1280, "height": 720, "upscale": "none"}
+        path = self._render_options_path(scene_id)
+        if path.exists():
+            try:
+                return json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+        return {"modalities": ["rgb", "depth"], "spp": 64, "width": 1280, "height": 720, "upscale": "none"}
+
+    def _parse_iso_timestamp(self, value: str | None) -> datetime | None:
+        if not value:
+            return None
+        try:
+            return datetime.fromisoformat(value).astimezone(timezone.utc)
+        except Exception:
+            return None
+
+    def _seconds_between(self, start: str | None, end: str | None) -> float | None:
+        start_dt = self._parse_iso_timestamp(start)
+        end_dt = self._parse_iso_timestamp(end)
+        if start_dt is None or end_dt is None:
+            return None
+        return max(0.0, (end_dt - start_dt).total_seconds())
+
+    def _percentile(self, values: list[float], percentile: float) -> float | None:
+        if not values:
+            return None
+        ordered = sorted(float(value) for value in values)
+        index = max(0, min(len(ordered) - 1, int(math.ceil(percentile * len(ordered))) - 1))
+        return ordered[index]
+
+    def _classify_windows_path_mode(self, raw_path: str | None) -> str:
+        path_str = str(raw_path or "").strip()
+        if not path_str:
+            return "unknown"
+        if path_str.startswith("\\\\"):
+            return "unc"
+        if len(path_str) > 1 and path_str[1] == ":":
+            normalized = path_str.replace("\\", "/").lower()
+            if "/workspace/jinnyeong/project/robomituba/" in normalized:
+                return "mapped_drive"
+            return "local_mirror"
+        return "unknown"
+
+    def _classify_error_kind(self, message: str | None, *, windows_path_mode: str = "unknown") -> str:
+        raw = str(message or "").lower()
+        if not raw:
+            return "unknown"
+        if "shape_map" in raw:
+            return "shape_map_missing"
+        if "session/open" in raw or "session open" in raw:
+            return "session_open_failed"
+        if "usd" in raw and "open" in raw:
+            return "usd_open_failed"
+        if windows_path_mode == "unc" and any(token in raw for token in ("texture", "stream", "dome", "hdri")):
+            return "unc_texture_risk"
+        return "unknown"
+
+    def _scene_telemetry_context(self, scene_id: str | None) -> dict[str, Any]:
+        if not scene_id:
+            return {
+                "scene_id": None,
+                "usd_stage_path": None,
+                "stage_path_local": None,
+                "windows_path_mode": "unknown",
+                "render_ready": None,
+                "shape_map_exists": None,
+                "size_tier": None,
+                "asset_file_count": None,
+                "texture_cache_status": None,
+                "texture_cache_root": None,
+                "texture_cache_hit": None,
+            }
+        catalog = {item["scene_id"]: item for item in self._isaac_scene_catalog_records()}
+        scene = catalog.get(scene_id) or {}
+        usd_stage_path = _maybe_str(scene.get("usd_stage_path"))
+        return {
+            "scene_id": scene_id,
+            "usd_stage_path": usd_stage_path,
+            "stage_path_local": _maybe_str(scene.get("stage_path_local")),
+            "windows_path_mode": self._classify_windows_path_mode(usd_stage_path),
+            "render_ready": scene.get("render_ready"),
+            "shape_map_exists": scene.get("shape_map_exists"),
+            "size_tier": scene.get("size_tier"),
+            "asset_file_count": scene.get("asset_file_count"),
+            "texture_cache_status": scene.get("texture_cache_status"),
+            "texture_cache_root": scene.get("texture_cache_root"),
+            "texture_cache_hit": scene.get("texture_cache_hit"),
+        }
+
+    def _append_telemetry_row(self, row: Mapping[str, Any]) -> None:
+        path = self._isaac_command_telemetry_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(dict(row), ensure_ascii=False) + "\n")
+        self._telemetry_cache["mtime_ns"] = None
+
+    def _record_isaac_command_telemetry(self, command: _IsaacRemoteCommand, *, event_type: str) -> None:
+        scene_ctx = self._scene_telemetry_context(command.scene_id)
+        timestamp = command.updated_at or command.completed_at or command.dispatched_at or command.created_at or _utc_now_iso()
+        terminal_ts = command.completed_at if command.status in {"succeeded", "failed"} else None
+        elapsed_s = self._seconds_between(command.created_at, terminal_ts or timestamp)
+        progress_message = command.error or command.progress_message
+        row = {
+            "kind": "isaac_command",
+            "event_type": event_type,
+            "timestamp": timestamp,
+            "command_id": command.command_id,
+            "scene_id": command.scene_id,
+            "command_type": command.command_type,
+            "status": command.status,
+            "progress_stage": command.progress_stage,
+            "progress_message": progress_message,
+            "progress_origin": command.progress_origin,
+            "progress_counts": dict(command.progress_counts or {}),
+            "elapsed_s": elapsed_s,
+            "windows_path_mode": scene_ctx["windows_path_mode"],
+            "usd_stage_path": scene_ctx["usd_stage_path"],
+            "stage_path_local": scene_ctx["stage_path_local"],
+            "render_ready": scene_ctx["render_ready"],
+            "shape_map_exists": scene_ctx["shape_map_exists"],
+            "size_tier": scene_ctx["size_tier"],
+            "asset_file_count": scene_ctx["asset_file_count"],
+            "texture_cache_status": scene_ctx["texture_cache_status"],
+            "texture_cache_root": scene_ctx["texture_cache_root"],
+            "texture_cache_hit": scene_ctx["texture_cache_hit"],
+            "error_kind": self._classify_error_kind(progress_message, windows_path_mode=scene_ctx["windows_path_mode"]) if command.status == "failed" else None,
+        }
+        self._append_telemetry_row(row)
+
+    def _record_render_job_telemetry(self, job: _QueuedJob, *, event_type: str) -> None:
+        scene_ctx = self._scene_telemetry_context(job.render_request.scene_state.scene_id)
+        timestamp = job.status.finished_at or job.status.started_at or job.status.submitted_at or _utc_now_iso()
+        row = {
+            "kind": "render_job",
+            "event_type": event_type,
+            "timestamp": timestamp,
+            "job_id": job.render_request.job_id,
+            "frame_id": job.render_request.frame_id,
+            "scene_id": job.render_request.scene_state.scene_id,
+            "command_type": "render_job",
+            "status": job.status.status,
+            "progress_stage": job.status.progress_stage,
+            "progress_message": job.status.error or job.status.progress_stage,
+            "progress_origin": "daemon_render",
+            "progress_counts": dict(job.status.extras.get("progress_context", {}) or {}) if isinstance(job.status.extras.get("progress_context"), Mapping) else {},
+            "elapsed_s": self._seconds_between(job.status.submitted_at, timestamp),
+            "windows_path_mode": scene_ctx["windows_path_mode"],
+            "usd_stage_path": scene_ctx["usd_stage_path"],
+            "stage_path_local": scene_ctx["stage_path_local"],
+            "render_ready": scene_ctx["render_ready"],
+            "shape_map_exists": scene_ctx["shape_map_exists"],
+            "size_tier": scene_ctx["size_tier"],
+            "asset_file_count": scene_ctx["asset_file_count"],
+            "error_kind": self._classify_error_kind(job.status.error, windows_path_mode=scene_ctx["windows_path_mode"]) if job.status.status == "failed" else None,
+        }
+        self._append_telemetry_row(row)
+
+    def _load_telemetry_rows(self, *, limit: int = 500) -> list[dict[str, Any]]:
+        path = self._isaac_command_telemetry_path()
+        if not path.exists():
+            return []
+        try:
+            stat = path.stat()
+        except OSError:
+            return []
+        cache_path = self._telemetry_cache.get("path")
+        cache_mtime = self._telemetry_cache.get("mtime_ns")
+        if cache_path == str(path) and cache_mtime == stat.st_mtime_ns:
+            rows = self._telemetry_cache.get("rows", [])
+            return rows[-limit:] if limit else list(rows)
+        rows: list[dict[str, Any]] = []
+        try:
+            for line in path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    payload = json.loads(line)
+                except Exception:
+                    continue
+                if isinstance(payload, dict):
+                    rows.append(payload)
+        except OSError:
+            return []
+        self._telemetry_cache = {"path": str(path), "mtime_ns": stat.st_mtime_ns, "rows": rows}
+        return rows[-limit:] if limit else rows
+
+    def _telemetry_recent_rows(self, *, limit: int = 25) -> list[dict[str, Any]]:
+        rows = self._load_telemetry_rows(limit=max(limit * 4, 100))
+        rows.sort(key=lambda item: _safe_sort_ts(_maybe_str(item.get("timestamp"))), reverse=True)
+        return rows[:limit]
+
+    def _telemetry_recent_rows_for_command(self, command_id: str, *, limit: int = 8) -> list[dict[str, Any]]:
+        rows = [
+            row
+            for row in self._load_telemetry_rows(limit=2000)
+            if row.get("kind") == "isaac_command" and str(row.get("command_id") or "") == command_id
+        ]
+        rows.sort(key=lambda item: _safe_sort_ts(_maybe_str(item.get("timestamp"))), reverse=True)
+        return rows[:limit]
+
+    def _telemetry_stats(self, *, limit: int = 1000) -> dict[str, Any]:
+        rows = [row for row in self._load_telemetry_rows(limit=limit) if row.get("kind") == "isaac_command"]
+        by_command: dict[str, list[dict[str, Any]]] = {}
+        for row in rows:
+            command_id = _maybe_str(row.get("command_id"))
+            if not command_id:
+                continue
+            by_command.setdefault(command_id, []).append(row)
+
+        stage_buckets: dict[tuple[str, str, str], dict[str, Any]] = {}
+        error_counts: dict[str, int] = {}
+        path_mode_counts: dict[str, int] = {}
+
+        for command_rows in by_command.values():
+            command_rows.sort(key=lambda item: _safe_sort_ts(_maybe_str(item.get("timestamp"))))
+            terminal = command_rows[-1]
+            terminal_status = _maybe_str(terminal.get("status")) or "running"
+            scene_id = _maybe_str(terminal.get("scene_id")) or "scene"
+            command_type = _maybe_str(terminal.get("command_type")) or "command"
+            path_mode = _maybe_str(terminal.get("windows_path_mode")) or "unknown"
+            path_mode_counts[path_mode] = path_mode_counts.get(path_mode, 0) + 1
+            error_kind = _maybe_str(terminal.get("error_kind"))
+            if error_kind:
+                error_counts[error_kind] = error_counts.get(error_kind, 0) + 1
+            if terminal_status not in {"succeeded", "failed"}:
+                continue
+
+            segment_stage = _maybe_str(command_rows[0].get("progress_stage")) or _maybe_str(command_rows[0].get("status")) or "running"
+            segment_start = _maybe_str(command_rows[0].get("timestamp"))
+            segment_end = segment_start
+            for row in command_rows[1:]:
+                row_stage = _maybe_str(row.get("progress_stage")) or _maybe_str(row.get("status")) or "running"
+                row_ts = _maybe_str(row.get("timestamp"))
+                if row_stage != segment_stage:
+                    duration = self._seconds_between(segment_start, row_ts)
+                    bucket = stage_buckets.setdefault((scene_id, command_type, segment_stage), {"durations": [], "success_count": 0, "failure_count": 0, "last_seen_at": None})
+                    if duration is not None:
+                        bucket["durations"].append(duration)
+                    if terminal_status == "succeeded":
+                        bucket["success_count"] += 1
+                    else:
+                        bucket["failure_count"] += 1
+                    bucket["last_seen_at"] = max(bucket.get("last_seen_at") or "", row_ts or "")
+                    segment_stage = row_stage
+                    segment_start = row_ts
+                segment_end = row_ts
+
+            duration = self._seconds_between(segment_start, segment_end)
+            bucket = stage_buckets.setdefault((scene_id, command_type, segment_stage), {"durations": [], "success_count": 0, "failure_count": 0, "last_seen_at": None})
+            if duration is not None:
+                bucket["durations"].append(duration)
+            if terminal_status == "succeeded":
+                bucket["success_count"] += 1
+            else:
+                bucket["failure_count"] += 1
+            bucket["last_seen_at"] = max(bucket.get("last_seen_at") or "", segment_end or "")
+
+        stage_stats: list[dict[str, Any]] = []
+        for (scene_id, command_type, progress_stage), bucket in stage_buckets.items():
+            durations = [float(value) for value in bucket["durations"] if value is not None]
+            stage_stats.append(
+                {
+                    "scene_id": scene_id,
+                    "command_type": command_type,
+                    "progress_stage": progress_stage,
+                    "count": len(durations),
+                    "success_count": int(bucket["success_count"]),
+                    "failure_count": int(bucket["failure_count"]),
+                    "median_duration_s": round(self._percentile(durations, 0.5) or 0.0, 2) if durations else None,
+                    "p90_duration_s": round(self._percentile(durations, 0.9) or 0.0, 2) if durations else None,
+                    "last_seen_at": bucket["last_seen_at"],
+                }
+            )
+        stage_stats.sort(key=lambda item: (item["scene_id"], item["command_type"], item["progress_stage"]))
+        error_summary = [{"error_kind": key, "count": value} for key, value in sorted(error_counts.items(), key=lambda item: (-item[1], item[0]))]
+        path_mode_summary = [{"windows_path_mode": key, "count": value} for key, value in sorted(path_mode_counts.items(), key=lambda item: (-item[1], item[0]))]
+        return {
+            "stage_stats": stage_stats,
+            "error_summary": error_summary,
+            "path_mode_summary": path_mode_summary,
+        }
+
+    def _telemetry_baseline_for_command(self, command: _IsaacRemoteCommand) -> dict[str, Any] | None:
+        scene_id = command.scene_id or "scene"
+        progress_stage = command.progress_stage or command.status or "running"
+        for item in self._telemetry_stats(limit=1200)["stage_stats"]:
+            if item["scene_id"] == scene_id and item["command_type"] == command.command_type and item["progress_stage"] == progress_stage:
+                return {
+                    "median_duration_s": item["median_duration_s"],
+                    "p90_duration_s": item["p90_duration_s"],
+                    "sample_count": item["count"],
+                }
+        return None
+
+    def _expected_next_stage_for_command(self, command: _IsaacRemoteCommand) -> dict[str, str] | None:
+        stage = command.progress_stage or command.status or ""
+        command_stages: dict[str, list[tuple[str, dict[str, str]]]] = {
+            "load_scene": [
+                ("picked_up", {"en": "Resolve scene path", "kr": "장면 경로 해석"}),
+                ("resolving_scene", {"en": "Open stage", "kr": "stage 열기"}),
+                ("opening_stage", {"en": "Load assets", "kr": "에셋 로딩"}),
+                ("assets_loading", {"en": "Prepare streaming", "kr": "streaming 준비"}),
+                ("assets_loaded", {"en": "Prepare Hydra", "kr": "Hydra 준비"}),
+                ("streaming_scene", {"en": "Scene ready", "kr": "scene 준비 완료"}),
+            ],
+            "connect_session": [
+                ("picked_up", {"en": "Collect scene refs", "kr": "scene ref 수집"}),
+                ("collecting_scene_refs", {"en": "Open daemon session", "kr": "daemon session 열기"}),
+                ("opening_session", {"en": "Session ready", "kr": "세션 준비 완료"}),
+            ],
+            "sync_session": [
+                ("picked_up", {"en": "Capture stage state", "kr": "stage 상태 수집"}),
+                ("capturing_stage_state", {"en": "Serialize patch", "kr": "patch 직렬화"}),
+                ("serializing_patch", {"en": "Upload patch", "kr": "patch 업로드"}),
+                ("uploading_patch", {"en": "Sync complete", "kr": "동기화 완료"}),
+            ],
+            "render_current_view": [
+                ("picked_up", {"en": "Ensure active session", "kr": "active session 확인"}),
+                ("ensuring_session", {"en": "Capture viewport", "kr": "뷰포트 수집"}),
+                ("capturing_view", {"en": "Submit capture request", "kr": "capture 요청 제출"}),
+                ("sending_capture_request", {"en": "Ambient branch", "kr": "ambient 렌더 시작"}),
+                ("ambient", {"en": "Stage scene XML", "kr": "씬 XML 준비"}),
+                ("staging_scene", {"en": "Load scene to GPU", "kr": "GPU 메모리 로딩"}),
+                ("loading_scene", {"en": "Ray tracing", "kr": "경로 추적 중"}),
+                ("rendering", {"en": "Save EXR outputs", "kr": "EXR 출력 저장"}),
+                ("saving_output", {"en": "Active / polar branch", "kr": "active/polar branch"}),
+                ("active", {"en": "Polar branch", "kr": "polar branch"}),
+                ("polar", {"en": "Write manifest", "kr": "manifest 기록"}),
+                ("writing_manifest", {"en": "Render complete", "kr": "렌더 완료"}),
+            ],
+            "render_sensor": [
+                ("picked_up", {"en": "Ensure active session", "kr": "active session 확인"}),
+                ("ensuring_session", {"en": "Resolve sensor", "kr": "센서 확인"}),
+                ("resolving_sensor", {"en": "Submit capture request", "kr": "capture 요청 제출"}),
+                ("sending_capture_request", {"en": "Ambient branch", "kr": "ambient 렌더 시작"}),
+                ("ambient", {"en": "Stage scene XML", "kr": "씬 XML 준비"}),
+                ("staging_scene", {"en": "Load scene to GPU", "kr": "GPU 메모리 로딩"}),
+                ("loading_scene", {"en": "Ray tracing", "kr": "경로 추적 중"}),
+                ("rendering", {"en": "Save EXR outputs", "kr": "EXR 출력 저장"}),
+                ("saving_output", {"en": "Active / polar branch", "kr": "active/polar branch"}),
+                ("active", {"en": "Polar branch", "kr": "polar branch"}),
+                ("polar", {"en": "Write manifest", "kr": "manifest 기록"}),
+                ("writing_manifest", {"en": "Render complete", "kr": "렌더 완료"}),
+            ],
+        }
+        stages = command_stages.get(command.command_type)
+        if not stages:
+            return None
+        for index, (stage_name, _label) in enumerate(stages):
+            if stage_name == stage and index + 1 < len(stages):
+                return stages[index + 1][1]
+        return None
+
+    def _current_stage_elapsed_for_command(self, command: _IsaacRemoteCommand) -> float | None:
+        current_stage = command.progress_stage or command.status or ""
+        if not current_stage:
+            return None
+        rows = self._telemetry_recent_rows_for_command(command.command_id, limit=40)
+        if not rows:
+            return self._seconds_between(command.created_at, command.updated_at or _utc_now_iso())
+        rows_chrono = list(reversed(rows))
+        stage_start_ts = command.created_at
+        for row in rows_chrono:
+            row_stage = _maybe_str(row.get("progress_stage")) or _maybe_str(row.get("status")) or ""
+            row_ts = _maybe_str(row.get("timestamp"))
+            if row_stage == current_stage and row_ts:
+                stage_start_ts = row_ts
+                break
+        return self._seconds_between(stage_start_ts, command.updated_at or _utc_now_iso())
+
+    def _progress_details_for_command(self, command: _IsaacRemoteCommand) -> dict[str, Any] | None:
+        recent_rows = self._telemetry_recent_rows_for_command(command.command_id, limit=8)
+        if not recent_rows:
+            return None
+        baseline = self._telemetry_baseline_for_command(command)
+        current_stage_elapsed_s = self._current_stage_elapsed_for_command(command)
+        relative_speed = None
+        if baseline and current_stage_elapsed_s is not None:
+            median_s = baseline.get("median_duration_s")
+            p90_s = baseline.get("p90_duration_s")
+            if isinstance(p90_s, (int, float)) and p90_s > 0 and current_stage_elapsed_s > p90_s:
+                relative_speed = "slower_than_p90"
+            elif isinstance(median_s, (int, float)) and median_s > 0 and current_stage_elapsed_s > (median_s * 2.0):
+                relative_speed = "slower_than_median"
+            else:
+                relative_speed = "within_range"
+        recent_events = []
+        for row in recent_rows:
+            recent_events.append(
+                {
+                    "timestamp": row.get("timestamp"),
+                    "event_type": row.get("event_type"),
+                    "progress_stage": row.get("progress_stage") or row.get("status"),
+                    "progress_message": row.get("progress_message"),
+                    "progress_origin": row.get("progress_origin"),
+                }
+            )
+        return {
+            "current_stage_elapsed_s": round(current_stage_elapsed_s, 2) if current_stage_elapsed_s is not None else None,
+            "expected_next_stage": self._expected_next_stage_for_command(command),
+            "relative_speed": relative_speed,
+            "recent_events": recent_events,
+        }
+
+    def _telemetry_hint_for_command(self, command: _IsaacRemoteCommand) -> dict[str, str] | None:
+        baseline = self._telemetry_baseline_for_command(command)
+        scene_ctx = self._scene_telemetry_context(command.scene_id)
+        elapsed_s = self._seconds_between(command.created_at, command.updated_at or _utc_now_iso()) or 0.0
+        windows_path_mode = scene_ctx["windows_path_mode"]
+        hint_en = ""
+        hint_kr = ""
+        if baseline and baseline.get("sample_count"):
+            median_s = baseline.get("median_duration_s")
+            p90_s = baseline.get("p90_duration_s")
+            sample_count = baseline.get("sample_count")
+            if median_s is not None:
+                hint_en = f"Recent median for this stage: {median_s:.0f}s"
+                hint_kr = f"최근 동일 stage 중앙값: {median_s:.0f}초"
+            if p90_s is not None and p90_s > 0:
+                range_en = f"Usually finishes within ~{p90_s:.0f}s (p90, {sample_count} samples)."
+                range_kr = f"최근 {sample_count}회 기준 보통 ~{p90_s:.0f}초 안에 끝났습니다."
+                hint_en = f"{hint_en} · {range_en}" if hint_en else range_en
+                hint_kr = f"{hint_kr} · {range_kr}" if hint_kr else range_kr
+            if median_s and elapsed_s > max(median_s * 2.0, baseline.get("p90_duration_s") or 0.0):
+                slow_en = "This run is taking longer than the recent baseline."
+                slow_kr = "이번 실행은 최근 기준보다 오래 걸리고 있습니다."
+                hint_en = f"{hint_en} · {slow_en}" if hint_en else slow_en
+                hint_kr = f"{hint_kr} · {slow_kr}" if hint_kr else slow_kr
+        if windows_path_mode == "unc" and (command.command_type == "load_scene" or (command.progress_stage or "") in {"opening_stage", "streaming_scene", "assets_loading"}):
+            unc_en = "UNC network path detected; texture streaming may be slow. Mapped drive or local mirror is recommended."
+            unc_kr = "UNC 네트워크 경로가 감지되었습니다. 텍스처 streaming이 느릴 수 있어 mapped drive나 local mirror를 권장합니다."
+            hint_en = f"{hint_en} · {unc_en}" if hint_en else unc_en
+            hint_kr = f"{hint_kr} · {unc_kr}" if hint_kr else unc_kr
+        if not hint_en and scene_ctx.get("size_tier") in {"heavy", "huge"}:
+            size_en = f"{scene_ctx.get('size_tier', 'heavy').title()} scene with {scene_ctx.get('asset_file_count') or 0} asset files; cold loads may take a while."
+            size_kr = f"{scene_ctx.get('asset_file_count') or 0}개 에셋 파일이 있는 {scene_ctx.get('size_tier') or 'heavy'} 장면으로, 처음 로딩이 오래 걸릴 수 있습니다."
+            hint_en = size_en
+            hint_kr = size_kr
+        if not hint_en:
+            return None
+        return {"en": hint_en, "kr": hint_kr}
+
+    def _next_isaac_command_id(self) -> str:
+        return f"isaac-cmd-{_utc_now().strftime('%Y%m%dT%H%M%S%f')}"
+
+    def _queue_isaac_command(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        command_type = _maybe_str(payload.get("command_type"))
+        if not command_type:
+            raise ValueError("command_type is required.")
+        scene_id = _maybe_str(payload.get("scene_id"))
+        command_payload = dict(payload.get("payload") or {})
+        # Inject saved render options into render commands when not explicitly set
+        if command_type in {"render_current_view", "render_sensor"} and "modalities" not in command_payload:
+            saved = self._load_scene_render_options(scene_id)
+            command_payload["modalities"] = saved.get("modalities", ["rgb", "depth"])
+            if "spp" not in command_payload:
+                command_payload["spp"] = saved.get("spp", 64)
+            # 해상도 및 업스케일 주입
+            rs = command_payload.setdefault("render_settings", {})
+            if "width" not in rs:
+                rs["width"] = saved.get("width", 1280)
+            if "height" not in rs:
+                rs["height"] = saved.get("height", 720)
+            if "upscale" not in rs:
+                rs["upscale"] = saved.get("upscale", "none")
+        command_id = self._next_isaac_command_id()
+        command = _IsaacRemoteCommand(
+            command_id=command_id,
+            command_type=command_type,
+            scene_id=scene_id,
+            payload=command_payload,
+            status="queued",
+            created_at=_utc_now_iso(),
+            updated_at=_utc_now_iso(),
+        )
+        with self._condition:
+            self._isaac_commands[command_id] = command
+            self._isaac_commands_pending.append(command_id)
+            self._condition.notify_all()
+        self._record_isaac_command_telemetry(command, event_type="queued")
+        return self._isaac_command_payload(command)
+
+    def _start_isaac_command(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        command_type = _maybe_str(payload.get("command_type"))
+        if not command_type:
+            raise ValueError("command_type is required.")
+        scene_id = _maybe_str(payload.get("scene_id"))
+        command_payload = dict(payload.get("payload") or {})
+        now = _utc_now_iso()
+        command = _IsaacRemoteCommand(
+            command_id=self._next_isaac_command_id(),
+            command_type=command_type,
+            scene_id=scene_id,
+            payload=command_payload,
+            status="running",
+            created_at=now,
+            dispatched_at=now,
+            updated_at=now,
+        )
+        with self._condition:
+            self._isaac_commands[command.command_id] = command
+            self._condition.notify_all()
+        self._record_isaac_command_telemetry(command, event_type="running")
+        return self._isaac_command_payload(command)
+
+    def _isaac_command_payload(self, command: _IsaacRemoteCommand) -> dict[str, Any]:
+        payload = {
+            "command_id": command.command_id,
+            "command_type": command.command_type,
+            "scene_id": command.scene_id,
+            "payload": command.payload,
+            "status": command.status,
+            "created_at": command.created_at,
+            "dispatched_at": command.dispatched_at,
+            "completed_at": command.completed_at,
+            "updated_at": command.updated_at,
+            "progress_stage": command.progress_stage,
+            "progress_message": command.progress_message,
+            "progress_origin": command.progress_origin,
+            "progress_counts": dict(command.progress_counts or {}),
+            "result": command.result,
+            "error": command.error,
+        }
+        baseline = self._telemetry_baseline_for_command(command)
+        hint = self._telemetry_hint_for_command(command) if command.status in {"queued", "dispatched", "running"} else None
+        if baseline is not None:
+            payload["telemetry_baseline"] = baseline
+        if hint is not None:
+            payload["telemetry_hint"] = hint
+        progress_details = self._progress_details_for_command(command)
+        if progress_details is not None:
+            payload["progress_details"] = progress_details
+        return payload
+
+    def _list_isaac_commands(self, *, limit: int = 20) -> list[dict[str, Any]]:
+        commands = list(self._isaac_commands.values())
+        commands.sort(key=lambda item: _safe_sort_ts(item.created_at), reverse=False)
+        commands.reverse()
+        return [self._isaac_command_payload(item) for item in commands[:limit]]
+
+    def _recent_isaac_render_commands(self, *, limit: int = 20) -> list[dict[str, Any]]:
+        render_command_types = {"render_current_view", "render_sensor"}
+        commands = [
+            command
+            for command in self._list_isaac_commands(limit=max(limit * 4, 20))
+            if str(command.get("command_type") or "") in render_command_types
+        ]
+        return commands[:limit]
+
+    def _next_isaac_command(self) -> dict[str, Any] | None:
+        with self._condition:
+            while self._isaac_commands_pending:
+                command_id = self._isaac_commands_pending.popleft()
+                command = self._isaac_commands.get(command_id)
+                if command is None or command.status != "queued":
+                    continue
+                command.status = "dispatched"
+                command.dispatched_at = _utc_now_iso()
+                command.updated_at = command.dispatched_at
+                self._record_isaac_command_telemetry(command, event_type="dispatched")
+                return self._isaac_command_payload(command)
+        return None
+
+    def _update_isaac_command_progress(self, command_id: str, payload: Mapping[str, Any]) -> dict[str, Any]:
+        with self._condition:
+            command = self._isaac_commands.get(command_id)
+            if command is None:
+                raise KeyError(command_id)
+            status = _maybe_str(payload.get("status")) or command.status
+            if status not in {"queued", "dispatched", "running", "succeeded", "failed"}:
+                raise ValueError("status must be one of 'queued', 'dispatched', 'running', 'succeeded', or 'failed'.")
+            command.status = status
+            command.progress_stage = _maybe_str(payload.get("progress_stage")) or command.progress_stage
+            progress_message = _maybe_str(payload.get("progress_message")) or command.progress_message
+            if status == "failed":
+                progress_message = self._normalize_command_error(progress_message, scene_id=command.scene_id)
+            command.progress_message = progress_message
+            command.progress_origin = _maybe_str(payload.get("progress_origin")) or command.progress_origin
+            progress_counts = payload.get("progress_counts")
+            if isinstance(progress_counts, Mapping):
+                loaded = progress_counts.get("loaded")
+                total = progress_counts.get("total")
+                normalized: dict[str, int] = {}
+                if isinstance(loaded, (int, float)):
+                    normalized["loaded"] = int(loaded)
+                if isinstance(total, (int, float)):
+                    normalized["total"] = int(total)
+                command.progress_counts = normalized or None
+            command.updated_at = _utc_now_iso()
+            if status in {"succeeded", "failed"} and command.completed_at is None:
+                command.completed_at = command.updated_at
+            self._condition.notify_all()
+            self._record_isaac_command_telemetry(command, event_type="progress")
+            return self._isaac_command_payload(command)
+
+    def _complete_isaac_command(self, command_id: str, payload: Mapping[str, Any]) -> dict[str, Any]:
+        with self._condition:
+            command = self._isaac_commands.get(command_id)
+            if command is None:
+                raise KeyError(command_id)
+            status = _maybe_str(payload.get("status")) or "succeeded"
+            if status not in {"succeeded", "failed"}:
+                raise ValueError("status must be either 'succeeded' or 'failed'.")
+            command.status = status
+            command.completed_at = _utc_now_iso()
+            command.updated_at = command.completed_at
+            if status == "succeeded":
+                command.progress_stage = command.progress_stage or "ready"
+                command.progress_message = command.progress_message or "Completed"
+            else:
+                command.progress_stage = "failed"
+            command.progress_message = self._normalize_command_error(
+                _maybe_str(payload.get("error")) or command.progress_message or "Failed",
+                scene_id=command.scene_id,
+            )
+            result = payload.get("result")
+            command.result = dict(result) if isinstance(result, Mapping) else None
+            command.error = self._normalize_command_error(_maybe_str(payload.get("error")), scene_id=command.scene_id)
+            self._record_isaac_command_telemetry(command, event_type="complete")
+            return self._isaac_command_payload(command)
+
+    def _load_registered_isaac_scenes(self) -> dict[str, dict[str, Any]]:
+        path = self._isaac_scene_catalog_path()
+        if not path.exists():
+            return {}
+        try:
+            payload = _read_json(path)
+        except Exception:
+            return {}
+        scenes = payload.get("scenes", {})
+        if not isinstance(scenes, Mapping):
+            return {}
+        return {
+            str(scene_id): dict(scene_payload)
+            for scene_id, scene_payload in scenes.items()
+            if isinstance(scene_payload, Mapping)
+        }
+
+    def _write_registered_isaac_scenes(self, scenes: Mapping[str, Any]) -> Path:
+        path = self._isaac_scene_catalog_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "updated_at": _utc_now_iso(),
+            "scenes": scenes,
+        }
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        return path
 
     @property
     def base_url(self) -> str:
@@ -285,6 +1118,7 @@ class RenderDaemon:
             self._persist_request_unlocked(job)
             self._persist_status_unlocked(job)
             self._condition.notify_all()
+            self._record_render_job_telemetry(job, event_type="queued")
 
         return RenderJobAccepted(
             job_id=render_request.job_id,
@@ -346,25 +1180,51 @@ class RenderDaemon:
                 self._send_json(handler, HTTPStatus.OK, self._health_payload())
                 return
             if path in {"/", "/admin"}:
-                self._send_html(handler, HTTPStatus.OK, self._render_page("home.html", nav_key="home", page_title="Operations Home", page_subtitle="Warm Mitsuba daemon, scene bundles, and quick smoke actions.", recent_jobs=self._recent_jobs(limit=8), failed_jobs=self._failed_jobs(limit=5), scenes=self._scene_records(limit=6)))
+                self._send_html(handler, HTTPStatus.OK, self._render_page("home.html", nav_key="home", page_title="Operations Home", page_subtitle="Warm Mitsuba daemon, scene bundles, and quick smoke actions.", recent_jobs=self._recent_jobs(limit=8), failed_jobs=self._failed_jobs(limit=5), scenes=self._scene_records(limit=6), activity_feed=self._activity_feed(limit=12)))
                 return
             if path == "/jobs":
-                self._send_html(handler, HTTPStatus.OK, self._render_page("jobs.html", nav_key="jobs", page_title="Render Jobs", page_subtitle="Daemon queue and historical job state from out/bridge_jobs.", jobs=self._job_records(limit=100)))
+                self._send_html(
+                    handler,
+                    HTTPStatus.OK,
+                    self._render_page(
+                        "jobs.html",
+                        nav_key="jobs",
+                        page_title="Render Jobs",
+                        page_subtitle="Daemon queue and historical job state from out/bridge_jobs.",
+                        jobs=self._job_records(limit=100),
+                        active_isaac_command=self._active_isaac_command_summary(),
+                        isaac_render_commands=self._recent_isaac_render_commands(limit=24),
+                    ),
+                )
                 return
             if path == "/scenes":
-                self._send_html(handler, HTTPStatus.OK, self._render_page("scenes.html", nav_key="scenes", page_title="Scene Explorer", page_subtitle="Observation bundle centric view of scenes and captures.", scenes=self._scene_records()))
+                self._send_html(handler, HTTPStatus.OK, self._render_page("scenes.html", nav_key="scenes", page_title="Scene Explorer", page_subtitle="Known exports and registered USD scenes for Isaac and Mitsuba handoff.", scenes=self._isaac_scene_catalog_records()))
                 return
             if path.startswith("/scenes/"):
                 scene_id = path[len("/scenes/"):]
                 scene_detail = self._scene_detail(scene_id)
-                floorplan = self._ensure_floorplan(scene_id)
-                self._send_html(handler, HTTPStatus.OK, self._render_page("scene_detail.html", nav_key="scenes", page_title=f"Scene · {scene_id}", page_subtitle="Top-down floorplan, overlay cameras, and modality explorer.", scene=scene_detail["scene"], captures=scene_detail["captures"], latest_capture=scene_detail["latest_capture"], floorplan=floorplan))
+                current_scene_id = self._summary_payload().get("current_scene_id")
+                self._send_html(
+                    handler,
+                    HTTPStatus.OK,
+                    self._render_page(
+                        "scene_detail.html",
+                        nav_key="current_scene" if current_scene_id and current_scene_id == scene_id else "scenes",
+                        page_title=f"Scene · {scene_id}",
+                        page_subtitle="Top-down floorplan, overlay cameras, and modality explorer.",
+                        scene=scene_detail["scene"],
+                        captures=scene_detail["captures"],
+                        latest_capture=scene_detail["latest_capture"],
+                        material_presets=self._material_presets(),
+                    ),
+                )
                 return
             if path == "/system":
-                self._send_html(handler, HTTPStatus.OK, self._render_page("system.html", nav_key="system", page_title="System", page_subtitle="Worker, cache, and runtime overview.", jobs=self._job_records(limit=20)))
+                telemetry = self._telemetry_stats(limit=1200)
+                self._send_html(handler, HTTPStatus.OK, self._render_page("system.html", nav_key="system", page_title="System", page_subtitle="Worker, cache, runtime, and Isaac telemetry overview.", jobs=self._job_records(limit=20), env_checks=self._environment_checks(), telemetry_recent=self._telemetry_recent_rows(limit=20), telemetry_stats=telemetry))
                 return
             if path == "/integrations/isaac":
-                self._send_html(handler, HTTPStatus.OK, self._render_page("isaac.html", nav_key="isaac", page_title="Isaac Integration", page_subtitle="Current viewport capture and daemon submit flow.", guide=self._isaac_guide_payload()))
+                self._send_html(handler, HTTPStatus.OK, self._render_page("isaac.html", nav_key="isaac", page_title="Isaac Integration", page_subtitle="Hybrid Isaac UI and control-plane workflow for scene sync and Mitsuba rendering.", guide=self._isaac_guide_payload()))
                 return
             if path == "/static/tailwind.css":
                 self._serve_static_file(handler, self._static_dir / "tailwind.css")
@@ -385,6 +1245,60 @@ class RenderDaemon:
             if path == "/api/scenes":
                 self._send_json(handler, HTTPStatus.OK, {"scenes": self._scene_records()})
                 return
+            if path == "/api/debug/events":
+                since = int(_maybe_str(query.get("since", [None])[0]) or 0)
+                with self._condition:
+                    events = [e for e in self._debug_events if e["id"] > since]
+                self._send_json(handler, HTTPStatus.OK, {"events": events, "latest_id": self._debug_event_counter})
+                return
+            if path == "/api/isaac/scenes":
+                self._send_json(handler, HTTPStatus.OK, {"scenes": self._isaac_scene_catalog_records()})
+                return
+            if path == "/api/material-presets":
+                self._send_json(handler, HTTPStatus.OK, {"presets": self._material_presets()})
+                return
+            if path == "/api/material-library":
+                from .material_library import get_library_grouped
+                self._send_json(handler, HTTPStatus.OK, {"groups": get_library_grouped(self.repo_root)})
+                return
+            if path == "/api/isaac/commands":
+                self._send_json(handler, HTTPStatus.OK, {"commands": self._list_isaac_commands()})
+                return
+            if path == "/api/isaac/telemetry/recent":
+                limit = int(_maybe_str(query.get("limit", [None])[0]) or 25)
+                self._send_json(handler, HTTPStatus.OK, {"events": self._telemetry_recent_rows(limit=max(1, min(limit, 200)))})
+                return
+            if path == "/api/isaac/telemetry/stats":
+                self._send_json(handler, HTTPStatus.OK, self._telemetry_stats(limit=1200))
+                return
+            if path == "/api/isaac/commands/next":
+                self._send_json(handler, HTTPStatus.OK, {"command": self._next_isaac_command()})
+                return
+            if path.startswith("/api/isaac/scenes/"):
+                scene_id = path[len("/api/isaac/scenes/") :].rstrip("/")
+                try:
+                    self._send_json(handler, HTTPStatus.OK, self._isaac_scene_detail(scene_id))
+                except KeyError:
+                    self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": f"Unknown Isaac scene_id: {scene_id}"})
+                return
+            if path == "/api/isaac/captures/latest":
+                scene_id = _maybe_str(query.get("scene_id", [None])[0])
+                capture = self._latest_capture_record(scene_id=scene_id)
+                if capture is None:
+                    self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": "No captures available."})
+                    return
+                self._send_json(handler, HTTPStatus.OK, capture)
+                return
+            if path.startswith("/api/isaac/captures/"):
+                parts = [part for part in path.split("/") if part]
+                if len(parts) == 5:
+                    job_id = parts[3]
+                    frame_id = parts[4]
+                    try:
+                        self._send_json(handler, HTTPStatus.OK, self._capture_detail_by_ids(job_id, frame_id))
+                    except KeyError:
+                        self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": f"Unknown capture: {job_id}/{frame_id}"})
+                    return
             if path.startswith("/api/scenes/") and path.endswith("/floorplan"):
                 scene_id = path[len("/api/scenes/") : -len("/floorplan")].rstrip("/")
                 self._send_json(handler, HTTPStatus.OK, self._ensure_floorplan(scene_id))
@@ -393,12 +1307,19 @@ class RenderDaemon:
                 scene_id = path[len("/api/scenes/") : -len("/captures")].rstrip("/")
                 self._send_json(handler, HTTPStatus.OK, {"scene_id": scene_id, "captures": self._scene_detail(scene_id)["captures"]})
                 return
+            if path.startswith("/api/scenes/") and path.endswith("/render-options"):
+                scene_id = path[len("/api/scenes/") : -len("/render-options")].rstrip("/")
+                self._send_json(handler, HTTPStatus.OK, self._load_scene_render_options(scene_id))
+                return
             if path.startswith("/api/scenes/"):
                 scene_id = path[len("/api/scenes/") :].rstrip("/")
                 self._send_json(handler, HTTPStatus.OK, self._scene_detail(scene_id))
                 return
             if path == "/api/integrations/isaac":
                 self._send_json(handler, HTTPStatus.OK, self._isaac_guide_payload())
+                return
+            if path == "/isaac/session":
+                self._send_json(handler, HTTPStatus.OK, self._active_isaac_session_summary())
                 return
             if path.startswith("/jobs/"):
                 parts = [part for part in path.split("/") if part]
@@ -459,6 +1380,55 @@ class RenderDaemon:
                 self._send_json(handler, HTTPStatus.ACCEPTED, render_job_accepted_to_payload(accepted))
                 return
 
+            if path == "/api/isaac/scenes/register":
+                try:
+                    result = self._register_isaac_scene(payload)
+                except ValueError as exc:
+                    self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                    return
+                self._send_json(handler, HTTPStatus.OK, result)
+                return
+            if path == "/api/isaac/commands":
+                try:
+                    result = self._queue_isaac_command(payload)
+                except ValueError as exc:
+                    self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                    return
+                self._send_json(handler, HTTPStatus.ACCEPTED, result)
+                return
+            if path == "/api/isaac/commands/start":
+                try:
+                    result = self._start_isaac_command(payload)
+                except ValueError as exc:
+                    self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                    return
+                self._send_json(handler, HTTPStatus.OK, result)
+                return
+            if path.startswith("/api/isaac/commands/") and path.endswith("/progress"):
+                command_id = path[len("/api/isaac/commands/") : -len("/progress")].rstrip("/")
+                try:
+                    result = self._update_isaac_command_progress(command_id, payload)
+                except KeyError:
+                    self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": f"Unknown command_id: {command_id}"})
+                    return
+                except ValueError as exc:
+                    self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                    return
+                self._send_json(handler, HTTPStatus.OK, result)
+                return
+            if path.startswith("/api/isaac/commands/") and path.endswith("/complete"):
+                command_id = path[len("/api/isaac/commands/") : -len("/complete")].rstrip("/")
+                try:
+                    result = self._complete_isaac_command(command_id, payload)
+                except KeyError:
+                    self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": f"Unknown command_id: {command_id}"})
+                    return
+                except ValueError as exc:
+                    self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                    return
+                self._send_json(handler, HTTPStatus.OK, result)
+                return
+
             if path.startswith("/jobs/") and path.endswith("/cancel"):
                 parts = [part for part in path.split("/") if part]
                 if len(parts) == 3:
@@ -475,7 +1445,7 @@ class RenderDaemon:
                     return
 
             if path == "/isaac/render":
-                timeout_s = float(payload.get("timeout_s", 120.0))
+                timeout_s = float(payload.get("timeout_s", 600.0))
                 try:
                     result = self._handle_isaac_render_blocked(payload, timeout_s=timeout_s)
                 except TimeoutError:
@@ -494,6 +1464,142 @@ class RenderDaemon:
                     self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                     return
                 self._send_json(handler, HTTPStatus.ACCEPTED, render_job_accepted_to_payload(accepted))
+                return
+
+            if path == "/isaac/session/open":
+                try:
+                    summary = self._open_isaac_session(payload)
+                except (KeyError, ValueError) as exc:
+                    self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                    return
+                self._send_json(handler, HTTPStatus.OK, summary)
+                return
+
+            if path == "/isaac/session/update_state":
+                try:
+                    summary = self._update_isaac_state(payload)
+                except RuntimeError as exc:
+                    self._send_json(handler, HTTPStatus.CONFLICT, {"error": str(exc)})
+                    return
+                except (KeyError, ValueError) as exc:
+                    self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                    return
+                self._send_json(handler, HTTPStatus.OK, summary)
+                return
+
+            if path == "/isaac/session/update_materials":
+                try:
+                    summary = self._update_isaac_materials(payload)
+                except RuntimeError as exc:
+                    self._send_json(handler, HTTPStatus.CONFLICT, {"error": str(exc)})
+                    return
+                except (KeyError, ValueError) as exc:
+                    self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                    return
+                self._send_json(handler, HTTPStatus.OK, summary)
+                return
+
+            if path == "/isaac/session/update_selection":
+                try:
+                    summary = self._update_isaac_selection(payload)
+                except RuntimeError as exc:
+                    self._send_json(handler, HTTPStatus.CONFLICT, {"error": str(exc)})
+                    return
+                except (KeyError, ValueError) as exc:
+                    self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                    return
+                self._send_json(handler, HTTPStatus.OK, summary)
+                return
+
+            if path == "/isaac/session/register_sensors":
+                try:
+                    summary = self._register_isaac_sensors(payload)
+                except RuntimeError as exc:
+                    self._send_json(handler, HTTPStatus.CONFLICT, {"error": str(exc)})
+                    return
+                except (KeyError, ValueError) as exc:
+                    self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                    return
+                self._send_json(handler, HTTPStatus.OK, summary)
+                return
+
+            if path == "/isaac/capture":
+                try:
+                    result = self._handle_isaac_session_capture(payload)
+                except RuntimeError as exc:
+                    self._send_json(handler, HTTPStatus.CONFLICT, {"error": str(exc)})
+                    return
+                except TimeoutError:
+                    self._send_json(handler, 504, {"error": "Render timed out"})
+                    return
+                except (KeyError, ValueError) as exc:
+                    self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                    return
+                if isinstance(result, RenderJobAccepted):
+                    self._send_json(handler, HTTPStatus.ACCEPTED, render_job_accepted_to_payload(result))
+                else:
+                    self._send_json(handler, HTTPStatus.OK, result)
+                return
+
+            if path.startswith("/api/scenes/") and path.endswith("/render-options"):
+                scene_id = path[len("/api/scenes/") : -len("/render-options")].rstrip("/")
+                modalities = payload.get("modalities", [])
+                invalid = [m for m in modalities if m not in SUPPORTED_MODALITIES]
+                if invalid:
+                    self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": f"Unsupported modalities: {invalid}"})
+                    return
+                options_path = self._render_options_path(scene_id)
+                options_path.parent.mkdir(parents=True, exist_ok=True)
+                data: dict[str, Any] = {
+                    "scene_id": scene_id,
+                    "modalities": modalities,
+                    "spp": int(payload.get("spp", 64)),
+                    "width": int(payload.get("width", 1280)),
+                    "height": int(payload.get("height", 720)),
+                    "upscale": str(payload.get("upscale", "none")),
+                    "updated_at": _utc_now_iso(),
+                }
+                options_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+                self._send_json(handler, HTTPStatus.OK, data)
+                return
+
+            if path.startswith("/api/scenes/") and path.endswith("/apply-measured-material"):
+                scene_id = path[len("/api/scenes/") : -len("/apply-measured-material")].rstrip("/")
+                prim_path = payload.get("prim_path")
+                bsdf_type = payload.get("bsdf_type", "measured_polarized")
+                measured_file_path = payload.get("measured_file_path") or ""
+                dataset_id = payload.get("dataset_id", "")
+                material_id = payload.get("material_id", "")
+                if not prim_path:
+                    self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": "prim_path required"})
+                    return
+                if not measured_file_path:
+                    self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": "measured_file_path required (material not downloaded)"})
+                    return
+                session = self._active_isaac_session
+                if session is None or session.scene_id != scene_id:
+                    self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": f"No active session for scene {scene_id!r}"})
+                    return
+                override = BsdfOverride(
+                    bsdf_type=bsdf_type,
+                    measured_file_path=measured_file_path,
+                    dataset_id=dataset_id or None,
+                    material_id=material_id or None,
+                )
+                session.material_overrides[prim_path] = override
+                existing_obj = session.objects.get(prim_path)
+                if existing_obj is not None:
+                    existing_obj.bsdf_override = override
+                    existing_obj.bsdf_override_key = f"{dataset_id}/{material_id}" if dataset_id else bsdf_type
+                session.updated_at = _utc_now_iso()
+                self._send_json(handler, HTTPStatus.OK, {
+                    "prim_path": prim_path,
+                    "bsdf_type": bsdf_type,
+                    "dataset_id": dataset_id,
+                    "material_id": material_id,
+                    "measured_file_path": measured_file_path,
+                    "status": "applied",
+                })
                 return
 
             self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": f"Unknown route: {path}"})
@@ -583,7 +1689,7 @@ class RenderDaemon:
         camera_spec = CameraSpec(
             camera_id=cam.camera_id or "isaac_viewport",
             name=cam.name or "Isaac Active Viewport",
-            camera_to_world=list(cam.camera_to_world),
+            camera_to_world=normalize_mat4_storage(cam.camera_to_world).reshape(-1).astype(float).tolist(),
             fov_deg=float(cam.fov_deg),
             resolution=list(cam.resolution) if cam.resolution is not None else None,
             sensor_modality=cam.sensor_modality,
@@ -592,6 +1698,14 @@ class RenderDaemon:
             source_camera_id=cam.source_camera_id,
             extras=dict(cam.extras),
         )
+        _snap_modalities = list(snapshot.modalities) if snapshot.modalities else []
+        if not _snap_modalities:
+            _saved = self._load_scene_render_options(str(snapshot.scene_id))
+            _snap_modalities = _saved.get("modalities", ["rgb"])
+        _snap_render_settings = dict(snapshot.render_settings)
+        _POLAR_MODALITIES = {"s1", "s2", "dop", "aolp", "polar_rgb_preview"}
+        if any(m in _POLAR_MODALITIES for m in _snap_modalities) and "variant" not in _snap_render_settings:
+            _snap_render_settings["variant"] = "polarized_cuda_mono"
         render_request = RenderRequest(
             request_id=request_id,
             job_id=job_id,
@@ -599,9 +1713,9 @@ class RenderDaemon:
             timestamp=timestamp,
             scene_state=scene_state,
             camera_specs=[camera_spec],
-            modalities=list(snapshot.modalities) if snapshot.modalities else ["rgb"],
+            modalities=_snap_modalities,
             robot_state=snapshot.robot_state or RobotState(),
-            render_settings=dict(snapshot.render_settings),
+            render_settings=_snap_render_settings,
             scene_override=scene_override,
             assist_light=AssistLightSpec(**snapshot.extras["assist_light"]) if isinstance(snapshot.extras.get("assist_light"), Mapping) else None,
             depth_approx=DepthApproxSpec(**snapshot.extras["depth_approx"]) if isinstance(snapshot.extras.get("depth_approx"), Mapping) else None,
@@ -615,6 +1729,292 @@ class RenderDaemon:
         )
         return render_request, str(shape_map_ref)
 
+    def _active_isaac_session_summary(self, *, include_inventory: bool = True) -> dict[str, Any]:
+        session = self._isaac_session
+        if session is None:
+            return {"status": "inactive", "session": None}
+        robot_inventory = self._session_robot_inventory(session)
+        scene_record = next((item for item in self._isaac_scene_catalog_records() if item.get("scene_id") == session.scene_id), None)
+        result: dict[str, Any] = {
+            "status": "active",
+            "session": {
+                "scene_id": session.scene_id,
+                "usd_stage_path": scene_record.get("usd_stage_path") if scene_record else None,
+                "mitsuba_scene_ref": session.mitsuba_scene_ref,
+                "shape_map_ref": session.shape_map_ref,
+                "scene_snapshot_ref": session.scene_snapshot_ref,
+                "opened_at": session.opened_at,
+                "updated_at": session.updated_at,
+                "object_count": len(session.objects),
+                "material_override_count": len(session.material_overrides),
+                "sensor_count": len(session.sensors),
+                "sensor_ids": sorted(session.sensors.keys()),
+                "robot_count": len(robot_inventory),
+                "robot_inventory": robot_inventory,
+                "selected_prim_paths": list(session.selected_prim_paths),
+                "material_overrides": {
+                    prim_path: override.bsdf_type
+                    for prim_path, override in sorted(session.material_overrides.items())
+                },
+                "active_viewport_camera": self._active_viewport_camera_payload(session),
+            },
+        }
+        if include_inventory:
+            result["session"]["object_inventory"] = self._session_object_inventory(session)
+        return result
+
+    def _require_active_isaac_session(self) -> _IsaacActiveSession:
+        if self._isaac_session is None:
+            raise RuntimeError("No active Isaac scene session. Call POST /isaac/session/open first.")
+        return self._isaac_session
+
+    def _open_isaac_session(self, payload: dict[str, Any]) -> dict[str, Any]:
+        session_open_payload = payload.get("session_open") if isinstance(payload.get("session_open"), Mapping) else payload
+        session_open = isaac_session_open_from_payload(dict(session_open_payload))
+        scene_xml = resolve_repo_path(self.repo_root, session_open.mitsuba_scene_ref)
+        if not scene_xml.exists():
+            raise ValueError(f"Scene XML not found: {session_open.mitsuba_scene_ref}")
+        shape_map_payload = read_shape_mapping(session_open.shape_map_ref, repo_root=self.repo_root)
+        prim_to_shape_ids = shape_map_payload.get("prim_to_shape_ids", {})
+        if not isinstance(prim_to_shape_ids, Mapping):
+            raise ValueError(f"Invalid shape map payload in {session_open.shape_map_ref}: missing prim_to_shape_ids.")
+
+        scene_snapshot_ref = session_open.scene_snapshot_ref or shape_map_payload.get("scene_snapshot_ref")
+        timestamp = _utc_now_iso()
+        self._isaac_session = _IsaacActiveSession(
+            scene_id=session_open.scene_id,
+            mitsuba_scene_ref=session_open.mitsuba_scene_ref,
+            shape_map_ref=session_open.shape_map_ref,
+            scene_snapshot_ref=str(scene_snapshot_ref) if scene_snapshot_ref else None,
+            prim_to_shape_ids={
+                str(prim_path): [str(shape_id) for shape_id in shape_ids]
+                for prim_path, shape_ids in prim_to_shape_ids.items()
+                if isinstance(shape_ids, list)
+            },
+            objects={},
+            material_overrides={},
+            sensors={},
+            selected_prim_paths=[],
+            opened_at=timestamp,
+            updated_at=timestamp,
+        )
+        return self._active_isaac_session_summary()
+
+    def _update_isaac_state(self, payload: dict[str, Any]) -> dict[str, Any]:
+        session = self._require_active_isaac_session()
+        patch_payload = payload.get("state_patch") if isinstance(payload.get("state_patch"), Mapping) else payload
+        state_patch = isaac_state_patch_from_payload(dict(patch_payload))
+        for obj in state_patch.objects:
+            existing = session.objects.get(obj.prim_path)
+            if existing is not None and obj.visible is None:
+                obj.visible = existing.visible
+            session.objects[obj.prim_path] = obj
+            if obj.bsdf_override is not None:
+                session.material_overrides[obj.prim_path] = obj.bsdf_override
+        session.updated_at = state_patch.timestamp or _utc_now_iso()
+        summary = self._active_isaac_session_summary(include_inventory=False)
+        summary["updated_objects"] = len(state_patch.objects)
+        return summary
+
+    def _update_isaac_materials(self, payload: dict[str, Any]) -> dict[str, Any]:
+        session = self._require_active_isaac_session()
+        patch_payload = payload.get("material_patch") if isinstance(payload.get("material_patch"), Mapping) else payload
+        material_patch = isaac_material_patch_from_payload(dict(patch_payload))
+        for prim_path, override in material_patch.overrides.items():
+            session.material_overrides[prim_path] = override
+            existing = session.objects.get(prim_path)
+            if existing is not None:
+                existing.bsdf_override = override
+                existing.bsdf_override_key = override.bsdf_type
+        session.updated_at = material_patch.timestamp or _utc_now_iso()
+        summary = self._active_isaac_session_summary(include_inventory=False)
+        summary["updated_materials"] = len(material_patch.overrides)
+        return summary
+
+    def _update_isaac_selection(self, payload: dict[str, Any]) -> dict[str, Any]:
+        session = self._require_active_isaac_session()
+        selected_payload = payload.get("selected_prim_paths")
+        if not isinstance(selected_payload, list):
+            raise ValueError("selected_prim_paths must be a list.")
+        prev_paths = set(session.selected_prim_paths)
+        session.selected_prim_paths = [str(path) for path in selected_payload if isinstance(path, str) and path]
+        session.updated_at = _utc_now_iso()
+        # Fire debug event only when selection actually changes
+        new_paths = set(session.selected_prim_paths)
+        if new_paths != prev_paths:
+            if new_paths:
+                label = session.selected_prim_paths[0].split("/")[-1]
+                extra = f" +{len(new_paths)-1}" if len(new_paths) > 1 else ""
+                self._push_debug_event("selection", f"🖱 선택: {label}{extra}", {"paths": session.selected_prim_paths})
+            else:
+                self._push_debug_event("selection", "🖱 선택 해제", {"paths": []})
+        summary = self._active_isaac_session_summary(include_inventory=False)
+        summary["selected_prim_count"] = len(session.selected_prim_paths)
+        return summary
+
+    def _register_isaac_sensors(self, payload: dict[str, Any]) -> dict[str, Any]:
+        session = self._require_active_isaac_session()
+        sensors_payload = payload.get("sensors")
+        if isinstance(sensors_payload, list):
+            sensors = [isaac_sensor_spec_from_payload(dict(item)) for item in sensors_payload if isinstance(item, Mapping)]
+        else:
+            single_payload = payload.get("sensor") if isinstance(payload.get("sensor"), Mapping) else payload
+            sensors = [isaac_sensor_spec_from_payload(dict(single_payload))]
+        for sensor in sensors:
+            prev = session.sensors.get(sensor.sensor_id)
+            session.sensors[sensor.sensor_id] = sensor
+            # Fire debug event when the viewport camera moves (any translation or rotation)
+            if sensor.camera_to_world is not None:
+                # Compare full matrix rounded to 1 decimal to avoid jitter noise
+                _mat_vals = list(sensor.camera_to_world)
+                new_sig = tuple(round(float(v), 1) for v in _mat_vals)
+                prev_sig = tuple(round(float(v), 1) for v in list(prev.camera_to_world)) if (prev and prev.camera_to_world is not None) else None
+                if new_sig != prev_sig:
+                    # Extract translation: matrix[:3, 3] after normalising storage order
+                    try:
+                        _m = normalize_mat4_storage(_mat_vals)  # → (4,4) column-major
+                        x, y, z = float(_m[0, 3]), float(_m[1, 3]), float(_m[2, 3])
+                    except Exception:
+                        x, y, z = 0.0, 0.0, 0.0
+                    self._push_debug_event(
+                        "camera",
+                        f"📷 카메라 이동: ({x:.1f}, {y:.1f}, {z:.1f})",
+                        {"sensor_id": sensor.sensor_id, "pos": [x, y, z], "fov_deg": sensor.fov_deg},
+                    )
+        session.updated_at = _utc_now_iso()
+        # Lightweight response — inventory rebuild not needed for sensor registration
+        summary = self._active_isaac_session_summary(include_inventory=False)
+        summary["registered_sensors"] = [sensor.sensor_id for sensor in sensors]
+        return summary
+
+    def _camera_spec_from_isaac_sensor(self, sensor: IsaacSensorSpec) -> CameraSpec:
+        if sensor.camera_to_world is None or sensor.fov_deg is None:
+            raise ValueError(f"Registered sensor {sensor.sensor_id} is missing camera_to_world or fov_deg.")
+        camera_to_world = normalize_mat4_storage(sensor.camera_to_world).reshape(-1).astype(float).tolist()
+        return CameraSpec(
+            camera_id=sensor.sensor_id,
+            name=sensor.name,
+            camera_to_world=camera_to_world,
+            fov_deg=float(sensor.fov_deg),
+            resolution=list(sensor.resolution) if sensor.resolution is not None else None,
+            sensor_modality="multimodal",
+            sensor_sync_group=sensor.sensor_sync_group,
+            calibration_ref=sensor.calibration_ref,
+            source_camera_id=sensor.pose_source,
+            extras=dict(sensor.extras),
+        )
+
+    def _render_request_from_active_isaac_session(self, capture_request: IsaacCaptureRequest) -> RenderRequest:
+        session = self._require_active_isaac_session()
+        if capture_request.sensor_id:
+            sensor = session.sensors.get(capture_request.sensor_id)
+            if sensor is None:
+                raise ValueError(f"Unknown sensor_id for active Isaac session: {capture_request.sensor_id}")
+            camera_spec = self._camera_spec_from_isaac_sensor(sensor)
+            requested_modalities = list(capture_request.modalities or sensor.modalities or ["rgb"])
+            sensor_resolution = list(sensor.resolution) if sensor.resolution is not None else None
+        elif capture_request.camera is not None:
+            camera_spec = capture_request.camera
+            requested_modalities = list(capture_request.modalities or ["rgb"])
+            sensor_resolution = list(camera_spec.resolution) if camera_spec.resolution is not None else None
+        else:
+            raise ValueError("Isaac capture requires either sensor_id or inline camera.")
+
+        timestamp = _utc_now_iso()
+        stamp = self._timestamp_slug()
+        job_id = make_job_id("isaac-session")
+        frame_id = f"frame_{stamp}"
+        request_id = f"request_{stamp}"
+        scene_override = SceneOverrideSpec(
+            prim_to_shape_ids=dict(session.prim_to_shape_ids),
+            bsdf_overrides={prim_path: override for prim_path, override in session.material_overrides.items()},
+            transform_overrides={
+                prim_path: list(obj.transform)
+                for prim_path, obj in session.objects.items()
+                if obj.transform is not None
+            },
+            extras={
+                "source": "isaac_session_v2",
+                "object_count": len(session.objects),
+            },
+        )
+        render_settings = dict(capture_request.render_settings)
+        if sensor_resolution:
+            render_settings.setdefault("width", int(sensor_resolution[0]))
+            if len(sensor_resolution) > 1:
+                render_settings.setdefault("height", int(sensor_resolution[1]))
+        # Auto-select polarization variant when polar modalities are requested
+        _POLAR_MODALITIES = {"s1", "s2", "dop", "aolp", "polar_rgb_preview"}
+        if any(m in _POLAR_MODALITIES for m in requested_modalities) and "variant" not in render_settings:
+            render_settings["variant"] = "polarized_cuda_mono"
+        scene_state = SceneState(
+            job_id=job_id,
+            scene_id=session.scene_id,
+            frame_id=frame_id,
+            timestamp=timestamp,
+            scene_snapshot_ref=session.scene_snapshot_ref or session.shape_map_ref,
+            mitsuba_scene_ref=session.mitsuba_scene_ref,
+            scene_version="isaac_session_v2",
+            illumination_setup="ambient_room",
+            extras={"shape_map_ref": session.shape_map_ref},
+        )
+        return RenderRequest(
+            request_id=request_id,
+            job_id=job_id,
+            frame_id=frame_id,
+            timestamp=timestamp,
+            scene_state=scene_state,
+            camera_specs=[camera_spec],
+            modalities=requested_modalities,
+            robot_state=RobotState(),
+            render_settings=render_settings,
+            scene_override=scene_override,
+            extras={
+                "source": "isaac_session_v2",
+                "submit_mode": capture_request.submit_mode,
+                "shape_map_ref": session.shape_map_ref,
+                **dict(capture_request.extras),
+            },
+        )
+
+    def _handle_isaac_session_capture(self, payload: dict[str, Any]) -> Any:
+        capture_payload = payload.get("capture_request") if isinstance(payload.get("capture_request"), Mapping) else payload
+        capture_request = isaac_capture_request_from_payload(dict(capture_payload))
+        render_request = self._render_request_from_active_isaac_session(capture_request)
+        variant = str(payload.get("variant") or render_request.render_settings.get("variant") or self.variant)
+        runtime_overrides = payload.get("runtime_overrides") or {}
+        command_id = _maybe_str(payload.get("command_id"))
+        if capture_request.submit_mode == "async":
+            return self.submit(render_request, variant=variant, runtime_overrides=runtime_overrides)
+        timeout_s = float(payload.get("timeout_s", 600.0))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(
+                self.render_fn,
+                render_request,
+                repo_root=self.repo_root,
+                variant=variant,
+                progress_callback=(lambda stage, ctx=None: self._update_isaac_command_progress(
+                    command_id,
+                    {
+                        "status": "running",
+                        "progress_stage": stage,
+                        "progress_origin": "daemon_render",
+                        "progress_message": self._isaac_render_stage_message(stage, ctx),
+                        **({"progress_counts": {"loaded": ctx.get("pass_index", 0), "total": ctx.get("total_passes", 0)}}
+                           if isinstance(ctx, Mapping) and ctx.get("total_passes") else {}),
+                    },
+                )) if command_id else None,
+            )
+            bundle = future.result(timeout=timeout_s)
+        return {
+            "status": "completed",
+            "job_id": render_request.job_id,
+            "frame_id": render_request.frame_id,
+            "manifest_path": f"{bundle.bundle_root}/manifest.json",
+            "artifacts": _artifact_paths_from_bundle(bundle),
+            "session": self._active_isaac_session_summary()["session"],
+        }
+
     def _handle_isaac_render_submit(self, payload: dict[str, Any]) -> RenderJobAccepted:
         snapshot = isaac_state_snapshot_from_payload(payload["isaac_state"])
         render_request, _shape_map_ref = self._render_request_from_isaac_snapshot(snapshot)
@@ -622,7 +2022,7 @@ class RenderDaemon:
         runtime_overrides = payload.get("runtime_overrides") or {}
         return self.submit(render_request, variant=variant, runtime_overrides=runtime_overrides)
 
-    def _handle_isaac_render_blocked(self, payload: dict[str, Any], *, timeout_s: float = 120.0) -> dict[str, Any]:
+    def _handle_isaac_render_blocked(self, payload: dict[str, Any], *, timeout_s: float = 600.0) -> dict[str, Any]:
         """Handle POST /isaac/render in blocked mode — wait for render, return artifacts immediately."""
         snapshot = isaac_state_snapshot_from_payload(payload["isaac_state"])
         render_request, shape_map_ref = self._render_request_from_isaac_snapshot(snapshot)
@@ -648,6 +2048,35 @@ class RenderDaemon:
             "artifacts": _artifact_paths_from_bundle(bundle),
         }
 
+    def _isaac_render_stage_message(self, stage: str, payload: Mapping[str, Any] | None = None) -> str:
+        ctx = payload if isinstance(payload, Mapping) else {}
+        camera_id = _maybe_str(ctx.get("camera_id"))
+        pass_name = _maybe_str(ctx.get("pass"))
+        spp = ctx.get("spp")
+        pass_index = ctx.get("pass_index")
+        total_passes = ctx.get("total_passes")
+        pass_suffix = f" ({pass_name})" if pass_name else ""
+        cam_suffix = f" · {camera_id}" if camera_id else ""
+        spp_suffix = f" · {spp} spp" if spp else ""
+        count_suffix = f" [{pass_index}/{total_passes}]" if pass_index and total_passes else ""
+        if stage == "ambient":
+            return f"Rendering ambient branch{cam_suffix}."
+        if stage == "active":
+            return f"Rendering active/NIR branch{cam_suffix}."
+        if stage == "polar":
+            return f"Rendering polarization branch{cam_suffix}."
+        if stage == "staging_scene":
+            return f"Preparing scene XML{pass_suffix}{count_suffix}."
+        if stage == "loading_scene":
+            return f"Loading scene into GPU memory{pass_suffix}{spp_suffix}{count_suffix}."
+        if stage == "rendering":
+            return f"Ray tracing{pass_suffix}{spp_suffix}{count_suffix}."
+        if stage == "saving_output":
+            return f"Writing EXR output{pass_suffix}{count_suffix}."
+        if stage == "writing_manifest":
+            return "Writing observation manifest."
+        return stage.replace("_", " ").strip().capitalize()
+
     def _worker_loop(self) -> None:
         while True:
             with self._condition:
@@ -663,6 +2092,7 @@ class RenderDaemon:
                 job.status.started_at = _utc_now_iso()
                 job.status.progress_stage = "starting"
                 self._persist_status_unlocked(job)
+                self._record_render_job_telemetry(job, event_type="running")
 
             try:
                 scene_cache_key = self._scene_cache_key(job.render_request, job.variant)
@@ -693,6 +2123,7 @@ class RenderDaemon:
             job.status.manifest_path = manifest_path
             job.status.error = None
             self._persist_status_unlocked(job)
+            self._record_render_job_telemetry(job, event_type="complete")
 
     def _mark_failed(self, job_id: str, error: str) -> None:
         with self._condition:
@@ -702,6 +2133,7 @@ class RenderDaemon:
             job.status.progress_stage = "failed"
             job.status.error = error
             self._persist_status_unlocked(job)
+            self._record_render_job_telemetry(job, event_type="failed")
 
     def _update_progress(self, job_id: str, stage: str, payload: Mapping[str, Any] | None) -> None:
         with self._condition:
@@ -712,6 +2144,7 @@ class RenderDaemon:
             if payload:
                 job.status.extras["progress_context"] = dict(payload)
             self._persist_status_unlocked(job)
+            self._record_render_job_telemetry(job, event_type="progress")
 
     def _scene_cache_key(self, render_request: RenderRequest, variant: str) -> str:
         branch_policy = str(render_request.extras.get("branch_policy", "default"))
@@ -788,14 +2221,19 @@ class RenderDaemon:
         content_type = default_type or mime_type or "application/octet-stream"
         self._send_bytes(handler, HTTPStatus.OK, payload, content_type=content_type)
 
-    def _nav_items(self) -> list[dict[str, str]]:
-        return [
+    def _nav_items(self, *, current_scene_id: str | None = None) -> list[dict[str, str]]:
+        items = [
             {"key": "home", "label": "Home", "href": "/"},
+        ]
+        if current_scene_id:
+            items.append({"key": "current_scene", "label": "Current Scene", "href": f"/scenes/{quote(current_scene_id, safe='')}"})
+        items.extend([
             {"key": "scenes", "label": "Scenes", "href": "/scenes"},
             {"key": "jobs", "label": "Jobs", "href": "/jobs"},
             {"key": "system", "label": "System", "href": "/system"},
             {"key": "isaac", "label": "Isaac Guide", "href": "/integrations/isaac"},
-        ]
+        ])
+        return items
 
     def _render_page(self, template_name: str, *, nav_key: str, page_title: str, page_subtitle: str = "", flash_message: str | None = None, **context: Any) -> str:
         template = self._jinja.get_template(template_name)
@@ -804,22 +2242,265 @@ class RenderDaemon:
             page_title=page_title,
             page_subtitle=page_subtitle,
             nav_key=nav_key,
-            nav_items=self._nav_items(),
+            nav_items=self._nav_items(current_scene_id=summary.get("current_scene_id")),
             base_url=self.base_url,
             latest_scene_id=summary.get("latest_scene_id"),
+            current_scene_id=summary.get("current_scene_id"),
             summary=summary,
             flash_message=flash_message,
             **context,
         )
 
+    def _active_isaac_command_summary(self) -> dict[str, Any] | None:
+        """Return the most recent in-flight Isaac command, if any."""
+        with self._condition:
+            active = [
+                cmd for cmd in self._isaac_commands.values()
+                if cmd.status in {"queued", "dispatched", "running"}
+            ]
+        if not active:
+            return None
+        active.sort(key=lambda c: _safe_sort_ts(c.updated_at or c.created_at), reverse=True)
+        cmd = active[0]
+        elapsed_s = None
+        try:
+            started_at = datetime.fromisoformat(cmd.created_at).astimezone(timezone.utc)
+            elapsed_s = max(0, int((_utc_now() - started_at).total_seconds()))
+        except Exception:
+            elapsed_s = None
+        payload = self._isaac_command_payload(cmd)
+        payload["elapsed_s"] = elapsed_s
+        return payload
+
+    def _latest_isaac_command_summary(self) -> dict[str, Any] | None:
+        with self._condition:
+            commands = list(self._isaac_commands.values())
+        if not commands:
+            return None
+        commands.sort(key=lambda c: _safe_sort_ts(c.updated_at or c.completed_at or c.created_at), reverse=True)
+        return self._isaac_command_payload(commands[0])
+
+    def _material_presets(self) -> list[dict[str, Any]]:
+        return [dict(item) for item in MATERIAL_PRESETS]
+
+    def _session_object_inventory(self, session: _IsaacActiveSession) -> list[dict[str, Any]]:
+        selected_paths = {str(path) for path in session.selected_prim_paths if str(path)}
+        explicit_paths = {
+            str(path)
+            for path in (
+                list(session.prim_to_shape_ids.keys())
+                + list(session.objects.keys())
+                + list(session.material_overrides.keys())
+                + list(selected_paths)
+            )
+            if str(path).startswith("/")
+        }
+        nodes: dict[str, dict[str, Any]] = {}
+
+        def ensure_node(path: str) -> None:
+            parts = [part for part in path.split("/") if part]
+            if not parts:
+                return
+            current = ""
+            for depth, part in enumerate(parts):
+                current += f"/{part}"
+                if current not in nodes:
+                    nodes[current] = {
+                        "path": current,
+                        "name": part,
+                        "depth": depth,
+                        "kind": "group",
+                        "selected": False,
+                        "shape_count": 0,
+                        "has_state": False,
+                        "visible": None,
+                        "override_bsdf": None,
+                    }
+
+        for path in explicit_paths:
+            ensure_node(path)
+
+        for path, node in nodes.items():
+            object_state = session.objects.get(path)
+            override = session.material_overrides.get(path)
+            if override is None and object_state is not None:
+                override = object_state.bsdf_override
+            node["selected"] = path in selected_paths
+            node["shape_count"] = len(session.prim_to_shape_ids.get(path, []))
+            node["has_state"] = object_state is not None
+            node["visible"] = object_state.visible if object_state is not None else None
+            node["override_bsdf"] = override.bsdf_type if override is not None else None
+            node["transform"] = list(object_state.transform) if object_state is not None and object_state.transform else None
+            if path in explicit_paths and (node["shape_count"] or node["has_state"] or node["override_bsdf"] is not None):
+                node["kind"] = "object"
+
+        object_translations: dict[str, tuple[float, float, float]] = {}
+        for prim_path, object_state in session.objects.items():
+            translation = _object_transform_translation(object_state.transform)
+            if translation is None:
+                continue
+            object_translations[str(prim_path)] = (float(translation[0]), float(translation[1]), float(translation[2]))
+
+        def _synthetic_transform_from_translation(translation: tuple[float, float, float]) -> list[float]:
+            tx, ty, tz = translation
+            return [
+                1.0, 0.0, 0.0, 0.0,
+                0.0, 1.0, 0.0, 0.0,
+                0.0, 0.0, 1.0, 0.0,
+                tx, ty, tz, 1.0,
+            ]
+
+        # Build ancestor→[descendant translations] map in O(N·depth) instead of O(N²)
+        # For each object path, walk up the hierarchy and accumulate translation into each ancestor node
+        ancestor_translations: dict[str, list[tuple[float, float, float]]] = {}
+        ancestor_shape_counts: dict[str, int] = {}
+        for obj_path, translation in object_translations.items():
+            parts = [p for p in obj_path.split("/") if p]
+            ancestor = ""
+            for part in parts:
+                ancestor += f"/{part}"
+                if ancestor not in ancestor_translations:
+                    ancestor_translations[ancestor] = []
+                ancestor_translations[ancestor].append(translation)
+            # Accumulate shape counts along ancestry
+            obj_shapes = len(session.prim_to_shape_ids.get(obj_path, []))
+            if obj_shapes:
+                ancestor = ""
+                for part in parts:
+                    ancestor += f"/{part}"
+                    ancestor_shape_counts[ancestor] = ancestor_shape_counts.get(ancestor, 0) + obj_shapes
+
+        for path, node in nodes.items():
+            if node.get("transform"):
+                continue
+            descendant_points = ancestor_translations.get(path)
+            if not descendant_points:
+                continue
+            count = len(descendant_points)
+            centroid = (
+                sum(item[0] for item in descendant_points) / count,
+                sum(item[1] for item in descendant_points) / count,
+                sum(item[2] for item in descendant_points) / count,
+            )
+            node["transform"] = _synthetic_transform_from_translation(centroid)
+            if not node.get("shape_count"):
+                node["shape_count"] = ancestor_shape_counts.get(path, 0) or count
+
+        robot_root_paths = {
+            path
+            for path, node in nodes.items()
+            if str(node.get("name") or "").lower().startswith("rangermini")
+        }
+        for path, node in nodes.items():
+            matched_root = next(
+                (root for root in sorted(robot_root_paths, key=len, reverse=True) if path == root or path.startswith(f"{root}/")),
+                None,
+            )
+            if not matched_root:
+                continue
+            node["robot_root_path"] = matched_root
+            node["robot_member"] = True
+            node["robot_root"] = path == matched_root
+            if path == matched_root:
+                node["kind"] = "robot"
+
+        result = list(nodes.values())
+        result.sort(key=lambda item: tuple(part for part in item["path"].split("/") if part))
+        return result
+
+    def _session_robot_inventory(self, session: _IsaacActiveSession) -> list[dict[str, Any]]:
+        inventory = self._session_object_inventory(session)
+        selected_paths = [str(path) for path in session.selected_prim_paths if isinstance(path, str)]
+        robot_nodes = [
+            node for node in inventory
+            if isinstance(node, Mapping) and node.get("robot_root") is True and isinstance(node.get("path"), str)
+        ]
+        if not robot_nodes:
+            fallback_roots: set[str] = set()
+            for path in selected_paths:
+                if "/RangerMini" in path or path.rsplit("/", 1)[-1].lower().startswith("rangermini"):
+                    fallback_roots.add(path)
+                elif "/base_link" in path:
+                    fallback_roots.add(path.rsplit("/base_link", 1)[0])
+            if fallback_roots:
+                for node in inventory:
+                    node_path = str(node.get("path") or "")
+                    if node_path in fallback_roots:
+                        node["robot_root"] = True
+                        node["robot_member"] = True
+                        node["robot_root_path"] = node_path
+                        node["kind"] = "robot"
+                        robot_nodes.append(node)
+        robots: list[dict[str, Any]] = []
+        for node in robot_nodes:
+            path = str(node["path"])
+            descendants = [
+                item for item in inventory
+                if isinstance(item, Mapping)
+                and isinstance(item.get("path"), str)
+                and str(item.get("path")).startswith(f"{path}/")
+            ]
+            translation = _object_transform_translation(node.get("transform")) if isinstance(node.get("transform"), list) else None
+            robots.append(
+                {
+                    "path": path,
+                    "name": str(node.get("name") or path.rsplit("/", 1)[-1] or path),
+                    "label": str(node.get("name") or path.rsplit("/", 1)[-1] or path),
+                    "shape_count": int(node.get("shape_count") or 0),
+                    "member_count": len(descendants),
+                    "selected": any(sel == path or sel.startswith(f"{path}/") for sel in selected_paths),
+                    "transform": list(node["transform"]) if isinstance(node.get("transform"), list) else None,
+                    "translation": list(translation) if translation is not None else None,
+                    "override_count": sum(1 for item in descendants if item.get("override_bsdf")),
+                    "hidden_count": sum(1 for item in descendants if item.get("visible") is False),
+                    "active_count": sum(1 for item in descendants if item.get("has_state")),
+                }
+            )
+        robots.sort(key=lambda item: item["path"])
+        return robots
+
+    def _normalize_command_error(self, message: str | None, *, scene_id: str | None = None) -> str:
+        raw = str(message or "").strip()
+        if not raw:
+            return "Unknown Isaac command failure."
+        if "registered but not render-ready" in raw:
+            return raw
+        if "/isaac/session/open" in raw and "No such file or directory" in raw and "shape_map" in raw:
+            scene_label = scene_id or "selected scene"
+            try:
+                missing_path = raw.split("No such file or directory:", 1)[1].strip().strip("{} ").strip('"').strip("'")
+            except Exception:
+                missing_path = "shape_map_ref"
+            return (
+                f"Scene {scene_label} is registered but not render-ready. "
+                f"shape_map_ref missing on disk: {missing_path}. "
+                "Open the USD only if you just want to inspect it in Isaac, or prepare render-ready files before rendering."
+            )
+        if "No such file or directory" in raw and "shape_map" in raw:
+            scene_label = scene_id or "selected scene"
+            return (
+                f"Scene {scene_label} is registered but not render-ready. "
+                "shape_map_ref is missing on disk. Prepare render-ready files before rendering."
+            )
+        return raw
+
     def _health_payload(self) -> dict[str, Any]:
         summary = self._summary_payload()
+        session = self._isaac_session
         return {
             "status": "ok",
             "base_url": self.base_url,
             "worker_state": summary["worker_state"],
+            "active_stage": summary["active_stage"],
             "queue_length": summary["queue_length"],
             "variant": summary["variant"],
+            "isaac_connected": session is not None,
+            "isaac_scene_id": session.scene_id if session else None,
+            "isaac_opened_at": session.opened_at if session else None,
+            "isaac_updated_at": session.updated_at if session else None,
+            "isaac_sensor_count": len(session.sensors) if session else 0,
+            "active_isaac_command": self._active_isaac_command_summary(),
+            "latest_isaac_command": self._latest_isaac_command_summary(),
         }
 
     def _snapshot_state(self) -> tuple[list[str], dict[str, RenderJobStatus], dict[str, dict[str, Any]]]:
@@ -895,6 +2576,140 @@ class RenderDaemon:
         failures = [item for item in self._job_records() if item["status"] == "failed"]
         return failures[:limit]
 
+    def _activity_feed(self, limit: int = 12) -> list[dict[str, Any]]:
+        """Return recent activity items for the home page feed."""
+        from datetime import datetime, timezone as _tz
+
+        def _time_ago(ts: str | None) -> str:
+            if not ts:
+                return "—"
+            try:
+                dt = datetime.fromisoformat(ts).astimezone(_tz.utc)
+                delta = int((_utc_now() - dt).total_seconds())
+                if delta < 60:
+                    return f"{delta}s ago"
+                if delta < 3600:
+                    return f"{delta // 60}m ago"
+                if delta < 86400:
+                    return f"{delta // 3600}h ago"
+                return f"{delta // 86400}d ago"
+            except Exception:
+                return ts[:16] if len(ts) >= 16 else ts
+
+        items: list[dict[str, Any]] = []
+        seen_command_keys: set[tuple[str, str, str]] = set()
+        for job in self._job_records():
+            status = job["status"]
+            if status == "succeeded":
+                items.append({
+                    "type": "render",
+                    "label": f"Render completed · {job.get('scene_id') or job['job_id'][:12]}",
+                    "time_ago": _time_ago(job.get("finished_at")),
+                    "job_id": job["job_id"],
+                })
+            elif status == "failed":
+                items.append({
+                    "type": "fail",
+                    "label": f"Render failed · {job.get('scene_id') or job['job_id'][:12]}",
+                    "time_ago": _time_ago(job.get("finished_at") or job.get("submitted_at")),
+                    "job_id": job["job_id"],
+                })
+        for command in self._list_isaac_commands(limit=limit):
+            status = command.get("status")
+            scene_id = command.get("scene_id") or "scene"
+            label = self._normalize_command_error(command.get("error") or command.get("progress_message") or command.get("command_type") or "Isaac command", scene_id=scene_id)
+            command_type = str(command.get("command_type") or "command")
+            if status == "failed":
+                dedupe_key = ("fail", str(scene_id), label)
+                if dedupe_key in seen_command_keys:
+                    continue
+                seen_command_keys.add(dedupe_key)
+                items.append(
+                    {
+                        "type": "fail",
+                        "label": f"Isaac failed · {scene_id} · {label}",
+                        "time_ago": _time_ago(command.get("updated_at") or command.get("completed_at") or command.get("created_at")),
+                        "command_id": command["command_id"],
+                    }
+                )
+            elif status == "succeeded":
+                dedupe_key = ("done", str(scene_id), command_type)
+                if dedupe_key in seen_command_keys:
+                    continue
+                seen_command_keys.add(dedupe_key)
+                items.append(
+                    {
+                        "type": "scene",
+                        "label": f"Isaac done · {scene_id} · {label}",
+                        "time_ago": _time_ago(command.get("updated_at") or command.get("completed_at") or command.get("created_at")),
+                        "command_id": command["command_id"],
+                    }
+                )
+            elif status in {"queued", "dispatched", "running"}:
+                dedupe_key = ("active", str(scene_id), command_type)
+                if dedupe_key in seen_command_keys:
+                    continue
+                seen_command_keys.add(dedupe_key)
+                items.append(
+                    {
+                        "type": "system",
+                        "label": f"Isaac active · {scene_id} · {label}",
+                        "time_ago": _time_ago(command.get("updated_at") or command.get("created_at")),
+                        "command_id": command["command_id"],
+                    }
+                )
+        items.sort(key=lambda x: x["time_ago"], reverse=False)
+        return items[:limit]
+
+    def _environment_checks(self) -> list[dict[str, Any]]:
+        """Return environment diagnostic check results."""
+        import os
+        checks: list[dict[str, Any]] = []
+
+        # Daemon always reachable (we are serving)
+        checks.append({"icon": "✅", "label": "Daemon listening", "detail": self.base_url, "status": "ok"})
+
+        # repo_root exists and writable
+        if self.repo_root.exists():
+            writable = os.access(self.repo_root, os.W_OK)
+            checks.append({
+                "icon": "✅" if writable else "⚠️",
+                "label": "Repo root writable",
+                "detail": str(self.repo_root),
+                "status": "ok" if writable else "warn",
+            })
+        else:
+            checks.append({"icon": "❌", "label": "Repo root missing", "detail": str(self.repo_root), "status": "fail"})
+
+        # out/bridge_jobs exists
+        jobs_dir = self.repo_root / "out" / "bridge_jobs"
+        checks.append({
+            "icon": "✅" if jobs_dir.exists() else "⚠️",
+            "label": "Jobs output dir",
+            "detail": str(jobs_dir),
+            "status": "ok" if jobs_dir.exists() else "warn",
+        })
+
+        # WSL GPU path
+        wsl_lib = Path("/usr/lib/wsl/lib")
+        checks.append({
+            "icon": "✅" if wsl_lib.exists() else "⚠️",
+            "label": "WSL GPU lib path",
+            "detail": str(wsl_lib),
+            "status": "ok" if wsl_lib.exists() else "warn",
+        })
+
+        # Mitsuba variant configured
+        variant_ok = bool(self.variant and self.variant != "none")
+        checks.append({
+            "icon": "✅" if variant_ok else "❌",
+            "label": "Mitsuba variant configured",
+            "detail": self.variant or "(not set)",
+            "status": "ok" if variant_ok else "fail",
+        })
+
+        return checks
+
     def _bundle_manifests(self) -> list[ObservationBundleManifest]:
         root = self.repo_root / "out" / "bridge_jobs"
         if not root.exists():
@@ -929,11 +2744,29 @@ class RenderDaemon:
                 return value
         return None
 
+    def _capture_camera_payload_from_spec(self, camera: CameraSpec | None) -> dict[str, Any] | None:
+        if camera is None:
+            return None
+        try:
+            origin, target, up = camera_to_world_to_lookat(camera.camera_to_world)
+        except Exception:
+            return None
+        return {
+            "camera_id": camera.camera_id,
+            "camera_name": camera.name,
+            "camera_origin": origin.tolist(),
+            "camera_target": target.tolist(),
+            "camera_up": up.tolist(),
+            "camera_fov_deg": float(camera.fov_deg),
+            "camera_to_world": list(normalize_mat4_storage(camera.camera_to_world).reshape(-1).astype(float).tolist()),
+        }
+
     def _capture_records(self, bundle: ObservationBundleManifest) -> list[dict[str, Any]]:
         camera_map = {camera.camera_id: camera for camera in bundle.camera_specs}
         per_camera: dict[str, dict[str, Any]] = {}
         for artifact in bundle.artifacts:
             camera_id = artifact.camera_id
+            camera_payload = self._capture_camera_payload_from_spec(camera_map.get(camera_id))
             capture = per_camera.setdefault(
                 camera_id,
                 {
@@ -950,8 +2783,11 @@ class RenderDaemon:
                     "manifest_href": self._artifact_href(f"{bundle.bundle_root}/manifest.json"),
                     "modalities": [],
                     "preview_items": [],
+                    "status": "completed",
                 },
             )
+            if camera_payload:
+                capture.update(camera_payload)
             capture["modalities"].append(artifact.modality)
             preview_path = self._pick_preview_path(artifact.artifact_paths)
             capture["preview_items"].append(
@@ -1007,6 +2843,7 @@ class RenderDaemon:
     def _scene_detail(self, scene_id: str) -> dict[str, Any]:
         captures: list[dict[str, Any]] = []
         scene_record = None
+        catalog = {item["scene_id"]: item for item in self._isaac_scene_catalog_records()}
         for bundle in self._bundle_manifests():
             if bundle.scene_id != scene_id:
                 continue
@@ -1022,9 +2859,43 @@ class RenderDaemon:
                 }
         captures.sort(key=lambda item: _safe_sort_ts(item["timestamp"]), reverse=False)
         captures.reverse()
-        if scene_record is not None:
+        catalog_record = catalog.get(scene_id)
+        if scene_record is None:
+            if catalog_record is not None:
+                scene_record = {
+                    "scene_id": catalog_record["scene_id"],
+                    "scene_version": catalog_record.get("scene_version"),
+                    "illumination_setup": catalog_record.get("illumination_setup"),
+                    "scene_snapshot_ref": catalog_record.get("scene_snapshot_ref"),
+                    "mitsuba_scene_ref": catalog_record.get("mitsuba_scene_ref"),
+                    "usd_stage_path": catalog_record.get("usd_stage_path"),
+                    "shape_map_ref": catalog_record.get("shape_map_ref"),
+                    "render_ready": catalog_record.get("render_ready"),
+                    "mitsuba_scene_exists": catalog_record.get("mitsuba_scene_exists"),
+                    "shape_map_exists": catalog_record.get("shape_map_exists"),
+                    "capture_count": int(catalog_record.get("capture_count", 0) or 0),
+                    "camera_count": int(catalog_record.get("camera_count", 0) or 0),
+                    "latest_timestamp": catalog_record.get("latest_timestamp"),
+                    "source": catalog_record.get("source"),
+                }
+        elif scene_record is not None:
             scene_record["capture_count"] = len(captures)
             scene_record["camera_count"] = len({capture["camera_id"] for capture in captures})
+        if scene_record is not None and catalog_record is not None:
+            for key in (
+                "usd_stage_path",
+                "shape_map_ref",
+                "render_ready",
+                "readiness_status",
+                "mitsuba_scene_exists",
+                "shape_map_exists",
+                "source",
+                "latest_timestamp",
+            ):
+                if key in catalog_record:
+                    scene_record[key] = catalog_record.get(key)
+        if scene_record is not None:
+            scene_record = self._attach_load_prep_summary(scene_record)
         return {
             "scene_id": scene_id,
             "scene": scene_record,
@@ -1032,10 +2903,378 @@ class RenderDaemon:
             "latest_capture": captures[0] if captures else None,
         }
 
+    def _scene_snapshot_usd_stage_ref(self, scene_snapshot_ref: str | None) -> str | None:
+        snapshot, _cameras, _lights = self._load_snapshot_sidecars(scene_snapshot_ref)
+        return snapshot.usd_stage_path if snapshot is not None else None
+
+    def _human_bytes(self, value: int | None) -> str | None:
+        if value is None:
+            return None
+        units = ["B", "KB", "MB", "GB", "TB"]
+        size = float(value)
+        unit_index = 0
+        while size >= 1024.0 and unit_index < len(units) - 1:
+            size /= 1024.0
+            unit_index += 1
+        if unit_index == 0:
+            return f"{int(size)} {units[unit_index]}"
+        return f"{size:.1f} {units[unit_index]}"
+
+    def _resolve_isaac_catalog_path(self, raw_path: str | None) -> Path | None:
+        if not raw_path:
+            return None
+        path_str = str(raw_path).strip()
+        if not path_str:
+            return None
+        if path_str.startswith("\\\\"):
+            marker = "\\workspace\\jinnyeong\\project\\robomituba\\"
+            lowered = path_str.lower()
+            marker_index = lowered.find(marker)
+            if marker_index >= 0:
+                suffix = path_str[marker_index + len(marker) :].replace("\\", "/")
+                return self.repo_root / suffix
+            return None
+        if len(path_str) > 1 and path_str[1] == ":":
+            lowered = path_str.replace("\\", "/").lower()
+            marker = "/workspace/jinnyeong/project/robomituba/"
+            marker_index = lowered.find(marker)
+            if marker_index >= 0:
+                suffix = path_str.replace("\\", "/")[marker_index + len(marker) :]
+                return self.repo_root / suffix
+            return None
+        path = Path(path_str)
+        if path.is_absolute():
+            return path
+        return resolve_repo_path(self.repo_root, path_str)
+
+    def _guess_scene_asset_root(self, stage_path: Path) -> Path | None:
+        if stage_path.is_dir():
+            return stage_path
+        parent = stage_path.parent
+        if parent.name.lower() == "usd" and parent.parent.exists():
+            return parent.parent
+        for ancestor in [parent, *parent.parents]:
+            try:
+                has_textures = (ancestor / "textures").exists()
+                has_usd = (ancestor / "USD").exists() or (ancestor / "usd").exists()
+            except Exception:
+                continue
+            if has_textures or has_usd:
+                return ancestor
+            if ancestor == self.repo_root:
+                break
+        return parent if parent.exists() else None
+
+    def _measure_path_size(self, path: Path) -> dict[str, Any]:
+        cache_key = str(path.resolve()) if path.exists() else str(path)
+        cached = self._path_size_cache.get(cache_key)
+        if cached is not None:
+            return dict(cached)
+        payload: dict[str, Any] = {
+            "exists": path.exists(),
+            "bytes": None,
+            "file_count": 0,
+        }
+        if not path.exists():
+            self._path_size_cache[cache_key] = dict(payload)
+            return payload
+        if path.is_file():
+            payload["bytes"] = int(path.stat().st_size)
+            payload["file_count"] = 1
+            self._path_size_cache[cache_key] = dict(payload)
+            return payload
+        total_bytes = 0
+        file_count = 0
+        for root, _dirs, files in os.walk(path):
+            for file_name in files:
+                file_path = Path(root) / file_name
+                try:
+                    total_bytes += int(file_path.stat().st_size)
+                    file_count += 1
+                except OSError:
+                    continue
+        payload["bytes"] = total_bytes
+        payload["file_count"] = file_count
+        self._path_size_cache[cache_key] = dict(payload)
+        return payload
+
+    def _load_prep_summary(self, usd_stage_path: str | None) -> dict[str, Any]:
+        stage_path = self._resolve_isaac_catalog_path(usd_stage_path)
+        if stage_path is None:
+            return {
+                "stage_path_local": None,
+                "stage_exists": False,
+                "stage_size_bytes": None,
+                "stage_size_label": None,
+                "asset_root_local": None,
+                "asset_root_exists": False,
+                "asset_root_size_bytes": None,
+                "asset_root_size_label": None,
+                "asset_file_count": 0,
+                "size_tier": "unknown",
+                "advisory_en": "Scene size is not available from this path yet.",
+                "advisory_kr": "이 경로에서는 아직 장면 크기를 계산할 수 없습니다.",
+            }
+        stage_stats = self._measure_path_size(stage_path)
+        asset_root = self._guess_scene_asset_root(stage_path)
+        asset_stats = self._measure_path_size(asset_root) if asset_root is not None else {"exists": False, "bytes": None, "file_count": 0}
+        reference_bytes = asset_stats.get("bytes") if asset_stats.get("exists") else stage_stats.get("bytes")
+        size_tier = "light"
+        advisory_en = "Light scene. Isaac should open this without much waiting."
+        advisory_kr = "가벼운 장면입니다. Isaac에서 비교적 빠르게 열릴 가능성이 큽니다."
+        if reference_bytes is None:
+            size_tier = "unknown"
+            advisory_en = "Scene size is still unknown. Be ready for a cold load."
+            advisory_kr = "장면 크기를 아직 알 수 없습니다. 처음 로딩은 시간이 걸릴 수 있습니다."
+        elif reference_bytes >= 5 * 1024**3:
+            size_tier = "huge"
+            advisory_en = "Huge scene. Isaac may spend a while loading assets and textures."
+            advisory_kr = "매우 큰 장면입니다. Isaac이 에셋과 텍스처를 오래 로딩할 수 있습니다."
+        elif reference_bytes >= 1 * 1024**3:
+            size_tier = "heavy"
+            advisory_en = "Heavy scene. Expect a noticeable load and streaming phase."
+            advisory_kr = "무거운 장면입니다. 로딩과 스트리밍에 시간이 꽤 걸릴 수 있습니다."
+        elif reference_bytes >= 200 * 1024**2:
+            size_tier = "medium"
+            advisory_en = "Medium scene. Load should be fine, but textures may take a moment."
+            advisory_kr = "중간 규모 장면입니다. 기본 로딩은 괜찮지만 텍스처 로딩에 잠시 걸릴 수 있습니다."
+        return {
+            "stage_path_local": str(stage_path),
+            "stage_exists": bool(stage_stats.get("exists")),
+            "stage_size_bytes": stage_stats.get("bytes"),
+            "stage_size_label": self._human_bytes(stage_stats.get("bytes")),
+            "asset_root_local": str(asset_root) if asset_root is not None else None,
+            "asset_root_exists": bool(asset_stats.get("exists")),
+            "asset_root_size_bytes": asset_stats.get("bytes"),
+            "asset_root_size_label": self._human_bytes(asset_stats.get("bytes")),
+            "asset_file_count": int(asset_stats.get("file_count", 0) or 0),
+            "size_tier": size_tier,
+            "advisory_en": advisory_en,
+            "advisory_kr": advisory_kr,
+        }
+
+    def _attach_load_prep_summary(self, record: dict[str, Any]) -> dict[str, Any]:
+        enriched = dict(record)
+        enriched.update(self._load_prep_summary(_maybe_str(record.get("usd_stage_path"))))
+        return enriched
+
+    def _infer_shape_map_ref(self, *, scene_snapshot_ref: str | None, mitsuba_scene_ref: str | None) -> str | None:
+        if scene_snapshot_ref and scene_snapshot_ref.endswith(".json"):
+            candidate = Path(scene_snapshot_ref).with_name("shape_map.json").as_posix()
+            resolved = resolve_repo_path(self.repo_root, candidate)
+            if resolved.exists():
+                return candidate
+        if mitsuba_scene_ref:
+            scene_path = Path(mitsuba_scene_ref)
+            candidates = [
+                scene_path.with_suffix(".shape_map.json").as_posix(),
+                scene_path.with_name(f"{scene_path.stem}.shape_map.json").as_posix(),
+                scene_path.with_name("shape_map.json").as_posix(),
+            ]
+            for candidate in candidates:
+                resolved = resolve_repo_path(self.repo_root, candidate)
+                if resolved.exists():
+                    return candidate
+        return None
+
+    def _known_isaac_scene_records(self) -> dict[str, dict[str, Any]]:
+        records: dict[str, dict[str, Any]] = {}
+        for bundle in self._bundle_manifests():
+            scene_id = bundle.scene_id
+            latest_capture_records = self._capture_records(bundle)
+            latest_capture = latest_capture_records[0] if latest_capture_records else None
+            shape_map_ref = _maybe_str(bundle.scene_state.extras.get("shape_map_ref")) or self._infer_shape_map_ref(
+                scene_snapshot_ref=bundle.scene_state.scene_snapshot_ref,
+                mitsuba_scene_ref=bundle.scene_state.mitsuba_scene_ref,
+            )
+            usd_stage_path = self._scene_snapshot_usd_stage_ref(bundle.scene_state.scene_snapshot_ref)
+            record = records.get(scene_id)
+            if record is None or (bundle.timestamp or "") > (record.get("latest_timestamp") or ""):
+                records[scene_id] = {
+                    "scene_id": scene_id,
+                    "source": "known_export",
+                    "usd_stage_path": usd_stage_path,
+                    "scene_snapshot_ref": bundle.scene_state.scene_snapshot_ref,
+                    "mitsuba_scene_ref": bundle.scene_state.mitsuba_scene_ref,
+                    "shape_map_ref": shape_map_ref,
+                    "scene_version": bundle.scene_state.scene_version,
+                    "illumination_setup": bundle.scene_state.illumination_setup,
+                    "latest_timestamp": bundle.timestamp,
+                    "latest_capture": latest_capture,
+                    "capture_count": len(latest_capture_records),
+                }
+        return records
+
+    def _registered_isaac_scene_records(self) -> dict[str, dict[str, Any]]:
+        records: dict[str, dict[str, Any]] = {}
+        for scene_id, payload in self._load_registered_isaac_scenes().items():
+            usd_stage_path = _maybe_str(payload.get("usd_stage_path"))
+            records[scene_id] = {
+                "scene_id": scene_id,
+                "source": "registered",
+                "usd_stage_path": usd_stage_path,
+                "scene_snapshot_ref": _maybe_str(payload.get("scene_snapshot_ref")),
+                "mitsuba_scene_ref": _maybe_str(payload.get("mitsuba_scene_ref")),
+                "shape_map_ref": _maybe_str(payload.get("shape_map_ref")),
+                "scene_version": _maybe_str(payload.get("scene_version")),
+                "illumination_setup": _maybe_str(payload.get("illumination_setup")),
+                "texture_cache_status": _maybe_str(payload.get("texture_cache_status")),
+                "texture_cache_root": _maybe_str(payload.get("texture_cache_root")),
+                "texture_cache_bytes": payload.get("texture_cache_bytes"),
+                "texture_cache_file_count": payload.get("texture_cache_file_count"),
+                "texture_cache_last_synced_at": _maybe_str(payload.get("texture_cache_last_synced_at")),
+                "texture_cache_source_mode": _maybe_str(payload.get("texture_cache_source_mode")),
+                "latest_timestamp": _maybe_str(payload.get("updated_at")) or _maybe_str(payload.get("created_at")),
+                "latest_capture": None,
+                "capture_count": 0,
+            }
+        return records
+
+    def _isaac_scene_catalog_records(self) -> list[dict[str, Any]]:
+        records = self._known_isaac_scene_records()
+        with self._condition:
+            preparing_scene_ids = {
+                command.scene_id
+                for command in self._isaac_commands.values()
+                if command.scene_id
+                and command.command_type == "prepare_render_ready"
+                and command.status in {"queued", "dispatched", "running"}
+            }
+        for scene_id, registered in self._registered_isaac_scene_records().items():
+            if scene_id not in records:
+                records[scene_id] = registered
+                continue
+            merged = records[scene_id]
+            for key in (
+                "usd_stage_path",
+                "scene_snapshot_ref",
+                "mitsuba_scene_ref",
+                "shape_map_ref",
+                "scene_version",
+                "illumination_setup",
+                "texture_cache_status",
+                "texture_cache_root",
+                "texture_cache_bytes",
+                "texture_cache_file_count",
+                "texture_cache_last_synced_at",
+                "texture_cache_source_mode",
+            ):
+                if registered.get(key):
+                    merged[key] = registered[key]
+            merged["source"] = "known_export+registered"
+            if registered.get("latest_timestamp") and (registered["latest_timestamp"] > (merged.get("latest_timestamp") or "")):
+                merged["latest_timestamp"] = registered["latest_timestamp"]
+        scene_summaries = {item["scene_id"]: item for item in self._scene_records()}
+        for scene_id, record in records.items():
+            summary = scene_summaries.get(scene_id)
+            if summary is not None:
+                record["capture_count"] = summary.get("capture_count", record.get("capture_count", 0))
+                record["camera_count"] = summary.get("camera_count", record.get("camera_count", 0))
+                if summary.get("latest_capture"):
+                    record["latest_capture"] = summary["latest_capture"]
+                    record["latest_timestamp"] = summary.get("latest_timestamp", record.get("latest_timestamp"))
+            else:
+                record.setdefault("capture_count", 0)
+                record.setdefault("camera_count", 0)
+            mitsuba_scene_ref = _maybe_str(record.get("mitsuba_scene_ref"))
+            shape_map_ref = _maybe_str(record.get("shape_map_ref"))
+            record["mitsuba_scene_exists"] = bool(mitsuba_scene_ref and resolve_repo_path(self.repo_root, mitsuba_scene_ref).exists())
+            record["shape_map_exists"] = bool(shape_map_ref and resolve_repo_path(self.repo_root, shape_map_ref).exists())
+            record["render_ready"] = bool(record["mitsuba_scene_exists"] and record["shape_map_exists"])
+            record["texture_cache_source_mode"] = record.get("texture_cache_source_mode") or self._classify_windows_path_mode(_maybe_str(record.get("usd_stage_path")))
+            if not record.get("texture_cache_status"):
+                if record["texture_cache_source_mode"] in {"mapped_drive", "local_mirror"}:
+                    record["texture_cache_status"] = "bypassed"
+                elif record["texture_cache_source_mode"] == "unc":
+                    record["texture_cache_status"] = "missing"
+                else:
+                    record["texture_cache_status"] = "unknown"
+            if scene_id in preparing_scene_ids:
+                record["readiness_status"] = "preparing"
+            else:
+                record["readiness_status"] = "render-ready" if record["render_ready"] else "open-only"
+            record = self._attach_load_prep_summary(record)
+            records[scene_id] = record
+        result = list(records.values())
+        result.sort(key=lambda item: _safe_sort_ts(item.get("latest_timestamp")), reverse=False)
+        result.reverse()
+        return result
+
+    def _isaac_scene_detail(self, scene_id: str) -> dict[str, Any]:
+        catalog = {item["scene_id"]: item for item in self._isaac_scene_catalog_records()}
+        record = catalog.get(scene_id)
+        if record is None:
+            raise KeyError(scene_id)
+        captures = self._scene_detail(scene_id).get("captures", [])
+        return {
+            "scene": self._attach_load_prep_summary(record),
+            "captures": captures,
+            "latest_capture": record.get("latest_capture") or (captures[0] if captures else None),
+        }
+
+    def _register_isaac_scene(self, payload: dict[str, Any]) -> dict[str, Any]:
+        usd_stage_path = _maybe_str(payload.get("usd_stage_path"))
+        if not usd_stage_path:
+            raise ValueError("usd_stage_path is required to register an Isaac scene.")
+        scene_id = _maybe_str(payload.get("scene_id")) or Path(usd_stage_path).stem or f"scene-{self._timestamp_slug()}"
+        scenes = self._load_registered_isaac_scenes()
+        now = _utc_now_iso()
+        existing = dict(scenes.get(scene_id, {}))
+        existing.update(
+            {
+                "scene_id": scene_id,
+                "usd_stage_path": usd_stage_path,
+                "scene_snapshot_ref": _maybe_str(payload.get("scene_snapshot_ref")) or existing.get("scene_snapshot_ref"),
+                "mitsuba_scene_ref": _maybe_str(payload.get("mitsuba_scene_ref")) or existing.get("mitsuba_scene_ref"),
+                "shape_map_ref": _maybe_str(payload.get("shape_map_ref")) or existing.get("shape_map_ref"),
+                "scene_version": _maybe_str(payload.get("scene_version")) or existing.get("scene_version"),
+                "illumination_setup": _maybe_str(payload.get("illumination_setup")) or existing.get("illumination_setup"),
+                "texture_cache_status": _maybe_str(payload.get("texture_cache_status")) or existing.get("texture_cache_status"),
+                "texture_cache_root": _maybe_str(payload.get("texture_cache_root")) or existing.get("texture_cache_root"),
+                "texture_cache_bytes": payload.get("texture_cache_bytes") if payload.get("texture_cache_bytes") is not None else existing.get("texture_cache_bytes"),
+                "texture_cache_file_count": payload.get("texture_cache_file_count") if payload.get("texture_cache_file_count") is not None else existing.get("texture_cache_file_count"),
+                "texture_cache_last_synced_at": _maybe_str(payload.get("texture_cache_last_synced_at")) or existing.get("texture_cache_last_synced_at"),
+                "texture_cache_source_mode": _maybe_str(payload.get("texture_cache_source_mode")) or existing.get("texture_cache_source_mode"),
+                "created_at": existing.get("created_at") or now,
+                "updated_at": now,
+            }
+        )
+        scenes[scene_id] = existing
+        self._write_registered_isaac_scenes(scenes)
+        return self._isaac_scene_detail(scene_id)
+
+    def _latest_capture_record(self, *, scene_id: str | None = None) -> dict[str, Any] | None:
+        if scene_id:
+            detail = self._scene_detail(scene_id)
+            return detail.get("latest_capture")
+        for bundle in self._bundle_manifests():
+            captures = self._capture_records(bundle)
+            if captures:
+                return captures[0]
+        return None
+
+    def _capture_detail_by_ids(self, job_id: str, frame_id: str) -> dict[str, Any]:
+        manifest_path = self.repo_root / "out" / "bridge_jobs" / job_id / "observations" / frame_id / "manifest.json"
+        if not manifest_path.exists():
+            raise KeyError(f"{job_id}/{frame_id}")
+        bundle = read_observation_bundle_manifest(manifest_path)
+        captures = self._capture_records(bundle)
+        if not captures:
+            raise KeyError(f"{job_id}/{frame_id}")
+        return {
+            "job_id": job_id,
+            "frame_id": frame_id,
+            "scene_id": bundle.scene_id,
+            "timestamp": bundle.timestamp,
+            "captures": captures,
+            "latest_capture": captures[0],
+        }
+
     def _summary_payload(self) -> dict[str, Any]:
         pending, _memory_statuses, cache_stats = self._snapshot_state()
         jobs = self._job_records()
         scenes = self._scene_records()
+        telemetry = self._telemetry_stats(limit=1200)
         failed_jobs = [job for job in jobs if job["status"] == "failed"]
         worker_state = "running" if any(job["status"] == "running" for job in jobs) else "idle"
         active_stage = next((job["progress_stage"] for job in jobs if job["status"] == "running"), None)
@@ -1051,6 +3290,43 @@ class RenderDaemon:
         ]
         scene_cache_items.sort(key=lambda item: _safe_sort_ts(item.get("last_started_at") or item.get("last_submitted_at")), reverse=False)
         scene_cache_items.reverse()
+        # ── New fields: today_completed, avg_render_time_s, health_status ──
+        from datetime import date as _date
+        today_prefix = _date.today().strftime("%Y-%m-%d")
+        today_completed = sum(
+            1 for job in jobs
+            if job["status"] == "succeeded" and (job.get("finished_at") or "").startswith(today_prefix)
+        )
+        recent_completed = [
+            job for job in jobs
+            if job["status"] == "succeeded" and job.get("started_at") and job.get("finished_at")
+        ][-5:]
+        avg_render_time_s: float | None = None
+        if recent_completed:
+            def _parse_ts(s: str) -> float:
+                from datetime import datetime, timezone
+                try:
+                    return datetime.fromisoformat(s).astimezone(timezone.utc).timestamp()
+                except Exception:
+                    return 0.0
+            durations = [
+                _parse_ts(j["finished_at"]) - _parse_ts(j["started_at"])
+                for j in recent_completed
+                if _parse_ts(j["finished_at"]) > _parse_ts(j["started_at"])
+            ]
+            avg_render_time_s = sum(durations) / len(durations) if durations else None
+
+        if any(job["status"] == "running" for job in jobs):
+            health_status = "degraded"
+        elif failed_jobs and not any(job["status"] == "succeeded" for job in jobs):
+            health_status = "blocked"
+        else:
+            health_status = "healthy"
+
+        latest_failure_error: str | None = None
+        if failed_jobs:
+            latest_failure_error = failed_jobs[0].get("error")
+
         return {
             "base_url": self.base_url,
             "repo_root": str(self.repo_root),
@@ -1063,8 +3339,26 @@ class RenderDaemon:
             "failed_jobs": len(failed_jobs),
             "scene_count": len(scenes),
             "latest_scene_id": scenes[0]["scene_id"] if scenes else None,
+            "current_scene_id": (self._isaac_session.scene_id if self._isaac_session is not None else (scenes[0]["scene_id"] if scenes else None)),
             "latest_failure_job_id": failed_jobs[0]["job_id"] if failed_jobs else None,
+            "latest_failure_error": latest_failure_error,
             "scene_cache_stats": scene_cache_items,
+            "today_completed": today_completed,
+            "avg_render_time_s": avg_render_time_s,
+            "health_status": health_status,
+            "isaac_connected": self._isaac_session is not None,
+            "isaac_scene_id": self._isaac_session.scene_id if self._isaac_session else None,
+            "isaac_opened_at": self._isaac_session.opened_at if self._isaac_session else None,
+            "isaac_updated_at": self._isaac_session.updated_at if self._isaac_session else None,
+            "isaac_sensor_count": len(self._isaac_session.sensors) if self._isaac_session else 0,
+            "active_isaac_command": self._active_isaac_command_summary(),
+            "latest_isaac_command": self._latest_isaac_command_summary(),
+            "telemetry_summary": {
+                "recent_event_count": len(self._telemetry_recent_rows(limit=20)),
+                "stage_stat_count": len(telemetry.get("stage_stats", [])),
+                "error_summary": telemetry.get("error_summary", []),
+                "path_mode_summary": telemetry.get("path_mode_summary", []),
+            },
         }
 
     def _timestamp_slug(self) -> str:
@@ -1089,12 +3383,14 @@ class RenderDaemon:
         request_dict["job_id"] = f"smoke-{stamp}"
         request_dict["frame_id"] = f"frame_{stamp}"
         request_dict["timestamp"] = _utc_now_iso()
-        request_dict["modalities"] = ["rgb", "depth"]
+        _smoke_options = self._load_scene_render_options(scene_id or _maybe_str(request_dict.get("scene_state", {}).get("scene_id")))
+        request_dict["modalities"] = _smoke_options.get("modalities", ["rgb", "depth"])
+        _smoke_spp = _smoke_options.get("spp", 64)
         request_dict["render_settings"] = {
             **request_dict.get("render_settings", {}),
             "width": 640,
             "height": 360,
-            "path_spp": 64,
+            "path_spp": _smoke_spp,
             "aov_spp": 8,
             "samples_per_pass": 16,
         }
@@ -1113,15 +3409,126 @@ class RenderDaemon:
 
     def _isaac_guide_payload(self) -> dict[str, Any]:
         repo_root = str(self.repo_root).replace("\\", "\\\\")
-        apps_dir = str(self.repo_root / "apps").replace("\\", "\\\\")
+        windows_repo_root = r"%ROBOMITUBA_WINDOWS_REPO_ROOT%"
+        windows_apps_dir = windows_repo_root + r"\apps"
+        windows_moorelane_usd = windows_repo_root + r"\assets\moorelane\Intel_mooreLane_v1_2_0\Intel_mooreLane\USD\MooreLane_ASWF_0623.usda"
+        windows_bat_path = windows_repo_root + r"\apps\isaac_extension\isaac-sim-robomituba.example.bat"
         script_path = str(self.repo_root / "apps" / "isaac_capture_current_view_request.py").replace("\\", "\\\\")
         return {
             "daemon_url": self.base_url,
+            "helper_import_snippet": "\n".join(
+                [
+                    "import sys",
+                    "import os",
+                    r'sys.path.insert(0, os.path.join(os.environ.get("ROBOMITUBA_WINDOWS_REPO_ROOT", r"J:\project\robomituba"), "apps"))',
+                    "from isaac_extension import connect_daemon",
+                ]
+            ),
+            "helper_render_snippet": "\n".join(
+                [
+                    "import omni.usd",
+                    "",
+                    "daemon = connect_daemon()",
+                    "",
+                    "scenes = daemon.list_scenes()",
+                    "print([scene['scene_id'] for scene in scenes])",
+                    "",
+                    'daemon.load_scene(scene_id="moorelane")',
+                    "stage = omni.usd.get_context().get_stage()",
+                    "",
+                    '# Place the robot, move joints/objects, and define your working view in Isaac',
+                    'daemon.connect_scene_session("moorelane")',
+                    'daemon.sync_scene_state(stage, "moorelane")',
+                    'result = daemon.render_current_view("moorelane", submit_mode="blocking")',
+                    'print(result["manifest_path"])',
+                    'daemon.open_capture(scene_id="moorelane")',
+                ]
+            ),
+            "windows_launcher_snippet": "\n".join(
+                [
+                    "@echo off",
+                    "setlocal",
+                    "",
+                    'set "SCRIPT_DIR=%~dp0"',
+                    'if not defined ROBOMITUBA_WINDOWS_REPO_ROOT set "ROBOMITUBA_WINDOWS_REPO_ROOT=J:\\project\\robomituba"',
+                    'set "ROBOMITUBA_ROOT=%ROBOMITUBA_WINDOWS_REPO_ROOT%"',
+                    'set "ROBOMITUBA_APPS=%ROBOMITUBA_ROOT%\\apps"',
+                    'set "ROBOMITUBA_BRIDGE_SRC=%ROBOMITUBA_ROOT%\\modules\\robomituba_bridge\\src"',
+                    'set "ROBOMITUBA_CONVERTER_SRC=%ROBOMITUBA_ROOT%\\modules\\mitsuba_converter\\src"',
+                    "",
+                    'set "PYTHONPATH=%ROBOMITUBA_APPS%;%ROBOMITUBA_BRIDGE_SRC%;%ROBOMITUBA_CONVERTER_SRC%;%PYTHONPATH%"',
+                    "",
+                    'call "%SCRIPT_DIR%isaac-sim.bat" ^',
+                    '  --ext-folder "%ROBOMITUBA_APPS%" ^',
+                    '  --enable isaac_extension ^',
+                    '  --/app/python/extraPaths/0="%ROBOMITUBA_APPS%" ^',
+                    '  --/app/python/extraPaths/1="%ROBOMITUBA_BRIDGE_SRC%" ^',
+                    '  --/app/python/extraPaths/2="%ROBOMITUBA_CONVERTER_SRC%" ^',
+                    "  %*",
+                ]
+            ),
+            "windows_launcher_path": windows_bat_path,
+            "moorelane_open_only_snippet": "\n".join(
+                [
+                    "from isaac_extension import connect_daemon",
+                    "",
+                    "daemon = connect_daemon()",
+                    "",
+                    'daemon.load_scene(',
+                    f'    usd_path=rf"{windows_moorelane_usd}"',
+                    ")",
+                ]
+            ),
+            "moorelane_register_snippet": "\n".join(
+                [
+                    "from isaac_extension import connect_daemon",
+                    "",
+                    "daemon = connect_daemon()",
+                    "",
+                    "daemon.register_scene(",
+                    '    scene_id="moorelane",',
+                    f'    usd_stage_path=rf"{windows_moorelane_usd}",',
+                    '    mitsuba_scene_ref="out/moorelane_full_cam03_rgb_all/scene_curated_shell_furniture_sanitized.xml",',
+                    '    shape_map_ref="out/moorelane_full_cam03_rgb_all/scene_curated_shell_furniture_sanitized.shape_map.json",',
+                    ")",
+                ]
+            ),
+            "session_import_snippet": "\n".join(
+                [
+                    "import sys",
+                    f'sys.path.insert(0, r"{windows_apps_dir}")',
+                    "from isaac_extension.stage_capture import capture_session_open, capture_state_patch, capture_current_view_sensor_spec, capture_current_view_camera",
+                    "from isaac_extension.daemon_client import open_isaac_session, update_isaac_state, register_isaac_sensors, capture_isaac_view",
+                ]
+            ),
+            "session_render_snippet": "\n".join(
+                [
+                    "import omni.usd",
+                    "stage = omni.usd.get_context().get_stage()",
+                    "",
+                    "open_isaac_session(",
+                    f'    capture_session_open(',
+                    '        scene_id="moorelane",',
+                    '        mitsuba_scene_ref="out/moorelane_full_cam03_rgb_all/scene_curated_shell_furniture_sanitized.xml",',
+                    '        shape_map_ref="out/moorelane_full_cam03_rgb_all/scene_curated_shell_furniture_sanitized.shape_map.json",',
+                    "    ),",
+                    f'    "{self.base_url}",',
+                    ")",
+                    "update_isaac_state(capture_state_patch(stage), daemon_url=" + f'"{self.base_url}")',
+                    "register_isaac_sensors([capture_current_view_sensor_spec(modalities=['rgb', 'depth', 's1', 'dop'])], daemon_url=" + f'"{self.base_url}")',
+                    "result = capture_isaac_view(",
+                    f'    daemon_url="{self.base_url}",',
+                    "    modalities=['rgb', 'depth', 's1', 'dop'],",
+                    "    submit_mode='blocking',",
+                    ")",
+                    'print(result["manifest_path"])',
+                ]
+            ),
             # --- Blocked mode (new): Isaac Extension / IsaacStateSnapshot ---
             "extension_import_snippet": "\n".join(
                 [
                     "import sys",
-                    f'sys.path.insert(0, r"{apps_dir}")',
+                    f'sys.path.insert(0, r"{windows_apps_dir}")',
                     "from isaac_extension.stage_capture import capture_isaac_state",
                     "from isaac_extension.daemon_client import submit_isaac_state_render, enqueue_isaac_state_render",
                     "from robomituba_bridge import BsdfOverride",
@@ -1182,12 +3589,78 @@ class RenderDaemon:
                     'print(status["manifest_path"])',
                 ]
             ),
+            # ── New: quickstart cards & steps ──────────────────────────
+            "quickstart_choices": [
+                {
+                    "icon": "⚡",
+                    "title_en": "Quick Single Render",
+                    "title_kr": "바로 한 장 렌더",
+                    "desc_en": "Render the current viewport once. Best for quick checks.",
+                    "desc_kr": "현재 viewport 기준으로 즉시 렌더합니다. 빠른 확인에 적합.",
+                    "tab": "control-plane",
+                },
+                {
+                    "icon": "🔄",
+                    "title_en": "Session + Repeat Render",
+                    "title_kr": "세션 연결 반복 작업",
+                    "desc_en": "Open a scene, sync stage state, render repeatedly. Best for real workflows.",
+                    "desc_kr": "scene을 열고, stage 상태를 동기화하고, 반복 렌더합니다. 실제 작업 흐름에 적합.",
+                    "tab": "control-plane",
+                },
+                {
+                    "icon": "📋",
+                    "title_en": "Async Queue Render",
+                    "title_kr": "잡 큐 비동기",
+                    "desc_en": "Submit jobs and poll for results. Best for long or batch renders.",
+                    "desc_kr": "작업을 제출하고 결과를 polling합니다. 긴 작업이나 대량 처리에 적합.",
+                    "tab": "queue",
+                },
+            ],
+            "quickstart_steps": [
+                {"en": "Check daemon is reachable", "kr": "daemon 연결 확인"},
+                {"en": "Prepare or register a scene", "kr": "scene 준비 또는 등록"},
+                {"en": "Connect a session", "kr": "session 연결"},
+                {"en": "Run the render", "kr": "render 실행"},
+                {"en": "Open the latest capture", "kr": "최신 capture 확인"},
+            ],
+            # ── New: Windows launcher paths ─────────────────────────────
+            "windows_isaac_sim_root": r"C:\isaac_sim_win",
+            "windows_exts_user_path": r"C:\isaac_sim_win\extsUser\robomituba.isaac_extension",
+            "windows_wsl_exts_path": "/mnt/c/isaac_sim_win/extsUser/robomituba.isaac_extension",
+            # ── Checklist ───────────────────────────────────────────────
             "checklist": [
-                "Isaac should add the robomituba <code>apps/</code> directory to sys.path (or PYTHONPATH) before importing extension helpers.",
-                "The daemon must be reachable from the Isaac host at the URL shown on this page.",
-                "WSL: set LD_LIBRARY_PATH=/usr/lib/wsl/lib before launching the daemon for GPU Mitsuba renders.",
-                "Blocked mode (/isaac/render) holds the HTTP connection open until rendering completes — use async submit for longer jobs.",
-                "The base scene XML (mitsuba_scene_ref) and explicit shape map (shape_map_ref) must already exist on disk; the daemon patches them at render time, it does not rebuild them from USD.",
+                {
+                    "en": 'Isaac should add the robomituba <code>apps/</code> directory to <code>sys.path</code> (or <code>PYTHONPATH</code>) before importing extension helpers.',
+                    "kr": 'Isaac은 extension helper를 import하기 전에 robomituba의 <code>apps/</code> 디렉터리를 <code>sys.path</code> 또는 <code>PYTHONPATH</code>에 추가해야 합니다.',
+                },
+                {
+                    "en": 'Preferred startup path: launch Isaac with the provided <code>.bat</code> so the <code>isaac_extension</code> panel auto-loads. Script Editor snippets are still supported for debugging and quick tests.',
+                    "kr": '권장 시작 경로는 제공된 <code>.bat</code> 로 Isaac을 실행해 <code>isaac_extension</code> 패널을 자동 로드하는 것입니다. Script Editor 스니펫은 디버깅과 빠른 테스트용으로 계속 지원됩니다.',
+                },
+                {
+                    "en": "The daemon must be reachable from the Isaac host at the URL shown on this page.",
+                    "kr": "이 페이지에 표시된 URL로 Isaac host에서 daemon에 접속할 수 있어야 합니다.",
+                },
+                {
+                    "en": "WSL: set <code>LD_LIBRARY_PATH=/usr/lib/wsl/lib</code> before launching the daemon for GPU Mitsuba renders.",
+                    "kr": "WSL에서는 GPU Mitsuba 렌더를 위해 daemon 실행 전에 <code>LD_LIBRARY_PATH=/usr/lib/wsl/lib</code> 를 설정해야 합니다.",
+                },
+                {
+                    "en": "New default flow: open one active Isaac session once, then call <code>/isaac/capture</code> for one-click current view renders.",
+                    "kr": "새 기본 흐름은 active Isaac session을 한 번 열고, 이후 <code>/isaac/capture</code> 로 현재 시점을 원클릭 렌더하는 방식입니다.",
+                },
+                {
+                    "en": "Blocked mode (<code>/isaac/render</code>) holds the HTTP connection open until rendering completes. Use async submit for longer jobs.",
+                    "kr": "Blocked mode(<code>/isaac/render</code>)는 렌더가 끝날 때까지 HTTP 연결을 유지합니다. 시간이 긴 작업은 async submit을 사용하세요.",
+                },
+                {
+                    "en": "The base scene XML (<code>mitsuba_scene_ref</code>) and explicit shape map (<code>shape_map_ref</code>) must already exist on disk. The daemon patches them at render time; it does not rebuild them from USD.",
+                    "kr": "base scene XML(<code>mitsuba_scene_ref</code>)과 explicit shape map(<code>shape_map_ref</code>)은 미리 디스크에 존재해야 합니다. daemon은 렌더 시점에 patch만 적용하며 USD에서 다시 빌드하지 않습니다.",
+                },
+                {
+                    "en": "Prefer setting <code>ROBOMITUBA_WINDOWS_REPO_ROOT</code> to a mapped drive or local SSD mirror such as <code>J:\\project\\robomituba</code>. UNC can open USD stages, but textures are usually more stable from mapped/local paths.",
+                    "kr": "가능하면 <code>ROBOMITUBA_WINDOWS_REPO_ROOT</code> 를 <code>J:\\project\\robomituba</code> 같은 mapped drive나 로컬 SSD mirror로 설정하세요. UNC로도 USD stage를 열 수는 있지만, 텍스처는 mapped/local 경로 쪽이 더 안정적인 경우가 많습니다.",
+                },
             ],
         }
 
@@ -1222,9 +3695,135 @@ class RenderDaemon:
         return snapshot, cameras_payload, lights_payload
 
     def _extract_translation(self, transform: list[float] | None) -> list[float] | None:
-        if not isinstance(transform, list) or len(transform) != 16:
+        return _object_transform_translation(transform)
+
+    def _active_viewport_sensor(self, session: _IsaacActiveSession) -> IsaacSensorSpec | None:
+        viewport_candidates = [
+            sensor
+            for sensor in session.sensors.values()
+            if (sensor.sensor_sync_group or "") == "isaac_viewport"
+            or sensor.sensor_id in {"isaac_viewport", "viewport_current"}
+        ]
+        if viewport_candidates:
+            viewport_candidates.sort(key=lambda item: (item.sensor_id != "viewport_current", item.sensor_id != "isaac_viewport", item.sensor_id))
+            return viewport_candidates[0]
+        sensors = list(session.sensors.values())
+        return sensors[0] if sensors else None
+
+    def _camera_overlay_payload(self, camera: CameraOverlay, *, kind: str) -> dict[str, Any]:
+        return {
+            "camera_id": camera.label,
+            "label": camera.label,
+            "origin": [float(value) for value in camera.origin],
+            "target": [float(value) for value in camera.target],
+            "fov_deg": float(camera.fov_deg),
+            "kind": kind,
+            "color": list(camera.color),
+        }
+
+    def _active_viewport_camera_payload(self, session: _IsaacActiveSession) -> dict[str, Any] | None:
+        sensor = self._active_viewport_sensor(session)
+        if sensor is None or sensor.camera_to_world is None or sensor.fov_deg is None:
             return None
-        return [float(transform[3]), float(transform[7]), float(transform[11])]
+        try:
+            normalized_camera = normalize_mat4_storage(sensor.camera_to_world)
+            origin, target, up = camera_to_world_to_lookat(normalized_camera)
+        except Exception:
+            return None
+        return {
+            "sensor_id": sensor.sensor_id,
+            "name": sensor.name,
+            "sensor_sync_group": sensor.sensor_sync_group,
+            "pose_source": sensor.pose_source,
+            "camera_to_world": normalized_camera.reshape(-1).astype(float).tolist(),
+            "origin": origin.tolist(),
+            "target": target.tolist(),
+            "up": up.tolist(),
+            "fov_deg": float(sensor.fov_deg),
+            "resolution": list(sensor.resolution) if sensor.resolution is not None else None,
+            "extras": dict(sensor.extras or {}),
+        }
+
+    def _object_overlays_from_session(self, session: _IsaacActiveSession, *, metadata: Mapping[str, Any]) -> list[dict[str, Any]]:
+        world_bounds = metadata.get("world_bounds_xz")
+        projection = metadata.get("projection")
+        canvas_size = int(metadata.get("canvas_size_px") or 512)
+        if not isinstance(world_bounds, Mapping) or not isinstance(projection, Mapping):
+            return []
+        try:
+            x_min = float(world_bounds["x_min"])
+            z_max = float(world_bounds["z_max"])
+            scale = float(projection["scale_px_per_world_unit"])
+            pad_x = float(projection["pad_x"])
+            pad_z = float(projection["pad_z"])
+        except Exception:
+            return []
+
+        overlays: list[dict[str, Any]] = []
+        inventory_by_path = {
+            str(item["path"]): item
+            for item in self._session_object_inventory(session)
+            if isinstance(item, Mapping) and isinstance(item.get("path"), str)
+        }
+        for prim_path, object_state in sorted(session.objects.items()):
+            translation = _object_transform_translation(object_state.transform)
+            if translation is None:
+                continue
+            tx, _ty, tz = translation
+            px = ((tx - x_min) * scale + pad_x)
+            py = ((z_max - tz) * scale + pad_z)
+            node = inventory_by_path.get(prim_path, {})
+            overlays.append(
+                {
+                    "path": prim_path,
+                    "label": node.get("name") or prim_path.rsplit("/", 1)[-1] or prim_path,
+                    "kind": node.get("kind") or "object",
+                    "selected": prim_path in session.selected_prim_paths,
+                    "override_bsdf": node.get("override_bsdf"),
+                    "centroid_world": [float(tx), float(tz)],
+                    "centroid_px": [float(px), float(py)],
+                    "canvas_size_px": canvas_size,
+                }
+            )
+        return overlays
+
+    def _robot_overlays_from_session(self, session: _IsaacActiveSession, *, metadata: Mapping[str, Any]) -> list[dict[str, Any]]:
+        world_bounds = metadata.get("world_bounds_xz")
+        projection = metadata.get("projection")
+        canvas_size = int(metadata.get("canvas_size_px") or 512)
+        if not isinstance(world_bounds, Mapping) or not isinstance(projection, Mapping):
+            return []
+        try:
+            x_min = float(world_bounds["x_min"])
+            z_max = float(world_bounds["z_max"])
+            scale = float(projection["scale_px_per_world_unit"])
+            pad_x = float(projection["pad_x"])
+            pad_z = float(projection["pad_z"])
+        except Exception:
+            return []
+
+        overlays: list[dict[str, Any]] = []
+        for robot in self._session_robot_inventory(session):
+            translation = robot.get("translation")
+            if not isinstance(translation, list) or len(translation) < 3:
+                continue
+            tx, _ty, tz = float(translation[0]), float(translation[1]), float(translation[2])
+            px = ((tx - x_min) * scale + pad_x)
+            py = ((z_max - tz) * scale + pad_z)
+            overlays.append(
+                {
+                    "path": robot["path"],
+                    "label": robot["label"],
+                    "selected": bool(robot.get("selected")),
+                    "centroid_world": [tx, tz],
+                    "centroid_px": [float(px), float(py)],
+                    "canvas_size_px": canvas_size,
+                    "member_count": int(robot.get("member_count") or 0),
+                    "shape_count": int(robot.get("shape_count") or 0),
+                    "override_count": int(robot.get("override_count") or 0),
+                }
+            )
+        return overlays
 
     def _camera_overlay_from_spec(self, camera: Mapping[str, Any], *, request: bool) -> CameraOverlay | None:
         if "camera_to_world" in camera:
@@ -1266,8 +3865,8 @@ class RenderDaemon:
             return None
         return LightOverlay(label=str(payload.get("light_id") or payload.get("name") or "light"), position=position)
 
-    def _ensure_floorplan(self, scene_id: str) -> dict[str, Any]:
-        detail = self._scene_detail(scene_id)
+    def _ensure_floorplan(self, scene_id: str, *, detail: dict[str, Any] | None = None) -> dict[str, Any]:
+        detail = detail or self._scene_detail(scene_id)
         scene_record = detail["scene"]
         latest_capture = detail["latest_capture"]
         if scene_record is None or latest_capture is None:
@@ -1278,6 +3877,8 @@ class RenderDaemon:
                 "request_camera_count": 0,
                 "snapshot_camera_count": 0,
                 "snapshot_light_count": 0,
+                "camera_overlays": [],
+                "object_overlays": [],
             }
 
         scene_path = resolve_repo_path(self.repo_root, scene_record["mitsuba_scene_ref"])
@@ -1290,6 +3891,8 @@ class RenderDaemon:
                 "request_camera_count": 0,
                 "snapshot_camera_count": 0,
                 "snapshot_light_count": 0,
+                "camera_overlays": [],
+                "object_overlays": [],
             }
 
         request = self._load_saved_request(latest_capture["job_id"], latest_capture["frame_id"])
@@ -1324,6 +3927,86 @@ class RenderDaemon:
         cache_dir.mkdir(parents=True, exist_ok=True)
         image_path = cache_dir / f"{scene_id}.png"
         metadata_path = cache_dir / f"{scene_id}.json"
+        image_rel = to_repo_relative_posix(self.repo_root, image_path)
+        metadata_rel = to_repo_relative_posix(self.repo_root, metadata_path)
+        expected_cache_key = {
+            "floorplan_version": 2,
+            "scene_id": scene_id,
+            "latest_capture_job_id": latest_capture["job_id"],
+            "latest_capture_frame_id": latest_capture["frame_id"],
+            "scene_ref": scene_record["mitsuba_scene_ref"],
+            "scene_snapshot_ref": scene_record.get("scene_snapshot_ref"),
+            "request_camera_count": len(request_cameras),
+            "snapshot_camera_count": len(snapshot_cameras),
+            "snapshot_light_count": len(snapshot_lights),
+        }
+        def _response_payload(*, cached: bool) -> dict[str, Any]:
+            try:
+                metadata = _read_json(metadata_path) if metadata_path.exists() else {}
+            except Exception:
+                metadata = {}
+            if not isinstance(metadata, dict):
+                metadata = {}
+            camera_overlays = [self._camera_overlay_payload(camera, kind="request") for camera in request_cameras]
+            camera_overlays.extend(self._camera_overlay_payload(camera, kind="snapshot") for camera in snapshot_cameras)
+            session = self._isaac_session if self._isaac_session and self._isaac_session.scene_id == scene_id else None
+            active_camera = self._active_viewport_camera_payload(session) if session is not None else None
+            if active_camera is not None:
+                camera_overlays.insert(
+                    0,
+                    {
+                        "camera_id": active_camera["sensor_id"],
+                        "label": active_camera.get("name") or active_camera["sensor_id"],
+                        "origin": list(active_camera["origin"]),
+                        "target": list(active_camera["target"]),
+                        "fov_deg": float(active_camera["fov_deg"]),
+                        "kind": "active_viewport",
+                        "color": [47, 123, 246],
+                    },
+                )
+            object_overlays = self._object_overlays_from_session(session, metadata=metadata) if session is not None else []
+            robot_overlays = self._robot_overlays_from_session(session, metadata=metadata) if session is not None else []
+            return {
+                "scene_id": scene_id,
+                "artifact_path": image_rel,
+                "artifact_href": self._artifact_href(image_rel),
+                "metadata_path": metadata_rel,
+                "metadata_href": self._artifact_href(metadata_rel),
+                "request_camera_count": len(request_cameras),
+                "snapshot_camera_count": len(snapshot_cameras),
+                "snapshot_light_count": len(snapshot_lights),
+                "cached": cached,
+                "canvas_size_px": metadata.get("canvas_size_px"),
+                "world_bounds_xz": metadata.get("world_bounds_xz"),
+                "projection": metadata.get("projection"),
+                "camera_overlays": camera_overlays,
+                "object_overlays": object_overlays,
+                "robot_overlays": robot_overlays,
+                "active_viewport_camera": active_camera,
+            }
+
+        if image_path.exists() and metadata_path.exists():
+            try:
+                cached_metadata = _read_json(metadata_path)
+            except Exception:
+                cached_metadata = None
+            if isinstance(cached_metadata, dict):
+                cache_key = cached_metadata.get("cache_key")
+                if isinstance(cache_key, Mapping) and all(cache_key.get(key) == value for key, value in expected_cache_key.items()):
+                    return _response_payload(cached=True)
+                return _response_payload(cached=True)
+        context_points_xz: list[list[float]] = []
+        for camera in request_cameras:
+            context_points_xz.append([float(camera.origin[0]), float(camera.origin[2])])
+            context_points_xz.append([float(camera.target[0]), float(camera.target[2])])
+        for camera in snapshot_cameras:
+            context_points_xz.append([float(camera.origin[0]), float(camera.origin[2])])
+            context_points_xz.append([float(camera.target[0]), float(camera.target[2])])
+        session = self._isaac_session if self._isaac_session and self._isaac_session.scene_id == scene_id else None
+        active_camera = self._active_viewport_camera_payload(session) if session is not None else None
+        if active_camera is not None:
+            context_points_xz.append([float(active_camera["origin"][0]), float(active_camera["origin"][2])])
+            context_points_xz.append([float(active_camera["target"][0]), float(active_camera["target"][2])])
         render_scene_floorplan(
             scene_path=scene_path,
             output_path=image_path,
@@ -1331,20 +4014,18 @@ class RenderDaemon:
             request_cameras=request_cameras,
             snapshot_cameras=snapshot_cameras,
             snapshot_lights=snapshot_lights,
+            context_points_xz=context_points_xz,
             title=f"{scene_id} floorplan",
         )
-        image_rel = to_repo_relative_posix(self.repo_root, image_path)
-        metadata_rel = to_repo_relative_posix(self.repo_root, metadata_path)
-        return {
-            "scene_id": scene_id,
-            "artifact_path": image_rel,
-            "artifact_href": self._artifact_href(image_rel),
-            "metadata_path": metadata_rel,
-            "metadata_href": self._artifact_href(metadata_rel),
-            "request_camera_count": len(request_cameras),
-            "snapshot_camera_count": len(snapshot_cameras),
-            "snapshot_light_count": len(snapshot_lights),
-        }
+        try:
+            raw_metadata = _read_json(metadata_path) if metadata_path.exists() else {}
+        except Exception:
+            raw_metadata = {}
+        if not isinstance(raw_metadata, dict):
+            raw_metadata = {}
+        raw_metadata["cache_key"] = expected_cache_key
+        metadata_path.write_text(json.dumps(raw_metadata, indent=2), encoding="utf-8")
+        return _response_payload(cached=False)
 
 
 def serve_render_daemon(

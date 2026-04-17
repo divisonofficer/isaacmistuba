@@ -11,44 +11,229 @@
       <aside class="sidebar">
         <div>
           <div class="eyebrow">Robomituba</div>
-          <div class="brand-title">Control Plane</div>
-          <p class="muted mt-3">
-            Warm Mitsuba daemon, scene explorer, render jobs, and Isaac handoff in one place.
-          </p>
+          <div class="brand-title"><span data-lang="en">Control Plane</span><span data-lang="kr" class="hidden">컨트롤 플레인</span></div>
+          <div class="mt-3">
+            {% set _pill_variant = 'blocked' if summary.worker_state == 'blocked' else ('degraded' if summary.worker_state == 'running' else 'healthy') %}
+            {% set _dot_live = summary.worker_state == 'running' %}
+            <span class="status-pill status-pill-{{ _pill_variant }}">
+              <span class="status-dot {% if _dot_live %}status-amber live{% else %}status-green{% endif %}"></span>
+              <span data-lang="en">{{ summary.worker_state|capitalize }} &middot; Queue {{ summary.queue_length }}</span>
+              <span data-lang="kr" class="hidden">
+                {% if summary.worker_state == 'running' %}
+                  실행 중
+                {% elif summary.worker_state == 'blocked' %}
+                  차단됨
+                {% else %}
+                  유휴
+                {% endif %}
+                &middot; 큐 {{ summary.queue_length }}
+              </span>
+            </span>
+          </div>
         </div>
         <nav class="nav-list mt-8">
           {% for item in nav_items %}
             <a href="{{ item.href }}" class="nav-link {% if item.key == nav_key %}nav-link-active{% endif %}">
-              <span>{{ item.label }}</span>
+              {% if item.key == 'home' %}
+                <span data-lang="en">Home</span><span data-lang="kr" class="hidden">홈</span>
+              {% elif item.key == 'current_scene' %}
+                <span data-lang="en">Current Scene</span><span data-lang="kr" class="hidden">현재 장면</span>
+              {% elif item.key == 'scenes' %}
+                <span data-lang="en">Scenes</span><span data-lang="kr" class="hidden">장면</span>
+              {% elif item.key == 'jobs' %}
+                <span data-lang="en">Jobs</span><span data-lang="kr" class="hidden">작업</span>
+              {% elif item.key == 'system' %}
+                <span data-lang="en">System</span><span data-lang="kr" class="hidden">시스템</span>
+              {% elif item.key == 'integrations' %}
+                <span data-lang="en">Isaac Guide</span><span data-lang="kr" class="hidden">Isaac 가이드</span>
+              {% else %}
+                <span>{{ item.label }}</span>
+              {% endif %}
             </a>
           {% endfor %}
         </nav>
         <div class="panel mt-8">
-          <div class="panel-label">Runtime</div>
+          <div class="panel-label"><span data-lang="en">Runtime</span><span data-lang="kr" class="hidden">런타임</span></div>
           <div class="mt-3 stack-sm">
             <div class="mono text-xs text-slate-300">{{ base_url }}</div>
-            <div class="flex items-center gap-2">
-              <span class="status-dot {% if summary.worker_state == 'running' %}status-amber{% else %}status-green{% endif %}"></span>
-              <span class="text-sm">{{ summary.worker_state|capitalize }}</span>
-            </div>
-            <div class="muted text-sm">Queue {{ summary.queue_length }} · Variant {{ summary.variant }}</div>
+            <div class="muted text-xs"><span data-lang="en">Variant</span><span data-lang="kr" class="hidden">변형</span> {{ summary.variant }}</div>
           </div>
         </div>
       </aside>
 
       <main class="main">
-        <header class="topbar">
+        <header class="topbar {% block topbar_extra_class %}{% endblock %}">
+          {% block topbar_left %}
           <div>
-            <h1 class="page-title">{{ page_title }}</h1>
-            {% if page_subtitle %}
+            <h1 class="page-title">
+              {% if nav_key == 'home' %}
+                <span data-lang="en">Operations Home</span><span data-lang="kr" class="hidden">운영 홈</span>
+              {% elif nav_key == 'current_scene' %}
+                <span data-lang="en">Current Scene</span><span data-lang="kr" class="hidden">현재 장면</span>
+              {% elif nav_key == 'scenes' %}
+                <span data-lang="en">Scene Explorer</span><span data-lang="kr" class="hidden">장면 탐색기</span>
+              {% elif nav_key == 'jobs' %}
+                <span data-lang="en">Render Jobs</span><span data-lang="kr" class="hidden">렌더 작업</span>
+              {% elif nav_key == 'system' %}
+                <span data-lang="en">System Overview</span><span data-lang="kr" class="hidden">시스템 개요</span>
+              {% elif nav_key == 'integrations' %}
+                <span data-lang="en">Isaac Integration</span><span data-lang="kr" class="hidden">Isaac 연동</span>
+              {% else %}
+                {{ page_title }}
+              {% endif %}
+            </h1>
+            {% if nav_key == 'integrations' %}
+              <p class="muted mt-2">
+                <span data-lang="en">Hybrid Isaac UI and control-plane workflow for scene sync and Mitsuba rendering.</span>
+                <span data-lang="kr" class="hidden">scene 동기화와 Mitsuba 렌더를 위한 Isaac UI + control plane 하이브리드 흐름.</span>
+              </p>
+            {% elif page_subtitle %}
               <p class="muted mt-2">{{ page_subtitle }}</p>
             {% endif %}
           </div>
-          <div class="topbar-actions">
-            <a href="/health" class="button button-subtle">Health JSON</a>
-            <a href="/api/summary" class="button button-subtle">Summary API</a>
+          {% endblock topbar_left %}
+          <div class="topbar-actions gap-2">
+            {% block topbar_actions_extra %}{% endblock %}
+            <div class="topbar-actions gap-2" style="margin-right:0.35rem;">
+              <button class="button button-primary js-global-lang" data-lang-value="en">EN</button>
+              <button class="button button-subtle js-global-lang" data-lang-value="kr">KR</button>
+            </div>
+            <button class="button button-subtle" id="cmd-search" style="font-size:0.83rem;gap:0.4rem;">
+              <span style="opacity:0.55;">⌘K</span>
+              <span data-lang="en">Search</span>
+              <span data-lang="kr" class="hidden">검색</span>
+            </button>
+
+            {# ── Live status icons (직접 topbar에 노출) ── #}
+            {% set _wstate = summary.worker_state %}
+            <div class="hsi-bar" id="hsi-bar"
+                 data-variant="{{ summary.variant }}" data-base-url="{{ base_url }}">
+
+              {# Daemon: left-aligned pop, live state dot on icon #}
+              <div class="hsi-item" data-key="daemon">
+                <button class="hsi-btn" tabindex="0">
+                  <span class="hsi-icon-wrap">
+                    <span class="hsi-glyph">🖥</span>
+                    <span class="hsi-state-dot {% if _wstate == 'running' %}hsi-dot-running{% else %}hsi-dot-ok{% endif %}" id="hsi-dot"></span>
+                  </span>
+                </button>
+                <div class="hsi-popover hsi-pop-left">
+                  <div class="hsi-pop-icon">🖥</div>
+                  <div class="hsi-pop-label"><span data-lang="en">Daemon</span><span data-lang="kr" class="hidden">데몬</span></div>
+                  <div class="hsi-pop-value hp-ok" id="hsi-daemon-val"><span data-lang="en">Reachable</span><span data-lang="kr" class="hidden">접속 가능</span></div>
+                  <div class="hsi-pop-desc"><span data-lang="en">HTTP server is listening and responsive</span><span data-lang="kr" class="hidden">HTTP 서버가 응답 중입니다</span></div>
+                </div>
+              </div>
+
+              {# Worker: left-aligned pop, state dot (running=orange / idle=gray) #}
+              <div class="hsi-item" data-key="worker">
+                <button class="hsi-btn" tabindex="0">
+                  <span class="hsi-icon-wrap">
+                    <span class="hsi-glyph">⚙️</span>
+                    <span class="hsi-state-dot {% if _wstate == 'running' %}hsi-dot-running{% else %}hsi-dot-idle{% endif %}" id="hsi-worker-dot"></span>
+                  </span>
+                </button>
+                <div class="hsi-popover hsi-pop-left">
+                  <div class="hsi-pop-icon">⚙️</div>
+                  <div class="hsi-pop-label"><span data-lang="en">Worker</span><span data-lang="kr" class="hidden">워커</span></div>
+                  <div class="hsi-pop-value" id="hsi-worker-val">
+                    <span data-lang="en">{{ _wstate|capitalize }}</span>
+                    <span data-lang="kr" class="hidden">
+                      {% if _wstate == 'running' %}실행 중{% elif _wstate == 'blocked' %}차단됨{% else %}유휴{% endif %}
+                    </span>
+                  </div>
+                  <div class="hsi-pop-desc"><span data-lang="en">Single-threaded Mitsuba render worker</span><span data-lang="kr" class="hidden">단일 스레드 Mitsuba 렌더 워커</span></div>
+                </div>
+              </div>
+
+              {# Queue: right-aligned pop (icon is mid-right of bar — extend leftward to prevent overflow) #}
+              <div class="hsi-item" data-key="queue">
+                <button class="hsi-btn" tabindex="0">
+                  <span class="hsi-icon-wrap">
+                    <span class="hsi-glyph" style="font-size:1rem;">≡</span>
+                    <span class="hsi-badge{% if summary.queue_length == 0 %} hsi-badge-zero{% endif %}" id="hsi-queue-badge">
+                      {{- summary.queue_length if summary.queue_length > 0 else '·' -}}
+                    </span>
+                  </span>
+                </button>
+                <div class="hsi-popover hsi-pop-right">
+                  <div class="hsi-pop-icon">≡</div>
+                  <div class="hsi-pop-label"><span data-lang="en">Queue</span><span data-lang="kr" class="hidden">큐</span></div>
+                  <div class="hsi-pop-value" id="hsi-queue-val">
+                    <span data-lang="en">{%- if summary.queue_length == 0 %}Empty{%- else %}{{ summary.queue_length }} jobs{%- endif %}</span>
+                    <span data-lang="kr" class="hidden">{%- if summary.queue_length == 0 %}비어 있음{%- else %}{{ summary.queue_length }}개 작업{%- endif %}</span>
+                  </div>
+                  <div class="hsi-pop-desc"><span data-lang="en">Pending render jobs waiting on the worker</span><span data-lang="kr" class="hidden">워커에서 대기 중인 렌더 작업</span></div>
+                </div>
+              </div>
+
+              {# Renderer: right-aligned pop #}
+              <div class="hsi-item" data-key="renderer">
+                <button class="hsi-btn" tabindex="0">
+                  <span class="hsi-glyph">✨</span>
+                </button>
+                <div class="hsi-popover hsi-pop-right">
+                  <div class="hsi-pop-icon">✨</div>
+                  <div class="hsi-pop-label"><span data-lang="en">Renderer</span><span data-lang="kr" class="hidden">렌더러</span></div>
+                  <div class="hsi-pop-value mono" style="font-size:0.78rem;">{{ summary.variant }}</div>
+                  <div class="hsi-pop-desc"><span data-lang="en">Active Mitsuba render variant</span><span data-lang="kr" class="hidden">현재 활성 Mitsuba 렌더 변형</span></div>
+                </div>
+              </div>
+
+              {# URL: right-aligned pop #}
+              <div class="hsi-item" data-key="url">
+                <button class="hsi-btn" tabindex="0">
+                  <span class="hsi-glyph">🌐</span>
+                </button>
+                <div class="hsi-popover hsi-pop-right">
+                  <div class="hsi-pop-icon">🌐</div>
+                  <div class="hsi-pop-label"><span data-lang="en">Base URL</span><span data-lang="kr" class="hidden">기본 URL</span></div>
+                  <div class="hsi-pop-value mono" style="font-size:0.78rem;">{{ base_url }}</div>
+                  <div class="hsi-pop-desc"><span data-lang="en">Daemon HTTP listen address</span><span data-lang="kr" class="hidden">데몬 HTTP 리슨 주소</span></div>
+                </div>
+              </div>
+
+              {# Isaac Sim: right-aligned pop, connected=green / disconnected=gray #}
+              {% set _isaac_ok = summary.isaac_connected %}
+              <div class="hsi-item" data-key="isaac">
+                <button class="hsi-btn" tabindex="0">
+                  <span class="hsi-icon-wrap">
+                    <span class="hsi-glyph">🤖</span>
+                    <span class="hsi-state-dot {% if _isaac_ok %}hsi-dot-ok{% else %}hsi-dot-idle{% endif %}" id="hsi-isaac-dot"></span>
+                  </span>
+                </button>
+                <div class="hsi-popover hsi-pop-right">
+                  <div class="hsi-pop-icon">🤖</div>
+                  <div class="hsi-pop-label"><span data-lang="en">Isaac Sim</span><span data-lang="kr" class="hidden">Isaac Sim</span></div>
+                  <div class="hsi-pop-value {% if _isaac_ok %}hp-ok{% else %}hp-err{% endif %}" id="hsi-isaac-val">
+                    <span data-lang="en">{%- if _isaac_ok %}Connected{%- else %}Not connected{%- endif %}</span>
+                    <span data-lang="kr" class="hidden">{%- if _isaac_ok %}연결됨{%- else %}연결 안 됨{%- endif %}</span>
+                  </div>
+                  <div class="hsi-pop-desc" id="hsi-isaac-desc">
+                    <span data-lang="en">
+                      {%- if _isaac_ok -%}
+                        Scene: <span class="mono">{{ summary.isaac_scene_id }}</span>
+                        {%- if summary.isaac_sensor_count %} · {{ summary.isaac_sensor_count }} sensor{{ 's' if summary.isaac_sensor_count != 1 }}{%- endif %}
+                      {%- else -%}
+                        Call <span class="mono">POST /isaac/session/open</span> from Isaac Sim
+                      {%- endif %}
+                    </span>
+                    <span data-lang="kr" class="hidden">
+                      {%- if _isaac_ok -%}
+                        장면: <span class="mono">{{ summary.isaac_scene_id }}</span>
+                        {%- if summary.isaac_sensor_count %} · 센서 {{ summary.isaac_sensor_count }}개{%- endif %}
+                      {%- else -%}
+                        Isaac Sim에서 <span class="mono">POST /isaac/session/open</span> 을 호출하세요
+                      {%- endif %}
+                    </span>
+                  </div>
+                </div>
+              </div>
+
+            </div>
+
             {% if latest_scene_id %}
-              <button class="button button-primary js-smoke-render" data-scene-id="{{ latest_scene_id }}">Smoke Render</button>
+              <button class="button button-primary js-smoke-render" data-scene-id="{{ latest_scene_id }}"><span data-lang="en">Smoke Render</span><span data-lang="kr" class="hidden">스모크 렌더</span></button>
             {% endif %}
           </div>
         </header>
@@ -59,14 +244,558 @@
           <div class="flash-banner hidden" id="flash-banner"></div>
         {% endif %}
 
-        {% block content %}{% endblock %}
+        {# ── Activity snackbar: 진행 중인 작업 실시간 표시 ── #}
+        <div id="activity-snackbar" class="activity-snackbar hidden">
+          <span class="activity-spinner"></span>
+          <span id="activity-snackbar-text"></span>
+        </div>
+
+        <div class="page-content">
+          {% block content %}{% endblock %}
+        </div>
       </main>
+    </div>
+
+    <!-- Debug event toast container -->
+    <div id="debug-toast-container"></div>
+
+    <!-- ⌘K search overlay (placeholder — no backend yet) -->
+    <div id="cmd-overlay" style="display:none;position:fixed;inset:0;z-index:100;background:rgba(15,23,42,0.45);backdrop-filter:blur(4px);">
+      <div style="margin:8vh auto 0;max-width:480px;background:#fff;border-radius:1.5rem;box-shadow:0 24px 64px rgba(15,23,42,0.18);padding:1.2rem;border:1px solid rgba(148,163,184,0.2);">
+        <input id="cmd-input" data-placeholder-en="Search scenes, jobs…" data-placeholder-kr="장면과 작업 검색…" placeholder="Search scenes, jobs…" style="width:100%;padding:0.75rem 1rem;font-size:1rem;border:1px solid rgba(47,123,246,0.3);border-radius:1rem;outline:none;">
+        <div style="color:var(--muted);font-size:0.78rem;margin-top:0.75rem;text-align:center;">
+          <span data-lang="en">Press <kbd style="background:var(--subpanel);padding:0.15rem 0.4rem;border-radius:0.3rem;border:1px solid var(--panel-border);">Esc</kbd> to close</span>
+          <span data-lang="kr" class="hidden"><kbd style="background:var(--subpanel);padding:0.15rem 0.4rem;border-radius:0.3rem;border:1px solid var(--panel-border);">Esc</kbd> 키로 닫기</span>
+        </div>
+      </div>
     </div>
 
     <script>
       (() => {
+        /* Tab switching — used by isaac.html and any page with data-tab */
+        function initTabs(root) {
+          const tabs = root.querySelectorAll(".tab[data-tab]");
+          if (!tabs.length) return;
+          tabs.forEach(tab => {
+            tab.addEventListener("click", () => {
+              tabs.forEach(t => t.classList.remove("active"));
+              tab.classList.add("active");
+              root.querySelectorAll(".tab-panel[data-panel]").forEach(panel => {
+                panel.classList.toggle("hidden", panel.dataset.panel !== tab.dataset.tab);
+              });
+            });
+          });
+        }
+        document.querySelectorAll(".tab-bar").forEach(bar => initTabs(bar.closest(".panel") || bar.parentElement));
+
+        /* Global language switching */
+        const LANG_STORAGE_KEY = "robomituba_lang";
+
+        function applyGlobalLang(lang) {
+          const active = (lang === "kr") ? "kr" : "en";
+          document.documentElement.setAttribute("lang", active);
+          document.documentElement.dataset.lang = active;
+
+          document.querySelectorAll("[data-lang]").forEach(node => {
+            node.classList.toggle("hidden", node.dataset.lang !== active);
+          });
+
+          document.querySelectorAll("[data-lang-panel]").forEach(panel => {
+            panel.classList.toggle("hidden", panel.dataset.langPanel !== active);
+          });
+
+          document.querySelectorAll("[data-placeholder-en][data-placeholder-kr]").forEach(node => {
+            node.setAttribute("placeholder", active === "kr" ? node.dataset.placeholderKr : node.dataset.placeholderEn);
+          });
+
+          document.querySelectorAll(".js-global-lang").forEach(btn => {
+            const isActive = btn.dataset.langValue === active;
+            btn.classList.toggle("button-primary", isActive);
+            btn.classList.toggle("button-subtle", !isActive);
+          });
+        }
+
+        const storedLang = localStorage.getItem(LANG_STORAGE_KEY) || "en";
+        applyGlobalLang(storedLang);
+        document.querySelectorAll(".js-global-lang").forEach(btn => {
+          btn.addEventListener("click", () => {
+            const lang = btn.dataset.langValue || "en";
+            localStorage.setItem(LANG_STORAGE_KEY, lang);
+            applyGlobalLang(lang);
+          });
+        });
+
+        /* Live status icons — independent per-icon popovers */
+        (() => {
+          const bar = document.getElementById("hsi-bar");
+          if (!bar) return;
+
+          let pollTimer = null;
+          let lastState = null;
+          let isActive  = false; /* true when render or isaac command is running */
+          let lastIsaacCommandKey = null;
+          let snackbarFlash = null;
+          let snackbarFlashUntil = 0;
+
+          /* Start polling immediately on page load */
+          function activeLang() {
+            return document.documentElement.dataset.lang === "kr" ? "kr" : "en";
+          }
+
+          /* ── Isaac command type → human label ── */
+          const CMD_LABELS = {
+            load_scene:       { en: "Loading scene in Isaac…",    kr: "Isaac에서 장면 로드 중…" },
+            connect_session:  { en: "Connecting session…",        kr: "세션 연결 중…" },
+            sync_session:     { en: "Syncing stage state…",       kr: "스테이지 동기화 중…" },
+            render_current_view: { en: "Rendering current view…", kr: "현재 뷰 렌더 중…" },
+            render_sensor:    { en: "Rendering sensor…",          kr: "센서 렌더 중…" },
+            open_latest_capture: { en: "Opening capture…",        kr: "캡처 열기 중…" },
+          };
+
+          const ORIGIN_LABELS = {
+            isaac_internal: { en: "Isaac Internal", kr: "Isaac 내부" },
+            isaac_app: { en: "Isaac App", kr: "Isaac 앱" },
+            daemon_render: { en: "Daemon Render", kr: "데몬 렌더" },
+          };
+
+          function _commandDisplayText(cmd, lang) {
+            if (!cmd) return null;
+            if (cmd.progress_message) return cmd.progress_message;
+            const label = CMD_LABELS[cmd.command_type];
+            return label ? label[lang] : (lang === "kr" ? `${cmd.command_type} 실행 중…` : `Running ${cmd.command_type}…`);
+          }
+
+          function _commandOriginLabel(origin, lang) {
+            const label = ORIGIN_LABELS[origin || ""];
+            return label ? label[lang] : (lang === "kr" ? "유휴" : "Idle");
+          }
+
+          function _telemetryHintText(cmd, lang) {
+            if (!cmd || !cmd.telemetry_hint) return null;
+            if (typeof cmd.telemetry_hint === "string") return cmd.telemetry_hint;
+            return cmd.telemetry_hint[lang] || cmd.telemetry_hint.en || cmd.telemetry_hint.kr || null;
+          }
+
+          function _expectedNextStageText(cmd, lang) {
+            const next = cmd && cmd.progress_details ? cmd.progress_details.expected_next_stage : null;
+            if (!next) return null;
+            return next[lang] || next.en || next.kr || null;
+          }
+
+          function _relativeSpeedText(cmd, lang) {
+            const value = cmd && cmd.progress_details ? cmd.progress_details.relative_speed : null;
+            if (!value) return null;
+            if (value === "slower_than_p90") return lang === "kr" ? "최근 p90보다 오래 걸리는 중" : "Running slower than recent p90";
+            if (value === "slower_than_median") return lang === "kr" ? "최근 중앙값보다 오래 걸리는 중" : "Running slower than recent median";
+            if (value === "within_range") return lang === "kr" ? "최근 범위 안에서 진행 중" : "Running within recent range";
+            return null;
+          }
+
+          function _stageElapsedText(cmd, lang) {
+            const elapsed = cmd && cmd.progress_details ? cmd.progress_details.current_stage_elapsed_s : null;
+            if (!Number.isFinite(elapsed)) return null;
+            return lang === "kr" ? `현재 단계 ${Math.max(0, Math.round(elapsed))}초 경과` : `${Math.max(0, Math.round(elapsed))}s in current stage`;
+          }
+
+          function _recentEventsHtml(cmd, lang) {
+            const events = cmd && cmd.progress_details && Array.isArray(cmd.progress_details.recent_events)
+              ? cmd.progress_details.recent_events.slice(0, 4)
+              : [];
+            if (!events.length) return "";
+            return `<div class="isaac-progress-events mt-3">${
+              events.map((event) => {
+                const timestamp = String(event.timestamp || "").split("T")[1]?.slice(0, 8) || "—";
+                const stage = event.progress_stage || event.event_type || "-";
+                const message = event.progress_message || "";
+                return `<div class="isaac-progress-event">
+                  <div class="isaac-progress-event-time mono text-xs">${_esc(timestamp)}</div>
+                  <div class="isaac-progress-event-body">
+                    <div class="isaac-progress-event-stage">${_esc(stage)}</div>
+                    <div class="isaac-progress-event-message">${_esc(message || (lang === "kr" ? "상태 갱신" : "State update"))}</div>
+                  </div>
+                </div>`;
+              }).join("")
+            }</div>`;
+          }
+
+          function _setSnackbarTone(snackbar, tone) {
+            snackbar.classList.remove("activity-snackbar-success", "activity-snackbar-error", "activity-snackbar-busy");
+            snackbar.classList.add(tone === "success" ? "activity-snackbar-success" : tone === "error" ? "activity-snackbar-error" : "activity-snackbar-busy");
+          }
+
+          function _rememberCompletion(cmd) {
+            if (!cmd || !cmd.command_id) return;
+            const key = `${cmd.command_id}|${cmd.status}|${cmd.updated_at || cmd.completed_at || cmd.created_at || ""}`;
+            if (key === lastIsaacCommandKey) return;
+            lastIsaacCommandKey = key;
+            const lang = activeLang();
+            if (cmd.status === "succeeded") {
+              snackbarFlash = {
+                tone: "success",
+                text: _commandDisplayText(cmd, lang) || (lang === "kr" ? "Isaac 작업 완료" : "Isaac command completed"),
+              };
+              snackbarFlashUntil = Date.now() + 4500;
+            } else if (cmd.status === "failed") {
+              snackbarFlash = {
+                tone: "error",
+                text: cmd.error || _commandDisplayText(cmd, lang) || (lang === "kr" ? "Isaac 작업 실패" : "Isaac command failed"),
+              };
+              snackbarFlashUntil = Date.now() + 6500;
+            }
+          }
+
+          function _snackbarText(data) {
+            const lang = activeLang();
+            /* 1) Blocking render / queue running */
+            if (data.worker_state === "running") {
+              const stage = data.active_stage || "";
+              const stageHint = stage ? ` · ${stage}` : "";
+              return lang === "kr" ? `렌더 중…${stageHint}` : `Rendering…${stageHint}`;
+            }
+            /* 2) Active Isaac command dispatched/queued */
+            const cmd = data.active_isaac_command;
+            if (cmd && (cmd.status === "dispatched" || cmd.status === "queued" || cmd.status === "running")) {
+              const base = _commandDisplayText(cmd, lang);
+              return cmd.scene_id ? `${base} (${cmd.scene_id})` : base;
+            }
+            if (snackbarFlash && Date.now() < snackbarFlashUntil) return snackbarFlash.text;
+            return null;
+          }
+
+          function _updateSnackbar(data) {
+            const snackbar = document.getElementById("activity-snackbar");
+            const textEl   = document.getElementById("activity-snackbar-text");
+            if (!snackbar || !textEl) return;
+            _rememberCompletion(data.latest_isaac_command);
+            const text = _snackbarText(data);
+            const nowActive = !!text;
+            if (text) textEl.textContent = text;
+            snackbar.classList.toggle("hidden", !nowActive);
+            if (data.active_isaac_command && ["queued", "dispatched", "running"].includes(data.active_isaac_command.status)) {
+              _setSnackbarTone(snackbar, "busy");
+            } else if (snackbarFlash && Date.now() < snackbarFlashUntil) {
+              _setSnackbarTone(snackbar, snackbarFlash.tone);
+            }
+            /* Speed up polling when active, slow down when idle */
+            if (nowActive !== isActive) {
+              isActive = nowActive;
+              if (pollTimer) clearInterval(pollTimer);
+              pollTimer = setInterval(fetchHealth, isActive ? 1200 : 3000);
+            }
+          }
+
+          function _updateIsaacProgressPanel(data) {
+            const panel = document.getElementById("isaac-progress-panel");
+            if (!panel) return;
+            const title = document.getElementById("isaac-progress-title");
+            const message = document.getElementById("isaac-progress-message");
+            const origin = document.getElementById("isaac-progress-origin");
+            const scene = document.getElementById("isaac-progress-scene");
+            const stage = document.getElementById("isaac-progress-stage");
+            const counts = document.getElementById("isaac-progress-counts");
+            const hint = document.getElementById("isaac-progress-hint");
+            const bar = document.getElementById("isaac-progress-bar");
+            const lang = activeLang();
+            const active = data.active_isaac_command;
+            const latest = data.latest_isaac_command;
+
+            origin.className = "isaac-progress-origin";
+            if (active) {
+              title.textContent = _commandDisplayText(active, lang) || (lang === "kr" ? "Isaac 작업 진행 중" : "Isaac command in progress");
+              message.textContent = active.progress_message || (lang === "kr" ? "상세 진행 상태를 기다리는 중입니다." : "Waiting for detailed progress.");
+              origin.textContent = _commandOriginLabel(active.progress_origin || "isaac_app", lang);
+              origin.classList.add(`is-${(active.progress_origin || "isaac_app").replace(/_/g, "-")}`);
+              scene.textContent = active.scene_id || "-";
+              stage.textContent = active.progress_stage || active.status || "running";
+              const progressCounts = active.progress_counts || {};
+              if (progressCounts.total > 0) {
+                counts.textContent = `${progressCounts.loaded || 0} / ${progressCounts.total}`;
+                bar.classList.remove("is-indeterminate");
+                bar.style.width = `${Math.max(4, Math.min(100, ((progressCounts.loaded || 0) / progressCounts.total) * 100))}%`;
+                if (hint) hint.textContent = "";
+              } else {
+                counts.textContent = lang === "kr" ? "측정 불가" : "indeterminate";
+                bar.classList.add("is-indeterminate");
+                bar.style.width = "";
+                if (hint) hint.textContent = _telemetryHintText(active, lang) || "";
+              }
+              return;
+            }
+
+            if (latest && latest.status === "failed") {
+              title.textContent = lang === "kr" ? "최근 Isaac 작업이 실패했습니다" : "Latest Isaac command failed";
+              message.textContent = latest.error || latest.progress_message || "-";
+              origin.textContent = lang === "kr" ? "실패" : "Failed";
+              origin.classList.add("is-failed");
+              scene.textContent = latest.scene_id || "-";
+              stage.textContent = latest.progress_stage || latest.status || "failed";
+              counts.textContent = "-";
+              bar.classList.add("is-indeterminate");
+              bar.style.width = "";
+              if (hint) hint.textContent = "";
+              return;
+            }
+
+            title.textContent = lang === "kr" ? "진행 중인 Isaac 작업이 없습니다" : "No active Isaac command";
+            message.textContent = lang === "kr"
+              ? "Isaac에서 장면 로드, 세션 동기화, 렌더를 시작하면 진행 상태가 여기에 나타납니다."
+              : "When Isaac starts a scene load, sync, or render, progress will appear here.";
+            origin.textContent = lang === "kr" ? "유휴" : "Idle";
+            scene.textContent = latest && latest.scene_id ? latest.scene_id : "-";
+            stage.textContent = latest && latest.progress_stage ? latest.progress_stage : "idle";
+            counts.textContent = "-";
+            bar.classList.add("is-indeterminate");
+            bar.style.width = "";
+            if (hint) hint.textContent = "";
+          }
+
+          /* HTML-escape helper for JS-injected content */
+          function _esc(s) {
+            return String(s || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+          }
+
+          /* ── Home page: Isaac status card ── */
+          function _updateHomeIsaacStatus(data) {
+            const wrap = document.getElementById("home-isaac-status-wrap");
+            if (!wrap) return;  /* not on home page */
+            const lang = activeLang();
+            const cmd = data.active_isaac_command;
+            const latest = data.latest_isaac_command;
+            const isIsaacActive = cmd && ["dispatched", "queued", "running"].includes(cmd.status);
+            const isRenderRunning = data.worker_state === "running";
+
+            if (isIsaacActive || isRenderRunning) {
+              const title = isIsaacActive
+                ? (_commandDisplayText(cmd, lang) || (lang === "kr" ? "Isaac 작업 진행 중" : "Isaac command running"))
+                : (lang === "kr" ? "렌더 작업 실행 중…" : "Rendering in progress…");
+              const originLabel = isIsaacActive
+                ? _commandOriginLabel(cmd.progress_origin || "isaac_app", lang)
+                : (lang === "kr" ? "데몬 렌더" : "Daemon Render");
+              const originClass = isIsaacActive ? `is-${(cmd.progress_origin || "isaac_app").replace(/_/g, "-")}` : "is-daemon-render";
+              const sceneId = isIsaacActive ? (cmd.scene_id || "-") : (data.active_stage || "-");
+              const stage = isIsaacActive ? (cmd.progress_stage || cmd.status || "running") : "rendering";
+              const started = isIsaacActive ? (cmd.dispatched_at || cmd.created_at || "-") : "-";
+              const progressCounts = isIsaacActive ? (cmd.progress_counts || {}) : {};
+              const elapsedText = isIsaacActive && Number.isFinite(cmd.elapsed_s)
+                ? `${Math.max(0, Math.round(cmd.elapsed_s))}s`
+                : "-";
+              const progressMeta = progressCounts.total > 0
+                ? `${progressCounts.loaded || 0} / ${progressCounts.total}`
+                : (lang === "kr" ? "측정 불가" : "indeterminate");
+              const telemetryHint = !progressCounts.total ? _telemetryHintText(cmd, lang) : null;
+              const stageElapsed = isIsaacActive ? _stageElapsedText(cmd, lang) : null;
+              const nextStage = isIsaacActive ? _expectedNextStageText(cmd, lang) : null;
+              const relativeSpeed = isIsaacActive ? _relativeSpeedText(cmd, lang) : null;
+              const baseline = cmd && cmd.telemetry_baseline
+                ? (lang === "kr"
+                    ? `중앙값 ${Math.round(cmd.telemetry_baseline.median_duration_s || 0)}초 · p90 ${Math.round(cmd.telemetry_baseline.p90_duration_s || 0)}초 · 표본 ${cmd.telemetry_baseline.sample_count || 0}`
+                    : `median ${Math.round(cmd.telemetry_baseline.median_duration_s || 0)}s · p90 ${Math.round(cmd.telemetry_baseline.p90_duration_s || 0)}s · samples ${cmd.telemetry_baseline.sample_count || 0}`)
+                : null;
+              const progressWidth = progressCounts.total > 0
+                ? `${Math.max(4, Math.min(100, ((progressCounts.loaded || 0) / progressCounts.total) * 100))}%`
+                : "";
+              const progressClass = progressCounts.total > 0 ? "" : " is-indeterminate";
+              wrap.innerHTML = `<div class="isaac-status-card isaac-status-running" id="home-isaac-status">
+  <div class="isaac-status-header">
+    <span class="isaac-status-title">${_esc(title)}</span>
+    <span class="isaac-status-origin ${originClass}">${_esc(originLabel)}</span>
+  </div>
+  <div class="isaac-progress-bar-shell mt-3">
+    <div class="isaac-progress-bar${progressClass}" style="${progressWidth ? `width:${progressWidth};` : ''}"></div>
+  </div>
+  ${telemetryHint ? `<div class="isaac-status-cta muted mt-3">${_esc(telemetryHint)}</div>` : ""}
+  ${(stageElapsed || relativeSpeed || nextStage)
+    ? `<div class="isaac-progress-aux mt-3">
+        ${stageElapsed ? `<span class="isaac-progress-pill">${_esc(stageElapsed)}</span>` : ""}
+        ${relativeSpeed ? `<span class="isaac-progress-pill">${_esc(relativeSpeed)}</span>` : ""}
+        ${nextStage ? `<span class="isaac-progress-pill">${lang === "kr" ? "다음:" : "Next:"} ${_esc(nextStage)}</span>` : ""}
+      </div>` : ""}
+  ${baseline ? `<div class="isaac-status-cta muted mt-2">${_esc(baseline)}</div>` : ""}
+  <div class="isaac-status-meta">
+    <div class="isaac-status-meta-item">
+      <div class="isaac-status-meta-label">${lang === "kr" ? "장면" : "Scene"}</div>
+      <div class="isaac-status-meta-val mono text-xs">${_esc(sceneId)}</div>
+    </div>
+    <div class="isaac-status-meta-item">
+      <div class="isaac-status-meta-label">${lang === "kr" ? "단계" : "Stage"}</div>
+      <div class="isaac-status-meta-val">${_esc(stage)}</div>
+    </div>
+    <div class="isaac-status-meta-item">
+      <div class="isaac-status-meta-label">${lang === "kr" ? "시작" : "Started"}</div>
+      <div class="isaac-status-meta-val text-xs">${_esc(started)}</div>
+    </div>
+    <div class="isaac-status-meta-item">
+      <div class="isaac-status-meta-label">${lang === "kr" ? "경과" : "Elapsed"}</div>
+      <div class="isaac-status-meta-val text-xs">${_esc(elapsedText)}</div>
+    </div>
+    <div class="isaac-status-meta-item">
+      <div class="isaac-status-meta-label">${lang === "kr" ? "진행량" : "Progress"}</div>
+      <div class="isaac-status-meta-val text-xs">${_esc(progressMeta)}</div>
+    </div>
+  </div>
+  ${isIsaacActive ? _recentEventsHtml(cmd, lang) : ""}
+</div>`;
+            } else if (latest && latest.status === "failed") {
+              const title = lang === "kr" ? "최근 Isaac 작업이 실패했습니다" : "Latest Isaac command failed";
+              const errorText = latest.error || latest.progress_message || (lang === "kr" ? "알 수 없는 오류" : "Unknown error");
+              const sceneHref = latest.scene_id ? `/scenes/${_esc(latest.scene_id)}` : "/scenes";
+              wrap.innerHTML = `<div class="isaac-status-card isaac-status-failed" id="home-isaac-status">
+  <div class="isaac-status-header">
+    <span class="isaac-status-title">${_esc(title)}</span>
+    <span class="isaac-status-origin is-failed">${lang === "kr" ? "실패" : "Failed"}</span>
+  </div>
+  <div class="isaac-status-error">${_esc(errorText)}</div>
+  <div class="isaac-status-actions mt-3">
+    <a href="${sceneHref}" class="button button-subtle" style="font-size:0.8rem;">${lang === "kr" ? "장면 열기" : "Open Scene"}</a>
+    <a href="/integrations/isaac" class="button button-subtle" style="font-size:0.8rem;">${lang === "kr" ? "문제 해결" : "Troubleshoot"}</a>
+  </div>
+</div>`;
+            } else {
+              wrap.innerHTML = `<div class="isaac-status-card isaac-status-idle" id="home-isaac-status">
+  <div class="isaac-status-icon">🤖</div>
+  <div class="isaac-status-title">${lang === "kr" ? "진행 중인 Isaac 작업 없음" : "No active Isaac action"}</div>
+  <div class="isaac-status-cta muted mt-2">${lang === "kr" ? "Isaac이 작업을 시작하면 실시간 진행도가 여기에 표시됩니다." : "When Isaac picks up a command, live progress appears here."}</div>
+  <div class="isaac-status-actions mt-3">
+    <a href="/integrations/isaac" class="button button-subtle" style="font-size:0.8rem;">${lang === "kr" ? "Isaac 가이드" : "Isaac Guide"}</a>
+    <a href="/scenes" class="button button-subtle" style="font-size:0.8rem;">${lang === "kr" ? "장면 탐색" : "Scene Explorer"}</a>
+  </div>
+</div>`;
+            }
+          }
+
+          /* Also update Isaac icon when a command is in progress (pending = orange dot) */
+          function _isaacCommandInProgress(data) {
+            const cmd = data.active_isaac_command;
+            return cmd && (cmd.status === "dispatched" || cmd.status === "queued" || cmd.status === "running");
+          }
+
+          async function fetchHealth() {
+            try {
+              const res  = await fetch("/health");
+              if (!res.ok) return;
+              const data = await res.json();
+
+              /* ── Snackbar: always update regardless of state cache ── */
+              _updateSnackbar(data);
+              _updateIsaacProgressPanel(data);
+              _updateHomeIsaacStatus(data);
+
+              const newState = data.worker_state + "|" + data.queue_length + "|" + data.isaac_connected + "|" + (data.active_isaac_command ? data.active_isaac_command.status + data.active_isaac_command.command_type + (data.active_isaac_command.progress_stage || "") + (data.active_isaac_command.progress_message || "") : "") + "|" + (data.latest_isaac_command ? data.latest_isaac_command.status + data.latest_isaac_command.command_id : "");
+              if (newState === lastState) return;
+              lastState = newState;
+
+              const running     = data.worker_state === "running";
+              const queueN      = data.queue_length || 0;
+              const workerCap   = (data.worker_state || "idle")[0].toUpperCase() + (data.worker_state || "idle").slice(1);
+              const isaacOk     = !!data.isaac_connected;
+              const isaacCmdActive = _isaacCommandInProgress(data);
+              const isaacScene  = data.isaac_scene_id || null;
+              const isaacSensors = data.isaac_sensor_count || 0;
+
+              /* Popover text values */
+              const workerEl = document.getElementById("hsi-worker-val");
+              const queueEl  = document.getElementById("hsi-queue-val");
+              if (workerEl) workerEl.textContent = activeLang() === "kr"
+                ? (data.worker_state === "running" ? "실행 중" : data.worker_state === "blocked" ? "차단됨" : "유휴")
+                : workerCap;
+              if (queueEl)  queueEl.textContent  = activeLang() === "kr"
+                ? (queueN === 0 ? "비어 있음" : queueN + "개 작업")
+                : (queueN === 0 ? "Empty" : queueN + " jobs");
+
+              /* Daemon dot */
+              const daemonDot = document.getElementById("hsi-dot");
+              if (daemonDot) {
+                daemonDot.className = "hsi-state-dot " + (running ? "hsi-dot-running" : "hsi-dot-ok");
+              }
+
+              /* Worker dot */
+              const workerDot = document.getElementById("hsi-worker-dot");
+              if (workerDot) {
+                workerDot.className = "hsi-state-dot " + (running ? "hsi-dot-running" : "hsi-dot-idle");
+              }
+
+              /* Queue badge */
+              const badge = document.getElementById("hsi-queue-badge");
+              if (badge) {
+                if (queueN > 0) {
+                  badge.textContent = queueN;
+                  badge.className = "hsi-badge";
+                } else {
+                  badge.textContent = "·";
+                  badge.className = "hsi-badge hsi-badge-zero";
+                }
+              }
+
+              /* Isaac Sim dot + popover
+                 - connected (green) if session open
+                 - orange/running if command is dispatched (pending Isaac execution)
+                 - idle (gray) if not connected and no active command */
+              const isaacDot = document.getElementById("hsi-isaac-dot");
+              if (isaacDot) {
+                if (isaacCmdActive) isaacDot.className = "hsi-state-dot hsi-dot-running";
+                else if (isaacOk) isaacDot.className = "hsi-state-dot hsi-dot-ok";
+                else isaacDot.className = "hsi-state-dot hsi-dot-idle";
+              }
+              const isaacVal = document.getElementById("hsi-isaac-val");
+              if (isaacVal) {
+                let label;
+                if (isaacCmdActive) {
+                  const cmd = data.active_isaac_command;
+                  label = _commandDisplayText(cmd, activeLang()) || (activeLang() === "kr" ? "명령 실행 중…" : "Command running…");
+                } else if (isaacOk) {
+                  label = activeLang() === "kr" ? "연결됨" : "Connected";
+                } else {
+                  label = activeLang() === "kr" ? "연결 안 됨" : "Not connected";
+                }
+                isaacVal.textContent = label;
+                isaacVal.className = "hsi-pop-value " + (isaacCmdActive ? "hp-warn" : isaacOk ? "hp-ok" : "hp-err");
+              }
+              const isaacDesc = document.getElementById("hsi-isaac-desc");
+              if (isaacDesc) {
+                if (isaacOk && isaacScene) {
+                  isaacDesc.innerHTML = activeLang() === "kr"
+                    ? `장면: <span class="mono">${isaacScene}</span>` + (isaacSensors ? ` · 센서 ${isaacSensors}개` : "")
+                    : `Scene: <span class="mono">${isaacScene}</span>` + (isaacSensors ? ` · ${isaacSensors} sensor${isaacSensors !== 1 ? "s" : ""}` : "");
+                } else if (isaacCmdActive) {
+                  const cmd = data.active_isaac_command;
+                  isaacDesc.innerHTML = activeLang() === "kr"
+                    ? `${cmd.progress_message || "Isaac 작업 진행 중"} · <span class="mono">${cmd.progress_stage || cmd.command_type}</span>`
+                    : `${cmd.progress_message || "Isaac command running"} · <span class="mono">${cmd.progress_stage || cmd.command_type}</span>`;
+                } else {
+                  isaacDesc.innerHTML = activeLang() === "kr"
+                    ? `Isaac Sim에서 <span class="mono">POST /isaac/session/open</span> 을 호출하세요`
+                    : `Call <span class="mono">POST /isaac/session/open</span> from Isaac Sim`;
+                }
+              }
+            } catch (_e) {
+              const d = document.getElementById("hsi-daemon-val");
+              if (d) { d.textContent = document.documentElement.dataset.lang === "kr" ? "접속 불가" : "Unreachable"; d.className = "hsi-pop-value hp-err"; }
+              const dot = document.getElementById("hsi-dot");
+              if (dot) dot.className = "hsi-state-dot hsi-dot-running"; /* red-ish = problem */
+            }
+          }
+
+          function startPolling() {
+            fetchHealth();
+            if (!pollTimer) pollTimer = setInterval(fetchHealth, 3000);
+          }
+
+          /* Always start polling — needed for snackbar even when HSI bar not hovered */
+          startPolling();
+        })();
+
+        /* ⌘K overlay */
+        const overlay = document.getElementById("cmd-overlay");
+        const cmdBtn  = document.getElementById("cmd-search");
+        if (cmdBtn && overlay) {
+          cmdBtn.addEventListener("click", () => { overlay.style.display = ""; document.getElementById("cmd-input").focus(); });
+          overlay.addEventListener("click", e => { if (e.target === overlay) overlay.style.display = "none"; });
+          document.addEventListener("keydown", e => { if (e.key === "Escape") overlay.style.display = "none"; });
+        }
+
         const flash = document.getElementById("flash-banner");
         async function submitSmoke(sceneId) {
+          const activeLang = document.documentElement.dataset.lang === "kr" ? "kr" : "en";
           try {
             const response = await fetch("/api/tests/smoke-render", {
               method: "POST",
@@ -76,21 +805,102 @@
             const payload = await response.json();
             flash.classList.remove("hidden");
             if (!response.ok) {
-              flash.textContent = payload.error || "Smoke render request failed.";
+              flash.textContent = payload.error || (activeLang === "kr" ? "스모크 렌더 요청에 실패했습니다." : "Smoke render request failed.");
               flash.classList.add("flash-error");
               return;
             }
-            flash.textContent = `Queued ${payload.job_id} (${payload.frame_id})`;
+            flash.textContent = activeLang === "kr"
+              ? `큐에 추가됨 ${payload.job_id} (${payload.frame_id})`
+              : `Queued ${payload.job_id} (${payload.frame_id})`;
             flash.classList.remove("flash-error");
           } catch (error) {
             flash.classList.remove("hidden");
             flash.classList.add("flash-error");
-            flash.textContent = `Smoke render request failed: ${error}`;
+            flash.textContent = activeLang === "kr"
+              ? `스모크 렌더 요청 실패: ${error}`
+              : `Smoke render request failed: ${error}`;
           }
         }
         for (const button of document.querySelectorAll(".js-smoke-render")) {
           button.addEventListener("click", () => submitSmoke(button.dataset.sceneId || null));
         }
+
+        /* ── Debug event toasts ── */
+        (() => {
+          const TOAST_TTL_MS = 4000;
+          const POLL_MS = 1000;
+          let _latestEventId = 0;
+          let _pollTimer = null;
+
+          const KIND_ICON = { camera: "📷", selection: "🖱", default: "ℹ️" };
+          const KIND_CLASS = { camera: "toast-camera", selection: "toast-selection" };
+
+          function _showToast(event) {
+            const container = document.getElementById("debug-toast-container");
+            if (!container) return;
+
+            const kind = event.kind || "default";
+            const icon = KIND_ICON[kind] || KIND_ICON.default;
+            const kindClass = KIND_CLASS[kind] || "";
+
+            const el = document.createElement("div");
+            el.className = `debug-toast ${kindClass}`;
+            el.innerHTML = `<span class="debug-toast-icon">${icon}</span>
+              <div class="debug-toast-body">
+                <div class="debug-toast-msg">${_esc(event.message || "")}</div>
+                <div class="debug-toast-kind">${_esc(kind)}</div>
+              </div>`;
+            container.appendChild(el);
+
+            /* Auto-dismiss */
+            setTimeout(() => {
+              el.classList.add("toast-out");
+              el.addEventListener("animationend", () => el.remove(), { once: true });
+            }, TOAST_TTL_MS);
+
+            /* Click to dismiss immediately */
+            el.addEventListener("click", () => {
+              el.classList.add("toast-out");
+              el.addEventListener("animationend", () => el.remove(), { once: true });
+            });
+          }
+
+          function _esc(s) {
+            return String(s || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+          }
+
+          async function _pollDebugEvents() {
+            try {
+              const res = await fetch(`/api/debug/events?since=${_latestEventId}`);
+              if (!res.ok) return;
+              const data = await res.json();
+              const events = data.events || [];
+              if (typeof data.latest_id === "number" && data.latest_id > _latestEventId) {
+                _latestEventId = data.latest_id;
+              }
+              for (const ev of events) {
+                _showToast(ev);
+              }
+            } catch (_) { /* daemon unreachable — skip silently */ }
+          }
+
+          /* On first load, sync to current latest_id without showing old events */
+          async function _initDebugEventBaseline() {
+            try {
+              const res = await fetch("/api/debug/events?since=999999999");
+              if (!res.ok) return;
+              const data = await res.json();
+              if (typeof data.latest_id === "number") {
+                _latestEventId = data.latest_id;
+              }
+            } catch (_) {}
+          }
+
+          /* Start polling after baseline is established */
+          _initDebugEventBaseline().finally(() => {
+            _pollTimer = setInterval(_pollDebugEvents, POLL_MS);
+          });
+        })();
       })();
     </script>
   </body>

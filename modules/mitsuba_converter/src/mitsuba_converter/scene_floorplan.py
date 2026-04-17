@@ -109,7 +109,15 @@ def _convex_hull(points: np.ndarray) -> np.ndarray:
     return np.vstack((lower[:-1], upper[:-1]))
 
 
-def _build_masks(scene_path: Path, *, size: int, margin: int):
+def _build_masks(
+    scene_path: Path,
+    *,
+    size: int,
+    margin: int,
+    context_points_xz: Sequence[Sequence[float]] = (),
+    context_padding_ratio: float = 0.35,
+    context_padding_world: float = 12.0,
+):
     obj_paths = _parse_scene_obj_paths(scene_path)
     vertex_sets: dict[str, np.ndarray] = {}
     per_category: dict[str, list[str]] = {"floor": [], "shell": [], "furniture": [], "roof": []}
@@ -132,10 +140,35 @@ def _build_masks(scene_path: Path, *, size: int, margin: int):
     if not math.isfinite(x_min):
         raise RuntimeError(f"No geometry vertices found in {scene_path}")
 
+    geom_x_min = float(x_min)
+    geom_x_max = float(x_max)
+    geom_z_min = float(z_min)
+    geom_z_max = float(z_max)
+
+    for point in context_points_xz:
+        try:
+            px = float(point[0])
+            pz = float(point[1])
+        except Exception:
+            continue
+        x_min = min(x_min, px)
+        x_max = max(x_max, px)
+        z_min = min(z_min, pz)
+        z_max = max(z_max, pz)
+
     extent_x = x_max - x_min
     extent_z = z_max - z_min
     if extent_x <= 0 or extent_z <= 0:
         raise RuntimeError("Invalid scene extent for top-down projection")
+
+    pad_world_x = max(extent_x * context_padding_ratio, context_padding_world)
+    pad_world_z = max(extent_z * context_padding_ratio, context_padding_world)
+    x_min -= pad_world_x
+    x_max += pad_world_x
+    z_min -= pad_world_z
+    z_max += pad_world_z
+    extent_x = x_max - x_min
+    extent_z = z_max - z_min
 
     inner_size = max(size - 2 * margin, 100)
     scale = min(inner_size / extent_x, inner_size / extent_z)
@@ -195,6 +228,12 @@ def _build_masks(scene_path: Path, *, size: int, margin: int):
             "x_max": x_max,
             "z_min": z_min,
             "z_max": z_max,
+        },
+        "geometry_world_bounds_xz": {
+            "x_min": geom_x_min,
+            "x_max": geom_x_max,
+            "z_min": geom_z_min,
+            "z_max": geom_z_max,
         },
         "projection": {
             "scale_px_per_world_unit": scale,
@@ -357,6 +396,7 @@ def render_scene_floorplan(
     request_cameras: Sequence[CameraOverlay] = (),
     snapshot_cameras: Sequence[CameraOverlay] = (),
     snapshot_lights: Sequence[LightOverlay] = (),
+    context_points_xz: Sequence[Sequence[float]] = (),
     size: int = 1600,
     margin: int = 96,
     title: str = "Top-Down Scene Plan",
@@ -365,7 +405,12 @@ def render_scene_floorplan(
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
 
-    masks, metadata = _build_masks(scene, size=size, margin=margin)
+    masks, metadata = _build_masks(
+        scene,
+        size=size,
+        margin=margin,
+        context_points_xz=context_points_xz,
+    )
     metadata["request_cameras"] = [camera.label for camera in request_cameras]
     metadata["snapshot_cameras"] = [camera.label for camera in snapshot_cameras]
     metadata["snapshot_lights"] = [light.label for light in snapshot_lights]

@@ -1,48 +1,224 @@
 {% extends "base.html" %}
 
 {% block content %}
+  {% set current_scene = namespace(item=None) %}
+  {% if current_scene_id %}
+    {% for scene in scenes %}
+      {% if scene.scene_id == current_scene_id %}
+        {% set current_scene.item = scene %}
+      {% endif %}
+    {% endfor %}
+  {% endif %}
+
+  {# ── Row 1: KPI 4개 ─────────────────────────────────────────── #}
   <section class="grid gap-4 lg:grid-cols-4">
-    <article class="panel metric-card metric-card-scenes">
-      <div class="panel-label">Scenes</div>
-      <div class="metric">{{ summary.scene_count }}</div>
-      <div class="muted text-sm">Scenes with at least one observation bundle</div>
+    <article class="panel metric-card metric-card-health">
+      <div class="panel-label"><span data-lang="en">System Health</span><span data-lang="kr" class="hidden">시스템 상태</span></div>
+      <div class="metric">{{ summary.health_status|capitalize }}</div>
+      <div class="muted text-sm">
+        {% if summary.health_status == 'healthy' %}
+          <span data-lang="en">All systems nominal</span><span data-lang="kr" class="hidden">모든 시스템이 정상입니다</span>
+        {% elif summary.health_status == 'degraded' %}
+          <span data-lang="en">Worker active, queue building</span><span data-lang="kr" class="hidden">워커가 동작 중이며 큐가 쌓이고 있습니다</span>
+        {% else %}
+          <span data-lang="en">Worker blocked or unresponsive</span><span data-lang="kr" class="hidden">워커가 막혔거나 응답하지 않습니다</span>
+        {% endif %}
+      </div>
     </article>
     <article class="panel metric-card metric-card-queued">
-      <div class="panel-label">Queued Jobs</div>
+      <div class="panel-label"><span data-lang="en">Queue Pressure</span><span data-lang="kr" class="hidden">큐 적체</span></div>
       <div class="metric">{{ summary.queued_jobs }}</div>
-      <div class="muted text-sm">Pending jobs waiting on the single warm worker</div>
+      <div class="muted text-sm"><span data-lang="en">Jobs pending on the single warm worker</span><span data-lang="kr" class="hidden">단일 워커에서 대기 중인 작업 수</span></div>
     </article>
-    <article class="panel metric-card metric-card-running">
-      <div class="panel-label">Running Jobs</div>
-      <div class="metric">{{ summary.running_jobs }}</div>
-      <div class="muted text-sm">Current worker stage: {{ summary.active_stage or "idle" }}</div>
+    <article class="panel metric-card metric-card-throughput">
+      <div class="panel-label"><span data-lang="en">Render Throughput</span><span data-lang="kr" class="hidden">렌더 처리량</span></div>
+      <div class="metric">{{ summary.today_completed }}</div>
+      <div class="muted text-sm">
+        <span data-lang="en">Completed today</span><span data-lang="kr" class="hidden">오늘 완료</span>
+        {% if summary.avg_render_time_s is not none %}
+          <span data-lang="en"> · avg {{ "%.0f"|format(summary.avg_render_time_s) }}s</span><span data-lang="kr" class="hidden"> · 평균 {{ "%.0f"|format(summary.avg_render_time_s) }}초</span>
+        {% endif %}
+      </div>
     </article>
     <article class="panel metric-card metric-card-failed">
-      <div class="panel-label">Failed Jobs</div>
+      <div class="panel-label"><span data-lang="en">Failure Watch</span><span data-lang="kr" class="hidden">실패 모니터링</span></div>
       <div class="metric">{{ summary.failed_jobs }}</div>
-      <div class="muted text-sm">Latest failure: {{ summary.latest_failure_job_id or "none" }}</div>
+      <div class="muted text-sm">
+        {% if summary.latest_failure_error %}
+          {{ summary.latest_failure_error[:60] }}…
+        {% else %}
+          <span data-lang="en">No failures recorded</span><span data-lang="kr" class="hidden">기록된 실패가 없습니다</span>
+        {% endif %}
+      </div>
     </article>
   </section>
 
+  {# ── Current Scene Workspace entry ──────────────────────────── #}
+  {% if current_scene_id %}
+    <section class="panel mt-6">
+      <div class="panel-header">
+        <div>
+          <h2 class="section-title"><span data-lang="en">Current Scene</span><span data-lang="kr" class="hidden">현재 장면</span></h2>
+          <p class="muted text-sm">
+            <span data-lang="en">Jump straight into the live Isaac workspace without going through the scene list.</span>
+            <span data-lang="kr" class="hidden">장면 목록을 거치지 않고 바로 현재 Isaac 작업공간으로 들어갑니다.</span>
+          </p>
+        </div>
+        <a href="/scenes/{{ current_scene_id }}" class="button button-primary">
+          <span data-lang="en">Open Workspace</span><span data-lang="kr" class="hidden">작업공간 열기</span>
+        </a>
+      </div>
+
+      <a href="/scenes/{{ current_scene_id }}" class="scene-card scene-card-soft mt-4" style="display:block;padding:1.3rem 1.35rem;border-width:1.5px;">
+        <div class="flex items-start justify-between gap-4 flex-wrap">
+          <div style="min-width:240px;flex:1;">
+            <div class="eyebrow"><span data-lang="en">Live Workspace</span><span data-lang="kr" class="hidden">현재 작업공간</span></div>
+            <div class="scene-card-title" style="font-size:1.35rem;margin-top:0.35rem;">{{ current_scene_id }}</div>
+            <div class="muted text-sm mt-2">
+              {% if summary.isaac_connected and summary.isaac_scene_id == current_scene_id %}
+                <span data-lang="en">Active Isaac session connected</span><span data-lang="kr" class="hidden">활성 Isaac session이 연결되어 있습니다</span>
+              {% else %}
+                <span data-lang="en">Open the live scene workspace for this registered scene</span><span data-lang="kr" class="hidden">이 등록된 scene의 live 작업공간으로 바로 이동합니다</span>
+              {% endif %}
+            </div>
+          </div>
+          <div class="scene-workspace-status" style="grid-template-columns:repeat(4,minmax(140px,1fr));flex:1.4;min-width:320px;">
+            <div class="scene-summary-card">
+              <div class="scene-summary-label"><span data-lang="en">Session</span><span data-lang="kr" class="hidden">세션</span></div>
+              <div class="scene-summary-val">
+                {% if summary.isaac_connected and summary.isaac_scene_id == current_scene_id %}
+                  <span data-lang="en">Live</span><span data-lang="kr" class="hidden">연결됨</span>
+                {% else %}
+                  <span data-lang="en">Ready</span><span data-lang="kr" class="hidden">대기</span>
+                {% endif %}
+              </div>
+              <div class="muted text-xs">{{ summary.isaac_updated_at or "-" }}</div>
+            </div>
+            <div class="scene-summary-card">
+              <div class="scene-summary-label"><span data-lang="en">Render Readiness</span><span data-lang="kr" class="hidden">렌더 준비</span></div>
+              <div class="scene-summary-val">
+                {% if current_scene.item and current_scene.item.render_ready %}
+                  <span data-lang="en">Ready</span><span data-lang="kr" class="hidden">준비됨</span>
+                {% else %}
+                  <span data-lang="en">Open-only</span><span data-lang="kr" class="hidden">오픈 전용</span>
+                {% endif %}
+              </div>
+              <div class="muted text-xs">
+                {% if current_scene.item %}
+                  {{ current_scene.item.scene_version or "scene" }}
+                {% else %}
+                  -
+                {% endif %}
+              </div>
+            </div>
+            <div class="scene-summary-card">
+              <div class="scene-summary-label"><span data-lang="en">Cameras</span><span data-lang="kr" class="hidden">카메라</span></div>
+              <div class="scene-summary-val">
+                {% if current_scene.item %}
+                  {{ current_scene.item.camera_count }}
+                {% else %}
+                  {{ summary.isaac_sensor_count or 0 }}
+                {% endif %}
+              </div>
+              <div class="muted text-xs"><span data-lang="en">workspace view</span><span data-lang="kr" class="hidden">작업공간 보기</span></div>
+            </div>
+            <div class="scene-summary-card">
+              <div class="scene-summary-label"><span data-lang="en">Captures</span><span data-lang="kr" class="hidden">캡처</span></div>
+              <div class="scene-summary-val">{{ current_scene.item.capture_count if current_scene.item else 0 }}</div>
+              <div class="muted text-xs">{{ current_scene.item.latest_timestamp if current_scene.item and current_scene.item.latest_timestamp else "-" }}</div>
+            </div>
+          </div>
+        </div>
+      </a>
+    </section>
+  {% endif %}
+
+  {# ── Row 2: Isaac 작업 패널 + Activity Feed ──────────────────── #}
+  <section class="grid gap-4 lg:grid-cols-2 mt-6">
+
+    {# 좌: Isaac 작업 패널 (컴팩트, 상태 기반) #}
+    <article class="panel" style="display:flex;flex-direction:column;">
+      <div class="panel-header">
+        <div>
+          <h2 class="section-title"><span data-lang="en">Active Isaac Action</span><span data-lang="kr" class="hidden">현재 Isaac 작업</span></h2>
+          <p class="muted text-sm"><span data-lang="en">Live status from Isaac and daemon render stages.</span><span data-lang="kr" class="hidden">Isaac과 daemon 렌더 단계에서 올라오는 실시간 상태입니다.</span></p>
+        </div>
+      </div>
+      <div style="margin-top:1rem;" id="home-isaac-status-wrap">
+        {# 초기 상태: idle (compact) #}
+        <div class="isaac-status-card isaac-status-idle" id="home-isaac-status">
+          <div class="isaac-status-icon" style="font-size:1.4rem;margin-bottom:0.35rem;">🤖</div>
+          <div class="isaac-status-title">
+            <span data-lang="en">No active Isaac action</span>
+            <span data-lang="kr" class="hidden">진행 중인 Isaac 작업 없음</span>
+          </div>
+          <div class="isaac-status-cta muted mt-1" style="font-size:0.78rem;">
+            <span data-lang="en">Isaac progress appears here when a command is dispatched.</span>
+            <span data-lang="kr" class="hidden">Isaac 작업이 시작되면 진행도가 여기에 표시됩니다.</span>
+          </div>
+          <div class="isaac-status-actions mt-2">
+            <a href="/integrations/isaac" class="button button-subtle" style="font-size:0.78rem;padding:0.3rem 0.7rem;"><span data-lang="en">Isaac Guide</span><span data-lang="kr" class="hidden">Isaac 가이드</span></a>
+            <a href="/scenes" class="button button-subtle" style="font-size:0.78rem;padding:0.3rem 0.7rem;"><span data-lang="en">Scene Explorer</span><span data-lang="kr" class="hidden">장면 탐색</span></a>
+          </div>
+        </div>
+      </div>
+    </article>
+
+    {# 우: Activity Feed #}
+    <article class="panel">
+      <div class="panel-header">
+        <div>
+          <h2 class="section-title"><span data-lang="en">Activity Feed</span><span data-lang="kr" class="hidden">활동 피드</span></h2>
+          <p class="muted text-sm"><span data-lang="en">Recent render, failure, and scene events.</span><span data-lang="kr" class="hidden">최근 렌더, 실패, 장면 이벤트.</span></p>
+        </div>
+      </div>
+      {% if activity_feed %}
+        <div class="activity-feed mt-4">
+          {% for item in activity_feed %}
+            <div class="activity-item">
+              <div class="activity-dot activity-dot-{{ item.type }}">
+                {% if item.type == 'render' %}✓
+                {% elif item.type == 'fail' %}✗
+                {% elif item.type == 'scene' %}⬡
+                {% else %}·{% endif %}
+              </div>
+              <div class="activity-body">
+                <div class="activity-label">{{ item.label }}</div>
+                <div class="activity-time">{{ item.time_ago }}</div>
+              </div>
+            </div>
+          {% endfor %}
+        </div>
+      {% else %}
+        <div class="empty-state-illustrated mt-4">
+          <div class="empty-icon">📡</div>
+          <div class="empty-title"><span data-lang="en">No activity yet</span><span data-lang="kr" class="hidden">아직 활동이 없습니다</span></div>
+          <div class="empty-desc"><span data-lang="en">Events will appear here as renders complete.</span><span data-lang="kr" class="hidden">렌더가 완료되면 여기에 이벤트가 표시됩니다.</span></div>
+        </div>
+      {% endif %}
+    </article>
+  </section>
+
+  {# ── Row 3: Recent Jobs + Playbook ───────────────────────────── #}
   <section class="grid gap-4 lg:grid-cols-[1.4fr,1fr] mt-6">
     <article class="panel">
       <div class="panel-header">
         <div>
-          <h2 class="section-title">Recent Jobs</h2>
-          <p class="muted text-sm">Queue, progress, and last known manifest path.</p>
+          <h2 class="section-title"><span data-lang="en">Recent Jobs</span><span data-lang="kr" class="hidden">최근 작업</span></h2>
+          <p class="muted text-sm"><span data-lang="en">Queue, progress, and last known manifest path.</span><span data-lang="kr" class="hidden">큐 상태, 진행 단계, 마지막 manifest 경로.</span></p>
         </div>
-        <a href="/jobs" class="button button-subtle">Open Jobs</a>
+        <a href="/jobs" class="button button-subtle"><span data-lang="en">All Jobs</span><span data-lang="kr" class="hidden">전체 작업</span></a>
       </div>
       {% if recent_jobs %}
         <div class="table-wrap mt-4">
           <table class="table">
             <thead>
               <tr>
-                <th>Job</th>
-                <th>Status</th>
-                <th>Stage</th>
-                <th>Scene</th>
-                <th>Submitted</th>
+                <th><span data-lang="en">Job</span><span data-lang="kr" class="hidden">작업</span></th>
+                <th><span data-lang="en">Status</span><span data-lang="kr" class="hidden">상태</span></th>
+                <th><span data-lang="en">Stage</span><span data-lang="kr" class="hidden">단계</span></th>
+                <th><span data-lang="en">Scene</span><span data-lang="kr" class="hidden">장면</span></th>
+                <th><span data-lang="en">Submitted</span><span data-lang="kr" class="hidden">제출 시각</span></th>
               </tr>
             </thead>
             <tbody>
@@ -51,7 +227,7 @@
                   <td class="mono text-xs">{{ job.job_id }}</td>
                   <td><span class="badge badge-{{ job.status }}">{{ job.status }}</span></td>
                   <td>{{ job.progress_stage }}</td>
-                  <td>{{ job.scene_id or "unknown" }}</td>
+                  <td>{{ job.scene_id or "-" }}</td>
                   <td>{{ job.submitted_at or "-" }}</td>
                 </tr>
               {% endfor %}
@@ -59,91 +235,83 @@
           </table>
         </div>
       {% else %}
-        <div class="empty-state mt-4">No render jobs yet.</div>
+        <div class="empty-state-illustrated mt-4">
+          <div class="empty-icon">🎬</div>
+          <div class="empty-title"><span data-lang="en">No render jobs yet</span><span data-lang="kr" class="hidden">아직 렌더 작업이 없습니다</span></div>
+          <div class="empty-desc"><span data-lang="en">Submit a render from Isaac Sim or via the API to see queue activity here.</span><span data-lang="kr" class="hidden">Isaac Sim 또는 API에서 렌더를 제출하면 여기에 큐 활동이 표시됩니다.</span></div>
+          <a href="/integrations/isaac" class="button button-subtle" style="margin-top:0.5rem;"><span data-lang="en">Open Isaac Guide</span><span data-lang="kr" class="hidden">Isaac 가이드 열기</span></a>
+        </div>
       {% endif %}
     </article>
 
     <article class="panel">
       <div class="panel-header">
         <div>
-          <h2 class="section-title">Quick Actions</h2>
-          <p class="muted text-sm">Smoke tests and links for day-to-day operations.</p>
+          <h2 class="section-title"><span data-lang="en">Playbook</span><span data-lang="kr" class="hidden">플레이북</span></h2>
+          <p class="muted text-sm"><span data-lang="en">Common workflows at a click.</span><span data-lang="kr" class="hidden">자주 쓰는 흐름을 바로 실행합니다.</span></p>
         </div>
       </div>
-      <div class="stack-sm mt-4 quick-actions-list">
-        <a href="/integrations/isaac" class="button button-primary">Open Isaac Guide</a>
-        <a href="/system" class="button button-subtle">System Overview</a>
-        <a href="/api/render-jobs" class="button button-subtle">Render Jobs API</a>
+      <div class="playbook-grid mt-4">
+        <a href="/integrations/isaac" class="playbook-tile">
+          <div class="playbook-tile-icon">🤖</div>
+          <div class="playbook-tile-title"><span data-lang="en">Isaac Render</span><span data-lang="kr" class="hidden">Isaac 렌더</span></div>
+          <div class="playbook-tile-desc"><span data-lang="en">Blocked render from Isaac Sim extension</span><span data-lang="kr" class="hidden">Isaac Sim extension에서 직접 렌더</span></div>
+        </a>
         {% if latest_scene_id %}
-          <button class="button button-subtle js-smoke-render" data-scene-id="{{ latest_scene_id }}">Smoke Render Latest Scene</button>
+          <button class="playbook-tile js-smoke-render" data-scene-id="{{ latest_scene_id }}">
+            <div class="playbook-tile-icon">💨</div>
+            <div class="playbook-tile-title"><span data-lang="en">Smoke Render</span><span data-lang="kr" class="hidden">스모크 렌더</span></div>
+            <div class="playbook-tile-desc"><span data-lang="en">Low-res quick sanity check</span><span data-lang="kr" class="hidden">저해상도 빠른 점검</span></div>
+          </button>
         {% endif %}
+        <a href="/scenes" class="playbook-tile">
+          <div class="playbook-tile-icon">🗺️</div>
+          <div class="playbook-tile-title"><span data-lang="en">Scene Explorer</span><span data-lang="kr" class="hidden">장면 탐색기</span></div>
+          <div class="playbook-tile-desc"><span data-lang="en">Browse observation bundles</span><span data-lang="kr" class="hidden">observation bundle 탐색</span></div>
+        </a>
+        <a href="/jobs" class="playbook-tile">
+          <div class="playbook-tile-icon">📋</div>
+          <div class="playbook-tile-title"><span data-lang="en">Jobs History</span><span data-lang="kr" class="hidden">작업 기록</span></div>
+          <div class="playbook-tile-desc"><span data-lang="en">Full queue and status log</span><span data-lang="kr" class="hidden">전체 큐와 상태 기록</span></div>
+        </a>
+        <a href="/system" class="playbook-tile">
+          <div class="playbook-tile-icon">⚙️</div>
+          <div class="playbook-tile-title"><span data-lang="en">System Check</span><span data-lang="kr" class="hidden">시스템 점검</span></div>
+          <div class="playbook-tile-desc"><span data-lang="en">Worker, cache, env status</span><span data-lang="kr" class="hidden">워커, 캐시, 환경 상태</span></div>
+        </a>
       </div>
-      <div class="divider"></div>
-      <div class="panel-label">Scene Cache</div>
-      {% if summary.scene_cache_stats %}
-        <div class="stack-xs mt-3">
-          {% for item in summary.scene_cache_stats[:4] %}
-            <div class="subpanel">
-              <div class="mono text-xs text-slate-300">{{ item.key }}</div>
-              <div class="muted text-xs mt-2">submissions {{ item.submissions }} · runs {{ item.runs }}</div>
-            </div>
-          {% endfor %}
-        </div>
-      {% else %}
-        <div class="empty-state mt-3">No cached scene activity yet.</div>
-      {% endif %}
     </article>
   </section>
 
-  <section class="grid gap-4 lg:grid-cols-[1.1fr,1fr] mt-6">
-    <article class="panel">
-      <div class="panel-header">
-        <div>
-          <h2 class="section-title">Scene Explorer</h2>
-          <p class="muted text-sm">Latest scenes derived from observation bundles.</p>
-        </div>
-        <a href="/scenes" class="button button-subtle">Open Scenes</a>
+  {# ── Row 4: 장면 탐색기 (전체 폭) ────────────────────────────── #}
+  <section class="panel mt-6">
+    <div class="panel-header">
+      <div>
+        <h2 class="section-title"><span data-lang="en">Scene Explorer</span><span data-lang="kr" class="hidden">장면 탐색기</span></h2>
+        <p class="muted text-sm"><span data-lang="en">Latest scenes derived from observation bundles.</span><span data-lang="kr" class="hidden">observation bundle에서 파생된 최신 scene 목록.</span></p>
       </div>
-      {% if scenes %}
-        <div class="scene-grid mt-4">
-          {% for scene in scenes %}
-            <a href="/scenes/{{ scene.scene_id }}" class="scene-card scene-card-soft">
-              <div class="eyebrow">{{ scene.scene_version or "scene" }}</div>
-              <div class="scene-card-title">{{ scene.scene_id }}</div>
-              <div class="muted text-sm mt-2">
-                captures {{ scene.capture_count }} · cameras {{ scene.camera_count }}
-              </div>
-              <div class="muted text-xs mt-2">{{ scene.latest_timestamp or "-" }}</div>
-            </a>
-          {% endfor %}
-        </div>
-      {% else %}
-        <div class="empty-state mt-4">No scenes have produced observation bundles yet.</div>
-      {% endif %}
-    </article>
-
-    <article class="panel">
-      <div class="panel-header">
-        <div>
-          <h2 class="section-title">Recent Failures</h2>
-          <p class="muted text-sm">Helpful when the worker is blocked or scene refs drift.</p>
-        </div>
-      </div>
-      {% if failed_jobs %}
-        <div class="stack-sm mt-4">
-          {% for job in failed_jobs %}
-            <div class="subpanel">
-              <div class="flex items-center justify-between gap-3">
-                <span class="mono text-xs">{{ job.job_id }}</span>
-                <span class="badge badge-failed">failed</span>
-              </div>
-              <div class="muted text-xs mt-2">{{ job.error or "No error payload captured." }}</div>
+      <a href="/scenes" class="button button-subtle"><span data-lang="en">All Scenes</span><span data-lang="kr" class="hidden">전체 장면</span></a>
+    </div>
+    {% if scenes %}
+      <div class="scene-grid mt-4">
+        {% for scene in scenes %}
+          <a href="/scenes/{{ scene.scene_id }}" class="scene-card scene-card-soft" data-scene-id="{{ scene.scene_id }}">
+            <div class="eyebrow">{{ scene.scene_version or "scene" }}</div>
+            <div class="scene-card-title">{{ scene.scene_id }}</div>
+            <div class="muted text-sm mt-2">
+              <span data-lang="en">captures {{ scene.capture_count }} · cameras {{ scene.camera_count }}</span>
+              <span data-lang="kr" class="hidden">캡처 {{ scene.capture_count }} · 카메라 {{ scene.camera_count }}</span>
             </div>
-          {% endfor %}
-        </div>
-      {% else %}
-        <div class="empty-state mt-4">No failed jobs recorded.</div>
-      {% endif %}
-    </article>
+            <div class="muted text-xs mt-2">{{ scene.latest_timestamp or "-" }}</div>
+          </a>
+        {% endfor %}
+      </div>
+    {% else %}
+      <div class="empty-state-illustrated mt-4">
+        <div class="empty-icon">🗺️</div>
+        <div class="empty-title"><span data-lang="en">No scenes yet</span><span data-lang="kr" class="hidden">아직 장면이 없습니다</span></div>
+        <div class="empty-desc"><span data-lang="en">Scenes appear here once observation bundles are produced.</span><span data-lang="kr" class="hidden">observation bundle이 생성되면 여기에 장면이 표시됩니다.</span></div>
+      </div>
+    {% endif %}
   </section>
 {% endblock %}

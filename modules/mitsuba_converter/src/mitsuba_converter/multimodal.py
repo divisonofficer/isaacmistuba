@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 import tempfile
 import time
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 import xml.etree.ElementTree as ET
 
 import numpy as np
@@ -145,6 +145,21 @@ def _normalize(v: np.ndarray) -> np.ndarray:
     return v / norm
 
 
+def normalize_mat4_storage(matrix: np.ndarray | Sequence[float]) -> np.ndarray:
+    candidate = np.asarray(matrix, dtype=np.float32)
+    if candidate.shape == (16,):
+        candidate = candidate.reshape(4, 4)
+    if candidate.shape != (4, 4):
+        raise ValueError(f"Expected 4x4 transform matrix, got {candidate.shape}")
+    last_col = candidate[:3, 3]
+    last_row = candidate[3, :3]
+    last_col_strength = float(np.linalg.norm(last_col))
+    last_row_strength = float(np.linalg.norm(last_row))
+    if last_row_strength > max(1e-5, last_col_strength * 2.0):
+        candidate = candidate.T
+    return candidate
+
+
 def camera_to_world_from_lookat(
     origin: Sequence[float],
     target: Sequence[float],
@@ -167,9 +182,7 @@ def camera_to_world_from_lookat(
 
 
 def camera_to_world_to_lookat(camera_to_world: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    matrix = np.asarray(camera_to_world, dtype=np.float32)
-    if matrix.shape != (4, 4):
-        raise ValueError(f"camera_to_world must be a 4x4 matrix, got {matrix.shape}")
+    matrix = normalize_mat4_storage(camera_to_world)
 
     origin = matrix[:3, 3]
     up = _normalize(matrix[:3, 1])
@@ -402,7 +415,7 @@ def _compute_target_union_bounds(scene_path: Path, targets: set[str]) -> tuple[n
 
 
 def _camera_basis(camera_to_world: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    matrix = np.asarray(camera_to_world, dtype=np.float32)
+    matrix = normalize_mat4_storage(camera_to_world)
     origin = matrix[:3, 3]
     right = _normalize(matrix[:3, 0])
     up = _normalize(matrix[:3, 1])
@@ -1235,7 +1248,13 @@ def _import_mitsuba():
     return mi
 
 
-def _render_scene(scene_path: Path, *, variant: str, spp: int) -> tuple[np.ndarray, dict[str, float]]:
+def _render_scene(
+    scene_path: Path,
+    *,
+    variant: str,
+    spp: int,
+    on_loaded: Callable[[], None] | None = None,
+) -> tuple[np.ndarray, dict[str, float]]:
     mi = _import_mitsuba()
     start = time.perf_counter()
     mi.set_variant(variant)
@@ -1243,6 +1262,9 @@ def _render_scene(scene_path: Path, *, variant: str, spp: int) -> tuple[np.ndarr
     load_start = time.perf_counter()
     scene = mi.load_file(str(scene_path))
     load_s = time.perf_counter() - load_start
+
+    if on_loaded is not None:
+        on_loaded()
 
     render_start = time.perf_counter()
     image = np.array(mi.render(scene, spp=spp), dtype=np.float32)
@@ -2164,6 +2186,7 @@ def render_modalities(
     assist_light: AssistLightSpec | None = None,
     depth_approx: DepthApproxSpec | None = None,
     variant: str = "cuda_ad_spectral",
+    progress_callback: Callable[[str, Mapping[str, Any] | None], None] | None = None,
 ) -> MultimodalRenderResult:
     config = config or RenderConfig()
     requested = _resolve_modalities(modalities)
@@ -2193,10 +2216,61 @@ def render_modalities(
     if "active_nir_intensity" in requested_set and assist_light is None:
         raise ValueError("active_nir_intensity requires an assist_light specification.")
 
+    # ── progress helpers ──────────────────────────────────────────────────
+    _pass_index: list[int] = [0]
+    _total_passes = sum([
+        1 if _needs_path_total(requested_set) else 0,
+        1 if _needs_direct(requested_set) else 0,
+        1 if _needs_diffuse(requested_set) else 0,
+        1 if _needs_aov(requested_set) else 0,
+        1 if (_needs_sensor_depth(requested_set) and depth_approx is not None) else 0,
+        1 if (_needs_sensor_depth(requested_set) and depth_approx is not None) else 0,  # mirror pass
+        1 if (_needs_active_nir(requested_set) and assist_light is not None) else 0,
+        1 if _needs_polar(requested_set) else 0,
+    ])
+
+    def _cb(stage: str, ctx: Mapping[str, Any] | None = None) -> None:
+        if progress_callback is not None:
+            progress_callback(stage, ctx)
+
+    def _render_pass(
+        scene_path: Path,
+        *,
+        pass_name: str,
+        spp: int,
+        variant_override: str | None = None,
+    ) -> tuple[np.ndarray, dict[str, float]]:
+        _pass_index[0] += 1
+        v = variant_override or variant
+        _cb("loading_scene", {
+            "pass": pass_name,
+            "spp": spp,
+            "variant": v,
+            "pass_index": _pass_index[0],
+            "total_passes": _total_passes,
+        })
+        def _on_loaded() -> None:
+            _cb("rendering", {
+                "pass": pass_name,
+                "spp": spp,
+                "variant": v,
+                "pass_index": _pass_index[0],
+                "total_passes": _total_passes,
+            })
+        image, timing = _render_scene(scene_path, variant=v, spp=spp, on_loaded=_on_loaded)
+        _cb("saving_output", {
+            "pass": pass_name,
+            "pass_index": _pass_index[0],
+            "total_passes": _total_passes,
+        })
+        return image, timing
+    # ─────────────────────────────────────────────────────────────────────
+
     def stage_filename(key: str, default: str) -> Path:
         return workspace / config.scene_filename(key, default)
 
     if _needs_path_total(requested_set):
+        _cb("staging_scene", {"pass": "rgb"})
         scene_rgb = _stage_path_scene(
             source_scene,
             stage_filename("rgb", "scene_rgb.xml"),
@@ -2211,7 +2285,7 @@ def render_modalities(
             scene_override=scene_override,
         )
         staged_scenes["rgb"] = str(scene_rgb)
-        image, timing = _render_scene(scene_rgb, variant=variant, spp=config.path_spp)
+        image, timing = _render_pass(scene_rgb, pass_name="rgb", spp=config.path_spp)
         timing["spp"] = config.path_spp
         rgb = image[:, :, :3] if image.ndim == 3 else np.repeat(image[:, :, None], 3, axis=2)
         rgb_result, rgb_record = _build_rgb_result(
@@ -2231,6 +2305,7 @@ def render_modalities(
             results["rgb"] = rgb_result
 
     if _needs_direct(requested_set):
+        _cb("staging_scene", {"pass": "direct_light_map"})
         scene_direct = _stage_path_scene(
             source_scene,
             stage_filename("direct_light_map", "scene_direct_light_map.xml"),
@@ -2245,7 +2320,7 @@ def render_modalities(
             scene_override=scene_override,
         )
         staged_scenes["direct_light_map"] = str(scene_direct)
-        image, timing = _render_scene(scene_direct, variant=variant, spp=config.path_spp)
+        image, timing = _render_pass(scene_direct, pass_name="direct_light_map", spp=config.path_spp)
         timing["spp"] = config.path_spp
         rgb = image[:, :, :3] if image.ndim == 3 else np.repeat(image[:, :, None], 3, axis=2)
         direct_result, direct_record = _build_rgb_result(
@@ -2265,6 +2340,7 @@ def render_modalities(
             results["direct_light_map"] = direct_result
 
     if _needs_diffuse(requested_set):
+        _cb("staging_scene", {"pass": "diffuse_map"})
         scene_diffuse = _stage_diffuse_override_scene(
             source_scene,
             stage_filename("diffuse_map", "scene_diffuse_map.xml"),
@@ -2279,7 +2355,7 @@ def render_modalities(
             scene_override=scene_override,
         )
         staged_scenes["diffuse_map"] = str(scene_diffuse)
-        image, timing = _render_scene(scene_diffuse, variant=variant, spp=config.path_spp)
+        image, timing = _render_pass(scene_diffuse, pass_name="diffuse_map", spp=config.path_spp)
         timing["spp"] = config.path_spp
         rgb = image[:, :, :3] if image.ndim == 3 else np.repeat(image[:, :, None], 3, axis=2)
         diffuse_result, diffuse_record = _build_rgb_result(
@@ -2299,6 +2375,7 @@ def render_modalities(
             results["diffuse_map"] = diffuse_result
 
     if _needs_aov(requested_set):
+        _cb("staging_scene", {"pass": "aov"})
         scene_aov = _stage_aov_scene(
             source_scene,
             stage_filename("aov", "scene_aov.xml"),
@@ -2310,7 +2387,7 @@ def render_modalities(
             scene_override=scene_override,
         )
         staged_scenes["aov"] = str(scene_aov)
-        image, timing = _render_scene(scene_aov, variant=variant, spp=config.aov_spp)
+        image, timing = _render_pass(scene_aov, pass_name="aov", spp=config.aov_spp)
         timing["spp"] = config.aov_spp
         if image.ndim != 3 or image.shape[2] < 7:
             raise RuntimeError(f"Unexpected AOV tensor shape: {image.shape}")
@@ -2414,6 +2491,7 @@ def render_modalities(
                     height=config.height,
                 )
 
+            _cb("staging_scene", {"pass": "target_mask"})
             scene_mask = _stage_target_mask_scene(
                 source_scene,
                 stage_filename("target_mask", "scene_target_mask.xml"),
@@ -2425,7 +2503,7 @@ def render_modalities(
                 target_shape_filenames=depth_approx.target_shape_filenames,
             )
             staged_scenes["target_mask"] = str(scene_mask)
-            mask_image, mask_timing = _render_scene(scene_mask, variant=variant, spp=max(1, config.aov_spp))
+            mask_image, mask_timing = _render_pass(scene_mask, pass_name="target_mask", spp=max(1, config.aov_spp))
             mask_timing["spp"] = max(1, config.aov_spp)
             target_mask = _extract_binary_mask(mask_image)
             use_projected_bbox = bool(depth_approx.extras.get("use_projected_bbox", False))
@@ -2452,7 +2530,8 @@ def render_modalities(
                     height=config.height,
                 )
                 staged_scenes["sensor_depth_mirror"] = str(scene_mirror)
-                mirror_image, mirror_timing = _render_scene(scene_mirror, variant=variant, spp=config.aov_spp)
+                _cb("staging_scene", {"pass": "sensor_depth_mirror"})
+                mirror_image, mirror_timing = _render_pass(scene_mirror, pass_name="sensor_depth_mirror", spp=config.aov_spp)
                 mirror_timing["spp"] = config.aov_spp
                 if mirror_image.ndim == 3 and mirror_image.shape[2] >= 7:
                     mirror_depth = mirror_image[:, :, -1].astype(np.float32)
@@ -2542,7 +2621,8 @@ def render_modalities(
             assist_light=assist_light,
         )
         staged_scenes["active_nir_intensity"] = str(scene_active)
-        image, timing = _render_scene(scene_active, variant=variant, spp=config.polar_spp)
+        _cb("staging_scene", {"pass": "active_nir_intensity"})
+        image, timing = _render_pass(scene_active, pass_name="active_nir_intensity", spp=config.polar_spp)
         timing["spp"] = config.polar_spp
         rgb = image[:, :, :3] if image.ndim == 3 else np.repeat(image[:, :, None], 3, axis=2)
         intensity = np.tensordot(rgb, np.array([0.2126, 0.7152, 0.0722], dtype=np.float32), axes=([2], [0])).astype(np.float32)
@@ -2594,12 +2674,13 @@ def render_modalities(
         )
         staged_scenes["polar"] = str(scene_polar)
         staged_scenes["polar_fallback"] = str(scene_polar_fallback)
+        _cb("staging_scene", {"pass": "polar"})
 
         requested_polar = {modality for modality in requested_set if modality in {"polar_rgb_preview", "dop", "aolp", "s1", "s2"}}
         polar_scene_used = scene_polar
         fallback_used = False
         try:
-            image, timing = _render_scene(scene_polar, variant=_polar_variant(variant), spp=config.polar_spp)
+            image, timing = _render_pass(scene_polar, pass_name="polar", spp=config.polar_spp, variant_override=_polar_variant(variant))
             timing["spp"] = config.polar_spp
             summary, arrays = save_polarization_products(image, workspace, requested_polar)
             polarization_material_mode = "original_scene"
@@ -2610,7 +2691,7 @@ def render_modalities(
             if weak_scales or invalid_polar:
                 fallback_workspace = workspace / "_polar_fallback_candidate"
                 fallback_workspace.mkdir(parents=True, exist_ok=True)
-                fallback_image, fallback_timing = _render_scene(scene_polar_fallback, variant=_polar_variant(variant), spp=config.polar_spp)
+                fallback_image, fallback_timing = _render_pass(scene_polar_fallback, pass_name="polar_fallback", spp=config.polar_spp, variant_override=_polar_variant(variant))
                 fallback_timing["spp"] = config.polar_spp
                 fallback_summary, fallback_arrays = save_polarization_products(fallback_image, fallback_workspace, requested_polar)
                 prefer_fallback = weak_scales
@@ -2629,7 +2710,7 @@ def render_modalities(
                     polar_scene_used = scene_polar_fallback
                     fallback_used = True
         except Exception:
-            image, timing = _render_scene(scene_polar_fallback, variant=_polar_variant(variant), spp=config.polar_spp)
+            image, timing = _render_pass(scene_polar_fallback, pass_name="polar_fallback", spp=config.polar_spp, variant_override=_polar_variant(variant))
             timing["spp"] = config.polar_spp
             summary, arrays = save_polarization_products(image, workspace, requested_polar)
             polarization_material_mode = "pplastic_fallback"

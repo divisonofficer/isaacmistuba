@@ -1,106 +1,2950 @@
 {% extends "base.html" %}
 
+{% block topbar_extra_class %}topbar-compact{% endblock %}
+
+{% block topbar_left %}
+<div class="ws-topbar-scene">
+  <div class="ws-topbar-scene-name">
+    {{ scene.scene_id if scene else page_title }}
+  </div>
+  {% if scene %}
+  <div class="ws-topbar-scene-meta">
+    <span class="hsi-state-dot hsi-dot-idle" id="ws-topbar-dot"></span>
+    <span id="ws-topbar-status-text" class="muted" style="font-size:0.73rem;">idle</span>
+    {% if scene.usd_stage_path %}
+    <span class="ws-topbar-sep">·</span>
+    <span class="mono muted" style="font-size:0.68rem;max-width:22ch;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="{{ scene.usd_stage_path }}">{{ scene.usd_stage_path }}</span>
+    {% endif %}
+  </div>
+  {% endif %}
+</div>
+{% endblock topbar_left %}
+
+{% block topbar_actions_extra %}
+{% if scene %}
+<button class="button button-subtle js-isaac-command" data-command="load_scene" data-scene-id="{{ scene.scene_id }}"><span data-lang="en">Load</span><span data-lang="kr" class="hidden">불러오기</span></button>
+<button class="button button-subtle js-isaac-command" data-command="connect_session" data-scene-id="{{ scene.scene_id }}"><span data-lang="en">Connect</span><span data-lang="kr" class="hidden">연결</span></button>
+<button class="button button-subtle js-isaac-command" data-command="sync_session" data-scene-id="{{ scene.scene_id }}"><span data-lang="en">Sync</span><span data-lang="kr" class="hidden">동기화</span></button>
+<button class="button button-primary js-isaac-command" data-command="render_current_view" data-scene-id="{{ scene.scene_id }}">
+  <span data-lang="en">Render</span><span data-lang="kr" class="hidden">렌더</span>
+  <span id="ws-render-mod-badge" style="font-size:0.65rem;opacity:0.75;margin-left:0.3rem;"></span>
+</button>
+<button class="button button-subtle js-smoke-render" data-scene-id="{{ scene.scene_id }}"><span data-lang="en">Smoke</span><span data-lang="kr" class="hidden">스모크</span></button>
+{% endif %}
+{% endblock topbar_actions_extra %}
+
 {% block content %}
   {% if scene %}
-    <section class="grid gap-4 xl:grid-cols-[1.35fr,1fr]">
-      <article class="panel">
-        <div class="panel-header">
-          <div>
-            <h2 class="section-title">Scene Inspector</h2>
-            <p class="muted text-sm">
-              {{ scene.scene_version or "scene" }} · {{ scene.capture_count }} capture bundle(s)
-            </p>
-          </div>
-          <div class="topbar-actions">
-            <button class="button button-subtle js-smoke-render" data-scene-id="{{ scene.scene_id }}">Smoke Render</button>
-            <a href="/api/scenes/{{ scene.scene_id }}/floorplan" class="button button-subtle">Floorplan JSON</a>
-          </div>
+    <section class="panel scene-workspace-panel">
+      <!-- 컴팩트 상태 스트립: topbar에서 내려온 정보를 세로 공간 없이 한 줄로 표시 -->
+      <div class="ws-status-strip">
+        <div class="ws-status-item">
+          <span class="ws-status-label"><span data-lang="en">Session</span><span data-lang="kr" class="hidden">세션</span></span>
+          <span class="ws-status-val" id="ws-session-status">-</span>
+          <span class="hidden" id="ws-session-subtitle"></span>
         </div>
-        {% if floorplan and floorplan.artifact_href %}
-          <div class="image-frame mt-4">
-            <img src="{{ floorplan.artifact_href }}" alt="Scene floorplan for {{ scene.scene_id }}">
-          </div>
-          <div class="muted text-xs mt-3">
-            Request cameras {{ floorplan.request_camera_count }} · Snapshot cameras {{ floorplan.snapshot_camera_count }} · Lights {{ floorplan.snapshot_light_count }}
-          </div>
-        {% else %}
-          <div class="empty-state mt-4">No floorplan available yet for this scene.</div>
-        {% endif %}
-      </article>
-
-      <article class="panel">
-        <div class="panel-header">
-          <div>
-            <h2 class="section-title">Latest Capture</h2>
-            <p class="muted text-sm">Most recent camera/modality bundle for this scene.</p>
-          </div>
+        <span class="ws-status-sep">·</span>
+        <div class="ws-status-item">
+          <span class="ws-status-label">USD</span>
+          <span class="ws-status-val mono" style="font-size:0.72rem;max-width:26ch;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" id="ws-usd-path" title="{{ scene.usd_stage_path or '' }}">{{ scene.usd_stage_path or "-" }}</span>
+          <span class="hidden" id="ws-render-ready">{% if scene.render_ready %}render-ready{% else %}open-only{% endif %}</span>
         </div>
-        {% if latest_capture %}
-          <div class="stack-sm mt-4">
-            <div class="subpanel capture-summary-card">
-              <div class="eyebrow">{{ latest_capture.timestamp }}</div>
-              <div class="scene-card-title mt-2">{{ latest_capture.camera_id }}</div>
-              <div class="muted text-sm mt-2">modalities {{ latest_capture.modalities|join(", ") }}</div>
-              <div class="muted text-xs mt-2">
-                manifest <a href="{{ latest_capture.manifest_href }}" class="link mono">{{ latest_capture.manifest_path }}</a>
-              </div>
-            </div>
-            <div class="kv-list metadata-grid">
-              <div><span>Sync group</span><span>{{ latest_capture.sensor_sync_group or "-" }}</span></div>
-              <div><span>Calibration</span><span>{{ latest_capture.calibration_ref or "-" }}</span></div>
-              <div><span>Scene ref</span><span class="mono text-xs">{{ latest_capture.scene_ref }}</span></div>
-            </div>
-          </div>
-        {% else %}
-          <div class="empty-state mt-4">No captures yet.</div>
-        {% endif %}
-      </article>
-    </section>
-
-    <section class="panel mt-6">
-      <div class="panel-header">
-        <div>
-          <h2 class="section-title">Result Explorer</h2>
-          <p class="muted text-sm">Capture bundles and modality thumbnails.</p>
+        <span class="ws-status-sep">·</span>
+        <div class="ws-status-item">
+          <span class="ws-status-label"><span data-lang="en">Cam</span><span data-lang="kr" class="hidden">카메라</span></span>
+          <span class="ws-status-val" id="ws-active-camera">-</span>
+          <span class="hidden" id="ws-active-camera-meta"></span>
+        </div>
+        <span class="ws-status-sep">·</span>
+        <div class="ws-status-item">
+          <span class="ws-status-label"><span data-lang="en">Sel</span><span data-lang="kr" class="hidden">선택</span></span>
+          <span class="ws-status-val" id="ws-selected-count">0</span>
+          <span class="hidden" id="ws-selected-label"></span>
         </div>
       </div>
-      {% if captures %}
-        <div class="stack-lg mt-4">
-          {% for capture in captures %}
-            <div class="subpanel capture-bundle-card">
-              <div class="flex items-center justify-between gap-3">
-                <div>
-                  <div class="eyebrow">{{ capture.timestamp }}</div>
-                  <div class="scene-card-title mt-2">{{ capture.camera_id }}</div>
-                </div>
-                <div class="badge badge-succeeded">{{ capture.modalities|length }} modalities</div>
-              </div>
-              <div class="thumb-grid mt-4">
-                {% for item in capture.preview_items %}
-                  <a href="{{ item.href }}" class="thumb-card">
-                    <div class="thumb-label">{{ item.modality }}</div>
-                    {% if item.href %}
-                      <img src="{{ item.href }}" alt="{{ item.modality }}">
-                    {% else %}
-                      <div class="thumb-empty">no preview</div>
-                    {% endif %}
-                  </a>
-                {% endfor %}
-              </div>
-              <div class="mt-4 flex flex-wrap gap-3">
-                <a href="{{ capture.manifest_href }}" class="button button-subtle">Manifest</a>
-                <a href="/api/scenes/{{ scene.scene_id }}/captures" class="button button-subtle">Captures API</a>
+
+      <div class="tab-bar mt-2">
+        <button class="tab active" data-tab="workspace"><span data-lang="en">Workspace</span><span data-lang="kr" class="hidden">작업공간</span></button>
+        <button class="tab" data-tab="render"><span data-lang="en">Render Status</span><span data-lang="kr" class="hidden">렌더 상태</span></button>
+        <button class="tab" data-tab="captures"><span data-lang="en">Capture History</span><span data-lang="kr" class="hidden">캡처 기록</span>{% if captures %}<span class="tab-badge">{{ captures|length }}</span>{% endif %}</button>
+        <button class="tab" data-tab="diagnostics"><span data-lang="en">Diagnostics</span><span data-lang="kr" class="hidden">진단</span>{% if not scene.render_ready %}<span class="tab-badge tab-badge-warn">!</span>{% endif %}</button>
+        <button class="tab" data-tab="materials"><span data-lang="en">Materials</span><span data-lang="kr" class="hidden">재질 라이브러리</span></button>
+      </div>
+
+      <div class="tab-panel" data-panel="workspace">
+        <div class="scene-health-chipbar">
+          <span class="health-chip health-chip-{{ 'ok' if scene.usd_stage_path else 'err' }}" title="{{ scene.usd_stage_path or 'Not registered' }}">
+            {{ '✅' if scene.usd_stage_path else '❌' }} USD
+          </span>
+          <span class="health-chip health-chip-{{ 'ok' if scene.mitsuba_scene_exists else 'warn' }}" title="{{ scene.mitsuba_scene_ref or 'Not found' }}">
+            {{ '✅' if scene.mitsuba_scene_exists else '⚠' }} XML
+          </span>
+          <span class="health-chip health-chip-{{ 'ok' if scene.shape_map_exists else 'warn' }}" title="{{ scene.shape_map_ref or 'Not found' }}">
+            {{ '✅' if scene.shape_map_exists else '⚠' }} Shape Map
+          </span>
+          <span class="health-chip health-chip-{{ 'ok' if scene.render_ready else 'warn' }}" title="{{ 'Render-ready' if scene.render_ready else 'Open-only mode' }}">
+            {{ '✅' if scene.render_ready else '⚠' }} <span data-lang="en">Render Ready</span><span data-lang="kr" class="hidden">렌더 준비</span>
+          </span>
+          <span class="health-chip health-chip-{{ 'ok' if scene.texture_cache_status == 'ready' else ('warn' if scene.texture_cache_status in ['caching', 'stale', 'missing'] else 'ok') }}" title="{{ scene.texture_cache_root or 'No local texture cache root yet' }}">
+            {% if scene.texture_cache_status == "ready" %}✅{% elif scene.texture_cache_status in ["caching", "stale"] %}⚠{% else %}ℹ{% endif %}
+            <span data-lang="en">Texture Cache {{ scene.texture_cache_status or "unknown" }}</span>
+            <span data-lang="kr" class="hidden">Texture Cache {{ scene.texture_cache_status or "unknown" }}</span>
+          </span>
+          {% if scene.source %}
+          <span class="health-chip health-chip-ok" title="Source: {{ scene.source }}">
+            ✅ <span data-lang="en">Registered</span><span data-lang="kr" class="hidden">등록됨</span>
+          </span>
+          {% endif %}
+        </div>
+        <div class="workspace-shell">
+          <aside class="workspace-pane workspace-tree-pane">
+            <div class="workspace-pane-head">
+              <div class="panel-label"><span data-lang="en">Live Object Tree</span><span data-lang="kr" class="hidden">현재 오브젝트 트리</span></div>
+              <div class="muted text-xs" id="ws-tree-status">
+                <span data-lang="en">Waiting for Isaac session…</span>
+                <span data-lang="kr" class="hidden">Isaac session 대기 중…</span>
               </div>
             </div>
-          {% endfor %}
+            <div class="workspace-tree-toolbar">
+              <input id="workspace-tree-search" class="search-input" data-placeholder-en="Filter objects…" data-placeholder-kr="오브젝트 필터…" placeholder="Filter objects…">
+            </div>
+            <div class="obj-filter-bar filter-chips" id="obj-filter-chips">
+              <button class="filter-chip active" data-obj-filter="all"><span data-lang="en">All</span><span data-lang="kr" class="hidden">전체</span></button>
+              <button class="filter-chip" data-obj-filter="modified">M</button>
+              <button class="filter-chip" data-obj-filter="hidden">H</button>
+              <button class="filter-chip" data-obj-filter="override"><span data-lang="en">Override</span><span data-lang="kr" class="hidden">재질 적용</span></button>
+            </div>
+            <div id="workspace-tree-body" class="workspace-tree-body" role="tree">
+              <div class="empty-state">
+                <span data-lang="en">Load or connect a live Isaac session to see the current stage tree.</span>
+                <span data-lang="kr" class="hidden">현재 stage 트리를 보려면 live Isaac session을 불러오거나 연결하세요.</span>
+              </div>
+            </div>
+          </aside>
+
+          <section class="workspace-pane workspace-map-pane">
+            <div class="workspace-pane-head">
+              <div>
+                <div class="panel-label"><span data-lang="en">Current Scene Map</span><span data-lang="kr" class="hidden">현재 장면 맵</span></div>
+                <div class="muted text-xs" id="workspace-floorplan-status">
+                  <span data-lang="en">Preparing floorplan…</span>
+                  <span data-lang="kr" class="hidden">도면 준비 중…</span>
+                </div>
+              </div>
+              <div class="muted text-xs" id="workspace-floorplan-meta"></div>
+            </div>
+            <div id="workspace-map-frame" class="workspace-map-frame">
+              <div id="workspace-map-layer" class="workspace-map-layer">
+                <img id="workspace-map-img" src="" alt="Scene floorplan" style="display:none;">
+                <canvas id="workspace-map-canvas"></canvas>
+              </div>
+              <div id="workspace-map-empty" class="empty-state workspace-map-empty">
+                <span data-lang="en">No floorplan yet. The live object tree and materials can still be edited.</span>
+                <span data-lang="kr" class="hidden">아직 도면이 없더라도 현재 오브젝트와 재질은 계속 편집할 수 있습니다.</span>
+              </div>
+            </div>
+            <div class="workspace-map-footer">
+              <div id="workspace-map-hint" class="muted text-xs">
+                <span data-lang="en">Drag to pan, wheel to zoom, click to select the nearest object.</span>
+                <span data-lang="kr" class="hidden">드래그로 이동, 휠로 확대/축소, 클릭으로 가장 가까운 오브젝트를 선택합니다.</span>
+              </div>
+              <div class="workspace-map-footer-actions">
+                <button type="button" class="button button-subtle" id="workspace-copy-debug">
+                  <span data-lang="en">Copy Debug</span><span data-lang="kr" class="hidden">디버그 복사</span>
+                </button>
+                <a href="/api/scenes/{{ scene.scene_id }}/floorplan" class="button button-subtle">
+                  <span data-lang="en">Floorplan JSON</span><span data-lang="kr" class="hidden">도면 JSON</span>
+                </a>
+              </div>
+            </div>
+            <div class="workspace-map-debug" id="workspace-map-debug">
+              <div class="workspace-map-debug-head">
+                <span data-lang="en">Coordinate Debug</span><span data-lang="kr" class="hidden">좌표 디버그</span>
+              </div>
+              <div class="workspace-map-debug-grid">
+                <div class="workspace-map-debug-item">
+                  <span class="workspace-map-debug-label"><span data-lang="en">Hover Canvas</span><span data-lang="kr" class="hidden">호버 캔버스</span></span>
+                  <span class="workspace-map-debug-value mono" id="workspace-debug-hover-canvas">-</span>
+                </div>
+                <div class="workspace-map-debug-item">
+                  <span class="workspace-map-debug-label"><span data-lang="en">Hover World XZ</span><span data-lang="kr" class="hidden">호버 월드 XZ</span></span>
+                  <span class="workspace-map-debug-value mono" id="workspace-debug-hover-world">-</span>
+                </div>
+                <div class="workspace-map-debug-item">
+                  <span class="workspace-map-debug-label"><span data-lang="en">Last Click Canvas</span><span data-lang="kr" class="hidden">마지막 클릭 캔버스</span></span>
+                  <span class="workspace-map-debug-value mono" id="workspace-debug-click-canvas">-</span>
+                </div>
+                <div class="workspace-map-debug-item">
+                  <span class="workspace-map-debug-label"><span data-lang="en">Last Click World XZ</span><span data-lang="kr" class="hidden">마지막 클릭 월드 XZ</span></span>
+                  <span class="workspace-map-debug-value mono" id="workspace-debug-click-world">-</span>
+                </div>
+                <div class="workspace-map-debug-item">
+                  <span class="workspace-map-debug-label"><span data-lang="en">Viewport Origin XYZ</span><span data-lang="kr" class="hidden">뷰포트 Origin XYZ</span></span>
+                  <span class="workspace-map-debug-value mono" id="workspace-debug-camera-origin">-</span>
+                </div>
+                <div class="workspace-map-debug-item">
+                  <span class="workspace-map-debug-label"><span data-lang="en">Viewport Target XYZ</span><span data-lang="kr" class="hidden">뷰포트 Target XYZ</span></span>
+                  <span class="workspace-map-debug-value mono" id="workspace-debug-camera-target">-</span>
+                </div>
+                <div class="workspace-map-debug-item">
+                  <span class="workspace-map-debug-label"><span data-lang="en">Render Origin XYZ</span><span data-lang="kr" class="hidden">렌더 Origin XYZ</span></span>
+                  <span class="workspace-map-debug-value mono" id="workspace-debug-render-origin">-</span>
+                </div>
+                <div class="workspace-map-debug-item">
+                  <span class="workspace-map-debug-label"><span data-lang="en">Render Target XYZ</span><span data-lang="kr" class="hidden">렌더 Target XYZ</span></span>
+                  <span class="workspace-map-debug-value mono" id="workspace-debug-render-target">-</span>
+                </div>
+                <div class="workspace-map-debug-item">
+                  <span class="workspace-map-debug-label"><span data-lang="en">Selected Object XYZ</span><span data-lang="kr" class="hidden">선택 오브젝트 XYZ</span></span>
+                  <span class="workspace-map-debug-value mono" id="workspace-debug-object-world">-</span>
+                </div>
+                <div class="workspace-map-debug-item">
+                  <span class="workspace-map-debug-label"><span data-lang="en">Selected Object Map XZ</span><span data-lang="kr" class="hidden">선택 오브젝트 맵 XZ</span></span>
+                  <span class="workspace-map-debug-value mono" id="workspace-debug-object-map">-</span>
+                </div>
+                <div class="workspace-map-debug-item workspace-map-debug-item-wide">
+                  <span class="workspace-map-debug-label"><span data-lang="en">Floorplan Bounds</span><span data-lang="kr" class="hidden">도면 Bounds</span></span>
+                  <span class="workspace-map-debug-value mono" id="workspace-debug-bounds">-</span>
+                </div>
+                <div class="workspace-map-debug-item workspace-map-debug-item-wide">
+                  <span class="workspace-map-debug-label"><span data-lang="en">Projection</span><span data-lang="kr" class="hidden">투영 정보</span></span>
+                  <span class="workspace-map-debug-value mono" id="workspace-debug-projection">-</span>
+                </div>
+                <div class="workspace-map-debug-item workspace-map-debug-item-wide">
+                  <span class="workspace-map-debug-label"><span data-lang="en">Assumption</span><span data-lang="kr" class="hidden">가정</span></span>
+                  <span class="workspace-map-debug-value" id="workspace-debug-assumption">Top-down XZ projection (Y-up assumption).</span>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <aside class="workspace-pane workspace-detail-pane">
+            <section class="workspace-robot-panel">
+              <div class="workspace-pane-head workspace-robot-head">
+                <div class="panel-label"><span data-lang="en">Live Robots</span><span data-lang="kr" class="hidden">실행 중인 로봇</span></div>
+                <div class="muted text-xs" id="workspace-robot-status">
+                  <span data-lang="en">Waiting for robot entities…</span>
+                  <span data-lang="kr" class="hidden">로봇 엔티티 대기 중…</span>
+                </div>
+              </div>
+              <div id="workspace-robot-list" class="workspace-robot-list">
+                <div class="empty-state">
+                  <span data-lang="en">Spawned robots will appear here and on the center map.</span>
+                  <span data-lang="kr" class="hidden">스폰된 로봇은 여기와 중앙 맵에 함께 표시됩니다.</span>
+                </div>
+              </div>
+            </section>
+            <!-- 빈 상태 -->
+            <div id="workspace-detail-empty" class="ws-detail-empty">
+              <div class="empty-state">
+                <span data-lang="en">Select an object from the tree or map to inspect and edit it.</span>
+                <span data-lang="kr" class="hidden">트리나 맵에서 오브젝트를 선택하면 상세 정보와 재질 편집기가 열립니다.</span>
+              </div>
+            </div>
+
+            <!-- 선택 상태 — 3분할: 요약 / 뷰 토글 / 재질 -->
+            <div id="workspace-detail-content" class="ws-detail-content hidden">
+
+              <!-- 상단: 선택 오브젝트 요약 (항상 표시) -->
+              <div class="ws-obj-summary">
+                <div id="workspace-detail-name" class="ws-obj-name">—</div>
+                <div id="workspace-detail-path" class="ws-obj-path">—</div>
+                <div id="workspace-detail-badges" class="ws-obj-badges">
+                  <!-- kind + visible + override 배지 (JS가 채움) -->
+                </div>
+                <!-- 숨겨진 호환용 stat IDs -->
+                <span id="workspace-stat-shapes" class="hidden">0</span>
+                <span id="workspace-stat-visible" class="hidden">-</span>
+                <span id="workspace-stat-in-view" class="hidden">-</span>
+                <span id="workspace-current-material-label" class="hidden">-</span>
+                <span id="workspace-current-material-hint" class="hidden"></span>
+              </div>
+
+              <!-- 중단: 위치 / 렌더 프리뷰 토글 -->
+              <div class="ws-view-seg" id="ws-view-seg">
+                <button class="seg-btn active" data-view="map">
+                  <span data-lang="en">Map</span><span data-lang="kr" class="hidden">위치</span>
+                </button>
+                <button class="seg-btn" data-view="preview">
+                  <span data-lang="en">Preview</span><span data-lang="kr" class="hidden">렌더 프리뷰</span>
+                </button>
+              </div>
+              <div class="ws-view-panel" id="ws-view-map">
+                <div class="muted text-xs" style="padding:0.25rem 0;">
+                  <span data-lang="en">Selected object is highlighted on the center map.</span>
+                  <span data-lang="kr" class="hidden">선택된 오브젝트가 중앙 맵에 강조 표시됩니다.</span>
+                </div>
+                <div id="ws-map-relation" class="muted text-xs mt-1"></div>
+              </div>
+              <div class="ws-view-panel hidden" id="ws-view-preview">
+                <div id="ws-preview-img-wrap" class="hidden">
+                  <img id="ws-preview-img" src="" alt="Render preview" style="width:100%;border-radius:0.5rem;display:block;">
+                </div>
+                <div id="ws-preview-empty" class="muted text-xs">
+                  <span data-lang="en">No render preview yet.</span>
+                  <span data-lang="kr" class="hidden">아직 렌더 프리뷰가 없습니다.</span>
+                </div>
+                <button class="button button-subtle mt-2" id="ws-preview-trigger" style="width:100%;">
+                  <span data-lang="en">Smoke Render</span><span data-lang="kr" class="hidden">스모크 렌더</span>
+                </button>
+                <div id="ws-preview-status" class="muted text-xs mt-1"></div>
+              </div>
+
+              <!-- 하단: 재질 편집 -->
+              <div class="ws-material-section">
+                <div class="panel-label" style="padding:0.4rem 0 0.3rem;">
+                  <span data-lang="en">Material</span><span data-lang="kr" class="hidden">재질</span>
+                </div>
+                <div class="ws-material-toolbar">
+                  <input id="workspace-material-search" class="search-input" placeholder="Search presets…" data-placeholder-en="Search presets…" data-placeholder-kr="재질 검색…">
+                  <div class="filter-chips mt-2" id="ws-mat-filter-chips">
+                    <button class="filter-chip active" data-mat-filter="all"><span data-lang="en">All</span><span data-lang="kr" class="hidden">전체</span></button>
+                    <button class="filter-chip" data-mat-filter="glass"><span data-lang="en">Glass</span><span data-lang="kr" class="hidden">유리</span></button>
+                    <button class="filter-chip" data-mat-filter="metal"><span data-lang="en">Metal</span><span data-lang="kr" class="hidden">금속</span></button>
+                    <button class="filter-chip" data-mat-filter="plastic"><span data-lang="en">Plastic</span><span data-lang="kr" class="hidden">플라스틱</span></button>
+                    <button class="filter-chip" data-mat-filter="paint"><span data-lang="en">Paint</span><span data-lang="kr" class="hidden">페인트</span></button>
+                  </div>
+                </div>
+                <div class="material-browser-grid workspace-material-grid" id="workspace-material-grid" style="margin-top:0.6rem;">
+                  {% for preset in material_presets %}
+                    <article
+                      class="material-card material-card-clickable"
+                      data-bsdf-type="{{ preset.bsdf_type }}"
+                      data-category="{{ preset.category }}"
+                      data-title-en="{{ preset.title_en|lower }}"
+                      data-title-kr="{{ preset.title_kr|lower }}"
+                      data-tooltip-title-en="{{ preset.title_en }}"
+                      data-tooltip-title-kr="{{ preset.title_kr }}"
+                      data-tooltip-desc-en="{{ preset.description_en }}"
+                      data-tooltip-desc-kr="{{ preset.description_kr }}"
+                      tabindex="0"
+                    >
+                      <div class="material-card-head">
+                        <div class="material-sphere {{ preset.swatch }}"></div>
+                        <div>
+                          <div class="material-card-title"><span data-lang="en">{{ preset.title_en }}</span><span data-lang="kr" class="hidden">{{ preset.title_kr }}</span></div>
+                          <div class="material-card-meta">{{ preset.category }}</div>
+                        </div>
+                      </div>
+                    </article>
+                  {% endfor %}
+                </div>
+                <!-- Material sphere tooltip -->
+                <div id="mat-sphere-tooltip" class="hidden" aria-hidden="true">
+                  <div class="mat-tooltip-title" id="mat-tip-title"></div>
+                  <div class="mat-tooltip-category" id="mat-tip-category"></div>
+                  <div class="mat-tooltip-bsdf" id="mat-tip-bsdf"></div>
+                  <div class="mat-tooltip-desc" id="mat-tip-desc"></div>
+                </div>
+                <button class="ws-mat-more hidden" id="ws-mat-more">
+                  <span data-lang="en">More presets ↓</span><span data-lang="kr" class="hidden">더 보기 ↓</span>
+                </button>
+              </div>
+
+              <!-- Apply bar removed: 클릭 즉시 적용 방식 -->
+            </div>
+          </aside>
         </div>
-      {% else %}
-        <div class="empty-state mt-4">No observation captures are available for this scene.</div>
-      {% endif %}
+      </div>
+
+      <div class="tab-panel hidden" data-panel="render">
+        <!-- Render Options -->
+        <div class="subpanel render-options-panel" id="render-options-panel">
+          <div class="render-options-header">
+            <span class="panel-label"><span data-lang="en">Render Options</span><span data-lang="kr" class="hidden">렌더 옵션</span></span>
+            <button class="button button-subtle" id="render-options-save" style="font-size:0.72rem;padding:0.25rem 0.65rem;">
+              <span data-lang="en">Save</span><span data-lang="kr" class="hidden">저장</span>
+            </button>
+          </div>
+          <div class="render-mod-groups">
+            <!-- Core -->
+            <div class="render-mod-group">
+              <div class="render-mod-group-label"><span data-lang="en">Core</span><span data-lang="kr" class="hidden">기본</span></div>
+              <div class="render-mod-checkgrid">
+                <label class="mod-check"><input type="checkbox" value="rgb"> rgb</label>
+                <label class="mod-check"><input type="checkbox" value="depth"> depth</label>
+                <label class="mod-check"><input type="checkbox" value="albedo"> albedo</label>
+                <label class="mod-check"><input type="checkbox" value="sensor_depth_approx"> sensor depth</label>
+              </div>
+            </div>
+            <!-- Decomposition -->
+            <div class="render-mod-group">
+              <div class="render-mod-group-label"><span data-lang="en">Decomposition</span><span data-lang="kr" class="hidden">분해</span></div>
+              <div class="render-mod-checkgrid">
+                <label class="mod-check"><input type="checkbox" value="direct_light_map"> direct light</label>
+                <label class="mod-check"><input type="checkbox" value="indirect_light_map"> indirect light</label>
+                <label class="mod-check"><input type="checkbox" value="diffuse_map"> diffuse</label>
+                <label class="mod-check"><input type="checkbox" value="specular_map"> specular</label>
+              </div>
+            </div>
+            <!-- Polarization -->
+            <div class="render-mod-group">
+              <div class="render-mod-group-label"><span data-lang="en">Polarization</span><span data-lang="kr" class="hidden">편광</span></div>
+              <div class="render-mod-group-note muted" style="font-size:0.7rem;margin-bottom:0.3rem;">polarized_cuda_mono variant 필요</div>
+              <div class="render-mod-checkgrid">
+                <label class="mod-check"><input type="checkbox" value="polar_rgb_preview"> preview</label>
+                <label class="mod-check"><input type="checkbox" value="dop"> DoP</label>
+                <label class="mod-check"><input type="checkbox" value="aolp"> AoLP</label>
+                <label class="mod-check"><input type="checkbox" value="s1"> S1</label>
+                <label class="mod-check"><input type="checkbox" value="s2"> S2</label>
+              </div>
+            </div>
+            <!-- NIR -->
+            <div class="render-mod-group">
+              <div class="render-mod-group-label">Active NIR</div>
+              <div class="render-mod-checkgrid">
+                <label class="mod-check"><input type="checkbox" value="active_nir_intensity"> NIR intensity</label>
+              </div>
+            </div>
+          </div>
+          <div class="render-options-row mt-3">
+            <span class="render-options-label">SPP</span>
+            <input type="number" id="render-spp-input" value="64" min="1" max="4096" class="render-spp-input">
+          </div>
+          <div class="render-options-row mt-2">
+            <span class="render-options-label">해상도</span>
+            <div class="render-res-inputs">
+              <input type="number" id="render-width-input" value="1280" min="64" max="4096" step="64" class="render-spp-input" placeholder="W">
+              <span class="render-res-sep">×</span>
+              <input type="number" id="render-height-input" value="720" min="64" max="4096" step="64" class="render-spp-input" placeholder="H">
+            </div>
+            <div class="render-res-presets">
+              <button class="render-res-preset" data-w="640" data-h="480">SD</button>
+              <button class="render-res-preset" data-w="1280" data-h="720">HD</button>
+              <button class="render-res-preset" data-w="1920" data-h="1080">FHD</button>
+            </div>
+          </div>
+          <div class="render-options-row mt-2">
+            <span class="render-options-label">업스케일</span>
+            <select id="render-upscale-select" class="cap-select">
+              <option value="none">None</option>
+              <option value="2x_esrgan">2× Real-ESRGAN</option>
+              <option value="4x_esrgan">4× Real-ESRGAN</option>
+              <option value="2x_bicubic">2× Bicubic (빠름)</option>
+            </select>
+            <span class="muted" style="font-size:0.68rem;" id="render-effective-res"></span>
+          </div>
+        </div>
+
+        <div class="render-status-layout">
+          <!-- 좌: 현재 활성 렌더 (라이브 폴링) -->
+          <div class="render-active-panel">
+            <div class="render-active-header">
+              <span class="render-live-dot" id="render-live-dot"></span>
+              <span class="render-active-title" id="render-active-title">
+                <span data-lang="en">No active render</span><span data-lang="kr" class="hidden">진행 중인 렌더 없음</span>
+              </span>
+              <span class="render-active-elapsed" id="render-active-elapsed"></span>
+            </div>
+            <div id="render-active-state" class="render-active-state">
+              <div class="empty-state text-sm">
+                <span data-lang="en">Trigger Render or Smoke Render to start.</span>
+                <span data-lang="kr" class="hidden">Render 또는 Smoke Render로 렌더를 시작하세요.</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- 우: 최근 렌더 작업 타임라인 (작업항목 링크 포함) -->
+          <div>
+            <div class="render-timeline-header">
+              <span class="panel-label"><span data-lang="en">Recent Jobs</span><span data-lang="kr" class="hidden">최근 작업</span></span>
+              <a href="/jobs" class="button button-subtle" style="font-size:0.72rem;padding:0.25rem 0.65rem;">
+                <span data-lang="en">All Jobs →</span><span data-lang="kr" class="hidden">전체 작업 →</span>
+              </a>
+            </div>
+            <div id="render-timeline" class="render-job-list">
+              <div class="empty-state text-sm">
+                <span data-lang="en">Recent render events will appear here.</span>
+                <span data-lang="kr" class="hidden">최근 렌더 이벤트가 여기에 표시됩니다.</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="tab-panel hidden" data-panel="captures">
+        {# ── 메인 row: 지도(좌) + 갤러리(우) ── #}
+        <div class="cap-main-row" id="cap-main-row" data-vm="gallery">
+
+          {# 좌: 캡처 위치 맵 #}
+          <section class="cap-map-left" id="capture-map-panel">
+            <div class="workspace-pane-head" style="margin-bottom:0.4rem;">
+              <div>
+                <div class="panel-label"><span data-lang="en">Capture Map</span><span data-lang="kr" class="hidden">캡처 위치 맵</span></div>
+                <div class="muted text-xs" id="capture-map-status">
+                  <span data-lang="en">Click a card to show its position.</span>
+                  <span data-lang="kr" class="hidden">캡처 카드를 선택하면 촬영 위치를 지도에 표시합니다.</span>
+                </div>
+              </div>
+              <div class="muted text-xs" id="capture-map-meta"></div>
+            </div>
+            <div id="capture-map-frame" class="workspace-map-frame capture-map-frame cap-map-frame-stretch">
+              <img id="capture-map-img" src="" alt="Capture floorplan" style="display:none;">
+              <canvas id="capture-map-canvas"></canvas>
+              <div id="capture-map-empty" class="empty-state workspace-map-empty">
+                <span data-lang="en">No floorplan yet.</span>
+                <span data-lang="kr" class="hidden">아직 도면 정보가 없습니다.</span>
+              </div>
+            </div>
+          </section>
+
+          {# 우: 툴바 + 갤러리 + 드로어 #}
+          <div class="cap-gallery-side">
+
+            {# 툴바 #}
+            <div class="cap-toolbar" id="cap-toolbar">
+              <div class="cap-filter-group">
+                <span class="cap-filter-label"><span data-lang="en">Preview</span><span data-lang="kr" class="hidden">미리보기</span></span>
+                <select id="cap-repr-select" class="cap-select">
+                  <option value="auto">Auto</option>
+                  <option value="rgb">RGB</option>
+                  <option value="depth">Depth</option>
+                  <option value="polar_rgb_preview">Polar</option>
+                </select>
+              </div>
+              <div class="cap-filter-group">
+                <span class="cap-filter-label"><span data-lang="en">Modality</span><span data-lang="kr" class="hidden">모달리티</span></span>
+                <select id="cap-mod-filter" class="cap-select">
+                  <option value="">All</option>
+                  <option value="rgb">RGB</option>
+                  <option value="depth">Depth</option>
+                  <option value="dop">DoP</option>
+                  <option value="aolp">AoLP</option>
+                </select>
+              </div>
+              <div class="cap-filter-group">
+                <span class="cap-filter-label"><span data-lang="en">Status</span><span data-lang="kr" class="hidden">상태</span></span>
+                <select id="cap-status-filter" class="cap-select">
+                  <option value="">All</option>
+                  <option value="completed">Completed</option>
+                  <option value="failed">Failed</option>
+                </select>
+              </div>
+              <div style="flex:1"></div>
+              <div class="cap-viewmode-btns" id="cap-viewmode-btns">
+                <button class="cap-vm-btn is-active" data-vm="gallery" title="Gallery">⊞</button>
+                <button class="cap-vm-btn" data-vm="split" title="Split">⊟</button>
+                <button class="cap-vm-btn" data-vm="mapfocus" title="Map Focus">🗺</button>
+              </div>
+            </div>
+
+            {# 갤러리 + 드로어 #}
+            <div class="cap-shell" id="cap-shell">
+              <div class="cap-gallery-area" id="cap-gallery-area">
+                <div id="capture-live-list" class="capture-live-list hidden"></div>
+                <div class="cap-grid" id="capture-history-grid"></div>
+                <div id="capture-history-empty" class="empty-state-illustrated mt-4 hidden">
+                  <div class="empty-icon">📷</div>
+                  <div class="empty-title"><span data-lang="en">No captures yet</span><span data-lang="kr" class="hidden">캡처 기록 없음</span></div>
+                  <div class="empty-desc"><span data-lang="en">Use Smoke Render or Render Current View to create captures.</span><span data-lang="kr" class="hidden">스모크 렌더 또는 Render Current View로 캡처를 생성하세요.</span></div>
+                </div>
+              </div>
+
+              {# 드로어 #}
+              <aside class="cap-drawer" id="cap-drawer">
+                <div class="cap-drawer-header">
+                  <span class="panel-label" id="cap-drawer-title">—</span>
+                  <button class="icon-btn" id="cap-drawer-close" title="Close" style="font-size:0.9rem;padding:0.2rem 0.4rem;">✕</button>
+                </div>
+                <div class="cap-drawer-main-img-wrap">
+                  <img id="cap-drawer-main-img" src="" alt="" class="cap-drawer-main-img">
+                </div>
+                <div class="cap-drawer-chips" id="cap-drawer-chips"></div>
+                <div class="cap-drawer-matrix" id="cap-drawer-matrix"></div>
+                <dl class="cap-drawer-meta" id="cap-drawer-meta"></dl>
+                <div class="cap-drawer-actions" id="cap-drawer-actions"></div>
+              </aside>
+            </div>
+
+          </div>{# /cap-gallery-side #}
+        </div>{# /cap-main-row #}
+      </div>
+
+      <div class="tab-panel hidden mt-4" data-panel="diagnostics">
+        <div class="grid gap-4 lg:grid-cols-[1.1fr,1fr]">
+          <div class="scene-health-panel">
+            <div class="scene-health-label"><span data-lang="en">Readiness</span><span data-lang="kr" class="hidden">준비 상태</span></div>
+            <div class="mt-3 stack-xs">
+              <div class="scene-health-item {% if scene.usd_stage_path %}scene-health-ok{% else %}scene-health-err{% endif %}">
+                <span>{% if scene.usd_stage_path %}✅{% else %}❌{% endif %}</span>
+                <span class="scene-health-item-label"><span data-lang="en">USD stage path registered</span><span data-lang="kr" class="hidden">USD stage 경로 등록됨</span></span>
+              </div>
+              <div class="scene-health-item {% if scene.mitsuba_scene_exists %}scene-health-ok{% else %}scene-health-warn{% endif %}">
+                <span>{% if scene.mitsuba_scene_exists %}✅{% else %}⚠{% endif %}</span>
+                <span class="scene-health-item-label"><span data-lang="en">Mitsuba XML found</span><span data-lang="kr" class="hidden">Mitsuba XML 존재</span></span>
+              </div>
+              <div class="scene-health-item {% if scene.shape_map_exists %}scene-health-ok{% else %}scene-health-warn{% endif %}">
+                <span>{% if scene.shape_map_exists %}✅{% else %}⚠{% endif %}</span>
+                <span class="scene-health-item-label"><span data-lang="en">Shape map found</span><span data-lang="kr" class="hidden">Shape map 존재</span></span>
+              </div>
+            </div>
+            <div class="scene-health-hint mt-3">
+              <span data-lang="en">{{ scene.advisory_en }}</span>
+              <span data-lang="kr" class="hidden">{{ scene.advisory_kr }}</span>
+            </div>
+          </div>
+          <div class="subpanel">
+            <div class="panel-label"><span data-lang="en">Load Preparation</span><span data-lang="kr" class="hidden">로딩 준비 정보</span></div>
+            <div class="kv-list mt-3">
+              <div><span><span data-lang="en">Load Tier</span><span data-lang="kr" class="hidden">로딩 등급</span></span><span>{{ scene.size_tier or "-" }}</span></div>
+              <div><span><span data-lang="en">USD Size</span><span data-lang="kr" class="hidden">USD 크기</span></span><span>{{ scene.stage_size_label or "-" }}</span></div>
+              <div><span><span data-lang="en">Asset Root Size</span><span data-lang="kr" class="hidden">에셋 루트 크기</span></span><span>{{ scene.asset_root_size_label or "-" }}</span></div>
+              <div><span><span data-lang="en">Asset File Count</span><span data-lang="kr" class="hidden">에셋 파일 수</span></span><span>{{ scene.asset_file_count or 0 }}</span></div>
+              <div><span><span data-lang="en">Stage Path</span><span data-lang="kr" class="hidden">Stage 경로</span></span><span class="mono text-xs">{{ scene.stage_path_local or "-" }}</span></div>
+              <div><span><span data-lang="en">Texture Cache</span><span data-lang="kr" class="hidden">Texture Cache</span></span><span>{{ scene.texture_cache_status or "-" }}</span></div>
+              <div><span><span data-lang="en">Cache Root</span><span data-lang="kr" class="hidden">캐시 루트</span></span><span class="mono text-xs">{{ scene.texture_cache_root or "-" }}</span></div>
+              <div><span><span data-lang="en">Cache Size</span><span data-lang="kr" class="hidden">캐시 크기</span></span><span>{{ scene.texture_cache_bytes or "-" }}</span></div>
+              <div><span><span data-lang="en">Cached Files</span><span data-lang="kr" class="hidden">캐시 파일 수</span></span><span>{{ scene.texture_cache_file_count or 0 }}</span></div>
+              <div><span><span data-lang="en">Last Synced</span><span data-lang="kr" class="hidden">마지막 동기화</span></span><span>{{ scene.texture_cache_last_synced_at or "-" }}</span></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ══════════════════════════════════════════════════════
+           Materials Tab — Measured BRDF Library (논문 출처별 그룹)
+           ══════════════════════════════════════════════════════ -->
+      <div class="tab-panel hidden mt-4" data-panel="materials">
+
+        <!-- Search + filter bar -->
+        <div class="mat-lib-toolbar">
+          <input id="mat-search" type="text" class="mat-search" placeholder="Search materials…" oninput="filterMaterials()">
+          <button class="mat-filter-btn active" data-lib-filter="all" onclick="setMatFilter('all',this)">
+            <span data-lang="en">All</span><span data-lang="kr" class="hidden">전체</span>
+          </button>
+          <button class="mat-filter-btn" data-lib-filter="polarized" onclick="setMatFilter('polarized',this)">
+            ● <span data-lang="en">Polarized</span><span data-lang="kr" class="hidden">편광</span>
+          </button>
+          <button class="mat-filter-btn" data-lib-filter="nir" onclick="setMatFilter('nir',this)">
+            ● <span data-lang="en">NIR</span>
+          </button>
+          <button class="mat-filter-btn" data-lib-filter="available" onclick="setMatFilter('available',this)">
+            <span data-lang="en">Downloaded</span><span data-lang="kr" class="hidden">다운로드됨</span>
+          </button>
+        </div>
+
+        <!-- Selected object hint -->
+        <div id="mat-selected-hint" class="muted text-xs mb-3" style="min-height:1.2em"></div>
+
+        <!-- Groups container — filled by JS -->
+        <div id="material-library-root"></div>
+
+      </div>
+      <!-- /Materials Tab -->
+
     </section>
   {% else %}
     <section class="panel">
-      <div class="empty-state">Unknown scene.</div>
+      <div class="empty-state"><span data-lang="en">Unknown scene.</span><span data-lang="kr" class="hidden">알 수 없는 scene입니다.</span></div>
     </section>
   {% endif %}
+
+  <div id="capture-preview-modal" class="capture-preview-modal hidden" aria-hidden="true">
+    <div class="capture-preview-backdrop" data-capture-modal-close></div>
+    <div class="capture-preview-dialog" role="dialog" aria-modal="true" aria-labelledby="capture-preview-title">
+      <div class="capture-preview-head">
+        <div>
+          <div id="capture-preview-title" class="capture-preview-title">Capture Preview</div>
+          <div id="capture-preview-meta" class="capture-preview-meta"></div>
+        </div>
+        <button type="button" class="button button-subtle capture-preview-close" data-capture-modal-close>
+          <span data-lang="en">Close</span><span data-lang="kr" class="hidden">닫기</span>
+        </button>
+      </div>
+      <div class="capture-preview-body">
+        <img id="capture-preview-image" class="capture-preview-image" src="" alt="Capture preview">
+      </div>
+    </div>
+  </div>
+
+  <script>
+    (() => {
+      const selectedSceneId = {{ scene.scene_id|tojson if scene else "null" }};
+      if (!selectedSceneId) return;
+
+      let _session = null;
+      let _inventory = [];
+      let _inventoryByPath = new Map();
+      let _selectedPath = null;
+      window.getSelectedPrimPath = () => _selectedPath;
+      let _collapsed = new Set();
+      let _floorplan = null;
+      let _pollTimer = null;
+      let _renderTimer = null;
+      let _treeSeeded = false;
+      let _sessionWasActive = false;
+      let _lastViewportSignature = null;
+      let _mapView = {
+        scale: 1,
+        tx: 0,
+        ty: 0,
+        dragging: false,
+        moved: false,
+        startX: 0,
+        startY: 0,
+        startTx: 0,
+        startTy: 0,
+      };
+      let _mapDebug = {
+        hoverCanvas: null,
+        hoverWorldXZ: null,
+        clickCanvas: null,
+        clickWorldXZ: null,
+      };
+      let _matFilter = "all";
+      let _matSearch = "";
+      let _matSelected = null;
+      let _objFilter = "all";
+      let _activeRenderRequestOverlay = null;
+      let _activeRenderRequestKey = null;
+      const _initialCaptures = {{ captures|tojson if captures else "[]" }};
+      let _captureRecords = Array.isArray(_initialCaptures) ? _initialCaptures : [];
+      let _liveCaptureEntries = [];
+      let _selectedCaptureKey = _captureRecords.length
+        ? `${_captureRecords[0].job_id}:${_captureRecords[0].frame_id}:${_captureRecords[0].camera_id}`
+        : null;
+      let _capturePreviewState = { href: "", modality: "", camera: "", timestamp: "" };
+      let _captureViewMode = "gallery"; // 'gallery' | 'split' | 'mapfocus'
+      const MAT_PAGE_SIZE = 6;
+      let _matPageExpanded = false;
+      let _lastSessionJson = "";
+      let _lastViewportJson = "";
+
+      function lang() {
+        return document.documentElement.dataset.lang === "kr" ? "kr" : "en";
+      }
+
+      function esc(value) {
+        return String(value || "")
+          .replace(/&/g, "&amp;")
+          .replace(/</g, "&lt;")
+          .replace(/>/g, "&gt;")
+          .replace(/"/g, "&quot;");
+      }
+
+      function currentNode() {
+        return _selectedPath ? _inventoryByPath.get(_selectedPath) || null : null;
+      }
+
+      function objectWorldXYZ(node) {
+        if (!node || !Array.isArray(node.transform) || node.transform.length !== 16) return null;
+        return [
+          Number(node.transform[12] || 0),
+          Number(node.transform[13] || 0),
+          Number(node.transform[14] || 0),
+        ];
+      }
+
+      function objectWorldXZ(node) {
+        const xyz = objectWorldXYZ(node);
+        return xyz ? [xyz[0], xyz[2]] : null;
+      }
+
+      function formatVec(values, digits = 2) {
+        if (!Array.isArray(values) || !values.length) return "-";
+        return values.map((value) => Number(value).toFixed(digits)).join(", ");
+      }
+
+      function captureRecordKey(record) {
+        if (!record) return null;
+        if (record.capture_key) return String(record.capture_key);
+        if (record.command_id) return `live:${record.command_id}`;
+        return `${record.job_id || "job"}:${record.frame_id || "frame"}:${record.camera_id || "camera"}`;
+      }
+
+      function payloadHeaders() {
+        return { "Content-Type": "application/json" };
+      }
+
+      async function queueIsaacCommand(sceneId, commandType, payload) {
+        const res = await fetch("/api/isaac/commands", {
+          method: "POST",
+          headers: payloadHeaders(),
+          body: JSON.stringify({ scene_id: sceneId, command_type: commandType, payload: payload || {} }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.error || "Failed to queue Isaac command.");
+        return data;
+      }
+
+      async function updateSelection(paths) {
+        try {
+          await fetch("/isaac/session/update_selection", {
+            method: "POST",
+            headers: payloadHeaders(),
+            body: JSON.stringify({ selected_prim_paths: paths }),
+          });
+        } catch (_) {}
+      }
+
+      function applyTab(tabKey) {
+        document.querySelectorAll("[data-tab]").forEach((button) => {
+          button.classList.toggle("active", button.dataset.tab === tabKey);
+        });
+        document.querySelectorAll("[data-panel]").forEach((panel) => {
+          panel.classList.toggle("hidden", panel.dataset.panel !== tabKey);
+        });
+      }
+
+      document.querySelectorAll("[data-tab]").forEach((button) => {
+        button.addEventListener("click", () => {
+          applyTab(button.dataset.tab);
+          if (button.dataset.tab === "render") loadRenderOptions();
+        });
+      });
+
+      // ── Render Options: load / save ──────────────────────────────
+      let _savedRenderOptions = { modalities: ["rgb", "depth"], spp: 64 };
+
+      function updateEffectiveRes() {
+        const w = parseInt(document.getElementById("render-width-input")?.value || "0");
+        const h = parseInt(document.getElementById("render-height-input")?.value || "0");
+        const upscale = document.getElementById("render-upscale-select")?.value || "none";
+        const scale = upscale.startsWith("4x") ? 4 : upscale.startsWith("2x") ? 2 : 1;
+        const el = document.getElementById("render-effective-res");
+        if (el && scale > 1) el.textContent = `→ 최종 ${w * scale} × ${h * scale}`;
+        else if (el) el.textContent = "";
+      }
+
+      document.querySelectorAll(".render-res-preset").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          document.getElementById("render-width-input").value = btn.dataset.w;
+          document.getElementById("render-height-input").value = btn.dataset.h;
+          updateEffectiveRes();
+        });
+      });
+
+      ["render-width-input", "render-height-input", "render-upscale-select"].forEach((id) => {
+        document.getElementById(id)?.addEventListener("input", updateEffectiveRes);
+        document.getElementById(id)?.addEventListener("change", updateEffectiveRes);
+      });
+
+      async function loadRenderOptions() {
+        if (!selectedSceneId) return;
+        try {
+          const res = await fetch(`/api/scenes/${encodeURIComponent(selectedSceneId)}/render-options`);
+          if (!res.ok) return;
+          const opts = await res.json();
+          _savedRenderOptions = opts;
+          document.querySelectorAll(".mod-check input[type=checkbox]").forEach((cb) => {
+            cb.checked = (opts.modalities || []).includes(cb.value);
+          });
+          const sppInput = document.getElementById("render-spp-input");
+          if (sppInput && opts.spp) sppInput.value = opts.spp;
+          const widthInput = document.getElementById("render-width-input");
+          const heightInput = document.getElementById("render-height-input");
+          const upscaleSel = document.getElementById("render-upscale-select");
+          if (widthInput && opts.width) widthInput.value = opts.width;
+          if (heightInput && opts.height) heightInput.value = opts.height;
+          if (upscaleSel && opts.upscale) upscaleSel.value = opts.upscale;
+          updateEffectiveRes();
+          // Update Render button badge
+          const badge = document.getElementById("ws-render-mod-badge");
+          if (badge) {
+            const mods = opts.modalities || [];
+            const hasPolar = mods.some((m) => ["s1", "s2", "dop", "aolp", "polar_rgb_preview"].includes(m));
+            badge.textContent = `${mods.length} mod${mods.length !== 1 ? "s" : ""}${hasPolar ? " · polar" : ""}`;
+          }
+        } catch (_) {}
+      }
+
+      // Load on page init so Render button always has current options
+      loadRenderOptions();
+
+      document.getElementById("render-options-save")?.addEventListener("click", async () => {
+        if (!selectedSceneId) return;
+        const btn = document.getElementById("render-options-save");
+        const modalities = [...document.querySelectorAll(".mod-check input:checked")].map((c) => c.value);
+        const spp = parseInt(document.getElementById("render-spp-input")?.value || "64", 10);
+        const width = parseInt(document.getElementById("render-width-input")?.value || "1280", 10);
+        const height = parseInt(document.getElementById("render-height-input")?.value || "720", 10);
+        const upscale = document.getElementById("render-upscale-select")?.value || "none";
+        try {
+          const res = await fetch(`/api/scenes/${encodeURIComponent(selectedSceneId)}/render-options`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ modalities, spp, width, height, upscale }),
+          });
+          if (res.ok && btn) {
+            const prev = btn.textContent;
+            btn.textContent = lang() === "kr" ? "저장됨 ✓" : "Saved ✓";
+            _savedRenderOptions = { modalities, spp, width, height, upscale };
+            // Refresh badge on Render button
+            const badge = document.getElementById("ws-render-mod-badge");
+            if (badge) {
+              const hasPolar = modalities.some((m) => ["s1", "s2", "dop", "aolp", "polar_rgb_preview"].includes(m));
+              badge.textContent = `${modalities.length} mod${modalities.length !== 1 ? "s" : ""}${hasPolar ? " · polar" : ""}`;
+            }
+            setTimeout(() => { btn.textContent = prev; }, 1800);
+          }
+        } catch (_) {}
+      });
+
+      function setWorkspaceStatus() {
+        const sessionStatus = document.getElementById("ws-session-status");
+        const sessionSubtitle = document.getElementById("ws-session-subtitle");
+        const usdPath = document.getElementById("ws-usd-path");
+        const renderReady = document.getElementById("ws-render-ready");
+        const activeCamera = document.getElementById("ws-active-camera");
+        const activeCameraMeta = document.getElementById("ws-active-camera-meta");
+        const selectedCount = document.getElementById("ws-selected-count");
+        const selectedLabel = document.getElementById("ws-selected-label");
+
+        const session = _session;
+        const active = !!(session && session.scene_id === selectedSceneId);
+        if (sessionStatus) sessionStatus.textContent = active ? (lang() === "kr" ? "연결됨" : "Active") : (lang() === "kr" ? "대기" : "Idle");
+        if (sessionSubtitle) sessionSubtitle.textContent = active ? (session.updated_at || session.opened_at || "") : (lang() === "kr" ? "현재 연결된 Isaac session 없음" : "No live Isaac session connected.");
+
+        // topbar 컴팩트 상태 동기화
+        const topbarDot = document.getElementById("ws-topbar-dot");
+        const topbarStatusText = document.getElementById("ws-topbar-status-text");
+        if (topbarDot) {
+          topbarDot.className = "hsi-state-dot " + (active ? "hsi-dot-ok" : "hsi-dot-idle");
+        }
+        if (topbarStatusText) {
+          topbarStatusText.textContent = active ? (lang() === "kr" ? "연결됨" : "Connected") : (lang() === "kr" ? "대기" : "Idle");
+        }
+        if (usdPath && active && session.usd_stage_path) usdPath.textContent = session.usd_stage_path;
+        if (renderReady) renderReady.textContent = {{ ("render-ready" if scene.render_ready else "open-only")|tojson }};
+
+        const viewport = active ? (session.active_viewport_camera || null) : null;
+        if (activeCamera) activeCamera.textContent = viewport ? (viewport.name || viewport.sensor_id || "viewport") : "-";
+        if (activeCameraMeta) {
+          activeCameraMeta.textContent = viewport
+            ? `${Math.round(Number(viewport.fov_deg || 0))}° · ${(viewport.sensor_sync_group || "viewport")}`
+            : (lang() === "kr" ? "활성 viewport 카메라 없음" : "No active viewport camera yet.");
+        }
+
+        const selectedPaths = active ? (session.selected_prim_paths || []) : [];
+        if (selectedCount) selectedCount.textContent = String(selectedPaths.length);
+        if (selectedLabel) selectedLabel.textContent = selectedPaths[0] || (lang() === "kr" ? "선택 없음" : "No current selection");
+      }
+
+      function viewportSignature(session) {
+        if (!session || !session.active_viewport_camera) return "none";
+        const camera = session.active_viewport_camera;
+        return JSON.stringify({
+          sensor_id: camera.sensor_id || null,
+          origin: camera.origin || null,
+          target: camera.target || null,
+          fov_deg: camera.fov_deg || null,
+        });
+      }
+
+      function activeViewportOverlayFromSession() {
+        if (!_session || !_session.active_viewport_camera) return null;
+        const camera = _session.active_viewport_camera;
+        if (!Array.isArray(camera.origin) || !Array.isArray(camera.target)) return null;
+        return {
+          camera_id: camera.sensor_id || "isaac_viewport",
+          label: camera.name || camera.sensor_id || "Current Viewport",
+          origin: camera.origin,
+          target: camera.target,
+          fov_deg: Number(camera.fov_deg || 60),
+          kind: "active_viewport",
+          color: [47, 123, 246],
+        };
+      }
+
+      function snapshotRenderRequestOverlayFromSession() {
+        if (!_session || !_session.active_viewport_camera) return null;
+        const camera = _session.active_viewport_camera;
+        if (!Array.isArray(camera.origin) || !Array.isArray(camera.target)) return null;
+        return {
+          camera_id: camera.sensor_id || "render_request_camera",
+          label: lang() === "kr" ? "작업중" : "Rendering",
+          origin: [...camera.origin],
+          target: [...camera.target],
+          fov_deg: Number(camera.fov_deg || 60),
+          kind: "render_request_active",
+          color: [249, 115, 22],
+        };
+      }
+
+      function renderCommandKey(command) {
+        if (!command) return null;
+        return String(
+          command.request_id ||
+          command.command_id ||
+          command.id ||
+          `${command.command_type || "render"}:${command.scene_id || selectedSceneId}:${command.started_at || command.updated_at || ""}`
+        );
+      }
+
+      function startRenderRequestOverlay(command) {
+        const key = renderCommandKey(command);
+        if (!key || _activeRenderRequestKey === key) return;
+        const overlay = snapshotRenderRequestOverlayFromSession();
+        if (!overlay) return;
+        _activeRenderRequestKey = key;
+        _activeRenderRequestOverlay = overlay;
+        drawWorkspaceMap();
+      }
+
+      function clearRenderRequestOverlay() {
+        if (!_activeRenderRequestOverlay && !_activeRenderRequestKey) return;
+        _activeRenderRequestOverlay = null;
+        _activeRenderRequestKey = null;
+        drawWorkspaceMap();
+      }
+
+      function syncFloorplanActiveViewportFromSession() {
+        if (!_floorplan) return;
+        const activeOverlay = activeViewportOverlayFromSession();
+        const preserved = Array.isArray(_floorplan.camera_overlays)
+          ? _floorplan.camera_overlays.filter((overlay) => overlay.kind !== "active_viewport")
+          : [];
+        _floorplan.camera_overlays = activeOverlay ? [activeOverlay, ...preserved] : preserved;
+        _floorplan.active_viewport_camera = _session && _session.active_viewport_camera ? _session.active_viewport_camera : null;
+      }
+
+      function applyMapTransform() {
+        const layer = document.getElementById("workspace-map-layer");
+        const frame = document.getElementById("workspace-map-frame");
+        if (!layer || !frame) return;
+        layer.style.transform = `translate(${_mapView.tx}px, ${_mapView.ty}px) scale(${_mapView.scale})`;
+        frame.classList.toggle("is-dragging", !!_mapView.dragging);
+      }
+
+      function clampMapScale(value) {
+        return Math.max(1, Math.min(4, value));
+      }
+
+      function framePointToMapPoint(clientX, clientY) {
+        const frame = document.getElementById("workspace-map-frame");
+        if (!frame) return null;
+        const rect = frame.getBoundingClientRect();
+        return {
+          x: (clientX - rect.left - _mapView.tx) / _mapView.scale,
+          y: (clientY - rect.top - _mapView.ty) / _mapView.scale,
+        };
+      }
+
+      function mapPointToWorldXZ(point, canvas) {
+        if (!_floorplan || !point || !canvas) return null;
+        const bounds = _floorplan.world_bounds_xz;
+        const projection = _floorplan.projection;
+        const size = Number(_floorplan.canvas_size_px || 0);
+        if (!bounds || !projection || !size || !canvas.width || !canvas.height) return null;
+        const px = point.x / canvas.width * size;
+        const py = point.y / canvas.height * size;
+        const worldX = ((px - Number(projection.pad_x)) / Number(projection.scale_px_per_world_unit)) + Number(bounds.x_min);
+        const worldZ = Number(bounds.z_max) - ((py - Number(projection.pad_z)) / Number(projection.scale_px_per_world_unit));
+        return [worldX, worldZ];
+      }
+
+      function updateMapDebugPanel() {
+        const hoverCanvas = document.getElementById("workspace-debug-hover-canvas");
+        const hoverWorld = document.getElementById("workspace-debug-hover-world");
+        const clickCanvas = document.getElementById("workspace-debug-click-canvas");
+        const clickWorld = document.getElementById("workspace-debug-click-world");
+        const camOrigin = document.getElementById("workspace-debug-camera-origin");
+        const camTarget = document.getElementById("workspace-debug-camera-target");
+        const objWorld = document.getElementById("workspace-debug-object-world");
+        const objMap = document.getElementById("workspace-debug-object-map");
+        const bounds = document.getElementById("workspace-debug-bounds");
+        const projection = document.getElementById("workspace-debug-projection");
+        const renderOrigin = document.getElementById("workspace-debug-render-origin");
+        const renderTarget = document.getElementById("workspace-debug-render-target");
+
+        if (hoverCanvas) hoverCanvas.textContent = formatVec(_mapDebug.hoverCanvas);
+        if (hoverWorld) hoverWorld.textContent = formatVec(_mapDebug.hoverWorldXZ);
+        if (clickCanvas) clickCanvas.textContent = formatVec(_mapDebug.clickCanvas);
+        if (clickWorld) clickWorld.textContent = formatVec(_mapDebug.clickWorldXZ);
+
+        const camera = _session && _session.active_viewport_camera ? _session.active_viewport_camera : null;
+        if (camOrigin) camOrigin.textContent = camera && Array.isArray(camera.origin) ? formatVec(camera.origin) : "-";
+        if (camTarget) camTarget.textContent = camera && Array.isArray(camera.target) ? formatVec(camera.target) : "-";
+        if (renderOrigin) renderOrigin.textContent = _activeRenderRequestOverlay && Array.isArray(_activeRenderRequestOverlay.origin) ? formatVec(_activeRenderRequestOverlay.origin) : "-";
+        if (renderTarget) renderTarget.textContent = _activeRenderRequestOverlay && Array.isArray(_activeRenderRequestOverlay.target) ? formatVec(_activeRenderRequestOverlay.target) : "-";
+
+        const node = currentNode();
+        if (objWorld) objWorld.textContent = formatVec(objectWorldXYZ(node));
+        if (objMap) objMap.textContent = formatVec(objectWorldXZ(node));
+
+        if (bounds) {
+          const b = _floorplan && _floorplan.world_bounds_xz;
+          bounds.textContent = b
+            ? `x:[${Number(b.x_min).toFixed(2)}, ${Number(b.x_max).toFixed(2)}] · z:[${Number(b.z_min).toFixed(2)}, ${Number(b.z_max).toFixed(2)}]`
+            : "-";
+        }
+        if (projection) {
+          const p = _floorplan && _floorplan.projection;
+          projection.textContent = p
+            ? `scale:${Number(p.scale_px_per_world_unit).toFixed(3)} · pad_x:${Number(p.pad_x).toFixed(2)} · pad_z:${Number(p.pad_z).toFixed(2)}`
+            : "-";
+        }
+      }
+
+      function collectMapDebugPayload() {
+        const camera = _session && _session.active_viewport_camera ? _session.active_viewport_camera : null;
+        const node = currentNode();
+        return {
+          scene_id: selectedSceneId,
+          selected_path: _selectedPath,
+          selected_node: node ? {
+            path: node.path,
+            name: node.name,
+            kind: node.kind,
+            transform: Array.isArray(node.transform) ? node.transform : null,
+            world_xyz: objectWorldXYZ(node),
+            world_xz: objectWorldXZ(node),
+            shape_count: Number(node.shape_count || 0),
+            override_bsdf: node.override_bsdf || null,
+          } : null,
+          active_viewport_camera: camera ? {
+            sensor_id: camera.sensor_id || null,
+            name: camera.name || null,
+            origin: camera.origin || null,
+            target: camera.target || null,
+            up: camera.up || null,
+            fov_deg: camera.fov_deg || null,
+            resolution: camera.resolution || null,
+            pose_source: camera.pose_source || null,
+            camera_to_world: camera.camera_to_world || null,
+          } : null,
+          active_render_request_camera: _activeRenderRequestOverlay ? {
+            camera_id: _activeRenderRequestOverlay.camera_id || null,
+            label: _activeRenderRequestOverlay.label || null,
+            origin: _activeRenderRequestOverlay.origin || null,
+            target: _activeRenderRequestOverlay.target || null,
+            fov_deg: _activeRenderRequestOverlay.fov_deg || null,
+          } : null,
+          floorplan: _floorplan ? {
+            bounds: _floorplan.world_bounds_xz || null,
+            geometry_bounds: _floorplan.geometry_world_bounds_xz || null,
+            projection: _floorplan.projection || null,
+            canvas_size_px: _floorplan.canvas_size_px || null,
+            cached: !!_floorplan.cached,
+          } : null,
+          map_debug: {
+            hover_canvas: _mapDebug.hoverCanvas,
+            hover_world_xz: _mapDebug.hoverWorldXZ,
+            click_canvas: _mapDebug.clickCanvas,
+            click_world_xz: _mapDebug.clickWorldXZ,
+            pan_zoom: { scale: _mapView.scale, tx: _mapView.tx, ty: _mapView.ty },
+          },
+        };
+      }
+
+      function zoomMapAt(clientX, clientY, nextScale) {
+        const frame = document.getElementById("workspace-map-frame");
+        if (!frame) return;
+        const rect = frame.getBoundingClientRect();
+        const mouseX = clientX - rect.left;
+        const mouseY = clientY - rect.top;
+        const worldX = (mouseX - _mapView.tx) / _mapView.scale;
+        const worldY = (mouseY - _mapView.ty) / _mapView.scale;
+        _mapView.scale = clampMapScale(nextScale);
+        _mapView.tx = mouseX - worldX * _mapView.scale;
+        _mapView.ty = mouseY - worldY * _mapView.scale;
+        applyMapTransform();
+      }
+
+      async function selectNearestOverlayAt(clientX, clientY) {
+        const point = framePointToMapPoint(clientX, clientY);
+        if (!point || !_floorplan || !Array.isArray(_floorplan.object_overlays) || !_floorplan.object_overlays.length) return;
+        const canvas = document.getElementById("workspace-map-canvas");
+        _mapDebug.clickCanvas = [point.x, point.y];
+        _mapDebug.clickWorldXZ = mapPointToWorldXZ(point, canvas);
+        updateMapDebugPanel();
+        let best = null;
+        let bestDistance = Number.POSITIVE_INFINITY;
+        _floorplan.object_overlays.forEach((overlay) => {
+          const size = Number(overlay.canvas_size_px || _floorplan.canvas_size_px || 0) || 1;
+          const px = Number(overlay.centroid_px[0]) / size * (document.getElementById("workspace-map-canvas")?.width || 1);
+          const py = Number(overlay.centroid_px[1]) / size * (document.getElementById("workspace-map-canvas")?.height || 1);
+          const distance = Math.hypot(px - point.x, py - point.y);
+          if (distance < bestDistance) {
+            bestDistance = distance;
+            best = overlay;
+          }
+        });
+        if (best && best.path) {
+          _selectedPath = best.path;
+          renderTree();
+          showNodeDetail();
+          drawWorkspaceMap();
+          await updateSelection([best.path]);
+        }
+      }
+
+      async function loadFloorplan() {
+        const status = document.getElementById("workspace-floorplan-status");
+        const meta = document.getElementById("workspace-floorplan-meta");
+        const wrapEmpty = document.getElementById("workspace-map-empty");
+        const img = document.getElementById("workspace-map-img");
+        try {
+          const res = await fetch(`/api/scenes/${encodeURIComponent(selectedSceneId)}/floorplan`);
+          if (!res.ok) throw new Error("floorplan fetch failed");
+          const payload = await res.json();
+          _floorplan = payload;
+          syncFloorplanActiveViewportFromSession();
+          if (payload.artifact_href && img) {
+            img.src = payload.artifact_href;
+            img.style.display = "";
+            if (wrapEmpty) wrapEmpty.classList.add("hidden");
+            if (status) {
+              status.textContent = payload.cached
+                ? (lang() === "kr" ? "캐시된 도면 사용 중" : "Using cached floorplan")
+                : (lang() === "kr" ? "도면 갱신됨" : "Floorplan prepared");
+            }
+            if (meta) {
+              const activeViewportCount = payload.active_viewport_camera ? 1 : 0;
+              const robotCount = Array.isArray(payload.robot_overlays) ? payload.robot_overlays.length : 0;
+              meta.textContent = lang() === "kr"
+                ? `요청 카메라 ${payload.request_camera_count || 0} · 스냅샷 카메라 ${payload.snapshot_camera_count || 0} · 실시간 카메라 ${activeViewportCount} · 조명 ${payload.snapshot_light_count || 0} · 로봇 ${robotCount}`
+                : `Request cameras ${payload.request_camera_count || 0} · Snapshot cameras ${payload.snapshot_camera_count || 0} · Live camera ${activeViewportCount} · Lights ${payload.snapshot_light_count || 0} · Robots ${robotCount}`;
+            }
+          if (status && payload.active_viewport_camera) {
+            status.textContent = payload.cached
+              ? (lang() === "kr" ? "캐시된 도면 사용 중 · 메인 카메라 표시 중" : "Using cached floorplan · main camera visible")
+              : (lang() === "kr" ? "도면 갱신됨 · 메인 카메라 표시 중" : "Floorplan prepared · main camera visible");
+          }
+          } else {
+            if (status) status.textContent = lang() === "kr" ? "도면이 아직 없습니다" : "No floorplan yet";
+            if (wrapEmpty) wrapEmpty.classList.remove("hidden");
+          }
+          drawWorkspaceMap();
+          drawCaptureMap();
+          updateMapDebugPanel();
+        } catch (_) {
+          if (status) status.textContent = lang() === "kr" ? "도면을 아직 불러오지 못했습니다" : "Floorplan is not available yet";
+          if (wrapEmpty) wrapEmpty.classList.remove("hidden");
+          drawCaptureMap();
+          updateMapDebugPanel();
+        }
+      }
+
+      function objectOverlayFor(path) {
+        if (!_floorplan || !Array.isArray(_floorplan.object_overlays)) return null;
+        return _floorplan.object_overlays.find((item) => item.path === path) || null;
+      }
+
+      function isDescendantPath(candidatePath, ancestorPath) {
+        if (!candidatePath || !ancestorPath) return false;
+        if (candidatePath === ancestorPath) return true;
+        return candidatePath.startsWith(`${ancestorPath}/`);
+      }
+
+      function highlightedSelectionRoots() {
+        const paths = [];
+        if (_session && Array.isArray(_session.selected_prim_paths)) {
+          _session.selected_prim_paths.forEach((path) => {
+            if (path && !paths.includes(path)) paths.push(path);
+          });
+        }
+        if (_selectedPath && !paths.includes(_selectedPath)) {
+          paths.push(_selectedPath);
+        }
+        return paths;
+      }
+
+      function highlightedOverlays() {
+        if (!_floorplan || !Array.isArray(_floorplan.object_overlays)) return [];
+        const roots = highlightedSelectionRoots();
+        if (!roots.length) return [];
+        const matched = _floorplan.object_overlays.filter((overlay) => roots.some((path) => isDescendantPath(overlay.path, path)));
+        if (matched.length) return matched;
+        const node = currentNode();
+        const world = objectWorldXZ(node);
+        if (!node || !world) return [];
+        return [{
+          path: node.path,
+          label: node.name,
+          kind: node.kind || "object",
+          centroid_world: [world[0], world[1]],
+          synthetic: true,
+        }];
+      }
+
+      function highlightedSelectionSummary() {
+        const node = currentNode();
+        const overlays = highlightedOverlays();
+        if (!node || !overlays.length) return null;
+        const groupLike = node.kind && node.kind !== "object";
+        return {
+          label: groupLike
+            ? (lang() === "kr" ? `${node.name} 그룹 강조` : `Highlighting group ${node.name}`)
+            : (lang() === "kr" ? `${node.name} 위치 강조` : `Highlighting ${node.name}`),
+          count: overlays.length,
+          groupLike,
+        };
+      }
+
+      function currentRobot() {
+        const robots = (_session && Array.isArray(_session.robot_inventory)) ? _session.robot_inventory : [];
+        if (!robots.length) return null;
+        if (_selectedPath) {
+          const matched = robots.find((robot) => _selectedPath === robot.path || _selectedPath.startsWith(`${robot.path}/`));
+          if (matched) return matched;
+        }
+        return robots.find((robot) => robot.selected) || null;
+      }
+
+      function worldToCanvas(worldXZ, canvas) {
+        if (!_floorplan || !worldXZ || !canvas) return null;
+        const bounds = _floorplan.world_bounds_xz;
+        const projection = _floorplan.projection;
+        const size = Number(_floorplan.canvas_size_px || 0);
+        if (!bounds || !projection || !size) return null;
+        const px = ((Number(worldXZ[0]) - Number(bounds.x_min)) * Number(projection.scale_px_per_world_unit) + Number(projection.pad_x));
+        const py = ((Number(bounds.z_max) - Number(worldXZ[1])) * Number(projection.scale_px_per_world_unit) + Number(projection.pad_z));
+        return [px / size * canvas.width, py / size * canvas.height];
+      }
+
+      function overlayCanvasPoint(overlay, canvas) {
+        if (!overlay || !canvas || !_floorplan) return null;
+        if (Array.isArray(overlay.centroid_world) && overlay.centroid_world.length >= 2) {
+          return worldToCanvas(overlay.centroid_world, canvas);
+        }
+        const size = Number(overlay.canvas_size_px || _floorplan.canvas_size_px || 0) || 1;
+        if (!Array.isArray(overlay.centroid_px) || overlay.centroid_px.length < 2) return null;
+        return [
+          Number(overlay.centroid_px[0]) / size * canvas.width,
+          Number(overlay.centroid_px[1]) / size * canvas.height,
+        ];
+      }
+
+      function drawCameraOverlay(ctx, canvas, overlay) {
+        const origin = worldToCanvas([overlay.origin[0], overlay.origin[2]], canvas);
+        const target = worldToCanvas([overlay.target[0], overlay.target[2]], canvas);
+        if (!origin || !target) return;
+        const dx = target[0] - origin[0];
+        const dy = target[1] - origin[1];
+        const length = Math.hypot(dx, dy) || 1;
+        const dirX = dx / length;
+        const dirY = dy / length;
+        const isActiveViewport = overlay.kind === "active_viewport";
+        const isRenderRequest = overlay.kind === "render_request_active";
+        const radius = isActiveViewport
+          ? Math.max(72, Math.min(canvas.width, canvas.height) * 0.18)
+          : (isRenderRequest
+            ? Math.max(64, Math.min(canvas.width, canvas.height) * 0.16)
+            : Math.max(42, Math.min(canvas.width, canvas.height) * 0.12));
+        const halfAngle = (Number(overlay.fov_deg || 60) * Math.PI / 180) / 2;
+        const a1 = Math.atan2(dirY, dirX) - halfAngle;
+        const a2 = Math.atan2(dirY, dirX) + halfAngle;
+        const angle = Math.atan2(dirY, dirX);
+        const stroke = isActiveViewport ? "#2563eb" : (isRenderRequest ? "#f97316" : "#2e86c1");
+
+        ctx.save();
+        ctx.beginPath();
+        ctx.moveTo(origin[0], origin[1]);
+        ctx.lineTo(origin[0] + Math.cos(a1) * radius, origin[1] + Math.sin(a1) * radius);
+        ctx.arc(origin[0], origin[1], radius, a1, a2);
+        ctx.closePath();
+        ctx.fillStyle = isActiveViewport
+          ? "rgba(37,99,235,0.18)"
+          : (isRenderRequest ? "rgba(249,115,22,0.18)" : "rgba(46,134,193,0.08)");
+        ctx.fill();
+
+        ctx.beginPath();
+        ctx.moveTo(origin[0], origin[1]);
+        ctx.lineTo(target[0], target[1]);
+        ctx.strokeStyle = stroke;
+        ctx.lineWidth = isActiveViewport ? 3.6 : (isRenderRequest ? 3.2 : 1.6);
+        ctx.stroke();
+
+        if (isActiveViewport || isRenderRequest) {
+          const arrowSize = isRenderRequest ? 14 : 12;
+          ctx.beginPath();
+          ctx.moveTo(target[0], target[1]);
+          ctx.lineTo(
+            target[0] - Math.cos(angle - Math.PI / 6) * arrowSize,
+            target[1] - Math.sin(angle - Math.PI / 6) * arrowSize,
+          );
+          ctx.lineTo(
+            target[0] - Math.cos(angle + Math.PI / 6) * arrowSize,
+            target[1] - Math.sin(angle + Math.PI / 6) * arrowSize,
+          );
+          ctx.closePath();
+          ctx.fillStyle = stroke;
+          ctx.fill();
+        }
+
+        ctx.beginPath();
+        ctx.arc(origin[0], origin[1], isActiveViewport ? 7 : (isRenderRequest ? 8 : 4), 0, Math.PI * 2);
+        ctx.fillStyle = stroke;
+        ctx.fill();
+        if (isActiveViewport || isRenderRequest) {
+          ctx.strokeStyle = "#ffffff";
+          ctx.lineWidth = 2;
+          ctx.stroke();
+        }
+
+        if (isActiveViewport || isRenderRequest) {
+          const label = overlay.label || "viewport";
+          ctx.font = "700 12px Inter, system-ui, sans-serif";
+          const textWidth = ctx.measureText(label).width;
+          const boxX = origin[0] + 12;
+          const boxY = origin[1] - (isRenderRequest ? 34 : 28);
+          ctx.fillStyle = isRenderRequest ? "rgba(255,247,237,0.96)" : "rgba(255,255,255,0.92)";
+          ctx.strokeStyle = isRenderRequest ? "rgba(249,115,22,0.40)" : "rgba(37,99,235,0.35)";
+          ctx.lineWidth = 1;
+          ctx.beginPath();
+          ctx.roundRect(boxX - 8, boxY - 12, textWidth + 16, 22, 10);
+          ctx.fill();
+          ctx.stroke();
+          ctx.fillStyle = stroke;
+          ctx.fillText(label, boxX, boxY + 3);
+        }
+        ctx.restore();
+      }
+
+      function drawWorkspaceMap() {
+        const canvas = document.getElementById("workspace-map-canvas");
+        const frame = document.getElementById("workspace-map-frame");
+        if (!canvas || !frame) return;
+        canvas.width = frame.clientWidth;
+        canvas.height = frame.clientHeight;
+        const ctx = canvas.getContext("2d");
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        const highlighted = highlightedOverlays();
+
+        const cameraOverlays = _floorplan && Array.isArray(_floorplan.camera_overlays) ? _floorplan.camera_overlays : [];
+        const robotOverlays = _floorplan && Array.isArray(_floorplan.robot_overlays) ? _floorplan.robot_overlays : [];
+        cameraOverlays
+          .filter((overlay) => overlay.kind !== "active_viewport" && overlay.kind !== "render_request_active")
+          .forEach((overlay) => drawCameraOverlay(ctx, canvas, overlay));
+
+        if (highlighted.length > 1) {
+          const points = highlighted
+            .map((overlay) => overlayCanvasPoint(overlay, canvas))
+            .filter(Boolean)
+            .map((point) => ({ x: point[0], y: point[1] }));
+          const xs = points.map((item) => item.x);
+          const ys = points.map((item) => item.y);
+          const pad = 14;
+          const minX = Math.min(...xs) - pad;
+          const minY = Math.min(...ys) - pad;
+          const maxX = Math.max(...xs) + pad;
+          const maxY = Math.max(...ys) + pad;
+          ctx.save();
+          ctx.strokeStyle = "rgba(239, 68, 68, 0.92)";
+          ctx.fillStyle = "rgba(239, 68, 68, 0.08)";
+          ctx.lineWidth = 2;
+          ctx.beginPath();
+          ctx.roundRect(minX, minY, Math.max(24, maxX - minX), Math.max(24, maxY - minY), 14);
+          ctx.fill();
+          ctx.stroke();
+          ctx.restore();
+        }
+
+        if (_floorplan && Array.isArray(_floorplan.object_overlays)) {
+          _floorplan.object_overlays.forEach((overlay) => {
+            const point = overlayCanvasPoint(overlay, canvas);
+            if (!point) return;
+            const [x, y] = point;
+            const selected = highlighted.some((item) => item.path === overlay.path);
+            ctx.beginPath();
+            ctx.arc(x, y, selected ? 8 : 3.5, 0, Math.PI * 2);
+            ctx.fillStyle = selected ? "#ef4444" : "rgba(59,130,246,0.38)";
+            ctx.fill();
+            if (selected) {
+              ctx.strokeStyle = "#ffffff";
+              ctx.lineWidth = 2;
+              ctx.stroke();
+            }
+          });
+        }
+
+        robotOverlays.forEach((overlay) => {
+          const point = overlayCanvasPoint(overlay, canvas);
+          if (!point) return;
+          const [x, y] = point;
+          const selected = !!overlay.selected || (_selectedPath && (_selectedPath === overlay.path || _selectedPath.startsWith(`${overlay.path}/`)));
+          ctx.save();
+          ctx.translate(x, y);
+          ctx.rotate(Math.PI / 4);
+          ctx.beginPath();
+          ctx.rect(-8, -8, 16, 16);
+          ctx.fillStyle = selected ? "rgba(16,185,129,0.96)" : "rgba(16,185,129,0.78)";
+          ctx.fill();
+          ctx.strokeStyle = "#ffffff";
+          ctx.lineWidth = selected ? 2.4 : 1.4;
+          ctx.stroke();
+          ctx.restore();
+
+          const label = `${overlay.label}`;
+          ctx.save();
+          ctx.font = "700 12px Inter, system-ui, sans-serif";
+          const textWidth = ctx.measureText(label).width;
+          ctx.fillStyle = selected ? "rgba(236,253,245,0.97)" : "rgba(240,253,250,0.94)";
+          ctx.strokeStyle = selected ? "rgba(16,185,129,0.55)" : "rgba(15,118,110,0.25)";
+          ctx.lineWidth = 1;
+          ctx.beginPath();
+          ctx.roundRect(x + 12, y - 18, textWidth + 18, 22, 10);
+          ctx.fill();
+          ctx.stroke();
+          ctx.fillStyle = selected ? "#047857" : "#115e59";
+          ctx.fillText(label, x + 21, y - 3);
+          ctx.restore();
+        });
+
+        cameraOverlays
+          .filter((overlay) => overlay.kind === "active_viewport")
+          .forEach((overlay) => drawCameraOverlay(ctx, canvas, overlay));
+
+        if (_activeRenderRequestOverlay) {
+          drawCameraOverlay(ctx, canvas, _activeRenderRequestOverlay);
+        }
+
+        if (_mapDebug.clickCanvas) {
+          ctx.save();
+          ctx.strokeStyle = "rgba(239, 68, 68, 0.95)";
+          ctx.lineWidth = 1.5;
+          ctx.beginPath();
+          ctx.arc(_mapDebug.clickCanvas[0], _mapDebug.clickCanvas[1], 8, 0, Math.PI * 2);
+          ctx.stroke();
+          ctx.beginPath();
+          ctx.moveTo(_mapDebug.clickCanvas[0] - 10, _mapDebug.clickCanvas[1]);
+          ctx.lineTo(_mapDebug.clickCanvas[0] + 10, _mapDebug.clickCanvas[1]);
+          ctx.moveTo(_mapDebug.clickCanvas[0], _mapDebug.clickCanvas[1] - 10);
+          ctx.lineTo(_mapDebug.clickCanvas[0], _mapDebug.clickCanvas[1] + 10);
+          ctx.stroke();
+          ctx.restore();
+        }
+
+        if (_mapDebug.hoverCanvas) {
+          ctx.save();
+          ctx.strokeStyle = "rgba(37, 99, 235, 0.75)";
+          ctx.lineWidth = 1;
+          ctx.beginPath();
+          ctx.arc(_mapDebug.hoverCanvas[0], _mapDebug.hoverCanvas[1], 6, 0, Math.PI * 2);
+          ctx.stroke();
+          ctx.restore();
+        }
+
+        const summary = highlightedSelectionSummary();
+        if (summary && highlighted.length) {
+          const anchor = highlighted[0];
+          const anchorPoint = overlayCanvasPoint(anchor, canvas);
+          if (!anchorPoint) return;
+          const [x, y] = anchorPoint;
+          ctx.save();
+          ctx.font = "600 12px Inter, system-ui, sans-serif";
+          ctx.fillStyle = "#1f2937";
+          const suffix = summary.groupLike && summary.count > 1
+            ? (lang() === "kr" ? ` · ${summary.count}개 오브젝트` : ` · ${summary.count} objects`)
+            : "";
+          ctx.fillText(`${summary.label}${suffix}`, x + 10, y - 10);
+          ctx.restore();
+        }
+      }
+
+      function captureOverlayFromRecord(record) {
+        if (!record || !Array.isArray(record.camera_origin) || !Array.isArray(record.camera_target)) return null;
+        return {
+          camera_id: record.camera_id || record.command_id || "capture_camera",
+          label: record.status === "completed"
+            ? (record.camera_name || record.camera_id || "Capture")
+            : (lang() === "kr" ? "작업중" : "Rendering"),
+          origin: record.camera_origin,
+          target: record.camera_target,
+          fov_deg: Number(record.camera_fov_deg || 60),
+          kind: record.status === "completed" ? "capture_history" : "capture_pending",
+          color: record.status === "completed" ? [20, 184, 166] : [249, 115, 22],
+        };
+      }
+
+      function renderLiveCaptureCards() {
+        const container = document.getElementById("capture-live-list");
+        if (!container) return;
+        if (!_liveCaptureEntries.length) {
+          container.innerHTML = "";
+          container.classList.add("hidden");
+          return;
+        }
+        container.classList.remove("hidden");
+        container.innerHTML = _liveCaptureEntries.map((record) => {
+          const key = captureRecordKey(record);
+          const statusLabel = record.status === "queued"
+            ? (lang() === "kr" ? "대기 중" : "Queued")
+            : (record.status === "dispatched"
+              ? (lang() === "kr" ? "배정됨" : "Dispatched")
+              : (lang() === "kr" ? "작업중" : "Running"));
+          const overlayReady = Array.isArray(record.camera_origin) && Array.isArray(record.camera_target);
+          return `
+            <article class="capture-frame-card capture-frame-card-live js-capture-card${_selectedCaptureKey === key ? " is-selected" : ""}" data-capture-key="${esc(key)}" tabindex="0">
+              <div class="capture-frame-header">
+                <div class="capture-frame-meta">
+                  <div class="capture-frame-time">${esc(record.timestamp || "")}</div>
+                  <div class="capture-frame-cam">📷 ${esc(record.camera_id || "isaac_viewport")}</div>
+                </div>
+                <span class="render-job-badge rjob-badge-live">${statusLabel}</span>
+              </div>
+              <div class="capture-mod-chips">
+                ${(record.modalities || []).map((mod) => `<span class="capture-mod-chip">${esc(mod)}</span>`).join("")}
+              </div>
+              <div class="capture-live-message">${esc(record.progress_message || "")}</div>
+              <div class="capture-frame-actions">
+                <button type="button" class="button button-subtle js-capture-show-map" data-capture-key="${esc(key)}" ${overlayReady ? "" : "disabled"}>
+                  <span data-lang="en">Show on Map</span><span data-lang="kr" class="hidden">맵에서 보기</span>
+                </button>
+              </div>
+            </article>
+          `;
+        }).join("");
+      }
+
+      function captureModalityChipClass(modality) {
+        const mod = String(modality || "").toLowerCase();
+        if (["rgb", "albedo", "preview", "ldr", "hdr"].includes(mod)) return "cmc-rgb";
+        if (["depth", "normal", "dop", "geometric_normal", "smooth_normal", "position"].includes(mod)) return "cmc-geo";
+        if (["s1", "s2", "s3", "aolp", "dolp", "polar", "polarization", "polar_rgb_preview"].includes(mod)) return "cmc-pol";
+        return "";
+      }
+
+      /* ── Capture gallery helpers ── */
+
+      function pickRepresentativeItem(capture) {
+        const mode = document.getElementById("cap-repr-select")?.value || "auto";
+        const items = Array.isArray(capture.preview_items) ? capture.preview_items : [];
+        if (mode !== "auto") {
+          return items.find((i) => i.modality === mode && i.href) || items.find((i) => i.href) || items[0] || null;
+        }
+        const priority = ["rgb", "albedo", "polar_rgb_preview", "depth"];
+        for (const p of priority) {
+          const found = items.find((i) => i.modality === p && i.href);
+          if (found) return found;
+        }
+        return items.find((i) => i.href) || items[0] || null;
+      }
+
+      function buildCaptureCard(capture) {
+        const key = captureRecordKey(capture);
+        const repr = pickRepresentativeItem(capture);
+        const chips = (capture.modalities || [])
+          .map((mod) => `<span class="capture-mod-chip ${captureModalityChipClass(mod)}">${esc(mod)}</span>`)
+          .join("");
+        const imgHtml = repr?.href
+          ? `<img src="${esc(repr.href)}" alt="${esc(repr.modality || "")}" class="cap-card-img" loading="lazy">`
+          : `<div class="cap-card-img-empty"></div>`;
+        return `
+          <div class="cap-card js-capture-card${_selectedCaptureKey === key ? " is-selected" : ""}"
+               data-capture-key="${esc(key)}" tabindex="0">
+            <div class="cap-card-img-wrap">${imgHtml}</div>
+            <div class="cap-card-body">
+              <div class="cap-card-chips">${chips}</div>
+              <div class="cap-card-footer">
+                <span class="cap-card-cam">📷 ${esc(capture.camera_id || "")}</span>
+                <span class="cap-card-time">${esc((capture.timestamp || "").slice(11, 19))}</span>
+              </div>
+            </div>
+          </div>`;
+      }
+
+      function openCaptureDrawer(capture) {
+        if (!capture) return;
+        _selectedCaptureKey = captureRecordKey(capture);
+        const drawer = document.getElementById("cap-drawer");
+        const mainImg = document.getElementById("cap-drawer-main-img");
+        const chips = document.getElementById("cap-drawer-chips");
+        const matrix = document.getElementById("cap-drawer-matrix");
+        const meta = document.getElementById("cap-drawer-meta");
+        const actions = document.getElementById("cap-drawer-actions");
+        const title = document.getElementById("cap-drawer-title");
+
+        if (title) title.textContent = `📷 ${capture.camera_id || ""} · ${(capture.timestamp || "").slice(11, 19)}`;
+
+        const repr = pickRepresentativeItem(capture);
+        if (mainImg) {
+          mainImg.src = repr?.href || "";
+          mainImg.alt = repr?.modality || "";
+        }
+
+        if (chips) {
+          chips.innerHTML = (capture.preview_items || []).map((item) => `
+            <button class="cap-drawer-chip capture-mod-chip ${captureModalityChipClass(item.modality || "")}"
+                    data-href="${esc(item.href || "")}" data-mod="${esc(item.modality || "")}">
+              ${esc(item.modality || "")}
+            </button>`).join("");
+          chips.querySelectorAll(".cap-drawer-chip").forEach((btn) => {
+            btn.addEventListener("click", () => {
+              if (mainImg) { mainImg.src = btn.dataset.href; mainImg.alt = btn.dataset.mod; }
+            });
+          });
+        }
+
+        if (matrix) {
+          matrix.innerHTML = (capture.preview_items || []).map((item) => `
+            <button class="cap-matrix-cell js-capture-preview-open"
+                    data-preview-href="${esc(item.href || "")}"
+                    data-preview-modality="${esc(item.modality || "")}"
+                    data-preview-camera="${esc(capture.camera_id || "")}"
+                    data-preview-timestamp="${esc(capture.timestamp || "")}">
+              ${item.href ? `<img src="${esc(item.href)}" alt="${esc(item.modality || "")}">` : '<div class="cap-matrix-empty"></div>'}
+              <span>${esc(item.modality || "")}</span>
+            </button>`).join("");
+        }
+
+        if (meta) {
+          meta.innerHTML = `
+            <dt>Camera</dt><dd>${esc(capture.camera_id || "—")}</dd>
+            <dt>Time</dt><dd>${esc(capture.timestamp || "—")}</dd>
+            ${capture.camera_fov_deg != null ? `<dt>FoV</dt><dd>${Number(capture.camera_fov_deg).toFixed(1)}°</dd>` : ""}
+            <dt>Modalities</dt><dd>${(capture.modalities || []).length}</dd>
+          `;
+        }
+
+        if (actions) {
+          actions.innerHTML = `
+            <a href="${esc(capture.manifest_href || "#")}" class="button button-subtle" style="font-size:0.72rem;">Manifest</a>
+            <button class="button button-subtle js-capture-show-map" data-capture-key="${esc(_selectedCaptureKey || "")}"
+                    style="font-size:0.72rem;">
+              <span data-lang="en">Map</span><span data-lang="kr" class="hidden">맵</span>
+            </button>`;
+        }
+
+        drawer?.classList.add("is-open");
+        syncCaptureCardSelection();
+        drawCaptureMap();
+      }
+
+      function setCaptureViewMode(mode) {
+        _captureViewMode = mode;
+        const mainRow = document.getElementById("cap-main-row");
+        const drawer = document.getElementById("cap-drawer");
+        if (mainRow) mainRow.setAttribute("data-vm", mode);
+        if (mode === "split") drawer?.classList.add("is-open");
+        document.querySelectorAll(".cap-vm-btn").forEach((btn) => {
+          btn.classList.toggle("is-active", btn.dataset.vm === mode);
+        });
+        // force map redraw for new dimensions after CSS transition
+        setTimeout(() => { drawCaptureMap(); }, 210);
+      }
+
+      function renderCaptureHistoryGrid() {
+        const grid = document.getElementById("capture-history-grid");
+        const empty = document.getElementById("capture-history-empty");
+        if (!grid) return;
+
+        // Apply modality + status filters
+        const modFilter = document.getElementById("cap-mod-filter")?.value || "";
+        const statusFilter = document.getElementById("cap-status-filter")?.value || "";
+        let records = _captureRecords;
+        if (modFilter) records = records.filter((c) => (c.modalities || []).includes(modFilter));
+        if (statusFilter) records = records.filter((c) => (c.status || "") === statusFilter);
+
+        if (!records.length) {
+          grid.innerHTML = "";
+          if (empty) empty.classList.remove("hidden");
+          return;
+        }
+        if (empty) empty.classList.add("hidden");
+        grid.innerHTML = records.map(buildCaptureCard).join("");
+      }
+
+      function drawCaptureMap() {
+        const canvas = document.getElementById("capture-map-canvas");
+        const frame = document.getElementById("capture-map-frame");
+        const img = document.getElementById("capture-map-img");
+        const empty = document.getElementById("capture-map-empty");
+        const status = document.getElementById("capture-map-status");
+        const meta = document.getElementById("capture-map-meta");
+        if (!canvas || !frame) return;
+        canvas.width = frame.clientWidth;
+        canvas.height = frame.clientHeight;
+        const ctx = canvas.getContext("2d");
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+        if (_floorplan && _floorplan.artifact_href && img) {
+          img.src = _floorplan.artifact_href;
+          img.style.display = "";
+          if (empty) empty.classList.add("hidden");
+        } else {
+          if (empty) empty.classList.remove("hidden");
+          if (status) status.textContent = lang() === "kr" ? "도면이 아직 없어 위치를 표시할 수 없습니다." : "No floorplan is available yet.";
+          return;
+        }
+
+        const completedEntries = _captureRecords
+          .map((record) => ({ record, overlay: captureOverlayFromRecord(record) }))
+          .filter((item) => item.overlay);
+        const liveEntries = _liveCaptureEntries
+          .map((record) => ({ record, overlay: captureOverlayFromRecord(record) }))
+          .filter((item) => item.overlay);
+        const selectedEntry =
+          liveEntries.find((item) => captureRecordKey(item.record) === _selectedCaptureKey) ||
+          completedEntries.find((item) => captureRecordKey(item.record) === _selectedCaptureKey) ||
+          null;
+
+        completedEntries.forEach(({ record, overlay }) => {
+          const point = worldToCanvas([overlay.origin[0], overlay.origin[2]], canvas);
+          if (!point) return;
+          const selected = captureRecordKey(record) === _selectedCaptureKey;
+          ctx.save();
+          ctx.beginPath();
+          ctx.arc(point[0], point[1], selected ? 7 : 4, 0, Math.PI * 2);
+          ctx.fillStyle = selected ? "rgba(20,184,166,0.92)" : "rgba(20,184,166,0.35)";
+          ctx.fill();
+          if (selected) {
+            ctx.strokeStyle = "#ffffff";
+            ctx.lineWidth = 2;
+            ctx.stroke();
+          }
+          ctx.restore();
+        });
+
+        liveEntries.forEach(({ overlay }) => drawCameraOverlay(ctx, canvas, overlay));
+
+        if (selectedEntry) {
+          drawCameraOverlay(ctx, canvas, selectedEntry.overlay);
+          if (status) {
+            status.textContent = selectedEntry.record.status === "completed"
+              ? (lang() === "kr"
+                ? `${selectedEntry.record.camera_id || "capture"} 캡처 위치 표시 중`
+                : `Showing capture camera ${selectedEntry.record.camera_id || "capture"}`)
+              : (lang() === "kr"
+                ? "작업중인 캡처 카메라 위치 표시 중"
+                : "Showing the in-progress capture camera");
+          }
+        } else if (status) {
+          status.textContent = lang() === "kr"
+            ? "캡처 카드를 선택하면 촬영 위치를 지도에 표시합니다."
+            : "Select a capture card to see where it was taken.";
+        }
+
+        if (meta) {
+          meta.textContent = lang() === "kr"
+            ? `완료 ${completedEntries.length} · 진행중 ${liveEntries.length}`
+            : `Completed ${completedEntries.length} · Live ${liveEntries.length}`;
+        }
+      }
+
+      function openCapturePreview({ href = "", modality = "", camera = "", timestamp = "" } = {}) {
+        if (!href) return;
+        const modal = document.getElementById("capture-preview-modal");
+        const image = document.getElementById("capture-preview-image");
+        const title = document.getElementById("capture-preview-title");
+        const meta = document.getElementById("capture-preview-meta");
+        if (!modal || !image || !title || !meta) return;
+        _capturePreviewState = { href, modality, camera, timestamp };
+        title.textContent = modality || (lang() === "kr" ? "캡처 미리보기" : "Capture Preview");
+        meta.textContent = [camera, timestamp].filter(Boolean).join(" · ");
+        image.src = href;
+        image.alt = modality || "Capture preview";
+        modal.classList.remove("hidden");
+        modal.setAttribute("aria-hidden", "false");
+        document.body.classList.add("capture-preview-open");
+      }
+
+      function closeCapturePreview() {
+        const modal = document.getElementById("capture-preview-modal");
+        const image = document.getElementById("capture-preview-image");
+        if (!modal || !image) return;
+        modal.classList.add("hidden");
+        modal.setAttribute("aria-hidden", "true");
+        image.src = "";
+        document.body.classList.remove("capture-preview-open");
+      }
+
+      function syncCaptureCardSelection() {
+        document.querySelectorAll(".js-capture-card").forEach((card) => {
+          card.classList.toggle("is-selected", card.dataset.captureKey === _selectedCaptureKey);
+        });
+      }
+
+      function viewRelation(node) {
+        if (!_session || !_session.active_viewport_camera) return { label: "-", hint: "" };
+        const world = objectWorldXZ(node);
+        const camera = _session.active_viewport_camera;
+        if (!world || !camera || !Array.isArray(camera.origin) || !Array.isArray(camera.target)) return { label: "-", hint: "" };
+        const origin = [Number(camera.origin[0]), Number(camera.origin[2])];
+        const target = [Number(camera.target[0]), Number(camera.target[2])];
+        const forward = [target[0] - origin[0], target[1] - origin[1]];
+        const toObj = [world[0] - origin[0], world[1] - origin[1]];
+        const fLen = Math.hypot(forward[0], forward[1]) || 1;
+        const oLen = Math.hypot(toObj[0], toObj[1]) || 1;
+        const dot = (forward[0] * toObj[0] + forward[1] * toObj[1]) / (fLen * oLen);
+        const angle = Math.acos(Math.max(-1, Math.min(1, dot)));
+        const inside = angle <= ((Number(camera.fov_deg || 60) * Math.PI / 180) / 2);
+        return {
+          label: inside ? (lang() === "kr" ? "시야 안" : "In View") : (lang() === "kr" ? "시야 밖" : "Out of View"),
+          hint: `${Math.round(oLen * 100) / 100}m · ${Math.round(angle * 180 / Math.PI)}°`,
+        };
+      }
+
+      function updateMaterialSelection() {
+        const node = currentNode();
+        const currentBsdf = node && node.override_bsdf ? node.override_bsdf : "none";
+        document.querySelectorAll(".material-card-clickable").forEach((card) => {
+          card.classList.toggle("is-current", card.dataset.bsdfType === currentBsdf);
+        });
+      }
+
+      function showNodeDetail() {
+        const empty = document.getElementById("workspace-detail-empty");
+        const content = document.getElementById("workspace-detail-content");
+        const node = currentNode();
+        if (!node) {
+          if (empty) empty.classList.remove("hidden");
+          if (content) content.classList.add("hidden");
+          return;
+        }
+        if (empty) empty.classList.add("hidden");
+        if (content) content.classList.remove("hidden");
+
+        const relation = viewRelation(node);
+
+        // 이름 + 경로
+        const namEl = document.getElementById("workspace-detail-name");
+        const pathEl = document.getElementById("workspace-detail-path");
+        if (namEl) namEl.textContent = node.name;
+        if (pathEl) pathEl.textContent = node.path;
+
+        // 호환용 hidden stat 업데이트
+        const statShapes = document.getElementById("workspace-stat-shapes");
+        const statVisible = document.getElementById("workspace-stat-visible");
+        const statView = document.getElementById("workspace-stat-in-view");
+        if (statShapes) statShapes.textContent = String(node.shape_count || 0);
+        if (statVisible) statVisible.textContent = node.visible === undefined || node.visible === null ? "–" : (node.visible ? "Visible" : "Hidden");
+        if (statView) statView.textContent = relation.label;
+
+        // 속성 배지 행 (prop-badge, not badge)
+        const badges = document.getElementById("workspace-detail-badges");
+        const robot = currentRobot();
+        if (badges) {
+          const kindClass = node.kind === "object" ? "" : " prop-badge-kind";
+          const visClass = (node.visible === false) ? " prop-badge-hidden" : "";
+          const robotPart = robot
+            ? `<span class="prop-badge prop-badge-robot">${esc(robot.name || "robot")}</span>`
+            : "";
+          const overridePart = node.override_bsdf
+            ? `<span class="prop-badge prop-badge-override">M · ${esc(node.override_bsdf)}</span>`
+            : "";
+          const hiddenPart = (node.visible === false)
+            ? `<span class="prop-badge prop-badge-hidden">H · hidden</span>`
+            : "";
+          const viewPart = relation.hint
+            ? `<span class="prop-badge">${esc(relation.hint)}</span>`
+            : "";
+          badges.innerHTML = `
+            <span class="prop-badge prop-badge-kind">${esc(node.kind || "node")}</span>
+            <span class="prop-badge${visClass}">${node.shape_count || 0} shapes</span>
+            ${robotPart}${overridePart}${hiddenPart}${viewPart}
+          `;
+        }
+
+        // 맵 뷰 관계 업데이트
+        const mapRelation = document.getElementById("ws-map-relation");
+        if (mapRelation) mapRelation.textContent = relation.label + (relation.hint ? ` · ${relation.hint}` : "");
+
+        // 노드 전환 시 이전 적용 중 상태 초기화
+        _matPageExpanded = false;
+        document.querySelectorAll(".material-card-clickable").forEach((c) => {
+          c.classList.remove("is-selected", "is-applying");
+          c.dataset.applying = "";
+        });
+
+        updateMaterialSelection();
+        filterMaterials();
+        updateMapDebugPanel();
+      }
+
+      function renderRobotRoster() {
+        const container = document.getElementById("workspace-robot-list");
+        const status = document.getElementById("workspace-robot-status");
+        if (!container) return;
+        const robots = (_session && Array.isArray(_session.robot_inventory)) ? _session.robot_inventory : [];
+        if (!robots.length) {
+          container.innerHTML = `<div class="empty-state"><span>${lang() === "kr" ? "연결된 로봇 엔티티가 아직 없습니다." : "No live robot entities yet."}</span></div>`;
+          if (status) status.textContent = lang() === "kr" ? "로봇 0대" : "0 robots";
+          return;
+        }
+        if (status) status.textContent = lang() === "kr" ? `로봇 ${robots.length}대 추적 중` : `Tracking ${robots.length} robots`;
+        container.innerHTML = robots.map((robot) => {
+          const selected = !!robot.selected || (_selectedPath && (_selectedPath === robot.path || _selectedPath.startsWith(`${robot.path}/`)));
+          const xyz = Array.isArray(robot.translation) ? robot.translation : null;
+          const location = xyz ? `${Number(xyz[0]).toFixed(2)}, ${Number(xyz[1]).toFixed(2)}, ${Number(xyz[2]).toFixed(2)}` : "—";
+          return `
+            <button type="button" class="workspace-robot-card${selected ? " is-selected" : ""}" data-robot-path="${esc(robot.path)}">
+              <div class="workspace-robot-card-head">
+                <span class="workspace-robot-card-title">${esc(robot.name)}</span>
+                <span class="workspace-robot-card-badge">${selected ? (lang() === "kr" ? "선택됨" : "Selected") : (lang() === "kr" ? "실행 중" : "Live")}</span>
+              </div>
+              <div class="workspace-robot-card-path">${esc(robot.path)}</div>
+              <div class="workspace-robot-card-meta">${lang() === "kr" ? "위치" : "XYZ"} · ${esc(location)}</div>
+              <div class="workspace-robot-card-stats">
+                <span>${lang() === "kr" ? `노드 ${robot.member_count || 0}` : `${robot.member_count || 0} nodes`}</span>
+                <span>${lang() === "kr" ? `Shape ${robot.shape_count || 0}` : `${robot.shape_count || 0} shapes`}</span>
+                <span>${lang() === "kr" ? `재질 ${robot.override_count || 0}` : `${robot.override_count || 0} overrides`}</span>
+              </div>
+            </button>
+          `;
+        }).join("");
+        container.querySelectorAll("[data-robot-path]").forEach((button) => {
+          button.addEventListener("click", async () => {
+            const path = button.dataset.robotPath;
+            if (!path) return;
+            _selectedPath = path;
+            renderTree();
+            renderRobotRoster();
+            showNodeDetail();
+            drawWorkspaceMap();
+            await updateSelection([path]);
+          });
+        });
+      }
+
+      function buildTree(flat) {
+        const byPath = new Map();
+        flat.forEach((node) => byPath.set(node.path, { ...node, children: [] }));
+        const roots = [];
+        flat.forEach((node) => {
+          const current = byPath.get(node.path);
+          const last = node.path.lastIndexOf("/");
+          const parentPath = last > 0 ? node.path.slice(0, last) : null;
+          const parent = parentPath ? byPath.get(parentPath) : null;
+          if (parent) parent.children.push(current);
+          else roots.push(current);
+        });
+        return { roots, byPath };
+      }
+
+      function seedCollapsedTree(inventory) {
+        const parents = new Set();
+        inventory.forEach((node) => {
+          const parts = String(node.path || "").split("/").filter(Boolean);
+          let current = "";
+          parts.slice(0, -1).forEach((part) => {
+            current += `/${part}`;
+            parents.add(current);
+          });
+        });
+        _collapsed = parents;
+        if (_selectedPath) {
+          const parts = _selectedPath.split("/").filter(Boolean);
+          let current = "";
+          parts.slice(0, -1).forEach((part) => {
+            current += `/${part}`;
+            _collapsed.delete(current);
+          });
+        }
+      }
+
+      function renderTree() {
+        const body = document.getElementById("workspace-tree-body");
+        const status = document.getElementById("ws-tree-status");
+        const query = ((document.getElementById("workspace-tree-search") || {}).value || "").toLowerCase().trim();
+        if (!body) return;
+
+        if (!_inventory.length) {
+          body.innerHTML = `<div class="empty-state">${lang() === "kr" ? "Load 또는 Connect 이후 live stage 오브젝트가 여기에 나타납니다." : "Live stage objects will appear here after Load or Connect."}</div>`;
+          if (status) status.textContent = lang() === "kr" ? "현재 연결된 stage 오브젝트 없음" : "No live stage objects yet.";
+          return;
+        }
+        if (status) status.textContent = lang() === "kr" ? `${_inventory.length}개 노드 동기화됨` : `${_inventory.length} nodes synced`;
+
+        const { roots } = buildTree(_inventory);
+
+        function passesObjFilter(node) {
+          if (_objFilter === "all") return true;
+          if (_objFilter === "modified") return !!node.override_bsdf;
+          if (_objFilter === "hidden") return node.visible === false;
+          if (_objFilter === "override") return !!node.override_bsdf;
+          return true;
+        }
+
+        function matches(node) {
+          const textMatch = !query || node.name.toLowerCase().includes(query) || node.path.toLowerCase().includes(query);
+          const filterMatch = passesObjFilter(node);
+          if (textMatch && filterMatch) return true;
+          return node.children.some(matches);
+        }
+
+        function renderNode(node) {
+          if (!matches(node)) return "";
+          const hasChildren = node.children.length > 0;
+          const collapsed = _collapsed.has(node.path);
+          const selected = node.path === _selectedPath;
+          const indent = (Number(node.depth || 0) * 14) + 8;
+          const badges = [
+            node.override_bsdf ? `<span class="tree-node-badge badge-M" title="${esc(node.override_bsdf)}">M</span>` : "",
+            (node.visible === false) ? `<span class="tree-node-badge badge-H" title="hidden">H</span>` : "",
+            node.has_state ? `<span class="tree-node-badge badge-active" title="active">●</span>` : "",
+          ].join("");
+          return `
+            <div>
+              <div class="obj-tree-node${selected ? " is-selected" : ""} js-tree-node" data-path="${esc(node.path)}" style="padding-left:${indent}px;" tabindex="0">
+                <span class="obj-tree-toggle js-tree-toggle" data-path="${esc(node.path)}">${hasChildren ? (collapsed ? "▶" : "▾") : ""}</span>
+                <span class="obj-tree-kind">${node.kind === "object" ? "○" : "⬡"}</span>
+                <span class="obj-tree-label">${esc(node.name)}</span>
+                ${badges}
+              </div>
+              ${hasChildren && !collapsed ? node.children.map(renderNode).join("") : ""}
+            </div>
+          `;
+        }
+        body.innerHTML = roots.map(renderNode).join("");
+        body.querySelectorAll(".js-tree-toggle").forEach((toggle) => {
+          toggle.addEventListener("click", (event) => {
+            event.stopPropagation();
+            const path = toggle.dataset.path;
+            if (!path) return;
+            if (_collapsed.has(path)) _collapsed.delete(path);
+            else _collapsed.add(path);
+            renderTree();
+          });
+        });
+        body.querySelectorAll(".js-tree-node").forEach((row) => {
+          const activate = async () => {
+            const path = row.dataset.path;
+            if (!path) return;
+            _selectedPath = path;
+            renderTree();
+            showNodeDetail();
+            drawWorkspaceMap();
+            await updateSelection([path]);
+          };
+          row.addEventListener("click", activate);
+          row.addEventListener("keydown", (event) => {
+            if (event.key === "Enter" || event.key === " ") {
+              event.preventDefault();
+              activate();
+            }
+          });
+        });
+      }
+
+      async function pollSession() {
+        try {
+          const res = await fetch("/isaac/session");
+          if (!res.ok) return;
+          const payload = await res.json();
+          const session = payload.status === "active" && payload.session && payload.session.scene_id === selectedSceneId
+            ? payload.session
+            : null;
+          const isActive = !!session;
+          if (isActive && !_sessionWasActive) {
+            _treeSeeded = false;
+          }
+          _sessionWasActive = isActive;
+          _session = session;
+          setWorkspaceStatus();
+          const viewportSig = viewportSignature(session);
+          if (viewportSig !== _lastViewportSignature) {
+            _lastViewportSignature = viewportSig;
+            syncFloorplanActiveViewportFromSession();
+          }
+          const inventory = session ? (session.object_inventory || []) : [];
+          const signature = JSON.stringify(inventory.map((item) => [item.path, item.kind, item.shape_count, item.override_bsdf, item.visible, (item.transform || []).join(",")]));
+          const prevSignature = JSON.stringify(_inventory.map((item) => [item.path, item.kind, item.shape_count, item.override_bsdf, item.visible, (item.transform || []).join(",")]));
+          const inventoryChanged = signature !== prevSignature;
+          if (inventoryChanged) {
+            _inventory = inventory;
+            _inventoryByPath = new Map(inventory.map((item) => [item.path, item]));
+            if (_selectedPath && !_inventoryByPath.has(_selectedPath)) {
+              _selectedPath = null;
+            }
+            if (!_selectedPath && session && Array.isArray(session.selected_prim_paths) && session.selected_prim_paths.length) {
+              _selectedPath = session.selected_prim_paths[0];
+            }
+            if (!_treeSeeded && inventory.length) {
+              seedCollapsedTree(inventory);
+              _treeSeeded = true;
+            }
+            renderTree();
+          } else {
+            _inventoryByPath = new Map(inventory.map((item) => [item.path, item]));
+          }
+          renderRobotRoster();
+          // dirty-flag: showNodeDetail only when selection / BSDF changes
+          const newSessionJson = JSON.stringify({
+            isActive,
+            selectedPath: _selectedPath,
+            overrideBsdf: currentNode()?.override_bsdf,
+            robotPath: currentRobot()?.path || null,
+          });
+          if (newSessionJson !== _lastSessionJson || inventoryChanged) {
+            _lastSessionJson = newSessionJson;
+            showNodeDetail();
+          }
+          // drawWorkspaceMap only when viewport or inventory changes
+          const viewportChanged = viewportSig !== _lastViewportJson;
+          if (viewportChanged || inventoryChanged) {
+            _lastViewportJson = viewportSig;
+            if ("requestIdleCallback" in window) {
+              requestIdleCallback(() => { drawWorkspaceMap(); updateMapDebugPanel(); }, { timeout: 300 });
+            } else {
+              drawWorkspaceMap();
+              updateMapDebugPanel();
+            }
+          }
+        } catch (_) {}
+      }
+
+      async function pollRenderStatus() {
+        const activeState   = document.getElementById("render-active-state");
+        const activeDot     = document.getElementById("render-live-dot");
+        const activeTitle   = document.getElementById("render-active-title");
+        const activeElapsed = document.getElementById("render-active-elapsed");
+        const timeline      = document.getElementById("render-timeline");
+        try {
+          const [healthRes, telemetryRes, commandsRes] = await Promise.all([
+            fetch("/health"),
+            fetch("/api/isaac/telemetry/recent"),
+            fetch("/api/isaac/commands"),
+          ]);
+          const health   = healthRes.ok   ? await healthRes.json()   : {};
+          const telemetry = telemetryRes.ok ? await telemetryRes.json() : { events: [] };
+          const commandsPayload = commandsRes.ok ? await commandsRes.json() : { commands: [] };
+          const active = health.active_isaac_command;
+          const isLive = !!(active && active.scene_id === selectedSceneId &&
+            ["render_current_view", "render_sensor"].includes(active.command_type || ""));
+          if (isLive) {
+            startRenderRequestOverlay(active);
+          } else {
+            clearRenderRequestOverlay();
+          }
+          _liveCaptureEntries = (commandsPayload.commands || [])
+            .filter((item) => item.scene_id === selectedSceneId && ["render_current_view", "render_sensor"].includes(item.command_type || "") && ["queued", "dispatched", "running"].includes(item.status || ""))
+            .slice(0, 6)
+            .map((item) => {
+              const key = renderCommandKey(item);
+              const overlay = key && key === _activeRenderRequestKey && _activeRenderRequestOverlay
+                ? _activeRenderRequestOverlay
+                : null;
+              return {
+                capture_key: key ? `live:${key}` : null,
+                command_id: key,
+                status: item.status || "running",
+                timestamp: item.created_at || item.updated_at || "",
+                camera_id: overlay ? overlay.camera_id : ((_session && _session.active_viewport_camera && _session.active_viewport_camera.sensor_id) || "isaac_viewport"),
+                modalities: (item.payload && Array.isArray(item.payload.modalities)) ? item.payload.modalities : ["rgb", "depth"],
+                progress_message: item.progress_message || item.progress_stage || item.status || "",
+                camera_origin: overlay ? overlay.origin : null,
+                camera_target: overlay ? overlay.target : null,
+                camera_fov_deg: overlay ? overlay.fov_deg : null,
+              };
+            });
+          renderLiveCaptureCards();
+          drawCaptureMap();
+          syncCaptureCardSelection();
+
+          // ── 활성 렌더 패널 ──
+          if (activeDot) activeDot.classList.toggle("is-live", isLive);
+          if (activeTitle) {
+            activeTitle.textContent = isLive
+              ? (active.command_type || "render")
+              : (lang() === "kr" ? "진행 중인 렌더 없음" : "No active render");
+          }
+          if (activeElapsed && isLive && active.started_at) {
+            const secs = Math.floor((Date.now() - new Date(active.started_at).getTime()) / 1000);
+            activeElapsed.textContent = secs < 60 ? `${secs}s` : `${Math.floor(secs/60)}m ${secs%60}s`;
+          } else if (activeElapsed) {
+            activeElapsed.textContent = "";
+          }
+          if (activeState) {
+            if (isLive) {
+              const stage   = esc(active.progress_stage   || "");
+              const origin  = esc(active.progress_origin  || "");
+              const message = esc(active.progress_message || active.status || "");
+              activeState.innerHTML = `
+                <div style="margin-top:0.35rem;">
+                  <div class="render-stage-row">
+                    <span class="render-stage-dot active"></span>
+                    <span style="font-size:0.8rem;color:var(--text);font-weight:600;">${message}</span>
+                  </div>
+                  ${stage ? `<div class="render-stage-row"><span class="render-stage-dot done"></span><span class="muted" style="font-size:0.72rem;">${stage} · ${origin}</span></div>` : ""}
+                </div>`;
+            } else {
+              activeState.innerHTML = `<div class="empty-state text-sm" style="padding:0.5rem 0;">
+                <span>${lang() === "kr" ? "Render 또는 Smoke Render로 렌더를 시작하세요." : "Trigger Render or Smoke Render to start."}</span>
+              </div>`;
+            }
+          }
+
+          // ── 타임라인: 최근 렌더 작업항목 ──
+          if (timeline) {
+            const RENDER_CMDS = ["render_current_view", "render_sensor", "smoke_render"];
+            const recent = (commandsPayload.commands || [])
+              .filter((item) => item.scene_id === selectedSceneId && RENDER_CMDS.includes(item.command_type || ""))
+              .slice(0, 10);
+            if (!recent.length) {
+              timeline.innerHTML = `<div class="empty-state text-sm"><span>${lang() === "kr" ? "최근 렌더 이벤트가 여기에 표시됩니다." : "Recent render events will appear here."}</span></div>`;
+            } else {
+              timeline.innerHTML = recent.map((item) => {
+                const itemIsLive = ["queued", "dispatched", "running"].includes(item.status || "");
+                const st = itemIsLive ? "live" : (item.status === "succeeded" || item.status === "completed" ? "done" : (item.status === "failed" ? "failed" : "unknown"));
+                const badgeClass = `rjob-badge-${st}`;
+                const itemClass  = `rjob-${st}`;
+                const badgeLabel = itemIsLive
+                  ? (lang() === "kr" ? "실행 중" : "running")
+                  : esc(item.status || "-");
+                const liveAnim = itemIsLive ? `style="animation:pulse-dot 1.4s ease-in-out infinite;"` : "";
+                const itemTime = esc(item.updated_at || item.completed_at || item.created_at || "");
+                const itemMsg = esc(item.progress_message || item.error || item.progress_stage || "");
+                return `
+                  <a href="/jobs" class="render-job-item ${itemClass}" title="${lang() === "kr" ? "작업 목록에서 보기" : "View in Jobs"}">
+                    <div class="render-job-body">
+                      <div class="render-job-name">${esc(item.command_type || "render")}</div>
+                      <div class="render-job-msg">${itemMsg}</div>
+                      <div class="render-job-time">${itemTime}</div>
+                    </div>
+                    <div class="render-job-right">
+                      <span class="render-job-badge ${badgeClass}" ${liveAnim}>${badgeLabel}</span>
+                      <span class="render-job-goto">${lang() === "kr" ? "작업 보기 →" : "Jobs →"}</span>
+                    </div>
+                  </a>`;
+              }).join("");
+            }
+          }
+        } catch (_) {}
+      }
+
+      async function refreshCaptureHistory() {
+        try {
+          const res = await fetch(`/api/scenes/${encodeURIComponent(selectedSceneId)}/captures`);
+          if (!res.ok) return;
+          const payload = await res.json();
+          if (!Array.isArray(payload.captures)) return;
+          _captureRecords = payload.captures;
+          if (!_selectedCaptureKey && _captureRecords.length) {
+            _selectedCaptureKey = captureRecordKey(_captureRecords[0]);
+          }
+          renderCaptureHistoryGrid();
+          drawCaptureMap();
+          syncCaptureCardSelection();
+        } catch (_) {}
+      }
+
+      async function applyMaterial(bsdfType) {
+        const node = currentNode();
+        if (!node) return;
+        const previousBsdf = node && node.override_bsdf ? node.override_bsdf : "none";
+        const targetPaths = materialTargetPathsForNode(node);
+        if (!targetPaths.length) return;
+        const previousByPath = new Map(targetPaths.map((path) => {
+          const targetNode = _inventoryByPath.get(path);
+          return [path, targetNode && targetNode.override_bsdf ? targetNode.override_bsdf : "none"];
+        }));
+        try {
+          node.override_bsdf = bsdfType;
+          targetPaths.forEach((path) => {
+            const targetNode = _inventoryByPath.get(path);
+            if (targetNode) targetNode.override_bsdf = bsdfType;
+          });
+          updateMaterialSelection();
+          renderTree();
+          showNodeDetail();
+          await queueIsaacCommand(selectedSceneId, "apply_material_override", {
+            prim_paths: targetPaths,
+            bsdf_type: bsdfType,
+          });
+          showNodeDetail();
+          renderTree();
+        } catch (error) {
+          const fresh = _inventoryByPath.get(node.path);
+          if (fresh) fresh.override_bsdf = previousBsdf;
+          targetPaths.forEach((path) => {
+            const targetNode = _inventoryByPath.get(path);
+            if (targetNode) targetNode.override_bsdf = previousByPath.get(path) || "none";
+          });
+          updateMaterialSelection();
+          renderTree();
+          showNodeDetail();
+          alert(error.message || String(error));
+        }
+      }
+
+      function materialTargetPathsForNode(node) {
+        if (!node) return [];
+        // 노드 자체에 shape가 있으면 바로 사용
+        if (Number(node.shape_count || 0) > 0) return [node.path];
+        // shape가 없으면 자식 중 shape를 가진 것들을 모두 타겟으로
+        const descendants = _inventory
+          .filter((item) => item.path !== node.path && isDescendantPath(item.path, node.path) && Number(item.shape_count || 0) > 0)
+          .map((item) => item.path);
+        // 자식에도 shape가 없으면 노드 자체에 적용 (서버 측에서 처리)
+        return descendants.length ? descendants : [node.path];
+      }
+
+      function filterMaterials() {
+        const q = _matSearch.toLowerCase().trim();
+        const allCards = [...document.querySelectorAll(".material-card-clickable")];
+        let visibleCards = allCards.filter((card) => {
+          const matchFilter = _matFilter === "all" || card.dataset.category === _matFilter;
+          const matchSearch = !q || (card.dataset.titleEn || "").includes(q) || (card.dataset.titleKr || "").includes(q) || (card.dataset.bsdfType || "").includes(q);
+          return matchFilter && matchSearch;
+        });
+        // 먼저 전부 숨기고
+        allCards.forEach((c) => c.classList.add("hidden"));
+        // 필터된 것 중 MAT_PAGE_SIZE개만 표시 (expanded 시 전체)
+        const limit = _matPageExpanded ? visibleCards.length : MAT_PAGE_SIZE;
+        visibleCards.slice(0, limit).forEach((c) => c.classList.remove("hidden"));
+        const moreBtn = document.getElementById("ws-mat-more");
+        if (moreBtn) moreBtn.classList.toggle("hidden", visibleCards.length <= MAT_PAGE_SIZE || _matPageExpanded);
+      }
+
+      function bindInteractions() {
+        document.querySelectorAll(".js-isaac-command").forEach((button) => {
+          button.addEventListener("click", async () => {
+            try {
+              if (["render_current_view", "render_sensor"].includes(button.dataset.command || "")) {
+                startRenderRequestOverlay({
+                  command_type: button.dataset.command,
+                  scene_id: button.dataset.sceneId,
+                  started_at: new Date().toISOString(),
+                });
+                _liveCaptureEntries = [{
+                  capture_key: _activeRenderRequestKey ? `live:${_activeRenderRequestKey}` : null,
+                  command_id: _activeRenderRequestKey,
+                  status: "queued",
+                  timestamp: new Date().toISOString(),
+                  camera_id: _activeRenderRequestOverlay ? _activeRenderRequestOverlay.camera_id : "isaac_viewport",
+                  modalities: _savedRenderOptions.modalities || ["rgb", "depth"],
+                  progress_message: lang() === "kr" ? "렌더 요청 대기 중" : "Render request queued",
+                  camera_origin: _activeRenderRequestOverlay ? _activeRenderRequestOverlay.origin : null,
+                  camera_target: _activeRenderRequestOverlay ? _activeRenderRequestOverlay.target : null,
+                  camera_fov_deg: _activeRenderRequestOverlay ? _activeRenderRequestOverlay.fov_deg : null,
+                }];
+                if (!_selectedCaptureKey && _liveCaptureEntries[0].capture_key) {
+                  _selectedCaptureKey = _liveCaptureEntries[0].capture_key;
+                }
+                renderLiveCaptureCards();
+                drawCaptureMap();
+                syncCaptureCardSelection();
+              }
+              const _renderPayload = ["render_current_view", "render_sensor"].includes(button.dataset.command || "")
+                ? { modalities: _savedRenderOptions.modalities || ["rgb", "depth"], spp: _savedRenderOptions.spp || 64 }
+                : {};
+              await queueIsaacCommand(button.dataset.sceneId, button.dataset.command, _renderPayload);
+              applyTab("workspace");
+              setTimeout(pollSession, 500);
+              setTimeout(pollRenderStatus, 750);
+            } catch (error) {
+              alert(error.message || String(error));
+            }
+          });
+        });
+
+        document.querySelectorAll(".js-smoke-render").forEach((button) => {
+          button.addEventListener("click", async () => {
+            try {
+              await fetch("/api/tests/smoke-render", {
+                method: "POST",
+                headers: payloadHeaders(),
+                body: JSON.stringify({ scene_id: button.dataset.sceneId }),
+              });
+              applyTab("render");
+              setTimeout(pollRenderStatus, 500);
+            } catch (error) {
+              alert(error.message || String(error));
+            }
+          });
+        });
+
+        const mapFrame = document.getElementById("workspace-map-frame");
+        if (mapFrame) {
+          mapFrame.addEventListener("wheel", (event) => {
+            if (!_floorplan) return;
+            event.preventDefault();
+            const delta = event.deltaY < 0 ? 1.12 : 0.9;
+            zoomMapAt(event.clientX, event.clientY, _mapView.scale * delta);
+          }, { passive: false });
+
+          mapFrame.addEventListener("pointerdown", (event) => {
+            if (!_floorplan) return;
+            _mapView.dragging = true;
+            _mapView.moved = false;
+            _mapView.startX = event.clientX;
+            _mapView.startY = event.clientY;
+            _mapView.startTx = _mapView.tx;
+            _mapView.startTy = _mapView.ty;
+            mapFrame.setPointerCapture(event.pointerId);
+            applyMapTransform();
+          });
+
+          mapFrame.addEventListener("pointermove", (event) => {
+            const point = framePointToMapPoint(event.clientX, event.clientY);
+            const canvas = document.getElementById("workspace-map-canvas");
+            _mapDebug.hoverCanvas = point ? [point.x, point.y] : null;
+            _mapDebug.hoverWorldXZ = point ? mapPointToWorldXZ(point, canvas) : null;
+            updateMapDebugPanel();
+            if (!_mapView.dragging) return;
+            const dx = event.clientX - _mapView.startX;
+            const dy = event.clientY - _mapView.startY;
+            if (Math.abs(dx) > 3 || Math.abs(dy) > 3) _mapView.moved = true;
+            _mapView.tx = _mapView.startTx + dx;
+            _mapView.ty = _mapView.startTy + dy;
+            applyMapTransform();
+            drawWorkspaceMap();
+          });
+
+          const finishPointer = async (event) => {
+            if (!_mapView.dragging) return;
+            const moved = _mapView.moved;
+            _mapView.dragging = false;
+            applyMapTransform();
+            if (mapFrame.hasPointerCapture(event.pointerId)) {
+              mapFrame.releasePointerCapture(event.pointerId);
+            }
+            if (!moved) {
+              await selectNearestOverlayAt(event.clientX, event.clientY);
+            }
+          };
+          mapFrame.addEventListener("pointerup", finishPointer);
+          mapFrame.addEventListener("pointercancel", finishPointer);
+          mapFrame.addEventListener("pointerleave", () => {
+            _mapDebug.hoverCanvas = null;
+            _mapDebug.hoverWorldXZ = null;
+            updateMapDebugPanel();
+            drawWorkspaceMap();
+          });
+        }
+
+        // 재질 카드 — 클릭 즉시 적용 (두 단계 없음)
+        document.querySelectorAll(".material-card-clickable").forEach((card) => {
+          const selectCard = async () => {
+            if (card.dataset.applying === "1") return;  // 이중 클릭 방지
+
+            // 선택 노드 확인 (applyMaterial과 동일 경로)
+            const node = currentNode();
+            if (!node) return;
+
+            const bsdfType = card.dataset.bsdfType || "none";
+
+            // 즉시 시각적 피드백
+            document.querySelectorAll(".material-card-clickable").forEach((c) => c.classList.remove("is-selected", "is-applying"));
+            card.classList.add("is-applying");
+            card.dataset.applying = "1";
+
+            try {
+              await applyMaterial(bsdfType);
+              // 성공: is-applying 제거, is-current가 updateMaterialSelection에서 설정됨
+            } catch (_) {
+              // applyMaterial 내부에서 alert 처리
+            } finally {
+              card.classList.remove("is-applying");
+              card.dataset.applying = "";
+            }
+          };
+          card.addEventListener("click", selectCard);
+          card.addEventListener("keydown", (event) => {
+            if (event.key === "Enter" || event.key === " ") { event.preventDefault(); selectCard(); }
+          });
+        });
+
+        // Material filter chips
+        document.querySelectorAll("[data-mat-filter]").forEach((chip) => {
+          chip.addEventListener("click", () => {
+            _matFilter = chip.dataset.matFilter;
+            _matPageExpanded = false;
+            document.querySelectorAll("[data-mat-filter]").forEach((c) => c.classList.remove("active"));
+            chip.classList.add("active");
+            filterMaterials();
+          });
+        });
+
+        // More presets button
+        const moreBtn = document.getElementById("ws-mat-more");
+        if (moreBtn) {
+          moreBtn.addEventListener("click", () => { _matPageExpanded = true; filterMaterials(); });
+        }
+
+        // Tree filter chips
+        document.querySelectorAll("[data-obj-filter]").forEach((chip) => {
+          chip.addEventListener("click", () => {
+            _objFilter = chip.dataset.objFilter;
+            document.querySelectorAll("[data-obj-filter]").forEach((c) => c.classList.remove("active"));
+            chip.classList.add("active");
+            renderTree();
+          });
+        });
+
+        // Map/Preview seg control
+        document.querySelectorAll(".ws-view-seg .seg-btn").forEach((btn) => {
+          btn.addEventListener("click", () => {
+            const view = btn.dataset.view;
+            document.querySelectorAll(".ws-view-seg .seg-btn").forEach((b) => b.classList.remove("active"));
+            btn.classList.add("active");
+            document.getElementById("ws-view-map").classList.toggle("hidden", view !== "map");
+            document.getElementById("ws-view-preview").classList.toggle("hidden", view !== "preview");
+          });
+        });
+
+        // Preview trigger (smoke render from detail pane)
+        const previewTrigger = document.getElementById("ws-preview-trigger");
+        if (previewTrigger) {
+          previewTrigger.addEventListener("click", async () => {
+            const statusEl = document.getElementById("ws-preview-status");
+            if (statusEl) statusEl.textContent = lang() === "kr" ? "스모크 렌더 요청 중…" : "Requesting smoke render…";
+            try {
+              await fetch("/api/tests/smoke-render", {
+                method: "POST",
+                headers: payloadHeaders(),
+                body: JSON.stringify({ scene_id: selectedSceneId }),
+              });
+              if (statusEl) statusEl.textContent = lang() === "kr" ? "렌더 중… 결과가 캡처 탭에 표시됩니다." : "Rendering… results will appear in the Captures tab.";
+              setTimeout(() => applyTab("captures"), 3000);
+            } catch (err) {
+              if (statusEl) statusEl.textContent = lang() === "kr" ? "요청 실패" : "Request failed";
+            }
+          });
+        }
+
+        const materialSearch = document.getElementById("workspace-material-search");
+        const treeSearch = document.getElementById("workspace-tree-search");
+        if (materialSearch) materialSearch.addEventListener("input", (e) => { _matSearch = e.target.value; _matPageExpanded = false; filterMaterials(); });
+        if (treeSearch) treeSearch.addEventListener("input", renderTree);
+        const copyDebug = document.getElementById("workspace-copy-debug");
+        if (copyDebug) {
+          copyDebug.addEventListener("click", async () => {
+            const payload = JSON.stringify(collectMapDebugPayload(), null, 2);
+            try {
+              if (navigator.clipboard && navigator.clipboard.writeText) {
+                await navigator.clipboard.writeText(payload);
+              } else {
+                throw new Error("clipboard unavailable");
+              }
+              copyDebug.classList.add("is-copied");
+              setTimeout(() => copyDebug.classList.remove("is-copied"), 1200);
+            } catch (_) {
+              window.prompt(lang() === "kr" ? "디버그 JSON을 복사하세요" : "Copy debug JSON", payload);
+            }
+          });
+        }
+        document.addEventListener("click", (event) => {
+          const modalClose = event.target.closest("[data-capture-modal-close]");
+          if (modalClose) {
+            closeCapturePreview();
+            return;
+          }
+          const previewTrigger = event.target.closest(".js-capture-preview-open");
+          if (previewTrigger) {
+            event.preventDefault();
+            openCapturePreview({
+              href: previewTrigger.dataset.previewHref || "",
+              modality: previewTrigger.dataset.previewModality || "",
+              camera: previewTrigger.dataset.previewCamera || "",
+              timestamp: previewTrigger.dataset.previewTimestamp || "",
+            });
+            return;
+          }
+          const showMapButton = event.target.closest(".js-capture-show-map");
+          if (showMapButton) {
+            const key = showMapButton.dataset.captureKey;
+            if (key) {
+              _selectedCaptureKey = key;
+              drawCaptureMap();
+              syncCaptureCardSelection();
+            }
+            return;
+          }
+          const captureCard = event.target.closest(".js-capture-card");
+          if (captureCard) {
+            const key = captureCard.dataset.captureKey;
+            if (key) {
+              const record =
+                _captureRecords.find((c) => captureRecordKey(c) === key) ||
+                _liveCaptureEntries.find((c) => captureRecordKey(c) === key) ||
+                null;
+              if (record) {
+                openCaptureDrawer(record);
+              } else {
+                _selectedCaptureKey = key;
+                drawCaptureMap();
+                syncCaptureCardSelection();
+              }
+            }
+          }
+        });
+        document.addEventListener("keydown", (event) => {
+          if (event.key === "Escape") {
+            closeCapturePreview();
+          }
+          const captureCard = event.target.closest(".js-capture-card");
+          if (!captureCard) return;
+          if (event.key === "Enter" || event.key === " ") {
+            event.preventDefault();
+            const key = captureCard.dataset.captureKey;
+            if (key) {
+              const record =
+                _captureRecords.find((c) => captureRecordKey(c) === key) ||
+                _liveCaptureEntries.find((c) => captureRecordKey(c) === key) ||
+                null;
+              if (record) openCaptureDrawer(record);
+            }
+          }
+        });
+
+        // View mode buttons
+        document.getElementById("cap-viewmode-btns")?.addEventListener("click", (e) => {
+          const btn = e.target.closest(".cap-vm-btn");
+          if (btn) setCaptureViewMode(btn.dataset.vm);
+        });
+        document.getElementById("cap-drawer-close")?.addEventListener("click", () => {
+          document.getElementById("cap-drawer")?.classList.remove("is-open");
+          if (_captureViewMode === "split") setCaptureViewMode("gallery");
+        });
+        // Filter changes re-render grid
+        ["cap-repr-select", "cap-mod-filter", "cap-status-filter"].forEach((id) => {
+          document.getElementById(id)?.addEventListener("change", () => renderCaptureHistoryGrid());
+        });
+        window.addEventListener("resize", () => {
+          drawWorkspaceMap();
+          drawCaptureMap();
+          applyMapTransform();
+          updateMapDebugPanel();
+        });
+      }
+
+      bindInteractions();
+      setWorkspaceStatus();
+      renderTree();
+      showNodeDetail();
+      filterMaterials();
+      renderCaptureHistoryGrid();
+      renderLiveCaptureCards();
+      syncCaptureCardSelection();
+      updateMapDebugPanel();
+      loadFloorplan();
+      pollSession();
+      pollRenderStatus();
+      refreshCaptureHistory();
+      _pollTimer = setInterval(pollSession, 750);
+      _renderTimer = setInterval(pollRenderStatus, 3000);
+
+      /* ── Pause polling when tab is hidden ── */
+      document.addEventListener("visibilitychange", () => {
+        if (document.hidden) {
+          clearInterval(_pollTimer);
+          clearInterval(_renderTimer);
+          _pollTimer = null;
+          _renderTimer = null;
+        } else {
+          pollSession();
+          pollRenderStatus();
+          _pollTimer = setInterval(pollSession, 750);
+          _renderTimer = setInterval(pollRenderStatus, 3000);
+        }
+      });
+
+      /* ── Material sphere tooltip ── */
+      (() => {
+        const tip = document.getElementById("mat-sphere-tooltip");
+        const tipTitle = document.getElementById("mat-tip-title");
+        const tipCat = document.getElementById("mat-tip-category");
+        const tipBsdf = document.getElementById("mat-tip-bsdf");
+        const tipDesc = document.getElementById("mat-tip-desc");
+        if (!tip) return;
+
+        const GAP = 14; // px offset from cursor
+
+        function _show(card, mx, my) {
+          const isKr = document.documentElement.dataset.lang === "kr";
+          tipTitle.textContent = isKr
+            ? (card.dataset.tooltipTitleKr || card.dataset.titleKr || "")
+            : (card.dataset.tooltipTitleEn || card.dataset.titleEn || "");
+          tipCat.textContent = card.dataset.category || "";
+          tipBsdf.textContent = card.dataset.bsdfType || "";
+          tipDesc.textContent = isKr
+            ? (card.dataset.tooltipDescKr || "")
+            : (card.dataset.tooltipDescEn || "");
+          tip.classList.remove("hidden");
+          _position(mx, my);
+        }
+
+        function _position(mx, my) {
+          const tw = tip.offsetWidth;
+          const th = tip.offsetHeight;
+          let left = mx + GAP;
+          let top  = my + GAP;
+          if (left + tw > window.innerWidth - 8)  left = mx - tw - GAP;
+          if (top  + th > window.innerHeight - 8) top  = my - th - GAP;
+          tip.style.left = left + "px";
+          tip.style.top  = top  + "px";
+        }
+
+        const grid = document.getElementById("workspace-material-grid");
+        if (!grid) return;
+
+        grid.addEventListener("mouseover", (e) => {
+          const card = e.target.closest(".material-card-clickable");
+          if (card) _show(card, e.clientX, e.clientY);
+        });
+        grid.addEventListener("mousemove", (e) => {
+          if (!tip.classList.contains("hidden")) _position(e.clientX, e.clientY);
+        });
+        grid.addEventListener("mouseout", (e) => {
+          if (!e.relatedTarget || !e.relatedTarget.closest(".material-card-clickable")) {
+            tip.classList.add("hidden");
+          }
+        });
+        // Hide on scroll/resize
+        document.addEventListener("scroll", () => tip.classList.add("hidden"), { passive: true });
+      })();
+    })();
+
+    // ══════════════════════════════════════════════════════════
+    // Material Library — 논문 출처별 measured BRDF 그리드
+    // ══════════════════════════════════════════════════════════
+    (() => {
+      const sceneId = {{ scene.scene_id|tojson if scene else "null" }};
+      let _matLibGroups = [];        // raw data from /api/material-library
+      let _matFilter = "all";        // "all" | "polarized" | "nir" | "available"
+      let _matQuery = "";            // search text
+
+      // ── Load data when Materials tab is first activated ────
+      let _matLibLoaded = false;
+      document.querySelectorAll("[data-tab]").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          if (btn.dataset.tab === "materials" && !_matLibLoaded) {
+            _matLibLoaded = true;
+            loadMaterialLibrary();
+          }
+        });
+      });
+
+      // ── Fetch and render ────────────────────────────────────
+      async function loadMaterialLibrary() {
+        const root = document.getElementById("material-library-root");
+        if (!root) return;
+        root.innerHTML = '<div class="muted text-xs p-4">Loading…</div>';
+        try {
+          const resp = await fetch("/api/material-library");
+          if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+          const json = await resp.json();
+          _matLibGroups = json.groups || [];
+          renderMaterialLibrary();
+        } catch (err) {
+          root.innerHTML = `<div class="muted text-xs p-4">Failed to load: ${err.message}</div>`;
+        }
+      }
+
+      function renderMaterialLibrary() {
+        const root = document.getElementById("material-library-root");
+        if (!root) return;
+        const query = _matQuery.toLowerCase();
+
+        let html = "";
+        for (const group of _matLibGroups) {
+          // Filter by capability
+          if (_matFilter === "polarized" && !group.capabilities.polarization) continue;
+          if (_matFilter === "nir"       && !group.capabilities.nir)           continue;
+
+          // Filter materials
+          let mats = group.materials;
+          if (_matFilter === "available") mats = mats.filter(m => m.status === "available" || m.status === "needs_patch");
+          if (query) mats = mats.filter(m => m.display_name.toLowerCase().includes(query) || group.display_name.toLowerCase().includes(query));
+          if (mats.length === 0) continue;
+
+          const spectral = group.capabilities.spectral_range_nm || [400, 700];
+          const capBadges = [
+            group.capabilities.polarization ? '<span class="cap-badge polar">● Polarized</span>' : "",
+            group.capabilities.nir          ? '<span class="cap-badge nir">● NIR</span>'         : "",
+            `<span class="cap-badge spectral">${spectral[0]}–${spectral[1]} nm</span>`,
+            (!group.capabilities.polarization && !group.capabilities.nir) ? '<span class="cap-badge conv">Conversion target</span>' : "",
+          ].filter(Boolean).join("");
+
+          const patchWarn = group.patch_required
+            ? `<div class="patch-warning">⚠ Mitsuba source patch required (${group.display_name})</div>`
+            : "";
+
+          const cards = mats.map(mat => {
+            const hue = group.swatch_hue || 200;
+            const sat = mat.status === "not_downloaded" ? "15%" : "40%";
+            const lit = mat.status === "not_downloaded" ? "70%" : "55%";
+            const bg = `hsl(${hue}, ${sat}, ${lit})`;
+            const statusDot = `<span class="status-dot ${mat.status}"></span>`;
+            const safeFile = (mat.native_file || "").replace(/'/g, "\\'");
+            const safeMat  = mat.material_id.replace(/'/g, "\\'");
+            const safeDs   = group.dataset_id.replace(/'/g, "\\'");
+            const safeBsdf = group.mitsuba_strategy.replace(/'/g, "\\'");
+            return `<div class="measured-card"
+                         title="${mat.display_name} — ${mat.status}"
+                         onclick="applyMeasuredMaterial('${safeDs}','${safeMat}','${safeFile}','${safeBsdf}')">
+              <div class="mat-swatch" style="background:${bg}">${statusDot}</div>
+              <div class="mat-label">${mat.display_name}</div>
+            </div>`;
+          }).join("");
+
+          html += `<div class="dataset-group"
+                        data-polar="${group.capabilities.polarization}"
+                        data-nir="${group.capabilities.nir}"
+                        data-ds="${group.dataset_id}">
+            <div class="dataset-group-header">
+              <span class="ds-name">${group.display_name}</span>
+              <span class="venue-badge">${group.venue}</span>
+              ${capBadges}
+              <span class="mat-count">${mats.length} material${mats.length !== 1 ? "s" : ""}</span>
+            </div>
+            ${patchWarn}
+            <div class="material-grid-row">${cards}</div>
+          </div>`;
+        }
+
+        root.innerHTML = html || '<div class="muted text-xs p-4">No materials match the current filter.</div>';
+        updateSelectedHint();
+      }
+
+      // ── Selected object hint ────────────────────────────────
+      function updateSelectedHint() {
+        const hint = document.getElementById("mat-selected-hint");
+        if (!hint) return;
+        const sel = (typeof window.getSelectedPrimPath === "function") ? window.getSelectedPrimPath() : null;
+        if (sel) {
+          hint.textContent = `Applying to: ${sel}`;
+        } else {
+          hint.textContent = "Select an object in the Workspace tree first, then click a material to apply it.";
+        }
+      }
+
+      // ── Apply material to selected object ───────────────────
+      window.applyMeasuredMaterial = async function(datasetId, materialId, filePath, bsdfType) {
+        const prim = (typeof window.getSelectedPrimPath === "function") ? window.getSelectedPrimPath() : null;
+        if (!prim) {
+          alert("Please select an object in the Workspace tree first.");
+          return;
+        }
+        if (!filePath) {
+          alert(`Material "${materialId}" is not downloaded yet.\nPlease download from the dataset source first.`);
+          return;
+        }
+        if (!sceneId) return;
+
+        try {
+          const resp = await fetch(`/api/scenes/${sceneId}/apply-measured-material`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              prim_path: prim,
+              dataset_id: datasetId,
+              material_id: materialId,
+              bsdf_type: bsdfType,
+              measured_file_path: filePath,
+            }),
+          });
+          if (!resp.ok) {
+            const err = await resp.json().catch(() => ({ error: resp.statusText }));
+            alert(`Apply failed: ${err.error || resp.statusText}`);
+            return;
+          }
+          const label = prim.split("/").pop() || prim;
+          // Show snackbar using existing helper if available
+          if (typeof showActivitySnackbar === "function") {
+            showActivitySnackbar(`Applied ${materialId} → ${label}`);
+          }
+        } catch (err) {
+          alert(`Network error: ${err.message}`);
+        }
+      };
+
+      // ── Filter helpers (called from HTML) ──────────────────
+      window.setMatFilter = function(filter, btn) {
+        _matFilter = filter;
+        document.querySelectorAll(".mat-filter-btn").forEach(b => b.classList.remove("active"));
+        if (btn) btn.classList.add("active");
+        renderMaterialLibrary();
+      };
+
+      window.filterMaterials = function() {
+        _matQuery = document.getElementById("mat-search")?.value || "";
+        renderMaterialLibrary();
+      };
+    })();
+
+    </script>
 {% endblock %}

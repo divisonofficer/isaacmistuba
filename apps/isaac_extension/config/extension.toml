@@ -1,0 +1,18 @@
+[core]
+reloadable = true
+order = 0
+
+[package]
+version = "0.1.0"
+title = "Robomituba Isaac Extension"
+description = "Hybrid Isaac Sim UI for Robomituba live scene sync and Mitsuba rendering."
+category = "Simulation"
+authors = ["Robomituba"]
+keywords = ["isaac", "mitsuba", "render", "robotics"]
+readme = "../README.md"
+
+[dependencies]
+"omni.kit.uiapp" = {}
+
+[[python.module]]
+name = "extension"

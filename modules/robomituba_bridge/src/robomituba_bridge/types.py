@@ -91,6 +91,7 @@ class SceneSnapshot:
     cameras: List[CameraRecord] = field(default_factory=list)
     lights: List[LightRecord] = field(default_factory=list)
     usd_stage_path: Optional[str] = None
+    robot_state: Optional[RobotState] = None
     extras: JsonDict = field(default_factory=dict)
 
 
@@ -149,12 +150,15 @@ class CameraSpec:
 @dataclass
 class BsdfOverride:
     """Mitsuba BSDF 재질 정의 (Isaac에서 오브젝트별로 선택 가능)"""
-    bsdf_type: str  # "diffuse" | "conductor" | "roughplastic" | "dielectric" | "roughconductor" | "principled"
+    bsdf_type: str  # "diffuse" | "conductor" | "roughplastic" | "dielectric" | "roughconductor" | "principled" | "measured_polarized" | "measured"
     base_color: Optional[Vec3] = None
     roughness: Optional[float] = None
     metallic: Optional[float] = None
     ior: Optional[float] = None
     material: Optional[str] = None  # conductor용 material name ("Al", "Cu", "Au", etc)
+    measured_file_path: Optional[str] = None  # measured / measured_polarized용 파일 경로 (repo-relative)
+    dataset_id: Optional[str] = None  # 출처 데이터셋 ID (e.g. "pbrdf_2020", "hpbrdf_2025")
+    material_id: Optional[str] = None  # 데이터셋 내 material ID
     extras: JsonDict = field(default_factory=dict)
 
 
@@ -175,13 +179,60 @@ class IsaacStateSnapshot:
     snapshot_id: str
     timestamp: str
     scene_id: str
-    scene_snapshot_ref: Optional[str] = None
     mitsuba_scene_ref: str  # repo-relative path to base scene.xml
+    scene_snapshot_ref: Optional[str] = None
     shape_map_ref: Optional[str] = None
     objects: List[IsaacObjectState] = field(default_factory=list)
     camera: Optional[CameraSpec] = None
     robot_state: Optional[RobotState] = None
     modalities: List[str] = field(default_factory=lambda: ["rgb"])
+    submit_mode: str = "blocking"
+    render_settings: JsonDict = field(default_factory=dict)
+    extras: JsonDict = field(default_factory=dict)
+
+
+@dataclass
+class IsaacSessionOpen:
+    scene_id: str
+    mitsuba_scene_ref: str
+    shape_map_ref: str
+    scene_snapshot_ref: Optional[str] = None
+    extras: JsonDict = field(default_factory=dict)
+
+
+@dataclass
+class IsaacStatePatch:
+    objects: List[IsaacObjectState] = field(default_factory=list)
+    timestamp: Optional[str] = None
+    extras: JsonDict = field(default_factory=dict)
+
+
+@dataclass
+class IsaacMaterialPatch:
+    overrides: Dict[str, BsdfOverride] = field(default_factory=dict)
+    timestamp: Optional[str] = None
+    extras: JsonDict = field(default_factory=dict)
+
+
+@dataclass
+class IsaacSensorSpec:
+    sensor_id: str
+    name: str
+    modalities: List[str] = field(default_factory=lambda: ["rgb"])
+    calibration_ref: Optional[str] = None
+    camera_to_world: Optional[Mat4] = None
+    fov_deg: Optional[float] = None
+    resolution: Optional[List[int]] = None
+    sensor_sync_group: str = "default"
+    pose_source: Optional[str] = None
+    extras: JsonDict = field(default_factory=dict)
+
+
+@dataclass
+class IsaacCaptureRequest:
+    sensor_id: Optional[str] = None
+    camera: Optional[CameraSpec] = None
+    modalities: List[str] = field(default_factory=list)
     submit_mode: str = "blocking"
     render_settings: JsonDict = field(default_factory=dict)
     extras: JsonDict = field(default_factory=dict)

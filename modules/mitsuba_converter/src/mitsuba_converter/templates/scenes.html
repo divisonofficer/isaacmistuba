@@ -4,39 +4,252 @@
   <section class="panel">
     <div class="panel-header">
       <div>
-        <h2 class="section-title">Scenes</h2>
-        <p class="muted text-sm">Grouped by observation bundles, not raw files.</p>
+        <h2 class="section-title"><span data-lang="en">Scenes</span><span data-lang="kr" class="hidden">장면</span></h2>
+        <p class="muted text-sm"><span data-lang="en">Known exports plus manually registered USD scenes for Isaac handoff.</span><span data-lang="kr" class="hidden">기존 export와 수동 등록된 USD scene을 함께 보여줍니다.</span></p>
+      </div>
+      <div class="flex items-center gap-2">
+        <input class="search-input js-scene-search" data-placeholder-en="Search scenes…" data-placeholder-kr="장면 검색…" placeholder="Search scenes…" aria-label="Search scenes">
+        <div class="view-toggle">
+          <button class="active js-view-table"><span data-lang="en">≡ Table</span><span data-lang="kr" class="hidden">≡ 표</span></button>
+          <button class="js-view-grid"><span data-lang="en">⊞ Grid</span><span data-lang="kr" class="hidden">⊞ 그리드</span></button>
+        </div>
       </div>
     </div>
+
+    <div class="subpanel mt-4" style="padding:1rem;">
+      <div class="panel-header">
+        <div>
+          <div class="panel-label"><span data-lang="en">Register Arbitrary USD Scene</span><span data-lang="kr" class="hidden">임의 USD 장면 등록</span></div>
+          <div class="muted text-sm mt-2"><span data-lang="en">Add a USD stage path so Isaac can load it later with one-line helpers.</span><span data-lang="kr" class="hidden">USD stage 경로를 등록해 두면 Isaac에서 한 줄 helper로 나중에 바로 열 수 있습니다.</span></div>
+        </div>
+      </div>
+      <div class="grid gap-3 lg:grid-cols-2 mt-4">
+        <input class="search-input js-register-scene-id" data-placeholder-en="scene_id (optional)" data-placeholder-kr="scene_id (선택)" placeholder="scene_id (optional)">
+        <input class="search-input js-register-usd-path" data-placeholder-en="usd_stage_path (required)" data-placeholder-kr="usd_stage_path (필수)" placeholder="usd_stage_path (required)">
+        <input class="search-input js-register-mitsuba-ref" data-placeholder-en="mitsuba_scene_ref (optional)" data-placeholder-kr="mitsuba_scene_ref (선택)" placeholder="mitsuba_scene_ref (optional)">
+        <input class="search-input js-register-shape-map" data-placeholder-en="shape_map_ref (optional)" data-placeholder-kr="shape_map_ref (선택)" placeholder="shape_map_ref (optional)">
+      </div>
+      <div class="flex items-center gap-2 mt-3">
+        <button class="button button-primary js-register-scene"><span data-lang="en">Register Scene</span><span data-lang="kr" class="hidden">장면 등록</span></button>
+        <a href="/api/isaac/scenes" class="button button-subtle"><span data-lang="en">Catalog API</span><span data-lang="kr" class="hidden">카탈로그 API</span></a>
+      </div>
+    </div>
+
     {% if scenes %}
-      <div class="table-wrap mt-4">
-        <table class="table">
-          <thead>
-            <tr>
-              <th>Scene</th>
-              <th>Version</th>
-              <th>Illumination</th>
-              <th>Captures</th>
-              <th>Cameras</th>
-              <th>Latest</th>
-            </tr>
-          </thead>
-          <tbody>
-            {% for scene in scenes %}
+      {# — Table view (default) — #}
+      <div class="scene-table-view">
+        <div class="table-wrap mt-4">
+          <table class="table">
+            <thead>
               <tr>
-                <td><a href="/scenes/{{ scene.scene_id }}" class="link">{{ scene.scene_id }}</a></td>
-                <td>{{ scene.scene_version or "-" }}</td>
-                <td>{{ scene.illumination_setup or "-" }}</td>
-                <td>{{ scene.capture_count }}</td>
-                <td>{{ scene.camera_count }}</td>
-                <td>{{ scene.latest_timestamp or "-" }}</td>
+                <th><span data-lang="en">Scene</span><span data-lang="kr" class="hidden">장면</span></th>
+                <th><span data-lang="en">Version</span><span data-lang="kr" class="hidden">버전</span></th>
+                <th><span data-lang="en">Illumination</span><span data-lang="kr" class="hidden">조명 설정</span></th>
+                <th><span data-lang="en">Captures</span><span data-lang="kr" class="hidden">캡처 수</span></th>
+                <th><span data-lang="en">Cameras</span><span data-lang="kr" class="hidden">카메라 수</span></th>
+                <th><span data-lang="en">USD Stage</span><span data-lang="kr" class="hidden">USD 스테이지</span></th>
+                <th><span data-lang="en">Load Prep</span><span data-lang="kr" class="hidden">로딩 준비</span></th>
+                <th><span data-lang="en">Ready</span><span data-lang="kr" class="hidden">준비 상태</span></th>
+                <th><span data-lang="en">Latest</span><span data-lang="kr" class="hidden">최신 시각</span></th>
+                <th><span data-lang="en">Isaac Remote</span><span data-lang="kr" class="hidden">Isaac 원격 제어</span></th>
+                <th><span data-lang="en">Links</span><span data-lang="kr" class="hidden">링크</span></th>
               </tr>
-            {% endfor %}
-          </tbody>
-        </table>
+            </thead>
+            <tbody>
+              {% for scene in scenes %}
+                <tr data-scene-id="{{ scene.scene_id|lower }}">
+                  <td><a href="/scenes/{{ scene.scene_id }}" class="link">{{ scene.scene_id }}</a></td>
+                  <td>{{ scene.scene_version or "-" }}</td>
+                  <td>{{ scene.illumination_setup or "-" }}</td>
+                  <td>{{ scene.capture_count }}</td>
+                  <td>{{ scene.camera_count }}</td>
+                  <td class="mono text-xs">{{ scene.usd_stage_path or "-" }}</td>
+                  <td>
+                    <div class="stack-xs">
+                      <div>
+                        {% if scene.size_tier == "huge" %}
+                          <span class="badge badge-failed"><span data-lang="en">huge</span><span data-lang="kr" class="hidden">매우 큼</span></span>
+                        {% elif scene.size_tier == "heavy" %}
+                          <span class="badge badge-queued"><span data-lang="en">heavy</span><span data-lang="kr" class="hidden">무거움</span></span>
+                        {% elif scene.size_tier == "medium" %}
+                          <span class="badge badge-dispatched"><span data-lang="en">medium</span><span data-lang="kr" class="hidden">중간</span></span>
+                        {% elif scene.size_tier == "light" %}
+                          <span class="badge badge-succeeded"><span data-lang="en">light</span><span data-lang="kr" class="hidden">가벼움</span></span>
+                        {% else %}
+                          <span class="badge badge-dispatched"><span data-lang="en">unknown</span><span data-lang="kr" class="hidden">미상</span></span>
+                        {% endif %}
+                      </div>
+                      <div class="muted text-xs">
+                        <span data-lang="en">USD {{ scene.stage_size_label or "-" }} · assets {{ scene.asset_root_size_label or "-" }}</span>
+                        <span data-lang="kr" class="hidden">USD {{ scene.stage_size_label or "-" }} · 에셋 {{ scene.asset_root_size_label or "-" }}</span>
+                      </div>
+                      <div class="muted text-xs">
+                        <span data-lang="en">texture cache {{ scene.texture_cache_status or "unknown" }}{% if scene.texture_cache_file_count %} · {{ scene.texture_cache_file_count }} files{% endif %}</span>
+                        <span data-lang="kr" class="hidden">texture cache {{ scene.texture_cache_status or "unknown" }}{% if scene.texture_cache_file_count %} · {{ scene.texture_cache_file_count }}개 파일{% endif %}</span>
+                      </div>
+                    </div>
+                  </td>
+                  <td>
+                    {% if scene.readiness_status == "render-ready" %}
+                      <span class="badge badge-succeeded"><span data-lang="en">render-ready</span><span data-lang="kr" class="hidden">렌더 준비 완료</span></span>
+                    {% elif scene.readiness_status == "preparing" %}
+                      <span class="badge badge-dispatched"><span data-lang="en">preparing</span><span data-lang="kr" class="hidden">준비 중</span></span>
+                    {% else %}
+                      <span class="badge badge-queued"><span data-lang="en">open-only</span><span data-lang="kr" class="hidden">열기 전용</span></span>
+                    {% endif %}
+                  </td>
+                  <td>{{ scene.latest_timestamp or "-" }}</td>
+                  <td>
+                    <div class="flex items-center gap-2 flex-wrap">
+                      <button class="button button-subtle js-isaac-command" data-command="load_scene" data-scene-id="{{ scene.scene_id }}"><span data-lang="en">Load</span><span data-lang="kr" class="hidden">열기</span></button>
+                      <button class="button button-subtle js-isaac-command" data-command="prepare_render_ready" data-scene-id="{{ scene.scene_id }}"><span data-lang="en">Prepare</span><span data-lang="kr" class="hidden">준비</span></button>
+                      <button class="button button-subtle js-isaac-command" data-command="connect_session" data-scene-id="{{ scene.scene_id }}"><span data-lang="en">Connect</span><span data-lang="kr" class="hidden">연결</span></button>
+                      <button class="button button-subtle js-isaac-command" data-command="sync_session" data-scene-id="{{ scene.scene_id }}"><span data-lang="en">Sync</span><span data-lang="kr" class="hidden">동기화</span></button>
+                      <button class="button button-primary js-isaac-command" data-command="render_current_view" data-scene-id="{{ scene.scene_id }}"><span data-lang="en">Render View</span><span data-lang="kr" class="hidden">현재 시점 렌더</span></button>
+                    </div>
+                  </td>
+                  <td>
+                    <div class="flex items-center gap-2">
+                      <a href="/api/isaac/scenes/{{ scene.scene_id }}" class="link"><span data-lang="en">Isaac JSON</span><span data-lang="kr" class="hidden">Isaac JSON</span></a>
+                      {% if scene.latest_capture and scene.latest_capture.manifest_href %}
+                        <a href="{{ scene.latest_capture.manifest_href }}" class="link"><span data-lang="en">Latest Capture</span><span data-lang="kr" class="hidden">최신 캡처</span></a>
+                      {% endif %}
+                    </div>
+                  </td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {# — Grid view (hidden by default) — #}
+      <div class="scene-grid-view mt-4" style="display:none;">
+        <div class="scene-grid">
+          {% for scene in scenes %}
+            <a href="/scenes/{{ scene.scene_id }}" class="scene-card scene-card-soft" data-scene-id="{{ scene.scene_id|lower }}">
+              <div class="eyebrow">{{ scene.scene_version or "scene" }}</div>
+              <div class="scene-card-title">{{ scene.scene_id }}</div>
+              <div class="muted text-sm mt-2">
+                <span data-lang="en">captures {{ scene.capture_count }} · cameras {{ scene.camera_count }}</span>
+                <span data-lang="kr" class="hidden">캡처 {{ scene.capture_count }} · 카메라 {{ scene.camera_count }}</span>
+              </div>
+              <div class="muted text-xs mt-2">
+                <span data-lang="en">load prep · USD {{ scene.stage_size_label or "-" }} · assets {{ scene.asset_root_size_label or "-" }}</span>
+                <span data-lang="kr" class="hidden">로딩 준비 · USD {{ scene.stage_size_label or "-" }} · 에셋 {{ scene.asset_root_size_label or "-" }}</span>
+              </div>
+              <div class="muted text-xs mt-2">
+                {% if scene.usd_stage_path %}
+                  {{ scene.usd_stage_path }}
+                {% else %}
+                  <span data-lang="en">no usd path registered</span><span data-lang="kr" class="hidden">등록된 USD 경로 없음</span>
+                {% endif %}
+              </div>
+              <div class="muted text-xs mt-2">{{ scene.latest_timestamp or "-" }}</div>
+            </a>
+          {% endfor %}
+        </div>
       </div>
     {% else %}
-      <div class="empty-state mt-4">No scene bundles found in <span class="mono">out/bridge_jobs</span>.</div>
+      <div class="empty-state-illustrated mt-4">
+        <div class="empty-icon">🗺️</div>
+        <div class="empty-title"><span data-lang="en">No scene bundles found</span><span data-lang="kr" class="hidden">장면 번들을 찾지 못했습니다</span></div>
+        <div class="empty-desc"><span data-lang="en">Scenes appear here once renders produce observation bundles in <span class="mono">out/bridge_jobs</span>.</span><span data-lang="kr" class="hidden">렌더가 <span class="mono">out/bridge_jobs</span> 아래 observation bundle을 생성하면 여기에 표시됩니다.</span></div>
+        <a href="/integrations/isaac" class="button button-subtle" style="margin-top:0.5rem;"><span data-lang="en">Open Isaac Guide</span><span data-lang="kr" class="hidden">Isaac 가이드 열기</span></a>
+      </div>
     {% endif %}
   </section>
+
+  <script>
+    (() => {
+      /* search */
+      const searchInput = document.querySelector(".js-scene-search");
+      if (searchInput) {
+        searchInput.addEventListener("keyup", () => {
+          const q = searchInput.value.toLowerCase().trim();
+          document.querySelectorAll("[data-scene-id]").forEach(el => {
+            el.style.display = (q === "" || el.dataset.sceneId.includes(q)) ? "" : "none";
+          });
+        });
+      }
+      /* view toggle */
+      const tableView = document.querySelector(".scene-table-view");
+      const gridView  = document.querySelector(".scene-grid-view");
+      const btnTable  = document.querySelector(".js-view-table");
+      const btnGrid   = document.querySelector(".js-view-grid");
+      function showTable() {
+        if (!tableView) return;
+        tableView.style.display = ""; gridView.style.display = "none";
+        btnTable.classList.add("active"); btnGrid.classList.remove("active");
+      }
+      function showGrid() {
+        if (!gridView) return;
+        gridView.style.display = ""; tableView.style.display = "none";
+        btnGrid.classList.add("active"); btnTable.classList.remove("active");
+      }
+      if (btnTable) btnTable.addEventListener("click", showTable);
+      if (btnGrid)  btnGrid.addEventListener("click", showGrid);
+
+      const registerButton = document.querySelector(".js-register-scene");
+      if (registerButton) {
+        registerButton.addEventListener("click", async () => {
+          const sceneId = document.querySelector(".js-register-scene-id")?.value?.trim() || "";
+          const usdPath = document.querySelector(".js-register-usd-path")?.value?.trim() || "";
+          const mitsubaRef = document.querySelector(".js-register-mitsuba-ref")?.value?.trim() || "";
+          const shapeMapRef = document.querySelector(".js-register-shape-map")?.value?.trim() || "";
+          const lang = document.documentElement.dataset.lang === "kr" ? "kr" : "en";
+          if (!usdPath) {
+            alert(lang === "kr" ? "usd_stage_path 가 필요합니다." : "usd_stage_path is required.");
+            return;
+          }
+          const payload = { usd_stage_path: usdPath };
+          if (sceneId) payload.scene_id = sceneId;
+          if (mitsubaRef) payload.mitsuba_scene_ref = mitsubaRef;
+          if (shapeMapRef) payload.shape_map_ref = shapeMapRef;
+          const res = await fetch("/api/isaac/scenes/register", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+          });
+          if (!res.ok) {
+            const errorPayload = await res.json().catch(() => ({}));
+            alert(errorPayload.error || (lang === "kr" ? "장면 등록에 실패했습니다." : "Failed to register scene."));
+            return;
+          }
+          window.location.reload();
+        });
+      }
+
+      async function queueIsaacCommand(sceneId, commandType) {
+        const lang = document.documentElement.dataset.lang === "kr" ? "kr" : "en";
+        const res = await fetch("/api/isaac/commands", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ scene_id: sceneId, command_type: commandType }),
+        });
+        const payload = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          throw new Error(payload.error || (lang === "kr" ? "원격 명령 전송에 실패했습니다." : "Failed to queue remote Isaac command."));
+        }
+        return payload;
+      }
+
+      document.querySelectorAll(".js-isaac-command").forEach((button) => {
+        button.addEventListener("click", async () => {
+          const sceneId = button.dataset.sceneId;
+          const commandType = button.dataset.command;
+          const lang = document.documentElement.dataset.lang === "kr" ? "kr" : "en";
+          try {
+            const payload = await queueIsaacCommand(sceneId, commandType);
+            const message = lang === "kr"
+              ? `Isaac 원격 명령이 queue에 들어갔습니다: ${commandType} (${payload.command_id})`
+              : `Queued remote Isaac command: ${commandType} (${payload.command_id})`;
+            alert(message);
+          } catch (error) {
+            alert(error.message || String(error));
+          }
+        });
+      });
+    })();
+  </script>
 {% endblock %}

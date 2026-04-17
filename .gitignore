@@ -2,7 +2,12 @@ __pycache__/
 *.pyc
 *.pyo
 .pytest_cache/
-
+*.usda
+*.blend
+*.blend1
+*.zip
+*.hdr
+*.dae
 out/bridge_jobs/
 out/*
 CLAUDE.md
@@ -17,6 +22,11 @@ fix_optics.sh
 *.jpg
 *.png
 assets/*
+!assets/robots/
+assets/robots/*
+!assets/robots/ranger_mini_v3/
+!assets/robots/ranger_mini_v3/**
 tests/*
 notes/*
 apps/run_control_plane_dev.sh
+Makefile

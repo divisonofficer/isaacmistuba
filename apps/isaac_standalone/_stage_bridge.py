@@ -13,7 +13,7 @@ REPO_ROOT = bootstrap_repo_paths()
 from robomituba_bridge.io import scene_snapshot_to_payload
 from robomituba_bridge.paths import to_repo_relative_posix
 from robomituba_bridge.shape_mapping import build_shape_mapping, write_shape_mapping
-from robomituba_bridge.types import CameraRecord, FrameRecord, LightRecord, MaterialRecord, MeshRecord, SceneSnapshot
+from robomituba_bridge.types import CameraRecord, FrameRecord, LightRecord, MaterialRecord, MeshRecord, RobotState, SceneSnapshot
 
 
 def _require_pxr():
@@ -51,11 +51,18 @@ def _tri_face_count(counts: list[int]) -> int:
 
 
 def _matrix_to_list(matrix: Any) -> list[float]:
-    values: list[float] = []
-    for row in range(4):
-        for col in range(4):
-            values.append(float(matrix[row][col]))
-    return values
+    import numpy as np
+
+    candidate = np.asarray(matrix, dtype=np.float32)
+    if candidate.shape == (16,):
+        candidate = candidate.reshape(4, 4)
+    if candidate.shape != (4, 4):
+        raise ValueError(f"Expected 4x4 matrix, got {candidate.shape}")
+    last_col = candidate[:3, 3]
+    last_row = candidate[3, :3]
+    if float(np.linalg.norm(last_row)) > max(1e-5, float(np.linalg.norm(last_col)) * 2.0):
+        candidate = candidate.T
+    return candidate.reshape(-1).astype(float).tolist()
 
 
 def _extract_look_at(matrix) -> dict[str, list[float]]:
@@ -200,6 +207,79 @@ def _extract_material_record(material, source_usd_path: Path | None):
     )
 
 
+def _is_renderable_mesh(mesh_prim) -> bool:
+    imageable = None
+    try:
+        _, _, UsdGeom, _, _ = _require_pxr()
+        imageable = UsdGeom.Imageable(mesh_prim)
+    except Exception:
+        imageable = None
+
+    if imageable:
+        purpose_attr = imageable.GetPurposeAttr()
+        purpose = purpose_attr.Get() if purpose_attr else None
+        if str(purpose or "") in {"guide", "proxy"}:
+            return False
+        visibility_attr = imageable.GetVisibilityAttr()
+        visibility = visibility_attr.Get() if visibility_attr else None
+        if str(visibility or "") == "invisible":
+            return False
+
+    path_lower = str(mesh_prim.GetPath()).lower()
+    return "/colliders/" not in path_lower and "/collision/" not in path_lower
+
+
+def _attr_value(prim, name: str):
+    attr = prim.GetAttribute(name)
+    if not attr:
+        return None
+    return attr.Get()
+
+
+def _extract_robot_state(stage, xform_cache) -> RobotState | None:
+    for prim in stage.Traverse():
+        robot_name = _attr_value(prim, "robomituba:robotName")
+        if str(robot_name or "") != "ranger_mini_v3":
+            continue
+
+        joint_names_raw = _attr_value(prim, "robomituba:jointNames") or []
+        joint_positions_raw = _attr_value(prim, "robomituba:jointPositions") or []
+        steering_angles_raw = _attr_value(prim, "robomituba:steeringAngles") or []
+        wheel_speeds_raw = _attr_value(prim, "robomituba:wheelSpeeds") or []
+
+        joint_names = [str(item) for item in joint_names_raw]
+        joint_positions = [float(item) for item in joint_positions_raw]
+        steering_angles = [float(item) for item in steering_angles_raw]
+        wheel_speeds = [float(item) for item in wheel_speeds_raw]
+
+        battery_soc = _attr_value(prim, "robomituba:batterySoc")
+        battery_voltage = _attr_value(prim, "robomituba:batteryVoltage")
+        estop = _attr_value(prim, "robomituba:estop")
+        has_error = _attr_value(prim, "robomituba:hasError")
+        motion_mode = _attr_value(prim, "robomituba:motionMode")
+
+        return RobotState(
+            base_pose=_matrix_to_list(xform_cache.GetLocalToWorldTransform(prim)),
+            joint_names=joint_names,
+            joint_positions=joint_positions,
+            extras={
+                "ranger_mini": {
+                    "robot_name": "ranger_mini_v3",
+                    "motion_mode": int(motion_mode) if motion_mode is not None else 0,
+                    "steering_angles": steering_angles,
+                    "wheel_speeds": wheel_speeds,
+                    "battery": {
+                        "voltage": float(battery_voltage) if battery_voltage is not None else 48.0,
+                        "soc": float(battery_soc) if battery_soc is not None else 1.0,
+                    },
+                    "estop": bool(estop) if estop is not None else False,
+                    "has_error": bool(has_error) if has_error is not None else False,
+                }
+            },
+        )
+    return None
+
+
 def extract_snapshot(
     stage,
     *,
@@ -219,6 +299,8 @@ def extract_snapshot(
 
     for prim in stage.Traverse():
         if prim.IsA(UsdGeom.Mesh):
+            if not _is_renderable_mesh(prim):
+                continue
             mesh = UsdGeom.Mesh(prim)
             points = mesh.GetPointsAttr().Get() or []
             counts = mesh.GetFaceVertexCountsAttr().Get() or []
@@ -311,6 +393,7 @@ def extract_snapshot(
         meters_per_unit=float(UsdGeom.GetStageMetersPerUnit(stage)),
         up_axis=str(UsdGeom.GetStageUpAxis(stage)),
     )
+    robot_state = _extract_robot_state(stage, xform_cache)
     return SceneSnapshot(
         scene_id=scene_id,
         frame=frame,
@@ -319,6 +402,7 @@ def extract_snapshot(
         cameras=camera_records,
         lights=light_records,
         usd_stage_path=usd_stage_path,
+        robot_state=robot_state,
     )
 
 
