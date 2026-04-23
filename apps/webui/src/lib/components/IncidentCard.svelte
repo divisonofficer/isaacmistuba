@@ -51,20 +51,24 @@
 		<span class="inc-glyph">{TONE_GLYPH[tone]}</span>
 	</div>
 	<div class="inc-body">
-		<header class="inc-header">
-			<h4 class="inc-title">{title}</h4>
-			{#if timestamp}
-				<time class="inc-timestamp" datetime={timestamp instanceof Date ? timestamp.toISOString() : String(timestamp)}>
-					{formatTs(timestamp)}
-				</time>
-			{/if}
-		</header>
-		{#if description}<p class="inc-desc">{description}</p>{/if}
+		<h4 class="inc-title">{title}</h4>
 		{#if source}<p class="inc-source mono">{source}</p>{/if}
+		{#if description}<p class="inc-desc">{description}</p>{/if}
 		{#if children}<div class="inc-extra">{@render children()}</div>{/if}
-		{#if actions}
-			<div class="inc-actions" role="group" aria-label="Incident actions">
-				{@render actions()}
+		{#if timestamp || actions}
+			<div class="inc-meta-row">
+				{#if timestamp}
+					<time class="inc-timestamp" datetime={timestamp instanceof Date ? timestamp.toISOString() : String(timestamp)}>
+						{formatTs(timestamp)}
+					</time>
+				{:else}
+					<span></span>
+				{/if}
+				{#if actions}
+					<div class="inc-actions" role="group" aria-label="Incident actions">
+						{@render actions()}
+					</div>
+				{/if}
 			</div>
 		{/if}
 	</div>
@@ -73,8 +77,8 @@
 <style>
 	.inc {
 		display: flex;
-		gap: var(--space-3);
-		padding: var(--space-3) var(--space-4);
+		gap: var(--space-2);
+		padding: var(--space-2) var(--space-3);
 		background: var(--panel);
 		border: 1px solid var(--panel-border);
 		border-left: 3px solid currentColor;
@@ -102,12 +106,6 @@
 	.inc-glyph { font-size: var(--font-size-xs); font-weight: var(--font-weight-bold); }
 
 	.inc-body { flex: 1 1 auto; min-width: 0; color: var(--text); }
-	.inc-header {
-		display: flex;
-		align-items: baseline;
-		justify-content: space-between;
-		gap: var(--space-3);
-	}
 	.inc-title {
 		margin: 0;
 		font-size: var(--font-size-sm);
@@ -124,18 +122,33 @@
 		font-size: var(--font-size-xs);
 		color: var(--muted-strong);
 		line-height: var(--line-height-snug);
+		display: -webkit-box;
+		-webkit-line-clamp: 1;
+		line-clamp: 1;
+		-webkit-box-orient: vertical;
+		overflow: hidden;
 	}
 	.inc-source {
 		margin: var(--space-1) 0 0;
 		font-size: var(--font-size-2xs);
 		color: var(--muted);
 	}
-	.inc-extra { margin-top: var(--space-2); }
+	.inc-extra { margin-top: var(--space-1); }
+	.inc-meta-row {
+		display: flex;
+		justify-content: space-between;
+		align-items: center;
+		gap: var(--space-2);
+		margin-top: var(--space-2);
+	}
 	.inc-actions {
 		display: flex;
 		flex-wrap: wrap;
 		align-items: center;
-		gap: var(--space-2);
-		margin-top: var(--space-3);
+		gap: var(--space-1);
+	}
+	.inc-actions :global(.button) {
+		padding: 0.25rem 0.55rem;
+		font-size: var(--font-size-2xs);
 	}
 </style>

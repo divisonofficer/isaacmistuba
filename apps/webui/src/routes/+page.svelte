@@ -78,19 +78,40 @@
 			<div class="panel-label">Quick Actions</div>
 			<div class="playbook-grid mt-3">
 				<a href="/jobs" class="playbook-tile">
-					<div class="playbook-tile-icon">📋</div>
+					<svg class="playbook-tile-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+						<rect x="4" y="4" width="16" height="4" rx="1" />
+						<rect x="4" y="10" width="16" height="4" rx="1" />
+						<rect x="4" y="16" width="16" height="4" rx="1" />
+					</svg>
 					<div class="playbook-tile-title">Job Queue</div>
 				</a>
 				<a href="/bridge" class="playbook-tile">
-					<div class="playbook-tile-icon">🌉</div>
+					<svg class="playbook-tile-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+						<path d="M4 17h16" />
+						<path d="M4 17v-2a4 4 0 0 1 4-4h8a4 4 0 0 1 4 4v2" />
+						<path d="M8 11V7" />
+						<path d="M16 11V7" />
+						<path d="M12 11V5" />
+					</svg>
 					<div class="playbook-tile-title">Bridge Monitor</div>
 				</a>
 				<a href="/scenes" class="playbook-tile">
-					<div class="playbook-tile-icon">🎬</div>
+					<svg class="playbook-tile-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+						<rect x="3" y="5" width="18" height="14" rx="2" />
+						<path d="M3 9h18" />
+						<path d="M7 5v4" />
+						<path d="M12 5v4" />
+						<path d="M17 5v4" />
+					</svg>
 					<div class="playbook-tile-title">Scenes</div>
 				</a>
 				<a href="/system" class="playbook-tile">
-					<div class="playbook-tile-icon">🖥</div>
+					<svg class="playbook-tile-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+						<rect x="3" y="4" width="18" height="12" rx="2" />
+						<path d="M8 20h8" />
+						<path d="M12 16v4" />
+						<path d="M7 9l2 2 5-5" />
+					</svg>
 					<div class="playbook-tile-title">System Check</div>
 				</a>
 			</div>

@@ -58,7 +58,7 @@
   --space-20: 5rem;     /* 80 */
 
   /* Layout — shell measurements */
-  --layout-topbar-height:    3rem;     /* 48 */
+  --layout-topbar-height:    4.25rem;  /* 68 — labeled status chip row, compact */
   --layout-leftnav-width:    15.5rem;  /* 248 */
   --layout-rightrail-width:  21rem;    /* 336 */
   --layout-bottompanel-min:  16.25rem; /* 260 */

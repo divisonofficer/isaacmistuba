@@ -3,16 +3,17 @@
 	import { page } from '$app/stores';
 	import { lang } from '$lib/stores/lang';
 	import { healthStore } from '$lib/stores/health';
-	import { debugToasts } from '$lib/stores/debugEvents';
+	import { debugEvents } from '$lib/stores/debugEvents';
 	import { sceneRailSnippet, sceneBottomSnippet } from '$lib/stores/scenePortals';
+	import { bottomPanelCollapsed, toggleBottomPanel } from '$lib/stores/shell';
 	import {
 		summary, getIsaacSession, getIsaacSessionInventory,
 		getScene, listJobs, materialPresets, materialLibrary,
 		isaacCommand, smokeRender, applyMeasuredMaterial,
 		listIsaacScenes, downloadDataset, getDatasetDownloadStatus,
-		retryJob
+		retryJob, measuredMaterialPreviewUrl
 	} from '$lib/api';
-	import { Card, IncidentCard, LogList, KeyValueList, DataTable, Breadcrumb, Tabs } from '$lib/components';
+	import { Card, IncidentCard, LogList, KeyValueList, DataTable, Breadcrumb } from '$lib/components';
 	import type { LogEntry, KeyValueItem, DataTableColumn, Tone, BreadcrumbItem, TabItem } from '$lib/components';
 
 	const L = $derived($lang);
@@ -106,7 +107,6 @@
 	let viewMode = $state<ViewMode>('2d');
 	let bottomTab = $state<BottomTabId>('jobs');
 	let layerFilters = $state<Set<LayerKey>>(new Set(['scene', 'render', 'shape']));
-	let materialDrawerOpen = $state(false);
 
 	let timer: ReturnType<typeof setInterval>;
 	let refreshInFlight = false;
@@ -133,7 +133,7 @@
 	const lastSucceededJob = $derived(recentJobs.find(j => j.status === 'succeeded') ?? null);
 	const bottomTabs = $derived<TabItem[]>([
 		{ id: 'jobs', label: L === 'kr' ? '작업 큐' : 'Jobs', badge: runningJobsCount > 0 ? runningJobsCount : undefined },
-		{ id: 'logs', label: L === 'kr' ? '최근 로그' : 'Logs', badge: $debugToasts.length > 0 ? $debugToasts.length : undefined },
+		{ id: 'logs', label: L === 'kr' ? '최근 로그' : 'Logs', badge: $debugEvents.length > 0 ? $debugEvents.length : undefined },
 		{ id: 'selection', label: L === 'kr' ? '선택 상세' : 'Selection', disabled: !selectedObj },
 		{ id: 'history', label: L === 'kr' ? '렌더 이력' : 'History', badge: failedJobsCount > 0 ? failedJobsCount : undefined },
 		{ id: 'materials', label: L === 'kr' ? '재질' : 'Materials' }
@@ -277,7 +277,7 @@
 	const sceneInfoKv = $derived<KeyValueItem[]>(buildSceneInfoKv());
 
 	const recentLogs = $derived<LogEntry[]>(
-		$debugToasts.map(ev => ({
+		$debugEvents.map(ev => ({
 			ts: ev.ts,
 			level: ev.kind === 'error' ? 'error' : 'info',
 			message: ev.message,
@@ -325,7 +325,8 @@
 	function buildPipelineSteps(): PipelineStep[] {
 		const isaacOk = isaacConnected;
 		const sessOk = sessionConnected;
-		const usdReady = !!scene?.usd_stage_path;
+		const usdReady = !!scene?.mitsuba_scene_exists || !!scene?.usd_stage_path;
+		const shapeMapReady = !!scene?.shape_map_exists || !!scene?.render_ready;
 		const sceneReady = !!scene?.render_ready;
 		const lastJob = recentJobs[0] as Record<string, unknown> | undefined;
 		const lastJobStage = String(lastJob?.progress_stage ?? '');
@@ -347,7 +348,7 @@
 			{ key: 'usd_export', label_en: 'USD Export', label_kr: 'USD 내보내기',
 				state: mark(usdReady) },
 			{ key: 'shape_map', label_en: 'Shape Map', label_kr: 'Shape Map',
-				state: mark(!!floorplanImgSrc, !!currentSceneId && !floorplanImgSrc) },
+				state: mark(shapeMapReady, !!currentSceneId && !shapeMapReady) },
 			{ key: 'material_meta', label_en: 'Material Meta', label_kr: '재질 메타',
 				state: mark(matGroups.length > 0) },
 			{ key: 'pose_sync', label_en: 'Pose Sync', label_kr: 'Pose 동기화',
@@ -987,11 +988,23 @@
 		return `radial-gradient(circle at 36% 30%, ${hi} 0%, ${base} 52%, ${shad} 100%)`;
 	}
 
+	function materialFallbackBg(group: DatasetGroup, mat: MatEntry): string {
+		let hash = 0;
+		for (let i = 0; i < mat.material_id.length; i += 1) {
+			hash = ((hash << 5) - hash + mat.material_id.charCodeAt(i)) | 0;
+		}
+		const hue = (group.swatch_hue + Math.abs(hash % 84) - 42 + 360) % 360;
+		return swatchBg(hue, mat.status);
+	}
+
 	$effect(() => {
 		if (isVisible) {
 			sceneRailSnippet.set(railContent);
 			sceneBottomSnippet.set(bottomContent);
-			void refresh();
+			return () => {
+				sceneRailSnippet.set(null);
+				sceneBottomSnippet.set(null);
+			};
 		} else {
 			sceneRailSnippet.set(null);
 			sceneBottomSnippet.set(null);
@@ -1262,40 +1275,42 @@
 {/snippet}
 
 {#snippet materialBrowserPanel()}
-	<div style="display:flex;flex-direction:column;height:100%;min-height:0">
-		{#if selectedObj}
-			<div style="font-size:0.7rem;background:rgba(37,99,235,0.08);border-radius:0.3rem;padding:0.25rem 0.5rem;margin-bottom:0.5rem;color:var(--accent);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex-shrink:0">
-				→ {selectedObj.prim_path}
-			</div>
-		{:else}
-			<div class="muted text-xs" style="margin-bottom:0.5rem;flex-shrink:0">{L === 'kr' ? '오브젝트 선택 후 재질 적용' : 'Select an object to apply material'}</div>
-		{/if}
+	<div class="material-panel-split">
+		<aside class="material-tool-rail">
+			<span class="card-eyebrow">{L === 'kr' ? '재질' : 'Materials'}</span>
+			{#if selectedObj}
+				<div class="material-target-chip mono" title={selectedObj.prim_path}>→ {selectedObj.prim_path}</div>
+			{:else}
+				<div class="muted text-xs">{L === 'kr' ? '오브젝트 선택 후 적용' : 'Select object first'}</div>
+			{/if}
 
-		<div style="display:flex;gap:0.5rem;flex-shrink:0;margin-bottom:0.5rem;flex-wrap:wrap">
-			<input class="search-input" placeholder={L === 'kr' ? '재질 검색…' : 'Search…'} bind:value={matSearch} style="flex:1;min-width:8rem;font-size:0.8rem" />
-			<div style="display:flex;gap:0.3rem;flex-wrap:wrap">
+			<input class="search-input material-search" placeholder={L === 'kr' ? '재질 검색…' : 'Search…'} bind:value={matSearch} />
+
+			<div class="material-filter-stack" aria-label={L === 'kr' ? '재질 필터' : 'Material filters'}>
 				{#each [['all', L === 'kr' ? '전체' : 'All'], ['polarized', 'Polar'], ['nir', 'NIR'], ['available', L === 'kr' ? '사용가능' : 'Ready']] as [f, label]}
-					<button class="filter-chip {matCapFilter === f ? 'active' : ''}" onclick={() => matCapFilter = f as typeof matCapFilter}
-						style="font-size:0.7rem;padding:0.15rem 0.4rem">{label}</button>
+					<button class="filter-chip material-filter-btn {matCapFilter === f ? 'active' : ''}" onclick={() => matCapFilter = f as typeof matCapFilter}>{label}</button>
 				{/each}
 			</div>
-		</div>
+		</aside>
 
-		<div style="overflow-y:auto;flex:1;min-height:0">
+		<div class="material-scroll-area">
 			{#if filteredPresets.length > 0 && (matCapFilter === 'all' || matCapFilter === 'available')}
-				<div style="font-size:0.7rem;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:0.04em;margin-bottom:0.35rem">
-					{L === 'kr' ? '기본 재질' : 'Built-in Presets'}
-				</div>
-				<div style="display:flex;flex-wrap:wrap;gap:0.35rem;margin-bottom:0.75rem">
-					{#each filteredPresets as preset}
-						<button
-							onclick={() => applyPreset(preset)}
-							title="{preset.title_en} – {preset.description_en}"
-							style="background:none;border:1px solid var(--border);border-radius:0.3rem;padding:0.25rem 0.5rem;font-size:0.72rem;cursor:pointer;white-space:nowrap"
-						>
-							{L === 'kr' ? (preset.title_kr || preset.title_en) : preset.title_en}
-						</button>
-					{/each}
+				<div class="material-content-section">
+					<div class="material-section-head">
+						<span class="card-eyebrow">{L === 'kr' ? '기본 재질' : 'Built-in presets'}</span>
+						<span class="muted text-xs">{filteredPresets.length}</span>
+					</div>
+					<div class="material-preset-grid">
+						{#each filteredPresets as preset}
+							<button
+								class="material-preset-btn"
+								onclick={() => applyPreset(preset)}
+								title="{preset.title_en} – {preset.description_en}"
+							>
+								{L === 'kr' ? (preset.title_kr || preset.title_en) : preset.title_en}
+							</button>
+						{/each}
+					</div>
 				</div>
 			{/if}
 
@@ -1347,21 +1362,25 @@
 					{/if}
 
 					{#if !collapsedGroups.has(group.dataset_id)}
-						<div style="display:flex;flex-wrap:wrap;gap:0.3rem">
+						<div class="material-swatch-grid">
 							{#each group.materials as mat}
 								<button
+									class="material-swatch-tile"
 									onclick={() => applyMeasured(group, mat)}
 									title="{mat.display_name} [{mat.status}]{mat.status !== 'available' ? ' – ' + (L === 'kr' ? '적용 불가' : 'not applicable') : ''}"
-									style="position:relative;width:3.2rem;height:3.2rem;border:none;border-radius:0.4rem;cursor:{mat.status === 'available' ? 'pointer' : 'default'};background:{swatchBg(group.swatch_hue, mat.status)};opacity:{mat.status === 'not_downloaded' ? 0.45 : 1};overflow:hidden"
+									style:cursor={mat.status === 'available' ? 'pointer' : 'default'}
+									style:opacity={mat.status === 'not_downloaded' ? 0.45 : 1}
 								>
-									<img
-										src="/api/material-preview/measured/{group.dataset_id}/{mat.material_id}"
-										alt={mat.display_name}
-										style="position:absolute;inset:0;width:100%;height:100%;object-fit:cover;display:none"
-										onload={(e) => { (e.target as HTMLImageElement).style.display = 'block'; }}
-										onerror={(e) => { (e.target as HTMLImageElement).style.display = 'none'; }}
-									/>
-									<span style="position:absolute;bottom:2px;right:2px;width:6px;height:6px;border-radius:50%;background:{mat.status === 'available' ? '#16a34a' : mat.status === 'needs_patch' ? '#f59e0b' : '#9ca3af'};border:1px solid rgba(255,255,255,0.7)"></span>
+									<span class="material-swatch-sphere" style:background={materialFallbackBg(group, mat)}>
+										<img
+											src={measuredMaterialPreviewUrl(group.dataset_id, mat.material_id, mat.native_file)}
+											alt={mat.display_name}
+											class="material-swatch-img"
+											onload={(e) => { (e.target as HTMLImageElement).style.display = 'block'; }}
+											onerror={(e) => { (e.target as HTMLImageElement).style.display = 'none'; }}
+										/>
+									</span>
+									<span class="material-swatch-status" data-status={mat.status}></span>
 								</button>
 							{/each}
 						</div>
@@ -1431,54 +1450,51 @@
 {/snippet}
 
 {#snippet bottomContent()}
-	<div class="bottom-grid">
-		<section class="bottom-pane">
-			<header class="bottom-pane-head">
-				<span class="card-eyebrow">{L === 'kr' ? '작업 큐' : 'Jobs'}</span>
-				<h3 class="card-title">{L === 'kr' ? '최근 렌더 작업' : 'Recent render jobs'}</h3>
-				<span class="bottom-pane-meta">
-					{#if runningJobsCount > 0}<span class="badge badge-running">{runningJobsCount} running</span>{/if}
-					{#if failedJobsCount > 0}<span class="badge badge-failed">{failedJobsCount} failed</span>{/if}
-				</span>
-			</header>
-			<div class="bottom-pane-body">
-				<DataTable
-					columns={jobColumns}
-					rows={jobRows}
-					rowKey={(r) => r.job_id}
-					emptyMessage={L === 'kr' ? '작업 없음' : 'No jobs yet'}
-					dense
-					stickyHeader
-					onRowClick={(r) => { window.location.href = `/jobs/${r.job_id}`; }}
+	<div class="bottom-tabs-shell" data-collapsed={$bottomPanelCollapsed}>
+		<div class="bottom-tabs-rail" role="tablist" aria-label={L === 'kr' ? '하단 탭' : 'Bottom tabs'}>
+			<button
+				class="bottom-collapse-btn"
+				type="button"
+				onclick={toggleBottomPanel}
+				aria-expanded={!$bottomPanelCollapsed}
+				aria-label={$bottomPanelCollapsed ? (L === 'kr' ? '하단 영역 펼치기' : 'Expand bottom area') : (L === 'kr' ? '하단 영역 접기' : 'Collapse bottom area')}
+				title={$bottomPanelCollapsed ? (L === 'kr' ? '펼치기' : 'Expand') : (L === 'kr' ? '접기' : 'Collapse')}
+			>{$bottomPanelCollapsed ? '▲' : '▼'}</button>
+			{#each bottomTabs as tab}
+				<button
+					type="button"
+					class="bottom-tab-btn {bottomTab === tab.id ? 'active' : ''}"
+					role="tab"
+					aria-selected={bottomTab === tab.id}
+					disabled={tab.disabled}
+					onclick={() => {
+						bottomTab = tab.id as BottomTabId;
+						if ($bottomPanelCollapsed) toggleBottomPanel();
+					}}
+					title={tab.label}
 				>
-					{#snippet cell(row, col)}
-						{#if col.key === 'status'}
-							<span class="badge {statusClass(row.status)}">{row.status}</span>
-						{:else if col.mono}
-							<span class="mono">{row[col.key]}</span>
-						{:else}
-							{row[col.key] ?? ''}
-						{/if}
-					{/snippet}
-				</DataTable>
+					<span class="bottom-tab-label">{tab.label}</span>
+					{#if tab.badge != null}
+						<span class="bottom-tab-badge">{tab.badge}</span>
+					{/if}
+				</button>
+			{/each}
+		</div>
+		{#if !$bottomPanelCollapsed}
+			<div class="bottom-tabs-body">
+				{#if bottomTab === 'jobs'}
+					{@render jobsTabPanel()}
+				{:else if bottomTab === 'logs'}
+					{@render logsTabPanel()}
+				{:else if bottomTab === 'selection'}
+					{@render selectionDetailPanel()}
+				{:else if bottomTab === 'history'}
+					{@render historyTabPanel()}
+				{:else if bottomTab === 'materials'}
+					{@render materialBrowserPanel()}
+				{/if}
 			</div>
-		</section>
-		<section class="bottom-pane">
-			<header class="bottom-pane-head">
-				<span class="card-eyebrow">{L === 'kr' ? '활동' : 'Activity'}</span>
-				<h3 class="card-title">{L === 'kr' ? '최근 로그' : 'Recent logs'}</h3>
-				<span class="bottom-pane-meta">
-					{#if recentLogs.length > 0}<span class="muted text-xs">{recentLogs.length}</span>{/if}
-				</span>
-			</header>
-			<div class="bottom-pane-body">
-				<LogList
-					entries={recentLogs}
-					emptyMessage={L === 'kr' ? '최근 로그 없음' : 'No recent activity'}
-					dense
-				/>
-			</div>
-		</section>
+		{/if}
 	</div>
 {/snippet}
 
@@ -1497,22 +1513,22 @@
 		</span>
 		{#if currentSceneId}
 			<div class="session-actions">
-				<button class="button button-subtle text-xs" onclick={() => sendCommand('load_scene')} disabled={!!cmdPending}>
+				<button class="button button-ghost text-xs" onclick={() => sendCommand('load_scene')} disabled={!!cmdPending}>
 					{cmdPending === 'load_scene' ? '…' : (L === 'kr' ? '불러오기' : 'Load')}
 				</button>
-				<button class="button button-subtle text-xs" onclick={() => sendCommand('prepare_render_ready')} disabled={!!cmdPending}>
+				<button class="button button-ghost text-xs" onclick={() => sendCommand('prepare_render_ready')} disabled={!!cmdPending}>
 					{cmdPending === 'prepare_render_ready' ? '…' : (L === 'kr' ? '준비' : 'Prepare')}
 				</button>
-				<button class="button {sessionConnected ? 'button-subtle' : 'button-primary'} text-xs" onclick={() => sendCommand('connect_session')} disabled={!!cmdPending}>
+				<button class="button {sessionConnected ? 'button-ghost' : 'button-primary'} text-xs" onclick={() => sendCommand('connect_session')} disabled={!!cmdPending}>
 					{cmdPending === 'connect_session' ? '…' : (L === 'kr' ? '연결' : 'Connect')}
 				</button>
-				<button class="button button-subtle text-xs" onclick={() => sendCommand('sync_session')} disabled={!!cmdPending || !sessionConnected}>
+				<button class="button button-ghost text-xs" onclick={() => sendCommand('sync_session')} disabled={!!cmdPending || !sessionConnected}>
 					{cmdPending === 'sync_session' ? '…' : (L === 'kr' ? '동기화' : 'Sync')}
 				</button>
 				<button class="button button-primary text-xs" onclick={() => sendCommand('render_current_view')} disabled={!!cmdPending || workerBusy || !renderReady}>
 					{cmdPending === 'render_current_view' ? '…' : (L === 'kr' ? '렌더' : 'Render')}
 				</button>
-				<a href="/scenes/{currentSceneId}" class="button button-subtle text-xs">{L === 'kr' ? '상세 →' : 'Detail →'}</a>
+				<a href="/scenes/{currentSceneId}" class="button button-ghost text-xs">{L === 'kr' ? '상세 →' : 'Detail →'}</a>
 			</div>
 		{/if}
 	</div>
@@ -1605,28 +1621,30 @@
 		<!-- ══ RIGHT: Viewport with toolbar + materials drawer overlay ══ -->
 		<div class="panel cs-viewport-panel">
 			<div class="cs-viewport-toolbar">
-				<div class="vt-chip-group" role="group" aria-label={L === 'kr' ? '레이어 필터' : 'Layer filters'}>
-					<button class="vt-chip {layerFilters.has('scene') ? 'active' : ''}" onclick={() => toggleLayer('scene')}>{L === 'kr' ? '장면' : 'Scene'}</button>
-					<button class="vt-chip {layerFilters.has('render') ? 'active' : ''}" onclick={() => toggleLayer('render')}>{L === 'kr' ? '렌더' : 'Render'}</button>
-					<button class="vt-chip {layerFilters.has('shape') ? 'active' : ''}" onclick={() => toggleLayer('shape')}>{L === 'kr' ? 'Shape' : 'Shape Map'}</button>
-				</div>
-				<div class="vt-mode" role="tablist" aria-label={L === 'kr' ? '뷰 모드' : 'View mode'}>
-					<button class="vt-mode-btn {viewMode === '2d' ? 'active' : ''}" role="tab" aria-selected={viewMode === '2d'} onclick={() => viewMode = '2d'}>2D Map</button>
-					<button class="vt-mode-btn {viewMode === '3d' ? 'active' : ''}" role="tab" aria-selected={viewMode === '3d'} onclick={() => viewMode = '3d'}>3D View</button>
-				</div>
-				<div class="vt-spacer"></div>
-				{#if viewMode === '2d' && floorplanImgSrc}
-					<div class="vt-zoom">
-						<button class="button button-subtle text-xs" onclick={() => zoomBy(1/1.2)} aria-label="Zoom out">−</button>
-						<span class="mono muted text-xs vt-zoom-pct">{Math.round(mapZoom*100)}%</span>
-						<button class="button button-subtle text-xs" onclick={() => zoomBy(1.2)} aria-label="Zoom in">+</button>
-						<button class="button button-subtle text-xs" onclick={resetMapView} title="Reset">⤢</button>
+				<div class="vt-group vt-group-left">
+					<div class="vt-chip-group" role="group" aria-label={L === 'kr' ? '레이어 필터' : 'Layer filters'}>
+						<button class="vt-chip {layerFilters.has('scene') ? 'active' : ''}" onclick={() => toggleLayer('scene')}>{L === 'kr' ? '장면' : 'Scene'}</button>
+						<button class="vt-chip {layerFilters.has('render') ? 'active' : ''}" onclick={() => toggleLayer('render')}>{L === 'kr' ? '렌더' : 'Render'}</button>
+						<button class="vt-chip {layerFilters.has('shape') ? 'active' : ''}" onclick={() => toggleLayer('shape')}>{L === 'kr' ? 'Shape' : 'Shape Map'}</button>
 					</div>
-				{/if}
-				<button class="button button-subtle text-xs" onclick={handleSmokeRender} disabled={!!cmdPending} title="Smoke Render">🧪</button>
-				<button class="button {materialDrawerOpen ? 'button-primary' : 'button-subtle'} text-xs" onclick={() => materialDrawerOpen = !materialDrawerOpen}>
-					{L === 'kr' ? '재질' : 'Materials'} ({materialCount})
-				</button>
+				</div>
+				<div class="vt-group vt-group-mid">
+					<div class="vt-mode" role="tablist" aria-label={L === 'kr' ? '뷰 모드' : 'View mode'}>
+						<button class="vt-mode-btn {viewMode === '2d' ? 'active' : ''}" role="tab" aria-selected={viewMode === '2d'} onclick={() => viewMode = '2d'}>2D Map</button>
+						<button class="vt-mode-btn {viewMode === '3d' ? 'active' : ''}" role="tab" aria-selected={viewMode === '3d'} onclick={() => viewMode = '3d'}>3D View</button>
+					</div>
+					{#if viewMode === '2d' && floorplanImgSrc}
+						<div class="vt-zoom">
+							<button class="button button-ghost text-xs" onclick={() => zoomBy(1/1.2)} aria-label="Zoom out">−</button>
+							<span class="mono muted text-xs vt-zoom-pct">{Math.round(mapZoom*100)}%</span>
+							<button class="button button-ghost text-xs" onclick={() => zoomBy(1.2)} aria-label="Zoom in">+</button>
+							<button class="button button-ghost text-xs" onclick={resetMapView} title="Reset">⤢</button>
+						</div>
+					{/if}
+				</div>
+				<div class="vt-group vt-group-right">
+					<button class="button button-ghost text-xs" onclick={handleSmokeRender} disabled={!!cmdPending} title="Smoke Render">🧪</button>
+				</div>
 			</div>
 
 			<div class="cs-viewport-stage">
@@ -1681,20 +1699,6 @@
 					</div>
 				{/if}
 
-				{#if materialDrawerOpen}
-					<aside class="material-drawer" aria-label={L === 'kr' ? '재질 라이브러리' : 'Material library'}>
-						<header class="material-drawer-head">
-							<div>
-								<span class="card-eyebrow">{L === 'kr' ? '재질' : 'Materials'}</span>
-								<h3 class="card-title">{L === 'kr' ? '재질 라이브러리' : 'Material library'}</h3>
-							</div>
-							<button class="button button-subtle text-xs" onclick={() => materialDrawerOpen = false} aria-label="Close">✕</button>
-						</header>
-						<div class="material-drawer-body">
-							{@render materialBrowserPanel()}
-						</div>
-					</aside>
-				{/if}
 			</div>
 		</div>
 	</div>
@@ -1716,7 +1720,7 @@
 		background: var(--panel);
 		border: 1px solid var(--panel-border);
 		border-radius: var(--radius-md);
-		padding: var(--space-3) var(--space-4);
+		padding: var(--space-2) var(--space-3);
 		display: flex;
 		flex-direction: column;
 		gap: var(--space-2);
@@ -1724,7 +1728,7 @@
 	}
 	.session-header-top {
 		display: flex;
-		align-items: flex-start;
+		align-items: center;
 		gap: var(--space-3);
 		flex-wrap: wrap;
 	}
@@ -1736,7 +1740,7 @@
 		flex: 1;
 	}
 	.session-title {
-		font-size: var(--font-size-lg, 1.15rem);
+		font-size: 1rem;
 		font-weight: var(--font-weight-semibold, 600);
 		line-height: 1.2;
 		margin: 0;
@@ -1748,10 +1752,10 @@
 	.session-status-pill {
 		display: inline-flex;
 		align-items: center;
-		gap: 0.35rem;
-		padding: 0.2rem 0.55rem;
+		gap: 0.3rem;
+		padding: 0.2rem 0.5rem;
 		border-radius: 999px;
-		font-size: var(--font-size-xs);
+		font-size: 0.7rem;
 		font-weight: 600;
 		border: 1px solid transparent;
 	}
@@ -1775,20 +1779,26 @@
 	}
 	.session-actions {
 		display: flex;
-		gap: 0.35rem;
+		gap: 0.25rem;
 		flex-wrap: wrap;
 		margin-left: auto;
+		align-items: center;
+	}
+	.session-actions :global(.button-ghost) {
+		padding: 0.25rem 0.5rem;
+		font-size: var(--font-size-xs);
 	}
 	.session-chips {
 		display: flex;
 		flex-wrap: wrap;
-		gap: 0.4rem;
+		gap: 0.3rem;
+		opacity: 0.85;
 	}
 	.sum-chip {
 		display: inline-flex;
 		align-items: center;
 		gap: 0.4rem;
-		padding: 0.2rem 0.55rem;
+		padding: 0.15rem 0.45rem;
 		border: 1px solid var(--panel-border);
 		border-radius: var(--radius-sm);
 		background: var(--surface-2);
@@ -1862,11 +1872,19 @@
 	.cs-viewport-toolbar {
 		display: flex;
 		align-items: center;
+		justify-content: space-between;
 		gap: 0.5rem;
 		padding: 0 0.25rem 0.5rem;
 		flex-shrink: 0;
 		flex-wrap: wrap;
 	}
+	.vt-group {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.4rem;
+	}
+	.vt-group-mid { flex: 1 1 auto; justify-content: center; }
+	.vt-group-right { margin-left: auto; }
 	.vt-chip-group {
 		display: inline-flex;
 		gap: 2px;
@@ -1996,78 +2014,225 @@
 		gap: 0.25rem;
 	}
 
-	/* ── Materials drawer overlay ── */
-	.material-drawer {
-		position: absolute;
-		top: 0;
-		right: 0;
-		bottom: 0;
-		width: clamp(280px, 32%, 380px);
-		background: var(--panel);
-		border-left: 1px solid var(--panel-border);
-		box-shadow: -8px 0 24px rgba(0, 0, 0, 0.12);
-		display: flex;
-		flex-direction: column;
-		min-height: 0;
-		z-index: 5;
-	}
-	.material-drawer-head {
-		display: flex;
-		align-items: center;
-		justify-content: space-between;
-		gap: 0.5rem;
-		padding: 0.6rem 0.75rem;
-		border-bottom: 1px solid var(--panel-border);
-		flex-shrink: 0;
-	}
-	.material-drawer-body {
-		flex: 1;
-		min-height: 0;
-		overflow: auto;
-		padding: 0.75rem;
-	}
-
-	/* ── Bottom panel: 2-col Jobs + Logs ── */
-	.bottom-grid {
+	.material-panel-split {
 		display: grid;
-		grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr);
+		grid-template-columns: 11rem minmax(0, 1fr);
 		gap: var(--space-3);
 		height: 100%;
 		min-height: 0;
-		padding: 0.75rem;
 	}
-	.bottom-pane {
+	.material-tool-rail {
 		display: flex;
 		flex-direction: column;
+		gap: 0.55rem;
 		min-height: 0;
-		border: 1px solid var(--panel-border);
-		border-radius: var(--radius-md);
-		background: var(--panel);
 		overflow: hidden;
+		border-right: 1px solid var(--panel-border);
+		padding-right: var(--space-3);
 	}
-	.bottom-pane-head {
+	.material-target-chip {
+		font-size: 0.68rem;
+		background: rgba(37, 99, 235, 0.08);
+		border-radius: 0.35rem;
+		padding: 0.35rem 0.5rem;
+		color: var(--brand-strong);
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+	.material-search {
+		width: 100%;
+		font-size: 0.8rem;
+	}
+	.material-filter-stack {
 		display: flex;
-		align-items: baseline;
-		gap: 0.5rem;
-		padding: 0.5rem 0.75rem;
-		border-bottom: 1px solid var(--panel-border);
-		flex-shrink: 0;
+		flex-direction: column;
+		gap: 0.35rem;
 	}
-	.bottom-pane-head .card-title {
-		margin: 0;
-		font-size: var(--font-size-sm);
-		font-weight: 600;
+	.material-filter-btn {
+		width: 100%;
+		justify-content: flex-start;
+		font-size: 0.72rem;
+		padding: 0.28rem 0.5rem;
 	}
-	.bottom-pane-meta {
-		margin-left: auto;
-		display: inline-flex;
-		gap: 0.3rem;
+	.material-content-section {
+		margin-bottom: 0.8rem;
+	}
+	.material-section-head {
+		display: flex;
 		align-items: center;
+		gap: 0.5rem;
+		margin-bottom: 0.4rem;
 	}
-	.bottom-pane-body {
-		flex: 1;
+	.material-preset-grid {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0.35rem;
+	}
+	.material-preset-btn {
+		appearance: none;
+		border: 1px solid var(--panel-border);
+		background: var(--panel);
+		color: var(--text);
+		border-radius: var(--radius-sm);
+		padding: 0.35rem 0.5rem;
+		font: inherit;
+		font-size: 0.72rem;
+		text-align: left;
+		cursor: pointer;
+	}
+	.material-preset-btn:hover,
+	.material-preset-btn:focus-visible {
+		border-color: rgba(47, 123, 246, 0.32);
+		background: var(--brand-soft);
+	}
+	.material-scroll-area {
+		min-height: 0;
+		overflow-y: auto;
+		padding-right: 0.25rem;
+	}
+	.material-swatch-grid {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0.35rem;
+	}
+	.material-swatch-tile {
+		appearance: none;
+		position: relative;
+		width: 3.2rem;
+		height: 3.2rem;
+		border: 1px solid transparent;
+		border-radius: 0.45rem;
+		background: transparent;
+		padding: 0;
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		overflow: visible;
+	}
+	.material-swatch-tile:hover,
+	.material-swatch-tile:focus-visible {
+		border-color: rgba(47, 123, 246, 0.34);
+		background: var(--brand-soft);
+		outline: none;
+	}
+	.material-swatch-sphere {
+		position: relative;
+		width: 2.25rem;
+		height: 2.25rem;
+		border-radius: 999px;
+		overflow: hidden;
+		border: 1px solid rgba(148, 163, 184, 0.22);
+		box-shadow:
+			inset -0.45rem -0.45rem 0.8rem rgba(15, 23, 42, 0.18),
+			inset 0.45rem 0.45rem 0.7rem rgba(255, 255, 255, 0.78),
+			0 0.25rem 0.65rem rgba(15, 23, 42, 0.12);
+	}
+	.material-swatch-img {
+		position: absolute;
+		inset: 0;
+		width: 100%;
+		height: 100%;
+		border-radius: 999px;
+		object-fit: cover;
+		display: none;
+	}
+	.material-swatch-status {
+		position: absolute;
+		right: 0.42rem;
+		bottom: 0.42rem;
+		width: 0.45rem;
+		height: 0.45rem;
+		border-radius: 999px;
+		border: 1px solid rgba(255, 255, 255, 0.8);
+		background: #9ca3af;
+		box-shadow: 0 0 0 1px rgba(15, 23, 42, 0.08);
+	}
+	.material-swatch-status[data-status='available'] { background: #16a34a; }
+	.material-swatch-status[data-status='needs_patch'] { background: #f59e0b; }
+
+	/* ── Bottom panel tabs ── */
+	.bottom-tabs-shell {
+		display: grid;
+		grid-template-columns: 8.5rem minmax(0, 1fr);
+		height: 100%;
+		min-height: 0;
+	}
+	.bottom-tabs-shell[data-collapsed='true'] {
+		grid-template-columns: minmax(0, 1fr);
+	}
+	.bottom-tabs-rail {
+		display: flex;
+		flex-direction: column;
+		gap: 0.25rem;
+		padding: 0.45rem;
+		border-right: 1px solid var(--panel-border);
+		background: var(--subpanel);
+		min-height: 0;
+		overflow-y: auto;
+	}
+	.bottom-tabs-shell[data-collapsed='true'] .bottom-tabs-rail {
+		flex-direction: row;
+		align-items: center;
+		border-right: none;
+		overflow-x: auto;
+		overflow-y: hidden;
+	}
+	.bottom-collapse-btn,
+	.bottom-tab-btn {
+		appearance: none;
+		border: 1px solid transparent;
+		background: transparent;
+		color: var(--muted-strong);
+		border-radius: var(--radius-sm);
+		min-height: 2rem;
+		padding: 0.35rem 0.5rem;
+		font: inherit;
+		font-size: var(--font-size-xs);
+		font-weight: 650;
+		cursor: pointer;
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 0.35rem;
+		text-align: left;
+	}
+	.bottom-collapse-btn {
+		justify-content: center;
+		color: var(--brand-strong);
+		background: var(--brand-soft);
+	}
+	.bottom-tab-btn:hover:not(:disabled),
+	.bottom-tab-btn.active {
+		border-color: rgba(47, 123, 246, 0.24);
+		background: var(--brand-soft);
+		color: var(--brand-strong);
+	}
+	.bottom-tab-btn:disabled {
+		opacity: 0.45;
+		cursor: not-allowed;
+	}
+	.bottom-tab-label {
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+	.bottom-tab-badge {
+		min-width: 1.25rem;
+		height: 1.25rem;
+		border-radius: var(--radius-pill);
+		background: var(--surface-2);
+		color: var(--muted-strong);
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		padding: 0 0.35rem;
+		font-size: var(--font-size-2xs);
+	}
+	.bottom-tabs-body {
 		min-height: 0;
 		overflow: auto;
+		padding: 0.75rem;
 	}
 
 	/* ── Right rail stack + pipeline list ── */
@@ -2141,7 +2306,21 @@
 			grid-template-rows: minmax(220px, 38vh) auto;
 		}
 		.cs-selection-panel { max-height: none; }
-		.bottom-grid { grid-template-columns: minmax(0, 1fr); }
-		.material-drawer { width: 90%; }
+		.material-panel-split { grid-template-columns: 1fr; }
+		.material-tool-rail {
+			border-right: none;
+			border-bottom: 1px solid var(--panel-border);
+			padding-right: 0;
+			padding-bottom: var(--space-3);
+			overflow: visible;
+		}
+		.material-filter-stack {
+			flex-direction: row;
+			flex-wrap: wrap;
+		}
+		.material-filter-btn,
+		.material-preset-btn {
+			width: auto;
+		}
 	}
 </style>
