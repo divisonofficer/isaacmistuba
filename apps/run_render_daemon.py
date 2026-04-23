@@ -17,14 +17,14 @@ def main() -> None:
 
     repo_root = repo_root_from(args.repo_root)
     daemon = serve_render_daemon(repo_root=repo_root, host=args.host, port=args.port, variant=args.variant)
-    print(f"Render daemon listening on {daemon.base_url}")
-    print(f"Control plane home: {daemon.base_url}/")
-    print(f"Repo root: {repo_root}")
+    print(f"Render daemon listening on {daemon.base_url}", flush=True)
+    print(f"Control plane home: {daemon.base_url}/", flush=True)
+    print(f"Repo root: {repo_root}", flush=True)
     try:
         while True:
             time.sleep(1.0)
     except KeyboardInterrupt:
-        print("Shutting down render daemon...")
+        print("Shutting down render daemon...", flush=True)
         daemon.shutdown()
 
 

@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 import json
+from collections import OrderedDict
 from pathlib import Path
 import tempfile
+import threading
 import time
 from typing import Any, Callable, Mapping, Sequence
 import xml.etree.ElementTree as ET
@@ -48,6 +50,13 @@ MODALITY_DEFINITIONS = {
     "s2": "Luminance-weighted Stokes S2 signed field.",
     "polarization": "Stokes integrator with direct nested integrator, with pplastic fallback when needed.",
 }
+
+_PARSED_SCENE_CACHE: dict[tuple[str, int, int], ET.Element] = {}
+_SCENE_TEMPLATE_CACHE: dict[tuple[tuple[str, int, int], str, tuple[Any, ...]], ET.Element] = {}
+_RESIDENT_SCENE_CACHE: "OrderedDict[tuple[str, int, int, str], Any]" = OrderedDict()
+_STAGED_SCENE_SIGNATURE_CACHE: dict[str, tuple[Any, ...]] = {}
+_SCENE_CACHE_LOCK = threading.Lock()
+_RESIDENT_SCENE_CACHE_LIMIT = 8
 
 
 @dataclass
@@ -231,14 +240,127 @@ def extract_camera_from_scene(scene_xml: str | Path) -> tuple[np.ndarray, float]
     return camera_to_world, float(fov.attrib["value"])
 
 
-def _parse_scene(scene_path: Path) -> ET.Element:
+def _scene_cache_key(scene_path: Path) -> tuple[str, int, int]:
+    resolved = scene_path.resolve()
+    stat = resolved.stat()
+    return (str(resolved), int(stat.st_mtime_ns), int(stat.st_size))
+
+
+def _clone_scene_root(root: ET.Element) -> ET.Element:
+    return ET.fromstring(ET.tostring(root, encoding="unicode"))
+
+
+def _parse_scene_uncached(scene_path: Path) -> ET.Element:
     parser = ET.XMLParser(target=ET.TreeBuilder(insert_comments=True))
     return ET.parse(scene_path, parser=parser).getroot()
 
 
+def _parse_scene(scene_path: Path) -> ET.Element:
+    cache_key = _scene_cache_key(scene_path)
+    with _SCENE_CACHE_LOCK:
+        cached = _PARSED_SCENE_CACHE.get(cache_key)
+    if cached is None:
+        parsed = _parse_scene_uncached(scene_path)
+        with _SCENE_CACHE_LOCK:
+            _PARSED_SCENE_CACHE[cache_key] = _clone_scene_root(parsed)
+        return parsed
+    return _clone_scene_root(cached)
+
+
+def _scene_template(
+    scene_path: Path,
+    *,
+    branch_kind: str,
+    branch_signature: Sequence[Any],
+    builder: Callable[[ET.Element], None],
+) -> ET.Element:
+    scene_key = _scene_cache_key(scene_path)
+    template_key = (scene_key, branch_kind, tuple(branch_signature))
+    with _SCENE_CACHE_LOCK:
+        cached = _SCENE_TEMPLATE_CACHE.get(template_key)
+    if cached is None:
+        root = _parse_scene(scene_path)
+        builder(root)
+        with _SCENE_CACHE_LOCK:
+            _SCENE_TEMPLATE_CACHE[template_key] = _clone_scene_root(root)
+        return root
+    return _clone_scene_root(cached)
+
+
+def _normalize_signature_value(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, bool)):
+        return value
+    if isinstance(value, float):
+        return round(float(value), 6)
+    if isinstance(value, np.ndarray):
+        return tuple(_normalize_signature_value(item) for item in np.asarray(value).reshape(-1).tolist())
+    if isinstance(value, Mapping):
+        return tuple(
+            (str(key), _normalize_signature_value(val))
+            for key, val in sorted(value.items(), key=lambda item: str(item[0]))
+        )
+    if isinstance(value, (list, tuple, set)):
+        return tuple(_normalize_signature_value(item) for item in value)
+    if hasattr(value, "__dict__"):
+        return _normalize_signature_value(vars(value))
+    return repr(value)
+
+
+def _camera_signature(camera_to_world: np.ndarray, *, fov_deg: float, spp: int, width: int, height: int) -> tuple[Any, ...]:
+    matrix = normalize_mat4_storage(camera_to_world).reshape(-1).tolist()
+    return (
+        tuple(round(float(item), 6) for item in matrix),
+        round(float(fov_deg), 6),
+        int(spp),
+        int(width),
+        int(height),
+    )
+
+
+def _scene_override_signature(scene_override: SceneOverrideSpec | None) -> Any:
+    if scene_override is None:
+        return None
+    return _normalize_signature_value(
+        {
+            "target_shape_filenames": list(scene_override.target_shape_filenames),
+            "material_profile": scene_override.material_profile,
+            "bsdf_overrides": scene_override.bsdf_overrides,
+            "transform_overrides": scene_override.transform_overrides,
+            "prim_to_shape_ids": scene_override.prim_to_shape_ids,
+            "extras": scene_override.extras,
+        }
+    )
+
+
+def _assist_light_signature(assist_light: AssistLightSpec | None) -> Any:
+    if assist_light is None:
+        return None
+    return _normalize_signature_value(asdict(assist_light))
+
+
+def _should_reuse_staged_scene(out_scene: Path, *, signature: tuple[Any, ...]) -> bool:
+    cache_key = str(out_scene.resolve())
+    with _SCENE_CACHE_LOCK:
+        cached_signature = _STAGED_SCENE_SIGNATURE_CACHE.get(cache_key)
+    return cached_signature == signature and out_scene.exists()
+
+
+def _record_staged_scene_signature(out_scene: Path, *, signature: tuple[Any, ...]) -> None:
+    cache_key = str(out_scene.resolve())
+    with _SCENE_CACHE_LOCK:
+        _STAGED_SCENE_SIGNATURE_CACHE[cache_key] = signature
+
+
 def _write_scene(root: ET.Element, out_scene: Path) -> Path:
     ET.indent(root, space="  ")
-    out_scene.write_text(ET.tostring(root, encoding="unicode"), encoding="utf-8")
+    scene_text = ET.tostring(root, encoding="unicode")
+    if out_scene.exists():
+        try:
+            if out_scene.read_text(encoding="utf-8") == scene_text:
+                return out_scene
+        except OSError:
+            pass
+    out_scene.write_text(scene_text, encoding="utf-8")
     return out_scene
 
 
@@ -889,16 +1011,34 @@ def _stage_path_scene(
     assist_light: AssistLightSpec | None = None,
     integrator_type: str = "path",
 ) -> Path:
-    root = _parse_scene(scene_path)
-    integrator = root.find("./integrator")
-    if integrator is None:
-        raise RuntimeError("Scene has no integrator node")
-    _configure_path_integrator(
-        integrator,
-        integrator_type=integrator_type,
-        max_depth=max_depth,
-        rr_depth=rr_depth,
-        samples_per_pass=samples_per_pass,
+    stage_signature = (
+        "path",
+        _scene_cache_key(scene_path),
+        _camera_signature(camera_to_world, fov_deg=fov_deg, spp=spp, width=width, height=height),
+        (integrator_type, int(max_depth), int(rr_depth), int(samples_per_pass or 0)),
+        _scene_override_signature(scene_override),
+        _assist_light_signature(assist_light),
+    )
+    if _should_reuse_staged_scene(out_scene, signature=stage_signature):
+        return out_scene
+
+    def _build_template(root: ET.Element) -> None:
+        integrator = root.find("./integrator")
+        if integrator is None:
+            raise RuntimeError("Scene has no integrator node")
+        _configure_path_integrator(
+            integrator,
+            integrator_type=integrator_type,
+            max_depth=max_depth,
+            rr_depth=rr_depth,
+            samples_per_pass=samples_per_pass,
+        )
+
+    root = _scene_template(
+        scene_path,
+        branch_kind="path",
+        branch_signature=(integrator_type, int(max_depth), int(rr_depth), int(samples_per_pass or 0)),
+        builder=_build_template,
     )
     _update_sensor(
         root,
@@ -911,7 +1051,9 @@ def _stage_path_scene(
     _apply_scene_override(root, scene_override, mode="rgb")
     if assist_light is not None:
         _append_camera_assist_light(root, camera_to_world, assist_light, polarized=False)
-    return _write_scene(root, out_scene)
+    result = _write_scene(root, out_scene)
+    _record_staged_scene_signature(result, signature=stage_signature)
+    return result
 
 
 def _stage_aov_scene(
@@ -926,15 +1068,32 @@ def _stage_aov_scene(
     scene_override: SceneOverrideSpec | None = None,
     assist_light: AssistLightSpec | None = None,
 ) -> Path:
-    root = _parse_scene(scene_path)
-    integrator = root.find("./integrator")
-    if integrator is None:
-        raise RuntimeError("Scene has no integrator node")
-    integrator.attrib["type"] = "aov"
-    for child in list(integrator):
-        integrator.remove(child)
-    ET.SubElement(integrator, "string", {"name": "aovs", "value": "ab:albedo,dd:depth"})
-    ET.SubElement(integrator, "integrator", {"type": "direct", "name": "img"})
+    stage_signature = (
+        "aov",
+        _scene_cache_key(scene_path),
+        _camera_signature(camera_to_world, fov_deg=fov_deg, spp=spp, width=width, height=height),
+        _scene_override_signature(scene_override),
+        _assist_light_signature(assist_light),
+    )
+    if _should_reuse_staged_scene(out_scene, signature=stage_signature):
+        return out_scene
+
+    def _build_template(root: ET.Element) -> None:
+        integrator = root.find("./integrator")
+        if integrator is None:
+            raise RuntimeError("Scene has no integrator node")
+        integrator.attrib["type"] = "aov"
+        for child in list(integrator):
+            integrator.remove(child)
+        ET.SubElement(integrator, "string", {"name": "aovs", "value": "ab:albedo,dd:depth"})
+        ET.SubElement(integrator, "integrator", {"type": "direct", "name": "img"})
+
+    root = _scene_template(
+        scene_path,
+        branch_kind="aov",
+        branch_signature=(),
+        builder=_build_template,
+    )
     _update_sensor(
         root,
         camera_to_world=camera_to_world,
@@ -946,7 +1105,9 @@ def _stage_aov_scene(
     _apply_scene_override(root, scene_override, mode="rgb")
     if assist_light is not None:
         _append_camera_assist_light(root, camera_to_world, assist_light, polarized=False)
-    return _write_scene(root, out_scene)
+    result = _write_scene(root, out_scene)
+    _record_staged_scene_signature(result, signature=stage_signature)
+    return result
 
 
 def _stage_stokes_scene(
@@ -963,16 +1124,34 @@ def _stage_stokes_scene(
     assist_light: AssistLightSpec | None = None,
     nested_integrator_type: str = "direct",
 ) -> Path:
-    root = _parse_scene(scene_path)
-    integrator = root.find("./integrator")
-    if integrator is None:
-        raise RuntimeError("Scene has no integrator node")
-    integrator.attrib["type"] = "stokes"
-    for child in list(integrator):
-        integrator.remove(child)
-    if samples_per_pass is not None and samples_per_pass > 0:
-        ET.SubElement(integrator, "integer", {"name": "samples_per_pass", "value": str(samples_per_pass)})
-    ET.SubElement(integrator, "integrator", {"type": nested_integrator_type})
+    stage_signature = (
+        "stokes",
+        _scene_cache_key(scene_path),
+        _camera_signature(camera_to_world, fov_deg=fov_deg, spp=spp, width=width, height=height),
+        (nested_integrator_type, int(samples_per_pass or 0)),
+        _scene_override_signature(scene_override),
+        _assist_light_signature(assist_light),
+    )
+    if _should_reuse_staged_scene(out_scene, signature=stage_signature):
+        return out_scene
+
+    def _build_template(root: ET.Element) -> None:
+        integrator = root.find("./integrator")
+        if integrator is None:
+            raise RuntimeError("Scene has no integrator node")
+        integrator.attrib["type"] = "stokes"
+        for child in list(integrator):
+            integrator.remove(child)
+        if samples_per_pass is not None and samples_per_pass > 0:
+            ET.SubElement(integrator, "integer", {"name": "samples_per_pass", "value": str(samples_per_pass)})
+        ET.SubElement(integrator, "integrator", {"type": nested_integrator_type})
+
+    root = _scene_template(
+        scene_path,
+        branch_kind="stokes",
+        branch_signature=(nested_integrator_type, int(samples_per_pass or 0)),
+        builder=_build_template,
+    )
     _update_sensor(
         root,
         camera_to_world=camera_to_world,
@@ -984,7 +1163,9 @@ def _stage_stokes_scene(
     _apply_scene_override(root, scene_override, mode="polar")
     if assist_light is not None:
         _append_camera_assist_light(root, camera_to_world, assist_light, polarized=assist_light.polarized)
-    return _write_scene(root, out_scene)
+    result = _write_scene(root, out_scene)
+    _record_staged_scene_signature(result, signature=stage_signature)
+    return result
 
 
 def _stage_diffuse_override_scene(
@@ -1002,16 +1183,85 @@ def _stage_diffuse_override_scene(
     scene_override: SceneOverrideSpec | None = None,
     assist_light: AssistLightSpec | None = None,
 ) -> Path:
-    root = _parse_scene(scene_path)
-    integrator = root.find("./integrator")
-    if integrator is None:
-        raise RuntimeError("Scene has no integrator node")
-    _configure_path_integrator(
-        integrator,
-        integrator_type="path",
-        max_depth=max_depth,
-        rr_depth=rr_depth,
-        samples_per_pass=samples_per_pass,
+    stage_signature = (
+        "diffuse_override",
+        _scene_cache_key(scene_path),
+        _camera_signature(camera_to_world, fov_deg=fov_deg, spp=spp, width=width, height=height),
+        (int(max_depth), int(rr_depth), int(samples_per_pass or 0)),
+        _scene_override_signature(scene_override),
+        _assist_light_signature(assist_light),
+    )
+    if _should_reuse_staged_scene(out_scene, signature=stage_signature):
+        return out_scene
+
+    def _build_template(root: ET.Element) -> None:
+        integrator = root.find("./integrator")
+        if integrator is None:
+            raise RuntimeError("Scene has no integrator node")
+        _configure_path_integrator(
+            integrator,
+            integrator_type="path",
+            max_depth=max_depth,
+            rr_depth=rr_depth,
+            samples_per_pass=samples_per_pass,
+        )
+
+        for shape in root.findall("./shape"):
+            filename = shape.find("string[@name='filename']")
+            if filename is None:
+                continue
+            obj_name = Path(filename.attrib["value"]).name.lower()
+            old_bsdf = shape.find("./bsdf")
+            if old_bsdf is not None:
+                shape.remove(old_bsdf)
+
+            if "glass" in obj_name:
+                bsdf = ET.SubElement(shape, "bsdf", {"type": "roughdielectric"})
+                ET.SubElement(bsdf, "float", {"name": "alpha", "value": "0.02"})
+                ET.SubElement(bsdf, "float", {"name": "int_ior", "value": "1.5"})
+                ET.SubElement(bsdf, "float", {"name": "ext_ior", "value": "1.0"})
+                continue
+
+            twosided = ET.SubElement(shape, "bsdf", {"type": "twosided"})
+            diffuse = ET.SubElement(twosided, "bsdf", {"type": "diffuse"})
+
+            base_tex = None
+            base_rgb = None
+            if old_bsdf is not None:
+                base_tex = extract_first_by_name(old_bsdf, "texture", ("base_color", "diffuse_reflectance"))
+                base_rgb = extract_first_by_name(old_bsdf, "rgb", ("base_color", "reflectance", "diffuse_reflectance"))
+
+            if base_tex is not None:
+                tex = ET.SubElement(
+                    diffuse,
+                    "texture",
+                    {
+                        "type": base_tex.attrib.get("type", "bitmap"),
+                        "name": "reflectance",
+                    },
+                )
+                for key, value in base_tex.attrib.items():
+                    if key not in ("type", "name"):
+                        tex.attrib[key] = value
+                for child in list(base_tex):
+                    tex.append(child)
+            elif base_rgb is not None:
+                ET.SubElement(
+                    diffuse,
+                    "rgb",
+                    {
+                        "name": "reflectance",
+                        "value": base_rgb.attrib.get("value", "0.75,0.75,0.75"),
+                    },
+                )
+            else:
+                ET.SubElement(diffuse, "rgb", {"name": "reflectance", "value": "0.75,0.75,0.75"})
+
+    root = _scene_template(
+        scene_path,
+        branch_kind="diffuse_override",
+        branch_signature=(int(max_depth), int(rr_depth), int(samples_per_pass or 0)),
+        builder=_build_template,
     )
     _update_sensor(
         root,
@@ -1025,58 +1275,9 @@ def _stage_diffuse_override_scene(
     if assist_light is not None:
         _append_camera_assist_light(root, camera_to_world, assist_light, polarized=False)
 
-    for shape in root.findall("./shape"):
-        filename = shape.find("string[@name='filename']")
-        if filename is None:
-            continue
-        obj_name = Path(filename.attrib["value"]).name.lower()
-        old_bsdf = shape.find("./bsdf")
-        if old_bsdf is not None:
-            shape.remove(old_bsdf)
-
-        if "glass" in obj_name:
-            bsdf = ET.SubElement(shape, "bsdf", {"type": "roughdielectric"})
-            ET.SubElement(bsdf, "float", {"name": "alpha", "value": "0.02"})
-            ET.SubElement(bsdf, "float", {"name": "int_ior", "value": "1.5"})
-            ET.SubElement(bsdf, "float", {"name": "ext_ior", "value": "1.0"})
-            continue
-
-        twosided = ET.SubElement(shape, "bsdf", {"type": "twosided"})
-        diffuse = ET.SubElement(twosided, "bsdf", {"type": "diffuse"})
-
-        base_tex = None
-        base_rgb = None
-        if old_bsdf is not None:
-            base_tex = extract_first_by_name(old_bsdf, "texture", ("base_color", "diffuse_reflectance"))
-            base_rgb = extract_first_by_name(old_bsdf, "rgb", ("base_color", "reflectance", "diffuse_reflectance"))
-
-        if base_tex is not None:
-            tex = ET.SubElement(
-                diffuse,
-                "texture",
-                {
-                    "type": base_tex.attrib.get("type", "bitmap"),
-                    "name": "reflectance",
-                },
-            )
-            for key, value in base_tex.attrib.items():
-                if key not in ("type", "name"):
-                    tex.attrib[key] = value
-            for child in list(base_tex):
-                tex.append(child)
-        elif base_rgb is not None:
-            ET.SubElement(
-                diffuse,
-                "rgb",
-                {
-                    "name": "reflectance",
-                    "value": base_rgb.attrib.get("value", "0.75,0.75,0.75"),
-                },
-            )
-        else:
-            ET.SubElement(diffuse, "rgb", {"name": "reflectance", "value": "0.75,0.75,0.75"})
-
-    return _write_scene(root, out_scene)
+    result = _write_scene(root, out_scene)
+    _record_staged_scene_signature(result, signature=stage_signature)
+    return result
 
 
 def _stage_polarized_fallback_scene(
@@ -1093,16 +1294,104 @@ def _stage_polarized_fallback_scene(
     assist_light: AssistLightSpec | None = None,
     nested_integrator_type: str = "direct",
 ) -> Path:
-    root = _parse_scene(scene_path)
-    integrator = root.find("./integrator")
-    if integrator is None:
-        raise RuntimeError("Scene has no integrator node")
-    integrator.attrib["type"] = "stokes"
-    for child in list(integrator):
-        integrator.remove(child)
-    if samples_per_pass is not None and samples_per_pass > 0:
-        ET.SubElement(integrator, "integer", {"name": "samples_per_pass", "value": str(samples_per_pass)})
-    ET.SubElement(integrator, "integrator", {"type": nested_integrator_type})
+    stage_signature = (
+        "polarized_fallback",
+        _scene_cache_key(scene_path),
+        _camera_signature(camera_to_world, fov_deg=fov_deg, spp=spp, width=width, height=height),
+        (nested_integrator_type, int(samples_per_pass or 0)),
+        _scene_override_signature(scene_override),
+        _assist_light_signature(assist_light),
+    )
+    if _should_reuse_staged_scene(out_scene, signature=stage_signature):
+        return out_scene
+
+    def _build_template(root: ET.Element) -> None:
+        integrator = root.find("./integrator")
+        if integrator is None:
+            raise RuntimeError("Scene has no integrator node")
+        integrator.attrib["type"] = "stokes"
+        for child in list(integrator):
+            integrator.remove(child)
+        if samples_per_pass is not None and samples_per_pass > 0:
+            ET.SubElement(integrator, "integer", {"name": "samples_per_pass", "value": str(samples_per_pass)})
+        ET.SubElement(integrator, "integrator", {"type": nested_integrator_type})
+
+        for shape in root.findall("./shape"):
+            filename = shape.find("string[@name='filename']")
+            if filename is None:
+                continue
+            obj_name = Path(filename.attrib["value"]).name.lower()
+            old_bsdf = shape.find("./bsdf")
+            if old_bsdf is not None:
+                shape.remove(old_bsdf)
+
+            if "glass" in obj_name:
+                bsdf = ET.SubElement(shape, "bsdf", {"type": "roughdielectric"})
+                ET.SubElement(bsdf, "float", {"name": "alpha", "value": "0.02"})
+                ET.SubElement(bsdf, "float", {"name": "int_ior", "value": "1.5"})
+                ET.SubElement(bsdf, "float", {"name": "ext_ior", "value": "1.0"})
+                continue
+
+            twosided = ET.SubElement(shape, "bsdf", {"type": "twosided"})
+            pplastic = ET.SubElement(twosided, "bsdf", {"type": "pplastic"})
+
+            base_tex = None
+            base_rgb = None
+            roughness = None
+            if old_bsdf is not None:
+                base_tex = extract_first_by_name(old_bsdf, "texture", ("base_color", "diffuse_reflectance"))
+                base_rgb = extract_first_by_name(old_bsdf, "rgb", ("base_color", "reflectance", "diffuse_reflectance"))
+                roughness = extract_first_by_name(old_bsdf, "float", ("roughness", "alpha"))
+
+            if base_tex is not None:
+                tex = ET.SubElement(
+                    pplastic,
+                    "texture",
+                    {
+                        "type": base_tex.attrib.get("type", "bitmap"),
+                        "name": "diffuse_reflectance",
+                    },
+                )
+                for child in list(base_tex):
+                    tex.append(child)
+                for key, value in base_tex.attrib.items():
+                    if key not in ("type", "name"):
+                        tex.attrib[key] = value
+            elif base_rgb is not None:
+                ET.SubElement(
+                    pplastic,
+                    "rgb",
+                    {
+                        "name": "diffuse_reflectance",
+                        "value": base_rgb.attrib.get("value", "0.75,0.75,0.75"),
+                    },
+                )
+            else:
+                ET.SubElement(
+                    pplastic,
+                    "rgb",
+                    {
+                        "name": "diffuse_reflectance",
+                        "value": "0.75,0.75,0.75",
+                    },
+                )
+
+            alpha = "0.12"
+            if roughness is not None:
+                try:
+                    alpha = f"{max(0.03, min(0.35, float(roughness.attrib.get('value', '0.12')))):.4f}"
+                except ValueError:
+                    alpha = "0.12"
+            ET.SubElement(pplastic, "float", {"name": "alpha", "value": alpha})
+            ET.SubElement(pplastic, "float", {"name": "int_ior", "value": "1.49"})
+            ET.SubElement(pplastic, "float", {"name": "ext_ior", "value": "1.0"})
+
+    root = _scene_template(
+        scene_path,
+        branch_kind="polarized_fallback",
+        branch_signature=(nested_integrator_type, int(samples_per_pass or 0)),
+        builder=_build_template,
+    )
     _update_sensor(
         root,
         camera_to_world=camera_to_world,
@@ -1115,77 +1404,9 @@ def _stage_polarized_fallback_scene(
     if assist_light is not None:
         _append_camera_assist_light(root, camera_to_world, assist_light, polarized=assist_light.polarized)
 
-    for shape in root.findall("./shape"):
-        filename = shape.find("string[@name='filename']")
-        if filename is None:
-            continue
-        obj_name = Path(filename.attrib["value"]).name.lower()
-        old_bsdf = shape.find("./bsdf")
-        if old_bsdf is not None:
-            shape.remove(old_bsdf)
-
-        if "glass" in obj_name:
-            bsdf = ET.SubElement(shape, "bsdf", {"type": "roughdielectric"})
-            ET.SubElement(bsdf, "float", {"name": "alpha", "value": "0.02"})
-            ET.SubElement(bsdf, "float", {"name": "int_ior", "value": "1.5"})
-            ET.SubElement(bsdf, "float", {"name": "ext_ior", "value": "1.0"})
-            continue
-
-        twosided = ET.SubElement(shape, "bsdf", {"type": "twosided"})
-        pplastic = ET.SubElement(twosided, "bsdf", {"type": "pplastic"})
-
-        base_tex = None
-        base_rgb = None
-        roughness = None
-        if old_bsdf is not None:
-            base_tex = extract_first_by_name(old_bsdf, "texture", ("base_color", "diffuse_reflectance"))
-            base_rgb = extract_first_by_name(old_bsdf, "rgb", ("base_color", "reflectance", "diffuse_reflectance"))
-            roughness = extract_first_by_name(old_bsdf, "float", ("roughness", "alpha"))
-
-        if base_tex is not None:
-            tex = ET.SubElement(
-                pplastic,
-                "texture",
-                {
-                    "type": base_tex.attrib.get("type", "bitmap"),
-                    "name": "diffuse_reflectance",
-                },
-            )
-            for child in list(base_tex):
-                tex.append(child)
-            for key, value in base_tex.attrib.items():
-                if key not in ("type", "name"):
-                    tex.attrib[key] = value
-        elif base_rgb is not None:
-            ET.SubElement(
-                pplastic,
-                "rgb",
-                {
-                    "name": "diffuse_reflectance",
-                    "value": base_rgb.attrib.get("value", "0.75,0.75,0.75"),
-                },
-            )
-        else:
-            ET.SubElement(
-                pplastic,
-                "rgb",
-                {
-                    "name": "diffuse_reflectance",
-                    "value": "0.75,0.75,0.75",
-                },
-            )
-
-        alpha = "0.12"
-        if roughness is not None:
-            try:
-                alpha = f"{max(0.03, min(0.35, float(roughness.attrib.get('value', '0.12')))):.4f}"
-            except ValueError:
-                alpha = "0.12"
-        ET.SubElement(pplastic, "float", {"name": "alpha", "value": alpha})
-        ET.SubElement(pplastic, "float", {"name": "int_ior", "value": "1.49"})
-        ET.SubElement(pplastic, "float", {"name": "ext_ior", "value": "1.0"})
-
-    return _write_scene(root, out_scene)
+    result = _write_scene(root, out_scene)
+    _record_staged_scene_signature(result, signature=stage_signature)
+    return result
 
 
 def _stage_target_mask_scene(
@@ -1199,6 +1420,15 @@ def _stage_target_mask_scene(
     height: int,
     target_shape_filenames: Sequence[str],
 ) -> Path:
+    stage_signature = (
+        "target_mask",
+        _scene_cache_key(scene_path),
+        _camera_signature(camera_to_world, fov_deg=fov_deg, spp=spp, width=width, height=height),
+        tuple(sorted(Path(item).name for item in target_shape_filenames)),
+    )
+    if _should_reuse_staged_scene(out_scene, signature=stage_signature):
+        return out_scene
+
     root = _parse_scene(scene_path)
     integrator = root.find("./integrator")
     if integrator is None:
@@ -1239,13 +1469,51 @@ def _stage_target_mask_scene(
         polarized=False,
     )
 
-    return _write_scene(root, out_scene)
+    result = _write_scene(root, out_scene)
+    _record_staged_scene_signature(result, signature=stage_signature)
+    return result
 
 
 def _import_mitsuba():
     import mitsuba as mi
 
     return mi
+
+
+def _resident_scene_cache_key(scene_path: Path, *, variant: str) -> tuple[str, int, int, str]:
+    stat = scene_path.stat()
+    return (str(scene_path.resolve()), int(stat.st_mtime_ns), int(stat.st_size), str(variant))
+
+
+def _load_resident_scene(scene_path: Path, *, variant: str) -> tuple[Any, float, bool]:
+    mi = _import_mitsuba()
+    mi.set_variant(variant)
+    cache_key = _resident_scene_cache_key(scene_path, variant=variant)
+
+    with _SCENE_CACHE_LOCK:
+        cached_scene = _RESIDENT_SCENE_CACHE.get(cache_key)
+        if cached_scene is not None:
+            _RESIDENT_SCENE_CACHE.move_to_end(cache_key)
+            return cached_scene, 0.0, True
+
+    load_start = time.perf_counter()
+    scene = mi.load_file(str(scene_path))
+    load_s = time.perf_counter() - load_start
+
+    with _SCENE_CACHE_LOCK:
+        _RESIDENT_SCENE_CACHE[cache_key] = scene
+        _RESIDENT_SCENE_CACHE.move_to_end(cache_key)
+        while len(_RESIDENT_SCENE_CACHE) > _RESIDENT_SCENE_CACHE_LIMIT:
+            _RESIDENT_SCENE_CACHE.popitem(last=False)
+    return scene, load_s, False
+
+
+def _clear_scene_caches() -> None:
+    with _SCENE_CACHE_LOCK:
+        _PARSED_SCENE_CACHE.clear()
+        _SCENE_TEMPLATE_CACHE.clear()
+        _RESIDENT_SCENE_CACHE.clear()
+        _STAGED_SCENE_SIGNATURE_CACHE.clear()
 
 
 def _render_scene(
@@ -1257,11 +1525,7 @@ def _render_scene(
 ) -> tuple[np.ndarray, dict[str, float]]:
     mi = _import_mitsuba()
     start = time.perf_counter()
-    mi.set_variant(variant)
-
-    load_start = time.perf_counter()
-    scene = mi.load_file(str(scene_path))
-    load_s = time.perf_counter() - load_start
+    scene, load_s, cache_hit = _load_resident_scene(scene_path, variant=variant)
 
     if on_loaded is not None:
         on_loaded()
@@ -1273,6 +1537,7 @@ def _render_scene(
     return image, {
         "variant": variant,
         "load_scene_s": load_s,
+        "scene_cache_hit": cache_hit,
         "render_s": render_s,
         "total_s": total_s,
     }
@@ -1988,6 +2253,7 @@ def _build_rgb_result(
         "scene": str(scene_path),
         "spp": timing["spp"],
         "load_scene_s": timing["load_scene_s"],
+        "scene_cache_hit": bool(timing.get("scene_cache_hit", False)),
         "render_s": timing["render_s"],
         "save_s": time.perf_counter() - save_start,
         "total_s": timing["total_s"] + (time.perf_counter() - save_start),
@@ -2006,6 +2272,7 @@ def _build_rgb_result(
         timing={
             "variant": timing["variant"],
             "load_scene_s": timing["load_scene_s"],
+            "scene_cache_hit": bool(timing.get("scene_cache_hit", False)),
             "render_s": timing["render_s"],
             "save_s": timing_record["save_s"],
             "total_s": timing_record["total_s"],
@@ -2044,6 +2311,7 @@ def _build_grayscale_result(
         "scene": str(scene_path),
         "spp": timing["spp"],
         "load_scene_s": timing["load_scene_s"],
+        "scene_cache_hit": bool(timing.get("scene_cache_hit", False)),
         "render_s": timing["render_s"],
         "save_s": save_s,
         "total_s": timing["total_s"] + save_s,
@@ -2062,6 +2330,7 @@ def _build_grayscale_result(
         timing={
             "variant": timing["variant"],
             "load_scene_s": timing["load_scene_s"],
+            "scene_cache_hit": bool(timing.get("scene_cache_hit", False)),
             "render_s": timing["render_s"],
             "save_s": save_s,
             "total_s": timing_record["total_s"],
@@ -2468,6 +2737,7 @@ def render_modalities(
             "scene": str(scene_aov),
             "spp": config.aov_spp,
             "load_scene_s": timing["load_scene_s"],
+            "scene_cache_hit": bool(timing.get("scene_cache_hit", False)),
             "render_s": timing["render_s"],
             "total_s": timing["total_s"],
             "albedo": albedo_outputs,
@@ -2540,6 +2810,7 @@ def render_modalities(
                     "scene": str(scene_mirror),
                     "spp": config.aov_spp,
                     "load_scene_s": mirror_timing["load_scene_s"],
+                    "scene_cache_hit": bool(mirror_timing.get("scene_cache_hit", False)),
                     "render_s": mirror_timing["render_s"],
                     "total_s": mirror_timing["total_s"],
                     "plane_point": plane_point.tolist(),
@@ -2599,6 +2870,7 @@ def render_modalities(
                 "scene": str(scene_mask),
                 "spp": max(1, config.aov_spp),
                 "load_scene_s": mask_timing["load_scene_s"],
+                "scene_cache_hit": bool(mask_timing.get("scene_cache_hit", False)),
                 "render_s": mask_timing["render_s"],
                 "total_s": mask_timing["total_s"],
                 "mask_pixels": int(np.count_nonzero(target_mask)),
@@ -2722,6 +2994,7 @@ def render_modalities(
             "scene": str(polar_scene_used),
             "spp": config.polar_spp,
             "load_scene_s": timing["load_scene_s"],
+            "scene_cache_hit": bool(timing.get("scene_cache_hit", False)),
             "render_s": timing["render_s"],
             "total_s": timing["total_s"],
             "material_mode": polarization_material_mode,
@@ -2734,6 +3007,7 @@ def render_modalities(
         shared_timing = {
             "variant": timing["variant"],
             "load_scene_s": timing["load_scene_s"],
+            "scene_cache_hit": bool(timing.get("scene_cache_hit", False)),
             "render_s": timing["render_s"],
             "scene": str(polar_scene_used),
             "spp": config.polar_spp,

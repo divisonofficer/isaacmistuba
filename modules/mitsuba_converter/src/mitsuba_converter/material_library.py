@@ -84,7 +84,10 @@ DATASET_DISPLAY_META: dict[str, dict[str, Any]] = {
 # Per-dataset material catalogs
 # ---------------------------------------------------------------------------
 
+_PBRDF_2020_BASE = "https://vclab.kaist.ac.kr/siggraph2020/pbrdfdataset"
+
 # KAIST pBRDF — 25 materials (SIGGRAPH 2020 official list)
+# Tuple: (material_id, display_name, native_file, download_zip_url)
 _PBRDF_2020_MATERIALS = [
     ("spectralon",        "Spectralon",        "data/pbrdf_2020/mitsuba/1_spectralon_inpainted.pbsdf"),
     ("white_billiard",    "White Billiard",    "data/pbrdf_2020/mitsuba/2_white_billiard_inpainted.pbsdf"),
@@ -251,13 +254,18 @@ def get_library_grouped(repo_root: Path) -> list[dict[str, Any]]:
 
         raw_materials = MATERIAL_CATALOG.get(ds_id, [])
         materials_out: list[dict[str, Any]] = []
-        for (mat_id, mat_name, native_file) in raw_materials:
+        for idx, (mat_id, mat_name, native_file) in enumerate(raw_materials):
             status = _material_status(repo_root, native_file, requires_patch)
+            download_url: str | None = None
+            if ds_id == "pbrdf_2020":
+                n = idx + 1
+                download_url = f"{_PBRDF_2020_BASE}/{n}_{mat_id}_mitsuba.zip"
             materials_out.append({
                 "material_id": mat_id,
                 "display_name": mat_name,
                 "native_file": native_file,
                 "status": status,
+                "download_url": download_url,
             })
 
         group: dict[str, Any] = {

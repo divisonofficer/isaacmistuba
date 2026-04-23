@@ -2,16 +2,15 @@
 
 {% block content %}
   {% set active_render = active_isaac_command if active_isaac_command and active_isaac_command.command_type in ["render_current_view", "render_sensor"] else None %}
-  {% set has_bridge_jobs = jobs|length > 0 %}
-  {% set has_isaac_renders = isaac_render_commands|length > 0 %}
+
   {% if active_render %}
     <section class="panel" style="margin-bottom:1rem;">
       <div class="panel-header">
         <div>
           <h2 class="section-title"><span data-lang="en">Live Isaac Render</span><span data-lang="kr" class="hidden">실시간 Isaac 렌더</span></h2>
           <p class="muted text-sm">
-            <span data-lang="en">This render is running through the active Isaac session. Blocking renders may not appear in the bridge_jobs queue until artifacts are written.</span>
-            <span data-lang="kr" class="hidden">이 렌더는 active Isaac session 안에서 직접 실행 중입니다. blocking 렌더는 artifact가 기록되기 전까지 bridge_jobs 큐 표에 바로 나타나지 않을 수 있습니다.</span>
+            <span data-lang="en">This render is running through the active Isaac session.</span>
+            <span data-lang="kr" class="hidden">이 렌더는 active Isaac session 안에서 직접 실행 중입니다.</span>
           </p>
         </div>
       </div>
@@ -33,58 +32,48 @@
           <div class="mini-value">{{ active_render.progress_stage or "-" }}</div>
         </article>
       </div>
-      <div class="empty-state-illustrated mt-4" style="padding:1rem 1.2rem; text-align:left;">
+      <div class="empty-state-illustrated mt-4" style="padding:1rem 1.2rem;text-align:left;">
         <div class="muted text-sm">{{ active_render.progress_message or "-" }}</div>
-        {% if active_render.telemetry_hint %}
-          <div class="muted text-sm" style="margin-top:0.4rem;">
-            <span data-lang="en">{{ active_render.telemetry_hint.en }}</span>
-            <span data-lang="kr" class="hidden">{{ active_render.telemetry_hint.kr }}</span>
-          </div>
-        {% endif %}
       </div>
     </section>
   {% endif %}
 
-  {% if has_isaac_renders %}
+  {% if isaac_render_commands|length > 0 %}
     <section class="panel" style="margin-bottom:1rem;">
       <div class="panel-header">
         <div>
           <h2 class="section-title"><span data-lang="en">Isaac Session Render Timeline</span><span data-lang="kr" class="hidden">Isaac 세션 렌더 타임라인</span></h2>
           <p class="muted text-sm">
-            <span data-lang="en">Recent render_current_view / render_sensor commands, including blocking renders that do not enter the queue table below.</span>
-            <span data-lang="kr" class="hidden">아래 큐 표에 들어가지 않는 blocking 렌더까지 포함한 최근 render_current_view / render_sensor 명령입니다.</span>
+            <span data-lang="en">Recent render_current_view / render_sensor commands.</span>
+            <span data-lang="kr" class="hidden">최근 render_current_view / render_sensor 명령.</span>
           </p>
         </div>
       </div>
       <div class="table-wrap mt-4">
-        <table class="table">
-          <thead>
-            <tr>
-              <th><span data-lang="en">Command</span><span data-lang="kr" class="hidden">명령</span></th>
-              <th><span data-lang="en">Status</span><span data-lang="kr" class="hidden">상태</span></th>
-              <th><span data-lang="en">Stage</span><span data-lang="kr" class="hidden">단계</span></th>
-              <th><span data-lang="en">Scene</span><span data-lang="kr" class="hidden">장면</span></th>
-              <th><span data-lang="en">Origin</span><span data-lang="kr" class="hidden">원천</span></th>
-              <th><span data-lang="en">Created</span><span data-lang="kr" class="hidden">생성 시각</span></th>
-              <th><span data-lang="en">Updated</span><span data-lang="kr" class="hidden">갱신 시각</span></th>
-            </tr>
-          </thead>
+        <table class="data-table">
+          <thead><tr>
+            <th><span data-lang="en">Command</span><span data-lang="kr" class="hidden">명령</span></th>
+            <th><span data-lang="en">Status</span><span data-lang="kr" class="hidden">상태</span></th>
+            <th><span data-lang="en">Stage</span><span data-lang="kr" class="hidden">단계</span></th>
+            <th><span data-lang="en">Scene</span><span data-lang="kr" class="hidden">장면</span></th>
+            <th><span data-lang="en">Origin</span><span data-lang="kr" class="hidden">원천</span></th>
+            <th><span data-lang="en">Created</span><span data-lang="kr" class="hidden">생성</span></th>
+            <th><span data-lang="en">Updated</span><span data-lang="kr" class="hidden">갱신</span></th>
+          </tr></thead>
           <tbody>
             {% for command in isaac_render_commands %}
-              <tr>
-                <td>{{ command.command_type }}</td>
-                <td><span class="badge badge-{{ command.status }}">{{ command.status }}</span></td>
-                <td>
-                  <div>{{ command.progress_stage or "-" }}</div>
-                  {% if command.progress_message %}
-                    <div class="muted text-xs">{{ command.progress_message }}</div>
-                  {% endif %}
-                </td>
-                <td>{{ command.scene_id or "-" }}</td>
-                <td>{{ command.progress_origin or "-" }}</td>
-                <td>{{ command.created_at or "-" }}</td>
-                <td>{{ command.updated_at or command.completed_at or "-" }}</td>
-              </tr>
+            <tr>
+              <td class="mono text-xs">{{ command.command_type }}</td>
+              <td><span class="status-badge status-badge-{{ command.status }}">{{ command.status }}</span></td>
+              <td>
+                <div class="text-xs">{{ command.progress_stage or "—" }}</div>
+                {% if command.progress_message %}<div class="muted text-xs">{{ command.progress_message }}</div>{% endif %}
+              </td>
+              <td class="mono text-xs">{{ command.scene_id or "—" }}</td>
+              <td class="muted text-xs">{{ command.progress_origin or "—" }}</td>
+              <td class="muted text-xs">{{ (command.created_at or "")[:16] }}</td>
+              <td class="muted text-xs">{{ (command.updated_at or command.completed_at or "")[:16] }}</td>
+            </tr>
             {% endfor %}
           </tbody>
         </table>
@@ -95,42 +84,73 @@
   <section class="panel">
     <div class="panel-header">
       <div>
-        <h2 class="section-title"><span data-lang="en">Render Jobs</span><span data-lang="kr" class="hidden">렌더 작업</span></h2>
-        <p class="muted text-sm"><span data-lang="en">Daemon queue, status, manifest links, and recent failures.</span><span data-lang="kr" class="hidden">daemon 큐, 상태, manifest 링크, 최근 실패 기록.</span></p>
+        <h2 class="section-title"><span data-lang="en">Render Jobs</span><span data-lang="kr" class="hidden">렌더 잡</span></h2>
+        <p class="muted text-sm"><span data-lang="en">Daemon queue, status, filters, and per-job actions.</span><span data-lang="kr" class="hidden">데몬 큐, 상태, 필터, 잡별 액션.</span></p>
       </div>
-      <div class="flex items-center gap-2">
-        <button class="button button-subtle js-error-only" style="font-size:0.82rem;"><span data-lang="en">Errors only</span><span data-lang="kr" class="hidden">오류만</span></button>
-        <a href="/api/render-jobs" class="button button-subtle"><span data-lang="en">Jobs API</span><span data-lang="kr" class="hidden">작업 API</span></a>
+      <div class="flex items-center gap-2 flex-wrap">
+        <div class="flex gap-1" id="job-filter-btns">
+          <button class="button js-job-filter job-filter-active" data-filter="all"><span data-lang="en">All</span><span data-lang="kr" class="hidden">전체</span></button>
+          <button class="button js-job-filter" data-filter="running"><span data-lang="en">Running</span><span data-lang="kr" class="hidden">실행 중</span></button>
+          <button class="button js-job-filter" data-filter="failed"><span data-lang="en">Failed</span><span data-lang="kr" class="hidden">실패</span></button>
+          <button class="button js-job-filter" data-filter="stuck"><span data-lang="en">Stuck</span><span data-lang="kr" class="hidden">지연</span></button>
+        </div>
+        <a href="/api/render-jobs" class="button button-subtle"><span data-lang="en">API</span></a>
       </div>
     </div>
+
     {% if jobs %}
       <div class="table-wrap mt-4">
-        <table class="table" id="jobs-table">
-          <thead>
-            <tr>
-              <th><span data-lang="en">Job</span><span data-lang="kr" class="hidden">작업</span></th>
-              <th><span data-lang="en">Status</span><span data-lang="kr" class="hidden">상태</span></th>
-              <th><span data-lang="en">Stage</span><span data-lang="kr" class="hidden">단계</span></th>
-              <th><span data-lang="en">Scene</span><span data-lang="kr" class="hidden">장면</span></th>
-              <th><span data-lang="en">Queue</span><span data-lang="kr" class="hidden">큐</span></th>
-              <th><span data-lang="en">Submitted</span><span data-lang="kr" class="hidden">제출 시각</span></th>
-              <th><span data-lang="en">Finished</span><span data-lang="kr" class="hidden">완료 시각</span></th>
-            </tr>
-          </thead>
+        <table class="data-table" id="jobs-table">
+          <thead><tr>
+            <th><span data-lang="en">Job ID</span><span data-lang="kr" class="hidden">잡 ID</span></th>
+            <th><span data-lang="en">Status</span><span data-lang="kr" class="hidden">상태</span></th>
+            <th><span data-lang="en">Stage</span><span data-lang="kr" class="hidden">단계</span></th>
+            <th><span data-lang="en">Scene</span><span data-lang="kr" class="hidden">장면</span></th>
+            <th><span data-lang="en">Age</span><span data-lang="kr" class="hidden">경과</span></th>
+            <th><span data-lang="en">Queue</span><span data-lang="kr" class="hidden">큐</span></th>
+            <th><span data-lang="en">Finished</span><span data-lang="kr" class="hidden">완료</span></th>
+            <th><span data-lang="en">Actions</span><span data-lang="kr" class="hidden">액션</span></th>
+          </tr></thead>
           <tbody>
             {% for job in jobs %}
-              <tr data-status="{{ job.status }}" {% if job.error %}data-has-error="1"{% endif %}>
-                <td class="mono text-xs">{{ job.job_id }}</td>
-                <td><span class="badge badge-{{ job.status }}">{{ job.status }}</span></td>
-                <td>{{ job.progress_stage }}</td>
-                <td>{{ job.scene_id or "-" }}</td>
-                <td>{{ job.queue_position or "-" }}</td>
-                <td>{{ job.submitted_at or "-" }}</td>
-                <td>{{ job.finished_at or "-" }}</td>
+              <tr
+                data-status="{{ job.status }}"
+                data-stuck="{{ 'true' if job.is_stuck else 'false' }}"
+                data-submitted="{{ job.submitted_at or '' }}"
+                {% if job.is_stuck %}class="job-row-stuck"{% endif %}
+              >
+                <td class="mono text-xs">
+                  {{ job.job_id[:20] }}…
+                  {% if job.is_stuck %}<span class="status-badge status-badge-warn" style="margin-left:4px;font-size:0.65rem;">Stuck</span>{% endif %}
+                </td>
+                <td><span class="status-badge status-badge-{{ job.status }}">{{ job.status }}</span></td>
+                <td class="muted text-xs">{{ job.progress_stage or "—" }}</td>
+                <td class="mono text-xs">{{ job.scene_id or "—" }}</td>
+                <td class="muted text-xs job-age" data-submitted="{{ job.submitted_at or '' }}">
+                  {% if job.age_s is not none %}
+                    {% if job.age_s < 60 %}{{ job.age_s|int }}s
+                    {% elif job.age_s < 3600 %}{{ (job.age_s / 60)|int }}m
+                    {% else %}{{ (job.age_s / 3600)|round(1) }}h{% endif %}
+                  {% else %}—{% endif %}
+                </td>
+                <td class="muted text-xs">{{ job.queue_position or "—" }}</td>
+                <td class="muted text-xs">{{ (job.finished_at or "")[:16] or "—" }}</td>
+                <td>
+                  <div class="flex gap-1">
+                    <button class="button button-subtle js-view-log" data-job-id="{{ job.job_id }}" style="font-size:0.75rem;padding:0.2rem 0.55rem;">
+                      <span data-lang="en">Log</span><span data-lang="kr" class="hidden">로그</span>
+                    </button>
+                    {% if job.status in ['failed', 'cancelled'] %}
+                      <button class="button button-subtle js-retry-job" data-job-id="{{ job.job_id }}" style="font-size:0.75rem;padding:0.2rem 0.55rem;">
+                        <span data-lang="en">Retry</span><span data-lang="kr" class="hidden">재시도</span>
+                      </button>
+                    {% endif %}
+                  </div>
+                </td>
               </tr>
               {% if job.error %}
-                <tr data-status="{{ job.status }}" data-has-error="1">
-                  <td colspan="7" class="error-row">{{ job.error }}</td>
+                <tr data-status="{{ job.status }}" data-stuck="{{ 'true' if job.is_stuck else 'false' }}">
+                  <td colspan="8" class="error-row" style="padding:0.35rem 0.75rem;font-size:0.75rem;color:var(--red,#ef4444);border-left:3px solid var(--red,#ef4444);">{{ job.error }}</td>
                 </tr>
               {% endif %}
             {% endfor %}
@@ -140,32 +160,120 @@
     {% else %}
       <div class="empty-state-illustrated mt-4">
         <div class="empty-icon">📋</div>
-        <div class="empty-title"><span data-lang="en">No queued daemon jobs yet</span><span data-lang="kr" class="hidden">아직 큐에 기록된 daemon 작업이 없습니다</span></div>
+        <div class="empty-title"><span data-lang="en">No render jobs yet</span><span data-lang="kr" class="hidden">아직 렌더 잡 없음</span></div>
         <div class="empty-desc">
-          <span data-lang="en">Blocking Isaac renders can still be active above even when this queue table is empty. Use async submit mode if you want a bridge_jobs entry immediately.</span>
-          <span data-lang="kr" class="hidden">이 큐 표가 비어 있어도 위에서 blocking Isaac 렌더가 진행 중일 수 있습니다. 즉시 bridge_jobs 항목을 보고 싶다면 async submit mode를 사용하세요.</span>
+          <span data-lang="en">Submit a render from Isaac or via the API to see jobs here.</span>
+          <span data-lang="kr" class="hidden">Isaac 또는 API에서 렌더를 제출하면 여기에 잡이 표시됩니다.</span>
         </div>
-        <div class="flex gap-2" style="margin-top:0.75rem;">
-          <a href="/integrations/isaac" class="button button-primary"><span data-lang="en">Open Isaac Guide</span><span data-lang="kr" class="hidden">Isaac 가이드 열기</span></a>
-          <a href="/api/render-jobs" class="button button-subtle"><span data-lang="en">Jobs API</span><span data-lang="kr" class="hidden">작업 API</span></a>
+        <div class="flex gap-2 mt-3">
+          <a href="/integrations/isaac" class="button button-primary"><span data-lang="en">Isaac Guide</span><span data-lang="kr" class="hidden">Isaac 가이드</span></a>
+          <a href="/api/render-jobs" class="button button-subtle"><span data-lang="en">Jobs API</span><span data-lang="kr" class="hidden">잡 API</span></a>
         </div>
       </div>
     {% endif %}
   </section>
 
+  <!-- Log viewer modal -->
+  <dialog id="log-modal" style="border:1px solid var(--panel-border);border-radius:8px;padding:0;background:var(--panel);color:var(--text);min-width:min(90vw,780px);max-height:80vh;overflow:hidden;display:flex;flex-direction:column;">
+    <div style="display:flex;align-items:center;justify-content:space-between;padding:0.75rem 1rem;border-bottom:1px solid var(--panel-border);flex-shrink:0;">
+      <div>
+        <span style="font-weight:600;font-size:0.9rem;" id="log-modal-title">Job Log</span>
+        <span class="mono muted" style="font-size:0.72rem;margin-left:0.5rem;" id="log-modal-job-id"></span>
+      </div>
+      <button id="log-modal-close" style="background:none;border:none;cursor:pointer;color:var(--muted);font-size:1.2rem;line-height:1;padding:0.2rem 0.4rem;">✕</button>
+    </div>
+    <div style="overflow-y:auto;flex:1;padding:0.5rem 0.75rem;">
+      <pre id="log-modal-body" style="font-family:ui-monospace,monospace;font-size:0.76rem;white-space:pre-wrap;word-break:break-all;margin:0;line-height:1.5;color:var(--text);"></pre>
+    </div>
+  </dialog>
+
   <script>
-    (() => {
-      const btn = document.querySelector(".js-error-only");
-      if (!btn) return;
-      let errorsOnly = false;
-      btn.addEventListener("click", () => {
-        errorsOnly = !errorsOnly;
-        btn.style.background = errorsOnly ? "var(--danger-soft)" : "";
-        btn.style.color = errorsOnly ? "var(--danger)" : "";
-        document.querySelectorAll("#jobs-table tbody tr[data-status]").forEach(tr => {
-          tr.style.display = (errorsOnly && !tr.dataset.hasError) ? "none" : "";
+  (function () {
+    // ── Filter buttons ──────────────────────────────────────────
+    var currentFilter = 'all';
+    document.querySelectorAll('.js-job-filter').forEach(function (btn) {
+      btn.addEventListener('click', function () {
+        currentFilter = btn.dataset.filter;
+        document.querySelectorAll('.js-job-filter').forEach(function (b) {
+          b.classList.toggle('job-filter-active', b === btn);
         });
+        applyFilter();
       });
-    })();
+    });
+
+    function applyFilter() {
+      document.querySelectorAll('#jobs-table tbody tr[data-status]').forEach(function (tr) {
+        var status = tr.dataset.status;
+        var stuck = tr.dataset.stuck === 'true';
+        var show = false;
+        if (currentFilter === 'all') show = true;
+        else if (currentFilter === 'running') show = status === 'running';
+        else if (currentFilter === 'failed') show = status === 'failed';
+        else if (currentFilter === 'stuck') show = stuck;
+        tr.style.display = show ? '' : 'none';
+      });
+    }
+
+    // ── Retry ───────────────────────────────────────────────────
+    document.querySelectorAll('.js-retry-job').forEach(function (btn) {
+      btn.addEventListener('click', function () {
+        var jobId = btn.dataset.jobId;
+        if (!jobId) return;
+        btn.disabled = true;
+        var orig = btn.textContent.trim();
+        btn.textContent = '…';
+        fetch('/api/render-jobs/' + encodeURIComponent(jobId) + '/retry', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: '{}',
+        })
+          .then(function (r) { return r.json(); })
+          .then(function (d) {
+            if (d.job_id) { window.location.reload(); }
+            else { btn.disabled = false; btn.textContent = orig; }
+          })
+          .catch(function () { btn.disabled = false; btn.textContent = orig; });
+      });
+    });
+
+    // ── Log modal ───────────────────────────────────────────────
+    var modal = document.getElementById('log-modal');
+    var modalTitle = document.getElementById('log-modal-title');
+    var modalJobId = document.getElementById('log-modal-job-id');
+    var modalBody = document.getElementById('log-modal-body');
+
+    function colorizeLog(lines) {
+      return lines.map(function (line) {
+        var esc = line.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+        if (esc.includes('[FAILED  ]') || esc.includes('[ERROR   ]')) return '<span style="color:var(--red,#ef4444)">' + esc + '</span>';
+        if (esc.includes('[COMPLETE]')) return '<span style="color:#4ade80">' + esc + '</span>';
+        if (esc.includes('[RUNNING ]')) return '<span style="color:#60a5fa">' + esc + '</span>';
+        return '<span style="opacity:0.7">' + esc + '</span>';
+      }).join('\n');
+    }
+
+    document.querySelectorAll('.js-view-log').forEach(function (btn) {
+      btn.addEventListener('click', function () {
+        var jobId = btn.dataset.jobId;
+        modalJobId.textContent = jobId;
+        modalTitle.textContent = 'Render Log';
+        modalBody.innerHTML = '<span style="opacity:0.5">Loading…</span>';
+        modal.showModal();
+        fetch('/api/render-jobs/' + encodeURIComponent(jobId) + '/log?limit=500')
+          .then(function (r) { return r.json(); })
+          .then(function (data) {
+            var lines = data.lines || [];
+            if (!lines.length) { modalBody.innerHTML = '<span style="opacity:0.5">No log entries yet.</span>'; return; }
+            var note = data.total_lines > lines.length ? '<span style="opacity:0.5">Showing last ' + lines.length + ' of ' + data.total_lines + ' lines.\n\n</span>' : '';
+            modalBody.innerHTML = note + colorizeLog(lines);
+            modalBody.parentElement.scrollTop = modalBody.parentElement.scrollHeight;
+          })
+          .catch(function (e) { modalBody.innerHTML = '<span style="color:var(--red,#ef4444)">Error: ' + e.message + '</span>'; });
+      });
+    });
+
+    document.getElementById('log-modal-close').addEventListener('click', function () { modal.close(); });
+    modal.addEventListener('click', function (e) { if (e.target === modal) modal.close(); });
+  })();
   </script>
 {% endblock %}

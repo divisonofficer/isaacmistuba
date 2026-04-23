@@ -1,0 +1,24 @@
+{
+	"name": "webui",
+	"private": true,
+	"version": "0.0.1",
+	"type": "module",
+	"scripts": {
+		"dev": "RENDER_DAEMON_HOST=${RENDER_DAEMON_HOST:-127.0.0.1} RENDER_DAEMON_PORT=${RENDER_DAEMON_PORT:-8765} node node_modules/vite/bin/vite.js dev",
+		"build": "node node_modules/@sveltejs/kit/svelte-kit.js sync && node node_modules/vite/bin/vite.js build",
+		"preview": "node node_modules/vite/bin/vite.js preview",
+		"check": "node node_modules/@sveltejs/kit/svelte-kit.js sync && node node_modules/svelte-check/bin/svelte-check --tsconfig ./tsconfig.json"
+	},
+	"devDependencies": {
+		"@sveltejs/adapter-auto": "^7.0.1",
+		"@sveltejs/kit": "^2.57.0",
+		"@sveltejs/vite-plugin-svelte": "^7.0.0",
+		"svelte": "^5.55.2",
+		"svelte-check": "^4.4.6",
+		"typescript": "^6.0.2",
+		"vite": "^8.0.7"
+	},
+	"dependencies": {
+		"@sveltejs/adapter-static": "^3.0.10"
+	}
+}

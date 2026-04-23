@@ -30,3 +30,9 @@ tests/*
 notes/*
 apps/run_control_plane_dev.sh
 Makefile
+modules/mitsuba_converter/src/mitsuba_converter/static/app/*
+.codex
+.playwright-mcp/*
+data/pbrdf_2020/*
+data/pbrdf_2020/mitsuba/1_spectralon_inpainted.pbsdf
+assets/robots/ranger_mini_v3/*

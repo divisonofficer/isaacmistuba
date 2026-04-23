@@ -1,0 +1,107 @@
+- generic [ref=e3]:
+  - banner [ref=e4]:
+    - link "Robomituba Control Plane" [ref=e6] [cursor=pointer]:
+      - /url: /
+      - generic [ref=e7]: Robomituba
+      - generic [ref=e8]: Control Plane
+    - button "Daemon" [ref=e52] [cursor=pointer]:
+      - generic [ref=e54]: 🖥
+    - button "Worker" [ref=e57] [cursor=pointer]:
+      - generic [ref=e59]: ⚙️
+    - button "Queue" [ref=e62] [cursor=pointer]:
+      - generic [ref=e63]:
+        - generic [ref=e64]: ≡
+        - generic [ref=e65]: ·
+    - button "Renderer variant" [ref=e67] [cursor=pointer]:
+      - generic [ref=e68]: cuda
+    - button "GPU" [ref=e70] [cursor=pointer]:
+      - generic [ref=e72]: GPU
+    - button "Isaac Sim" [ref=e75] [cursor=pointer]:
+      - generic [ref=e77]: 🤖
+    - generic [ref=e9]:
+      - button "Toggle language" [ref=e10] [cursor=pointer]: EN
+      - button "🧪 Smoke" [ref=e11] [cursor=pointer]
+      - link "Settings" [ref=e12] [cursor=pointer]:
+        - /url: /settings
+        - text: ⚙
+  - complementary [ref=e13]:
+    - navigation [ref=e14]:
+      - link "🏠 Operations" [ref=e15] [cursor=pointer]:
+        - /url: /
+        - generic [ref=e16]: 🏠 Operations
+      - link "📍 Current Session ▶" [ref=e17] [cursor=pointer]:
+        - /url: /current-scene
+        - generic [ref=e18]: 📍 Current Session
+        - generic [ref=e19]: ▶
+      - link "📋 Jobs · Queue" [ref=e20] [cursor=pointer]:
+        - /url: /jobs
+        - generic [ref=e21]: 📋 Jobs · Queue
+      - link "🎬 Scene Registry" [ref=e22] [cursor=pointer]:
+        - /url: /scenes
+        - generic [ref=e23]: 🎬 Scene Registry
+      - link "🌉 Bridge Status" [ref=e24] [cursor=pointer]:
+        - /url: /bridge
+        - generic [ref=e25]: 🌉 Bridge Status
+      - link "🖥 System · Workers" [ref=e26] [cursor=pointer]:
+        - /url: /system
+        - generic [ref=e27]: 🖥 System · Workers
+      - link "📘 Guide" [ref=e28] [cursor=pointer]:
+        - /url: /guide
+        - generic [ref=e29]: 📘 Guide
+      - link "⚙ Settings" [ref=e30] [cursor=pointer]:
+        - /url: /settings
+        - generic [ref=e31]: ⚙ Settings
+      - link "📍 Active Scene" [ref=e79] [cursor=pointer]:
+        - /url: /scenes/moorelane
+        - generic [ref=e80]: 📍 Active Scene
+  - main [ref=e32]:
+    - generic [ref=e35]:
+      - generic [ref=e37]:
+        - generic [ref=e38]: ❌ Scene Loaded
+        - generic [ref=e39]: ✅ Isaac Connected
+        - generic [ref=e40]: ⚠ Render Ready
+        - generic [ref=e82]: moorelane
+        - generic [ref=e83]:
+          - button "Load" [ref=e84] [cursor=pointer]
+          - button "Prepare" [ref=e85] [cursor=pointer]
+          - button "Connect" [ref=e86] [cursor=pointer]
+          - button "Sync" [ref=e87] [cursor=pointer]
+          - button "Render" [disabled] [ref=e88] [cursor=pointer]
+          - button "🧪" [ref=e89] [cursor=pointer]
+          - link "Detail →" [ref=e90] [cursor=pointer]:
+            - /url: /scenes/moorelane
+      - generic [ref=e41]:
+        - generic [ref=e42]: Selection
+        - generic [ref=e43]: Select an object from the tree
+      - generic [ref=e91]:
+        - generic [ref=e92]:
+          - generic [ref=e93]:
+            - generic [ref=e94]: Scene Tree
+            - textbox "Filter…" [ref=e95]
+          - generic [ref=e96]: No objects
+        - generic [ref=e97]:
+          - generic [ref=e98]:
+            - generic [ref=e99]: Viewport
+            - generic [ref=e100]: (2D Map)
+            - generic [ref=e101]: · 0cam · 0light
+            - generic [ref=e102]:
+              - button "Zoom out" [ref=e103] [cursor=pointer]: −
+              - generic [ref=e104]: 100%
+              - button "Zoom in" [ref=e105] [cursor=pointer]: +
+              - button "⤢" [ref=e106] [cursor=pointer]
+          - generic [ref=e107]:
+            - generic:
+              - generic:
+                - img "Floorplan"
+          - generic [ref=e108]:
+            - generic [ref=e109]: Req. cam
+            - generic [ref=e111]: Scene cam
+            - generic [ref=e113]: Robot
+            - link "JSON" [ref=e115] [cursor=pointer]:
+              - /url: /api/scenes/moorelane/floorplan
+    - region "Bottom panel" [ref=e45]:
+      - generic [ref=e46]:
+        - generic [ref=e47]: Bottom Panel
+        - button "Expand bottom panel" [ref=e48] [cursor=pointer]: ▲
+  - complementary "Right rail":
+    - button "Expand right rail" [ref=e50] [cursor=pointer]: ◀

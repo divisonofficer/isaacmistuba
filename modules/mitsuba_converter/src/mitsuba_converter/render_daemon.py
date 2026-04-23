@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import base64
 from collections import deque
 import concurrent.futures
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import hashlib
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -11,13 +13,19 @@ import mimetypes
 import os
 from pathlib import Path
 import math
+import sys
 import tempfile
 import threading
+import time
+import traceback
 from typing import Any, Callable, Mapping
-from urllib.parse import parse_qs, quote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
+import urllib.request
+import zipfile
+
+import subprocess
 
 import numpy as np
-from jinja2 import Environment, FileSystemLoader, select_autoescape
 
 from robomituba_bridge import (
     AssistLightSpec,
@@ -65,6 +73,7 @@ from .scene_floorplan import CameraOverlay, LightOverlay, render_scene_floorplan
 
 
 RenderFn = Callable[..., ObservationBundleManifest]
+_WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 
 def _isaac_snapshot_to_scene_override(snapshot: Any) -> SceneOverrideSpec | None:
@@ -130,6 +139,16 @@ def _maybe_str(value: Any) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
+def _extract_render_settings_variant(render_request: RenderRequest) -> tuple[RenderRequest, str | None]:
+    render_settings = dict(render_request.render_settings or {})
+    variant = _maybe_str(render_settings.pop("variant", None))
+    if variant is None:
+        return render_request, None
+    request_payload = render_request_to_payload(render_request)
+    request_payload["render_settings"] = render_settings
+    return render_request_from_payload(request_payload), variant
+
+
 @dataclass
 class _QueuedJob:
     render_request: RenderRequest
@@ -152,6 +171,12 @@ class _IsaacActiveSession:
     selected_prim_paths: list[str]
     opened_at: str
     updated_at: str
+    session_revision: int = 1
+    state_revision: int = 0
+    material_revision: int = 0
+    sensor_revision: int = 0
+    state_dirty: bool = True
+    material_dirty: bool = False
 
 
 def _object_transform_translation(transform: list[float] | None) -> list[float] | None:
@@ -277,6 +302,10 @@ class _IsaacRemoteCommand:
     error: str | None = None
 
 
+_download_jobs: dict[str, dict[str, Any]] = {}
+_download_jobs_lock = threading.Lock()
+
+
 class RenderDaemon:
     def __init__(
         self,
@@ -299,6 +328,13 @@ class RenderDaemon:
         self._scene_cache_stats: dict[str, dict[str, Any]] = {}
         self._path_size_cache: dict[str, dict[str, Any]] = {}
         self._telemetry_cache: dict[str, Any] = {"path": None, "mtime_ns": None, "rows": []}
+        # TTL caches for expensive glob+deserialize operations in request handlers
+        self._job_status_cache: list[Any] | None = None
+        self._job_status_cache_ts: float = 0.0
+        self._bundle_manifest_cache: list[Any] | None = None
+        self._bundle_manifest_cache_ts: float = 0.0
+        self._session_inventory_cache: list[Any] | None = None
+        self._session_inventory_cache_ts: float = 0.0
         self._isaac_session: _IsaacActiveSession | None = None
         self._isaac_commands_pending: deque[str] = deque()
         self._isaac_commands: dict[str, _IsaacRemoteCommand] = {}
@@ -310,12 +346,8 @@ class RenderDaemon:
         self._worker_thread: threading.Thread | None = None
 
         asset_root = Path(__file__).resolve().parent
-        self._templates_dir = asset_root / "templates"
         self._static_dir = asset_root / "static"
-        self._jinja = Environment(
-            loader=FileSystemLoader(str(self._templates_dir)),
-            autoescape=select_autoescape(("html", "xml")),
-        )
+        self._spa_dir = asset_root / "static" / "app"
 
     def _isaac_scene_catalog_path(self) -> Path:
         return self.repo_root / "out" / "control_plane_cache" / "isaac_scene_catalog.json"
@@ -474,6 +506,7 @@ class RenderDaemon:
     def _record_render_job_telemetry(self, job: _QueuedJob, *, event_type: str) -> None:
         scene_ctx = self._scene_telemetry_context(job.render_request.scene_state.scene_id)
         timestamp = job.status.finished_at or job.status.started_at or job.status.submitted_at or _utc_now_iso()
+        timing_summary = job.status.extras.get("render_timing_summary") if isinstance(job.status.extras.get("render_timing_summary"), Mapping) else {}
         row = {
             "kind": "render_job",
             "event_type": event_type,
@@ -488,6 +521,8 @@ class RenderDaemon:
             "progress_origin": "daemon_render",
             "progress_counts": dict(job.status.extras.get("progress_context", {}) or {}) if isinstance(job.status.extras.get("progress_context"), Mapping) else {},
             "elapsed_s": self._seconds_between(job.status.submitted_at, timestamp),
+            "sync_mode": str(job.status.extras.get("sync_mode") or "unknown"),
+            "sync_policy": str(job.status.extras.get("sync_policy") or "default"),
             "windows_path_mode": scene_ctx["windows_path_mode"],
             "usd_stage_path": scene_ctx["usd_stage_path"],
             "stage_path_local": scene_ctx["stage_path_local"],
@@ -495,6 +530,12 @@ class RenderDaemon:
             "shape_map_exists": scene_ctx["shape_map_exists"],
             "size_tier": scene_ctx["size_tier"],
             "asset_file_count": scene_ctx["asset_file_count"],
+            "render_pass_count": timing_summary.get("pass_count"),
+            "render_scene_cache_hits": timing_summary.get("scene_cache_hits"),
+            "render_scene_cache_misses": timing_summary.get("scene_cache_misses"),
+            "render_scene_cache_hit_ratio": timing_summary.get("scene_cache_hit_ratio"),
+            "render_load_scene_total_s": timing_summary.get("load_scene_total_s"),
+            "render_total_s": timing_summary.get("total_s"),
             "error_kind": self._classify_error_kind(job.status.error, windows_path_mode=scene_ctx["windows_path_mode"]) if job.status.status == "failed" else None,
         }
         self._append_telemetry_row(row)
@@ -1005,13 +1046,35 @@ class RenderDaemon:
             daemon = controller
 
             def log_message(self, format: str, *args: Any) -> None:  # noqa: A003
-                return
+                if os.environ.get("ROBOMITUBA_DAEMON_DEBUG_LOG") not in {"1", "true", "yes", "on"}:
+                    return
+                message = format % args
+                print(f"[http] {self.address_string()} {message}", file=sys.stderr, flush=True)
+
+            def _log_exception(self, method: str) -> None:
+                print(f"[daemon] unhandled {method} {self.path}", file=sys.stderr, flush=True)
+                traceback.print_exc(file=sys.stderr)
 
             def do_GET(self) -> None:  # noqa: N802
-                self.daemon._handle_get(self)
+                try:
+                    parsed = urlparse(self.path)
+                    if (
+                        parsed.path == "/isaac/session/camera_ws"
+                        and self.headers.get("Upgrade", "").lower() == "websocket"
+                    ):
+                        self.daemon._handle_camera_websocket(self)
+                        return
+                    self.daemon._handle_get(self)
+                except Exception:
+                    self._log_exception("GET")
+                    raise
 
             def do_POST(self) -> None:  # noqa: N802
-                self.daemon._handle_post(self)
+                try:
+                    self.daemon._handle_post(self)
+                except Exception:
+                    self._log_exception("POST")
+                    raise
 
         self._server = ThreadingHTTPServer((self.host, self.port), Handler)
         self._server.daemon_threads = True
@@ -1046,17 +1109,94 @@ class RenderDaemon:
             raise RuntimeError("RenderDaemon.start() must be called before wait_forever().")
         self._server_thread.join()
 
+    def _handle_camera_websocket(self, handler: BaseHTTPRequestHandler) -> None:
+        key = handler.headers.get("Sec-WebSocket-Key", "").strip()
+        if not key:
+            handler.send_error(HTTPStatus.BAD_REQUEST, "Missing Sec-WebSocket-Key")
+            return
+        accept = base64.b64encode(hashlib.sha1(f"{key}{_WS_GUID}".encode("ascii")).digest()).decode("ascii")
+        handler.send_response(HTTPStatus.SWITCHING_PROTOCOLS)
+        handler.send_header("Upgrade", "websocket")
+        handler.send_header("Connection", "Upgrade")
+        handler.send_header("Sec-WebSocket-Accept", accept)
+        handler.end_headers()
+
+        while not self._shutdown:
+            frame = self._read_ws_frame(handler)
+            if frame is None:
+                break
+            opcode, payload = frame
+            if opcode == 0x8:
+                break
+            if opcode == 0x9:
+                self._write_ws_frame(handler, payload, opcode=0xA)
+                continue
+            if opcode != 0x1:
+                continue
+            try:
+                message = json.loads(payload.decode("utf-8"))
+                if isinstance(message, Mapping):
+                    self._register_isaac_sensors(dict(message))
+            except RuntimeError:
+                # Camera telemetry is best-effort. If the Isaac session is not
+                # active yet, drop the frame instead of creating HTTP 409 noise.
+                continue
+            except Exception as exc:
+                self._push_debug_event("error", f"camera websocket payload ignored: {exc}")
+
+    def _read_ws_frame(self, handler: BaseHTTPRequestHandler) -> tuple[int, bytes] | None:
+        header = handler.rfile.read(2)
+        if len(header) < 2:
+            return None
+        first, second = header[0], header[1]
+        opcode = first & 0x0F
+        masked = (second & 0x80) != 0
+        length = second & 0x7F
+        if length == 126:
+            raw = handler.rfile.read(2)
+            if len(raw) < 2:
+                return None
+            length = int.from_bytes(raw, "big")
+        elif length == 127:
+            raw = handler.rfile.read(8)
+            if len(raw) < 8:
+                return None
+            length = int.from_bytes(raw, "big")
+        if length > 1_000_000:
+            return None
+        mask = handler.rfile.read(4) if masked else b""
+        if masked and len(mask) < 4:
+            return None
+        payload = handler.rfile.read(length)
+        if len(payload) < length:
+            return None
+        if masked:
+            payload = bytes(byte ^ mask[i % 4] for i, byte in enumerate(payload))
+        return opcode, payload
+
+    def _write_ws_frame(self, handler: BaseHTTPRequestHandler, payload: bytes, *, opcode: int = 0x1) -> None:
+        length = len(payload)
+        header = bytearray([0x80 | (opcode & 0x0F)])
+        if length < 126:
+            header.append(length)
+        elif length < 65536:
+            header.extend([126, *length.to_bytes(2, "big")])
+        else:
+            header.extend([127, *length.to_bytes(8, "big")])
+        handler.wfile.write(bytes(header) + payload)
+        handler.wfile.flush()
+
     def submit_payload(self, payload: Mapping[str, Any]) -> RenderJobAccepted:
         request_payload = dict(payload)
         runtime_overrides = request_payload.pop("runtime_overrides", None)
-        variant = request_payload.pop("variant", self.variant)
+        variant = request_payload.pop("variant", None)
         nested_request = request_payload.pop("render_request", None)
         if request_payload:
             if nested_request is not None:
                 raise ValueError("Unexpected keys alongside render_request envelope.")
             nested_request = payload
             runtime_overrides = None
-            variant = self.variant
+            variant = None
 
         if nested_request is None or not isinstance(nested_request, Mapping):
             raise ValueError("POST /render expects a RenderRequest payload or {'render_request': ...}.")
@@ -1069,7 +1209,7 @@ class RenderDaemon:
         if runtime_overrides:
             request_dict = render_request_to_payload(render_request)
             render_request = render_request_from_payload(_deep_merge(request_dict, dict(runtime_overrides)))
-        return self.submit(render_request, variant=str(variant), runtime_overrides=dict(runtime_overrides))
+        return self.submit(render_request, variant=str(variant) if variant is not None else None, runtime_overrides=dict(runtime_overrides))
 
     def submit(
         self,
@@ -1078,7 +1218,8 @@ class RenderDaemon:
         variant: str | None = None,
         runtime_overrides: Mapping[str, Any] | None = None,
     ) -> RenderJobAccepted:
-        chosen_variant = str(variant or self.variant)
+        render_request, render_settings_variant = _extract_render_settings_variant(render_request)
+        chosen_variant = str(variant or render_settings_variant or self.variant)
         runtime_override_payload = dict(runtime_overrides or {})
         request_payload = render_request_to_payload(render_request)
         scene_cache_key = self._scene_cache_key(render_request, chosen_variant)
@@ -1103,6 +1244,8 @@ class RenderDaemon:
                     "variant": chosen_variant,
                     "scene_cache_key": scene_cache_key,
                     "scene_cache_submissions": int(cache_stats["submissions"]),
+                    "sync_mode": str(render_request.extras.get("sync_mode") or "unknown"),
+                    "sync_policy": str(render_request.extras.get("sync_policy") or "default"),
                 },
             )
             job = _QueuedJob(
@@ -1179,55 +1322,17 @@ class RenderDaemon:
             if path == "/health":
                 self._send_json(handler, HTTPStatus.OK, self._health_payload())
                 return
-            if path in {"/", "/admin"}:
-                self._send_html(handler, HTTPStatus.OK, self._render_page("home.html", nav_key="home", page_title="Operations Home", page_subtitle="Warm Mitsuba daemon, scene bundles, and quick smoke actions.", recent_jobs=self._recent_jobs(limit=8), failed_jobs=self._failed_jobs(limit=5), scenes=self._scene_records(limit=6), activity_feed=self._activity_feed(limit=12)))
-                return
-            if path == "/jobs":
-                self._send_html(
-                    handler,
-                    HTTPStatus.OK,
-                    self._render_page(
-                        "jobs.html",
-                        nav_key="jobs",
-                        page_title="Render Jobs",
-                        page_subtitle="Daemon queue and historical job state from out/bridge_jobs.",
-                        jobs=self._job_records(limit=100),
-                        active_isaac_command=self._active_isaac_command_summary(),
-                        isaac_render_commands=self._recent_isaac_render_commands(limit=24),
-                    ),
-                )
-                return
-            if path == "/scenes":
-                self._send_html(handler, HTTPStatus.OK, self._render_page("scenes.html", nav_key="scenes", page_title="Scene Explorer", page_subtitle="Known exports and registered USD scenes for Isaac and Mitsuba handoff.", scenes=self._isaac_scene_catalog_records()))
-                return
-            if path.startswith("/scenes/"):
-                scene_id = path[len("/scenes/"):]
-                scene_detail = self._scene_detail(scene_id)
-                current_scene_id = self._summary_payload().get("current_scene_id")
-                self._send_html(
-                    handler,
-                    HTTPStatus.OK,
-                    self._render_page(
-                        "scene_detail.html",
-                        nav_key="current_scene" if current_scene_id and current_scene_id == scene_id else "scenes",
-                        page_title=f"Scene · {scene_id}",
-                        page_subtitle="Top-down floorplan, overlay cameras, and modality explorer.",
-                        scene=scene_detail["scene"],
-                        captures=scene_detail["captures"],
-                        latest_capture=scene_detail["latest_capture"],
-                        material_presets=self._material_presets(),
-                    ),
-                )
-                return
-            if path == "/system":
-                telemetry = self._telemetry_stats(limit=1200)
-                self._send_html(handler, HTTPStatus.OK, self._render_page("system.html", nav_key="system", page_title="System", page_subtitle="Worker, cache, runtime, and Isaac telemetry overview.", jobs=self._job_records(limit=20), env_checks=self._environment_checks(), telemetry_recent=self._telemetry_recent_rows(limit=20), telemetry_stats=telemetry))
-                return
-            if path == "/integrations/isaac":
-                self._send_html(handler, HTTPStatus.OK, self._render_page("isaac.html", nav_key="isaac", page_title="Isaac Integration", page_subtitle="Hybrid Isaac UI and control-plane workflow for scene sync and Mitsuba rendering.", guide=self._isaac_guide_payload()))
-                return
             if path == "/static/tailwind.css":
                 self._serve_static_file(handler, self._static_dir / "tailwind.css")
+                return
+            if path.startswith("/static/app/"):
+                # Serve SvelteKit build assets
+                rel = path[len("/static/app/"):]
+                self._serve_spa_file(handler, self._spa_dir / rel)
+                return
+            if path.startswith("/_app/"):
+                # SvelteKit emits root-relative assets when paths.base is empty.
+                self._serve_spa_file(handler, self._spa_dir / path.lstrip("/"))
                 return
             if path == "/artifacts":
                 artifact_path = _maybe_str(query.get("path", [None])[0])
@@ -1241,6 +1346,20 @@ class RenderDaemon:
                 return
             if path == "/api/render-jobs":
                 self._send_json(handler, HTTPStatus.OK, {"jobs": self._job_records(limit=250)})
+                return
+            if path.startswith("/api/render-jobs/") and path.endswith("/log"):
+                job_id = path[len("/api/render-jobs/"):-len("/log")]
+                log_path = self._job_log_path(job_id)
+                if not log_path.exists():
+                    self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": "No log found for this job.", "job_id": job_id})
+                    return
+                try:
+                    lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+                    limit = int(_maybe_str(query.get("limit", [None])[0]) or 500)
+                    tail = lines[-limit:] if len(lines) > limit else lines
+                    self._send_json(handler, HTTPStatus.OK, {"job_id": job_id, "lines": tail, "total_lines": len(lines)})
+                except Exception as exc:
+                    self._send_json(handler, HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
                 return
             if path == "/api/scenes":
                 self._send_json(handler, HTTPStatus.OK, {"scenes": self._scene_records()})
@@ -1260,6 +1379,12 @@ class RenderDaemon:
             if path == "/api/material-library":
                 from .material_library import get_library_grouped
                 self._send_json(handler, HTTPStatus.OK, {"groups": get_library_grouped(self.repo_root)})
+                return
+            if path == "/api/dataset-download/status":
+                self._handle_dataset_download_status(handler, query)
+                return
+            if path.startswith("/api/material-preview/"):
+                self._handle_material_preview_get(handler, path, query)
                 return
             if path == "/api/isaac/commands":
                 self._send_json(handler, HTTPStatus.OK, {"commands": self._list_isaac_commands()})
@@ -1303,6 +1428,15 @@ class RenderDaemon:
                 scene_id = path[len("/api/scenes/") : -len("/floorplan")].rstrip("/")
                 self._send_json(handler, HTTPStatus.OK, self._ensure_floorplan(scene_id))
                 return
+            if path.startswith("/api/scenes/") and "/geometry/" in path:
+                parts = path[len("/api/scenes/") :].split("/geometry/", 1)
+                if len(parts) != 2 or not parts[0] or not parts[1].endswith(".obj"):
+                    self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": "Expected /api/scenes/{scene_id}/geometry/{mesh_id}.obj"})
+                    return
+                scene_id = unquote(parts[0].rstrip("/"))
+                mesh_id = unquote(parts[1][:-len(".obj")])
+                self._serve_scene_geometry(handler, scene_id, mesh_id)
+                return
             if path.startswith("/api/scenes/") and path.endswith("/captures"):
                 scene_id = path[len("/api/scenes/") : -len("/captures")].rstrip("/")
                 self._send_json(handler, HTTPStatus.OK, {"scene_id": scene_id, "captures": self._scene_detail(scene_id)["captures"]})
@@ -1319,7 +1453,16 @@ class RenderDaemon:
                 self._send_json(handler, HTTPStatus.OK, self._isaac_guide_payload())
                 return
             if path == "/isaac/session":
-                self._send_json(handler, HTTPStatus.OK, self._active_isaac_session_summary())
+                self._send_json(handler, HTTPStatus.OK, self._active_isaac_session_summary(include_inventory=False))
+                return
+
+            if path == "/isaac/session/inventory":
+                session = self._isaac_session
+                if session is None:
+                    self._send_json(handler, HTTPStatus.OK, {"status": "inactive", "object_inventory": []})
+                else:
+                    inventory = self._get_cached_session_inventory(session)
+                    self._send_json(handler, HTTPStatus.OK, {"status": "active", "object_inventory": inventory})
                 return
             if path.startswith("/jobs/"):
                 parts = [part for part in path.split("/") if part]
@@ -1346,7 +1489,8 @@ class RenderDaemon:
                     self._send_json(handler, HTTPStatus.OK, observation_bundle_manifest_to_payload(manifest))
                     return
 
-            self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": f"Unknown route: {path}"})
+            # SPA catch-all: serve index.html for all non-API GET routes
+            self._serve_spa_index(handler)
         except _ClientDisconnectedError:
             return
         except Exception as exc:  # pragma: no cover - defensive path
@@ -1355,12 +1499,29 @@ class RenderDaemon:
             except _ClientDisconnectedError:
                 return
 
+    def _serve_spa_index(self, handler: BaseHTTPRequestHandler) -> None:
+        index = self._spa_dir / "index.html"
+        if not index.exists():
+            self._send_json(handler, HTTPStatus.NOT_FOUND, {
+                "error": "SPA not built. Run: cd apps/webui && npm run build"
+            })
+            return
+        body = index.read_bytes()
+        handler.send_response(HTTPStatus.OK)
+        handler.send_header("Content-Type", "text/html; charset=utf-8")
+        handler.send_header("Content-Length", str(len(body)))
+        handler.end_headers()
+        handler.wfile.write(body)
+
     def _handle_post(self, handler: BaseHTTPRequestHandler) -> None:
         try:
             parsed = urlparse(handler.path)
             path = parsed.path
             payload = self._read_request_body(handler)
 
+            if path == "/api/dataset-download":
+                self._handle_dataset_download_post(handler, payload)
+                return
             if path == "/render":
                 try:
                     accepted = self.submit_payload(payload)
@@ -1377,6 +1538,17 @@ class RenderDaemon:
                 except RuntimeError as exc:
                     self._send_json(handler, HTTPStatus.CONFLICT, {"error": str(exc)})
                     return
+                self._send_json(handler, HTTPStatus.ACCEPTED, render_job_accepted_to_payload(accepted))
+                return
+
+            if path.startswith("/api/render-jobs/") and path.endswith("/retry"):
+                job_id = path[len("/api/render-jobs/"):-len("/retry")]
+                with self._condition:
+                    original = self._jobs.get(job_id)
+                if original is None or original.status.status not in ("failed", "cancelled"):
+                    self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": "Job not found or not retryable.", "job_id": job_id})
+                    return
+                accepted = self.submit(original.render_request)
                 self._send_json(handler, HTTPStatus.ACCEPTED, render_job_accepted_to_payload(accepted))
                 return
 
@@ -1703,9 +1875,6 @@ class RenderDaemon:
             _saved = self._load_scene_render_options(str(snapshot.scene_id))
             _snap_modalities = _saved.get("modalities", ["rgb"])
         _snap_render_settings = dict(snapshot.render_settings)
-        _POLAR_MODALITIES = {"s1", "s2", "dop", "aolp", "polar_rgb_preview"}
-        if any(m in _POLAR_MODALITIES for m in _snap_modalities) and "variant" not in _snap_render_settings:
-            _snap_render_settings["variant"] = "polarized_cuda_mono"
         render_request = RenderRequest(
             request_id=request_id,
             job_id=job_id,
@@ -1752,6 +1921,12 @@ class RenderDaemon:
                 "robot_count": len(robot_inventory),
                 "robot_inventory": robot_inventory,
                 "selected_prim_paths": list(session.selected_prim_paths),
+                "session_revision": int(session.session_revision),
+                "state_revision": int(session.state_revision),
+                "material_revision": int(session.material_revision),
+                "sensor_revision": int(session.sensor_revision),
+                "state_dirty": bool(session.state_dirty),
+                "material_dirty": bool(session.material_dirty),
                 "material_overrides": {
                     prim_path: override.bsdf_type
                     for prim_path, override in sorted(session.material_overrides.items())
@@ -1763,14 +1938,82 @@ class RenderDaemon:
             result["session"]["object_inventory"] = self._session_object_inventory(session)
         return result
 
+    def _get_cached_session_inventory(self, session: "_IsaacActiveSession") -> list[Any]:
+        """Return _session_object_inventory() with a 3-second TTL cache."""
+        now = time.monotonic()
+        if self._session_inventory_cache is not None and (now - self._session_inventory_cache_ts) < 3.0:
+            return self._session_inventory_cache
+        inventory = self._session_object_inventory(session)
+        self._session_inventory_cache = inventory
+        self._session_inventory_cache_ts = now
+        return inventory
+
+    def _invalidate_session_inventory_cache(self) -> None:
+        self._session_inventory_cache = None
+        self._session_inventory_cache_ts = 0.0
+
     def _require_active_isaac_session(self) -> _IsaacActiveSession:
         if self._isaac_session is None:
             raise RuntimeError("No active Isaac scene session. Call POST /isaac/session/open first.")
         return self._isaac_session
 
+    def _matches_active_isaac_session(self, session_open: IsaacSessionOpen) -> bool:
+        session = self._isaac_session
+        if session is None:
+            return False
+        return (
+            session.scene_id == session_open.scene_id
+            and session.mitsuba_scene_ref == session_open.mitsuba_scene_ref
+            and session.shape_map_ref == session_open.shape_map_ref
+        )
+
+    def _set_render_job_extra(self, job_id: str, key: str, value: Any) -> None:
+        with self._condition:
+            job = self._jobs.get(job_id)
+            if job is None:
+                return
+            job.status.extras[key] = value
+            self._persist_status_unlocked(job)
+
+    def _wait_for_render_job(self, job_id: str, *, timeout_s: float) -> RenderJobStatus:
+        deadline = time.monotonic() + timeout_s
+        with self._condition:
+            while True:
+                job = self._jobs.get(job_id)
+                if job is None:
+                    raise KeyError(job_id)
+                status = job.status.status
+                if status in {"succeeded", "failed", "cancelled"}:
+                    return RenderJobStatus(**render_job_status_to_payload(job.status))
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(f"Timed out waiting for render job {job_id}")
+                self._condition.wait(timeout=min(0.5, remaining))
+
+    def _blocking_render_result(self, status: RenderJobStatus) -> dict[str, Any]:
+        if status.status == "failed":
+            raise RuntimeError(status.error or f"Render job failed: {status.job_id}")
+        if status.status == "cancelled":
+            raise RuntimeError(f"Render job cancelled: {status.job_id}")
+        manifest = self.get_manifest(status.job_id)
+        return {
+            "status": "completed",
+            "job_id": status.job_id,
+            "frame_id": status.frame_id,
+            "manifest_path": status.manifest_path,
+            "artifacts": _artifact_paths_from_bundle(manifest),
+        }
+
     def _open_isaac_session(self, payload: dict[str, Any]) -> dict[str, Any]:
         session_open_payload = payload.get("session_open") if isinstance(payload.get("session_open"), Mapping) else payload
         session_open = isaac_session_open_from_payload(dict(session_open_payload))
+        if self._matches_active_isaac_session(session_open):
+            session = self._require_active_isaac_session()
+            session.updated_at = _utc_now_iso()
+            session.session_revision += 1
+            summary = self._active_isaac_session_summary(include_inventory=False)
+            summary["reused"] = True
+            return summary
         scene_xml = resolve_repo_path(self.repo_root, session_open.mitsuba_scene_ref)
         if not scene_xml.exists():
             raise ValueError(f"Scene XML not found: {session_open.mitsuba_scene_ref}")
@@ -1797,8 +2040,17 @@ class RenderDaemon:
             selected_prim_paths=[],
             opened_at=timestamp,
             updated_at=timestamp,
+            session_revision=1,
+            state_revision=0,
+            material_revision=0,
+            sensor_revision=0,
+            state_dirty=True,
+            material_dirty=False,
         )
-        return self._active_isaac_session_summary()
+        self._invalidate_session_inventory_cache()
+        summary = self._active_isaac_session_summary(include_inventory=False)
+        summary["reused"] = False
+        return summary
 
     def _update_isaac_state(self, payload: dict[str, Any]) -> dict[str, Any]:
         session = self._require_active_isaac_session()
@@ -1812,6 +2064,9 @@ class RenderDaemon:
             if obj.bsdf_override is not None:
                 session.material_overrides[obj.prim_path] = obj.bsdf_override
         session.updated_at = state_patch.timestamp or _utc_now_iso()
+        session.state_revision += 1
+        session.state_dirty = False
+        self._invalidate_session_inventory_cache()
         summary = self._active_isaac_session_summary(include_inventory=False)
         summary["updated_objects"] = len(state_patch.objects)
         return summary
@@ -1827,6 +2082,9 @@ class RenderDaemon:
                 existing.bsdf_override = override
                 existing.bsdf_override_key = override.bsdf_type
         session.updated_at = material_patch.timestamp or _utc_now_iso()
+        session.material_revision += 1
+        session.material_dirty = False
+        self._invalidate_session_inventory_cache()
         summary = self._active_isaac_session_summary(include_inventory=False)
         summary["updated_materials"] = len(material_patch.overrides)
         return summary
@@ -1882,6 +2140,7 @@ class RenderDaemon:
                         {"sensor_id": sensor.sensor_id, "pos": [x, y, z], "fov_deg": sensor.fov_deg},
                     )
         session.updated_at = _utc_now_iso()
+        session.sensor_revision += 1
         # Lightweight response — inventory rebuild not needed for sensor registration
         summary = self._active_isaac_session_summary(include_inventory=False)
         summary["registered_sensors"] = [sensor.sensor_id for sensor in sensors]
@@ -1906,6 +2165,9 @@ class RenderDaemon:
 
     def _render_request_from_active_isaac_session(self, capture_request: IsaacCaptureRequest) -> RenderRequest:
         session = self._require_active_isaac_session()
+        sync_mode = str(capture_request.extras.get("sync_mode") or "full_resync")
+        sync_policy = str(capture_request.extras.get("sync_policy") or "auto")
+        force_resync = bool(capture_request.extras.get("force_resync", False))
         if capture_request.sensor_id:
             sensor = session.sensors.get(capture_request.sensor_id)
             if sensor is None:
@@ -1936,6 +2198,9 @@ class RenderDaemon:
             extras={
                 "source": "isaac_session_v2",
                 "object_count": len(session.objects),
+                "sync_mode": sync_mode,
+                "state_revision": int(session.state_revision),
+                "material_revision": int(session.material_revision),
             },
         )
         render_settings = dict(capture_request.render_settings)
@@ -1943,10 +2208,6 @@ class RenderDaemon:
             render_settings.setdefault("width", int(sensor_resolution[0]))
             if len(sensor_resolution) > 1:
                 render_settings.setdefault("height", int(sensor_resolution[1]))
-        # Auto-select polarization variant when polar modalities are requested
-        _POLAR_MODALITIES = {"s1", "s2", "dop", "aolp", "polar_rgb_preview"}
-        if any(m in _POLAR_MODALITIES for m in requested_modalities) and "variant" not in render_settings:
-            render_settings["variant"] = "polarized_cuda_mono"
         scene_state = SceneState(
             job_id=job_id,
             scene_id=session.scene_id,
@@ -1973,6 +2234,13 @@ class RenderDaemon:
                 "source": "isaac_session_v2",
                 "submit_mode": capture_request.submit_mode,
                 "shape_map_ref": session.shape_map_ref,
+                "sync_policy": sync_policy,
+                "sync_mode": sync_mode,
+                "force_resync": force_resync,
+                "session_revision": int(session.session_revision),
+                "state_revision": int(session.state_revision),
+                "material_revision": int(session.material_revision),
+                "sensor_revision": int(session.sensor_revision),
                 **dict(capture_request.extras),
             },
         )
@@ -1984,36 +2252,16 @@ class RenderDaemon:
         variant = str(payload.get("variant") or render_request.render_settings.get("variant") or self.variant)
         runtime_overrides = payload.get("runtime_overrides") or {}
         command_id = _maybe_str(payload.get("command_id"))
+        accepted = self.submit(render_request, variant=variant, runtime_overrides=runtime_overrides)
+        if command_id:
+            self._set_render_job_extra(accepted.job_id, "isaac_command_id", command_id)
         if capture_request.submit_mode == "async":
-            return self.submit(render_request, variant=variant, runtime_overrides=runtime_overrides)
+            return accepted
         timeout_s = float(payload.get("timeout_s", 600.0))
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            future = pool.submit(
-                self.render_fn,
-                render_request,
-                repo_root=self.repo_root,
-                variant=variant,
-                progress_callback=(lambda stage, ctx=None: self._update_isaac_command_progress(
-                    command_id,
-                    {
-                        "status": "running",
-                        "progress_stage": stage,
-                        "progress_origin": "daemon_render",
-                        "progress_message": self._isaac_render_stage_message(stage, ctx),
-                        **({"progress_counts": {"loaded": ctx.get("pass_index", 0), "total": ctx.get("total_passes", 0)}}
-                           if isinstance(ctx, Mapping) and ctx.get("total_passes") else {}),
-                    },
-                )) if command_id else None,
-            )
-            bundle = future.result(timeout=timeout_s)
-        return {
-            "status": "completed",
-            "job_id": render_request.job_id,
-            "frame_id": render_request.frame_id,
-            "manifest_path": f"{bundle.bundle_root}/manifest.json",
-            "artifacts": _artifact_paths_from_bundle(bundle),
-            "session": self._active_isaac_session_summary()["session"],
-        }
+        status = self._wait_for_render_job(accepted.job_id, timeout_s=timeout_s)
+        result = self._blocking_render_result(status)
+        result["session"] = self._active_isaac_session_summary()["session"]
+        return result
 
     def _handle_isaac_render_submit(self, payload: dict[str, Any]) -> RenderJobAccepted:
         snapshot = isaac_state_snapshot_from_payload(payload["isaac_state"])
@@ -2027,26 +2275,12 @@ class RenderDaemon:
         snapshot = isaac_state_snapshot_from_payload(payload["isaac_state"])
         render_request, shape_map_ref = self._render_request_from_isaac_snapshot(snapshot)
         variant = str(payload.get("variant") or render_request.render_settings.get("variant") or self.variant)
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            future = pool.submit(
-                self.render_fn,
-                render_request,
-                repo_root=self.repo_root,
-                variant=variant,
-                progress_callback=None,
-            )
-            bundle = future.result(timeout=timeout_s)
-
-        return {
-            "status": "completed",
-            "snapshot_id": snapshot.snapshot_id,
-            "job_id": render_request.job_id,
-            "frame_id": render_request.frame_id,
-            "shape_map_ref": shape_map_ref,
-            "manifest_path": f"{bundle.bundle_root}/manifest.json",
-            "artifacts": _artifact_paths_from_bundle(bundle),
-        }
+        accepted = self.submit(render_request, variant=variant, runtime_overrides=payload.get("runtime_overrides") or {})
+        status = self._wait_for_render_job(accepted.job_id, timeout_s=timeout_s)
+        result = self._blocking_render_result(status)
+        result["snapshot_id"] = snapshot.snapshot_id
+        result["shape_map_ref"] = shape_map_ref
+        return result
 
     def _isaac_render_stage_message(self, stage: str, payload: Mapping[str, Any] | None = None) -> str:
         ctx = payload if isinstance(payload, Mapping) else {}
@@ -2091,8 +2325,10 @@ class RenderDaemon:
                 job.status.status = "running"
                 job.status.started_at = _utc_now_iso()
                 job.status.progress_stage = "starting"
-                self._persist_status_unlocked(job)
-                self._record_render_job_telemetry(job, event_type="running")
+            # Disk I/O outside the lock
+            self._persist_status_unlocked(job)
+            self._record_render_job_telemetry(job, event_type="running")
+            self._append_job_log_line(job, event_type="running", stage="starting", message="Job started")
 
             try:
                 scene_cache_key = self._scene_cache_key(job.render_request, job.variant)
@@ -2101,7 +2337,8 @@ class RenderDaemon:
                     cache_stats["runs"] += 1
                     cache_stats["last_started_at"] = job.status.started_at
                     job.status.extras["scene_cache_runs"] = int(cache_stats["runs"])
-                    self._persist_status_unlocked(job)
+                # Disk I/O outside the lock
+                self._persist_status_unlocked(job)
 
                 bundle = self.render_fn(
                     job.render_request,
@@ -2122,8 +2359,16 @@ class RenderDaemon:
             job.status.progress_stage = "complete"
             job.status.manifest_path = manifest_path
             job.status.error = None
-            self._persist_status_unlocked(job)
-            self._record_render_job_telemetry(job, event_type="complete")
+            # New observation bundles written — invalidate the bundle manifest cache
+            self._bundle_manifest_cache = None
+            self._bundle_manifest_cache_ts = 0.0
+        self._update_job_render_timing_summary(job, manifest_path=manifest_path)
+        # Disk I/O outside the lock
+        self._persist_status_unlocked(job)
+        with self._condition:
+            self._condition.notify_all()
+        self._record_render_job_telemetry(job, event_type="complete")
+        self._append_job_log_line(job, event_type="complete", stage="complete", message="Job succeeded")
 
     def _mark_failed(self, job_id: str, error: str) -> None:
         with self._condition:
@@ -2132,10 +2377,17 @@ class RenderDaemon:
             job.status.finished_at = _utc_now_iso()
             job.status.progress_stage = "failed"
             job.status.error = error
-            self._persist_status_unlocked(job)
-            self._record_render_job_telemetry(job, event_type="failed")
+            self._condition.notify_all()
+        # Disk I/O outside the lock
+        self._persist_status_unlocked(job)
+        self._record_render_job_telemetry(job, event_type="failed")
+        self._append_job_log_line(job, event_type="failed", stage="failed", message=error or "Job failed")
 
     def _update_progress(self, job_id: str, stage: str, payload: Mapping[str, Any] | None) -> None:
+        command_id = None
+        progress_counts = None
+        message = self._isaac_render_stage_message(stage, payload)
+        job_for_persist = None
         with self._condition:
             job = self._jobs.get(job_id)
             if job is None or job.status.status != "running":
@@ -2143,8 +2395,33 @@ class RenderDaemon:
             job.status.progress_stage = stage
             if payload:
                 job.status.extras["progress_context"] = dict(payload)
-            self._persist_status_unlocked(job)
-            self._record_render_job_telemetry(job, event_type="progress")
+                if payload.get("total_passes"):
+                    progress_counts = {
+                        "loaded": int(payload.get("pass_index", 0) or 0),
+                        "total": int(payload.get("total_passes", 0) or 0),
+                    }
+            command_id = _maybe_str(job.status.extras.get("isaac_command_id"))
+            job_for_persist = job
+            self._condition.notify_all()
+        # Disk I/O outside the lock — prevents blocking HTTP handlers during rendering
+        if job_for_persist is not None:
+            self._persist_status_unlocked(job_for_persist)
+            self._record_render_job_telemetry(job_for_persist, event_type="progress")
+            self._append_job_log_line(job_for_persist, event_type="progress", stage=stage, message=message)
+        if command_id:
+            try:
+                self._update_isaac_command_progress(
+                    command_id,
+                    {
+                        "status": "running",
+                        "progress_stage": stage,
+                        "progress_message": message,
+                        "progress_origin": "daemon_render",
+                        **({"progress_counts": progress_counts} if progress_counts else {}),
+                    },
+                )
+            except Exception:
+                pass
 
     def _scene_cache_key(self, render_request: RenderRequest, variant: str) -> str:
         branch_policy = str(render_request.extras.get("branch_policy", "default"))
@@ -2152,6 +2429,20 @@ class RenderDaemon:
 
     def _status_path(self, job_id: str) -> Path:
         return self.repo_root / "out" / "bridge_jobs" / job_id / "job_status.json"
+
+    def _job_log_path(self, job_id: str) -> Path:
+        return self.repo_root / "out" / "bridge_jobs" / job_id / "render_progress.log"
+
+    def _append_job_log_line(self, job: "_QueuedJob", *, event_type: str, stage: str, message: str) -> None:
+        try:
+            log_path = self._job_log_path(job.render_request.job_id)
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            ts = _utc_now_iso()
+            line = f"[{ts}] [{event_type.upper():<8}] {stage:<25} {message}\n"
+            with open(log_path, "a", encoding="utf-8") as fh:
+                fh.write(line)
+        except Exception:
+            pass
 
     def _request_path(self, job: _QueuedJob) -> Path:
         return self.repo_root / "out" / "bridge_jobs" / job.render_request.job_id / "requests" / f"{job.render_request.frame_id}.json"
@@ -2165,6 +2456,8 @@ class RenderDaemon:
         status_path = self._status_path(job.render_request.job_id)
         status_path.parent.mkdir(parents=True, exist_ok=True)
         write_render_job_status(status_path, job.status)
+        # Invalidate cached file scan so next request sees the updated status
+        self._invalidate_job_status_cache()
 
     def _read_request_body(self, handler: BaseHTTPRequestHandler) -> dict[str, Any]:
         length = int(handler.headers.get("Content-Length", "0") or "0")
@@ -2180,6 +2473,9 @@ class RenderDaemon:
         raise ValueError(f"Unsupported Content-Type: {content_type or 'unknown'}")
 
     def _send_json(self, handler: BaseHTTPRequestHandler, status_code: int, payload: Mapping[str, Any]) -> None:
+        if status_code >= 400 and os.environ.get("ROBOMITUBA_DAEMON_DEBUG_LOG") in {"1", "true", "yes", "on"}:
+            compact = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+            print(f"[http] {handler.command} {handler.path} -> {status_code} {compact}", file=sys.stderr, flush=True)
         encoded = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
         self._send_bytes(handler, status_code, encoded, content_type="application/json; charset=utf-8")
 
@@ -2197,11 +2493,122 @@ class RenderDaemon:
         except (BrokenPipeError, ConnectionResetError):
             raise _ClientDisconnectedError from None
 
+    # ── Dataset auto-download ────────────────────────────────────────────────
+
+    def _handle_dataset_download_post(self, handler: BaseHTTPRequestHandler, payload: dict) -> None:
+        dataset_id = payload.get("dataset_id", "")
+        if not dataset_id:
+            self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": "dataset_id required"})
+            return
+        from .material_library import get_library_grouped
+        groups = get_library_grouped(self.repo_root)
+        group = next((g for g in groups if g["dataset_id"] == dataset_id), None)
+        if not group:
+            self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": "dataset not found"})
+            return
+        pending = [
+            (m["material_id"], m["display_name"], m["native_file"], m["download_url"])
+            for m in group["materials"]
+            if m.get("download_url") and m["status"] == "not_downloaded"
+        ]
+        if not pending:
+            self._send_json(handler, HTTPStatus.OK, {"status": "nothing_to_download", "job_id": None})
+            return
+        job_id = f"dl-{_utc_now_iso().replace(':', '').replace('-', '').replace('.', '')}"
+        job: dict[str, Any] = {
+            "done": 0, "total": len(pending), "current_name": "",
+            "status": "running", "errors": [],
+        }
+        with _download_jobs_lock:
+            _download_jobs[job_id] = job
+        threading.Thread(target=self._run_download_job, args=(job_id, pending), daemon=True).start()
+        self._send_json(handler, HTTPStatus.OK, {"job_id": job_id})
+
+    def _run_download_job(
+        self,
+        job_id: str,
+        pending: list[tuple[str, str, str, str]],
+    ) -> None:
+        job = _download_jobs[job_id]
+        for mat_id, mat_name, native_file, url in pending:
+            job["current_name"] = mat_name
+            dest = self.repo_root / native_file
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
+                    tmp_path = tmp.name
+                urllib.request.urlretrieve(url, tmp_path)
+                with zipfile.ZipFile(tmp_path) as zf:
+                    pbsdf_names = [n for n in zf.namelist() if n.endswith(".pbsdf") or n.endswith(".bsdf")]
+                    if pbsdf_names:
+                        dest.write_bytes(zf.read(pbsdf_names[0]))
+                    else:
+                        job["errors"].append(f"{mat_name}: no .pbsdf in zip")
+                os.unlink(tmp_path)
+            except Exception as exc:
+                job["errors"].append(f"{mat_name}: {exc}")
+            job["done"] += 1
+        job["status"] = "done"
+
+    def _handle_dataset_download_status(self, handler: BaseHTTPRequestHandler, query: dict) -> None:
+        job_id = (query.get("job_id") or [""])[0]
+        with _download_jobs_lock:
+            job = _download_jobs.get(job_id)
+        if not job:
+            self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": "job not found"})
+            return
+        self._send_json(handler, HTTPStatus.OK, job)
+
+    def _handle_material_preview_get(
+        self,
+        handler: BaseHTTPRequestHandler,
+        path: str,
+        query: dict,
+    ) -> None:
+        """Serve a Mitsuba-rendered sphere preview PNG for a preset or measured BSDF."""
+        from .sphere_preview import get_preset_preview, get_measured_preview
+
+        cache_dir = self.repo_root / "out" / "material_previews"
+        # /api/material-preview/preset/{bsdf_type}
+        if path.startswith("/api/material-preview/preset/"):
+            bsdf_type = path[len("/api/material-preview/preset/"):].strip("/")
+            png_path = get_preset_preview(bsdf_type, cache_dir)
+            if png_path is None:
+                self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": f"Preview unavailable for preset: {bsdf_type}"})
+                return
+            self._send_bytes(handler, HTTPStatus.OK, png_path.read_bytes(), content_type="image/png")
+            return
+        # /api/material-preview/measured/{dataset_id}/{material_id}?file=<repo_relative_path>
+        if path.startswith("/api/material-preview/measured/"):
+            rest = path[len("/api/material-preview/measured/"):].strip("/")
+            parts = rest.split("/", 1)
+            if len(parts) != 2:
+                self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": "Expected /measured/{dataset_id}/{material_id}"})
+                return
+            dataset_id, material_id = parts
+            file_param = _maybe_str(query.get("file", [None])[0])
+            if not file_param:
+                self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": "Missing ?file= query parameter"})
+                return
+            png_path = get_measured_preview(dataset_id, material_id, file_param, self.repo_root, cache_dir)
+            if png_path is None:
+                self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": f"Preview unavailable for measured: {dataset_id}/{material_id}"})
+                return
+            self._send_bytes(handler, HTTPStatus.OK, png_path.read_bytes(), content_type="image/png")
+            return
+        self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": f"Unknown material-preview path: {path}"})
+
     def _serve_static_file(self, handler: BaseHTTPRequestHandler, path: Path) -> None:
         if not path.exists() or not path.is_file():
             self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": f"Static asset not found: {path.name}"})
             return
         self._serve_file(handler, path, default_type="text/css; charset=utf-8")
+
+    def _serve_spa_file(self, handler: BaseHTTPRequestHandler, path: Path) -> None:
+        if not path.exists() or not path.is_file():
+            self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": f"SPA asset not found: {path.name}"})
+            return
+        self._serve_file(handler, path)
 
     def _serve_repo_artifact(self, handler: BaseHTTPRequestHandler, repo_relative_path: str) -> None:
         candidate = resolve_repo_path(self.repo_root, repo_relative_path).resolve()
@@ -2215,41 +2622,165 @@ class RenderDaemon:
             return
         self._serve_file(handler, candidate)
 
+    def _serve_scene_geometry(self, handler: BaseHTTPRequestHandler, scene_id: str, mesh_id: str) -> None:
+        detail = self._scene_detail(scene_id).get("scene")
+        if not detail:
+            self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": f"Unknown scene_id: {scene_id}"})
+            return
+
+        snapshot_ref = _maybe_str(detail.get("scene_snapshot_ref"))
+        snapshot, _cameras, _lights = self._load_snapshot_sidecars(snapshot_ref)
+        if snapshot is None:
+            self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": "Scene snapshot unavailable.", "scene_id": scene_id})
+            return
+
+        match = None
+        for mesh in snapshot.meshes:
+            candidates = {
+                mesh.mesh_id,
+                mesh.source_path,
+                mesh.name,
+                Path(mesh.geometry_path).stem if mesh.geometry_path else "",
+            }
+            if mesh_id in candidates:
+                match = mesh
+                break
+
+        if match is None or not match.geometry_path:
+            self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": f"Geometry not found for mesh_id: {mesh_id}", "scene_id": scene_id})
+            return
+
+        self._serve_repo_artifact(handler, match.geometry_path)
+
     def _serve_file(self, handler: BaseHTTPRequestHandler, path: Path, *, default_type: str | None = None) -> None:
         payload = path.read_bytes()
         mime_type, _ = mimetypes.guess_type(str(path))
         content_type = default_type or mime_type or "application/octet-stream"
         self._send_bytes(handler, HTTPStatus.OK, payload, content_type=content_type)
 
-    def _nav_items(self, *, current_scene_id: str | None = None) -> list[dict[str, str]]:
-        items = [
-            {"key": "home", "label": "Home", "href": "/"},
-        ]
-        if current_scene_id:
-            items.append({"key": "current_scene", "label": "Current Scene", "href": f"/scenes/{quote(current_scene_id, safe='')}"})
-        items.extend([
-            {"key": "scenes", "label": "Scenes", "href": "/scenes"},
-            {"key": "jobs", "label": "Jobs", "href": "/jobs"},
-            {"key": "system", "label": "System", "href": "/system"},
-            {"key": "isaac", "label": "Isaac Guide", "href": "/integrations/isaac"},
-        ])
-        return items
+    def _last_command_of_type(self, *types: str) -> "_IsaacRemoteCommand | None":
+        with self._condition:
+            commands = [cmd for cmd in self._isaac_commands.values() if cmd.command_type in types]
+        if not commands:
+            return None
+        commands.sort(key=lambda c: _safe_sort_ts(c.updated_at or c.completed_at or c.created_at), reverse=True)
+        return commands[0]
 
-    def _render_page(self, template_name: str, *, nav_key: str, page_title: str, page_subtitle: str = "", flash_message: str | None = None, **context: Any) -> str:
-        template = self._jinja.get_template(template_name)
-        summary = self._summary_payload()
-        return template.render(
-            page_title=page_title,
-            page_subtitle=page_subtitle,
-            nav_key=nav_key,
-            nav_items=self._nav_items(current_scene_id=summary.get("current_scene_id")),
-            base_url=self.base_url,
-            latest_scene_id=summary.get("latest_scene_id"),
-            current_scene_id=summary.get("current_scene_id"),
-            summary=summary,
-            flash_message=flash_message,
-            **context,
+    def _bridge_pipeline_status(self) -> list[dict[str, Any]]:
+        """Derive 8-stage pipeline status from in-memory data."""
+        session = self._isaac_session
+
+        def _step(key: str, label: str, label_kr: str, status: str, *,
+                   last_ok_at: str | None = None, last_error_at: str | None = None,
+                   last_error_msg: str | None = None, detail: str | None = None) -> dict[str, Any]:
+            return {
+                "key": key, "label": label, "label_kr": label_kr, "status": status,
+                "last_ok_at": last_ok_at, "last_error_at": last_error_at,
+                "last_error_msg": last_error_msg, "detail": detail,
+            }
+
+        def _from_command(key: str, label: str, label_kr: str, cmd: "_IsaacRemoteCommand | None", *,
+                          warn_if: bool = False) -> dict[str, Any]:
+            if cmd is None:
+                return _step(key, label, label_kr, "inactive")
+            if cmd.status == "succeeded":
+                st = "warn" if warn_if else "ok"
+                return _step(key, label, label_kr, st, last_ok_at=cmd.completed_at or cmd.updated_at)
+            if cmd.status in ("failed", "cancelled"):
+                return _step(key, label, label_kr, "error",
+                              last_error_at=cmd.completed_at or cmd.updated_at,
+                              last_error_msg=cmd.error)
+            if cmd.status in ("queued", "dispatched", "running"):
+                return _step(key, label, label_kr, "warn", detail=cmd.progress_stage or cmd.status)
+            return _step(key, label, label_kr, "inactive")
+
+        last_succeeded_job = next(
+            (j for j in sorted(self._jobs.values(), key=lambda x: _safe_sort_ts(x.status.finished_at), reverse=True)
+             if j.status.status == "succeeded"), None
         )
+        last_manifest_job = next(
+            (j for j in sorted(self._jobs.values(), key=lambda x: _safe_sort_ts(x.status.finished_at), reverse=True)
+             if j.status.manifest_path), None
+        )
+
+        steps = [
+            _step("connected", "Isaac Connected", "Isaac 연결",
+                  "ok" if session else "inactive",
+                  last_ok_at=session.opened_at if session else None),
+            _from_command("scene_loaded", "Scene Loaded", "Scene 로드",
+                          self._last_command_of_type("load_scene")),
+            _from_command("render_ready", "Render-Ready", "렌더 준비",
+                          self._last_command_of_type("prepare_render_ready")),
+            _from_command("session_connected", "Session Connected", "세션 연결",
+                          self._last_command_of_type("connect_session")),
+            _from_command("session_synced", "Session Synced", "세션 동기화",
+                          self._last_command_of_type("sync_session"),
+                          warn_if=bool(session and session.state_dirty)),
+            _from_command("render_dispatched", "Render Dispatched", "렌더 요청",
+                          self._last_command_of_type("render_current_view", "render_sensor")),
+            _step("mitsuba_done", "Mitsuba Done", "렌더 완료",
+                  "ok" if last_succeeded_job else "inactive",
+                  last_ok_at=last_succeeded_job.status.finished_at if last_succeeded_job else None),
+            _step("capture_attached", "Capture Attached", "캡처 연결",
+                  "ok" if last_manifest_job else "inactive",
+                  last_ok_at=last_manifest_job.status.finished_at if last_manifest_job else None),
+        ]
+        return steps
+
+    def _health_detail_text(self) -> str:
+        from datetime import datetime, timezone as _tz
+
+        summary = self._summary_payload()
+        parts = []
+        worker_state = summary.get("worker_state", "idle")
+        queue_length = int(summary.get("queue_length", 0))
+        failed_count = int(summary.get("failed_jobs", 0))
+        isaac_connected = summary.get("isaac_connected", False)
+        avg_rt = summary.get("avg_render_time_s")
+        today_completed = int(summary.get("today_completed", 0))
+
+        if worker_state == "running":
+            parts.append("worker running")
+        else:
+            parts.append("worker idle")
+
+        if queue_length > 0:
+            parts.append(f"queue {queue_length}")
+        else:
+            parts.append("queue empty")
+
+        if failed_count > 0:
+            parts.append(f"{failed_count} failed")
+
+        if not isaac_connected:
+            parts.append("Isaac disconnected")
+        else:
+            parts.append("Isaac connected")
+
+        if today_completed > 0 and avg_rt:
+            parts.append(f"today {today_completed} renders · avg {avg_rt:.0f}s")
+        elif today_completed > 0:
+            parts.append(f"{today_completed} renders today")
+
+        return " · ".join(parts)
+
+    def _stuck_jobs(self, *, threshold_s: float = 600.0) -> list[dict[str, Any]]:
+        from datetime import datetime, timezone as _tz
+        now = _utc_now()
+        stuck = []
+        for job in self._job_records():
+            if job["status"] != "running":
+                continue
+            started_at = job.get("started_at")
+            if not started_at:
+                continue
+            try:
+                started_dt = datetime.fromisoformat(started_at).astimezone(_tz.utc)
+                if (now - started_dt).total_seconds() >= threshold_s:
+                    stuck.append(job)
+            except Exception:
+                pass
+        return stuck
 
     def _active_isaac_command_summary(self) -> dict[str, Any] | None:
         """Return the most recent in-flight Isaac command, if any."""
@@ -2484,16 +3015,45 @@ class RenderDaemon:
             )
         return raw
 
+    @staticmethod
+    def _gpu_stats() -> list[dict[str, Any]]:
+        try:
+            out = subprocess.check_output(
+                ["nvidia-smi", "--query-gpu=index,utilization.gpu,memory.used,memory.total",
+                 "--format=csv,noheader,nounits"],
+                timeout=2, stderr=subprocess.DEVNULL
+            ).decode()
+            gpus = []
+            for line in out.strip().splitlines():
+                parts = [p.strip() for p in line.split(",")]
+                if len(parts) == 4:
+                    gpus.append({
+                        "index": int(parts[0]),
+                        "util_pct": int(parts[1]),
+                        "mem_used_mb": int(parts[2]),
+                        "mem_total_mb": int(parts[3]),
+                    })
+            return gpus
+        except Exception:
+            return []
+
     def _health_payload(self) -> dict[str, Any]:
-        summary = self._summary_payload()
+        # Fast path: in-memory reads only — no disk I/O, no telemetry scan.
+        # _summary_payload() is too heavy (glob + telemetry JSONL) for a 1s poll endpoint.
+        with self._condition:
+            running_jobs = [job for job in self._jobs.values() if job.status.status == "running"]
+            worker_state = "running" if running_jobs else "idle"
+            active_stage = running_jobs[0].status.progress_stage if running_jobs else None
+            queue_length = len(self._pending)
+            variant = self.variant
         session = self._isaac_session
         return {
             "status": "ok",
             "base_url": self.base_url,
-            "worker_state": summary["worker_state"],
-            "active_stage": summary["active_stage"],
-            "queue_length": summary["queue_length"],
-            "variant": summary["variant"],
+            "worker_state": worker_state,
+            "active_stage": active_stage,
+            "queue_length": queue_length,
+            "variant": variant,
             "isaac_connected": session is not None,
             "isaac_scene_id": session.scene_id if session else None,
             "isaac_opened_at": session.opened_at if session else None,
@@ -2501,6 +3061,7 @@ class RenderDaemon:
             "isaac_sensor_count": len(session.sensors) if session else 0,
             "active_isaac_command": self._active_isaac_command_summary(),
             "latest_isaac_command": self._latest_isaac_command_summary(),
+            "gpus": self._gpu_stats(),
         }
 
     def _snapshot_state(self) -> tuple[list[str], dict[str, RenderJobStatus], dict[str, dict[str, Any]]]:
@@ -2511,9 +3072,15 @@ class RenderDaemon:
         return pending, jobs, cache_stats
 
     def _status_file_records(self) -> dict[str, RenderJobStatus]:
+        """Read job_status.json files from disk with a 2-second TTL cache."""
+        now = time.monotonic()
+        if self._job_status_cache is not None and (now - self._job_status_cache_ts) < 2.0:
+            return self._job_status_cache  # type: ignore[return-value]
         records: dict[str, RenderJobStatus] = {}
         root = self.repo_root / "out" / "bridge_jobs"
         if not root.exists():
+            self._job_status_cache = records
+            self._job_status_cache_ts = now
             return records
         for status_path in root.glob("*/job_status.json"):
             try:
@@ -2521,7 +3088,14 @@ class RenderDaemon:
             except Exception:
                 continue
             records[status.job_id] = status
+        self._job_status_cache = records
+        self._job_status_cache_ts = now
         return records
+
+    def _invalidate_job_status_cache(self) -> None:
+        """Call this whenever a new job is submitted or status changes to force cache refresh."""
+        self._job_status_cache = None
+        self._job_status_cache_ts = 0.0
 
     def _load_saved_request(self, job_id: str, frame_id: str) -> RenderRequest | None:
         request_path = self.repo_root / "out" / "bridge_jobs" / job_id / "requests" / f"{frame_id}.json"
@@ -2536,10 +3110,74 @@ class RenderDaemon:
         except Exception:
             return None
 
+    def _collect_render_pass_records(self, node: Any) -> list[dict[str, Any]]:
+        records: list[dict[str, Any]] = []
+        if isinstance(node, Mapping):
+            if "task" in node and "scene" in node:
+                records.append(dict(node))
+            for value in node.values():
+                records.extend(self._collect_render_pass_records(value))
+        elif isinstance(node, list):
+            for item in node:
+                records.extend(self._collect_render_pass_records(item))
+        return records
+
+    def _render_timing_summary_from_bundle(self, bundle: ObservationBundleManifest) -> dict[str, Any] | None:
+        timing_log_ref = _maybe_str(bundle.extras.get("timing_log_ref")) if isinstance(bundle.extras, Mapping) else None
+        if not timing_log_ref:
+            return None
+        timing_log_path = resolve_repo_path(self.repo_root, timing_log_ref)
+        if not timing_log_path.exists():
+            return None
+        try:
+            timing_payload = json.loads(timing_log_path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        pass_records = self._collect_render_pass_records(timing_payload.get("cameras", {}))
+        pass_count = len(pass_records)
+        scene_cache_hits = sum(1 for record in pass_records if bool(record.get("scene_cache_hit", False)))
+        return {
+            "timing_log_ref": timing_log_ref,
+            "pass_count": pass_count,
+            "scene_cache_hits": scene_cache_hits,
+            "scene_cache_misses": max(0, pass_count - scene_cache_hits),
+            "scene_cache_hit_ratio": (float(scene_cache_hits) / float(pass_count)) if pass_count else 0.0,
+            "load_scene_total_s": sum(float(record.get("load_scene_s", 0.0) or 0.0) for record in pass_records),
+            "render_total_s": sum(float(record.get("render_s", 0.0) or 0.0) for record in pass_records),
+            "total_s": sum(float(record.get("total_s", 0.0) or 0.0) for record in pass_records),
+            "tasks": sorted({str(record.get("task") or "unknown") for record in pass_records}),
+        }
+
+    def _update_job_render_timing_summary(self, job: _QueuedJob, *, manifest_path: str) -> None:
+        manifest_abs = resolve_repo_path(self.repo_root, manifest_path)
+        if not manifest_abs.exists():
+            return
+        try:
+            bundle = read_observation_bundle_manifest(manifest_abs)
+        except Exception:
+            return
+        summary = self._render_timing_summary_from_bundle(bundle)
+        if summary is None:
+            return
+        job.status.extras["render_timing_summary"] = summary
+
     def _job_record_from_status(self, status: RenderJobStatus, *, queue_position: int | None) -> dict[str, Any]:
+        from datetime import datetime, timezone as _tz
         request = self._load_saved_request(status.job_id, status.frame_id)
         scene_id = request.scene_state.scene_id if request is not None else None
         scene_version = request.scene_state.scene_version if request is not None else None
+        age_s: float | None = None
+        is_stuck = False
+        ref_ts = status.submitted_at
+        if ref_ts:
+            try:
+                ref_dt = datetime.fromisoformat(ref_ts).astimezone(_tz.utc)
+                age_s = max(0.0, (_utc_now() - ref_dt).total_seconds())
+                if status.status == "running" and status.started_at:
+                    started_dt = datetime.fromisoformat(status.started_at).astimezone(_tz.utc)
+                    is_stuck = (_utc_now() - started_dt).total_seconds() >= 600.0
+            except Exception:
+                pass
         return {
             "job_id": status.job_id,
             "frame_id": status.frame_id,
@@ -2553,6 +3191,8 @@ class RenderDaemon:
             "scene_id": scene_id,
             "scene_version": scene_version,
             "queue_position": queue_position,
+            "age_s": age_s,
+            "is_stuck": is_stuck,
             "extras": dict(status.extras),
         }
 
@@ -2710,10 +3350,21 @@ class RenderDaemon:
 
         return checks
 
-    def _bundle_manifests(self) -> list[ObservationBundleManifest]:
+    def _bundle_manifests(self, *, force_refresh: bool = False) -> list[ObservationBundleManifest]:
+        """Glob + deserialize observation bundle manifests with a 3-second TTL cache."""
+        now = time.monotonic()
+        if (
+            not force_refresh
+            and self._bundle_manifest_cache is not None
+            and (now - self._bundle_manifest_cache_ts) < 3.0
+        ):
+            return self._bundle_manifest_cache  # type: ignore[return-value]
         root = self.repo_root / "out" / "bridge_jobs"
         if not root.exists():
-            return []
+            result: list[ObservationBundleManifest] = []
+            self._bundle_manifest_cache = result
+            self._bundle_manifest_cache_ts = now
+            return result
         bundles: list[ObservationBundleManifest] = []
         for manifest_path in root.glob("*/observations/*/manifest.json"):
             try:
@@ -2721,6 +3372,8 @@ class RenderDaemon:
             except Exception:
                 continue
         bundles.sort(key=lambda item: _safe_sort_ts(item.timestamp), reverse=True)
+        self._bundle_manifest_cache = bundles
+        self._bundle_manifest_cache_ts = now
         return bundles
 
     def _artifact_href(self, repo_relative_path: str | None) -> str | None:
@@ -3244,14 +3897,39 @@ class RenderDaemon:
         return self._isaac_scene_detail(scene_id)
 
     def _latest_capture_record(self, *, scene_id: str | None = None) -> dict[str, Any] | None:
+        def _find_capture(force_refresh: bool) -> dict[str, Any] | None:
+            bundles = self._bundle_manifests(force_refresh=force_refresh)
+            if scene_id:
+                for bundle in bundles:
+                    if bundle.scene_id != scene_id:
+                        continue
+                    captures = self._capture_records(bundle)
+                    if captures:
+                        return captures[0]
+                return None
+            for bundle in bundles:
+                captures = self._capture_records(bundle)
+                if captures:
+                    return captures[0]
+            return None
+
         if scene_id:
-            detail = self._scene_detail(scene_id)
-            return detail.get("latest_capture")
-        for bundle in self._bundle_manifests():
-            captures = self._capture_records(bundle)
-            if captures:
-                return captures[0]
-        return None
+            try:
+                detail = self._scene_detail(scene_id)
+            except KeyError:
+                detail = None
+            if detail is not None:
+                capture = detail.get("latest_capture")
+                if capture is not None:
+                    return capture
+            capture = _find_capture(force_refresh=False)
+            if capture is not None:
+                return capture
+            return _find_capture(force_refresh=True)
+        capture = _find_capture(force_refresh=False)
+        if capture is not None:
+            return capture
+        return _find_capture(force_refresh=True)
 
     def _capture_detail_by_ids(self, job_id: str, frame_id: str) -> dict[str, Any]:
         manifest_path = self.repo_root / "out" / "bridge_jobs" / job_id / "observations" / frame_id / "manifest.json"

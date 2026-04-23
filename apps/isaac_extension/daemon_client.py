@@ -2,17 +2,21 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import inspect
 import json
 import os
 import shutil
+import socket
+import ssl
 import subprocess
 import sys
 import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
+from urllib.parse import urlparse
 import webbrowser
 
 # Allow importing from repo apps roots when running inside Isaac Sim runtime copies.
@@ -33,7 +37,7 @@ from isaac_capture_current_view_request import _http_json  # noqa: E402
 
 DEFAULT_UNC_REPO_ROOT = r"\\jarvis.postech.ac.kr\workspace\jinnyeong\project\robomituba"
 DEFAULT_DAEMON_URL = "http://127.0.0.1:8765"
-DEFAULT_RENDER_TIMEOUT_S = 600.0
+DEFAULT_RENDER_TIMEOUT_S = 1800.0
 DEFAULT_LOAD_SCENE_TIMEOUT_S = 1800.0
 DEFAULT_FULL_MITSUBA_SCENE_REF = "out/moorelane_full_cam03_rgb_all/scene_full_sanitized_direct.xml"
 _FULL_SCENE_SIBLING_CANDIDATES = (
@@ -54,7 +58,14 @@ def resolve_windows_repo_root(repo_root: str | None = None) -> str:
 
 
 DEFAULT_REPO_ROOT = resolve_windows_repo_root()
-DEFAULT_RENDER_PREP_TIMEOUT_S = 60.0
+DEFAULT_RENDER_PREP_TIMEOUT_S = 300.0
+_SENSOR_REGISTER_SUPPRESSED_UNTIL = 0.0
+_LAST_VIEWPORT_SENSOR_REGISTER_SIGNATURE: tuple[Any, ...] | None = None
+_LAST_VIEWPORT_SENSOR_REGISTER_TS = 0.0
+_SENSOR_REGISTER_REFRESH_INTERVAL_S = 30.0
+_SENSOR_REGISTER_NO_SESSION_BACKOFF_S = 15.0
+_CAMERA_WS_CLIENTS: dict[str, "_CameraTelemetryWebSocket"] = {}
+_CAMERA_WS_CLIENTS_LOCK = threading.Lock()
 
 
 def _is_windows_host() -> bool:
@@ -122,6 +133,96 @@ def _source_signature_from_stats(stats: dict[str, Any]) -> str:
     if not stats.get("exists"):
         return "missing"
     return f"{int(stats.get('bytes', 0) or 0)}:{int(stats.get('file_count', 0) or 0)}:{int(stats.get('latest_mtime_ns', 0) or 0)}"
+
+
+class _CameraTelemetryWebSocket:
+    def __init__(self, daemon_url: str) -> None:
+        self.daemon_url = daemon_url.rstrip("/")
+        self._sock: socket.socket | None = None
+        self._lock = threading.Lock()
+
+    def close(self) -> None:
+        sock = self._sock
+        self._sock = None
+        if sock is not None:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+    def send_json(self, payload: Mapping[str, Any], *, timeout_s: float) -> None:
+        data = json.dumps(dict(payload), separators=(",", ":")).encode("utf-8")
+        with self._lock:
+            sock = self._sock
+            if sock is None:
+                sock = self._connect(timeout_s=timeout_s)
+                self._sock = sock
+            try:
+                sock.settimeout(timeout_s)
+                sock.sendall(self._frame(data))
+            except Exception:
+                self.close()
+                raise
+
+    def _connect(self, *, timeout_s: float) -> socket.socket:
+        parsed = urlparse(self.daemon_url)
+        scheme = parsed.scheme or "http"
+        host = parsed.hostname or "127.0.0.1"
+        port = int(parsed.port or (443 if scheme == "https" else 80))
+        path_base = parsed.path.rstrip("/")
+        path = f"{path_base}/isaac/session/camera_ws" if path_base else "/isaac/session/camera_ws"
+        raw_sock = socket.create_connection((host, port), timeout=timeout_s)
+        sock: socket.socket
+        if scheme == "https":
+            sock = ssl.create_default_context().wrap_socket(raw_sock, server_hostname=host)
+        else:
+            sock = raw_sock
+        key = base64.b64encode(os.urandom(16)).decode("ascii")
+        request = "\r\n".join(
+            [
+                f"GET {path} HTTP/1.1",
+                f"Host: {host}:{port}",
+                "Upgrade: websocket",
+                "Connection: Upgrade",
+                f"Sec-WebSocket-Key: {key}",
+                "Sec-WebSocket-Version: 13",
+                "\r\n",
+            ]
+        )
+        sock.sendall(request.encode("ascii"))
+        response = b""
+        while b"\r\n\r\n" not in response and len(response) < 8192:
+            chunk = sock.recv(1024)
+            if not chunk:
+                break
+            response += chunk
+        if b" 101 " not in response.split(b"\r\n", 1)[0]:
+            sock.close()
+            raise RuntimeError("camera websocket upgrade failed")
+        return sock
+
+    def _frame(self, payload: bytes) -> bytes:
+        mask = os.urandom(4)
+        length = len(payload)
+        header = bytearray([0x81])
+        if length < 126:
+            header.append(0x80 | length)
+        elif length < 65536:
+            header.extend([0x80 | 126, *length.to_bytes(2, "big")])
+        else:
+            header.extend([0x80 | 127, *length.to_bytes(8, "big")])
+        masked = bytes(byte ^ mask[i % 4] for i, byte in enumerate(payload))
+        return bytes(header) + mask + masked
+
+
+def _camera_ws_client(daemon_url: str | None = None) -> _CameraTelemetryWebSocket:
+    url = _resolve_daemon_url(daemon_url)
+    with _CAMERA_WS_CLIENTS_LOCK:
+        client = _CAMERA_WS_CLIENTS.get(url)
+        if client is None:
+            client = _CameraTelemetryWebSocket(url)
+            _CAMERA_WS_CLIENTS[url] = client
+        return client
 
 
 def _safe_symlink(source: Path, target: Path) -> bool:
@@ -629,6 +730,44 @@ def get_isaac_session(*, daemon_url: str | None = None, timeout_s: float = 10.0)
     return _http_json("GET", f"{_resolve_daemon_url(daemon_url)}/isaac/session", timeout_s=timeout_s)
 
 
+def _active_session_payload(session_summary: dict[str, Any]) -> dict[str, Any]:
+    session = session_summary.get("session")
+    return dict(session) if isinstance(session, Mapping) else {}
+
+
+def _session_matches_scene(session_summary: dict[str, Any], scene: dict[str, Any]) -> bool:
+    session = _active_session_payload(session_summary)
+    if session_summary.get("status") != "active" or not session:
+        return False
+    return (
+        str(session.get("scene_id") or "") == str(scene.get("scene_id") or "")
+        and str(session.get("mitsuba_scene_ref") or "") == str(scene.get("mitsuba_scene_ref") or "")
+        and str(session.get("shape_map_ref") or "") == str(scene.get("shape_map_ref") or "")
+    )
+
+
+def _resolve_render_sync_mode(
+    *,
+    session_summary: dict[str, Any],
+    scene: dict[str, Any],
+    sync_policy: str,
+    force_resync: bool,
+    state_dirty: bool | None,
+    material_dirty: bool | None,
+) -> str:
+    normalized_policy = str(sync_policy or "auto").strip().lower()
+    if normalized_policy == "force_full" or force_resync:
+        return "full_resync"
+    if not _session_matches_scene(session_summary, scene):
+        return "full_resync"
+    session = _active_session_payload(session_summary)
+    if bool(state_dirty) or bool(session.get("state_dirty")):
+        return "full_resync"
+    if bool(material_dirty) or bool(session.get("material_dirty")):
+        return "material_delta"
+    return "camera_only"
+
+
 def list_scenes_from_daemon(*, daemon_url: str | None = None, timeout_s: float = 10.0) -> list[dict[str, Any]]:
     payload = _http_json("GET", f"{_resolve_daemon_url(daemon_url)}/api/isaac/scenes", timeout_s=timeout_s)
     return list(payload.get("scenes", []))
@@ -1124,6 +1263,20 @@ def connect_scene_session_from_daemon(
         or scene.get("shape_map_exists") is False
     ):
         raise _render_ready_error(scene_id, scene)
+    try:
+        active_session = get_isaac_session(daemon_url=daemon_url, timeout_s=min(timeout_s, 5.0))
+    except Exception:
+        active_session = {"status": "inactive", "session": None}
+    if _session_matches_scene(active_session, scene):
+        _emit_progress(progress_callback, stage="opening_session", message="Reusing the already-open Isaac session for this scene.")
+        _register_active_viewport_sensor_best_effort(
+            daemon_url=daemon_url,
+            timeout_s=min(timeout_s, 10.0),
+            progress_callback=progress_callback,
+        )
+        result = dict(active_session)
+        result["reused"] = True
+        return result
     _emit_progress(progress_callback, stage="opening_session", message="Opening active Isaac session.")
     session_result = open_isaac_session(
         capture_session_open(
@@ -1140,6 +1293,8 @@ def connect_scene_session_from_daemon(
         timeout_s=min(timeout_s, 10.0),
         progress_callback=progress_callback,
     )
+    if isinstance(session_result, dict):
+        session_result["reused"] = bool(session_result.get("reused", False))
     return session_result
 
 
@@ -1160,18 +1315,20 @@ def sync_scene_state_to_daemon(
     bsdf_overrides_by_path: dict[str, Any] | None = None,
     timeout_s: float = 10.0,
     progress_callback: ProgressCallback | None = None,
+    ensure_session: bool = True,
 ) -> dict[str, Any]:
     try:
         from isaac_extension.stage_capture import capture_material_patch, capture_selected_prim_paths, capture_state_patch
     except ImportError:  # pragma: no cover - Isaac runtime fallback
         from stage_capture import capture_material_patch, capture_selected_prim_paths, capture_state_patch
 
-    connect_scene_session_from_daemon(
-        scene_id,
-        daemon_url=daemon_url,
-        timeout_s=timeout_s,
-        progress_callback=progress_callback,
-    )
+    if ensure_session:
+        connect_scene_session_from_daemon(
+            scene_id,
+            daemon_url=daemon_url,
+            timeout_s=timeout_s,
+            progress_callback=progress_callback,
+        )
     _emit_progress(progress_callback, stage="capturing_stage_state", message="Capturing current stage state from Isaac.")
     state_result = update_isaac_state(
         capture_state_patch(stage, scene_id=scene_id, bsdf_overrides_by_path=bsdf_overrides_by_path or {}),
@@ -1228,6 +1385,16 @@ def register_isaac_sensors(
     return _http_json("POST", f"{_resolve_daemon_url(daemon_url)}/isaac/session/register_sensors", payload, timeout_s=timeout_s)
 
 
+def register_isaac_sensors_ws(
+    sensors: list[Any],
+    *,
+    daemon_url: str | None = None,
+    timeout_s: float = 1.0,
+) -> None:
+    payload = {"sensors": [_sensor_spec_payload(sensor) for sensor in sensors]}
+    _camera_ws_client(daemon_url).send_json(payload, timeout_s=timeout_s)
+
+
 def capture_active_viewport_camera_signature(*, decimals: int = 5) -> tuple[Any, ...] | None:
     try:
         try:
@@ -1255,11 +1422,29 @@ def _register_active_viewport_sensor_best_effort(
     modalities: list[str] | None = None,
     progress_callback: ProgressCallback | None = None,
 ) -> dict[str, Any] | None:
+    global _SENSOR_REGISTER_SUPPRESSED_UNTIL
+    global _LAST_VIEWPORT_SENSOR_REGISTER_SIGNATURE
+    global _LAST_VIEWPORT_SENSOR_REGISTER_TS
+
+    now = time.monotonic()
+    if now < _SENSOR_REGISTER_SUPPRESSED_UNTIL:
+        return None
+
     try:
         try:
             from isaac_extension.stage_capture import capture_current_view_sensor_spec
         except ImportError:  # pragma: no cover - Isaac runtime fallback
             from stage_capture import capture_current_view_sensor_spec
+
+        modalities_key = tuple(sorted(str(modality) for modality in list(modalities or ["rgb"])))
+        camera_signature = capture_active_viewport_camera_signature()
+        signature = (modalities_key, camera_signature)
+        if (
+            camera_signature is not None
+            and signature == _LAST_VIEWPORT_SENSOR_REGISTER_SIGNATURE
+            and now - _LAST_VIEWPORT_SENSOR_REGISTER_TS < _SENSOR_REGISTER_REFRESH_INTERVAL_S
+        ):
+            return None
 
         _emit_progress(
             progress_callback,
@@ -1267,12 +1452,26 @@ def _register_active_viewport_sensor_best_effort(
             message="Syncing the active Isaac viewport camera to daemon.",
             origin="isaac_app",
         )
-        return register_isaac_sensors(
-            [capture_current_view_sensor_spec(modalities=list(modalities or ["rgb"]))],
-            daemon_url=daemon_url,
-            timeout_s=timeout_s,
-        )
+        sensor = capture_current_view_sensor_spec(modalities=list(modalities or ["rgb"]))
+        try:
+            register_isaac_sensors_ws(
+                [sensor],
+                daemon_url=daemon_url,
+                timeout_s=min(timeout_s, 1.0),
+            )
+            result: dict[str, Any] | None = None
+        except Exception:
+            result = register_isaac_sensors(
+                [sensor],
+                daemon_url=daemon_url,
+                timeout_s=timeout_s,
+            )
+        _LAST_VIEWPORT_SENSOR_REGISTER_SIGNATURE = signature
+        _LAST_VIEWPORT_SENSOR_REGISTER_TS = now
+        return result
     except Exception as exc:
+        if "No active Isaac scene session" in str(exc):
+            _SENSOR_REGISTER_SUPPRESSED_UNTIL = time.monotonic() + _SENSOR_REGISTER_NO_SESSION_BACKOFF_S
         _emit_progress(
             progress_callback,
             stage="syncing_viewport_camera",
@@ -1280,7 +1479,6 @@ def _register_active_viewport_sensor_best_effort(
             origin="isaac_app",
         )
         return None
-
 
 def sync_active_viewport_camera_to_daemon(
     *,
@@ -1373,8 +1571,13 @@ def capture_isaac(
     timeout_s: float = DEFAULT_RENDER_TIMEOUT_S,
     variant: str | None = None,
     command_id: str | None = None,
+    extras: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     payload = _capture_request_payload(capture_request)
+    if extras:
+        merged_extras = dict(payload.get("extras") or {})
+        merged_extras.update(dict(extras))
+        payload["extras"] = merged_extras
     payload["timeout_s"] = timeout_s
     if variant:
         payload["variant"] = variant
@@ -1388,7 +1591,7 @@ def render_current_view_from_daemon(
     *,
     stage: Any | None = None,
     daemon_url: str | None = None,
-    submit_mode: str = "blocking",
+    submit_mode: str = "async",
     modalities: list[str] | None = None,
     render_settings: dict[str, Any] | None = None,
     bsdf_overrides_by_path: dict[str, Any] | None = None,
@@ -1396,14 +1599,23 @@ def render_current_view_from_daemon(
     variant: str | None = None,
     progress_callback: ProgressCallback | None = None,
     command_id: str | None = None,
+    sync_policy: str = "auto",
+    force_resync: bool = False,
+    state_dirty: bool | None = None,
+    material_dirty: bool | None = None,
 ) -> dict[str, Any]:
     try:
-        from isaac_extension.stage_capture import capture_current_view_sensor_spec
+        from isaac_extension.stage_capture import capture_current_view_sensor_spec, capture_material_patch
     except ImportError:  # pragma: no cover - Isaac runtime fallback
-        from stage_capture import capture_current_view_sensor_spec
+        from stage_capture import capture_current_view_sensor_spec, capture_material_patch
 
     if stage is None:
         stage = _require_isaac_context().get_stage()
+    try:
+        scene_payload = get_scene_from_daemon(scene_id, daemon_url=daemon_url, timeout_s=min(timeout_s, 10.0))
+        scene = dict(scene_payload.get("scene") or {})
+    except Exception:
+        scene = {"scene_id": scene_id}
     _emit_progress(progress_callback, stage="ensuring_session", message="Ensuring active Isaac session exists.")
     connect_scene_session_from_daemon(
         scene_id,
@@ -1411,14 +1623,35 @@ def render_current_view_from_daemon(
         timeout_s=min(timeout_s, DEFAULT_RENDER_PREP_TIMEOUT_S),
         progress_callback=progress_callback,
     )
-    sync_scene_state_to_daemon(
-        stage,
-        scene_id,
-        daemon_url=daemon_url,
-        bsdf_overrides_by_path=bsdf_overrides_by_path,
-        timeout_s=min(timeout_s, DEFAULT_RENDER_PREP_TIMEOUT_S),
-        progress_callback=progress_callback,
+    try:
+        session_summary = get_isaac_session(daemon_url=daemon_url, timeout_s=min(timeout_s, 10.0))
+    except Exception:
+        session_summary = {"status": "inactive", "session": None}
+    sync_mode = _resolve_render_sync_mode(
+        session_summary=session_summary,
+        scene=scene,
+        sync_policy=sync_policy,
+        force_resync=force_resync,
+        state_dirty=state_dirty,
+        material_dirty=material_dirty,
     )
+    if sync_mode == "full_resync":
+        sync_scene_state_to_daemon(
+            stage,
+            scene_id,
+            daemon_url=daemon_url,
+            bsdf_overrides_by_path=bsdf_overrides_by_path,
+            timeout_s=min(timeout_s, DEFAULT_RENDER_PREP_TIMEOUT_S),
+            progress_callback=progress_callback,
+            ensure_session=False,
+        )
+    elif sync_mode == "material_delta" and bsdf_overrides_by_path:
+        _emit_progress(progress_callback, stage="serializing_patch", message="Uploading material-only patch to daemon.")
+        update_isaac_materials(
+            capture_material_patch(bsdf_overrides_by_path),
+            daemon_url=daemon_url,
+            timeout_s=min(timeout_s, DEFAULT_RENDER_PREP_TIMEOUT_S),
+        )
     _emit_progress(progress_callback, stage="capturing_view", message="Capturing current viewport sensor definition.")
     register_isaac_sensors(
         [capture_current_view_sensor_spec(modalities=list(modalities or ["rgb"]))],
@@ -1426,7 +1659,7 @@ def render_current_view_from_daemon(
         timeout_s=min(timeout_s, DEFAULT_RENDER_PREP_TIMEOUT_S),
     )
     _emit_progress(progress_callback, stage="sending_capture_request", message="Submitting current-view capture request to daemon.")
-    return capture_isaac_view(
+    result = capture_isaac_view(
         daemon_url=daemon_url,
         modalities=modalities,
         submit_mode=submit_mode,
@@ -1434,7 +1667,15 @@ def render_current_view_from_daemon(
         timeout_s=timeout_s,
         variant=variant,
         command_id=command_id,
+        extras={
+            "sync_policy": sync_policy,
+            "sync_mode": sync_mode,
+            "force_resync": force_resync,
+        },
     )
+    if isinstance(result, dict):
+        result.setdefault("sync_mode", sync_mode)
+    return result
 
 
 def render_sensor_from_daemon(
@@ -1451,11 +1692,24 @@ def render_sensor_from_daemon(
     variant: str | None = None,
     progress_callback: ProgressCallback | None = None,
     command_id: str | None = None,
+    sync_policy: str = "auto",
+    force_resync: bool = False,
+    state_dirty: bool | None = None,
+    material_dirty: bool | None = None,
 ) -> dict[str, Any]:
     from robomituba_bridge import IsaacCaptureRequest
+    try:
+        from isaac_extension.stage_capture import capture_material_patch
+    except ImportError:  # pragma: no cover - Isaac runtime fallback
+        from stage_capture import capture_material_patch
 
     if stage is None:
         stage = _require_isaac_context().get_stage()
+    try:
+        scene_payload = get_scene_from_daemon(scene_id, daemon_url=daemon_url, timeout_s=min(timeout_s, 10.0))
+        scene = dict(scene_payload.get("scene") or {})
+    except Exception:
+        scene = {"scene_id": scene_id}
     _emit_progress(progress_callback, stage="ensuring_session", message="Ensuring active Isaac session exists.")
     connect_scene_session_from_daemon(
         scene_id,
@@ -1463,23 +1717,58 @@ def render_sensor_from_daemon(
         timeout_s=min(timeout_s, DEFAULT_RENDER_PREP_TIMEOUT_S),
         progress_callback=progress_callback,
     )
-    sync_scene_state_to_daemon(
-        stage,
-        scene_id,
-        daemon_url=daemon_url,
-        bsdf_overrides_by_path=bsdf_overrides_by_path,
-        timeout_s=min(timeout_s, DEFAULT_RENDER_PREP_TIMEOUT_S),
-        progress_callback=progress_callback,
+    try:
+        session_summary = get_isaac_session(daemon_url=daemon_url, timeout_s=min(timeout_s, 10.0))
+    except Exception:
+        session_summary = {"status": "inactive", "session": None}
+    sync_mode = _resolve_render_sync_mode(
+        session_summary=session_summary,
+        scene=scene,
+        sync_policy=sync_policy,
+        force_resync=force_resync,
+        state_dirty=state_dirty,
+        material_dirty=material_dirty,
     )
+    if sync_mode == "full_resync":
+        sync_scene_state_to_daemon(
+            stage,
+            scene_id,
+            daemon_url=daemon_url,
+            bsdf_overrides_by_path=bsdf_overrides_by_path,
+            timeout_s=min(timeout_s, DEFAULT_RENDER_PREP_TIMEOUT_S),
+            progress_callback=progress_callback,
+            ensure_session=False,
+        )
+    elif sync_mode == "material_delta" and bsdf_overrides_by_path:
+        _emit_progress(progress_callback, stage="serializing_patch", message="Uploading material-only patch to daemon.")
+        update_isaac_materials(
+            capture_material_patch(bsdf_overrides_by_path),
+            daemon_url=daemon_url,
+            timeout_s=min(timeout_s, DEFAULT_RENDER_PREP_TIMEOUT_S),
+        )
     _emit_progress(progress_callback, stage="resolving_sensor", message=f"Resolving sensor {sensor_id}.")
     capture_request = IsaacCaptureRequest(
         sensor_id=sensor_id,
         modalities=list(modalities or []),
         submit_mode=submit_mode,
         render_settings=dict(render_settings or {}),
+        extras={
+            "sync_policy": sync_policy,
+            "sync_mode": sync_mode,
+            "force_resync": force_resync,
+        },
     )
     _emit_progress(progress_callback, stage="sending_capture_request", message="Submitting sensor capture request to daemon.")
-    return capture_isaac(capture_request, daemon_url=daemon_url, timeout_s=timeout_s, variant=variant, command_id=command_id)
+    result = capture_isaac(
+        capture_request,
+        daemon_url=daemon_url,
+        timeout_s=timeout_s,
+        variant=variant,
+        command_id=command_id,
+    )
+    if isinstance(result, dict):
+        result.setdefault("sync_mode", sync_mode)
+    return result
 
 
 def get_latest_capture_from_daemon(
@@ -1556,6 +1845,7 @@ def capture_isaac_view(
     timeout_s: float = DEFAULT_RENDER_TIMEOUT_S,
     variant: str | None = None,
     command_id: str | None = None,
+    extras: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     from robomituba_bridge import IsaacCaptureRequest
     try:
@@ -1569,7 +1859,14 @@ def capture_isaac_view(
         submit_mode=submit_mode,
         render_settings=dict(render_settings or {}),
     )
-    return capture_isaac(capture_request, daemon_url=daemon_url, timeout_s=timeout_s, variant=variant, command_id=command_id)
+    return capture_isaac(
+        capture_request,
+        daemon_url=daemon_url,
+        timeout_s=timeout_s,
+        variant=variant,
+        command_id=command_id,
+        extras=extras,
+    )
 
 
 def get_render_job_status(job_id: str, *, daemon_url: str, timeout_s: float = 10.0) -> dict[str, Any]:
@@ -1582,13 +1879,30 @@ def wait_for_render_job(
     daemon_url: str | None = None,
     poll_interval_s: float = 1.0,
     timeout_s: float = 600.0,
+    on_status: "Callable[[dict[str, Any]], None] | None" = None,
 ) -> dict[str, Any]:
     import time
 
     deadline = time.monotonic() + timeout_s
     last_status: dict[str, Any] | None = None
+    consecutive_errors = 0
     while time.monotonic() < deadline:
-        last_status = get_render_job_status(job_id, daemon_url=daemon_url, timeout_s=min(10.0, poll_interval_s + 5.0))
+        try:
+            last_status = get_render_job_status(job_id, daemon_url=daemon_url, timeout_s=15.0)
+            consecutive_errors = 0
+        except Exception as poll_err:
+            consecutive_errors += 1
+            if consecutive_errors >= 5:
+                raise RuntimeError(
+                    f"Failed to reach daemon after 5 consecutive attempts while polling job {job_id}: {poll_err}"
+                ) from poll_err
+            time.sleep(poll_interval_s)
+            continue
+        if on_status is not None:
+            try:
+                on_status(last_status)
+            except Exception:
+                pass
         if last_status.get("status") in {"succeeded", "failed", "cancelled"}:
             return last_status
         time.sleep(poll_interval_s)
@@ -1734,6 +2048,8 @@ class RobomitubaDaemonClient:
         bsdf_overrides_by_path: dict[str, Any] | None = None,
         timeout_s: float = DEFAULT_RENDER_TIMEOUT_S,
         variant: str | None = None,
+        sync_policy: str = "auto",
+        force_resync: bool = False,
     ) -> dict[str, Any]:
         return render_current_view_from_daemon(
             scene_id,
@@ -1745,6 +2061,8 @@ class RobomitubaDaemonClient:
             bsdf_overrides_by_path=bsdf_overrides_by_path,
             timeout_s=timeout_s,
             variant=variant,
+            sync_policy=sync_policy,
+            force_resync=force_resync,
         )
 
     def request_render_current_view(
@@ -1753,9 +2071,11 @@ class RobomitubaDaemonClient:
         *,
         submit_mode: str = "blocking",
         modalities: list[str] | None = None,
+        sync_policy: str = "auto",
+        force_resync: bool = False,
         timeout_s: float = 10.0,
     ) -> dict[str, Any]:
-        payload: dict[str, Any] = {"submit_mode": submit_mode}
+        payload: dict[str, Any] = {"submit_mode": submit_mode, "sync_policy": sync_policy, "force_resync": force_resync}
         if modalities:
             payload["modalities"] = list(modalities)
         return queue_isaac_command(
@@ -1778,6 +2098,8 @@ class RobomitubaDaemonClient:
         bsdf_overrides_by_path: dict[str, Any] | None = None,
         timeout_s: float = DEFAULT_RENDER_TIMEOUT_S,
         variant: str | None = None,
+        sync_policy: str = "auto",
+        force_resync: bool = False,
     ) -> dict[str, Any]:
         return render_sensor_from_daemon(
             scene_id,
@@ -1790,6 +2112,8 @@ class RobomitubaDaemonClient:
             bsdf_overrides_by_path=bsdf_overrides_by_path,
             timeout_s=timeout_s,
             variant=variant,
+            sync_policy=sync_policy,
+            force_resync=force_resync,
         )
 
     def latest_capture(self, *, scene_id: str | None = None, timeout_s: float = 10.0) -> dict[str, Any]:

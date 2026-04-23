@@ -22,14 +22,14 @@
 
 {% block topbar_actions_extra %}
 {% if scene %}
-<button class="button button-subtle js-isaac-command" data-command="load_scene" data-scene-id="{{ scene.scene_id }}"><span data-lang="en">Load</span><span data-lang="kr" class="hidden">불러오기</span></button>
-<button class="button button-subtle js-isaac-command" data-command="connect_session" data-scene-id="{{ scene.scene_id }}"><span data-lang="en">Connect</span><span data-lang="kr" class="hidden">연결</span></button>
-<button class="button button-subtle js-isaac-command" data-command="sync_session" data-scene-id="{{ scene.scene_id }}"><span data-lang="en">Sync</span><span data-lang="kr" class="hidden">동기화</span></button>
-<button class="button button-primary js-isaac-command" data-command="render_current_view" data-scene-id="{{ scene.scene_id }}">
+<button id="ws-btn-load" class="button button-subtle js-isaac-command" data-command="load_scene" data-scene-id="{{ scene.scene_id }}"><span data-lang="en">Load</span><span data-lang="kr" class="hidden">불러오기</span></button>
+<button id="ws-btn-connect" class="button button-subtle js-isaac-command" data-command="connect_session" data-scene-id="{{ scene.scene_id }}"><span data-lang="en">Connect</span><span data-lang="kr" class="hidden">연결</span></button>
+<button id="ws-btn-sync" class="button button-subtle js-isaac-command" data-command="sync_session" data-scene-id="{{ scene.scene_id }}" style="display:none"><span data-lang="en">Sync</span><span data-lang="kr" class="hidden">동기화</span></button>
+<button id="ws-btn-render" class="button button-primary js-isaac-command" data-command="render_current_view" data-scene-id="{{ scene.scene_id }}" style="display:none">
   <span data-lang="en">Render</span><span data-lang="kr" class="hidden">렌더</span>
   <span id="ws-render-mod-badge" style="font-size:0.65rem;opacity:0.75;margin-left:0.3rem;"></span>
 </button>
-<button class="button button-subtle js-smoke-render" data-scene-id="{{ scene.scene_id }}"><span data-lang="en">Smoke</span><span data-lang="kr" class="hidden">스모크</span></button>
+<button id="ws-btn-smoke" class="button button-subtle js-smoke-render" data-scene-id="{{ scene.scene_id }}" style="display:none"><span data-lang="en">Smoke</span><span data-lang="kr" class="hidden">스모크</span></button>
 {% endif %}
 {% endblock topbar_actions_extra %}
 
@@ -290,58 +290,60 @@
                 <div id="ws-preview-status" class="muted text-xs mt-1"></div>
               </div>
 
-              <!-- 하단: 재질 편집 -->
-              <div class="ws-material-section">
-                <div class="panel-label" style="padding:0.4rem 0 0.3rem;">
-                  <span data-lang="en">Material</span><span data-lang="kr" class="hidden">재질</span>
-                </div>
-                <div class="ws-material-toolbar">
-                  <input id="workspace-material-search" class="search-input" placeholder="Search presets…" data-placeholder-en="Search presets…" data-placeholder-kr="재질 검색…">
-                  <div class="filter-chips mt-2" id="ws-mat-filter-chips">
-                    <button class="filter-chip active" data-mat-filter="all"><span data-lang="en">All</span><span data-lang="kr" class="hidden">전체</span></button>
-                    <button class="filter-chip" data-mat-filter="glass"><span data-lang="en">Glass</span><span data-lang="kr" class="hidden">유리</span></button>
-                    <button class="filter-chip" data-mat-filter="metal"><span data-lang="en">Metal</span><span data-lang="kr" class="hidden">금속</span></button>
-                    <button class="filter-chip" data-mat-filter="plastic"><span data-lang="en">Plastic</span><span data-lang="kr" class="hidden">플라스틱</span></button>
-                    <button class="filter-chip" data-mat-filter="paint"><span data-lang="en">Paint</span><span data-lang="kr" class="hidden">페인트</span></button>
-                  </div>
-                </div>
-                <div class="material-browser-grid workspace-material-grid" id="workspace-material-grid" style="margin-top:0.6rem;">
-                  {% for preset in material_presets %}
-                    <article
-                      class="material-card material-card-clickable"
-                      data-bsdf-type="{{ preset.bsdf_type }}"
-                      data-category="{{ preset.category }}"
-                      data-title-en="{{ preset.title_en|lower }}"
-                      data-title-kr="{{ preset.title_kr|lower }}"
-                      data-tooltip-title-en="{{ preset.title_en }}"
-                      data-tooltip-title-kr="{{ preset.title_kr }}"
-                      data-tooltip-desc-en="{{ preset.description_en }}"
-                      data-tooltip-desc-kr="{{ preset.description_kr }}"
-                      tabindex="0"
-                    >
-                      <div class="material-card-head">
-                        <div class="material-sphere {{ preset.swatch }}"></div>
-                        <div>
-                          <div class="material-card-title"><span data-lang="en">{{ preset.title_en }}</span><span data-lang="kr" class="hidden">{{ preset.title_kr }}</span></div>
-                          <div class="material-card-meta">{{ preset.category }}</div>
-                        </div>
-                      </div>
-                    </article>
-                  {% endfor %}
-                </div>
-                <!-- Material sphere tooltip -->
-                <div id="mat-sphere-tooltip" class="hidden" aria-hidden="true">
-                  <div class="mat-tooltip-title" id="mat-tip-title"></div>
-                  <div class="mat-tooltip-category" id="mat-tip-category"></div>
-                  <div class="mat-tooltip-bsdf" id="mat-tip-bsdf"></div>
-                  <div class="mat-tooltip-desc" id="mat-tip-desc"></div>
-                </div>
-                <button class="ws-mat-more hidden" id="ws-mat-more">
-                  <span data-lang="en">More presets ↓</span><span data-lang="kr" class="hidden">더 보기 ↓</span>
-                </button>
-              </div>
-
               <!-- Apply bar removed: 클릭 즉시 적용 방식 -->
+            </div>
+
+            <!-- 재질 편집: 오브젝트 선택 여부와 무관하게 항상 표시 -->
+            <div class="ws-material-section">
+              <div class="panel-label" style="padding:0.4rem 0 0.3rem;">
+                <span data-lang="en">Material</span><span data-lang="kr" class="hidden">재질</span>
+              </div>
+              <div class="ws-material-toolbar">
+                <input id="workspace-material-search" class="search-input" placeholder="Search presets…" data-placeholder-en="Search presets…" data-placeholder-kr="재질 검색…">
+                <div class="filter-chips mt-2" id="ws-mat-filter-chips">
+                  <button class="filter-chip active" data-mat-filter="all"><span data-lang="en">All</span><span data-lang="kr" class="hidden">전체</span></button>
+                  <button class="filter-chip" data-mat-filter="glass"><span data-lang="en">Glass</span><span data-lang="kr" class="hidden">유리</span></button>
+                  <button class="filter-chip" data-mat-filter="metal"><span data-lang="en">Metal</span><span data-lang="kr" class="hidden">금속</span></button>
+                  <button class="filter-chip" data-mat-filter="plastic"><span data-lang="en">Plastic</span><span data-lang="kr" class="hidden">플라스틱</span></button>
+                  <button class="filter-chip" data-mat-filter="paint"><span data-lang="en">Paint</span><span data-lang="kr" class="hidden">페인트</span></button>
+                </div>
+              </div>
+              <div class="material-browser-grid workspace-material-grid" id="workspace-material-grid" style="margin-top:0.6rem;">
+                {% for preset in material_presets %}
+                  <article
+                    class="material-card material-card-clickable"
+                    data-bsdf-type="{{ preset.bsdf_type }}"
+                    data-category="{{ preset.category }}"
+                    data-title-en="{{ preset.title_en|lower }}"
+                    data-title-kr="{{ preset.title_kr|lower }}"
+                    data-tooltip-title-en="{{ preset.title_en }}"
+                    data-tooltip-title-kr="{{ preset.title_kr }}"
+                    data-tooltip-desc-en="{{ preset.description_en }}"
+                    data-tooltip-desc-kr="{{ preset.description_kr }}"
+                    tabindex="0"
+                  >
+                    <div class="material-card-head">
+                      <div class="material-sphere {{ preset.swatch }}">
+                        <img src="/api/material-preview/preset/{{ preset.bsdf_type }}" class="mat-preview-img" style="display:none" onload="this.style.display='block';this.closest('.material-sphere')?.classList.remove('no-preview')" onerror="this.style.display='none';this.closest('.material-sphere')?.classList.add('no-preview')" alt="">
+                      </div>
+                      <div>
+                        <div class="material-card-title"><span data-lang="en">{{ preset.title_en }}</span><span data-lang="kr" class="hidden">{{ preset.title_kr }}</span></div>
+                        <div class="material-card-meta">{{ preset.category }}</div>
+                      </div>
+                    </div>
+                  </article>
+                {% endfor %}
+              </div>
+              <!-- Material sphere tooltip -->
+              <div id="mat-sphere-tooltip" class="hidden" aria-hidden="true">
+                <div class="mat-tooltip-title" id="mat-tip-title"></div>
+                <div class="mat-tooltip-category" id="mat-tip-category"></div>
+                <div class="mat-tooltip-bsdf" id="mat-tip-bsdf"></div>
+                <div class="mat-tooltip-desc" id="mat-tip-desc"></div>
+              </div>
+              <button class="ws-mat-more hidden" id="ws-mat-more">
+                <span data-lang="en">More presets ↓</span><span data-lang="kr" class="hidden">더 보기 ↓</span>
+              </button>
             </div>
           </aside>
         </div>
@@ -709,6 +711,37 @@
       let _matPageExpanded = false;
       let _lastSessionJson = "";
       let _lastViewportJson = "";
+
+      // ── Polling guards — prevent request pile-up when server is slow ──
+      let _pollSessionBusy   = false;
+      let _pollRenderBusy    = false;
+      let _pollCaptureBusy   = false;
+      let _pollInventoryBusy = false;
+
+      /** fetch() with an automatic AbortController timeout (default 5 s) */
+      function _fetchWithTimeout(url, options = {}, ms = 5000) {
+        const ctrl  = new AbortController();
+        const timer = setTimeout(() => ctrl.abort(), ms);
+        return fetch(url, { ...options, signal: ctrl.signal })
+          .finally(() => clearTimeout(timer));
+      }
+
+      // ── Topbar button visibility: Connect ↔ Sync/Render/Smoke are mutually exclusive ──
+      function updateTopbarButtons(isConnected) {
+        const show = (id) => { const el = document.getElementById(id); if (el) el.style.display = ""; };
+        const hide = (id) => { const el = document.getElementById(id); if (el) el.style.display = "none"; };
+        if (isConnected) {
+          hide("ws-btn-connect");
+          show("ws-btn-sync");
+          show("ws-btn-render");
+          show("ws-btn-smoke");
+        } else {
+          show("ws-btn-connect");
+          hide("ws-btn-sync");
+          hide("ws-btn-render");
+          hide("ws-btn-smoke");
+        }
+      }
 
       function lang() {
         return document.documentElement.dataset.lang === "kr" ? "kr" : "en";
@@ -2109,8 +2142,10 @@
       }
 
       async function pollSession() {
+        if (_pollSessionBusy) return;            // skip if previous request is still in-flight
+        _pollSessionBusy = true;
         try {
-          const res = await fetch("/isaac/session");
+          const res = await _fetchWithTimeout("/isaac/session", {}, 4000);
           if (!res.ok) return;
           const payload = await res.json();
           const session = payload.status === "active" && payload.session && payload.session.scene_id === selectedSceneId
@@ -2122,32 +2157,12 @@
           }
           _sessionWasActive = isActive;
           _session = session;
+          updateTopbarButtons(isActive);
           setWorkspaceStatus();
           const viewportSig = viewportSignature(session);
           if (viewportSig !== _lastViewportSignature) {
             _lastViewportSignature = viewportSig;
             syncFloorplanActiveViewportFromSession();
-          }
-          const inventory = session ? (session.object_inventory || []) : [];
-          const signature = JSON.stringify(inventory.map((item) => [item.path, item.kind, item.shape_count, item.override_bsdf, item.visible, (item.transform || []).join(",")]));
-          const prevSignature = JSON.stringify(_inventory.map((item) => [item.path, item.kind, item.shape_count, item.override_bsdf, item.visible, (item.transform || []).join(",")]));
-          const inventoryChanged = signature !== prevSignature;
-          if (inventoryChanged) {
-            _inventory = inventory;
-            _inventoryByPath = new Map(inventory.map((item) => [item.path, item]));
-            if (_selectedPath && !_inventoryByPath.has(_selectedPath)) {
-              _selectedPath = null;
-            }
-            if (!_selectedPath && session && Array.isArray(session.selected_prim_paths) && session.selected_prim_paths.length) {
-              _selectedPath = session.selected_prim_paths[0];
-            }
-            if (!_treeSeeded && inventory.length) {
-              seedCollapsedTree(inventory);
-              _treeSeeded = true;
-            }
-            renderTree();
-          } else {
-            _inventoryByPath = new Map(inventory.map((item) => [item.path, item]));
           }
           renderRobotRoster();
           // dirty-flag: showNodeDetail only when selection / BSDF changes
@@ -2157,13 +2172,12 @@
             overrideBsdf: currentNode()?.override_bsdf,
             robotPath: currentRobot()?.path || null,
           });
-          if (newSessionJson !== _lastSessionJson || inventoryChanged) {
+          if (newSessionJson !== _lastSessionJson) {
             _lastSessionJson = newSessionJson;
             showNodeDetail();
           }
-          // drawWorkspaceMap only when viewport or inventory changes
-          const viewportChanged = viewportSig !== _lastViewportJson;
-          if (viewportChanged || inventoryChanged) {
+          // drawWorkspaceMap when viewport changes (inventory changes handled in pollInventory)
+          if (viewportSig !== _lastViewportJson) {
             _lastViewportJson = viewportSig;
             if ("requestIdleCallback" in window) {
               requestIdleCallback(() => { drawWorkspaceMap(); updateMapDebugPanel(); }, { timeout: 300 });
@@ -2173,23 +2187,66 @@
             }
           }
         } catch (_) {}
+        finally { _pollSessionBusy = false; }
+      }
+
+      async function pollInventory() {
+        if (_pollInventoryBusy) return;          // skip if previous inventory fetch is still in-flight
+        _pollInventoryBusy = true;
+        try {
+          const res = await _fetchWithTimeout("/isaac/session/inventory", {}, 6000);
+          if (!res.ok) return;
+          const data = await res.json();
+          const inventory = data.status === "active" ? (data.object_inventory || []) : [];
+          const signature = JSON.stringify(inventory.map((item) => [item.path, item.kind, item.shape_count, item.override_bsdf, item.visible, (item.transform || []).join(",")]));
+          const prevSignature = JSON.stringify(_inventory.map((item) => [item.path, item.kind, item.shape_count, item.override_bsdf, item.visible, (item.transform || []).join(",")]));
+          const inventoryChanged = signature !== prevSignature;
+          if (inventoryChanged) {
+            _inventory = inventory;
+            _inventoryByPath = new Map(inventory.map((item) => [item.path, item]));
+            if (_selectedPath && !_inventoryByPath.has(_selectedPath)) {
+              _selectedPath = null;
+            }
+            if (!_selectedPath && _session && Array.isArray(_session.selected_prim_paths) && _session.selected_prim_paths.length) {
+              _selectedPath = _session.selected_prim_paths[0];
+            }
+            if (!_treeSeeded && inventory.length) {
+              seedCollapsedTree(inventory);
+              _treeSeeded = true;
+            }
+            renderTree();
+            showNodeDetail();
+            if ("requestIdleCallback" in window) {
+              requestIdleCallback(() => { drawWorkspaceMap(); updateMapDebugPanel(); }, { timeout: 300 });
+            } else {
+              drawWorkspaceMap();
+              updateMapDebugPanel();
+            }
+          } else {
+            _inventoryByPath = new Map(inventory.map((item) => [item.path, item]));
+          }
+        } catch (_) {}
+        finally { _pollInventoryBusy = false; }
       }
 
       async function pollRenderStatus() {
+        if (_pollRenderBusy) return;             // skip if previous round is still in-flight
+        _pollRenderBusy = true;
         const activeState   = document.getElementById("render-active-state");
         const activeDot     = document.getElementById("render-live-dot");
         const activeTitle   = document.getElementById("render-active-title");
         const activeElapsed = document.getElementById("render-active-elapsed");
         const timeline      = document.getElementById("render-timeline");
         try {
+          // Independent fetches — one slow/failing endpoint doesn't block the others
           const [healthRes, telemetryRes, commandsRes] = await Promise.all([
-            fetch("/health"),
-            fetch("/api/isaac/telemetry/recent"),
-            fetch("/api/isaac/commands"),
+            _fetchWithTimeout("/health", {}, 4000).catch(() => null),
+            _fetchWithTimeout("/api/isaac/telemetry/recent", {}, 4000).catch(() => null),
+            _fetchWithTimeout("/api/isaac/commands", {}, 4000).catch(() => null),
           ]);
-          const health   = healthRes.ok   ? await healthRes.json()   : {};
-          const telemetry = telemetryRes.ok ? await telemetryRes.json() : { events: [] };
-          const commandsPayload = commandsRes.ok ? await commandsRes.json() : { commands: [] };
+          const health   = (healthRes   && healthRes.ok)   ? await healthRes.json()   : {};
+          const telemetry = (telemetryRes && telemetryRes.ok) ? await telemetryRes.json() : { events: [] };
+          const commandsPayload = (commandsRes && commandsRes.ok) ? await commandsRes.json() : { commands: [] };
           const active = health.active_isaac_command;
           const isLive = !!(active && active.scene_id === selectedSceneId &&
             ["render_current_view", "render_sensor"].includes(active.command_type || ""));
@@ -2238,17 +2295,41 @@
           }
           if (activeState) {
             if (isLive) {
-              const stage   = esc(active.progress_stage   || "");
-              const origin  = esc(active.progress_origin  || "");
+              const stage   = active.progress_stage || "";
               const message = esc(active.progress_message || active.status || "");
-              activeState.innerHTML = `
-                <div style="margin-top:0.35rem;">
-                  <div class="render-stage-row">
-                    <span class="render-stage-dot active"></span>
-                    <span style="font-size:0.8rem;color:var(--text);font-weight:600;">${message}</span>
-                  </div>
-                  ${stage ? `<div class="render-stage-row"><span class="render-stage-dot done"></span><span class="muted" style="font-size:0.72rem;">${stage} · ${origin}</span></div>` : ""}
-                </div>`;
+              const details = active.progress_details || {};
+              const counts  = active.progress_counts || {};
+              const recentEvents = Array.isArray(details.recent_events) ? details.recent_events.slice().reverse() : [];
+              const nextStage = details.expected_next_stage;
+
+              const PHASES = [
+                { label: "Setup",  stages: ["queued","dispatched","picked_up","ensuring_session","capturing_view","sending_capture_request","resolving_sensor"] },
+                { label: "Prep",   stages: ["staging_scene"] },
+                { label: "Load",   stages: ["loading_scene"] },
+                { label: "Render", stages: ["ambient","active","polar","rendering"] },
+                { label: "Save",   stages: ["saving_output","writing_manifest"] },
+              ];
+              const activePhaseIdx = PHASES.findIndex(p => p.stages.includes(stage));
+              const trackHtml = PHASES.map((ph, idx) => {
+                const cls = idx < activePhaseIdx ? "done" : idx === activePhaseIdx ? "active" : "pending";
+                const arrow = idx < PHASES.length - 1 ? `<span class="rpt-arrow">›</span>` : "";
+                return `<span class="rpt-phase ${cls}">${ph.label}</span>${arrow}`;
+              }).join("");
+
+              const countBadge = (counts.total > 0) ? `<span class="rpt-pass-badge">Pass ${counts.loaded}/${counts.total}</span>` : "";
+              const nextHtml   = nextStage ? `<div class="rpt-next-hint">→ ${esc(lang()==="kr" ? (nextStage.kr||nextStage.en) : nextStage.en)}</div>` : "";
+              const eventsHtml = recentEvents.length > 1
+                ? recentEvents.slice(0, 8).map(ev => {
+                    const ts = ev.timestamp ? new Date(ev.timestamp).toLocaleTimeString([], {hour:"2-digit",minute:"2-digit",second:"2-digit"}) : "";
+                    return `<div class="rpt-log-row"><span class="rpt-log-dot"></span><span class="rpt-log-ts">${ts}</span><span class="rpt-log-stage">${esc(ev.progress_stage||"")}</span><span class="rpt-log-msg">${esc(ev.progress_message||ev.progress_stage||"")}</span></div>`;
+                  }).join("") : "";
+
+              activeState.innerHTML = `<div class="rpt-root">
+                <div class="rpt-track">${trackHtml}${countBadge}</div>
+                <div class="rpt-current-msg">${message}</div>
+                ${nextHtml}
+                ${eventsHtml ? `<div class="rpt-events-log">${eventsHtml}</div>` : ""}
+              </div>`;
             } else {
               activeState.innerHTML = `<div class="empty-state text-sm" style="padding:0.5rem 0;">
                 <span>${lang() === "kr" ? "Render 또는 Smoke Render로 렌더를 시작하세요." : "Trigger Render or Smoke Render to start."}</span>
@@ -2292,11 +2373,14 @@
             }
           }
         } catch (_) {}
+        finally { _pollRenderBusy = false; }
       }
 
       async function refreshCaptureHistory() {
+        if (_pollCaptureBusy) return;
+        _pollCaptureBusy = true;
         try {
-          const res = await fetch(`/api/scenes/${encodeURIComponent(selectedSceneId)}/captures`);
+          const res = await _fetchWithTimeout(`/api/scenes/${encodeURIComponent(selectedSceneId)}/captures`, {}, 5000);
           if (!res.ok) return;
           const payload = await res.json();
           if (!Array.isArray(payload.captures)) return;
@@ -2308,6 +2392,7 @@
           drawCaptureMap();
           syncCaptureCardSelection();
         } catch (_) {}
+        finally { _pollCaptureBusy = false; }
       }
 
       async function applyMaterial(bsdfType) {
@@ -2702,23 +2787,38 @@
       updateMapDebugPanel();
       loadFloorplan();
       pollSession();
+      pollInventory();
       pollRenderStatus();
       refreshCaptureHistory();
-      _pollTimer = setInterval(pollSession, 750);
+
+      /* ── Adaptive session poll: 750 ms idle, 2000 ms while a render is active ── */
+      function _scheduleSessionPoll() {
+        const ms = _activeRenderRequestOverlay ? 2000 : 750;
+        _pollTimer = setTimeout(async () => {
+          await pollSession();
+          if (_pollTimer !== null) _scheduleSessionPoll();
+        }, ms);
+      }
+      _scheduleSessionPoll();
       _renderTimer = setInterval(pollRenderStatus, 3000);
+      let _inventoryTimer = setInterval(pollInventory, 3000);
 
       /* ── Pause polling when tab is hidden ── */
       document.addEventListener("visibilitychange", () => {
         if (document.hidden) {
-          clearInterval(_pollTimer);
+          clearTimeout(_pollTimer);
           clearInterval(_renderTimer);
+          clearInterval(_inventoryTimer);
           _pollTimer = null;
           _renderTimer = null;
+          _inventoryTimer = null;
         } else {
           pollSession();
+          pollInventory();
           pollRenderStatus();
-          _pollTimer = setInterval(pollSession, 750);
+          _scheduleSessionPoll();
           _renderTimer = setInterval(pollRenderStatus, 3000);
+          _inventoryTimer = setInterval(pollInventory, 3000);
         }
       });
 
@@ -2844,22 +2944,43 @@
             : "";
 
           const cards = mats.map(mat => {
-            const hue = group.swatch_hue || 200;
-            const sat = mat.status === "not_downloaded" ? "15%" : "40%";
-            const lit = mat.status === "not_downloaded" ? "70%" : "55%";
-            const bg = `hsl(${hue}, ${sat}, ${lit})`;
+            const hue  = group.swatch_hue || 200;
+            const satN = mat.status === "not_downloaded" ? 15 : 42;
+            const litN = mat.status === "not_downloaded" ? 72 : 52;
+            const hiH  = `hsl(${hue},${Math.min(satN+18,92)}%,${Math.min(litN+24,93)}%)`;
+            const base = `hsl(${hue},${satN}%,${litN}%)`;
+            const shad = `hsl(${hue},${Math.max(satN-8,4)}%,${Math.max(litN-20,12)}%)`;
+            const bg   = `radial-gradient(circle at 36% 30%, ${hiH} 0%, ${base} 52%, ${shad} 100%)`;
             const statusDot = `<span class="status-dot ${mat.status}"></span>`;
             const safeFile = (mat.native_file || "").replace(/'/g, "\\'");
             const safeMat  = mat.material_id.replace(/'/g, "\\'");
             const safeDs   = group.dataset_id.replace(/'/g, "\\'");
             const safeBsdf = group.mitsuba_strategy.replace(/'/g, "\\'");
+            const previewSrc = `/api/material-preview/measured/${encodeURIComponent(group.dataset_id)}/${encodeURIComponent(mat.material_id)}?file=${encodeURIComponent(mat.native_file || "")}`;
+            const previewImg = `<img src="${previewSrc}" class="mat-preview-img" style="display:none" onload="this.style.display='block';this.closest('.mat-swatch')?.classList.remove('no-preview')" onerror="this.style.display='none';this.closest('.mat-swatch')?.classList.add('no-preview')" alt="">`;
             return `<div class="measured-card"
                          title="${mat.display_name} — ${mat.status}"
                          onclick="applyMeasuredMaterial('${safeDs}','${safeMat}','${safeFile}','${safeBsdf}')">
-              <div class="mat-swatch" style="background:${bg}">${statusDot}</div>
+              <div class="mat-swatch" style="background:${bg}">${previewImg}${statusDot}</div>
               <div class="mat-label">${mat.display_name}</div>
             </div>`;
           }).join("");
+
+          const notDownloaded = mats.filter(m => m.status === "not_downloaded").length;
+          const hasAutoDownload = mats.some(m => m.download_url && m.status === "not_downloaded");
+          const dlInfoAttr = JSON.stringify({
+            dataset_id: group.dataset_id,
+            name: group.display_name,
+            url: group.source_url,
+            venue: group.venue,
+            total: mats.length,
+            missing: notDownloaded,
+            has_auto: hasAutoDownload,
+            example_path: mats[0]?.native_file || "",
+          }).replace(/"/g, "&quot;");
+          const dlBtn = group.source_url
+            ? `<button class="ds-dl-btn" data-info="${dlInfoAttr}" onclick="showDlInfo(JSON.parse(this.dataset.info))">↓ 다운로드</button>`
+            : "";
 
           html += `<div class="dataset-group"
                         data-polar="${group.capabilities.polarization}"
@@ -2869,7 +2990,8 @@
               <span class="ds-name">${group.display_name}</span>
               <span class="venue-badge">${group.venue}</span>
               ${capBadges}
-              <span class="mat-count">${mats.length} material${mats.length !== 1 ? "s" : ""}</span>
+              <span class="mat-count">${mats.length} material${mats.length !== 1 ? "s" : ""}${notDownloaded > 0 ? ` · <span style="color:var(--warn,#f59e0b)">${notDownloaded} 미다운로드</span>` : ""}</span>
+              ${dlBtn}
             </div>
             ${patchWarn}
             <div class="material-grid-row">${cards}</div>
@@ -2891,6 +3013,142 @@
           hint.textContent = "Select an object in the Workspace tree first, then click a material to apply it.";
         }
       }
+
+      // ── Download info dialog ────────────────────────────────
+      window.showDlInfo = function(info) {
+        const dir = info.example_path ? info.example_path.split("/").slice(0, -1).join("/") + "/" : "data/...";
+        const existing = document.getElementById("ds-dl-dialog");
+        if (existing) existing.remove();
+        const d = document.createElement("div");
+        d.id = "ds-dl-dialog";
+        d.className = "ds-dl-dialog-overlay";
+        const previewInfoAttr = JSON.stringify(info).replace(/"/g, "&quot;");
+        const autoBtn = info.has_auto
+          ? `<button class="ds-dl-auto-btn" id="ds-dl-auto-btn"
+               data-dsid="${info.dataset_id}"
+               onclick="startAutoDownload(this.dataset.dsid)">
+               ↓ 자동 다운로드 (${info.missing}개 파일)
+             </button>`
+          : `<a href="${info.url}" target="_blank" class="ds-dl-link">↗ 수동 다운로드</a>`;
+        d.innerHTML = `
+          <div class="ds-dl-dialog-box">
+            <div class="ds-dl-dialog-title">${info.name} 다운로드</div>
+            <div class="ds-dl-dialog-venue">${info.venue} · ${info.total} materials · 미다운로드 ${info.missing}개</div>
+            <div style="margin-bottom:0.6rem;">
+              ${autoBtn}
+            </div>
+            <div id="ds-dl-auto-wrap" style="display:none; margin-bottom:0.7rem;">
+              <div class="ds-dl-progress-bg">
+                <div class="ds-dl-progress-fill" id="ds-dl-auto-fill" style="width:0%"></div>
+              </div>
+              <div id="ds-dl-auto-status" style="font-size:0.72rem;margin-top:0.3rem;color:var(--muted);"></div>
+            </div>
+            <div class="ds-dl-dialog-step"><span class="ds-dl-step-num">1</span>
+              <span>공식 사이트</span>
+              <a href="${info.url}" target="_blank" class="ds-dl-link" style="font-size:0.7rem;">↗ ${info.url}</a>
+            </div>
+            <div class="ds-dl-dialog-step"><span class="ds-dl-step-num">2</span>
+              <span>배치 경로</span>
+              <code class="ds-dl-path">${dir}</code>
+            </div>
+            <hr style="margin:0.8rem 0;border:none;border-top:1px solid var(--border);">
+            <div style="font-size:0.8rem;color:var(--muted);margin-bottom:0.6rem;">파일 없이도 구분 가능한 예시 구 미리 만들기 (roughplastic 기반)</div>
+            <button class="ds-dl-preview-btn" id="ds-dl-preview-btn"
+              data-info="${previewInfoAttr}"
+              onclick="requestDatasetPreviews(JSON.parse(this.dataset.info))">
+              ⬤ 예시 구 만들기 (${info.total}개)
+            </button>
+            <div id="ds-dl-progress-wrap" style="display:none; margin-top:0.55rem;">
+              <div class="ds-dl-progress-bg">
+                <div class="ds-dl-progress-fill" id="ds-dl-progress-fill" style="width:0%"></div>
+              </div>
+              <div id="ds-dl-preview-status" style="font-size:0.72rem;margin-top:0.3rem;color:var(--muted);"></div>
+            </div>
+            <button class="ds-dl-dialog-close" style="margin-top:0.75rem" onclick="document.getElementById('ds-dl-dialog').remove()">닫기</button>
+          </div>`;
+        d.addEventListener("click", (e) => { if (e.target === d) d.remove(); });
+        document.body.appendChild(d);
+      };
+
+      window.startAutoDownload = async function(datasetId) {
+        const btn    = document.getElementById("ds-dl-auto-btn");
+        const wrap   = document.getElementById("ds-dl-auto-wrap");
+        const fill   = document.getElementById("ds-dl-auto-fill");
+        const status = document.getElementById("ds-dl-auto-status");
+        if (btn)  { btn.disabled = true; btn.textContent = "다운로드 시작 중…"; }
+        if (wrap) { wrap.style.display = "block"; }
+        try {
+          const startResp = await fetch("/api/dataset-download", {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({dataset_id: datasetId}),
+          });
+          const startData = await startResp.json();
+          if (startData.status === "nothing_to_download") {
+            if (status) status.textContent = "이미 모두 다운로드되어 있습니다.";
+            if (btn) btn.textContent = "✓ 완료";
+            return;
+          }
+          const jobId = startData.job_id;
+          if (!jobId) { if (status) status.textContent = "오류: job_id 없음"; return; }
+          // Poll progress
+          while (true) {
+            await new Promise(r => setTimeout(r, 800));
+            const pollResp = await fetch(`/api/dataset-download/status?job_id=${encodeURIComponent(jobId)}`);
+            const job = await pollResp.json();
+            const pct = job.total > 0 ? Math.round(job.done / job.total * 100) : 0;
+            if (fill)   fill.style.width = pct + "%";
+            if (status) {
+              const errInfo = job.errors?.length ? ` (오류 ${job.errors.length}개)` : "";
+              status.textContent = job.status === "done"
+                ? `완료! ${job.done}/${job.total} 다운로드됨${errInfo}. 페이지 새로고침 후 사용 가능.`
+                : `다운로드 중… ${job.done} / ${job.total} (${pct}%) — ${job.current_name || ""}${errInfo}`;
+            }
+            if (job.status === "done") {
+              if (btn) btn.textContent = `✓ ${job.done}개 완료`;
+              break;
+            }
+          }
+        } catch(e) {
+          if (status) status.textContent = "오류: " + e.message;
+          if (btn) { btn.disabled = false; btn.textContent = "↓ 자동 다운로드"; }
+        }
+      };
+
+      window.requestDatasetPreviews = async function(info) {
+        const btn    = document.getElementById("ds-dl-preview-btn");
+        const wrap   = document.getElementById("ds-dl-progress-wrap");
+        const fill   = document.getElementById("ds-dl-progress-fill");
+        const status = document.getElementById("ds-dl-preview-status");
+        if (btn)  { btn.disabled = true; btn.textContent = "렌더링 중…"; }
+        if (wrap) { wrap.style.display = "block"; }
+        try {
+          const resp = await fetch("/api/material-library");
+          const data = await resp.json();
+          const group = (data.groups || []).find(g => g.display_name === info.name);
+          if (!group) {
+            if (status) status.textContent = "그룹을 찾을 수 없습니다.";
+            if (btn) { btn.disabled = false; btn.textContent = "⬤ 예시 구 만들기"; }
+            return;
+          }
+          const mats = group.materials;
+          let done = 0;
+          for (const mat of mats) {
+            const src = `/api/material-preview/measured/${encodeURIComponent(group.dataset_id)}/${encodeURIComponent(mat.material_id)}?file=${encodeURIComponent(mat.native_file || "")}`;
+            try { await fetch(src); } catch (_) {}
+            done++;
+            const pct = Math.round(done / mats.length * 100);
+            if (fill)   fill.style.width = pct + "%";
+            if (status) status.textContent = `렌더링 중… ${done} / ${mats.length} 완료 (${pct}%)`;
+          }
+          if (fill)   fill.style.width = "100%";
+          if (btn)    { btn.textContent = `✓ ${mats.length}개 완료`; }
+          if (status) status.textContent = "완료! 페이지를 새로고침하면 구가 표시됩니다.";
+        } catch(e) {
+          if (status) status.textContent = "오류: " + e.message;
+          if (btn) { btn.disabled = false; btn.textContent = "⬤ 예시 구 만들기"; }
+        }
+      };
 
       // ── Apply material to selected object ───────────────────
       window.applyMeasuredMaterial = async function(datasetId, materialId, filePath, bsdfType) {

@@ -1,0 +1,198 @@
+{% extends "base.html" %}
+
+{% block content %}
+
+{# ── Pipeline track ───────────────────────────────────────────── #}
+<section class="panel">
+  <div class="panel-header">
+    <div>
+      <h2 class="section-title"><span data-lang="en">Pipeline Stages</span><span data-lang="kr" class="hidden">파이프라인 단계</span></h2>
+      <p class="muted text-sm"><span data-lang="en">Isaac–Mitsuba bridge step status. Updates every 3s.</span><span data-lang="kr" class="hidden">Isaac–Mitsuba 브리지 단계별 상태. 3초마다 갱신됩니다.</span></p>
+    </div>
+    <a href="/bridge" class="button" style="flex-shrink:0;"><span data-lang="en">Refresh</span><span data-lang="kr" class="hidden">새로고침</span></a>
+  </div>
+
+  <div class="pipeline-track mt-5" id="pipeline-track">
+    {% for step in bridge_status %}
+      {% if not loop.first %}<div class="pipeline-connector" data-step-connector="{{ step.key }}"></div>{% endif %}
+      <div class="pipeline-step pipeline-step-{{ step.status }}" data-step-key="{{ step.key }}" title="{{ step.last_error_msg or step.detail or '' }}">
+        <div class="pipeline-dot"></div>
+        <div class="pipeline-step-label mt-2">
+          <span data-lang="en">{{ step.label }}</span>
+          <span data-lang="kr" class="hidden">{{ step.label_kr }}</span>
+        </div>
+        <div class="pipeline-step-time muted">
+          {% if step.last_ok_at %}{{ step.last_ok_at[:16] }}{% elif step.last_error_at %}{{ step.last_error_at[:16] }}{% else %}—{% endif %}
+        </div>
+        {% if step.last_error_msg %}
+          <div class="pipeline-step-error-msg">{{ step.last_error_msg[:40] }}</div>
+        {% endif %}
+      </div>
+    {% endfor %}
+  </div>
+</section>
+
+{# ── Isaac commands + Render jobs ────────────────────────────── #}
+<section class="grid gap-4 lg:grid-cols-2 mt-6">
+
+  <article class="panel">
+    <div class="panel-header">
+      <div>
+        <h2 class="section-title"><span data-lang="en">Recent Isaac Commands</span><span data-lang="kr" class="hidden">최근 Isaac 명령</span></h2>
+        <p class="muted text-sm"><span data-lang="en">Last 10 commands across all types.</span><span data-lang="kr" class="hidden">모든 타입의 최근 10개 명령.</span></p>
+      </div>
+    </div>
+    {% if recent_commands %}
+      <div class="table-wrap mt-4" style="overflow-x:auto;">
+        <table class="data-table">
+          <thead><tr>
+            <th><span data-lang="en">Command</span><span data-lang="kr" class="hidden">명령</span></th>
+            <th><span data-lang="en">Scene</span><span data-lang="kr" class="hidden">장면</span></th>
+            <th><span data-lang="en">Status</span><span data-lang="kr" class="hidden">상태</span></th>
+            <th><span data-lang="en">Stage</span><span data-lang="kr" class="hidden">단계</span></th>
+            <th><span data-lang="en">Updated</span><span data-lang="kr" class="hidden">업데이트</span></th>
+          </tr></thead>
+          <tbody>
+            {% for cmd in recent_commands %}
+            <tr>
+              <td class="mono text-xs">{{ cmd.command_type or "—" }}</td>
+              <td class="mono text-xs">{{ cmd.scene_id or "—" }}</td>
+              <td>
+                <span class="status-badge status-badge-{{ cmd.status }}">{{ cmd.status }}</span>
+                {% if cmd.error %}<span class="muted text-xs" title="{{ cmd.error }}"> ⚠</span>{% endif %}
+              </td>
+              <td class="muted text-xs">{{ cmd.progress_stage or "—" }}</td>
+              <td class="muted text-xs">{{ (cmd.updated_at or cmd.created_at or "")[:16] }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% else %}
+      <div class="empty-state-illustrated mt-4">
+        <div class="empty-icon">📡</div>
+        <div class="empty-title"><span data-lang="en">No Isaac commands yet</span><span data-lang="kr" class="hidden">Isaac 명령 없음</span></div>
+        <div class="empty-desc"><span data-lang="en">Commands appear after Isaac connects and sends a session update.</span><span data-lang="kr" class="hidden">Isaac이 연결되면 명령이 여기에 표시됩니다.</span></div>
+      </div>
+    {% endif %}
+  </article>
+
+  <article class="panel">
+    <div class="panel-header">
+      <div>
+        <h2 class="section-title"><span data-lang="en">Recent Render Jobs</span><span data-lang="kr" class="hidden">최근 렌더 잡</span></h2>
+        <p class="muted text-sm"><span data-lang="en">Last 8 daemon render jobs.</span><span data-lang="kr" class="hidden">최근 8개 렌더 잡.</span></p>
+      </div>
+      <a href="/jobs" class="button"><span data-lang="en">All Jobs</span><span data-lang="kr" class="hidden">모든 잡</span></a>
+    </div>
+    {% if recent_jobs %}
+      <div class="table-wrap mt-4" style="overflow-x:auto;">
+        <table class="data-table">
+          <thead><tr>
+            <th><span data-lang="en">Job ID</span><span data-lang="kr" class="hidden">잡 ID</span></th>
+            <th><span data-lang="en">Scene</span><span data-lang="kr" class="hidden">장면</span></th>
+            <th><span data-lang="en">Status</span><span data-lang="kr" class="hidden">상태</span></th>
+            <th><span data-lang="en">Stage</span><span data-lang="kr" class="hidden">단계</span></th>
+            <th><span data-lang="en">Finished</span><span data-lang="kr" class="hidden">완료</span></th>
+          </tr></thead>
+          <tbody>
+            {% for job in recent_jobs %}
+            <tr>
+              <td class="mono text-xs">{{ job.job_id[:16] }}…</td>
+              <td class="mono text-xs">{{ job.scene_id or "—" }}</td>
+              <td><span class="status-badge status-badge-{{ job.status }}">{{ job.status }}</span></td>
+              <td class="muted text-xs">{{ job.progress_stage or "—" }}</td>
+              <td class="muted text-xs">{{ (job.finished_at or "")[:16] or "—" }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% else %}
+      <div class="empty-state-illustrated mt-4">
+        <div class="empty-icon">🗂️</div>
+        <div class="empty-title"><span data-lang="en">No render jobs yet</span><span data-lang="kr" class="hidden">렌더 잡 없음</span></div>
+      </div>
+    {% endif %}
+  </article>
+
+</section>
+
+{# ── Stage Timing Baselines ───────────────────────────────────── #}
+{% if telemetry_stage_stats %}
+<section class="panel mt-6">
+  <div class="panel-header">
+    <div>
+      <h2 class="section-title"><span data-lang="en">Stage Timing Baselines</span><span data-lang="kr" class="hidden">단계별 타이밍 기준값</span></h2>
+      <p class="muted text-sm"><span data-lang="en">Median and P90 duration per scene/command/stage from telemetry.</span><span data-lang="kr" class="hidden">텔레메트리 기반 장면/명령/단계별 중앙값 및 P90 지연.</span></p>
+    </div>
+  </div>
+  <div class="table-wrap mt-4" style="overflow-x:auto;">
+    <table class="data-table">
+      <thead><tr>
+        <th><span data-lang="en">Scene</span><span data-lang="kr" class="hidden">장면</span></th>
+        <th><span data-lang="en">Command</span><span data-lang="kr" class="hidden">명령</span></th>
+        <th><span data-lang="en">Stage</span><span data-lang="kr" class="hidden">단계</span></th>
+        <th><span data-lang="en">Median (s)</span><span data-lang="kr" class="hidden">중앙값 (s)</span></th>
+        <th><span data-lang="en">P90 (s)</span><span data-lang="kr" class="hidden">P90 (s)</span></th>
+        <th><span data-lang="en">Samples</span><span data-lang="kr" class="hidden">샘플</span></th>
+      </tr></thead>
+      <tbody>
+        {% for stat in telemetry_stage_stats %}
+        <tr>
+          <td class="mono text-xs">{{ stat.scene_id or "—" }}</td>
+          <td class="mono text-xs">{{ stat.command_type or "—" }}</td>
+          <td class="mono text-xs">{{ stat.progress_stage or "—" }}</td>
+          <td>{{ stat.median_duration_s or "—" }}</td>
+          <td>{{ stat.p90_duration_s or "—" }}</td>
+          <td class="muted text-xs">{{ stat.count or "—" }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% endif %}
+
+<script>
+(function () {
+  var _busy = false;
+  function refreshPipeline() {
+    if (_busy) return;
+    _busy = true;
+    fetch('/health', { signal: AbortSignal.timeout(4000) })
+      .then(function (r) { return r.json(); })
+      .then(function (data) {
+        var connected = data.isaac_connected;
+        var el = document.querySelector('[data-step-key="connected"]');
+        if (el) {
+          el.className = el.className.replace(/pipeline-step-\w+/, 'pipeline-step-' + (connected ? 'ok' : 'inactive'));
+        }
+        var activeCmd = data.active_isaac_command;
+        if (activeCmd) {
+          var cmdType = activeCmd.command_type;
+          var typeToKey = {
+            'load_scene': 'scene_loaded',
+            'prepare_render_ready': 'render_ready',
+            'connect_session': 'session_connected',
+            'sync_session': 'session_synced',
+            'render_current_view': 'render_dispatched',
+            'render_sensor': 'render_dispatched',
+          };
+          var stepKey = typeToKey[cmdType];
+          if (stepKey) {
+            var stepEl = document.querySelector('[data-step-key="' + stepKey + '"]');
+            if (stepEl) {
+              stepEl.className = stepEl.className.replace(/pipeline-step-\w+/, 'pipeline-step-warn');
+            }
+          }
+        }
+      })
+      .catch(function () {})
+      .finally(function () { _busy = false; });
+  }
+  setInterval(refreshPipeline, 3000);
+})();
+</script>
+
+{% endblock %}

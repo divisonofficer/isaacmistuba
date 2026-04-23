@@ -37,15 +37,19 @@
               {% if item.key == 'home' %}
                 <span data-lang="en">Home</span><span data-lang="kr" class="hidden">홈</span>
               {% elif item.key == 'current_scene' %}
-                <span data-lang="en">Current Scene</span><span data-lang="kr" class="hidden">현재 장면</span>
-              {% elif item.key == 'scenes' %}
-                <span data-lang="en">Scenes</span><span data-lang="kr" class="hidden">장면</span>
+                <span data-lang="en">Current Session</span><span data-lang="kr" class="hidden">현재 세션</span>
               {% elif item.key == 'jobs' %}
                 <span data-lang="en">Jobs</span><span data-lang="kr" class="hidden">작업</span>
+              {% elif item.key == 'bridge' %}
+                <span data-lang="en">Bridge</span><span data-lang="kr" class="hidden">연동 상태</span>
+              {% elif item.key == 'scenes' %}
+                <span data-lang="en">Scenes</span><span data-lang="kr" class="hidden">장면</span>
               {% elif item.key == 'system' %}
                 <span data-lang="en">System</span><span data-lang="kr" class="hidden">시스템</span>
-              {% elif item.key == 'integrations' %}
-                <span data-lang="en">Isaac Guide</span><span data-lang="kr" class="hidden">Isaac 가이드</span>
+              {% elif item.key == 'isaac' or item.key == 'integrations' %}
+                <span data-lang="en">Guide</span><span data-lang="kr" class="hidden">가이드</span>
+              {% elif item.key == 'settings' %}
+                <span data-lang="en">Settings</span><span data-lang="kr" class="hidden">설정</span>
               {% else %}
                 <span>{{ item.label }}</span>
               {% endif %}
@@ -94,10 +98,6 @@
           {% endblock topbar_left %}
           <div class="topbar-actions gap-2">
             {% block topbar_actions_extra %}{% endblock %}
-            <div class="topbar-actions gap-2" style="margin-right:0.35rem;">
-              <button class="button button-primary js-global-lang" data-lang-value="en">EN</button>
-              <button class="button button-subtle js-global-lang" data-lang-value="kr">KR</button>
-            </div>
             <button class="button button-subtle" id="cmd-search" style="font-size:0.83rem;gap:0.4rem;">
               <span style="opacity:0.55;">⌘K</span>
               <span data-lang="en">Search</span>
@@ -233,8 +233,13 @@
             </div>
 
             {% if latest_scene_id %}
-              <button class="button button-primary js-smoke-render" data-scene-id="{{ latest_scene_id }}"><span data-lang="en">Smoke Render</span><span data-lang="kr" class="hidden">스모크 렌더</span></button>
+              <button class="button button-primary js-smoke-render topbar-global-smoke" data-scene-id="{{ latest_scene_id }}"><span data-lang="en">Smoke Render</span><span data-lang="kr" class="hidden">스모크 렌더</span></button>
             {% endif %}
+
+            {# ── Settings link ── #}
+            <a href="/settings" class="hsi-btn" title="Settings" style="text-decoration:none;">
+              <span id="settings-lang-badge" style="font-size:0.72rem;font-weight:700;letter-spacing:0.04em;color:var(--muted-strong);line-height:1;">EN</span>
+            </a>
           </div>
         </header>
 
@@ -313,6 +318,10 @@
             btn.classList.toggle("button-primary", isActive);
             btn.classList.toggle("button-subtle", !isActive);
           });
+
+          // Update the settings badge to show current language
+          const badge = document.getElementById("settings-lang-badge");
+          if (badge) badge.textContent = active.toUpperCase();
         }
 
         const storedLang = localStorage.getItem(LANG_STORAGE_KEY) || "en";
@@ -325,6 +334,21 @@
           });
         });
 
+        // Settings panel toggle
+        const settingsToggle = document.getElementById("settings-toggle");
+        const settingsPanel  = document.getElementById("settings-panel");
+        if (settingsToggle && settingsPanel) {
+          settingsToggle.addEventListener("click", (e) => {
+            e.stopPropagation();
+            settingsPanel.classList.toggle("hidden");
+          });
+          document.addEventListener("click", (e) => {
+            if (!settingsToggle.contains(e.target) && !settingsPanel.contains(e.target)) {
+              settingsPanel.classList.add("hidden");
+            }
+          });
+        }
+
         /* Live status icons — independent per-icon popovers */
         (() => {
           const bar = document.getElementById("hsi-bar");
@@ -333,6 +357,15 @@
           let pollTimer = null;
           let lastState = null;
           let isActive  = false; /* true when render or isaac command is running */
+          let _healthBusy = false; /* in-flight guard for fetchHealth */
+
+          /** fetch() with automatic AbortController timeout (ms) */
+          function _fetchT(url, opts = {}, ms = 5000) {
+            const ctrl  = new AbortController();
+            const timer = setTimeout(() => ctrl.abort(), ms);
+            return fetch(url, { ...opts, signal: ctrl.signal })
+              .finally(() => clearTimeout(timer));
+          }
           let lastIsaacCommandKey = null;
           let snackbarFlash = null;
           let snackbarFlashUntil = 0;
@@ -670,8 +703,10 @@
           }
 
           async function fetchHealth() {
+            if (_healthBusy) return;           // skip if previous call still in-flight
+            _healthBusy = true;
             try {
-              const res  = await fetch("/health");
+              const res  = await _fetchT("/health", {}, 4000);
               if (!res.ok) return;
               const data = await res.json();
 
@@ -772,6 +807,8 @@
               if (d) { d.textContent = document.documentElement.dataset.lang === "kr" ? "접속 불가" : "Unreachable"; d.className = "hsi-pop-value hp-err"; }
               const dot = document.getElementById("hsi-dot");
               if (dot) dot.className = "hsi-state-dot hsi-dot-running"; /* red-ish = problem */
+            } finally {
+              _healthBusy = false;
             }
           }
 
@@ -831,6 +868,7 @@
           const POLL_MS = 1000;
           let _latestEventId = 0;
           let _pollTimer = null;
+          let _debugEventsBusy = false;
 
           const KIND_ICON = { camera: "📷", selection: "🖱", default: "ℹ️" };
           const KIND_CLASS = { camera: "toast-camera", selection: "toast-selection" };
@@ -870,8 +908,10 @@
           }
 
           async function _pollDebugEvents() {
+            if (_debugEventsBusy) return;
+            _debugEventsBusy = true;
             try {
-              const res = await fetch(`/api/debug/events?since=${_latestEventId}`);
+              const res = await _fetchT(`/api/debug/events?since=${_latestEventId}`, {}, 4000);
               if (!res.ok) return;
               const data = await res.json();
               const events = data.events || [];
@@ -882,6 +922,7 @@
                 _showToast(ev);
               }
             } catch (_) { /* daemon unreachable — skip silently */ }
+            finally { _debugEventsBusy = false; }
           }
 
           /* On first load, sync to current latest_id without showing old events */

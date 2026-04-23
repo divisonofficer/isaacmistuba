@@ -1,0 +1,75 @@
+{% extends "base.html" %}
+
+{% block content %}
+  <section class="grid gap-6 lg:grid-cols-[1fr,1fr]">
+
+    {# ── Language ────────────────────────────────────────────────── #}
+    <article class="panel">
+      <div class="panel-header">
+        <div>
+          <h2 class="section-title"><span data-lang="en">Language</span><span data-lang="kr" class="hidden">언어</span></h2>
+          <p class="muted text-sm"><span data-lang="en">UI display language. Stored in browser localStorage.</span><span data-lang="kr" class="hidden">UI 표시 언어. 브라우저 localStorage에 저장됩니다.</span></p>
+        </div>
+      </div>
+      <div class="flex gap-3 mt-5">
+        <button class="button js-global-lang" data-lang-target="en">English</button>
+        <button class="button js-global-lang" data-lang-target="kr">한국어</button>
+      </div>
+      <p class="muted text-xs mt-4">
+        <span data-lang="en">Current: <strong id="settings-current-lang">EN</strong></span>
+        <span data-lang="kr" class="hidden">현재: <strong id="settings-current-lang-kr">KR</strong></span>
+      </p>
+    </article>
+
+    {# ── Runtime Info ─────────────────────────────────────────────── #}
+    <article class="panel">
+      <div class="panel-header">
+        <div>
+          <h2 class="section-title"><span data-lang="en">Runtime</span><span data-lang="kr" class="hidden">런타임</span></h2>
+          <p class="muted text-sm"><span data-lang="en">Daemon configuration (read-only).</span><span data-lang="kr" class="hidden">데몬 설정 (읽기 전용).</span></p>
+        </div>
+      </div>
+      <div class="kv-list mt-4">
+        <div>
+          <span><span data-lang="en">Base URL</span><span data-lang="kr" class="hidden">기본 URL</span></span>
+          <span class="mono text-xs">{{ base_url }}</span>
+        </div>
+        <div>
+          <span><span data-lang="en">Variant</span><span data-lang="kr" class="hidden">변형</span></span>
+          <span class="mono text-xs">{{ summary.variant }}</span>
+        </div>
+        <div>
+          <span><span data-lang="en">Repo Root</span><span data-lang="kr" class="hidden">저장소 루트</span></span>
+          <span class="mono text-xs" style="word-break:break-all;">{{ summary.repo_root }}</span>
+        </div>
+        <div>
+          <span><span data-lang="en">Worker State</span><span data-lang="kr" class="hidden">워커 상태</span></span>
+          <span>
+            {% if summary.worker_state == "running" %}
+              <span data-lang="en">running</span><span data-lang="kr" class="hidden">실행 중</span>
+            {% elif summary.worker_state == "blocked" %}
+              <span data-lang="en">blocked</span><span data-lang="kr" class="hidden">차단됨</span>
+            {% else %}
+              <span data-lang="en">idle</span><span data-lang="kr" class="hidden">유휴</span>
+            {% endif %}
+          </span>
+        </div>
+      </div>
+    </article>
+
+  </section>
+
+  <script>
+    (function () {
+      function refresh() {
+        var lang = localStorage.getItem("global-lang") || "en";
+        var el = document.getElementById("settings-current-lang");
+        var elKr = document.getElementById("settings-current-lang-kr");
+        if (el) el.textContent = lang.toUpperCase();
+        if (elKr) elKr.textContent = lang.toUpperCase();
+      }
+      refresh();
+      document.addEventListener("global-lang-changed", refresh);
+    })();
+  </script>
+{% endblock %}

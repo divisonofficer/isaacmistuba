@@ -1,0 +1,111 @@
+/*
+ * Design tokens — non-color scales.
+ * Color tokens live in app.css (:root and [data-theme="dark"]) and are
+ * owned by the theme layer (lib/design/theme.ts).
+ */
+
+:root {
+  /* Typography — font families */
+  --font-sans:
+    Pretendard, "Pretendard Variable", Inter, ui-sans-serif, system-ui,
+    -apple-system, BlinkMacSystemFont, "Segoe UI", "Apple SD Gothic Neo",
+    "Noto Sans KR", "Malgun Gothic", sans-serif;
+  --font-mono:
+    "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
+    "Liberation Mono", monospace;
+
+  /* Typography — sizes (rem) */
+  --font-size-2xs: 0.6875rem;  /* 11 */
+  --font-size-xs:  0.75rem;    /* 12 */
+  --font-size-sm:  0.8125rem;  /* 13 */
+  --font-size-md:  0.875rem;   /* 14 — body default */
+  --font-size-lg:  1rem;       /* 16 */
+  --font-size-xl:  1.125rem;   /* 18 */
+  --font-size-2xl: 1.375rem;   /* 22 — section title */
+  --font-size-3xl: 1.75rem;    /* 28 — page title */
+  --font-size-4xl: 2.25rem;    /* 36 — display */
+
+  /* Typography — weights */
+  --font-weight-regular:  400;
+  --font-weight-medium:   500;
+  --font-weight-semibold: 600;
+  --font-weight-bold:     700;
+
+  /* Typography — line heights */
+  --line-height-tight:   1.2;
+  --line-height-snug:    1.35;
+  --line-height-normal:  1.5;
+  --line-height-relaxed: 1.65;
+
+  /* Typography — letter spacing */
+  --letter-spacing-tight:  -0.02em;
+  --letter-spacing-normal: 0;
+  --letter-spacing-wide:   0.04em;
+  --letter-spacing-eyebrow: 0.14em;
+
+  /* Spacing — 4px base scale */
+  --space-0:  0;
+  --space-1:  0.25rem;  /* 4 */
+  --space-2:  0.5rem;   /* 8 */
+  --space-3:  0.75rem;  /* 12 */
+  --space-4:  1rem;     /* 16 */
+  --space-5:  1.25rem;  /* 20 */
+  --space-6:  1.5rem;   /* 24 */
+  --space-8:  2rem;     /* 32 */
+  --space-10: 2.5rem;   /* 40 */
+  --space-12: 3rem;     /* 48 — top status bar height */
+  --space-16: 4rem;     /* 64 */
+  --space-20: 5rem;     /* 80 */
+
+  /* Layout — shell measurements */
+  --layout-topbar-height:    3rem;     /* 48 */
+  --layout-leftnav-width:    15.5rem;  /* 248 */
+  --layout-rightrail-width:  21rem;    /* 336 */
+  --layout-bottompanel-min:  16.25rem; /* 260 */
+  --layout-bottompanel-max:  20rem;    /* 320 */
+  --layout-min-width:        1440px;
+
+  /* Radius */
+  --radius-xs:    4px;
+  --radius-sm:    6px;
+  --radius-md:    10px;
+  --radius-lg:    14px;
+  --radius-xl:    20px;
+  --radius-2xl:   28px;
+  --radius-pill:  999px;
+  --radius-circle: 50%;
+
+  /* Elevation — additional to existing --shadow-soft / --shadow-panel */
+  --shadow-flat:  none;
+  --shadow-xs:    0 1px 2px rgba(15, 23, 42, 0.06);
+  --shadow-sm:    0 4px 12px rgba(15, 23, 42, 0.06);
+  --shadow-md:    0 8px 22px rgba(15, 23, 42, 0.08);
+  --shadow-lg:    0 18px 44px rgba(15, 23, 42, 0.1);
+  --shadow-modal: 0 32px 80px rgba(15, 23, 42, 0.18);
+
+  /* Motion */
+  --duration-instant: 80ms;
+  --duration-fast:    140ms;
+  --duration-base:    220ms;
+  --duration-slow:    360ms;
+  --easing-standard:  cubic-bezier(0.2, 0, 0, 1);
+  --easing-emphasized: cubic-bezier(0.3, 0, 0, 1);
+  --easing-decel:     cubic-bezier(0, 0, 0.2, 1);
+
+  /* Z-index scale */
+  --z-base:     1;
+  --z-sticky:   100;
+  --z-dropdown: 1000;
+  --z-overlay:  1100;
+  --z-modal:    1200;
+  --z-toast:    1300;
+  --z-tooltip:  1400;
+}
+
+[data-theme="dark"] {
+  --shadow-xs:    0 1px 2px rgba(0, 0, 0, 0.4);
+  --shadow-sm:    0 4px 12px rgba(0, 0, 0, 0.32);
+  --shadow-md:    0 8px 22px rgba(0, 0, 0, 0.36);
+  --shadow-lg:    0 18px 44px rgba(0, 0, 0, 0.4);
+  --shadow-modal: 0 32px 80px rgba(0, 0, 0, 0.5);
+}

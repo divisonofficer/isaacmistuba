@@ -435,6 +435,7 @@ def render_timestep_bundle_split_lighting(
                 assist_light=None,
                 depth_approx=None,
                 variant=variant,
+                progress_callback=progress_callback,
             )
 
         if branch_modalities["active"]:
@@ -451,6 +452,7 @@ def render_timestep_bundle_split_lighting(
                 assist_light=render_request.assist_light,
                 depth_approx=render_request.depth_approx,
                 variant=variant,
+                progress_callback=progress_callback,
             )
 
         if branch_modalities["polar"]:
@@ -468,6 +470,7 @@ def render_timestep_bundle_split_lighting(
                 assist_light=render_request.assist_light,
                 depth_approx=None,
                 variant=variant,
+                progress_callback=progress_callback,
             )
 
         timing_log["cameras"][camera_spec.camera_id] = {

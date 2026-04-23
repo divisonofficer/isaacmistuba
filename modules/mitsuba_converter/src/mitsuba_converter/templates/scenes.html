@@ -16,24 +16,21 @@
       </div>
     </div>
 
-    <div class="subpanel mt-4" style="padding:1rem;">
-      <div class="panel-header">
-        <div>
-          <div class="panel-label"><span data-lang="en">Register Arbitrary USD Scene</span><span data-lang="kr" class="hidden">임의 USD 장면 등록</span></div>
-          <div class="muted text-sm mt-2"><span data-lang="en">Add a USD stage path so Isaac can load it later with one-line helpers.</span><span data-lang="kr" class="hidden">USD stage 경로를 등록해 두면 Isaac에서 한 줄 helper로 나중에 바로 열 수 있습니다.</span></div>
-        </div>
-      </div>
-      <div class="grid gap-3 lg:grid-cols-2 mt-4">
-        <input class="search-input js-register-scene-id" data-placeholder-en="scene_id (optional)" data-placeholder-kr="scene_id (선택)" placeholder="scene_id (optional)">
-        <input class="search-input js-register-usd-path" data-placeholder-en="usd_stage_path (required)" data-placeholder-kr="usd_stage_path (필수)" placeholder="usd_stage_path (required)">
-        <input class="search-input js-register-mitsuba-ref" data-placeholder-en="mitsuba_scene_ref (optional)" data-placeholder-kr="mitsuba_scene_ref (선택)" placeholder="mitsuba_scene_ref (optional)">
-        <input class="search-input js-register-shape-map" data-placeholder-en="shape_map_ref (optional)" data-placeholder-kr="shape_map_ref (선택)" placeholder="shape_map_ref (optional)">
-      </div>
-      <div class="flex items-center gap-2 mt-3">
-        <button class="button button-primary js-register-scene"><span data-lang="en">Register Scene</span><span data-lang="kr" class="hidden">장면 등록</span></button>
-        <a href="/api/isaac/scenes" class="button button-subtle"><span data-lang="en">Catalog API</span><span data-lang="kr" class="hidden">카탈로그 API</span></a>
-      </div>
+    {# Scene stats summary line #}
+    {% if scenes %}
+    <div class="muted text-sm mt-3" id="scenes-stats-line">
+      <span id="scenes-count-total">{{ scenes|length }}</span>
+      <span data-lang="en"> scenes</span><span data-lang="kr" class="hidden"> 장면</span>
+      <span id="scenes-count-ready"> · {{ scenes|selectattr('readiness_status','equalto','render-ready')|list|length }} render-ready</span>
+      <span id="scenes-count-nocam"> · {{ scenes|selectattr('camera_count','equalto',0)|list|length }} without cameras</span>
     </div>
+
+    <div class="flex gap-1 mt-3" id="scene-filter-btns">
+      <button class="button js-scene-filter scene-filter-active" data-filter="all"><span data-lang="en">All</span><span data-lang="kr" class="hidden">전체</span></button>
+      <button class="button js-scene-filter" data-filter="render-ready"><span data-lang="en">Render-Ready</span><span data-lang="kr" class="hidden">렌더 준비</span></button>
+      <button class="button js-scene-filter" data-filter="no-cameras"><span data-lang="en">No Cameras</span><span data-lang="kr" class="hidden">카메라 없음</span></button>
+    </div>
+    {% endif %}
 
     {% if scenes %}
       {# — Table view (default) — #}
@@ -57,7 +54,7 @@
             </thead>
             <tbody>
               {% for scene in scenes %}
-                <tr data-scene-id="{{ scene.scene_id|lower }}">
+                <tr data-scene-id="{{ scene.scene_id|lower }}" data-readiness="{{ scene.readiness_status or '' }}" data-camera-count="{{ scene.camera_count or 0 }}">
                   <td><a href="/scenes/{{ scene.scene_id }}" class="link">{{ scene.scene_id }}</a></td>
                   <td>{{ scene.scene_version or "-" }}</td>
                   <td>{{ scene.illumination_setup or "-" }}</td>
@@ -158,6 +155,28 @@
         <a href="/integrations/isaac" class="button button-subtle" style="margin-top:0.5rem;"><span data-lang="en">Open Isaac Guide</span><span data-lang="kr" class="hidden">Isaac 가이드 열기</span></a>
       </div>
     {% endif %}
+
+    {# Register form — collapsed by default #}
+    <details class="subpanel mt-6" style="padding:0;">
+      <summary style="padding:0.75rem 1rem;cursor:pointer;font-weight:600;font-size:0.85rem;list-style:none;display:flex;align-items:center;gap:0.5rem;">
+        <span>▶</span>
+        <span data-lang="en">Register Arbitrary USD Scene</span>
+        <span data-lang="kr" class="hidden">임의 USD 장면 등록</span>
+      </summary>
+      <div style="padding:0 1rem 1rem;">
+        <div class="muted text-sm mt-1 mb-3"><span data-lang="en">Add a USD stage path so Isaac can load it with one-line helpers.</span><span data-lang="kr" class="hidden">USD stage 경로를 등록해 두면 Isaac에서 한 줄 helper로 바로 열 수 있습니다.</span></div>
+        <div class="grid gap-3 lg:grid-cols-2">
+          <input class="search-input js-register-scene-id" data-placeholder-en="scene_id (optional)" data-placeholder-kr="scene_id (선택)" placeholder="scene_id (optional)">
+          <input class="search-input js-register-usd-path" data-placeholder-en="usd_stage_path (required)" data-placeholder-kr="usd_stage_path (필수)" placeholder="usd_stage_path (required)">
+          <input class="search-input js-register-mitsuba-ref" data-placeholder-en="mitsuba_scene_ref (optional)" data-placeholder-kr="mitsuba_scene_ref (선택)" placeholder="mitsuba_scene_ref (optional)">
+          <input class="search-input js-register-shape-map" data-placeholder-en="shape_map_ref (optional)" data-placeholder-kr="shape_map_ref (선택)" placeholder="shape_map_ref (optional)">
+        </div>
+        <div class="flex items-center gap-2 mt-3">
+          <button class="button button-primary js-register-scene"><span data-lang="en">Register Scene</span><span data-lang="kr" class="hidden">장면 등록</span></button>
+          <a href="/api/isaac/scenes" class="button button-subtle"><span data-lang="en">Catalog API</span><span data-lang="kr" class="hidden">카탈로그 API</span></a>
+        </div>
+      </div>
+    </details>
   </section>
 
   <script>
@@ -172,6 +191,25 @@
           });
         });
       }
+
+      /* scene filters */
+      let currentSceneFilter = 'all';
+      document.querySelectorAll('.js-scene-filter').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+          currentSceneFilter = btn.dataset.filter;
+          document.querySelectorAll('.js-scene-filter').forEach(function (b) {
+            b.classList.toggle('scene-filter-active', b === btn);
+          });
+          document.querySelectorAll('[data-scene-id]').forEach(function (el) {
+            var ready = el.dataset.readiness || '';
+            var cameras = parseInt(el.dataset.cameraCount || '0', 10);
+            var show = true;
+            if (currentSceneFilter === 'render-ready') show = ready === 'render-ready';
+            else if (currentSceneFilter === 'no-cameras') show = cameras === 0;
+            el.style.display = show ? '' : 'none';
+          });
+        });
+      });
       /* view toggle */
       const tableView = document.querySelector(".scene-table-view");
       const gridView  = document.querySelector(".scene-grid-view");

@@ -25,7 +25,7 @@ BSDF_OPTIONS = [
     "glossy_black_lacquer",
     "mirror_black_enamel",
 ]
-SUBMIT_MODES = ["blocking", "async"]
+SUBMIT_MODES = ["async", "blocking"]
 MODALITY_OPTIONS = [
     "rgb",
     "depth",
@@ -154,6 +154,9 @@ class RobomitubaPanel:
         self._last_selection_signature: tuple[str, ...] = ()
         self._last_viewport_camera_sync_key: tuple[str, tuple[Any, ...]] | None = None
         self._last_viewport_camera_sync_at: float = 0.0
+        self._scene_state_dirty = True
+        self._material_state_dirty = False
+        self._stage_notice_registration: Any = None
         self._robot_records: list[dict[str, Any]] = []
         self._robot_combo: Any = None
         self._robot_combo_model: Any = None
@@ -274,6 +277,7 @@ class RobomitubaPanel:
                     self._result_label = ui.Label("—", height=80, word_wrap=True)
         self._rebuild_scene_picker()
         self._do_refresh_scenes()
+        self._setup_stage_dirty_tracking()
         threading.Thread(target=self._poll_remote_commands_loop, daemon=True).start()
         threading.Thread(target=self._poll_selection_loop, daemon=True).start()
         threading.Thread(target=self._poll_viewport_camera_loop, daemon=True).start()
@@ -585,6 +589,50 @@ class RobomitubaPanel:
         except Exception:
             return []
 
+    def _mark_scene_state_dirty(self, *, reason: str | None = None) -> None:
+        self._scene_state_dirty = True
+        if reason:
+            self._log_progress("sync_state", self._current_scene_id(), "running", "state_dirty", reason, "isaac_stage", None)
+
+    def _mark_material_state_dirty(self, *, reason: str | None = None) -> None:
+        self._material_state_dirty = True
+        if reason:
+            self._log_progress("sync_state", self._current_scene_id(), "running", "material_dirty", reason, "isaac_stage", None)
+
+    def _clear_sync_dirty_flags(self, *, clear_state: bool = True, clear_material: bool = True) -> None:
+        if clear_state:
+            self._scene_state_dirty = False
+        if clear_material:
+            self._material_state_dirty = False
+
+    def _setup_stage_dirty_tracking(self) -> None:
+        try:
+            from pxr import Tf, Usd  # type: ignore
+
+            stage = self._get_stage()
+            if stage is None:
+                return
+            if self._stage_notice_registration is not None:
+                try:
+                    self._stage_notice_registration.Revoke()
+                except Exception:
+                    pass
+            self._stage_notice_registration = Tf.Notice.Register(Usd.Notice.ObjectsChanged, self._on_stage_objects_changed, stage)
+        except Exception:
+            self._stage_notice_registration = None
+
+    def _on_stage_objects_changed(self, notice: Any, _sender: Any) -> None:
+        try:
+            resynced = [str(path) for path in notice.GetResyncedPaths() if str(path)]
+            changed = [str(path) for path in notice.GetChangedInfoOnlyPaths() if str(path)]
+        except Exception:
+            self._mark_scene_state_dirty(reason="Stage changes detected in Isaac.")
+            return
+        changed_paths = resynced or changed
+        if not changed_paths:
+            return
+        self._mark_scene_state_dirty(reason=f"Stage edits detected ({len(changed_paths)} path(s)).")
+
     def _refresh_selection_label(self, prim_paths: list[str]) -> None:
         if self._selection_label is None:
             return
@@ -621,13 +669,12 @@ class RobomitubaPanel:
             time.sleep(1.0)
 
     def _poll_viewport_camera_loop(self) -> None:
-        # 10 Hz — no dedup here; daemon handles change detection for toasts
         while not self._stop_event.is_set():
             try:
                 self._push_viewport_camera_to_daemon()
             except Exception:
                 pass
-            time.sleep(0.1)
+            time.sleep(0.5)
 
     def _push_viewport_camera_to_daemon(self) -> None:
         try:
@@ -641,9 +688,23 @@ class RobomitubaPanel:
         scene_id = self._current_scene_id()
         if not scene_id:
             return
+        try:
+            from isaac_extension.daemon_client import capture_active_viewport_camera_signature
+        except ImportError:  # pragma: no cover - Isaac runtime fallback
+            from daemon_client import capture_active_viewport_camera_signature
+
+        signature = capture_active_viewport_camera_signature()
+        if signature is None:
+            return
+        sync_key = (scene_id, signature)
+        now = time.monotonic()
+        if sync_key == self._last_viewport_camera_sync_key and now - self._last_viewport_camera_sync_at < 2.0:
+            return
+        self._last_viewport_camera_sync_key = sync_key
+        self._last_viewport_camera_sync_at = now
         sync_active_viewport_camera_to_daemon(
             daemon_url=daemon_url,
-            timeout_s=0.08,  # must finish within one 10 Hz tick
+            timeout_s=0.08,
             modalities=["rgb"],
         )
 
@@ -808,6 +869,9 @@ class RobomitubaPanel:
                     ]
                 )
             )
+            self._scene_state_dirty = True
+            self._material_state_dirty = False
+            self._setup_stage_dirty_tracking()
             return result
         except Exception as exc:  # pragma: no cover
             self._set_result(f"Load scene error: {exc}")
@@ -903,6 +967,7 @@ class RobomitubaPanel:
             if bsdf_type != "none":
                 overrides = {prim_path: BsdfOverride(bsdf_type=bsdf_type) for prim_path in prim_paths}
             update_isaac_materials(capture_material_patch(overrides), daemon_url=daemon_url)
+            self._clear_sync_dirty_flags(clear_state=False, clear_material=True)
             self._set_result(f"Applied {bsdf_type} to {len(prim_paths)} selected prim(s).")
         except Exception as exc:  # pragma: no cover
             self._set_result(f"Selected override error: {exc}")
@@ -979,6 +1044,9 @@ class RobomitubaPanel:
                 daemon_url=daemon_url,
                 progress_callback=progress_callback,
             )
+            self._scene_state_dirty = True
+            self._material_state_dirty = False
+            self._setup_stage_dirty_tracking()
             self._set_result(f"Remote load complete.\nscene: {result.get('scene_id')}")
             # Auto-connect session if the scene has the necessary refs in the daemon catalog
             try:
@@ -1020,6 +1088,7 @@ class RobomitubaPanel:
                 daemon_url=daemon_url,
                 progress_callback=progress_callback,
             )
+            self._clear_sync_dirty_flags()
             self._set_result(f"Remote sync complete.\nscene: {scene_id}")
             return result
         if command_type == "render_current_view":
@@ -1027,12 +1096,21 @@ class RobomitubaPanel:
                 str(scene_id),
                 stage=stage,
                 daemon_url=daemon_url,
-                submit_mode=str(payload.get("submit_mode") or "blocking"),
+                submit_mode=str(payload.get("submit_mode") or "async"),
                 modalities=list(payload.get("modalities") or []),
                 timeout_s=600.0,
                 progress_callback=progress_callback,
                 command_id=command_id,
+                sync_policy=str(payload.get("sync_policy") or "auto"),
+                force_resync=bool(payload.get("force_resync", False)),
+                state_dirty=self._scene_state_dirty,
+                material_dirty=self._material_state_dirty,
             )
+            sync_mode = str(result.get("sync_mode") or "")
+            if sync_mode == "full_resync":
+                self._clear_sync_dirty_flags()
+            elif sync_mode == "material_delta":
+                self._clear_sync_dirty_flags(clear_state=False, clear_material=True)
             manifest_path = result.get("manifest_path") or result.get("status_url") or "-"
             self._set_result(f"Remote render complete.\nscene: {scene_id}\nresult: {manifest_path}")
             return result
@@ -1059,6 +1137,7 @@ class RobomitubaPanel:
             _report = progress_callback or (lambda *_args, **_kwargs: None)
             _report("running", "serializing_patch", f"Applying {bsdf_type} to {len(prim_paths)} prim(s).", "isaac_app", None)
             result = update_isaac_materials(capture_material_patch(overrides), daemon_url=daemon_url)
+            self._clear_sync_dirty_flags(clear_state=False, clear_material=True)
             self._set_result(f"Applied {bsdf_type} to {len(prim_paths)} prim(s).")
             return {"status": "applied", "bsdf_type": bsdf_type, "prim_paths": prim_paths, "session": result}
         raise RuntimeError(f"Unsupported remote command: {command_type}")
@@ -1107,6 +1186,7 @@ class RobomitubaPanel:
                     ]
                 )
             )
+            self._setup_stage_dirty_tracking()
             return summary
         except Exception as exc:  # pragma: no cover
             self._set_result(f"Connect error: {exc}")
@@ -1184,6 +1264,7 @@ class RobomitubaPanel:
                     ]
                 )
             )
+            self._clear_sync_dirty_flags()
             return {"state_summary": state_summary, "sensor_summary": sensor_summary, "selection_summary": selection_summary}
         except Exception as exc:  # pragma: no cover
             self._set_result(f"Sync error: {exc}")
@@ -1217,6 +1298,10 @@ class RobomitubaPanel:
                     timeout_s=600.0,
                     progress_callback=progress_callback,
                     command_id=command_id,
+                    sync_policy=str((command_payload or {}).get("sync_policy") or "auto"),
+                    force_resync=bool((command_payload or {}).get("force_resync", False)),
+                    state_dirty=self._scene_state_dirty,
+                    material_dirty=self._material_state_dirty,
                 )
             else:
                 if not shape_map_ref:
@@ -1259,22 +1344,61 @@ class RobomitubaPanel:
                     submit_mode=submit_mode,
                     timeout_s=600.0,
                     command_id=command_id,
+                    extras={
+                        "sync_policy": str((command_payload or {}).get("sync_policy") or "auto"),
+                        "sync_mode": "full_resync",
+                        "force_resync": True,
+                    },
                 )
-            if submit_mode == "blocking":
+            sync_mode = str(result.get("sync_mode") or "")
+            if sync_mode == "full_resync":
+                self._clear_sync_dirty_flags()
+            elif sync_mode == "material_delta":
+                self._clear_sync_dirty_flags(clear_state=False, clear_material=True)
+            if result.get("status") in ("queued", "accepted") and result.get("job_id"):
+                job_id = result["job_id"]
+                self._set_result(f"Render queued: {job_id}\nPolling for completion...")
+                if progress_callback is not None:
+                    progress_callback("running", "polling_render", f"Render queued: {job_id}. Waiting for completion...", "daemon_render", None)
+                try:
+                    from isaac_extension.daemon_client import wait_for_render_job
+                except ImportError:  # pragma: no cover - Isaac runtime fallback
+                    from daemon_client import wait_for_render_job
+
+                def _on_poll_status(status_payload: dict) -> None:
+                    progress = status_payload.get("progress") or 0
+                    stage = str(status_payload.get("progress_stage") or "rendering")
+                    msg = str(status_payload.get("progress_message") or f"Rendering: {progress:.0f}%")
+                    self._set_result(f"Render {job_id}: {msg}")
+                    if progress_callback is not None:
+                        progress_callback("running", stage, msg, "daemon_render", None)
+
+                result = wait_for_render_job(
+                    job_id,
+                    daemon_url=daemon_url,
+                    poll_interval_s=2.0,
+                    timeout_s=600.0,
+                    on_status=_on_poll_status,
+                )
+
+            if result.get("status") == "succeeded" or result.get("status") == "completed":
                 artifact_lines = [
                     f"✓ {modality}: {', '.join(paths.values())}"
                     for modality, paths in result.get("artifacts", {}).items()
                 ]
                 manifest_path = result.get("manifest_path")
-                header = f"Completed blocking render.\nmanifest: {manifest_path}" if manifest_path else "Completed blocking render."
+                header = f"Completed render.\nmanifest: {manifest_path}" if manifest_path else "Completed render."
                 self._set_result("\n".join([header, *artifact_lines]).strip())
+            elif result.get("status") == "failed":
+                error = result.get("error") or "unknown error"
+                self._set_result(f"Render failed: {error}")
             else:
                 self._set_result(
                     "\n".join(
                         [
-                            f"Queued render job {result.get('job_id')}",
+                            f"Render job {result.get('job_id')}",
                             f"status: {result.get('status')}",
-                            f"status_url: {result.get('status_url')}",
+                            f"status_url: {result.get('status_url', '')}",
                         ]
                     )
                 )
@@ -1329,6 +1453,12 @@ class RobomitubaPanel:
 
     def destroy(self) -> None:
         self._stop_event.set()
+        if self._stage_notice_registration is not None:
+            try:
+                self._stage_notice_registration.Revoke()
+            except Exception:
+                pass
+            self._stage_notice_registration = None
         if self._keyboard_input is not None and self._keyboard_device is not None and self._keyboard_subscription is not None:
             try:
                 self._keyboard_input.unsubscribe_to_keyboard_events(self._keyboard_device, self._keyboard_subscription)
