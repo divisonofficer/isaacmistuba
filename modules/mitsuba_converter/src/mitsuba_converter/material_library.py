@@ -226,6 +226,50 @@ def _scan_rgl_materials(repo_root: Path) -> list[tuple[str, str, str]]:
 # Public API
 # ---------------------------------------------------------------------------
 
+def _build_curated_group(repo_root: Path) -> dict[str, Any]:
+    """Build the synthetic 'curated' dataset group prepended to the library.
+
+    Each entry mirrors the shape of measured-material entries (material_id,
+    display_name, native_file, status, download_url) so the existing UI list
+    rendering works without branching, and adds curated-only fields
+    (kind, category, description, preview_baked) that the new tile renderer
+    can dispatch on.
+    """
+    from .curated_library import curated_preview_path, list_curated_materials
+
+    materials_out: list[dict[str, Any]] = []
+    for mat in list_curated_materials():
+        baked = curated_preview_path(repo_root, mat.material_id)
+        materials_out.append({
+            "material_id": mat.material_id,
+            "display_name": mat.display_name,
+            "native_file": "",
+            "status": "available",
+            "download_url": None,
+            "kind": "curated",
+            "category": mat.category,
+            "description": mat.description,
+            "preview_baked": baked.exists(),
+        })
+
+    return {
+        "dataset_id": "curated",
+        "display_name": "큐레이션",
+        "paper_title": "Robomituba Curated Library",
+        "venue": "—",
+        "source_url": "",
+        "swatch_hue": 200,
+        "mitsuba_strategy": "curated",
+        "patch_required": False,
+        "capabilities": {
+            "polarization": False,
+            "nir": False,
+            "spectral_range_nm": [400, 700],
+        },
+        "materials": materials_out,
+    }
+
+
 def get_library_grouped(repo_root: Path) -> list[dict[str, Any]]:
     """
     Return the material library as a list of dataset groups, each with:
@@ -233,6 +277,10 @@ def get_library_grouped(repo_root: Path) -> list[dict[str, Any]]:
       swatch_hue, mitsuba_strategy, patch_required,
       capabilities: {polarization, nir, spectral_range_nm},
       materials: [{material_id, display_name, native_file, status}, ...]
+
+    The synthetic ``curated`` group is prepended at index 0; its entries
+    additionally carry ``kind="curated"`` plus ``category`` / ``description``
+    / ``preview_baked`` for category-chip filtering and pre-baked thumbnails.
     """
     configs = load_dataset_config(repo_root)
     cfg_by_id = _dataset_config_by_id(configs)
@@ -240,7 +288,7 @@ def get_library_grouped(repo_root: Path) -> list[dict[str, Any]]:
     # Refresh dynamic datasets
     MATERIAL_CATALOG["rgl_material_db"] = _scan_rgl_materials(repo_root)
 
-    groups: list[dict[str, Any]] = []
+    groups: list[dict[str, Any]] = [_build_curated_group(repo_root)]
 
     for ds_id in DATASET_ORDER:
         display_meta = DATASET_DISPLAY_META.get(ds_id, {})

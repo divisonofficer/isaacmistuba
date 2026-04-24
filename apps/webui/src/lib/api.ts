@@ -24,11 +24,15 @@ export const retryJob = (jobId: string) =>
 	post(`/api/render-jobs/${jobId}/retry`);
 export const cancelJob = (jobId: string) =>
 	post(`/jobs/${jobId}/cancel`);
+export const deleteJob = (jobId: string) =>
+	post(`/api/render-jobs/${encodeURIComponent(jobId)}/delete`);
 export const smokeRender = (sceneId: string) =>
 	post('/api/tests/smoke-render', { scene_id: sceneId });
 
 export const listScenes = () => fetch('/api/scenes').then(json);
 export const getScene = (id: string) => fetch(`/api/scenes/${id}`).then(json);
+export const getSceneDiagram3D = (id: string) =>
+	fetch(`/api/scenes/${encodeURIComponent(id)}/diagram-3d`).then(json);
 export const sceneGeometryUrl = (sceneId: string, meshId: string) =>
 	`/api/scenes/${encodeURIComponent(sceneId)}/geometry/${encodeURIComponent(meshId)}.obj`;
 export const getSceneCaptures = (id: string) =>
@@ -60,9 +64,15 @@ export const getIsaacSessionInventory = () => fetch('/isaac/session/inventory').
 export const materialPresets = () => fetch('/api/material-presets').then(json);
 export const materialLibrary = () => fetch('/api/material-library').then(json);
 export const materialPreviewUrl = (bsdfType: string) =>
-	`/api/material-preview/preset/${bsdfType}`;
-export const measuredMaterialPreviewUrl = (datasetId: string, materialId: string) =>
-	`/api/material-preview/measured/${datasetId}/${materialId}`;
+	`/api/material-preview/preset/${encodeURIComponent(bsdfType)}`;
+export const measuredMaterialPreviewUrl = (datasetId: string, materialId: string, nativeFile?: string) => {
+	const base = `/api/material-preview/measured/${encodeURIComponent(datasetId)}/${encodeURIComponent(materialId)}`;
+	return nativeFile ? `${base}?file=${encodeURIComponent(nativeFile)}` : base;
+};
+export const curatedMaterialPreviewUrl = (materialId: string) =>
+	`/api/material-preview/curated/${encodeURIComponent(materialId)}`;
+export const applyCuratedMaterial = (sceneId: string, payload: unknown) =>
+	post(`/api/scenes/${sceneId}/apply-curated-material`, payload);
 
 export const submitRender = (payload: unknown) => post('/render', payload);
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import subprocess
 import sys
 import time
@@ -374,7 +375,7 @@ def orchestrate(args: argparse.Namespace) -> None:
         write_json(record_json, record)
 
         cmd = [
-            sys.executable,
+            os.environ.get("ROBOMITUBA_PYTHON", sys.executable),
             str(Path(__file__).resolve()),
             "--child-render",
             "--scene-xml",

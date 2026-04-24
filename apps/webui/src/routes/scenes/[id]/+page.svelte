@@ -7,14 +7,14 @@
 		getScene, getSceneCaptures, materialPresets, materialLibrary,
 		getSceneRenderOptions, saveSceneRenderOptions,
 		isaacCommand, listJobs, smokeRender,
-		materialPreviewUrl, applyMeasuredMaterial
+		materialPreviewUrl, measuredMaterialPreviewUrl, applyMeasuredMaterial
 	} from '$lib/api';
 
 	const sceneId = $derived(page.params.id ?? '');
 	const L = $derived($lang);
 
 	type Preset = { bsdf_type: string; category: string; title_en: string; title_kr: string; description_en: string; description_kr: string; swatch?: string };
-	type MeasuredMat = { dataset_id: string; material_id: string; label_en: string; label_kr?: string };
+	type MeasuredMat = { dataset_id: string; material_id: string; native_file?: string; label_en: string; label_kr?: string };
 
 	let scene: Record<string, unknown> | null = $state(null);
 	let captures: Record<string, unknown>[] = $state([]);
@@ -46,7 +46,15 @@
 				getScene(sceneId).catch(() => null),
 				getSceneCaptures(sceneId).then(r => r.captures ?? []).catch(() => []),
 				materialPresets().then(r => r.presets ?? []).catch(() => []),
-				materialLibrary().then(r => r.materials ?? []).catch(() => []),
+				materialLibrary().then(r => r.materials ?? r.groups?.flatMap((g: Record<string, unknown>) =>
+					((g.materials as Record<string, unknown>[] | undefined) ?? []).map((m) => ({
+						dataset_id: String(g.dataset_id ?? ''),
+						material_id: String(m.material_id ?? ''),
+						native_file: String(m.native_file ?? ''),
+						label_en: String(m.display_name ?? m.material_id ?? ''),
+						label_kr: String(m.display_name ?? m.material_id ?? '')
+					}))
+				) ?? []).catch(() => []),
 				listJobs(10).then(r => r.jobs ?? []).catch(() => [])
 			]);
 			scene = scRes;
@@ -496,27 +504,26 @@
 				<div class="panel-label mt-4" style="margin-bottom:0.5rem">{L === 'kr' ? '측정 재질' : 'Measured Materials'}</div>
 				<div class="material-browser-grid">
 					{#each measuredMats as mat}
-						{@const m = mat as Record<string, unknown>}
 						<div
 							class="material-card material-card-clickable"
-							onclick={() => applyMeasuredMaterial(sceneId as string, { dataset_id: m.dataset_id, material_id: m.material_id })}
-							onkeydown={(e) => e.key === 'Enter' && applyMeasuredMaterial(sceneId as string, { dataset_id: m.dataset_id, material_id: m.material_id })}
+							onclick={() => applyMeasuredMaterial(sceneId as string, { dataset_id: mat.dataset_id, material_id: mat.material_id, measured_file_path: mat.native_file })}
+							onkeydown={(e) => e.key === 'Enter' && applyMeasuredMaterial(sceneId as string, { dataset_id: mat.dataset_id, material_id: mat.material_id, measured_file_path: mat.native_file })}
 							tabindex="0"
 							role="button"
 						>
 							<div class="material-card-head">
 								<div class="material-sphere">
 									<img
-										src={`/api/material-preview/measured/${m.dataset_id}/${m.material_id}`}
-										alt={String(m.label_en ?? '')}
+										src={measuredMaterialPreviewUrl(mat.dataset_id, mat.material_id, mat.native_file)}
+										alt={String(mat.label_en ?? '')}
 										style="display:none"
 										onload={(e) => { (e.target as HTMLImageElement).style.display = 'block'; }}
 										onerror={(e) => { (e.target as HTMLImageElement).style.display = 'none'; }}
 									/>
 								</div>
 								<div>
-									<div class="material-card-title">{L === 'kr' ? (m.label_kr || m.label_en) : m.label_en}</div>
-									<div class="material-card-meta">{m.dataset_id}</div>
+									<div class="material-card-title">{L === 'kr' ? (mat.label_kr || mat.label_en) : mat.label_en}</div>
+									<div class="material-card-meta">{mat.dataset_id}</div>
 								</div>
 							</div>
 						</div>

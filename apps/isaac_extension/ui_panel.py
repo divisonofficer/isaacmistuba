@@ -674,7 +674,7 @@ class RobomitubaPanel:
                 self._push_viewport_camera_to_daemon()
             except Exception:
                 pass
-            time.sleep(0.5)
+            time.sleep(0.1)
 
     def _push_viewport_camera_to_daemon(self) -> None:
         try:
@@ -698,7 +698,7 @@ class RobomitubaPanel:
             return
         sync_key = (scene_id, signature)
         now = time.monotonic()
-        if sync_key == self._last_viewport_camera_sync_key and now - self._last_viewport_camera_sync_at < 2.0:
+        if sync_key == self._last_viewport_camera_sync_key and now - self._last_viewport_camera_sync_at < 0.25:
             return
         self._last_viewport_camera_sync_key = sync_key
         self._last_viewport_camera_sync_at = now
@@ -1097,7 +1097,8 @@ class RobomitubaPanel:
                 stage=stage,
                 daemon_url=daemon_url,
                 submit_mode=str(payload.get("submit_mode") or "async"),
-                modalities=list(payload.get("modalities") or []),
+                modalities=list(payload.get("modalities") or ["rgb"]),
+                render_settings=dict(payload.get("render_settings") or {}),
                 timeout_s=600.0,
                 progress_callback=progress_callback,
                 command_id=command_id,
@@ -1284,22 +1285,30 @@ class RobomitubaPanel:
             stage = self._get_stage()
             render_prep_timeout_s = 60.0
             daemon_url, scene_ref, scene_snapshot_ref, shape_map_ref, scene_id, submit_mode, modalities, bsdf_overrides = self._collect_form_state()
+            command_payload = command_payload or {}
+            requested_modalities = list(command_payload.get("modalities") or modalities or ["rgb"])
+            render_settings = dict(command_payload.get("render_settings") or {})
+            sync_policy = str(command_payload.get("sync_policy") or "auto")
+            force_resync = bool(command_payload.get("force_resync", False))
             selected = self._selected_scene_record()
-            if selected is not None:
-                self._populate_fields_from_scene(selected)
-                scene_id = str(selected.get("scene_id") or scene_id)
+            if selected is not None or not shape_map_ref:
+                if selected is not None:
+                    self._populate_fields_from_scene(selected)
+                if selected is not None:
+                    scene_id = str(selected.get("scene_id") or scene_id)
                 result = render_current_view_from_daemon(
                     scene_id,
                     stage=stage,
                     daemon_url=daemon_url,
                     submit_mode=submit_mode,
-                    modalities=modalities,
+                    modalities=requested_modalities,
+                    render_settings=render_settings,
                     bsdf_overrides_by_path=bsdf_overrides,
                     timeout_s=600.0,
                     progress_callback=progress_callback,
                     command_id=command_id,
-                    sync_policy=str((command_payload or {}).get("sync_policy") or "auto"),
-                    force_resync=bool((command_payload or {}).get("force_resync", False)),
+                    sync_policy=sync_policy,
+                    force_resync=force_resync,
                     state_dirty=self._scene_state_dirty,
                     material_dirty=self._material_state_dirty,
                 )
@@ -1332,7 +1341,7 @@ class RobomitubaPanel:
                 if progress_callback is not None:
                     progress_callback("running", "capturing_view", "Capturing current viewport sensor definition.", "isaac_app", None)
                 register_isaac_sensors(
-                    [capture_current_view_sensor_spec(modalities=modalities)],
+                    [capture_current_view_sensor_spec(modalities=requested_modalities)],
                     daemon_url=daemon_url,
                     timeout_s=render_prep_timeout_s,
                 )
@@ -1340,14 +1349,15 @@ class RobomitubaPanel:
                     progress_callback("running", "sending_capture_request", "Submitting current-view capture request to daemon.", "isaac_app", None)
                 result = capture_isaac_view(
                     daemon_url=daemon_url,
-                    modalities=modalities,
+                    modalities=requested_modalities,
                     submit_mode=submit_mode,
+                    render_settings=render_settings,
                     timeout_s=600.0,
                     command_id=command_id,
                     extras={
-                        "sync_policy": str((command_payload or {}).get("sync_policy") or "auto"),
+                        "sync_policy": sync_policy,
                         "sync_mode": "full_resync",
-                        "force_resync": True,
+                        "force_resync": force_resync or True,
                     },
                 )
             sync_mode = str(result.get("sync_mode") or "")

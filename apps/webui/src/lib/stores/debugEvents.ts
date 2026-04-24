@@ -8,13 +8,17 @@ export interface DebugEvent {
 	ts: string;
 }
 
+export const debugEvents = writable<DebugEvent[]>([]);
 export const debugToasts = writable<DebugEvent[]>([]);
 
 const POLL_MS = 2500;
 const TTL_MS = 4000;
+const MAX_EVENTS = 80;
+const MAX_TOASTS = 4;
 
 let latestId = 0;
 let timer: ReturnType<typeof setTimeout> | null = null;
+let bootstrapped = false;
 
 function kindIcon(kind: string): string {
 	if (kind === 'camera') return '📷';
@@ -25,15 +29,21 @@ function kindIcon(kind: string): string {
 async function poll() {
 	try {
 		const data = await fetch(`/api/debug/events?since=${latestId}`).then((r) => r.json());
+		latestId = data?.latest_id ?? latestId;
 		if (data?.events?.length) {
-			latestId = data.latest_id ?? latestId;
-			debugToasts.update((toasts) => [...toasts, ...data.events]);
-			for (const ev of data.events) {
-				setTimeout(() => {
-					debugToasts.update((toasts) => toasts.filter((t) => t.id !== ev.id));
-				}, TTL_MS);
+			debugEvents.update((events) => [...events, ...data.events].slice(-MAX_EVENTS));
+
+			if (bootstrapped) {
+				const toastEvents = data.events.slice(-MAX_TOASTS);
+				debugToasts.update((toasts) => [...toasts, ...toastEvents].slice(-MAX_TOASTS));
+				for (const ev of toastEvents) {
+					setTimeout(() => {
+						debugToasts.update((toasts) => toasts.filter((t) => t.id !== ev.id));
+					}, TTL_MS);
+				}
 			}
 		}
+		bootstrapped = true;
 	} catch {
 		// ignore
 	}

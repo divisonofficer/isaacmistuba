@@ -1485,6 +1485,27 @@ def _resident_scene_cache_key(scene_path: Path, *, variant: str) -> tuple[str, i
     return (str(scene_path.resolve()), int(stat.st_mtime_ns), int(stat.st_size), str(variant))
 
 
+def _count_scene_assets(scene_path: Path) -> dict[str, int]:
+    try:
+        root = ET.parse(scene_path).getroot()
+    except (ET.ParseError, OSError):
+        return {}
+    return {
+        "mesh_count": len(root.findall(".//shape")),
+        "texture_count": len(root.findall(".//texture")),
+        "bsdf_count": len(root.findall(".//bsdf")),
+    }
+
+
+def _resident_scene_cache_has(scene_path: Path, *, variant: str) -> bool:
+    try:
+        cache_key = _resident_scene_cache_key(scene_path, variant=variant)
+    except OSError:
+        return False
+    with _SCENE_CACHE_LOCK:
+        return cache_key in _RESIDENT_SCENE_CACHE
+
+
 def _load_resident_scene(scene_path: Path, *, variant: str) -> tuple[Any, float, bool]:
     mi = _import_mitsuba()
     mi.set_variant(variant)
@@ -2511,21 +2532,41 @@ def render_modalities(
     ) -> tuple[np.ndarray, dict[str, float]]:
         _pass_index[0] += 1
         v = variant_override or variant
-        _cb("loading_scene", {
+        base_ctx = {
             "pass": pass_name,
             "spp": spp,
             "variant": v,
             "pass_index": _pass_index[0],
             "total_passes": _total_passes,
-        })
-        def _on_loaded() -> None:
-            _cb("rendering", {
-                "pass": pass_name,
-                "spp": spp,
-                "variant": v,
-                "pass_index": _pass_index[0],
-                "total_passes": _total_passes,
+        }
+        cache_hit = _resident_scene_cache_has(scene_path, variant=v)
+        if cache_hit:
+            _cb("loading_scene", {
+                **base_ctx,
+                "sub_step": "cached",
+                "sub_phase": 5,
+                "sub_total": 5,
+                "cached": True,
             })
+        else:
+            counts = _count_scene_assets(scene_path)
+            # phases 1-4 emit *before* mi.load_file() because mitsuba exposes no
+            # in-call progress callback; the actual mesh/texture/optix work all
+            # happens inside the single load_file() invocation below.
+            _cb("loading_scene", {**base_ctx, "sub_step": "parsing_xml",        "sub_phase": 1, "sub_total": 5, **counts})
+            _cb("loading_scene", {**base_ctx, "sub_step": "loading_meshes",     "sub_phase": 2, "sub_total": 5, **counts})
+            _cb("loading_scene", {**base_ctx, "sub_step": "uploading_textures", "sub_phase": 3, "sub_total": 5, **counts})
+            _cb("loading_scene", {**base_ctx, "sub_step": "compiling_optix",    "sub_phase": 4, "sub_total": 5, **counts})
+
+        def _on_loaded() -> None:
+            if not cache_hit:
+                _cb("loading_scene", {
+                    **base_ctx,
+                    "sub_step": "ready",
+                    "sub_phase": 5,
+                    "sub_total": 5,
+                })
+            _cb("rendering", base_ctx)
         image, timing = _render_scene(scene_path, variant=v, spp=spp, on_loaded=_on_loaded)
         _cb("saving_output", {
             "pass": pass_name,

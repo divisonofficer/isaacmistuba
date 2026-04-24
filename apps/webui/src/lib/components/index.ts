@@ -11,6 +11,7 @@ export { default as DataTable } from './DataTable.svelte';
 export { default as IncidentCard } from './IncidentCard.svelte';
 export { default as LogList } from './LogList.svelte';
 export { default as KeyValueList } from './KeyValueList.svelte';
+export { default as Tooltip } from './Tooltip.svelte';
 
 export type {
 	Tone,

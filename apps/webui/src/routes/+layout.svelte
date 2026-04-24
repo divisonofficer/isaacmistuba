@@ -10,6 +10,8 @@
 	import { onMount, onDestroy } from 'svelte';
 	import { smokeRender } from '$lib/api';
 	import CurrentScenePanel from '$lib/CurrentScenePanel.svelte';
+	import { Tooltip } from '$lib/components';
+	import { cmdPending, runCmd, currentSceneIdStore, currentSceneStore } from '$lib/stores/sceneCommands';
 
 	let { children } = $props();
 	let stopTheme: (() => void) | undefined;
@@ -123,6 +125,35 @@
 	function toggleLang() {
 		lang.set($lang === 'kr' ? 'en' : 'kr');
 	}
+
+	const effectiveSceneId = $derived(
+		(typeof $healthStore?.isaac_scene_id === 'string' ? ($healthStore.isaac_scene_id as string) : null)
+		?? $currentSceneIdStore
+	);
+	const sessionActive = $derived(!!$healthStore?.isaac_connected && !!$healthStore?.isaac_scene_id);
+	const activeIsaacCmd = $derived($healthStore?.active_isaac_command as Record<string, unknown> | null);
+	const preparingNow = $derived(activeIsaacCmd?.command_type === 'prepare_render_ready');
+	const syncingNow = $derived(activeIsaacCmd?.command_type === 'sync_session');
+	const renderingNow = $derived(activeIsaacCmd?.command_type === 'render_current_view');
+
+	const isConnected = $derived(!!$healthStore?.isaac_connected);
+	const shapeMapReady = $derived(!!$currentSceneStore?.shape_map_exists);
+	const mitsubaReady = $derived(!!$currentSceneStore?.mitsuba_scene_exists);
+	const renderReady = $derived(shapeMapReady && mitsubaReady);
+
+	const renderDisabledMsg = $derived.by(() => {
+		const L = $lang;
+		if (!effectiveSceneId) return L === 'kr' ? '활성 세션 없음' : 'No active session';
+		if (!isConnected) return L === 'kr' ? '먼저 세션을 연결하세요' : 'Connect session first';
+		if (preparingNow) return L === 'kr' ? '준비 작업 진행 중…' : 'Prepare in progress…';
+		if (!mitsubaReady && !shapeMapReady) return L === 'kr' ? '준비 필요 (Mitsuba 씬 + Shape Map)' : 'Prepare required';
+		if (!mitsubaReady) return L === 'kr' ? 'Mitsuba 씬 미생성 — 준비 재실행' : 'Mitsuba scene missing';
+		if (!shapeMapReady) return L === 'kr' ? 'Shape Map 진행 중 — 잠시 후 다시' : 'Shape Map in progress';
+		const workerBusy = $healthStore?.worker_state === 'running';
+		if (workerBusy) return L === 'kr' ? '워커가 작업 중' : 'Worker busy';
+		if ($cmdPending) return L === 'kr' ? '명령 진행 중' : 'Command in flight';
+		return '';
+	});
 </script>
 
 <svelte:head><title>Robomituba Control Plane</title></svelte:head>
@@ -166,6 +197,99 @@
 				{/each}
 			{/if}
 		</div>
+
+		{#if effectiveSceneId}
+			<div class="shell-topbar-session-actions" role="toolbar" aria-label={$lang === 'kr' ? '세션 액션' : 'Session actions'}>
+				<!-- 1구역: 단계 (Connect → Prepare → Sync) -->
+				<div class="step-group">
+					{#if isConnected}
+						<span class="step-chip step-chip-done" title={$lang === 'kr' ? '연결됨' : 'Connected'}>
+							<svg width="11" height="11" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="2.5 6.5 5 9 9.5 3.5"/></svg>
+							<span>{$lang === 'kr' ? '연결됨' : 'Connected'}</span>
+						</span>
+					{:else}
+						<button
+							class="step-btn step-btn-active"
+							onclick={() => runCmd('connect_session')}
+							disabled={!!$cmdPending}
+							title={$lang === 'kr' ? `${effectiveSceneId} 연결` : `Connect to ${effectiveSceneId}`}
+						>
+							<svg width="12" height="12" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 9l-2 2a2.5 2.5 0 0 1-3.5-3.5l2-2"/><path d="M9 5l2-2a2.5 2.5 0 0 1 3.5 3.5l-2 2" transform="translate(-1 -1)"/><line x1="5" y1="9" x2="9" y2="5"/></svg>
+							<span>{$cmdPending === 'connect_session' ? '…' : ($lang === 'kr' ? '연결' : 'Connect')}</span>
+						</button>
+					{/if}
+
+					{#if !isConnected}
+						<span class="step-divider" aria-hidden="true">›</span>
+						<span class="step-chip step-chip-pending" title={$lang === 'kr' ? '연결 후 가능' : 'After connect'}>
+							<span>{$lang === 'kr' ? '장면 준비' : 'Prepare'}</span>
+						</span>
+						<span class="step-divider" aria-hidden="true">›</span>
+						<span class="step-chip step-chip-pending">
+							<span>{$lang === 'kr' ? '동기화' : 'Sync'}</span>
+						</span>
+					{:else}
+						<span class="step-divider" aria-hidden="true">›</span>
+						{#if preparingNow}
+							<span class="step-chip step-chip-running" title={$lang === 'kr' ? '장면 준비 진행 중' : 'Prepare running'}>
+								<span class="step-spinner" aria-hidden="true"></span>
+								<span>{$lang === 'kr' ? '장면 준비 중' : 'Preparing'}</span>
+							</span>
+						{:else if renderReady}
+							<span class="step-chip step-chip-done" title={$lang === 'kr' ? '렌더 준비 완료' : 'Render ready'}>
+								<svg width="11" height="11" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="2.5 6.5 5 9 9.5 3.5"/></svg>
+								<span>{$lang === 'kr' ? '장면 준비됨' : 'Prepared'}</span>
+							</span>
+						{:else}
+							<button
+								class="step-btn"
+								onclick={() => runCmd('prepare_render_ready')}
+								disabled={!!$cmdPending}
+								title={!mitsubaReady && !shapeMapReady ? ($lang === 'kr' ? 'Mitsuba 씬 + Shape Map 생성' : 'Build Mitsuba scene + Shape Map') : !mitsubaReady ? ($lang === 'kr' ? 'Mitsuba 씬 재생성' : 'Rebuild Mitsuba scene') : ($lang === 'kr' ? 'Shape Map 진행 중' : 'Shape Map running')}
+							>
+								<svg width="12" height="12" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="7" cy="7" r="2"/><path d="M7 1v2M7 11v2M1 7h2M11 7h2M2.7 2.7l1.4 1.4M9.9 9.9l1.4 1.4M2.7 11.3l1.4-1.4M9.9 4.1l1.4-1.4"/></svg>
+								<span>{$cmdPending === 'prepare_render_ready' ? '…' : ($lang === 'kr' ? '장면 준비' : 'Prepare')}</span>
+							</button>
+						{/if}
+
+						<span class="step-divider" aria-hidden="true">›</span>
+						<button
+							class="step-btn"
+							onclick={() => runCmd('sync_session')}
+							disabled={!!$cmdPending || !sessionActive}
+							title={$lang === 'kr' ? '세션 상태 동기화' : 'Sync session state'}
+						>
+							{#if syncingNow}
+								<span class="step-spinner" aria-hidden="true"></span>
+							{:else}
+								<svg width="12" height="12" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 6.5A5 5 0 0 0 3.5 4M2 7.5A5 5 0 0 0 10.5 10"/><polyline points="12 2 12 6 8 6"/><polyline points="2 12 2 8 6 8"/></svg>
+							{/if}
+							<span>{$cmdPending === 'sync_session' ? '…' : ($lang === 'kr' ? '동기화' : 'Sync')}</span>
+						</button>
+					{/if}
+				</div>
+
+				<!-- 2구역: 핵심 액션 (Render) -->
+				<div class="step-group step-group-primary">
+					<Tooltip text={renderingNow ? ($lang === 'kr' ? '렌더 중…' : 'Rendering…') : (renderDisabledMsg || ($lang === 'kr' ? '현재 뷰 렌더링' : 'Render current view'))} position="bottom">
+						<button
+							class="step-render-btn"
+							class:step-render-btn-running={renderingNow}
+							onclick={() => runCmd('render_current_view')}
+							disabled={!!$cmdPending || !sessionActive || preparingNow || renderingNow || !renderReady}
+						>
+							{#if renderingNow}
+								<span class="step-spinner" aria-hidden="true"></span>
+								<span>{$lang === 'kr' ? '렌더 중' : 'Rendering'}</span>
+							{:else}
+								<svg width="13" height="13" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polygon points="3 2 12 7 3 12 3 2" fill="currentColor" stroke="none"/></svg>
+								<span>{$cmdPending === 'render_current_view' ? '…' : ($lang === 'kr' ? '렌더' : 'Render')}</span>
+							{/if}
+						</button>
+					</Tooltip>
+				</div>
+			</div>
+		{/if}
 
 		<div class="shell-topbar-actions">
 			<a class="button button-subtle text-xs" href="/current-scene" title={$lang === 'kr' ? '세션 열기' : 'Open session'}>
@@ -270,8 +394,8 @@
 				<div class="shell-bottom-placeholder">
 					<p class="muted text-xs">
 						{$lang === 'kr'
-							? '작업 큐, 최근 로그, 선택 상세, 렌더 이력이 이곳에 표시됩니다.'
-							: 'Job queue, recent logs, selection detail, and render history will surface here.'}
+							? '작업 라이프사이클(실행·대기·완료·실패), 최근 로그, 선택 상세, 재질이 이곳에 표시됩니다.'
+							: 'Job lifecycle (running, queued, recent, failed), logs, selection detail, and materials surface here.'}
 					</p>
 				</div>
 			{/if}

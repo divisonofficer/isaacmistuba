@@ -14,6 +14,14 @@
 		 */
 		actions?: Snippet;
 		children?: Snippet;
+		/** When true, the card renders a compact collapsed form with a chevron toggle. */
+		collapsible?: boolean;
+		/** Controlled expanded state (used when collapsible=true). Defaults to false. */
+		expanded?: boolean;
+		/** Fired when the user clicks the card body (only in collapsible mode). */
+		onToggle?: () => void;
+		/** Extra detail rendered only when expanded (traceback, links, related items). */
+		expandedContent?: Snippet;
 	}
 
 	let {
@@ -23,7 +31,11 @@
 		timestamp,
 		source,
 		actions,
-		children
+		children,
+		collapsible = false,
+		expanded = false,
+		onToggle,
+		expandedContent
 	}: Props = $props();
 
 	const TONE_GLYPH: Record<Tone, string> = {
@@ -44,17 +56,46 @@
 			return String(ts);
 		}
 	}
+
+	function handleRootClick() {
+		if (collapsible) onToggle?.();
+	}
+	function handleRootKeydown(e: KeyboardEvent) {
+		if (!collapsible) return;
+		if (e.key === 'Enter' || e.key === ' ') {
+			e.preventDefault();
+			onToggle?.();
+		}
+	}
 </script>
 
-<article class="inc" data-tone={tone} role="status">
+<article
+	class="inc"
+	data-tone={tone}
+	data-collapsible={collapsible ? 'true' : 'false'}
+	data-expanded={collapsible ? (expanded ? 'true' : 'false') : undefined}
+	role={collapsible ? 'button' : 'status'}
+	tabindex={collapsible ? 0 : undefined}
+	aria-expanded={collapsible ? expanded : undefined}
+	onclick={collapsible ? handleRootClick : undefined}
+	onkeydown={collapsible ? handleRootKeydown : undefined}
+>
 	<div class="inc-marker" aria-hidden="true">
 		<span class="inc-glyph">{TONE_GLYPH[tone]}</span>
 	</div>
 	<div class="inc-body">
-		<h4 class="inc-title">{title}</h4>
+		<div class="inc-head">
+			<h4 class="inc-title">{title}</h4>
+			{#if collapsible}
+				<span class="inc-chevron" aria-hidden="true">{expanded ? '▾' : '▸'}</span>
+			{/if}
+		</div>
 		{#if source}<p class="inc-source mono">{source}</p>{/if}
 		{#if description}<p class="inc-desc">{description}</p>{/if}
-		{#if children}<div class="inc-extra">{@render children()}</div>{/if}
+		{#if !collapsible || expanded}
+			{#if children}<div class="inc-extra">{@render children()}</div>{/if}
+			{#if expandedContent}<div class="inc-expanded">{@render expandedContent()}</div>{/if}
+		{/if}
 		{#if timestamp || actions}
 			<div class="inc-meta-row">
 				{#if timestamp}
@@ -83,6 +124,7 @@
 		border: 1px solid var(--panel-border);
 		border-left: 3px solid currentColor;
 		border-radius: var(--radius-md);
+		transition: background 120ms ease;
 	}
 	.inc[data-tone='success'] { color: var(--success); }
 	.inc[data-tone='warning'] { color: var(--warning); }
@@ -90,6 +132,23 @@
 	.inc[data-tone='active']  { color: var(--brand); }
 	.inc[data-tone='info']    { color: var(--cyan); }
 	.inc[data-tone='neutral'] { color: var(--muted-strong); }
+
+	.inc[data-collapsible='true'] {
+		cursor: pointer;
+		min-height: 72px;
+	}
+	.inc[data-collapsible='true']:hover {
+		background: var(--panel-hover, var(--panel));
+	}
+	.inc[data-collapsible='true'][data-expanded='false'] .inc-source,
+	.inc[data-collapsible='true'][data-expanded='false'] .inc-desc {
+		-webkit-line-clamp: 1;
+		line-clamp: 1;
+	}
+	.inc[data-collapsible='true'][data-tone='warning'] {
+		border-left-width: 2px;
+		min-height: 60px;
+	}
 
 	.inc-marker {
 		flex: 0 0 auto;
@@ -106,11 +165,23 @@
 	.inc-glyph { font-size: var(--font-size-xs); font-weight: var(--font-weight-bold); }
 
 	.inc-body { flex: 1 1 auto; min-width: 0; color: var(--text); }
+	.inc-head {
+		display: flex;
+		align-items: center;
+		gap: var(--space-2);
+		justify-content: space-between;
+	}
 	.inc-title {
 		margin: 0;
 		font-size: var(--font-size-sm);
 		font-weight: var(--font-weight-semibold);
 		color: var(--text);
+	}
+	.inc-chevron {
+		flex-shrink: 0;
+		font-size: 0.7rem;
+		color: var(--muted);
+		transition: transform 120ms ease;
 	}
 	.inc-timestamp {
 		flex-shrink: 0;
@@ -128,12 +199,32 @@
 		-webkit-box-orient: vertical;
 		overflow: hidden;
 	}
+	.inc[data-expanded='true'] .inc-desc {
+		-webkit-line-clamp: unset;
+		line-clamp: unset;
+		display: block;
+		overflow: visible;
+	}
 	.inc-source {
 		margin: var(--space-1) 0 0;
 		font-size: var(--font-size-2xs);
 		color: var(--muted);
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+	.inc[data-expanded='true'] .inc-source {
+		white-space: normal;
+		overflow: visible;
 	}
 	.inc-extra { margin-top: var(--space-1); }
+	.inc-expanded {
+		margin-top: var(--space-2);
+		padding-top: var(--space-2);
+		border-top: 1px dashed var(--panel-border);
+		font-size: var(--font-size-xs);
+		color: var(--muted-strong);
+	}
 	.inc-meta-row {
 		display: flex;
 		justify-content: space-between;
@@ -150,5 +241,10 @@
 	.inc-actions :global(.button) {
 		padding: 0.25rem 0.55rem;
 		font-size: var(--font-size-2xs);
+	}
+	.inc[data-collapsible='true'][data-expanded='false'] .inc-actions :global(.button) {
+		padding: 0.2rem 0.45rem;
+		font-size: 0.68rem;
+		height: 28px;
 	}
 </style>

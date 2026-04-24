@@ -302,6 +302,24 @@ class _IsaacRemoteCommand:
     error: str | None = None
 
 
+@dataclass(eq=False)
+class _SceneTelemetrySubscriber:
+    scene_id: str | None
+    handler: BaseHTTPRequestHandler
+    lock: threading.Lock
+
+    def matches(self, scene_id: str | None) -> bool:
+        return self.scene_id is None or self.scene_id == scene_id
+
+    def send_json(self, payload: Mapping[str, Any]) -> None:
+        data = json.dumps(dict(payload), separators=(",", ":")).encode("utf-8")
+        with self.lock:
+            daemon = getattr(self.handler, "daemon", None)
+            if daemon is None:
+                raise RuntimeError("scene telemetry handler is missing daemon")
+            daemon._write_ws_frame(self.handler, data)
+
+
 _download_jobs: dict[str, dict[str, Any]] = {}
 _download_jobs_lock = threading.Lock()
 
@@ -335,11 +353,15 @@ class RenderDaemon:
         self._bundle_manifest_cache_ts: float = 0.0
         self._session_inventory_cache: list[Any] | None = None
         self._session_inventory_cache_ts: float = 0.0
+        self._geometry_bounds_cache: dict[str, dict[str, Any] | None] = {}
         self._isaac_session: _IsaacActiveSession | None = None
         self._isaac_commands_pending: deque[str] = deque()
         self._isaac_commands: dict[str, _IsaacRemoteCommand] = {}
         self._debug_events: deque[dict[str, Any]] = deque(maxlen=50)
         self._debug_event_counter: int = 0
+        self._scene_telemetry_subscribers: set[_SceneTelemetrySubscriber] = set()
+        self._scene_telemetry_lock = threading.Lock()
+        self._last_scene_telemetry_signature: tuple[Any, ...] | None = None
         self._shutdown = False
         self._server: ThreadingHTTPServer | None = None
         self._server_thread: threading.Thread | None = None
@@ -1064,6 +1086,12 @@ class RenderDaemon:
                     ):
                         self.daemon._handle_camera_websocket(self)
                         return
+                    if (
+                        parsed.path == "/api/ws/current-scene"
+                        and self.headers.get("Upgrade", "").lower() == "websocket"
+                    ):
+                        self.daemon._handle_scene_telemetry_websocket(self, parsed)
+                        return
                     self.daemon._handle_get(self)
                 except Exception:
                     self._log_exception("GET")
@@ -1144,6 +1172,44 @@ class RenderDaemon:
             except Exception as exc:
                 self._push_debug_event("error", f"camera websocket payload ignored: {exc}")
 
+    def _handle_scene_telemetry_websocket(self, handler: BaseHTTPRequestHandler, parsed: Any) -> None:
+        key = handler.headers.get("Sec-WebSocket-Key", "").strip()
+        if not key:
+            handler.send_error(HTTPStatus.BAD_REQUEST, "Missing Sec-WebSocket-Key")
+            return
+        accept = base64.b64encode(hashlib.sha1(f"{key}{_WS_GUID}".encode("ascii")).digest()).decode("ascii")
+        handler.send_response(HTTPStatus.SWITCHING_PROTOCOLS)
+        handler.send_header("Upgrade", "websocket")
+        handler.send_header("Connection", "Upgrade")
+        handler.send_header("Sec-WebSocket-Accept", accept)
+        handler.end_headers()
+
+        query = parse_qs(parsed.query or "")
+        requested_scene_id = _maybe_str((query.get("scene_id") or [None])[0])
+        subscriber = _SceneTelemetrySubscriber(
+            scene_id=requested_scene_id,
+            handler=handler,
+            lock=threading.Lock(),
+        )
+        with self._scene_telemetry_lock:
+            self._scene_telemetry_subscribers.add(subscriber)
+        try:
+            payload = self._scene_telemetry_payload(scene_id=requested_scene_id)
+            if payload is not None:
+                subscriber.send_json(payload)
+            while not self._shutdown:
+                frame = self._read_ws_frame(handler)
+                if frame is None:
+                    break
+                opcode, payload = frame
+                if opcode == 0x8:
+                    break
+                if opcode == 0x9:
+                    self._write_ws_frame(handler, payload, opcode=0xA)
+        finally:
+            with self._scene_telemetry_lock:
+                self._scene_telemetry_subscribers.discard(subscriber)
+
     def _read_ws_frame(self, handler: BaseHTTPRequestHandler) -> tuple[int, bytes] | None:
         header = handler.rfile.read(2)
         if len(header) < 2:
@@ -1185,6 +1251,59 @@ class RenderDaemon:
             header.extend([127, *length.to_bytes(8, "big")])
         handler.wfile.write(bytes(header) + payload)
         handler.wfile.flush()
+
+    def _scene_telemetry_signature(self, payload: Mapping[str, Any] | None) -> tuple[Any, ...] | None:
+        if not isinstance(payload, Mapping):
+            return None
+        active_camera = payload.get("active_viewport_camera")
+        if not isinstance(active_camera, Mapping):
+            return (
+                str(payload.get("scene_id") or ""),
+                None,
+            )
+        return (
+            str(payload.get("scene_id") or ""),
+            str(active_camera.get("sensor_id") or ""),
+            round(float(active_camera.get("fov_deg") or 0.0), 3),
+            tuple(round(float(value), 4) for value in list(active_camera.get("origin") or [])),
+            tuple(round(float(value), 4) for value in list(active_camera.get("target") or [])),
+        )
+
+    def _scene_telemetry_payload(self, *, scene_id: str | None = None) -> dict[str, Any] | None:
+        session = self._isaac_session
+        if session is None:
+            return None
+        if scene_id is not None and session.scene_id != scene_id:
+            return None
+        return {
+            "scene_id": session.scene_id,
+            "updated_at": session.updated_at,
+            "sensor_revision": int(session.sensor_revision),
+            "active_viewport_camera": self._active_viewport_camera_payload(session),
+        }
+
+    def _broadcast_scene_telemetry(self, *, force: bool = False) -> None:
+        payload = self._scene_telemetry_payload()
+        signature = self._scene_telemetry_signature(payload)
+        if not force and signature == self._last_scene_telemetry_signature:
+            return
+        self._last_scene_telemetry_signature = signature
+        if payload is None:
+            return
+        stale: list[_SceneTelemetrySubscriber] = []
+        with self._scene_telemetry_lock:
+            subscribers = list(self._scene_telemetry_subscribers)
+        for subscriber in subscribers:
+            if not subscriber.matches(str(payload.get("scene_id") or "")):
+                continue
+            try:
+                subscriber.send_json(payload)
+            except Exception:
+                stale.append(subscriber)
+        if stale:
+            with self._scene_telemetry_lock:
+                for subscriber in stale:
+                    self._scene_telemetry_subscribers.discard(subscriber)
 
     def submit_payload(self, payload: Mapping[str, Any]) -> RenderJobAccepted:
         request_payload = dict(payload)
@@ -1313,6 +1432,37 @@ class RenderDaemon:
                 raise RuntimeError("Queued cancellation is supported, but running renders are not interruptible in v1.")
             return RenderJobStatus(**render_job_status_to_payload(job.status))
 
+    def delete_job(self, job_id: str) -> None:
+        """Remove a finished/cancelled/failed job record and its log file.
+
+        Running and queued jobs are refused — callers should cancel first.
+        Deletes in-memory status, the status JSON, and the log file. No-ops for
+        unknown ids so that repeated UI dismissals are idempotent.
+        """
+        job_id = (job_id or "").strip()
+        if not job_id:
+            raise ValueError("Missing job_id")
+        with self._condition:
+            job = self._jobs.get(job_id)
+            if job is not None:
+                state = job.status.status
+                if state in ("queued", "running"):
+                    raise RuntimeError(f"Cannot delete a {state} job; cancel it first.")
+                self._jobs.pop(job_id, None)
+            try:
+                self._pending.remove(job_id)
+            except ValueError:
+                pass
+            try:
+                self._status_path(job_id).unlink(missing_ok=True)
+            except Exception:
+                pass
+            try:
+                self._job_log_path(job_id).unlink(missing_ok=True)
+            except Exception:
+                pass
+            self._invalidate_job_status_cache()
+
     def _handle_get(self, handler: BaseHTTPRequestHandler) -> None:
         try:
             parsed = urlparse(handler.path)
@@ -1427,6 +1577,10 @@ class RenderDaemon:
             if path.startswith("/api/scenes/") and path.endswith("/floorplan"):
                 scene_id = path[len("/api/scenes/") : -len("/floorplan")].rstrip("/")
                 self._send_json(handler, HTTPStatus.OK, self._ensure_floorplan(scene_id))
+                return
+            if path.startswith("/api/scenes/") and path.endswith("/diagram-3d"):
+                scene_id = path[len("/api/scenes/") : -len("/diagram-3d")].rstrip("/")
+                self._send_json(handler, HTTPStatus.OK, self._scene_diagram_3d(scene_id))
                 return
             if path.startswith("/api/scenes/") and "/geometry/" in path:
                 parts = path[len("/api/scenes/") :].split("/geometry/", 1)
@@ -1550,6 +1704,19 @@ class RenderDaemon:
                     return
                 accepted = self.submit(original.render_request)
                 self._send_json(handler, HTTPStatus.ACCEPTED, render_job_accepted_to_payload(accepted))
+                return
+
+            if path.startswith("/api/render-jobs/") and path.endswith("/delete"):
+                job_id = path[len("/api/render-jobs/"):-len("/delete")]
+                try:
+                    self.delete_job(job_id)
+                except ValueError as exc:
+                    self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                    return
+                except RuntimeError as exc:
+                    self._send_json(handler, HTTPStatus.CONFLICT, {"error": str(exc)})
+                    return
+                self._send_json(handler, HTTPStatus.OK, {"job_id": job_id, "deleted": True})
                 return
 
             if path == "/api/isaac/scenes/register":
@@ -1748,7 +1915,7 @@ class RenderDaemon:
                 if not measured_file_path:
                     self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": "measured_file_path required (material not downloaded)"})
                     return
-                session = self._active_isaac_session
+                session = self._isaac_session
                 if session is None or session.scene_id != scene_id:
                     self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": f"No active session for scene {scene_id!r}"})
                     return
@@ -1764,12 +1931,61 @@ class RenderDaemon:
                     existing_obj.bsdf_override = override
                     existing_obj.bsdf_override_key = f"{dataset_id}/{material_id}" if dataset_id else bsdf_type
                 session.updated_at = _utc_now_iso()
+                session.material_revision += 1
+                session.material_dirty = True
                 self._send_json(handler, HTTPStatus.OK, {
                     "prim_path": prim_path,
                     "bsdf_type": bsdf_type,
                     "dataset_id": dataset_id,
                     "material_id": material_id,
                     "measured_file_path": measured_file_path,
+                    "status": "applied",
+                })
+                return
+
+            if path.startswith("/api/scenes/") and path.endswith("/apply-curated-material"):
+                from .curated_library import get_curated_material
+
+                scene_id = path[len("/api/scenes/") : -len("/apply-curated-material")].rstrip("/")
+                prim_path = payload.get("prim_path")
+                material_id = payload.get("material_id", "")
+                if not prim_path:
+                    self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": "prim_path required"})
+                    return
+                if not material_id:
+                    self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": "material_id required"})
+                    return
+                mat = get_curated_material(material_id)
+                if mat is None:
+                    self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": f"unknown curated material: {material_id}"})
+                    return
+                session = self._isaac_session
+                if session is None or session.scene_id != scene_id:
+                    self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": f"No active session for scene {scene_id!r}"})
+                    return
+                override = BsdfOverride(
+                    bsdf_type="curated",
+                    material_id=mat.material_id,
+                    extras={
+                        "curated_bsdf_spec": dict(mat.bsdf_spec),
+                        "curated_category": mat.category,
+                        "curated_display_name": mat.display_name,
+                    },
+                )
+                session.material_overrides[prim_path] = override
+                existing_obj = session.objects.get(prim_path)
+                if existing_obj is not None:
+                    existing_obj.bsdf_override = override
+                    existing_obj.bsdf_override_key = f"curated/{mat.material_id}"
+                session.updated_at = _utc_now_iso()
+                session.material_revision += 1
+                session.material_dirty = True
+                self._send_json(handler, HTTPStatus.OK, {
+                    "prim_path": prim_path,
+                    "bsdf_type": "curated",
+                    "material_id": mat.material_id,
+                    "category": mat.category,
+                    "display_name": mat.display_name,
                     "status": "applied",
                 })
                 return
@@ -2013,6 +2229,7 @@ class RenderDaemon:
             session.session_revision += 1
             summary = self._active_isaac_session_summary(include_inventory=False)
             summary["reused"] = True
+            self._broadcast_scene_telemetry(force=True)
             return summary
         scene_xml = resolve_repo_path(self.repo_root, session_open.mitsuba_scene_ref)
         if not scene_xml.exists():
@@ -2050,6 +2267,7 @@ class RenderDaemon:
         self._invalidate_session_inventory_cache()
         summary = self._active_isaac_session_summary(include_inventory=False)
         summary["reused"] = False
+        self._broadcast_scene_telemetry(force=True)
         return summary
 
     def _update_isaac_state(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -2141,6 +2359,7 @@ class RenderDaemon:
                     )
         session.updated_at = _utc_now_iso()
         session.sensor_revision += 1
+        self._broadcast_scene_telemetry()
         # Lightweight response — inventory rebuild not needed for sensor registration
         summary = self._active_isaac_session_summary(include_inventory=False)
         summary["registered_sensors"] = [sensor.sensor_id for sensor in sensors]
@@ -2302,7 +2521,19 @@ class RenderDaemon:
         if stage == "staging_scene":
             return f"Preparing scene XML{pass_suffix}{count_suffix}."
         if stage == "loading_scene":
-            return f"Loading scene into GPU memory{pass_suffix}{spp_suffix}{count_suffix}."
+            sub = _maybe_str(ctx.get("sub_step"))
+            mesh_n = ctx.get("mesh_count")
+            tex_n = ctx.get("texture_count")
+            sub_label_map = {
+                "parsing_xml":        "Parsing scene XML",
+                "loading_meshes":     f"Loading meshes ({mesh_n})" if isinstance(mesh_n, int) and mesh_n else "Loading meshes",
+                "uploading_textures": f"Uploading textures ({tex_n})" if isinstance(tex_n, int) and tex_n else "Uploading textures",
+                "compiling_optix":    "Compiling OptiX shaders (may take minutes)",
+                "ready":              "Scene loaded into GPU",
+                "cached":             "Scene already in GPU cache",
+            }
+            base = sub_label_map.get(sub or "", "Loading scene into GPU memory")
+            return f"{base}{pass_suffix}{spp_suffix}{count_suffix}."
         if stage == "rendering":
             return f"Ray tracing{pass_suffix}{spp_suffix}{count_suffix}."
         if stage == "saving_output":
@@ -2472,22 +2703,46 @@ class RenderDaemon:
             return {key: values[-1] if values else "" for key, values in parsed.items()}
         raise ValueError(f"Unsupported Content-Type: {content_type or 'unknown'}")
 
-    def _send_json(self, handler: BaseHTTPRequestHandler, status_code: int, payload: Mapping[str, Any]) -> None:
+    def _send_json(
+        self,
+        handler: BaseHTTPRequestHandler,
+        status_code: int,
+        payload: Mapping[str, Any],
+        *,
+        extra_headers: Mapping[str, str] | None = None,
+    ) -> None:
         if status_code >= 400 and os.environ.get("ROBOMITUBA_DAEMON_DEBUG_LOG") in {"1", "true", "yes", "on"}:
             compact = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
             print(f"[http] {handler.command} {handler.path} -> {status_code} {compact}", file=sys.stderr, flush=True)
         encoded = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
-        self._send_bytes(handler, status_code, encoded, content_type="application/json; charset=utf-8")
+        self._send_bytes(
+            handler,
+            status_code,
+            encoded,
+            content_type="application/json; charset=utf-8",
+            extra_headers=extra_headers,
+        )
 
     def _send_html(self, handler: BaseHTTPRequestHandler, status_code: int, html: str) -> None:
         encoded = html.encode("utf-8")
         self._send_bytes(handler, status_code, encoded, content_type="text/html; charset=utf-8")
 
-    def _send_bytes(self, handler: BaseHTTPRequestHandler, status_code: int, payload: bytes, *, content_type: str) -> None:
+    def _send_bytes(
+        self,
+        handler: BaseHTTPRequestHandler,
+        status_code: int,
+        payload: bytes,
+        *,
+        content_type: str,
+        extra_headers: Mapping[str, str] | None = None,
+    ) -> None:
         try:
             handler.send_response(status_code)
             handler.send_header("Content-Type", content_type)
             handler.send_header("Content-Length", str(len(payload)))
+            if extra_headers:
+                for key, value in extra_headers.items():
+                    handler.send_header(key, value)
             handler.end_headers()
             handler.wfile.write(payload)
         except (BrokenPipeError, ConnectionResetError):
@@ -2569,6 +2824,11 @@ class RenderDaemon:
         from .sphere_preview import get_preset_preview, get_measured_preview
 
         cache_dir = self.repo_root / "out" / "material_previews"
+        # /api/material-preview/curated/{material_id}
+        if path.startswith("/api/material-preview/curated/"):
+            material_id = path[len("/api/material-preview/curated/"):].strip("/")
+            self._serve_curated_preview(handler, material_id, cache_dir)
+            return
         # /api/material-preview/preset/{bsdf_type}
         if path.startswith("/api/material-preview/preset/"):
             bsdf_type = path[len("/api/material-preview/preset/"):].strip("/")
@@ -2590,13 +2850,120 @@ class RenderDaemon:
             if not file_param:
                 self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": "Missing ?file= query parameter"})
                 return
-            png_path = get_measured_preview(dataset_id, material_id, file_param, self.repo_root, cache_dir)
-            if png_path is None:
-                self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": f"Preview unavailable for measured: {dataset_id}/{material_id}"})
+            result = get_measured_preview(dataset_id, material_id, file_param, self.repo_root, cache_dir)
+            status_header = {"X-Preview-Status": result.status}
+            if result.path is None:
+                self._send_json(
+                    handler,
+                    HTTPStatus.NOT_FOUND,
+                    {
+                        "error": f"Preview unavailable for measured: {dataset_id}/{material_id}",
+                        "status": result.status,
+                    },
+                    extra_headers=status_header,
+                )
                 return
-            self._send_bytes(handler, HTTPStatus.OK, png_path.read_bytes(), content_type="image/png")
+            self._send_bytes(
+                handler,
+                HTTPStatus.OK,
+                result.path.read_bytes(),
+                content_type="image/png",
+                extra_headers=status_header,
+            )
             return
         self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": f"Unknown material-preview path: {path}"})
+
+    def _serve_curated_preview(
+        self,
+        handler: BaseHTTPRequestHandler,
+        material_id: str,
+        cache_dir: Path,
+    ) -> None:
+        """Serve the pre-baked curated material PNG, falling back to on-demand render."""
+        from .curated_library import curated_preview_path, get_curated_material
+
+        mat = get_curated_material(material_id)
+        if mat is None:
+            self._send_json(
+                handler,
+                HTTPStatus.NOT_FOUND,
+                {"error": f"Unknown curated material: {material_id}"},
+                extra_headers={"X-Preview-Status": "unknown"},
+            )
+            return
+
+        baked = curated_preview_path(self.repo_root, material_id)
+        if baked.exists():
+            self._send_bytes(
+                handler,
+                HTTPStatus.OK,
+                baked.read_bytes(),
+                content_type="image/png",
+                extra_headers={
+                    "X-Preview-Status": "baked",
+                    "Cache-Control": "public, max-age=86400",
+                },
+            )
+            return
+
+        # Fallback: render on demand into the daemon cache dir.
+        from .sphere_preview import (
+            _build_scene_dict,
+            _get_lock,
+            _mitsuba_render_lock,
+            _pick_variant_for,
+            _render_to_png,
+        )
+
+        out = cache_dir / "curated" / f"{material_id}.png"
+        if out.exists():
+            self._send_bytes(
+                handler,
+                HTTPStatus.OK,
+                out.read_bytes(),
+                content_type="image/png",
+                extra_headers={"X-Preview-Status": "ok"},
+            )
+            return
+
+        variant = _pick_variant_for("rgb")
+        if variant is None:
+            self._send_json(
+                handler,
+                HTTPStatus.NOT_FOUND,
+                {"error": "Mitsuba variant unavailable; bake assets/material_previews/curated/ first."},
+                extra_headers={"X-Preview-Status": "mitsuba_unavailable"},
+            )
+            return
+
+        lock = _get_lock(f"curated:{material_id}")
+        with lock:
+            if not out.exists():
+                try:
+                    scene_dict = _build_scene_dict(mat.bsdf_spec, size=192, spp=128)
+                    with _mitsuba_render_lock:
+                        _render_to_png(scene_dict, out, variant=variant, spp=128)
+                except Exception as exc:
+                    print(
+                        f"[daemon] curated preview render failed ({material_id}): {exc}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    self._send_json(
+                        handler,
+                        HTTPStatus.NOT_FOUND,
+                        {"error": "render_failed", "status": "load_error"},
+                        extra_headers={"X-Preview-Status": "load_error"},
+                    )
+                    return
+
+        self._send_bytes(
+            handler,
+            HTTPStatus.OK,
+            out.read_bytes(),
+            content_type="image/png",
+            extra_headers={"X-Preview-Status": "ok"},
+        )
 
     def _serve_static_file(self, handler: BaseHTTPRequestHandler, path: Path) -> None:
         if not path.exists() or not path.is_file():
@@ -4422,6 +4789,248 @@ class RenderDaemon:
             "extras": dict(sensor.extras or {}),
         }
 
+    def _obj_local_bounds(self, geometry_path: str | None) -> dict[str, Any] | None:
+        if not geometry_path:
+            return None
+        cache_key = str(geometry_path)
+        if cache_key in self._geometry_bounds_cache:
+            cached = self._geometry_bounds_cache[cache_key]
+            return dict(cached) if isinstance(cached, dict) else None
+        path = resolve_repo_path(self.repo_root, geometry_path)
+        if not path.exists() or not path.is_file():
+            self._geometry_bounds_cache[cache_key] = None
+            return None
+        min_corner: np.ndarray | None = None
+        max_corner: np.ndarray | None = None
+        try:
+            with path.open("r", encoding="utf-8", errors="ignore") as handle:
+                for line in handle:
+                    if not line.startswith("v "):
+                        continue
+                    parts = line.strip().split()
+                    if len(parts) < 4:
+                        continue
+                    point = np.asarray([float(parts[1]), float(parts[2]), float(parts[3])], dtype=np.float32)
+                    min_corner = point.copy() if min_corner is None else np.minimum(min_corner, point)
+                    max_corner = point.copy() if max_corner is None else np.maximum(max_corner, point)
+        except Exception:
+            self._geometry_bounds_cache[cache_key] = None
+            return None
+        if min_corner is None or max_corner is None:
+            self._geometry_bounds_cache[cache_key] = None
+            return None
+        size = np.maximum(max_corner - min_corner, 1e-4)
+        center = (min_corner + max_corner) * 0.5
+        payload = {
+            "min": min_corner.astype(float).tolist(),
+            "max": max_corner.astype(float).tolist(),
+            "size": size.astype(float).tolist(),
+            "center": center.astype(float).tolist(),
+        }
+        self._geometry_bounds_cache[cache_key] = dict(payload)
+        return payload
+
+    def _transform_bounds_payload(self, bounds: Mapping[str, Any], transform: list[float] | None) -> dict[str, Any] | None:
+        min_corner = bounds.get("min")
+        max_corner = bounds.get("max")
+        if not isinstance(min_corner, list) or not isinstance(max_corner, list) or len(min_corner) < 3 or len(max_corner) < 3:
+            return None
+        local_min = np.asarray(min_corner[:3], dtype=np.float32)
+        local_max = np.asarray(max_corner[:3], dtype=np.float32)
+        matrix = np.eye(4, dtype=np.float32)
+        if isinstance(transform, list) and len(transform) == 16:
+            try:
+                matrix = normalize_mat4_storage(transform).astype(np.float32)
+            except Exception:
+                matrix = np.eye(4, dtype=np.float32)
+        corners = np.asarray(
+            [
+                [local_min[0], local_min[1], local_min[2], 1.0],
+                [local_min[0], local_min[1], local_max[2], 1.0],
+                [local_min[0], local_max[1], local_min[2], 1.0],
+                [local_min[0], local_max[1], local_max[2], 1.0],
+                [local_max[0], local_min[1], local_min[2], 1.0],
+                [local_max[0], local_min[1], local_max[2], 1.0],
+                [local_max[0], local_max[1], local_min[2], 1.0],
+                [local_max[0], local_max[1], local_max[2], 1.0],
+            ],
+            dtype=np.float32,
+        )
+        world = corners @ matrix.T
+        world_min = world[:, :3].min(axis=0)
+        world_max = world[:, :3].max(axis=0)
+        size = np.maximum(world_max - world_min, 1e-4)
+        center = (world_min + world_max) * 0.5
+        return {
+            "min": world_min.astype(float).tolist(),
+            "max": world_max.astype(float).tolist(),
+            "size": size.astype(float).tolist(),
+            "center": center.astype(float).tolist(),
+        }
+
+    @staticmethod
+    def _diagram_category(name: str, source_path: str, material_id: str | None = None) -> str:
+        key = " ".join([name, source_path, str(material_id or "")]).lower()
+        if any(token in key for token in ("rangermini", "robot", "base_link")):
+            return "robot"
+        if any(token in key for token in ("floor", "ground", "slab", "tile")):
+            return "floor"
+        if any(token in key for token in ("wall", "shell", "ceiling", "roof")):
+            return "shell"
+        if any(token in key for token in ("glass", "window", "door", "pane")):
+            return "glass"
+        if any(token in key for token in ("chair", "table", "desk", "cabinet", "sofa", "shelf", "bed", "bench", "kitchen", "counter", "furniture")):
+            return "furniture"
+        if any(token in key for token in ("frame", "art", "props", "deco", "plant", "lamp")):
+            return "props"
+        return "other"
+
+    def _scene_diagram_3d(self, scene_id: str) -> dict[str, Any]:
+        detail = self._scene_detail(scene_id)
+        scene_record = detail.get("scene")
+        session = self._isaac_session if self._isaac_session is not None and self._isaac_session.scene_id == scene_id else None
+        if scene_record is None:
+            return {
+                "scene_id": scene_id,
+                "status": "unavailable",
+                "reason": "unknown_scene",
+                "objects": [],
+                "robots": [],
+                "active_viewport_camera": None,
+                "simplification_mode": "proxy_bounds_v1",
+            }
+        snapshot_ref = (
+            _maybe_str(scene_record.get("scene_snapshot_ref"))
+            or (session.scene_snapshot_ref if session is not None else None)
+            or (session.shape_map_ref if session is not None else None)
+        )
+        snapshot, _cameras, _lights = self._load_snapshot_sidecars(snapshot_ref)
+        if snapshot is None:
+            return {
+                "scene_id": scene_id,
+                "status": "unavailable",
+                "reason": f"snapshot_unavailable:{snapshot_ref or 'missing'}",
+                "objects": [],
+                "robots": self._session_robot_inventory(session) if session is not None else [],
+                "active_viewport_camera": self._active_viewport_camera_payload(session) if session is not None else None,
+                "simplification_mode": "proxy_bounds_v1",
+            }
+        selected_paths = {str(path) for path in (session.selected_prim_paths if session is not None else []) if str(path)}
+        objects: list[dict[str, Any]] = []
+        scene_points: list[np.ndarray] = []
+
+        for mesh in snapshot.meshes:
+            geometry_bounds = self._obj_local_bounds(mesh.geometry_path)
+            if geometry_bounds is None:
+                translation = _object_transform_translation(mesh.transform)
+                if translation is None:
+                    continue
+                tx, ty, tz = (float(translation[0]), float(translation[1]), float(translation[2]))
+                geometry_bounds = {
+                    "min": [-0.05, -0.05, -0.05],
+                    "max": [0.05, 0.05, 0.05],
+                    "size": [0.1, 0.1, 0.1],
+                    "center": [0.0, 0.0, 0.0],
+                }
+                transform = [
+                    1.0, 0.0, 0.0, 0.0,
+                    0.0, 1.0, 0.0, 0.0,
+                    0.0, 0.0, 1.0, 0.0,
+                    tx, ty, tz, 1.0,
+                ]
+            else:
+                transform = list(mesh.transform) if isinstance(mesh.transform, list) and len(mesh.transform) == 16 else None
+            world_bounds = self._transform_bounds_payload(geometry_bounds, transform)
+            if world_bounds is None:
+                continue
+            size = np.asarray(world_bounds["size"], dtype=np.float32)
+            volume = float(size[0] * size[1] * size[2])
+            category = self._diagram_category(str(mesh.name or ""), str(mesh.source_path or ""), mesh.material_id)
+            is_selected = any(
+                candidate and (
+                    candidate == str(mesh.source_path or "")
+                    or str(mesh.source_path or "").startswith(f"{candidate}/")
+                    or candidate.startswith(f"{str(mesh.source_path or '')}/")
+                )
+                for candidate in selected_paths
+            )
+            record = {
+                "id": str(mesh.mesh_id or mesh.source_path or mesh.name or f"mesh_{len(objects)}"),
+                "path": str(mesh.source_path or ""),
+                "label": str(mesh.name or mesh.mesh_id or "mesh"),
+                "kind": str(mesh.primitive or "mesh"),
+                "category": category,
+                "material_id": mesh.material_id,
+                "selected": is_selected,
+                "bounds": world_bounds,
+                "transform": list(transform) if isinstance(transform, list) else None,
+                "vertex_count": mesh.vertex_count,
+                "face_count": mesh.face_count,
+                "geometry_path": mesh.geometry_path,
+                "_volume": volume,
+            }
+            objects.append(record)
+            scene_points.append(np.asarray(world_bounds["min"], dtype=np.float32))
+            scene_points.append(np.asarray(world_bounds["max"], dtype=np.float32))
+
+        if not objects:
+            return {
+                "scene_id": scene_id,
+                "status": "empty",
+                "reason": "no_proxy_objects",
+                "objects": [],
+                "robots": self._session_robot_inventory(session) if session is not None else [],
+                "active_viewport_camera": self._active_viewport_camera_payload(session) if session is not None else None,
+                "simplification_mode": "proxy_bounds_v1",
+            }
+
+        scene_min = np.vstack(scene_points).min(axis=0)
+        scene_max = np.vstack(scene_points).max(axis=0)
+        scene_size = np.maximum(scene_max - scene_min, 1e-4)
+        scene_volume = float(scene_size[0] * scene_size[1] * scene_size[2])
+        must_keep = {
+            record["id"]
+            for record in objects
+            if record["selected"] or record["category"] in {"floor", "shell", "glass", "robot"}
+        }
+        sorted_objects = sorted(objects, key=lambda item: float(item.get("_volume") or 0.0), reverse=True)
+        included: list[dict[str, Any]] = []
+        for record in sorted_objects:
+            volume_ratio = float(record.get("_volume") or 0.0) / scene_volume if scene_volume > 0 else 0.0
+            if record["id"] in must_keep or volume_ratio >= 0.0005 or len(included) < 160:
+                included.append(record)
+        included_ids = {item["id"] for item in included}
+        omitted_count = len(objects) - len(included_ids)
+        included.sort(key=lambda item: (item["category"] not in {"floor", "shell", "glass"}, item["label"]))
+        final_objects = []
+        for record in included:
+            stripped = {key: value for key, value in record.items() if not key.startswith("_")}
+            final_objects.append(stripped)
+
+        robots = self._session_robot_inventory(session) if session is not None else []
+        active_camera = self._active_viewport_camera_payload(session) if session is not None else None
+        status = "partial" if omitted_count > 0 else "ready"
+        return {
+            "scene_id": scene_id,
+            "status": status,
+            "reason": "tiny_objects_omitted" if omitted_count > 0 else None,
+            "simplification_mode": "proxy_bounds_v1",
+            "objects": final_objects,
+            "robots": robots,
+            "active_viewport_camera": active_camera,
+            "summary": {
+                "object_count_total": len(objects),
+                "object_count_included": len(final_objects),
+                "object_count_omitted": omitted_count,
+                "scene_bounds": {
+                    "min": scene_min.astype(float).tolist(),
+                    "max": scene_max.astype(float).tolist(),
+                    "size": scene_size.astype(float).tolist(),
+                    "center": ((scene_min + scene_max) * 0.5).astype(float).tolist(),
+                },
+            },
+        }
+
     def _object_overlays_from_session(self, session: _IsaacActiveSession, *, metadata: Mapping[str, Any]) -> list[dict[str, Any]]:
         world_bounds = metadata.get("world_bounds_xz")
         projection = metadata.get("projection")
@@ -4547,7 +5156,7 @@ class RenderDaemon:
         detail = detail or self._scene_detail(scene_id)
         scene_record = detail["scene"]
         latest_capture = detail["latest_capture"]
-        if scene_record is None or latest_capture is None:
+        if scene_record is None:
             return {
                 "scene_id": scene_id,
                 "artifact_path": None,
@@ -4573,7 +5182,7 @@ class RenderDaemon:
                 "object_overlays": [],
             }
 
-        request = self._load_saved_request(latest_capture["job_id"], latest_capture["frame_id"])
+        request = self._load_saved_request(latest_capture["job_id"], latest_capture["frame_id"]) if latest_capture is not None else None
         request_cameras: list[CameraOverlay] = []
         if request is not None:
             for camera in request.camera_specs:
@@ -4610,8 +5219,8 @@ class RenderDaemon:
         expected_cache_key = {
             "floorplan_version": 2,
             "scene_id": scene_id,
-            "latest_capture_job_id": latest_capture["job_id"],
-            "latest_capture_frame_id": latest_capture["frame_id"],
+            "latest_capture_job_id": latest_capture["job_id"] if latest_capture is not None else None,
+            "latest_capture_frame_id": latest_capture["frame_id"] if latest_capture is not None else None,
             "scene_ref": scene_record["mitsuba_scene_ref"],
             "scene_snapshot_ref": scene_record.get("scene_snapshot_ref"),
             "request_camera_count": len(request_cameras),

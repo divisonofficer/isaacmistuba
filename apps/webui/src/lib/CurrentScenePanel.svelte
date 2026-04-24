@@ -1,17 +1,20 @@
 <script lang="ts">
 	import { onMount, onDestroy } from 'svelte';
 	import { page } from '$app/stores';
+	import { goto } from '$app/navigation';
 	import { lang } from '$lib/stores/lang';
 	import { healthStore } from '$lib/stores/health';
 	import { debugEvents } from '$lib/stores/debugEvents';
 	import { sceneRailSnippet, sceneBottomSnippet } from '$lib/stores/scenePortals';
 	import { bottomPanelCollapsed, toggleBottomPanel } from '$lib/stores/shell';
+	import { currentSceneIdStore, currentSceneStore } from '$lib/stores/sceneCommands';
+	import CurrentSceneBlueprint3D from '$lib/CurrentSceneBlueprint3D.svelte';
 	import {
 		summary, getIsaacSession, getIsaacSessionInventory,
 		getScene, listJobs, materialPresets, materialLibrary,
-		isaacCommand, smokeRender, applyMeasuredMaterial,
+		isaacCommand, smokeRender, applyMeasuredMaterial, applyCuratedMaterial,
 		listIsaacScenes, downloadDataset, getDatasetDownloadStatus,
-		retryJob, measuredMaterialPreviewUrl
+		retryJob, deleteJob, measuredMaterialPreviewUrl, curatedMaterialPreviewUrl
 	} from '$lib/api';
 	import { Card, IncidentCard, LogList, KeyValueList, DataTable, Breadcrumb } from '$lib/components';
 	import type { LogEntry, KeyValueItem, DataTableColumn, Tone, BreadcrumbItem, TabItem } from '$lib/components';
@@ -29,7 +32,18 @@
 		shape_count?: number;
 	};
 	type Preset = { bsdf_type: string; category: string; title_en: string; title_kr: string; description_en: string; description_kr: string; swatch?: string };
-	type MatEntry = { material_id: string; display_name: string; native_file: string; status: string; download_url: string | null };
+	type CategoryKey = 'metal' | 'plastic' | 'dielectric' | 'principled' | 'fluid' | 'fabric' | 'other';
+	type MatEntry = {
+		material_id: string;
+		display_name: string;
+		native_file: string;
+		status: string;
+		download_url: string | null;
+		kind?: 'curated';
+		category?: CategoryKey;
+		description?: string;
+		preview_baked?: boolean;
+	};
 	type DatasetGroup = {
 		dataset_id: string; display_name: string; paper_title: string; venue: string;
 		swatch_hue: number; patch_required: boolean; mitsuba_strategy: string;
@@ -40,6 +54,12 @@
 	type LayerKey = 'scene' | 'render' | 'shape';
 	type ViewMode = '2d' | '3d';
 	type BottomTabId = 'jobs' | 'logs' | 'selection' | 'history' | 'materials';
+	type LiveCameraPayload = {
+		scene_id?: string;
+		updated_at?: string;
+		sensor_revision?: number;
+		active_viewport_camera?: Record<string, unknown> | null;
+	};
 	type JobRow = {
 		job_id: string;
 		status: string;
@@ -78,6 +98,17 @@
 	let matGroups = $state<DatasetGroup[]>([]);
 	let matSearch = $state('');
 	let matCapFilter = $state<'all' | 'polarized' | 'nir' | 'available'>('all');
+	let activeCategory = $state<'all' | CategoryKey>('all');
+	const CATEGORY_CHIPS: { key: 'all' | CategoryKey; label_kr: string; label_en: string }[] = [
+		{ key: 'all',         label_kr: '전체',         label_en: 'All' },
+		{ key: 'metal',       label_kr: '금속',         label_en: 'Metal' },
+		{ key: 'plastic',     label_kr: '플라스틱',     label_en: 'Plastic' },
+		{ key: 'dielectric',  label_kr: '유전체',       label_en: 'Dielectric' },
+		{ key: 'principled',  label_kr: '프린시폴드',   label_en: 'Principled' },
+		{ key: 'fluid',       label_kr: '유체',         label_en: 'Fluid' },
+		{ key: 'fabric',      label_kr: '패브릭',       label_en: 'Fabric' },
+		{ key: 'other',       label_kr: '기타',         label_en: 'Other' }
+	];
 	let collapsedGroups = $state<Set<string>>(new Set());
 	let dlJobs = $state<Record<string, { done: number; total: number; status: string; current_name?: string; error?: string }>>({});
 
@@ -89,6 +120,7 @@
 	// Map state
 	let floorplan = $state<Record<string, unknown> | null>(null);
 	let floorplanImgSrc = $state<string | null>(null);
+	let floorplanError = $state('');
 	let mapImg = $state<HTMLImageElement | null>(null);
 	let mapCanvas = $state<HTMLCanvasElement | null>(null);
 	let mapViewport = $state<HTMLDivElement | null>(null);
@@ -96,7 +128,12 @@
 	let mapPanX = $state(0);
 	let mapPanY = $state(0);
 	let isPanning = $state(false);
+	let liveActiveViewportCamera = $state<Record<string, unknown> | null>(null);
 	let panStart = { x: 0, y: 0, px: 0, py: 0 };
+	let currentSceneSocket: WebSocket | null = null;
+	let currentSceneSocketSceneId: string | null = null;
+	let currentSceneSocketRetry: ReturnType<typeof setTimeout> | null = null;
+	let currentSceneSocketClosedByUs = false;
 
 	// UI state
 	let loading = $state(true);
@@ -104,38 +141,73 @@
 	let cmdPending = $state<string | null>(null);
 	let cmdMsg = $state('');
 	let retryingJobId = $state<string | null>(null);
+	let deletingJobId = $state<string | null>(null);
 	let viewMode = $state<ViewMode>('2d');
 	let bottomTab = $state<BottomTabId>('jobs');
 	let layerFilters = $state<Set<LayerKey>>(new Set(['scene', 'render', 'shape']));
 
+	// Incident accordion + filter state
+	let expandedIncidentId = $state<string | null>(null);
+	let incidentFilter = $state<'all' | 'danger' | 'warning'>('all');
+
+	// Unified job hub selection
+	let selectedJobKey = $state<string | null>(null);
+
 	let timer: ReturnType<typeof setInterval>;
+
+	$effect(() => { currentSceneIdStore.set(currentSceneId); });
+	$effect(() => { currentSceneStore.set(scene); });
 	let refreshInFlight = false;
 	let lastSceneDetailAt = 0;
 	let lastJobsAt = 0;
 	let lastInventoryAt = 0;
 	let lastFloorplanAt = 0;
+	let lastMatLibAt = 0;
 
 	const SCENE_DETAIL_POLL_MS = 7000;
 	const JOBS_POLL_MS = 5000;
 	const INVENTORY_POLL_MS = 12000;
 	const FLOORPLAN_POLL_MS = 15000;
+	const MATLIB_POLL_MS = 30000;
 
 	const isaacConnected = $derived($healthStore?.isaac_connected ?? false);
 	const workerBusy = $derived($healthStore?.worker_state === 'running');
-	const sceneLoaded = $derived(!!scene?.usd_stage_path);
 	const sessionConnected = $derived(!!session && !!isaacConnected);
+	const shapeMapExists = $derived(!!scene?.shape_map_exists);
+	const mitsubaSceneExists = $derived(!!scene?.mitsuba_scene_exists);
 	const renderReady = $derived(!!scene?.render_ready);
 	const activeCmd = $derived($healthStore?.active_isaac_command as Record<string, unknown> | null);
+	const preparingNow = $derived(activeCmd?.command_type === 'prepare_render_ready');
+	const snapshotReady = $derived(
+		!!scene?.scene_snapshot_ref
+		|| !!scene?.shape_map_ref
+		|| !!session?.scene_snapshot_ref
+		|| !!session?.shape_map_ref
+	);
+	const renderDisabledReason = $derived(
+		!sessionConnected ? (L === 'kr' ? '세션 연결 후 가능' : 'Connect session first')
+		: preparingNow ? (L === 'kr' ? '준비 작업 진행 중…' : 'Prepare in progress…')
+		: !mitsubaSceneExists && !shapeMapExists ? (L === 'kr' ? '준비 필요 (Mitsuba 씬 + Shape Map)' : 'Run Prepare (Mitsuba scene + Shape Map missing)')
+		: !mitsubaSceneExists ? (L === 'kr' ? 'Mitsuba 씬 미생성 — 준비 재실행' : 'Mitsuba scene missing — re-run Prepare')
+		: !shapeMapExists ? (L === 'kr' ? 'Shape Map 진행 중 — 잠시 후 다시' : 'Shape Map in progress — try again shortly')
+		: workerBusy ? (L === 'kr' ? '워커가 작업 중' : 'Worker busy')
+		: cmdPending ? (L === 'kr' ? '명령 진행 중' : 'Command in flight')
+		: ''
+	);
 	const isVisible = $derived($page.url.pathname.startsWith('/current-scene'));
 
-	const failedJobsCount = $derived(recentJobs.filter(j => j.status === 'failed').length);
-	const runningJobsCount = $derived(recentJobs.filter(j => j.status === 'running').length);
-	const lastSucceededJob = $derived(recentJobs.find(j => j.status === 'succeeded') ?? null);
+	const cleanJobs = $derived(recentJobs.filter(j => String(j.job_id ?? '').trim()));
+	const failedJobsCount = $derived(cleanJobs.filter(j => j.status === 'failed').length);
+	const runningJobsCount = $derived(cleanJobs.filter(j => j.status === 'running').length);
+	const queuedJobsCount = $derived(cleanJobs.filter(j => j.status === 'queued').length);
+	const finishedJobsCount = $derived(cleanJobs.filter(j => j.status === 'succeeded' || j.status === 'failed').length);
+	const runningCount = $derived((activeCmd ? 1 : 0) + runningJobsCount);
+	const lastSucceededJob = $derived(cleanJobs.find(j => j.status === 'succeeded') ?? null);
 	const bottomTabs = $derived<TabItem[]>([
-		{ id: 'jobs', label: L === 'kr' ? '작업 큐' : 'Jobs', badge: runningJobsCount > 0 ? runningJobsCount : undefined },
+		{ id: 'jobs', label: L === 'kr' ? '작업 큐' : 'Jobs', badge: runningCount > 0 ? runningCount : undefined },
 		{ id: 'logs', label: L === 'kr' ? '최근 로그' : 'Logs', badge: $debugEvents.length > 0 ? $debugEvents.length : undefined },
 		{ id: 'selection', label: L === 'kr' ? '선택 상세' : 'Selection', disabled: !selectedObj },
-		{ id: 'history', label: L === 'kr' ? '렌더 이력' : 'History', badge: failedJobsCount > 0 ? failedJobsCount : undefined },
+		{ id: 'history', label: L === 'kr' ? '렌더 이력' : 'History', badge: finishedJobsCount > 0 ? finishedJobsCount : undefined },
 		{ id: 'materials', label: L === 'kr' ? '재질' : 'Materials' }
 	]);
 
@@ -226,18 +298,22 @@
 	}));
 
 	// Filtered dataset groups
-	const filteredGroups = $derived(matGroups.map(g => ({
-		...g,
-		materials: g.materials.filter(m => {
-			const q = matSearch.toLowerCase();
-			const matchSearch = !q || m.display_name.toLowerCase().includes(q) || m.material_id.toLowerCase().includes(q);
-			const matchCap = matCapFilter === 'all'
-				|| (matCapFilter === 'polarized' && g.capabilities.polarization)
-				|| (matCapFilter === 'nir' && g.capabilities.nir)
-				|| (matCapFilter === 'available' && m.status === 'available');
-			return matchSearch && matchCap;
-		})
-	})).filter(g => g.materials.length > 0));
+	const filteredGroups = $derived(matGroups
+		.filter(g => activeCategory === 'all' || g.dataset_id === 'curated')
+		.map(g => ({
+			...g,
+			materials: g.materials.filter(m => {
+				const q = matSearch.toLowerCase();
+				const matchSearch = !q || m.display_name.toLowerCase().includes(q) || m.material_id.toLowerCase().includes(q);
+				const matchCap = matCapFilter === 'all'
+					|| (matCapFilter === 'polarized' && g.capabilities.polarization)
+					|| (matCapFilter === 'nir' && g.capabilities.nir)
+					|| (matCapFilter === 'available' && m.status === 'available');
+				const matchCategory = activeCategory === 'all' || m.category === activeCategory;
+				return matchSearch && matchCap && matchCategory;
+			})
+		}))
+		.filter(g => g.materials.length > 0));
 
 	const selectionKv = $derived<KeyValueItem[]>(
 		selectedObj
@@ -269,8 +345,14 @@
 			if (s.usd_stage_path) items.push({ key: 'USD', value: String(s.usd_stage_path), mono: true });
 			items.push({ key: L === 'kr' ? '마지막 업데이트' : 'Last Update', value: sessionOpenedAt ? `${ago(sessionOpenedAt)} ago` : '—' });
 		}
+		items.push({ key: L === 'kr' ? '카메라' : 'Cameras', value: String(cameraCount) });
+		items.push({ key: L === 'kr' ? '메시' : 'Meshes', value: String(meshCount) });
+		items.push({ key: L === 'kr' ? '로봇' : 'Robots', value: String(robotCount) });
 		items.push({ key: L === 'kr' ? '렌더 가능 오브젝트' : 'Renderable', value: String(renderableObjectCount) });
 		items.push({ key: L === 'kr' ? '재질 수' : 'Materials', value: String(materialCount) });
+		if (lastSucceededJob?.finished_at) {
+			items.push({ key: L === 'kr' ? '마지막 성공' : 'Last success', value: `${ago(String(lastSucceededJob.finished_at))} ago`, mono: true });
+		}
 		return items;
 	}
 
@@ -293,25 +375,55 @@
 		source?: string;
 		timestamp?: string;
 		jobId: string;
+		fullError?: string;
+		relatedJobs?: string[];
 	};
 
-	const incidentItems = $derived<IncidentItem[]>(
-		recentJobs
-			.filter(j => j.status === 'failed')
-			.slice(0, 3)
-			.map(j => {
-				const jobId = String(j.job_id ?? '');
-				return {
-					key: jobId,
-					tone: 'danger' as const,
-					title: L === 'kr' ? `렌더 실패 — ${jobId.slice(0, 12)}` : `Render failed — ${jobId.slice(0, 12)}`,
-					description: j.progress_stage ? String(j.progress_stage).replace(/_/g, ' ') : undefined,
-					source: j.error ? String(j.error) : (j.scene_id ? String(j.scene_id) : undefined),
-					timestamp: j.finished_at ? String(j.finished_at) : undefined,
-					jobId
-				};
-			})
+	function truncate(s: string, n: number): string {
+		return s.length > n ? s.slice(0, n - 1) + '…' : s;
+	}
+
+	const incidentItems = $derived<IncidentItem[]>((() => {
+		const failed = recentJobs.filter(j => j.status === 'failed' && String(j.job_id ?? '').trim());
+		// Group by identical error string (ignoring jobs without error text).
+		const byKey = new Map<string, Record<string, unknown>[]>();
+		for (const j of failed) {
+			const err = j.error ? String(j.error) : '';
+			const key = err || `__job__${String(j.job_id ?? '')}`;
+			const bucket = byKey.get(key);
+			if (bucket) bucket.push(j); else byKey.set(key, [j]);
+		}
+		const items: IncidentItem[] = [];
+		for (const [, jobs] of byKey) {
+			const rep = jobs[0];
+			const jobId = String(rep.job_id ?? '');
+			const err = rep.error ? String(rep.error) : '';
+			const dup = jobs.length > 1 ? ` (${L === 'kr' ? '동일 오류' : 'same error'} ×${jobs.length})` : '';
+			const descBase = rep.progress_stage ? String(rep.progress_stage).replace(/_/g, ' ') : '';
+			items.push({
+				key: jobId,
+				tone: 'danger' as const,
+				title: (L === 'kr' ? `렌더 실패 — ${jobId.slice(0, 12)}` : `Render failed — ${jobId.slice(0, 12)}`) + dup,
+				description: (descBase || err) ? truncate(err || descBase, 80) : undefined,
+				source: rep.scene_id ? String(rep.scene_id) : undefined,
+				timestamp: rep.finished_at ? String(rep.finished_at) : undefined,
+				jobId,
+				fullError: err || undefined,
+				relatedJobs: jobs.length > 1 ? jobs.slice(1).map(j => String(j.job_id ?? '')) : undefined
+			});
+			if (items.length >= 10) break;
+		}
+		return items;
+	})());
+
+	const visibleIncidents = $derived<IncidentItem[]>(
+		incidentItems.filter(i => incidentFilter === 'all' || i.tone === incidentFilter)
 	);
+
+	function jumpToJobsTab() {
+		bottomTab = 'jobs';
+		if ($bottomPanelCollapsed) toggleBottomPanel();
+	}
 
 	type PipelineState = 'done' | 'running' | 'failed' | 'waiting';
 	type PipelineStep = {
@@ -387,14 +499,73 @@
 	];
 
 	const jobRows = $derived<JobRow[]>(
-		recentJobs.slice(0, 12).map(j => ({
-			job_id: String(j.job_id ?? '').slice(0, 18),
-			status: String(j.status ?? ''),
-			stage: String(j.progress_stage ?? '—').replace(/_/g, ' '),
-			scene_id: String(j.scene_id ?? ''),
-			finished_at: j.finished_at ? `${ago(String(j.finished_at))} ago` : (j.status === 'running' ? '…' : '—')
-		}))
+		recentJobs
+			.filter(j => String(j.job_id ?? '').trim())
+			.slice(0, 30)
+			.map(j => ({
+				job_id: String(j.job_id ?? '').slice(0, 18),
+				status: String(j.status ?? ''),
+				stage: String(j.progress_stage ?? '—').replace(/_/g, ' '),
+				scene_id: String(j.scene_id ?? ''),
+				finished_at: j.finished_at ? `${ago(String(j.finished_at))} ago` : (j.status === 'running' ? '…' : '—')
+			}))
 	);
+
+	type JobListRow = {
+		key: string;              // job_id or '__isaac__'
+		kind: 'isaac' | 'render';
+		title: string;
+		status: string;
+		stage: string;
+		source: Record<string, unknown>;
+	};
+
+	const ISAAC_JOB_KEY = '__isaac__';
+
+	const jobListGroups = $derived<{ labelKey: 'running' | 'queued' | 'recent' | 'failed'; label: string; rows: JobListRow[] }[]>((() => {
+		const rows: JobListRow[] = [];
+		if (activeCmd) {
+			const raw = String(activeCmd.status ?? 'running');
+			const normalized = raw === 'completed' ? 'succeeded' : raw;
+			rows.push({
+				key: ISAAC_JOB_KEY,
+				kind: 'isaac',
+				title: `Isaac: ${commandLabel(String(activeCmd.command_type ?? ''))}`,
+				status: normalized,
+				stage: String(activeCmd.progress_stage ?? ''),
+				source: activeCmd as Record<string, unknown>
+			});
+		}
+		for (const j of recentJobs) {
+			const jobId = String(j.job_id ?? '').trim();
+			if (!jobId) continue;
+			rows.push({
+				key: jobId,
+				kind: 'render',
+				title: jobId.slice(0, 18),
+				status: String(j.status ?? ''),
+				stage: String(j.progress_stage ?? ''),
+				source: j as Record<string, unknown>
+			});
+		}
+		const groups: { labelKey: 'running' | 'queued' | 'recent' | 'failed'; label: string; rows: JobListRow[] }[] = [
+			{ labelKey: 'running', label: L === 'kr' ? '실행 중' : 'Running', rows: rows.filter(r => r.status === 'running') },
+			{ labelKey: 'queued',  label: L === 'kr' ? '대기' : 'Queued',    rows: rows.filter(r => r.status === 'queued') },
+			{ labelKey: 'recent',  label: L === 'kr' ? '최근 완료' : 'Recently completed', rows: rows.filter(r => r.status === 'succeeded').slice(0, 5) },
+			{ labelKey: 'failed',  label: L === 'kr' ? '실패' : 'Failed',    rows: rows.filter(r => r.status === 'failed').slice(0, 5) }
+		];
+		return groups.filter(g => g.rows.length > 0);
+	})());
+
+	$effect(() => {
+		// Auto-select the first running job if nothing is selected, or if the current selection vanished.
+		const allKeys = new Set(jobListGroups.flatMap(g => g.rows.map(r => r.key)));
+		if (selectedJobKey && !allKeys.has(selectedJobKey)) selectedJobKey = null;
+		if (!selectedJobKey) {
+			const running = jobListGroups.find(g => g.labelKey === 'running')?.rows[0];
+			if (running) selectedJobKey = running.key;
+		}
+	});
 
 	function toggleLayer(layer: LayerKey) {
 		const next = new Set(layerFilters);
@@ -410,15 +581,105 @@
 		try {
 			const data = await fetch(`/api/scenes/${encodeURIComponent(sceneId)}/floorplan`).then(r => r.json());
 			floorplan = data;
-			floorplanImgSrc = (data.artifact_href as string) ?? null;
-		} catch {}
+			floorplanImgSrc = (data.artifact_href as string) ?? ((data.artifact_path as string) ? `/artifacts?path=${encodeURIComponent(String(data.artifact_path))}` : null);
+			floorplanError = String(data.error ?? '');
+		} catch (error: unknown) {
+			floorplan = null;
+			floorplanImgSrc = null;
+			floorplanError = error instanceof Error ? error.message : 'Failed to load floorplan';
+		}
 	}
 
-	async function refresh() {
+	function onFloorplanImageError() {
+		floorplanImgSrc = null;
+		floorplanError = L === 'kr' ? '2D 맵 이미지 파일을 불러오지 못했습니다.' : 'Failed to load the 2D map image.';
+	}
+
+	function clearCurrentSceneSocketRetry() {
+		if (currentSceneSocketRetry != null) {
+			clearTimeout(currentSceneSocketRetry);
+			currentSceneSocketRetry = null;
+		}
+	}
+
+	function disconnectCurrentSceneStream() {
+		clearCurrentSceneSocketRetry();
+		currentSceneSocketClosedByUs = true;
+		if (currentSceneSocket) {
+			try {
+				currentSceneSocket.close();
+			} catch {}
+		}
+		currentSceneSocket = null;
+		currentSceneSocketSceneId = null;
+	}
+
+	function currentSceneStreamUrl(sceneId: string): string | null {
+		if (typeof window === 'undefined') return null;
+		const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+		return `${protocol}//${window.location.host}/api/ws/current-scene?scene_id=${encodeURIComponent(sceneId)}`;
+	}
+
+	function applyCurrentSceneTelemetry(message: unknown) {
+		if (!message || typeof message !== 'object') return;
+		const payload = message as LiveCameraPayload;
+		if (payload.scene_id && currentSceneId && payload.scene_id !== currentSceneId) return;
+		const activeCamera = payload.active_viewport_camera;
+		liveActiveViewportCamera = activeCamera && typeof activeCamera === 'object' ? activeCamera : null;
+		drawOverlays();
+	}
+
+	function scheduleCurrentSceneReconnect(sceneId: string) {
+		if (!isVisible || !currentSceneId || currentSceneId !== sceneId) return;
+		clearCurrentSceneSocketRetry();
+		currentSceneSocketRetry = setTimeout(() => {
+			currentSceneSocketRetry = null;
+			connectCurrentSceneStream(sceneId);
+		}, 1000);
+	}
+
+	function connectCurrentSceneStream(sceneId: string) {
+		const url = currentSceneStreamUrl(sceneId);
+		if (!url) return;
+		if (
+			currentSceneSocket &&
+			currentSceneSocketSceneId === sceneId &&
+			(currentSceneSocket.readyState === WebSocket.OPEN || currentSceneSocket.readyState === WebSocket.CONNECTING)
+		) {
+			return;
+		}
+		disconnectCurrentSceneStream();
+		currentSceneSocketClosedByUs = false;
+		const ws = new WebSocket(url);
+		currentSceneSocket = ws;
+		currentSceneSocketSceneId = sceneId;
+		ws.onmessage = (event) => {
+			try {
+				applyCurrentSceneTelemetry(JSON.parse(String(event.data ?? '{}')));
+			} catch {}
+		};
+		ws.onerror = () => {
+			try {
+				ws.close();
+			} catch {}
+		};
+		ws.onclose = () => {
+			if (currentSceneSocket === ws) {
+				currentSceneSocket = null;
+				currentSceneSocketSceneId = null;
+			}
+			if (!currentSceneSocketClosedByUs) {
+				scheduleCurrentSceneReconnect(sceneId);
+			}
+		};
+	}
+
+	async function refresh(opts: { force?: boolean } = {}) {
 		if (refreshInFlight) return;
 		refreshInFlight = true;
 		try {
 			const now = Date.now();
+			const force = !!opts.force;
 			const [sumRes, sessRes] = await Promise.all([
 				summary().catch(() => null),
 				getIsaacSession().catch(() => null)
@@ -427,6 +688,9 @@
 			const prevSceneId = currentSceneId;
 			currentSceneId = newSceneId;
 			session = sessRes?.status === 'active' ? (sessRes.session as Record<string, unknown>) : null;
+			liveActiveViewportCamera = session
+				? ((session as Record<string, unknown>).active_viewport_camera as Record<string, unknown> | null) ?? liveActiveViewportCamera
+				: null;
 
 			if (newSceneId) {
 				const sceneChanged = newSceneId !== prevSceneId;
@@ -435,18 +699,19 @@
 					lastJobsAt = 0;
 					lastInventoryAt = 0;
 					lastFloorplanAt = 0;
+					liveActiveViewportCamera = null;
 				}
 
 				const tasks: Promise<void>[] = [];
-				if (sceneChanged || now - lastSceneDetailAt > SCENE_DETAIL_POLL_MS) {
+				if (force || sceneChanged || now - lastSceneDetailAt > SCENE_DETAIL_POLL_MS) {
 					lastSceneDetailAt = now;
 					tasks.push(getScene(newSceneId).then((sceneRes) => { scene = sceneRes; }).catch(() => {}));
 				}
-				if (sceneChanged || now - lastJobsAt > JOBS_POLL_MS) {
+				if (force || sceneChanged || now - lastJobsAt > JOBS_POLL_MS) {
 					lastJobsAt = now;
-					tasks.push(listJobs(10).then(r => { recentJobs = r.jobs ?? []; }).catch(() => {}));
+					tasks.push(listJobs(30).then(r => { recentJobs = r.jobs ?? []; }).catch(() => {}));
 				}
-				if (sessRes?.status === 'active' && (sceneChanged || now - lastInventoryAt > INVENTORY_POLL_MS)) {
+				if (sessRes?.status === 'active' && (force || sceneChanged || now - lastInventoryAt > INVENTORY_POLL_MS)) {
 					lastInventoryAt = now;
 					tasks.push(
 						getIsaacSessionInventory()
@@ -457,14 +722,24 @@
 							.catch(() => {})
 					);
 				}
-				if (sceneChanged || now - lastFloorplanAt > FLOORPLAN_POLL_MS) {
+				if (force || sceneChanged || now - lastFloorplanAt > FLOORPLAN_POLL_MS) {
 					lastFloorplanAt = now;
 					tasks.push(loadFloorplan(newSceneId));
+				}
+				if (force || now - lastMatLibAt > MATLIB_POLL_MS) {
+					lastMatLibAt = now;
+					tasks.push(
+						materialLibrary()
+							.then(r => { matGroups = (r.groups ?? matGroups) as DatasetGroup[]; })
+							.catch(() => {})
+					);
 				}
 				await Promise.all(tasks);
 			} else {
 				scene = null; recentJobs = []; objectInventory = [];
 				floorplan = null; floorplanImgSrc = null;
+				floorplanError = '';
+				liveActiveViewportCamera = null;
 				collapsedNodes = new Set();
 				treeInitializedSceneId = null;
 			}
@@ -494,8 +769,20 @@
 	});
 	onDestroy(() => {
 		clearInterval(timer);
+		disconnectCurrentSceneStream();
 		sceneRailSnippet.set(null);
 		sceneBottomSnippet.set(null);
+	});
+
+	$effect(() => {
+		if (!isVisible || !currentSceneId) {
+			disconnectCurrentSceneStream();
+			return;
+		}
+		connectCurrentSceneStream(currentSceneId);
+		return () => {
+			disconnectCurrentSceneStream();
+		};
 	});
 
 	async function sendCommand(cmd: string, sceneId?: string) {
@@ -506,7 +793,7 @@
 		try {
 			await isaacCommand(cmd, sid);
 			cmdMsg = L === 'kr' ? `${cmd} 전송됨` : `${cmd} sent`;
-			await refresh();
+			await refresh({ force: true });
 		} catch (e: unknown) {
 			cmdMsg = (e as Error).message ?? 'error';
 		} finally { cmdPending = null; }
@@ -534,13 +821,20 @@
 	async function applyMeasured(group: DatasetGroup, mat: MatEntry) {
 		if (!currentSceneId || mat.status !== 'available') return;
 		try {
-			await applyMeasuredMaterial(currentSceneId, {
-				dataset_id: group.dataset_id,
-				material_id: mat.material_id,
-				measured_file_path: mat.native_file,
-				mitsuba_strategy: group.mitsuba_strategy,
-				prim_path: selectedObj?.prim_path
-			});
+			if (mat.kind === 'curated') {
+				await applyCuratedMaterial(currentSceneId, {
+					material_id: mat.material_id,
+					prim_path: selectedObj?.prim_path
+				});
+			} else {
+				await applyMeasuredMaterial(currentSceneId, {
+					dataset_id: group.dataset_id,
+					material_id: mat.material_id,
+					measured_file_path: mat.native_file,
+					mitsuba_strategy: group.mitsuba_strategy,
+					prim_path: selectedObj?.prim_path
+				});
+			}
 			cmdMsg = L === 'kr' ? `재질 적용: ${mat.display_name}` : `Applied: ${mat.display_name}`;
 		} catch (e: unknown) { cmdMsg = (e as Error).message ?? 'error'; }
 	}
@@ -582,6 +876,23 @@
 		} catch (e: unknown) {
 			cmdMsg = (e as Error).message ?? 'error';
 		} finally { retryingJobId = null; }
+	}
+
+	async function handleDeleteJob(jobId: string) {
+		if (!jobId || deletingJobId) return;
+		const confirmMsg = L === 'kr'
+			? `잡 ${jobId.slice(0, 12)} 의 로그와 상태 기록을 삭제할까요?`
+			: `Delete log and status records for job ${jobId.slice(0, 12)}?`;
+		if (typeof window !== 'undefined' && !window.confirm(confirmMsg)) return;
+		deletingJobId = jobId;
+		try {
+			await deleteJob(jobId);
+			if (selectedJobKey === jobId) selectedJobKey = null;
+			cmdMsg = L === 'kr' ? `삭제됨: ${jobId.slice(0, 12)}` : `Deleted: ${jobId.slice(0, 12)}`;
+			await refresh({ force: true });
+		} catch (e: unknown) {
+			cmdMsg = (e as Error).message ?? 'error';
+		} finally { deletingJobId = null; }
 	}
 
 	function toggleGroup(datasetId: string) {
@@ -784,9 +1095,12 @@
 		const canvasSize = (fp.canvas_size_px as number) ?? 512;
 		const ctx = mapCanvas.getContext('2d');
 		if (!ctx) return;
-		const scaleX = mapCanvas.width / canvasSize;
-		const scaleY = mapCanvas.height / canvasSize;
-		ctx.clearRect(0, 0, mapCanvas.width, mapCanvas.height);
+		const canvasWidth = mapCanvas.width;
+		const canvasHeight = mapCanvas.height;
+		const scaleX = canvasWidth / canvasSize;
+		const scaleY = canvasHeight / canvasSize;
+		ctx.clearRect(0, 0, canvasWidth, canvasHeight);
+		const mirrorCanvasX = (value: number) => canvasWidth - value;
 
 		function projectWorld(position: unknown): [number, number] | null {
 			if (!Array.isArray(position) || position.length < 3) return null;
@@ -816,11 +1130,22 @@
 		}
 
 		const sceneLayer = layerFilters.has('scene');
-		const cams = sceneLayer ? ((fp.camera_overlays as Record<string,unknown>[]) ?? []) : [];
+		const baseCams = sceneLayer ? ((fp.camera_overlays as Record<string,unknown>[]) ?? []) : [];
+		const cams = baseCams.filter((cam) => String(cam.kind ?? '') !== 'active_viewport');
+		const fallbackActiveCamera = fp.active_viewport_camera;
+		const activeCamera = liveActiveViewportCamera ?? (fallbackActiveCamera && typeof fallbackActiveCamera === 'object' ? fallbackActiveCamera as Record<string, unknown> : null);
+		if (sceneLayer && activeCamera) {
+			cams.unshift({
+				...activeCamera,
+				camera_id: String(activeCamera.sensor_id ?? activeCamera.camera_id ?? 'active_viewport'),
+				label: String(activeCamera.name ?? activeCamera.label ?? activeCamera.sensor_id ?? 'Active viewport'),
+				kind: 'active_viewport'
+			});
+		}
 		for (const cam of cams) {
 			const point = overlayPoint(cam, 'origin');
 			if (!point) continue;
-			const x = point[0] * scaleX;
+			const x = mirrorCanvasX(point[0] * scaleX);
 			const y = point[1] * scaleY;
 			const targetPoint = projectWorld(cam.target);
 			const kind = String(cam.kind ?? '');
@@ -828,7 +1153,7 @@
 			const isRequest = kind === 'request' || cam.request === true;
 			const color = isActive ? '47,123,246' : isRequest ? '230,126,34' : '22,163,74';
 			if (targetPoint) {
-				const tx = targetPoint[0] * scaleX;
+				const tx = mirrorCanvasX(targetPoint[0] * scaleX);
 				const ty = targetPoint[1] * scaleY;
 				const dx = tx - x;
 				const dy = ty - y;
@@ -910,7 +1235,7 @@
 		for (const rob of robots) {
 			const point = overlayPoint(rob);
 			if (!point) continue;
-			const x = point[0] * scaleX;
+			const x = mirrorCanvasX(point[0] * scaleX);
 			const y = point[1] * scaleY;
 			ctx.fillStyle = 'rgba(245,158,11,0.95)';
 			ctx.beginPath(); ctx.arc(x, y, 7 * scaleX, 0, Math.PI * 2); ctx.fill();
@@ -927,7 +1252,7 @@
 				if ((obj.prim_path ?? obj.path) !== selectedObj.prim_path) continue;
 				const point = overlayPoint(obj);
 				if (!point) continue;
-				const x = point[0] * scaleX;
+				const x = mirrorCanvasX(point[0] * scaleX);
 				const y = point[1] * scaleY;
 				ctx.strokeStyle = '#dc2626';
 				ctx.lineWidth = 2 * scaleX;
@@ -938,7 +1263,7 @@
 		}
 	}
 
-	$effect(() => { selectedObj; layerFilters; drawOverlays(); });
+	$effect(() => { selectedObj; layerFilters; floorplan; liveActiveViewportCamera; drawOverlays(); });
 
 	function statusClass(s: string) {
 		if (s === 'succeeded') return 'badge-succeeded';
@@ -1027,6 +1352,7 @@
 		{@const currentStep = steps[stepIndex]}
 		{@const progressPct = commandProgressPct(steps, stepIndex, status)}
 		{@const expectedNext = details?.expected_next_stage as Record<string, string> | undefined}
+		{@const isRunning = status !== 'succeeded' && status !== 'completed' && status !== 'failed'}
 		<div class="panel active-command-card">
 			<div class="active-command-head">
 				<div class="active-command-title">
@@ -1045,7 +1371,14 @@
 				</div>
 			</div>
 
-			<div class="active-command-current">
+			<div class="active-command-progress" aria-label="Command progress">
+				<div class="active-command-progress-bar" style:width={`${progressPct}%`}></div>
+			</div>
+
+			<div class="active-command-current" data-running={isRunning ? 'true' : 'false'}>
+				{#if isRunning}
+					<span class="step-spinner active-command-current-spinner" aria-hidden="true"></span>
+				{/if}
 				<span class="active-command-stage">
 					{#if currentStep}
 						{L === 'kr' ? currentStep.kr : currentStep.en}
@@ -1053,13 +1386,9 @@
 						{humanStage(stage || status)}
 					{/if}
 				</span>
-				{#if stage}
-					<span class="mono muted">{stage}</span>
+				{#if message}
+					<span class="active-command-current-sub">{message}</span>
 				{/if}
-			</div>
-
-			<div class="active-command-progress" aria-label="Command progress">
-				<div class="active-command-progress-bar" style:width={`${progressPct}%`}></div>
 			</div>
 
 			{#if steps.length}
@@ -1068,22 +1397,33 @@
 						{@const isDone = i < stepIndex || status === 'succeeded' || status === 'completed'}
 						{@const isCurrent = i === stepIndex && status !== 'succeeded' && status !== 'completed'}
 						<div class="active-command-step" data-state={isDone ? 'done' : isCurrent ? 'current' : 'todo'}>
-							<span class="active-command-step-dot">{isDone ? '✓' : i + 1}</span>
+							<span class="active-command-step-dot">
+								{#if isCurrent}
+									<span class="step-spinner active-command-step-spinner" aria-hidden="true"></span>
+								{:else}
+									{isDone ? '✓' : i + 1}
+								{/if}
+							</span>
 							<span class="active-command-step-label">{L === 'kr' ? step.kr : step.en}</span>
 						</div>
 					{/each}
 				</div>
 			{/if}
 
-			{#if stage || message}
-				<div class="active-command-message">
-					{#if message}<span>{message}</span>{/if}
-					{#if expectedNext}
-						<span class="muted">
-							{L === 'kr' ? '다음:' : 'Next:'}
-							{L === 'kr' ? expectedNext.kr : expectedNext.en}
-						</span>
-					{/if}
+			{#if stage}
+				<details class="active-command-tech">
+					<summary>{L === 'kr' ? '기술 로그' : 'Technical log'}</summary>
+					<div class="active-command-tech-body">
+						<span class="mono muted">{stage}</span>
+						{#if message}<span class="muted">{message}</span>{/if}
+					</div>
+				</details>
+			{/if}
+
+			{#if expectedNext}
+				<div class="active-command-next">
+					<span class="muted">{L === 'kr' ? '다음:' : 'Next:'}</span>
+					<span>{L === 'kr' ? expectedNext.kr : expectedNext.en}</span>
 				</div>
 			{/if}
 
@@ -1145,81 +1485,39 @@
 	{/if}
 {/snippet}
 
-{#snippet jobCard(job: Record<string, unknown>)}
-	{@const curStage = String(job.progress_stage ?? job.active_stage ?? '')}
-	{@const curIdx = stageIndex(curStage)}
-	{@const failed = job.status === 'failed'}
-	{@const running = job.status === 'running'}
-	{@const jobId = String(job.job_id ?? '')}
-	{#if failed}
-		<IncidentCard
-			tone="danger"
-			title={L === 'kr' ? `렌더 실패 — ${jobId.slice(0, 12)}` : `Render failed — ${jobId.slice(0, 12)}`}
-			description={curStage ? curStage.replace(/_/g, ' ') : undefined}
-			source={job.error ? String(job.error) : (job.scene_id ? String(job.scene_id) : undefined)}
-			timestamp={job.finished_at ? String(job.finished_at) : undefined}
-		>
-			{#snippet actions()}
-				<button
-					class="button button-primary text-xs"
-					onclick={() => handleRetry(jobId)}
-					disabled={retryingJobId === jobId}
-				>{retryingJobId === jobId ? '…' : (L === 'kr' ? '재시도' : 'Retry')}</button>
-				<a
-					class="button button-subtle text-xs"
-					href="/jobs/{jobId}"
-				>{L === 'kr' ? '로그' : 'Logs'}</a>
-				<a
-					class="button button-subtle text-xs"
-					href="/jobs/{jobId}"
-				>{L === 'kr' ? '상세' : 'Detail'}</a>
-			{/snippet}
-		</IncidentCard>
-	{:else}
-		<div style="border:1px solid {running ? 'rgba(245,158,11,0.3)' : 'var(--border)'};border-radius:0.4rem;padding:0.4rem 0.55rem;border-left:{running ? '3px solid #f59e0b' : '1px solid var(--border)'}">
-			<div style="display:flex;align-items:center;gap:0.4rem;flex-wrap:wrap">
-				<a class="mono" href="/jobs/{jobId}" style="font-size:0.68rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;color:inherit;text-decoration:none">{jobId.slice(0, 20)}</a>
-				<span class="badge {statusClass(String(job.status ?? ''))}" style="font-size:0.65rem">{job.status}</span>
-			</div>
-			{#if job.scene_id && job.scene_id !== currentSceneId}
-				<div class="muted mono" style="font-size:0.65rem">{job.scene_id}</div>
-			{/if}
-			<div style="display:flex;gap:2px;margin-top:0.35rem">
-				{#each STAGES as _st, i}
-					<div style="flex:1;height:3px;border-radius:2px;background:{
-						i < curIdx ? '#16a34a' :
-						running && i === curIdx ? '#f59e0b' :
-						'rgba(0,0,0,0.1)'
-					}"></div>
-				{/each}
-			</div>
-			{#if running && curStage}
-				<div style="font-size:0.68rem;color:#b45309;margin-top:0.2rem">▶ {curStage.replace(/_/g,' ')}…</div>
-			{:else if job.finished_at}
-				<div class="muted" style="font-size:0.65rem;margin-top:0.2rem">{ago(String(job.finished_at))} ago</div>
-			{/if}
-		</div>
-	{/if}
-{/snippet}
-
 {#snippet incidentsCard()}
 	<Card padding="sm" elevation="none">
 		{#snippet header()}
 			<span class="card-eyebrow">{L === 'kr' ? '인시던트' : 'Incidents'}</span>
 			<h3 class="card-title">{L === 'kr' ? '주의 필요' : 'Needs attention'}</h3>
 		{/snippet}
-		{#snippet actions()}
-			{#if failedJobsCount > 0}
-				<span class="badge badge-failed">{failedJobsCount}</span>
-			{/if}
-		{/snippet}
-		{@render activeCmdCard()}
-		{#if incidentItems.length === 0}
+		<button class="incident-summary-chip" type="button" onclick={jumpToJobsTab}
+			title={L === 'kr' ? '하단 작업 큐로 이동' : 'Jump to work queue'}>
+			<span>{L === 'kr' ? '실행 중' : 'Running'} <strong>{runningCount}</strong></span>
+			<span class="dot">·</span>
+			<span>{L === 'kr' ? '대기' : 'Queued'} <strong>{queuedJobsCount}</strong></span>
+			<span class="dot">·</span>
+			<span class="fail">{L === 'kr' ? '실패' : 'Failed'} <strong>{failedJobsCount}</strong></span>
+		</button>
+		<div class="incident-filter-row" role="tablist" aria-label={L === 'kr' ? '인시던트 필터' : 'Incident filter'}>
+			{#each [['all', L === 'kr' ? '전체' : 'All'], ['danger', L === 'kr' ? '실패' : 'Fail'], ['warning', L === 'kr' ? '주의' : 'Warn']] as [k, lbl]}
+				<button
+					type="button"
+					class="filter-chip incident-filter-btn"
+					class:active={incidentFilter === k}
+					onclick={() => incidentFilter = k as typeof incidentFilter}
+				>{lbl}</button>
+			{/each}
+		</div>
+		{#if visibleIncidents.length === 0}
 			<div class="empty-state text-xs">{L === 'kr' ? '활성 인시던트 없음' : 'No active incidents'}</div>
 		{:else}
 			<div class="rail-stack-inner">
-				{#each incidentItems as inc (inc.key)}
+				{#each visibleIncidents as inc (inc.key)}
 					<IncidentCard
+						collapsible
+						expanded={expandedIncidentId === inc.key}
+						onToggle={() => expandedIncidentId = expandedIncidentId === inc.key ? null : inc.key}
 						tone={inc.tone}
 						title={inc.title}
 						description={inc.description}
@@ -1229,10 +1527,26 @@
 						{#snippet actions()}
 							<button
 								class="button button-primary text-xs"
-								onclick={() => handleRetry(inc.jobId)}
+								onclick={(e) => { e.stopPropagation(); handleRetry(inc.jobId); }}
 								disabled={retryingJobId === inc.jobId}
 							>{retryingJobId === inc.jobId ? '…' : (L === 'kr' ? '재시도' : 'Retry')}</button>
-							<a class="button button-subtle text-xs" href="/jobs/{inc.jobId}">{L === 'kr' ? '로그' : 'Logs'}</a>
+							{#if expandedIncidentId === inc.key}
+								<a class="button button-subtle text-xs" href="/jobs/{inc.jobId}" onclick={(e) => e.stopPropagation()}>{L === 'kr' ? '로그' : 'Logs'}</a>
+								<a class="button button-subtle text-xs" href="/jobs/{inc.jobId}" onclick={(e) => e.stopPropagation()}>{L === 'kr' ? '상세' : 'Detail'}</a>
+							{/if}
+						{/snippet}
+						{#snippet expandedContent()}
+							{#if inc.fullError}
+								<pre class="inc-trace">{inc.fullError}</pre>
+							{/if}
+							{#if inc.relatedJobs && inc.relatedJobs.length > 0}
+								<div class="inc-related">
+									<span class="muted text-xs">{L === 'kr' ? '관련 잡' : 'Related jobs'}:</span>
+									{#each inc.relatedJobs as rid}
+										<a class="mono text-xs" href="/jobs/{rid}" onclick={(e) => e.stopPropagation()}>{rid.slice(0, 12)}</a>
+									{/each}
+								</div>
+							{/if}
 						{/snippet}
 					</IncidentCard>
 				{/each}
@@ -1294,7 +1608,20 @@
 		</aside>
 
 		<div class="material-scroll-area">
-			{#if filteredPresets.length > 0 && (matCapFilter === 'all' || matCapFilter === 'available')}
+			<div class="category-chip-row" role="tablist" aria-label={L === 'kr' ? '재질 카테고리' : 'Material categories'}>
+				{#each CATEGORY_CHIPS as chip}
+					<button
+						type="button"
+						role="tab"
+						aria-selected={activeCategory === chip.key}
+						class="category-chip"
+						class:active={activeCategory === chip.key}
+						onclick={() => activeCategory = chip.key}
+					>{L === 'kr' ? chip.label_kr : chip.label_en}</button>
+				{/each}
+			</div>
+
+			{#if filteredPresets.length > 0 && activeCategory === 'all' && (matCapFilter === 'all' || matCapFilter === 'available')}
 				<div class="material-content-section">
 					<div class="material-section-head">
 						<span class="card-eyebrow">{L === 'kr' ? '기본 재질' : 'Built-in presets'}</span>
@@ -1373,11 +1700,21 @@
 								>
 									<span class="material-swatch-sphere" style:background={materialFallbackBg(group, mat)}>
 										<img
-											src={measuredMaterialPreviewUrl(group.dataset_id, mat.material_id, mat.native_file)}
+											src={mat.kind === 'curated'
+												? curatedMaterialPreviewUrl(mat.material_id)
+												: measuredMaterialPreviewUrl(group.dataset_id, mat.material_id, mat.native_file)}
 											alt={mat.display_name}
 											class="material-swatch-img"
-											onload={(e) => { (e.target as HTMLImageElement).style.display = 'block'; }}
-											onerror={(e) => { (e.target as HTMLImageElement).style.display = 'none'; }}
+											onload={(e) => {
+												const img = e.target as HTMLImageElement;
+												img.style.display = 'block';
+												img.closest('.material-swatch-tile')?.removeAttribute('data-preview-error');
+											}}
+											onerror={(e) => {
+												const img = e.target as HTMLImageElement;
+												img.style.display = 'none';
+												img.closest('.material-swatch-tile')?.setAttribute('data-preview-error', 'true');
+											}}
 										/>
 									</span>
 									<span class="material-swatch-status" data-status={mat.status}></span>
@@ -1407,29 +1744,145 @@
 	{/if}
 {/snippet}
 
-{#snippet jobsTabPanel()}
-	{@const activeJobs = recentJobs.filter(j => j.status === 'queued' || j.status === 'running')}
-	{#if activeJobs.length === 0}
-		<div class="muted text-xs">{L === 'kr' ? '활성 작업 없음 — 이력 탭 참조' : 'No active jobs — see History tab'}</div>
-	{:else}
-		<div style="display:flex;flex-direction:column;gap:0.5rem">
-			{#each activeJobs as job}
-				{@render jobCard(job)}
+{#snippet renderJobDetailCard(job: Record<string, unknown>)}
+	{@const jobId = String(job.job_id ?? '')}
+	{@const status = String(job.status ?? '')}
+	{@const stage = String(job.progress_stage ?? '')}
+	{@const curIdx = stageIndex(stage)}
+	{@const pct = status === 'succeeded' ? 100
+		: status === 'failed' ? Math.max(5, Math.round((Math.max(curIdx, 0) / STAGES.length) * 100))
+		: Math.round(((Math.max(curIdx, 0) + 0.35) / STAGES.length) * 100)}
+	{@const error = job.error ? String(job.error) : ''}
+	<div class="panel active-command-card">
+		<div class="active-command-head">
+			<div class="active-command-title">
+				<span class="status-dot live" class:status-amber={status === 'running'}
+					class:status-red={status === 'failed'}
+					class:status-green={status === 'succeeded'}></span>
+				<div>
+					<div class="active-command-kicker">{L === 'kr' ? '렌더 잡' : 'Render job'}</div>
+					<div class="active-command-name mono">{jobId.slice(0, 24)}</div>
+				</div>
+			</div>
+			<div class="active-command-meta">
+				<span class="badge {statusClass(status)}">{status}</span>
+				<span class="mono">{Math.min(Math.max(curIdx, 0) + 1, STAGES.length)}/{STAGES.length}</span>
+				{#if job.finished_at}<span class="muted">{ago(String(job.finished_at))} ago</span>{/if}
+			</div>
+		</div>
+		<div class="active-command-progress"><div class="active-command-progress-bar" style:width={`${pct}%`}></div></div>
+		<div class="active-command-current" data-running={status === 'running' ? 'true' : 'false'}>
+			{#if status === 'running'}<span class="step-spinner active-command-current-spinner" aria-hidden="true"></span>{/if}
+			<span class="active-command-stage">{humanStage(stage)}</span>
+			{#if job.scene_id}<span class="active-command-current-sub mono">{String(job.scene_id)}</span>{/if}
+		</div>
+		<div class="active-command-steps">
+			{#each STAGES as st, i}
+				{@const isDone = i < curIdx || status === 'succeeded'}
+				{@const isCurrent = i === curIdx && status === 'running'}
+				<div class="active-command-step" data-state={isDone ? 'done' : isCurrent ? 'current' : 'todo'}>
+					<span class="active-command-step-dot">
+						{#if isCurrent}<span class="step-spinner active-command-step-spinner" aria-hidden="true"></span>
+						{:else}{isDone ? '✓' : i + 1}{/if}
+					</span>
+					<span class="active-command-step-label">{L === 'kr' ? st.kr : st.en}</span>
+				</div>
 			{/each}
 		</div>
-	{/if}
+		{#if error}
+			<pre class="inc-trace" style="margin-top:0.5rem">{error}</pre>
+		{/if}
+		<div class="job-detail-actions">
+			{#if status === 'failed'}
+				<button class="button button-primary text-xs" onclick={() => handleRetry(jobId)}
+					disabled={retryingJobId === jobId}>
+					{retryingJobId === jobId ? '…' : (L === 'kr' ? '재시도' : 'Retry')}
+				</button>
+			{/if}
+			<a class="button button-subtle text-xs" href="/jobs">{L === 'kr' ? '로그' : 'Logs'}</a>
+			{#if status !== 'running' && status !== 'queued'}
+				<button class="button button-subtle text-xs" onclick={() => handleDeleteJob(jobId)}
+					disabled={deletingJobId === jobId}>
+					{deletingJobId === jobId ? '…' : (L === 'kr' ? '삭제' : 'Delete')}
+				</button>
+			{/if}
+		</div>
+	</div>
+{/snippet}
+
+{#snippet jobsTabPanel()}
+	<div class="job-hub">
+		<aside class="job-hub-list">
+			{#if jobListGroups.length === 0}
+				<div class="empty-state text-xs">{L === 'kr' ? '작업 없음' : 'No jobs'}</div>
+			{:else}
+				{#each jobListGroups as group (group.labelKey)}
+					<div class="job-hub-group">
+						<div class="job-hub-group-label">
+							<span>{group.label}</span>
+							<span class="muted">{group.rows.length}</span>
+						</div>
+						{#each group.rows as row (row.key)}
+							<div
+								class="job-hub-row"
+								class:active={selectedJobKey === row.key}
+								role="button"
+								tabindex="0"
+								aria-pressed={selectedJobKey === row.key}
+								onclick={() => selectedJobKey = row.key}
+								onkeydown={(e) => {
+									if (e.key === 'Enter' || e.key === ' ') {
+										e.preventDefault();
+										selectedJobKey = row.key;
+									}
+								}}
+							>
+								<span class="badge {statusClass(row.status)}">{row.status}</span>
+								<span class="job-hub-row-title mono">{row.title}</span>
+								{#if row.stage}
+									<span class="muted text-xs job-hub-row-stage">{row.stage.replace(/_/g, ' ')}</span>
+								{/if}
+								{#if row.status === 'failed' && row.kind === 'render'}
+									<button
+										type="button"
+										class="button button-primary text-xs job-hub-row-retry"
+										onclick={(e) => { e.stopPropagation(); handleRetry(row.key); }}
+										disabled={retryingJobId === row.key}
+									>{retryingJobId === row.key ? '…' : (L === 'kr' ? '재시도' : 'Retry')}</button>
+								{/if}
+							</div>
+						{/each}
+					</div>
+				{/each}
+			{/if}
+		</aside>
+		<section class="job-hub-detail">
+			{#if !selectedJobKey}
+				<div class="empty-state text-xs">{L === 'kr' ? '왼쪽에서 작업을 선택하세요' : 'Select a job from the list'}</div>
+			{:else if selectedJobKey === ISAAC_JOB_KEY}
+				{@render activeCmdCard()}
+			{:else}
+				{@const job = recentJobs.find(j => String(j.job_id) === selectedJobKey)}
+				{#if job}
+					{@render renderJobDetailCard(job)}
+				{:else}
+					<div class="empty-state text-xs">{L === 'kr' ? '작업 정보를 찾을 수 없음' : 'Job not found'}</div>
+				{/if}
+			{/if}
+		</section>
+	</div>
 {/snippet}
 
 {#snippet historyTabPanel()}
-	{@const finishedJobs = recentJobs.filter(j => j.status === 'succeeded' || j.status === 'failed')}
-	{#if finishedJobs.length === 0}
+	{#if jobRows.length === 0}
 		<div class="empty-state text-xs">{L === 'kr' ? '이력 없음' : 'No history yet'}</div>
 	{:else}
-		<div style="display:flex;flex-direction:column;gap:0.5rem">
-			{#each finishedJobs as job}
-				{@render jobCard(job)}
-			{/each}
-		</div>
+		<DataTable
+			columns={jobColumns}
+			rows={jobRows}
+			rowKey={(r) => r.job_id}
+			onRowClick={(r) => goto(`/jobs/${r.job_id}`)}
+		/>
 	{/if}
 {/snippet}
 
@@ -1450,8 +1903,8 @@
 {/snippet}
 
 {#snippet bottomContent()}
-	<div class="bottom-tabs-shell" data-collapsed={$bottomPanelCollapsed}>
-		<div class="bottom-tabs-rail" role="tablist" aria-label={L === 'kr' ? '하단 탭' : 'Bottom tabs'}>
+	<div class="bottom-tabs-shell" data-collapsed={$bottomPanelCollapsed} data-orientation="vertical">
+		<div class="bottom-tabs-rail bottom-tabs-rail-vertical" role="tablist" aria-label={L === 'kr' ? '하단 탭' : 'Bottom tabs'}>
 			<button
 				class="bottom-collapse-btn"
 				type="button"
@@ -1459,7 +1912,7 @@
 				aria-expanded={!$bottomPanelCollapsed}
 				aria-label={$bottomPanelCollapsed ? (L === 'kr' ? '하단 영역 펼치기' : 'Expand bottom area') : (L === 'kr' ? '하단 영역 접기' : 'Collapse bottom area')}
 				title={$bottomPanelCollapsed ? (L === 'kr' ? '펼치기' : 'Expand') : (L === 'kr' ? '접기' : 'Collapse')}
-			>{$bottomPanelCollapsed ? '▲' : '▼'}</button>
+			>{$bottomPanelCollapsed ? '▶' : '◀'}</button>
 			{#each bottomTabs as tab}
 				<button
 					type="button"
@@ -1500,47 +1953,7 @@
 
 <div class="cs-root">
 
-<!-- ── Session Header ── -->
-<header class="session-header">
-	<div class="session-header-top">
-		<div class="session-title-block">
-			<span class="card-eyebrow">{L === 'kr' ? '현재 세션' : 'Current session'}</span>
-			<h1 class="session-title">{currentSceneId ?? (L === 'kr' ? '연결된 씬 없음' : 'No active scene')}</h1>
-		</div>
-		<span class="session-status-pill" data-state={sessionConnected ? 'active' : sceneLoaded ? 'idle' : 'off'}>
-			<span class="status-dot"></span>
-			{sessionConnected ? (L === 'kr' ? '활성' : 'Active') : sceneLoaded ? (L === 'kr' ? '대기' : 'Idle') : (L === 'kr' ? '미연결' : 'Offline')}
-		</span>
-		{#if currentSceneId}
-			<div class="session-actions">
-				<button class="button button-ghost text-xs" onclick={() => sendCommand('load_scene')} disabled={!!cmdPending}>
-					{cmdPending === 'load_scene' ? '…' : (L === 'kr' ? '불러오기' : 'Load')}
-				</button>
-				<button class="button button-ghost text-xs" onclick={() => sendCommand('prepare_render_ready')} disabled={!!cmdPending}>
-					{cmdPending === 'prepare_render_ready' ? '…' : (L === 'kr' ? '준비' : 'Prepare')}
-				</button>
-				<button class="button {sessionConnected ? 'button-ghost' : 'button-primary'} text-xs" onclick={() => sendCommand('connect_session')} disabled={!!cmdPending}>
-					{cmdPending === 'connect_session' ? '…' : (L === 'kr' ? '연결' : 'Connect')}
-				</button>
-				<button class="button button-ghost text-xs" onclick={() => sendCommand('sync_session')} disabled={!!cmdPending || !sessionConnected}>
-					{cmdPending === 'sync_session' ? '…' : (L === 'kr' ? '동기화' : 'Sync')}
-				</button>
-				<button class="button button-primary text-xs" onclick={() => sendCommand('render_current_view')} disabled={!!cmdPending || workerBusy || !renderReady}>
-					{cmdPending === 'render_current_view' ? '…' : (L === 'kr' ? '렌더' : 'Render')}
-				</button>
-				<a href="/scenes/{currentSceneId}" class="button button-ghost text-xs">{L === 'kr' ? '상세 →' : 'Detail →'}</a>
-			</div>
-		{/if}
-	</div>
-	<div class="session-chips">
-		<span class="sum-chip"><span class="sum-chip-key">{L === 'kr' ? '카메라' : 'Cameras'}</span><span class="sum-chip-val">{cameraCount}</span></span>
-		<span class="sum-chip"><span class="sum-chip-key">{L === 'kr' ? '메시' : 'Meshes'}</span><span class="sum-chip-val">{meshCount}</span></span>
-		<span class="sum-chip"><span class="sum-chip-key">{L === 'kr' ? '로봇' : 'Robots'}</span><span class="sum-chip-val">{robotCount}</span></span>
-		<span class="sum-chip"><span class="sum-chip-key">{L === 'kr' ? '업데이트' : 'Updated'}</span><span class="sum-chip-val">{sessionOpenedAt ? `${ago(sessionOpenedAt)} ago` : '—'}</span></span>
-		<span class="sum-chip"><span class="sum-chip-key">{L === 'kr' ? '마지막 성공' : 'Last success'}</span><span class="sum-chip-val mono">{lastSucceededJob?.finished_at ? `${ago(String(lastSucceededJob.finished_at))} ago` : '—'}</span></span>
-	</div>
-	{#if cmdMsg}<div class="text-xs muted session-msg">{cmdMsg}</div>{/if}
-</header>
+{#if cmdMsg}<div class="text-xs muted cs-cmd-msg">{cmdMsg}</div>{/if}
 
 {#if loading}
 	<div class="muted text-sm" style="flex:1;display:flex;align-items:center;justify-content:center">{L === 'kr' ? '로딩 중…' : 'Loading…'}</div>
@@ -1629,11 +2042,21 @@
 					</div>
 				</div>
 				<div class="vt-group vt-group-mid">
-					<div class="vt-mode" role="tablist" aria-label={L === 'kr' ? '뷰 모드' : 'View mode'}>
-						<button class="vt-mode-btn {viewMode === '2d' ? 'active' : ''}" role="tab" aria-selected={viewMode === '2d'} onclick={() => viewMode = '2d'}>2D Map</button>
-						<button class="vt-mode-btn {viewMode === '3d' ? 'active' : ''}" role="tab" aria-selected={viewMode === '3d'} onclick={() => viewMode = '3d'}>3D View</button>
+					<div class="vt-mode" role="group" aria-label={L === 'kr' ? '맵 패널' : 'Map panels'}>
+						<button
+							class="vt-mode-btn {viewMode === '2d' ? 'active' : ''}"
+							onclick={() => { viewMode = '2d'; }}
+						>
+							2D Map
+						</button>
+						<button
+							class="vt-mode-btn {viewMode === '3d' ? 'active' : ''}"
+							onclick={() => { viewMode = '3d'; }}
+						>
+							3D Blueprint
+						</button>
 					</div>
-					{#if viewMode === '2d' && floorplanImgSrc}
+					{#if floorplanImgSrc && viewMode === '2d'}
 						<div class="vt-zoom">
 							<button class="button button-ghost text-xs" onclick={() => zoomBy(1/1.2)} aria-label="Zoom out">−</button>
 							<span class="mono muted text-xs vt-zoom-pct">{Math.round(mapZoom*100)}%</span>
@@ -1643,62 +2066,86 @@
 					{/if}
 				</div>
 				<div class="vt-group vt-group-right">
+					{#if currentSceneId && viewMode === '3d'}
+						<button
+							class="button button-subtle text-xs"
+							onclick={() => sendCommand('prepare_render_ready')}
+							disabled={!!cmdPending || preparingNow || !sessionConnected}
+							title={L === 'kr' ? '3D 블루프린트용 snapshot/shape map 생성' : 'Generate snapshot/shape map for 3D blueprint'}
+						>
+							{preparingNow ? (L === 'kr' ? '장면 준비 중…' : 'Preparing scene…') : (L === 'kr' ? '장면 준비' : 'Prepare Scene')}
+						</button>
+					{/if}
 					<button class="button button-ghost text-xs" onclick={handleSmokeRender} disabled={!!cmdPending} title="Smoke Render">🧪</button>
 				</div>
 			</div>
 
 			<div class="cs-viewport-stage">
 				{#if viewMode === '2d'}
-					{#if floorplanImgSrc}
-						<!-- svelte-ignore a11y_no_static_element_interactions -->
-						<div
-							bind:this={mapViewport}
-							class="viewport-canvas-wrap"
-							style:cursor={isPanning ? 'grabbing' : 'grab'}
-							onwheel={onMapWheel}
-							onpointerdown={onMapPointerDown}
-							onpointermove={onMapPointerMove}
-							onpointerup={onMapPointerUp}
-							onpointercancel={onMapPointerUp}
-							ondragstart={(e) => e.preventDefault()}
-						>
-							<div class="viewport-canvas-center">
-								<div class="viewport-canvas-transform" style:transform={`translate(${mapPanX}px,${mapPanY}px) scale(${mapZoom})`} style:transition={isPanning ? 'none' : 'transform 0.1s ease'}>
-									<img
-										bind:this={mapImg}
-										src={floorplanImgSrc}
-										alt="Floorplan"
-										class="viewport-img"
-										draggable="false"
-										onload={onMapLoad}
-									/>
-									<canvas
-										bind:this={mapCanvas}
-										class="viewport-canvas"
-									></canvas>
+					<div class="viewport-pane viewport-pane-2d">
+						{#if floorplanImgSrc}
+							<!-- svelte-ignore a11y_no_static_element_interactions -->
+							<div
+								bind:this={mapViewport}
+								class="viewport-canvas-wrap"
+								style:cursor={isPanning ? 'grabbing' : 'grab'}
+								onwheel={onMapWheel}
+								onpointerdown={onMapPointerDown}
+								onpointermove={onMapPointerMove}
+								onpointerup={onMapPointerUp}
+								onpointercancel={onMapPointerUp}
+								ondragstart={(e) => e.preventDefault()}
+							>
+								<div class="viewport-canvas-center">
+									<div class="viewport-canvas-transform" style:transform={`translate(${mapPanX}px,${mapPanY}px) scale(${mapZoom})`} style:transition={isPanning ? 'none' : 'transform 0.1s ease'}>
+								<img
+											bind:this={mapImg}
+											src={floorplanImgSrc}
+											alt="Floorplan"
+											class="viewport-img viewport-img-mirrored"
+											draggable="false"
+											onload={onMapLoad}
+											onerror={onFloorplanImageError}
+										/>
+										<canvas
+											bind:this={mapCanvas}
+											class="viewport-canvas"
+										></canvas>
+									</div>
 								</div>
 							</div>
-						</div>
-						<div class="viewport-legend">
-							<span><span class="viewport-legend-dot" style="background:rgb(37,99,235)"></span>{L === 'kr' ? '요청 카메라' : 'Req. cam'}</span>
-							<span><span class="viewport-legend-dot" style="background:rgb(22,163,74)"></span>{L === 'kr' ? '씬 카메라' : 'Scene cam'}</span>
-							<span><span class="viewport-legend-dot" style="background:rgb(245,158,11)"></span>{L === 'kr' ? '로봇' : 'Robot'}</span>
-							{#if selectedObj}<span><span class="viewport-legend-dot" style="border:2px solid #dc2626;background:transparent"></span>{L === 'kr' ? '선택' : 'Selected'}</span>{/if}
-							<a href="/api/scenes/{currentSceneId}/floorplan" class="button button-subtle text-xs viewport-legend-json" target="_blank">JSON</a>
-						</div>
-					{:else if currentSceneId}
-						<div class="viewport-empty">
-							<div class="muted text-sm">{L === 'kr' ? '도면 생성 중…' : 'Generating floorplan…'}</div>
-							<div class="muted text-xs mt-1">{L === 'kr' ? '씬이 로드되면 자동 생성됩니다' : 'Auto-generated when scene is loaded'}</div>
-						</div>
-					{/if}
+							<div class="viewport-legend">
+								<span><span class="viewport-legend-dot" style="background:rgb(47,123,246)"></span>{L === 'kr' ? '활성 카메라' : 'Active cam'}</span>
+								<span><span class="viewport-legend-dot" style="background:rgb(230,126,34)"></span>{L === 'kr' ? '요청 카메라' : 'Req. cam'}</span>
+								<span><span class="viewport-legend-dot" style="background:rgb(22,163,74)"></span>{L === 'kr' ? '씬 카메라' : 'Scene cam'}</span>
+								<span><span class="viewport-legend-dot" style="background:rgb(245,158,11)"></span>{L === 'kr' ? '로봇' : 'Robot'}</span>
+								{#if selectedObj}<span><span class="viewport-legend-dot" style="border:2px solid #dc2626;background:transparent"></span>{L === 'kr' ? '선택' : 'Selected'}</span>{/if}
+								<a href="/api/scenes/{currentSceneId}/floorplan" class="button button-subtle text-xs viewport-legend-json" target="_blank">JSON</a>
+							</div>
+						{:else if currentSceneId}
+							<div class="viewport-empty">
+								<div class="muted text-sm">
+									{floorplanError
+										? (L === 'kr' ? '2D 맵을 불러오지 못했습니다' : 'Failed to load 2D map')
+										: (L === 'kr' ? '도면 생성 중…' : 'Generating floorplan…')}
+								</div>
+								<div class="muted text-xs mt-1">
+									{floorplanError
+										? floorplanError
+										: (L === 'kr' ? '씬이 로드되면 자동 생성됩니다' : 'Auto-generated when scene is loaded')}
+								</div>
+							</div>
+						{/if}
+					</div>
 				{:else}
-					<div class="viewport-empty">
-						<div class="muted text-sm">{L === 'kr' ? '3D 뷰 — 곧 제공' : '3D View — coming soon'}</div>
-						<div class="muted text-xs mt-1">{L === 'kr' ? 'WebGL 뷰포트 작업 중' : 'WebGL viewport in progress'}</div>
+					<div class="viewport-pane viewport-pane-3d">
+						<CurrentSceneBlueprint3D
+							sceneId={currentSceneId}
+							selectedPath={selectedObj?.prim_path ?? null}
+							activeCamera={liveActiveViewportCamera}
+						/>
 					</div>
 				{/if}
-
 			</div>
 		</div>
 	</div>
@@ -1711,111 +2158,19 @@
 		height: 100%;
 		display: flex;
 		flex-direction: column;
-		gap: var(--space-3);
+		gap: var(--space-1);
 		min-height: 0;
 	}
 
-	/* ── Session Header ── */
-	.session-header {
-		background: var(--panel);
-		border: 1px solid var(--panel-border);
-		border-radius: var(--radius-md);
-		padding: var(--space-2) var(--space-3);
-		display: flex;
-		flex-direction: column;
-		gap: var(--space-2);
+	.cs-cmd-msg {
+		margin: 0;
+		padding: 0.25rem 0.5rem;
+		background: var(--brand-soft, rgba(47, 123, 246, 0.06));
+		color: var(--brand-strong);
+		border-radius: var(--radius-sm);
+		font-weight: 600;
 		flex-shrink: 0;
 	}
-	.session-header-top {
-		display: flex;
-		align-items: center;
-		gap: var(--space-3);
-		flex-wrap: wrap;
-	}
-	.session-title-block {
-		display: flex;
-		flex-direction: column;
-		gap: 2px;
-		min-width: 0;
-		flex: 1;
-	}
-	.session-title {
-		font-size: 1rem;
-		font-weight: var(--font-weight-semibold, 600);
-		line-height: 1.2;
-		margin: 0;
-		color: var(--text);
-		font-family: var(--font-mono);
-		letter-spacing: -0.01em;
-		overflow-wrap: anywhere;
-	}
-	.session-status-pill {
-		display: inline-flex;
-		align-items: center;
-		gap: 0.3rem;
-		padding: 0.2rem 0.5rem;
-		border-radius: 999px;
-		font-size: 0.7rem;
-		font-weight: 600;
-		border: 1px solid transparent;
-	}
-	.session-status-pill[data-state='active'] {
-		background: rgba(22, 163, 74, 0.12);
-		color: rgb(21, 128, 61);
-		border-color: rgba(22, 163, 74, 0.3);
-	}
-	.session-status-pill[data-state='idle'] {
-		background: rgba(245, 158, 11, 0.12);
-		color: rgb(180, 110, 0);
-		border-color: rgba(245, 158, 11, 0.3);
-	}
-	.session-status-pill[data-state='off'] {
-		background: rgba(148, 163, 184, 0.16);
-		color: var(--muted);
-		border-color: rgba(148, 163, 184, 0.3);
-	}
-	.session-status-pill .status-dot {
-		width: 6px; height: 6px; border-radius: 50%; background: currentColor;
-	}
-	.session-actions {
-		display: flex;
-		gap: 0.25rem;
-		flex-wrap: wrap;
-		margin-left: auto;
-		align-items: center;
-	}
-	.session-actions :global(.button-ghost) {
-		padding: 0.25rem 0.5rem;
-		font-size: var(--font-size-xs);
-	}
-	.session-chips {
-		display: flex;
-		flex-wrap: wrap;
-		gap: 0.3rem;
-		opacity: 0.85;
-	}
-	.sum-chip {
-		display: inline-flex;
-		align-items: center;
-		gap: 0.4rem;
-		padding: 0.15rem 0.45rem;
-		border: 1px solid var(--panel-border);
-		border-radius: var(--radius-sm);
-		background: var(--surface-2);
-		font-size: var(--font-size-xs);
-	}
-	.sum-chip-key {
-		text-transform: uppercase;
-		letter-spacing: var(--letter-spacing-wide);
-		color: var(--muted);
-		font-weight: 600;
-		font-size: 0.62rem;
-	}
-	.sum-chip-val {
-		color: var(--text);
-		font-weight: 600;
-	}
-	.session-msg { margin-top: 0.1rem; }
 
 	/* ── Main 2-col grid ── */
 	.cs-grid {
@@ -1918,18 +2273,21 @@
 		background: var(--surface-2);
 	}
 	.vt-mode-btn {
-		background: transparent;
+		display: inline-flex;
+		align-items: center;
 		border: none;
 		padding: 0.2rem 0.6rem;
 		font-size: var(--font-size-xs);
 		font-weight: 600;
 		color: var(--muted);
-		cursor: pointer;
 		border-radius: calc(var(--radius-sm) - 1px);
+		background: transparent;
+		cursor: pointer;
 	}
 	.vt-mode-btn.active {
-		background: var(--accent, #2563eb);
-		color: white;
+		color: var(--text);
+		background: rgba(37, 99, 235, 0.12);
+		box-shadow: inset 0 0 0 1px rgba(37, 99, 235, 0.08);
 	}
 	.vt-spacer { flex: 1; }
 	.vt-zoom {
@@ -1949,13 +2307,33 @@
 		display: flex;
 		flex-direction: column;
 	}
+	.viewport-pane {
+		flex: 1;
+		min-height: 0;
+		display: flex;
+		flex-direction: column;
+		padding: 0.3rem;
+		border: 1px solid rgba(148, 163, 184, 0.22);
+		border-radius: calc(var(--radius-lg) - 4px);
+		background:
+			linear-gradient(180deg, rgba(255, 255, 255, 0.96), rgba(248, 250, 252, 0.96));
+		box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.9);
+	}
+	.viewport-pane-2d {
+		background:
+			linear-gradient(180deg, rgba(255, 255, 255, 0.96), rgba(248, 250, 252, 0.92));
+	}
+	.viewport-pane-3d {
+		background:
+			linear-gradient(180deg, rgba(255, 255, 255, 0.98), rgba(244, 247, 250, 0.96));
+	}
 	.viewport-canvas-wrap {
 		position: relative;
 		background: #0a0a0a;
 		border-radius: var(--radius-sm);
 		overflow: hidden;
 		flex: 1;
-		min-height: 0;
+		min-height: 18rem;
 		touch-action: none;
 		user-select: none;
 		-webkit-user-drag: none;
@@ -1979,6 +2357,10 @@
 		user-select: none;
 		pointer-events: none;
 	}
+	.viewport-img-mirrored {
+		transform: scaleX(-1);
+		transform-origin: center center;
+	}
 	.viewport-canvas {
 		position: absolute;
 		top: 0;
@@ -1991,6 +2373,7 @@
 		display: flex;
 		gap: 0.75rem;
 		margin-top: 0.4rem;
+		padding: 0 0.15rem;
 		font-size: 0.68rem;
 		color: var(--muted);
 		flex-shrink: 0;
@@ -2007,6 +2390,7 @@
 	.viewport-legend-json { margin-left: auto; }
 	.viewport-empty {
 		flex: 1;
+		min-height: 18rem;
 		display: flex;
 		flex-direction: column;
 		align-items: center;
@@ -2091,6 +2475,41 @@
 		overflow-y: auto;
 		padding-right: 0.25rem;
 	}
+	.category-chip-row {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0.3rem;
+		margin-bottom: 0.6rem;
+		position: sticky;
+		top: 0;
+		z-index: 1;
+		padding-bottom: 0.35rem;
+		background: var(--panel);
+	}
+	.category-chip {
+		appearance: none;
+		border: 1px solid var(--panel-border);
+		background: transparent;
+		color: var(--text-muted, var(--text));
+		border-radius: 999px;
+		padding: 0.2rem 0.65rem;
+		font: inherit;
+		font-size: 0.7rem;
+		cursor: pointer;
+		transition: background 120ms ease, color 120ms ease, border-color 120ms ease;
+	}
+	.category-chip:hover,
+	.category-chip:focus-visible {
+		border-color: rgba(47, 123, 246, 0.4);
+		color: var(--text);
+		outline: none;
+	}
+	.category-chip.active {
+		background: var(--brand-soft);
+		border-color: rgba(47, 123, 246, 0.55);
+		color: var(--brand-strong, var(--text));
+		font-weight: 600;
+	}
 	.material-swatch-grid {
 		display: flex;
 		flex-wrap: wrap;
@@ -2151,62 +2570,69 @@
 	.material-swatch-status[data-status='available'] { background: #16a34a; }
 	.material-swatch-status[data-status='needs_patch'] { background: #f59e0b; }
 
-	/* ── Bottom panel tabs ── */
+	/* ── Bottom panel tabs (vertical rail) ── */
 	.bottom-tabs-shell {
 		display: grid;
-		grid-template-columns: 8.5rem minmax(0, 1fr);
+		grid-template-columns: 108px minmax(0, 1fr);
 		height: 100%;
 		min-height: 0;
 	}
 	.bottom-tabs-shell[data-collapsed='true'] {
-		grid-template-columns: minmax(0, 1fr);
+		grid-template-columns: 108px;
 	}
 	.bottom-tabs-rail {
 		display: flex;
 		flex-direction: column;
-		gap: 0.25rem;
-		padding: 0.45rem;
+		gap: 0.15rem;
+		padding: 0.5rem 0.4rem;
 		border-right: 1px solid var(--panel-border);
-		background: var(--subpanel);
+		background: var(--panel-soft, var(--subpanel));
 		min-height: 0;
 		overflow-y: auto;
-	}
-	.bottom-tabs-shell[data-collapsed='true'] .bottom-tabs-rail {
-		flex-direction: row;
-		align-items: center;
-		border-right: none;
-		overflow-x: auto;
-		overflow-y: hidden;
 	}
 	.bottom-collapse-btn,
 	.bottom-tab-btn {
 		appearance: none;
-		border: 1px solid transparent;
+		border: 0;
 		background: transparent;
 		color: var(--muted-strong);
 		border-radius: var(--radius-sm);
-		min-height: 2rem;
-		padding: 0.35rem 0.5rem;
+		min-height: 1.85rem;
+		padding: 0.4rem 0.55rem;
 		font: inherit;
-		font-size: var(--font-size-xs);
-		font-weight: 650;
+		font-size: 0.74rem;
+		font-weight: 600;
 		cursor: pointer;
 		display: flex;
 		align-items: center;
-		justify-content: space-between;
-		gap: 0.35rem;
+		justify-content: flex-start;
+		gap: 0.4rem;
 		text-align: left;
+		position: relative;
 	}
 	.bottom-collapse-btn {
 		justify-content: center;
 		color: var(--brand-strong);
-		background: var(--brand-soft);
+		background: rgba(47, 123, 246, 0.08);
+		margin-bottom: 0.25rem;
 	}
-	.bottom-tab-btn:hover:not(:disabled),
+	.bottom-tab-btn:hover:not(:disabled) {
+		background: rgba(47, 123, 246, 0.06);
+	}
 	.bottom-tab-btn.active {
-		border-color: rgba(47, 123, 246, 0.24);
-		background: var(--brand-soft);
 		color: var(--brand-strong);
+		background: rgba(47, 123, 246, 0.06);
+		font-weight: var(--font-weight-semibold, 650);
+	}
+	.bottom-tab-btn.active::before {
+		content: '';
+		position: absolute;
+		left: -0.4rem;
+		top: 6px;
+		bottom: 6px;
+		width: 3px;
+		border-radius: 0 2px 2px 0;
+		background: var(--brand);
 	}
 	.bottom-tab-btn:disabled {
 		opacity: 0.45;
@@ -2216,18 +2642,21 @@
 		overflow: hidden;
 		text-overflow: ellipsis;
 		white-space: nowrap;
+		flex: 1;
 	}
 	.bottom-tab-badge {
-		min-width: 1.25rem;
-		height: 1.25rem;
+		margin-left: auto;
+		min-width: 1.1rem;
+		height: 1.1rem;
 		border-radius: var(--radius-pill);
-		background: var(--surface-2);
-		color: var(--muted-strong);
+		background: var(--brand-soft);
+		color: var(--brand-strong);
 		display: inline-flex;
 		align-items: center;
 		justify-content: center;
 		padding: 0 0.35rem;
 		font-size: var(--font-size-2xs);
+		font-weight: 600;
 	}
 	.bottom-tabs-body {
 		min-height: 0;
@@ -2321,6 +2750,9 @@
 		.material-filter-btn,
 		.material-preset-btn {
 			width: auto;
+		}
+		.viewport-pane-3d {
+			min-height: 22rem;
 		}
 	}
 </style>
