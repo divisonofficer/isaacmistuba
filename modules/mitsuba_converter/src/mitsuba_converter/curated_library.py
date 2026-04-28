@@ -123,8 +123,8 @@ _CURATED_MATERIALS: list[CuratedMaterial] = [
     ),
     CuratedMaterial(
         "brushed_steel", "Brushed Steel", "metal",
-        _roughconductor("Fe", 0.0, anisotropic=True, alpha_u=0.05, alpha_v=0.30),
-        "결이 수평으로 난 브러시드 스틸.",
+        _roughconductor("Ni_palik", 0.0, anisotropic=True, alpha_u=0.05, alpha_v=0.30),
+        "결이 수평으로 난 브러시드 스틸 (Ni 광학값 사용).",
     ),
     CuratedMaterial(
         "chrome", "Chrome", "metal",

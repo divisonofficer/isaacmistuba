@@ -13,10 +13,11 @@
 		summary, getIsaacSession, getIsaacSessionInventory,
 		getScene, listJobs, materialPresets, materialLibrary,
 		isaacCommand, smokeRender, applyMeasuredMaterial, applyCuratedMaterial,
-		listIsaacScenes, downloadDataset, getDatasetDownloadStatus,
-		retryJob, deleteJob, measuredMaterialPreviewUrl, curatedMaterialPreviewUrl
+		listIsaacScenes, listIsaacCommands, downloadDataset, getDatasetDownloadStatus,
+		retryJob, deleteJob, prepareBasicScene, measuredMaterialPreviewUrl, curatedMaterialPreviewUrl
 	} from '$lib/api';
-	import { Card, IncidentCard, LogList, KeyValueList, DataTable, Breadcrumb } from '$lib/components';
+	import { commandTypeLabel } from '$lib/stores/commandResultToasts';
+	import { Card, IncidentCard, LogList, KeyValueList, DataTable, Breadcrumb, Tooltip } from '$lib/components';
 	import type { LogEntry, KeyValueItem, DataTableColumn, Tone, BreadcrumbItem, TabItem } from '$lib/components';
 
 	const L = $derived($lang);
@@ -91,6 +92,7 @@
 	let session = $state<Record<string, unknown> | null>(null);
 	let objectInventory = $state<ObjNode[]>([]);
 	let recentJobs = $state<Record<string, unknown>[]>([]);
+	let recentIsaacCommands = $state<Record<string, unknown>[]>([]);
 	let registeredScenes = $state<Record<string, unknown>[]>([]);
 
 	// Material state
@@ -142,6 +144,7 @@
 	let cmdMsg = $state('');
 	let retryingJobId = $state<string | null>(null);
 	let deletingJobId = $state<string | null>(null);
+	let preparingBasicNow = $state(false);
 	let viewMode = $state<ViewMode>('2d');
 	let bottomTab = $state<BottomTabId>('jobs');
 	let layerFilters = $state<Set<LayerKey>>(new Set(['scene', 'render', 'shape']));
@@ -178,6 +181,17 @@
 	const renderReady = $derived(!!scene?.render_ready);
 	const activeCmd = $derived($healthStore?.active_isaac_command as Record<string, unknown> | null);
 	const preparingNow = $derived(activeCmd?.command_type === 'prepare_render_ready');
+	const prepareBasicDisabledReason = $derived(
+		!currentSceneId
+			? (L === 'kr' ? '씬이 선택되지 않음' : 'No scene selected')
+		: preparingBasicNow
+			? (L === 'kr' ? '생성 중…' : 'Already building…')
+		: !scene?.mitsuba_scene_ref
+			? (L === 'kr' ? 'Mitsuba XML 미등록 (scene_record.mitsuba_scene_ref 없음)' : 'Mitsuba XML not registered (missing scene_record.mitsuba_scene_ref)')
+		: ''
+		// If mitsuba_scene_exists is false we still enable — the backend probes
+		// the XML directory for a sibling .xml and self-heals the stale catalog path.
+	);
 	const snapshotReady = $derived(
 		!!scene?.scene_snapshot_ref
 		|| !!scene?.shape_map_ref
@@ -194,6 +208,37 @@
 		: cmdPending ? (L === 'kr' ? '명령 진행 중' : 'Command in flight')
 		: ''
 	);
+
+	type Tip = { title: string; text: string };
+
+	const bp3dPrepareTip = $derived.by((): Tip => {
+		const KR = L === 'kr';
+		if (!sessionConnected)
+			return KR
+				? { title: '먼저 세션 연결이 필요해요', text: 'Isaac Sim 세션이 활성화돼야 3D 블루프린트용 snapshot 과 Shape Map 을 만들 수 있어요.' }
+				: { title: 'Connect session first', text: 'An active Isaac session is required to build the 3D blueprint snapshot + Shape Map.' };
+		if (preparingNow)
+			return KR
+				? { title: '장면 준비 중', text: '백그라운드에서 snapshot/Shape Map 빌드가 진행 중이에요. 큰 씬은 몇 분 걸릴 수 있어요.' }
+				: { title: 'Preparing scene', text: 'Snapshot / Shape Map build is running in the background. Large scenes can take a few minutes.' };
+		if (cmdPending)
+			return KR
+				? { title: '잠시만요', text: '다른 명령이 진행 중이에요. 끝나면 다시 활성화돼요.' }
+				: { title: 'Hold on', text: 'Another command is running. The button will re-enable when it finishes.' };
+		if (mitsubaSceneExists && shapeMapExists)
+			return KR
+				? { title: '재생성', text: '이미 준비된 상태지만, 씬이 변경됐다면 다시 실행해서 최신 snapshot 을 만들 수 있어요.' }
+				: { title: 'Re-run', text: 'Already prepared — re-run if the scene changed to refresh the snapshot.' };
+		return KR
+			? {
+					title: '3D 블루프린트 준비',
+					text: 'Isaac Sim 씬에서 snapshot 과 Shape Map 을 추출해 3D 블루프린트와 렌더가 모두 가능하게 만듭니다.'
+				}
+			: {
+					title: 'Prepare 3D blueprint',
+					text: 'Extract snapshot + Shape Map from the Isaac scene so both blueprint and render can use them.'
+				};
+	});
 	const isVisible = $derived($page.url.pathname.startsWith('/current-scene'));
 
 	const cleanJobs = $derived(recentJobs.filter(j => String(j.job_id ?? '').trim()));
@@ -520,20 +565,36 @@
 		source: Record<string, unknown>;
 	};
 
-	const ISAAC_JOB_KEY = '__isaac__';
+	const ISAAC_JOB_KEY = '__isaac_active__';
 
+	function isaacRowKey(cmd: Record<string, unknown>): string {
+		const cid = String(cmd.command_id ?? '').trim();
+		return cid ? `isaac:${cid}` : ISAAC_JOB_KEY;
+	}
+
+	const ISAAC_HISTORY_CAP = 30;
 	const jobListGroups = $derived<{ labelKey: 'running' | 'queued' | 'recent' | 'failed'; label: string; rows: JobListRow[] }[]>((() => {
 		const rows: JobListRow[] = [];
-		if (activeCmd) {
-			const raw = String(activeCmd.status ?? 'running');
-			const normalized = raw === 'completed' ? 'succeeded' : raw;
+		const seenIsaacIds = new Set<string>();
+		const isaacEntries: Record<string, unknown>[] = [];
+		if (activeCmd) isaacEntries.push(activeCmd as Record<string, unknown>);
+		const history = recentIsaacCommands.slice(0, ISAAC_HISTORY_CAP);
+		for (const c of history) isaacEntries.push(c);
+		for (const cmd of isaacEntries) {
+			const key = isaacRowKey(cmd);
+			if (seenIsaacIds.has(key)) continue;
+			seenIsaacIds.add(key);
+			const raw = String(cmd.status ?? '');
+			const normalized = raw === 'completed' ? 'succeeded'
+				: raw === 'dispatched' ? 'running'
+				: raw;
 			rows.push({
-				key: ISAAC_JOB_KEY,
+				key,
 				kind: 'isaac',
-				title: `Isaac: ${commandLabel(String(activeCmd.command_type ?? ''))}`,
+				title: `Isaac: ${commandTypeLabel(String(cmd.command_type ?? ''), L as 'kr' | 'en')}`,
 				status: normalized,
-				stage: String(activeCmd.progress_stage ?? ''),
-				source: activeCmd as Record<string, unknown>
+				stage: String(cmd.progress_stage ?? ''),
+				source: cmd
 			});
 		}
 		for (const j of recentJobs) {
@@ -551,8 +612,8 @@
 		const groups: { labelKey: 'running' | 'queued' | 'recent' | 'failed'; label: string; rows: JobListRow[] }[] = [
 			{ labelKey: 'running', label: L === 'kr' ? '실행 중' : 'Running', rows: rows.filter(r => r.status === 'running') },
 			{ labelKey: 'queued',  label: L === 'kr' ? '대기' : 'Queued',    rows: rows.filter(r => r.status === 'queued') },
-			{ labelKey: 'recent',  label: L === 'kr' ? '최근 완료' : 'Recently completed', rows: rows.filter(r => r.status === 'succeeded').slice(0, 5) },
-			{ labelKey: 'failed',  label: L === 'kr' ? '실패' : 'Failed',    rows: rows.filter(r => r.status === 'failed').slice(0, 5) }
+			{ labelKey: 'recent',  label: L === 'kr' ? '최근 완료' : 'Recently completed', rows: rows.filter(r => r.status === 'succeeded').slice(0, 8) },
+			{ labelKey: 'failed',  label: L === 'kr' ? '실패' : 'Failed',    rows: rows.filter(r => r.status === 'failed').slice(0, 8) }
 		];
 		return groups.filter(g => g.rows.length > 0);
 	})());
@@ -710,6 +771,7 @@
 				if (force || sceneChanged || now - lastJobsAt > JOBS_POLL_MS) {
 					lastJobsAt = now;
 					tasks.push(listJobs(30).then(r => { recentJobs = r.jobs ?? []; }).catch(() => {}));
+					tasks.push(listIsaacCommands().then(r => { recentIsaacCommands = r.commands ?? []; }).catch(() => {}));
 				}
 				if (sessRes?.status === 'active' && (force || sceneChanged || now - lastInventoryAt > INVENTORY_POLL_MS)) {
 					lastInventoryAt = now;
@@ -736,7 +798,7 @@
 				}
 				await Promise.all(tasks);
 			} else {
-				scene = null; recentJobs = []; objectInventory = [];
+				scene = null; recentJobs = []; recentIsaacCommands = []; objectInventory = [];
 				floorplan = null; floorplanImgSrc = null;
 				floorplanError = '';
 				liveActiveViewportCamera = null;
@@ -810,6 +872,20 @@
 		} finally { cmdPending = null; }
 	}
 
+	async function handlePrepareBasic() {
+		if (!currentSceneId || preparingBasicNow) return;
+		preparingBasicNow = true;
+		try {
+			const r = await prepareBasicScene(currentSceneId);
+			cmdMsg = L === 'kr'
+				? `기본 스냅샷 생성됨 · 메시 ${r.mesh_count} · 매칭 ${r.matched}/${r.shape_count}`
+				: `Basic snapshot built · meshes ${r.mesh_count} · matched ${r.matched}/${r.shape_count}`;
+			await refresh({ force: true });
+		} catch (e: unknown) {
+			cmdMsg = (e as Error).message ?? 'error';
+		} finally { preparingBasicNow = false; }
+	}
+
 	async function applyPreset(preset: Preset) {
 		if (!currentSceneId) return;
 		try {
@@ -840,6 +916,18 @@
 	}
 
 	async function startDownload(datasetId: string) {
+		// hpBRDF files are ~13 GB each (182 GB total) — guard against accidental clicks.
+		if (datasetId === 'hpbrdf_2025') {
+			const grp = matGroups.find(g => g.dataset_id === datasetId);
+			const pending = grp?.materials.filter(m => m.status === 'not_downloaded' && m.download_url).length ?? 0;
+			if (pending > 0) {
+				const totalGb = pending * 13;
+				const msg = L === 'kr'
+					? `hpBRDF 데이터셋은 파일 1개당 약 13 GB 입니다.\n${pending}개 파일 다운로드 (총 ~${totalGb} GB).\n계속할까요?`
+					: `hpBRDF files are ~13 GB each.\nDownloading ${pending} file(s) (total ~${totalGb} GB).\nContinue?`;
+				if (!confirm(msg)) return;
+			}
+		}
 		try {
 			const r = await downloadDataset(datasetId);
 			if (r.job_id) {
@@ -878,15 +966,12 @@
 		} finally { retryingJobId = null; }
 	}
 
-	async function handleDeleteJob(jobId: string) {
+	async function handleDeleteJob(jobId: string, currentStatus: string) {
 		if (!jobId || deletingJobId) return;
-		const confirmMsg = L === 'kr'
-			? `잡 ${jobId.slice(0, 12)} 의 로그와 상태 기록을 삭제할까요?`
-			: `Delete log and status records for job ${jobId.slice(0, 12)}?`;
-		if (typeof window !== 'undefined' && !window.confirm(confirmMsg)) return;
+		const isActive = currentStatus === 'running' || currentStatus === 'queued';
 		deletingJobId = jobId;
 		try {
-			await deleteJob(jobId);
+			await deleteJob(jobId, { force: isActive });
 			if (selectedJobKey === jobId) selectedJobKey = null;
 			cmdMsg = L === 'kr' ? `삭제됨: ${jobId.slice(0, 12)}` : `Deleted: ${jobId.slice(0, 12)}`;
 			await refresh({ force: true });
@@ -1589,145 +1674,28 @@
 {/snippet}
 
 {#snippet materialBrowserPanel()}
-	<div class="material-panel-split">
-		<aside class="material-tool-rail">
-			<span class="card-eyebrow">{L === 'kr' ? '재질' : 'Materials'}</span>
+	<div class="material-redirect">
+		<div class="material-redirect-body">
+			<span class="card-eyebrow">{L === 'kr' ? '재질 적용' : 'Apply material'}</span>
 			{#if selectedObj}
 				<div class="material-target-chip mono" title={selectedObj.prim_path}>→ {selectedObj.prim_path}</div>
+				<p class="muted text-xs">
+					{L === 'kr'
+						? '재질 라이브러리 페이지에서 적용할 재질을 선택하세요. 적용 후 자동으로 이 화면으로 돌아옵니다.'
+						: 'Pick a material on the library page. You will return here after applying.'}
+				</p>
+				<button
+					type="button"
+					class="button button-primary"
+					onclick={() => goto(`/materials?apply_to=${encodeURIComponent(selectedObj?.prim_path ?? '')}&scene=${encodeURIComponent(currentSceneId ?? '')}`)}
+				>
+					🎨 {L === 'kr' ? '재질 라이브러리에서 선택…' : 'Choose from material library…'}
+				</button>
 			{:else}
-				<div class="muted text-xs">{L === 'kr' ? '오브젝트 선택 후 적용' : 'Select object first'}</div>
-			{/if}
-
-			<input class="search-input material-search" placeholder={L === 'kr' ? '재질 검색…' : 'Search…'} bind:value={matSearch} />
-
-			<div class="material-filter-stack" aria-label={L === 'kr' ? '재질 필터' : 'Material filters'}>
-				{#each [['all', L === 'kr' ? '전체' : 'All'], ['polarized', 'Polar'], ['nir', 'NIR'], ['available', L === 'kr' ? '사용가능' : 'Ready']] as [f, label]}
-					<button class="filter-chip material-filter-btn {matCapFilter === f ? 'active' : ''}" onclick={() => matCapFilter = f as typeof matCapFilter}>{label}</button>
-				{/each}
-			</div>
-		</aside>
-
-		<div class="material-scroll-area">
-			<div class="category-chip-row" role="tablist" aria-label={L === 'kr' ? '재질 카테고리' : 'Material categories'}>
-				{#each CATEGORY_CHIPS as chip}
-					<button
-						type="button"
-						role="tab"
-						aria-selected={activeCategory === chip.key}
-						class="category-chip"
-						class:active={activeCategory === chip.key}
-						onclick={() => activeCategory = chip.key}
-					>{L === 'kr' ? chip.label_kr : chip.label_en}</button>
-				{/each}
-			</div>
-
-			{#if filteredPresets.length > 0 && activeCategory === 'all' && (matCapFilter === 'all' || matCapFilter === 'available')}
-				<div class="material-content-section">
-					<div class="material-section-head">
-						<span class="card-eyebrow">{L === 'kr' ? '기본 재질' : 'Built-in presets'}</span>
-						<span class="muted text-xs">{filteredPresets.length}</span>
-					</div>
-					<div class="material-preset-grid">
-						{#each filteredPresets as preset}
-							<button
-								class="material-preset-btn"
-								onclick={() => applyPreset(preset)}
-								title="{preset.title_en} – {preset.description_en}"
-							>
-								{L === 'kr' ? (preset.title_kr || preset.title_en) : preset.title_en}
-							</button>
-						{/each}
-					</div>
-				</div>
-			{/if}
-
-			{#each filteredGroups as group}
-				{@const dl = dlJobs[group.dataset_id]}
-				{@const notDownloaded = group.materials.filter(m => m.status === 'not_downloaded' && m.download_url).length}
-				<div style="margin-bottom:0.75rem">
-					<div style="display:flex;align-items:center;gap:0.35rem;flex-wrap:wrap;margin-bottom:0.35rem">
-						<button
-							onclick={() => toggleGroup(group.dataset_id)}
-							style="background:none;border:none;padding:0;cursor:pointer;font-weight:600;font-size:0.78rem;color:var(--text)"
-						>
-							{collapsedGroups.has(group.dataset_id) ? '▶' : '▼'} {group.display_name}
-						</button>
-						<span class="badge" style="font-size:0.6rem;padding:0 0.3rem">{group.venue}</span>
-						{#if group.capabilities.polarization}<span class="badge badge-running" style="font-size:0.6rem;padding:0 0.3rem">Polar</span>{/if}
-						{#if group.capabilities.nir}<span class="badge" style="font-size:0.6rem;padding:0 0.3rem;background:rgba(124,58,237,0.12);color:rgb(124,58,237)">NIR</span>{/if}
-						{#if group.patch_required}<span class="badge" style="font-size:0.6rem;padding:0 0.3rem;background:rgba(245,158,11,0.12);color:rgb(180,110,0)">patch</span>{/if}
-						{#if notDownloaded > 0 && !dl}
-							<button
-								class="button button-subtle"
-								style="font-size:0.65rem;padding:0.1rem 0.4rem;margin-left:auto"
-								onclick={() => startDownload(group.dataset_id)}
-							>↓ {notDownloaded}</button>
-						{:else if dl?.status === 'done'}
-							<span style="font-size:0.65rem;color:#16a34a;margin-left:auto">✓ done</span>
-						{/if}
-					</div>
-
-					{#if dl && dl.status !== 'done'}
-						{@const pct = dl.total > 0 ? Math.round((dl.done / dl.total) * 100) : 0}
-						<div style="margin-bottom:0.45rem;padding:0.35rem 0.5rem;background:rgba(37,99,235,0.06);border:1px solid rgba(37,99,235,0.2);border-radius:0.3rem">
-							<div style="display:flex;justify-content:space-between;align-items:center;font-size:0.68rem;margin-bottom:0.25rem">
-								<span style="font-weight:600;color:var(--accent)">
-									{dl.status === 'running' ? (L === 'kr' ? '다운로드 중…' : 'Downloading…') : dl.status}
-								</span>
-								<span class="mono">{dl.done}/{dl.total} ({pct}%)</span>
-							</div>
-							<div style="height:6px;background:rgba(0,0,0,0.08);border-radius:3px;overflow:hidden">
-								<div style="height:100%;width:{pct}%;background:linear-gradient(90deg,#2563eb,#3b82f6);transition:width 0.3s ease"></div>
-							</div>
-							{#if dl.current_name}
-								<div class="muted mono" style="font-size:0.62rem;margin-top:0.2rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{dl.current_name}</div>
-							{/if}
-							{#if dl.error}
-								<div style="color:#dc2626;font-size:0.65rem;margin-top:0.2rem">✕ {dl.error}</div>
-							{/if}
-						</div>
-					{/if}
-
-					{#if !collapsedGroups.has(group.dataset_id)}
-						<div class="material-swatch-grid">
-							{#each group.materials as mat}
-								<button
-									class="material-swatch-tile"
-									onclick={() => applyMeasured(group, mat)}
-									title="{mat.display_name} [{mat.status}]{mat.status !== 'available' ? ' – ' + (L === 'kr' ? '적용 불가' : 'not applicable') : ''}"
-									style:cursor={mat.status === 'available' ? 'pointer' : 'default'}
-									style:opacity={mat.status === 'not_downloaded' ? 0.45 : 1}
-								>
-									<span class="material-swatch-sphere" style:background={materialFallbackBg(group, mat)}>
-										<img
-											src={mat.kind === 'curated'
-												? curatedMaterialPreviewUrl(mat.material_id)
-												: measuredMaterialPreviewUrl(group.dataset_id, mat.material_id, mat.native_file)}
-											alt={mat.display_name}
-											class="material-swatch-img"
-											onload={(e) => {
-												const img = e.target as HTMLImageElement;
-												img.style.display = 'block';
-												img.closest('.material-swatch-tile')?.removeAttribute('data-preview-error');
-											}}
-											onerror={(e) => {
-												const img = e.target as HTMLImageElement;
-												img.style.display = 'none';
-												img.closest('.material-swatch-tile')?.setAttribute('data-preview-error', 'true');
-											}}
-										/>
-									</span>
-									<span class="material-swatch-status" data-status={mat.status}></span>
-								</button>
-							{/each}
-						</div>
-						<div class="muted" style="font-size:0.65rem;margin-top:0.2rem">{group.materials.length} materials · {group.materials.filter(m=>m.status==='available').length} available</div>
-					{/if}
-				</div>
-			{/each}
-
-			{#if filteredGroups.length === 0 && filteredPresets.length === 0}
-				<div class="empty-state text-xs">{L === 'kr' ? '재질 없음' : 'No materials found'}</div>
+				<p class="muted text-xs">{L === 'kr' ? '먼저 오브젝트를 선택하세요.' : 'Select an object first.'}</p>
+				<button type="button" class="button button-subtle" onclick={() => goto('/materials')}>
+					🎨 {L === 'kr' ? '재질 라이브러리 열기' : 'Open material library'}
+				</button>
 			{/if}
 		</div>
 	</div>
@@ -1742,6 +1710,58 @@
 	{:else}
 		<div class="empty-state text-xs">{L === 'kr' ? '오브젝트가 선택되지 않았습니다' : 'No object selected'}</div>
 	{/if}
+{/snippet}
+
+{#snippet isaacHistoryCard(cmd: Record<string, unknown>)}
+	{@const cmdType = String(cmd.command_type ?? '')}
+	{@const status = String(cmd.status ?? '')}
+	{@const normalized = status === 'completed' ? 'succeeded' : status === 'dispatched' ? 'running' : status}
+	{@const stage = String(cmd.progress_stage ?? '')}
+	{@const message = String(cmd.progress_message ?? '')}
+	{@const createdAt = typeof cmd.created_at === 'string' ? Date.parse(cmd.created_at) : NaN}
+	{@const finishedAt = typeof cmd.completed_at === 'string'
+		? Date.parse(cmd.completed_at)
+		: typeof cmd.updated_at === 'string' ? Date.parse(cmd.updated_at) : NaN}
+	{@const elapsedS = Number.isFinite(createdAt) && Number.isFinite(finishedAt)
+		? Math.max(0, Math.round((finishedAt - createdAt) / 1000)) : null}
+	{@const isError = normalized === 'failed'}
+	<div class="panel active-command-card" data-history-state={normalized}>
+		<div class="active-command-head">
+			<div class="active-command-title">
+				<span class="status-dot {isError ? 'status-red' : 'status-green'}"></span>
+				<div>
+					<div class="active-command-kicker">{L === 'kr' ? '완료된 명령' : 'Completed command'}</div>
+					<div class="active-command-name">{commandTypeLabel(cmdType, L as 'kr' | 'en')}</div>
+				</div>
+			</div>
+			<div class="active-command-meta">
+				<span class="badge {statusClass(normalized)}">{normalized}</span>
+				{#if elapsedS !== null}<span class="muted">{elapsedS}s</span>{/if}
+			</div>
+		</div>
+
+		{#if message}
+			<div class="active-command-current" data-running="false">
+				<span class="cmd-toast-icon" aria-hidden="true" style:background={isError ? 'rgb(220,38,38)' : 'rgb(22,163,74)'}>{isError ? '✕' : '✓'}</span>
+				<span class="active-command-stage">
+					{isError ? (L === 'kr' ? '실패' : 'Failed') : (L === 'kr' ? '성공' : 'Succeeded')}
+				</span>
+				<span class="active-command-current-sub">{message}</span>
+			</div>
+		{/if}
+
+		{#if stage}
+			<details class="active-command-tech">
+				<summary>{L === 'kr' ? '기술 로그' : 'Technical log'}</summary>
+				<div class="active-command-tech-body">
+					<span class="mono muted">{stage}</span>
+					{#if String(cmd.command_id ?? '')}<span class="mono muted">id: {String(cmd.command_id)}</span>{/if}
+					{#if typeof cmd.created_at === 'string'}<span class="muted">{L === 'kr' ? '시작' : 'Started'}: {cmd.created_at}</span>{/if}
+					{#if typeof cmd.completed_at === 'string'}<span class="muted">{L === 'kr' ? '완료' : 'Completed'}: {cmd.completed_at}</span>{/if}
+				</div>
+			</details>
+		{/if}
+	</div>
 {/snippet}
 
 {#snippet renderJobDetailCard(job: Record<string, unknown>)}
@@ -1800,12 +1820,10 @@
 				</button>
 			{/if}
 			<a class="button button-subtle text-xs" href="/jobs">{L === 'kr' ? '로그' : 'Logs'}</a>
-			{#if status !== 'running' && status !== 'queued'}
-				<button class="button button-subtle text-xs" onclick={() => handleDeleteJob(jobId)}
-					disabled={deletingJobId === jobId}>
-					{deletingJobId === jobId ? '…' : (L === 'kr' ? '삭제' : 'Delete')}
-				</button>
-			{/if}
+			<button class="button button-subtle text-xs" onclick={() => handleDeleteJob(jobId, status)}
+				disabled={deletingJobId === jobId}>
+				{deletingJobId === jobId ? '…' : (L === 'kr' ? '삭제' : 'Delete')}
+			</button>
 		</div>
 	</div>
 {/snippet}
@@ -1859,8 +1877,19 @@
 		<section class="job-hub-detail">
 			{#if !selectedJobKey}
 				<div class="empty-state text-xs">{L === 'kr' ? '왼쪽에서 작업을 선택하세요' : 'Select a job from the list'}</div>
-			{:else if selectedJobKey === ISAAC_JOB_KEY}
-				{@render activeCmdCard()}
+			{:else if selectedJobKey.startsWith('isaac:') || selectedJobKey === ISAAC_JOB_KEY}
+				{@const cid = selectedJobKey.startsWith('isaac:') ? selectedJobKey.slice('isaac:'.length) : String(activeCmd?.command_id ?? '')}
+				{@const isActiveSelection = !!activeCmd && cid === String(activeCmd.command_id ?? '')}
+				{#if isActiveSelection}
+					{@render activeCmdCard()}
+				{:else}
+					{@const cmd = recentIsaacCommands.find(c => String(c.command_id ?? '') === cid)}
+					{#if cmd}
+						{@render isaacHistoryCard(cmd)}
+					{:else}
+						<div class="empty-state text-xs">{L === 'kr' ? '명령 기록을 찾을 수 없음' : 'Command not found'}</div>
+					{/if}
+				{/if}
 			{:else}
 				{@const job = recentJobs.find(j => String(j.job_id) === selectedJobKey)}
 				{#if job}
@@ -2069,12 +2098,23 @@
 					{#if currentSceneId && viewMode === '3d'}
 						<button
 							class="button button-subtle text-xs"
-							onclick={() => sendCommand('prepare_render_ready')}
-							disabled={!!cmdPending || preparingNow || !sessionConnected}
-							title={L === 'kr' ? '3D 블루프린트용 snapshot/shape map 생성' : 'Generate snapshot/shape map for 3D blueprint'}
+							onclick={handlePrepareBasic}
+							disabled={!!prepareBasicDisabledReason}
+							title={prepareBasicDisabledReason
+								? (L === 'kr' ? `비활성 이유: ${prepareBasicDisabledReason}` : `Disabled: ${prepareBasicDisabledReason}`)
+								: (L === 'kr' ? 'Isaac 없이 Mitsuba XML에서 기본 스냅샷/shape_map 재생성' : 'Rebuild basic snapshot/shape_map from Mitsuba XML (Isaac-free)')}
 						>
-							{preparingNow ? (L === 'kr' ? '장면 준비 중…' : 'Preparing scene…') : (L === 'kr' ? '장면 준비' : 'Prepare Scene')}
+							{preparingBasicNow ? (L === 'kr' ? '생성 중…' : 'Building…') : (L === 'kr' ? '기본 스냅샷' : 'Basic snapshot')}
 						</button>
+						<Tooltip title={bp3dPrepareTip.title} text={bp3dPrepareTip.text} position="bottom">
+							<button
+								class="button button-subtle text-xs"
+								onclick={() => sendCommand('prepare_render_ready')}
+								disabled={!!cmdPending || preparingNow || !sessionConnected}
+							>
+								{preparingNow ? (L === 'kr' ? '장면 준비 중…' : 'Preparing scene…') : (L === 'kr' ? '장면 준비' : 'Prepare Scene')}
+							</button>
+						</Tooltip>
 					{/if}
 					<button class="button button-ghost text-xs" onclick={handleSmokeRender} disabled={!!cmdPending} title="Smoke Render">🧪</button>
 				</div>
@@ -2556,20 +2596,6 @@
 		object-fit: cover;
 		display: none;
 	}
-	.material-swatch-status {
-		position: absolute;
-		right: 0.42rem;
-		bottom: 0.42rem;
-		width: 0.45rem;
-		height: 0.45rem;
-		border-radius: 999px;
-		border: 1px solid rgba(255, 255, 255, 0.8);
-		background: #9ca3af;
-		box-shadow: 0 0 0 1px rgba(15, 23, 42, 0.08);
-	}
-	.material-swatch-status[data-status='available'] { background: #16a34a; }
-	.material-swatch-status[data-status='needs_patch'] { background: #f59e0b; }
-
 	/* ── Bottom panel tabs (vertical rail) ── */
 	.bottom-tabs-shell {
 		display: grid;

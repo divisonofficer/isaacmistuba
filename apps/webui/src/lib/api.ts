@@ -24,8 +24,8 @@ export const retryJob = (jobId: string) =>
 	post(`/api/render-jobs/${jobId}/retry`);
 export const cancelJob = (jobId: string) =>
 	post(`/jobs/${jobId}/cancel`);
-export const deleteJob = (jobId: string) =>
-	post(`/api/render-jobs/${encodeURIComponent(jobId)}/delete`);
+export const deleteJob = (jobId: string, opts: { force?: boolean } = {}) =>
+	post(`/api/render-jobs/${encodeURIComponent(jobId)}/delete${opts.force ? '?force=1' : ''}`);
 export const smokeRender = (sceneId: string) =>
 	post('/api/tests/smoke-render', { scene_id: sceneId });
 
@@ -76,7 +76,34 @@ export const applyCuratedMaterial = (sceneId: string, payload: unknown) =>
 
 export const submitRender = (payload: unknown) => post('/render', payload);
 
+export const prepareBasicScene = (sceneId: string) =>
+	post(`/api/scenes/${encodeURIComponent(sceneId)}/prepare-basic`);
+
 export const downloadDataset = (datasetId: string) =>
 	post('/api/dataset-download', { dataset_id: datasetId });
+export const downloadDatasetForce = (datasetId: string, materialIds?: string[]) =>
+	post('/api/dataset-download', { dataset_id: datasetId, force: true, material_ids: materialIds });
 export const getDatasetDownloadStatus = (jobId: string) =>
 	fetch(`/api/dataset-download/status?job_id=${encodeURIComponent(jobId)}`).then(json);
+
+export const getUserSettings = () =>
+	fetch('/api/user-settings').then(json);
+export const setUserSettings = (payload: {
+	dataset_storage_overrides?: Record<string, string>;
+	material_preview_spp?: number | null;
+}) => post('/api/user-settings', payload);
+
+export const invalidateCuratedPreview = (materialId: string) =>
+	post(`/api/material-preview/curated/${encodeURIComponent(materialId)}/invalidate`);
+export const invalidateMeasuredPreview = (datasetId: string, materialId: string) =>
+	post(
+		`/api/material-preview/measured/${encodeURIComponent(datasetId)}/${encodeURIComponent(materialId)}/invalidate`
+	);
+export type PreviewRef =
+	| { type: 'curated'; material_id: string }
+	| { type: 'measured'; dataset_id: string; material_id: string };
+export const batchInvalidatePreviews = (items: PreviewRef[]) =>
+	post('/api/material-previews/batch-invalidate', { items });
+
+export const materialJobs = () => fetch('/api/material-jobs').then(json);
+export const clearMaterialJobs = () => post('/api/material-jobs/clear-finished');

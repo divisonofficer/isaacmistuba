@@ -13,6 +13,7 @@ import mimetypes
 import os
 from pathlib import Path
 import math
+import shutil
 import sys
 import tempfile
 import threading
@@ -67,6 +68,15 @@ from robomituba_bridge import (
 )
 from robomituba_bridge.io import scene_snapshot_from_payload
 
+from .local_snapshot import enumerate_xml_targets, prepare_basic_scene_from_disk
+from .material_overrides_store import (
+    StoredOverride,
+    load_overrides as _load_material_overrides,
+    merge_overrides as _merge_material_overrides,
+    overrides_path_for_scene as _overrides_path_for_scene,
+    overrides_ref_for_scene as _overrides_ref_for_scene,
+    save_overrides as _save_material_overrides,
+)
 from .multimodal import SUPPORTED_MODALITIES, camera_to_world_to_lookat, normalize_mat4_storage
 from .observation_bridge import render_timestep_bundle_split_lighting
 from .scene_floorplan import CameraOverlay, LightOverlay, render_scene_floorplan
@@ -322,6 +332,316 @@ class _SceneTelemetrySubscriber:
 
 _download_jobs: dict[str, dict[str, Any]] = {}
 _download_jobs_lock = threading.Lock()
+
+
+def _parse_hf_dataset_url(url: str) -> tuple[str, str]:
+    """Parse hf-dataset://<owner>/<repo>/<path/inside/repo> into (repo_id, filename)."""
+    rest = url[len("hf-dataset://"):]
+    parts = rest.split("/", 2)
+    if len(parts) < 3:
+        raise ValueError(f"invalid hf-dataset URL: {url}")
+    owner, repo, filename = parts[0], parts[1], parts[2]
+    return f"{owner}/{repo}", filename
+
+
+def _human_bytes(n: int | float) -> str:
+    """Pretty-print a byte count. 13_000_000_000 -> '12.1 GB'."""
+    n = float(n)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return f"{n:.1f} {unit}" if unit not in ("B", "KB") else f"{int(n)} {unit}"
+        n /= 1024
+    return f"{n:.1f} TB"
+
+
+def _hf_file_size(repo_id: str, filename: str) -> int:
+    """Look up the size of a single file in a HF dataset repo, in bytes.
+
+    Returns 0 if the metadata is unavailable. Used to seed the progress
+    total before download starts (Xet downloads don't drive tqdm reliably).
+    """
+    try:
+        from huggingface_hub import HfApi
+    except ImportError:
+        return 0
+    try:
+        info_list = HfApi().get_paths_info(
+            repo_id=repo_id, paths=[filename], repo_type="dataset"
+        )
+    except Exception:
+        return 0
+    if not info_list:
+        return 0
+    info = info_list[0]
+    # Regular file (post-2024 schema)
+    size = getattr(info, "size", 0) or 0
+    if size:
+        return int(size)
+    # LFS-pointed file (Xet falls under LFS for size info)
+    lfs = getattr(info, "lfs", None)
+    if lfs is not None:
+        return int(getattr(lfs, "size", 0) or 0)
+    return 0
+
+
+def _download_hf_dataset_file(
+    repo_id: str,
+    filename: str,
+    dest: Path,
+    progress_cb: "Callable[[int, int], None] | None" = None,
+) -> None:
+    """Stream a single file from a HF dataset repo into ``dest``.
+
+    We bypass ``hf_hub_download`` because HF's Xet backend writes to a
+    chunk-addressed CAS cache (``~/.cache/huggingface/xet/``) and only
+    assembles the final file at the very end — meaning ``dest`` stays at 0
+    bytes throughout the download and there's no way to surface progress.
+    Streaming via the public ``resolve`` URL also skips the (mostly opaque)
+    Xet cache, downloading directly to a ``.part`` next to ``dest`` so we
+    can poll its size for accurate per-chunk progress and resume via HTTP
+    Range on retry.
+    """
+    import requests
+    from urllib.parse import quote
+
+    base = f"https://huggingface.co/datasets/{repo_id}/resolve/main/{quote(filename)}"
+
+    # Resolve total size via HF API (for the progress total) — falls back to
+    # Content-Length from a HEAD if API metadata is missing.
+    total_bytes = _hf_file_size(repo_id, filename)
+    if total_bytes <= 0:
+        try:
+            head = requests.head(base, allow_redirects=True, timeout=30)
+            total_bytes = int(head.headers.get("Content-Length") or 0)
+        except Exception:
+            total_bytes = 0
+
+    part = dest.with_suffix(dest.suffix + ".part")
+    resume_pos = part.stat().st_size if part.exists() else 0
+    if total_bytes and resume_pos >= total_bytes:
+        # Already fully downloaded but never renamed; finalize and exit.
+        part.replace(dest)
+        if progress_cb:
+            try:
+                progress_cb(total_bytes, total_bytes)
+            except Exception:
+                pass
+        return
+
+    headers = {}
+    if resume_pos > 0:
+        headers["Range"] = f"bytes={resume_pos}-"
+
+    if progress_cb:
+        try:
+            progress_cb(resume_pos, total_bytes)
+        except Exception:
+            pass
+
+    chunk_size = 1024 * 1024  # 1 MB
+    last_emit = 0.0
+    downloaded = resume_pos
+
+    with requests.get(base, headers=headers, stream=True, timeout=(30, 300), allow_redirects=True) as r:
+        if resume_pos > 0 and r.status_code == 200:
+            # Server ignored Range — restart from scratch.
+            downloaded = 0
+            mode = "wb"
+        else:
+            r.raise_for_status()
+            mode = "ab" if resume_pos > 0 else "wb"
+        with part.open(mode) as fh:
+            for chunk in r.iter_content(chunk_size=chunk_size):
+                if not chunk:
+                    continue
+                fh.write(chunk)
+                downloaded += len(chunk)
+                if progress_cb:
+                    now = time.time()
+                    # Throttle UI updates to ~5/sec to avoid lock spam.
+                    if now - last_emit >= 0.2:
+                        last_emit = now
+                        try:
+                            progress_cb(downloaded, total_bytes or downloaded)
+                        except Exception:
+                            pass
+
+    # Atomic rename to final destination.
+    part.replace(dest)
+    if progress_cb:
+        try:
+            final_size = dest.stat().st_size
+            progress_cb(final_size, total_bytes or final_size)
+        except Exception:
+            pass
+
+
+# In-flight sphere-preview renders. The HTTP handler kicks the actual
+# Mitsuba render off into a background daemon thread so the request thread
+# returns 202 Accepted right away — otherwise a single slow render (~5–15s
+# for spp=128 on the scalar variant) blocks every other request behind the
+# Python GIL, which is what made /health time out at 8s while a preview was
+# rendering. The set lets duplicate requests for the same key short-circuit
+# instead of starting a duplicate render.
+_preview_inflight: set[str] = set()
+_preview_inflight_lock = threading.Lock()
+
+
+# Server-side job registry for the materials page bottom panel. Lives in
+# process memory only — survives browser refreshes (which previously wiped
+# the log) but not daemon restarts. Capped at MAX_MATERIAL_JOBS so memory
+# doesn't grow without bound. Each entry mirrors the frontend `MaterialJob`
+# shape so the page can render it directly.
+_material_jobs: list[dict[str, Any]] = []
+_material_jobs_lock = threading.Lock()
+_material_jobs_seq = 0
+MAX_MATERIAL_JOBS = 200
+
+
+def _create_material_job(key: str, title: str, subtitle: str, action: str) -> dict[str, Any]:
+    """Append a new running-state job to the registry and return it."""
+    global _material_jobs_seq
+    with _material_jobs_lock:
+        _material_jobs_seq += 1
+        job: dict[str, Any] = {
+            "id": _material_jobs_seq,
+            "key": key,
+            "title": title,
+            "subtitle": subtitle,
+            "action": action,
+            "status": "running",
+            "stage": "queued",
+            "stage_message": "큐 대기 중",
+            # Sub-render progress: current chunk index out of progress_total.
+            # progress_total=0 means "no progress info" (e.g. for jobs that
+            # don't render in chunks like measured renders going through
+            # get_measured_preview).
+            "progress": 0,
+            "progress_total": 0,
+            "started_at": time.time(),
+            "stage_updated_at": time.time(),
+            "finished_at": None,
+            "error": None,
+        }
+        _material_jobs.insert(0, job)
+        if len(_material_jobs) > MAX_MATERIAL_JOBS:
+            del _material_jobs[MAX_MATERIAL_JOBS:]
+        return dict(job)
+
+
+def _update_material_job_stage(job_id: int, stage: str, message: str) -> None:
+    """Update the live stage of a running job — e.g. 'rendering' / 'saving'."""
+    with _material_jobs_lock:
+        for j in _material_jobs:
+            if j["id"] == job_id:
+                j["stage"] = stage
+                j["stage_message"] = message
+                j["stage_updated_at"] = time.time()
+                return
+
+
+def _update_material_job_progress(job_id: int, current: int, total: int) -> None:
+    """Update the live sub-step progress of a running job. Used by chunked
+    Mitsuba renders to show n/N + percentage in the bottom panel."""
+    with _material_jobs_lock:
+        for j in _material_jobs:
+            if j["id"] == job_id:
+                j["progress"] = int(current)
+                j["progress_total"] = int(total)
+                j["stage_updated_at"] = time.time()
+                return
+
+
+def _set_material_job_bytes(
+    job_id: int,
+    done: int,
+    total: int,
+    speed_bps: float | None = None,
+) -> None:
+    """Attach byte-level progress (and optional moving-avg speed) to a job."""
+    with _material_jobs_lock:
+        for j in _material_jobs:
+            if j["id"] == job_id:
+                j["current_done_bytes"] = int(done)
+                j["current_total_bytes"] = int(total)
+                if speed_bps is not None:
+                    j["current_speed_bps"] = float(speed_bps)
+                j["stage_updated_at"] = time.time()
+                return
+
+
+def _finish_material_job(job_id: int, status: str, error: str | None = None) -> None:
+    """Mark `job_id` as success or failed. Logs to stderr so the operator
+    can verify BG-thread completion in the daemon log even when the
+    frontend isn't actively polling."""
+    info: dict[str, Any] | None = None
+    with _material_jobs_lock:
+        for j in _material_jobs:
+            if j["id"] == job_id:
+                j["status"] = status
+                j["finished_at"] = time.time()
+                j["stage"] = "done" if status == "success" else "failed"
+                j["stage_message"] = "완료" if status == "success" else (error or "실패")
+                j["stage_updated_at"] = time.time()
+                if error is not None:
+                    j["error"] = error
+                info = {"key": j["key"], "elapsed": j["finished_at"] - j["started_at"]}
+                break
+    if info is not None:
+        suffix = f" — {error}" if error else ""
+        print(
+            f"[daemon] material-job #{job_id} {info['key']} -> {status}"
+            f" ({info['elapsed']:.1f}s){suffix}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
+def _list_material_jobs() -> list[dict[str, Any]]:
+    with _material_jobs_lock:
+        return [dict(j) for j in _material_jobs]
+
+
+def _clear_finished_material_jobs() -> int:
+    with _material_jobs_lock:
+        before = len(_material_jobs)
+        _material_jobs[:] = [j for j in _material_jobs if j["status"] == "running"]
+        return before - len(_material_jobs)
+
+
+def _claim_preview_inflight(key: str) -> bool:
+    """Reserve `key` if no render for it is in progress; return True if claimed."""
+    with _preview_inflight_lock:
+        if key in _preview_inflight:
+            return False
+        _preview_inflight.add(key)
+        return True
+
+
+def _release_preview_inflight(key: str) -> None:
+    with _preview_inflight_lock:
+        _preview_inflight.discard(key)
+
+
+def _spawn_preview_render(key: str, render_fn: Any) -> None:
+    """Run `render_fn()` in a background daemon thread under inflight tracking."""
+    def _task() -> None:
+        try:
+            render_fn()
+        except Exception as exc:
+            print(
+                f"[daemon] preview render failed ({key}): {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+        finally:
+            _release_preview_inflight(key)
+
+    threading.Thread(
+        target=_task,
+        daemon=True,
+        name=f"preview-{key.replace(':', '-').replace('/', '-')}",
+    ).start()
 
 
 class RenderDaemon:
@@ -1432,12 +1752,13 @@ class RenderDaemon:
                 raise RuntimeError("Queued cancellation is supported, but running renders are not interruptible in v1.")
             return RenderJobStatus(**render_job_status_to_payload(job.status))
 
-    def delete_job(self, job_id: str) -> None:
+    def delete_job(self, job_id: str, *, force: bool = False) -> None:
         """Remove a finished/cancelled/failed job record and its log file.
 
-        Running and queued jobs are refused — callers should cancel first.
-        Deletes in-memory status, the status JSON, and the log file. No-ops for
-        unknown ids so that repeated UI dismissals are idempotent.
+        Queued/running jobs are refused unless `force=True`, which lets callers
+        purge orphaned stale entries (e.g. records left behind when a daemon
+        exited mid-render). Deletes in-memory status, the status JSON, and the
+        log file. No-ops for unknown ids so repeated UI dismissals are idempotent.
         """
         job_id = (job_id or "").strip()
         if not job_id:
@@ -1446,7 +1767,7 @@ class RenderDaemon:
             job = self._jobs.get(job_id)
             if job is not None:
                 state = job.status.status
-                if state in ("queued", "running"):
+                if state in ("queued", "running") and not force:
                     raise RuntimeError(f"Cannot delete a {state} job; cancel it first.")
                 self._jobs.pop(job_id, None)
             try:
@@ -1527,11 +1848,17 @@ class RenderDaemon:
                 self._send_json(handler, HTTPStatus.OK, {"presets": self._material_presets()})
                 return
             if path == "/api/material-library":
-                from .material_library import get_library_grouped
-                self._send_json(handler, HTTPStatus.OK, {"groups": get_library_grouped(self.repo_root)})
+                from .material_library import get_library_response
+                self._send_json(handler, HTTPStatus.OK, get_library_response(self.repo_root))
+                return
+            if path == "/api/material-jobs":
+                self._send_json(handler, HTTPStatus.OK, {"jobs": _list_material_jobs()})
                 return
             if path == "/api/dataset-download/status":
                 self._handle_dataset_download_status(handler, query)
+                return
+            if path == "/api/user-settings":
+                self._handle_user_settings_get(handler)
                 return
             if path.startswith("/api/material-preview/"):
                 self._handle_material_preview_get(handler, path, query)
@@ -1581,6 +1908,18 @@ class RenderDaemon:
             if path.startswith("/api/scenes/") and path.endswith("/diagram-3d"):
                 scene_id = path[len("/api/scenes/") : -len("/diagram-3d")].rstrip("/")
                 self._send_json(handler, HTTPStatus.OK, self._scene_diagram_3d(scene_id))
+                return
+            if path.startswith("/api/scenes/") and path.endswith("/material-targets"):
+                scene_id = path[len("/api/scenes/") : -len("/material-targets")].rstrip("/")
+                try:
+                    payload = self._scene_material_targets(scene_id)
+                except KeyError:
+                    self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": f"Unknown scene_id: {scene_id}"})
+                    return
+                except FileNotFoundError as exc:
+                    self._send_json(handler, HTTPStatus.CONFLICT, {"error": str(exc)})
+                    return
+                self._send_json(handler, HTTPStatus.OK, payload)
                 return
             if path.startswith("/api/scenes/") and "/geometry/" in path:
                 parts = path[len("/api/scenes/") :].split("/geometry/", 1)
@@ -1671,10 +2010,37 @@ class RenderDaemon:
         try:
             parsed = urlparse(handler.path)
             path = parsed.path
+            query = parse_qs(parsed.query)
             payload = self._read_request_body(handler)
 
             if path == "/api/dataset-download":
                 self._handle_dataset_download_post(handler, payload)
+                return
+
+            if path == "/api/user-settings":
+                self._handle_user_settings_post(handler, payload)
+                return
+
+            if path.startswith("/api/material-preview/curated/") and path.endswith("/invalidate"):
+                material_id = path[len("/api/material-preview/curated/"):-len("/invalidate")].strip("/")
+                self._handle_invalidate_curated(handler, material_id)
+                return
+
+            if path.startswith("/api/material-preview/measured/") and path.endswith("/invalidate"):
+                rest = path[len("/api/material-preview/measured/"):-len("/invalidate")].strip("/")
+                parts = rest.split("/", 1)
+                if len(parts) != 2:
+                    self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": "expected /api/material-preview/measured/{dataset_id}/{material_id}/invalidate"})
+                    return
+                self._handle_invalidate_measured(handler, parts[0], parts[1])
+                return
+
+            if path == "/api/material-previews/batch-invalidate":
+                self._handle_batch_invalidate(handler, payload)
+                return
+            if path == "/api/material-jobs/clear-finished":
+                cleared = _clear_finished_material_jobs()
+                self._send_json(handler, HTTPStatus.OK, {"cleared": cleared})
                 return
             if path == "/render":
                 try:
@@ -1695,6 +2061,23 @@ class RenderDaemon:
                 self._send_json(handler, HTTPStatus.ACCEPTED, render_job_accepted_to_payload(accepted))
                 return
 
+            if path.startswith("/api/scenes/") and path.endswith("/prepare-basic"):
+                scene_id = path[len("/api/scenes/"):-len("/prepare-basic")].rstrip("/")
+                try:
+                    result = self.prepare_basic_scene(scene_id)
+                except KeyError:
+                    self._send_json(
+                        handler,
+                        HTTPStatus.NOT_FOUND,
+                        {"error": f"Unknown or unprepared scene_id: {scene_id}"},
+                    )
+                    return
+                except FileNotFoundError as exc:
+                    self._send_json(handler, HTTPStatus.CONFLICT, {"error": str(exc)})
+                    return
+                self._send_json(handler, HTTPStatus.OK, {"scene_id": scene_id, **result})
+                return
+
             if path.startswith("/api/render-jobs/") and path.endswith("/retry"):
                 job_id = path[len("/api/render-jobs/"):-len("/retry")]
                 with self._condition:
@@ -1708,15 +2091,17 @@ class RenderDaemon:
 
             if path.startswith("/api/render-jobs/") and path.endswith("/delete"):
                 job_id = path[len("/api/render-jobs/"):-len("/delete")]
+                force_flag = _maybe_str(query.get("force", [None])[0]) or ""
+                force = force_flag.lower() in {"1", "true", "yes", "on"}
                 try:
-                    self.delete_job(job_id)
+                    self.delete_job(job_id, force=force)
                 except ValueError as exc:
                     self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                     return
                 except RuntimeError as exc:
                     self._send_json(handler, HTTPStatus.CONFLICT, {"error": str(exc)})
                     return
-                self._send_json(handler, HTTPStatus.OK, {"job_id": job_id, "deleted": True})
+                self._send_json(handler, HTTPStatus.OK, {"job_id": job_id, "deleted": True, "forced": force})
                 return
 
             if path == "/api/isaac/scenes/register":
@@ -1902,6 +2287,31 @@ class RenderDaemon:
                 self._send_json(handler, HTTPStatus.OK, data)
                 return
 
+            if path.startswith("/api/scenes/") and path.endswith("/material-overrides/batch"):
+                scene_id = path[len("/api/scenes/") : -len("/material-overrides/batch")].rstrip("/")
+                overrides = payload.get("overrides")
+                if not isinstance(overrides, list):
+                    self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": "'overrides' must be a list"})
+                    return
+                replace_mode = _maybe_str(payload.get("replace_mode")) or "merge"
+                try:
+                    result = self.apply_material_overrides_batch(
+                        scene_id,
+                        overrides=overrides,
+                        replace_mode=replace_mode,
+                    )
+                except KeyError:
+                    self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": f"Unknown scene_id: {scene_id}"})
+                    return
+                except FileNotFoundError as exc:
+                    self._send_json(handler, HTTPStatus.CONFLICT, {"error": str(exc)})
+                    return
+                except ValueError as exc:
+                    self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                    return
+                self._send_json(handler, HTTPStatus.OK, result)
+                return
+
             if path.startswith("/api/scenes/") and path.endswith("/apply-measured-material"):
                 scene_id = path[len("/api/scenes/") : -len("/apply-measured-material")].rstrip("/")
                 prim_path = payload.get("prim_path")
@@ -2051,6 +2461,10 @@ class RenderDaemon:
             scene_override = SceneOverrideSpec(prim_to_shape_ids=prim_to_shape_ids)
         else:
             scene_override.prim_to_shape_ids = prim_to_shape_ids
+        # Layer the agent-driven sidecar (if any) on top so persisted picks
+        # survive across daemon restarts and reach renders that don't go through
+        # an Isaac session-mutated snapshot.
+        self._merge_sidecar_overrides(scene_override, snapshot.mitsuba_scene_ref)
 
         timestamp = str(snapshot.timestamp)
         stamp = timestamp.replace(":", "").replace("-", "").replace("+", "").replace("T", "_")
@@ -2755,6 +3169,9 @@ class RenderDaemon:
         if not dataset_id:
             self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": "dataset_id required"})
             return
+        force = bool(payload.get("force", False))
+        only = payload.get("material_ids")
+        only_set: set[str] | None = set(only) if isinstance(only, list) else None
         from .material_library import get_library_grouped
         groups = get_library_grouped(self.repo_root)
         group = next((g for g in groups if g["dataset_id"] == dataset_id), None)
@@ -2764,11 +3181,18 @@ class RenderDaemon:
         pending = [
             (m["material_id"], m["display_name"], m["native_file"], m["download_url"])
             for m in group["materials"]
-            if m.get("download_url") and m["status"] == "not_downloaded"
+            if m.get("download_url")
+            and (force or m["status"] == "not_downloaded")
+            and (only_set is None or m["material_id"] in only_set)
         ]
         if not pending:
             self._send_json(handler, HTTPStatus.OK, {"status": "nothing_to_download", "job_id": None})
             return
+        # Resolve dataset's local_root once so the worker thread can apply the
+        # user's storage override (~/.robomituba/settings.json) per file.
+        from .material_library import load_dataset_config, _dataset_config_by_id
+        cfg_by_id = _dataset_config_by_id(load_dataset_config(self.repo_root))
+        dataset_local_root = (cfg_by_id.get(dataset_id) or {}).get("local_root")
         job_id = f"dl-{_utc_now_iso().replace(':', '').replace('-', '').replace('.', '')}"
         job: dict[str, Any] = {
             "done": 0, "total": len(pending), "current_name": "",
@@ -2776,34 +3200,433 @@ class RenderDaemon:
         }
         with _download_jobs_lock:
             _download_jobs[job_id] = job
-        threading.Thread(target=self._run_download_job, args=(job_id, pending), daemon=True).start()
+        threading.Thread(
+            target=self._run_download_job,
+            args=(job_id, pending, dataset_id, dataset_local_root),
+            daemon=True,
+        ).start()
         self._send_json(handler, HTTPStatus.OK, {"job_id": job_id})
+
+    # ── Preview cache invalidation ───────────────────────────────────────────
+
+    def _preview_cache_dir(self) -> Path:
+        return self.repo_root / "out" / "material_previews"
+
+    def _handle_invalidate_curated(self, handler: BaseHTTPRequestHandler, material_id: str) -> None:
+        from .curated_library import get_curated_material
+
+        mat = get_curated_material(material_id)
+        if mat is None:
+            self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": f"unknown curated material: {material_id}"})
+            return
+        removed = self._invalidate_curated_files(material_id)
+        # Create a server-side job so the materials page bottom panel can show
+        # progress + history that survives browser refresh, then kick off the
+        # actual render in the background. This way the user doesn't have to
+        # wait for the browser to issue the follow-up GET to drive the render.
+        job = self._enqueue_curated_render(mat, material_id)
+        self._send_json(handler, HTTPStatus.OK, {
+            "ok": True,
+            "material_id": material_id,
+            "removed": removed,
+            "job": job,
+        })
+
+    def _enqueue_curated_render(self, mat: Any, material_id: str) -> dict[str, Any] | None:
+        """Spawn the curated-preview Mitsuba render in a BG thread and create
+        a tracked job entry. Returns the job dict (or None if a render for
+        this material was already in flight)."""
+        from .sphere_preview import (
+            _build_scene_dict,
+            _ensure_mitsuba_variant,
+            _mitsuba_render_lock,
+            _pick_variant_for,
+            _render_to_png,
+            _supersample_default,
+        )
+
+        cache_dir = self._preview_cache_dir()
+        out = cache_dir / "curated" / f"{material_id}.png"
+        key = f"curated:{material_id}"
+
+        if not _claim_preview_inflight(key):
+            return None  # render already in flight; an existing job covers it
+
+        job = _create_material_job(
+            key=f"curated/{material_id}",
+            title="프리뷰 재렌더",
+            subtitle=getattr(mat, "display_name", material_id),
+            action="rerender",
+        )
+        job_id = job["id"]
+
+        variant = _pick_variant_for("rgb")
+        if variant is None:
+            _release_preview_inflight(key)
+            _finish_material_job(job_id, "failed", "Mitsuba variant unavailable")
+            return job
+
+        bsdf_spec = mat.bsdf_spec
+
+        def _render_curated() -> None:
+            try:
+                # Variant + scene dict build + render must all happen under
+                # the global Mitsuba lock — `_build_scene_dict` constructs
+                # `mi.ScalarTransform4f` inline, which fails if the variant
+                # isn't set in this process yet.
+                from .user_settings import get_material_preview_spp
+                spp = get_material_preview_spp(default=2048)
+                ss = _supersample_default()
+                target_size = 192
+                render_size = target_size * ss
+                with _mitsuba_render_lock:
+                    _ensure_mitsuba_variant(variant)
+                    _update_material_job_stage(
+                        job_id, "scene_build",
+                        f"씬 dict 빌드 중 (spp={spp}, render={render_size}px)",
+                    )
+                    scene_dict = _build_scene_dict(bsdf_spec, size=render_size, spp=spp)
+
+                    def _progress(current: int, total: int) -> None:
+                        pct = int(round(current / max(total, 1) * 100))
+                        _update_material_job_stage(
+                            job_id,
+                            "rendering",
+                            f"Mitsuba 렌더 중 ({material_id}) {current}/{total} · {pct}% · spp={spp}",
+                        )
+                        _update_material_job_progress(job_id, current, total)
+
+                    _update_material_job_stage(
+                        job_id, "rendering", f"Mitsuba 렌더 중 ({material_id}) 0/0 · spp={spp}"
+                    )
+                    _render_to_png(
+                        scene_dict, out, variant=variant, spp=spp,
+                        progress_cb=_progress,
+                        supersample=ss, target_size=target_size,
+                    )
+                _update_material_job_stage(job_id, "saved", "PNG 저장 완료")
+                _finish_material_job(job_id, "success")
+            except Exception as exc:
+                _finish_material_job(job_id, "failed", str(exc))
+                raise
+
+        _spawn_preview_render(key, _render_curated)
+        return job
+
+    def _invalidate_curated_files(self, material_id: str) -> list[str]:
+        """Delete the baked + cache PNG (and sidecar) for one curated id.
+
+        The next GET on the preview URL will re-render on-demand; the next bake
+        will write a fresh sidecar with a current rig_hash.
+        """
+        from .curated_library import curated_preview_path
+
+        removed: list[str] = []
+        baked = curated_preview_path(self.repo_root, material_id)
+        for p in (baked, baked.with_suffix(".meta.json")):
+            if p.exists():
+                try:
+                    p.unlink()
+                    removed.append(str(p.relative_to(self.repo_root)))
+                except OSError:
+                    pass
+        cached = self._preview_cache_dir() / "curated" / f"{material_id}.png"
+        if cached.exists():
+            try:
+                cached.unlink()
+                removed.append(str(cached.relative_to(self.repo_root)))
+            except OSError:
+                pass
+        return removed
+
+    def _handle_invalidate_measured(
+        self,
+        handler: BaseHTTPRequestHandler,
+        dataset_id: str,
+        material_id: str,
+    ) -> None:
+        removed = self._invalidate_measured_files(dataset_id, material_id)
+        # Look up the file path for this material (so we can drive the BG
+        # render without needing the client to GET the preview URL).
+        from .material_library import get_library_grouped
+        groups = get_library_grouped(self.repo_root)
+        group = next((g for g in groups if g["dataset_id"] == dataset_id), None)
+        mat_entry = next((m for m in (group["materials"] if group else []) if m["material_id"] == material_id), None)
+        file_path = mat_entry.get("native_file") if mat_entry else None
+        display_name = mat_entry.get("display_name", material_id) if mat_entry else material_id
+        job = self._enqueue_measured_render(dataset_id, material_id, file_path, display_name)
+        self._send_json(handler, HTTPStatus.OK, {
+            "ok": True,
+            "dataset_id": dataset_id,
+            "material_id": material_id,
+            "removed": removed,
+            "job": job,
+        })
+
+    def _enqueue_measured_render(
+        self,
+        dataset_id: str,
+        material_id: str,
+        measured_file_path: str | None,
+        display_name: str,
+    ) -> dict[str, Any] | None:
+        """Spawn the measured-preview render in a BG thread + register a job.
+
+        The BG task acquires `_mitsuba_render_lock` itself so the job's
+        `stage` accurately reflects whether it's "queued" (waiting for the
+        lock) vs "rendering" (actually inside `mi.render`). Calling
+        `get_measured_preview` directly would set stage to "rendering"
+        immediately even when the task is sitting behind N other renders
+        in the lock queue, which is what made the panel look like all jobs
+        were rendering at once when in fact only one was active.
+        """
+        from .sphere_preview import get_measured_preview
+
+        key = f"measured:{dataset_id}:{material_id}"
+        if not _claim_preview_inflight(key):
+            # Already rendering — surface the existing material_job so the UI
+            # has something to show instead of a silent 200 with no row.
+            existing_key = f"{dataset_id}/{material_id}"
+            with _material_jobs_lock:
+                for j in _material_jobs:
+                    if j.get("key") == existing_key and j.get("status") == "running":
+                        return dict(j)
+            return None
+        job = _create_material_job(
+            key=f"{dataset_id}/{material_id}",
+            title="프리뷰 재렌더",
+            subtitle=display_name,
+            action="rerender",
+        )
+        job_id = job["id"]
+
+        if not measured_file_path:
+            _release_preview_inflight(key)
+            _finish_material_job(job_id, "failed", "measured_file_path missing")
+            return job
+
+        from .sphere_preview import _mitsuba_render_lock
+
+        repo_root = self.repo_root
+        cache_dir = self._preview_cache_dir()
+
+        def _render_measured() -> None:
+            try:
+                # Acquire the Mitsuba lock OURSELVES (it's reentrant — see
+                # sphere_preview._mitsuba_render_lock) so the stage stays
+                # "queued"/"큐 대기 중" while waiting and only flips to
+                # "rendering" once we're actually about to enter mi.render.
+                # `get_measured_preview` re-acquires the same RLock internally
+                # — that's a no-op since we already hold it on this thread.
+                from .user_settings import get_material_preview_spp
+                spp = get_material_preview_spp(default=384)
+                with _mitsuba_render_lock:
+                    _update_material_job_stage(
+                        job_id, "rendering", f"Mitsuba 렌더 중 ({material_id}) · spp={spp}"
+                    )
+                    result = get_measured_preview(
+                        dataset_id, material_id, measured_file_path, repo_root, cache_dir,
+                        spp=spp,
+                    )
+                if result.path is None:
+                    status_msg = {
+                        "plugin_unavailable": (
+                            "GPU(CUDA) 변종이 빌드되지 않았거나, 이 재질이 패치된 "
+                            "Mitsuba 빌드를 요구합니다 (hpBRDF 등)"
+                        ),
+                        "mitsuba_unavailable": "Mitsuba 임포트 실패",
+                        "load_error": "파일 파싱 실패 (포맷 불일치)",
+                        "not_downloaded": "원본 파일 없음 — 먼저 다운로드 필요",
+                        "placeholder": "원본 파일 없음 — placeholder 사용",
+                    }.get(result.status, f"render unavailable: {result.status}")
+                    _finish_material_job(job_id, "failed", status_msg)
+                else:
+                    _update_material_job_stage(job_id, "saved", "PNG 저장 완료")
+                    _finish_material_job(job_id, "success")
+            except Exception as exc:
+                _finish_material_job(job_id, "failed", str(exc))
+                raise
+
+        _spawn_preview_render(key, _render_measured)
+        return job
+
+    def _invalidate_measured_files(self, dataset_id: str, material_id: str) -> list[str]:
+        """Best-effort delete of measured cache PNGs.
+
+        Cache filenames follow ``{safe_id}_{size}.png`` where safe_id is a
+        sanitized form of dataset_id+material_id; we glob anything with the
+        material_id substring to catch all sizes / variants.
+        """
+        cache_dir = self._preview_cache_dir() / "measured"
+        if not cache_dir.exists():
+            return []
+        removed: list[str] = []
+        # Match "{anything containing dataset_id and material_id}*.png"
+        for p in cache_dir.glob("*.png"):
+            stem = p.stem
+            if dataset_id in stem and material_id in stem:
+                try:
+                    p.unlink()
+                    removed.append(str(p.relative_to(self.repo_root)))
+                except OSError:
+                    pass
+        return removed
+
+    def _handle_batch_invalidate(self, handler: BaseHTTPRequestHandler, payload: dict) -> None:
+        items = payload.get("items")
+        if not isinstance(items, list):
+            self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": "items[] required"})
+            return
+        # Look up library once so we can resolve display names + measured file
+        # paths for the per-item job entries.
+        from .curated_library import get_curated_material
+        from .material_library import get_library_grouped
+        groups = get_library_grouped(self.repo_root)
+        measured_index: dict[tuple[str, str], dict[str, Any]] = {}
+        for g in groups:
+            for m in g["materials"]:
+                measured_index[(g["dataset_id"], m["material_id"])] = m
+
+        processed = 0
+        all_removed: list[str] = []
+        errors: list[dict[str, str]] = []
+        spawned_jobs: list[dict[str, Any]] = []
+        for item in items:
+            if not isinstance(item, dict):
+                errors.append({"item": str(item), "error": "not an object"})
+                continue
+            kind = item.get("type")
+            try:
+                if kind == "curated":
+                    mid = item.get("material_id", "")
+                    if not mid:
+                        errors.append({"item": str(item), "error": "material_id required"})
+                        continue
+                    all_removed.extend(self._invalidate_curated_files(mid))
+                    processed += 1
+                    cmat = get_curated_material(mid)
+                    if cmat is not None:
+                        job = self._enqueue_curated_render(cmat, mid)
+                        if job is not None:
+                            spawned_jobs.append(job)
+                elif kind == "measured":
+                    ds = item.get("dataset_id", "")
+                    mid = item.get("material_id", "")
+                    if not ds or not mid:
+                        errors.append({"item": str(item), "error": "dataset_id + material_id required"})
+                        continue
+                    all_removed.extend(self._invalidate_measured_files(ds, mid))
+                    processed += 1
+                    mentry = measured_index.get((ds, mid))
+                    if mentry is not None:
+                        job = self._enqueue_measured_render(
+                            ds, mid, mentry.get("native_file"), mentry.get("display_name", mid)
+                        )
+                        if job is not None:
+                            spawned_jobs.append(job)
+                else:
+                    errors.append({"item": str(item), "error": f"unknown type: {kind}"})
+            except Exception as exc:
+                errors.append({"item": str(item), "error": str(exc)})
+        self._send_json(handler, HTTPStatus.OK, {
+            "processed": processed,
+            "removed": all_removed,
+            "errors": errors,
+            "jobs": spawned_jobs,
+        })
 
     def _run_download_job(
         self,
         job_id: str,
         pending: list[tuple[str, str, str, str]],
+        dataset_id: str = "",
+        dataset_local_root: str | None = None,
     ) -> None:
+        from .user_settings import resolve_dataset_path
         job = _download_jobs[job_id]
+        # Register in the materials-page job table too, so download progress
+        # shows up alongside preview-render jobs.
+        mat_job = _create_material_job(
+            key=f"download:{dataset_id or 'dataset'}:{job_id}",
+            title="데이터셋 다운로드",
+            subtitle=f"{dataset_id or 'dataset'} ({len(pending)}개 파일)",
+            action="redownload",
+        )
+        mat_job_id = mat_job["id"]
+        _update_material_job_stage(mat_job_id, "downloading", "큐 대기 중")
         for mat_id, mat_name, native_file, url in pending:
             job["current_name"] = mat_name
-            dest = self.repo_root / native_file
+            job["current_done_bytes"] = 0
+            job["current_total_bytes"] = 0
+            job["current_speed_bps"] = 0.0
+            dest = resolve_dataset_path(self.repo_root, dataset_id, native_file, dataset_local_root)
             dest.parent.mkdir(parents=True, exist_ok=True)
+            # Per-file rolling sample window for instantaneous speed (~3s).
+            samples: list[tuple[float, int]] = []
+            speed_window_s = 3.0
+
+            def _on_progress(done: int, total: int, _name: str = mat_name) -> None:
+                now = time.time()
+                samples.append((now, int(done)))
+                cutoff = now - speed_window_s
+                while len(samples) > 2 and samples[0][0] < cutoff:
+                    samples.pop(0)
+                speed_bps = 0.0
+                if len(samples) >= 2:
+                    dt = samples[-1][0] - samples[0][0]
+                    db = samples[-1][1] - samples[0][1]
+                    if dt > 0 and db > 0:
+                        speed_bps = db / dt
+                job["current_done_bytes"] = int(done)
+                job["current_total_bytes"] = int(total)
+                job["current_speed_bps"] = float(speed_bps)
+                speed_str = f" · {_human_bytes(speed_bps)}/s" if speed_bps > 0 else ""
+                if total > 0:
+                    pct = int(done * 100 / total)
+                    msg = f"{_name} · {_human_bytes(done)} / {_human_bytes(total)} ({pct}%){speed_str}"
+                else:
+                    msg = f"{_name} · {_human_bytes(done)}{speed_str}"
+                _update_material_job_stage(mat_job_id, "downloading", msg)
+                _set_material_job_bytes(mat_job_id, int(done), int(total), speed_bps=speed_bps)
+
             try:
-                with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
-                    tmp_path = tmp.name
-                urllib.request.urlretrieve(url, tmp_path)
-                with zipfile.ZipFile(tmp_path) as zf:
-                    pbsdf_names = [n for n in zf.namelist() if n.endswith(".pbsdf") or n.endswith(".bsdf")]
-                    if pbsdf_names:
-                        dest.write_bytes(zf.read(pbsdf_names[0]))
-                    else:
-                        job["errors"].append(f"{mat_name}: no .pbsdf in zip")
-                os.unlink(tmp_path)
+                if url.startswith("hf-dataset://"):
+                    repo_id, filename = _parse_hf_dataset_url(url)
+                    _download_hf_dataset_file(repo_id, filename, dest, progress_cb=_on_progress)
+                else:
+                    _update_material_job_stage(
+                        mat_job_id, "downloading", f"{mat_name} (zip)"
+                    )
+                    self._download_zip_extract(url, dest, mat_name, job)
             except Exception as exc:
                 job["errors"].append(f"{mat_name}: {exc}")
             job["done"] += 1
         job["status"] = "done"
+        if job["errors"]:
+            _finish_material_job(
+                mat_job_id, "failed",
+                "; ".join(job["errors"][:3]) + (" …" if len(job["errors"]) > 3 else ""),
+            )
+        else:
+            _finish_material_job(mat_job_id, "success")
+
+    def _download_zip_extract(self, url: str, dest: Path, mat_name: str, job: dict) -> None:
+        """Original ZIP-based downloader (pbrdf_2020 etc.)."""
+        with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
+            tmp_path = tmp.name
+        try:
+            urllib.request.urlretrieve(url, tmp_path)
+            with zipfile.ZipFile(tmp_path) as zf:
+                pbsdf_names = [n for n in zf.namelist() if n.endswith(".pbsdf") or n.endswith(".bsdf")]
+                if pbsdf_names:
+                    dest.write_bytes(zf.read(pbsdf_names[0]))
+                else:
+                    job["errors"].append(f"{mat_name}: no .pbsdf in zip")
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
     def _handle_dataset_download_status(self, handler: BaseHTTPRequestHandler, query: dict) -> None:
         job_id = (query.get("job_id") or [""])[0]
@@ -2814,6 +3637,57 @@ class RenderDaemon:
             return
         self._send_json(handler, HTTPStatus.OK, job)
 
+    # ── User settings (storage path overrides etc.) ─────────────────────────
+
+    def _handle_user_settings_get(self, handler: BaseHTTPRequestHandler) -> None:
+        from .user_settings import load_user_settings, settings_path
+        self._send_json(handler, HTTPStatus.OK, {
+            "settings": load_user_settings(),
+            "settings_path": str(settings_path()),
+        })
+
+    def _handle_user_settings_post(self, handler: BaseHTTPRequestHandler, payload: dict) -> None:
+        from .user_settings import load_user_settings, save_user_settings, MIN_PREVIEW_SPP, MAX_PREVIEW_SPP
+        if not isinstance(payload, dict):
+            self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": "payload must be an object"})
+            return
+        overrides = payload.get("dataset_storage_overrides")
+        if overrides is not None and not isinstance(overrides, dict):
+            self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": "dataset_storage_overrides must be an object"})
+            return
+        current = load_user_settings()
+        if overrides is not None:
+            cleaned: dict[str, str] = {}
+            for k, v in overrides.items():
+                if not isinstance(k, str) or not isinstance(v, str):
+                    continue
+                v = v.strip()
+                if v:
+                    cleaned[k] = v
+            current["dataset_storage_overrides"] = cleaned
+        if "material_preview_spp" in payload:
+            spp_val = payload.get("material_preview_spp")
+            if spp_val in (None, "", 0, "0"):
+                current.pop("material_preview_spp", None)
+            else:
+                try:
+                    n = int(spp_val)
+                except (TypeError, ValueError):
+                    self._send_json(
+                        handler, HTTPStatus.BAD_REQUEST,
+                        {"error": "material_preview_spp must be an integer"},
+                    )
+                    return
+                if not (MIN_PREVIEW_SPP <= n <= MAX_PREVIEW_SPP):
+                    self._send_json(
+                        handler, HTTPStatus.BAD_REQUEST,
+                        {"error": f"material_preview_spp must be in [{MIN_PREVIEW_SPP}, {MAX_PREVIEW_SPP}]"},
+                    )
+                    return
+                current["material_preview_spp"] = n
+        save_user_settings(current)
+        self._send_json(handler, HTTPStatus.OK, {"settings": current})
+
     def _handle_material_preview_get(
         self,
         handler: BaseHTTPRequestHandler,
@@ -2821,7 +3695,7 @@ class RenderDaemon:
         query: dict,
     ) -> None:
         """Serve a Mitsuba-rendered sphere preview PNG for a preset or measured BSDF."""
-        from .sphere_preview import get_preset_preview, get_measured_preview
+        from .sphere_preview import get_preset_preview, get_measured_preview, peek_measured_preview
 
         cache_dir = self.repo_root / "out" / "material_previews"
         # /api/material-preview/curated/{material_id}
@@ -2850,25 +3724,42 @@ class RenderDaemon:
             if not file_param:
                 self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": "Missing ?file= query parameter"})
                 return
-            result = get_measured_preview(dataset_id, material_id, file_param, self.repo_root, cache_dir)
-            status_header = {"X-Preview-Status": result.status}
-            if result.path is None:
-                self._send_json(
+            # Cache hit → serve immediately. Cache miss → delegate to the same
+            # enqueue helper that the invalidate POST uses. Critically this
+            # path used to spawn a BG render directly with no job entry, so
+            # GET-triggered renders (e.g. card image fetches on a fresh page
+            # load) finished invisibly — they never showed up in the bottom
+            # panel and `_finish_material_job` had nothing to mark complete.
+            cached = peek_measured_preview(dataset_id, material_id, file_param, self.repo_root, cache_dir)
+            if cached is not None and cached.path is not None:
+                self._send_bytes(
                     handler,
-                    HTTPStatus.NOT_FOUND,
-                    {
-                        "error": f"Preview unavailable for measured: {dataset_id}/{material_id}",
-                        "status": result.status,
-                    },
-                    extra_headers=status_header,
+                    HTTPStatus.OK,
+                    cached.path.read_bytes(),
+                    content_type="image/png",
+                    extra_headers={"X-Preview-Status": cached.status},
                 )
                 return
-            self._send_bytes(
+            # Look up the display name so the job entry reads nicely in the
+            # bottom panel. Fall back to material_id if it's not in the
+            # current library response.
+            from .material_library import get_library_grouped
+            groups = get_library_grouped(self.repo_root)
+            display_name = material_id
+            for g in groups:
+                if g["dataset_id"] != dataset_id:
+                    continue
+                for m in g["materials"]:
+                    if m["material_id"] == material_id:
+                        display_name = m.get("display_name", material_id)
+                        break
+                break
+            self._enqueue_measured_render(dataset_id, material_id, file_param, display_name)
+            self._send_json(
                 handler,
-                HTTPStatus.OK,
-                result.path.read_bytes(),
-                content_type="image/png",
-                extra_headers=status_header,
+                HTTPStatus.ACCEPTED,
+                {"status": "rendering", "dataset_id": dataset_id, "material_id": material_id},
+                extra_headers={"X-Preview-Status": "rendering", "Retry-After": "2"},
             )
             return
         self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": f"Unknown material-preview path: {path}"})
@@ -2906,15 +3797,7 @@ class RenderDaemon:
             )
             return
 
-        # Fallback: render on demand into the daemon cache dir.
-        from .sphere_preview import (
-            _build_scene_dict,
-            _get_lock,
-            _mitsuba_render_lock,
-            _pick_variant_for,
-            _render_to_png,
-        )
-
+        # Cache miss path — see `_enqueue_curated_render` below.
         out = cache_dir / "curated" / f"{material_id}.png"
         if out.exists():
             self._send_bytes(
@@ -2926,43 +3809,19 @@ class RenderDaemon:
             )
             return
 
-        variant = _pick_variant_for("rgb")
-        if variant is None:
-            self._send_json(
-                handler,
-                HTTPStatus.NOT_FOUND,
-                {"error": "Mitsuba variant unavailable; bake assets/material_previews/curated/ first."},
-                extra_headers={"X-Preview-Status": "mitsuba_unavailable"},
-            )
-            return
-
-        lock = _get_lock(f"curated:{material_id}")
-        with lock:
-            if not out.exists():
-                try:
-                    scene_dict = _build_scene_dict(mat.bsdf_spec, size=192, spp=128)
-                    with _mitsuba_render_lock:
-                        _render_to_png(scene_dict, out, variant=variant, spp=128)
-                except Exception as exc:
-                    print(
-                        f"[daemon] curated preview render failed ({material_id}): {exc}",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                    self._send_json(
-                        handler,
-                        HTTPStatus.NOT_FOUND,
-                        {"error": "render_failed", "status": "load_error"},
-                        extra_headers={"X-Preview-Status": "load_error"},
-                    )
-                    return
-
-        self._send_bytes(
+        # Cache miss — delegate to the same enqueue path used by invalidate.
+        # That path correctly sets the Mitsuba variant inside the render lock
+        # before calling `_build_scene_dict` (which constructs
+        # `mi.ScalarTransform4f` and would otherwise raise "Cannot access
+        # 'ScalarTransform4f' before setting a variant"), AND creates a
+        # tracked material-job so the frontend bottom panel sees this render
+        # alongside ones triggered via invalidate.
+        self._enqueue_curated_render(mat, material_id)
+        self._send_json(
             handler,
-            HTTPStatus.OK,
-            out.read_bytes(),
-            content_type="image/png",
-            extra_headers={"X-Preview-Status": "ok"},
+            HTTPStatus.ACCEPTED,
+            {"status": "rendering", "material_id": material_id},
+            extra_headers={"X-Preview-Status": "rendering", "Retry-After": "2"},
         )
 
     def _serve_static_file(self, handler: BaseHTTPRequestHandler, path: Path) -> None:
@@ -3905,6 +4764,7 @@ class RenderDaemon:
             for key in (
                 "usd_stage_path",
                 "shape_map_ref",
+                "material_overrides_ref",
                 "render_ready",
                 "readiness_status",
                 "mitsuba_scene_exists",
@@ -4170,6 +5030,7 @@ class RenderDaemon:
                 "scene_snapshot_ref",
                 "mitsuba_scene_ref",
                 "shape_map_ref",
+                "material_overrides_ref",
                 "scene_version",
                 "illumination_setup",
                 "texture_cache_status",
@@ -4232,6 +5093,327 @@ class RenderDaemon:
             "latest_capture": record.get("latest_capture") or (captures[0] if captures else None),
         }
 
+    def _resolve_mitsuba_scene_ref_on_disk(self, mitsuba_ref: str) -> str | None:
+        """Return a repo-relative XML path that exists on disk.
+
+        The registered ``mitsuba_scene_ref`` may be stale (e.g. points at
+        ``scene.xml`` when only ``scene_curated_shell_furniture_sanitized.xml``
+        is present). Probe the parent directory and prefer, in order:
+        a file whose ``<stem>.scene_snapshot.json`` already exists, then a
+        file containing ``sanitized``, then the first ``.xml`` found.
+        """
+        if not mitsuba_ref:
+            return None
+        direct = resolve_repo_path(self.repo_root, mitsuba_ref)
+        if direct.exists():
+            return mitsuba_ref
+        parent = direct.parent
+        if not parent.exists():
+            return None
+        xml_files = sorted(parent.glob("*.xml"))
+        if not xml_files:
+            return None
+        best = next((f for f in xml_files if f.with_suffix(".scene_snapshot.json").exists()), None)
+        if best is None:
+            best = next((f for f in xml_files if "sanitized" in f.stem.lower()), None)
+        if best is None:
+            best = xml_files[0]
+        return to_repo_relative_posix(self.repo_root, best)
+
+    def _merge_sidecar_overrides(self, spec: SceneOverrideSpec, mitsuba_scene_ref: str | None) -> None:
+        """Layer persisted agent overrides onto a SceneOverrideSpec in place.
+
+        Sidecar wins for prims it covers — explicit on-disk picks override
+        whatever a stale Isaac session put on the spec. No-op when there's no
+        sidecar for the scene.
+        """
+        if not mitsuba_scene_ref:
+            return
+        try:
+            stored = _load_material_overrides(self.repo_root, mitsuba_scene_ref)
+        except Exception:
+            return
+        if not stored:
+            return
+        bsdf_overrides = dict(spec.bsdf_overrides or {})
+        for prim_path, entry in stored.items():
+            bsdf_overrides[prim_path] = entry.to_bsdf_override()
+        spec.bsdf_overrides = bsdf_overrides
+
+    def prepare_basic_scene(self, scene_id: str) -> dict[str, Any]:
+        """Build a SceneSnapshot + shape_map from the Mitsuba XML on disk and
+        re-register the scene so the 3D Blueprint view can render without Isaac.
+        """
+        detail = self._scene_detail(scene_id)
+        scene_record = detail.get("scene") or {}
+        registered_ref = _maybe_str(scene_record.get("mitsuba_scene_ref"))
+        if not registered_ref:
+            raise KeyError(scene_id)
+        mitsuba_ref = self._resolve_mitsuba_scene_ref_on_disk(registered_ref) or registered_ref
+        result = prepare_basic_scene_from_disk(
+            scene_id,
+            mitsuba_scene_ref=mitsuba_ref,
+            repo_root=self.repo_root,
+        )
+        self._register_isaac_scene(
+            {
+                "scene_id": scene_id,
+                # _register_isaac_scene requires a usd_stage_path; fall back to the
+                # XML ref when no USD was previously registered (offline scenes).
+                "usd_stage_path": _maybe_str(scene_record.get("usd_stage_path")) or mitsuba_ref,
+                "mitsuba_scene_ref": mitsuba_ref,
+                "scene_snapshot_ref": result["scene_snapshot_ref"],
+                "shape_map_ref": result["shape_map_ref"],
+                "scene_version": _maybe_str(scene_record.get("scene_version")),
+                "illumination_setup": _maybe_str(scene_record.get("illumination_setup")),
+                "source": "local_xml_v1",
+            }
+        )
+        return result
+
+    def _scene_material_targets(self, scene_id: str) -> dict[str, Any]:
+        """Enumerate per-shape semantic context for an external LLM agent.
+
+        Pairs each Mitsuba ``<shape>`` with its USD prim path (via shape_map)
+        and any override the agent has already persisted to the sidecar, so
+        the agent can resume an in-progress run without re-deciding shapes.
+        """
+        detail = self._scene_detail(scene_id)
+        scene_record = detail.get("scene") or {}
+        registered_ref = _maybe_str(scene_record.get("mitsuba_scene_ref"))
+        if not registered_ref:
+            raise KeyError(scene_id)
+        mitsuba_ref = self._resolve_mitsuba_scene_ref_on_disk(registered_ref) or registered_ref
+        xml_path = resolve_repo_path(self.repo_root, mitsuba_ref)
+        if not xml_path.exists():
+            raise FileNotFoundError(f"Mitsuba XML not found on disk: {mitsuba_ref}")
+
+        targets = enumerate_xml_targets(xml_path)
+
+        # Resolve prim_path per shape from the shape_map (build inverse).
+        shape_id_to_prim: dict[str, str] = {}
+        shape_map_ref = _maybe_str(scene_record.get("shape_map_ref"))
+        if shape_map_ref:
+            try:
+                mapping = read_shape_mapping(shape_map_ref, repo_root=self.repo_root)
+                for prim_path, shape_ids in (mapping.get("prim_to_shape_ids") or {}).items():
+                    if not isinstance(shape_ids, list):
+                        continue
+                    for sid in shape_ids:
+                        shape_id_to_prim[str(sid)] = str(prim_path)
+            except Exception:
+                pass
+
+        # Existing overrides (so the agent can resume).
+        stored = _load_material_overrides(self.repo_root, mitsuba_ref)
+
+        out_targets: list[dict[str, Any]] = []
+        targetable = 0
+        for entry in targets:
+            shape_id = entry["shape_id"]
+            prim_path = shape_id_to_prim.get(shape_id) or f"/xml/{shape_id}"
+            geometry_file = entry.get("geometry_file")
+            geometry_repo = (
+                to_repo_relative_posix(self.repo_root, Path(geometry_file))
+                if geometry_file and Path(geometry_file).is_absolute()
+                else geometry_file
+            )
+            applied = stored.get(prim_path)
+            target = {
+                "prim_path": prim_path,
+                "shape_ids": [shape_id],
+                "primitive": entry.get("primitive"),
+                "geometry_file": geometry_repo,
+                "embedded_emitter": bool(entry.get("embedded_emitter")),
+                "current_bsdf": entry.get("current_bsdf"),
+                "applied_override": (
+                    {
+                        "bsdf_type": applied.bsdf_type,
+                        "dataset_id": applied.dataset_id,
+                        "material_id": applied.material_id,
+                        "tier": applied.tier,
+                        "source": applied.source,
+                        "updated_at": applied.updated_at,
+                    }
+                    if applied is not None
+                    else None
+                ),
+            }
+            if not target["embedded_emitter"] and target["geometry_file"]:
+                targetable += 1
+            out_targets.append(target)
+
+        return {
+            "scene_id": scene_id,
+            "mitsuba_scene_ref": mitsuba_ref,
+            "shape_count": len(out_targets),
+            "targetable": targetable,
+            "applied_count": len(stored),
+            "material_overrides_ref": _overrides_ref_for_scene(self.repo_root, mitsuba_ref) if stored else None,
+            "targets": out_targets,
+        }
+
+    def apply_material_overrides_batch(
+        self,
+        scene_id: str,
+        *,
+        overrides: list[Mapping[str, Any]],
+        replace_mode: str = "merge",
+    ) -> dict[str, Any]:
+        """Persist a chunk of agent-picked BRDF overrides to the sidecar.
+
+        Mirrors successful entries to the live Isaac session if one is open
+        for this scene so the in-flight render reflects the new picks
+        immediately. Returns per-entry status so the agent can keep its other
+        picks even when one prim fails (unknown prim, missing measured file,
+        unknown curated material, ...).
+        """
+        from .curated_library import get_curated_material
+
+        detail = self._scene_detail(scene_id)
+        scene_record = detail.get("scene") or {}
+        registered_ref = _maybe_str(scene_record.get("mitsuba_scene_ref"))
+        if not registered_ref:
+            raise KeyError(scene_id)
+        mitsuba_ref = self._resolve_mitsuba_scene_ref_on_disk(registered_ref) or registered_ref
+        xml_path = resolve_repo_path(self.repo_root, mitsuba_ref)
+        if not xml_path.exists():
+            raise FileNotFoundError(f"Mitsuba XML not found on disk: {mitsuba_ref}")
+
+        # Resolve known prim paths from shape_map; agent prim paths must be in
+        # the map (or use the local "/xml/{shape_id}" convention).
+        valid_prim_paths: set[str] = set()
+        prim_to_shape_ids: dict[str, list[str]] = {}
+        shape_map_ref = _maybe_str(scene_record.get("shape_map_ref"))
+        if shape_map_ref:
+            try:
+                mapping = read_shape_mapping(shape_map_ref, repo_root=self.repo_root)
+                for prim_path, shape_ids in (mapping.get("prim_to_shape_ids") or {}).items():
+                    if not isinstance(shape_ids, list):
+                        continue
+                    valid_prim_paths.add(str(prim_path))
+                    prim_to_shape_ids[str(prim_path)] = [str(sid) for sid in shape_ids]
+            except Exception:
+                pass
+        # Also accept synthetic /xml/{shape_id} refs from the offline-built snapshot.
+        for entry in enumerate_xml_targets(xml_path):
+            valid_prim_paths.add(f"/xml/{entry['shape_id']}")
+
+        existing = _load_material_overrides(self.repo_root, mitsuba_ref)
+        if replace_mode == "replace_all":
+            existing = {}
+        elif replace_mode != "merge":
+            raise ValueError(f"Unknown replace_mode: {replace_mode!r}")
+
+        applied: list[StoredOverride] = []
+        skipped: list[dict[str, Any]] = []
+        for raw in overrides:
+            prim_path = _maybe_str(raw.get("prim_path") if isinstance(raw, Mapping) else None)
+            if not prim_path:
+                skipped.append({"prim_path": None, "reason": "missing_prim_path"})
+                continue
+            if prim_path not in valid_prim_paths:
+                skipped.append({"prim_path": prim_path, "reason": "unknown_prim_path"})
+                continue
+            bsdf_type = _maybe_str(raw.get("bsdf_type")) or ""
+            if not bsdf_type:
+                skipped.append({"prim_path": prim_path, "reason": "missing_bsdf_type"})
+                continue
+            extras: dict[str, Any] = dict(raw.get("extras") or {})
+            measured_file_path: str | None = None
+            dataset_id = _maybe_str(raw.get("dataset_id"))
+            material_id = _maybe_str(raw.get("material_id"))
+            material_name = _maybe_str(raw.get("material"))
+
+            if bsdf_type == "curated":
+                if not material_id:
+                    skipped.append({"prim_path": prim_path, "reason": "missing_curated_material_id"})
+                    continue
+                mat = get_curated_material(material_id)
+                if mat is None:
+                    skipped.append({"prim_path": prim_path, "reason": "unknown_curated_material", "material_id": material_id})
+                    continue
+                extras.setdefault("curated_bsdf_spec", dict(mat.bsdf_spec))
+                extras.setdefault("curated_category", mat.category)
+                extras.setdefault("curated_display_name", mat.display_name)
+            elif bsdf_type in ("measured", "measured_polarized"):
+                measured_file_path = _maybe_str(raw.get("measured_file_path"))
+                if not measured_file_path:
+                    skipped.append({"prim_path": prim_path, "reason": "missing_measured_file_path"})
+                    continue
+                if not resolve_repo_path(self.repo_root, measured_file_path).exists():
+                    skipped.append(
+                        {
+                            "prim_path": prim_path,
+                            "reason": "measured_file_missing",
+                            "measured_file_path": measured_file_path,
+                        }
+                    )
+                    continue
+            # else: parametric BSDF (diffuse/conductor/...) — accept verbatim.
+
+            stored = StoredOverride(
+                prim_path=prim_path,
+                bsdf_type=bsdf_type,
+                dataset_id=dataset_id,
+                material_id=material_id,
+                measured_file_path=measured_file_path,
+                base_color=list(raw["base_color"]) if isinstance(raw.get("base_color"), (list, tuple)) else None,
+                roughness=raw.get("roughness") if isinstance(raw.get("roughness"), (int, float)) else None,
+                metallic=raw.get("metallic") if isinstance(raw.get("metallic"), (int, float)) else None,
+                ior=raw.get("ior") if isinstance(raw.get("ior"), (int, float)) else None,
+                material=material_name,
+                tier=int(raw["tier"]) if isinstance(raw.get("tier"), (int, float)) else None,
+                rationale=_maybe_str(raw.get("rationale")),
+                source=_maybe_str(raw.get("source")) or "agent_v1",
+                extras=extras,
+            )
+            applied.append(stored)
+
+        merged = _merge_material_overrides(existing, applied)
+        sidecar_path = _save_material_overrides(self.repo_root, mitsuba_ref, merged, scene_id=scene_id)
+        sidecar_ref = to_repo_relative_posix(self.repo_root, sidecar_path)
+
+        # Update catalog so subsequent scene reads see the new ref.
+        self._register_isaac_scene(
+            {
+                "scene_id": scene_id,
+                "usd_stage_path": _maybe_str(scene_record.get("usd_stage_path")) or mitsuba_ref,
+                "mitsuba_scene_ref": mitsuba_ref,
+                "material_overrides_ref": sidecar_ref,
+            }
+        )
+
+        # Mirror to live Isaac session if one is open for this scene.
+        material_revision: int | None = None
+        session = self._isaac_session
+        if session is not None and session.scene_id == scene_id:
+            for stored in applied:
+                session.material_overrides[stored.prim_path] = stored.to_bsdf_override()
+                obj = session.objects.get(stored.prim_path)
+                if obj is not None:
+                    obj.bsdf_override = session.material_overrides[stored.prim_path]
+                    obj.bsdf_override_key = (
+                        f"{stored.dataset_id}/{stored.material_id}"
+                        if stored.dataset_id and stored.material_id
+                        else (stored.bsdf_type or "override")
+                    )
+            if applied:
+                session.updated_at = _utc_now_iso()
+                session.material_revision += 1
+                session.material_dirty = True
+                material_revision = session.material_revision
+
+        return {
+            "scene_id": scene_id,
+            "mitsuba_scene_ref": mitsuba_ref,
+            "applied_count": len(applied),
+            "skipped": skipped,
+            "material_overrides_ref": sidecar_ref,
+            "total_overrides": len(merged),
+            "material_revision": material_revision,
+        }
+
     def _register_isaac_scene(self, payload: dict[str, Any]) -> dict[str, Any]:
         usd_stage_path = _maybe_str(payload.get("usd_stage_path"))
         if not usd_stage_path:
@@ -4247,6 +5429,7 @@ class RenderDaemon:
                 "scene_snapshot_ref": _maybe_str(payload.get("scene_snapshot_ref")) or existing.get("scene_snapshot_ref"),
                 "mitsuba_scene_ref": _maybe_str(payload.get("mitsuba_scene_ref")) or existing.get("mitsuba_scene_ref"),
                 "shape_map_ref": _maybe_str(payload.get("shape_map_ref")) or existing.get("shape_map_ref"),
+                "material_overrides_ref": _maybe_str(payload.get("material_overrides_ref")) or existing.get("material_overrides_ref"),
                 "scene_version": _maybe_str(payload.get("scene_version")) or existing.get("scene_version"),
                 "illumination_setup": _maybe_str(payload.get("illumination_setup")) or existing.get("illumination_setup"),
                 "texture_cache_status": _maybe_str(payload.get("texture_cache_status")) or existing.get("texture_cache_status"),

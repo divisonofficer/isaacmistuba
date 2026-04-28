@@ -26,19 +26,21 @@ def main() -> int:
                         help="Repository root. Defaults to auto-detected.")
     parser.add_argument("--size", type=int, default=192,
                         help="PNG side length in pixels (default 192).")
-    parser.add_argument("--spp", type=int, default=256,
-                        help="Samples per pixel (default 256).")
+    parser.add_argument("--spp", type=int, default=2048,
+                        help="Samples per pixel (default 2048 — matches the on-demand daemon path).")
     parser.add_argument("--force", action="store_true",
                         help="Re-render even when the PNG already exists.")
     parser.add_argument("--only", default=None,
                         help="Comma-separated subset of material_ids to bake.")
+    parser.add_argument("--variant", default=None,
+                        help="Override Mitsuba variant (e.g. scalar_rgb to bypass OptiX).")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 
     repo_root: Path = repo_root_from(args.repo_root)
     only = [s.strip() for s in args.only.split(",")] if args.only else None
-    statuses = bake_all(repo_root, size=args.size, spp=args.spp, force=args.force, only=only)
+    statuses = bake_all(repo_root, size=args.size, spp=args.spp, force=args.force, only=only, variant=args.variant)
 
     n_baked = sum(1 for v in statuses.values() if v == "baked")
     n_skipped = sum(1 for v in statuses.values() if v == "skipped")

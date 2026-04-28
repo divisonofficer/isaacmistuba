@@ -1542,13 +1542,17 @@ def prepare_render_ready_from_daemon(
         repo_root=repo_root,
     )
     _emit_progress(progress_callback, stage="uploading_patch", message="Registering generated shape map with daemon.")
+    # Prefer the freshly-written scene_snapshot.json produced above; fall back
+    # to whatever was already registered only if the capture step didn't
+    # surface one (older bridges).
+    fresh_snapshot_ref = str(generated.get("scene_snapshot_ref") or "") or None
     registered = register_scene_with_daemon(
         daemon_url=daemon_url,
         usd_stage_path=str(scene.get("usd_stage_path") or ""),
         scene_id=scene_id,
         mitsuba_scene_ref=selected_scene_ref,
         shape_map_ref=str(generated["shape_map_ref"]),
-        scene_snapshot_ref=str(scene.get("scene_snapshot_ref") or "") or None,
+        scene_snapshot_ref=fresh_snapshot_ref or (str(scene.get("scene_snapshot_ref") or "") or None),
         scene_version=str(scene.get("scene_version") or "") or None,
         illumination_setup=str(scene.get("illumination_setup") or "") or None,
         timeout_s=min(timeout_s, 10.0),

@@ -86,6 +86,11 @@ DATASET_DISPLAY_META: dict[str, dict[str, Any]] = {
 
 _PBRDF_2020_BASE = "https://vclab.kaist.ac.kr/siggraph2020/pbrdfdataset"
 
+# Hugging Face dataset repo for hpBRDF 2025 (raw .hpbrdf files, ~13 GB each).
+_HPBRDF_2025_HF_REPO = "yunseongmoon/Hyperspectral-Polarimetric-BRDF"
+# Approximate per-file size for the catalog UI (each .hpbrdf is ~13 GB).
+_HPBRDF_2025_FILE_SIZE_BYTES = 13_000_000_000
+
 # KAIST pBRDF — 25 materials (SIGGRAPH 2020 official list)
 # Tuple: (material_id, display_name, native_file, download_zip_url)
 _PBRDF_2020_MATERIALS = [
@@ -187,7 +192,13 @@ def _dataset_config_by_id(configs: list[dict]) -> dict[str, dict]:
 # Helper: material status check
 # ---------------------------------------------------------------------------
 
-def _material_status(repo_root: Path, native_file: str, requires_patch: bool) -> str:
+def _material_status(
+    repo_root: Path,
+    native_file: str,
+    requires_patch: bool,
+    dataset_id: str = "",
+    dataset_local_root: str | None = None,
+) -> str:
     """
     Returns one of:
       'available'       — file exists on disk
@@ -196,10 +207,86 @@ def _material_status(repo_root: Path, native_file: str, requires_patch: bool) ->
     """
     if not native_file:
         return "not_downloaded"
-    abs_path = repo_root / native_file
+    from .user_settings import resolve_dataset_path
+    abs_path = resolve_dataset_path(repo_root, dataset_id, native_file, dataset_local_root)
     if abs_path.exists():
         return "needs_patch" if requires_patch else "available"
     return "not_downloaded"
+
+
+# ---------------------------------------------------------------------------
+# Helper: preview file probing (status + mtime + sidecar metadata)
+# ---------------------------------------------------------------------------
+
+def _file_mtime_iso(p: Path) -> str | None:
+    try:
+        ts = p.stat().st_mtime
+    except OSError:
+        return None
+    import datetime as _dt
+    return _dt.datetime.fromtimestamp(ts, tz=_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _read_sidecar(meta_path: Path) -> dict | None:
+    if not meta_path.exists():
+        return None
+    try:
+        import json as _json
+        return _json.loads(meta_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def _curated_preview_status(
+    repo_root: Path,
+    material_id: str,
+    current_rig_hash: str,
+) -> tuple[str, str | None, dict | None]:
+    """Return (preview_status, preview_mtime, preview_meta) for a curated id.
+
+    preview_status:
+      * 'baked'  — repo PNG present, sidecar rig_hash matches current rig
+      * 'stale'  — repo PNG present but sidecar rig_hash differs (or missing)
+      * 'cached' — only the on-demand cache PNG exists (no committed bake)
+      * 'missing' — neither baked nor cached
+    """
+    from .curated_library import curated_preview_path
+
+    baked = curated_preview_path(repo_root, material_id)
+    if baked.exists():
+        meta = _read_sidecar(baked.with_suffix(".meta.json"))
+        if meta and meta.get("rig_hash") == current_rig_hash:
+            return ("baked", _file_mtime_iso(baked), meta)
+        # PNG present but sidecar missing or rig changed — treat as stale.
+        return ("stale", _file_mtime_iso(baked), meta)
+    cache = repo_root / "out" / "material_previews" / "curated" / f"{material_id}.png"
+    if cache.exists():
+        return ("cached", _file_mtime_iso(cache), None)
+    return ("missing", None, None)
+
+
+def _measured_preview_status(
+    repo_root: Path,
+    dataset_id: str,
+    material_id: str,
+) -> tuple[str, str | None]:
+    """Return (preview_status, preview_mtime) for a measured material.
+
+    Measured previews have no committed bake; they live only in the on-demand
+    cache (``out/material_previews/measured/*.png``). We glob the cache for any
+    PNG whose stem contains both dataset_id and material_id.
+    """
+    cache_dir = repo_root / "out" / "material_previews" / "measured"
+    if not cache_dir.exists():
+        return ("missing", None)
+    candidates = [
+        p for p in cache_dir.glob("*.png")
+        if dataset_id in p.stem and material_id in p.stem
+    ]
+    if not candidates:
+        return ("missing", None)
+    newest = max(candidates, key=lambda p: p.stat().st_mtime)
+    return ("cached", _file_mtime_iso(newest))
 
 
 # ---------------------------------------------------------------------------
@@ -227,19 +314,17 @@ def _scan_rgl_materials(repo_root: Path) -> list[tuple[str, str, str]]:
 # ---------------------------------------------------------------------------
 
 def _build_curated_group(repo_root: Path) -> dict[str, Any]:
-    """Build the synthetic 'curated' dataset group prepended to the library.
-
-    Each entry mirrors the shape of measured-material entries (material_id,
-    display_name, native_file, status, download_url) so the existing UI list
-    rendering works without branching, and adds curated-only fields
-    (kind, category, description, preview_baked) that the new tile renderer
-    can dispatch on.
-    """
+    """Build the synthetic 'curated' dataset group prepended to the library."""
     from .curated_library import curated_preview_path, list_curated_materials
+    from .sphere_preview import rig_hash
 
+    current_hash = rig_hash()
     materials_out: list[dict[str, Any]] = []
     for mat in list_curated_materials():
         baked = curated_preview_path(repo_root, mat.material_id)
+        preview_status, preview_mtime, preview_meta = _curated_preview_status(
+            repo_root, mat.material_id, current_hash,
+        )
         materials_out.append({
             "material_id": mat.material_id,
             "display_name": mat.display_name,
@@ -250,9 +335,13 @@ def _build_curated_group(repo_root: Path) -> dict[str, Any]:
             "category": mat.category,
             "description": mat.description,
             "preview_baked": baked.exists(),
+            "preview_status": preview_status,
+            "preview_mtime": preview_mtime,
+            "preview_meta": preview_meta,
+            "download_size_bytes": None,
         })
 
-    return {
+    group = {
         "dataset_id": "curated",
         "display_name": "큐레이션",
         "paper_title": "Robomituba Curated Library",
@@ -268,6 +357,43 @@ def _build_curated_group(repo_root: Path) -> dict[str, Any]:
         },
         "materials": materials_out,
     }
+    group["summary"] = _summarize_materials(materials_out)
+    return group
+
+
+def _summarize_materials(materials: list[dict[str, Any]]) -> dict[str, int]:
+    """Count downloaded / preview_ok / preview_failed / errors across a list."""
+    total = len(materials)
+    downloaded = sum(1 for m in materials if m["status"] in ("available", "needs_patch"))
+    preview_ok = sum(
+        1 for m in materials
+        if m.get("preview_status") in ("baked", "cached")
+    )
+    preview_failed = sum(
+        1 for m in materials if m.get("preview_status") == "failed"
+    )
+    # Treat needs_patch + stale + missing-but-downloaded as "errors / 주의" so
+    # the summary card has meaningful surface area.
+    errors = sum(
+        1 for m in materials
+        if m["status"] == "needs_patch" or m.get("preview_status") == "stale"
+    )
+    return {
+        "total": total,
+        "downloaded": downloaded,
+        "preview_ok": preview_ok,
+        "preview_failed": preview_failed,
+        "errors": errors,
+    }
+
+
+def _aggregate_summaries(groups: list[dict[str, Any]]) -> dict[str, int]:
+    out = {"total": 0, "downloaded": 0, "preview_ok": 0, "preview_failed": 0, "errors": 0}
+    for g in groups:
+        s = g.get("summary") or {}
+        for key in out:
+            out[key] += int(s.get(key, 0))
+    return out
 
 
 def get_library_grouped(repo_root: Path) -> list[dict[str, Any]]:
@@ -302,18 +428,42 @@ def get_library_grouped(repo_root: Path) -> list[dict[str, Any]]:
 
         raw_materials = MATERIAL_CATALOG.get(ds_id, [])
         materials_out: list[dict[str, Any]] = []
+        dataset_local_root = cfg.get("local_root")
         for idx, (mat_id, mat_name, native_file) in enumerate(raw_materials):
-            status = _material_status(repo_root, native_file, requires_patch)
+            status = _material_status(
+                repo_root, native_file, requires_patch,
+                dataset_id=ds_id, dataset_local_root=dataset_local_root,
+            )
             download_url: str | None = None
             if ds_id == "pbrdf_2020":
                 n = idx + 1
                 download_url = f"{_PBRDF_2020_BASE}/{n}_{mat_id}_mitsuba.zip"
+            elif ds_id == "hpbrdf_2025" and native_file:
+                fname = Path(native_file).name
+                download_url = f"hf-dataset://{_HPBRDF_2025_HF_REPO}/{fname}"
+            preview_status, preview_mtime = _measured_preview_status(repo_root, ds_id, mat_id)
+            size_bytes: int | None = None
+            if native_file:
+                from .user_settings import resolve_dataset_path
+                abs_path = resolve_dataset_path(repo_root, ds_id, native_file, dataset_local_root)
+                try:
+                    size_bytes = abs_path.stat().st_size
+                except OSError:
+                    size_bytes = None
+            # Pre-download size hint for hpBRDF (each .hpbrdf is ~13 GB).
+            if size_bytes is None and ds_id == "hpbrdf_2025":
+                size_bytes = _HPBRDF_2025_FILE_SIZE_BYTES
             materials_out.append({
                 "material_id": mat_id,
                 "display_name": mat_name,
                 "native_file": native_file,
                 "status": status,
                 "download_url": download_url,
+                "kind": "measured",
+                "preview_status": preview_status,
+                "preview_mtime": preview_mtime,
+                "preview_meta": None,
+                "download_size_bytes": size_bytes,
             })
 
         group: dict[str, Any] = {
@@ -334,6 +484,21 @@ def get_library_grouped(repo_root: Path) -> list[dict[str, Any]]:
             },
             "materials": materials_out,
         }
+        group["summary"] = _summarize_materials(materials_out)
         groups.append(group)
 
     return groups
+
+
+def get_library_response(repo_root: Path) -> dict[str, Any]:
+    """Top-level material library payload: groups + aggregate summary.
+
+    The daemon returns this directly from ``GET /api/material-library``. The
+    summary is the union of every group's summary so the frontend's stat cards
+    don't have to recompute it on every render.
+    """
+    groups = get_library_grouped(repo_root)
+    return {
+        "groups": groups,
+        "summary": _aggregate_summaries(groups),
+    }

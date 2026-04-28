@@ -268,30 +268,49 @@ def generate_shape_map_for_stage(
     scene_snapshot_ref: str | None = None,
     repo_root: str | None = None,
 ) -> dict[str, Any]:
+    import json
+
     from isaac_standalone._stage_bridge import extract_snapshot as _extract_snapshot
     from robomituba_bridge import build_shape_mapping, to_repo_relative_posix, write_shape_mapping
+    from robomituba_bridge.io import scene_snapshot_to_payload
 
     scene_snapshot = _extract_snapshot(stage, scene_id=scene_id, frame_id="live")
     local_scene_xml = _repo_relative_to_local_path(mitsuba_scene_ref, repo_root=repo_root)
+    resolved_repo_root = Path(_resolve_windows_repo_root(repo_root)).resolve()
+
+    # Persist the extracted SceneSnapshot alongside the XML so downstream code
+    # (3D Blueprint, offline consumers) can load it back without Isaac. Without
+    # this, scene_snapshot_ref kept pointing at the shape_map.json from a prior
+    # run and `_load_snapshot_sidecars` silently returned None.
+    local_snapshot_path = local_scene_xml.with_suffix(".scene_snapshot.json")
+    local_snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+    local_snapshot_path.write_text(
+        json.dumps(scene_snapshot_to_payload(scene_snapshot), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    resolved_scene_snapshot_ref = to_repo_relative_posix(resolved_repo_root, local_snapshot_path.resolve())
+
     if shape_map_ref:
         local_shape_map = _repo_relative_to_local_path(shape_map_ref, repo_root=repo_root)
     else:
         local_shape_map = local_scene_xml.with_suffix(".shape_map.json")
-        shape_map_ref = to_repo_relative_posix(Path(_resolve_windows_repo_root(repo_root)).resolve(), local_shape_map.resolve())
+        shape_map_ref = to_repo_relative_posix(resolved_repo_root, local_shape_map.resolve())
 
     mapping_payload = build_shape_mapping(scene_snapshot, local_scene_xml)
     write_shape_mapping(
         local_shape_map,
         mapping_payload=mapping_payload,
-        repo_root=Path(_resolve_windows_repo_root(repo_root)).resolve(),
+        repo_root=resolved_repo_root,
         scene_xml_ref=mitsuba_scene_ref,
-        scene_snapshot_ref=scene_snapshot_ref,
+        scene_snapshot_ref=resolved_scene_snapshot_ref,
     )
     return {
         "status": "generated",
         "scene_id": scene_id,
         "shape_map_ref": shape_map_ref,
         "shape_map_path": str(local_shape_map),
+        "scene_snapshot_ref": resolved_scene_snapshot_ref,
+        "scene_snapshot_path": str(local_snapshot_path),
         "unmatched_prim_paths": list(mapping_payload.get("unmatched_prim_paths") or []),
         "prim_count": len(mapping_payload.get("prim_to_shape_ids") or {}),
         "shape_count": int(mapping_payload.get("shape_count") or 0),

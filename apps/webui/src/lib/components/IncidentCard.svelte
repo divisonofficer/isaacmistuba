@@ -69,6 +69,7 @@
 	}
 </script>
 
+<!-- svelte-ignore a11y_no_noninteractive_tabindex -->
 <article
 	class="inc"
 	data-tone={tone}
