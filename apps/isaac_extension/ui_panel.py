@@ -151,6 +151,11 @@ class RobomitubaPanel:
         self._last_logged_progress: tuple[str, str, str] | None = None
         self._selection_label: Any = None
         self._selected_bsdf_combo: Any = None
+        self._daemon_material_records: list[dict[str, Any]] = []
+        self._daemon_material_combo: Any = None
+        self._daemon_material_combo_model: Any = None
+        self._daemon_material_picker_container: Any = None
+        self._selected_daemon_material_label: Any = None
         self._last_selection_signature: tuple[str, ...] = ()
         self._last_viewport_camera_sync_key: tuple[str, tuple[Any, ...]] | None = None
         self._last_viewport_camera_sync_at: float = 0.0
@@ -267,6 +272,16 @@ class RobomitubaPanel:
                         apply_selected_btn.set_clicked_fn(self._on_apply_selected_override)
                         clear_selected_btn = ui.Button("Clear Selected", width=130, height=30)
                         clear_selected_btn.set_clicked_fn(self._on_clear_selected_override)
+                    ui.Label("Render Daemon Materials", height=20)
+                    self._selected_daemon_material_label = ui.Label("Selected material override: unknown", height=38, word_wrap=True)
+                    self._daemon_material_picker_container = ui.VStack(height=30)
+                    with self._daemon_material_picker_container:
+                        pass
+                    with ui.HStack(spacing=6, height=30):
+                        refresh_materials_btn = ui.Button("Refresh Materials", width=150, height=30)
+                        refresh_materials_btn.set_clicked_fn(self._on_refresh_daemon_materials)
+                        apply_daemon_material_btn = ui.Button("Apply Daemon Material", width=190, height=30)
+                        apply_daemon_material_btn.set_clicked_fn(self._on_apply_daemon_material)
 
                     ui.Spacer(height=8)
                     render_btn = ui.Button("Render Current View", height=36)
@@ -284,6 +299,8 @@ class RobomitubaPanel:
         self._setup_keyboard_shortcuts()
         self._rebuild_robot_picker()
         self._refresh_robot_records()
+        self._rebuild_daemon_material_picker()
+        threading.Thread(target=self._do_refresh_daemon_materials, daemon=True).start()
 
     def _on_render(self) -> None:
         self._set_result("Syncing state and rendering the current viewport…")
@@ -332,6 +349,14 @@ class RobomitubaPanel:
             self._push_selection_to_daemon()
         except Exception as exc:  # pragma: no cover
             self._set_result(f"Selection sync error: {exc}")
+
+    def _on_refresh_daemon_materials(self) -> None:
+        self._set_result("Refreshing render daemon materials…")
+        threading.Thread(target=self._do_refresh_daemon_materials, daemon=True).start()
+
+    def _on_apply_daemon_material(self) -> None:
+        self._set_result("Applying render daemon material to the selected Isaac prims…")
+        threading.Thread(target=self._do_apply_daemon_material, daemon=True).start()
 
     def _on_apply_selected_override(self) -> None:
         self._set_result("Applying BSDF override to the selected Isaac prims…")
@@ -638,11 +663,138 @@ class RobomitubaPanel:
             return
         if not prim_paths:
             self._selection_label.text = "No selected prims synced yet."
+            self._refresh_selected_daemon_material_status(prim_paths)
             return
         preview = ", ".join(path.split("/")[-1] or path for path in prim_paths[:3])
         if len(prim_paths) > 3:
             preview = f"{preview} +{len(prim_paths) - 3}"
         self._selection_label.text = f"Selected prims: {preview}"
+
+    def _daemon_material_label(self, record: dict[str, Any]) -> str:
+        group = str(record.get("group_display_name") or record.get("dataset_id") or "Material")
+        name = str(record.get("display_name") or record.get("material_id") or "material")
+        return f"{group} / {name}"
+
+    def _rebuild_daemon_material_picker(self, *, selected_key: str | None = None) -> None:
+        ui = self._ui
+        if self._daemon_material_picker_container is None:
+            return
+        labels = [self._daemon_material_label(item) for item in self._daemon_material_records] or ["(refresh material library)"]
+        with self._daemon_material_picker_container:
+            self._daemon_material_picker_container.clear()
+            self._daemon_material_combo = ui.ComboBox(0, *labels, width=470, height=24)
+            self._daemon_material_combo_model = self._daemon_material_combo.model
+            if selected_key and self._daemon_material_records:
+                for index, item in enumerate(self._daemon_material_records):
+                    if str(item.get("key")) == selected_key:
+                        self._daemon_material_combo_model.get_item_value_model().set_value(index)
+                        break
+
+    def _selected_daemon_material_record(self) -> dict[str, Any] | None:
+        if not self._daemon_material_records or self._daemon_material_combo_model is None:
+            return None
+        try:
+            index = int(self._daemon_material_combo_model.get_item_value_model().get_value_as_int())
+        except Exception:
+            return None
+        if index < 0 or index >= len(self._daemon_material_records):
+            return None
+        return self._daemon_material_records[index]
+
+    def _do_refresh_daemon_materials(self) -> None:
+        try:
+            try:
+                from isaac_extension.daemon_client import get_material_library
+            except ImportError:  # pragma: no cover - Isaac runtime fallback
+                from daemon_client import get_material_library
+
+            daemon_url = self._daemon_url_field.model.get_value_as_string().strip()
+            payload = get_material_library(daemon_url=daemon_url, timeout_s=10.0)
+            records: list[dict[str, Any]] = []
+            for group in payload.get("groups") or []:
+                if not isinstance(group, dict):
+                    continue
+                dataset_id = str(group.get("dataset_id") or "")
+                group_name = str(group.get("display_name") or dataset_id)
+                strategy = str(group.get("mitsuba_strategy") or "")
+                for material in group.get("materials") or []:
+                    if not isinstance(material, dict):
+                        continue
+                    kind = str(material.get("kind") or ("curated" if dataset_id == "curated" else "measured"))
+                    status = str(material.get("status") or "")
+                    native_file = str(material.get("native_file") or "")
+                    if kind == "curated":
+                        pass
+                    elif status != "available" or not native_file:
+                        continue
+                    else:
+                        kind = "measured"
+                    material_id = str(material.get("material_id") or "")
+                    if not material_id:
+                        continue
+                    record = {
+                        "key": f"{dataset_id}:{material_id}",
+                        "kind": kind,
+                        "dataset_id": dataset_id,
+                        "group_display_name": group_name,
+                        "material_id": material_id,
+                        "display_name": str(material.get("display_name") or material_id),
+                        "native_file": native_file,
+                        "bsdf_type": "measured" if strategy == "measured" else "measured_polarized",
+                    }
+                    records.append(record)
+            selected = self._selected_daemon_material_record()
+            selected_key = str(selected.get("key")) if selected else None
+            self._daemon_material_records = records
+            self._rebuild_daemon_material_picker(selected_key=selected_key)
+            self._set_result(f"Loaded {len(records)} render daemon material(s).")
+        except Exception as exc:  # pragma: no cover
+            if self._selected_daemon_material_label is not None:
+                self._selected_daemon_material_label.text = f"Selected material override: unavailable ({exc})"
+            self._set_result(f"Material library refresh error: {exc}")
+
+    def _format_override_detail(self, detail: dict[str, Any] | str | None) -> str:
+        if detail is None:
+            return "scene/default"
+        if isinstance(detail, str):
+            return detail
+        bsdf_type = str(detail.get("bsdf_type") or "unknown")
+        if bsdf_type == "curated":
+            extras = detail.get("extras") if isinstance(detail.get("extras"), dict) else {}
+            return str(extras.get("curated_display_name") or detail.get("material_id") or "curated")
+        dataset_id = detail.get("dataset_id")
+        material_id = detail.get("material_id")
+        if dataset_id or material_id:
+            return f"{bsdf_type}: {dataset_id or 'dataset'}/{material_id or 'material'}"
+        return bsdf_type
+
+    def _refresh_selected_daemon_material_status(self, prim_paths: list[str] | None = None) -> None:
+        if self._selected_daemon_material_label is None:
+            return
+        prim_paths = list(prim_paths if prim_paths is not None else self._selected_prim_paths())
+        if not prim_paths:
+            self._selected_daemon_material_label.text = "Selected material override: no selected prim"
+            return
+        try:
+            try:
+                from isaac_extension.daemon_client import get_isaac_session
+            except ImportError:  # pragma: no cover - Isaac runtime fallback
+                from daemon_client import get_isaac_session
+            daemon_url = self._daemon_url_field.model.get_value_as_string().strip()
+            payload = get_isaac_session(daemon_url=daemon_url, timeout_s=2.0)
+            session = payload.get("session") if isinstance(payload.get("session"), dict) else {}
+            details = session.get("material_override_details") if isinstance(session.get("material_override_details"), dict) else {}
+            simple = session.get("material_overrides") if isinstance(session.get("material_overrides"), dict) else {}
+            first = prim_paths[0]
+            detail = details.get(first) if first in details else simple.get(first)
+            label = self._format_override_detail(detail)
+            suffix = ""
+            if len(prim_paths) > 1:
+                applied = sum(1 for path in prim_paths if path in details or path in simple)
+                suffix = f" ({applied}/{len(prim_paths)} selected have overrides)"
+            self._selected_daemon_material_label.text = f"Selected material override: {label}{suffix}"
+        except Exception as exc:
+            self._selected_daemon_material_label.text = f"Selected material override: unknown ({exc})"
 
     def _push_selection_to_daemon(self) -> None:
         try:
@@ -659,6 +811,7 @@ class RobomitubaPanel:
         self._last_selection_signature = signature
         if daemon_url:
             update_isaac_selection(prim_paths, daemon_url=daemon_url, timeout_s=2.0)
+            self._refresh_selected_daemon_material_status(prim_paths)
 
     def _poll_selection_loop(self) -> None:
         while not self._stop_event.is_set():
@@ -971,6 +1124,51 @@ class RobomitubaPanel:
             self._set_result(f"Applied {bsdf_type} to {len(prim_paths)} selected prim(s).")
         except Exception as exc:  # pragma: no cover
             self._set_result(f"Selected override error: {exc}")
+
+    def _do_apply_daemon_material(self) -> None:
+        try:
+            try:
+                from isaac_extension.daemon_client import apply_curated_material, apply_measured_material
+            except ImportError:  # pragma: no cover - Isaac runtime fallback
+                from daemon_client import apply_curated_material, apply_measured_material
+
+            scene_id = self._current_scene_id()
+            if not scene_id:
+                raise RuntimeError("No daemon scene is selected.")
+            prim_paths = self._selected_prim_paths()
+            if not prim_paths:
+                raise RuntimeError("No selected prims are available in Isaac.")
+            material = self._selected_daemon_material_record()
+            if material is None:
+                raise RuntimeError("No render daemon material is selected. Refresh materials first.")
+
+            daemon_url = self._daemon_url_field.model.get_value_as_string().strip()
+            applied = 0
+            for prim_path in prim_paths:
+                if material.get("kind") == "curated":
+                    apply_curated_material(
+                        scene_id,
+                        prim_path=prim_path,
+                        material_id=str(material.get("material_id") or ""),
+                        daemon_url=daemon_url,
+                        timeout_s=10.0,
+                    )
+                else:
+                    apply_measured_material(
+                        scene_id,
+                        prim_path=prim_path,
+                        dataset_id=str(material.get("dataset_id") or ""),
+                        material_id=str(material.get("material_id") or ""),
+                        measured_file_path=str(material.get("native_file") or ""),
+                        bsdf_type=str(material.get("bsdf_type") or "measured_polarized"),
+                        daemon_url=daemon_url,
+                        timeout_s=10.0,
+                    )
+                applied += 1
+            self._refresh_selected_daemon_material_status(prim_paths)
+            self._set_result(f"Applied {self._daemon_material_label(material)} to {applied} selected prim(s).")
+        except Exception as exc:  # pragma: no cover
+            self._set_result(f"Daemon material apply error: {exc}")
 
     def _poll_remote_commands_loop(self) -> None:
         while not self._stop_event.is_set():

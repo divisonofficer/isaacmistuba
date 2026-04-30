@@ -9,6 +9,7 @@
 	import { bottomPanelCollapsed, toggleBottomPanel } from '$lib/stores/shell';
 	import { currentSceneIdStore, currentSceneStore } from '$lib/stores/sceneCommands';
 	import CurrentSceneBlueprint3D from '$lib/CurrentSceneBlueprint3D.svelte';
+	import CurrentSceneNavigationMap from '$lib/CurrentSceneNavigationMap.svelte';
 	import InlineMaterialPicker from '$lib/components/InlineMaterialPicker.svelte';
 	import {
 		summary, getIsaacSession, getIsaacSessionInventory,
@@ -54,7 +55,7 @@
 	};
 
 	type LayerKey = 'scene' | 'render' | 'shape';
-	type ViewMode = '2d' | '3d';
+	type ViewMode = '2d' | '3d' | 'nav';
 	type BottomTabId = 'jobs' | 'logs' | 'selection' | 'history' | 'materials';
 	type LiveCameraPayload = {
 		scene_id?: string;
@@ -2179,15 +2180,25 @@
 				{/if}
 			</div>
 
-			<div class="panel cs-selection-panel">
-				<div class="cs-selection-head">
-					<span class="card-eyebrow">{L === 'kr' ? '선택' : 'Selection'}</span>
-					{#if selectedObj}
+			{#if selectedObj}
+				<!-- Floating overlay anchored to the bottom of .cs-left-col.
+				     Only mounts when something is selected so the tree
+				     gets the full vertical height when nothing is picked. -->
+				<div class="panel cs-selection-panel">
+					<div class="cs-selection-head">
+						<span class="card-eyebrow">{L === 'kr' ? '선택' : 'Selection'}</span>
 						<span class="badge badge-running">{selectedObj.kind ?? 'object'}</span>
-					{/if}
+						<button
+							type="button"
+							class="cs-selection-close"
+							onclick={clearSelection}
+							aria-label={L === 'kr' ? '선택 해제' : 'Clear selection'}
+							title={L === 'kr' ? '선택 해제' : 'Clear selection'}
+						>×</button>
+					</div>
+					{@render selectionDetailPanel()}
 				</div>
-				{@render selectionDetailPanel()}
-			</div>
+			{/if}
 		</div>
 
 		<!-- ══ RIGHT: Viewport with toolbar + materials drawer overlay ══ -->
@@ -2213,6 +2224,13 @@
 							onclick={() => { viewMode = '3d'; }}
 						>
 							3D Blueprint
+						</button>
+						<button
+							class="vt-mode-btn {viewMode === 'nav' ? 'active' : ''}"
+							onclick={() => { viewMode = 'nav'; }}
+							title={L === 'kr' ? '주행용 2D occupancy map' : '2D navigation/occupancy map'}
+						>
+							🧭 Navigation
 						</button>
 					</div>
 					{#if floorplanImgSrc && viewMode === '2d'}
@@ -2307,12 +2325,20 @@
 							</div>
 						{/if}
 					</div>
-				{:else}
+				{:else if viewMode === '3d'}
 					<div class="viewport-pane viewport-pane-3d">
 						<CurrentSceneBlueprint3D
 							sceneId={currentSceneId}
 							selectedPath={selectedObj?.prim_path ?? null}
+							selectedPaths={selectedTargetPaths}
 							activeCamera={liveActiveViewportCamera}
+						/>
+					</div>
+				{:else}
+					<div class="viewport-pane viewport-pane-nav">
+						<CurrentSceneNavigationMap
+							sceneId={currentSceneId}
+							selectedAabbs={null}
 						/>
 					</div>
 				{/if}
@@ -2352,14 +2378,18 @@
 		overflow: hidden;
 		align-items: stretch;
 	}
+	/* Left column: tree fills the full height, selection card floats at the
+	   bottom as an overlay so multi-select doesn't squeeze the tree. The
+	   relative positioning anchors the absolute selection card. */
 	.cs-left-col {
-		display: grid;
-		grid-template-rows: minmax(0, 1fr) auto;
-		gap: var(--space-3);
+		position: relative;
+		display: flex;
+		flex-direction: column;
 		min-height: 0;
 		overflow: hidden;
 	}
 	.cs-tree-panel {
+		flex: 1 1 auto;
 		display: flex;
 		flex-direction: column;
 		min-height: 0;
@@ -2372,17 +2402,45 @@
 		flex-shrink: 0;
 	}
 	.cs-selection-panel {
+		position: absolute;
+		left: 0;
+		right: 0;
+		bottom: 0;
+		z-index: 5;
 		display: flex;
 		flex-direction: column;
 		gap: 0.4rem;
-		min-height: 0;
-		max-height: 40%;
-		overflow: hidden;
+		max-height: 45%;
+		overflow: auto;
+		/* Float over the tree with a soft shadow + slightly translucent
+		   surface so the underlying tree remains hinted at. */
+		background: var(--panel, #fff);
+		border: 1px solid var(--panel-border, rgba(0, 0, 0, 0.08));
+		border-radius: var(--radius-lg, 10px);
+		box-shadow: 0 -6px 18px rgba(15, 23, 42, 0.12);
+		padding: 0.5rem 0.6rem;
+		backdrop-filter: blur(6px);
 	}
 	.cs-selection-head {
 		display: flex;
 		align-items: center;
 		gap: 0.4rem;
+	}
+	.cs-selection-close {
+		margin-left: auto;
+		width: 1.4rem;
+		height: 1.4rem;
+		border: none;
+		background: transparent;
+		font-size: 1.05rem;
+		line-height: 1;
+		cursor: pointer;
+		color: var(--muted, #6b7280);
+		border-radius: 4px;
+	}
+	.cs-selection-close:hover {
+		background: rgba(0, 0, 0, 0.06);
+		color: var(--text, #1f2330);
 	}
 
 	/* ── Viewport panel + toolbar ── */

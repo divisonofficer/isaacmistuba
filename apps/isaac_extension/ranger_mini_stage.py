@@ -1,7 +1,6 @@
 """Helpers for spawning and controlling Ranger Mini robots from the Isaac panel."""
 from __future__ import annotations
 
-import math
 from pathlib import Path
 from typing import Any
 
@@ -52,7 +51,6 @@ def _default_spawn_path(stage: Any) -> str:
 
 def _viewport_based_spawn_translation(stage: Any, *, robot_index: int = 0) -> tuple[float, float, float]:
     try:
-        import omni.usd  # type: ignore
         from omni.kit.viewport.utility import get_active_viewport  # type: ignore
         from pxr import Gf, Usd, UsdGeom  # type: ignore
     except Exception:
@@ -69,37 +67,13 @@ def _viewport_based_spawn_translation(stage: Any, *, robot_index: int = 0) -> tu
             return (float(robot_index) * 1.2, 0.0, 0.0)
         matrix = UsdGeom.Xformable(camera_prim).ComputeLocalToWorldTransform(Usd.TimeCode.Default())
         origin = matrix.Transform(Gf.Vec3d(0.0, 0.0, 0.0))
-        target = matrix.Transform(Gf.Vec3d(0.0, 0.0, -1.0))
-        forward = Gf.Vec3d(target[0] - origin[0], target[1] - origin[1], target[2] - origin[2])
-        length = math.sqrt(float(forward[0] ** 2 + forward[1] ** 2 + forward[2] ** 2))
-        if length <= 1e-6:
-            return (float(robot_index) * 1.2, 0.0, 0.0)
-        forward = Gf.Vec3d(forward[0] / length, forward[1] / length, forward[2] / length)
 
+        # Drop the robot at the current preview camera's XY position on the floor.
         spawn_x = float(origin[0])
         spawn_y = float(origin[1])
         spawn_z = 0.0
-
-        # Prefer the point where the camera view ray meets the ground plane (Z=0).
-        if abs(float(forward[2])) > 1e-4:
-            t_ground = -float(origin[2]) / float(forward[2])
-            if t_ground > 0.25:
-                spawn_x = float(origin[0] + forward[0] * t_ground)
-                spawn_y = float(origin[1] + forward[1] * t_ground)
-            else:
-                raise ValueError("Viewport ray does not intersect ground in front of the camera.")
-        else:
-            raise ValueError("Viewport ray is parallel to the ground plane.")
-
-        flat_len = math.sqrt(float(forward[0] ** 2 + forward[1] ** 2))
-        if flat_len > 1e-6:
-            left_x = -float(forward[1]) / flat_len
-            left_y = float(forward[0]) / flat_len
-        else:
-            left_x, left_y = 0.0, 1.0
-        lateral_offset = float(robot_index) * 0.9
-        spawn_x += left_x * lateral_offset
-        spawn_y += left_y * lateral_offset
+        if robot_index:
+            spawn_x += float(robot_index) * 0.9
         return (spawn_x, spawn_y, spawn_z)
     except Exception as exc:
         _log_debug(f"viewport-based spawn fallback engaged error={exc}")

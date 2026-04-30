@@ -1500,6 +1500,53 @@ def list_material_presets(*, daemon_url: str | None = None, timeout_s: float = 1
     return list(payload.get("presets", []))
 
 
+def get_material_library(*, daemon_url: str | None = None, timeout_s: float = 10.0) -> dict[str, Any]:
+    return _http_json("GET", f"{_resolve_daemon_url(daemon_url)}/api/material-library", timeout_s=timeout_s)
+
+
+def apply_curated_material(
+    scene_id: str,
+    *,
+    prim_path: str,
+    material_id: str,
+    daemon_url: str | None = None,
+    timeout_s: float = 10.0,
+) -> dict[str, Any]:
+    payload = {"prim_path": str(prim_path), "material_id": str(material_id)}
+    return _http_json(
+        "POST",
+        f"{_resolve_daemon_url(daemon_url)}/api/scenes/{scene_id}/apply-curated-material",
+        payload,
+        timeout_s=timeout_s,
+    )
+
+
+def apply_measured_material(
+    scene_id: str,
+    *,
+    prim_path: str,
+    dataset_id: str,
+    material_id: str,
+    measured_file_path: str,
+    bsdf_type: str = "measured_polarized",
+    daemon_url: str | None = None,
+    timeout_s: float = 10.0,
+) -> dict[str, Any]:
+    payload = {
+        "prim_path": str(prim_path),
+        "dataset_id": str(dataset_id),
+        "material_id": str(material_id),
+        "measured_file_path": str(measured_file_path),
+        "bsdf_type": str(bsdf_type),
+    }
+    return _http_json(
+        "POST",
+        f"{_resolve_daemon_url(daemon_url)}/api/scenes/{scene_id}/apply-measured-material",
+        payload,
+        timeout_s=timeout_s,
+    )
+
+
 def prepare_render_ready_from_daemon(
     scene_id: str,
     *,
@@ -1971,6 +2018,47 @@ class RobomitubaDaemonClient:
 
     def list_material_presets(self, *, timeout_s: float = 10.0) -> list[dict[str, Any]]:
         return list_material_presets(daemon_url=self.url, timeout_s=timeout_s)
+
+    def get_material_library(self, *, timeout_s: float = 10.0) -> dict[str, Any]:
+        return get_material_library(daemon_url=self.url, timeout_s=timeout_s)
+
+    def apply_curated_material(
+        self,
+        scene_id: str,
+        *,
+        prim_path: str,
+        material_id: str,
+        timeout_s: float = 10.0,
+    ) -> dict[str, Any]:
+        return apply_curated_material(
+            scene_id,
+            prim_path=prim_path,
+            material_id=material_id,
+            daemon_url=self.url,
+            timeout_s=timeout_s,
+        )
+
+    def apply_measured_material(
+        self,
+        scene_id: str,
+        *,
+        prim_path: str,
+        dataset_id: str,
+        material_id: str,
+        measured_file_path: str,
+        bsdf_type: str = "measured_polarized",
+        timeout_s: float = 10.0,
+    ) -> dict[str, Any]:
+        return apply_measured_material(
+            scene_id,
+            prim_path=prim_path,
+            dataset_id=dataset_id,
+            material_id=material_id,
+            measured_file_path=measured_file_path,
+            bsdf_type=bsdf_type,
+            daemon_url=self.url,
+            timeout_s=timeout_s,
+        )
 
     def get_scene_texture_cache_status(self, scene_id: str, *, timeout_s: float = 10.0) -> dict[str, Any]:
         payload = self.get_scene(scene_id, timeout_s=timeout_s)

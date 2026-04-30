@@ -53,6 +53,7 @@ from robomituba_bridge import (
     isaac_sensor_spec_from_payload,
     isaac_session_open_from_payload,
     isaac_state_patch_from_payload,
+    bsdf_override_to_payload,
     read_shape_mapping,
     make_job_id,
     observation_bundle_manifest_to_payload,
@@ -1988,6 +1989,35 @@ class RenderDaemon:
                 scene_id = path[len("/api/scenes/") : -len("/diagram-3d")].rstrip("/")
                 self._send_json(handler, HTTPStatus.OK, self._scene_diagram_3d(scene_id))
                 return
+            if path.startswith("/api/scenes/") and path.endswith("/occupancy-map"):
+                scene_id = unquote(path[len("/api/scenes/") : -len("/occupancy-map")].rstrip("/"))
+                cell_size = float(query.get("cell_size", ["0.05"])[0])
+                height_min = float(query.get("height_min", ["0.1"])[0])
+                height_max = float(query.get("height_max", ["1.5"])[0])
+                show_furniture = query.get("furniture", ["1"])[0] not in ("0", "false", "")
+                payload = self._scene_occupancy_map(
+                    scene_id,
+                    cell_size=cell_size, height_min=height_min, height_max=height_max,
+                    show_furniture=show_furniture,
+                )
+                self._send_json(handler, HTTPStatus.OK, payload)
+                return
+            if path.startswith("/api/scenes/") and path.endswith("/occupancy-map.png"):
+                scene_id = unquote(path[len("/api/scenes/") : -len("/occupancy-map.png")].rstrip("/"))
+                cell_size = float(query.get("cell_size", ["0.05"])[0])
+                height_min = float(query.get("height_min", ["0.1"])[0])
+                height_max = float(query.get("height_max", ["1.5"])[0])
+                show_furniture = query.get("furniture", ["1"])[0] not in ("0", "false", "")
+                grid = self._build_occupancy_grid(
+                    scene_id, cell_size=cell_size, height_min=height_min, height_max=height_max,
+                )
+                if grid.get("status") != "ready":
+                    self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": grid.get("reason") or "unavailable"})
+                    return
+                png = self._render_occupancy_png(grid["_layers"], show_furniture=show_furniture)
+                self._send_bytes(handler, HTTPStatus.OK, png, content_type="image/png",
+                                 extra_headers={"Cache-Control": "private, max-age=15"})
+                return
             if path.startswith("/api/scenes/") and path.endswith("/material-targets"):
                 scene_id = path[len("/api/scenes/") : -len("/material-targets")].rstrip("/")
                 try:
@@ -2638,6 +2668,10 @@ class RenderDaemon:
                 "material_dirty": bool(session.material_dirty),
                 "material_overrides": {
                     prim_path: override.bsdf_type
+                    for prim_path, override in sorted(session.material_overrides.items())
+                },
+                "material_override_details": {
+                    prim_path: bsdf_override_to_payload(override)
                     for prim_path, override in sorted(session.material_overrides.items())
                 },
                 "active_viewport_camera": self._active_viewport_camera_payload(session),
@@ -6478,7 +6512,10 @@ class RenderDaemon:
             return "robot"
         if any(token in key for token in ("floor", "ground", "slab", "tile")):
             return "floor"
-        if any(token in key for token in ("wall", "shell", "ceiling", "roof")):
+        # Split roof/ceiling out of "shell" so the UI can hide them in cutaway view.
+        if any(token in key for token in ("ceiling", "roof")):
+            return "roof"
+        if any(token in key for token in ("wall", "shell")):
             return "shell"
         if any(token in key for token in ("glass", "window", "door", "pane")):
             return "glass"
@@ -6600,6 +6637,12 @@ class RenderDaemon:
         scene_max = np.vstack(scene_points).max(axis=0)
         scene_size = np.maximum(scene_max - scene_min, 1e-4)
         scene_volume = float(scene_size[0] * scene_size[1] * scene_size[2])
+        # Height-fallback: meshes sitting in the top 30% of the scene that didn't
+        # match a roof/ceiling token by name still belong above the user → roof.
+        roof_height_threshold = float(scene_min[1] + (scene_max[1] - scene_min[1]) * 0.7)
+        for record in objects:
+            if record["category"] in {"shell", "other"} and record["bounds"]["min"][1] >= roof_height_threshold:
+                record["category"] = "roof"
         must_keep = {
             record["id"]
             for record in objects
@@ -6619,6 +6662,41 @@ class RenderDaemon:
             stripped = {key: value for key, value in record.items() if not key.startswith("_")}
             final_objects.append(stripped)
 
+        # Aggregate rooms by prim path heuristic: second segment is the room,
+        # except under /ROOT/Core/* where the third segment names the actual room.
+        rooms_acc: dict[str, dict[str, Any]] = {}
+        for record in final_objects:
+            path = str(record.get("path") or "")
+            parts = [p for p in path.split("/") if p]
+            if len(parts) < 2:
+                continue
+            room_id = parts[2] if (len(parts) >= 3 and parts[1].lower() == "core") else parts[1]
+            slot = rooms_acc.get(room_id)
+            mn = record["bounds"]["min"]
+            mx = record["bounds"]["max"]
+            if slot is None:
+                rooms_acc[room_id] = {
+                    "id": room_id,
+                    "label": room_id,
+                    "object_count": 1,
+                    "min": [float(mn[0]), float(mn[1]), float(mn[2])],
+                    "max": [float(mx[0]), float(mx[1]), float(mx[2])],
+                }
+            else:
+                slot["object_count"] += 1
+                slot["min"] = [min(slot["min"][i], float(mn[i])) for i in range(3)]
+                slot["max"] = [max(slot["max"][i], float(mx[i])) for i in range(3)]
+        rooms: list[dict[str, Any]] = []
+        for slot in rooms_acc.values():
+            mn = slot["min"]; mx = slot["max"]
+            size = [max(mx[i] - mn[i], 1e-4) for i in range(3)]
+            center = [(mn[i] + mx[i]) * 0.5 for i in range(3)]
+            rooms.append({
+                "id": slot["id"], "label": slot["label"], "object_count": slot["object_count"],
+                "bounds": {"min": mn, "max": mx, "size": size, "center": center},
+            })
+        rooms.sort(key=lambda r: -r["object_count"])
+
         robots = self._session_robot_inventory(session) if session is not None else []
         active_camera = self._active_viewport_camera_payload(session) if session is not None else None
         status = "partial" if omitted_count > 0 else "ready"
@@ -6629,6 +6707,7 @@ class RenderDaemon:
             "simplification_mode": "proxy_bounds_v1",
             "objects": final_objects,
             "robots": robots,
+            "rooms": rooms,
             "active_viewport_camera": active_camera,
             "summary": {
                 "object_count_total": len(objects),
@@ -6642,6 +6721,138 @@ class RenderDaemon:
                 },
             },
         }
+
+    # ── Navigation occupancy / cost map ─────────────────────────────────────
+
+    _OCCUPANCY_LEGEND = [
+        {"key": "wall",      "color": "#1f2937", "label_en": "Wall",      "label_kr": "벽"},
+        {"key": "glass",     "color": "#06b6d4", "label_en": "Glass",     "label_kr": "유리"},
+        {"key": "risk",      "color": "#f97316", "label_en": "Risk zone", "label_kr": "위험구역"},
+        {"key": "furniture", "color": "#9ca3af", "label_en": "Furniture", "label_kr": "가구"},
+        {"key": "free",      "color": "#f9fafb", "label_en": "Free",      "label_kr": "빈 공간"},
+    ]
+
+    def _build_occupancy_grid(
+        self,
+        scene_id: str,
+        *,
+        cell_size: float,
+        height_min: float,
+        height_max: float,
+    ) -> dict[str, Any]:
+        """Project mesh AABBs onto an XZ grid for navigation planning.
+
+        Returns the metadata dict + raw layer arrays. Both the JSON and PNG
+        endpoints share this single source so the picture and the legend
+        always agree.
+        """
+        diagram = self._scene_diagram_3d(scene_id)
+        bounds = (diagram.get("summary") or {}).get("scene_bounds")
+        if not bounds:
+            return {"status": "unavailable", "scene_id": scene_id, "reason": diagram.get("reason") or "no_bounds"}
+        cell_size = max(0.01, float(cell_size))
+        x_min = float(bounds["min"][0]); z_min = float(bounds["min"][2])
+        x_max = float(bounds["max"][0]); z_max = float(bounds["max"][2])
+        width = max(1, int(np.ceil((x_max - x_min) / cell_size)))
+        height = max(1, int(np.ceil((z_max - z_min) / cell_size)))
+        # Layers: wall, glass, furniture (+ risk derived from glass dilation).
+        wall = np.zeros((height, width), dtype=bool)
+        glass = np.zeros((height, width), dtype=bool)
+        furniture = np.zeros((height, width), dtype=bool)
+        layer_for = {
+            "shell": wall,
+            "glass": glass,
+            "furniture": furniture,
+            "props": furniture,
+            "other": furniture,
+        }
+        for obj in diagram.get("objects", []):
+            cat = obj.get("category")
+            target = layer_for.get(cat)
+            if target is None:
+                continue
+            mn = obj["bounds"]["min"]; mx = obj["bounds"]["max"]
+            # Filter to the robot collision band.
+            if mx[1] < height_min or mn[1] > height_max:
+                continue
+            x0 = max(0, int(np.floor((mn[0] - x_min) / cell_size)))
+            x1 = min(width, int(np.ceil((mx[0] - x_min) / cell_size)))
+            z0 = max(0, int(np.floor((mn[2] - z_min) / cell_size)))
+            z1 = min(height, int(np.ceil((mx[2] - z_min) / cell_size)))
+            if x0 >= x1 or z0 >= z1:
+                continue
+            target[z0:z1, x0:x1] = True
+        # Risk zone = glass dilated by 0.3m, minus the glass itself.
+        risk_radius_cells = max(1, int(round(0.3 / cell_size)))
+        if glass.any():
+            # Cheap manual dilation via numpy slicing — avoids scipy dependency.
+            dilated = glass.copy()
+            for shift in range(1, risk_radius_cells + 1):
+                dilated[shift:, :] |= glass[:-shift, :]
+                dilated[:-shift, :] |= glass[shift:, :]
+                dilated[:, shift:] |= glass[:, :-shift]
+                dilated[:, :-shift] |= glass[:, shift:]
+            risk = dilated & ~glass
+        else:
+            risk = np.zeros_like(glass)
+        return {
+            "status": "ready",
+            "scene_id": scene_id,
+            "cell_size": cell_size,
+            "height_min": height_min,
+            "height_max": height_max,
+            "width": width,
+            "height": height,
+            "bounds_xz": {"min": [x_min, z_min], "max": [x_max, z_max]},
+            "scene_bounds": bounds,
+            "robots": diagram.get("robots", []),
+            "rooms": diagram.get("rooms", []),
+            "_layers": {"wall": wall, "glass": glass, "furniture": furniture, "risk": risk},
+        }
+
+    def _render_occupancy_png(self, layers: Mapping[str, np.ndarray], *, show_furniture: bool = True) -> bytes:
+        from PIL import Image as _PILImage
+        # Composite color map (RGB).
+        wall = layers["wall"]; glass = layers["glass"]; risk = layers["risk"]; furniture = layers["furniture"]
+        h, w = wall.shape
+        rgb = np.full((h, w, 3), 0xF9, dtype=np.uint8)  # free = #f9fafb
+        rgb[..., 1] = 0xFA; rgb[..., 2] = 0xFB
+        if show_furniture:
+            rgb[furniture] = (0x9C, 0xA3, 0xAF)
+        rgb[risk] = (0xF9, 0x73, 0x16)
+        rgb[glass] = (0x06, 0xB6, 0xD4)
+        rgb[wall] = (0x1F, 0x29, 0x37)
+        # Light grid every 1m
+        cell_idx_per_meter = max(1, int(round(1.0 / 0.05)))  # tuned alongside default cell_size
+        # PIL expects rows from top: our z axis grows downward already (z_min at top row 0).
+        img = _PILImage.fromarray(rgb, mode="RGB")
+        from io import BytesIO
+        buf = BytesIO()
+        img.save(buf, format="PNG", optimize=True)
+        return buf.getvalue()
+
+    def _scene_occupancy_map(
+        self,
+        scene_id: str,
+        *,
+        cell_size: float,
+        height_min: float,
+        height_max: float,
+        show_furniture: bool = True,
+    ) -> dict[str, Any]:
+        grid = self._build_occupancy_grid(
+            scene_id, cell_size=cell_size, height_min=height_min, height_max=height_max,
+        )
+        if grid.get("status") != "ready":
+            return {"scene_id": scene_id, "status": grid.get("status", "unavailable"), "reason": grid.get("reason")}
+        # Strip raw arrays from public payload — they're only for the PNG path.
+        layers = grid.pop("_layers")
+        png = self._render_occupancy_png(layers, show_furniture=show_furniture)
+        params = f"cell_size={cell_size}&height_min={height_min}&height_max={height_max}&furniture={1 if show_furniture else 0}"
+        grid["composite_png_url"] = f"/api/scenes/{quote(scene_id, safe='')}/occupancy-map.png?{params}"
+        grid["composite_png_bytes"] = len(png)
+        grid["legend"] = list(self._OCCUPANCY_LEGEND)
+        return grid
 
     def _object_overlays_from_session(self, session: _IsaacActiveSession, *, metadata: Mapping[str, Any]) -> list[dict[str, Any]]:
         world_bounds = metadata.get("world_bounds_xz")

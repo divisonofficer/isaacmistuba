@@ -264,9 +264,14 @@ class RangerMiniRobot:
             _log_debug(f"_spawn_reference asset missing candidates={_format_asset_candidates(self.asset_path)}")
             return False
 
-        refs = root_prim.GetReferences()
-        _log_debug(f"_spawn_reference adding reference asset={asset_abs}")
-        refs.AddReference(assetPath=str(asset_abs))
+        if _prim_references_asset(root_prim, asset_abs):
+            _log_debug(f"_spawn_reference reusing existing reference asset={asset_abs}")
+        else:
+            refs = root_prim.GetReferences()
+            _log_debug(f"_spawn_reference adding reference asset={asset_abs}")
+            if not refs.AddReference(assetPath=str(asset_abs)):
+                _log_debug(f"_spawn_reference AddReference returned false asset={asset_abs}")
+                return False
 
         xformable = UsdGeom.Xformable(root_prim)
         if xformable:
