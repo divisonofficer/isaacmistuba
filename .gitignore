@@ -36,3 +36,8 @@ modules/mitsuba_converter/src/mitsuba_converter/static/app/*
 data/pbrdf_2020/*
 data/pbrdf_2020/mitsuba/1_spectralon_inpainted.pbsdf
 assets/robots/ranger_mini_v3/*
+*.hpbrdf
+*.pbrdf
+Thumbs.db
+scheduled_tasks.lock
+.claude/*

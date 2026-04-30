@@ -1,5 +1,11 @@
 <script lang="ts">
-	import { curatedMaterialPreviewUrl, measuredMaterialPreviewUrl } from '$lib/api';
+	import {
+		curatedMaterialPreviewUrl,
+		measuredMaterialPreviewUrl,
+		measuredModalities,
+		type Modality,
+	} from '$lib/api';
+	import { previewObject } from '$lib/stores/previewObject';
 	import type { DatasetGroup, MatEntry } from '$lib/types/materialLibrary';
 
 	type Props = {
@@ -16,6 +22,10 @@
 		// of opening the right-rail detail).
 		checkable?: boolean;
 		checked?: boolean;
+		// Group-level band selector value, e.g. 'composite' or 'band:446'.
+		// When set the card shows that band instead of the default composite.
+		// Only meaningful for hpBRDF cards; ignored elsewhere.
+		activeBandKey?: string;
 		onToggleCheck?: (mat: MatEntry, group: DatasetGroup) => void;
 		onSelect?: (mat: MatEntry, group: DatasetGroup) => void;
 		onAction?: (action: 'rerender' | 'redownload', mat: MatEntry, group: DatasetGroup) => void;
@@ -28,19 +38,67 @@
 		bust = 0,
 		checkable = false,
 		checked = false,
+		activeBandKey = 'composite',
 		onToggleCheck,
 		onSelect,
 		onAction
 	}: Props = $props();
 
 	let menuOpen = $state(false);
+	// Lazy-fetched per-band modality list. Populated on first non-composite
+	// activeBandKey so the URL for that band can be resolved. Composite-only
+	// cards never trigger the fetch.
+	let modalities = $state<Modality[] | null>(null);
+	let modalityFetchInflight = $state(false);
+
+	const isHpbrdf = $derived(group.dataset_id === 'hpbrdf_2025');
+
+	async function ensureModalities(): Promise<void> {
+		if (modalities !== null || modalityFetchInflight || !isHpbrdf) return;
+		modalityFetchInflight = true;
+		try {
+			const resp = await measuredModalities(group.dataset_id, mat.material_id);
+			modalities = resp.modalities ?? [];
+		} catch {
+			modalities = []; // remember the failure so we don't hammer
+		} finally {
+			modalityFetchInflight = false;
+		}
+	}
+
+	$effect(() => {
+		if (isHpbrdf && activeBandKey !== 'composite' && modalities === null) {
+			ensureModalities();
+		}
+	});
 
 	function previewSrc(): string {
+		// hpBRDF + the dataset header selected a non-default band → resolve the
+		// modality URL. Falls back to composite if the band PNG isn't on disk
+		// yet (legacy cache, pre-Phase-9 render).
+		if (isHpbrdf && modalities && activeBandKey !== 'composite') {
+			const m = modalities.find((m) => kindKey(m) === activeBandKey);
+			if (m) {
+				const base = m.url;
+				return bust > 0
+					? `${base}${base.includes('?') ? '&' : '?'}v=${bust}`
+					: base;
+			}
+		}
+		const obj = $previewObject;
 		const base =
 			mat.kind === 'curated'
-				? curatedMaterialPreviewUrl(mat.material_id)
-				: measuredMaterialPreviewUrl(group.dataset_id, mat.material_id, mat.native_file);
+				? curatedMaterialPreviewUrl(mat.material_id, { object: obj })
+				: measuredMaterialPreviewUrl(group.dataset_id, mat.material_id, mat.native_file, { object: obj });
 		return bust > 0 ? `${base}${base.includes('?') ? '&' : '?'}v=${bust}` : base;
+	}
+
+	function kindKey(m: Modality): string {
+		// Stable identifier shared with the dataset header selector. Composite
+		// collapses to a single 'composite' key; bands key off their wavelength.
+		if (m.kind === 'composite') return 'composite';
+		if (m.kind === 'band' && m.wavelength_nm != null) return `band:${m.wavelength_nm}`;
+		return `${m.kind}:${m.label}`;
 	}
 
 	function downloadBadge(): { label: string; cls: string } {
@@ -69,6 +127,38 @@
 		}
 	}
 
+	// hpBRDF-only — surfaces the channel-split mirror state. The daemon
+	// dispatches to the channel-split renderer (~200 MB/channel) when the
+	// local mirror is present; otherwise it falls back to loading the
+	// monolithic 13 GB .hpbrdf which has been crashing shared GPUs with
+	// CUDA OOM. This badge tells the user *which path their click will
+	// take* before they click.
+	function spectralBadge(): { label: string; cls: string; title: string } | null {
+		if (!mat.preview_source) return null;
+		switch (mat.preview_source) {
+			case 'channel_split':
+				return {
+					label: 'RGB+NIR (4ch)',
+					cls: 'badge-ok-blue',
+					title: '채널 분리 미러 (4 × 191 MB) — VRAM 안전',
+				};
+			case 'monolithic':
+				return {
+					label: '⚠ 13GB monolithic',
+					cls: 'badge-warn',
+					title:
+						'채널 분리 미러 없음 — 렌더 시 13 GB 로드, 공유 GPU 에서 OOM 위험. ' +
+						'`python tools/hpbrdf/mirror.py --material ' + mat.material_id + '` 로 미러 생성 권장',
+				};
+			case 'missing':
+				return {
+					label: '소스 없음',
+					cls: 'badge-err',
+					title: '로컬 미러 / 모노리식 .hpbrdf 둘 다 부재 — 다운로드 또는 mirror 필요',
+				};
+		}
+	}
+
 	function handleImgError(e: Event) {
 		// First fetch after invalidate often returns 202 (background render);
 		// the browser treats that as an image error, so we mark the element as
@@ -94,6 +184,7 @@
 
 	const dlBadge = $derived(downloadBadge());
 	const pvBadge = $derived(previewBadge());
+	const spBadge = $derived(spectralBadge());
 </script>
 
 <div
@@ -127,6 +218,9 @@
 		<div class="mat-badges">
 			<span class="mat-badge {dlBadge.cls}">{dlBadge.label}</span>
 			<span class="mat-badge {pvBadge.cls}">{pvBadge.label}</span>
+			{#if spBadge}
+				<span class="mat-badge {spBadge.cls}" title={spBadge.title}>{spBadge.label}</span>
+			{/if}
 		</div>
 	</div>
 	<button

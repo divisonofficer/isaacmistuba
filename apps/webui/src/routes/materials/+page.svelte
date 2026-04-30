@@ -11,10 +11,13 @@
 		applyMeasuredMaterial,
 		applyCuratedMaterial,
 		materialJobs,
-		clearMaterialJobs
+		clearMaterialJobs,
+		listPreviewObjects
 	} from '$lib/api';
 	import MaterialCard from '$lib/components/MaterialCard.svelte';
+	import ModalityGrid from '$lib/components/ModalityGrid.svelte';
 	import { sceneRailSnippet, sceneBottomSnippet } from '$lib/stores/scenePortals';
+	import { previewObject } from '$lib/stores/previewObject';
 	import type {
 		LibraryResponse,
 		DatasetGroup,
@@ -34,6 +37,30 @@
 	let searchQuery = $state('');
 
 	let selected = $state<{ mat: MatEntry; group: DatasetGroup } | null>(null);
+	// Group-level band selector: one entry per dataset_id. The cards in that
+	// group all swap their <img src> to whatever band is picked here, instead
+	// of each card carrying its own toggle. Replaces the per-card BandToggle
+	// dropdown from Phase 11.
+	let groupActiveBand = $state<Record<string, string>>({});
+	// "RGB" = visible-only sRGB composite (the daemon's "composite" entry).
+	// "NIR" maps to the 854 nm band — surfaced as a separate primary view
+	// alongside RGB per user request ("RGB 따로 NIR 따로 보여달라").
+	// 446/542/614 stay below as advanced per-band views.
+	const HPBRDF_BAND_OPTIONS: { key: string; label: string }[] = [
+		{ key: 'composite', label: 'RGB' },
+		{ key: 'band:854', label: 'NIR (854 nm)' },
+		{ key: 'band:446', label: '446 nm (B)' },
+		{ key: 'band:542', label: '542 nm (G)' },
+		{ key: 'band:614', label: '614 nm (R)' },
+	];
+	function bandOptionsFor(datasetId: string): { key: string; label: string }[] {
+		// Only hpBRDF has multi-modality output today. Other datasets get
+		// composite-only (selector stays hidden).
+		return datasetId === 'hpbrdf_2025' ? HPBRDF_BAND_OPTIONS : [];
+	}
+	function activeBandFor(datasetId: string): string {
+		return groupActiveBand[datasetId] ?? 'composite';
+	}
 	// Check mode: when on, cards show a checkbox in the corner and clicking
 	// a card toggles its checked state (instead of opening the right-rail
 	// detail). Selected items can be batch-rerendered or batch-redownloaded
@@ -264,8 +291,40 @@
 		loading = false;
 	}
 
+	let previewObjects = $state<Array<{ object_id: string; label_en: string; label_kr: string; icon: string }>>([
+		{ object_id: 'sphere', label_en: 'Sphere', label_kr: '구', icon: '🟢' },
+	]);
+
+	async function loadPreviewObjects(): Promise<void> {
+		try {
+			const r = await listPreviewObjects();
+			if (Array.isArray(r?.objects) && r.objects.length > 0) {
+				previewObjects = r.objects;
+			}
+		} catch {
+			// daemon doesn't expose the endpoint yet → keep the sphere-only fallback
+		}
+	}
+
+	function selectPreviewObject(objectId: string): void {
+		previewObject.set(objectId);
+		// bump bustMap so each card's <img src> changes → browser re-fetches the
+		// new ?object=... URL even when the file path is the same shape.
+		const stamp = Date.now();
+		const next = new Map<string, number>();
+		for (const k of bustMap.keys()) next.set(k, stamp);
+		// also stamp keys that aren't in the map yet so first-render cards refresh
+		if (library) {
+			for (const g of library.groups) {
+				for (const m of g.materials) next.set(busyKey(m, g), stamp);
+			}
+		}
+		bustMap = next;
+	}
+
 	onMount(() => {
 		reload();
+		loadPreviewObjects();
 		pollJobs();
 		// Adaptive polling: tight interval while a render is running so the
 		// stage column reads "live", longer interval when idle so we're not
@@ -514,6 +573,20 @@
 			<p class="page-sub">전역 BRDF 자산과 프리뷰 상태를 관리합니다.</p>
 		</div>
 		<div class="page-actions">
+			<div class="object-toggle" role="group" aria-label="프리뷰 오브젝트">
+				{#each previewObjects as o (o.object_id)}
+					<button
+						type="button"
+						class="object-chip"
+						class:object-chip-active={$previewObject === o.object_id}
+						onclick={() => selectPreviewObject(o.object_id)}
+						title="{o.label_kr} ({o.label_en})"
+					>
+						<span aria-hidden="true">{o.icon}</span>
+						<span>{o.label_kr}</span>
+					</button>
+				{/each}
+			</div>
 			<button type="button" class="btn-ghost" onclick={reload}>↻ 동기화</button>
 			<button type="button" class="btn-ghost" onclick={batchRedownloadMissing}
 				>⬇ 누락만 재다운로드</button
@@ -621,11 +694,31 @@
 			<div class="empty">조건에 맞는 재질이 없습니다.</div>
 		{:else}
 			{#each visibleGroups as { group, materials } (group.dataset_id)}
+				{@const bandOpts = bandOptionsFor(group.dataset_id)}
 				<section class="group-section">
 					<header class="group-header">
 						<div class="group-title-row">
 							<h2 class="group-title">{group.display_name}</h2>
 							<span class="group-count">{materials.length}개</span>
+							{#if bandOpts.length > 0}
+								<!-- Group-wide visible-channel selector. Picking a band
+								     here makes every card in this dataset swap its
+								     thumbnail to that band (cards lazy-fetch their own
+								     modality URLs). Only hpBRDF is multi-band today. -->
+								<select
+									class="group-band-select"
+									value={activeBandFor(group.dataset_id)}
+									onchange={(e) => {
+										const v = (e.currentTarget as HTMLSelectElement).value;
+										groupActiveBand = { ...groupActiveBand, [group.dataset_id]: v };
+									}}
+									title="이 데이터셋의 모든 카드 채널 보기"
+								>
+									{#each bandOpts as opt (opt.key)}
+										<option value={opt.key}>{opt.label}</option>
+									{/each}
+								</select>
+							{/if}
 						</div>
 						<div class="group-meta">
 							<span class="group-id mono">{group.dataset_id}</span>
@@ -649,6 +742,7 @@
 								bust={bustMap.get(busyKey(mat, group)) ?? 0}
 								checkable={checkMode}
 								checked={checkedKeys.has(busyKey(mat, group))}
+								activeBandKey={activeBandFor(group.dataset_id)}
 								onToggleCheck={toggleChecked}
 								onSelect={(m, g) =>
 									checkMode ? toggleChecked(m, g) : (selected = { mat: m, group: g })}
@@ -737,6 +831,20 @@
 					</button>
 				{/if}
 			</div>
+
+			{#if sel.group.dataset_id === 'hpbrdf_2025'}
+				<!-- Inline modality grid (composite first, then per-band by
+				     ascending wavelength). Replaces the old popup modal
+				     opened from "🔬 전체 모달리티 보기". refreshKey bumps
+				     when the user re-renders so the post-Phase-9 manifest
+				     replaces the legacy single-composite list. -->
+				<h3 class="drawer-section">전체 모달리티</h3>
+				<ModalityGrid
+					datasetId={sel.group.dataset_id}
+					materialId={sel.mat.material_id}
+					refreshKey={bustMap.get(busyKey(sel.mat, sel.group)) ?? 0}
+				/>
+			{/if}
 		</div>
 	{:else}
 		<p class="muted text-xs rail-empty">
@@ -986,6 +1094,22 @@
 		align-items: baseline;
 		gap: 0.5rem;
 	}
+	/* Group-wide band selector lives on the right of the dataset title. The
+	   left auto-margin pushes it past the count chip without needing a
+	   wrapper. */
+	.group-band-select {
+		margin-left: auto;
+		font-size: 0.75rem;
+		padding: 0.2rem 0.45rem;
+		border-radius: 6px;
+		border: 1px solid var(--border-soft, rgba(0, 0, 0, 0.12));
+		background: var(--surface, #fff);
+		color: var(--ink-strong, #1f2330);
+		cursor: pointer;
+	}
+	.group-band-select:hover {
+		border-color: rgba(0, 0, 0, 0.25);
+	}
 	.group-title {
 		margin: 0;
 		font-size: 1rem;
@@ -1132,6 +1256,40 @@
 	.btn-ghost:disabled {
 		opacity: 0.4;
 		cursor: not-allowed;
+	}
+	.object-toggle {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.25rem;
+		padding: 0.18rem;
+		border: 1px solid var(--panel-border, #d0d4dc);
+		border-radius: 999px;
+		background: var(--panel, #fff);
+	}
+	.object-chip {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.3rem;
+		height: 1.7rem;
+		padding: 0 0.7rem;
+		border: 0;
+		background: transparent;
+		border-radius: 999px;
+		font-size: 0.78rem;
+		font-weight: 600;
+		color: var(--ink-muted, #6b7280);
+		cursor: pointer;
+		transition: background 120ms ease, color 120ms ease;
+	}
+	.object-chip:hover {
+		color: var(--text);
+	}
+	.object-chip-active {
+		background: var(--brand, #3a7afe);
+		color: #fff;
+	}
+	.object-chip-active:hover {
+		color: #fff;
 	}
 
 	.check-bar {

@@ -9,6 +9,7 @@
 	import { bottomPanelCollapsed, toggleBottomPanel } from '$lib/stores/shell';
 	import { currentSceneIdStore, currentSceneStore } from '$lib/stores/sceneCommands';
 	import CurrentSceneBlueprint3D from '$lib/CurrentSceneBlueprint3D.svelte';
+	import InlineMaterialPicker from '$lib/components/InlineMaterialPicker.svelte';
 	import {
 		summary, getIsaacSession, getIsaacSessionInventory,
 		getScene, listJobs, materialPresets, materialLibrary,
@@ -139,7 +140,41 @@
 
 	// UI state
 	let loading = $state(true);
-	let selectedObj = $state<ObjNode | null>(null);
+	let selectedPaths = $state<Set<string>>(new Set());
+	let primarySelectedPath = $state<string | null>(null);
+	let selectionAnchorPath: string | null = null;
+	let lastUserSelectionEditMs = 0;
+	let lastExternalSelectionSignature = '';
+	const cmpSelectionSignature = (paths: string[]) => paths.slice().sort().join('|');
+	const cmpSelectionFromState = () => cmpSelectionSignature([...selectedPaths]);
+	function findNodeByPath(nodes: ObjNode[], path: string): ObjNode | null {
+		for (const n of nodes) {
+			if (n.prim_path === path) return n;
+			if (n.children) {
+				const hit = findNodeByPath(n.children, path);
+				if (hit) return hit;
+			}
+		}
+		return null;
+	}
+	function visibleFlatTreePaths(): string[] {
+		const out: string[] = [];
+		const walk = (nodes: ObjNode[]) => {
+			for (const n of nodes) {
+				const matches = !treeFilter || nodeMatchesFilter(n, treeFilter);
+				if (matches) out.push(n.prim_path);
+				const isCollapsed = !treeFilter && collapsedNodes.has(n.prim_path);
+				if (n.children?.length && (!isCollapsed || treeFilter)) {
+					walk(n.children);
+				}
+			}
+		};
+		walk(objectInventory);
+		return out;
+	}
+	const selectedObj = $derived(primarySelectedPath ? findNodeByPath(objectInventory, primarySelectedPath) : null);
+	const selectedCount = $derived(selectedPaths.size);
+	const selectedTargetPaths = $derived([...selectedPaths]);
 	let cmdPending = $state<string | null>(null);
 	let cmdMsg = $state('');
 	let retryingJobId = $state<string | null>(null);
@@ -160,6 +195,19 @@
 
 	$effect(() => { currentSceneIdStore.set(currentSceneId); });
 	$effect(() => { currentSceneStore.set(scene); });
+	// When prepare_render_ready finishes, the daemon flips render_ready/shape_map_exists
+	// on its scene record, but our SCENE_DETAIL_POLL_MS (7s) cycle leaves the gate
+	// stale. Fire a forced getScene immediately on the running→idle transition.
+	let prevPreparingNow = false;
+	$effect(() => {
+		const nowPreparing = preparingNow;
+		if (prevPreparingNow && !nowPreparing) {
+			lastSceneDetailAt = 0;
+			lastJobsAt = 0;
+			void refresh({ force: true });
+		}
+		prevPreparingNow = nowPreparing;
+	});
 	let refreshInFlight = false;
 	let lastSceneDetailAt = 0;
 	let lastJobsAt = 0;
@@ -752,6 +800,10 @@
 			liveActiveViewportCamera = session
 				? ((session as Record<string, unknown>).active_viewport_camera as Record<string, unknown> | null) ?? liveActiveViewportCamera
 				: null;
+			if (session) {
+				const isaacSelected = ((session as Record<string, unknown>).selected_prim_paths as string[] | undefined) ?? [];
+				applyExternalSelection(Array.isArray(isaacSelected) ? isaacSelected.map(String) : []);
+			}
 
 			if (newSceneId) {
 				const sceneChanged = newSceneId !== prevSceneId;
@@ -1116,8 +1168,81 @@
 
 	const treeCount = $derived(flatTree(objectInventory).length);
 
-	function selectObj(node: ObjNode) {
-		selectedObj = node;
+	function selectObj(node: ObjNode, e?: MouseEvent | KeyboardEvent) {
+		const isCtrl = !!(e && (e.ctrlKey || e.metaKey));
+		const isShift = !!(e && e.shiftKey);
+		const next = new Set(selectedPaths);
+		if (isShift && selectionAnchorPath && selectionAnchorPath !== node.prim_path) {
+			const visible = visibleFlatTreePaths();
+			const i = visible.indexOf(selectionAnchorPath);
+			const j = visible.indexOf(node.prim_path);
+			if (i >= 0 && j >= 0) {
+				const [lo, hi] = i <= j ? [i, j] : [j, i];
+				for (let k = lo; k <= hi; k++) next.add(visible[k]);
+			} else {
+				next.add(node.prim_path);
+			}
+			primarySelectedPath = node.prim_path;
+		} else if (isCtrl) {
+			if (next.has(node.prim_path)) {
+				next.delete(node.prim_path);
+				if (primarySelectedPath === node.prim_path) {
+					primarySelectedPath = next.size ? [...next][next.size - 1] : null;
+				}
+			} else {
+				next.add(node.prim_path);
+				primarySelectedPath = node.prim_path;
+			}
+			selectionAnchorPath = node.prim_path;
+		} else {
+			next.clear();
+			next.add(node.prim_path);
+			primarySelectedPath = node.prim_path;
+			selectionAnchorPath = node.prim_path;
+		}
+		selectedPaths = next;
+		lastUserSelectionEditMs = Date.now();
+		lastExternalSelectionSignature = cmpSelectionFromState();
+		drawOverlays();
+	}
+
+	function toggleObjSelection(node: ObjNode) {
+		const next = new Set(selectedPaths);
+		if (next.has(node.prim_path)) {
+			next.delete(node.prim_path);
+			if (primarySelectedPath === node.prim_path) {
+				primarySelectedPath = next.size ? [...next][next.size - 1] : null;
+			}
+		} else {
+			next.add(node.prim_path);
+			primarySelectedPath = node.prim_path;
+			selectionAnchorPath = node.prim_path;
+		}
+		selectedPaths = next;
+		lastUserSelectionEditMs = Date.now();
+		lastExternalSelectionSignature = cmpSelectionFromState();
+		drawOverlays();
+	}
+
+	function clearSelection() {
+		selectedPaths = new Set();
+		primarySelectedPath = null;
+		selectionAnchorPath = null;
+		lastUserSelectionEditMs = Date.now();
+		lastExternalSelectionSignature = '';
+		drawOverlays();
+	}
+
+	function applyExternalSelection(paths: string[]) {
+		const sig = cmpSelectionSignature(paths);
+		if (sig === lastExternalSelectionSignature) return;
+		lastExternalSelectionSignature = sig;
+		// Suppress remote replays of our own click for 500ms.
+		if (Date.now() - lastUserSelectionEditMs < 500) return;
+		const next = new Set(paths);
+		selectedPaths = next;
+		primarySelectedPath = paths.length ? paths[paths.length - 1] : null;
+		selectionAnchorPath = primarySelectedPath;
 		drawOverlays();
 	}
 
@@ -1536,19 +1661,27 @@
 		? (node.children ?? []).filter(c => nodeMatchesFilter(c, treeFilter))
 		: (node.children ?? [])}
 	<div
-		class="obj-tree-row {selectedObj?.prim_path === node.prim_path ? 'obj-tree-row-selected' : ''}"
+		class="obj-tree-row {selectedPaths.has(node.prim_path) ? 'obj-tree-row-selected' : ''} {primarySelectedPath === node.prim_path ? 'obj-tree-row-primary' : ''}"
 		role="treeitem"
 		tabindex="0"
-		aria-selected={selectedObj?.prim_path === node.prim_path}
+		aria-selected={selectedPaths.has(node.prim_path)}
 		aria-expanded={hasChildren ? !collapsed : undefined}
-		onclick={() => selectObj(node)}
+		onclick={(e) => selectObj(node, e)}
 		onkeydown={(e) => {
-			if (e.key === 'Enter') selectObj(node);
+			if (e.key === 'Enter') selectObj(node, e);
+			if (e.key === 'Escape') { e.preventDefault(); clearSelection(); }
 			if (e.key === 'ArrowRight' && hasChildren && collapsed) toggleNode(node.prim_path);
 			if (e.key === 'ArrowLeft' && hasChildren && !collapsed) toggleNode(node.prim_path);
 		}}
 		style="--tree-depth:{depth}"
 	>
+		<input
+			type="checkbox"
+			class="obj-tree-check"
+			checked={selectedPaths.has(node.prim_path)}
+			onclick={(e) => { e.stopPropagation(); toggleObjSelection(node); }}
+			aria-label={selectedPaths.has(node.prim_path) ? 'Deselect' : 'Select'}
+		/>
 		{#if hasChildren}
 			<button
 				onclick={(e) => { e.stopPropagation(); toggleNode(node.prim_path); }}
@@ -1674,36 +1807,33 @@
 {/snippet}
 
 {#snippet materialBrowserPanel()}
-	<div class="material-redirect">
-		<div class="material-redirect-body">
-			<span class="card-eyebrow">{L === 'kr' ? '재질 적용' : 'Apply material'}</span>
-			{#if selectedObj}
-				<div class="material-target-chip mono" title={selectedObj.prim_path}>→ {selectedObj.prim_path}</div>
-				<p class="muted text-xs">
-					{L === 'kr'
-						? '재질 라이브러리 페이지에서 적용할 재질을 선택하세요. 적용 후 자동으로 이 화면으로 돌아옵니다.'
-						: 'Pick a material on the library page. You will return here after applying.'}
-				</p>
-				<button
-					type="button"
-					class="button button-primary"
-					onclick={() => goto(`/materials?apply_to=${encodeURIComponent(selectedObj?.prim_path ?? '')}&scene=${encodeURIComponent(currentSceneId ?? '')}`)}
-				>
-					🎨 {L === 'kr' ? '재질 라이브러리에서 선택…' : 'Choose from material library…'}
-				</button>
-			{:else}
-				<p class="muted text-xs">{L === 'kr' ? '먼저 오브젝트를 선택하세요.' : 'Select an object first.'}</p>
-				<button type="button" class="button button-subtle" onclick={() => goto('/materials')}>
-					🎨 {L === 'kr' ? '재질 라이브러리 열기' : 'Open material library'}
-				</button>
-			{/if}
-		</div>
-	</div>
+	<InlineMaterialPicker
+		sceneId={currentSceneId}
+		targetPrimPaths={selectedTargetPaths}
+		onApplied={() => { void refresh({ force: true }); }}
+	/>
 {/snippet}
 
 {#snippet selectionDetailPanel()}
 	{#if selectedObj}
 		<div style="display:flex;flex-direction:column;gap:0.5rem">
+			{#if selectedCount > 1}
+				<div style="display:flex;align-items:center;gap:0.5rem;padding:0.25rem 0.4rem;background:rgba(99,102,241,0.08);border-radius:4px;font-size:0.75rem">
+					<strong>{selectedCount}{L === 'kr' ? '개 선택됨' : ' selected'}</strong>
+					<span class="muted">· {L === 'kr' ? '대표' : 'primary'}: <span class="mono">{selectedObj.prim_path}</span></span>
+					<button type="button" class="button button-ghost text-xs" style="margin-left:auto" onclick={clearSelection}>
+						{L === 'kr' ? '선택 해제' : 'Clear'}
+					</button>
+				</div>
+				<details>
+					<summary class="text-xs muted" style="cursor:pointer">{L === 'kr' ? '선택된 prim 목록' : 'Selected prims'}</summary>
+					<div style="max-height:160px;overflow-y:auto;display:flex;flex-direction:column;gap:2px;padding-top:4px">
+						{#each [...selectedPaths] as p}
+							<span class="mono text-xs" style="padding:1px 4px;background:rgba(99,102,241,0.04);border-radius:2px">{p}</span>
+						{/each}
+					</div>
+				</details>
+			{/if}
 			<Breadcrumb items={breadcrumbItems} separator="/" ariaLabel={L === 'kr' ? '선택 경로' : 'Selection path'} />
 			<KeyValueList items={selectionKv} layout="columns" size="sm" />
 		</div>

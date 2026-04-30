@@ -33,6 +33,14 @@ export type LibrarySummary = {
 	errors: number;
 };
 
+// Source of the preview render — present on hpBRDF entries:
+//   "channel_split" → daemon will use the per-wavelength .pbrdf mirror
+//                     (~200 MB / channel, safe for shared GPUs).
+//   "monolithic"    → only the legacy 13 GB .hpbrdf is available; this
+//                     path OOMs on shared GPUs and is deprecated.
+//   "missing"       → no source data on disk; download or mirror first.
+export type PreviewSource = 'channel_split' | 'monolithic' | 'missing';
+
 export type MatEntry = {
 	material_id: string;
 	display_name: string;
@@ -47,6 +55,9 @@ export type MatEntry = {
 	preview_mtime: string | null;
 	preview_meta: PreviewMeta | null;
 	download_size_bytes: number | null;
+	// Channel-split mirror state — only set for hpBRDF entries.
+	channels_dir?: string | null;
+	preview_source?: PreviewSource;
 };
 
 export type DatasetGroup = {

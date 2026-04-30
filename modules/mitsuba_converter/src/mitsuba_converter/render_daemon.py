@@ -623,25 +623,97 @@ def _release_preview_inflight(key: str) -> None:
         _preview_inflight.discard(key)
 
 
-def _spawn_preview_render(key: str, render_fn: Any) -> None:
-    """Run `render_fn()` in a background daemon thread under inflight tracking."""
-    def _task() -> None:
+# Single-worker queue for preview renders.
+#
+# Why a queue (and not a fresh thread per call): historically each
+# `_spawn_preview_render` call started its own thread and relied on
+# `_mitsuba_render_lock` to serialize the actual `mi.render()`. That kept
+# the GPU usage technically serial, BUT all the Python `threading.Thread`
+# objects + their per-thread Mitsuba scene/Dr.Jit state stayed alive
+# concurrently. With ~12 hpBRDF threads queued behind one another, the
+# GPU residue from each loaded measured_polarized BSDF accumulated
+# (Dr.Jit's allocator doesn't release CUDA memory eagerly across thread
+# boundaries) and the next render OOMed.
+#
+# Single worker means one Python frame, one Mitsuba scene, one BSDF in
+# GPU memory at a time — and the scene + scene_dict refs go out of scope
+# fully between iterations so `_release_gpu_pool()` actually reclaims.
+import queue as _queue
+import gc as _gc
+
+_preview_render_queue: "_queue.Queue[tuple[str, Any, float]]" = _queue.Queue()
+_preview_worker_thread: threading.Thread | None = None
+_preview_worker_start_lock = threading.Lock()
+
+
+def _preview_worker_loop() -> None:
+    while True:
+        key, render_fn, enqueued_at = _preview_render_queue.get()
+        wait_s = time.perf_counter() - enqueued_at
+        depth_after = _preview_render_queue.qsize()
+        print(
+            f"[daemon] preview_queue: start key={key} waited={wait_s:.2f}s queue_depth_after={depth_after}",
+            file=sys.stderr, flush=True,
+        )
+        t_start = time.perf_counter()
+        outcome = "ok"
         try:
             render_fn()
         except Exception as exc:
+            outcome = "failed"
             print(
                 f"[daemon] preview render failed ({key}): {exc}",
-                file=sys.stderr,
-                flush=True,
+                file=sys.stderr, flush=True,
             )
         finally:
             _release_preview_inflight(key)
+            elapsed = time.perf_counter() - t_start
+            print(
+                f"[daemon] preview_queue: done key={key} outcome={outcome} elapsed={elapsed:.2f}s "
+                f"total_wait_plus_run={wait_s + elapsed:.2f}s",
+                file=sys.stderr, flush=True,
+            )
+            # Force a GC pass between renders so the previous scene's
+            # Python refs go away and `_release_gpu_pool()` (called
+            # inside the render itself) actually frees CUDA memory
+            # before we start the next one.
+            _gc.collect()
 
-    threading.Thread(
-        target=_task,
-        daemon=True,
-        name=f"preview-{key.replace(':', '-').replace('/', '-')}",
-    ).start()
+
+def _ensure_preview_worker() -> None:
+    """Lazily start the single preview worker thread on first enqueue."""
+    global _preview_worker_thread
+    with _preview_worker_start_lock:
+        if _preview_worker_thread is None or not _preview_worker_thread.is_alive():
+            _preview_worker_thread = threading.Thread(
+                target=_preview_worker_loop,
+                daemon=True,
+                name="preview-worker",
+            )
+            _preview_worker_thread.start()
+
+
+def _spawn_preview_render(key: str, render_fn: Any) -> None:
+    """Enqueue `render_fn()` onto the SINGLE preview worker thread.
+
+    Name kept for backward compat with all the existing call sites — the
+    semantics are now "queue for serial execution" rather than "fork a
+    new thread immediately". Inflight tracking still runs: callers
+    `_claim_preview_inflight(key)` BEFORE calling this; the worker
+    releases inflight in its finally clause.
+
+    Emits a ``preview_queue: enqueue`` line so operators can see the
+    queue depth at admission time — `[http] ... 202 -` alone hides
+    whether the daemon is keeping up.
+    """
+    _ensure_preview_worker()
+    enqueued_at = time.perf_counter()
+    depth_before = _preview_render_queue.qsize()
+    _preview_render_queue.put((key, render_fn, enqueued_at))
+    print(
+        f"[daemon] preview_queue: enqueue key={key} queue_depth_before={depth_before}",
+        file=sys.stderr, flush=True,
+    )
 
 
 class RenderDaemon:
@@ -1850,6 +1922,13 @@ class RenderDaemon:
             if path == "/api/material-library":
                 from .material_library import get_library_response
                 self._send_json(handler, HTTPStatus.OK, get_library_response(self.repo_root))
+                return
+            if path == "/api/preview-objects":
+                from .sphere_preview import list_preview_objects, DEFAULT_PREVIEW_OBJECT
+                self._send_json(handler, HTTPStatus.OK, {
+                    "objects": list_preview_objects(),
+                    "default": DEFAULT_PREVIEW_OBJECT,
+                })
                 return
             if path == "/api/material-jobs":
                 self._send_json(handler, HTTPStatus.OK, {"jobs": _list_material_jobs()})
@@ -3232,10 +3311,12 @@ class RenderDaemon:
             "job": job,
         })
 
-    def _enqueue_curated_render(self, mat: Any, material_id: str) -> dict[str, Any] | None:
+    def _enqueue_curated_render(
+        self, mat: Any, material_id: str, *, object_id: str = "sphere",
+    ) -> dict[str, Any] | None:
         """Spawn the curated-preview Mitsuba render in a BG thread and create
         a tracked job entry. Returns the job dict (or None if a render for
-        this material was already in flight)."""
+        this material+object was already in flight)."""
         from .sphere_preview import (
             _build_scene_dict,
             _ensure_mitsuba_variant,
@@ -3243,19 +3324,21 @@ class RenderDaemon:
             _pick_variant_for,
             _render_to_png,
             _supersample_default,
+            resolve_preview_object,
         )
 
+        object_id = resolve_preview_object(object_id)
         cache_dir = self._preview_cache_dir()
-        out = cache_dir / "curated" / f"{material_id}.png"
-        key = f"curated:{material_id}"
+        out = cache_dir / "curated" / f"{material_id}_{object_id}.png"
+        key = f"curated:{material_id}:{object_id}"
 
         if not _claim_preview_inflight(key):
             return None  # render already in flight; an existing job covers it
 
         job = _create_material_job(
-            key=f"curated/{material_id}",
+            key=f"curated/{material_id}/{object_id}",
             title="프리뷰 재렌더",
-            subtitle=getattr(mat, "display_name", material_id),
+            subtitle=f"{getattr(mat, 'display_name', material_id)} · {object_id}",
             action="rerender",
         )
         job_id = job["id"]
@@ -3275,7 +3358,13 @@ class RenderDaemon:
                 # `mi.ScalarTransform4f` inline, which fails if the variant
                 # isn't set in this process yet.
                 from .user_settings import get_material_preview_spp
-                spp = get_material_preview_spp(default=2048)
+                # Phase A-2: curated default 2048 → 768. The sphere-only rig
+                # at 192² × 2× supersample (effective 8192 samples/pixel @ 2048)
+                # was massively oversampled for diffuse / roughplastic / conductor;
+                # 768 stays visually clean for all 9 curated plugin types and
+                # cuts the path-tracing share of wall-clock by ~3×.
+                # User overrides via `material_preview_spp` setting still win.
+                spp = get_material_preview_spp(default=768)
                 ss = _supersample_default()
                 target_size = 192
                 render_size = target_size * ss
@@ -3283,26 +3372,30 @@ class RenderDaemon:
                     _ensure_mitsuba_variant(variant)
                     _update_material_job_stage(
                         job_id, "scene_build",
-                        f"씬 dict 빌드 중 (spp={spp}, render={render_size}px)",
+                        f"씬 dict 빌드 중 (spp={spp}, render={render_size}px, object={object_id})",
                     )
-                    scene_dict = _build_scene_dict(bsdf_spec, size=render_size, spp=spp)
+                    scene_dict = _build_scene_dict(
+                        bsdf_spec, size=render_size, spp=spp, object_id=object_id,
+                    )
 
                     def _progress(current: int, total: int) -> None:
                         pct = int(round(current / max(total, 1) * 100))
                         _update_material_job_stage(
                             job_id,
                             "rendering",
-                            f"Mitsuba 렌더 중 ({material_id}) {current}/{total} · {pct}% · spp={spp}",
+                            f"Mitsuba 렌더 중 ({material_id}/{object_id}) {current}/{total} · {pct}% · spp={spp}",
                         )
                         _update_material_job_progress(job_id, current, total)
 
                     _update_material_job_stage(
-                        job_id, "rendering", f"Mitsuba 렌더 중 ({material_id}) 0/0 · spp={spp}"
+                        job_id, "rendering",
+                        f"Mitsuba 렌더 중 ({material_id}/{object_id}) 0/0 · spp={spp}",
                     )
                     _render_to_png(
                         scene_dict, out, variant=variant, spp=spp,
                         progress_cb=_progress,
                         supersample=ss, target_size=target_size,
+                        bench_label=f"curated/{material_id}/{object_id}",
                     )
                 _update_material_job_stage(job_id, "saved", "PNG 저장 완료")
                 _finish_material_job(job_id, "success")
@@ -3369,6 +3462,8 @@ class RenderDaemon:
         material_id: str,
         measured_file_path: str | None,
         display_name: str,
+        *,
+        object_id: str = "sphere",
     ) -> dict[str, Any] | None:
         """Spawn the measured-preview render in a BG thread + register a job.
 
@@ -3380,22 +3475,23 @@ class RenderDaemon:
         in the lock queue, which is what made the panel look like all jobs
         were rendering at once when in fact only one was active.
         """
-        from .sphere_preview import get_measured_preview
+        from .sphere_preview import get_measured_preview, resolve_preview_object
 
-        key = f"measured:{dataset_id}:{material_id}"
+        object_id = resolve_preview_object(object_id)
+        key = f"measured:{dataset_id}:{material_id}:{object_id}"
         if not _claim_preview_inflight(key):
             # Already rendering — surface the existing material_job so the UI
             # has something to show instead of a silent 200 with no row.
-            existing_key = f"{dataset_id}/{material_id}"
+            existing_key = f"{dataset_id}/{material_id}/{object_id}"
             with _material_jobs_lock:
                 for j in _material_jobs:
                     if j.get("key") == existing_key and j.get("status") == "running":
                         return dict(j)
             return None
         job = _create_material_job(
-            key=f"{dataset_id}/{material_id}",
+            key=f"{dataset_id}/{material_id}/{object_id}",
             title="프리뷰 재렌더",
-            subtitle=display_name,
+            subtitle=f"{display_name} · {object_id}",
             action="rerender",
         )
         job_id = job["id"]
@@ -3406,9 +3502,18 @@ class RenderDaemon:
             return job
 
         from .sphere_preview import _mitsuba_render_lock
+        from .material_library import hpbrdf_channels_dir
 
         repo_root = self.repo_root
         cache_dir = self._preview_cache_dir()
+        # If a channel-split mirror exists for this hpBRDF material,
+        # take that path INSTEAD of loading the 13 GB monolithic file —
+        # the latter is what's been crashing the daemon with CUDA OOM
+        # on shared-GPU boxes. channel-split keeps each render under
+        # ~200 MB by loading one .pbrdf wavelength at a time.
+        channels_dir: Path | None = None
+        if dataset_id == "hpbrdf_2025":
+            channels_dir = hpbrdf_channels_dir(repo_root, material_id)
 
         def _render_measured() -> None:
             try:
@@ -3420,14 +3525,42 @@ class RenderDaemon:
                 # — that's a no-op since we already hold it on this thread.
                 from .user_settings import get_material_preview_spp
                 spp = get_material_preview_spp(default=384)
-                with _mitsuba_render_lock:
+                if channels_dir is not None:
+                    # Channel-split path — render N=4 RGB+NIR sequentially.
+                    # No outer lock here: each per-wavelength render takes
+                    # the lock itself inside `_render_single_channel_to_array`.
+                    from .sphere_preview import (
+                        get_channel_split_preview, RGBNIR_DEFAULT,
+                    )
+                    n_channels = len(RGBNIR_DEFAULT)
                     _update_material_job_stage(
-                        job_id, "rendering", f"Mitsuba 렌더 중 ({material_id}) · spp={spp}"
+                        job_id, "rendering",
+                        f"Mitsuba 채널-split 렌더 중 ({material_id}) "
+                        f"0/{n_channels} RGB+NIR · spp={spp}",
                     )
-                    result = get_measured_preview(
-                        dataset_id, material_id, measured_file_path, repo_root, cache_dir,
-                        spp=spp,
+                    def _on_channel(done: int, total: int) -> None:
+                        _update_material_job_stage(
+                            job_id, "rendering",
+                            f"Mitsuba 채널-split 렌더 중 ({material_id}) "
+                            f"{done}/{total} RGB+NIR · spp={spp}",
+                        )
+                        _update_material_job_progress(job_id, done, total)
+                    result = get_channel_split_preview(
+                        material_id, channels_dir, cache_dir,
+                        mode="rgbnir", spp=spp,
+                        progress_cb=_on_channel,
+                        object_id=object_id,
                     )
+                else:
+                    with _mitsuba_render_lock:
+                        _update_material_job_stage(
+                            job_id, "rendering",
+                            f"Mitsuba 렌더 중 ({material_id}/{object_id}) · spp={spp}",
+                        )
+                        result = get_measured_preview(
+                            dataset_id, material_id, measured_file_path, repo_root, cache_dir,
+                            spp=spp, object_id=object_id,
+                        )
                 if result.path is None:
                     status_msg = {
                         "plugin_unavailable": (
@@ -3436,6 +3569,10 @@ class RenderDaemon:
                         ),
                         "mitsuba_unavailable": "Mitsuba 임포트 실패",
                         "load_error": "파일 파싱 실패 (포맷 불일치)",
+                        "gpu_oom": (
+                            "GPU/host-pinned 메모리 부족 — hpBRDF는 파일당 13 GB라 "
+                            "다른 큰 작업 종료 후 재시도하세요"
+                        ),
                         "not_downloaded": "원본 파일 없음 — 먼저 다운로드 필요",
                         "placeholder": "원본 파일 없음 — placeholder 사용",
                     }.get(result.status, f"render unavailable: {result.status}")
@@ -3457,17 +3594,41 @@ class RenderDaemon:
         sanitized form of dataset_id+material_id; we glob anything with the
         material_id substring to catch all sizes / variants.
         """
-        cache_dir = self._preview_cache_dir() / "measured"
-        if not cache_dir.exists():
-            return []
+        cache_root = self._preview_cache_dir()
         removed: list[str] = []
-        # Match "{anything containing dataset_id and material_id}*.png"
-        for p in cache_dir.glob("*.png"):
-            stem = p.stem
-            if dataset_id in stem and material_id in stem:
+        measured_dir = cache_root / "measured"
+        if measured_dir.exists():
+            # Match "{anything containing dataset_id and material_id}*.png"
+            for p in measured_dir.glob("*.png"):
+                stem = p.stem
+                if dataset_id in stem and material_id in stem:
+                    try:
+                        p.unlink()
+                        removed.append(str(p.relative_to(self.repo_root)))
+                    except OSError:
+                        pass
+        # Channel-split cache lives separately and is keyed only on
+        # material_id (no dataset prefix). Glob for it too so re-render
+        # actually drops the stale PNG instead of serving the cached one.
+        cs_dir = cache_root / "channel_split"
+        if cs_dir.exists():
+            for p in cs_dir.glob(f"{material_id}__*.png"):
                 try:
                     p.unlink()
                     removed.append(str(p.relative_to(self.repo_root)))
+                except OSError:
+                    pass
+            # Phase 9 added a per-material directory layout containing the
+            # composite + per-band PNGs + manifest.json. The flat-glob
+            # above only catches the legacy file; we also need to wipe the
+            # whole directory so the next render starts from a clean slate
+            # (otherwise stale band PNGs persist after re-render).
+            per_mat_dir = cs_dir / material_id.replace("/", "_").replace(".", "_")
+            if per_mat_dir.exists() and per_mat_dir.is_dir():
+                import shutil as _shutil
+                try:
+                    _shutil.rmtree(per_mat_dir)
+                    removed.append(str(per_mat_dir.relative_to(self.repo_root)) + "/")
                 except OSError:
                     pass
         return removed
@@ -3694,24 +3855,53 @@ class RenderDaemon:
         path: str,
         query: dict,
     ) -> None:
-        """Serve a Mitsuba-rendered sphere preview PNG for a preset or measured BSDF."""
-        from .sphere_preview import get_preset_preview, get_measured_preview, peek_measured_preview
+        """Serve a Mitsuba-rendered preview PNG for a preset or measured BSDF.
+
+        Honors ``?object=<sphere|french_bread|...>`` query — falls back to
+        DEFAULT_PREVIEW_OBJECT if missing or unknown.
+        """
+        from .sphere_preview import (
+            get_preset_preview, get_measured_preview, peek_measured_preview,
+            peek_channel_split_preview, resolve_preview_object,
+        )
+        from .material_library import hpbrdf_channels_dir as _hpbrdf_ch_dir
 
         cache_dir = self.repo_root / "out" / "material_previews"
+        object_id = resolve_preview_object(_maybe_str(query.get("object", [None])[0]))
         # /api/material-preview/curated/{material_id}
         if path.startswith("/api/material-preview/curated/"):
             material_id = path[len("/api/material-preview/curated/"):].strip("/")
-            self._serve_curated_preview(handler, material_id, cache_dir)
+            self._serve_curated_preview(handler, material_id, cache_dir, object_id=object_id)
             return
         # /api/material-preview/preset/{bsdf_type}
         if path.startswith("/api/material-preview/preset/"):
             bsdf_type = path[len("/api/material-preview/preset/"):].strip("/")
-            png_path = get_preset_preview(bsdf_type, cache_dir)
+            png_path = get_preset_preview(bsdf_type, cache_dir, object_id=object_id)
             if png_path is None:
                 self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": f"Preview unavailable for preset: {bsdf_type}"})
                 return
             self._send_bytes(handler, HTTPStatus.OK, png_path.read_bytes(), content_type="image/png")
             return
+        # ── Phase 10 sub-routes (must match BEFORE the catch-all measured) ──
+        #   GET /api/material-preview/measured/{ds}/{mid}/modalities
+        #   GET /api/material-preview/measured/{ds}/{mid}/file/{filename}
+        if path.startswith("/api/material-preview/measured/") and "/modalities" in path:
+            rest = path[len("/api/material-preview/measured/"):].strip("/")
+            if rest.endswith("/modalities"):
+                core = rest[:-len("/modalities")]
+                parts = core.split("/", 1)
+                if len(parts) == 2:
+                    self._handle_modalities_get(handler, parts[0], parts[1], query)
+                    return
+        if path.startswith("/api/material-preview/measured/") and "/file/" in path:
+            rest = path[len("/api/material-preview/measured/"):].strip("/")
+            ds_mid, _, filename = rest.partition("/file/")
+            if ds_mid and filename:
+                parts = ds_mid.split("/", 1)
+                if len(parts) == 2:
+                    self._handle_modality_file_get(handler, parts[0], parts[1], filename, query)
+                    return
+
         # /api/material-preview/measured/{dataset_id}/{material_id}?file=<repo_relative_path>
         if path.startswith("/api/material-preview/measured/"):
             rest = path[len("/api/material-preview/measured/"):].strip("/")
@@ -3724,13 +3914,34 @@ class RenderDaemon:
             if not file_param:
                 self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": "Missing ?file= query parameter"})
                 return
+            # Channel-split cache lives at a separate path keyed only on
+            # (material_id, mode, size) — peek that FIRST when this
+            # material has a local mirror, otherwise the GET would forever
+            # 202-loop because peek_measured_preview only knows about the
+            # `measured/` subdir.
+            if dataset_id == "hpbrdf_2025" and _hpbrdf_ch_dir(self.repo_root, material_id) is not None:
+                cs_cached = peek_channel_split_preview(
+                    material_id, cache_dir, mode="rgbnir", object_id=object_id,
+                )
+                if cs_cached is not None and cs_cached.path is not None:
+                    self._send_bytes(
+                        handler,
+                        HTTPStatus.OK,
+                        cs_cached.path.read_bytes(),
+                        content_type="image/png",
+                        extra_headers={"X-Preview-Status": "channel_split"},
+                    )
+                    return
             # Cache hit → serve immediately. Cache miss → delegate to the same
             # enqueue helper that the invalidate POST uses. Critically this
             # path used to spawn a BG render directly with no job entry, so
             # GET-triggered renders (e.g. card image fetches on a fresh page
             # load) finished invisibly — they never showed up in the bottom
             # panel and `_finish_material_job` had nothing to mark complete.
-            cached = peek_measured_preview(dataset_id, material_id, file_param, self.repo_root, cache_dir)
+            cached = peek_measured_preview(
+                dataset_id, material_id, file_param, self.repo_root, cache_dir,
+                object_id=object_id,
+            )
             if cached is not None and cached.path is not None:
                 self._send_bytes(
                     handler,
@@ -3754,24 +3965,191 @@ class RenderDaemon:
                         display_name = m.get("display_name", material_id)
                         break
                 break
-            self._enqueue_measured_render(dataset_id, material_id, file_param, display_name)
+            self._enqueue_measured_render(
+                dataset_id, material_id, file_param, display_name, object_id=object_id,
+            )
             self._send_json(
                 handler,
                 HTTPStatus.ACCEPTED,
-                {"status": "rendering", "dataset_id": dataset_id, "material_id": material_id},
+                {"status": "rendering", "dataset_id": dataset_id, "material_id": material_id, "object_id": object_id},
                 extra_headers={"X-Preview-Status": "rendering", "Retry-After": "2"},
             )
             return
         self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": f"Unknown material-preview path: {path}"})
+
+    # ── Phase 10: modality discovery + per-band file serve ───────────────
+    def _handle_modalities_get(
+        self,
+        handler: BaseHTTPRequestHandler,
+        dataset_id: str,
+        material_id: str,
+        query: dict,
+    ) -> None:
+        """List the rendered modalities (composite + per-band, plus future
+        Stokes products) for one material as a JSON catalogue. Frontend
+        uses this to render the band toggle + grid modal data-driven.
+        Returns one synthetic composite entry as a fallback when only the
+        legacy flat cache exists.
+        """
+        from .sphere_preview import (
+            material_band_dir, material_band_manifest_path,
+            channel_split_cache_path, resolve_preview_object,
+        )
+        size = int(query.get("size", [192])[0]) if query.get("size") else 192
+        object_id = resolve_preview_object(_maybe_str(query.get("object", [None])[0]))
+        cache_dir = self._preview_cache_dir()
+
+        ds_enc = quote(dataset_id, safe="")
+        mid_enc = quote(material_id, safe="")
+        # Per-band /file/ URLs need to keep the object_id around so the
+        # follow-up GETs land in the same per-object dir.
+        obj_q = f"&object={quote(object_id, safe='')}" if object_id else ""
+        composite_fallback_url = (
+            f"/api/material-preview/measured/{ds_enc}/{mid_enc}?size={size}{obj_q}"
+        )
+
+        manifest_path = material_band_manifest_path(material_id, cache_dir, object_id=object_id)
+        if manifest_path.exists():
+            try:
+                payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except Exception as exc:
+                self._send_json(
+                    handler, HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {"error": f"manifest parse failed: {exc}"},
+                )
+                return
+            entries = payload.get("entries", [])
+            needs_rerender = False
+        else:
+            legacy = channel_split_cache_path(
+                material_id, cache_dir, mode="rgbnir", size=size, object_id=object_id,
+            )
+            if not legacy.exists():
+                # No render yet for this (material, object_id). Return 200 with
+                # an empty list + needs_rerender=true so the frontend can show
+                # a friendly "프리뷰 미생성" state instead of swallowing a 404
+                # network error. The composite fallback URL still points at the
+                # measured GET, which itself enqueues a render on cache miss.
+                self._send_json(handler, HTTPStatus.OK, {
+                    "material_id": material_id,
+                    "default_url": composite_fallback_url,
+                    "modalities": [],
+                    "needs_rerender": True,
+                })
+                return
+            entries = [{
+                "kind": "composite", "label": "RGB (legacy)",
+                "url": composite_fallback_url, "group": "composite",
+            }]
+            needs_rerender = True
+
+        modalities = []
+        default_url: str | None = None
+        for e in entries:
+            # Manifest entries store a bare filename → resolve via /file/.
+            # The legacy fallback already has a fully-qualified URL.
+            url = e.get("url")
+            if not url:
+                fname = e.get("file")
+                if not fname:
+                    continue
+                url = (
+                    f"/api/material-preview/measured/{ds_enc}/{mid_enc}/file/"
+                    f"{quote(fname, safe='')}?object={quote(object_id, safe='')}"
+                )
+            entry_out = {
+                "kind": e.get("kind", "band"),
+                "label": e.get("label", url),
+                "group": e.get("group", "spectral"),
+                "url": url,
+            }
+            for opt in ("wavelength_nm", "is_nir"):
+                if opt in e:
+                    entry_out[opt] = e[opt]
+            modalities.append(entry_out)
+            if e.get("kind") == "composite" and default_url is None:
+                default_url = url
+
+        self._send_json(handler, HTTPStatus.OK, {
+            "material_id": material_id,
+            "default_url": default_url or composite_fallback_url,
+            "modalities": modalities,
+            # Hint the UI: legacy cache → only composite available; user
+            # must rerender to populate per-band PNGs.
+            "needs_rerender": needs_rerender,
+        })
+
+    def _handle_modality_file_get(
+        self,
+        handler: BaseHTTPRequestHandler,
+        dataset_id: str,
+        material_id: str,
+        filename: str,
+        query: dict | None = None,
+    ) -> None:
+        """Static-serve a single PNG out of the per-material channel-split
+        directory. Path-traversal guard: filename must be a bare basename
+        (no ``..``, no ``/``, no leading ``.``) and the resolved path must
+        stay inside the material's directory. ``?object=`` scopes lookups
+        to the per-object subdirectory.
+        """
+        from .sphere_preview import material_band_dir, resolve_preview_object
+        # First-line guard: reject anything that isn't a plain basename.
+        if not filename or "/" in filename or "\\" in filename or filename.startswith("."):
+            self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": "invalid filename"})
+            return
+        if ".." in filename:
+            self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": "invalid filename"})
+            return
+
+        object_id = resolve_preview_object(
+            _maybe_str(((query or {}).get("object", [None]) or [None])[0])
+        )
+        cache_dir = self._preview_cache_dir()
+        bdir = material_band_dir(material_id, cache_dir, object_id=object_id).resolve()
+        target = (bdir / filename).resolve()
+        # Defense in depth: even if the basename guard slips, ensure the
+        # resolved target stays under the material dir.
+        try:
+            target.relative_to(bdir)
+        except ValueError:
+            self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": "path escape"})
+            return
+        if not target.exists() or not target.is_file():
+            self._send_json(
+                handler, HTTPStatus.NOT_FOUND,
+                {"error": "modality file not found", "filename": filename},
+            )
+            return
+        # Only PNG-bearing files are served from this route.
+        if target.suffix.lower() != ".png":
+            self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": "only .png served"})
+            return
+
+        self._send_bytes(
+            handler, HTTPStatus.OK, target.read_bytes(),
+            content_type="image/png",
+            extra_headers={"Cache-Control": "public, max-age=86400"},
+        )
 
     def _serve_curated_preview(
         self,
         handler: BaseHTTPRequestHandler,
         material_id: str,
         cache_dir: Path,
+        *,
+        object_id: str = "sphere",
     ) -> None:
-        """Serve the pre-baked curated material PNG, falling back to on-demand render."""
+        """Serve the pre-baked curated material PNG, falling back to on-demand render.
+
+        The pre-baked PNGs in ``assets/material_previews/curated/`` only
+        exist for the default sphere preview object — anything else has to
+        go through the on-demand render path.
+        """
         from .curated_library import curated_preview_path, get_curated_material
+        from .sphere_preview import DEFAULT_PREVIEW_OBJECT, resolve_preview_object
+
+        object_id = resolve_preview_object(object_id)
 
         mat = get_curated_material(material_id)
         if mat is None:
@@ -3783,22 +4161,25 @@ class RenderDaemon:
             )
             return
 
-        baked = curated_preview_path(self.repo_root, material_id)
-        if baked.exists():
-            self._send_bytes(
-                handler,
-                HTTPStatus.OK,
-                baked.read_bytes(),
-                content_type="image/png",
-                extra_headers={
-                    "X-Preview-Status": "baked",
-                    "Cache-Control": "public, max-age=86400",
-                },
-            )
-            return
+        # Baked PNG only exists for the default object (sphere). For other
+        # objects we always render on demand.
+        if object_id == DEFAULT_PREVIEW_OBJECT:
+            baked = curated_preview_path(self.repo_root, material_id)
+            if baked.exists():
+                self._send_bytes(
+                    handler,
+                    HTTPStatus.OK,
+                    baked.read_bytes(),
+                    content_type="image/png",
+                    extra_headers={
+                        "X-Preview-Status": "baked",
+                        "Cache-Control": "public, max-age=86400",
+                    },
+                )
+                return
 
         # Cache miss path — see `_enqueue_curated_render` below.
-        out = cache_dir / "curated" / f"{material_id}.png"
+        out = cache_dir / "curated" / f"{material_id}_{object_id}.png"
         if out.exists():
             self._send_bytes(
                 handler,
@@ -3809,18 +4190,11 @@ class RenderDaemon:
             )
             return
 
-        # Cache miss — delegate to the same enqueue path used by invalidate.
-        # That path correctly sets the Mitsuba variant inside the render lock
-        # before calling `_build_scene_dict` (which constructs
-        # `mi.ScalarTransform4f` and would otherwise raise "Cannot access
-        # 'ScalarTransform4f' before setting a variant"), AND creates a
-        # tracked material-job so the frontend bottom panel sees this render
-        # alongside ones triggered via invalidate.
-        self._enqueue_curated_render(mat, material_id)
+        self._enqueue_curated_render(mat, material_id, object_id=object_id)
         self._send_json(
             handler,
             HTTPStatus.ACCEPTED,
-            {"status": "rendering", "material_id": material_id},
+            {"status": "rendering", "material_id": material_id, "object_id": object_id},
             extra_headers={"X-Preview-Status": "rendering", "Retry-After": "2"},
         )
 
@@ -4775,6 +5149,13 @@ class RenderDaemon:
                 if key in catalog_record:
                     scene_record[key] = catalog_record.get(key)
         if scene_record is not None:
+            healed_snapshot_ref = self._resolve_scene_snapshot_ref(
+                scene_snapshot_ref=_maybe_str(scene_record.get("scene_snapshot_ref")),
+                shape_map_ref=_maybe_str(scene_record.get("shape_map_ref")),
+                mitsuba_scene_ref=_maybe_str(scene_record.get("mitsuba_scene_ref")),
+            )
+            if healed_snapshot_ref:
+                scene_record["scene_snapshot_ref"] = healed_snapshot_ref
             scene_record = self._attach_load_prep_summary(scene_record)
         return {
             "scene_id": scene_id,
@@ -5892,6 +6273,45 @@ class RenderDaemon:
             ],
         }
 
+    def _resolve_scene_snapshot_ref(
+        self,
+        *,
+        scene_snapshot_ref: str | None = None,
+        shape_map_ref: str | None = None,
+        mitsuba_scene_ref: str | None = None,
+    ) -> str | None:
+        """Find a usable repo-relative `.scene_snapshot.json` ref.
+
+        Old bundles sometimes store a `.shape_map.json` path in the
+        scene_snapshot_ref slot; honor a real `.scene_snapshot.json` first,
+        then derive one by convention from sibling shape_map / mitsuba refs.
+        """
+        candidates: list[str] = []
+        for ref in (scene_snapshot_ref, shape_map_ref, mitsuba_scene_ref):
+            if not ref:
+                continue
+            ref_str = str(ref)
+            if ref_str.endswith(".scene_snapshot.json"):
+                candidates.append(ref_str)
+            posix = Path(ref_str).as_posix()
+            stem_path = Path(posix)
+            sibling = stem_path.with_name(f"{stem_path.stem.split('.')[0]}.scene_snapshot.json").as_posix()
+            if sibling not in candidates:
+                candidates.append(sibling)
+            named = stem_path.with_name("scene_snapshot.json").as_posix()
+            if named not in candidates:
+                candidates.append(named)
+        for candidate in candidates:
+            if not candidate.endswith(".json"):
+                continue
+            try:
+                resolved = resolve_repo_path(self.repo_root, candidate)
+            except Exception:
+                continue
+            if resolved.exists():
+                return candidate
+        return None
+
     def _load_snapshot_sidecars(self, scene_snapshot_ref: str | None) -> tuple[SceneSnapshot | None, list[dict[str, Any]], list[dict[str, Any]]]:
         if not scene_snapshot_ref or not scene_snapshot_ref.endswith(".json"):
             return None, [], []
@@ -6082,10 +6502,19 @@ class RenderDaemon:
                 "active_viewport_camera": None,
                 "simplification_mode": "proxy_bounds_v1",
             }
-        snapshot_ref = (
-            _maybe_str(scene_record.get("scene_snapshot_ref"))
-            or (session.scene_snapshot_ref if session is not None else None)
-            or (session.shape_map_ref if session is not None else None)
+        snapshot_ref = self._resolve_scene_snapshot_ref(
+            scene_snapshot_ref=(
+                _maybe_str(scene_record.get("scene_snapshot_ref"))
+                or (session.scene_snapshot_ref if session is not None else None)
+            ),
+            shape_map_ref=(
+                _maybe_str(scene_record.get("shape_map_ref"))
+                or (session.shape_map_ref if session is not None else None)
+            ),
+            mitsuba_scene_ref=(
+                _maybe_str(scene_record.get("mitsuba_scene_ref"))
+                or (session.mitsuba_scene_ref if session is not None else None)
+            ),
         )
         snapshot, _cameras, _lights = self._load_snapshot_sidecars(snapshot_ref)
         if snapshot is None:

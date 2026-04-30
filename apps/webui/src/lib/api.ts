@@ -63,16 +63,69 @@ export const getIsaacSessionInventory = () => fetch('/isaac/session/inventory').
 
 export const materialPresets = () => fetch('/api/material-presets').then(json);
 export const materialLibrary = () => fetch('/api/material-library').then(json);
-export const materialPreviewUrl = (bsdfType: string) =>
-	`/api/material-preview/preset/${encodeURIComponent(bsdfType)}`;
-export const measuredMaterialPreviewUrl = (datasetId: string, materialId: string, nativeFile?: string) => {
-	const base = `/api/material-preview/measured/${encodeURIComponent(datasetId)}/${encodeURIComponent(materialId)}`;
-	return nativeFile ? `${base}?file=${encodeURIComponent(nativeFile)}` : base;
+
+// Pluggable preview geometry. Pass `{ object: 'french_bread' }` to render a
+// mesh instead of the default sphere. Cached PNGs are keyed per-object so
+// switching back and forth doesn't clobber the other object's cache.
+type PreviewObjectOpts = { object?: string };
+function _objectQuery(opts?: PreviewObjectOpts): string {
+	return opts?.object ? `object=${encodeURIComponent(opts.object)}` : '';
+}
+export const materialPreviewUrl = (bsdfType: string, opts?: PreviewObjectOpts) => {
+	const q = _objectQuery(opts);
+	const base = `/api/material-preview/preset/${encodeURIComponent(bsdfType)}`;
+	return q ? `${base}?${q}` : base;
 };
-export const curatedMaterialPreviewUrl = (materialId: string) =>
-	`/api/material-preview/curated/${encodeURIComponent(materialId)}`;
+export const measuredMaterialPreviewUrl = (
+	datasetId: string,
+	materialId: string,
+	nativeFile?: string,
+	opts?: PreviewObjectOpts
+) => {
+	const base = `/api/material-preview/measured/${encodeURIComponent(datasetId)}/${encodeURIComponent(materialId)}`;
+	const params: string[] = [];
+	if (nativeFile) params.push(`file=${encodeURIComponent(nativeFile)}`);
+	const q = _objectQuery(opts);
+	if (q) params.push(q);
+	return params.length ? `${base}?${params.join('&')}` : base;
+};
+export const curatedMaterialPreviewUrl = (materialId: string, opts?: PreviewObjectOpts) => {
+	const q = _objectQuery(opts);
+	const base = `/api/material-preview/curated/${encodeURIComponent(materialId)}`;
+	return q ? `${base}?${q}` : base;
+};
+
+export type PreviewObject = {
+	object_id: string;
+	label_en: string;
+	label_kr: string;
+	icon: string;
+	is_default: boolean;
+};
+export type PreviewObjectsResponse = {
+	objects: PreviewObject[];
+	default: string;
+};
+export const listPreviewObjects = (): Promise<PreviewObjectsResponse> =>
+	fetch('/api/preview-objects').then(json);
 export const applyCuratedMaterial = (sceneId: string, payload: unknown) =>
 	post(`/api/scenes/${sceneId}/apply-curated-material`, payload);
+
+export type MaterialOverrideEntry = {
+	prim_path: string;
+	bsdf_type: string;
+	measured_file_path?: string;
+	dataset_id?: string;
+	material_id?: string;
+};
+export const applyMaterialOverridesBatch = (
+	sceneId: string,
+	payload: { overrides: MaterialOverrideEntry[]; replace_mode?: 'merge' | 'replace_all' }
+) =>
+	post(
+		`/api/scenes/${encodeURIComponent(sceneId)}/material-overrides/batch`,
+		{ replace_mode: 'merge', ...payload }
+	);
 
 export const submitRender = (payload: unknown) => post('/render', payload);
 
@@ -107,3 +160,31 @@ export const batchInvalidatePreviews = (items: PreviewRef[]) =>
 
 export const materialJobs = () => fetch('/api/material-jobs').then(json);
 export const clearMaterialJobs = () => post('/api/material-jobs/clear-finished');
+
+// hpBRDF channel-split modalities — per-material list of (composite, per-band,
+// future Stokes) PNGs. Returned by the daemon's /modalities endpoint and
+// driven by the per-material `manifest.json` written by the renderer.
+export type ModalityKind = 'composite' | 'band' | 'stokes';
+export type ModalityGroup = 'composite' | 'spectral' | 'polar';
+export type Modality = {
+	kind: ModalityKind;
+	label: string;
+	group: ModalityGroup;
+	url: string;
+	wavelength_nm?: number;
+	is_nir?: boolean;
+};
+export type ModalityListResponse = {
+	material_id: string;
+	default_url: string;
+	modalities: Modality[];
+};
+
+export const measuredModalities = (
+	datasetId: string,
+	materialId: string,
+	size = 192,
+): Promise<ModalityListResponse> =>
+	fetch(
+		`/api/material-preview/measured/${encodeURIComponent(datasetId)}/${encodeURIComponent(materialId)}/modalities?size=${size}`,
+	).then(json);

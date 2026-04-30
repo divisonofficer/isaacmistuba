@@ -88,7 +88,10 @@ def bake_one(
         # constructs `mi.ScalarTransform4f` instances inline.
         mi.set_variant(variant)
         scene_dict = _build_scene_dict(mat.bsdf_spec, size=size, spp=spp)
-        _render_to_png(scene_dict, out_path, variant=variant, spp=spp)
+        _render_to_png(
+            scene_dict, out_path, variant=variant, spp=spp,
+            bench_label=f"bake/curated/{mat.material_id}",
+        )
     write_meta_sidecar(
         mat,
         out_path.with_suffix(".meta.json"),

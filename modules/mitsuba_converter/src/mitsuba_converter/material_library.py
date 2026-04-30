@@ -121,6 +121,43 @@ _PBRDF_2020_MATERIALS = [
     ("orange_silicone",   "Orange Silicone",   "data/pbrdf_2020/mitsuba/25_orange_silicone_inpainted.pbsdf"),
 ]
 
+# Local mirror of the channel-split hpBRDF dataset, keyed by *catalog*
+# material_id (bean has different names — see tools/hpbrdf/_catalog.py
+# for the bean↔catalog mapping table). Each subdirectory contains one
+# `.pbrdf` file per wavelength (414…950 nm in 8-nm steps), and the
+# default render tier reads only RGB+NIR (446 / 542 / 614 / 854).
+#
+# When a material's subdirectory exists here AND contains the requested
+# wavelengths, the daemon will dispatch to the channel-split renderer
+# (sphere_preview._render_channel_split, ~200 MB / channel) instead of
+# loading the monolithic 13 GB .hpbrdf — which previously OOMed any
+# shared GPU.
+HPBRDF_2025_CHANNELS_LOCAL_SUBDIR = "data/hpbrdf_2025/channels"
+
+# RGB+NIR default render tier — must all be present for the catalog to
+# advertise the directory as ready. Mirrors `RGBNIR_WAVELENGTHS` in
+# tools/hpbrdf/_catalog.py (kept inline here to avoid taking a tools/
+# dependency on the package; if these drift, both must change.)
+HPBRDF_2025_RGBNIR_WAVELENGTHS_NM = (446, 542, 614, 854)
+
+
+def hpbrdf_channels_dir(repo_root: Path, material_id: str) -> Path | None:
+    """Return the local channels dir for a catalog hpBRDF material if it
+    exists AND contains all 4 RGB+NIR `.pbrdf` files, else None.
+
+    Strict check — an empty dir (created by an aborted mirror run) does
+    NOT count, otherwise the daemon would advertise the material as
+    channel-split-ready and then fail at render time.
+    """
+    p = repo_root / HPBRDF_2025_CHANNELS_LOCAL_SUBDIR / material_id
+    if not (p.exists() and p.is_dir()):
+        return None
+    for w in HPBRDF_2025_RGBNIR_WAVELENGTHS_NM:
+        if not (p / f"{w}.pbrdf").exists():
+            return None
+    return p
+
+
 # hpBRDF — 14 materials (SIGGRAPH Asia 2025 official list)
 _HPBRDF_2025_MATERIALS = [
     ("aluminum",            "Aluminum",            "data/hpbrdf_2025/raw/Aluminum.hpbrdf"),
@@ -198,13 +235,32 @@ def _material_status(
     requires_patch: bool,
     dataset_id: str = "",
     dataset_local_root: str | None = None,
+    material_id: str = "",
 ) -> str:
     """
     Returns one of:
-      'available'       — file exists on disk
-      'needs_patch'     — dataset requires Mitsuba patch (hpBRDF) but file also exists
-      'not_downloaded'  — file does not exist
+      'available'       — source data on disk and ready to render
+      'needs_patch'     — file present but daemon's Mitsuba build doesn't have
+                          the required plugin patch (legacy / non-hpbrdf cases)
+      'not_downloaded'  — no source data on disk
+
+    For hpBRDF (`hpbrdf_2025`): the channel-split mirror at
+    `data/hpbrdf_2025/channels/{material_id}/` is treated as a first-class
+    source. If it's present we report "available" (no patch warning) since:
+      (a) channel-split renders use the same patched `measured_polarized`
+          plugin as monolithic — the patch is a *system requirement*, not
+          a per-material warning, and badging every card with "패치 필요"
+          when the user has already applied it is misleading.
+      (b) the legacy 13 GB monolithic `.hpbrdf` is no longer the canonical
+          source — channel-split is. Reporting "not_downloaded" just because
+          the user deleted the monolithic blob would be wrong.
     """
+    # hpBRDF channel-split takes precedence over monolithic file probing.
+    if dataset_id == "hpbrdf_2025" and material_id:
+        ch = hpbrdf_channels_dir(repo_root, material_id)
+        if ch is not None:
+            return "available"
+
     if not native_file:
         return "not_downloaded"
     from .user_settings import resolve_dataset_path
@@ -433,14 +489,24 @@ def get_library_grouped(repo_root: Path) -> list[dict[str, Any]]:
             status = _material_status(
                 repo_root, native_file, requires_patch,
                 dataset_id=ds_id, dataset_local_root=dataset_local_root,
+                material_id=mat_id,
             )
             download_url: str | None = None
             if ds_id == "pbrdf_2020":
                 n = idx + 1
                 download_url = f"{_PBRDF_2020_BASE}/{n}_{mat_id}_mitsuba.zip"
             elif ds_id == "hpbrdf_2025" and native_file:
-                fname = Path(native_file).name
-                download_url = f"hf-dataset://{_HPBRDF_2025_HF_REPO}/{fname}"
+                # Phase 7: monolithic 13 GB .hpbrdf is deprecated.
+                # If the channel-split mirror is present we hide the HF
+                # download URL entirely so the UI doesn't tempt the user
+                # into a 13 GB download they don't need (and which would
+                # OOM on shared GPUs anyway). When the mirror is missing
+                # we still expose the URL as a recovery option.
+                if hpbrdf_channels_dir(repo_root, mat_id) is None:
+                    fname = Path(native_file).name
+                    download_url = f"hf-dataset://{_HPBRDF_2025_HF_REPO}/{fname}"
+                else:
+                    download_url = None
             preview_status, preview_mtime = _measured_preview_status(repo_root, ds_id, mat_id)
             size_bytes: int | None = None
             if native_file:
@@ -453,7 +519,7 @@ def get_library_grouped(repo_root: Path) -> list[dict[str, Any]]:
             # Pre-download size hint for hpBRDF (each .hpbrdf is ~13 GB).
             if size_bytes is None and ds_id == "hpbrdf_2025":
                 size_bytes = _HPBRDF_2025_FILE_SIZE_BYTES
-            materials_out.append({
+            entry: dict[str, Any] = {
                 "material_id": mat_id,
                 "display_name": mat_name,
                 "native_file": native_file,
@@ -464,7 +530,27 @@ def get_library_grouped(repo_root: Path) -> list[dict[str, Any]]:
                 "preview_mtime": preview_mtime,
                 "preview_meta": None,
                 "download_size_bytes": size_bytes,
-            })
+            }
+            # Surface the channel-split mirror state for hpBRDF entries —
+            # frontend uses this to render the spectralBadge ("RGB+NIR (4ch)"
+            # vs "monolithic 13 GB"). The `channels_dir` is exposed as a
+            # repo-relative string so the UI can deep-link it without
+            # leaking absolute filesystem paths.
+            if ds_id == "hpbrdf_2025":
+                ch_dir = hpbrdf_channels_dir(repo_root, mat_id)
+                if ch_dir is not None:
+                    entry["channels_dir"] = str(ch_dir.relative_to(repo_root))
+                    entry["preview_source"] = "channel_split"
+                else:
+                    entry["channels_dir"] = None
+                    # `status` is "available" or "needs_patch" when the
+                    # monolithic .hpbrdf is on disk — both mean we *can*
+                    # render via the legacy 13 GB path (just needs the
+                    # patched build). Only "not_downloaded" → "missing".
+                    entry["preview_source"] = (
+                        "missing" if status == "not_downloaded" else "monolithic"
+                    )
+            materials_out.append(entry)
 
         group: dict[str, Any] = {
             "dataset_id": ds_id,

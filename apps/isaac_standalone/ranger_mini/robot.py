@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from math import cos, degrees, sin, tan
+import os
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +30,54 @@ def _identity_pose(x: float = 0.0, y: float = 0.0, z: float = 0.0) -> list[float
         0.0, 0.0, 1.0, 0.0,
         float(x), float(y), float(z), 1.0,
     ]
+
+
+def _path_from_env(name: str) -> Path | None:
+    value = os.environ.get(name)
+    if not value:
+        return None
+    return Path(value)
+
+
+def _repo_root_from_module() -> Path:
+    return Path(__file__).resolve().parents[3]
+
+
+def _asset_candidates(asset_path: str) -> list[Path]:
+    raw_path = Path(asset_path)
+    if raw_path.is_absolute():
+        return [raw_path]
+
+    roots: list[Path] = []
+    for root in (
+        _repo_root_from_module(),
+        _path_from_env("ROBOMITUBA_LOCAL_REPO_ROOT"),
+        _path_from_env("ROBOMITUBA_ROOT"),
+        _path_from_env("ROBOMITUBA_WINDOWS_REPO_ROOT"),
+    ):
+        if root is not None and root not in roots:
+            roots.append(root)
+
+    return [root / raw_path for root in roots]
+
+
+def _resolve_asset_path(asset_path: str) -> Path | None:
+    for candidate in _asset_candidates(asset_path):
+        if candidate.exists():
+            return candidate.resolve()
+    return None
+
+
+def _format_asset_candidates(asset_path: str) -> str:
+    return ", ".join(str(candidate) for candidate in _asset_candidates(asset_path))
+
+
+def _prim_references_asset(prim: Any, asset_path: Path) -> bool:
+    try:
+        references = str(prim.GetMetadata("references") or "")
+    except Exception:
+        return False
+    return str(asset_path) in references or asset_path.name in references
 
 
 class RangerMiniRobot:
@@ -209,13 +258,15 @@ class RangerMiniRobot:
         root_prim = stage.GetPrimAtPath(self.prim_path)
         if not root_prim or not root_prim.IsValid():
             root_prim = stage.DefinePrim(self.prim_path, "Xform")
-            asset_abs = (Path(__file__).resolve().parents[3] / self.asset_path).resolve()
-            if not asset_abs.exists():
-                _log_debug(f"_spawn_reference asset missing path={asset_abs}")
-                return False
-            refs = root_prim.GetReferences()
-            _log_debug(f"_spawn_reference adding reference asset={asset_abs}")
-            refs.AddReference(assetPath=str(asset_abs))
+
+        asset_abs = _resolve_asset_path(self.asset_path)
+        if asset_abs is None:
+            _log_debug(f"_spawn_reference asset missing candidates={_format_asset_candidates(self.asset_path)}")
+            return False
+
+        refs = root_prim.GetReferences()
+        _log_debug(f"_spawn_reference adding reference asset={asset_abs}")
+        refs.AddReference(assetPath=str(asset_abs))
 
         xformable = UsdGeom.Xformable(root_prim)
         if xformable:
