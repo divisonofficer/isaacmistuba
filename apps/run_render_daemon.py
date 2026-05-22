@@ -4,6 +4,40 @@ import argparse
 import os
 import sys
 import time
+from pathlib import Path
+
+
+def _bootstrap_project_sys_path() -> None:
+    """Add modules/*/src directories to sys.path so the daemon process can
+    import ``mitsuba_converter`` / ``robomituba_bridge`` without an editable
+    install. Idempotent; safe to call multiple times.
+
+    Without this the launcher only worked when the operator had previously
+    run ``pip install -e modules/mitsuba_converter`` (or set PYTHONPATH
+    manually) — fresh conda envs hit ``ModuleNotFoundError`` immediately.
+    """
+    repo_root = Path(__file__).resolve().parents[1]
+    modules_root = repo_root / "modules"
+    for sub in ("mitsuba_converter", "robomituba_bridge"):
+        src = modules_root / sub / "src"
+        if src.is_dir():
+            src_str = str(src)
+            if src_str not in sys.path:
+                sys.path.insert(0, src_str)
+
+
+_bootstrap_project_sys_path()
+
+
+def _is_subprocess_mode() -> bool:
+    """Phase R: daemon process does not import mitsuba when the worker
+    subprocess does it for us. Decided by the same env flag the daemon
+    code itself reads.
+    """
+    raw = os.environ.get("ROBOMITUBA_RENDER_INPROCESS", "1").strip().lower()
+    # default "1" (in-process, legacy) — only the explicit off values
+    # flip to subprocess mode.
+    return raw in ("0", "false", "no", "off")
 
 
 def _check_runtime() -> None:
@@ -13,7 +47,21 @@ def _check_runtime() -> None:
     with an interpreter (e.g. conda 3.12) that doesn't match the version drjit was
     compiled for (3.10.x), every render fails with a confusing late-bound error.
     Catch it at startup with an actionable message instead.
+
+    Phase R skip: in subprocess mode (``ROBOMITUBA_RENDER_INPROCESS=0``) the
+    daemon process never imports mitsuba — the worker subprocess does, with
+    its own (possibly alternate) Python interpreter (see
+    ``ROBOMITUBA_MITSUBA_PYTHON``). Skipping this probe lets the daemon
+    launch on a base conda env that has no mitsuba at all.
     """
+    if _is_subprocess_mode():
+        print(
+            "[run_render_daemon] subprocess mode (ROBOMITUBA_RENDER_INPROCESS=0): "
+            "skipping daemon-side drjit/mitsuba import probe; worker subprocess "
+            "will surface variant availability via its `ready` event.",
+            file=sys.stderr, flush=True,
+        )
+        return
     try:
         import drjit  # type: ignore
         import mitsuba  # type: ignore
@@ -27,7 +75,8 @@ def _check_runtime() -> None:
         )
         print(
             "[run_render_daemon] Re-launch with the interpreter drjit was built for, e.g.\n"
-            "    PYTHONPATH=/home/jinnyeong/robomituba-build/mitsuba3/python /usr/bin/python3.10 apps/run_render_daemon.py",
+            "    PYTHONPATH=/home/jinnyeong/robomituba-build/mitsuba3/python /usr/bin/python3.10 apps/run_render_daemon.py\n"
+            "[run_render_daemon] Or run subprocess mode: ROBOMITUBA_RENDER_INPROCESS=0",
             file=sys.stderr,
             flush=True,
         )
@@ -44,7 +93,11 @@ def main() -> None:
     parser.add_argument("--repo-root", default=None, help="Repository root. Defaults to auto-detected project root.")
     parser.add_argument("--host", default="127.0.0.1", help="Bind host. Defaults to 127.0.0.1.")
     parser.add_argument("--port", type=int, default=8765, help="Bind port. Defaults to 8765.")
-    parser.add_argument("--variant", default="cuda_ad_spectral", help="Default Mitsuba variant.")
+    parser.add_argument(
+        "--variant",
+        default=os.environ.get("ROBOMITUBA_MITSUBA_VARIANT", "auto"),
+        help="Default Mitsuba variant, or 'auto' to pick a compatible runtime variant.",
+    )
     args = parser.parse_args()
 
     repo_root = repo_root_from(args.repo_root)

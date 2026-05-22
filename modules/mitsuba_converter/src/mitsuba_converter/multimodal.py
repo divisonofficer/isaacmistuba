@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+import hashlib
 import json
+import os
+import sys
 from collections import OrderedDict
 from pathlib import Path
 import tempfile
@@ -340,6 +343,7 @@ def _assist_light_signature(assist_light: AssistLightSpec | None) -> Any:
 
 def _should_reuse_staged_scene(out_scene: Path, *, signature: tuple[Any, ...]) -> bool:
     cache_key = str(out_scene.resolve())
+    signature = _effective_stage_signature(signature)
     with _SCENE_CACHE_LOCK:
         cached_signature = _STAGED_SCENE_SIGNATURE_CACHE.get(cache_key)
     return cached_signature == signature and out_scene.exists()
@@ -347,11 +351,160 @@ def _should_reuse_staged_scene(out_scene: Path, *, signature: tuple[Any, ...]) -
 
 def _record_staged_scene_signature(out_scene: Path, *, signature: tuple[Any, ...]) -> None:
     cache_key = str(out_scene.resolve())
+    signature = _effective_stage_signature(signature)
     with _SCENE_CACHE_LOCK:
         _STAGED_SCENE_SIGNATURE_CACHE[cache_key] = signature
 
 
+def _texture_max_resolution() -> int:
+    raw = os.environ.get("ROBOMITUBA_TEXTURE_MAX_RESOLUTION", "0")
+    try:
+        return max(0, int(str(raw).strip() or "0"))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _texture_cache_signature() -> tuple[str, int]:
+    return ("texture_max_resolution", _texture_max_resolution())
+
+
+def _effective_stage_signature(signature: tuple[Any, ...]) -> tuple[Any, ...]:
+    return (*tuple(signature), _texture_cache_signature())
+
+
+def _texture_cache_root(out_scene: Path) -> Path:
+    override = os.environ.get("ROBOMITUBA_TEXTURE_CACHE_DIR")
+    if override:
+        return Path(override).expanduser().resolve()
+    return Path.cwd().resolve() / "out" / "texture_cache" / "mitsuba_downsampled"
+
+
+def _downsampled_texture_path(src: Path, *, cache_root: Path, max_resolution: int) -> Path | None:
+    try:
+        stat = src.stat()
+    except OSError:
+        return None
+    digest = hashlib.sha1(
+        f"{src.resolve()}|{stat.st_mtime_ns}|{stat.st_size}|{max_resolution}".encode("utf-8")
+    ).hexdigest()[:16]
+    suffix = src.suffix.lower()
+    if suffix not in {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".exr"}:
+        return None
+    return cache_root / f"max{max_resolution}" / digest[:2] / f"{src.stem}_{digest}{suffix}"
+
+
+def _ensure_downsampled_exr(src: Path, cached: Path, *, max_resolution: int) -> Path | None:
+    try:
+        import imageio.v3 as iio
+    except Exception as exc:
+        print(
+            f"[multimodal] EXR texture downsample skipped path={src}: imageio unavailable ({exc})",
+            file=sys.stderr,
+            flush=True,
+        )
+        return None
+    try:
+        image = np.asarray(iio.imread(src))
+        if image.ndim < 2:
+            return None
+        height, width = int(image.shape[0]), int(image.shape[1])
+        largest = max(width, height)
+        if largest <= max_resolution:
+            return src
+        factor = max(1, int(np.ceil(largest / float(max_resolution))))
+        new_height = max(1, height // factor)
+        new_width = max(1, width // factor)
+        cropped = image[: new_height * factor, : new_width * factor]
+        if image.ndim == 2:
+            resized = cropped.reshape(new_height, factor, new_width, factor).mean(axis=(1, 3))
+        else:
+            resized = cropped.reshape(new_height, factor, new_width, factor, *image.shape[2:]).mean(axis=(1, 3))
+        cached.parent.mkdir(parents=True, exist_ok=True)
+        iio.imwrite(cached, resized.astype(np.float32, copy=False))
+        return cached
+    except Exception as exc:
+        print(
+            f"[multimodal] EXR texture downsample skipped path={src} max={max_resolution}: {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return None
+
+
+def _ensure_downsampled_texture(src: Path, *, cache_root: Path, max_resolution: int) -> Path | None:
+    cached = _downsampled_texture_path(src, cache_root=cache_root, max_resolution=max_resolution)
+    if cached is None:
+        return None
+    if cached.exists():
+        return cached
+    if cached.suffix.lower() == ".exr":
+        return _ensure_downsampled_exr(src, cached, max_resolution=max_resolution)
+    try:
+        with Image.open(src) as image:
+            width, height = image.size
+            largest = max(width, height)
+            if largest <= max_resolution:
+                return src
+            scale = max_resolution / float(largest)
+            new_size = (max(1, int(round(width * scale))), max(1, int(round(height * scale))))
+            resized = image.copy()
+            resized.thumbnail(new_size, Image.Resampling.LANCZOS)
+            cached.parent.mkdir(parents=True, exist_ok=True)
+            save_kwargs: dict[str, Any] = {}
+            if cached.suffix.lower() in {".jpg", ".jpeg"}:
+                save_kwargs.update({"quality": 92, "subsampling": 0})
+            resized.save(cached, **save_kwargs)
+            return cached
+    except Exception as exc:
+        print(
+            f"[multimodal] texture downsample skipped path={src} max={max_resolution}: {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return None
+
+
+def _rewrite_texture_filenames(root: ET.Element, *, out_scene: Path) -> dict[str, int]:
+    max_resolution = _texture_max_resolution()
+    if max_resolution <= 0:
+        return {"rewritten": 0, "skipped": 0}
+    cache_root = _texture_cache_root(out_scene)
+    rewritten = 0
+    skipped = 0
+    for node in root.iter():
+        if node.tag not in {"texture", "emitter"}:
+            continue
+        plugin_type = node.attrib.get("type")
+        if plugin_type not in {"bitmap", "envmap"}:
+            continue
+        filename = node.find("string[@name='filename']")
+        if filename is None:
+            continue
+        value = filename.attrib.get("value")
+        if not value:
+            continue
+        src = Path(value)
+        if not src.is_absolute():
+            skipped += 1
+            continue
+        cached = _ensure_downsampled_texture(src, cache_root=cache_root, max_resolution=max_resolution)
+        if cached is None:
+            skipped += 1
+            continue
+        if cached != src:
+            filename.attrib["value"] = str(cached)
+            rewritten += 1
+    if rewritten or skipped:
+        print(
+            f"[multimodal] texture cap max={max_resolution} rewritten={rewritten} skipped={skipped} cache={cache_root}",
+            file=sys.stderr,
+            flush=True,
+        )
+    return {"rewritten": rewritten, "skipped": skipped}
+
+
 def _write_scene(root: ET.Element, out_scene: Path) -> Path:
+    _rewrite_texture_filenames(root, out_scene=out_scene)
     ET.indent(root, space="  ")
     scene_text = ET.tostring(root, encoding="unicode")
     if out_scene.exists():
@@ -1508,7 +1661,9 @@ def _resident_scene_cache_has(scene_path: Path, *, variant: str) -> bool:
 
 def _load_resident_scene(scene_path: Path, *, variant: str) -> tuple[Any, float, bool]:
     mi = _import_mitsuba()
-    mi.set_variant(variant)
+    from .mitsuba_runtime import ensure_mitsuba_variant
+
+    variant = ensure_mitsuba_variant(variant)
     cache_key = _resident_scene_cache_key(scene_path, variant=variant)
 
     with _SCENE_CACHE_LOCK:
@@ -2459,6 +2614,8 @@ def _needs_sensor_depth(modalities: set[str]) -> bool:
 
 
 def _polar_variant(base_variant: str) -> str:
+    if not base_variant or base_variant in {"auto", "default"}:
+        return "auto"
     if base_variant.endswith("_polarized"):
         return base_variant
     return f"{base_variant}_polarized"
@@ -2475,7 +2632,7 @@ def render_modalities(
     scene_override: SceneOverrideSpec | None = None,
     assist_light: AssistLightSpec | None = None,
     depth_approx: DepthApproxSpec | None = None,
-    variant: str = "cuda_ad_spectral",
+    variant: str = "auto",
     progress_callback: Callable[[str, Mapping[str, Any] | None], None] | None = None,
 ) -> MultimodalRenderResult:
     config = config or RenderConfig()
@@ -2531,7 +2688,25 @@ def render_modalities(
         variant_override: str | None = None,
     ) -> tuple[np.ndarray, dict[str, float]]:
         _pass_index[0] += 1
-        v = variant_override or variant
+        from .mitsuba_runtime import mark_variant_unavailable, resolve_variant
+
+        kind = "spectral_polarized" if pass_name.startswith("polar") else "spectral"
+        requested_variant = variant_override or variant
+        v = resolve_variant(requested_variant, kind=kind, allow_cpu=True)
+        if not v.startswith("cuda_"):
+            try:
+                cpu_spp_cap = int(os.environ.get("ROBOMITUBA_CPU_SPP_CAP", "256"))
+            except (TypeError, ValueError):
+                cpu_spp_cap = 256
+            if cpu_spp_cap > 0 and spp > cpu_spp_cap:
+                _cb("render_settings_adjusted", {
+                    "pass": pass_name,
+                    "requested_spp": spp,
+                    "effective_spp": cpu_spp_cap,
+                    "variant": v,
+                    "reason": "cpu_variant_spp_cap",
+                })
+                spp = cpu_spp_cap
         base_ctx = {
             "pass": pass_name,
             "spp": spp,
@@ -2567,7 +2742,25 @@ def render_modalities(
                     "sub_total": 5,
                 })
             _cb("rendering", base_ctx)
-        image, timing = _render_scene(scene_path, variant=v, spp=spp, on_loaded=_on_loaded)
+        try:
+            image, timing = _render_scene(scene_path, variant=v, spp=spp, on_loaded=_on_loaded)
+        except Exception as exc:
+            if not v.startswith("cuda_"):
+                raise
+            mark_variant_unavailable(v, exc)
+            fallback = resolve_variant("auto", kind=kind, allow_cpu=True)
+            if fallback == v:
+                raise
+            base_ctx["variant"] = fallback
+            _cb("loading_scene", {
+                **base_ctx,
+                "fallback_from_variant": v,
+                "sub_step": "runtime_fallback",
+                "sub_phase": 0,
+                "sub_total": 5,
+                "error": str(exc),
+            })
+            image, timing = _render_scene(scene_path, variant=fallback, spp=spp, on_loaded=_on_loaded)
         _cb("saving_output", {
             "pass": pass_name,
             "pass_index": _pass_index[0],

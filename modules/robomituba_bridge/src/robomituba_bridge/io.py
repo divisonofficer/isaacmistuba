@@ -412,6 +412,9 @@ def bsdf_override_from_payload(payload: Dict[str, Any]) -> BsdfOverride:
         metallic=payload.get("metallic"),
         ior=payload.get("ior"),
         material=payload.get("material"),
+        measured_file_path=payload.get("measured_file_path"),
+        dataset_id=payload.get("dataset_id"),
+        material_id=payload.get("material_id"),
         extras=payload.get("extras", {}),
     )
 

@@ -72,6 +72,16 @@ def _format_asset_candidates(asset_path: str) -> str:
     return ", ".join(str(candidate) for candidate in _asset_candidates(asset_path))
 
 
+def _resolve_visual_asset_path(asset_path: str) -> Path | None:
+    assembly = _resolve_asset_path(asset_path)
+    if assembly is None:
+        return None
+    visual = assembly.with_name("ranger_mini_rokace.usdc")
+    if visual.exists():
+        return visual.resolve()
+    return None
+
+
 def _prim_references_asset(prim: Any, asset_path: Path) -> bool:
     try:
         references = str(prim.GetMetadata("references") or "")
@@ -121,13 +131,14 @@ class RangerMiniRobot:
         use_reference: bool | None = None,
     ) -> "RangerMiniRobot":
         robot = cls(prim_path=prim_path, asset_path=asset_path, params=params)
-        robot.state.base_pose = _identity_pose(*translation)
+        spawn_translation = (float(translation[0]), float(translation[1]), 0.0)
+        robot.state.base_pose = _identity_pose(*spawn_translation)
         _log_debug(
-            f"spawn start prim_path={robot.prim_path} translation={translation} "
+            f"spawn start prim_path={robot.prim_path} translation={spawn_translation} "
             f"use_reference={use_reference} asset_path={robot.asset_path}"
         )
         if stage is not None:
-            robot._spawn_robot(stage, translation=translation, use_reference=use_reference)
+            robot._spawn_robot(stage, translation=spawn_translation, use_reference=use_reference)
             robot._write_state_to_stage(stage)
         _log_debug(f"spawn done prim_path={robot.prim_path}")
         return robot
@@ -244,13 +255,15 @@ class RangerMiniRobot:
             if self._spawn_reference(stage, translation=translation):
                 _log_debug(f"_spawn_robot succeeded via USD reference prim_path={self.prim_path}")
                 return
-            _log_debug(f"_spawn_robot reference fallback engaged prim_path={self.prim_path}")
+            if use_reference is not False:
+                raise RuntimeError(f"Failed to spawn RangerMini from USD reference: {self.asset_path}")
+            _log_debug(f"_spawn_robot reference failed, using procedural fallback prim_path={self.prim_path}")
         self._spawn_placeholder(stage, translation=translation)
         _log_debug(f"_spawn_robot procedural spawn finished prim_path={self.prim_path}")
 
     def _spawn_reference(self, stage: Any, *, translation: tuple[float, float, float]) -> bool:
         try:
-            from pxr import Gf, UsdGeom
+            from pxr import Gf, Sdf, UsdGeom
         except Exception:
             _log_debug("_spawn_reference pxr import unavailable")
             return False
@@ -264,10 +277,18 @@ class RangerMiniRobot:
             _log_debug(f"_spawn_reference asset missing candidates={_format_asset_candidates(self.asset_path)}")
             return False
 
+        refs = root_prim.GetReferences()
+        visual_abs = _resolve_visual_asset_path(self.asset_path)
+
+        if visual_abs is not None and not _prim_references_asset(root_prim, visual_abs):
+            _log_debug(f"_spawn_reference adding visual reference asset={visual_abs} prim=/root")
+            if not refs.AddReference(assetPath=str(visual_abs), primPath=Sdf.Path("/root")):
+                _log_debug(f"_spawn_reference visual AddReference returned false asset={visual_abs}")
+                return False
+
         if _prim_references_asset(root_prim, asset_abs):
             _log_debug(f"_spawn_reference reusing existing reference asset={asset_abs}")
         else:
-            refs = root_prim.GetReferences()
             _log_debug(f"_spawn_reference adding reference asset={asset_abs}")
             if not refs.AddReference(assetPath=str(asset_abs)):
                 _log_debug(f"_spawn_reference AddReference returned false asset={asset_abs}")
@@ -278,8 +299,130 @@ class RangerMiniRobot:
             translate_ops = [op for op in xformable.GetOrderedXformOps() if op.GetOpType() == UsdGeom.XformOp.TypeTranslate]
             op = translate_ops[0] if translate_ops else xformable.AddTranslateOp()
             op.Set(Gf.Vec3d(*translation))
-        _log_debug(f"_spawn_reference success prim_path={self.prim_path}")
+        hidden_colliders = self._hide_collision_debug_prims(stage)
+        if hidden_colliders:
+            _log_debug(f"_spawn_reference hid collision/debug prims count={hidden_colliders}")
+        disabled_lights = self._disable_embedded_scene_lights(stage)
+        if disabled_lights:
+            _log_debug(f"_spawn_reference disabled embedded camera/light prims count={disabled_lights}")
+        fixed_textures = self._repair_relative_texture_paths(stage, (asset_abs.parent, visual_abs.parent if visual_abs else asset_abs.parent))
+        if fixed_textures:
+            _log_debug(f"_spawn_reference fixed relative texture asset paths count={fixed_textures}")
+        mesh_count = self._count_descendant_meshes(stage)
+        _log_debug(f"_spawn_reference success prim_path={self.prim_path} meshes={mesh_count}")
+        if mesh_count <= 0:
+            _log_debug(
+                "_spawn_reference loaded no Mesh descendants; direct visual reference failed "
+                f"visual_asset={visual_abs} assembly_asset={asset_abs}"
+            )
+            return False
         return True
+
+    def _hide_collision_debug_prims(self, stage: Any) -> int:
+        try:
+            from pxr import Usd, UsdGeom
+        except Exception:
+            return 0
+
+        root = stage.GetPrimAtPath(self.prim_path)
+        if not root or not root.IsValid():
+            return 0
+
+        hidden = 0
+        for prim in Usd.PrimRange(root):
+            name = prim.GetName().lower()
+            path_text = str(prim.GetPath()).lower()
+            if "collision" not in name and "/colliders" not in path_text:
+                continue
+            imageable = UsdGeom.Imageable(prim)
+            if imageable:
+                imageable.CreateVisibilityAttr().Set(UsdGeom.Tokens.invisible)
+                imageable.CreatePurposeAttr().Set(UsdGeom.Tokens.guide)
+                hidden += 1
+        return hidden
+
+    def _disable_embedded_scene_lights(self, stage: Any) -> int:
+        try:
+            from pxr import Sdf, Usd, UsdGeom
+        except Exception:
+            return 0
+
+        root = stage.GetPrimAtPath(self.prim_path)
+        if not root or not root.IsValid():
+            return 0
+
+        disabled = 0
+        for prim in Usd.PrimRange(root):
+            is_camera = prim.IsA(UsdGeom.Camera)
+            is_light = "light" in prim.GetTypeName().lower() or "light" in prim.GetName().lower()
+            if not is_camera and not is_light:
+                continue
+            imageable = UsdGeom.Imageable(prim)
+            if imageable:
+                imageable.CreateVisibilityAttr().Set(UsdGeom.Tokens.invisible)
+            intensity_attr = prim.GetAttribute("inputs:intensity")
+            if intensity_attr:
+                intensity_attr.Set(0.0)
+            texture_attr = prim.GetAttribute("inputs:texture:file")
+            if texture_attr:
+                texture_attr.Set(Sdf.AssetPath(""))
+            disabled += 1
+        return disabled
+
+    def _repair_relative_texture_paths(self, stage: Any, asset_roots: tuple[Path, ...]) -> int:
+        try:
+            from pxr import Sdf, Usd
+        except Exception:
+            return 0
+
+        root = stage.GetPrimAtPath(self.prim_path)
+        if not root or not root.IsValid():
+            return 0
+
+        fixed = 0
+        seen_roots: list[Path] = []
+        for asset_root in asset_roots:
+            if asset_root not in seen_roots:
+                seen_roots.append(asset_root)
+
+        for prim in Usd.PrimRange(root):
+            for attr in prim.GetAttributes():
+                value = attr.Get()
+                if not isinstance(value, Sdf.AssetPath):
+                    continue
+                raw_path = str(value.path or value.resolvedPath or "")
+                if not raw_path:
+                    continue
+                normalized = raw_path.replace("\\", "/")
+                if Path(normalized).is_absolute():
+                    continue
+                suffix = Path(normalized).suffix.lower()
+                if suffix not in {".bmp", ".exr", ".hdr", ".jpeg", ".jpg", ".png", ".tga", ".tif", ".tiff"}:
+                    continue
+                relative = normalized[2:] if normalized.startswith("./") else normalized
+                for asset_root in seen_roots:
+                    candidate = (asset_root / relative).resolve()
+                    if candidate.exists() and candidate.stat().st_size > 0:
+                        attr.Set(Sdf.AssetPath(str(candidate)))
+                        fixed += 1
+                        _log_debug(f"_spawn_reference texture path fixed attr={attr.GetPath()} asset={candidate}")
+                        break
+        return fixed
+
+    def _count_descendant_meshes(self, stage: Any) -> int:
+        try:
+            from pxr import Usd, UsdGeom
+        except Exception:
+            return -1
+
+        root = stage.GetPrimAtPath(self.prim_path)
+        if not root or not root.IsValid():
+            return 0
+        count = 0
+        for prim in Usd.PrimRange(root):
+            if prim.IsA(UsdGeom.Mesh):
+                count += 1
+        return count
 
     def _spawn_placeholder(self, stage: Any, *, translation: tuple[float, float, float]) -> None:
         try:

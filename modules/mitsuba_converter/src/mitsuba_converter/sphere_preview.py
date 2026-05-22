@@ -37,6 +37,7 @@ class PreviewResult(NamedTuple):
       * ``plugin_unavailable`` — Mitsuba build lacks the required variant for this file
       * ``load_error``         — file present but Mitsuba couldn't parse it
       * ``gpu_oom``            — Dr.Jit ran out of GPU/host-pinned memory loading the BSDF
+      * ``optix_unavailable``  — CUDA variant failed because the host driver cannot load OptiX
       * ``mitsuba_unavailable``— ``import mitsuba`` failed entirely
       * ``unknown``            — other failure (preset id not found, etc.)
     """
@@ -67,84 +68,59 @@ def _get_lock(key: str) -> threading.Lock:
 
 # ── Variant discovery ───────────────────────────────────────────────────────
 
-_VARIANTS_CACHE: list[str] | None = None
-
 
 def _available_variants() -> list[str]:
     """Return the list of Mitsuba variants compiled into the current build."""
-    global _VARIANTS_CACHE
-    if _VARIANTS_CACHE is not None:
-        return _VARIANTS_CACHE
-    try:
-        import mitsuba as mi
-    except ImportError:
-        _VARIANTS_CACHE = []
-        return _VARIANTS_CACHE
-    try:
-        variants_fn = getattr(mi, "variants", None)
-        if callable(variants_fn):
-            _VARIANTS_CACHE = list(variants_fn())
-            return _VARIANTS_CACHE
-    except Exception as exc:
-        logger.warning("mi.variants() call failed: %s", exc)
-    # Fall back to probing a fixed list.
-    probe = [
-        "cuda_ad_spectral_polarized", "llvm_ad_spectral_polarized", "scalar_spectral_polarized",
-        "cuda_ad_spectral", "llvm_ad_spectral", "scalar_spectral",
-        "cuda_ad_rgb", "llvm_ad_rgb", "cuda_rgb", "scalar_rgb",
-    ]
-    found: list[str] = []
-    for v in probe:
-        try:
-            mi.set_variant(v)
-            found.append(v)
-        except Exception:
-            continue
-    _VARIANTS_CACHE = found
-    return found
+    from .mitsuba_runtime import available_variants
 
-
-# GPU-only policy: sphere previews must run on CUDA. Falling back to LLVM /
-# scalar (CPU) variants makes a single 128x128 render take 30+ seconds, which
-# blocks the daemon worker and looks like a hang to the user. If no CUDA
-# variant is available, we return None and surface ``plugin_unavailable`` so
-# the failure is explicit instead of a silent slow render.
-#
-# Variant priority: prefer non-AD ("cuda_rgb" / "cuda_spectral") because the
-# autodiff machinery is dead weight for forward-only previews — it carries
-# extra GPU memory and JIT overhead per render. AD variants stay as the
-# fallback for builds that haven't enabled the leaner ones yet.
-_POLARIZED_ORDER = (
-    "cuda_ad_spectral_polarized",
-)
-
-_RGB_ORDER = (
-    "cuda_rgb",                # NEW: lightest (no AD, RGB-only)
-    "cuda_spectral",           # NEW: when spectral upsampling is needed (no AD)
-    "cuda_ad_spectral",        # fallback (AD present but unused)
-    "cuda_ad_rgb",
-)
+    return available_variants()
 
 
 def _pick_variant_for(kind: str) -> str | None:
-    """Return the first available CUDA variant for the given BSDF kind.
+    """Return the first working variant for the given BSDF kind.
 
     ``kind``:
       * ``"spectral_polarized"`` — required by the ``measured_polarized`` plugin.
-      * ``"rgb"`` — any CUDA variant that can render a colour sphere.
+      * ``"rgb"`` — any variant that can render a colour sphere.
 
-    Returns None when no suitable CUDA variant exists in the build. CPU
-    variants (``scalar_*`` / ``llvm_*``) are intentionally never selected —
-    falling back to CPU made previews unbearably slow.
+    Returns None when no suitable variant exists in the build. CUDA variants
+    are still preferred, but Docker hosts with an older OptiX runtime can now
+    fall back to LLVM/scalar instead of failing the whole preview pipeline.
     """
-    available = set(_available_variants())
-    if not available:
+    from .mitsuba_runtime import MitsubaVariantUnavailable, resolve_variant
+
+    try:
+        return resolve_variant(None, kind=kind, allow_cpu=True)
+    except MitsubaVariantUnavailable as exc:
+        logger.warning("No Mitsuba variant available for %s preview: %s", kind, exc)
         return None
-    order = _POLARIZED_ORDER if kind == "spectral_polarized" else _RGB_ORDER
-    for v in order:
-        if v in available:
-            return v
-    return None
+
+
+def _pick_fallback_variant_after_failure(kind: str, failed_variant: str, exc: BaseException) -> str | None:
+    """Mark a failed CUDA variant and resolve the next CPU-safe candidate."""
+    from .mitsuba_runtime import MitsubaVariantUnavailable, mark_variant_unavailable, resolve_variant
+
+    if not str(failed_variant).startswith("cuda_"):
+        return None
+    mark_variant_unavailable(failed_variant, exc)
+    try:
+        fallback = resolve_variant("auto", kind=kind, allow_cpu=True)
+    except MitsubaVariantUnavailable as fallback_exc:
+        logger.warning("No fallback Mitsuba variant after %s failed: %s", failed_variant, fallback_exc)
+        return None
+    if fallback == failed_variant:
+        return None
+    return fallback
+
+
+def _is_optix_unavailable_error(message: str) -> bool:
+    lowered = message.lower()
+    return (
+        "could not initialize optix" in lowered
+        or "failed to load optix" in lowered
+        or "optix 8.0 requires driver" in lowered
+        or "jit_optix_api_init" in lowered
+    )
 
 
 # ── Default BSDF dicts for each preset ──────────────────────────────────────
@@ -508,10 +484,15 @@ def _ensure_mitsuba_variant(variant: str) -> None:
     access, under ``_mitsuba_render_lock`` because Mitsuba's variant state is a
     process-wide global that is not safe to flip concurrently.
     """
-    import mitsuba as mi
+    from .mitsuba_runtime import ensure_mitsuba_variant
 
-    if getattr(mi, "variant", lambda: None)() != variant:
-        mi.set_variant(variant)
+    ensure_mitsuba_variant(variant)
+
+
+_KEEP_KERNEL_CACHE = (
+    os.environ.get("ROBOMITUBA_KEEP_KERNEL_CACHE", "1").strip().lower()
+    in ("1", "true", "yes", "on")
+)
 
 
 def _release_gpu_pool() -> None:
@@ -523,14 +504,33 @@ def _release_gpu_pool() -> None:
     leak ~hundreds of MB to several GB of VRAM each, eventually OOM-ing the
     process. Call this in a ``finally`` after every render attempt so the next
     one starts from a clean slate.
+
+    Phase B-1 (2026-04-30): ``flush_malloc_cache`` stays — it's the actual
+    leak defense. ``flush_kernel_cache`` is gated on
+    ``ROBOMITUBA_KEEP_KERNEL_CACHE`` (default ``1`` = keep). Flushing the
+    kernel cache between renders forces OptiX to re-compile shaders every
+    time, which is the dominant cost (~5 min) on driver versions that
+    miss the OptiX 8 shader cache. Keeping the cache makes the second
+    render of the same variant essentially free.
+
+    Set ``ROBOMITUBA_KEEP_KERNEL_CACHE=0`` to restore the old behavior
+    (24-hour rollback escape hatch — see plan Phase B-1).
     """
     try:
         import gc
         import drjit as dr  # type: ignore
         gc.collect()
-        # Dr.Jit 0.4+: flush cached allocations on every backend
-        for fn_name in ("flush_malloc_cache", "flush_kernel_cache"):
-            fn = getattr(dr, fn_name, None)
+        # malloc cache: always flush (anti-leak — anti-improvement #4).
+        fn = getattr(dr, "flush_malloc_cache", None)
+        if callable(fn):
+            try:
+                fn()
+            except Exception:
+                pass
+        # kernel cache: keep by default (Phase B-1). Flushing forces
+        # OptiX shader recompile on every render — the dominant cost.
+        if not _KEEP_KERNEL_CACHE:
+            fn = getattr(dr, "flush_kernel_cache", None)
             if callable(fn):
                 try:
                     fn()
@@ -867,6 +867,7 @@ def _render_channel_split(
     # `_render_single_channel_to_array`).
     rgba_per_wavelength: dict[int, np.ndarray] = {}
     n = len(wavelengths_to_render)
+    fallback_tried = False
     for idx, wl in enumerate(wavelengths_to_render):
         channel_path = channels_dir / f"{wl}.pbrdf"
         if not channel_path.exists():
@@ -878,13 +879,28 @@ def _render_channel_split(
             "alpha_sample": _alpha_sample_for("hpbrdf_2025", channels_dir.name),
         }
         try:
-            raw = _render_single_channel_to_array(
-                bsdf_dict, variant=variant, spp=spp, size=size, object_id=object_id,
-                bench_label=f"channel/{material_id}/{wl}nm",
-            )
+            while True:
+                try:
+                    raw = _render_single_channel_to_array(
+                        bsdf_dict, variant=variant, spp=spp, size=size, object_id=object_id,
+                        bench_label=f"channel/{material_id}/{wl}nm",
+                    )
+                    break
+                except Exception as exc:
+                    fallback = None if fallback_tried else _pick_fallback_variant_after_failure("spectral_polarized", variant, exc)
+                    if fallback is None:
+                        raise
+                    fallback_tried = True
+                    logger.warning(
+                        "channel-split falling back after %s failed (%s @ %d nm): %s -> %s",
+                        variant, channels_dir.name, wl, exc, fallback,
+                    )
+                    variant = fallback
         except Exception as exc:
             logger.warning("channel-split render failed (%s @ %d nm): %s",
                             channels_dir.name, wl, exc)
+            if _is_optix_unavailable_error(str(exc)):
+                return PreviewResult(None, "optix_unavailable")
             return PreviewResult(None, "load_error")
         if raw.ndim != 3 or raw.shape[2] < 4:
             logger.warning("channel-split: unexpected raw shape %s for %d nm",
@@ -1437,25 +1453,39 @@ def get_measured_preview(
                     dataset_id, material_id, variant_kind,
                 )
                 return PreviewResult(None, "plugin_unavailable")
+            fallback_tried = False
             try:
-                with _mitsuba_render_lock:
+                while True:
                     try:
-                        _ensure_mitsuba_variant(variant)
-                        ss = _supersample_default()
-                        render_size = size * ss
-                        scene_dict = _build_scene_dict(
-                            measured_bsdf, size=render_size, spp=spp, object_id=object_id,
+                        with _mitsuba_render_lock:
+                            try:
+                                _ensure_mitsuba_variant(variant)
+                                ss = _supersample_default()
+                                render_size = size * ss
+                                scene_dict = _build_scene_dict(
+                                    measured_bsdf, size=render_size, spp=spp, object_id=object_id,
+                                )
+                                _render_to_png(
+                                    scene_dict, measured_out, variant=variant, spp=spp,
+                                    supersample=ss, target_size=size,
+                                    bench_label=f"measured/{dataset_id}/{material_id}/{object_id}",
+                                )
+                            finally:
+                                # Defensive cleanup in case _render_to_png didn't reach
+                                # its own finally (e.g. OOM during mi.load_dict before
+                                # the scene var was bound).
+                                _release_gpu_pool()
+                        break
+                    except Exception as exc:
+                        fallback = None if fallback_tried else _pick_fallback_variant_after_failure(variant_kind, variant, exc)
+                        if fallback is None:
+                            raise
+                        fallback_tried = True
+                        logger.warning(
+                            "Measured preview falling back after %s failed (%s/%s): %s -> %s",
+                            variant, dataset_id, material_id, exc, fallback,
                         )
-                        _render_to_png(
-                            scene_dict, measured_out, variant=variant, spp=spp,
-                            supersample=ss, target_size=size,
-                            bench_label=f"measured/{dataset_id}/{material_id}/{object_id}",
-                        )
-                    finally:
-                        # Defensive cleanup in case _render_to_png didn't reach
-                        # its own finally (e.g. OOM during mi.load_dict before
-                        # the scene var was bound).
-                        _release_gpu_pool()
+                        variant = fallback
                 if measured_out.exists():
                     return PreviewResult(measured_out, "ok")
             except Exception as exc:
@@ -1469,7 +1499,11 @@ def get_measured_preview(
                     "Measured preview render failed (%s/%s, variant=%s): %s",
                     dataset_id, material_id, variant, msg,
                 )
-                return PreviewResult(None, "gpu_oom" if is_oom else "load_error")
+                if is_oom:
+                    return PreviewResult(None, "gpu_oom")
+                if _is_optix_unavailable_error(msg):
+                    return PreviewResult(None, "optix_unavailable")
+                return PreviewResult(None, "load_error")
 
         # File is absent or no measured_file_path given — render a deterministic
         # colored placeholder. We keep this ONLY for the "not downloaded" case,

@@ -5,6 +5,7 @@ import argparse
 from dataclasses import replace
 import json
 import math
+import os
 from pathlib import Path
 import sys
 import time
@@ -47,7 +48,7 @@ def parse_args() -> argparse.Namespace:
         default=REPO_ROOT / "out" / "reflective_island_demo_gpu_frontal_v1",
         help="Output root for scout and final renders.",
     )
-    parser.add_argument("--variant", default="cuda_ad_spectral")
+    parser.add_argument("--variant", default=os.environ.get("ROBOMITUBA_MITSUBA_VARIANT", "auto"))
     parser.add_argument("--scout-width", type=int, default=768)
     parser.add_argument("--scout-height", type=int, default=576)
     parser.add_argument("--scout-spp", type=int, default=1024)

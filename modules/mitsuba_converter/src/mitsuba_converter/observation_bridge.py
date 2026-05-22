@@ -261,7 +261,7 @@ def render_scene_state(
     *,
     repo_root: str | Path,
     out_dir: str | Path | None = None,
-    variant: str = "cuda_ad_spectral",
+    variant: str = "auto",
 ) -> dict[str, MultimodalRenderResult]:
     validate_render_request(render_request)
     if scene_state != render_request.scene_state:
@@ -314,7 +314,7 @@ def render_timestep_bundle(
     render_request: RenderRequest,
     *,
     repo_root: str | Path,
-    variant: str = "cuda_ad_spectral",
+    variant: str = "auto",
 ) -> ObservationBundleManifest:
     validate_render_request(render_request)
     root = Path(repo_root).resolve()
@@ -394,7 +394,7 @@ def render_timestep_bundle_split_lighting(
     render_request: RenderRequest,
     *,
     repo_root: str | Path,
-    variant: str = "cuda_ad_spectral",
+    variant: str = "auto",
     progress_callback: Callable[[str, Mapping[str, Any] | None], None] | None = None,
 ) -> ObservationBundleManifest:
     validate_render_request(render_request)

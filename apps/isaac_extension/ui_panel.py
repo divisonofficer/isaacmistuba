@@ -1,6 +1,7 @@
 """Robomituba Isaac Extension — omni.ui panel."""
 from __future__ import annotations
 
+import asyncio
 import os
 import sys
 import threading
@@ -58,6 +59,7 @@ _RUNTIME_SYNC_WATCH_FILES = (
     "__init__.py",
     "daemon_client.py",
     "extension.py",
+    "material_override_layer.py",
     "stage_capture.py",
     "ui_panel.py",
 )
@@ -138,8 +140,33 @@ class RobomitubaPanel:
 
         self._ui = ui
         self._window: Any = None
+        self._session_window: Any = None
+        self._optical_window: Any = None
+        self._capture_window: Any = None
+        self._jobs_window: Any = None
         self._runtime_sync_status = _runtime_extension_sync_status()
         self._runtime_sync_label: Any = None
+        self._status_labels: dict[str, Any] = {}
+        self._selection_inspector_label: Any = None
+        self._optical_chain_label: Any = None
+        self._optical_preview_container: Any = None
+        self._optical_metadata_label: Any = None
+        self._object_tree_container: Any = None
+        self._scene_health_label: Any = None
+        self._session_selection_label: Any = None
+        self._session_job_summary_label: Any = None
+        self._job_queue_container: Any = None
+        self._timeline_label: Any = None
+        self._capture_gallery_container: Any = None
+        self._latest_capture_preview_container: Any = None
+        self._operator_snapshot_label: Any = None
+        self._override_source_label: Any = None
+        self._override_layer_label: Any = None
+        self._validation_label: Any = None
+        self._scene_validation_label: Any = None
+        self._material_scope_combo: Any = None
+        self._material_scope_combo_model: Any = None
+        self._material_grid_container: Any = None
         self._scene_records: list[dict[str, Any]] = []
         self._scene_combo: Any = None
         self._scene_combo_model: Any = None
@@ -154,6 +181,7 @@ class RobomitubaPanel:
         self._daemon_material_records: list[dict[str, Any]] = []
         self._daemon_material_combo: Any = None
         self._daemon_material_combo_model: Any = None
+        self._daemon_material_combo_changed_sub: Any = None
         self._daemon_material_picker_container: Any = None
         self._selected_daemon_material_label: Any = None
         self._last_selection_signature: tuple[str, ...] = ()
@@ -169,138 +197,372 @@ class RobomitubaPanel:
         self._keyboard_input: Any = None
         self._keyboard_device: Any = None
         self._keyboard_subscription: Any = None
+        self._operator_health: dict[str, Any] = {}
+        self._isaac_commands: list[dict[str, Any]] = []
+        self._render_jobs: list[dict[str, Any]] = []
+        self._capture_records: list[dict[str, Any]] = []
+        self._object_inventory: list[dict[str, Any]] = []
+        self._selected_optical_material: dict[str, Any] = {}
+        self._last_operator_poll: dict[str, float] = {}
+        self._operator_refresh_requested = False
+        self._selection_refresh_requested = False
+        self._material_picker_refresh_requested = False
+        self._pending_selection_paths: list[str] = []
+        self._pending_material_selected_key: str | None = None
+        self._operator_refresh_lock = threading.Lock()
+        self._ui_update_subscription: Any = None
         self._build()
 
     def _build(self) -> None:
         ui = self._ui
-        self._window = ui.Window("Robomituba Render", width=540, height=760)
-        with self._window.frame:
+        self._session_window = ui.Window("RoboMitsuba Session", width=520, height=720)
+        self._window = self._session_window
+        with self._session_window.frame:
+            with ui.VStack(spacing=8):
+                self._build_status_strip()
+                with ui.ScrollingFrame():
+                    self._build_session_column()
+
+        self._optical_window = ui.Window("RoboMitsuba Optical Inspector", width=1080, height=860)
+        with self._optical_window.frame:
             with ui.ScrollingFrame():
-                with ui.VStack(spacing=6):
-                    ui.Label("Daemon URL", height=20)
-                    self._daemon_url_field = ui.StringField(height=24)
-                    self._daemon_url_field.model.set_value(DEFAULT_DAEMON_URL)
-                    runtime_sync_message = str(self._runtime_sync_status.get("message") or "").strip()
-                    if runtime_sync_message:
-                        self._runtime_sync_label = ui.Label(runtime_sync_message, height=42, word_wrap=True)
+                self._build_selection_material_column()
+        self._set_window_visible(self._optical_window, False)
+        self._dock_optical_with_property_panel()
 
-                    ui.Spacer(height=4)
-                    ui.Label("Quick Actions", height=20)
-                    self._scene_picker_container = ui.VStack(height=60)
-                    with self._scene_picker_container:
-                        pass
-                    with ui.HStack(spacing=6, height=30):
-                        refresh_scenes_btn = ui.Button("Refresh Scenes", width=140, height=30)
-                        refresh_scenes_btn.set_clicked_fn(self._on_refresh_scenes)
-                        load_scene_btn = ui.Button("Load Scene", width=120, height=30)
-                        load_scene_btn.set_clicked_fn(self._on_load_scene)
-                        prepare_btn = ui.Button("Prepare Render-Ready", width=170, height=30)
-                        prepare_btn.set_clicked_fn(self._on_prepare_render_ready)
-                        open_capture_btn = ui.Button("Open Latest Capture", width=170, height=30)
-                        open_capture_btn.set_clicked_fn(self._on_open_latest_capture)
+        self._jobs_window = ui.Window("RoboMitsuba Jobs", width=540, height=640)
+        with self._jobs_window.frame:
+            with ui.ScrollingFrame():
+                self._build_jobs_column()
+        self._set_window_visible(self._jobs_window, False)
 
-                    ui.Spacer(height=4)
-                    ui.Label("Advanced Session Settings", height=20)
-                    ui.Label("Base Scene XML (repo-relative)", height=20)
-                    self._scene_ref_field = ui.StringField(height=24)
-                    self._scene_ref_field.model.set_value(DEFAULT_SCENE_REF)
+        self._capture_window = ui.Window("RoboMitsuba Capture Browser", width=540, height=620)
+        with self._capture_window.frame:
+            with ui.ScrollingFrame():
+                self._build_capture_column()
+        self._set_window_visible(self._capture_window, False)
 
-                    ui.Label("Scene Snapshot Ref (repo-relative, optional)", height=20)
-                    self._scene_snapshot_ref_field = ui.StringField(height=24)
-
-                    ui.Label("Shape Map Ref (repo-relative)", height=20)
-                    self._shape_map_ref_field = ui.StringField(height=24)
-
-                    ui.Label("Scene ID", height=20)
-                    self._scene_id_field = ui.StringField(height=24)
-                    self._scene_id_field.model.set_value(DEFAULT_SCENE_ID)
-
-                    ui.Label("Submit Mode", height=20)
-                    self._submit_mode_combo = ui.ComboBox(0, *SUBMIT_MODES, width=160, height=24)
-
-                    ui.Spacer(height=6)
-                    ui.Label("Modalities", height=20)
-                    with ui.VStack(spacing=3):
-                        for mod in MODALITY_OPTIONS:
-                            with ui.HStack(spacing=8, height=22):
-                                cb = ui.CheckBox(width=20, height=20)
-                                cb.model.set_value(mod in {"rgb", "depth"})
-                                ui.Label(mod, width=180, height=20)
-                                self._modality_models[mod] = cb.model
-
-                    ui.Spacer(height=6)
-                    with ui.HStack(spacing=6, height=32):
-                        connect_btn = ui.Button("Connect Scene", width=160, height=32)
-                        connect_btn.set_clicked_fn(self._on_connect)
-                        sync_btn = ui.Button("Sync Session", width=160, height=32)
-                        sync_btn.set_clicked_fn(self._on_sync)
-
-                    ui.Spacer(height=8)
-                    ui.Label("Ranger Mini Robots", height=20)
-                    with ui.HStack(spacing=6, height=30):
-                        spawn_robot_btn = ui.Button("Spawn RangerMini", width=180, height=30)
-                        spawn_robot_btn.set_clicked_fn(self._on_spawn_robot)
-                        refresh_robot_btn = ui.Button("Refresh Robot List", width=180, height=30)
-                        refresh_robot_btn.set_clicked_fn(self._on_refresh_robots)
-                        focus_robot_btn = ui.Button("Find Selected", width=150, height=30)
-                        focus_robot_btn.set_clicked_fn(self._on_focus_robot)
-                    self._robot_picker_container = ui.VStack(height=30)
-                    with self._robot_picker_container:
-                        pass
-                    self._robot_list_label = ui.Label("No RangerMini robots in the stage.", height=90, word_wrap=True)
-                    ui.Label("Keyboard: Up/Down move, Left/Right turn, Q/E spin, Space stop, P park", height=20)
-                    with ui.HStack(spacing=6, height=30):
-                        for label, action in RANGER_ACTIONS[:5]:
-                            btn = ui.Button(label, width=100, height=30)
-                            btn.set_clicked_fn(lambda a=action: self._on_robot_action(a))
-                    with ui.HStack(spacing=6, height=30):
-                        for label, action in RANGER_ACTIONS[5:]:
-                            btn = ui.Button(label, width=100, height=30)
-                            btn.set_clicked_fn(lambda a=action: self._on_robot_action(a))
-
-                    ui.Spacer(height=6)
-                    ui.Label("Selection + Material Browser", height=20)
-                    self._selection_label = ui.Label("No selected prims synced yet.", height=40, word_wrap=True)
-                    with ui.HStack(spacing=6, height=30):
-                        open_material_browser_btn = ui.Button("Open Material Browser", width=180, height=30)
-                        open_material_browser_btn.set_clicked_fn(self._on_open_material_browser)
-                        push_selection_btn = ui.Button("Sync Selection", width=140, height=30)
-                        push_selection_btn.set_clicked_fn(self._on_sync_selection)
-                    with ui.HStack(spacing=6, height=30):
-                        self._selected_bsdf_combo = ui.ComboBox(0, *BSDF_OPTIONS, width=180, height=24)
-                        apply_selected_btn = ui.Button("Apply to Selected", width=150, height=30)
-                        apply_selected_btn.set_clicked_fn(self._on_apply_selected_override)
-                        clear_selected_btn = ui.Button("Clear Selected", width=130, height=30)
-                        clear_selected_btn.set_clicked_fn(self._on_clear_selected_override)
-                    ui.Label("Render Daemon Materials", height=20)
-                    self._selected_daemon_material_label = ui.Label("Selected material override: unknown", height=38, word_wrap=True)
-                    self._daemon_material_picker_container = ui.VStack(height=30)
-                    with self._daemon_material_picker_container:
-                        pass
-                    with ui.HStack(spacing=6, height=30):
-                        refresh_materials_btn = ui.Button("Refresh Materials", width=150, height=30)
-                        refresh_materials_btn.set_clicked_fn(self._on_refresh_daemon_materials)
-                        apply_daemon_material_btn = ui.Button("Apply Daemon Material", width=190, height=30)
-                        apply_daemon_material_btn.set_clicked_fn(self._on_apply_daemon_material)
-
-                    ui.Spacer(height=8)
-                    render_btn = ui.Button("Render Current View", height=36)
-                    render_btn.set_clicked_fn(self._on_render)
-
-                    ui.Spacer(height=6)
-                    ui.Label("Result", height=20)
-                    self._result_label = ui.Label("—", height=80, word_wrap=True)
         self._rebuild_scene_picker()
         self._do_refresh_scenes()
         self._setup_stage_dirty_tracking()
+        self._attach_material_override_layer()
+        self._setup_ui_update_subscription()
         threading.Thread(target=self._poll_remote_commands_loop, daemon=True).start()
         threading.Thread(target=self._poll_selection_loop, daemon=True).start()
         threading.Thread(target=self._poll_viewport_camera_loop, daemon=True).start()
-        self._setup_keyboard_shortcuts()
-        self._rebuild_robot_picker()
-        self._refresh_robot_records()
+        threading.Thread(target=self._poll_operator_state_loop, daemon=True).start()
         self._rebuild_daemon_material_picker()
+        self._refresh_control_status()
         threading.Thread(target=self._do_refresh_daemon_materials, daemon=True).start()
+
+    def _build_status_strip(self) -> None:
+        ui = self._ui
+        with ui.VStack(spacing=4, height=114):
+            ui.Label("RoboMitsuba Session", height=22)
+            with ui.HStack(spacing=6, height=34):
+                self._status_chip("daemon", "Daemon", "unknown", width=118)
+                self._status_chip("scene", "Scene", "-", width=118)
+                self._status_chip("sync", "Sync", "dirty", width=118)
+                self._status_chip("queue", "Queue", "idle", width=118)
+            runtime_sync_message = str(self._runtime_sync_status.get("message") or "").strip()
+            self._runtime_sync_label = ui.Label(runtime_sync_message or "Runtime sync: not checked", height=48, word_wrap=True)
+
+    def _set_window_visible(self, window: Any, visible: bool) -> None:
+        if window is None:
+            return
+        try:
+            window.visible = visible
+        except Exception:
+            pass
+
+    def _window_is_visible(self, window: Any) -> bool:
+        if window is None:
+            return False
+        try:
+            return bool(window.visible)
+        except Exception:
+            return True
+
+    def _show_optical_window(self) -> None:
+        self._set_window_visible(self._optical_window, True)
+        self._dock_optical_with_property_panel()
+        self._refresh_selection_label(self._selected_prim_paths())
+
+    def _dock_optical_with_property_panel(self) -> None:
+        async def _dock_when_ready() -> None:
+            try:
+                import omni.kit.app  # type: ignore
+                import omni.ui as ui  # type: ignore
+
+                for _ in range(8):
+                    await omni.kit.app.get_app().next_update_async()
+                    property_window = ui.Workspace.get_window("Property")
+                    optical_window = ui.Workspace.get_window("RoboMitsuba Optical Inspector")
+                    if property_window is not None and optical_window is not None:
+                        optical_window.dock_in(property_window, ui.DockPosition.BOTTOM, 0.68)
+                        return
+            except Exception:
+                return
+
+        try:
+            asyncio.ensure_future(_dock_when_ready())
+        except Exception:
+            pass
+
+    def _show_jobs_window(self) -> None:
+        self._set_window_visible(self._jobs_window, True)
+        self._rebuild_job_queue()
+        self._refresh_timeline()
+
+    def _show_capture_window(self) -> None:
+        self._set_window_visible(self._capture_window, True)
+        self._rebuild_capture_gallery()
+
+    def _build_main_columns(self) -> None:
+        ui = self._ui
+        with ui.HStack(spacing=12):
+            with ui.ScrollingFrame(width=350):
+                self._build_session_column()
+            with ui.ScrollingFrame(width=450):
+                self._build_selection_material_column()
+            with ui.ScrollingFrame(width=390):
+                self._build_pipeline_column()
+
+    def _build_session_column(self) -> None:
+        ui = self._ui
+        with ui.VStack(spacing=12, width=490):
+            with self._card("Scene / Session Rail"):
+                with ui.VStack(spacing=8):
+                    ui.Label("Daemon URL", height=18)
+                    self._daemon_url_field = ui.StringField(height=24)
+                    self._daemon_url_field.model.set_value(DEFAULT_DAEMON_URL)
+                    self._operator_snapshot_label = ui.Label("Daemon: waiting\nWorker: unknown\nGPU: unavailable", height=76, word_wrap=True)
+                    self._scene_picker_container = ui.VStack(height=58)
+                    with self._scene_picker_container:
+                        pass
+                    with ui.HStack(spacing=6, height=30):
+                        refresh_scenes_btn = ui.Button("Refresh", width=96, height=28)
+                        refresh_scenes_btn.set_clicked_fn(self._on_refresh_scenes)
+                        load_scene_btn = ui.Button("Load", width=86, height=28)
+                        load_scene_btn.set_clicked_fn(self._on_load_scene)
+                        connect_btn = ui.Button("Connect", width=96, height=28)
+                        connect_btn.set_clicked_fn(self._on_connect)
+                    with ui.HStack(spacing=6, height=30):
+                        sync_btn = ui.Button("Sync Session", width=134, height=28)
+                        sync_btn.set_clicked_fn(self._on_sync)
+                        prepare_btn = ui.Button("Prepare", width=134, height=28)
+                        prepare_btn.set_clicked_fn(self._on_prepare_render_ready)
+                        render_btn = ui.Button("Render View", width=112, height=28)
+                        render_btn.set_clicked_fn(self._on_render)
+                    with ui.HStack(spacing=6, height=30):
+                        optical_btn = ui.Button("Optical", width=96, height=28)
+                        optical_btn.set_clicked_fn(self._show_optical_window)
+                        jobs_btn = ui.Button("Jobs", width=82, height=28)
+                        jobs_btn.set_clicked_fn(self._show_jobs_window)
+                        captures_btn = ui.Button("Captures", width=104, height=28)
+                        captures_btn.set_clicked_fn(self._show_capture_window)
+                    with ui.CollapsableFrame("Advanced refs", height=0, collapsed=True):
+                        with ui.VStack(spacing=4):
+                            ui.Label("Base Scene XML", height=18)
+                            self._scene_ref_field = ui.StringField(height=22)
+                            self._scene_ref_field.model.set_value(DEFAULT_SCENE_REF)
+                            ui.Label("Scene Snapshot Ref", height=18)
+                            self._scene_snapshot_ref_field = ui.StringField(height=22)
+                            ui.Label("Shape Map Ref", height=18)
+                            self._shape_map_ref_field = ui.StringField(height=22)
+                            ui.Label("Scene ID", height=18)
+                            self._scene_id_field = ui.StringField(height=22)
+                            self._scene_id_field.model.set_value(DEFAULT_SCENE_ID)
+            with self._card("Scene Health"):
+                with ui.VStack(spacing=6):
+                    self._scene_health_label = ui.Label(
+                        "Session: inactive\nRender readiness: not checked\nShape map: unknown\nOptical overrides: unavailable",
+                        height=112,
+                        word_wrap=True,
+                    )
+            with self._card("Selected Prim / Material"):
+                with ui.VStack(spacing=8):
+                    self._session_selection_label = ui.Label(
+                        "Select a prim in the Isaac Stage tree to choose its optical material.",
+                        height=54,
+                        word_wrap=True,
+                    )
+                    material_btn = ui.Button("Choose Optical Material", height=32)
+                    material_btn.set_clicked_fn(self._show_optical_window)
+            with self._card("Queue Summary"):
+                with ui.VStack(spacing=6):
+                    self._session_job_summary_label = ui.Label(
+                        "Queue: idle\nLatest job: none\nOpen Jobs for the full timeline.",
+                        height=78,
+                        word_wrap=True,
+                    )
+            with self._card("Render"):
+                with ui.VStack(spacing=8):
+                    with ui.HStack(spacing=8, height=28):
+                        ui.Label("Submit", width=58, height=24)
+                        self._submit_mode_combo = ui.ComboBox(0, *SUBMIT_MODES, width=126, height=24)
+                    ui.Label("Modalities", height=18)
+                    self._build_modality_grid()
+            with self._card("Operation Log"):
+                with ui.VStack(spacing=6):
+                    self._result_label = ui.Label("-", height=130, word_wrap=True)
+
+    def _build_selection_material_column(self) -> None:
+        ui = self._ui
+        with ui.VStack(spacing=12):
+            with self._card("Selected Prim"):
+                with ui.VStack(spacing=8):
+                    self._selection_label = ui.Label("No selected prims synced yet.", height=22, word_wrap=True)
+                    self._selection_inspector_label = ui.Label("Select a prim in the Isaac Stage tree.", height=96, word_wrap=True)
+                    self._override_source_label = ui.Label("Resolved Mitsuba material: none", height=44, word_wrap=True)
+                    self._override_layer_label = ui.Label("Override layer: not attached", height=34, word_wrap=True)
+                    sync_selection_btn = ui.Button("Sync Selection", width=132, height=28)
+                    sync_selection_btn.set_clicked_fn(self._on_sync_selection)
+            with self._card("Optical Material Inspector"):
+                with ui.VStack(spacing=8):
+                    self._optical_chain_label = ui.Label(
+                        "Isaac visual material: none\nSemantic mapping: none\nMitsuba override: none\nResolved optical material: scene default",
+                        height=82,
+                        word_wrap=True,
+                    )
+                    self._optical_preview_container = ui.VStack(height=132)
+                    with self._optical_preview_container:
+                        ui.Label("Material preview: unavailable", height=36, word_wrap=True)
+                    self._optical_metadata_label = ui.Label(
+                        "Type: unknown\nTags: -\nPolarization: unknown\nNIR response: unknown",
+                        height=76,
+                        word_wrap=True,
+                    )
+                    self._material_grid_container = ui.VStack(height=560)
+                    with self._material_grid_container:
+                        ui.Label("Material library previews: refresh materials.", height=36, word_wrap=True)
+                    self._selected_daemon_material_label = ui.Label("Candidate optical material: refresh library", height=34, word_wrap=True)
+                    self._daemon_material_picker_container = ui.VStack(height=28)
+                    with self._daemon_material_picker_container:
+                        pass
+                    with ui.HStack(spacing=6, height=30):
+                        refresh_materials_btn = ui.Button("Refresh Materials", width=142, height=28)
+                        refresh_materials_btn.set_clicked_fn(self._on_refresh_daemon_materials)
+                        open_material_browser_btn = ui.Button("Open Browser", width=126, height=28)
+                        open_material_browser_btn.set_clicked_fn(self._on_open_material_browser)
+                    with ui.HStack(spacing=6, height=30):
+                        self._material_scope_combo = ui.ComboBox(0, "selected", "selected + children", "same visual material", "same semantic class", width=194, height=24)
+                        self._material_scope_combo_model = self._material_scope_combo.model
+                        apply_daemon_material_btn = ui.Button("Apply Preset", width=116, height=28)
+                        apply_daemon_material_btn.set_clicked_fn(self._on_apply_daemon_material)
+                    with ui.HStack(spacing=6, height=30):
+                        self._selected_bsdf_combo = ui.ComboBox(0, *BSDF_OPTIONS, width=194, height=24)
+                        apply_selected_btn = ui.Button("Apply BSDF", width=116, height=28)
+                        apply_selected_btn.set_clicked_fn(self._on_apply_selected_override)
+                        reset_material_btn = ui.Button("Reset", width=76, height=28)
+                        reset_material_btn.set_clicked_fn(self._on_reset_usd_material_override)
+                    self._validation_label = ui.Label("Validation: waiting for stage selection.", height=66, word_wrap=True)
+            with self._card("Selection Validation"):
+                with ui.VStack(spacing=6):
+                    self._scene_validation_label = ui.Label(
+                        "Selected prim: waiting\nScene validation: not checked\nMissing materials: unavailable\nExport issues: not checked",
+                        height=96,
+                        word_wrap=True,
+                    )
+
+    def _build_jobs_column(self) -> None:
+        ui = self._ui
+        with ui.VStack(spacing=12, width=510):
+            with self._card("Job Queue + Timeline"):
+                with ui.VStack(spacing=8):
+                    self._job_queue_container = ui.VStack(height=220)
+                    with self._job_queue_container:
+                        ui.Label("No active jobs yet.", height=34, word_wrap=True)
+                    self._timeline_label = ui.Label("Timeline: waiting for render activity.", height=110, word_wrap=True)
+            with self._card("Bridge Pipeline"):
+                with ui.VStack(spacing=6):
+                    for label, state in (
+                        ("Isaac connected", "waiting"),
+                        ("USD export", "not checked"),
+                        ("Shape map", "not checked"),
+                        ("Material metadata", "waiting"),
+                        ("Pose sync", "waiting"),
+                        ("Render request", "idle"),
+                        ("Capture attach", "not checked"),
+                    ):
+                        self._pipeline_row(label, state)
+            with self._card("Render Log Tail"):
+                with ui.VStack(spacing=6):
+                    ui.Label("Detailed daemon log tail is unavailable in this V1 pane.", height=42, word_wrap=True)
+
+    def _build_capture_column(self) -> None:
+        ui = self._ui
+        with ui.VStack(spacing=12, width=510):
+            with self._card("Latest Capture"):
+                with ui.VStack(spacing=8):
+                    self._latest_capture_preview_container = ui.VStack(height=132)
+                    with self._latest_capture_preview_container:
+                        ui.Label("Latest capture preview: none", height=36, word_wrap=True)
+                    with ui.HStack(spacing=6, height=30):
+                        open_latest_btn = ui.Button("Open Latest", width=116, height=28)
+                        open_latest_btn.set_clicked_fn(self._on_open_latest_capture)
+                        jobs_btn = ui.Button("Jobs", width=80, height=28)
+                        jobs_btn.set_clicked_fn(self._show_jobs_window)
+            with self._card("Capture Gallery"):
+                with ui.VStack(spacing=8):
+                    self._capture_gallery_container = ui.VStack(height=360)
+                    with self._capture_gallery_container:
+                        ui.Label("No captures for the selected scene.", height=36, word_wrap=True)
+
+    def _build_pipeline_column(self) -> None:
+        self._build_jobs_column()
+
+    def _card(self, title: str, width: int | None = None) -> Any:
+        kwargs: dict[str, Any] = {"height": 0, "collapsed": False}
+        if width is not None:
+            kwargs["width"] = width
+        return self._ui.CollapsableFrame(title, **kwargs)
+
+    def _status_chip(self, key: str, label: str, state: str, *, width: int = 160) -> Any:
+        chip = self._ui.Label(f"{label}: {state}", width=width, height=36, word_wrap=True)
+        self._status_labels[key] = chip
+        return chip
+
+    def _pipeline_row(self, label: str, state: str, rerun_label: str | None = None) -> None:
+        ui = self._ui
+        with ui.HStack(spacing=6, height=24):
+            ui.Label(label, width=160, height=22)
+            ui.Label(state, width=90, height=22)
+            if rerun_label:
+                ui.Button(rerun_label, width=78, height=22)
+            else:
+                ui.Label("-", width=24, height=22)
+
+    def _build_modality_grid(self) -> None:
+        ui = self._ui
+        rows = [MODALITY_OPTIONS[:5], MODALITY_OPTIONS[5:]]
+        with ui.VStack(spacing=3):
+            for row in rows:
+                with ui.HStack(spacing=8, height=24):
+                    for mod in row:
+                        with ui.HStack(spacing=2, width=56, height=22):
+                            cb = ui.CheckBox(width=18, height=18)
+                            cb.model.set_value(mod in {"rgb", "depth"})
+                            ui.Label(mod, width=34, height=18)
+                            self._modality_models[mod] = cb.model
+
+    def _build_robot_direction_pad(self) -> None:
+        ui = self._ui
+        rows = [
+            [("Spin L", "spin_left"), ("Forward", "forward"), ("Spin R", "spin_right")],
+            [("Left", "left"), ("Stop", "stop"), ("Right", "right")],
+            [("Strafe L", "strafe_left"), ("Back", "backward"), ("Strafe R", "strafe_right")],
+            [(None, None), ("Park", "park"), (None, None)],
+        ]
+        with ui.VStack(spacing=4):
+            for row in rows:
+                with ui.HStack(spacing=4, height=28):
+                    for label, action in row:
+                        if label is None:
+                            ui.Spacer(width=86)
+                            continue
+                        btn = ui.Button(label, width=86, height=26)
+                        btn.set_clicked_fn(lambda a=action: self._on_robot_action(a))
 
     def _on_render(self) -> None:
         self._set_result("Syncing state and rendering the current viewport…")
@@ -365,6 +627,10 @@ class RobomitubaPanel:
     def _on_clear_selected_override(self) -> None:
         self._set_result("Clearing BSDF override from the selected Isaac prims…")
         threading.Thread(target=self._do_apply_selected_override, args=(True,), daemon=True).start()
+
+    def _on_reset_usd_material_override(self) -> None:
+        self._set_result("Resetting RoboMitsuba material override on the selected scope…")
+        threading.Thread(target=self._do_reset_usd_material_override, daemon=True).start()
 
     def _selected_robot_record(self) -> dict[str, Any] | None:
         if not self._robot_records or self._robot_combo_model is None:
@@ -512,14 +778,6 @@ class RobomitubaPanel:
                     return
         except Exception:
             pass
-        try:
-            import omni.kit.commands  # type: ignore
-
-            prim_paths = self._selected_prim_paths()
-            if prim_paths:
-                omni.kit.commands.execute("FramePrimsCommand", prim_to_move=False, prims_to_frame=prim_paths, time_code=0.0)
-        except Exception:
-            pass
 
     def _setup_keyboard_shortcuts(self) -> None:
         try:
@@ -616,11 +874,13 @@ class RobomitubaPanel:
 
     def _mark_scene_state_dirty(self, *, reason: str | None = None) -> None:
         self._scene_state_dirty = True
+        self._refresh_control_status()
         if reason:
             self._log_progress("sync_state", self._current_scene_id(), "running", "state_dirty", reason, "isaac_stage", None)
 
     def _mark_material_state_dirty(self, *, reason: str | None = None) -> None:
         self._material_state_dirty = True
+        self._refresh_control_status()
         if reason:
             self._log_progress("sync_state", self._current_scene_id(), "running", "material_dirty", reason, "isaac_stage", None)
 
@@ -629,6 +889,7 @@ class RobomitubaPanel:
             self._scene_state_dirty = False
         if clear_material:
             self._material_state_dirty = False
+        self._refresh_control_status()
 
     def _setup_stage_dirty_tracking(self) -> None:
         try:
@@ -646,6 +907,23 @@ class RobomitubaPanel:
         except Exception:
             self._stage_notice_registration = None
 
+    def _attach_material_override_layer(self) -> None:
+        try:
+            try:
+                from isaac_extension.material_override_layer import attach_existing_override_layer, default_override_layer_path
+            except ImportError:  # pragma: no cover - Isaac runtime fallback
+                from material_override_layer import attach_existing_override_layer, default_override_layer_path
+
+            stage = self._get_stage()
+            scene_id = self._current_scene_id() or DEFAULT_SCENE_ID
+            layer = attach_existing_override_layer(stage, scene_id=scene_id)
+            layer_path = str(default_override_layer_path(stage, scene_id=scene_id))
+            if self._override_layer_label is not None:
+                status = "attached" if layer is not None else "ready"
+                self._override_layer_label.text = f"Override layer: {status} · {layer_path}"
+        except Exception:
+            pass
+
     def _on_stage_objects_changed(self, notice: Any, _sender: Any) -> None:
         try:
             resynced = [str(path) for path in notice.GetResyncedPaths() if str(path)]
@@ -659,16 +937,185 @@ class RobomitubaPanel:
         self._mark_scene_state_dirty(reason=f"Stage edits detected ({len(changed_paths)} path(s)).")
 
     def _refresh_selection_label(self, prim_paths: list[str]) -> None:
+        self._refresh_session_selection_summary(prim_paths)
         if self._selection_label is None:
             return
         if not prim_paths:
             self._selection_label.text = "No selected prims synced yet."
             self._refresh_selected_daemon_material_status(prim_paths)
+            self._refresh_selection_inspector(prim_paths)
             return
         preview = ", ".join(path.split("/")[-1] or path for path in prim_paths[:3])
         if len(prim_paths) > 3:
             preview = f"{preview} +{len(prim_paths) - 3}"
         self._selection_label.text = f"Selected prims: {preview}"
+        self._refresh_selection_inspector(prim_paths)
+
+    def _refresh_session_selection_summary(self, prim_paths: list[str]) -> None:
+        if self._session_selection_label is None:
+            return
+        if not prim_paths:
+            self._session_selection_label.text = (
+                "Select a prim in the Isaac Stage tree to choose its optical material."
+            )
+            return
+        first = prim_paths[0]
+        name = first.rsplit("/", 1)[-1] or first
+        suffix = f" +{len(prim_paths) - 1}" if len(prim_paths) > 1 else ""
+        self._session_selection_label.text = (
+            f"Selected: {name}{suffix}\n"
+            "Optical Inspector is open for material preview, picker, apply, and reset."
+        )
+
+    def _refresh_control_status(self) -> None:
+        if not self._status_labels:
+            return
+        daemon_url = ""
+        try:
+            daemon_url = self._daemon_url_field.model.get_value_as_string().strip()
+        except Exception:
+            daemon_url = DEFAULT_DAEMON_URL
+        scene_id = self._current_scene_id()
+        daemon_state = "connected" if self._scene_records else ("configured" if daemon_url else "disconnected")
+        if self._material_state_dirty:
+            sync_state = "materials dirty"
+        elif self._scene_state_dirty:
+            sync_state = "stage dirty"
+        else:
+            sync_state = "clean"
+        labels = {
+            "daemon": f"Daemon: {daemon_state}",
+            "scene": f"Scene: {scene_id or '-'}",
+            "sync": f"Sync: {sync_state}",
+            "queue": (
+                f"Queue: {self._operator_health.get('worker_state', 'idle')} "
+                f"({self._operator_health.get('queue_length', 0)} waiting)"
+            ),
+        }
+        for key, text in labels.items():
+            label = self._status_labels.get(key)
+            if label is not None:
+                label.text = text
+
+    def _refresh_selection_inspector(self, prim_paths: list[str]) -> None:
+        if self._selection_inspector_label is None:
+            return
+        if not prim_paths:
+            self._selection_inspector_label.text = "Select a prim in the Isaac Stage tree."
+            self._selected_optical_material = {}
+            self._refresh_optical_material_panel([])
+            if self._override_source_label is not None:
+                self._override_source_label.text = "Resolved Mitsuba material: none"
+            if self._validation_label is not None:
+                self._validation_label.text = "Validation: no selected prim."
+            if self._scene_validation_label is not None:
+                self._scene_validation_label.text = (
+                    "Selected prim: none\n"
+                    "Scene validation: not checked\n"
+                    "Missing materials: unavailable\n"
+                    "Export issues: not checked"
+                )
+            return
+        path = prim_paths[0]
+        try:
+            stage = self._get_stage()
+            prim = stage.GetPrimAtPath(path)
+            type_name = prim.GetTypeName() if prim and prim.IsValid() else "invalid"
+            is_mesh = self._prim_is_mesh(prim)
+            visual_material = self._bound_visual_material_path(prim)
+            semantic = self._semantic_label(prim)
+            export_status = "mesh/exportable" if is_mesh else "non-mesh or group"
+            self._selection_inspector_label.text = "\n".join(
+                [
+                    f"Prim: {path}",
+                    f"Type: {type_name} · {export_status}",
+                    f"Visual material: {visual_material or 'none'}",
+                    f"Semantic: {semantic or 'none'}",
+                ]
+            )
+            try:
+                from isaac_extension.material_override_layer import resolve_material_override
+            except ImportError:  # pragma: no cover - Isaac runtime fallback
+                from material_override_layer import resolve_material_override
+            resolved = resolve_material_override(stage, path, scene_id=self._current_scene_id() or DEFAULT_SCENE_ID)
+            if self._override_source_label is not None:
+                source = resolved.source if resolved.source_path is None else f"{resolved.source} @ {resolved.source_path}"
+                self._override_source_label.text = f"Resolved Mitsuba material: {resolved.label}\nSource: {source}"
+            if self._override_layer_label is not None:
+                self._override_layer_label.text = f"Override layer: {resolved.layer_path or 'unknown'}"
+            if self._validation_label is not None:
+                warnings = []
+                if not is_mesh:
+                    warnings.append("selected prim is not a Mesh; apply scope may expand to child meshes")
+                if resolved.source == "none":
+                    warnings.append("no explicit Mitsuba override")
+                self._validation_label.text = "Validation: " + ("; ".join(warnings) if warnings else "selected prim is ready")
+            if self._scene_validation_label is not None:
+                selected_status = "mesh/exportable" if is_mesh else "non-mesh or group"
+                self._scene_validation_label.text = "\n".join(
+                    [
+                        f"Selected prim: {selected_status}",
+                        "Scene validation: not checked",
+                        "Missing materials: unavailable",
+                        "Export issues: not checked",
+                    ]
+                )
+            self._refresh_optical_material_panel(prim_paths)
+        except Exception as exc:
+            self._selection_inspector_label.text = f"Inspector error: {exc}"
+            self._refresh_optical_material_panel(prim_paths)
+
+    def _prim_is_mesh(self, prim: Any) -> bool:
+        try:
+            from pxr import UsdGeom  # type: ignore
+
+            return bool(prim and prim.IsValid() and prim.IsA(UsdGeom.Mesh))
+        except Exception:
+            return False
+
+    def _bound_visual_material_path(self, prim: Any) -> str | None:
+        if not prim or not prim.IsValid():
+            return None
+        try:
+            try:
+                from isaac_extension.material_override_layer import bound_visual_material_path
+            except ImportError:  # pragma: no cover - Isaac runtime fallback
+                from material_override_layer import bound_visual_material_path
+
+            return bound_visual_material_path(prim)
+        except Exception:
+            return None
+
+    def _semantic_label(self, prim: Any) -> str | None:
+        if not prim or not prim.IsValid():
+            return None
+        for name in ("semantic:class", "semantic:label", "Semantics:semanticType", "Semantics:semanticData"):
+            try:
+                attr = prim.GetAttribute(name)
+                if attr and attr.Get():
+                    return str(attr.Get())
+            except Exception:
+                continue
+        return None
+
+    def _selected_material_scope(self) -> str:
+        labels = ["selected", "children", "same_visual", "same_semantic"]
+        try:
+            index = int(self._material_scope_combo_model.get_item_value_model().get_value_as_int())
+            return labels[index]
+        except Exception:
+            return "selected"
+
+    def _expanded_material_scope_paths(self, stage: Any, prim_paths: list[str]) -> list[str]:
+        try:
+            try:
+                from isaac_extension.material_override_layer import expand_material_scope
+            except ImportError:  # pragma: no cover - Isaac runtime fallback
+                from material_override_layer import expand_material_scope
+
+            return expand_material_scope(stage, prim_paths, scope=self._selected_material_scope())
+        except Exception:
+            return prim_paths
 
     def _daemon_material_label(self, record: dict[str, Any]) -> str:
         group = str(record.get("group_display_name") or record.get("dataset_id") or "Material")
@@ -689,6 +1136,76 @@ class RobomitubaPanel:
                     if str(item.get("key")) == selected_key:
                         self._daemon_material_combo_model.get_item_value_model().set_value(index)
                         break
+            try:
+                self._daemon_material_combo_changed_sub = self._daemon_material_combo_model.add_item_changed_fn(
+                    lambda *_args: self._refresh_candidate_optical_material_status()
+                )
+            except Exception:
+                self._daemon_material_combo_changed_sub = None
+        self._rebuild_daemon_material_grid()
+
+    def _rebuild_daemon_material_grid(self) -> None:
+        ui = self._ui
+        if self._material_grid_container is None:
+            return
+        selected = self._selected_daemon_material_record()
+        selected_key = str(selected.get("key")) if selected else ""
+        columns = 8
+        card_width = 118
+        image_size = 88
+        row_height = 132
+        with self._material_grid_container:
+            self._material_grid_container.clear()
+            if not self._daemon_material_records:
+                ui.Label("Material library previews: refresh materials.", height=36, word_wrap=True)
+                return
+            with ui.ScrollingFrame(height=548):
+                with ui.VStack(spacing=8):
+                    for start in range(0, len(self._daemon_material_records), columns):
+                        row = self._daemon_material_records[start : start + columns]
+                        with ui.HStack(spacing=8, height=row_height):
+                            for offset, material in enumerate(row):
+                                index = start + offset
+                                key = str(material.get("key") or "")
+                                title = str(material.get("display_name") or material.get("material_id") or "material")
+                                prefix = "[selected] " if key and key == selected_key else ""
+                                with ui.VStack(spacing=3, width=card_width, height=row_height - 4):
+                                    local_path = None
+                                    try:
+                                        try:
+                                            from isaac_extension.daemon_client import material_preview_local_path
+                                        except ImportError:  # pragma: no cover - Isaac runtime fallback
+                                            from daemon_client import material_preview_local_path
+                                        local_path = material_preview_local_path(
+                                            material,
+                                            repo_root=os.environ.get("ROBOMITUBA_WINDOWS_REPO_ROOT")
+                                            or os.environ.get("ROBOMITUBA_ROOT")
+                                            or "",
+                                        )
+                                    except Exception:
+                                        local_path = None
+                                    if self._is_isaac_image_path(local_path):
+                                        try:
+                                            ui.Image(local_path, width=image_size, height=image_size)
+                                        except Exception:
+                                            ui.Label(self._material_swatch_hint(material), height=image_size, word_wrap=True)
+                                    else:
+                                        ui.Label(self._material_swatch_hint(material), height=image_size, word_wrap=True)
+                                    btn = ui.Button((prefix + title)[:32], height=28)
+                                    btn.set_clicked_fn(lambda i=index: self._select_daemon_material_index(i))
+                            for _ in range(columns - len(row)):
+                                ui.Spacer(width=card_width)
+
+    def _select_daemon_material_index(self, index: int) -> None:
+        if index < 0 or index >= len(self._daemon_material_records):
+            return
+        if self._daemon_material_combo_model is not None:
+            try:
+                self._daemon_material_combo_model.get_item_value_model().set_value(index)
+            except Exception:
+                pass
+        self._refresh_candidate_optical_material_status()
+        self._rebuild_daemon_material_grid()
 
     def _selected_daemon_material_record(self) -> dict[str, Any] | None:
         if not self._daemon_material_records or self._daemon_material_combo_model is None:
@@ -700,6 +1217,133 @@ class RobomitubaPanel:
         if index < 0 or index >= len(self._daemon_material_records):
             return None
         return self._daemon_material_records[index]
+
+    def _refresh_candidate_optical_material_status(self) -> None:
+        material = self._selected_daemon_material_record()
+        if self._selected_daemon_material_label is not None:
+            if material is None:
+                self._selected_daemon_material_label.text = "Candidate optical material: refresh material library"
+            else:
+                self._selected_daemon_material_label.text = f"Candidate optical material: {self._daemon_material_label(material)}"
+        self._refresh_material_preview(material)
+
+    def _refresh_material_preview(self, material: dict[str, Any] | None) -> None:
+        ui = self._ui
+        if self._optical_preview_container is None:
+            return
+        if self._optical_window is not None and not self._window_is_visible(self._optical_window):
+            return
+        with self._optical_preview_container:
+            self._optical_preview_container.clear()
+            local_path = None
+            if material:
+                try:
+                    try:
+                        from isaac_extension.daemon_client import material_preview_local_path
+                    except ImportError:  # pragma: no cover - Isaac runtime fallback
+                        from daemon_client import material_preview_local_path
+                    local_path = material_preview_local_path(material, repo_root=os.environ.get("ROBOMITUBA_WINDOWS_REPO_ROOT") or os.environ.get("ROBOMITUBA_ROOT") or "")
+                except Exception:
+                    local_path = None
+            if self._is_isaac_image_path(local_path):
+                try:
+                    ui.Image(local_path, width=132, height=112)
+                except Exception:
+                    ui.Label(f"Preview image:\n{local_path}", height=70, word_wrap=True)
+            elif material:
+                swatch = self._material_swatch_hint(material)
+                ui.Label(f"Preview sphere: cached image unavailable\n{swatch}", height=70, word_wrap=True)
+            else:
+                ui.Label("Material preview: select or refresh an optical material.", height=52, word_wrap=True)
+
+    def _refresh_optical_material_panel(self, prim_paths: list[str]) -> None:
+        material = self._selected_daemon_material_record()
+        path = prim_paths[0] if prim_paths else None
+        visual_material = "none"
+        semantic = "none"
+        resolved_label = "scene default"
+        resolved_source = "none"
+        override_source = "none"
+        inheritance = "not bound"
+        tags: list[str] = []
+        if path:
+            try:
+                stage = self._get_stage()
+                prim = stage.GetPrimAtPath(path)
+                visual = self._bound_visual_material_path(prim)
+                semantic_value = self._semantic_label(prim)
+                visual_material = visual or "none"
+                semantic = semantic_value or "none"
+                inheritance = "inherited/bound" if visual else "not bound"
+                try:
+                    from isaac_extension.material_override_layer import resolve_material_override
+                except ImportError:  # pragma: no cover - Isaac runtime fallback
+                    from material_override_layer import resolve_material_override
+                resolved = resolve_material_override(stage, path, scene_id=self._current_scene_id() or DEFAULT_SCENE_ID)
+                resolved_label = resolved.label or "scene default"
+                resolved_source = resolved.source or "none"
+                override_source = resolved.source if resolved.source != "none" else "none"
+            except Exception:
+                pass
+        if material:
+            mat_type = str(material.get("bsdf_type") or material.get("kind") or "unknown")
+            category = str(material.get("category") or "")
+            caps = material.get("capabilities") if isinstance(material.get("capabilities"), dict) else {}
+            tags = [item for item in (category, mat_type, "polarized" if caps.get("polarization") else "") if item]
+        else:
+            mat_type = "unknown"
+            caps = {}
+        if self._optical_chain_label is not None:
+            self._optical_chain_label.text = "\n".join(
+                [
+                    f"Isaac visual material: {visual_material} ({inheritance})",
+                    f"Semantic mapping: {semantic}",
+                    f"Mitsuba override: {override_source}",
+                    f"Resolved optical material: {resolved_label} ({resolved_source})",
+                ]
+            )
+        if self._optical_metadata_label is not None:
+            roughness = self._material_roughness_hint(material)
+            polar = "supported" if caps.get("polarization") else ("unknown" if not caps else "not advertised")
+            nir = "available" if caps.get("nir") else ("medium/unknown" if mat_type in {"measured", "measured_polarized"} else "unknown")
+            self._optical_metadata_label.text = "\n".join(
+                [
+                    f"Type: {mat_type}",
+                    f"Roughness: {roughness}",
+                    f"Tags: {', '.join(tags) if tags else '-'}",
+                    f"Polarization: {polar}",
+                    f"NIR response: {nir}",
+                ]
+            )
+        self._refresh_candidate_optical_material_status()
+
+    def _material_roughness_hint(self, material: dict[str, Any] | None) -> str:
+        if not material:
+            return "unknown"
+        for key in ("roughness", "alpha", "alpha_u"):
+            value = material.get(key)
+            if value not in (None, ""):
+                return str(value)
+        desc = str(material.get("description") or "").lower()
+        if "rough" in desc:
+            return "rough"
+        if "mirror" in desc or "gloss" in desc:
+            return "low"
+        return "unknown"
+
+    def _material_swatch_hint(self, material: dict[str, Any]) -> str:
+        name = str(material.get("display_name") or material.get("material_id") or "material")
+        mat_type = str(material.get("bsdf_type") or material.get("kind") or "unknown")
+        category = str(material.get("category") or "optical")
+        return f"{name} · {category} · {mat_type}"
+
+    def _is_isaac_image_path(self, path: str | None) -> bool:
+        if not path:
+            return False
+        value = str(path)
+        if value.startswith("\\\\"):
+            return False
+        return (len(value) > 1 and value[1] == ":") or Path(value).exists()
 
     def _do_refresh_daemon_materials(self) -> None:
         try:
@@ -741,12 +1385,17 @@ class RobomitubaPanel:
                         "display_name": str(material.get("display_name") or material_id),
                         "native_file": native_file,
                         "bsdf_type": "measured" if strategy == "measured" else "measured_polarized",
+                        "category": str(material.get("category") or group.get("category") or ""),
+                        "description": str(material.get("description") or ""),
+                        "status": status,
+                        "capabilities": dict(group.get("capabilities") or {}),
+                        "preview_path": str(material.get("preview_path") or material.get("preview_png") or ""),
                     }
                     records.append(record)
             selected = self._selected_daemon_material_record()
             selected_key = str(selected.get("key")) if selected else None
             self._daemon_material_records = records
-            self._rebuild_daemon_material_picker(selected_key=selected_key)
+            self._request_material_picker_refresh(selected_key)
             self._set_result(f"Loaded {len(records)} render daemon material(s).")
         except Exception as exc:  # pragma: no cover
             if self._selected_daemon_material_label is not None:
@@ -805,13 +1454,12 @@ class RobomitubaPanel:
         daemon_url = self._daemon_url_field.model.get_value_as_string().strip()
         prim_paths = self._selected_prim_paths()
         signature = tuple(prim_paths)
-        self._refresh_selection_label(prim_paths)
         if signature == self._last_selection_signature:
             return
         self._last_selection_signature = signature
+        self._request_selection_refresh(prim_paths)
         if daemon_url:
             update_isaac_selection(prim_paths, daemon_url=daemon_url, timeout_s=2.0)
-            self._refresh_selected_daemon_material_status(prim_paths)
 
     def _poll_selection_loop(self) -> None:
         while not self._stop_event.is_set():
@@ -860,6 +1508,436 @@ class RobomitubaPanel:
             timeout_s=0.08,
             modalities=["rgb"],
         )
+
+    def _poll_operator_state_loop(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                now = time.monotonic()
+                daemon_url = self._daemon_url()
+                if now - self._last_operator_poll.get("health", 0.0) >= 1.0:
+                    self._operator_health = self._fetch_operator_health(daemon_url)
+                    self._last_operator_poll["health"] = now
+                if now - self._last_operator_poll.get("jobs", 0.0) >= 2.0:
+                    self._isaac_commands = self._fetch_isaac_commands(daemon_url)
+                    self._render_jobs = self._fetch_render_jobs(daemon_url)
+                    self._last_operator_poll["jobs"] = now
+                if now - self._last_operator_poll.get("inventory", 0.0) >= 3.0:
+                    self._object_inventory = self._fetch_object_inventory(daemon_url)
+                    self._last_operator_poll["inventory"] = now
+                scene_id = self._current_scene_id()
+                if scene_id and now - self._last_operator_poll.get("captures", 0.0) >= 5.0:
+                    self._capture_records = self._fetch_scene_captures(daemon_url, scene_id)
+                    self._last_operator_poll["captures"] = now
+                self._request_operator_console_refresh()
+            except Exception:
+                pass
+            time.sleep(0.5)
+
+    def _setup_ui_update_subscription(self) -> None:
+        try:
+            import omni.kit.app  # type: ignore
+
+            stream = omni.kit.app.get_app().get_update_event_stream()
+            self._ui_update_subscription = stream.create_subscription_to_pop(
+                self._on_ui_update_tick,
+                name="robomituba_operator_console_refresh",
+            )
+        except Exception:
+            self._ui_update_subscription = None
+
+    def _request_operator_console_refresh(self) -> None:
+        with self._operator_refresh_lock:
+            self._operator_refresh_requested = True
+
+    def _request_selection_refresh(self, prim_paths: list[str]) -> None:
+        with self._operator_refresh_lock:
+            self._pending_selection_paths = list(prim_paths)
+            self._selection_refresh_requested = True
+
+    def _request_material_picker_refresh(self, selected_key: str | None) -> None:
+        with self._operator_refresh_lock:
+            self._pending_material_selected_key = selected_key
+            self._material_picker_refresh_requested = True
+
+    def _on_ui_update_tick(self, _event: Any) -> None:
+        with self._operator_refresh_lock:
+            requested = self._operator_refresh_requested
+            self._operator_refresh_requested = False
+            selection_requested = self._selection_refresh_requested
+            selection_paths = list(self._pending_selection_paths)
+            self._selection_refresh_requested = False
+            material_requested = self._material_picker_refresh_requested
+            material_selected_key = self._pending_material_selected_key
+            self._material_picker_refresh_requested = False
+        if requested and not self._stop_event.is_set():
+            self._refresh_operator_console()
+        if selection_requested and not self._stop_event.is_set():
+            if selection_paths:
+                self._set_window_visible(self._optical_window, True)
+            self._refresh_selection_label(selection_paths)
+        if material_requested and not self._stop_event.is_set():
+            self._rebuild_daemon_material_picker(selected_key=material_selected_key)
+            self._refresh_candidate_optical_material_status()
+
+    def _daemon_url(self) -> str:
+        try:
+            return self._daemon_url_field.model.get_value_as_string().strip() or DEFAULT_DAEMON_URL
+        except Exception:
+            return DEFAULT_DAEMON_URL
+
+    def _fetch_operator_health(self, daemon_url: str) -> dict[str, Any]:
+        try:
+            try:
+                from isaac_extension.daemon_client import get_health
+            except ImportError:  # pragma: no cover - Isaac runtime fallback
+                from daemon_client import get_health
+            return get_health(daemon_url=daemon_url, timeout_s=1.5)
+        except Exception as exc:
+            return {"status": "unavailable", "error": str(exc)}
+
+    def _fetch_isaac_commands(self, daemon_url: str) -> list[dict[str, Any]]:
+        try:
+            try:
+                from isaac_extension.daemon_client import list_isaac_commands
+            except ImportError:  # pragma: no cover - Isaac runtime fallback
+                from daemon_client import list_isaac_commands
+            return list_isaac_commands(daemon_url=daemon_url, timeout_s=2.0)[:30]
+        except Exception:
+            return []
+
+    def _fetch_render_jobs(self, daemon_url: str) -> list[dict[str, Any]]:
+        try:
+            try:
+                from isaac_extension.daemon_client import list_render_jobs
+            except ImportError:  # pragma: no cover - Isaac runtime fallback
+                from daemon_client import list_render_jobs
+            return list_render_jobs(daemon_url=daemon_url, limit=40, timeout_s=2.0)
+        except Exception:
+            return []
+
+    def _fetch_scene_captures(self, daemon_url: str, scene_id: str) -> list[dict[str, Any]]:
+        try:
+            try:
+                from isaac_extension.daemon_client import list_scene_captures
+            except ImportError:  # pragma: no cover - Isaac runtime fallback
+                from daemon_client import list_scene_captures
+            return list_scene_captures(scene_id, daemon_url=daemon_url, timeout_s=2.5)[:12]
+        except Exception:
+            return []
+
+    def _fetch_object_inventory(self, daemon_url: str) -> list[dict[str, Any]]:
+        try:
+            try:
+                from isaac_extension.daemon_client import get_isaac_session_inventory
+            except ImportError:  # pragma: no cover - Isaac runtime fallback
+                from daemon_client import get_isaac_session_inventory
+            return get_isaac_session_inventory(daemon_url=daemon_url, timeout_s=2.0)
+        except Exception:
+            return []
+
+    def _refresh_operator_console(self) -> None:
+        self._refresh_control_status()
+        self._refresh_operator_snapshot()
+        self._refresh_scene_health()
+        self._refresh_session_job_summary()
+        if self._window_is_visible(self._jobs_window):
+            self._rebuild_job_queue()
+            self._refresh_timeline()
+        if self._window_is_visible(self._capture_window):
+            self._rebuild_capture_gallery()
+
+    def _refresh_operator_snapshot(self) -> None:
+        if self._operator_snapshot_label is None:
+            return
+        health = self._operator_health
+        gpu_text = "GPU: unavailable"
+        gpus = health.get("gpus")
+        if isinstance(gpus, list) and gpus:
+            first = gpus[0] if isinstance(gpus[0], dict) else {}
+            gpu_text = f"GPU: {first.get('util_pct', '?')}% · {first.get('mem_used_mb', '?')}/{first.get('mem_total_mb', '?')} MB"
+        active = health.get("active_isaac_command")
+        active_text = "Active command: none"
+        if isinstance(active, dict):
+            active_text = f"Active command: {active.get('command_type')} · {active.get('progress_stage') or active.get('status')}"
+        self._operator_snapshot_label.text = "\n".join(
+            [
+                f"Daemon: {health.get('status', 'unknown')} · {self._daemon_url()}",
+                f"Worker: {health.get('worker_state', 'unknown')} · queue {health.get('queue_length', 0)}",
+                active_text,
+                gpu_text,
+            ]
+        )
+
+    def _refresh_scene_health(self) -> None:
+        if self._scene_health_label is None:
+            return
+        health = self._operator_health
+        session_state = "active" if health.get("isaac_connected") else "inactive"
+        scene_id = self._current_scene_id() or health.get("isaac_scene_id") or "-"
+        selected = self._selected_prim_paths()
+        override_count = sum(1 for item in self._object_inventory if item.get("override_bsdf"))
+        shape_count = sum(int(item.get("shape_count") or 0) for item in self._object_inventory if int(item.get("depth") or 0) == 0)
+        dirty_bits = []
+        if self._scene_state_dirty:
+            dirty_bits.append("stage dirty")
+        if self._material_state_dirty:
+            dirty_bits.append("materials dirty")
+        sync_state = ", ".join(dirty_bits) if dirty_bits else "clean"
+        active_stage = health.get("active_stage")
+        active_cmd = health.get("active_isaac_command")
+        if not active_stage and isinstance(active_cmd, dict):
+            active_stage = active_cmd.get("progress_stage")
+        self._scene_health_label.text = "\n".join(
+            [
+                f"Session: {session_state} · scene {scene_id}",
+                f"Sync: {sync_state}",
+                f"Render readiness: {active_stage or 'idle'}",
+                f"Optical overrides: {override_count}",
+                f"Shape coverage: {shape_count or 'unknown'} shapes",
+                f"Selected prims: {len(selected)}",
+            ]
+        )
+
+    def _rebuild_object_tree(self) -> None:
+        ui = self._ui
+        if self._object_tree_container is None:
+            return
+        selected = set(self._selected_prim_paths())
+        with self._object_tree_container:
+            self._object_tree_container.clear()
+            if not self._object_inventory:
+                ui.Label("No session inventory yet. Connect and sync to inspect object hierarchy.", height=48, word_wrap=True)
+                return
+            rows = sorted(
+                self._object_inventory,
+                key=lambda item: tuple(str(item.get("path") or "").split("/")),
+            )[:16]
+            for item in rows:
+                path = str(item.get("path") or item.get("prim_path") or "")
+                depth = int(item.get("depth") or max(0, path.count("/") - 1))
+                name = str(item.get("name") or path.rsplit("/", 1)[-1] or path)
+                marker = ">" if path in selected else " "
+                override = " M" if item.get("override_bsdf") else ""
+                shapes = int(item.get("shape_count") or 0)
+                label = f"{marker} {'  ' * min(depth, 4)}{name}{override} · shapes {shapes}"
+                btn = ui.Button(label[:64], height=22)
+                btn.set_clicked_fn(lambda p=path: self._select_inventory_prim(p))
+
+    def _refresh_session_job_summary(self) -> None:
+        if self._session_job_summary_label is None:
+            return
+        rows = self._job_rows_for_console()
+        active = next((row for row in rows if row.get("status") == "running"), None)
+        queued = sum(1 for row in rows if row.get("status") == "queued")
+        failed = next((row for row in rows if row.get("status") == "failed"), None)
+        latest = rows[0] if rows else None
+        if active:
+            latest_text = f"Running: {active.get('title')} · {active.get('stage') or active.get('status')}"
+        elif failed:
+            latest_text = f"Needs attention: {failed.get('title')} · failed"
+        elif latest:
+            latest_text = f"Latest: {latest.get('title')} · {latest.get('status') or 'unknown'}"
+        else:
+            latest_text = "Latest: none"
+        self._session_job_summary_label.text = "\n".join(
+            [
+                f"Worker: {self._operator_health.get('worker_state', 'idle')} · queued {queued}",
+                latest_text,
+                "Open Jobs for queue, timeline, and pipeline detail.",
+            ]
+        )
+
+    def _select_inventory_prim(self, prim_path: str) -> None:
+        if prim_path:
+            self._select_robot_prim(prim_path, focus=False, push_to_daemon=True)
+
+    def _rebuild_job_queue(self) -> None:
+        ui = self._ui
+        if self._job_queue_container is None:
+            return
+        rows = self._job_rows_for_console()
+        with self._job_queue_container:
+            self._job_queue_container.clear()
+            if not rows:
+                ui.Label("No active or recent jobs.", height=34, word_wrap=True)
+                return
+            for row in rows[:8]:
+                tone = self._status_glyph(row.get("status"))
+                title = str(row.get("title") or row.get("id") or "job")
+                stage = str(row.get("stage") or row.get("status") or "")
+                scene = str(row.get("scene_id") or "-")
+                ui.Label(f"{tone} {title} · {stage} · {scene}", height=22, word_wrap=True)
+
+    def _job_rows_for_console(self) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        active = self._operator_health.get("active_isaac_command")
+        if isinstance(active, dict):
+            rows.append(self._isaac_command_row(active))
+        seen_cmd_ids = {str(active.get("command_id"))} if isinstance(active, dict) else set()
+        for command in self._isaac_commands:
+            cid = str(command.get("command_id") or "")
+            if cid in seen_cmd_ids:
+                continue
+            if command.get("status") in {"queued", "dispatched", "running", "failed", "succeeded"}:
+                rows.append(self._isaac_command_row(command))
+        for job in self._render_jobs:
+            rows.append(
+                {
+                    "kind": "render",
+                    "id": str(job.get("job_id") or ""),
+                    "title": f"Render {str(job.get('job_id') or '')[:14]}",
+                    "status": str(job.get("status") or ""),
+                    "stage": str(job.get("progress_stage") or ""),
+                    "scene_id": str(job.get("scene_id") or ""),
+                }
+            )
+        status_rank = {"running": 0, "dispatched": 0, "queued": 1, "failed": 2, "succeeded": 3}
+        rows.sort(key=lambda row: status_rank.get(str(row.get("status") or ""), 4))
+        return rows
+
+    def _isaac_command_row(self, command: dict[str, Any]) -> dict[str, Any]:
+        command_type = str(command.get("command_type") or "command")
+        status = str(command.get("status") or "")
+        normalized = "running" if status == "dispatched" else status
+        return {
+            "kind": "isaac",
+            "id": str(command.get("command_id") or ""),
+            "title": f"Isaac {command_type.replace('_', ' ')}",
+            "status": normalized,
+            "stage": str(command.get("progress_stage") or command.get("progress_message") or ""),
+            "scene_id": str(command.get("scene_id") or ""),
+        }
+
+    def _status_glyph(self, status: Any) -> str:
+        value = str(status or "")
+        if value in {"running", "dispatched"}:
+            return "[run]"
+        if value == "queued":
+            return "[queue]"
+        if value == "succeeded":
+            return "[ok]"
+        if value == "failed":
+            return "[fail]"
+        if value == "cancelled":
+            return "[cancel]"
+        return "[idle]"
+
+    def _refresh_timeline(self) -> None:
+        if self._timeline_label is None:
+            return
+        active = next((row for row in self._job_rows_for_console() if row.get("status") == "running"), None)
+        stage = str(active.get("stage") or "") if active else ""
+        steps = [
+            ("Session", {"picked_up", "ensuring_session", "opening_session", "collecting_scene_refs"}),
+            ("Capture", {"capturing_view", "capturing_stage_state", "syncing_viewport_camera"}),
+            ("Submit", {"sending_capture_request", "polling_render", "queued"}),
+            ("XML", {"staging_scene"}),
+            ("GPU", {"loading_scene"}),
+            ("Render", {"rendering", "ambient", "active", "polar"}),
+            ("Save", {"saving_output"}),
+            ("Manifest", {"writing_manifest", "complete", "ready"}),
+        ]
+        labels = []
+        active_seen = False
+        for label, aliases in steps:
+            if stage in aliases:
+                labels.append(f"[{label}]")
+                active_seen = True
+            elif active_seen:
+                labels.append(label.lower())
+            else:
+                labels.append(label)
+        self._timeline_label.text = "Timeline:\n" + " -> ".join(labels) + (f"\nCurrent: {stage}" if stage else "\nCurrent: idle")
+
+    def _rebuild_capture_gallery(self) -> None:
+        ui = self._ui
+        self._rebuild_latest_capture_preview()
+        if self._capture_gallery_container is None:
+            return
+        with self._capture_gallery_container:
+            self._capture_gallery_container.clear()
+            if not self._capture_records:
+                ui.Label("No captures for the selected scene.", height=36, word_wrap=True)
+                return
+            for capture in self._capture_records[:5]:
+                camera = str(capture.get("camera_id") or capture.get("camera_name") or "camera")
+                status = str(capture.get("status") or "completed")
+                timestamp = str(capture.get("timestamp") or "")[:19]
+                mods = ", ".join(str(item) for item in (capture.get("modalities") or [])[:6])
+                ui.Label(f"{self._status_glyph(status)} {camera} · {timestamp}\n{mods}", height=42, word_wrap=True)
+                with ui.HStack(spacing=6, height=24):
+                    open_btn = ui.Button("Open Bundle", width=116, height=22)
+                    open_btn.set_clicked_fn(lambda c=dict(capture): self._open_capture_record(c))
+                    manifest_btn = ui.Button("Manifest", width=88, height=22)
+                    manifest_btn.set_clicked_fn(lambda c=dict(capture): self._open_capture_manifest(c))
+
+    def _rebuild_latest_capture_preview(self) -> None:
+        ui = self._ui
+        if self._latest_capture_preview_container is None:
+            return
+        capture = self._capture_records[0] if self._capture_records else None
+        with self._latest_capture_preview_container:
+            self._latest_capture_preview_container.clear()
+            if not capture:
+                ui.Label("Latest capture preview: none", height=36, word_wrap=True)
+                return
+            local_path = self._capture_preview_local_path(capture)
+            if self._is_isaac_image_path(local_path):
+                try:
+                    ui.Image(local_path, width=180, height=112)
+                except Exception:
+                    ui.Label(f"Latest preview:\n{local_path}", height=64, word_wrap=True)
+            else:
+                ui.Label("Latest capture has no local PNG preview yet.", height=44, word_wrap=True)
+
+    def _capture_preview_local_path(self, capture: dict[str, Any]) -> str | None:
+        try:
+            try:
+                from isaac_extension.daemon_client import material_preview_local_path
+            except ImportError:  # pragma: no cover - Isaac runtime fallback
+                from daemon_client import material_preview_local_path
+            for item in capture.get("preview_items") or []:
+                if not isinstance(item, dict):
+                    continue
+                raw_paths = item.get("raw_paths") if isinstance(item.get("raw_paths"), dict) else {}
+                for key in ("png", "preview_png", "colorbar_png", "image"):
+                    value = raw_paths.get(key)
+                    if isinstance(value, str) and value:
+                        local_path = material_preview_local_path(
+                            {"artifact_path": value},
+                            repo_root=os.environ.get("ROBOMITUBA_WINDOWS_REPO_ROOT") or os.environ.get("ROBOMITUBA_ROOT") or "",
+                        )
+                        if local_path:
+                            return local_path
+        except Exception:
+            return None
+        return None
+
+    def _open_capture_record(self, capture: dict[str, Any]) -> None:
+        job_id = str(capture.get("job_id") or "")
+        frame_id = str(capture.get("frame_id") or "")
+        scene_id = str(capture.get("scene_id") or self._current_scene_id() or "")
+        if job_id and frame_id:
+            threading.Thread(
+                target=self._run_tracked_command,
+                args=("open_latest_capture", scene_id, self._do_open_latest_capture),
+                kwargs={"command": {"payload": {"job_id": job_id, "frame_id": frame_id}}},
+                daemon=True,
+            ).start()
+            return
+        self._on_open_latest_capture()
+
+    def _open_capture_manifest(self, capture: dict[str, Any]) -> None:
+        href = str(capture.get("manifest_href") or "")
+        manifest_path = str(capture.get("manifest_path") or "")
+        daemon_url = self._daemon_url()
+        if href:
+            webbrowser.open(f"{daemon_url}{href}")
+        elif manifest_path:
+            webbrowser.open(f"{daemon_url}/artifacts?path={manifest_path}")
+        else:
+            scene_id = self._current_scene_id()
+            webbrowser.open(f"{daemon_url}/scenes/{scene_id}#captures" if scene_id else f"{daemon_url}/scenes")
 
     def _run_tracked_command(self, command_type: str, scene_id: str | None, worker: Any, *, command: dict[str, Any] | None = None) -> None:
         command_id = ""
@@ -1025,6 +2103,7 @@ class RobomitubaPanel:
             self._scene_state_dirty = True
             self._material_state_dirty = False
             self._setup_stage_dirty_tracking()
+            self._attach_material_override_layer()
             return result
         except Exception as exc:  # pragma: no cover
             self._set_result(f"Load scene error: {exc}")
@@ -1040,10 +2119,14 @@ class RobomitubaPanel:
             daemon_url = self._daemon_url_field.model.get_value_as_string().strip()
             selected = self._selected_scene_record()
             scene_id = str(selected.get("scene_id")) if selected is not None else None
+            job_id = str(command_payload.get("job_id") or "") if isinstance(command_payload, dict) else ""
+            frame_id = str(command_payload.get("frame_id") or "") if isinstance(command_payload, dict) else ""
             if progress_callback is not None:
                 progress_callback("running", "opening_capture", "Opening latest capture preview.", "isaac_app", None)
             result = open_capture_from_daemon(
                 scene_id=scene_id,
+                job_id=job_id or None,
+                frame_id=frame_id or None,
                 daemon_url=daemon_url,
             )
             self._set_result(
@@ -1109,66 +2192,122 @@ class RobomitubaPanel:
                 from daemon_client import update_isaac_materials
 
             daemon_url = self._daemon_url_field.model.get_value_as_string().strip()
+            stage = self._get_stage()
             prim_paths = self._selected_prim_paths()
             if not prim_paths:
                 raise RuntimeError("No selected prims are available in Isaac.")
+            scoped_paths = self._expanded_material_scope_paths(stage, prim_paths)
+            scene_id = self._current_scene_id() or DEFAULT_SCENE_ID
+            if clear_only:
+                self._clear_usd_material_overrides(stage, scoped_paths, daemon_url=daemon_url, scene_id=scene_id)
+                return
             selected_index = 0
             if self._selected_bsdf_combo is not None:
                 selected_index = int(self._selected_bsdf_combo.model.get_item_value_model().get_value_as_int())
-            bsdf_type = "none" if clear_only else BSDF_OPTIONS[selected_index]
-            overrides = {}
-            if bsdf_type != "none":
-                overrides = {prim_path: BsdfOverride(bsdf_type=bsdf_type) for prim_path in prim_paths}
+            bsdf_type = BSDF_OPTIONS[selected_index]
+            if bsdf_type == "none":
+                self._clear_usd_material_overrides(stage, scoped_paths, daemon_url=daemon_url, scene_id=scene_id)
+                return
+            overrides = {prim_path: BsdfOverride(bsdf_type=bsdf_type) for prim_path in scoped_paths}
+            try:
+                from isaac_extension.material_override_layer import write_material_override
+            except ImportError:  # pragma: no cover - Isaac runtime fallback
+                from material_override_layer import write_material_override
+
+            write_material_override(stage, scoped_paths, BsdfOverride(bsdf_type=bsdf_type), scene_id=scene_id, kind="bsdf", preset=bsdf_type)
             update_isaac_materials(capture_material_patch(overrides), daemon_url=daemon_url)
-            self._clear_sync_dirty_flags(clear_state=False, clear_material=True)
-            self._set_result(f"Applied {bsdf_type} to {len(prim_paths)} selected prim(s).")
+            self._material_state_dirty = True
+            self._refresh_control_status()
+            self._refresh_selection_label(prim_paths)
+            self._set_result(f"Applied {bsdf_type} to {len(scoped_paths)} prim(s) via USD override layer.")
         except Exception as exc:  # pragma: no cover
             self._set_result(f"Selected override error: {exc}")
 
     def _do_apply_daemon_material(self) -> None:
         try:
             try:
-                from isaac_extension.daemon_client import apply_curated_material, apply_measured_material
+                from isaac_extension.daemon_client import update_isaac_materials
             except ImportError:  # pragma: no cover - Isaac runtime fallback
-                from daemon_client import apply_curated_material, apply_measured_material
+                from daemon_client import update_isaac_materials
+            try:
+                from isaac_extension.stage_capture import capture_material_patch
+            except ImportError:  # pragma: no cover - Isaac runtime fallback
+                from stage_capture import capture_material_patch
+            try:
+                from isaac_extension.material_override_layer import material_record_to_override, write_material_override
+            except ImportError:  # pragma: no cover - Isaac runtime fallback
+                from material_override_layer import material_record_to_override, write_material_override
 
             scene_id = self._current_scene_id()
             if not scene_id:
                 raise RuntimeError("No daemon scene is selected.")
+            stage = self._get_stage()
             prim_paths = self._selected_prim_paths()
             if not prim_paths:
                 raise RuntimeError("No selected prims are available in Isaac.")
+            scoped_paths = self._expanded_material_scope_paths(stage, prim_paths)
             material = self._selected_daemon_material_record()
             if material is None:
                 raise RuntimeError("No render daemon material is selected. Refresh materials first.")
 
             daemon_url = self._daemon_url_field.model.get_value_as_string().strip()
-            applied = 0
-            for prim_path in prim_paths:
-                if material.get("kind") == "curated":
-                    apply_curated_material(
-                        scene_id,
-                        prim_path=prim_path,
-                        material_id=str(material.get("material_id") or ""),
-                        daemon_url=daemon_url,
-                        timeout_s=10.0,
-                    )
-                else:
-                    apply_measured_material(
-                        scene_id,
-                        prim_path=prim_path,
-                        dataset_id=str(material.get("dataset_id") or ""),
-                        material_id=str(material.get("material_id") or ""),
-                        measured_file_path=str(material.get("native_file") or ""),
-                        bsdf_type=str(material.get("bsdf_type") or "measured_polarized"),
-                        daemon_url=daemon_url,
-                        timeout_s=10.0,
-                    )
-                applied += 1
+            override = material_record_to_override(material)
+            kind = str(material.get("kind") or "measured")
+            preset = str(material.get("key") or material.get("material_id") or "")
+            write_material_override(stage, scoped_paths, override, scene_id=scene_id, kind=kind, preset=preset)
+            update_isaac_materials(
+                capture_material_patch({prim_path: override for prim_path in scoped_paths}),
+                daemon_url=daemon_url,
+                timeout_s=10.0,
+            )
             self._refresh_selected_daemon_material_status(prim_paths)
-            self._set_result(f"Applied {self._daemon_material_label(material)} to {applied} selected prim(s).")
+            self._material_state_dirty = True
+            self._refresh_control_status()
+            self._refresh_selection_label(prim_paths)
+            self._set_result(f"Applied {self._daemon_material_label(material)} to {len(scoped_paths)} prim(s) via USD override layer.")
         except Exception as exc:  # pragma: no cover
             self._set_result(f"Daemon material apply error: {exc}")
+
+    def _do_reset_usd_material_override(self) -> None:
+        try:
+            stage = self._get_stage()
+            prim_paths = self._selected_prim_paths()
+            if not prim_paths:
+                raise RuntimeError("No selected prims are available in Isaac.")
+            scoped_paths = self._expanded_material_scope_paths(stage, prim_paths)
+            self._clear_usd_material_overrides(
+                stage,
+                scoped_paths,
+                daemon_url=self._daemon_url_field.model.get_value_as_string().strip(),
+                scene_id=self._current_scene_id() or DEFAULT_SCENE_ID,
+            )
+            self._refresh_selection_label(prim_paths)
+        except Exception as exc:  # pragma: no cover
+            self._set_result(f"Reset override error: {exc}")
+
+    def _clear_usd_material_overrides(self, stage: Any, prim_paths: list[str], *, daemon_url: str, scene_id: str) -> None:
+        try:
+            from isaac_extension.material_override_layer import clear_material_override
+        except ImportError:  # pragma: no cover - Isaac runtime fallback
+            from material_override_layer import clear_material_override
+        try:
+            from isaac_extension.stage_capture import capture_material_patch
+        except ImportError:  # pragma: no cover - Isaac runtime fallback
+            from stage_capture import capture_material_patch
+        try:
+            from isaac_extension.daemon_client import update_isaac_materials
+        except ImportError:  # pragma: no cover - Isaac runtime fallback
+            from daemon_client import update_isaac_materials
+
+        cleared = clear_material_override(stage, prim_paths, scene_id=scene_id)
+        update_isaac_materials(
+            capture_material_patch({}, extras={"clear_paths": list(prim_paths)}),
+            daemon_url=daemon_url,
+            timeout_s=10.0,
+        )
+        self._material_state_dirty = True
+        self._refresh_control_status()
+        self._set_result(f"Reset RoboMitsuba override on {cleared} prim(s).")
 
     def _poll_remote_commands_loop(self) -> None:
         while not self._stop_event.is_set():
@@ -1386,6 +2525,7 @@ class RobomitubaPanel:
                 )
             )
             self._setup_stage_dirty_tracking()
+            self._attach_material_override_layer()
             return summary
         except Exception as exc:  # pragma: no cover
             self._set_result(f"Connect error: {exc}")
@@ -1631,6 +2771,7 @@ class RobomitubaPanel:
     def _set_result(self, text: str) -> None:
         if self._result_label is not None:
             self._result_label.text = text
+        self._refresh_control_status()
 
     def _log_progress(
         self,
@@ -1672,6 +2813,14 @@ class RobomitubaPanel:
                 self._keyboard_input.unsubscribe_to_keyboard_events(self._keyboard_device, self._keyboard_subscription)
             except Exception:
                 pass
-        if self._window is not None:
-            self._window.destroy()
-            self._window = None
+        self._ui_update_subscription = None
+        for attr in ("_capture_window", "_jobs_window", "_optical_window", "_session_window"):
+            window = getattr(self, attr, None)
+            if window is None:
+                continue
+            try:
+                window.destroy()
+            except Exception:
+                pass
+            setattr(self, attr, None)
+        self._window = None

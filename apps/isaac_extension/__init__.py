@@ -28,6 +28,14 @@ from .daemon_client import (
     sync_scene_state_to_daemon,
     update_isaac_selection,
 )
+from .material_override_layer import (
+    attach_existing_override_layer,
+    clear_material_override,
+    ensure_override_layer,
+    expand_material_scope,
+    resolve_material_override,
+    write_material_override,
+)
 
 __all__ = [
     "DEFAULT_DAEMON_URL",
@@ -57,4 +65,10 @@ __all__ = [
     "resolve_windows_repo_root",
     "sync_scene_state_to_daemon",
     "update_isaac_selection",
+    "attach_existing_override_layer",
+    "clear_material_override",
+    "ensure_override_layer",
+    "expand_material_scope",
+    "resolve_material_override",
+    "write_material_override",
 ]

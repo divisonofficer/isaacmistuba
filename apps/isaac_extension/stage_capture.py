@@ -68,6 +68,8 @@ def capture_isaac_state(
         if mesh.transform is None:
             continue
         selected_override = bsdf_map.get(mesh.source_path)
+        if selected_override is None:
+            selected_override = _stage_material_override(stage, mesh.source_path, scene_id=scene_id)
         objects.append(
             IsaacObjectState(
                 prim_path=mesh.source_path,
@@ -164,6 +166,8 @@ def capture_state_patch(
         if mesh.transform is None:
             continue
         selected_override = bsdf_map.get(mesh.source_path)
+        if selected_override is None:
+            selected_override = _stage_material_override(stage, mesh.source_path, scene_id=scene_id)
         objects.append(
             IsaacObjectState(
                 prim_path=mesh.source_path,
@@ -198,6 +202,38 @@ def capture_material_patch(
         timestamp=timestamp or _dt.datetime.now(_dt.timezone.utc).isoformat(),
         extras=dict(extras or {}),
     )
+
+
+def capture_stage_material_overrides(
+    stage: Any,
+    prim_paths: list[str],
+    *,
+    scene_id: str = "live",
+    timestamp: str | None = None,
+    extras: Mapping[str, Any] | None = None,
+) -> Any:
+    try:
+        from isaac_extension.material_override_layer import read_stage_material_overrides
+    except ImportError:  # pragma: no cover - Isaac runtime fallback
+        from material_override_layer import read_stage_material_overrides
+
+    return capture_material_patch(
+        read_stage_material_overrides(stage, prim_paths, scene_id=scene_id),
+        timestamp=timestamp,
+        extras=extras,
+    )
+
+
+def _stage_material_override(stage: Any, prim_path: str, *, scene_id: str) -> Any | None:
+    try:
+        try:
+            from isaac_extension.material_override_layer import resolve_material_override
+        except ImportError:  # pragma: no cover - Isaac runtime fallback
+            from material_override_layer import resolve_material_override
+
+        return resolve_material_override(stage, prim_path, scene_id=scene_id).override
+    except Exception:
+        return None
 
 
 def capture_current_view_camera() -> Any:

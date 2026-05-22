@@ -33,6 +33,30 @@ export const listScenes = () => fetch('/api/scenes').then(json);
 export const getScene = (id: string) => fetch(`/api/scenes/${id}`).then(json);
 export const getSceneDiagram3D = (id: string) =>
 	fetch(`/api/scenes/${encodeURIComponent(id)}/diagram-3d`).then(json);
+
+export type OccupancyMapOpts = {
+	cell_size?: number;
+	height_min?: number;
+	height_max?: number;
+	furniture?: boolean;
+};
+function _occupancyQuery(opts: OccupancyMapOpts): string {
+	const p = new URLSearchParams();
+	if (opts.cell_size != null) p.set('cell_size', String(opts.cell_size));
+	if (opts.height_min != null) p.set('height_min', String(opts.height_min));
+	if (opts.height_max != null) p.set('height_max', String(opts.height_max));
+	if (opts.furniture != null) p.set('furniture', opts.furniture ? '1' : '0');
+	return p.toString();
+}
+export const getOccupancyMap = (id: string, opts: OccupancyMapOpts = {}) => {
+	const q = _occupancyQuery(opts);
+	const url = `/api/scenes/${encodeURIComponent(id)}/occupancy-map${q ? `?${q}` : ''}`;
+	return fetch(url).then(json);
+};
+export const occupancyMapPngUrl = (id: string, opts: OccupancyMapOpts = {}) => {
+	const q = _occupancyQuery(opts);
+	return `/api/scenes/${encodeURIComponent(id)}/occupancy-map.png${q ? `?${q}` : ''}`;
+};
 export const sceneGeometryUrl = (sceneId: string, meshId: string) =>
 	`/api/scenes/${encodeURIComponent(sceneId)}/geometry/${encodeURIComponent(meshId)}.obj`;
 export const getSceneCaptures = (id: string) =>

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import inspect
 import json
 import os
@@ -16,7 +17,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Callable, Mapping
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, quote, urlparse
 import webbrowser
 
 # Allow importing from repo apps roots when running inside Isaac Sim runtime copies.
@@ -404,14 +405,67 @@ def _require_isaac_context():
     return omni.usd.get_context()
 
 
+def _posix_server_path_to_unc(path: str) -> str | None:
+    raw = str(path or "").strip()
+    normalized = raw.replace("\\", "/")
+    while normalized.startswith("//"):
+        normalized = normalized[1:]
+    parts = [part for part in normalized.split("/") if part]
+    if len(parts) >= 2 and "." in parts[0]:
+        return "\\\\" + "\\".join(parts)
+    return None
+
+
+def _windows_file_path_for_isaac(path: str) -> str:
+    unc = _posix_server_path_to_unc(path)
+    return unc if unc is not None else str(path)
+
+
+def _isaac_ui_image_cache_root() -> Path:
+    local_appdata = os.environ.get("LOCALAPPDATA")
+    if local_appdata:
+        return Path(local_appdata) / "robomituba" / "ui_image_cache"
+    return Path.home() / ".robomituba" / "ui_image_cache"
+
+
+def _isaac_ui_image_path(source_path: str) -> str | None:
+    """Return a path that omni.ui.Image can reliably upload.
+
+    Isaac's texture loader treats //server/share-style paths as kit-relative in
+    some builds. Network paths are copied into a small local cache first.
+    """
+    source = _windows_file_path_for_isaac(source_path)
+    if not source:
+        return None
+    try:
+        source_obj = Path(source)
+        if not source_obj.exists() or not source_obj.is_file() or source_obj.stat().st_size <= 0:
+            return None
+    except Exception:
+        return None
+    if not _is_windows_host() or (len(source) > 1 and source[1] == ":"):
+        return source
+    try:
+        stat = source_obj.stat()
+        suffix = source_obj.suffix or ".png"
+        digest = hashlib.sha1(f"{source}:{stat.st_mtime_ns}:{stat.st_size}".encode("utf-8")).hexdigest()[:16]
+        target = _isaac_ui_image_cache_root() / f"{digest}{suffix}"
+        if not target.exists() or target.stat().st_size != stat.st_size:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source_obj, target)
+        return str(target)
+    except Exception:
+        return None
+
+
 def _repo_relative_to_local_path(path: str, *, repo_root: str = DEFAULT_REPO_ROOT) -> str:
-    repo_root = resolve_windows_repo_root(repo_root)
+    repo_root = _windows_file_path_for_isaac(resolve_windows_repo_root(repo_root))
     if not path:
         raise ValueError("Path must not be empty.")
-    raw = str(path)
-    if PurePosixPath(raw).is_absolute():
-        return raw
+    raw = _windows_file_path_for_isaac(str(path))
     if raw.startswith(("file:", "omniverse://", "\\\\")) or (len(raw) > 1 and raw[1] == ":"):
+        return raw
+    if PurePosixPath(raw).is_absolute():
         return raw
     return str(PureWindowsPath(repo_root) / PurePosixPath(raw))
 
@@ -780,6 +834,104 @@ def get_scene_from_daemon(scene_id: str, *, daemon_url: str | None = None, timeo
 def list_isaac_commands(*, daemon_url: str | None = None, timeout_s: float = 10.0) -> list[dict[str, Any]]:
     payload = _http_json("GET", f"{_resolve_daemon_url(daemon_url)}/api/isaac/commands", timeout_s=timeout_s)
     return list(payload.get("commands", []))
+
+
+def get_health(*, daemon_url: str | None = None, timeout_s: float = 5.0) -> dict[str, Any]:
+    payload = _http_json("GET", f"{_resolve_daemon_url(daemon_url)}/health", timeout_s=timeout_s)
+    return payload if isinstance(payload, dict) else {}
+
+
+def list_render_jobs(
+    *,
+    daemon_url: str | None = None,
+    limit: int = 250,
+    timeout_s: float = 10.0,
+) -> list[dict[str, Any]]:
+    payload = _http_json("GET", f"{_resolve_daemon_url(daemon_url)}/api/render-jobs", timeout_s=timeout_s)
+    jobs = payload.get("jobs") if isinstance(payload, dict) else None
+    records = [dict(item) for item in jobs if isinstance(item, dict)] if isinstance(jobs, list) else []
+    return records[: max(0, int(limit))]
+
+
+def list_scene_captures(
+    scene_id: str,
+    *,
+    daemon_url: str | None = None,
+    timeout_s: float = 10.0,
+) -> list[dict[str, Any]]:
+    scene_id_q = quote(str(scene_id), safe="")
+    payload = _http_json("GET", f"{_resolve_daemon_url(daemon_url)}/api/scenes/{scene_id_q}/captures", timeout_s=timeout_s)
+    captures = payload.get("captures") if isinstance(payload, dict) else None
+    return [dict(item) for item in captures if isinstance(item, dict)] if isinstance(captures, list) else []
+
+
+def get_isaac_session_inventory(
+    *,
+    daemon_url: str | None = None,
+    timeout_s: float = 10.0,
+) -> list[dict[str, Any]]:
+    payload = _http_json("GET", f"{_resolve_daemon_url(daemon_url)}/isaac/session/inventory", timeout_s=timeout_s)
+    inventory = payload.get("object_inventory") if isinstance(payload, dict) else None
+    return [dict(item) for item in inventory if isinstance(item, dict)] if isinstance(inventory, list) else []
+
+
+def material_preview_local_path(
+    record_or_override: Mapping[str, Any] | None,
+    *,
+    repo_root: str = DEFAULT_REPO_ROOT,
+) -> str | None:
+    """Return a best-effort local PNG path for Isaac's native ui.Image widget."""
+    if not isinstance(record_or_override, Mapping):
+        return None
+    candidates: list[str] = []
+    for key in ("preview_path", "preview_png", "preview_ref", "artifact_path", "native_preview"):
+        value = record_or_override.get(key)
+        if isinstance(value, str) and value:
+            candidates.append(value)
+    href = record_or_override.get("href") or record_or_override.get("artifact_href")
+    if isinstance(href, str) and href:
+        parsed = urlparse(href)
+        if parsed.path == "/artifacts":
+            artifact_path = parse_qs(parsed.query).get("path", [None])[0]
+            if artifact_path:
+                candidates.append(artifact_path)
+    extras = record_or_override.get("extras")
+    if isinstance(extras, Mapping):
+        candidates.extend(
+            str(extras[key])
+            for key in ("preview_path", "preview_png", "preview_ref")
+            if isinstance(extras.get(key), str) and extras.get(key)
+        )
+        curated_spec = extras.get("curated_bsdf_spec")
+        if isinstance(curated_spec, Mapping):
+            material_id = extras.get("curated_material_id") or record_or_override.get("material_id")
+            if isinstance(material_id, str) and material_id:
+                candidates.append(f"assets/material_previews/curated/{material_id}.png")
+                candidates.append(f"out/material_previews/curated/{material_id}.png")
+    material_id = record_or_override.get("material_id")
+    kind = str(record_or_override.get("kind") or record_or_override.get("bsdf_type") or "")
+    if isinstance(material_id, str) and material_id:
+        if kind == "curated" or record_or_override.get("dataset_id") == "curated":
+            candidates.append(f"assets/material_previews/curated/{material_id}.png")
+            candidates.append(f"out/material_previews/curated/{material_id}.png")
+        candidates.append(f"out/material_previews/channel_split/{material_id}_sphere/rgb_composite_192.png")
+    for candidate in candidates:
+        try:
+            local_path = _repo_relative_to_local_path(candidate, repo_root=repo_root)
+        except Exception:
+            local_path = ""
+        try:
+            if local_path and Path(local_path).exists():
+                return _isaac_ui_image_path(local_path)
+        except Exception:
+            pass
+        try:
+            posix_path = Path(resolve_windows_repo_root(repo_root)) / PurePosixPath(candidate)
+            if posix_path.exists():
+                return _isaac_ui_image_path(str(posix_path))
+        except Exception:
+            pass
+    return None
 
 
 def next_isaac_command(*, daemon_url: str | None = None, timeout_s: float = 10.0) -> dict[str, Any] | None:
@@ -1973,6 +2125,21 @@ class RobomitubaDaemonClient:
 
     def list_commands(self, *, timeout_s: float = 10.0) -> list[dict[str, Any]]:
         return list_isaac_commands(daemon_url=self.url, timeout_s=timeout_s)
+
+    def health(self, *, timeout_s: float = 5.0) -> dict[str, Any]:
+        return get_health(daemon_url=self.url, timeout_s=timeout_s)
+
+    def list_render_jobs(self, *, limit: int = 250, timeout_s: float = 10.0) -> list[dict[str, Any]]:
+        return list_render_jobs(daemon_url=self.url, limit=limit, timeout_s=timeout_s)
+
+    def list_scene_captures(self, scene_id: str, *, timeout_s: float = 10.0) -> list[dict[str, Any]]:
+        return list_scene_captures(scene_id, daemon_url=self.url, timeout_s=timeout_s)
+
+    def get_session_inventory(self, *, timeout_s: float = 10.0) -> list[dict[str, Any]]:
+        return get_isaac_session_inventory(daemon_url=self.url, timeout_s=timeout_s)
+
+    def material_preview_local_path(self, record_or_override: Mapping[str, Any] | None) -> str | None:
+        return material_preview_local_path(record_or_override, repo_root=self.repo_root)
 
     def register_scene(
         self,

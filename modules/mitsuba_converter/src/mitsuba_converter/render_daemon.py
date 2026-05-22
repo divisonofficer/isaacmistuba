@@ -81,10 +81,23 @@ from .material_overrides_store import (
 from .multimodal import SUPPORTED_MODALITIES, camera_to_world_to_lookat, normalize_mat4_storage
 from .observation_bridge import render_timestep_bundle_split_lighting
 from .scene_floorplan import CameraOverlay, LightOverlay, render_scene_floorplan
+from .worker_manager import WorkerManager
 
 
 RenderFn = Callable[..., ObservationBundleManifest]
 _WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+
+# Phase R: subprocess-based render worker isolation. When ``ROBOMITUBA_RENDER_INPROCESS=1``
+# (the conservative default during the rollout window) the daemon keeps the
+# pre-Phase-R in-process worker thread. Once the subprocess path has been
+# verified end-to-end the default flips and this flag becomes the rollback
+# escape hatch (see plan: Phase R-5 rollout).
+_RENDER_INPROCESS_DEFAULT = "1"  # default during Phase R bake-in. Flip to "0" once verified.
+_RENDER_INPROCESS = (
+    os.environ.get("ROBOMITUBA_RENDER_INPROCESS", _RENDER_INPROCESS_DEFAULT).strip().lower()
+    in ("1", "true", "yes", "on")
+)
 
 
 def _isaac_snapshot_to_scene_override(snapshot: Any) -> SceneOverrideSpec | None:
@@ -717,6 +730,104 @@ def _spawn_preview_render(key: str, render_fn: Any) -> None:
     )
 
 
+# ── Phase R: subprocess-mode preview render dispatch ────────────────────
+
+# Maps worker_job_id (string sent across JSONL) → daemon-side metadata so
+# the listener can update _material_jobs / _preview_inflight without
+# leaking those internals through the JSONL protocol.
+_render_worker_job_meta: dict[str, dict[str, Any]] = {}
+_render_worker_job_meta_lock = threading.Lock()
+
+
+def _register_render_worker_job(
+    worker_job_id: str,
+    *,
+    material_job_id: int,
+    inflight_key: str,
+) -> None:
+    with _render_worker_job_meta_lock:
+        _render_worker_job_meta[worker_job_id] = {
+            "material_job_id": int(material_job_id),
+            "inflight_key": str(inflight_key),
+        }
+
+
+def _peek_render_worker_job_meta(worker_job_id: str) -> dict[str, Any] | None:
+    with _render_worker_job_meta_lock:
+        meta = _render_worker_job_meta.get(worker_job_id)
+        return dict(meta) if meta else None
+
+
+def _pop_render_worker_job_meta(worker_job_id: str) -> dict[str, Any] | None:
+    with _render_worker_job_meta_lock:
+        return _render_worker_job_meta.pop(worker_job_id, None)
+
+
+# Translate the worker's failure ``reason`` codes into the user-facing
+# Korean messages that the existing UI was displaying. Keeps the move to
+# subprocess invisible to the bottom-panel reader.
+_PHASE_R_REASON_MESSAGES: dict[str, str] = {
+    "plugin_unavailable": (
+        "GPU(CUDA) 변종이 빌드되지 않았거나, 이 재질이 패치된 "
+        "Mitsuba 빌드를 요구합니다 (hpBRDF 등)"
+    ),
+    "mitsuba_unavailable": "Mitsuba 임포트 실패",
+    "load_error": "파일 파싱 실패 (포맷 불일치)",
+    "optix_unavailable": (
+        "OptiX 초기화 실패 — 호스트 NVIDIA 드라이버가 OptiX 8 요구사항(R535+)보다 낮습니다. "
+        "ROBOMITUBA_DISABLE_CUDA=1 로 CPU variant를 사용하세요."
+    ),
+    "gpu_oom": (
+        "GPU/host-pinned 메모리 부족 — hpBRDF는 파일당 13 GB라 "
+        "다른 큰 작업 종료 후 재시도하세요"
+    ),
+    "not_downloaded": "원본 파일 없음 — 먼저 다운로드 필요",
+    "placeholder": "원본 파일 없음 — placeholder 사용",
+    "missing_path": "측정 BSDF 파일 경로가 비어있습니다",
+    "unknown_material": "큐레이션 머터리얼 ID 를 찾지 못했습니다",
+    "unknown_kind": "워커가 인식하지 못한 작업 종류입니다",
+    "bad_request": "워커로 보낸 요청이 형식에 맞지 않습니다",
+    "exception": "워커에서 처리되지 않은 예외 — daemon 로그 확인 필요",
+    "worker_exited": "렌더 워커 프로세스가 비정상 종료됨 — 자동 재시작됨",
+    "worker_restarting": "워커 재기동 중이라 이 작업은 실행되지 못함 — 명시적 재시도 필요",
+    "worker_pipe_broken": "워커 stdin 파이프가 닫힘 — 매니저가 재시작 중",
+    "manager_degraded": "워커 매니저가 degraded 상태 — daemon 재시작 필요",
+    "no_worker": "사용 가능한 렌더 워커 없음",
+}
+
+
+def _spawn_preview_render_subprocess(
+    daemon: "RenderDaemon",
+    key: str,
+    payload: dict[str, Any],
+    *,
+    material_job_id: int,
+) -> None:
+    """Submit a render job to the WorkerManager subprocess.
+
+    Mirrors :func:`_spawn_preview_render` semantics (enqueue line + serial
+    in-order delivery to a single worker) but routes via the JSON-RPC
+    subprocess instead of the in-process closure thread. ``payload`` must
+    be a JSON-serializable dict matching ``preview_worker._dispatch``'s
+    request envelope. The caller is responsible for having claimed
+    ``_preview_inflight`` and created the material_job; this function
+    only registers the worker→daemon lookup metadata and enqueues.
+    """
+    worker_job_id = f"matjob-{material_job_id}"
+    payload = dict(payload)
+    payload["job_id"] = worker_job_id
+    _register_render_worker_job(
+        worker_job_id, material_job_id=material_job_id, inflight_key=key,
+    )
+    mgr = daemon._ensure_render_worker_manager()
+    mgr.submit(payload)
+    print(
+        f"[daemon] preview_queue: enqueue (subprocess) key={key} "
+        f"worker_job_id={worker_job_id} kind={payload.get('kind')}",
+        file=sys.stderr, flush=True,
+    )
+
+
 class RenderDaemon:
     def __init__(
         self,
@@ -724,7 +835,7 @@ class RenderDaemon:
         repo_root: str | Path,
         host: str = "127.0.0.1",
         port: int = 8765,
-        variant: str = "cuda_ad_spectral",
+        variant: str = "auto",
         render_fn: RenderFn | None = None,
     ) -> None:
         self.repo_root = Path(repo_root).resolve()
@@ -760,9 +871,137 @@ class RenderDaemon:
         self._server_thread: threading.Thread | None = None
         self._worker_thread: threading.Thread | None = None
 
+        # Phase R: render subprocess manager. Lazily spawned on first
+        # subprocess-mode render submission so that an INPROCESS=1
+        # rollout never pays the worker startup cost.
+        self._render_worker_manager: WorkerManager | None = None
+        self._render_worker_manager_lock = threading.Lock()
+
         asset_root = Path(__file__).resolve().parent
         self._static_dir = asset_root / "static"
         self._spa_dir = asset_root / "static" / "app"
+
+    # ── Phase R: render worker subprocess wiring ────────────────────────
+
+    def _ensure_render_worker_manager(self) -> WorkerManager:
+        """Lazily start the render worker subprocess manager + listener."""
+        with self._render_worker_manager_lock:
+            if self._render_worker_manager is not None:
+                return self._render_worker_manager
+            mgr = WorkerManager(repo_root=self.repo_root, worker_count=1)
+            mgr.add_listener(self._on_render_worker_event)
+            mgr.start()
+            self._render_worker_manager = mgr
+            return mgr
+
+    def _on_render_worker_event(self, event: dict[str, Any]) -> None:
+        """Translate worker JSONL events back into daemon-side state mutations.
+
+        Looks up daemon-side metadata (material job id + inflight key) by
+        the worker's job_id via :func:`_peek_render_worker_job_meta`, so
+        the protocol can stay opaque about daemon internals.
+        """
+        kind = str(event.get("type") or "")
+        if kind in ("heartbeat", "ready", "log"):
+            return
+        worker_job_id = str(event.get("job_id") or "")
+        if not worker_job_id:
+            return
+        meta = _peek_render_worker_job_meta(worker_job_id)
+        if meta is None:
+            # No preview meta → this is a render_job (Phase R-4) whose
+            # daemon-side state lives in ``self._jobs`` keyed by the
+            # same string job_id, or a stale event after restart.
+            with self._condition:
+                render_job = self._jobs.get(worker_job_id)
+            if render_job is not None:
+                self._handle_render_job_event(worker_job_id, kind, event)
+                return
+            if kind == "failed":
+                print(
+                    f"[daemon] render_worker: unmapped failed event "
+                    f"job_id={worker_job_id!r} reason={event.get('reason')!r}",
+                    file=sys.stderr, flush=True,
+                )
+            return
+        material_job_id = int(meta["material_job_id"])
+        inflight_key = str(meta["inflight_key"])
+
+        if kind == "started":
+            _update_material_job_stage(
+                material_job_id, "rendering",
+                "워커에서 렌더 시작",
+            )
+        elif kind == "progress":
+            stage = str(event.get("stage") or "rendering")
+            message = event.get("message")
+            if isinstance(message, str) and message:
+                _update_material_job_stage(material_job_id, stage, message)
+            current = event.get("current")
+            total = event.get("total")
+            if isinstance(current, int) and isinstance(total, int) and total > 0:
+                _update_material_job_progress(material_job_id, current, total)
+        elif kind == "completed":
+            _update_material_job_stage(material_job_id, "saved", "PNG 저장 완료")
+            _finish_material_job(material_job_id, "success")
+            _release_preview_inflight(inflight_key)
+            _pop_render_worker_job_meta(worker_job_id)
+        elif kind == "failed":
+            reason = str(event.get("reason") or "unknown")
+            message_raw = event.get("message")
+            if isinstance(message_raw, str) and message_raw:
+                message = message_raw
+            else:
+                message = _PHASE_R_REASON_MESSAGES.get(reason, f"render unavailable: {reason}")
+            _finish_material_job(material_job_id, "failed", message)
+            _release_preview_inflight(inflight_key)
+            _pop_render_worker_job_meta(worker_job_id)
+
+    def _handle_render_job_event(self, job_id: str, kind: str, event: dict[str, Any]) -> None:
+        """Map worker events back onto a Phase R-4 render_job in ``self._jobs``.
+
+        ``started`` is a no-op (the dispatcher thread already marked the
+        job ``running`` when it popped from ``_pending``). The terminal
+        events drive ``_mark_succeeded`` / ``_mark_failed`` which finalise
+        on-disk status, telemetry and the log.
+        """
+        if kind == "started":
+            # Dispatcher already set status=running; just append a marker
+            # for the log so operators see the worker handoff timestamp.
+            with self._condition:
+                job = self._jobs.get(job_id)
+            if job is not None:
+                self._append_job_log_line(
+                    job, event_type="running", stage="worker_started",
+                    message="worker subprocess accepted job",
+                )
+            return
+        if kind == "progress":
+            stage = str(event.get("stage") or "rendering")
+            payload = event.get("payload") if isinstance(event.get("payload"), dict) else None
+            self._update_progress(job_id, stage, payload)
+            return
+        if kind == "completed":
+            manifest_path = event.get("manifest_path")
+            if not manifest_path:
+                # Worker emitted out_path style — synthesise the manifest path.
+                out_path = event.get("out_path") or ""
+                manifest_path = f"{out_path}/manifest.json" if out_path else ""
+            if not manifest_path:
+                self._mark_failed(job_id, "worker_completed_without_manifest")
+                return
+            self._mark_succeeded(job_id, manifest_path=str(manifest_path))
+            return
+        if kind == "failed":
+            reason = str(event.get("reason") or "unknown")
+            message_raw = event.get("message")
+            if isinstance(message_raw, str) and message_raw:
+                message = f"{reason}: {message_raw}"
+            else:
+                fallback = _PHASE_R_REASON_MESSAGES.get(reason, "render unavailable")
+                message = f"{reason}: {fallback}"
+            self._mark_failed(job_id, message)
+            return
 
     def _isaac_scene_catalog_path(self) -> Path:
         return self.repo_root / "out" / "control_plane_cache" / "isaac_scene_catalog.json"
@@ -2820,6 +3059,17 @@ class RenderDaemon:
         session = self._require_active_isaac_session()
         patch_payload = payload.get("material_patch") if isinstance(payload.get("material_patch"), Mapping) else payload
         material_patch = isaac_material_patch_from_payload(dict(patch_payload))
+        clear_paths = material_patch.extras.get("clear_paths") if isinstance(material_patch.extras, dict) else None
+        if isinstance(clear_paths, list):
+            for prim_path in clear_paths:
+                path = str(prim_path or "")
+                if not path:
+                    continue
+                session.material_overrides.pop(path, None)
+                existing = session.objects.get(path)
+                if existing is not None:
+                    existing.bsdf_override = None
+                    existing.bsdf_override_key = None
         for prim_path, override in material_patch.overrides.items():
             session.material_overrides[prim_path] = override
             existing = session.objects.get(prim_path)
@@ -2832,6 +3082,7 @@ class RenderDaemon:
         self._invalidate_session_inventory_cache()
         summary = self._active_isaac_session_summary(include_inventory=False)
         summary["updated_materials"] = len(material_patch.overrides)
+        summary["cleared_materials"] = len(clear_paths) if isinstance(clear_paths, list) else 0
         return summary
 
     def _update_isaac_selection(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -3098,16 +3349,58 @@ class RenderDaemon:
                 # Disk I/O outside the lock
                 self._persist_status_unlocked(job)
 
-                bundle = self.render_fn(
-                    job.render_request,
-                    repo_root=self.repo_root,
-                    variant=job.variant,
-                    progress_callback=lambda stage, payload=None: self._update_progress(job_id, stage, payload),
-                )
-                manifest_path = f"{bundle.bundle_root}/manifest.json"
-                self._mark_succeeded(job_id, manifest_path=manifest_path)
+                if _RENDER_INPROCESS:
+                    # Legacy path: drive the render inline. Daemon thread
+                    # blocks here for the full render, picking up the next
+                    # job only when this one is done.
+                    bundle = self.render_fn(
+                        job.render_request,
+                        repo_root=self.repo_root,
+                        variant=job.variant,
+                        progress_callback=lambda stage, payload=None: self._update_progress(job_id, stage, payload),
+                    )
+                    manifest_path = f"{bundle.bundle_root}/manifest.json"
+                    self._mark_succeeded(job_id, manifest_path=manifest_path)
+                else:
+                    # Phase R-4: hand the render to the worker subprocess.
+                    # The dispatcher thread returns immediately and starts
+                    # accepting the next job; the worker manager's reader
+                    # listener will call _mark_succeeded / _mark_failed
+                    # when the worker emits its terminal event.
+                    self._submit_render_job_to_worker(job_id, job)
             except Exception as exc:  # pragma: no cover - exercised in tests via failure path
                 self._mark_failed(job_id, str(exc))
+
+    def _submit_render_job_to_worker(self, job_id: str, job: "_QueuedJob") -> None:
+        """Send a queued render job to the worker subprocess.
+
+        Wraps the RenderRequest payload + envelope and pushes it onto the
+        WorkerManager. Failure to serialise / submit is mapped onto a
+        synthetic failed event so the job state still finalises.
+        """
+        try:
+            request_payload = render_request_to_payload(job.render_request)
+        except Exception as exc:
+            self._mark_failed(job_id, f"serialize_failed: {exc}")
+            return
+        payload = {
+            "job_id": job_id,
+            "kind": "render_job",
+            "spec": {
+                "request_payload": request_payload,
+                "repo_root": str(self.repo_root),
+                "variant": job.variant,
+                "disable_cuda": str(os.environ.get("ROBOMITUBA_FULL_RENDER_DISABLE_CUDA", "0")).strip().lower()
+                in {"1", "true", "yes", "on"},
+            },
+        }
+        mgr = self._ensure_render_worker_manager()
+        mgr.submit(payload)
+        print(
+            f"[daemon] render_queue: enqueue (subprocess) job_id={job_id} "
+            f"variant={job.variant}",
+            file=sys.stderr, flush=True,
+        )
 
     def _mark_succeeded(self, job_id: str, *, manifest_path: str) -> None:
         with self._condition:
@@ -3377,11 +3670,20 @@ class RenderDaemon:
         )
         job_id = job["id"]
 
-        variant = _pick_variant_for("rgb")
-        if variant is None:
-            _release_preview_inflight(key)
-            _finish_material_job(job_id, "failed", "Mitsuba variant unavailable")
-            return job
+        # Resolve the Mitsuba variant up-front only on the in-process
+        # path — the closure below captures it. In subprocess mode we
+        # deliberately skip this so the daemon process never has to
+        # import mitsuba; the worker does its own ``_pick_variant_for``
+        # and emits a ``plugin_unavailable`` failed event if no GPU
+        # variant is available, which the listener maps onto the same
+        # "Mitsuba variant unavailable" status.
+        variant: str | None = None
+        if _RENDER_INPROCESS:
+            variant = _pick_variant_for("rgb")
+            if variant is None:
+                _release_preview_inflight(key)
+                _finish_material_job(job_id, "failed", "Mitsuba variant unavailable")
+                return job
 
         bsdf_spec = mat.bsdf_spec
 
@@ -3437,7 +3739,28 @@ class RenderDaemon:
                 _finish_material_job(job_id, "failed", str(exc))
                 raise
 
-        _spawn_preview_render(key, _render_curated)
+        if _RENDER_INPROCESS:
+            _spawn_preview_render(key, _render_curated)
+        else:
+            from .user_settings import get_material_preview_spp
+            spp = get_material_preview_spp(default=768)
+            ss = _supersample_default()
+            target_size = 192
+            payload = {
+                "kind": "curated_preview",
+                "spec": {
+                    "material_id": material_id,
+                    "object_id": object_id,
+                    "out_path": str(out),
+                    "spp": int(spp),
+                    "target_size": int(target_size),
+                    "supersample": int(ss),
+                    "bench_label": f"curated/{material_id}/{object_id}",
+                },
+            }
+            _spawn_preview_render_subprocess(
+                self, key, payload, material_job_id=job_id,
+            )
         return job
 
     def _invalidate_curated_files(self, material_id: str) -> list[str]:
@@ -3603,6 +3926,10 @@ class RenderDaemon:
                         ),
                         "mitsuba_unavailable": "Mitsuba 임포트 실패",
                         "load_error": "파일 파싱 실패 (포맷 불일치)",
+                        "optix_unavailable": (
+                            "OptiX 초기화 실패 — 호스트 NVIDIA 드라이버가 OptiX 8 요구사항(R535+)보다 낮습니다. "
+                            "ROBOMITUBA_DISABLE_CUDA=1 로 CPU variant를 사용하세요."
+                        ),
                         "gpu_oom": (
                             "GPU/host-pinned 메모리 부족 — hpBRDF는 파일당 13 GB라 "
                             "다른 큰 작업 종료 후 재시도하세요"
@@ -3618,7 +3945,44 @@ class RenderDaemon:
                 _finish_material_job(job_id, "failed", str(exc))
                 raise
 
-        _spawn_preview_render(key, _render_measured)
+        if _RENDER_INPROCESS:
+            _spawn_preview_render(key, _render_measured)
+        else:
+            from .user_settings import get_material_preview_spp
+            spp = get_material_preview_spp(default=384)
+            if channels_dir is not None:
+                payload = {
+                    "kind": "channel_split_preview",
+                    "spec": {
+                        "dataset_id": dataset_id,
+                        "material_id": material_id,
+                        "object_id": object_id,
+                        "use_channel_split": True,
+                        "channels_dir": str(channels_dir),
+                        "cache_dir": str(cache_dir),
+                        "repo_root": str(repo_root),
+                        "spp": int(spp),
+                        "bench_label": f"channel/{material_id}",
+                    },
+                }
+            else:
+                payload = {
+                    "kind": "measured_preview",
+                    "spec": {
+                        "dataset_id": dataset_id,
+                        "material_id": material_id,
+                        "measured_file_path": measured_file_path,
+                        "object_id": object_id,
+                        "use_channel_split": False,
+                        "cache_dir": str(cache_dir),
+                        "repo_root": str(repo_root),
+                        "spp": int(spp),
+                        "bench_label": f"measured/{dataset_id}/{material_id}/{object_id}",
+                    },
+                }
+            _spawn_preview_render_subprocess(
+                self, key, payload, material_job_id=job_id,
+            )
         return job
 
     def _invalidate_measured_files(self, dataset_id: str, material_id: str) -> list[str]:
@@ -7143,7 +7507,7 @@ def serve_render_daemon(
     repo_root: str | Path,
     host: str = "127.0.0.1",
     port: int = 8765,
-    variant: str = "cuda_ad_spectral",
+    variant: str = "auto",
 ) -> RenderDaemon:
     daemon = RenderDaemon(repo_root=repo_root, host=host, port=port, variant=variant)
     daemon.start()

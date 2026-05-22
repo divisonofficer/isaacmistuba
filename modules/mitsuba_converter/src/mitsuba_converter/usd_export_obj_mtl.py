@@ -4,7 +4,48 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import re
+import sys
 import numpy as np
+
+
+_NORMAL_FALLBACK = np.asarray((0.0, 1.0, 0.0), dtype=np.float64)
+_NORMAL_MIN_NORM = 1e-9
+
+
+def _sanitize_normals(
+    normals: np.ndarray, *, where: str = "<unknown>",
+) -> tuple[np.ndarray, int]:
+    """Replace zero / NaN / inf vectors with a unit fallback (+Y).
+
+    Mitsuba's OBJ loader rejects an OBJ outright if any ``vn`` line is a
+    zero vector or has NaN components ("invalid vertex normal data").
+    The exporter's previous normalize step (``norm[norm == 0] = 1``)
+    guarded against divide-by-zero but still let zero-vector normals
+    flow through. This belt-and-suspenders pass forces every output
+    normal to be a unit vector with finite components.
+
+    Returns ``(sanitized, n_replaced)``; logs a one-line stderr warning
+    when ``n_replaced > 0`` so the operator can see how many primitives
+    were patched and from which mesh / phase.
+    """
+    arr = np.asarray(normals, dtype=np.float64)
+    if arr.size == 0:
+        return arr, 0
+    if arr.ndim != 2 or arr.shape[1] != 3:
+        return arr, 0
+    finite_mask = np.isfinite(arr).all(axis=1)
+    norms = np.linalg.norm(arr, axis=1)
+    bad = (~finite_mask) | (norms < _NORMAL_MIN_NORM)
+    n_bad = int(bad.sum())
+    if n_bad:
+        arr = arr.copy()
+        arr[bad] = _NORMAL_FALLBACK
+        print(
+            f"[daemon] usd_export: sanitized {n_bad}/{arr.shape[0]} "
+            f"invalid normals (zero/NaN/inf) at {where} -> +Y fallback",
+            file=sys.stderr, flush=True,
+        )
+    return arr, n_bad
 
 
 def _triangulate_with_corners(counts: List[int], indices: List[int]) -> tuple[np.ndarray, np.ndarray]:
@@ -56,6 +97,7 @@ def export_roots_to_obj_mtl(
     out_mtl: str,
     max_meshes: int = 500,
     smooth_normals: bool = True,
+    stage: "object | None" = None,
 ) -> Tuple[ExportStats, Dict]:
     """Export meshes under multiple root prims to OBJ+MTL.
 
@@ -67,11 +109,17 @@ def export_roots_to_obj_mtl(
 
     Materials:
     - Writes a minimal MTL mapping baseColor textures when available via USDPreviewSurface/UsdUVTexture.
+
+    ``stage`` (optional): a pre-opened ``Usd.Stage`` to reuse instead of
+    re-opening ``usd_path``. Batch callers that export the same stage
+    hundreds of times (one OBJ per material) should pass this — re-opening
+    a 3.8 GB USD per call is the dominant cost otherwise.
     """
     from pxr import Usd, UsdGeom, UsdShade
 
     usd_p = Path(usd_path)
-    stage = Usd.Stage.Open(str(usd_p))
+    if stage is None:
+        stage = Usd.Stage.Open(str(usd_p))
     if stage is None:
         raise RuntimeError(f"Failed to open USD: {usd_path}")
 
@@ -149,7 +197,7 @@ def export_roots_to_obj_mtl(
         return mat_info[mp]['mtlName']
 
     # --- Normal computation ---
-    def compute_smooth_normals(v: np.ndarray, tris: np.ndarray) -> np.ndarray:
+    def compute_smooth_normals(v: np.ndarray, tris: np.ndarray, *, where: str = "<smooth>") -> np.ndarray:
         # v: (N,3), tris: (T,3)
         n = np.zeros_like(v, dtype=np.float64)
         v0 = v[tris[:, 0]]
@@ -162,7 +210,11 @@ def export_roots_to_obj_mtl(
         # normalize
         norm = np.linalg.norm(n, axis=1, keepdims=True)
         norm[norm == 0] = 1
-        return (n / norm).astype(np.float64)
+        n = (n / norm).astype(np.float64)
+        # belt-and-suspenders: catch isolated vertices or degenerate fans
+        # whose accumulated face-normal is still zero / NaN.
+        n, _ = _sanitize_normals(n, where=f"smooth({where})")
+        return n
 
     v_offset = 0
     vt_offset = 0
@@ -232,6 +284,7 @@ def export_roots_to_obj_mtl(
                             # else: unsupported layout -> leave None
 
                 # Normals (vn)
+                prim_path = prim.GetPath().pathString
                 normals = None
                 n_attr = mesh.GetNormalsAttr()
                 if n_attr and n_attr.HasValue():
@@ -246,9 +299,15 @@ def export_roots_to_obj_mtl(
                         nn = np.linalg.norm(normals, axis=1, keepdims=True)
                         nn[nn == 0] = 1
                         normals = normals / nn
+                        # USD source can still carry zero / NaN normals
+                        # (procedurally generated meshes, mirrored geometry,
+                        # collapsed triangles, etc). Sanitize before they
+                        # reach the OBJ writer; mitsuba's loader rejects
+                        # the whole file on the first invalid vn line.
+                        normals, _ = _sanitize_normals(normals, where=f"usd({prim_path})")
 
                 if normals is None and smooth_normals:
-                    normals = compute_smooth_normals(v_w, tris_v)
+                    normals = compute_smooth_normals(v_w, tris_v, where=prim_path)
 
                 mtl = get_bound_material_name(prim)
 

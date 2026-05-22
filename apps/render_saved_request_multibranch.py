@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 import sys
 
@@ -31,8 +32,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--variant",
-        default="cuda_ad_spectral",
-        help="Mitsuba variant to use for rendering.",
+        default=os.environ.get("ROBOMITUBA_MITSUBA_VARIANT", "auto"),
+        help="Mitsuba variant to use for rendering, or 'auto' for runtime fallback.",
     )
     return parser.parse_args()
 

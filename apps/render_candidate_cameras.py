@@ -14,6 +14,11 @@ from pathlib import Path
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+CONVERTER_SRC = REPO_ROOT / "modules" / "mitsuba_converter" / "src"
+if str(CONVERTER_SRC) not in sys.path:
+    sys.path.insert(0, str(CONVERTER_SRC))
+
 from render_curated_multimodal import save_rgb_preview, write_json
 
 
@@ -28,6 +33,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--spp", type=int, default=512)
     parser.add_argument("--samples-per-pass", type=int, default=0)
     parser.add_argument("--integrator", default="direct")
+    parser.add_argument("--variant", default=os.environ.get("ROBOMITUBA_MITSUBA_VARIANT", "auto"))
     parser.add_argument("--names", help="Comma-separated subset of candidate names to render")
     parser.add_argument("--child-render", action="store_true")
     parser.add_argument("--scene-xml", type=Path)
@@ -295,8 +301,10 @@ def save_contact_sheet(image_paths: list[Path], labels: list[str], out_path: Pat
 
 def render_one(args: argparse.Namespace) -> None:
     import mitsuba as mi
+    from mitsuba_converter.mitsuba_runtime import resolve_variant
 
-    mi.set_variant("cuda_ad_spectral")
+    variant = resolve_variant(args.variant, kind="spectral", allow_cpu=True)
+    mi.set_variant(variant)
     record = read_json(args.record_json)
     load_start = time.perf_counter()
     scene = mi.load_file(str(args.scene_xml))
@@ -313,6 +321,7 @@ def render_one(args: argparse.Namespace) -> None:
     record["load_scene_s"] = load_s
     record["render_s"] = render_s
     record["total_s"] = load_s + render_s
+    record["variant"] = variant
     record["preview"] = preview_info
     write_json(args.timing_out, record)
 
@@ -390,6 +399,8 @@ def orchestrate(args: argparse.Namespace) -> None:
             str(record_json),
             "--spp",
             str(args.spp),
+            "--variant",
+            args.variant,
         ]
         result = subprocess.run(cmd, check=False)
         if result.returncode != 0:
