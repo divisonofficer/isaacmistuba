@@ -1,24 +1,37 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+from math import atan
 from typing import Any
 
-from .constants import RangerMiniMotionMode
+from .constants import RangerMiniMotionMode, RangerMiniParams
 from .types import RangerMiniCommand, RangerMiniState
 
 
 class RangerMiniRosAdapter:
     """Minimal ROS2-compatible adapter without depending on ROS Python packages."""
 
-    def command_from_twist(self, twist: Any, *, current_mode: int = int(RangerMiniMotionMode.ACKERMANN)) -> RangerMiniCommand:
+    def command_from_twist(
+        self,
+        twist: Any,
+        *,
+        current_mode: int = int(RangerMiniMotionMode.ACKERMANN),
+        params: RangerMiniParams | None = None,
+    ) -> RangerMiniCommand:
         linear = getattr(getattr(twist, "linear", twist), "x", 0.0)
         angular = getattr(getattr(twist, "angular", twist), "z", 0.0)
+        params = params or RangerMiniParams()
         if int(current_mode) == int(RangerMiniMotionMode.SPIN):
             return RangerMiniCommand(motion_mode=current_mode, spin_speed_radps=float(angular))
+        if abs(float(linear)) < 1e-6:
+            if abs(float(angular)) > 1e-6:
+                return RangerMiniCommand(motion_mode=int(RangerMiniMotionMode.SPIN), spin_speed_radps=float(angular))
+            return RangerMiniCommand(motion_mode=int(RangerMiniMotionMode.ACKERMANN))
+        steering_angle = atan((float(angular) * params.wheelbase_m) / (2.0 * float(linear)))
         return RangerMiniCommand(
-            motion_mode=current_mode,
+            motion_mode=int(RangerMiniMotionMode.ACKERMANN),
             linear_speed_mps=float(linear),
-            steering_angle_rad=float(angular),
+            steering_angle_rad=float(steering_angle),
         )
 
     def state_messages(self, state: RangerMiniState, *, base_frame: str = "base_link", odom_frame: str = "odom") -> dict[str, dict[str, Any]]:

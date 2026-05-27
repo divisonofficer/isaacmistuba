@@ -32,6 +32,8 @@ MODALITY_OPTIONS = [
     "depth",
     "albedo",
     "active_nir_intensity",
+    "nir_intensity",
+    "lidar_point_cloud",
     "polar_rgb_preview",
     "s1",
     "s2",
@@ -57,9 +59,12 @@ RANGER_ACTIONS = [
 
 _RUNTIME_SYNC_WATCH_FILES = (
     "__init__.py",
+    "asset_browser.py",
     "daemon_client.py",
     "extension.py",
     "material_override_layer.py",
+    "robot_sensors.py",
+    "ros_cmd_vel_bridge.py",
     "stage_capture.py",
     "ui_panel.py",
 )
@@ -243,6 +248,7 @@ class RobomitubaPanel:
         self._set_window_visible(self._capture_window, False)
 
         self._rebuild_scene_picker()
+        self._refresh_robot_records()
         self._do_refresh_scenes()
         self._setup_stage_dirty_tracking()
         self._attach_material_override_layer()
@@ -389,6 +395,29 @@ class RobomitubaPanel:
                     )
                     material_btn = ui.Button("Choose Optical Material", height=32)
                     material_btn.set_clicked_fn(self._show_optical_window)
+            with self._card("AgileX Ranger Mini"):
+                with ui.VStack(spacing=8):
+                    self._robot_list_label = ui.Label("No RangerMini robots in the stage.", height=58, word_wrap=True)
+                    self._robot_picker_container = ui.VStack(height=32)
+                    with self._robot_picker_container:
+                        pass
+                    with ui.HStack(spacing=6, height=30):
+                        refresh_robot_btn = ui.Button("Refresh", width=88, height=28)
+                        refresh_robot_btn.set_clicked_fn(self._on_refresh_robots)
+                        spawn_robot_btn = ui.Button("Spawn", width=82, height=28)
+                        spawn_robot_btn.set_clicked_fn(self._on_spawn_robot)
+                        focus_robot_btn = ui.Button("Focus", width=78, height=28)
+                        focus_robot_btn.set_clicked_fn(self._on_focus_robot)
+                        assets_btn = ui.Button("Assets", width=82, height=28)
+                        assets_btn.set_clicked_fn(self._on_open_robot_assets)
+                    with ui.HStack(spacing=6, height=30):
+                        physics_robot_btn = ui.Button("Enable Physics", width=132, height=28)
+                        physics_robot_btn.set_clicked_fn(self._on_enable_robot_physics)
+                        cmd_vel_btn = ui.Button("Start /cmd_vel", width=126, height=28)
+                        cmd_vel_btn.set_clicked_fn(self._on_start_cmd_vel_bridge)
+                        stop_cmd_vel_btn = ui.Button("Stop", width=62, height=28)
+                        stop_cmd_vel_btn.set_clicked_fn(self._on_stop_cmd_vel_bridge)
+                    self._build_robot_direction_pad()
             with self._card("Queue Summary"):
                 with ui.VStack(spacing=6):
                     self._session_job_summary_label = ui.Label(
@@ -606,6 +635,26 @@ class RobomitubaPanel:
         else:
             webbrowser.open(f"{daemon_url}/scenes")
 
+    def _on_open_robot_assets(self) -> None:
+        try:
+            try:
+                from isaac_extension.asset_browser import open_ranger_mini_asset_folder, register_robomituba_asset_root
+            except ImportError:  # pragma: no cover - Isaac runtime fallback
+                from asset_browser import open_ranger_mini_asset_folder, register_robomituba_asset_root
+            status = register_robomituba_asset_root()
+            opened = open_ranger_mini_asset_folder()
+            self._set_result(
+                "\n".join(
+                    [
+                        "Ranger Mini assets ready.",
+                        f"folder: {opened.get('asset_dir')}",
+                        f"browser_registered: {status.get('registered')}",
+                    ]
+                )
+            )
+        except Exception as exc:  # pragma: no cover
+            self._set_result(f"Open robot assets error: {exc}")
+
     def _on_sync_selection(self) -> None:
         try:
             self._push_selection_to_daemon()
@@ -731,16 +780,58 @@ class RobomitubaPanel:
     def _on_robot_action(self, action: str) -> None:
         self._do_robot_action(action)
 
-    def _do_robot_action(self, action: str) -> None:
+    def _on_enable_robot_physics(self) -> None:
         try:
             try:
-                from isaac_extension.ranger_mini_stage import command_robot
+                from isaac_extension.ranger_mini_stage import enable_ranger_mini_physics
             except ImportError:  # pragma: no cover - Isaac runtime fallback
-                from ranger_mini_stage import command_robot
+                from ranger_mini_stage import enable_ranger_mini_physics
             prim_path = self._selected_robot_path()
             if not prim_path:
                 raise RuntimeError("No RangerMini robot is selected.")
-            result = command_robot(self._get_stage(), prim_path, action)
+            result = enable_ranger_mini_physics(self._get_stage(), prim_path)
+            self._set_result(
+                "Enabled RangerMini physics "
+                f"scene={result.get('physics_scene')} collisions={result.get('collision_prims')}"
+            )
+        except Exception as exc:  # pragma: no cover
+            self._set_result(f"Robot physics error: {exc}")
+
+    def _on_start_cmd_vel_bridge(self) -> None:
+        try:
+            try:
+                from isaac_extension.ros_cmd_vel_bridge import start_cmd_vel_bridge
+            except ImportError:  # pragma: no cover - Isaac runtime fallback
+                from ros_cmd_vel_bridge import start_cmd_vel_bridge
+            prim_path = self._selected_robot_path()
+            if not prim_path:
+                raise RuntimeError("No RangerMini robot is selected.")
+            result = start_cmd_vel_bridge(self._get_stage(), prim_path, topic="/cmd_vel")
+            self._set_result(f"Started RangerMini cmd_vel bridge topic={result.get('topic')}")
+        except Exception as exc:  # pragma: no cover
+            self._set_result(f"cmd_vel bridge error: {exc}")
+
+    def _on_stop_cmd_vel_bridge(self) -> None:
+        try:
+            try:
+                from isaac_extension.ros_cmd_vel_bridge import stop_cmd_vel_bridge
+            except ImportError:  # pragma: no cover - Isaac runtime fallback
+                from ros_cmd_vel_bridge import stop_cmd_vel_bridge
+            stop_cmd_vel_bridge()
+            self._set_result("Stopped RangerMini cmd_vel bridge.")
+        except Exception as exc:  # pragma: no cover
+            self._set_result(f"cmd_vel bridge stop error: {exc}")
+
+    def _do_robot_action(self, action: str) -> None:
+        try:
+            try:
+                from isaac_extension.ranger_mini_stage import command_robot_physx
+            except ImportError:  # pragma: no cover - Isaac runtime fallback
+                from ranger_mini_stage import command_robot_physx
+            prim_path = self._selected_robot_path()
+            if not prim_path:
+                raise RuntimeError("No RangerMini robot is selected.")
+            result = command_robot_physx(self._get_stage(), prim_path, action)
             self._refresh_robot_records(selected_path=prim_path)
             self._set_result(f"{action} -> {result.get('prim_path')}")
         except Exception as exc:  # pragma: no cover
@@ -2352,6 +2443,8 @@ class RobomitubaPanel:
                 load_scene_from_daemon,
                 open_capture_from_daemon,
                 render_current_view_from_daemon,
+                render_sensor_from_daemon,
+                sync_opticalnav_stage_from_daemon,
                 sync_scene_state_to_daemon,
                 update_isaac_materials,
             )
@@ -2363,6 +2456,8 @@ class RobomitubaPanel:
                 load_scene_from_daemon,
                 open_capture_from_daemon,
                 render_current_view_from_daemon,
+                render_sensor_from_daemon,
+                sync_opticalnav_stage_from_daemon,
                 sync_scene_state_to_daemon,
                 update_isaac_materials,
             )
@@ -2372,7 +2467,7 @@ class RobomitubaPanel:
         payload = command.get("payload") if isinstance(command.get("payload"), dict) else {}
         daemon_url = self._daemon_url_field.model.get_value_as_string().strip()
         stage = None
-        if command_type in {"sync_session", "render_current_view"}:
+        if command_type in {"sync_session", "render_current_view", "render_sensor"}:
             stage = self._get_stage()
 
         if command_type == "load_scene":
@@ -2428,6 +2523,19 @@ class RobomitubaPanel:
             self._clear_sync_dirty_flags()
             self._set_result(f"Remote sync complete.\nscene: {scene_id}")
             return result
+        if command_type == "sync_opticalnav_stage":
+            result = sync_opticalnav_stage_from_daemon(
+                self._get_stage(),
+                payload,
+                daemon_url=daemon_url,
+                progress_callback=progress_callback,
+            )
+            self._scene_state_dirty = True
+            self._set_result(
+                f"OpticalNav stage sync complete.\nscene: {scene_id}\n"
+                f"objects: {result.get('object_count', 0)} regions: {result.get('region_count', 0)}"
+            )
+            return result
         if command_type == "render_current_view":
             result = render_current_view_from_daemon(
                 str(scene_id),
@@ -2451,6 +2559,28 @@ class RobomitubaPanel:
                 self._clear_sync_dirty_flags(clear_state=False, clear_material=True)
             manifest_path = result.get("manifest_path") or result.get("status_url") or "-"
             self._set_result(f"Remote render complete.\nscene: {scene_id}\nresult: {manifest_path}")
+            return result
+        if command_type == "render_sensor":
+            sensor_id = str(payload.get("sensor_id") or "")
+            if not sensor_id:
+                raise RuntimeError("render_sensor requires payload.sensor_id.")
+            result = render_sensor_from_daemon(
+                str(scene_id),
+                sensor_id,
+                stage=self._get_stage(),
+                daemon_url=daemon_url,
+                submit_mode=str(payload.get("submit_mode") or "async"),
+                modalities=list(payload.get("modalities") or []),
+                render_settings=dict(payload.get("render_settings") or {}),
+                timeout_s=600.0,
+                progress_callback=progress_callback,
+                command_id=command_id,
+                sync_policy=str(payload.get("sync_policy") or "auto"),
+                force_resync=bool(payload.get("force_resync", False)),
+                state_dirty=self._scene_state_dirty,
+                material_dirty=self._material_state_dirty,
+            )
+            self._set_result(f"Remote sensor render complete.\nscene: {scene_id}\nsensor: {sensor_id}")
             return result
         if command_type == "open_latest_capture":
             result = open_capture_from_daemon(scene_id=str(scene_id) if scene_id else None, daemon_url=daemon_url)

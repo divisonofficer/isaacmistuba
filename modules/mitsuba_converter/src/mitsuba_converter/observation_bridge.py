@@ -47,10 +47,13 @@ AMBIENT_MODALITIES = {
     "indirect_light_map",
     "diffuse_map",
     "specular_map",
+    "hazard_mask",
 }
 ACTIVE_MODALITIES = {
     "active_nir_intensity",
+    "nir_intensity",
     "sensor_depth_approx",
+    "lidar_point_cloud",
 }
 POLAR_MODALITIES = {
     "polar_rgb_preview",

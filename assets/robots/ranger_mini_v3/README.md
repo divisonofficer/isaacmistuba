@@ -7,9 +7,9 @@ Canonical Ranger Mini asset workspace for Isaac/Mitsuba integration.
 - Canonical runtime path: `/World/RangerMini`
 - Axes: `+X forward`, `+Y left`, `+Z up`
 - Runtime metadata is stored on the root prim under `robomituba:*`
-- Physics/control still use the existing articulation/joint contract
-- `ranger_mini_v3.usda` is the runtime assembly wrapper
+- `ranger_mini_v3.usda` is a visual/sensor-anchor assembly wrapper only
 - `ranger_mini_with_profile.usda` is the current canonical visual source exported from Blender
+- PhysX wheel drive must use a separate Isaac URDF-imported or physics-authored USD
 
 ## Official mesh acquisition
 
@@ -33,12 +33,11 @@ but not yet treated as the final photoreal asset. The large body mesh is deliver
 
 ## Planned authoring direction
 
-- Official Gazebo mesh is used as reference/base geometry input
-- Final source of truth remains `Blender source + exported USD`
-- Photoreal lookdev is built on top of a cleaned-up visual subtree
-- Collision/debug geometry remains separate from renderable visual geometry
-- The current assembly wrapper references the Blender-exported `ranger_mini_with_profile.usda`
-  and adds runtime metadata, colliders, masses, and wheel/steer joints on top
+- Official Gazebo xacro/meshes are used as the source for Isaac URDF Importer
+- Final visual source of truth remains `Blender source + exported USD`
+- Photoreal lookdev is built on top of the visual subtree
+- Physics articulation, collisions, masses, and wheel drives live in a separate generated USD
+- Runtime conversion of the visual USD into a PhysX articulation is intentionally unsupported
 
 ## Pipeline constraints
 
@@ -46,3 +45,32 @@ but not yet treated as the final photoreal asset. The large body mesh is deliver
   `USD -> snapshot/job -> OBJ fallback` pipeline
 - Collision/debug prims must stay out of render snapshots
 - Existing `base_link`, 8 joints, and `robomituba:*` runtime state contract must remain stable
+
+## Isaac PhysX authoring workflow
+
+1. Generate the Isaac URDF input package:
+
+   ```bash
+   python3 assets/robots/ranger_mini_v3/tools/prepare_isaac_urdf.py
+   ```
+
+2. In Isaac Sim, import:
+
+   ```text
+   assets/robots/ranger_mini_v3/isaac_urdf/ranger_mini_v3.urdf
+   ```
+
+3. Import it as a mobile articulation. Keep the base unfixed, use convex/cylinder
+   collisions, and save the resulting USD as:
+
+   ```text
+   assets/robots/ranger_mini_v3/isaac_physx/ranger_mini_v3_physx.usd
+   ```
+
+4. Mount RGB/NIR/polarization/LiDAR sensors on the generated PhysX robot or wrap it
+   with a sensor rig. The visual drag-drop asset remains available for rendering and
+   sensor placement, but it is not the wheel-drive simulation asset.
+
+5. Drag `RangerMiniPhysX.usda` from the RoboMitsuba Isaac browser folder after the
+   generated PhysX USD exists. The extension control path validates that asset and
+   drives it through Isaac `ArticulationAction`, not by editing USD drive attributes.

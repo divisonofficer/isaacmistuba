@@ -1,11 +1,49 @@
-const json = (r: Response) => {
-	if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
+export class ApiError extends Error {
+	status: number;
+	statusText: string;
+	payload: unknown;
+
+	constructor(response: Response, message: string, payload: unknown) {
+		super(message);
+		this.name = 'ApiError';
+		this.status = response.status;
+		this.statusText = response.statusText;
+		this.payload = payload;
+	}
+}
+
+const json = async (r: Response) => {
+	if (!r.ok) {
+		let detail = '';
+		let payload: unknown = null;
+		try {
+			payload = await r.clone().json();
+			const body = payload as Record<string, unknown>;
+			detail = body?.error ? `: ${body.error}` : body?.message ? `: ${body.message}` : `: ${JSON.stringify(payload)}`;
+		} catch {
+			try {
+				const text = await r.text();
+				payload = text;
+				detail = text ? `: ${text}` : '';
+			} catch {
+				detail = '';
+			}
+		}
+		throw new ApiError(r, `${r.status} ${r.statusText}${detail}`, payload);
+	}
 	return r.json();
 };
 
 const post = (url: string, body?: unknown) =>
 	fetch(url, {
 		method: 'POST',
+		headers: body ? { 'Content-Type': 'application/json' } : {},
+		body: body ? JSON.stringify(body) : undefined
+	}).then(json);
+
+const put = (url: string, body?: unknown) =>
+	fetch(url, {
+		method: 'PUT',
 		headers: body ? { 'Content-Type': 'application/json' } : {},
 		body: body ? JSON.stringify(body) : undefined
 	}).then(json);
@@ -212,3 +250,75 @@ export const measuredModalities = (
 	fetch(
 		`/api/material-preview/measured/${encodeURIComponent(datasetId)}/${encodeURIComponent(materialId)}/modalities?size=${size}`,
 	).then(json);
+
+export type OpticalNavProjectCreate = {
+	project_name: string;
+	dataset_type?: string;
+	target_scenario?: string;
+	robot_profile?: string;
+	modalities?: string[];
+};
+export type OpticalNavSceneCreate = {
+	scene_id: string;
+	usd_ref?: string;
+};
+
+const opticalProject = (projectId: string) =>
+	`/api/opticalnav/projects/${encodeURIComponent(projectId)}`;
+
+export const listOpticalNavProjects = () =>
+	fetch('/api/opticalnav/projects').then(json);
+export const listOpticalNavUsdCandidates = () =>
+	fetch('/api/opticalnav/usd-candidates').then(json);
+export const createOpticalNavProject = (payload: OpticalNavProjectCreate) =>
+	post('/api/opticalnav/projects', payload);
+export const getOpticalNavProject = (projectId: string) =>
+	fetch(opticalProject(projectId)).then(json);
+export const addOpticalNavScene = (projectId: string, payload: OpticalNavSceneCreate) =>
+	post(`${opticalProject(projectId)}/scenes`, payload);
+export const attachOpticalNavSceneUsd = (projectId: string, sceneId: string, payload: { usd_ref?: string }) =>
+	put(`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/usd-ref`, payload);
+export const getSceneAnnotation = (projectId: string, sceneId: string) =>
+	fetch(`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/annotation`).then(json);
+export const saveSceneAnnotation = (projectId: string, sceneId: string, payload: unknown) =>
+	put(`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/annotation`, payload);
+export const getOpticalNavAuthoringMap = (projectId: string, sceneId: string) =>
+	fetch(`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/authoring-map`).then(json);
+export const getOpticalNavEditorGeometry = (projectId: string, sceneId: string) =>
+	fetch(`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/editor-geometry`).then(json);
+export const saveOpticalNavAuthoringMap = (projectId: string, sceneId: string, payload: unknown) =>
+	put(`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/authoring-map`, payload);
+export const compileOpticalNavAuthoringMap = (projectId: string, sceneId: string) =>
+	post(`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/authoring-map/compile`);
+export const syncOpticalNavRenderScene = (projectId: string, sceneId: string, payload: unknown = {}) =>
+	post(`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/sync/render-scene`, payload);
+export const syncOpticalNavIsaacStage = (projectId: string, sceneId: string, payload: unknown = {}) =>
+	post(`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/sync/isaac-stage`, payload);
+export const buildOpticalNavMap = (projectId: string, sceneId: string, payload: { resolution: number }) =>
+	post(`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/map/build`, payload);
+export const buildOpticalNavViewpointGraph = (projectId: string, sceneId: string, payload: unknown) =>
+	post(`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/graph/build`, payload);
+export const getOpticalNavViewpointGraph = (projectId: string, sceneId: string) =>
+	fetch(`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/graph`).then(json);
+export const sweepOpticalNavViewpointGraph = (projectId: string, sceneId: string, payload: unknown) =>
+	post(`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/graph/sweep`, payload);
+export const getOpticalNavGraphRenderBatch = (projectId: string, batchId: string) =>
+	fetch(`${opticalProject(projectId)}/graph-render-batches/${encodeURIComponent(batchId)}`).then(json);
+export const planOpticalNavEpisodes = (projectId: string, payload: unknown) =>
+	post(`${opticalProject(projectId)}/episodes/plan`, payload);
+export const planOpticalNavGraphEpisodes = (projectId: string, payload: unknown) =>
+	post(`${opticalProject(projectId)}/graph/episodes/plan`, payload);
+export const listOpticalNavEpisodes = (projectId: string, split?: string) =>
+	fetch(`${opticalProject(projectId)}/episodes${split ? `?split=${encodeURIComponent(split)}` : ''}`).then(json);
+export const getOpticalNavEpisode = (projectId: string, episodeId: string) =>
+	fetch(`${opticalProject(projectId)}/episodes/${encodeURIComponent(episodeId)}`).then(json);
+export const renderOpticalNavEpisodes = (projectId: string, payload: unknown) =>
+	post(`${opticalProject(projectId)}/episodes/render`, payload);
+export const getOpticalNavRenderBatch = (projectId: string, batchId: string) =>
+	fetch(`${opticalProject(projectId)}/render-batches/${encodeURIComponent(batchId)}`).then(json);
+export const validateOpticalNavDataset = (projectId: string, payload: { require_observations?: boolean }) =>
+	post(`${opticalProject(projectId)}/validate`, payload);
+export const evaluateOpticalNavDataset = (projectId: string, payload: { policy?: string; success_radius?: number }) =>
+	post(`${opticalProject(projectId)}/evaluate`, payload);
+export const exportOpticalNavDataset = (projectId: string, payload: { zip?: boolean }) =>
+	post(`${opticalProject(projectId)}/export`, payload);

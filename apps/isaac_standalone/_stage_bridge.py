@@ -14,6 +14,7 @@ from robomituba_bridge.io import scene_snapshot_to_payload
 from robomituba_bridge.paths import to_repo_relative_posix
 from robomituba_bridge.shape_mapping import build_shape_mapping, write_shape_mapping
 from robomituba_bridge.types import CameraRecord, FrameRecord, LightRecord, MaterialRecord, MeshRecord, RobotState, SceneSnapshot
+from mitsuba_converter.usd_snapshot import extract_snapshot_from_stage
 
 
 def _require_pxr():
@@ -289,121 +290,17 @@ def extract_snapshot(
     usd_stage_path: str | None = None,
     source_usd_path: Path | None = None,
 ) -> SceneSnapshot:
-    _, _, UsdGeom, UsdLux, UsdShade = _require_pxr()
-
-    xform_cache = UsdGeom.XformCache()
-    material_records: dict[str, MaterialRecord] = {}
-    mesh_records: list[MeshRecord] = []
-    camera_records: list[CameraRecord] = []
-    light_records: list[LightRecord] = []
-
-    for prim in stage.Traverse():
-        if prim.IsA(UsdGeom.Mesh):
-            if not _is_renderable_mesh(prim):
-                continue
-            mesh = UsdGeom.Mesh(prim)
-            points = mesh.GetPointsAttr().Get() or []
-            counts = mesh.GetFaceVertexCountsAttr().Get() or []
-            material_id = None
-            bound = UsdShade.MaterialBindingAPI(prim).ComputeBoundMaterial()
-            material = _unwrap_connected_source(bound)
-            if material:
-                material_id = str(material.GetPath())
-                if material_id not in material_records:
-                    material_records[material_id] = _extract_material_record(material, source_usd_path)
-
-            mesh_records.append(
-                MeshRecord(
-                    mesh_id=str(prim.GetPath()),
-                    name=prim.GetName(),
-                    source_path=str(prim.GetPath()),
-                    material_id=material_id,
-                    vertex_count=len(points),
-                    face_count=_tri_face_count(list(counts)),
-                    transform=_matrix_to_list(xform_cache.GetLocalToWorldTransform(prim)),
-                )
-            )
-            continue
-
-        if prim.IsA(UsdGeom.Camera):
-            camera = UsdGeom.Camera(prim)
-            clip_range = camera.GetClippingRangeAttr().Get()
-            camera_records.append(
-                CameraRecord(
-                    camera_id=str(prim.GetPath()),
-                    name=prim.GetName(),
-                    source_path=str(prim.GetPath()),
-                    fov_deg=_fov_from_camera(camera),
-                    clip_range=[float(clip_range[0]), float(clip_range[1])] if clip_range else None,
-                    look_at=_extract_look_at(xform_cache.GetLocalToWorldTransform(prim)),
-                    transform=_matrix_to_list(xform_cache.GetLocalToWorldTransform(prim)),
-                )
-            )
-            continue
-
-        light_type = None
-        radius = None
-        size = None
-        texture_path = None
-        if prim.IsA(UsdLux.RectLight):
-            light_type = "rectangle"
-            rect = UsdLux.RectLight(prim)
-            size = [float(rect.GetWidthAttr().Get() or 1.0), float(rect.GetHeightAttr().Get() or 1.0)]
-        elif prim.IsA(UsdLux.SphereLight):
-            light_type = "sphere"
-            sphere = UsdLux.SphereLight(prim)
-            radius = float(sphere.GetRadiusAttr().Get() or 0.5)
-        elif prim.IsA(UsdLux.DomeLight):
-            light_type = "envmap"
-            dome = UsdLux.DomeLight(prim)
-            texture_path = _resolve_asset_path(source_usd_path, dome.GetTextureFileAttr().Get())
-        elif prim.IsA(UsdLux.DistantLight):
-            light_type = "distant"
-        elif prim.IsA(UsdLux.DiskLight):
-            light_type = "disk"
-
-        if light_type is None:
-            continue
-
-        light_api = UsdLux.LightAPI(prim)
-        color = light_api.GetColorAttr().Get() if light_api else None
-        intensity = light_api.GetIntensityAttr().Get() if light_api else None
-        exposure = light_api.GetExposureAttr().Get() if light_api else None
-
-        light_records.append(
-            LightRecord(
-                light_id=str(prim.GetPath()),
-                name=prim.GetName(),
-                source_path=str(prim.GetPath()),
-                light_type=light_type,
-                color=[float(color[0]), float(color[1]), float(color[2])] if color else None,
-                intensity=float(intensity) if intensity is not None else None,
-                exposure=float(exposure) if exposure is not None else None,
-                radius=radius,
-                size=size,
-                texture_path=texture_path,
-                transform=_matrix_to_list(xform_cache.GetLocalToWorldTransform(prim)),
-            )
-        )
-
-    frame = FrameRecord(
+    extracted = extract_snapshot_from_stage(
+        stage,
+        scene_id=scene_id,
         frame_id=frame_id,
         timestamp=timestamp,
-        active_camera_id=camera_records[0].camera_id if camera_records else None,
-        meters_per_unit=float(UsdGeom.GetStageMetersPerUnit(stage)),
-        up_axis=str(UsdGeom.GetStageUpAxis(stage)),
-    )
-    robot_state = _extract_robot_state(stage, xform_cache)
-    return SceneSnapshot(
-        scene_id=scene_id,
-        frame=frame,
-        meshes=mesh_records,
-        materials=list(material_records.values()),
-        cameras=camera_records,
-        lights=light_records,
         usd_stage_path=usd_stage_path,
-        robot_state=robot_state,
+        source_usd_path=source_usd_path,
+        repo_root=REPO_ROOT,
+        include_geometry_payloads=True,
     )
+    return extracted.snapshot
 
 
 def inspect_stage_summary(stage, *, source_usd_path: Path | None = None) -> dict[str, Any]:

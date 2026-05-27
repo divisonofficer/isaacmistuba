@@ -268,6 +268,37 @@ class _Worker:
         self._outbound.put(job)
         self.stats.submitted_count += 1
 
+    def cancel(self, job_id: str) -> bool:
+        """Cancel a queued or in-flight job owned by this worker.
+
+        Returns True when the job was found. In-flight cancellation uses
+        worker kill/restart because Mitsuba calls are not cooperatively
+        interruptible once inside CUDA/OptiX.
+        """
+        if self.stats.in_flight_job_id == job_id:
+            self._manager._request_restart(self, reason="job_cancelled")
+            return True
+        kept: list[dict] = []
+        found = False
+        while True:
+            try:
+                item = self._outbound.get_nowait()
+            except _queue.Empty:
+                break
+            if str(item.get("job_id") or "") == job_id:
+                found = True
+                self._inject_event({
+                    "job_id": job_id,
+                    "type": "failed",
+                    "reason": "job_cancelled",
+                    "message": "job cancelled before worker start",
+                })
+            else:
+                kept.append(item)
+        for item in kept:
+            self._outbound.put(item)
+        return found
+
     def _writer_loop(self) -> None:
         proc = self._process
         if proc is None or proc.stdin is None:
@@ -541,6 +572,15 @@ class WorkerManager:
             })
             return
         worker.submit(job)
+
+    def cancel(self, job_id: str) -> bool:
+        found = False
+        for worker in list(self._workers):
+            try:
+                found = worker.cancel(job_id) or found
+            except Exception:
+                pass
+        return found
 
     def shutdown(self) -> None:
         with self._lock:

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, fields
+import hashlib
 import json
 from pathlib import Path
 from typing import Any, Dict, Iterable
+import zipfile
 
 from .manifest import validate_job_manifest, validate_scene_snapshot
 from .manifest import (
@@ -41,6 +43,10 @@ from .types import (
     SceneOverrideSpec,
     SceneSnapshot,
     SceneState,
+    InstancerMappingRecord,
+    PoseRecord,
+    ReferenceRecord,
+    SCENE_SNAPSHOT_SCHEMA_VERSION,
 )
 
 
@@ -53,28 +59,48 @@ def _read_json(path: Path) -> Dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _dataclass_kwargs(cls, payload: Dict[str, Any]) -> Dict[str, Any]:
+    allowed = {item.name for item in fields(cls)}
+    return {key: value for key, value in payload.items() if key in allowed}
+
+
 def _mesh_from_dict(payload: Dict[str, Any]) -> MeshRecord:
-    return MeshRecord(**payload)
+    return MeshRecord(**_dataclass_kwargs(MeshRecord, payload))
 
 
 def _material_from_dict(payload: Dict[str, Any]) -> MaterialRecord:
-    return MaterialRecord(**payload)
+    return MaterialRecord(**_dataclass_kwargs(MaterialRecord, payload))
 
 
 def _camera_from_dict(payload: Dict[str, Any]) -> CameraRecord:
-    return CameraRecord(**payload)
+    return CameraRecord(**_dataclass_kwargs(CameraRecord, payload))
 
 
 def _light_from_dict(payload: Dict[str, Any]) -> LightRecord:
-    return LightRecord(**payload)
+    return LightRecord(**_dataclass_kwargs(LightRecord, payload))
 
 
 def _frame_from_dict(payload: Dict[str, Any]) -> FrameRecord:
-    return FrameRecord(**payload)
+    return FrameRecord(**_dataclass_kwargs(FrameRecord, payload))
+
+
+def _pose_from_dict(payload: Dict[str, Any]) -> PoseRecord:
+    return PoseRecord(**_dataclass_kwargs(PoseRecord, payload))
+
+
+def _instancer_mapping_from_dict(payload: Dict[str, Any]) -> InstancerMappingRecord:
+    return InstancerMappingRecord(**_dataclass_kwargs(InstancerMappingRecord, payload))
+
+
+def _reference_from_dict(payload: Dict[str, Any]) -> ReferenceRecord:
+    return ReferenceRecord(**_dataclass_kwargs(ReferenceRecord, payload))
 
 
 def _paths_from_dict(payload: Dict[str, Any]) -> JobPaths:
-    return JobPaths(**payload)
+    normalized = dict(payload)
+    if "snapshot_archive" not in normalized and normalized.get("snapshot_dir"):
+        normalized["snapshot_archive"] = f"{str(normalized['snapshot_dir']).rstrip('/')}/snapshot_package.zip"
+    return JobPaths(**_dataclass_kwargs(JobPaths, normalized))
 
 
 def _scene_state_from_dict(payload: Dict[str, Any]) -> SceneState:
@@ -116,9 +142,15 @@ def _render_job_status_from_dict(payload: Dict[str, Any]) -> RenderJobStatus:
 def scene_snapshot_to_payload(snapshot: SceneSnapshot) -> Dict[str, Any]:
     payload = {
         "scene_id": snapshot.scene_id,
+        "schema_version": snapshot.schema_version,
         "frame": asdict(snapshot.frame),
         "usd_stage_path": snapshot.usd_stage_path,
+        "snapshot_archive": snapshot.snapshot_archive,
+        "package_metadata": snapshot.package_metadata,
         "meshes": [asdict(mesh) for mesh in snapshot.meshes],
+        "pose_records": [asdict(pose) for pose in snapshot.pose_records],
+        "instancer_mappings": [asdict(item) for item in snapshot.instancer_mappings],
+        "reference_records": [asdict(item) for item in snapshot.reference_records],
         "extras": snapshot.extras,
     }
     if snapshot.robot_state is not None:
@@ -136,11 +168,19 @@ def scene_snapshot_from_payload(
     return SceneSnapshot(
         scene_id=payload["scene_id"],
         frame=_frame_from_dict(payload["frame"]),
+        schema_version=str(payload.get("schema_version") or SCENE_SNAPSHOT_SCHEMA_VERSION),
         usd_stage_path=payload.get("usd_stage_path"),
+        snapshot_archive=payload.get("snapshot_archive"),
+        package_metadata=payload.get("package_metadata", {}),
         meshes=[_mesh_from_dict(item) for item in payload.get("meshes", [])],
         materials=[_material_from_dict(item) for item in materials],
         cameras=[_camera_from_dict(item) for item in cameras],
         lights=[_light_from_dict(item) for item in lights],
+        pose_records=[_pose_from_dict(item) for item in payload.get("pose_records", [])],
+        instancer_mappings=[
+            _instancer_mapping_from_dict(item) for item in payload.get("instancer_mappings", [])
+        ],
+        reference_records=[_reference_from_dict(item) for item in payload.get("reference_records", [])],
         robot_state=robot_state_from_payload(payload["robot_state"]) if payload.get("robot_state") else None,
         extras=payload.get("extras", {}),
     )
@@ -373,6 +413,114 @@ def load_job_bundle(manifest_path: str | Path, *, repo_root: str | Path | None =
     )
     validate_scene_snapshot(snapshot)
     return manifest, snapshot
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _asset_refs_from_snapshot(snapshot: SceneSnapshot) -> dict[str, str]:
+    refs: dict[str, str] = {}
+    for mesh in snapshot.meshes:
+        for value in (mesh.geometry_path, mesh.geometry_sidecar):
+            if value:
+                refs[value] = value
+    for material in snapshot.materials:
+        for value in material.textures.values():
+            if isinstance(value, str):
+                refs[value] = value
+    for light in snapshot.lights:
+        if light.texture_path:
+            refs[light.texture_path] = light.texture_path
+    for record in snapshot.reference_records:
+        if record.asset_path:
+            refs[record.asset_path] = record.package_path or record.asset_path
+    if snapshot.usd_stage_path:
+        refs[snapshot.usd_stage_path] = snapshot.usd_stage_path
+    return refs
+
+
+def write_scene_snapshot_package(
+    snapshot: SceneSnapshot,
+    archive_path: str | Path,
+    *,
+    repo_root: str | Path,
+) -> Path:
+    """Write a portable JSON + sidecar ZIP package for a SceneSnapshot."""
+
+    archive = Path(archive_path)
+    archive.parent.mkdir(parents=True, exist_ok=True)
+    root = Path(repo_root)
+    payload = scene_snapshot_to_payload(snapshot)
+    asset_manifest: list[dict[str, Any]] = []
+
+    with zipfile.ZipFile(archive, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("scene_snapshot.json", json.dumps(payload, ensure_ascii=False, indent=2))
+        zf.writestr("materials.json", json.dumps({"materials": [asdict(item) for item in snapshot.materials]}, ensure_ascii=False, indent=2))
+        zf.writestr("cameras.json", json.dumps({"cameras": [asdict(item) for item in snapshot.cameras]}, ensure_ascii=False, indent=2))
+        zf.writestr("lights.json", json.dumps({"lights": [asdict(item) for item in snapshot.lights]}, ensure_ascii=False, indent=2))
+
+        for repo_ref, package_ref in sorted(_asset_refs_from_snapshot(snapshot).items()):
+            try:
+                source = resolve_repo_path(root, repo_ref)
+            except Exception:
+                continue
+            if not source.exists() or not source.is_file():
+                continue
+            archive_name = f"assets/{package_ref}".replace("\\", "/").lstrip("/")
+            zf.write(source, archive_name)
+            stat = source.stat()
+            asset_manifest.append(
+                {
+                    "repo_path": repo_ref,
+                    "archive_path": archive_name,
+                    "size_bytes": stat.st_size,
+                    "sha256": _sha256_file(source),
+                }
+            )
+
+        package = {
+            "package_version": "1.0",
+            "snapshot_schema_version": snapshot.schema_version,
+            "scene_id": snapshot.scene_id,
+            "frame_id": snapshot.frame.frame_id,
+            "assets": asset_manifest,
+        }
+        zf.writestr("package.json", json.dumps(package, ensure_ascii=False, indent=2))
+
+    return archive
+
+
+def read_scene_snapshot_package(archive_path: str | Path) -> SceneSnapshot:
+    """Read a SceneSnapshot from a portable package ZIP."""
+
+    with zipfile.ZipFile(Path(archive_path), mode="r") as zf:
+        scene_payload = json.loads(zf.read("scene_snapshot.json").decode("utf-8"))
+        materials_payload = json.loads(zf.read("materials.json").decode("utf-8")) if "materials.json" in zf.namelist() else {}
+        cameras_payload = json.loads(zf.read("cameras.json").decode("utf-8")) if "cameras.json" in zf.namelist() else {}
+        lights_payload = json.loads(zf.read("lights.json").decode("utf-8")) if "lights.json" in zf.namelist() else {}
+    snapshot = scene_snapshot_from_payload(
+        scene_payload,
+        materials=materials_payload.get("materials", []),
+        cameras=cameras_payload.get("cameras", []),
+        lights=lights_payload.get("lights", []),
+    )
+    validate_scene_snapshot(snapshot)
+    return snapshot
+
+
+def extract_scene_snapshot_package(archive_path: str | Path, output_dir: str | Path) -> SceneSnapshot:
+    """Extract package contents and return the contained SceneSnapshot."""
+
+    output = Path(output_dir)
+    output.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(Path(archive_path), mode="r") as zf:
+        zf.extractall(output)
+    return read_scene_snapshot_package(archive_path)
 
 
 def write_observation_bundle_manifest(path: str | Path, bundle: ObservationBundleManifest) -> Path:

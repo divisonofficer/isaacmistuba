@@ -32,6 +32,11 @@ if _OMNI_AVAILABLE:
 
         def on_startup(self, ext_id: str) -> None:  # noqa: N802
             try:
+                from isaac_extension.asset_browser import register_robomituba_asset_root
+            except ImportError:  # pragma: no cover - Isaac runtime fallback
+                from asset_browser import register_robomituba_asset_root
+            self._asset_browser_status = register_robomituba_asset_root()
+            try:
                 from isaac_extension.ui_panel import RobomitubaPanel
             except ImportError:  # pragma: no cover - Isaac runtime fallback
                 from ui_panel import RobomitubaPanel

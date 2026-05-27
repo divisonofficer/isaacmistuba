@@ -749,6 +749,49 @@ def _open_stage_with_progress(
     context.open_stage(open_path)
 
 
+def _normalize_up_axis(value: str | None) -> str | None:
+    normalized = str(value or "").strip().upper()
+    if normalized in {"Y", "Z"}:
+        return normalized
+    return None
+
+
+def _scene_load_up_axis(scene_id: str | None) -> str | None:
+    env_axis = _normalize_up_axis(os.environ.get("ROBOMITUBA_ISAAC_LOAD_UP_AXIS"))
+    if env_axis:
+        return env_axis
+    scene_key = str(scene_id or "").strip().upper()
+    if scene_key:
+        env_scene_axis = _normalize_up_axis(os.environ.get(f"ROBOMITUBA_ISAAC_LOAD_UP_AXIS_{scene_key}"))
+        if env_scene_axis:
+            return env_scene_axis
+    return None
+
+
+def _apply_stage_up_axis(axis: str | None) -> dict[str, Any] | None:
+    normalized = _normalize_up_axis(axis)
+    if not normalized:
+        return None
+    try:
+        import omni.usd  # type: ignore
+        from pxr import Gf, UsdGeom  # type: ignore
+    except Exception:
+        return None
+
+    stage = omni.usd.get_context().get_stage()
+    if stage is None:
+        return None
+    token = UsdGeom.Tokens.y if normalized == "Y" else UsdGeom.Tokens.z
+    UsdGeom.SetStageUpAxis(stage, token)
+    gravity_direction = (0.0, -1.0, 0.0) if normalized == "Y" else (0.0, 0.0, -1.0)
+    physics_scene = stage.GetPrimAtPath("/World/PhysicsScene")
+    if physics_scene and physics_scene.IsValid():
+        attr = physics_scene.GetAttribute("physics:gravityDirection")
+        if attr:
+            attr.Set(Gf.Vec3f(*gravity_direction))
+    return {"up_axis": normalized, "gravity_direction": gravity_direction}
+
+
 def submit_isaac_state_render(
     snapshot: Any,
     daemon_url: str | None = None,
@@ -1019,6 +1062,139 @@ def complete_isaac_command(
         request_payload,
         timeout_s=timeout_s,
     )
+
+
+def _set_custom_attr(prim: Any, name: str, value: Any) -> None:
+    try:
+        from pxr import Sdf  # type: ignore
+    except Exception:
+        return
+    type_name = Sdf.ValueTypeNames.String
+    if isinstance(value, bool):
+        type_name = Sdf.ValueTypeNames.Bool
+    elif isinstance(value, (int, float)):
+        type_name = Sdf.ValueTypeNames.Double
+    attr = prim.GetAttribute(name)
+    if not attr:
+        attr = prim.CreateAttribute(name, type_name, custom=True)
+    attr.Set(value)
+
+
+def _apply_xform(prim: Any, *, translate: tuple[float, float, float], scale: tuple[float, float, float], yaw_deg: float = 0.0) -> None:
+    from pxr import Gf, UsdGeom  # type: ignore
+
+    xformable = UsdGeom.Xformable(prim)
+    xformable.ClearXformOpOrder()
+    xformable.AddTranslateOp().Set(Gf.Vec3d(*translate))
+    if yaw_deg:
+        xformable.AddRotateYOp().Set(float(yaw_deg))
+    xformable.AddScaleOp().Set(Gf.Vec3f(*scale))
+
+
+def _line_geometry_transform(geometry: Mapping[str, Any]) -> tuple[tuple[float, float, float], tuple[float, float, float], float]:
+    import math
+
+    start = geometry.get("start") or [0.0, 0.0]
+    end = geometry.get("end") or [0.0, 0.0]
+    sx, sy = float(start[0]), float(start[1])
+    ex, ey = float(end[0]), float(end[1])
+    height = float(geometry.get("height_m") or 2.4)
+    thickness = float(geometry.get("thickness_m") or 0.08)
+    length = max(0.01, math.hypot(ex - sx, ey - sy))
+    yaw_deg = -math.degrees(math.atan2(ey - sy, ex - sx))
+    return ((sx + ex) / 2.0, height / 2.0, (sy + ey) / 2.0), (length, height, thickness), yaw_deg
+
+
+def _rectangle_geometry_transform(geometry: Mapping[str, Any], *, height: float = 0.02) -> tuple[tuple[float, float, float], tuple[float, float, float], float]:
+    bounds = geometry.get("bounds") or [0.0, 0.0, 0.1, 0.1]
+    min_x, min_y, max_x, max_y = [float(item) for item in bounds]
+    return ((min_x + max_x) / 2.0, height / 2.0, (min_y + max_y) / 2.0), (max(0.01, max_x - min_x), height, max(0.01, max_y - min_y)), 0.0
+
+
+def sync_opticalnav_stage_from_daemon(
+    stage: Any,
+    payload: Mapping[str, Any],
+    *,
+    daemon_url: str | None = None,
+    progress_callback: ProgressCallback | None = None,
+    timeout_s: float = 60.0,
+) -> dict[str, Any]:
+    """Materialize OpticalNav 2D editor overlays as simple USD guide prims."""
+    if stage is None:
+        raise RuntimeError("No Isaac stage is available for OpticalNav sync.")
+    try:
+        from pxr import Gf, UsdGeom  # type: ignore
+    except Exception as exc:  # pragma: no cover - Isaac runtime path
+        raise RuntimeError("pxr/UsdGeom is required for OpticalNav stage sync.") from exc
+
+    overlay = payload.get("overlay") if isinstance(payload.get("overlay"), Mapping) else {}
+    scene_id = str(payload.get("scene_id") or overlay.get("scene_id") or "scene")
+    objects = [item for item in overlay.get("objects", []) if isinstance(item, Mapping)]
+    regions = [item for item in overlay.get("regions", []) if isinstance(item, Mapping)]
+    root_path = f"/World/OpticalNavAuthoring/{scene_id}"
+    root = stage.DefinePrim(root_path, "Xform")
+    _set_custom_attr(root, "robomituba:opticalnav:sceneId", scene_id)
+    _set_custom_attr(root, "robomituba:opticalnav:sceneVariantRef", str(payload.get("scene_variant_ref") or ""))
+    _set_custom_attr(root, "robomituba:opticalnav:overlayRef", str(payload.get("render_scene_overlay_ref") or ""))
+
+    created_objects = 0
+    created_regions = 0
+    total = len(objects) + len(regions)
+    if progress_callback:
+        progress_callback("running", "creating_overlays", f"Creating {total} OpticalNav overlay prim(s).", "isaac_app", {"loaded": 0, "total": total})
+
+    for index, obj in enumerate(objects, start=1):
+        object_id = str(obj.get("id") or f"object_{index}")
+        geometry = obj.get("geometry") if isinstance(obj.get("geometry"), Mapping) else {}
+        if geometry.get("type") == "line":
+            translate, scale, yaw_deg = _line_geometry_transform(geometry)
+        elif geometry.get("type") == "rectangle":
+            translate, scale, yaw_deg = _rectangle_geometry_transform(geometry, height=float(geometry.get("height_m") or 0.08))
+        else:
+            center = geometry.get("center") or [0.0, 0.0]
+            translate, scale, yaw_deg = (float(center[0]), 0.1, float(center[1])), (0.2, 0.2, 0.2), float(geometry.get("yaw_deg") or 0.0)
+        cube = UsdGeom.Cube.Define(stage, f"{root_path}/Objects/{object_id}")
+        cube.CreateSizeAttr(1.0)
+        prim = cube.GetPrim()
+        _apply_xform(prim, translate=translate, scale=scale, yaw_deg=yaw_deg)
+        color = Gf.Vec3f(0.25, 0.78, 0.9)
+        if str(obj.get("type") or "") == "mirror_wall":
+            color = Gf.Vec3f(0.8, 0.45, 0.75)
+        cube.CreateDisplayColorAttr().Set([color])
+        _set_custom_attr(prim, "robomituba:opticalnav:id", object_id)
+        _set_custom_attr(prim, "robomituba:opticalnav:type", str(obj.get("type") or "object"))
+        _set_custom_attr(prim, "robomituba:opticalnav:material", str(obj.get("material") or ""))
+        _set_custom_attr(prim, "robomituba:opticalnav:navigation", json.dumps(obj.get("navigation") or {}, ensure_ascii=False, sort_keys=True))
+        created_objects += 1
+        if progress_callback:
+            progress_callback("running", "creating_overlays", f"Created {object_id}.", "isaac_app", {"loaded": index, "total": total})
+
+    for index, region in enumerate(regions, start=1):
+        region_id = str(region.get("id") or f"region_{index}")
+        geometry = region.get("geometry") if isinstance(region.get("geometry"), Mapping) else {}
+        if geometry.get("type") != "rectangle":
+            continue
+        translate, scale, yaw_deg = _rectangle_geometry_transform(geometry, height=0.01)
+        cube = UsdGeom.Cube.Define(stage, f"{root_path}/Regions/{region_id}")
+        cube.CreateSizeAttr(1.0)
+        prim = cube.GetPrim()
+        _apply_xform(prim, translate=translate, scale=scale, yaw_deg=yaw_deg)
+        color = Gf.Vec3f(0.23, 0.63, 0.35) if region.get("type") == "traversable" else Gf.Vec3f(0.18, 0.48, 0.92)
+        cube.CreateDisplayColorAttr().Set([color])
+        _set_custom_attr(prim, "robomituba:opticalnav:id", region_id)
+        _set_custom_attr(prim, "robomituba:opticalnav:type", str(region.get("type") or "region"))
+        created_regions += 1
+
+    result = {
+        "status": "synced",
+        "scene_id": scene_id,
+        "root_prim": root_path,
+        "object_count": created_objects,
+        "region_count": created_regions,
+    }
+    if progress_callback:
+        progress_callback("running", "sync_complete", f"OpticalNav stage sync complete: {created_objects} object(s), {created_regions} region(s).", "isaac_app", {"loaded": total, "total": total})
+    return result
 
 
 def _render_ready_error(scene_id: str, scene: dict[str, Any]) -> RuntimeError:
@@ -1356,12 +1532,14 @@ def load_scene_from_daemon(
         deadline = time.monotonic() + max(timeout_s, 10.0)
         while _stage_streaming_busy(context) and time.monotonic() < deadline:
             time.sleep(0.2)
+    applied_up_axis = _apply_stage_up_axis(_scene_load_up_axis(scene_id))
     _emit_progress(progress_callback, stage="ready", message="Scene open completed.", origin="isaac_internal")
     return {
         "status": "opened",
         "scene_id": (payload.get("scene") or {}).get("scene_id"),
         "usd_stage_path": open_path,
         "texture_cache": cache_status,
+        "applied_up_axis": applied_up_axis,
     }
 
 

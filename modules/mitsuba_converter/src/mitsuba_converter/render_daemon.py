@@ -11,6 +11,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import mimetypes
 import os
+import platform
 from pathlib import Path
 import math
 import shutil
@@ -81,6 +82,7 @@ from .material_overrides_store import (
 from .multimodal import SUPPORTED_MODALITIES, camera_to_world_to_lookat, normalize_mat4_storage
 from .observation_bridge import render_timestep_bundle_split_lighting
 from .scene_floorplan import CameraOverlay, LightOverlay, render_scene_floorplan
+from .usd_editor_geometry import build_usd_editor_geometry
 from .worker_manager import WorkerManager
 
 
@@ -93,7 +95,7 @@ _WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 # pre-Phase-R in-process worker thread. Once the subprocess path has been
 # verified end-to-end the default flips and this flag becomes the rollback
 # escape hatch (see plan: Phase R-5 rollout).
-_RENDER_INPROCESS_DEFAULT = "1"  # default during Phase R bake-in. Flip to "0" once verified.
+_RENDER_INPROCESS_DEFAULT = "1"
 _RENDER_INPROCESS = (
     os.environ.get("ROBOMITUBA_RENDER_INPROCESS", _RENDER_INPROCESS_DEFAULT).strip().lower()
     in ("1", "true", "yes", "on")
@@ -791,8 +793,18 @@ _PHASE_R_REASON_MESSAGES: dict[str, str] = {
     "worker_exited": "렌더 워커 프로세스가 비정상 종료됨 — 자동 재시작됨",
     "worker_restarting": "워커 재기동 중이라 이 작업은 실행되지 못함 — 명시적 재시도 필요",
     "worker_pipe_broken": "워커 stdin 파이프가 닫힘 — 매니저가 재시작 중",
+    "heartbeat_timeout": "워커 heartbeat timeout — 자동 재시작됨",
+    "job_cancelled": "작업이 취소되었습니다",
     "manager_degraded": "워커 매니저가 degraded 상태 — daemon 재시작 필요",
     "no_worker": "사용 가능한 렌더 워커 없음",
+}
+
+_RETRYABLE_RENDER_FAILURE_REASONS = {
+    "worker_exited",
+    "worker_restarting",
+    "worker_pipe_broken",
+    "heartbeat_timeout",
+    "no_worker",
 }
 
 
@@ -888,7 +900,8 @@ class RenderDaemon:
         with self._render_worker_manager_lock:
             if self._render_worker_manager is not None:
                 return self._render_worker_manager
-            mgr = WorkerManager(repo_root=self.repo_root, worker_count=1)
+            worker_count = max(1, int(os.environ.get("ROBOMITUBA_RENDER_WORKER_COUNT", "1") or "1"))
+            mgr = WorkerManager(repo_root=self.repo_root, worker_count=worker_count)
             mgr.add_listener(self._on_render_worker_event)
             mgr.start()
             self._render_worker_manager = mgr
@@ -994,12 +1007,18 @@ class RenderDaemon:
             return
         if kind == "failed":
             reason = str(event.get("reason") or "unknown")
+            with self._condition:
+                current = self._jobs.get(job_id)
+                if current is None or current.status.status == "cancelled":
+                    return
             message_raw = event.get("message")
             if isinstance(message_raw, str) and message_raw:
                 message = f"{reason}: {message_raw}"
             else:
                 fallback = _PHASE_R_REASON_MESSAGES.get(reason, "render unavailable")
                 message = f"{reason}: {fallback}"
+            if self._retry_render_job(job_id, reason=reason, message=message):
+                return
             self._mark_failed(job_id, message)
             return
 
@@ -1503,6 +1522,8 @@ class RenderDaemon:
                 rs["height"] = saved.get("height", 720)
             if "upscale" not in rs:
                 rs["upscale"] = saved.get("upscale", "none")
+        if command_type == "render_sensor" and not command_payload.get("sensor_id"):
+            raise ValueError("render_sensor command requires payload.sensor_id.")
         command_id = self._next_isaac_command_id()
         command = _IsaacRemoteCommand(
             command_id=command_id,
@@ -1656,8 +1677,36 @@ class RenderDaemon:
             result = payload.get("result")
             command.result = dict(result) if isinstance(result, Mapping) else None
             command.error = self._normalize_command_error(_maybe_str(payload.get("error")), scene_id=command.scene_id)
+            if status == "succeeded" and command.command_type == "sync_opticalnav_stage":
+                self._mark_opticalnav_isaac_stage_synced(command)
             self._record_isaac_command_telemetry(command, event_type="complete")
             return self._isaac_command_payload(command)
+
+    def _mark_opticalnav_isaac_stage_synced(self, command: _IsaacRemoteCommand) -> None:
+        command_payload = dict(command.payload or {})
+        project_id = _maybe_str(command_payload.get("project_id"))
+        scene_id = _maybe_str(command_payload.get("scene_id")) or command.scene_id
+        if not project_id or not scene_id:
+            return
+        try:
+            from navigation_dataset.scene_annotations import read_scene_annotation, write_scene_annotation
+
+            project_dir = self._opticalnav_project_dir(project_id)
+            annotation_path = project_dir / "scenes" / scene_id / "scene_annotation.json"
+            annotation = read_scene_annotation(annotation_path)
+            sync = dict(annotation.metadata.get("sync", {}))
+            sync.update({
+                "isaac_stage": "synced",
+                "isaac_stage_synced_at": _utc_now_iso(),
+                "isaac_stage_command_id": command.command_id,
+                "message": "Dataset, render-scene overlay, and Isaac stage are synced.",
+            })
+            if isinstance(command.result, Mapping):
+                sync["isaac_stage_result"] = dict(command.result)
+            annotation.metadata = {**dict(annotation.metadata or {}), "sync": sync}
+            write_scene_annotation(annotation_path, annotation)
+        except Exception:
+            return
 
     def _load_registered_isaac_scenes(self) -> dict[str, dict[str, Any]]:
         path = self._isaac_scene_catalog_path()
@@ -1734,6 +1783,20 @@ class RenderDaemon:
                     self.daemon._handle_post(self)
                 except Exception:
                     self._log_exception("POST")
+                    raise
+
+            def do_PUT(self) -> None:  # noqa: N802
+                try:
+                    self.daemon._handle_put(self)
+                except Exception:
+                    self._log_exception("PUT")
+                    raise
+
+            def do_DELETE(self) -> None:  # noqa: N802
+                try:
+                    self.daemon._handle_delete(self)
+                except Exception:
+                    self._log_exception("DELETE")
                     raise
 
         self._server = ThreadingHTTPServer((self.host, self.port), Handler)
@@ -2007,7 +2070,7 @@ class RenderDaemon:
                 runtime_overrides=runtime_override_payload,
             )
             self._jobs[render_request.job_id] = job
-            self._pending.append(render_request.job_id)
+            self._enqueue_pending_unlocked(render_request.job_id, job)
             queue_position = len(self._pending)
             self._persist_request_unlocked(job)
             self._persist_status_unlocked(job)
@@ -2059,9 +2122,24 @@ class RenderDaemon:
                 job.status.progress_stage = "cancelled"
                 job.status.extras["cancelled_before_start"] = True
                 self._persist_status_unlocked(job)
+                self._record_render_job_telemetry(job, event_type="cancelled")
+                self._append_job_log_line(job, event_type="cancelled", stage="cancelled", message="Job cancelled before start")
+                self._condition.notify_all()
                 return RenderJobStatus(**render_job_status_to_payload(job.status))
             if job.status.status == "running":
-                raise RuntimeError("Queued cancellation is supported, but running renders are not interruptible in v1.")
+                job.status.status = "cancelled"
+                job.status.finished_at = _utc_now_iso()
+                job.status.progress_stage = "cancelled"
+                job.status.extras["cancelled_while_running"] = True
+                job.status.error = None
+                manager = self._render_worker_manager
+                if manager is not None:
+                    job.status.extras["worker_cancel_requested"] = bool(manager.cancel(job_id))
+                self._persist_status_unlocked(job)
+                self._record_render_job_telemetry(job, event_type="cancelled")
+                self._append_job_log_line(job, event_type="cancelled", stage="cancelled", message="Job cancelled")
+                self._condition.notify_all()
+                return RenderJobStatus(**render_job_status_to_payload(job.status))
             return RenderJobStatus(**render_job_status_to_payload(job.status))
 
     def delete_job(self, job_id: str, *, force: bool = False) -> None:
@@ -2096,6 +2174,1679 @@ class RenderDaemon:
                 pass
             self._invalidate_job_status_cache()
 
+    def _opticalnav_root(self) -> Path:
+        root = self.repo_root / "out" / "opticalnav"
+        root.mkdir(parents=True, exist_ok=True)
+        return root
+
+    def _safe_opticalnav_project_id(self, value: str) -> str:
+        safe = []
+        previous_dash = False
+        for char in (value or "").strip().lower():
+            if char.isalnum() or char in {"_", "."}:
+                safe.append(char)
+                previous_dash = False
+            elif not previous_dash:
+                safe.append("-")
+                previous_dash = True
+        project_id = "".join(safe).strip("-.") or f"project-{_utc_now().strftime('%Y%m%d%H%M%S')}"
+        return project_id[:80]
+
+    def _opticalnav_project_dir(self, project_id: str) -> Path:
+        root = self._opticalnav_root().resolve()
+        project = (root / unquote(project_id)).resolve()
+        if project != root and root in project.parents:
+            return project
+        raise ValueError(f"Invalid OpticalNav project_id: {project_id!r}")
+
+    def _opticalnav_episode_files(self, project_dir: Path, *, split: str | None = None) -> list[Path]:
+        if split:
+            return sorted((project_dir / "episodes" / split).glob("*.json"))
+        return sorted((project_dir / "episodes").glob("*/*.json"))
+
+    def _opticalnav_find_episode(self, project_dir: Path, episode_id: str) -> Path:
+        for path in self._opticalnav_episode_files(project_dir):
+            if path.stem == episode_id:
+                return path
+        raise KeyError(episode_id)
+
+    def _opticalnav_create_layout(self, project_dir: Path) -> None:
+        for rel in (
+            "scenes",
+            "episodes/train",
+            "episodes/val_seen",
+            "episodes/val_unseen",
+            "episodes/test",
+            "observations",
+            "viewpoint_observations",
+            "splits",
+            "evaluation",
+            "docs",
+            "render_batches",
+            "graph_render_batches",
+        ):
+            (project_dir / rel).mkdir(parents=True, exist_ok=True)
+        readme = project_dir / "README.md"
+        if not readme.exists():
+            readme.write_text(
+                "# OpticalNav-v0.2\n\n"
+                "Targeted synthetic fine-tuning dataset for glass, mirror, "
+                "transparent partition, and reflective navigation hazards.\n\n"
+                "OpticalNav builds a sensor-rich viewpoint graph from Isaac-Mitsuba scene variants, "
+                "caches multi-modal observations at each graph node, and generates navigation episodes "
+                "by querying shortest paths over this graph.\n",
+                encoding="utf-8",
+            )
+        dataset_card = project_dir / "dataset_card.md"
+        if not dataset_card.exists():
+            dataset_card.write_text(
+                "# Dataset Card\n\n"
+                "This package is not a full VLN benchmark. It is a targeted "
+                "synthetic fine-tuning dataset generator output.\n\n"
+                "`active_nir_intensity` is an NIR-like proxy, not a calibrated physical NIR camera model.\n",
+                encoding="utf-8",
+            )
+        docs = {
+            "action_interface.md": "Actions: move_forward, turn_left, turn_right, stop.\n",
+            "coordinate_system.md": "Poses use [x, y, yaw] in the annotation/map coordinate system.\n",
+            "modality_definitions.md": (
+                "Public v0.2 modalities: rgb, depth, active_nir_intensity, hazard_mask.\n"
+                "active_nir_intensity is an NIR-like proxy, not calibrated physical NIR.\n"
+            ),
+            "graph_action_interface.md": "Graph actions: move_to_neighbor, turn_left_30, turn_right_30, stop.\n",
+            "known_limitations.md": (
+                "v0.2 excludes full physics rollout, real robot execution, VLN-CE/LeRobot native export, "
+                "semantic/instance segmentation, LiDAR-like point clouds, hyperspectral cubes, and training code.\n"
+            ),
+        }
+        for name, text in docs.items():
+            path = project_dir / "docs" / name
+            if not path.exists():
+                path.write_text(text, encoding="utf-8")
+
+    def _opticalnav_project_summary(self, project_dir: Path) -> dict[str, Any]:
+        from navigation_dataset.validation import validate_dataset
+
+        dataset_path = project_dir / "dataset.json"
+        dataset = _read_json(dataset_path) if dataset_path.exists() else {}
+        scenes = []
+        for scene_dir in sorted((project_dir / "scenes").glob("*")):
+            if not scene_dir.is_dir():
+                continue
+            annotation_path = scene_dir / "scene_annotation.json"
+            authoring_map_path = scene_dir / "authoring_map.json"
+            traversable_grid_path = scene_dir / "traversable_grid.npy"
+            nav_graph_path = scene_dir / "nav_graph.json"
+            annotation_ok = False
+            annotation_error = None
+            sync_status: dict[str, Any] = {
+                "dataset": "missing",
+                "render_scene": "missing",
+                "isaac_stage": "missing",
+                "annotation_stale": False,
+                "traversable_map_stale": False,
+                "viewpoint_graph_stale": False,
+            }
+            if annotation_path.exists():
+                try:
+                    from navigation_dataset.scene_annotations import read_scene_annotation
+
+                    annotation = read_scene_annotation(annotation_path)
+                    annotation_ok = True
+                    sync_status.update(dict(annotation.metadata.get("sync", {})))
+                except Exception as exc:
+                    annotation_error = str(exc)
+            if authoring_map_path.exists() and annotation_path.exists():
+                sync_status["annotation_stale"] = authoring_map_path.stat().st_mtime > annotation_path.stat().st_mtime
+            if annotation_path.exists() and traversable_grid_path.exists():
+                sync_status["traversable_map_stale"] = annotation_path.stat().st_mtime > traversable_grid_path.stat().st_mtime
+            graph_path = scene_dir / "viewpoint_graph.json"
+            graph_summary = None
+            if graph_path.exists():
+                try:
+                    from navigation_dataset.viewpoint_graph import read_viewpoint_graph
+
+                    graph = read_viewpoint_graph(graph_path)
+                    graph_summary = {
+                        "graph_id": graph.graph_id,
+                        "node_count": len(graph.nodes),
+                        "edge_count": len(graph.edges),
+                        "heading_count": graph.node_heading_count,
+                        "hazard_edge_count": sum(1 for edge in graph.edges if edge.hazard_crossing),
+                    }
+                except Exception as exc:
+                    graph_summary = {"error": str(exc)}
+            if traversable_grid_path.exists() and graph_path.exists():
+                sync_status["viewpoint_graph_stale"] = traversable_grid_path.stat().st_mtime > graph_path.stat().st_mtime
+            usd_ref = self._opticalnav_scene_usd_ref(project_dir, scene_dir.name)
+            scenes.append({
+                "scene_id": scene_dir.name,
+                "usd_ref": usd_ref,
+                "annotation_ref": annotation_path.relative_to(project_dir).as_posix() if annotation_path.exists() else None,
+                "authoring_map_ref": authoring_map_path.relative_to(project_dir).as_posix() if authoring_map_path.exists() else None,
+                "authoring_map_exists": authoring_map_path.exists(),
+                "editor_geometry_ref": (scene_dir / "editor_geometry.json").relative_to(project_dir).as_posix() if (scene_dir / "editor_geometry.json").exists() else None,
+                "editor_geometry_exists": (scene_dir / "editor_geometry.json").exists(),
+                "scene_variant_ref": (scene_dir / "scene_variant.json").relative_to(project_dir).as_posix() if (scene_dir / "scene_variant.json").exists() else None,
+                "render_scene_overlay_ref": (scene_dir / "render_scene_overlays.json").relative_to(project_dir).as_posix() if (scene_dir / "render_scene_overlays.json").exists() else None,
+                "annotation_ok": annotation_ok,
+                "annotation_error": annotation_error,
+                "sync_status": sync_status,
+                "map_exists": traversable_grid_path.exists(),
+                "nav_graph_exists": nav_graph_path.exists(),
+                "viewpoint_graph_exists": graph_path.exists(),
+                "viewpoint_graph": graph_summary,
+            })
+        split_counts: dict[str, int] = {}
+        for split_dir in sorted((project_dir / "episodes").glob("*")):
+            if split_dir.is_dir():
+                split_counts[split_dir.name] = len(list(split_dir.glob("*.json")))
+        report = validate_dataset(project_dir, require_observations=False).to_payload()
+        return {
+            "project_id": project_dir.name,
+            "root": project_dir.relative_to(self.repo_root).as_posix(),
+            "dataset": dataset,
+            "scenes": scenes,
+            "split_counts": split_counts,
+            "episode_count": sum(split_counts.values()),
+            "validation": report,
+        }
+
+    def _opticalnav_starter_annotation(self, scene_id: str, usd_ref: str | None) -> dict[str, Any]:
+        return {
+            "scene_id": scene_id,
+            "usd_ref": usd_ref,
+            "coordinate_system": "xy_yaw",
+            "objects": [
+                {
+                    "object_id": "glass_surface_01",
+                    "category": "transparent_surface",
+                    "hazard_type": "glass_door",
+                    "geometry": {"type": "box", "bounds": [0.9, -0.15, 1.1, 0.15]},
+                    "mask_export": True,
+                },
+                {
+                    "object_id": "chair_01",
+                    "category": "landmark",
+                    "geometry": {"type": "circle", "center": [2.0, 0.0], "radius": 0.2},
+                    "mask_export": False,
+                },
+            ],
+            "transparent_surfaces": ["glass_surface_01"],
+            "reflective_hazards": [],
+            "hazard_regions": [
+                {
+                    "region_id": "hazard_glass_surface_01",
+                    "hazard_type": "transparent_surface",
+                    "geometry": {"type": "box", "bounds": [0.85, -0.25, 1.15, 0.25]},
+                    "object_refs": ["glass_surface_01"],
+                    "collision_risk": True,
+                }
+            ],
+            "goal_regions": [
+                {
+                    "region_id": "goal_near_chair",
+                    "center": [2.0, 0.0, 0.0],
+                    "radius": 0.35,
+                    "label": "chair",
+                    "landmark_refs": ["chair_01"],
+                }
+            ],
+            "landmarks": [
+                {
+                    "landmark_id": "chair_01",
+                    "label": "chair",
+                    "center": [2.0, 0.0, 0.0],
+                    "object_ref": "chair_01",
+                    "goal_candidate": True,
+                }
+            ],
+            "traversable_regions": [
+                {
+                    "region_id": "corridor_floor",
+                    "geometry": {"type": "box", "bounds": [-0.5, -0.8, 2.6, 0.8]},
+                    "traversable": True,
+                }
+            ],
+            "metadata": {"starter": True},
+            "schema_version": "0.1",
+        }
+
+    def _opticalnav_scene_usd_ref(self, project_dir: Path, scene_id: str) -> str | None:
+        scene_dir = project_dir / "scenes" / scene_id
+        annotation_path = scene_dir / "scene_annotation.json"
+        if annotation_path.exists():
+            try:
+                annotation = _read_json(annotation_path)
+                usd_ref = _maybe_str(annotation.get("usd_ref"))
+                if usd_ref:
+                    return usd_ref
+            except Exception:
+                pass
+        dataset_path = project_dir / "dataset.json"
+        if dataset_path.exists():
+            try:
+                dataset = _read_json(dataset_path)
+                for scene in dataset.get("scenes", []) or []:
+                    if isinstance(scene, Mapping) and scene.get("scene_id") == scene_id:
+                        usd_ref = _maybe_str(scene.get("usd_ref"))
+                        if usd_ref:
+                            return usd_ref
+            except Exception:
+                pass
+        return None
+
+    def _opticalnav_usd_extractor_status(self) -> dict[str, Any]:
+        try:
+            from pxr import Usd  # type: ignore
+
+            return {
+                "runtime": "daemon_python",
+                "python_executable": sys.executable,
+                "python_version": platform.python_version(),
+                "pxr_available": True,
+                "usd_version": ".".join(str(part) for part in Usd.GetVersion()),
+            }
+        except Exception as exc:
+            return {
+                "runtime": "daemon_python",
+                "python_executable": sys.executable,
+                "python_version": platform.python_version(),
+                "pxr_available": False,
+                "reason": str(exc),
+                "recommended_fix": "Use Isaac-side extraction or install usd-core into this daemon Python runtime.",
+            }
+
+    def _opticalnav_usd_candidates(self) -> list[dict[str, Any]]:
+        candidates: list[dict[str, Any]] = []
+        roots = [self.repo_root / "assets" / "moorelane", self.repo_root / "scenes" / "moorelane"]
+        seen: set[str] = set()
+        for root in roots:
+            if not root.exists():
+                continue
+            for path in sorted([*root.rglob("*.usd"), *root.rglob("*.usda")]):
+                try:
+                    rel = path.relative_to(self.repo_root).as_posix()
+                except ValueError:
+                    continue
+                if rel in seen:
+                    continue
+                seen.add(rel)
+                label = path.stem.replace("_", " ")
+                candidates.append({
+                    "usd_ref": rel,
+                    "label": label,
+                    "source": "moorelane",
+                    "size_bytes": path.stat().st_size,
+                    "mtime_ns": path.stat().st_mtime_ns,
+                })
+        return candidates
+
+    def _opticalnav_set_scene_usd_ref(self, project_dir: Path, scene_id: str, usd_ref: str | None) -> dict[str, Any]:
+        from navigation_dataset.episode_schema import read_project, write_project
+
+        scene_dir = project_dir / "scenes" / scene_id
+        if not scene_dir.exists():
+            raise KeyError(scene_id)
+        if usd_ref:
+            resolve_repo_path(self.repo_root, usd_ref)
+
+        annotation_path = scene_dir / "scene_annotation.json"
+        if annotation_path.exists():
+            annotation = _read_json(annotation_path)
+        else:
+            annotation = self._opticalnav_starter_annotation(scene_id, usd_ref)
+        annotation["usd_ref"] = usd_ref
+        annotation_path.write_text(json.dumps(annotation, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        dataset_path = project_dir / "dataset.json"
+        if dataset_path.exists():
+            project = read_project(dataset_path)
+            scenes: list[Any] = []
+            updated = False
+            for item in project.scenes:
+                if isinstance(item, Mapping) and item.get("scene_id") == scene_id:
+                    scenes.append({
+                        **dict(item),
+                        "scene_id": scene_id,
+                        "usd_ref": usd_ref,
+                        "annotation_ref": f"scenes/{scene_id}/scene_annotation.json",
+                    })
+                    updated = True
+                elif item == scene_id:
+                    scenes.append({"scene_id": scene_id, "usd_ref": usd_ref, "annotation_ref": f"scenes/{scene_id}/scene_annotation.json"})
+                    updated = True
+                else:
+                    scenes.append(item)
+            if not updated:
+                scenes.append({"scene_id": scene_id, "usd_ref": usd_ref, "annotation_ref": f"scenes/{scene_id}/scene_annotation.json"})
+            project.scenes = scenes
+            write_project(dataset_path, project)
+
+        cache_path = scene_dir / "editor_geometry.json"
+        if cache_path.exists():
+            cache_path.unlink()
+        return {"scene_id": scene_id, "usd_ref": usd_ref, "annotation": _read_json(annotation_path)}
+
+    def _opticalnav_unavailable_editor_geometry(self, scene_id: str, reason: str, *, usd_ref: str | None = None) -> dict[str, Any]:
+        return {
+            "scene_id": scene_id,
+            "status": "unavailable",
+            "reason": reason,
+            "usd_ref": usd_ref,
+            "extractor": self._opticalnav_usd_extractor_status(),
+            "coordinate_system": "world_xz_authoring",
+            "bounds": {"min": [0.0, 0.0, 0.0], "max": [6.0, 0.1, 4.0], "size": [6.0, 0.1, 4.0], "center": [3.0, 0.05, 2.0]},
+            "objects": [],
+            "floor_planes": [
+                {
+                    "id": "floor_fallback",
+                    "bounds": {"min": [0.0, 0.0, 0.0], "max": [6.0, 0.05, 4.0], "size": [6.0, 0.05, 4.0], "center": [3.0, 0.025, 2.0]},
+                }
+            ],
+        }
+
+    def _opticalnav_editor_geometry(self, project_dir: Path, scene_id: str) -> dict[str, Any]:
+        scene_dir = project_dir / "scenes" / scene_id
+        if not scene_dir.exists():
+            raise KeyError(scene_id)
+        usd_ref = self._opticalnav_scene_usd_ref(project_dir, scene_id)
+        if not usd_ref:
+            return self._opticalnav_unavailable_editor_geometry(scene_id, "usd_ref missing for scene.", usd_ref=None)
+        try:
+            usd_path = resolve_repo_path(self.repo_root, usd_ref)
+        except Exception as exc:
+            return self._opticalnav_unavailable_editor_geometry(scene_id, f"USD ref could not be resolved: {exc}", usd_ref=usd_ref)
+        if not usd_path.exists():
+            return self._opticalnav_unavailable_editor_geometry(scene_id, f"USD ref does not exist: {usd_ref}", usd_ref=usd_ref)
+
+        stat = usd_path.stat()
+        cache_key = {
+            "editor_geometry_version": "proxy_bounds_v1",
+            "usd_ref": usd_ref,
+            "usd_mtime_ns": stat.st_mtime_ns,
+            "usd_size": stat.st_size,
+        }
+        cache_path = scene_dir / "editor_geometry.json"
+        cached_payload = None
+        if cache_path.exists():
+            try:
+                cached = _read_json(cache_path)
+                cached_payload = cached
+                if cached.get("cache_key") == cache_key:
+                    cached["cached"] = True
+                    cached["extractor"] = cached.get("extractor") or self._opticalnav_usd_extractor_status()
+                    return cached
+            except Exception:
+                pass
+        try:
+            payload = build_usd_editor_geometry(usd_path, scene_id=scene_id, repo_root=self.repo_root, usd_ref=usd_ref)
+            payload["cache_key"] = cache_key
+            payload["cached"] = False
+            payload["extractor"] = self._opticalnav_usd_extractor_status()
+            cache_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            return payload
+        except Exception as exc:
+            if isinstance(cached_payload, dict):
+                cached_payload["cached"] = True
+                cached_payload["cache_stale"] = True
+                cached_payload["status"] = cached_payload.get("status") or "ready"
+                cached_payload["warning"] = f"Using stale cached USD proxy geometry because extraction failed: {exc}"
+                cached_payload["extractor"] = cached_payload.get("extractor") or self._opticalnav_usd_extractor_status()
+                return cached_payload
+            return self._opticalnav_unavailable_editor_geometry(scene_id, f"USD geometry unavailable: {exc}", usd_ref=usd_ref)
+
+    def _opticalnav_episode_summary(self, project_dir: Path, episode_path: Path) -> dict[str, Any]:
+        from navigation_dataset.episode_schema import read_episode
+
+        episode = read_episode(episode_path)
+        observation_refs = [step.observation_bundle_ref for step in episode.timesteps]
+        complete = bool(observation_refs) and all(bool(ref) and (project_dir / str(ref)).exists() for ref in observation_refs)
+        return {
+            "episode_id": episode.episode_id,
+            "scene_id": episode.scene_id,
+            "split": episode.split,
+            "navigation_mode": episode.navigation_mode,
+            "status": "rendered" if complete else "planned",
+            "timestep_count": len(episode.timesteps),
+            "hazard_collision": any(step.hazard_collision for step in episode.timesteps),
+            "observation_complete": complete,
+            "path": episode_path.relative_to(project_dir).as_posix(),
+        }
+
+    def _opticalnav_render_precondition_payload(
+        self,
+        project_dir: Path,
+        scene_ids: list[str],
+        payload: Mapping[str, Any],
+        *,
+        mode: str,
+    ) -> dict[str, Any] | None:
+        if bool(payload.get("allow_unsynced_render_scene", False)):
+            return None
+        missing: list[dict[str, Any]] = []
+        for scene_id in sorted(set(scene_ids)):
+            annotation_path = project_dir / "scenes" / scene_id / "scene_annotation.json"
+            if not annotation_path.exists():
+                continue
+            try:
+                from navigation_dataset.scene_annotations import read_scene_annotation
+
+                annotation = read_scene_annotation(annotation_path)
+            except Exception as exc:
+                missing.append({
+                    "key": f"{scene_id}.scene_annotation",
+                    "label": f"{scene_id} annotation",
+                    "reason": f"Scene annotation cannot be read: {exc}",
+                    "action": "fix_scene_annotation",
+                })
+                continue
+            sync = dict(annotation.metadata.get("sync", {}))
+            if sync and sync.get("render_scene") != "synced":
+                missing.append({
+                    "key": f"{scene_id}.render_scene",
+                    "label": f"{scene_id} render scene",
+                    "reason": "Edited navigation overlays are not synced into render-scene artifacts.",
+                    "action": "sync_render_scene",
+                })
+            if sync.get("render_scene") == "synced":
+                for key in ("scene_variant_ref", "render_scene_overlay_ref"):
+                    ref = sync.get(key)
+                    if not ref or not (project_dir / str(ref)).exists():
+                        missing.append({
+                            "key": f"{scene_id}.{key}",
+                            "label": key,
+                            "reason": f"Synced render-scene artifact is missing: {ref or key}",
+                            "action": "sync_render_scene",
+                        })
+        if not isinstance(payload.get("scene_state"), Mapping):
+            missing.append({
+                "key": "scene_state",
+                "label": "Isaac scene state",
+                "reason": "No scene_state payload was provided for rendering.",
+                "action": "configure_sensor_sweep",
+            })
+        if not isinstance(payload.get("camera_spec"), Mapping):
+            missing.append({
+                "key": "camera_spec",
+                "label": "Camera specification",
+                "reason": "No camera_spec payload was provided for rendering.",
+                "action": "configure_sensor_sweep",
+            })
+        if not missing:
+            return None
+        return {
+            "ok": False,
+            "stage": "render_preconditions",
+            "status": "blocked",
+            "mode": mode,
+            "message": "Rendering is not ready.",
+            "missing": missing,
+            "next_action": {
+                "id": missing[0]["action"],
+                "label": "Sync Render Scene" if missing[0]["action"] == "sync_render_scene" else "Configure Sensor Sweep",
+            },
+        }
+
+    def _opticalnav_render_batch_payload(self, project_dir: Path, batch_id: str) -> dict[str, Any]:
+        batch_path = project_dir / "render_batches" / f"{batch_id}.json"
+        if not batch_path.exists():
+            raise KeyError(batch_id)
+        batch = _read_json(batch_path)
+        jobs = []
+        counts = {"queued": 0, "running": 0, "completed": 0, "failed": 0, "cancelled": 0, "unknown": 0}
+        for item in batch.get("jobs", []):
+            job_id = str(item.get("job_id") or "")
+            try:
+                status = render_job_status_to_payload(self.get_status(job_id))
+            except Exception:
+                status = {"job_id": job_id, "status": "unknown"}
+            state = str(status.get("status") or "unknown")
+            counts[state] = counts.get(state, 0) + 1
+            jobs.append({**item, "status": status})
+        total = max(1, len(jobs))
+        return {
+            **batch,
+            "jobs": jobs,
+            "counts": counts,
+            "progress": {
+                "completed": counts.get("completed", 0),
+                "failed": counts.get("failed", 0),
+                "total": len(jobs),
+                "fraction": (counts.get("completed", 0) + counts.get("failed", 0)) / total,
+            },
+        }
+
+    def _opticalnav_graph_batch_payload(self, project_dir: Path, batch_id: str) -> dict[str, Any]:
+        batch_path = project_dir / "graph_render_batches" / f"{batch_id}.json"
+        if not batch_path.exists():
+            raise KeyError(batch_id)
+        batch = _read_json(batch_path)
+        jobs = []
+        counts = {"queued": 0, "running": 0, "completed": 0, "failed": 0, "cancelled": 0, "unknown": 0}
+        for item in batch.get("jobs", []):
+            job_id = str(item.get("job_id") or "")
+            try:
+                status = render_job_status_to_payload(self.get_status(job_id))
+            except Exception:
+                status = {"job_id": job_id, "status": "unknown"}
+            state = str(status.get("status") or "unknown")
+            counts[state] = counts.get(state, 0) + 1
+            jobs.append({**item, "status": status})
+        total = max(1, len(jobs))
+        return {
+            **batch,
+            "jobs": jobs,
+            "counts": counts,
+            "progress": {
+                "completed": counts.get("completed", 0),
+                "failed": counts.get("failed", 0),
+                "total": len(jobs),
+                "fraction": (counts.get("completed", 0) + counts.get("failed", 0)) / total,
+            },
+        }
+
+    # --- OpticalNav Agent API helpers ---
+
+    @staticmethod
+    def _geom_summary(geom: Any) -> str:
+        if geom.type == "line" and geom.start and geom.end:
+            s, e = geom.start, geom.end
+            return f"line([{round(s[0],2)},{round(s[1],2)}]→[{round(e[0],2)},{round(e[1],2)}])"
+        if geom.type == "rectangle" and isinstance(geom.bounds, list) and len(geom.bounds) == 4:
+            b = [round(v, 2) for v in geom.bounds]
+            return f"rect([{b[0]},{b[1]}]→[{b[2]},{b[3]}])"
+        if geom.type == "point" and geom.center:
+            return f"point({round(geom.center[0],2)},{round(geom.center[1],2)})"
+        return geom.type
+
+    @staticmethod
+    def _parse_agent_geometry(obj_req: dict, placement: str) -> Any:
+        from navigation_dataset.authoring_map import AuthoringGeometry
+        if placement == "line":
+            return AuthoringGeometry(type="line", start=[float(v) for v in obj_req["start"]], end=[float(v) for v in obj_req["end"]])
+        if placement == "point":
+            return AuthoringGeometry(type="point", center=[float(v) for v in obj_req["position"]])
+        if placement == "rectangle":
+            mn, mx = obj_req["min"], obj_req["max"]
+            return AuthoringGeometry(type="rectangle", bounds=[float(mn[0]), float(mn[1]), float(mx[0]), float(mx[1])])
+        raise ValueError(f"Unknown placement: {placement!r}. Use 'line', 'point', or 'rectangle'.")
+
+    @staticmethod
+    def _auto_object_id(obj_type: str, existing_ids: set) -> str:
+        i = 1
+        while True:
+            candidate = f"{obj_type}_{i:03d}"
+            if candidate not in existing_ids:
+                return candidate
+            i += 1
+
+    def _build_agent_object(self, req: dict, existing_ids: set) -> Any:
+        from navigation_dataset.authoring_map import AuthoringNavigationFlags, AuthoringObject
+        _defaults: dict[str, dict] = {
+            "glass_wall":            {"blocks_navigation": True,  "hazard_type": "transparent_obstacle", "include_in_hazard_mask": True},
+            "mirror_wall":           {"blocks_navigation": True,  "hazard_type": "reflective_obstacle",  "include_in_hazard_mask": True},
+            "transparent_partition": {"blocks_navigation": True,  "hazard_type": "transparent_obstacle", "include_in_hazard_mask": True},
+            "glass_door":            {"blocks_navigation": False, "hazard_type": "transparent_obstacle", "include_in_hazard_mask": True},
+            "wall":                  {"blocks_navigation": True},
+            "chair":                 {"blocks_navigation": True},
+            "table":                 {"blocks_navigation": True},
+            "plant":                 {"blocks_navigation": True},
+            "shelf":                 {"blocks_navigation": True},
+            "landmark":              {"instruction_candidate": True},
+        }
+        obj_type = str(req.get("type") or "")
+        placement = str(req.get("placement") or "")
+        label = str(req.get("label") or obj_type)
+        obj_id = str(req["id"]) if req.get("id") else self._auto_object_id(obj_type, existing_ids)
+        geometry = self._parse_agent_geometry(req, placement)
+        d = _defaults.get(obj_type, {})
+        nav = AuthoringNavigationFlags(
+            blocks_navigation=bool(d.get("blocks_navigation", False)),
+            hazard_type=str(d["hazard_type"]) if d.get("hazard_type") else None,
+            include_in_hazard_mask=bool(d.get("include_in_hazard_mask", False)),
+            instruction_candidate=bool(d.get("instruction_candidate", False)),
+        )
+        return AuthoringObject(id=obj_id, type=obj_type, label=label, placement=placement, geometry=geometry,
+                               material=str(req["material"]) if req.get("material") else None, navigation=nav)
+
+    def _build_agent_region(self, req: dict, existing_ids: set) -> Any:
+        from navigation_dataset.authoring_map import AuthoringNavigationFlags, AuthoringRegion
+        _defaults: dict[str, dict] = {
+            "goal":        {"goal_candidate": True},
+            "hazard":      {"hazard_type": "transparent_obstacle", "include_in_hazard_mask": True},
+            "obstacle":    {"blocks_navigation": True},
+        }
+        region_type = str(req.get("type") or "")
+        placement = str(req.get("placement") or "")
+        label = str(req.get("label") or region_type)
+        obj_id = str(req["id"]) if req.get("id") else self._auto_object_id(region_type, existing_ids)
+        geometry = self._parse_agent_geometry(req, placement)
+        d = _defaults.get(region_type, {})
+        nav = AuthoringNavigationFlags(
+            blocks_navigation=bool(d.get("blocks_navigation", False)),
+            hazard_type=str(d["hazard_type"]) if d.get("hazard_type") else None,
+            include_in_hazard_mask=bool(d.get("include_in_hazard_mask", False)),
+            goal_candidate=bool(d.get("goal_candidate", False)),
+        )
+        return AuthoringRegion(id=obj_id, type=region_type, label=label, placement=placement, geometry=geometry, navigation=nav)
+
+    def _handle_opticalnav_get(self, handler: BaseHTTPRequestHandler, path: str, query: Mapping[str, list[str]]) -> bool:
+        if path == "/api/opticalnav/projects":
+            projects = []
+            for dataset_path in sorted(self._opticalnav_root().glob("*/dataset.json")):
+                projects.append(self._opticalnav_project_summary(dataset_path.parent))
+            self._send_json(handler, HTTPStatus.OK, {"projects": projects})
+            return True
+        if path == "/api/opticalnav/usd-candidates":
+            self._send_json(handler, HTTPStatus.OK, {"candidates": self._opticalnav_usd_candidates()})
+            return True
+        if path == "/api/opticalnav/agent/materials":
+            from mitsuba_converter.material_library import MATERIAL_CATALOG, hpbrdf_channels_dir
+            from navigation_dataset.authoring_map import MATERIAL_PRESETS
+            _preset_categories = {
+                "clear_glass": "glass", "frosted_glass": "glass",
+                "mirror": "metal", "painted_wall": "wall",
+                "wood": "furniture", "fabric": "furniture", "tile": "floor",
+            }
+            presets = [{"id": mid, "label": mid.replace("_", " ").title(), "category": _preset_categories.get(mid, "other")} for mid in sorted(MATERIAL_PRESETS)]
+            hpbrdf = [{"id": mid, "label": label, "dataset": "hpbrdf_2025", "local_available": hpbrdf_channels_dir(self.repo_root, mid) is not None} for mid, label, _ in MATERIAL_CATALOG.get("hpbrdf_2025", [])]
+            pbrdf = [{"id": mid, "label": label, "dataset": "pbrdf_2020"} for mid, label, _ in MATERIAL_CATALOG.get("pbrdf_2020", [])]
+            self._send_json(handler, HTTPStatus.OK, {"presets": presets, "hpbrdf": hpbrdf, "pbrdf": pbrdf})
+            return True
+        if not path.startswith("/api/opticalnav/projects/"):
+            return False
+        rest = path[len("/api/opticalnav/projects/"):].strip("/")
+        parts = [unquote(part) for part in rest.split("/") if part]
+        if not parts:
+            return False
+        try:
+            project_dir = self._opticalnav_project_dir(parts[0])
+        except ValueError as exc:
+            self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            return True
+        if not project_dir.exists():
+            self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": f"Unknown OpticalNav project_id: {parts[0]}"})
+            return True
+        if len(parts) == 1:
+            self._send_json(handler, HTTPStatus.OK, self._opticalnav_project_summary(project_dir))
+            return True
+        if len(parts) == 4 and parts[1] == "scenes" and parts[3] == "annotation":
+            annotation_path = project_dir / "scenes" / parts[2] / "scene_annotation.json"
+            if not annotation_path.exists():
+                self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": "scene_annotation.json not found"})
+                return True
+            self._send_json(handler, HTTPStatus.OK, _read_json(annotation_path))
+            return True
+        if len(parts) == 4 and parts[1] == "scenes" and parts[3] == "authoring-map":
+            from navigation_dataset.authoring_map import authoring_map_to_payload, load_authoring_map, starter_authoring_map
+
+            scene_id = parts[2]
+            scene_dir = project_dir / "scenes" / scene_id
+            if not scene_dir.exists():
+                self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": f"Unknown scene_id: {scene_id}"})
+                return True
+            map_path = scene_dir / "authoring_map.json"
+            try:
+                if map_path.exists():
+                    payload = authoring_map_to_payload(load_authoring_map(map_path))
+                else:
+                    payload = authoring_map_to_payload(starter_authoring_map(scene_id, f"/api/scenes/{quote(scene_id, safe='')}/floorplan"))
+            except Exception as exc:
+                self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return True
+            self._send_json(handler, HTTPStatus.OK, payload)
+            return True
+        if len(parts) == 4 and parts[1] == "scenes" and parts[3] == "editor-geometry":
+            scene_id = parts[2]
+            try:
+                payload = self._opticalnav_editor_geometry(project_dir, scene_id)
+            except KeyError:
+                self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": f"Unknown scene_id: {scene_id}"})
+                return True
+            self._send_json(handler, HTTPStatus.OK, payload)
+            return True
+        if len(parts) == 4 and parts[1] == "scenes" and parts[3] == "graph":
+            graph_path = project_dir / "scenes" / parts[2] / "viewpoint_graph.json"
+            if not graph_path.exists():
+                self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": "viewpoint_graph.json not found"})
+                return True
+            self._send_json(handler, HTTPStatus.OK, _read_json(graph_path))
+            return True
+        if len(parts) == 2 and parts[1] == "episodes":
+            split = _maybe_str((query.get("split") or [None])[0])
+            episodes = [self._opticalnav_episode_summary(project_dir, item) for item in self._opticalnav_episode_files(project_dir, split=split)]
+            self._send_json(handler, HTTPStatus.OK, {"episodes": episodes})
+            return True
+        if len(parts) == 3 and parts[1] == "episodes":
+            try:
+                episode_path = self._opticalnav_find_episode(project_dir, parts[2])
+            except KeyError:
+                self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": f"Unknown episode_id: {parts[2]}"})
+                return True
+            self._send_json(handler, HTTPStatus.OK, _read_json(episode_path))
+            return True
+        if len(parts) == 3 and parts[1] == "render-batches":
+            try:
+                self._send_json(handler, HTTPStatus.OK, self._opticalnav_render_batch_payload(project_dir, parts[2]))
+            except KeyError:
+                self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": f"Unknown batch_id: {parts[2]}"})
+            return True
+        if len(parts) == 2 and parts[1] == "graph-render-batches":
+            self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": "Missing graph batch id."})
+            return True
+        if len(parts) == 3 and parts[1] == "graph-render-batches":
+            try:
+                self._send_json(handler, HTTPStatus.OK, self._opticalnav_graph_batch_payload(project_dir, parts[2]))
+            except KeyError:
+                self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": f"Unknown graph batch_id: {parts[2]}"})
+            return True
+        if len(parts) == 4 and parts[1] == "scenes" and parts[3] == "agent-context":
+            from navigation_dataset.authoring_map import (
+                AuthoringMapValidationError,
+                authoring_map_to_payload,
+                load_authoring_map,
+                starter_authoring_map,
+                validate_authoring_map,
+            )
+
+            scene_id = parts[2]
+            scene_dir = project_dir / "scenes" / scene_id
+            if not scene_dir.exists():
+                self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": f"Unknown scene_id: {scene_id}"})
+                return True
+            map_path = scene_dir / "authoring_map.json"
+            if map_path.exists():
+                authoring_map = load_authoring_map(map_path)
+            else:
+                authoring_map = starter_authoring_map(scene_id, None)
+            compile_ready = False
+            compile_blockers: list[dict] = []
+            try:
+                validate_authoring_map(authoring_map, require_compile_ready=True)
+                compile_ready = True
+            except AuthoringMapValidationError as exc:
+                compile_blockers = [issue.to_payload() for issue in exc.issues]
+            annotation_path = scene_dir / "scene_annotation.json"
+            graph_path = scene_dir / "viewpoint_graph.json"
+            dataset_json = project_dir / "dataset.json"
+            sync = _read_json(scene_dir / "scene_variant.json").get("sync") if (scene_dir / "scene_variant.json").exists() else None
+            suggested: list[str] = []
+            if not compile_ready:
+                suggested.append("add_traversable_region_and_goal_region")
+            elif not annotation_path.exists():
+                suggested.append("compile_authoring_map")
+            elif not graph_path.exists():
+                suggested.append("build_traversability_map")
+                suggested.append("build_viewpoint_graph")
+            else:
+                suggested.append("plan_graph_episodes")
+            context = {
+                "scene_id": scene_id,
+                "project_id": parts[0],
+                "sync": sync,
+                "compile_ready": compile_ready,
+                "compile_blockers": compile_blockers,
+                "objects": [
+                    {"id": obj.id, "type": obj.type, "label": obj.label, "geometry": self._geom_summary(obj.geometry), "material": obj.material}
+                    for obj in authoring_map.objects
+                ],
+                "regions": [
+                    {"id": reg.id, "type": reg.type, "label": reg.label, "geometry": self._geom_summary(reg.geometry)}
+                    for reg in authoring_map.regions
+                ],
+                "artifacts": {
+                    "authoring_map": map_path.exists(),
+                    "annotation": annotation_path.exists(),
+                    "graph": graph_path.exists(),
+                },
+                "suggested_actions": suggested,
+            }
+            self._send_json(handler, HTTPStatus.OK, context)
+            return True
+        return False
+
+    def _handle_opticalnav_post(self, handler: BaseHTTPRequestHandler, path: str, payload: Mapping[str, Any]) -> bool:
+        if path == "/api/opticalnav/projects":
+            from navigation_dataset.episode_schema import DatasetProject, write_project
+
+            project_name = str(payload.get("project_name") or "OpticalNav-v0.1")
+            project_id = self._safe_opticalnav_project_id(project_name)
+            project_dir = self._opticalnav_project_dir(project_id)
+            if project_dir.exists() and (project_dir / "dataset.json").exists():
+                self._send_json(handler, HTTPStatus.CONFLICT, {"error": f"Project already exists: {project_id}", "project_id": project_id})
+                return True
+            self._opticalnav_create_layout(project_dir)
+            project = DatasetProject(
+                project_name=project_name,
+                dataset_type=str(payload.get("dataset_type") or "Synthetic fine-tuning dataset"),
+                target_scenario=str(payload.get("target_scenario") or "glass / mirror / transparent partition navigation"),
+                robot_profile=str(payload.get("robot_profile") or "mobile_base_front_camera"),
+                modalities=[str(item) for item in payload.get("modalities", ["rgb", "depth", "active_nir_intensity", "hazard_mask"])],
+                metadata={"project_id": project_id, "created_at": _utc_now_iso()},
+            )
+            write_project(project_dir / "dataset.json", project)
+            self._send_json(handler, HTTPStatus.CREATED, self._opticalnav_project_summary(project_dir))
+            return True
+        if not path.startswith("/api/opticalnav/projects/"):
+            return False
+        rest = path[len("/api/opticalnav/projects/"):].strip("/")
+        parts = [unquote(part) for part in rest.split("/") if part]
+        if not parts:
+            return False
+        try:
+            project_dir = self._opticalnav_project_dir(parts[0])
+        except ValueError as exc:
+            self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            return True
+        if not project_dir.exists():
+            self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": f"Unknown OpticalNav project_id: {parts[0]}"})
+            return True
+        if len(parts) == 2 and parts[1] == "scenes":
+            from navigation_dataset.episode_schema import read_project, write_project
+
+            scene_id = str(payload.get("scene_id") or "").strip()
+            if not scene_id:
+                self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": "scene_id is required."})
+                return True
+            usd_ref = _maybe_str(payload.get("usd_ref"))
+            scene_dir = project_dir / "scenes" / scene_id
+            scene_dir.mkdir(parents=True, exist_ok=True)
+            annotation_path = scene_dir / "scene_annotation.json"
+            if not annotation_path.exists():
+                annotation_path.write_text(json.dumps(self._opticalnav_starter_annotation(scene_id, usd_ref), ensure_ascii=False, indent=2), encoding="utf-8")
+            dataset_path = project_dir / "dataset.json"
+            if dataset_path.exists():
+                project = read_project(dataset_path)
+                scenes = [item for item in project.scenes if not (isinstance(item, Mapping) and item.get("scene_id") == scene_id) and item != scene_id]
+                scenes.append({"scene_id": scene_id, "usd_ref": usd_ref, "annotation_ref": f"scenes/{scene_id}/scene_annotation.json"})
+                project.scenes = scenes
+                write_project(dataset_path, project)
+            self._send_json(handler, HTTPStatus.CREATED, {"scene_id": scene_id, "annotation": _read_json(annotation_path), "project": self._opticalnav_project_summary(project_dir)})
+            return True
+        if len(parts) == 5 and parts[1] == "scenes" and parts[3] == "sync" and parts[4] == "render-scene":
+            scene_id = parts[2]
+            scene_dir = project_dir / "scenes" / scene_id
+            if not scene_dir.exists():
+                self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": f"Unknown scene_id: {scene_id}"})
+                return True
+            from navigation_dataset.authoring_map import load_authoring_map
+            from navigation_dataset.scene_annotations import read_scene_annotation, write_scene_annotation
+            from navigation_dataset.scene_sync import write_render_scene_sync
+
+            map_path = scene_dir / "authoring_map.json"
+            annotation_path = scene_dir / "scene_annotation.json"
+            if not map_path.exists():
+                self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": "authoring_map.json is required before render-scene sync."})
+                return True
+            if not annotation_path.exists():
+                self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": "scene_annotation.json is required before render-scene sync."})
+                return True
+            try:
+                authoring_map = load_authoring_map(map_path)
+                annotation = read_scene_annotation(annotation_path)
+                result = write_render_scene_sync(
+                    scene_dir,
+                    authoring_map,
+                    annotation,
+                    project_dir=project_dir,
+                    scene_variant_id=_maybe_str(payload.get("scene_variant_id")),
+                )
+                annotation.metadata = {
+                    **dict(annotation.metadata or {}),
+                    "sync": {
+                        **dict(annotation.metadata.get("sync", {})),
+                        **result.sync,
+                        "scene_variant_ref": result.scene_variant_ref,
+                        "render_scene_overlay_ref": result.overlay_ref,
+                    },
+                }
+                write_scene_annotation(annotation_path, annotation)
+            except Exception as exc:
+                self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return True
+            self._send_json(handler, HTTPStatus.OK, {
+                "ok": True,
+                "stage": "sync_render_scene",
+                "status": "done",
+                "message": "Render-scene overlay manifest synced. Isaac stage sync remains pending.",
+                "scene_id": scene_id,
+                "scene_variant_ref": result.scene_variant_ref,
+                "render_scene_overlay_ref": result.overlay_ref,
+                "sync": result.sync,
+                "scene_variant": result.scene_variant,
+                "overlay": result.overlay,
+                "project": self._opticalnav_project_summary(project_dir),
+            })
+            return True
+        if len(parts) == 5 and parts[1] == "scenes" and parts[3] == "sync" and parts[4] == "isaac-stage":
+            scene_id = parts[2]
+            scene_dir = project_dir / "scenes" / scene_id
+            variant_path = scene_dir / "scene_variant.json"
+            overlay_path = scene_dir / "render_scene_overlays.json"
+            if not variant_path.exists() or not overlay_path.exists():
+                self._send_json(handler, HTTPStatus.BAD_REQUEST, {
+                    "ok": False,
+                    "stage": "sync_isaac_stage",
+                    "status": "blocked",
+                    "message": "Render-scene artifacts are required before Isaac stage sync.",
+                    "missing": [
+                        {
+                            "key": "scene_variant",
+                            "label": "scene_variant.json",
+                            "reason": "Run Sync Render Scene first.",
+                            "action": "sync_render_scene",
+                        }
+                    ],
+                })
+                return True
+            try:
+                scene_variant = _read_json(variant_path)
+                overlay = _read_json(overlay_path)
+                command = self._queue_isaac_command({
+                    "command_type": "sync_opticalnav_stage",
+                    "scene_id": scene_id,
+                    "payload": {
+                        "project_id": project_dir.name,
+                        "scene_id": scene_id,
+                        "scene_variant_ref": variant_path.relative_to(project_dir).as_posix(),
+                        "render_scene_overlay_ref": overlay_path.relative_to(project_dir).as_posix(),
+                        "scene_variant": scene_variant,
+                        "overlay": overlay,
+                    },
+                })
+            except Exception as exc:
+                self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return True
+            self._send_json(handler, HTTPStatus.ACCEPTED, {
+                "ok": True,
+                "stage": "sync_isaac_stage",
+                "status": "queued",
+                "message": "Isaac stage sync command queued. Keep the Isaac extension connected to apply it.",
+                "command": command,
+                "project": self._opticalnav_project_summary(project_dir),
+            })
+            return True
+        if len(parts) == 5 and parts[1] == "scenes" and parts[3] == "map" and parts[4] == "build":
+            from navigation_dataset.scene_annotations import read_scene_annotation
+            from navigation_dataset.traversability import build_traversability_grid, save_traversability_grid, write_nav_graph
+
+            annotation_path = project_dir / "scenes" / parts[2] / "scene_annotation.json"
+            try:
+                annotation = read_scene_annotation(annotation_path)
+                grid = build_traversability_grid(annotation, resolution=float(payload.get("resolution", 0.05)))
+            except Exception as exc:
+                self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return True
+            grid_path = save_traversability_grid(annotation_path.parent / "traversable_grid.npy", grid)
+            graph_path = write_nav_graph(annotation_path.parent / "nav_graph.json", grid)
+            graph = _read_json(graph_path)
+            self._send_json(handler, HTTPStatus.OK, {
+                "scene_id": parts[2],
+                "grid_ref": grid_path.relative_to(project_dir).as_posix(),
+                "sidecar_ref": grid_path.with_suffix(grid_path.suffix + ".json").relative_to(project_dir).as_posix(),
+                "nav_graph_ref": graph_path.relative_to(project_dir).as_posix(),
+                "node_count": len(graph.get("nodes", [])),
+                "edge_count": len(graph.get("edges", [])),
+                "grid": graph.get("grid"),
+            })
+            return True
+        if len(parts) == 5 and parts[1] == "scenes" and parts[3] == "graph" and parts[4] == "build":
+            from navigation_dataset.edge_builder import build_viewpoint_edges, graph_summary
+            from navigation_dataset.node_sampler import sample_viewpoint_nodes
+            from navigation_dataset.traversability import load_traversability_grid
+            from navigation_dataset.viewpoint_graph import ViewpointGraph, write_viewpoint_graph
+
+            scene_id = parts[2]
+            try:
+                grid = load_traversability_grid(project_dir / "scenes" / scene_id / "traversable_grid.npy")
+                heading_count = int(payload.get("heading_count", 12))
+                nodes = sample_viewpoint_nodes(
+                    grid,
+                    max_nodes=int(payload.get("max_nodes", 300)),
+                    heading_count=heading_count,
+                    min_node_spacing_m=float(payload.get("min_node_spacing_m", 0.5)),
+                    min_clearance_m=float(payload.get("min_clearance_m", 0.0)),
+                    seed=int(payload.get("seed", 0)),
+                )
+                edges = build_viewpoint_edges(
+                    grid,
+                    nodes,
+                    robot_radius_m=float(payload.get("robot_radius_m", 0.25)),
+                    k_neighbors=int(payload.get("k_neighbors", 8)),
+                    max_edge_length_m=float(payload.get("max_edge_length_m", 1.5)),
+                )
+                graph = ViewpointGraph(
+                    scene_id=scene_id,
+                    graph_id=str(payload.get("graph_id") or f"{scene_id}_vg_0001"),
+                    node_heading_count=heading_count,
+                    nodes=nodes,
+                    edges=edges,
+                    metadata={
+                        "generation_version": "opticalnav-v0.2",
+                        "robot_radius_m": float(payload.get("robot_radius_m", 0.25)),
+                        "min_node_spacing_m": float(payload.get("min_node_spacing_m", 0.5)),
+                        "max_edge_length_m": float(payload.get("max_edge_length_m", 1.5)),
+                        "k_neighbors": int(payload.get("k_neighbors", 8)),
+                        "seed": int(payload.get("seed", 0)),
+                        "scene_variant_id": payload.get("scene_variant_id"),
+                    },
+                )
+                graph_path = write_viewpoint_graph(project_dir / "scenes" / scene_id / "viewpoint_graph.json", graph)
+            except Exception as exc:
+                self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return True
+            self._send_json(handler, HTTPStatus.OK, {
+                "scene_id": scene_id,
+                "graph_ref": graph_path.relative_to(project_dir).as_posix(),
+                "graph_id": graph.graph_id,
+                **graph_summary(nodes, edges, heading_count=heading_count),
+                "project": self._opticalnav_project_summary(project_dir),
+            })
+            return True
+        if len(parts) == 5 and parts[1] == "scenes" and parts[3] == "graph" and parts[4] == "sweep":
+            self._handle_opticalnav_graph_sweep(handler, project_dir, parts[2], payload)
+            return True
+        if len(parts) == 5 and parts[1] == "scenes" and parts[3] == "authoring-map" and parts[4] == "compile":
+            from navigation_dataset.authoring_compile import AuthoringMapCompileError, compile_authoring_map
+            from navigation_dataset.authoring_map import load_authoring_map
+            from navigation_dataset.scene_annotations import scene_annotation_to_payload, write_scene_annotation
+
+            scene_id = parts[2]
+            map_path = project_dir / "scenes" / scene_id / "authoring_map.json"
+            if not map_path.exists():
+                self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": "authoring_map.json not found"})
+                return True
+            try:
+                authoring_map = load_authoring_map(map_path)
+                usd_ref = None
+                dataset_path = project_dir / "dataset.json"
+                if dataset_path.exists():
+                    dataset = _read_json(dataset_path)
+                    for scene_entry in dataset.get("scenes", []):
+                        if isinstance(scene_entry, Mapping) and scene_entry.get("scene_id") == scene_id:
+                            usd_ref = _maybe_str(scene_entry.get("usd_ref"))
+                            break
+                result = compile_authoring_map(authoring_map, usd_ref=usd_ref)
+                annotation_path = project_dir / "scenes" / scene_id / "scene_annotation.json"
+                write_scene_annotation(annotation_path, result.annotation)
+            except AuthoringMapCompileError as exc:
+                self._send_json(handler, HTTPStatus.BAD_REQUEST, exc.to_payload())
+                return True
+            except Exception as exc:
+                self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return True
+            self._send_json(handler, HTTPStatus.OK, {
+                "ok": True,
+                "stage": "compile_annotation",
+                "status": "done",
+                "message": "Authoring map compiled to scene_annotation.json.",
+                "annotation": scene_annotation_to_payload(result.annotation),
+                "annotation_ref": annotation_path.relative_to(project_dir).as_posix(),
+                "summary": result.summary,
+                "sync": result.sync,
+                "project": self._opticalnav_project_summary(project_dir),
+            })
+            return True
+        if len(parts) == 3 and parts[1] == "episodes" and parts[2] == "plan":
+            from navigation_dataset.exporters.custom_json import write_dataset_index, write_split_files
+            from navigation_dataset.rollout import plan_episodes, split_counts_from_spec, write_episodes
+            from navigation_dataset.scene_annotations import read_scene_annotation
+            from navigation_dataset.traversability import load_traversability_grid
+
+            scene_id = str(payload.get("scene_id") or "").strip()
+            if not scene_id:
+                self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": "scene_id is required."})
+                return True
+            try:
+                annotation = read_scene_annotation(project_dir / "scenes" / scene_id / "scene_annotation.json")
+                grid = load_traversability_grid(project_dir / "scenes" / scene_id / "traversable_grid.npy")
+                split_spec = payload.get("splits", {"train": int(payload.get("num_pairs", 10))})
+                if isinstance(split_spec, str):
+                    split_counts = split_counts_from_spec(split_spec)
+                elif isinstance(split_spec, Mapping):
+                    split_counts = {str(k): int(v) for k, v in split_spec.items()}
+                else:
+                    raise ValueError("splits must be an object or 'train:60,val_seen:10' string.")
+                modalities = [str(item) for item in payload.get("modalities", ["rgb", "depth", "active_nir_intensity", "hazard_mask"])]
+                instruction_types = [str(item) for item in payload.get("instruction_types", ["goal_only", "hazard_aware", "ambiguous"])]
+                episodes = plan_episodes(
+                    annotation=annotation,
+                    grid=grid,
+                    num_pairs=int(payload.get("num_pairs", sum(split_counts.values()))),
+                    split_counts=split_counts,
+                    instruction_types=instruction_types,
+                    modalities=modalities,
+                    seed=int(payload.get("seed", 0)),
+                )
+                written = write_episodes(project_dir, episodes)
+                write_dataset_index(project_dir)
+                write_split_files(project_dir)
+            except Exception as exc:
+                self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return True
+            self._send_json(handler, HTTPStatus.OK, {
+                "scene_id": scene_id,
+                "planned_count": len(written),
+                "episodes": [path.relative_to(project_dir).as_posix() for path in written],
+                "project": self._opticalnav_project_summary(project_dir),
+            })
+            return True
+        if len(parts) == 4 and parts[1] == "graph" and parts[2] == "episodes" and parts[3] == "plan":
+            from navigation_dataset.exporters.custom_json import write_dataset_index, write_split_files
+            from navigation_dataset.graph_episode_sampler import GRAPH_SCENARIOS, plan_graph_episodes, write_graph_episodes
+            from navigation_dataset.rollout import split_counts_from_spec
+            from navigation_dataset.scene_annotations import read_scene_annotation
+            from navigation_dataset.viewpoint_graph import read_viewpoint_graph
+
+            scene_id = str(payload.get("scene_id") or "").strip()
+            if not scene_id:
+                self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": "scene_id is required."})
+                return True
+            try:
+                graph = read_viewpoint_graph(project_dir / "scenes" / scene_id / "viewpoint_graph.json")
+                annotation_path = project_dir / "scenes" / scene_id / "scene_annotation.json"
+                annotation = read_scene_annotation(annotation_path) if annotation_path.exists() else None
+                split_spec = payload.get("splits", {"train": int(payload.get("num_pairs", 10))})
+                if isinstance(split_spec, str):
+                    split_counts = split_counts_from_spec(split_spec)
+                elif isinstance(split_spec, Mapping):
+                    split_counts = {str(k): int(v) for k, v in split_spec.items()}
+                else:
+                    raise ValueError("splits must be an object or 'train:60,val_seen:10' string.")
+                scenarios = [str(item) for item in payload.get("scenarios", list(GRAPH_SCENARIOS))]
+                modalities = [str(item) for item in payload.get("modalities", ["rgb", "depth", "active_nir_intensity", "hazard_mask"])]
+                episodes = plan_graph_episodes(
+                    graph=graph,
+                    num_pairs=int(payload.get("num_pairs", sum(split_counts.values()))),
+                    split_counts=split_counts,
+                    scenarios=scenarios,
+                    modalities=modalities,
+                    annotation=annotation,
+                    seed=int(payload.get("seed", 0)),
+                )
+                written = write_graph_episodes(project_dir, episodes)
+                write_dataset_index(project_dir)
+                write_split_files(project_dir)
+            except Exception as exc:
+                self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return True
+            self._send_json(handler, HTTPStatus.OK, {
+                "scene_id": scene_id,
+                "planned_count": len(written),
+                "mode": "viewpoint_graph",
+                "episodes": [path.relative_to(project_dir).as_posix() for path in written],
+                "project": self._opticalnav_project_summary(project_dir),
+            })
+            return True
+        if len(parts) == 3 and parts[1] == "episodes" and parts[2] == "render":
+            self._handle_opticalnav_render(handler, project_dir, payload)
+            return True
+        if len(parts) == 2 and parts[1] == "validate":
+            from navigation_dataset.validation import validate_dataset
+
+            report = validate_dataset(project_dir, require_observations=bool(payload.get("require_observations", False)))
+            self._send_json(handler, HTTPStatus.OK, report.to_payload())
+            return True
+        if len(parts) == 2 and parts[1] == "evaluate":
+            from navigation_dataset.evaluator import evaluate_dataset
+
+            success_radius = float(payload.get("success_radius", 0.5))
+            result = evaluate_dataset(project_dir, success_radius=success_radius)
+            eval_path = project_dir / "evaluation" / f"{payload.get('policy') or 'shortest_oracle'}.json"
+            eval_path.parent.mkdir(parents=True, exist_ok=True)
+            eval_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+            self._send_json(handler, HTTPStatus.OK, {"policy": payload.get("policy") or "shortest_oracle", "evaluation_ref": eval_path.relative_to(project_dir).as_posix(), **result})
+            return True
+        if len(parts) == 2 and parts[1] == "export":
+            from navigation_dataset.exporters.custom_json import export_dataset_zip, write_dataset_index, write_split_files
+
+            index_path = write_dataset_index(project_dir)
+            split_paths = write_split_files(project_dir)
+            response = {
+                "dataset_ref": index_path.relative_to(project_dir).as_posix(),
+                "split_refs": [path.relative_to(project_dir).as_posix() for path in split_paths],
+                "project": self._opticalnav_project_summary(project_dir),
+            }
+            if bool(payload.get("zip", False)):
+                zip_path = export_dataset_zip(project_dir)
+                response["zip_ref"] = zip_path.relative_to(self.repo_root).as_posix()
+                response["download_url"] = f"/artifacts?path={quote(response['zip_ref'])}"
+            self._send_json(handler, HTTPStatus.OK, response)
+            return True
+        if len(parts) == 4 and parts[1] == "scenes" and parts[3] == "objects":
+            from navigation_dataset.authoring_map import (
+                OBJECT_TYPES, REGION_TYPES,
+                load_authoring_map, save_authoring_map, starter_authoring_map,
+            )
+
+            scene_id = parts[2]
+            scene_dir = project_dir / "scenes" / scene_id
+            if not scene_dir.exists():
+                self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": f"Unknown scene_id: {scene_id}"})
+                return True
+            map_path = scene_dir / "authoring_map.json"
+            obj_type = str(payload.get("type") or "")
+            is_region = bool(payload.get("region", False)) or obj_type in REGION_TYPES
+            try:
+                authoring_map = load_authoring_map(map_path) if map_path.exists() else starter_authoring_map(scene_id, None)
+                existing_ids = {obj.id for obj in authoring_map.objects} | {reg.id for reg in authoring_map.regions}
+                if is_region:
+                    if obj_type not in REGION_TYPES:
+                        self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": f"Unknown region type: {obj_type!r}. Valid: {sorted(REGION_TYPES)}"})
+                        return True
+                    new_item = self._build_agent_region(dict(payload), existing_ids)
+                    authoring_map.regions.append(new_item)
+                else:
+                    if obj_type not in OBJECT_TYPES:
+                        self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": f"Unknown object type: {obj_type!r}. Valid: {sorted(OBJECT_TYPES)}"})
+                        return True
+                    new_item = self._build_agent_object(dict(payload), existing_ids)
+                    authoring_map.objects.append(new_item)
+                save_authoring_map(map_path, authoring_map)
+            except (KeyError, ValueError) as exc:
+                self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return True
+            self._send_json(handler, HTTPStatus.CREATED, {"id": new_item.id, "type": new_item.type, "saved": True})
+            return True
+        if len(parts) == 5 and parts[1] == "scenes" and parts[3] == "objects" and parts[4] == "batch":
+            from navigation_dataset.authoring_compile import AuthoringMapCompileError, compile_authoring_map
+            from navigation_dataset.authoring_map import (
+                OBJECT_TYPES, REGION_TYPES,
+                load_authoring_map, save_authoring_map, starter_authoring_map,
+            )
+            from navigation_dataset.scene_annotations import write_scene_annotation
+
+            scene_id = parts[2]
+            scene_dir = project_dir / "scenes" / scene_id
+            if not scene_dir.exists():
+                self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": f"Unknown scene_id: {scene_id}"})
+                return True
+            map_path = scene_dir / "authoring_map.json"
+            auto_compile = bool(payload.get("auto_compile", False))
+            try:
+                authoring_map = load_authoring_map(map_path) if map_path.exists() else starter_authoring_map(scene_id, None)
+                placed_ids: list[str] = []
+                for item_req in list(payload.get("objects") or []):
+                    item_req = dict(item_req)
+                    obj_type = str(item_req.get("type") or "")
+                    is_region = bool(item_req.get("region", False)) or obj_type in REGION_TYPES
+                    existing_ids = {obj.id for obj in authoring_map.objects} | {reg.id for reg in authoring_map.regions}
+                    if is_region:
+                        new_item = self._build_agent_region(item_req, existing_ids)
+                        authoring_map.regions.append(new_item)
+                    else:
+                        new_item = self._build_agent_object(item_req, existing_ids)
+                        authoring_map.objects.append(new_item)
+                    placed_ids.append(new_item.id)
+                save_authoring_map(map_path, authoring_map)
+            except (KeyError, ValueError) as exc:
+                self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return True
+            compile_result = None
+            if auto_compile:
+                annotation_path = scene_dir / "scene_annotation.json"
+                try:
+                    result = compile_authoring_map(authoring_map)
+                    write_scene_annotation(annotation_path, result.annotation)
+                    compile_result = {"status": "ok", "annotation_ref": annotation_path.relative_to(project_dir).as_posix()}
+                except AuthoringMapCompileError as exc:
+                    compile_result = {"status": "blocked", "errors": [issue.to_payload() for issue in exc.issues]}
+                except Exception as exc:
+                    compile_result = {"status": "error", "error": str(exc)}
+            self._send_json(handler, HTTPStatus.CREATED, {"placed": placed_ids, "compile_result": compile_result})
+            return True
+        if len(parts) == 6 and parts[1] == "scenes" and parts[3] == "objects" and parts[5] == "material":
+            from mitsuba_converter.material_library import MATERIAL_CATALOG, hpbrdf_channels_dir
+            from navigation_dataset.authoring_map import (
+                AuthoringMaterial,
+                load_authoring_map, save_authoring_map, starter_authoring_map,
+            )
+
+            scene_id, object_id = parts[2], parts[4]
+            scene_dir = project_dir / "scenes" / scene_id
+            if not scene_dir.exists():
+                self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": f"Unknown scene_id: {scene_id}"})
+                return True
+            material_id = str(payload.get("material_id") or "")
+            dataset_id = str(payload.get("dataset_id") or "hpbrdf_2025")
+            if not material_id:
+                self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": "material_id is required."})
+                return True
+            native_file_path: str | None = None
+            for mid, _label, native_path in MATERIAL_CATALOG.get(dataset_id, []):
+                if mid == material_id:
+                    native_file_path = native_path
+                    break
+            if native_file_path is None:
+                self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": f"Unknown material_id {material_id!r} in dataset {dataset_id!r}."})
+                return True
+            local_available = hpbrdf_channels_dir(self.repo_root, material_id) is not None
+            map_path = scene_dir / "authoring_map.json"
+            try:
+                authoring_map = load_authoring_map(map_path) if map_path.exists() else starter_authoring_map(scene_id, None)
+                obj = next((o for o in authoring_map.objects if o.id == object_id), None)
+                if obj is None:
+                    self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": f"Unknown object_id: {object_id!r}"})
+                    return True
+                obj.material = f"{dataset_id}/{material_id}"
+                authoring_map.materials = [m for m in authoring_map.materials if m.material_id != f"{dataset_id}/{material_id}"]
+                authoring_map.materials.append(AuthoringMaterial(
+                    material_id=f"{dataset_id}/{material_id}",
+                    category=dataset_id,
+                    params={"dataset_id": dataset_id, "native_file_path": native_file_path},
+                ))
+                save_authoring_map(map_path, authoring_map)
+            except Exception as exc:
+                self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return True
+            self._send_json(handler, HTTPStatus.OK, {
+                "object_id": object_id,
+                "material_id": material_id,
+                "dataset_id": dataset_id,
+                "native_file_path": native_file_path,
+                "local_available": local_available,
+                "applied": True,
+            })
+            return True
+        return False
+
+    def _handle_opticalnav_put(self, handler: BaseHTTPRequestHandler, path: str, payload: Mapping[str, Any]) -> bool:
+        if not path.startswith("/api/opticalnav/projects/"):
+            return False
+        parts = [unquote(part) for part in path[len("/api/opticalnav/projects/"):].strip("/").split("/") if part]
+        if len(parts) == 4 and parts[1] == "scenes" and parts[3] == "usd-ref":
+            try:
+                project_dir = self._opticalnav_project_dir(parts[0])
+                scene_id = parts[2]
+                scene_dir = project_dir / "scenes" / scene_id
+                if not scene_dir.exists():
+                    self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": f"Unknown scene_id: {scene_id}"})
+                    return True
+                usd_ref = _maybe_str(payload.get("usd_ref"))
+                result = self._opticalnav_set_scene_usd_ref(project_dir, scene_id, usd_ref)
+            except Exception as exc:
+                self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return True
+            self._send_json(handler, HTTPStatus.OK, {
+                "ok": True,
+                **result,
+                "project": self._opticalnav_project_summary(project_dir),
+            })
+            return True
+        if len(parts) == 4 and parts[1] == "scenes" and parts[3] == "authoring-map":
+            from navigation_dataset.authoring_map import (
+                AuthoringMapValidationError,
+                authoring_map_to_payload,
+                save_authoring_map,
+            )
+
+            try:
+                project_dir = self._opticalnav_project_dir(parts[0])
+                scene_id = parts[2]
+                scene_dir = project_dir / "scenes" / scene_id
+                if not scene_dir.exists():
+                    self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": f"Unknown scene_id: {scene_id}"})
+                    return True
+                body = dict(payload)
+                if str(body.get("scene_id") or "") != scene_id:
+                    raise ValueError(f"authoring_map.scene_id must match route scene_id {scene_id!r}.")
+                path_out = scene_dir / "authoring_map.json"
+                save_authoring_map(path_out, body)
+                saved = _read_json(path_out)
+            except AuthoringMapValidationError as exc:
+                self._send_json(handler, HTTPStatus.BAD_REQUEST, exc.to_payload())
+                return True
+            except Exception as exc:
+                self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return True
+            self._send_json(handler, HTTPStatus.OK, {
+                "ok": True,
+                "authoring_map": authoring_map_to_payload(saved),
+                "authoring_map_ref": path_out.relative_to(project_dir).as_posix(),
+                "project": self._opticalnav_project_summary(project_dir),
+            })
+            return True
+        if len(parts) == 4 and parts[1] == "scenes" and parts[3] == "annotation":
+            from navigation_dataset.scene_annotations import scene_annotation_from_payload, write_scene_annotation
+
+            try:
+                project_dir = self._opticalnav_project_dir(parts[0])
+                annotation = scene_annotation_from_payload(dict(payload))
+                if annotation.scene_id != parts[2]:
+                    raise ValueError(f"annotation.scene_id must match route scene_id {parts[2]!r}.")
+                path_out = project_dir / "scenes" / parts[2] / "scene_annotation.json"
+                write_scene_annotation(path_out, annotation)
+            except Exception as exc:
+                self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return True
+            self._send_json(handler, HTTPStatus.OK, {"ok": True, "annotation": _read_json(path_out), "project": self._opticalnav_project_summary(project_dir)})
+            return True
+        return False
+
+    def _handle_delete(self, handler: BaseHTTPRequestHandler) -> None:
+        try:
+            parsed = urlparse(handler.path)
+            path = parsed.path
+            if path.startswith("/api/opticalnav/"):
+                if self._handle_opticalnav_delete(handler, path):
+                    return
+                self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": f"Unknown OpticalNav route: {path}"})
+                return
+            self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": f"Unknown route: {path}"})
+        except _ClientDisconnectedError:
+            return
+        except Exception as exc:
+            try:
+                self._send_json(handler, HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
+            except _ClientDisconnectedError:
+                return
+
+    def _handle_opticalnav_delete(self, handler: BaseHTTPRequestHandler, path: str) -> bool:
+        if not path.startswith("/api/opticalnav/projects/"):
+            return False
+        parts = [unquote(part) for part in path[len("/api/opticalnav/projects/"):].strip("/").split("/") if part]
+        if len(parts) < 1:
+            return False
+        try:
+            project_dir = self._opticalnav_project_dir(parts[0])
+        except ValueError as exc:
+            self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            return True
+        if not project_dir.exists():
+            self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": f"Unknown OpticalNav project_id: {parts[0]}"})
+            return True
+        if len(parts) == 5 and parts[1] == "scenes" and parts[3] == "objects":
+            from navigation_dataset.authoring_map import load_authoring_map, save_authoring_map
+
+            scene_id, object_id = parts[2], parts[4]
+            scene_dir = project_dir / "scenes" / scene_id
+            if not scene_dir.exists():
+                self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": f"Unknown scene_id: {scene_id}"})
+                return True
+            map_path = scene_dir / "authoring_map.json"
+            if not map_path.exists():
+                self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": "authoring_map.json not found"})
+                return True
+            try:
+                authoring_map = load_authoring_map(map_path)
+                obj_count_before = len(authoring_map.objects) + len(authoring_map.regions)
+                authoring_map.objects = [obj for obj in authoring_map.objects if obj.id != object_id]
+                authoring_map.regions = [reg for reg in authoring_map.regions if reg.id != object_id]
+                if len(authoring_map.objects) + len(authoring_map.regions) == obj_count_before:
+                    self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": f"Unknown object_id: {object_id!r}"})
+                    return True
+                save_authoring_map(map_path, authoring_map)
+            except Exception as exc:
+                self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return True
+            self._send_json(handler, HTTPStatus.OK, {"deleted": True, "id": object_id})
+            return True
+        return False
+
+    def _handle_opticalnav_graph_sweep(self, handler: BaseHTTPRequestHandler, project_dir: Path, scene_id: str, payload: Mapping[str, Any]) -> None:
+        from navigation_dataset.sensor_sweep import build_sweep_render_requests, render_viewpoint_sweep_direct
+        from navigation_dataset.viewpoint_graph import read_viewpoint_graph
+
+        graph_path = project_dir / "scenes" / scene_id / "viewpoint_graph.json"
+        if not graph_path.exists():
+            self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": "viewpoint_graph.json not found"})
+            return
+        modalities = [str(item) for item in payload.get("modalities", ["rgb", "depth", "active_nir_intensity", "hazard_mask"])]
+        backend = str(payload.get("backend") or "daemon")
+        scene_state_payload = payload.get("scene_state")
+        camera_spec_payload = payload.get("camera_spec")
+        precondition = self._opticalnav_render_precondition_payload(project_dir, [scene_id], payload, mode="graph_sweep")
+        if precondition is not None:
+            self._send_json(handler, HTTPStatus.BAD_REQUEST, precondition)
+            return
+        try:
+            graph = read_viewpoint_graph(graph_path)
+        except Exception as exc:
+            self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            return
+        if backend == "direct":
+            try:
+                updated = render_viewpoint_sweep_direct(
+                    graph,
+                    dataset_root=project_dir,
+                    graph_path=graph_path,
+                    scene_state_payload=dict(scene_state_payload),
+                    camera_spec_payload=dict(camera_spec_payload),
+                    modalities=modalities,
+                    render_fn=self.render_fn,
+                    variant=str(payload.get("variant") or self.variant),
+                )
+            except Exception as exc:
+                self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
+            rendered = sum(1 for node in updated.nodes for heading in node.headings if heading.sensor_observations)
+            self._send_json(handler, HTTPStatus.OK, {"backend": "direct", "graph_id": updated.graph_id, "rendered_node_headings": rendered})
+            return
+        if backend != "daemon":
+            self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": "backend must be 'direct' or 'daemon'."})
+            return
+        batch_id = f"opticalnav-graph-{_utc_now().strftime('%Y%m%dT%H%M%S%f')}"
+        jobs = []
+        try:
+            for sweep_request in build_sweep_render_requests(
+                graph,
+                scene_state_payload=dict(scene_state_payload),
+                camera_spec_payload=dict(camera_spec_payload),
+                modalities=modalities,
+                job_id_mode="per_heading",
+            ):
+                accepted = self.submit(sweep_request.request, variant=str(payload.get("variant") or self.variant))
+                jobs.append({
+                    "job_id": accepted.job_id,
+                    "scene_id": scene_id,
+                    "graph_id": graph.graph_id,
+                    "node_id": sweep_request.node_id,
+                    "heading_id": sweep_request.heading_id,
+                    "status_url": accepted.status_url,
+                })
+        except Exception as exc:
+            self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": str(exc), "submitted_jobs": jobs})
+            return
+        batch = {
+            "batch_id": batch_id,
+            "project_id": project_dir.name,
+            "scene_id": scene_id,
+            "graph_id": graph.graph_id,
+            "backend": "daemon",
+            "created_at": _utc_now_iso(),
+            "modalities": modalities,
+            "jobs": jobs,
+        }
+        batch_path = project_dir / "graph_render_batches" / f"{batch_id}.json"
+        batch_path.parent.mkdir(parents=True, exist_ok=True)
+        batch_path.write_text(json.dumps(batch, ensure_ascii=False, indent=2), encoding="utf-8")
+        self._send_json(handler, HTTPStatus.ACCEPTED, self._opticalnav_graph_batch_payload(project_dir, batch_id))
+
+    def _handle_opticalnav_render(self, handler: BaseHTTPRequestHandler, project_dir: Path, payload: Mapping[str, Any]) -> None:
+        from navigation_dataset.episode_schema import read_episode, write_episode
+        from navigation_dataset.renderer import build_episode_render_requests, render_episode_direct
+
+        modalities = [str(item) for item in payload.get("modalities", ["rgb", "depth", "active_nir_intensity", "hazard_mask"])]
+        backend = str(payload.get("backend") or "daemon")
+        scene_state_payload = payload.get("scene_state")
+        camera_spec_payload = payload.get("camera_spec")
+        episode_ids = payload.get("episode_ids")
+        split = _maybe_str(payload.get("split"))
+        if isinstance(episode_ids, list) and episode_ids:
+            paths = [self._opticalnav_find_episode(project_dir, str(episode_id)) for episode_id in episode_ids]
+        else:
+            paths = self._opticalnav_episode_files(project_dir, split=split)
+        if not paths:
+            self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": "No episodes matched render request."})
+            return
+        scene_ids = []
+        for path in paths:
+            try:
+                scene_ids.append(read_episode(path).scene_id)
+            except Exception:
+                pass
+        precondition = self._opticalnav_render_precondition_payload(project_dir, scene_ids, payload, mode="episode_render")
+        if precondition is not None:
+            self._send_json(handler, HTTPStatus.BAD_REQUEST, precondition)
+            return
+        if backend == "direct":
+            rendered = []
+            for path in paths:
+                episode = read_episode(path)
+                updated = render_episode_direct(
+                    episode,
+                    dataset_root=project_dir,
+                    scene_state_payload=dict(scene_state_payload),
+                    camera_spec_payload=dict(camera_spec_payload),
+                    modalities=modalities,
+                    render_fn=self.render_fn,
+                    variant=str(payload.get("variant") or self.variant),
+                )
+                write_episode(path, updated)
+                rendered.append({"episode_id": updated.episode_id, "timestep_count": len(updated.timesteps)})
+            self._send_json(handler, HTTPStatus.OK, {"backend": "direct", "rendered": rendered})
+            return
+        if backend != "daemon":
+            self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": "backend must be 'direct' or 'daemon'."})
+            return
+        batch_id = f"opticalnav-{_utc_now().strftime('%Y%m%dT%H%M%S%f')}"
+        jobs = []
+        try:
+            for path in paths:
+                episode = read_episode(path)
+                requests = build_episode_render_requests(
+                    episode,
+                    scene_state_payload=dict(scene_state_payload),
+                    camera_spec_payload=dict(camera_spec_payload),
+                    modalities=modalities,
+                    job_id_mode="per_timestep",
+                )
+                for request in requests:
+                    accepted = self.submit(request, variant=str(payload.get("variant") or self.variant))
+                    timestep_index = int(request.extras.get("timestep_index", -1))
+                    jobs.append({
+                        "job_id": accepted.job_id,
+                        "episode_id": episode.episode_id,
+                        "timestep_index": timestep_index,
+                        "status_url": accepted.status_url,
+                    })
+        except Exception as exc:
+            self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": str(exc), "submitted_jobs": jobs})
+            return
+        batch = {
+            "batch_id": batch_id,
+            "project_id": project_dir.name,
+            "backend": "daemon",
+            "created_at": _utc_now_iso(),
+            "modalities": modalities,
+            "jobs": jobs,
+        }
+        batch_path = project_dir / "render_batches" / f"{batch_id}.json"
+        batch_path.parent.mkdir(parents=True, exist_ok=True)
+        batch_path.write_text(json.dumps(batch, ensure_ascii=False, indent=2), encoding="utf-8")
+        self._send_json(handler, HTTPStatus.ACCEPTED, self._opticalnav_render_batch_payload(project_dir, batch_id))
+
     def _handle_get(self, handler: BaseHTTPRequestHandler) -> None:
         try:
             parsed = urlparse(handler.path)
@@ -2129,6 +3880,11 @@ class RenderDaemon:
                 return
             if path == "/api/render-jobs":
                 self._send_json(handler, HTTPStatus.OK, {"jobs": self._job_records(limit=250)})
+                return
+            if path.startswith("/api/opticalnav/"):
+                if self._handle_opticalnav_get(handler, path, query):
+                    return
+                self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": f"Unknown OpticalNav route: {path}"})
                 return
             if path.startswith("/api/render-jobs/") and path.endswith("/log"):
                 job_id = path[len("/api/render-jobs/"):-len("/log")]
@@ -2397,6 +4153,12 @@ class RenderDaemon:
                     self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                     return
                 self._send_json(handler, HTTPStatus.ACCEPTED, render_job_accepted_to_payload(accepted))
+                return
+
+            if path.startswith("/api/opticalnav/"):
+                if self._handle_opticalnav_post(handler, path, payload):
+                    return
+                self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": f"Unknown OpticalNav route: {path}"})
                 return
 
             if path == "/api/tests/smoke-render":
@@ -2748,6 +4510,25 @@ class RenderDaemon:
                 })
                 return
 
+            self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": f"Unknown route: {path}"})
+        except _ClientDisconnectedError:
+            return
+        except Exception as exc:  # pragma: no cover - defensive path
+            try:
+                self._send_json(handler, HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
+            except _ClientDisconnectedError:
+                return
+
+    def _handle_put(self, handler: BaseHTTPRequestHandler) -> None:
+        try:
+            parsed = urlparse(handler.path)
+            path = parsed.path
+            payload = self._read_request_body(handler)
+            if path.startswith("/api/opticalnav/"):
+                if self._handle_opticalnav_put(handler, path, payload):
+                    return
+                self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": f"Unknown OpticalNav route: {path}"})
+                return
             self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": f"Unknown route: {path}"})
         except _ClientDisconnectedError:
             return
@@ -3205,6 +4986,35 @@ class RenderDaemon:
             render_settings.setdefault("width", int(sensor_resolution[0]))
             if len(sensor_resolution) > 1:
                 render_settings.setdefault("height", int(sensor_resolution[1]))
+        sensor_extras = dict(camera_spec.extras or {})
+        if "nir_intensity" in requested_modalities:
+            if sensor_extras.get("wavelength_min_nm") is not None:
+                render_settings.setdefault("nir_wavelength_min_nm", float(sensor_extras["wavelength_min_nm"]))
+            if sensor_extras.get("wavelength_max_nm") is not None:
+                render_settings.setdefault("nir_wavelength_max_nm", float(sensor_extras["wavelength_max_nm"]))
+            if sensor_extras.get("active_emitter_radiance") is not None:
+                render_settings.setdefault("nir_active_emitter_radiance", float(sensor_extras["active_emitter_radiance"]))
+        if "lidar_point_cloud" in requested_modalities:
+            for extra_key, setting_key in (
+                ("horizontal_fov_deg", "lidar_horizontal_fov_deg"),
+                ("vertical_fov_min_deg", "lidar_vertical_fov_min_deg"),
+                ("vertical_fov_max_deg", "lidar_vertical_fov_max_deg"),
+                ("min_range_m", "lidar_min_range_m"),
+                ("max_range_m", "lidar_max_range_m"),
+                ("wavelength_nm", "lidar_wavelength_nm"),
+            ):
+                if sensor_extras.get(extra_key) is not None:
+                    render_settings.setdefault(setting_key, float(sensor_extras[extra_key]))
+        assist_light = None
+        if any(modality in requested_modalities for modality in ("active_nir_intensity", "nir_intensity")):
+            assist_light = AssistLightSpec(
+                mode="camera_aligned_rect",
+                distance_m=0.14,
+                size_world=[4.8, 3.6],
+                spectrum_mode="nir_grayscale_proxy",
+                polarized=False,
+                extras={"radiance": float(render_settings.get("nir_active_emitter_radiance", 40.0))},
+            )
         scene_state = SceneState(
             job_id=job_id,
             scene_id=session.scene_id,
@@ -3227,6 +5037,7 @@ class RenderDaemon:
             robot_state=RobotState(),
             render_settings=render_settings,
             scene_override=scene_override,
+            assist_light=assist_light,
             extras={
                 "source": "isaac_session_v2",
                 "submit_mode": capture_request.submit_mode,
@@ -3320,6 +5131,69 @@ class RenderDaemon:
             return "Writing observation manifest."
         return stage.replace("_", " ").strip().capitalize()
 
+    def _job_priority(self, job: "_QueuedJob") -> int:
+        raw = job.render_request.render_settings.get("priority", job.render_request.extras.get("priority", 0))
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return 0
+
+    def _enqueue_pending_unlocked(self, job_id: str, job: "_QueuedJob") -> None:
+        """Insert into the pending queue with higher numeric priority first."""
+        priority = self._job_priority(job)
+        job.status.extras["priority"] = priority
+        if not self._pending:
+            self._pending.append(job_id)
+            return
+        for index, existing_id in enumerate(self._pending):
+            existing = self._jobs.get(existing_id)
+            if existing is None:
+                continue
+            if priority > self._job_priority(existing):
+                self._pending.insert(index, job_id)
+                return
+        self._pending.append(job_id)
+
+    def _max_render_retries(self, job: "_QueuedJob") -> int:
+        raw = job.render_request.render_settings.get("max_retries")
+        if raw is None:
+            raw = os.environ.get("ROBOMITUBA_RENDER_MAX_RETRIES", "1")
+        try:
+            return max(0, int(raw))
+        except (TypeError, ValueError):
+            return 1
+
+    def _retry_render_job(self, job_id: str, *, reason: str, message: str) -> bool:
+        if reason not in _RETRYABLE_RENDER_FAILURE_REASONS:
+            return False
+        with self._condition:
+            job = self._jobs.get(job_id)
+            if job is None or job.status.status == "cancelled":
+                return False
+            attempts = int(job.status.extras.get("retry_attempts", 0) or 0)
+            max_retries = self._max_render_retries(job)
+            if attempts >= max_retries:
+                return False
+            job.status.status = "queued"
+            job.status.started_at = None
+            job.status.finished_at = None
+            job.status.progress_stage = "retry_queued"
+            job.status.error = None
+            job.status.extras["retry_attempts"] = attempts + 1
+            job.status.extras["last_retry_reason"] = reason
+            job.status.extras["last_retry_message"] = message
+            self._enqueue_pending_unlocked(job_id, job)
+            self._persist_status_unlocked(job)
+            self._condition.notify_all()
+        self._record_render_job_telemetry(job, event_type="retry_queued")
+        self._append_job_log_line(
+            job,
+            event_type="retry",
+            stage="retry_queued",
+            message=f"Retry {attempts + 1}/{max_retries} after {reason}",
+        )
+        return True
+
     def _worker_loop(self) -> None:
         while True:
             with self._condition:
@@ -3405,6 +5279,8 @@ class RenderDaemon:
     def _mark_succeeded(self, job_id: str, *, manifest_path: str) -> None:
         with self._condition:
             job = self._jobs[job_id]
+            if job.status.status == "cancelled":
+                return
             job.status.status = "succeeded"
             job.status.finished_at = _utc_now_iso()
             job.status.progress_stage = "complete"
@@ -3424,6 +5300,8 @@ class RenderDaemon:
     def _mark_failed(self, job_id: str, error: str) -> None:
         with self._condition:
             job = self._jobs[job_id]
+            if job.status.status == "cancelled":
+                return
             job.status.status = "failed"
             job.status.finished_at = _utc_now_iso()
             job.status.progress_stage = "failed"

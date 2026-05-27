@@ -44,6 +44,7 @@ def create_job_manifest(repo_root, layout: JobLayout, snapshot: SceneSnapshot, *
         usd_stage=to_repo_relative_posix(repo_root, layout.usd_stage),
         renders_dir=to_repo_relative_posix(repo_root, layout.renders_dir),
         logs_dir=to_repo_relative_posix(repo_root, layout.logs_dir),
+        snapshot_archive=to_repo_relative_posix(repo_root, layout.snapshot_dir / "snapshot_package.zip"),
     )
     return JobManifest(
         job_id=layout.job_dir.name,
@@ -71,7 +72,8 @@ def validate_job_manifest(manifest: JobManifest) -> None:
         raise ValueError("frame_id must not be empty.")
 
     for _, value in asdict(manifest.paths).items():
-        validate_repo_relative_path(value)
+        if value is not None:
+            validate_repo_relative_path(value)
 
 
 def validate_scene_snapshot(snapshot: SceneSnapshot) -> None:
@@ -81,13 +83,26 @@ def validate_scene_snapshot(snapshot: SceneSnapshot) -> None:
         raise ValueError("frame.frame_id must not be empty.")
     if snapshot.usd_stage_path:
         validate_repo_relative_path(snapshot.usd_stage_path)
+    if snapshot.snapshot_archive:
+        validate_repo_relative_path(snapshot.snapshot_archive)
 
     for mesh in snapshot.meshes:
         if mesh.geometry_path:
             validate_repo_relative_path(mesh.geometry_path)
+        if mesh.geometry_sidecar:
+            validate_repo_relative_path(mesh.geometry_sidecar)
     for material in snapshot.materials:
         for texture_path in material.textures.values():
-            validate_repo_relative_path(texture_path)
+            if isinstance(texture_path, str):
+                validate_repo_relative_path(texture_path)
+    for light in snapshot.lights:
+        if light.texture_path:
+            validate_repo_relative_path(light.texture_path)
+    for reference in snapshot.reference_records:
+        if reference.asset_path and not reference.asset_path.startswith(("/", "omniverse://", "http://", "https://")):
+            validate_repo_relative_path(reference.asset_path)
+        if reference.package_path:
+            validate_repo_relative_path(reference.package_path)
     if snapshot.robot_state is not None:
         validate_robot_state(snapshot.robot_state)
 
@@ -212,8 +227,8 @@ def validate_render_request(render_request: RenderRequest) -> None:
         validate_depth_approx_spec(render_request.depth_approx)
     if "sensor_depth_approx" in render_request.modalities and render_request.depth_approx is None:
         raise ValueError("sensor_depth_approx requires render_request.depth_approx.")
-    if "active_nir_intensity" in render_request.modalities and render_request.assist_light is None:
-        raise ValueError("active_nir_intensity requires render_request.assist_light.")
+    if any(item in render_request.modalities for item in ("active_nir_intensity", "nir_intensity")) and render_request.assist_light is None:
+        raise ValueError("active NIR modalities require render_request.assist_light.")
     try:
         json.dumps(render_request.render_settings)
     except TypeError as exc:

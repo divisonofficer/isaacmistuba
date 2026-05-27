@@ -44,6 +44,7 @@
 		{ en: 'Operations',       kr: '운영 홈',          href: '/',               icon: '🏠' },
 		{ en: 'Current Session',  kr: '현재 세션',        href: '/current-scene',  icon: '📍' },
 		{ en: 'Jobs / Queue',     kr: '작업 / 큐',        href: '/jobs',           icon: '📋' },
+		{ en: 'Datasets',         kr: '데이터셋',          href: '/datasets',       icon: 'DN' },
 		{ en: 'Scene Registry',   kr: '장면 레지스트리',  href: '/scenes',         icon: '🎬' },
 		{ en: 'Material Library', kr: '재질 라이브러리',  href: '/materials',      icon: '🎨' },
 		{ en: 'Bridge',           kr: '연동 상태 (Bridge)', href: '/bridge',       icon: '🌉' },

@@ -9,7 +9,7 @@ from pathlib import Path
 
 def _bootstrap_project_sys_path() -> None:
     """Add modules/*/src directories to sys.path so the daemon process can
-    import ``mitsuba_converter`` / ``robomituba_bridge`` without an editable
+    import local module packages without an editable
     install. Idempotent; safe to call multiple times.
 
     Without this the launcher only worked when the operator had previously
@@ -18,7 +18,7 @@ def _bootstrap_project_sys_path() -> None:
     """
     repo_root = Path(__file__).resolve().parents[1]
     modules_root = repo_root / "modules"
-    for sub in ("mitsuba_converter", "robomituba_bridge"):
+    for sub in ("mitsuba_converter", "robomituba_bridge", "navigation_dataset"):
         src = modules_root / sub / "src"
         if src.is_dir():
             src_str = str(src)

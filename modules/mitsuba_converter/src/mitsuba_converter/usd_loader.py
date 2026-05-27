@@ -5,6 +5,7 @@ from typing import List, Optional
 import numpy as np
 
 from .types import MeshData, SceneIR
+from .usd_snapshot import extract_snapshot_from_usd
 
 
 @dataclass
@@ -18,55 +19,28 @@ class UsdSceneLoader:
     usd_path: str
 
     def load(self) -> SceneIR:
-        try:
-            from pxr import Usd, UsdGeom
-        except Exception as e:
-            raise RuntimeError(
-                "USD Python bindings (pxr) not found. Run this inside Isaac Sim Python or install USD."
-            ) from e
-
-        stage = Usd.Stage.Open(self.usd_path)
-        if stage is None:
-            raise RuntimeError(f"Failed to open USD stage: {self.usd_path}")
-
         meshes: List[MeshData] = []
-
-        # MVP: extract first few UsdGeom.Mesh prims (no instancing/materials yet)
-        for prim in stage.Traverse():
-            if not prim.IsA(UsdGeom.Mesh):
+        extracted = extract_snapshot_from_usd(self.usd_path, include_geometry_payloads=True)
+        for mesh_record in extracted.snapshot.meshes:
+            geometry = mesh_record.extras.get("geometry") if isinstance(mesh_record.extras, dict) else None
+            if not isinstance(geometry, dict):
                 continue
-
-            mesh = UsdGeom.Mesh(prim)
-            points = mesh.GetPointsAttr().Get() or []
-            counts = mesh.GetFaceVertexCountsAttr().Get() or []
-            indices = mesh.GetFaceVertexIndicesAttr().Get() or []
-
-            if len(points) == 0 or len(counts) == 0 or len(indices) == 0:
+            vertices = geometry.get("vertices") or []
+            faces = geometry.get("faces") or []
+            if not vertices or not faces:
                 continue
-
-            # triangulate naively (fan) for MVP
-            tri_faces = []
-            cursor = 0
-            for c in counts:
-                face = indices[cursor:cursor+c]
-                cursor += c
-                if c < 3:
-                    continue
-                # fan triangulation
-                v0 = face[0]
-                for k in range(1, c-1):
-                    tri_faces.append([v0, face[k], face[k+1]])
-
-            if not tri_faces:
-                continue
-
-            v = np.asarray([(p[0], p[1], p[2]) for p in points], dtype=np.float32)
-            f = np.asarray(tri_faces, dtype=np.int32)
-
-            meshes.append(MeshData(name=str(prim.GetPath()), vertices=v, faces=f))
-
-            # keep MVP small by default
-            if len(meshes) >= 20:
-                break
+            normals = geometry.get("normals")
+            uvs = geometry.get("uvs")
+            meshes.append(
+                MeshData(
+                    name=mesh_record.source_path,
+                    vertices=np.asarray(vertices, dtype=np.float32),
+                    faces=np.asarray(faces, dtype=np.int32),
+                    normals=np.asarray(normals, dtype=np.float32) if normals else None,
+                    uvs=np.asarray(uvs, dtype=np.float32) if uvs else None,
+                    to_world=np.asarray(mesh_record.transform, dtype=np.float32).reshape(4, 4)
+                    if mesh_record.transform else None,
+                )
+            )
 
         return SceneIR(meshes=meshes)

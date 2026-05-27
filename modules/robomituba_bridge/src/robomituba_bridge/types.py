@@ -7,6 +7,7 @@ JsonDict = Dict[str, Any]
 Mat4 = List[float]
 Vec2 = List[float]
 Vec3 = List[float]
+SCENE_SNAPSHOT_SCHEMA_VERSION = "2.0"
 
 
 @dataclass
@@ -16,9 +17,15 @@ class MeshRecord:
     source_path: str
     material_id: Optional[str] = None
     geometry_path: Optional[str] = None
+    geometry_sidecar: Optional[str] = None
     primitive: str = "mesh"
     vertex_count: Optional[int] = None
     face_count: Optional[int] = None
+    normal_count: Optional[int] = None
+    uv_count: Optional[int] = None
+    visible: Optional[bool] = None
+    instance_id: Optional[str] = None
+    prototype_id: Optional[str] = None
     transform: Optional[Mat4] = None
     extras: JsonDict = field(default_factory=dict)
 
@@ -35,8 +42,13 @@ class MaterialRecord:
     metallic: Optional[float] = None
     ior: Optional[float] = None
     opacity: Optional[float] = None
+    specular: Optional[float] = None
+    transmission: Optional[float] = None
+    emission_color: Optional[Vec3] = None
+    emission_intensity: Optional[float] = None
     double_sided: bool = False
     textures: JsonDict = field(default_factory=dict)
+    physical_params: JsonDict = field(default_factory=dict)
     extras: JsonDict = field(default_factory=dict)
 
 
@@ -49,6 +61,12 @@ class CameraRecord:
     fov_deg: Optional[float] = None
     resolution: Optional[List[int]] = None
     clip_range: Optional[List[float]] = None
+    horizontal_aperture: Optional[float] = None
+    vertical_aperture: Optional[float] = None
+    focal_length: Optional[float] = None
+    focus_distance: Optional[float] = None
+    f_stop: Optional[float] = None
+    sensor_orientation: Optional[str] = None
     look_at: Optional[JsonDict] = None
     transform: Optional[Mat4] = None
     extras: JsonDict = field(default_factory=dict)
@@ -65,7 +83,11 @@ class LightRecord:
     exposure: Optional[float] = None
     radius: Optional[float] = None
     size: Optional[Vec2] = None
+    angle: Optional[float] = None
+    temperature: Optional[float] = None
+    normalize: Optional[bool] = None
     texture_path: Optional[str] = None
+    light_params: JsonDict = field(default_factory=dict)
     look_at: Optional[JsonDict] = None
     transform: Optional[Mat4] = None
     extras: JsonDict = field(default_factory=dict)
@@ -83,6 +105,43 @@ class FrameRecord:
 
 
 @dataclass
+class PoseRecord:
+    prim_path: str
+    transform: Mat4
+    time_code: Optional[float] = None
+    timestamp: Optional[str] = None
+    visible: Optional[bool] = None
+    extras: JsonDict = field(default_factory=dict)
+
+
+@dataclass
+class InstancerMappingRecord:
+    instance_id: str
+    instancer_path: str
+    prototype_id: str
+    prototype_path: Optional[str] = None
+    parent_id: Optional[str] = None
+    mesh_id: Optional[str] = None
+    material_id: Optional[str] = None
+    instance_index: Optional[int] = None
+    transform: Optional[Mat4] = None
+    visible: Optional[bool] = None
+    extras: JsonDict = field(default_factory=dict)
+
+
+@dataclass
+class ReferenceRecord:
+    reference_id: str
+    source_path: str
+    asset_path: str
+    package_path: Optional[str] = None
+    sha256: Optional[str] = None
+    size_bytes: Optional[int] = None
+    layer_identifier: Optional[str] = None
+    extras: JsonDict = field(default_factory=dict)
+
+
+@dataclass
 class SceneSnapshot:
     scene_id: str
     frame: FrameRecord
@@ -90,9 +149,15 @@ class SceneSnapshot:
     materials: List[MaterialRecord] = field(default_factory=list)
     cameras: List[CameraRecord] = field(default_factory=list)
     lights: List[LightRecord] = field(default_factory=list)
+    pose_records: List[PoseRecord] = field(default_factory=list)
+    instancer_mappings: List[InstancerMappingRecord] = field(default_factory=list)
+    reference_records: List[ReferenceRecord] = field(default_factory=list)
     usd_stage_path: Optional[str] = None
+    snapshot_archive: Optional[str] = None
+    package_metadata: JsonDict = field(default_factory=dict)
     robot_state: Optional[RobotState] = None
     extras: JsonDict = field(default_factory=dict)
+    schema_version: str = SCENE_SNAPSHOT_SCHEMA_VERSION
 
 
 @dataclass
@@ -108,6 +173,7 @@ class JobPaths:
     usd_stage: str
     renders_dir: str
     logs_dir: str
+    snapshot_archive: Optional[str] = None
 
 
 @dataclass

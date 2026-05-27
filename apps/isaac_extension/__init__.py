@@ -25,8 +25,15 @@ from .daemon_client import (
     render_sensor_from_daemon,
     request_apply_material_override,
     resolve_windows_repo_root,
+    sync_opticalnav_stage_from_daemon,
     sync_scene_state_to_daemon,
     update_isaac_selection,
+)
+from .asset_browser import (
+    open_ranger_mini_asset_folder,
+    ranger_mini_asset_dir,
+    register_robomituba_asset_root,
+    robomituba_asset_root,
 )
 from .material_override_layer import (
     attach_existing_override_layer,
@@ -36,6 +43,26 @@ from .material_override_layer import (
     resolve_material_override,
     write_material_override,
 )
+from .robot_sensors import (
+    attach_default_sensor_rig,
+    capture_robot_sensor_spec,
+    capture_robot_sensor_specs,
+    discover_robot_sensors,
+    register_robot_sensors,
+    render_robot_sensor,
+    render_robot_sensor_suite,
+)
+from .ranger_mini_stage import (
+    bind_ranger_mini_articulation,
+    enable_ranger_mini_physics,
+    import_ranger_mini_urdf_to_physx_asset,
+    ranger_mini_physx_asset_status,
+    require_ranger_mini_physx_asset,
+    restore_ranger_mini_visual_asset,
+    set_stage_up_axis,
+    validate_ranger_mini_physx,
+)
+from .ros_cmd_vel_bridge import start_cmd_vel_bridge, stop_cmd_vel_bridge
 
 __all__ = [
     "DEFAULT_DAEMON_URL",
@@ -63,12 +90,34 @@ __all__ = [
     "render_sensor_from_daemon",
     "request_apply_material_override",
     "resolve_windows_repo_root",
+    "sync_opticalnav_stage_from_daemon",
     "sync_scene_state_to_daemon",
     "update_isaac_selection",
+    "open_ranger_mini_asset_folder",
+    "ranger_mini_asset_dir",
+    "register_robomituba_asset_root",
+    "robomituba_asset_root",
     "attach_existing_override_layer",
     "clear_material_override",
     "ensure_override_layer",
     "expand_material_scope",
     "resolve_material_override",
     "write_material_override",
+    "attach_default_sensor_rig",
+    "capture_robot_sensor_spec",
+    "capture_robot_sensor_specs",
+    "discover_robot_sensors",
+    "register_robot_sensors",
+    "render_robot_sensor",
+    "render_robot_sensor_suite",
+    "bind_ranger_mini_articulation",
+    "enable_ranger_mini_physics",
+    "import_ranger_mini_urdf_to_physx_asset",
+    "ranger_mini_physx_asset_status",
+    "require_ranger_mini_physx_asset",
+    "restore_ranger_mini_visual_asset",
+    "set_stage_up_axis",
+    "validate_ranger_mini_physx",
+    "start_cmd_vel_bridge",
+    "stop_cmd_vel_bridge",
 ]
