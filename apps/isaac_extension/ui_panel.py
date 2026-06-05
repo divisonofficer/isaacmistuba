@@ -2440,6 +2440,7 @@ class RobomitubaPanel:
                 prepare_render_ready_from_daemon,
                 request_apply_material_override,
                 connect_scene_session_from_daemon,
+                get_camera_rig_from_daemon,
                 load_scene_from_daemon,
                 open_capture_from_daemon,
                 render_current_view_from_daemon,
@@ -2453,6 +2454,7 @@ class RobomitubaPanel:
                 prepare_render_ready_from_daemon,
                 request_apply_material_override,
                 connect_scene_session_from_daemon,
+                get_camera_rig_from_daemon,
                 load_scene_from_daemon,
                 open_capture_from_daemon,
                 render_current_view_from_daemon,
@@ -2534,6 +2536,27 @@ class RobomitubaPanel:
             self._set_result(
                 f"OpticalNav stage sync complete.\nscene: {scene_id}\n"
                 f"objects: {result.get('object_count', 0)} regions: {result.get('region_count', 0)}"
+            )
+            return result
+        if command_type == "apply_camera_rig":
+            try:
+                from isaac_extension.robot_sensors import apply_camera_rig
+            except ImportError:  # pragma: no cover - Isaac runtime fallback
+                from robot_sensors import apply_camera_rig
+
+            rig_id = str(payload.get("rig_id") or "ranger_mini_default")
+            rig_payload = get_camera_rig_from_daemon(rig_id, daemon_url=daemon_url)
+            robot_prim_path = str(payload.get("robot_prim_path") or "/World")
+            result = apply_camera_rig(
+                self._get_stage(),
+                robot_prim_path,
+                rig_payload,
+                replace_existing=bool(payload.get("replace_existing", True)),
+            )
+            self._scene_state_dirty = True
+            self._set_result(
+                f"Camera rig applied.\nrig: {result.get('rig_id')}\n"
+                f"robot: {result.get('robot_prim_path')}\nsensors: {result.get('sensor_count')}"
             )
             return result
         if command_type == "render_current_view":

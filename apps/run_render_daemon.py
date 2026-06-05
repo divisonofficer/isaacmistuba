@@ -34,9 +34,9 @@ def _is_subprocess_mode() -> bool:
     subprocess does it for us. Decided by the same env flag the daemon
     code itself reads.
     """
-    raw = os.environ.get("ROBOMITUBA_RENDER_INPROCESS", "1").strip().lower()
-    # default "1" (in-process, legacy) — only the explicit off values
-    # flip to subprocess mode.
+    raw = os.environ.get("ROBOMITUBA_RENDER_INPROCESS", "0").strip().lower()
+    # default "0" (subprocess isolation) — only explicit on values use
+    # the legacy in-process render thread.
     return raw in ("0", "false", "no", "off")
 
 

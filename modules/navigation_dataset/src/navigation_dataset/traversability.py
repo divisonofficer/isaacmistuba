@@ -11,6 +11,31 @@ import numpy as np
 from .scene_annotations import HazardRegion, SceneAnnotation, TraversableRegion
 
 
+# Categories that should always carve the walkable grid (physical obstacles).
+# ``landmark`` is intentionally excluded: it's a 15 cm point marker that, at the
+# typical 300+ landmarks per scene, would otherwise riddle the floor with holes.
+_BLOCKING_OBJECT_CATEGORIES = frozenset({
+    "obstacle",
+    "solid_obstacle",
+    "wall",
+    "table",
+    "desk",
+    "chair",
+    "sofa",
+    "couch",
+    "cabinet",
+    "shelf",
+    "bookshelf",
+    "appliance",
+    "plant",
+    "transparent_surface",
+    "reflective_hazard",
+    "reflective_obstacle",
+    "pillar",
+    "column",
+})
+
+
 @dataclass(frozen=True)
 class GridSpec:
     origin: list[float]
@@ -135,7 +160,39 @@ def _mask_geometry(spec: GridSpec, geometry: dict[str, Any]) -> np.ndarray:
     return mask
 
 
-def build_traversability_grid(annotation: SceneAnnotation, *, resolution: float = 0.05, margin: float = 0.5) -> TraversabilityGrid:
+def inflate_traversable_grid(traversable: np.ndarray, radius_m: float, resolution: float) -> np.ndarray:
+    """Erode the traversable mask by robot_radius so nodes/edges stay clear of obstacles."""
+    if radius_m <= 0:
+        return traversable.copy()
+    radius_cells = int(math.ceil(radius_m / resolution))
+    result = traversable.copy()
+    obstacle_cells = np.argwhere(~traversable)
+    height, width = traversable.shape
+    for oy, ox in obstacle_cells:
+        for dy in range(-radius_cells, radius_cells + 1):
+            for dx in range(-radius_cells, radius_cells + 1):
+                if dx * dx + dy * dy > radius_cells * radius_cells:
+                    continue
+                x = int(ox) + dx
+                y = int(oy) + dy
+                if 0 <= x < width and 0 <= y < height:
+                    result[y, x] = False
+    return result
+
+
+def build_traversability_grid(
+    annotation: SceneAnnotation,
+    *,
+    resolution: float = 0.05,
+    margin: float = 0.5,
+    walkability_overlay: "np.ndarray | None" = None,
+) -> TraversabilityGrid:
+    """Build the traversability grid.
+
+    ``walkability_overlay`` (uint8: 0/1/2) is merged in so user paint strokes
+    survive automatic rebuilds. See walkability_overlay.merge_overlay for the
+    semantics.
+    """
     if resolution <= 0:
         raise ValueError("resolution must be positive.")
     min_x, min_y, max_x, max_y = _annotation_bounds(annotation, margin)
@@ -143,18 +200,39 @@ def build_traversability_grid(annotation: SceneAnnotation, *, resolution: float 
     height = max(1, int(math.ceil((max_y - min_y) / resolution)))
     spec = GridSpec(origin=[float(min_x), float(min_y)], resolution=float(resolution), width=width, height=height, scene_id=annotation.scene_id)
     traversable = np.zeros((height, width), dtype=bool)
+    # Two-pass: first mark walkable areas, then carve out obstacles.
+    # Single-pass ordering was wrong: obstacles appended before the traversable
+    # rectangle would be AND-ed against an all-zero grid (no effect), then the
+    # rectangle would OR them back in, making every obstacle invisible to the grid.
     for region in annotation.traversable_regions:
-        region_mask = _mask_geometry(spec, region.geometry)
         if region.traversable:
-            traversable |= region_mask
-        else:
-            traversable &= ~region_mask
+            traversable |= _mask_geometry(spec, region.geometry)
+    for region in annotation.traversable_regions:
+        if not region.traversable:
+            traversable &= ~_mask_geometry(spec, region.geometry)
     hazard = np.zeros((height, width), dtype=bool)
     for region in annotation.hazard_regions:
         hazard |= _mask_geometry(spec, region.geometry)
+    # Anything that would physically block a robot's footprint should carve the
+    # walkable grid. The historic whitelist was just {"obstacle","solid_obstacle"},
+    # but ``authoring_compile._object_category`` only maps to those for walls with
+    # ``blocks_navigation=True``. Tables/chairs/plants/walls/glass were therefore
+    # invisible to edge_builder. We now (a) accept the common physical categories
+    # by name, and (b) respect ``extras.navigation.blocks_navigation`` as an
+    # explicit override coming from the authoring map.
     for obj in annotation.objects:
-        if obj.category in {"obstacle", "solid_obstacle"} and obj.geometry:
+        if not obj.geometry:
+            continue
+        category = str(obj.category or "")
+        nav_extras = dict(((obj.extras or {}).get("navigation") or {}))
+        blocks = bool(nav_extras.get("blocks_navigation"))
+        if blocks or category in _BLOCKING_OBJECT_CATEGORIES:
             traversable &= ~_mask_geometry(spec, obj.geometry)
+    # User-painted overlay last: 1 = force walkable, 2 = force blocked.
+    if walkability_overlay is not None and walkability_overlay.shape == (height, width):
+        forced_walkable = walkability_overlay == 1
+        forced_blocked = walkability_overlay == 2
+        traversable = (traversable | forced_walkable) & ~forced_blocked
     return TraversabilityGrid(spec=spec, traversable=traversable, hazard=hazard)
 
 

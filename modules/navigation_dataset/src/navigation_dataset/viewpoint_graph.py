@@ -161,3 +161,166 @@ def write_viewpoint_graph(path: str | Path, graph: ViewpointGraph) -> Path:
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(viewpoint_graph_to_payload(graph), ensure_ascii=False, indent=2), encoding="utf-8")
     return output
+
+
+def _next_manual_node_id(graph: ViewpointGraph) -> str:
+    existing = {node.node_id for node in graph.nodes}
+    n = 1
+    while True:
+        candidate = f"vp_manual_{n:04d}"
+        if candidate not in existing:
+            return candidate
+        n += 1
+
+
+def append_manual_node(graph: ViewpointGraph, x: float, y: float, *, heading_count: int | None = None) -> ViewpointNode:
+    """Add a manually-placed viewpoint node with N evenly spaced headings."""
+    headings_n = int(heading_count or graph.node_heading_count or 8)
+    if headings_n < 1:
+        headings_n = 1
+    headings = [
+        ViewpointHeading(heading_id=f"h_{int(round(360 * i / headings_n)):03d}", yaw_deg=float(360 * i / headings_n))
+        for i in range(headings_n)
+    ]
+    node = ViewpointNode(
+        node_id=_next_manual_node_id(graph),
+        position=[float(x), float(y), 0.0],
+        clearance_m=0.0,
+        tags=["manual"],
+        headings=headings,
+        extras={"manual": True},
+    )
+    graph.nodes.append(node)
+    return node
+
+
+def remove_node(graph: ViewpointGraph, node_id: str) -> bool:
+    """Remove a node by id along with any edges that touch it."""
+    before = len(graph.nodes)
+    graph.nodes = [n for n in graph.nodes if n.node_id != node_id]
+    if len(graph.nodes) == before:
+        return False
+    graph.edges = [e for e in graph.edges if e.source != node_id and e.target != node_id]
+    return True
+
+
+def _next_manual_edge_id(graph: ViewpointGraph) -> str:
+    existing = {edge.edge_id for edge in graph.edges}
+    n = 1
+    while True:
+        candidate = f"edge_manual_{n:04d}"
+        if candidate not in existing:
+            return candidate
+        n += 1
+
+
+def find_node(graph: ViewpointGraph, node_id: str) -> ViewpointNode | None:
+    for n in graph.nodes:
+        if n.node_id == node_id:
+            return n
+    return None
+
+
+def find_edge_by_endpoints(graph: ViewpointGraph, source: str, target: str) -> ViewpointEdge | None:
+    for e in graph.edges:
+        if (e.source == source and e.target == target) or (e.source == target and e.target == source):
+            return e
+    return None
+
+
+def append_edge(
+    graph: ViewpointGraph,
+    source: str,
+    target: str,
+    *,
+    edge_id: str | None = None,
+    distance_m: float | None = None,
+    weight: float | None = None,
+) -> ViewpointEdge | None:
+    """Add a (possibly manual) edge between two existing nodes.
+
+    Returns the new (or pre-existing) edge, or ``None`` if either endpoint is unknown.
+    """
+    src_node = find_node(graph, source)
+    tgt_node = find_node(graph, target)
+    if src_node is None or tgt_node is None or source == target:
+        return None
+    existing = find_edge_by_endpoints(graph, source, target)
+    if existing is not None:
+        return existing
+    import math as _math
+
+    if distance_m is None:
+        dx = float(src_node.position[0]) - float(tgt_node.position[0])
+        dy = float(src_node.position[1]) - float(tgt_node.position[1])
+        distance_m = _math.hypot(dx, dy)
+    if weight is None:
+        weight = float(distance_m)
+    new_id = edge_id or _next_manual_edge_id(graph)
+    edge = ViewpointEdge(
+        edge_id=new_id,
+        source=source,
+        target=target,
+        distance_m=float(distance_m),
+        weight=float(weight),
+        collision_free=True,
+        hazard_crossing=False,
+        path_polyline=[
+            [float(src_node.position[0]), float(src_node.position[1])],
+            [float(tgt_node.position[0]), float(tgt_node.position[1])],
+        ],
+        extras={"manual": True},
+    )
+    graph.edges.append(edge)
+    return edge
+
+
+def compute_connected_components(graph: ViewpointGraph) -> dict[str, Any]:
+    """Compute connected components over the undirected edge set.
+
+    Returns ``{"node_to_component": {node_id: idx}, "components": [{"index", "size", "node_ids"}]}``
+    where component 0 is the largest. Isolated nodes (no edges) form singleton components.
+    """
+    adj: dict[str, list[str]] = {n.node_id: [] for n in graph.nodes}
+    for e in graph.edges:
+        if e.source in adj and e.target in adj:
+            adj[e.source].append(e.target)
+            adj[e.target].append(e.source)
+    visited: set[str] = set()
+    components_raw: list[list[str]] = []
+    for start in adj:
+        if start in visited:
+            continue
+        stack = [start]
+        bucket: list[str] = []
+        while stack:
+            nid = stack.pop()
+            if nid in visited:
+                continue
+            visited.add(nid)
+            bucket.append(nid)
+            for nxt in adj.get(nid, ()):
+                if nxt not in visited:
+                    stack.append(nxt)
+        components_raw.append(bucket)
+    components_raw.sort(key=len, reverse=True)
+    node_to_component: dict[str, int] = {}
+    components: list[dict[str, Any]] = []
+    for idx, bucket in enumerate(components_raw):
+        for nid in bucket:
+            node_to_component[nid] = idx
+        components.append({
+            "index": idx,
+            "size": len(bucket),
+            "node_ids": bucket,
+        })
+    return {
+        "node_to_component": node_to_component,
+        "components": components,
+    }
+
+
+def remove_edge(graph: ViewpointGraph, edge_id: str) -> bool:
+    before = len(graph.edges)
+    graph.edges = [e for e in graph.edges if e.edge_id != edge_id]
+    return len(graph.edges) != before

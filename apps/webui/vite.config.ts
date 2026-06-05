@@ -16,11 +16,19 @@ const proxyOptions = {
 	secure: false
 } satisfies ProxyOptions;
 
+const wsProxyOptions = {
+	target: DAEMON.replace('http://', 'ws://'),
+	changeOrigin: true,
+	secure: false,
+	ws: true,
+} satisfies ProxyOptions;
+
 export default defineConfig({
 	plugins: [sveltekit()],
 	server: {
 		host: '0.0.0.0',  // WSL2에서 Windows 브라우저로 접근 가능
 		proxy: {
+			'/api/ws': wsProxyOptions,
 			'/api': proxyOptions,
 			'/jobs/': proxyOptions,
 			'/isaac/session': proxyOptions,

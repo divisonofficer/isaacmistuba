@@ -478,9 +478,10 @@ class _Worker:
 class WorkerManager:
     """Owns one or more :class:`_Worker` instances.
 
-    Phase R only spawns ``worker_count = 1``. Phase M3 will pass a
-    larger count derived from ``GpuDeviceRegistry``; the routing logic
-    here is a no-op single-worker passthrough until then.
+    The manager keeps one long-lived worker per configured GPU. Jobs are
+    routed to the least-busy live worker so independent viewpoint jobs can
+    spread across multiple GPUs while each worker keeps its resident scene
+    cache warm.
     """
 
     def __init__(
@@ -519,6 +520,7 @@ class WorkerManager:
         self._lock = threading.Lock()
         self._degraded = False
         self._restart_lock = threading.Lock()
+        self._rr_cursor = 0
         self._shutting_down = False
 
     def _project_src_paths(self) -> list[str]:
@@ -548,11 +550,11 @@ class WorkerManager:
                 w.start()
 
     def submit(self, job: dict) -> None:
-        """Route a job to a worker.
+        """Route a job to the least-busy live worker.
 
-        Phase R: round-robin across workers (worker_count is 1 today,
-        so this is a no-op pick). Phase M3 will replace this with a
-        ``RenderScheduler`` that uses ``job.weight`` and per-GPU VRAM.
+        Idle workers are preferred. When several workers have equal load,
+        a small round-robin cursor breaks ties so bursts of independent
+        jobs distribute across GPUs 0,1,2,3 instead of piling onto GPU 0.
         """
         if self._degraded:
             self._dispatch_synthetic({
@@ -562,15 +564,31 @@ class WorkerManager:
                 "message": "worker manager is in degraded state — manual reset required",
             })
             return
-        worker = self._pick_worker()
+        target_gpu_index = self._target_gpu_index(job)
+        worker = self._pick_target_worker(target_gpu_index) if target_gpu_index is not None else None
         if worker is None:
-            self._dispatch_synthetic({
-                "job_id": str(job.get("job_id") or ""),
-                "type": "failed",
-                "reason": "no_worker",
-                "message": "no worker available",
-            })
-            return
+            fallback_worker = self._pick_worker()
+            if fallback_worker is None:
+                self._dispatch_synthetic({
+                    "job_id": str(job.get("job_id") or ""),
+                    "type": "failed",
+                    "reason": "no_worker",
+                    "message": "no worker available",
+                })
+                return
+            if target_gpu_index is not None:
+                self._dispatch_synthetic({
+                    "job_id": str(job.get("job_id") or ""),
+                    "type": "routing_fallback",
+                    "reason": "target_worker_unavailable",
+                    "target_gpu_index": target_gpu_index,
+                    "routed_gpu_index": fallback_worker.stats.gpu_index,
+                    "message": (
+                        f"target gpu {target_gpu_index} unavailable; "
+                        f"routed to gpu {fallback_worker.stats.gpu_index}"
+                    ),
+                })
+            worker = fallback_worker
         worker.submit(job)
 
     def cancel(self, job_id: str) -> bool:
@@ -600,6 +618,8 @@ class WorkerManager:
                 "gpu_index": w.stats.gpu_index,
                 "pid": w.stats.pid,
                 "in_flight_job_id": w.stats.in_flight_job_id,
+                "queue_depth": self._worker_queue_depth(w),
+                "load_score": self._worker_load(w),
                 "submitted": w.stats.submitted_count,
                 "completed": w.stats.completed_count,
                 "failed": w.stats.failed_count,
@@ -617,12 +637,57 @@ class WorkerManager:
 
     # ── internals ─────────────────────────────────────────────────────
 
+    def _worker_queue_depth(self, worker: _Worker) -> int:
+        try:
+            return max(0, int(worker._outbound.qsize()))
+        except Exception:
+            return 0
+
+    def _worker_load(self, worker: _Worker) -> int:
+        """Best-effort load score used for routing.
+
+        ``in_flight_job_id`` is set after the worker emits ``started``; the
+        outbound queue covers jobs that were just submitted but not accepted
+        yet. This keeps rapid bursts from choosing the same idle worker over
+        and over before its ``started`` event arrives.
+        """
+        in_flight = 1 if worker.stats.in_flight_job_id else 0
+        return in_flight + self._worker_queue_depth(worker)
+
+    def _target_gpu_index(self, job: dict) -> int | None:
+        raw = job.get("worker_gpu_index")
+        if raw is None and isinstance(job.get("spec"), dict):
+            raw = job["spec"].get("worker_gpu_index")
+        if raw is None:
+            return None
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return None
+
+    def _live_workers(self) -> list[_Worker]:
+        return [
+            w for w in self._workers
+            if w._process is not None and w._process.poll() is None
+        ]
+
+    def _pick_target_worker(self, gpu_index: int) -> _Worker | None:
+        for worker in self._live_workers():
+            if int(worker.stats.gpu_index) == int(gpu_index):
+                return worker
+        return None
+
     def _pick_worker(self) -> Optional[_Worker]:
-        """Return a live worker. Phase R: first worker only."""
-        for w in self._workers:
-            if w._process is not None and w._process.poll() is None:
-                return w
-        return self._workers[0] if self._workers else None
+        """Return the least-busy live worker, rotating ties."""
+        live = self._live_workers()
+        if not live:
+            return self._workers[0] if self._workers else None
+
+        start = self._rr_cursor % len(live)
+        ordered = live[start:] + live[:start]
+        best = min(ordered, key=lambda w: (self._worker_load(w), ordered.index(w)))
+        self._rr_cursor = (live.index(best) + 1) % len(live)
+        return best
 
     def _dispatch_synthetic(self, event: dict) -> None:
         for listener in list(self._listeners):

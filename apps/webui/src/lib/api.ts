@@ -120,6 +120,87 @@ export const isaacTelemetryRecent = () =>
 export const isaacTelemetryStats = () =>
 	fetch('/api/isaac/telemetry/stats').then(json);
 
+export type CameraRigSensorType = 'rgb_camera' | 'nir_camera' | 'polar_camera' | 'lidar_3d';
+export type CameraRigRenderSettings = {
+	path_spp: number;
+	aov_spp: number;
+	polar_spp: number;
+	samples_per_pass?: number | null;
+};
+export type CameraRigSensor = {
+	sensor_id: string;
+	sensor_type: CameraRigSensorType;
+	modalities: string[];
+	enabled: boolean;
+	mount: {
+		parent_frame: string;
+		xyz_m: [number, number, number];
+		rpy_deg: [number, number, number];
+	};
+	intrinsics: {
+		resolution: [number, number];
+		fov_h_deg: number;
+		fov_v_deg: number;
+		focal_length_px: number;
+		clip_near_m: number;
+		clip_far_m: number;
+	};
+	render?: CameraRigRenderSettings;
+	nir?: {
+		wavelength_min_nm: number;
+		wavelength_max_nm: number;
+		active_emitter_radiance: number;
+	};
+	polarization?: {
+		polarizer_angle_deg: number;
+	};
+	lidar?: {
+		horizontal_samples: number;
+		vertical_channels: number;
+		horizontal_fov_deg: number;
+		vertical_fov_min_deg: number;
+		vertical_fov_max_deg: number;
+		min_range_m: number;
+		max_range_m: number;
+		wavelength_nm: number;
+	};
+};
+export type CameraRig = {
+	rig_id: string;
+	label: string;
+	robot_model: 'ranger_mini_v3' | string;
+	base_frame: string;
+	updated_at: string;
+	sensors: CameraRigSensor[];
+};
+export type CameraRigMeshPayload = {
+	robot_model: string;
+	source: string;
+	status: string;
+	vertices: number[];
+	indices: number[];
+	bounds?: {
+		min: number[];
+		max: number[];
+		size: number[];
+		center: number[];
+	};
+};
+export const listCameraRigs = (): Promise<{ default_rig_id: string; rigs: Array<Record<string, unknown>> }> =>
+	fetch('/api/camera-rigs').then(json);
+export const getCameraRig = (rigId: string): Promise<CameraRig> =>
+	fetch(`/api/camera-rigs/${encodeURIComponent(rigId)}`).then(json);
+export const saveCameraRig = (rigId: string, rig: CameraRig): Promise<CameraRig> =>
+	post(`/api/camera-rigs/${encodeURIComponent(rigId)}`, rig);
+export const getCameraRigRobotMesh = (): Promise<CameraRigMeshPayload> =>
+	fetch('/api/camera-rigs/ranger-mini/mesh').then(json);
+export const applyCameraRigToIsaac = (rigId: string, opts: { robot_prim_path?: string; replace_existing?: boolean } = {}) =>
+	isaacCommand('apply_camera_rig', undefined, {
+		rig_id: rigId,
+		robot_prim_path: opts.robot_prim_path,
+		replace_existing: opts.replace_existing ?? true
+	});
+
 export const getIsaacSession = () => fetch('/isaac/session').then(json);
 export const getIsaacSessionInventory = () => fetch('/isaac/session/inventory').then(json);
 
@@ -270,10 +351,46 @@ export const listOpticalNavProjects = () =>
 	fetch('/api/opticalnav/projects').then(json);
 export const listOpticalNavUsdCandidates = () =>
 	fetch('/api/opticalnav/usd-candidates').then(json);
+export const listOpticalNavAssetSources = () =>
+	fetch('/api/opticalnav/asset-library/sources').then(json);
+export const importOpticalNavAssetSource = (payload: { usd_ref?: string; source_ref?: string; glb_ref?: string; force?: boolean }) =>
+	post('/api/opticalnav/asset-library/import', payload);
+export const listOpticalNavAssets = (opts: { q?: string; category?: string; selected?: boolean; source_ref?: string; source_type?: string } = {}) => {
+	const params = new URLSearchParams();
+	if (opts.q) params.set('q', opts.q);
+	if (opts.category && opts.category !== 'all') params.set('category', opts.category);
+	if (opts.selected) params.set('selected', '1');
+	if (opts.source_ref) params.set('source_ref', opts.source_ref);
+	if (opts.source_type && opts.source_type !== 'all') params.set('source_type', opts.source_type);
+	const query = params.toString();
+	return fetch(`/api/opticalnav/asset-library/assets${query ? `?${query}` : ''}`).then(json);
+};
+export const listOpticalNavAgentAssets = (opts: { q?: string; category?: string; active?: boolean } = {}) => {
+	const params = new URLSearchParams();
+	if (opts.q) params.set('q', opts.q);
+	if (opts.category && opts.category !== 'all') params.set('category', opts.category);
+	if (opts.active != null) params.set('active', opts.active ? '1' : '0');
+	const query = params.toString();
+	return fetch(`/api/opticalnav/agent/assets${query ? `?${query}` : ''}`).then(json);
+};
+export const setOpticalNavAgentAssetActivation = (payload: {
+	activate?: string[];
+	deactivate?: string[];
+	replace?: boolean;
+	decisions?: Array<{ asset_id: string; active: boolean; reason?: string }>;
+}) => post('/api/opticalnav/agent/assets/activation', payload);
+export const updateOpticalNavAsset = (assetId: string, payload: unknown) =>
+	put(`/api/opticalnav/asset-library/assets/${encodeURIComponent(assetId)}`, payload);
+export const bulkSelectOpticalNavAssets = (payload: { asset_ids: string[]; selected: boolean }) =>
+	post('/api/opticalnav/asset-library/assets/bulk-select', payload);
 export const createOpticalNavProject = (payload: OpticalNavProjectCreate) =>
 	post('/api/opticalnav/projects', payload);
 export const getOpticalNavProject = (projectId: string) =>
 	fetch(opticalProject(projectId)).then(json);
+export const getOpticalNavMapAssets = (projectId: string) =>
+	fetch(`${opticalProject(projectId)}/map-assets`).then(json);
+export const opticalNavAssetThumbnailUrl = (projectId: string, assetId: string) =>
+	`${opticalProject(projectId)}/map-assets/${encodeURIComponent(assetId)}/thumbnail?v=mesh_thumb_v3`;
 export const addOpticalNavScene = (projectId: string, payload: OpticalNavSceneCreate) =>
 	post(`${opticalProject(projectId)}/scenes`, payload);
 export const attachOpticalNavSceneUsd = (projectId: string, sceneId: string, payload: { usd_ref?: string }) =>
@@ -284,8 +401,13 @@ export const saveSceneAnnotation = (projectId: string, sceneId: string, payload:
 	put(`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/annotation`, payload);
 export const getOpticalNavAuthoringMap = (projectId: string, sceneId: string) =>
 	fetch(`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/authoring-map`).then(json);
-export const getOpticalNavEditorGeometry = (projectId: string, sceneId: string) =>
-	fetch(`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/editor-geometry`).then(json);
+export const getOpticalNavEditorGeometry = (projectId: string, sceneId: string, refresh = false) =>
+	fetch(`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/editor-geometry${refresh ? '?refresh=1' : ''}`).then(json);
+export const getOpticalNavPrimMesh = (projectId: string, sceneId: string, sourcePath: string, usdRef?: string) => {
+	const params = new URLSearchParams({ source_path: sourcePath });
+	if (usdRef) params.set('usd_ref', usdRef);
+	return fetch(`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/prim-mesh?${params}`).then(json);
+};
 export const saveOpticalNavAuthoringMap = (projectId: string, sceneId: string, payload: unknown) =>
 	put(`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/authoring-map`, payload);
 export const compileOpticalNavAuthoringMap = (projectId: string, sceneId: string) =>
@@ -298,12 +420,40 @@ export const buildOpticalNavMap = (projectId: string, sceneId: string, payload: 
 	post(`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/map/build`, payload);
 export const buildOpticalNavViewpointGraph = (projectId: string, sceneId: string, payload: unknown) =>
 	post(`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/graph/build`, payload);
+export const graphBuildProgressWsUrl = (projectId: string, sceneId: string): string => {
+	const proto = typeof location !== 'undefined' && location.protocol === 'https:' ? 'wss:' : 'ws:';
+	const host = typeof location !== 'undefined' ? location.host : '127.0.0.1:8765';
+	return `${proto}//${host}/api/ws/graph-build-progress?project_id=${encodeURIComponent(projectId)}&scene_id=${encodeURIComponent(sceneId)}`;
+};
+export const opticalNavSyncProgressWsUrl = (syncJobId: string): string => {
+	const proto = typeof location !== 'undefined' && location.protocol === 'https:' ? 'wss:' : 'ws:';
+	const host = typeof location !== 'undefined' ? location.host : '127.0.0.1:8765';
+	return `${proto}//${host}/api/ws/opticalnav-sync-progress?sync_job_id=${encodeURIComponent(syncJobId)}`;
+};
 export const getOpticalNavViewpointGraph = (projectId: string, sceneId: string) =>
 	fetch(`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/graph`).then(json);
 export const sweepOpticalNavViewpointGraph = (projectId: string, sceneId: string, payload: unknown) =>
 	post(`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/graph/sweep`, payload);
+export const deleteOpticalNavObservations = (projectId: string, sceneId: string, nodeIds: string[] | null) =>
+	fetch(`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/observations`, {
+		method: 'DELETE',
+		headers: nodeIds ? { 'Content-Type': 'application/json' } : {},
+		body: nodeIds ? JSON.stringify({ node_ids: nodeIds }) : undefined
+	}).then(json);
+export const getOpticalNavRenderConfig = (projectId: string, sceneId: string) =>
+	fetch(`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/render-config`).then(json);
+export const getOpticalNavRenderReadiness = (projectId: string, sceneId: string) =>
+	fetch(`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/render-readiness`).then(json);
+export const listOpticalNavEnvmaps = (projectId: string, sceneId: string) =>
+	fetch(`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/envmaps`).then(json);
+export const uploadOpticalNavEnvmap = (projectId: string, sceneId: string, payload: { filename: string; content_type?: string; data_base64: string }) =>
+	post(`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/envmaps`, payload);
+export const saveOpticalNavRenderConfig = (projectId: string, sceneId: string, payload: { scene_state: unknown; camera_spec: unknown }) =>
+	put(`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/render-config`, payload);
 export const getOpticalNavGraphRenderBatch = (projectId: string, batchId: string) =>
 	fetch(`${opticalProject(projectId)}/graph-render-batches/${encodeURIComponent(batchId)}`).then(json);
+export const getOpticalNavGraphBatchLogs = (projectId: string, batchId: string, perJob = 30) =>
+	fetch(`${opticalProject(projectId)}/graph-render-batches/${encodeURIComponent(batchId)}/logs?per_job=${perJob}`).then(json);
 export const planOpticalNavEpisodes = (projectId: string, payload: unknown) =>
 	post(`${opticalProject(projectId)}/episodes/plan`, payload);
 export const planOpticalNavGraphEpisodes = (projectId: string, payload: unknown) =>
@@ -316,6 +466,46 @@ export const renderOpticalNavEpisodes = (projectId: string, payload: unknown) =>
 	post(`${opticalProject(projectId)}/episodes/render`, payload);
 export const getOpticalNavRenderBatch = (projectId: string, batchId: string) =>
 	fetch(`${opticalProject(projectId)}/render-batches/${encodeURIComponent(batchId)}`).then(json);
+export const scanOpticalNavObservations = (projectId: string, sceneId: string) =>
+	fetch(`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/observations-scan`).then(json);
+export const getOpticalNavRenderSceneStats = (projectId: string, sceneId: string) =>
+	fetch(`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/render-scene-stats`).then(json);
+export const getOpticalNavRoomShell = (projectId: string, sceneId: string) =>
+	fetch(`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/room-shell`).then(json);
+export const addOpticalNavGraphNode = (projectId: string, sceneId: string, payload: { x: number; y: number; heading_count?: number }) =>
+	post(`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/graph/nodes`, payload);
+export const deleteOpticalNavGraphNode = (projectId: string, sceneId: string, nodeId: string) =>
+	fetch(`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/graph/nodes/${encodeURIComponent(nodeId)}`, { method: 'DELETE' }).then(json);
+export const getOpticalNavWalkabilityOverlay = (projectId: string, sceneId: string) =>
+	fetch(`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/walkability-overlay`).then(json);
+export const paintOpticalNavWalkabilityOverlay = (
+	projectId: string, sceneId: string,
+	payload: { brush: 'walkable' | 'blocked' | 'erase'; radius_m?: number; points?: Array<[number, number]>; shape?: 'stroke' | 'rectangle'; bbox?: [number, number, number, number] }
+) => post(`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/walkability-overlay/paint`, payload);
+export const clearOpticalNavWalkabilityOverlay = (projectId: string, sceneId: string) =>
+	fetch(`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/walkability-overlay`, { method: 'DELETE' }).then(json);
+export const opticalNavWalkabilityOverlayPngUrl = (projectId: string, sceneId: string): string =>
+	`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/walkability-overlay.png`;
+export const getOpticalNavTraversableGridMeta = (projectId: string, sceneId: string, robotRadiusM: number) =>
+	fetch(`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/traversable-grid?robot_radius_m=${robotRadiusM}`).then(json);
+export const opticalNavTraversableGridPngUrl = (projectId: string, sceneId: string, robotRadiusM: number): string =>
+	`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/traversable-grid.png?robot_radius_m=${robotRadiusM}`;
+export const checkOpticalNavGraphEdge = (projectId: string, sceneId: string, payload: { source: string; target: string; robot_radius_m?: number; max_edge_length_m?: number }) =>
+	post(`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/graph/edge-check`, payload);
+export const regenerateOpticalNavGraphRegion = (
+	projectId: string, sceneId: string,
+	payload: { bbox: [number, number, number, number]; max_nodes?: number; min_node_spacing_m?: number; robot_radius_m?: number; min_clearance_m?: number; heading_count?: number; seed?: number }
+) => post(`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/graph/regenerate-region`, payload);
+export const addOpticalNavGraphEdge = (
+	projectId: string, sceneId: string,
+	payload: { source: string; target: string; distance_m?: number; weight?: number }
+) => post(`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/graph/edges`, payload);
+export const deleteOpticalNavGraphEdge = (projectId: string, sceneId: string, edgeId: string) =>
+	fetch(`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/graph/edges/${encodeURIComponent(edgeId)}`, { method: 'DELETE' }).then(json);
+export const opticalNavObservationRgbUrl = (projectId: string, sceneId: string, vpId: string, headingId: string): string =>
+	`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/observations/${encodeURIComponent(vpId)}/rgb?heading=${encodeURIComponent(headingId)}`;
+export const opticalNavObservationModalityUrl = (projectId: string, sceneId: string, vpId: string, headingId: string, modality: string, sensorId = ''): string =>
+	`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/observations/${encodeURIComponent(vpId)}/${encodeURIComponent(modality)}?heading=${encodeURIComponent(headingId)}${sensorId ? `&sensor_id=${encodeURIComponent(sensorId)}` : ''}`;
 export const validateOpticalNavDataset = (projectId: string, payload: { require_observations?: boolean }) =>
 	post(`${opticalProject(projectId)}/validate`, payload);
 export const evaluateOpticalNavDataset = (projectId: string, payload: { policy?: string; success_radius?: number }) =>

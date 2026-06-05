@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Launch the GPU render queue daemon with OptiX 7 Mitsuba workers.
+# Default port is 8766 so it can run next to apps/run_control_backend_dev.sh
+# on 8765. Set RENDER_QUEUE_PORT=8765 when using it as the all-in-one daemon.
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+: "${RENDER_QUEUE_HOST:=127.0.0.1}"
+: "${RENDER_QUEUE_PORT:=8766}"
+: "${ROBOMITUBA_MITSUBA_PYTHON:=/root/miniconda3/envs/mitsuba_optix7/bin/python}"
+: "${ROBOMITUBA_MITSUBA_PYTHONPATH:=/jarvis/project/robomituba/build/mitsuba3-optix7/python}"
+: "${ROBOMITUBA_RENDER_GPU_INDICES:=0,1,2,3}"
+: "${ROBOMITUBA_RENDER_WORKER_COUNT:=4}"
+: "${ROBOMITUBA_FULL_RENDER_DISABLE_CUDA:=0}"
+: "${ROBOMITUBA_DISABLE_CPU_FALLBACK:=1}"
+: "${ROBOMITUBA_CPU_SPP_CAP:=0}"
+: "${ROBOMITUBA_TEXTURE_MAX_RESOLUTION:=1024}"
+: "${ROBOMITUBA_WORKER_HEARTBEAT_TIMEOUT_S:=600}"
+: "${ROBOMITUBA_SCENE_LOAD_CONCURRENCY:=1}"
+: "${ROBOMITUBA_RENDER_INPROCESS:=0}"
+: "${ROBOMITUBA_BACKEND_ONLY:=0}"
+: "${PYTHONUNBUFFERED:=1}"
+
+export ROBOMITUBA_MITSUBA_PYTHON
+export ROBOMITUBA_MITSUBA_PYTHONPATH
+export ROBOMITUBA_RENDER_GPU_INDICES
+export ROBOMITUBA_RENDER_WORKER_COUNT
+export ROBOMITUBA_FULL_RENDER_DISABLE_CUDA
+export ROBOMITUBA_DISABLE_CPU_FALLBACK
+export ROBOMITUBA_CPU_SPP_CAP
+export ROBOMITUBA_TEXTURE_MAX_RESOLUTION
+export ROBOMITUBA_WORKER_HEARTBEAT_TIMEOUT_S
+export ROBOMITUBA_SCENE_LOAD_CONCURRENCY
+export ROBOMITUBA_RENDER_INPROCESS
+export ROBOMITUBA_BACKEND_ONLY
+export PYTHONUNBUFFERED
+export PYTHONPATH="$REPO_ROOT/modules/mitsuba_converter/src:$REPO_ROOT/modules/robomituba_bridge/src:$REPO_ROOT/modules/navigation_dataset/src:${PYTHONPATH:-}"
+
+echo "[render-queue] url: http://$RENDER_QUEUE_HOST:$RENDER_QUEUE_PORT"
+echo "[render-queue] GPUs: $ROBOMITUBA_RENDER_GPU_INDICES workers=$ROBOMITUBA_RENDER_WORKER_COUNT scene_load_concurrency=$ROBOMITUBA_SCENE_LOAD_CONCURRENCY"
+echo "[render-queue] texture max: $ROBOMITUBA_TEXTURE_MAX_RESOLUTION GPU-only cpu_fallback_disabled=$ROBOMITUBA_DISABLE_CPU_FALLBACK"
+
+exec python -u "$REPO_ROOT/apps/run_render_daemon.py" --repo-root "$REPO_ROOT" --host "$RENDER_QUEUE_HOST" --port "$RENDER_QUEUE_PORT" "$@"

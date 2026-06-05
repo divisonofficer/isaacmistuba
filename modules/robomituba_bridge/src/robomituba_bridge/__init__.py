@@ -213,4 +213,22 @@ __all__ = [
     "extract_scene_snapshot_package",
     "write_observation_bundle_manifest",
     "write_render_job_status",
+    # sensor profiles
+    "SensorProfile",
+    "SpectralBand",
+    "SENSOR_PROFILES",
+    "JAI_FS1600D",
+    "LUCID_TRT053S",
+    "get_profile",
+    "list_profiles",
 ]
+
+from .sensor_profiles import (  # noqa: E402
+    SensorProfile,
+    SpectralBand,
+    SENSOR_PROFILES,
+    JAI_FS1600D,
+    LUCID_TRT053S,
+    get_profile,
+    list_profiles,
+)

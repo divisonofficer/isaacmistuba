@@ -120,7 +120,7 @@ class AuthoringCompileTests(unittest.TestCase):
         scene_variant, overlay, sync = build_render_scene_sync_payload(payload, result.annotation)
         self.assertEqual(sync["render_scene"], "synced")
         self.assertEqual(sync["isaac_stage"], "pending")
-        self.assertEqual(scene_variant["render_sync_mode"], "overlay_manifest")
+        self.assertEqual(scene_variant["render_sync_mode"], "editor_generated_xml")
         self.assertEqual(scene_variant["base_usd_ref"], "scenes/glass_corridor_001/scene.usd")
         self.assertEqual(overlay["hazard_mask_targets"][0]["object_id"], "glass_wall_001")
         self.assertEqual(overlay["material_bindings"][0]["material"], "clear_glass")
@@ -132,10 +132,16 @@ class AuthoringCompileTests(unittest.TestCase):
             root = Path(tmpdir)
             scene_dir = root / "scenes" / result.annotation.scene_id
             sync_result = write_render_scene_sync(scene_dir, payload, result.annotation, project_dir=root)
+            render_scene = scene_dir / "render_scene.xml"
+            render_scene.write_text("<scene version=\"3.0.0\" />", encoding="utf-8")
+            readiness = scene_dir / "render_readiness.json"
+            readiness.write_text('{"ok": true}', encoding="utf-8")
             result.annotation.metadata["sync"] = {
                 **sync_result.sync,
                 "scene_variant_ref": sync_result.scene_variant_ref,
                 "render_scene_overlay_ref": sync_result.overlay_ref,
+                "render_scene_xml_ref": render_scene.relative_to(root).as_posix(),
+                "render_readiness_ref": readiness.relative_to(root).as_posix(),
             }
             write_scene_annotation(scene_dir / "scene_annotation.json", result.annotation)
             report = validate_dataset(root)

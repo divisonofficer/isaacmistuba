@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -10,7 +11,7 @@ from .scene_annotations import SceneAnnotation, scene_annotation_to_payload
 
 
 JsonDict = dict[str, Any]
-SCENE_VARIANT_VERSION = "opticalnav-scene-variant-v0.2"
+SCENE_VARIANT_VERSION = "opticalnav-scene-variant-v0.3"
 
 
 @dataclass
@@ -60,15 +61,21 @@ def build_render_scene_sync_payload(
             "navigation": navigation,
             "source_ref": obj.source_ref,
             "metadata": dict(obj.metadata or {}),
+            "is_emitter": bool(getattr(obj, "is_emitter", False)),
+            "emitter_radiance": getattr(obj, "emitter_radiance", None),
+            "emitter_intensity": float(getattr(obj, "emitter_intensity", 1.0) or 1.0),
         }
         overlay_objects.append(entry)
         if obj.material:
+            material_model = next((mat for mat in model.materials if mat.material_id == obj.material), None)
+            binding = dict(getattr(material_model, "render_binding", {}) or {}) if material_model else {}
             material_bindings.append(
                 {
                     "object_id": obj.id,
                     "material": obj.material,
                     "authoring_type": obj.type,
                     "geometry": geometry,
+                    "render_binding": binding,
                 }
             )
 
@@ -106,6 +113,13 @@ def build_render_scene_sync_payload(
         for item in annotation_payload.get("hazard_regions", [])
     ]
 
+    authoring_payload = authoring_map_to_payload(model)
+    authoring_source_hash = hashlib.sha1(
+        json.dumps(authoring_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    environment_payload = dict(authoring_payload.get("environment") or {})
+    camera_rig_payload = dict(authoring_payload.get("camera_rig") or {})
+
     overlay = {
         "version": SCENE_VARIANT_VERSION,
         "scene_id": annotation.scene_id,
@@ -118,8 +132,8 @@ def build_render_scene_sync_payload(
         "material_bindings": material_bindings,
         "metadata": {
             "source": "authoring_map",
-            "render_sync_mode": "overlay_manifest",
-            "note": "This manifest materializes 2D editor overlays for render tooling. It is not an Isaac USD stage mutation.",
+            "render_sync_mode": "editor_generated_xml",
+            "note": "This manifest materializes editor-authored geometry for render XML generation.",
         },
     }
     scene_variant = {
@@ -127,27 +141,34 @@ def build_render_scene_sync_payload(
         "scene_id": annotation.scene_id,
         "scene_variant_id": variant_id,
         "base_usd_ref": annotation.usd_ref,
-        "render_sync_mode": "overlay_manifest",
+        "render_sync_mode": "editor_generated_xml",
         "coordinate_system": annotation.coordinate_system,
-        "authoring_map": authoring_map_to_payload(model),
+        "authoring_map": authoring_payload,
         "scene_annotation": annotation_payload,
         "overlay_ref": "render_scene_overlays.json",
+        "base_scene_xml_ref": None,
+        "overlay_scene_xml_ref": None,
+        "authoring_source_hash": authoring_source_hash,
+        "environment_profile": environment_payload,
+        "camera_rig_id": camera_rig_payload.get("rig_id"),
+        "camera_rig": camera_rig_payload,
+        "texture_profile": None,
         "material_bindings": material_bindings,
         "hazard_mask_target_count": len(mask_targets),
         "metadata": {
             "source": "opticalnav_editor",
             "limitations": [
                 "No live Isaac prims are created by this artifact.",
-                "Renderers must explicitly consume render_scene_overlays.json to render edited geometry.",
+                "The render path must consume render_scene.xml generated from the editor state.",
             ],
         },
     }
     sync = {
         "dataset": "synced",
         "render_scene": "synced",
-        "render_scene_mode": "overlay_manifest",
+        "render_scene_mode": "editor_generated_xml",
         "isaac_stage": "pending",
-        "message": "Render-scene overlay manifest is synced. Isaac stage mutation is still pending.",
+        "message": "Render-scene XML is generated from the editor authoring map. Isaac stage mutation is still pending.",
     }
     return scene_variant, overlay, sync
 

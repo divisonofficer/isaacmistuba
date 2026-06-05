@@ -4,6 +4,7 @@ from dataclasses import asdict, dataclass, field
 import hashlib
 import json
 import os
+import re
 import sys
 from collections import OrderedDict
 from pathlib import Path
@@ -65,7 +66,8 @@ _SCENE_TEMPLATE_CACHE: dict[tuple[tuple[str, int, int], str, tuple[Any, ...]], E
 _RESIDENT_SCENE_CACHE: "OrderedDict[tuple[str, int, int, str], Any]" = OrderedDict()
 _STAGED_SCENE_SIGNATURE_CACHE: dict[str, tuple[Any, ...]] = {}
 _SCENE_CACHE_LOCK = threading.Lock()
-_RESIDENT_SCENE_CACHE_LIMIT = 8
+_RESIDENT_SCENE_CACHE_LIMIT: int = int(os.environ.get("ROBOMITUBA_SCENE_CACHE_LIMIT", "32"))
+_last_source_scene_dir: str = ""
 
 
 @dataclass
@@ -89,6 +91,7 @@ class RenderConfig:
     lidar_min_range_m: float = 0.2
     lidar_max_range_m: float = 80.0
     lidar_wavelength_nm: float = 905.0
+    ambient_radiance: float = 1.0
     artifact_stems: dict[str, str] = field(default_factory=dict)
     scene_filenames: dict[str, str] = field(default_factory=dict)
 
@@ -285,6 +288,59 @@ def _parse_scene(scene_path: Path) -> ET.Element:
     return _clone_scene_root(cached)
 
 
+_MEASURED_BSDF_TYPES = {"measured", "measured_polarized"}
+_CHANNEL_SPLIT_FILENAME_RE = re.compile(r"/channels/(?P<material>[^/]+)/(?P<wl>\d+)\.pbrdf$")
+
+
+def _swap_measured_bsdf_wavelength(root: ET.Element, *, target_nm: int) -> int:
+    """Rewrite filenames of channel-split measured BSDFs to a target wavelength.
+
+    Only swaps when the existing filename matches the channel-split layout
+    (``.../channels/{material}/{wavelength}.pbrdf``). Raw monolithic .hpbrdf
+    references are left alone since they're not channel-keyed.
+    """
+    swapped = 0
+    for bsdf in list(root.findall("./bsdf")):
+        if str(bsdf.get("type") or "") not in _MEASURED_BSDF_TYPES:
+            continue
+        for s in bsdf.findall("./string"):
+            if s.get("name") != "filename":
+                continue
+            value = s.get("value") or ""
+            m = _CHANNEL_SPLIT_FILENAME_RE.search(value)
+            if not m:
+                continue
+            new_value = value[: m.start("wl")] + str(target_nm) + ".pbrdf"
+            if new_value != value:
+                s.set("value", new_value)
+                swapped += 1
+    return swapped
+
+
+def _substitute_measured_bsdfs_with_diffuse(root: ET.Element, *, reflectance: str = "0.7 0.7 0.7") -> int:
+    """Replace top-level <bsdf type="measured*"> with diffuse stand-ins, preserving id.
+
+    Used for depth-only / AOV passes where BSDF response is irrelevant but the
+    measured BSDF would otherwise force a multi-hundred-MB GPU upload.
+    """
+    swapped = 0
+    for bsdf in list(root.findall("./bsdf")):
+        if str(bsdf.get("type") or "") not in _MEASURED_BSDF_TYPES:
+            continue
+        bsdf_id = bsdf.get("id")
+        # Clear children and reset to diffuse.
+        for child in list(bsdf):
+            bsdf.remove(child)
+        bsdf.set("type", "diffuse")
+        rgb = ET.SubElement(bsdf, "rgb")
+        rgb.set("name", "reflectance")
+        rgb.set("value", reflectance)
+        if bsdf_id is not None:
+            bsdf.set("id", bsdf_id)
+        swapped += 1
+    return swapped
+
+
 def _scene_template(
     scene_path: Path,
     *,
@@ -392,6 +448,10 @@ def _texture_cache_root(out_scene: Path) -> Path:
     if override:
         return Path(override).expanduser().resolve()
     return Path.cwd().resolve() / "out" / "texture_cache" / "mitsuba_downsampled"
+
+
+def _texture_audit_path(scene_path: Path) -> Path:
+    return scene_path.with_suffix(".texture_audit.json")
 
 
 def _downsampled_texture_path(src: Path, *, cache_root: Path, max_resolution: int) -> Path | None:
@@ -518,6 +578,131 @@ def _rewrite_texture_filenames(root: ET.Element, *, out_scene: Path) -> dict[str
     return {"rewritten": rewritten, "skipped": skipped}
 
 
+
+def _texture_image_size(path: Path) -> tuple[int, int] | None:
+    if path.suffix.lower() == ".exr":
+        try:
+            import imageio.v3 as iio
+            image = np.asarray(iio.imread(path))
+            if image.ndim >= 2:
+                return int(image.shape[1]), int(image.shape[0])
+        except Exception:
+            return None
+        return None
+    try:
+        with Image.open(path) as image:
+            return int(image.size[0]), int(image.size[1])
+    except Exception:
+        return None
+
+
+def _build_texture_audit(root: ET.Element, *, out_scene: Path) -> dict[str, Any]:
+    max_resolution = _texture_max_resolution()
+    cache_root = _texture_cache_root(out_scene)
+    texture_refs = 0
+    downsampled_refs = 0
+    original_refs = 0
+    original_gt_profile_refs = 0
+    missing_refs = 0
+    unreadable_refs = 0
+    original_gt_profile_examples: list[str] = []
+    for node in root.iter():
+        if node.tag not in {"texture", "emitter"}:
+            continue
+        plugin_type = node.attrib.get("type")
+        if plugin_type not in {"bitmap", "envmap"}:
+            continue
+        filename = node.find("string[@name='filename']")
+        if filename is None:
+            continue
+        value = filename.attrib.get("value")
+        if not value:
+            continue
+        texture_refs += 1
+        src = Path(value)
+        src_text = str(src)
+        if "out/texture_cache/mitsuba_downsampled" in src_text or src_text.startswith(str(cache_root)):
+            downsampled_refs += 1
+            continue
+        original_refs += 1
+        if not src.exists():
+            missing_refs += 1
+            continue
+        size = _texture_image_size(src)
+        if size is None:
+            unreadable_refs += 1
+            continue
+        width, height = size
+        if max_resolution > 0 and max(width, height) > max_resolution:
+            original_gt_profile_refs += 1
+            if len(original_gt_profile_examples) < 12:
+                original_gt_profile_examples.append(src_text)
+    audit = {
+        "texture_profile": max_resolution,
+        "texture_refs": texture_refs,
+        "downsampled_refs": downsampled_refs,
+        "original_refs": original_refs,
+        "original_gt_profile_refs": original_gt_profile_refs,
+        "missing_refs": missing_refs,
+        "xml_path": str(out_scene),
+        "audit_ok": original_gt_profile_refs == 0,
+    }
+    if unreadable_refs:
+        audit["unreadable_refs"] = unreadable_refs
+    if original_gt_profile_examples:
+        audit["original_gt_profile_examples"] = original_gt_profile_examples
+    return audit
+
+
+def _write_texture_audit(root: ET.Element, *, out_scene: Path, fail_on_gt_profile: bool = False) -> dict[str, Any]:
+    audit = _build_texture_audit(root, out_scene=out_scene)
+    audit_path = _texture_audit_path(out_scene)
+    audit_path.write_text(json.dumps(audit, ensure_ascii=False, indent=2), encoding="utf-8")
+    if fail_on_gt_profile and int(audit.get("original_gt_profile_refs", 0) or 0) > 0:
+        raise RuntimeError(
+            "texture audit failed: "
+            f"profile=max{audit.get('texture_profile')} "
+            f"original_gt_profile_refs={audit.get('original_gt_profile_refs')} "
+            f"xml={out_scene}"
+        )
+    return audit
+
+
+def _ensure_texture_audit(scene_path: Path, *, fail_on_gt_profile: bool = False) -> dict[str, Any] | None:
+    audit_path = _texture_audit_path(scene_path)
+    if audit_path.exists():
+        try:
+            return json.loads(audit_path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    try:
+        root = ET.parse(scene_path).getroot()
+    except Exception:
+        return None
+    return _write_texture_audit(root, out_scene=scene_path, fail_on_gt_profile=fail_on_gt_profile)
+
+
+def _texture_audit_progress_payload(scene_path: Path) -> dict[str, Any]:
+    audit_path = _texture_audit_path(scene_path)
+    if not audit_path.exists():
+        return {"texture_profile": _texture_max_resolution()}
+    try:
+        audit = json.loads(audit_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {"texture_profile": _texture_max_resolution()}
+    return {
+        "texture_profile": audit.get("texture_profile", _texture_max_resolution()),
+        "texture_audit": {
+            "texture_refs": audit.get("texture_refs"),
+            "downsampled_refs": audit.get("downsampled_refs"),
+            "original_refs": audit.get("original_refs"),
+            "original_gt_profile_refs": audit.get("original_gt_profile_refs"),
+            "missing_refs": audit.get("missing_refs"),
+            "xml_path": audit.get("xml_path"),
+            "audit_ok": audit.get("audit_ok"),
+        },
+    }
+
 def _write_scene(root: ET.Element, out_scene: Path) -> Path:
     _rewrite_texture_filenames(root, out_scene=out_scene)
     ET.indent(root, space="  ")
@@ -530,6 +715,17 @@ def _write_scene(root: ET.Element, out_scene: Path) -> Path:
             pass
     out_scene.write_text(scene_text, encoding="utf-8")
     return out_scene
+
+
+def _has_emitter(root: ET.Element) -> bool:
+    if root.find("./emitter") is not None:
+        return True
+    return any(shape.find("./emitter") is not None for shape in root.findall("./shape"))
+
+
+def _inject_constant_emitter(root: ET.Element, radiance: float) -> None:
+    emitter = ET.SubElement(root, "emitter", {"type": "constant"})
+    ET.SubElement(emitter, "rgb", {"name": "radiance", "value": f"{float(radiance):.6f}"})
 
 
 def _shape_filename_value(shape: ET.Element) -> str | None:
@@ -558,6 +754,20 @@ def _shape_matches_targets(shape: ET.Element, targets: set[str]) -> bool:
 def _remove_children(shape: ET.Element, tag: str) -> None:
     for child in list(shape.findall(f"./{tag}")):
         shape.remove(child)
+
+
+def _remove_shape_bsdf_children(shape: ET.Element) -> None:
+    """Remove direct material bindings before authoring a replacement BSDF.
+
+    Mitsuba accepts exactly one BSDF child per shape. Scene XML can bind that
+    material either inline with ``<bsdf>`` or by referencing a top-level BSDF
+    via ``<ref id="..."/>``. Polarization fallback rewrites per-shape BSDFs, so
+    both forms must be removed first.
+    """
+
+    for child in list(shape):
+        if child.tag == "bsdf" or child.tag == "ref":
+            shape.remove(child)
 
 
 def _remove_all_emitters(root: ET.Element) -> None:
@@ -1178,6 +1388,8 @@ def _stage_path_scene(
     scene_override: SceneOverrideSpec | None = None,
     assist_light: AssistLightSpec | None = None,
     integrator_type: str = "path",
+    ambient_radiance: float = 1.0,
+    measured_wavelength_nm: int | None = None,
 ) -> Path:
     stage_signature = (
         "path",
@@ -1186,6 +1398,8 @@ def _stage_path_scene(
         (integrator_type, int(max_depth), int(rr_depth), int(samples_per_pass or 0)),
         _scene_override_signature(scene_override),
         _assist_light_signature(assist_light),
+        round(float(ambient_radiance), 4),
+        int(measured_wavelength_nm) if measured_wavelength_nm else 0,
     )
     if _should_reuse_staged_scene(out_scene, signature=stage_signature):
         return out_scene
@@ -1201,11 +1415,13 @@ def _stage_path_scene(
             rr_depth=rr_depth,
             samples_per_pass=samples_per_pass,
         )
+        if measured_wavelength_nm is not None:
+            _swap_measured_bsdf_wavelength(root, target_nm=int(measured_wavelength_nm))
 
     root = _scene_template(
         scene_path,
         branch_kind="path",
-        branch_signature=(integrator_type, int(max_depth), int(rr_depth), int(samples_per_pass or 0)),
+        branch_signature=(integrator_type, int(max_depth), int(rr_depth), int(samples_per_pass or 0), int(measured_wavelength_nm) if measured_wavelength_nm else 0),
         builder=_build_template,
     )
     _update_sensor(
@@ -1217,6 +1433,8 @@ def _stage_path_scene(
         height=height,
     )
     _apply_scene_override(root, scene_override, mode="rgb")
+    if ambient_radiance > 0 and not _has_emitter(root):
+        _inject_constant_emitter(root, ambient_radiance)
     if assist_light is not None:
         _append_camera_assist_light(root, camera_to_world, assist_light, polarized=False)
     result = _write_scene(root, out_scene)
@@ -1255,11 +1473,15 @@ def _stage_aov_scene(
             integrator.remove(child)
         ET.SubElement(integrator, "string", {"name": "aovs", "value": "ab:albedo,dd:depth"})
         ET.SubElement(integrator, "integrator", {"type": "direct", "name": "img"})
+        # AOV branch only needs primary-ray hit geometry/depth; measured BSDFs
+        # contribute nothing here yet cost the full hpbrdf/pbrdf table load.
+        # Substitute them with diffuse so depth renders skip the heavy upload.
+        _substitute_measured_bsdfs_with_diffuse(root)
 
     root = _scene_template(
         scene_path,
         branch_kind="aov",
-        branch_signature=(),
+        branch_signature=("measured_substituted",),
         builder=_build_template,
     )
     _update_sensor(
@@ -1350,6 +1572,7 @@ def _stage_diffuse_override_scene(
     samples_per_pass: int | None,
     scene_override: SceneOverrideSpec | None = None,
     assist_light: AssistLightSpec | None = None,
+    ambient_radiance: float = 1.0,
 ) -> Path:
     stage_signature = (
         "diffuse_override",
@@ -1358,6 +1581,7 @@ def _stage_diffuse_override_scene(
         (int(max_depth), int(rr_depth), int(samples_per_pass or 0)),
         _scene_override_signature(scene_override),
         _assist_light_signature(assist_light),
+        round(float(ambient_radiance), 4),
     )
     if _should_reuse_staged_scene(out_scene, signature=stage_signature):
         return out_scene
@@ -1380,8 +1604,7 @@ def _stage_diffuse_override_scene(
                 continue
             obj_name = Path(filename.attrib["value"]).name.lower()
             old_bsdf = shape.find("./bsdf")
-            if old_bsdf is not None:
-                shape.remove(old_bsdf)
+            _remove_shape_bsdf_children(shape)
 
             if "glass" in obj_name:
                 bsdf = ET.SubElement(shape, "bsdf", {"type": "roughdielectric"})
@@ -1440,6 +1663,8 @@ def _stage_diffuse_override_scene(
         height=height,
     )
     _apply_scene_override(root, scene_override, mode="rgb")
+    if ambient_radiance > 0 and not _has_emitter(root):
+        _inject_constant_emitter(root, ambient_radiance)
     if assist_light is not None:
         _append_camera_assist_light(root, camera_to_world, assist_light, polarized=False)
 
@@ -1490,8 +1715,7 @@ def _stage_polarized_fallback_scene(
                 continue
             obj_name = Path(filename.attrib["value"]).name.lower()
             old_bsdf = shape.find("./bsdf")
-            if old_bsdf is not None:
-                shape.remove(old_bsdf)
+            _remove_shape_bsdf_children(shape)
 
             if "glass" in obj_name:
                 bsdf = ET.SubElement(shape, "bsdf", {"type": "roughdielectric"})
@@ -1642,6 +1866,197 @@ def _stage_target_mask_scene(
     return result
 
 
+@dataclass
+class _ViewpointSensorSpec:
+    """Camera parameters passed to _render_scene() for base-scene rendering."""
+    camera_to_world: np.ndarray
+    fov_deg: float
+    width: int
+    height: int
+
+
+def _shared_base_scene_path(source_scene: Path, base_sig: tuple) -> Path:
+    sig_hash = hashlib.sha1(str(base_sig).encode()).hexdigest()[:16]
+    return source_scene.parent / ".staged_mitsuba" / "base" / f"{sig_hash}.xml"
+
+
+def _stage_base_path_scene(
+    scene_path: Path,
+    *,
+    max_depth: int,
+    rr_depth: int,
+    samples_per_pass: int | None,
+    scene_override: SceneOverrideSpec | None = None,
+    integrator_type: str = "path",
+    ambient_radiance: float = 1.0,
+) -> Path:
+    """Stage a camera-free path-tracer scene shared across viewpoints.
+
+    The scene has no sensor transform baked in; callers must pass a
+    _ViewpointSensorSpec when calling _render_scene().
+    """
+    sig = (
+        "base_path",
+        _scene_cache_key(scene_path),
+        (integrator_type, int(max_depth), int(rr_depth), int(samples_per_pass or 0)),
+        _scene_override_signature(scene_override),
+        _texture_cache_signature(),
+        round(float(ambient_radiance), 4),
+    )
+    out_scene = _shared_base_scene_path(scene_path, sig)
+    if out_scene.exists():
+        _ensure_texture_audit(out_scene, fail_on_gt_profile=True)
+        return out_scene
+
+    def _build_template(root: ET.Element) -> None:
+        integrator = root.find("./integrator")
+        if integrator is None:
+            raise RuntimeError("Scene has no integrator node")
+        _configure_path_integrator(
+            integrator,
+            integrator_type=integrator_type,
+            max_depth=max_depth,
+            rr_depth=rr_depth,
+            samples_per_pass=samples_per_pass,
+        )
+
+    root = _scene_template(
+        scene_path,
+        branch_kind="path",
+        branch_signature=(integrator_type, int(max_depth), int(rr_depth), int(samples_per_pass or 0)),
+        builder=_build_template,
+    )
+    _apply_scene_override(root, scene_override, mode="rgb")
+    if ambient_radiance > 0 and not _has_emitter(root):
+        _inject_constant_emitter(root, ambient_radiance)
+    out_scene.parent.mkdir(parents=True, exist_ok=True)
+    tmp = out_scene.with_name(f"{out_scene.stem}.tmp.{os.getpid()}.{threading.get_ident()}.xml")
+    _write_scene(root, tmp)
+    try:
+        os.replace(tmp, out_scene)
+    except FileNotFoundError:
+        # Another worker won the race and already published out_scene; clean up if needed.
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+        if not out_scene.exists():
+            raise
+    _write_texture_audit(root, out_scene=out_scene, fail_on_gt_profile=True)
+    return out_scene
+
+
+def _stage_base_diffuse_override_scene(
+    scene_path: Path,
+    *,
+    max_depth: int,
+    rr_depth: int,
+    samples_per_pass: int | None,
+    scene_override: SceneOverrideSpec | None = None,
+    ambient_radiance: float = 1.0,
+) -> Path:
+    """Stage a camera-free diffuse-override scene shared across viewpoints."""
+    sig = (
+        "base_diffuse_override",
+        _scene_cache_key(scene_path),
+        (int(max_depth), int(rr_depth), int(samples_per_pass or 0)),
+        _scene_override_signature(scene_override),
+        _texture_cache_signature(),
+        round(float(ambient_radiance), 4),
+    )
+    out_scene = _shared_base_scene_path(scene_path, sig)
+    if out_scene.exists():
+        _ensure_texture_audit(out_scene, fail_on_gt_profile=True)
+        return out_scene
+
+    def _build_template(root: ET.Element) -> None:
+        integrator = root.find("./integrator")
+        if integrator is None:
+            raise RuntimeError("Scene has no integrator node")
+        _configure_path_integrator(
+            integrator,
+            integrator_type="path",
+            max_depth=max_depth,
+            rr_depth=rr_depth,
+            samples_per_pass=samples_per_pass,
+        )
+
+        for shape in root.findall("./shape"):
+            filename = shape.find("string[@name='filename']")
+            if filename is None:
+                continue
+            obj_name = Path(filename.attrib["value"]).name.lower()
+            old_bsdf = shape.find("./bsdf")
+            _remove_shape_bsdf_children(shape)
+
+            if "glass" in obj_name:
+                bsdf = ET.SubElement(shape, "bsdf", {"type": "roughdielectric"})
+                ET.SubElement(bsdf, "float", {"name": "alpha", "value": "0.02"})
+                ET.SubElement(bsdf, "float", {"name": "int_ior", "value": "1.5"})
+                ET.SubElement(bsdf, "float", {"name": "ext_ior", "value": "1.0"})
+                continue
+
+            twosided = ET.SubElement(shape, "bsdf", {"type": "twosided"})
+            diffuse = ET.SubElement(twosided, "bsdf", {"type": "diffuse"})
+
+            base_tex = None
+            base_rgb = None
+            if old_bsdf is not None:
+                base_tex = extract_first_by_name(old_bsdf, "texture", ("base_color", "diffuse_reflectance"))
+                base_rgb = extract_first_by_name(old_bsdf, "rgb", ("base_color", "reflectance", "diffuse_reflectance"))
+
+            if base_tex is not None:
+                tex = ET.SubElement(
+                    diffuse,
+                    "texture",
+                    {
+                        "type": base_tex.attrib.get("type", "bitmap"),
+                        "name": "reflectance",
+                    },
+                )
+                for key, value in base_tex.attrib.items():
+                    if key not in ("type", "name"):
+                        tex.attrib[key] = value
+                for child in list(base_tex):
+                    tex.append(child)
+            elif base_rgb is not None:
+                ET.SubElement(
+                    diffuse,
+                    "rgb",
+                    {
+                        "name": "reflectance",
+                        "value": base_rgb.attrib.get("value", "0.75,0.75,0.75"),
+                    },
+                )
+            else:
+                ET.SubElement(diffuse, "rgb", {"name": "reflectance", "value": "0.75,0.75,0.75"})
+
+    root = _scene_template(
+        scene_path,
+        branch_kind="diffuse_override",
+        branch_signature=(int(max_depth), int(rr_depth), int(samples_per_pass or 0)),
+        builder=_build_template,
+    )
+    _apply_scene_override(root, scene_override, mode="rgb")
+    if ambient_radiance > 0 and not _has_emitter(root):
+        _inject_constant_emitter(root, ambient_radiance)
+    out_scene.parent.mkdir(parents=True, exist_ok=True)
+    tmp = out_scene.with_name(f"{out_scene.stem}.tmp.{os.getpid()}.{threading.get_ident()}.xml")
+    _write_scene(root, tmp)
+    try:
+        os.replace(tmp, out_scene)
+    except FileNotFoundError:
+        # Another worker won the race and already published out_scene; clean up if needed.
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+        if not out_scene.exists():
+            raise
+    _write_texture_audit(root, out_scene=out_scene, fail_on_gt_profile=True)
+    return out_scene
+
+
 def _import_mitsuba():
     import mitsuba as mi
 
@@ -1713,16 +2128,41 @@ def _render_scene(
     variant: str,
     spp: int,
     on_loaded: Callable[[], None] | None = None,
+    viewpoint: "_ViewpointSensorSpec | None" = None,
 ) -> tuple[np.ndarray, dict[str, float]]:
     mi = _import_mitsuba()
     start = time.perf_counter()
     scene, load_s, cache_hit = _load_resident_scene(scene_path, variant=variant)
+    # variant is now active; safe to call mi.ScalarTransform4f etc.
+
+    sensor = None
+    if viewpoint is not None:
+        origin, target, up = camera_to_world_to_lookat(viewpoint.camera_to_world)
+        sensor = mi.load_dict({
+            "type": "perspective",
+            "fov": float(viewpoint.fov_deg),
+            "to_world": mi.ScalarTransform4f.look_at(
+                origin=list(origin), target=list(target), up=list(up)
+            ),
+            "film": {
+                "type": "hdrfilm",
+                "width": int(viewpoint.width),
+                "height": int(viewpoint.height),
+            },
+            "sampler": {
+                "type": "independent",
+                "sample_count": 1,
+            },
+        })
 
     if on_loaded is not None:
         on_loaded()
 
     render_start = time.perf_counter()
-    image = np.array(mi.render(scene, spp=spp), dtype=np.float32)
+    if sensor is not None:
+        image = np.array(mi.render(scene, sensor=sensor, spp=spp), dtype=np.float32)
+    else:
+        image = np.array(mi.render(scene, spp=spp), dtype=np.float32)
     render_s = time.perf_counter() - render_start
     total_s = time.perf_counter() - start
     return image, {
@@ -2796,6 +3236,21 @@ def render_modalities(
         workspace.mkdir(parents=True, exist_ok=True)
         temporary_workspace = False
 
+    _use_scene_reuse = not os.environ.get("ROBOMITUBA_DISABLE_SCENE_REUSE")
+    _viewpoint = _ViewpointSensorSpec(
+        camera_to_world=camera_to_world,
+        fov_deg=fov_deg,
+        width=config.width,
+        height=config.height,
+    )
+
+    global _last_source_scene_dir
+    current_dir = str(source_scene.parent.resolve())
+    if _last_source_scene_dir and _last_source_scene_dir != current_dir:
+        with _SCENE_CACHE_LOCK:
+            _RESIDENT_SCENE_CACHE.clear()
+    _last_source_scene_dir = current_dir
+
     results: dict[str, ModalityResult] = {}
     pass_records: dict[str, dict[str, Any]] = {}
     staged_scenes: dict[str, str] = {}
@@ -2843,11 +3298,12 @@ def render_modalities(
         pass_name: str,
         spp: int,
         variant_override: str | None = None,
+        viewpoint: "_ViewpointSensorSpec | None" = None,
     ) -> tuple[np.ndarray, dict[str, float]]:
         _pass_index[0] += 1
         from .mitsuba_runtime import mark_variant_unavailable, resolve_variant
 
-        kind = "spectral_polarized" if pass_name.startswith("polar") else "spectral"
+        kind = "spectral_polarized" if pass_name.startswith("polar") else "rgb"
         requested_variant = variant_override or variant
         v = resolve_variant(requested_variant, kind=kind, allow_cpu=True)
         if not v.startswith("cuda_"):
@@ -2870,6 +3326,7 @@ def render_modalities(
             "variant": v,
             "pass_index": _pass_index[0],
             "total_passes": _total_passes,
+            **_texture_audit_progress_payload(scene_path),
         }
         cache_hit = _resident_scene_cache_has(scene_path, variant=v)
         if cache_hit:
@@ -2900,7 +3357,7 @@ def render_modalities(
                 })
             _cb("rendering", base_ctx)
         try:
-            image, timing = _render_scene(scene_path, variant=v, spp=spp, on_loaded=_on_loaded)
+            image, timing = _render_scene(scene_path, variant=v, spp=spp, on_loaded=_on_loaded, viewpoint=viewpoint)
         except Exception as exc:
             if not v.startswith("cuda_"):
                 raise
@@ -2917,7 +3374,7 @@ def render_modalities(
                 "sub_total": 5,
                 "error": str(exc),
             })
-            image, timing = _render_scene(scene_path, variant=fallback, spp=spp, on_loaded=_on_loaded)
+            image, timing = _render_scene(scene_path, variant=fallback, spp=spp, on_loaded=_on_loaded, viewpoint=viewpoint)
         _cb("saving_output", {
             "pass": pass_name,
             "pass_index": _pass_index[0],
@@ -2931,21 +3388,35 @@ def render_modalities(
 
     if _needs_path_total(requested_set):
         _cb("staging_scene", {"pass": "rgb"})
-        scene_rgb = _stage_path_scene(
-            source_scene,
-            stage_filename("rgb", "scene_rgb.xml"),
-            camera_to_world=camera_to_world,
-            fov_deg=fov_deg,
-            spp=config.path_spp,
-            width=config.width,
-            height=config.height,
-            max_depth=config.path_max_depth,
-            rr_depth=config.rr_depth,
-            samples_per_pass=config.samples_per_pass,
-            scene_override=scene_override,
-        )
+        if _use_scene_reuse:
+            scene_rgb = _stage_base_path_scene(
+                source_scene,
+                max_depth=config.path_max_depth,
+                rr_depth=config.rr_depth,
+                samples_per_pass=config.samples_per_pass,
+                scene_override=scene_override,
+                ambient_radiance=config.ambient_radiance,
+            )
+        else:
+            scene_rgb = _stage_path_scene(
+                source_scene,
+                stage_filename("rgb", "scene_rgb.xml"),
+                camera_to_world=camera_to_world,
+                fov_deg=fov_deg,
+                spp=config.path_spp,
+                width=config.width,
+                height=config.height,
+                max_depth=config.path_max_depth,
+                rr_depth=config.rr_depth,
+                samples_per_pass=config.samples_per_pass,
+                scene_override=scene_override,
+                ambient_radiance=config.ambient_radiance,
+            )
         staged_scenes["rgb"] = str(scene_rgb)
-        image, timing = _render_pass(scene_rgb, pass_name="rgb", spp=config.path_spp)
+        image, timing = _render_pass(
+            scene_rgb, pass_name="rgb", spp=config.path_spp,
+            viewpoint=_viewpoint if _use_scene_reuse else None,
+        )
         timing["spp"] = config.path_spp
         rgb = image[:, :, :3] if image.ndim == 3 else np.repeat(image[:, :, None], 3, axis=2)
         rgb_result, rgb_record = _build_rgb_result(
@@ -2966,21 +3437,35 @@ def render_modalities(
 
     if _needs_direct(requested_set):
         _cb("staging_scene", {"pass": "direct_light_map"})
-        scene_direct = _stage_path_scene(
-            source_scene,
-            stage_filename("direct_light_map", "scene_direct_light_map.xml"),
-            camera_to_world=camera_to_world,
-            fov_deg=fov_deg,
-            spp=config.path_spp,
-            width=config.width,
-            height=config.height,
-            max_depth=config.direct_max_depth,
-            rr_depth=config.rr_depth,
-            samples_per_pass=config.samples_per_pass,
-            scene_override=scene_override,
-        )
+        if _use_scene_reuse:
+            scene_direct = _stage_base_path_scene(
+                source_scene,
+                max_depth=config.direct_max_depth,
+                rr_depth=config.rr_depth,
+                samples_per_pass=config.samples_per_pass,
+                scene_override=scene_override,
+                ambient_radiance=config.ambient_radiance,
+            )
+        else:
+            scene_direct = _stage_path_scene(
+                source_scene,
+                stage_filename("direct_light_map", "scene_direct_light_map.xml"),
+                camera_to_world=camera_to_world,
+                fov_deg=fov_deg,
+                spp=config.path_spp,
+                width=config.width,
+                height=config.height,
+                max_depth=config.direct_max_depth,
+                rr_depth=config.rr_depth,
+                samples_per_pass=config.samples_per_pass,
+                scene_override=scene_override,
+                ambient_radiance=config.ambient_radiance,
+            )
         staged_scenes["direct_light_map"] = str(scene_direct)
-        image, timing = _render_pass(scene_direct, pass_name="direct_light_map", spp=config.path_spp)
+        image, timing = _render_pass(
+            scene_direct, pass_name="direct_light_map", spp=config.path_spp,
+            viewpoint=_viewpoint if _use_scene_reuse else None,
+        )
         timing["spp"] = config.path_spp
         rgb = image[:, :, :3] if image.ndim == 3 else np.repeat(image[:, :, None], 3, axis=2)
         direct_result, direct_record = _build_rgb_result(
@@ -3001,21 +3486,35 @@ def render_modalities(
 
     if _needs_diffuse(requested_set):
         _cb("staging_scene", {"pass": "diffuse_map"})
-        scene_diffuse = _stage_diffuse_override_scene(
-            source_scene,
-            stage_filename("diffuse_map", "scene_diffuse_map.xml"),
-            camera_to_world=camera_to_world,
-            fov_deg=fov_deg,
-            spp=config.path_spp,
-            width=config.width,
-            height=config.height,
-            max_depth=config.path_max_depth,
-            rr_depth=config.rr_depth,
-            samples_per_pass=config.samples_per_pass,
-            scene_override=scene_override,
-        )
+        if _use_scene_reuse:
+            scene_diffuse = _stage_base_diffuse_override_scene(
+                source_scene,
+                max_depth=config.path_max_depth,
+                rr_depth=config.rr_depth,
+                samples_per_pass=config.samples_per_pass,
+                scene_override=scene_override,
+                ambient_radiance=config.ambient_radiance,
+            )
+        else:
+            scene_diffuse = _stage_diffuse_override_scene(
+                source_scene,
+                stage_filename("diffuse_map", "scene_diffuse_map.xml"),
+                camera_to_world=camera_to_world,
+                fov_deg=fov_deg,
+                spp=config.path_spp,
+                width=config.width,
+                height=config.height,
+                max_depth=config.path_max_depth,
+                rr_depth=config.rr_depth,
+                samples_per_pass=config.samples_per_pass,
+                scene_override=scene_override,
+                ambient_radiance=config.ambient_radiance,
+            )
         staged_scenes["diffuse_map"] = str(scene_diffuse)
-        image, timing = _render_pass(scene_diffuse, pass_name="diffuse_map", spp=config.path_spp)
+        image, timing = _render_pass(
+            scene_diffuse, pass_name="diffuse_map", spp=config.path_spp,
+            viewpoint=_viewpoint if _use_scene_reuse else None,
+        )
         timing["spp"] = config.path_spp
         rgb = image[:, :, :3] if image.ndim == 3 else np.repeat(image[:, :, None], 3, axis=2)
         diffuse_result, diffuse_record = _build_rgb_result(
@@ -3338,6 +3837,7 @@ def render_modalities(
             samples_per_pass=config.samples_per_pass,
             scene_override=scene_override,
             assist_light=assist_light,
+            measured_wavelength_nm=854,
         )
         staged_scenes["active_nir_intensity"] = str(scene_active)
         _cb("staging_scene", {"pass": "active_nir_intensity"})

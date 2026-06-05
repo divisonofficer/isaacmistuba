@@ -1,0 +1,27 @@
+# apps/ runtime dependencies.
+#
+# Install:
+#   pip install -r apps/requirements.txt
+#
+# The local in-repo packages (robomituba_bridge, mitsuba_converter) are
+# installed separately as editable installs:
+#   pip install -e modules/robomituba_bridge
+#   pip install -e modules/mitsuba_converter
+#
+# Mitsuba 3 is pulled from PyPI; the in-repo `mitsuba3/` submodule is the
+# source tree, not a package, and the CUDA / OptiX variants ship with the
+# wheel.
+
+# --- Rendering core ---
+mitsuba>=3.5
+
+# --- Imaging / numerics ---
+numpy>=1.24
+Pillow>=10.0
+
+# --- Templates (sphere preview HTML, daemon dashboard) ---
+Jinja2>=3.1
+
+# --- Material catalogue downloader (HuggingFace-hosted hpBRDF / curated sets) ---
+huggingface_hub>=0.23
+hf_xet>=0.1

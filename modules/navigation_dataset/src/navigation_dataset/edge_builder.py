@@ -1,29 +1,21 @@
 from __future__ import annotations
 
 import math
+from typing import Callable
 
 import numpy as np
 
-from .traversability import TraversabilityGrid, cell_to_world, world_to_cell
+from .traversability import TraversabilityGrid, cell_to_world, world_to_cell, inflate_traversable_grid
 from .viewpoint_graph import ViewpointEdge, ViewpointNode
 
 
 def _dilated_traversable(grid: TraversabilityGrid, robot_radius_m: float) -> np.ndarray:
-    if robot_radius_m <= 0:
-        return grid.traversable.copy()
-    radius_cells = int(math.ceil(robot_radius_m / grid.spec.resolution))
-    traversable = grid.traversable.copy()
-    obstacle_cells = np.argwhere(~grid.traversable)
-    for oy, ox in obstacle_cells:
-        for dy in range(-radius_cells, radius_cells + 1):
-            for dx in range(-radius_cells, radius_cells + 1):
-                if dx * dx + dy * dy > radius_cells * radius_cells:
-                    continue
-                x = int(ox) + dx
-                y = int(oy) + dy
-                if 0 <= x < grid.spec.width and 0 <= y < grid.spec.height:
-                    traversable[y, x] = False
-    return traversable
+    return inflate_traversable_grid(grid.traversable, robot_radius_m, grid.spec.resolution)
+
+
+def line_cells(grid: TraversabilityGrid, a: list[float], b: list[float]) -> list[tuple[int, int]]:
+    """Public alias — return cell indices visited by the line from ``a`` to ``b``."""
+    return _line_cells(grid, a, b)
 
 
 def _line_cells(grid: TraversabilityGrid, a: list[float], b: list[float]) -> list[tuple[int, int]]:
@@ -55,6 +47,7 @@ def build_viewpoint_edges(
     robot_radius_m: float = 0.25,
     k_neighbors: int = 8,
     max_edge_length_m: float = 1.5,
+    on_progress: Callable[[float], None] | None = None,
 ) -> list[ViewpointEdge]:
     if k_neighbors <= 0:
         raise ValueError("k_neighbors must be positive.")
@@ -63,7 +56,10 @@ def build_viewpoint_edges(
     traversable = _dilated_traversable(grid, robot_radius_m)
     edges: list[ViewpointEdge] = []
     seen_pairs: set[tuple[str, str]] = set()
-    for source in nodes:
+    total_nodes = len(nodes)
+    for node_idx, source in enumerate(nodes):
+        if on_progress is not None:
+            on_progress(node_idx / total_nodes if total_nodes else 1.0)
         candidates: list[tuple[float, ViewpointNode]] = []
         for target in nodes:
             if source.node_id == target.node_id:
@@ -101,6 +97,8 @@ def build_viewpoint_edges(
                 },
             )
             edges.append(edge)
+    if on_progress is not None:
+        on_progress(1.0)
     return edges
 
 

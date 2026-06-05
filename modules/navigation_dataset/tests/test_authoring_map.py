@@ -117,6 +117,46 @@ class AuthoringMapTests(unittest.TestCase):
         self.assertIn("traversable", reasons)
         self.assertIn("goal", reasons)
 
+    def test_render_ready_schema_roundtrip(self) -> None:
+        payload = self.minimum_map()
+        payload["environment"] = {"mode": "constant", "radiance": [0.7, 0.8, 0.9], "intensity": 1.2}
+        payload["camera_rig"] = {
+            "rig_id": "rig_test",
+            "base_frame": "base_link",
+            "sensors": [
+                {
+                    "sensor_id": "rgb_front",
+                    "label": "RGB Front",
+                    "modality": "rgb",
+                    "mount": {"xyz_m": [0.2, 1.0, 0.0], "rpy_deg": [0, 0, 2]},
+                    "fov_deg": 75,
+                    "resolution": [800, 600],
+                }
+            ],
+        }
+        payload["objects"].append({
+            "id": "box_001",
+            "type": "chair",
+            "label": "box",
+            "placement": "point",
+            "geometry": {"type": "point", "center": [1.0, 1.0], "size_m": [0.5, 0.8, 0.4], "base_height_m": 0.1, "yaw_deg": 15, "pitch_deg": 1, "roll_deg": 2, "scale": [1, 1, 1]},
+            "material": "dataset:mat",
+            "navigation": {"blocks_navigation": True},
+        })
+        payload["materials"] = [{
+            "material_id": "dataset:mat",
+            "category": "measured",
+            "render_binding": {"kind": "measured", "dataset_id": "dataset", "material_id": "mat", "bsdf_strategy": "measured_polarized", "native_file": "materials/mat.pbsdf"},
+        }]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "authoring_map.json"
+            save_authoring_map(path, payload)
+            restored = authoring_map_to_payload(load_authoring_map(path))
+        self.assertEqual(restored["environment"]["radiance"], [0.7, 0.8, 0.9])
+        self.assertEqual(restored["camera_rig"]["sensors"][0]["modality"], "rgb")
+        self.assertEqual(restored["objects"][-1]["geometry"]["size_m"], [0.5, 0.8, 0.4])
+        self.assertEqual(restored["materials"][0]["render_binding"]["bsdf_strategy"], "measured_polarized")
+
 
 if __name__ == "__main__":
     unittest.main()

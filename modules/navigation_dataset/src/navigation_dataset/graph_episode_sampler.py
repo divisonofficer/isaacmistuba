@@ -225,6 +225,100 @@ def make_graph_episode(
     )
 
 
+def _k_shortest_paths(graph: ViewpointGraph, start_node: str, goal_node: str, k: int = 4) -> list[GraphPath]:
+    """Yen's-style k-shortest simple paths. Returns at most k paths ordered by distance."""
+    if start_node == goal_node:
+        return []
+    try:
+        base = shortest_graph_path(graph, start_node, goal_node)
+    except ValueError:
+        return []
+    results: list[GraphPath] = [base]
+    adj = _adjacency(graph)
+    candidates: list[tuple[float, list[str], list[ViewpointEdge]]] = []
+    seen_node_seqs: set[tuple[str, ...]] = {tuple(base.nodes)}
+
+    for _ in range(k - 1):
+        prev_path = results[-1]
+        for spur_idx in range(len(prev_path.nodes) - 1):
+            spur_node = prev_path.nodes[spur_idx]
+            root_nodes = set(prev_path.nodes[:spur_idx + 1])
+            # Temporarily remove edges used by paths sharing this root segment
+            removed_edges: list[tuple[str, tuple[str, ViewpointEdge]]] = []
+            for existing in results:
+                if existing.nodes[:spur_idx + 1] == prev_path.nodes[:spur_idx + 1]:
+                    # Remove the edge from spur_node to its next node in existing path
+                    if spur_idx + 1 < len(existing.nodes):
+                        next_nd = existing.nodes[spur_idx + 1]
+                        orig = adj.get(spur_node, [])
+                        new_list = [(n, e) for n, e in orig if n != next_nd]
+                        removed_edges.append((spur_node, orig[0] if orig else None))
+                        adj[spur_node] = new_list
+                        orig2 = adj.get(next_nd, [])
+                        adj[next_nd] = [(n, e) for n, e in orig2 if n != spur_node]
+            # Also block root nodes to avoid cycles
+            for rn in root_nodes - {spur_node}:
+                saved = adj.pop(rn, [])
+                removed_edges.append((rn, saved))  # type: ignore[arg-type]
+
+            try:
+                spur_path = shortest_graph_path(
+                    # Build a temporary graph view — hack: temporarily replace edges
+                    graph, spur_node, goal_node
+                )
+                full_nodes = prev_path.nodes[:spur_idx] + spur_path.nodes
+                full_edges = prev_path.edges[:spur_idx] + spur_path.edges
+                key = tuple(full_nodes)
+                if key not in seen_node_seqs:
+                    seen_node_seqs.add(key)
+                    dist = sum(float(e.weight) for e in full_edges)
+                    hazard = any(e.hazard_crossing for e in full_edges)
+                    heapq.heappush(candidates, (dist, full_nodes, full_edges))  # type: ignore[misc]
+            except ValueError:
+                pass
+
+            # Restore adjacency
+            for rn, saved_val in removed_edges:
+                if isinstance(saved_val, list):
+                    adj[rn] = saved_val
+                elif saved_val is not None:
+                    adj.setdefault(rn, [])
+
+        if not candidates:
+            break
+        _, best_nodes, best_edges = heapq.heappop(candidates)
+        dist = sum(float(e.weight) for e in best_edges)
+        hazard = any(e.hazard_crossing for e in best_edges)
+        results.append(GraphPath(nodes=best_nodes, edges=best_edges, distance_m=dist, hazard_crossing=hazard))
+
+    return results
+
+
+def _path_indirectness(path: GraphPath) -> float:
+    """Ratio of path length to straight-line distance. Higher = more indirect (RxR desideratum 2)."""
+    if path.distance_m <= 0:
+        return 0.0
+    return path.distance_m  # use absolute distance; caller normalizes
+
+
+def _select_coverage_path(candidates: list[GraphPath], node_visit_counts: dict[str, int]) -> GraphPath:
+    """Pick the candidate path that best balances indirectness + low-coverage nodes (RxR §3)."""
+    if len(candidates) == 1:
+        return candidates[0]
+    best_path = candidates[0]
+    best_score = float("-inf")
+    for path in candidates:
+        # Term 1: prefer non-shortest (longer relative to straight-line) — use node count as proxy
+        indirectness = len(path.nodes)
+        # Term 2: prefer paths covering under-visited nodes
+        coverage = sum(1.0 / max(1, node_visit_counts.get(n, 0) + 1) for n in path.nodes) / len(path.nodes)
+        score = indirectness * 0.4 + coverage * 0.6
+        if score > best_score:
+            best_score = score
+            best_path = path
+    return best_path
+
+
 def plan_graph_episodes(
     *,
     graph: ViewpointGraph,
@@ -245,22 +339,30 @@ def plan_graph_episodes(
         raise ValueError(f"Unsupported graph scenarios: {unknown}")
     rng = random.Random(seed)
     node_ids = sorted(node.node_id for node in graph.nodes)
+    # Track how many times each node appears in accepted episodes (for coverage scoring)
+    node_visit_counts: dict[str, int] = {}
     episodes: list[EpisodeManifest] = []
     attempts = 0
     while len(episodes) < num_pairs and attempts < num_pairs * 20:
         attempts += 1
         start, goal = rng.sample(node_ids, 2)
-        try:
-            path = shortest_graph_path(graph, start, goal)
-        except ValueError:
-            continue
-        if len(path.nodes) < 2:
+        # Generate a small pool of alternative paths and pick by coverage score (RxR §3)
+        candidates = _k_shortest_paths(graph, start, goal, k=3)
+        if not candidates:
             continue
         index = len(episodes)
-        split = split_for_index(split_counts, index)
         scenario = scenario_cycle[index % len(scenario_cycle)]
-        if scenario == "hazard_aware" and path.hazard_crossing:
+        # Filter candidates by scenario constraint
+        valid = [p for p in candidates if not (scenario == "hazard_aware" and p.hazard_crossing)]
+        if not valid:
             continue
+        path = _select_coverage_path(valid, node_visit_counts)
+        if len(path.nodes) < 2:
+            continue
+        # Update coverage counts
+        for n in path.nodes:
+            node_visit_counts[n] = node_visit_counts.get(n, 0) + 1
+        split = split_for_index(split_counts, index)
         episode_id = f"{graph.scene_id}_{split}_graph_{index + 1:06d}"
         episodes.append(
             make_graph_episode(

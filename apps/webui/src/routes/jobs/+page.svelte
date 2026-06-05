@@ -33,33 +33,47 @@
 	let logModal = $state<{ jobId: string; lines: string[] } | null>(null);
 	let logLoading = $state(false);
 	let expandedLogs = $state<Record<string, string[]>>({});
-	let timer: ReturnType<typeof setInterval>;
+	let ws: WebSocket | null = null;
+	let wsReconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
 	async function refresh() {
 		try { jobs = (await listJobs(100)).jobs ?? []; } catch {}
 		loading = false;
 	}
 
-	async function refreshRunningLogs() {
-		const running = jobs.filter(j => j.status === 'running');
-		await Promise.all(running.map(async (j) => {
+	function connectWs() {
+		if (ws) { try { ws.close(); } catch {} }
+		const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+		ws = new WebSocket(`${proto}//${location.host}/api/ws/job-status`);
+		ws.onmessage = (ev) => {
 			try {
-				const r = await getJobLog(String(j.job_id), 20);
-				expandedLogs[String(j.job_id)] = r.lines ?? [];
+				const msg = JSON.parse(ev.data);
+				if (Array.isArray(msg.jobs)) {
+					jobs = msg.jobs;
+					loading = false;
+				}
+				if (msg.log_tails && typeof msg.log_tails === 'object') {
+					expandedLogs = { ...expandedLogs, ...msg.log_tails };
+				}
 			} catch {}
-		}));
-		expandedLogs = { ...expandedLogs };
+		};
+		ws.onerror = () => {};
+		ws.onclose = () => {
+			ws = null;
+			if (wsReconnectTimer === null) {
+				wsReconnectTimer = setTimeout(() => { wsReconnectTimer = null; connectWs(); }, 3000);
+			}
+		};
 	}
 
 	onMount(async () => {
 		await refresh();
-		await refreshRunningLogs();
-		timer = setInterval(async () => {
-			await refresh();
-			if (jobs.some(j => j.status === 'running')) await refreshRunningLogs();
-		}, 2500);
+		connectWs();
 	});
-	onDestroy(() => clearInterval(timer));
+	onDestroy(() => {
+		if (wsReconnectTimer !== null) clearTimeout(wsReconnectTimer);
+		if (ws) { try { ws.close(); } catch {} ws = null; }
+	});
 
 	async function retry(jobId: string) {
 		try { await retryJob(jobId); await refresh(); } catch {}

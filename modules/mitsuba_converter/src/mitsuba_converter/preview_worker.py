@@ -66,6 +66,100 @@ from typing import Any
 _HEARTBEAT_INTERVAL_S = 5.0
 _stdout_lock = threading.Lock()
 ENV_FULL_RENDER_DISABLE_CUDA = "ROBOMITUBA_FULL_RENDER_DISABLE_CUDA"
+ENV_SCENE_LOAD_CONCURRENCY = "ROBOMITUBA_SCENE_LOAD_CONCURRENCY"
+ENV_SCENE_LOAD_LOCK_DIR = "ROBOMITUBA_SCENE_LOAD_LOCK_DIR"
+_ALLOWED_RENDER_ENV_OVERRIDES = {"ROBOMITUBA_TEXTURE_MAX_RESOLUTION"}
+
+
+def _scene_load_concurrency() -> int:
+    raw = str(os.environ.get(ENV_SCENE_LOAD_CONCURRENCY, "1")).strip()
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError):
+        return 1
+
+
+def _scene_load_lock_root() -> Path:
+    return Path(os.environ.get(ENV_SCENE_LOAD_LOCK_DIR, "/tmp/robomituba_scene_load_slots"))
+
+
+def _pid_is_alive(pid: int | None) -> bool:
+    if not pid or pid <= 0:
+        return False
+    proc = Path(f"/proc/{pid}")
+    return proc.exists()
+
+
+def _clear_stale_scene_load_slot(slot: Path) -> bool:
+    holder = slot / "holder.json"
+    try:
+        data = json.loads(holder.read_text()) if holder.exists() else {}
+    except Exception:
+        data = {}
+    pid = data.get("pid") if isinstance(data, dict) else None
+    try:
+        pid_i = int(pid) if pid is not None else None
+    except (TypeError, ValueError):
+        pid_i = None
+    if _pid_is_alive(pid_i):
+        return False
+    try:
+        if holder.exists():
+            holder.unlink()
+        slot.rmdir()
+        return True
+    except OSError:
+        return False
+
+
+def _acquire_scene_load_slot(job_id: str, *, gpu_index: str | None = None) -> Path | None:
+    limit = _scene_load_concurrency()
+    if limit <= 0:
+        return None
+    root = _scene_load_lock_root()
+    root.mkdir(parents=True, exist_ok=True)
+    while True:
+        for idx in range(limit):
+            slot = root / f"slot_{idx}"
+            try:
+                slot.mkdir()
+            except FileExistsError:
+                _clear_stale_scene_load_slot(slot)
+                continue
+            except OSError:
+                continue
+            try:
+                (slot / "holder.json").write_text(json.dumps({
+                    "pid": os.getpid(),
+                    "job_id": job_id,
+                    "gpu_index": gpu_index,
+                    "acquired_at": time.time(),
+                }), encoding="utf-8")
+            except OSError:
+                pass
+            print(
+                f"[worker] scene_load_slot acquired job_id={job_id} slot={idx}/{limit}",
+                file=sys.stderr, flush=True,
+            )
+            return slot
+        time.sleep(0.5)
+
+
+def _release_scene_load_slot(slot: Path | None, *, job_id: str) -> None:
+    if slot is None:
+        return
+    try:
+        holder = slot / "holder.json"
+        if holder.exists():
+            holder.unlink()
+        slot.rmdir()
+    except OSError:
+        pass
+    else:
+        print(
+            f"[worker] scene_load_slot released job_id={job_id} slot={slot.name}",
+            file=sys.stderr, flush=True,
+        )
 
 
 def _emit(event: dict[str, Any]) -> None:
@@ -465,6 +559,7 @@ def _dispatch_render_job(job_id: str, spec: dict[str, Any]) -> None:
         return
 
     t_start = time.perf_counter()
+    scene_load_slot: Path | None = None
     with _DispatchHeartbeat(job_id) as hb:
         hb.update(
             "running",
@@ -472,7 +567,14 @@ def _dispatch_render_job(job_id: str, spec: dict[str, Any]) -> None:
             + (" cuda=disabled" if disable_cuda_for_full_render else ""),
         )
 
+        def _release_scene_load_gate() -> None:
+            nonlocal scene_load_slot
+            if scene_load_slot is not None:
+                _release_scene_load_slot(scene_load_slot, job_id=job_id)
+                scene_load_slot = None
+
         def _progress(stage: str, payload: Any = None) -> None:
+            nonlocal scene_load_slot
             event: dict[str, Any] = {
                 "job_id": job_id, "type": "progress",
                 "stage": str(stage),
@@ -481,8 +583,10 @@ def _dispatch_render_job(job_id: str, spec: dict[str, Any]) -> None:
             # current sub-stage (e.g. "rgb 1/2 spp=4096") instead of the
             # generic "running" placeholder.
             label = str(stage)
+            cached_scene = False
             if isinstance(payload, dict):
                 event["payload"] = payload
+                cached_scene = bool(payload.get("cached"))
                 if "pass_index" in payload and "total_passes" in payload:
                     event["current"] = int(payload.get("pass_index") or 0)
                     event["total"] = int(payload.get("total_passes") or 0)
@@ -497,12 +601,34 @@ def _dispatch_render_job(job_id: str, spec: dict[str, Any]) -> None:
                     bits.append(f"variant={payload['variant']}")
                 if bits:
                     label = f"{stage} · " + " · ".join(bits)
+
+            if str(stage) == "loading_scene" and not cached_scene and scene_load_slot is None:
+                hb.update("waiting_scene_load_slot", "Waiting for scene load slot")
+                scene_load_slot = _acquire_scene_load_slot(
+                    job_id,
+                    gpu_index=os.environ.get("CUDA_VISIBLE_DEVICES"),
+                )
+            elif str(stage) != "loading_scene":
+                _release_scene_load_gate()
+
             hb.update(stage, label)
             _emit(event)
 
-        previous_disable_cuda = os.environ.get("ROBOMITUBA_DISABLE_CUDA")
+        previous_env: dict[str, str | None] = {}
+
+        def _set_temp_env(key: str, value: str) -> None:
+            if key not in previous_env:
+                previous_env[key] = os.environ.get(key)
+            os.environ[key] = value
+
+        env_overrides = spec.get("env_overrides")
+        if isinstance(env_overrides, dict):
+            for key, value in env_overrides.items():
+                key_s = str(key)
+                if key_s in _ALLOWED_RENDER_ENV_OVERRIDES:
+                    _set_temp_env(key_s, str(value))
         if disable_cuda_for_full_render:
-            os.environ["ROBOMITUBA_DISABLE_CUDA"] = "1"
+            _set_temp_env("ROBOMITUBA_DISABLE_CUDA", "1")
         try:
             try:
                 bundle = render_timestep_bundle_split_lighting(
@@ -512,11 +638,12 @@ def _dispatch_render_job(job_id: str, spec: dict[str, Any]) -> None:
                     progress_callback=_progress,
                 )
             finally:
-                if disable_cuda_for_full_render:
-                    if previous_disable_cuda is None:
-                        os.environ.pop("ROBOMITUBA_DISABLE_CUDA", None)
+                _release_scene_load_gate()
+                for key, previous in reversed(list(previous_env.items())):
+                    if previous is None:
+                        os.environ.pop(key, None)
                     else:
-                        os.environ["ROBOMITUBA_DISABLE_CUDA"] = previous_disable_cuda
+                        os.environ[key] = previous
         except Exception as exc:
             elapsed_ms = int((time.perf_counter() - t_start) * 1000.0)
             tb_tail = "\n".join(traceback.format_exc().splitlines()[-12:])

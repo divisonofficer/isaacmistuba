@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import math
 import random
+from typing import Callable
 
 import numpy as np
 
-from .traversability import TraversabilityGrid, cell_to_world
+from .traversability import TraversabilityGrid, cell_to_world, inflate_traversable_grid
 from .viewpoint_graph import ViewpointHeading, ViewpointNode
 
 
@@ -38,22 +39,66 @@ def sample_viewpoint_nodes(
     heading_count: int = 12,
     min_node_spacing_m: float = 0.5,
     min_clearance_m: float = 0.0,
+    robot_radius_m: float = 0.0,
     seed: int = 0,
+    on_progress: Callable[[float], None] | None = None,
+    region_mask: "np.ndarray | None" = None,
 ) -> list[ViewpointNode]:
+    """Sample viewpoint nodes from a traversability grid.
+
+    ``region_mask`` (when provided) restricts sampling to cells where the mask is
+    True. Useful for local regeneration of a single bbox.
+    """
     if max_nodes <= 0:
         raise ValueError("max_nodes must be positive.")
     if min_node_spacing_m < 0:
         raise ValueError("min_node_spacing_m must be non-negative.")
-    candidates = [(int(x), int(y)) for y, x in np.argwhere(grid.traversable)]
+    # Inflate obstacles by robot radius so nodes are never placed inside the clearance zone.
+    sampling_traversable = inflate_traversable_grid(grid.traversable, robot_radius_m, grid.spec.resolution)
+    if region_mask is not None:
+        if region_mask.shape != sampling_traversable.shape:
+            raise ValueError(
+                f"region_mask shape {region_mask.shape} != grid shape {sampling_traversable.shape}"
+            )
+        sampling_traversable = sampling_traversable & region_mask
+    candidates = [(int(x), int(y)) for y, x in np.argwhere(sampling_traversable)]
     if not candidates:
         raise ValueError("No traversable cells available for viewpoint sampling.")
     rng = random.Random(seed)
     rng.shuffle(candidates)
     selected: list[tuple[int, int, float, float, float]] = []
-    for cell_x, cell_y in candidates:
-        clearance = _clearance_m(grid, cell_x, cell_y)
-        if clearance < min_clearance_m:
-            continue
+    total = len(candidates)
+    report_every = max(1, total // 40)
+    # Precompute distance transform only if clearance filtering is needed.
+    clearance_map: np.ndarray | None = None
+    if min_clearance_m > 0:
+        obstacle_mask = ~grid.traversable
+        obstacle_cells = np.argwhere(obstacle_mask)  # shape (N, 2) — [y, x]
+        h, w = grid.traversable.shape
+        if obstacle_cells.size == 0:
+            clearance_map = np.full((h, w), np.inf, dtype=np.float32)
+        else:
+            ys = np.arange(h, dtype=np.float32)[:, None, None]
+            xs = np.arange(w, dtype=np.float32)[None, :, None]
+            clearance_map = np.full((h, w), np.inf, dtype=np.float32)
+            # Vectorized over obstacles, looped over cells — split into chunks to avoid OOM.
+            chunk = 512
+            for start in range(0, len(obstacle_cells), chunk):
+                batch = obstacle_cells[start:start + chunk]  # (B, 2)
+                oy = batch[:, 0].astype(np.float32)  # (B,)
+                ox = batch[:, 1].astype(np.float32)  # (B,)
+                d = np.sqrt((ys - oy[None, None, :]) ** 2 + (xs - ox[None, None, :]) ** 2)
+                clearance_map = np.minimum(clearance_map, d.min(axis=2))
+            clearance_map = clearance_map * grid.spec.resolution
+    for idx, (cell_x, cell_y) in enumerate(candidates):
+        if on_progress is not None and idx % report_every == 0:
+            on_progress(idx / total)
+        if clearance_map is not None:
+            clearance = float(clearance_map[cell_y, cell_x])
+            if clearance < min_clearance_m:
+                continue
+        else:
+            clearance = 0.0
         wx, wy = cell_to_world(grid.spec, cell_x, cell_y)
         too_close = any(math.hypot(wx - sx, wy - sy) < min_node_spacing_m for _cx, _cy, sx, sy, _clear in selected)
         if too_close:
@@ -61,6 +106,8 @@ def sample_viewpoint_nodes(
         selected.append((cell_x, cell_y, wx, wy, clearance))
         if len(selected) >= max_nodes:
             break
+    if on_progress is not None:
+        on_progress(1.0)
     if not selected:
         raise ValueError("No viewpoint nodes survived spacing/clearance filters.")
     nodes: list[ViewpointNode] = []

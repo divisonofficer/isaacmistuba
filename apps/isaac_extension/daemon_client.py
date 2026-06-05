@@ -874,6 +874,11 @@ def get_scene_from_daemon(scene_id: str, *, daemon_url: str | None = None, timeo
     return _http_json("GET", f"{_resolve_daemon_url(daemon_url)}/api/isaac/scenes/{scene_id}", timeout_s=timeout_s)
 
 
+def get_camera_rig_from_daemon(rig_id: str, *, daemon_url: str | None = None, timeout_s: float = 10.0) -> dict[str, Any]:
+    rig_id_q = quote(str(rig_id or "ranger_mini_default"), safe="")
+    return _http_json("GET", f"{_resolve_daemon_url(daemon_url)}/api/camera-rigs/{rig_id_q}", timeout_s=timeout_s)
+
+
 def list_isaac_commands(*, daemon_url: str | None = None, timeout_s: float = 10.0) -> list[dict[str, Any]]:
     payload = _http_json("GET", f"{_resolve_daemon_url(daemon_url)}/api/isaac/commands", timeout_s=timeout_s)
     return list(payload.get("commands", []))

@@ -208,6 +208,7 @@ def cmd_graph_build(args) -> None:
         heading_count=args.heading_count,
         min_node_spacing_m=args.min_node_spacing,
         min_clearance_m=args.min_clearance,
+        robot_radius_m=args.robot_radius,
         seed=args.seed,
     )
     edges = build_viewpoint_edges(

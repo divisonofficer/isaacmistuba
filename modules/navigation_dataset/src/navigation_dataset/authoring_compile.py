@@ -99,6 +99,14 @@ def _point_to_circle(geometry: AuthoringGeometry, *, radius: float) -> JsonDict:
     return {"type": "circle", "center": [cx, cy], "radius": float(radius)}
 
 
+def _point_to_box(geometry: AuthoringGeometry, *, width: float, depth: float, padding: float = 0.05) -> JsonDict:
+    """Axis-aligned box obstacle from proxy dimensions, with a small safety padding."""
+    cx, cy = _pair(geometry.center)
+    hw = max(width / 2.0 + padding, padding)
+    hd = max(depth / 2.0 + padding, padding)
+    return {"type": "box", "bounds": [cx - hw, cy - hd, cx + hw, cy + hd]}
+
+
 def _geometry_to_annotation(geometry: AuthoringGeometry, *, point_radius: float = 0.2) -> JsonDict:
     if geometry.type == "line":
         return _line_to_box(geometry)
@@ -190,8 +198,24 @@ def compile_authoring_map(authoring_map: AuthoringMap | JsonDict, *, usd_ref: st
 
     for obj in model.objects:
         try:
-            point_radius = POINT_FOOTPRINT_RADIUS.get(obj.type, 0.2)
+            meta = obj.metadata if isinstance(obj.metadata, dict) else {}
+            proxy_size = meta.get("proxy_size")
+            # Build the display/hazard geometry (circle for landmarks, box for sized objects).
+            if proxy_size and len(proxy_size) >= 3 and obj.geometry.type == "point":
+                point_radius = max(float(proxy_size[0]), float(proxy_size[2])) / 2.0
+            else:
+                point_radius = POINT_FOOTPRINT_RADIUS.get(obj.type, 0.2)
             geometry = _geometry_to_annotation(obj.geometry, point_radius=point_radius)
+            # Obstacle footprint uses a tight axis-aligned box when proxy_size is available.
+            # This accurately covers long/thin furniture (e.g. a 0.34×4m sideboard body).
+            if proxy_size and len(proxy_size) >= 3 and obj.geometry.type == "point":
+                obstacle_geometry = _point_to_box(
+                    obj.geometry,
+                    width=float(proxy_size[0]),
+                    depth=float(proxy_size[2]),
+                )
+            else:
+                obstacle_geometry = geometry
             hazard_type = _hazard_type_for_object(obj)
             mask_export = bool(obj.navigation.include_in_hazard_mask or hazard_type)
             annotated = AnnotatedObject(
@@ -225,14 +249,21 @@ def compile_authoring_map(authoring_map: AuthoringMap | JsonDict, *, usd_ref: st
                     )
                 )
             if obj.navigation.blocks_navigation:
-                traversable_regions.append(
-                    TraversableRegion(
-                        region_id=f"obstacle_{obj.id}",
-                        geometry=geometry,
-                        traversable=False,
-                        extras=_source_extras(obj),
+                # Height clearance check: skip obstacle if the object is entirely above
+                # robot clearance height (2 m). Objects suspended above 2 m do not block
+                # ground-level navigation. normalized_y_min < clearance means the object
+                # starts below the robot's head, so it IS an obstacle.
+                _ROBOT_CLEARANCE_M = 2.0
+                normalized_y_min = float(meta.get("normalized_y_min", 0.0))
+                if normalized_y_min < _ROBOT_CLEARANCE_M:
+                    traversable_regions.append(
+                        TraversableRegion(
+                            region_id=f"obstacle_{obj.id}",
+                            geometry=obstacle_geometry,
+                            traversable=False,
+                            extras=_source_extras(obj),
+                        )
                     )
-                )
             if obj.navigation.instruction_candidate or obj.navigation.goal_candidate or obj.type in {"chair", "table", "plant", "landmark"}:
                 landmarks.append(
                     Landmark(

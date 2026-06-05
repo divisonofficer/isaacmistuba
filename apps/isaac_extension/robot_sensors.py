@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import json
+import math
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -88,6 +89,181 @@ def _sensor_path(robot_prim_path: str, sensor_id: str) -> str:
         "lidar_top": f"{robot_prim_path}/base_link/lidar_link/lidar_3d",
     }
     return mapping.get(sensor_id, sensor_id if sensor_id.startswith("/") else f"{robot_prim_path}/{sensor_id}")
+
+
+def _safe_prim_name(value: Any) -> str:
+    raw = str(value or "").strip() or "sensor"
+    chars = [ch if ch.isalnum() or ch == "_" else "_" for ch in raw]
+    safe = "".join(chars).strip("_") or "sensor"
+    if safe[0].isdigit():
+        safe = f"sensor_{safe}"
+    return safe
+
+
+def _resolve_ranger_robot_prim_path(stage: Any, robot_prim_path: str) -> str:
+    def is_ranger(prim: Any) -> bool:
+        if not prim or not prim.IsValid():
+            return False
+        name = prim.GetName().lower()
+        robot_name = str(_attr_value(prim, "robomituba:robotName", "") or "").lower()
+        return robot_name == "ranger_mini_v3" or "rangermini" in name or "ranger_mini" in name
+
+    candidate = stage.GetPrimAtPath(robot_prim_path)
+    if is_ranger(candidate):
+        return str(candidate.GetPath())
+    if candidate and candidate.IsValid():
+        try:
+            from pxr import Usd  # type: ignore
+
+            for prim in Usd.PrimRange(candidate):
+                if is_ranger(prim):
+                    return str(prim.GetPath())
+        except Exception:
+            pass
+    try:
+        for prim in stage.Traverse():
+            if is_ranger(prim):
+                return str(prim.GetPath())
+    except Exception:
+        pass
+    raise RuntimeError(f"No RangerMini robot found under {robot_prim_path}.")
+
+
+def _sequence_float(value: Any, default: Sequence[float], *, length: int) -> list[float]:
+    try:
+        result = [float(item) for item in value]
+        if len(result) == length:
+            return result
+    except Exception:
+        pass
+    return [float(item) for item in default]
+
+
+def _rig_sensor_to_attr_spec(sensor: Mapping[str, Any]) -> dict[str, Any]:
+    sensor_type = str(sensor.get("sensor_type") or "rgb_camera")
+    intrinsics = sensor.get("intrinsics") if isinstance(sensor.get("intrinsics"), Mapping) else {}
+    render = sensor.get("render") if isinstance(sensor.get("render"), Mapping) else {}
+    modalities = _as_str_list(sensor.get("modalities"), DEFAULT_SENSOR_MODALITIES.get(sensor_type, ["rgb"]))
+    spec: dict[str, Any] = {
+        "id": str(sensor.get("sensor_id") or "sensor"),
+        "type": sensor_type,
+        "modalities": modalities,
+        "resolution": _as_int_list(intrinsics.get("resolution"), [1280, 720]),
+        "path_spp": int(render.get("path_spp", 1 if sensor_type == "lidar_3d" else 4096)),
+        "aov_spp": int(render.get("aov_spp", 1 if sensor_type == "lidar_3d" else 16)),
+        "polar_spp": int(render.get("polar_spp", 1 if sensor_type == "lidar_3d" else 256)),
+    }
+    if render.get("samples_per_pass") not in (None, ""):
+        spec["samples_per_pass"] = int(render.get("samples_per_pass"))
+    if sensor_type == "nir_camera":
+        nir = sensor.get("nir") if isinstance(sensor.get("nir"), Mapping) else {}
+        spec["wavelength"] = (
+            float(nir.get("wavelength_min_nm", 830.0)),
+            float(nir.get("wavelength_max_nm", 870.0)),
+        )
+        spec["active_radiance"] = float(nir.get("active_emitter_radiance", 40.0))
+    elif sensor_type == "polar_camera":
+        pol = sensor.get("polarization") if isinstance(sensor.get("polarization"), Mapping) else {}
+        spec["wavelength"] = (400.0, 700.0)
+        spec["polarizer_angle"] = float(pol.get("polarizer_angle_deg", 0.0))
+    elif sensor_type == "lidar_3d":
+        lidar = sensor.get("lidar") if isinstance(sensor.get("lidar"), Mapping) else {}
+        spec.update(
+            {
+                "horizontal_samples": int(lidar.get("horizontal_samples", 1024)),
+                "vertical_channels": int(lidar.get("vertical_channels", 32)),
+                "horizontal_fov_deg": float(lidar.get("horizontal_fov_deg", 360.0)),
+                "vertical_fov_min_deg": float(lidar.get("vertical_fov_min_deg", -25.0)),
+                "vertical_fov_max_deg": float(lidar.get("vertical_fov_max_deg", 15.0)),
+                "min_range_m": float(lidar.get("min_range_m", 0.2)),
+                "max_range_m": float(lidar.get("max_range_m", 80.0)),
+                "wavelength_nm": float(lidar.get("wavelength_nm", 905.0)),
+            }
+        )
+    else:
+        spec["wavelength"] = (400.0, 700.0)
+    return spec
+
+
+def apply_camera_rig(stage: Any, robot_prim_path: str, rig: Mapping[str, Any], replace_existing: bool = True) -> dict[str, Any]:
+    """Apply a canonical JSON camera rig preset to a Ranger Mini USD prim.
+
+    The JSON preset remains canonical; this function authors the USD prims and
+    RoboMitsuba attrs consumed by discovery/render helpers.
+    """
+
+    Gf, Sdf, _Usd, UsdGeom = _require_pxr()
+    resolved_robot_path = _resolve_ranger_robot_prim_path(stage, robot_prim_path)
+    rig_id = str(rig.get("rig_id") or "camera_rig")
+    base_frame = _safe_prim_name(rig.get("base_frame") or "base_link")
+    rig_root_path = f"{resolved_robot_path}/{base_frame}/camera_rig"
+    if replace_existing and stage.GetPrimAtPath(rig_root_path):
+        stage.RemovePrim(rig_root_path)
+
+    rig_root = UsdGeom.Xform.Define(stage, rig_root_path).GetPrim()
+    _ensure_attr(rig_root, "robomituba:cameraRigId", Sdf.ValueTypeNames.String, rig_id)
+    _ensure_attr(rig_root, "robomituba:robotModel", Sdf.ValueTypeNames.String, str(rig.get("robot_model") or "ranger_mini_v3"))
+    _ensure_attr(rig_root, "robomituba:baseFrame", Sdf.ValueTypeNames.String, base_frame)
+    _ensure_attr(rig_root, "robomituba:updatedAt", Sdf.ValueTypeNames.String, _dt.datetime.now(_dt.timezone.utc).isoformat())
+
+    authored: list[str] = []
+    for raw_sensor in rig.get("sensors") or []:
+        if not isinstance(raw_sensor, Mapping):
+            continue
+        sensor_type = str(raw_sensor.get("sensor_type") or "")
+        if sensor_type not in ROBOT_SENSOR_TYPES:
+            raise ValueError(f"Unsupported sensor_type: {sensor_type}")
+        sensor_id = str(raw_sensor.get("sensor_id") or "").strip()
+        if not sensor_id:
+            raise ValueError("Camera rig sensor is missing sensor_id.")
+        mount = raw_sensor.get("mount") if isinstance(raw_sensor.get("mount"), Mapping) else {}
+        parent_frame = _safe_prim_name(mount.get("parent_frame") or base_frame)
+        parent_path = f"{resolved_robot_path}/{parent_frame}/camera_rig"
+        UsdGeom.Xform.Define(stage, parent_path)
+        sensor_path = f"{parent_path}/{_safe_prim_name(sensor_id)}"
+        if sensor_type == "lidar_3d":
+            prim = UsdGeom.Xform.Define(stage, sensor_path).GetPrim()
+        else:
+            camera = UsdGeom.Camera.Define(stage, sensor_path)
+            prim = camera.GetPrim()
+            intrinsics = raw_sensor.get("intrinsics") if isinstance(raw_sensor.get("intrinsics"), Mapping) else {}
+            focal_length_mm = 18.0
+            fov_h = float(intrinsics.get("fov_h_deg", 75.0))
+            aperture = 2.0 * focal_length_mm * math.tan(math.radians(max(fov_h, 1e-3)) * 0.5)
+            camera.CreateFocalLengthAttr(float(focal_length_mm))
+            camera.CreateHorizontalApertureAttr(float(aperture))
+            camera.CreateClippingRangeAttr(
+                Gf.Vec2f(
+                    float(intrinsics.get("clip_near_m", 0.1)),
+                    float(intrinsics.get("clip_far_m", 30.0)),
+                )
+            )
+            _ensure_attr(prim, "robomituba:fovHDeg", Sdf.ValueTypeNames.Double, fov_h)
+            _ensure_attr(prim, "robomituba:fovVDeg", Sdf.ValueTypeNames.Double, float(intrinsics.get("fov_v_deg", 60.0)))
+            _ensure_attr(prim, "robomituba:focalLengthPx", Sdf.ValueTypeNames.Double, float(intrinsics.get("focal_length_px", 410.0)))
+
+        xyz = _sequence_float(mount.get("xyz_m", [0.0, 0.0, 0.0]), [0.0, 0.0, 0.0], length=3)
+        rpy = _sequence_float(mount.get("rpy_deg", [0.0, 0.0, 0.0]), [0.0, 0.0, 0.0], length=3)
+        xformable = UsdGeom.Xformable(prim)
+        xformable.ClearXformOpOrder()
+        xformable.AddTranslateOp().Set(Gf.Vec3d(*xyz))
+        xformable.AddRotateXYZOp().Set(Gf.Vec3f(*rpy))
+
+        spec = _rig_sensor_to_attr_spec(raw_sensor)
+        _write_sensor_attrs(prim, Sdf, spec)
+        _ensure_attr(prim, "robomituba:cameraRigId", Sdf.ValueTypeNames.String, rig_id)
+        _ensure_attr(prim, "robomituba:parentFrame", Sdf.ValueTypeNames.String, parent_frame)
+        _ensure_attr(prim, "robomituba:enabled", Sdf.ValueTypeNames.Bool, bool(raw_sensor.get("enabled", True)))
+        authored.append(str(prim.GetPath()))
+
+    return {
+        "rig_id": rig_id,
+        "robot_prim_path": resolved_robot_path,
+        "rig_root_path": rig_root_path,
+        "sensor_count": len(authored),
+        "sensor_paths": authored,
+        "replace_existing": bool(replace_existing),
+    }
 
 
 def attach_default_sensor_rig(stage: Any, robot_prim_path: str) -> list[str]:
@@ -179,6 +355,10 @@ def _write_sensor_attrs(prim: Any, Sdf: Any, spec: Mapping[str, Any]) -> None:
     for key, attr_name in (
         ("active_radiance", "robomituba:activeEmitterRadiance"),
         ("polarizer_angle", "robomituba:polarizerAngleDeg"),
+        ("path_spp", "robomituba:pathSpp"),
+        ("aov_spp", "robomituba:aovSpp"),
+        ("polar_spp", "robomituba:polarSpp"),
+        ("samples_per_pass", "robomituba:samplesPerPass"),
         ("horizontal_samples", "robomituba:horizontalSamples"),
         ("vertical_channels", "robomituba:verticalChannels"),
         ("horizontal_fov_deg", "robomituba:horizontalFovDeg"),
@@ -269,6 +449,10 @@ def capture_robot_sensor_spec(stage: Any, robot_prim_path: str, sensor_id: str):
         "vertical_fov_max_deg": _attr_value(prim, "robomituba:verticalFovMaxDeg"),
         "min_range_m": _attr_value(prim, "robomituba:minRangeM"),
         "max_range_m": _attr_value(prim, "robomituba:maxRangeM"),
+        "path_spp": _attr_value(prim, "robomituba:pathSpp"),
+        "aov_spp": _attr_value(prim, "robomituba:aovSpp"),
+        "polar_spp": _attr_value(prim, "robomituba:polarSpp"),
+        "samples_per_pass": _attr_value(prim, "robomituba:samplesPerPass"),
     }
     return IsaacSensorSpec(
         sensor_id=resolved_sensor_id,
@@ -362,6 +546,9 @@ def render_robot_sensor(
             merged_render_settings.setdefault("nir_wavelength_max_nm", spec.extras["wavelength_max_nm"])
         if spec.extras.get("active_emitter_radiance") is not None:
             merged_render_settings.setdefault("nir_active_emitter_radiance", spec.extras["active_emitter_radiance"])
+    for extra_key in ("path_spp", "aov_spp", "polar_spp", "samples_per_pass"):
+        if spec.extras.get(extra_key) is not None:
+            merged_render_settings.setdefault(extra_key, spec.extras[extra_key])
     result = render_sensor_from_daemon(
         scene_id,
         spec.sensor_id,

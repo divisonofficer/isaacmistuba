@@ -181,6 +181,45 @@ PRESET_BSDFS: dict[str, dict[str, Any]] = {
         "alpha": 0.003,
         "distribution": "ggx",
     },
+    # ── material_hint aliases used by usd_editor_geometry ────────────────────
+    "painted_wall": {
+        "type": "roughplastic",
+        "diffuse_reflectance": {"type": "rgb", "value": [0.88, 0.87, 0.85]},
+        "alpha": 0.40,
+        "int_ior": 1.49,
+    },
+    "tile": {
+        "type": "roughplastic",
+        "diffuse_reflectance": {"type": "rgb", "value": [0.80, 0.80, 0.78]},
+        "alpha": 0.10,
+        "int_ior": 1.52,
+    },
+    "wood": {
+        "type": "roughplastic",
+        "diffuse_reflectance": {"type": "rgb", "value": [0.55, 0.38, 0.22]},
+        "alpha": 0.30,
+        "int_ior": 1.49,
+    },
+    "clear_glass": {
+        "type": "dielectric",
+        "int_ior": 1.5,
+        "ext_ior": 1.0,
+    },
+    "frosted_glass": {
+        "type": "roughdielectric",
+        "int_ior": 1.5,
+        "ext_ior": 1.0,
+        "alpha": 0.25,
+        "distribution": "ggx",
+    },
+    "fabric": {
+        "type": "diffuse",
+        "reflectance": {"type": "rgb", "value": [0.52, 0.46, 0.60]},
+    },
+    "mirror": {
+        "type": "conductor",
+        "material": "Ag",
+    },
 }
 
 
@@ -1126,6 +1165,113 @@ def _placeholder_color(dataset_id: str, material_id: str) -> tuple[float, float,
 
 # ── Public API ───────────────────────────────────────────────────────────────
 
+def _bsdf_preview_base_color(bsdf_dict: dict[str, Any]) -> tuple[float, float, float]:
+    for key in ("diffuse_reflectance", "reflectance", "base_color"):
+        value = bsdf_dict.get(key)
+        if isinstance(value, dict):
+            rgb = value.get("value")
+            if isinstance(rgb, (list, tuple)) and len(rgb) >= 3:
+                return tuple(float(max(0.0, min(1.0, c))) for c in rgb[:3])  # type: ignore[return-value]
+        elif isinstance(value, (list, tuple)) and len(value) >= 3:
+            return tuple(float(max(0.0, min(1.0, c))) for c in value[:3])  # type: ignore[return-value]
+    material = str(bsdf_dict.get("material", "")).lower()
+    if material in {"ag", "silver"}:
+        return (0.86, 0.88, 0.90)
+    if material in {"al", "aluminum", "aluminium"}:
+        return (0.72, 0.74, 0.76)
+    if material in {"au", "gold"}:
+        return (0.95, 0.70, 0.32)
+    if bsdf_dict.get("type") in {"dielectric", "roughdielectric"}:
+        return (0.72, 0.88, 1.0)
+    return (0.62, 0.64, 0.68)
+
+
+def _render_preset_software_preview(
+    bsdf_type: str,
+    bsdf_dict: dict[str, Any],
+    out_path: Path,
+    *,
+    size: int,
+) -> None:
+    """Write a deterministic shaded PNG when Mitsuba is unavailable."""
+    import numpy as np
+    from PIL import Image, ImageDraw
+
+    bsdf_kind = str(bsdf_dict.get("type", "")).lower()
+    base = np.array(_bsdf_preview_base_color(bsdf_dict), dtype=np.float32)
+    alpha_param = float(bsdf_dict.get("alpha", bsdf_dict.get("roughness", 0.22)) or 0.0)
+    roughness = max(0.02, min(1.0, alpha_param))
+    metallic = 1.0 if "conductor" in bsdf_kind else float(bsdf_dict.get("metallic", 0.0) or 0.0)
+    transparent = bsdf_kind in {"dielectric", "roughdielectric"}
+
+    ss = 3
+    w = h = max(32, int(size)) * ss
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    cx = (w - 1) * 0.50
+    cy = (h - 1) * 0.48
+    radius = min(w, h) * 0.37
+    x = (xx - cx) / radius
+    y = (yy - cy) / radius
+    rr = x * x + y * y
+    mask = rr <= 1.0
+    z = np.sqrt(np.clip(1.0 - rr, 0.0, 1.0))
+
+    normal = np.dstack([x, -y, z])
+    light = np.array([-0.45, 0.55, 0.78], dtype=np.float32)
+    light /= np.linalg.norm(light)
+    view = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+    half_vec = light + view
+    half_vec /= np.linalg.norm(half_vec)
+
+    ndotl = np.clip((normal * light).sum(axis=2), 0.0, 1.0)
+    ndoth = np.clip((normal * half_vec).sum(axis=2), 0.0, 1.0)
+    rim = np.clip(1.0 - z, 0.0, 1.0)
+    diffuse = 0.22 + 0.78 * ndotl
+    shininess = 16.0 + (1.0 - roughness) * 150.0
+    spec = np.power(ndoth, shininess) * (0.25 + 0.65 * (1.0 - roughness) + 0.35 * metallic)
+
+    if transparent:
+        tint = base * 0.45 + np.array([0.72, 0.86, 1.0], dtype=np.float32) * 0.55
+        color = tint * (0.36 + 0.32 * ndotl[..., None]) + spec[..., None] * 0.95 + rim[..., None] * 0.38
+        opacity = 0.34 + rim * 0.52
+        if bsdf_kind == "roughdielectric":
+            color = color * 0.82 + np.array([0.84, 0.91, 0.96], dtype=np.float32) * 0.18
+            opacity = np.maximum(opacity, 0.68)
+    elif metallic > 0.5:
+        env = np.dstack([0.52 + 0.28 * y, 0.56 + 0.24 * y, 0.62 + 0.20 * y])
+        color = base * (0.28 + 0.44 * ndotl[..., None]) + env * 0.34 + spec[..., None] * 0.90
+        opacity = np.ones_like(ndotl)
+    else:
+        color = base * diffuse[..., None] + spec[..., None] * 0.55
+        opacity = np.ones_like(ndotl)
+
+    rgba = np.zeros((h, w, 4), dtype=np.uint8)
+    rgba[..., :3] = (np.clip(color, 0.0, 1.0) ** (1.0 / 2.2) * 255.0).astype(np.uint8)
+    rgba[..., 3] = np.clip(opacity * 255.0, 0, 255).astype(np.uint8)
+    rgba[~mask, 3] = 0
+
+    img = Image.fromarray(rgba, mode="RGBA").resize((size, size), Image.LANCZOS)
+    draw = ImageDraw.Draw(img, "RGBA")
+    if bsdf_type in {"tile", "painted_wall"}:
+        line_color = (100, 116, 139, 70 if bsdf_type == "tile" else 32)
+        step = max(16, size // 3)
+        for p in range(step, size, step):
+            draw.line([(p, size * 0.18), (p, size * 0.82)], fill=line_color, width=1)
+            draw.line([(size * 0.18, p), (size * 0.82, p)], fill=line_color, width=1)
+    elif bsdf_type == "wood":
+        for i in range(5):
+            y0 = int(size * (0.35 + i * 0.065))
+            draw.arc((size * 0.16, y0 - 16, size * 0.86, y0 + 24), 190, 345, fill=(80, 48, 24, 82), width=1)
+    elif bsdf_type == "fabric":
+        spacing = max(8, size // 12)
+        for p in range(0, size, spacing):
+            draw.line([(p, size * 0.20), (p + size * 0.42, size * 0.84)], fill=(255, 255, 255, 42), width=1)
+            draw.line([(size - p, size * 0.20), (size - p - size * 0.42, size * 0.84)], fill=(80, 70, 95, 38), width=1)
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    img.save(str(out_path))
+
+
 def get_preset_preview(
     bsdf_type: str,
     cache_dir: Path,
@@ -1151,7 +1297,8 @@ def get_preset_preview(
             return out
         variant = _pick_variant_for("rgb")
         if variant is None:
-            return None
+            _render_preset_software_preview(bsdf_type, bsdf_dict, out, size=size)
+            return out if out.exists() else None
         try:
             with _mitsuba_render_lock:
                 _ensure_mitsuba_variant(variant)
@@ -1167,7 +1314,11 @@ def get_preset_preview(
                 )
         except Exception as exc:
             logger.warning("Preset preview render failed (%s): %s", bsdf_type, exc)
-            return None
+            try:
+                _render_preset_software_preview(bsdf_type, bsdf_dict, out, size=size)
+            except Exception as fallback_exc:
+                logger.warning("Preset software preview failed (%s): %s", bsdf_type, fallback_exc)
+                return None
 
     return out if out.exists() else None
 
