@@ -470,6 +470,17 @@ export const scanOpticalNavObservations = (projectId: string, sceneId: string) =
 	fetch(`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/observations-scan`).then(json);
 export const getOpticalNavRenderSceneStats = (projectId: string, sceneId: string) =>
 	fetch(`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/render-scene-stats`).then(json);
+// PR1: render geometry audit + XML scene index sidecars produced by Sync Render Scene.
+export const getOpticalNavMaterializationAudit = (projectId: string, sceneId: string) =>
+	fetch(`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/render-scene-materialization`).then(json);
+export const getOpticalNavXmlSceneIndex = (projectId: string, sceneId: string) =>
+	fetch(`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/xml-scene-index`).then(json);
+// PR2: serve raw OBJ bytes from mesh_cache for the XML-native editor preview.
+// xml_scene_index.shapes[].mesh_path stores absolute paths after PR1's
+// _absolutize_filename_refs(); the editor reduces them to a basename and hits
+// this endpoint so the browser-side OBJLoader can parse the geometry.
+export const opticalNavMeshCacheUrl = (projectId: string, sceneId: string, filename: string): string =>
+	`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/mesh-cache/${encodeURIComponent(filename)}`;
 export const getOpticalNavRoomShell = (projectId: string, sceneId: string) =>
 	fetch(`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/room-shell`).then(json);
 export const addOpticalNavGraphNode = (projectId: string, sceneId: string, payload: { x: number; y: number; heading_count?: number }) =>
@@ -490,6 +501,8 @@ export const getOpticalNavTraversableGridMeta = (projectId: string, sceneId: str
 	fetch(`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/traversable-grid?robot_radius_m=${robotRadiusM}`).then(json);
 export const opticalNavTraversableGridPngUrl = (projectId: string, sceneId: string, robotRadiusM: number): string =>
 	`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/traversable-grid.png?robot_radius_m=${robotRadiusM}`;
+export const opticalNavEnvmapPreviewUrl = (projectId: string, sceneId: string, filename: string): string =>
+	`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/envmaps/${encodeURIComponent(filename)}`;
 export const checkOpticalNavGraphEdge = (projectId: string, sceneId: string, payload: { source: string; target: string; robot_radius_m?: number; max_edge_length_m?: number }) =>
 	post(`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/graph/edge-check`, payload);
 export const regenerateOpticalNavGraphRegion = (
@@ -506,9 +519,20 @@ export const opticalNavObservationRgbUrl = (projectId: string, sceneId: string, 
 	`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/observations/${encodeURIComponent(vpId)}/rgb?heading=${encodeURIComponent(headingId)}`;
 export const opticalNavObservationModalityUrl = (projectId: string, sceneId: string, vpId: string, headingId: string, modality: string, sensorId = ''): string =>
 	`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/observations/${encodeURIComponent(vpId)}/${encodeURIComponent(modality)}?heading=${encodeURIComponent(headingId)}${sensorId ? `&sensor_id=${encodeURIComponent(sensorId)}` : ''}`;
-export const validateOpticalNavDataset = (projectId: string, payload: { require_observations?: boolean }) =>
+export const validateOpticalNavDataset = (
+	projectId: string,
+	payload: { require_observations?: boolean; scene_ids?: string[] | null },
+) =>
 	post(`${opticalProject(projectId)}/validate`, payload);
 export const evaluateOpticalNavDataset = (projectId: string, payload: { policy?: string; success_radius?: number }) =>
 	post(`${opticalProject(projectId)}/evaluate`, payload);
-export const exportOpticalNavDataset = (projectId: string, payload: { zip?: boolean }) =>
+export const exportOpticalNavDataset = (
+	projectId: string,
+	payload: {
+		zip?: boolean;
+		episode_ids?: string[] | null;
+		only_completed?: boolean;
+		scene_ids?: string[] | null;
+	},
+) =>
 	post(`${opticalProject(projectId)}/export`, payload);

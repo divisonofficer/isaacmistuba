@@ -30,6 +30,13 @@
   --danger-soft: rgba(239, 68, 68, 0.13);
   --shadow-soft: 0 12px 32px rgba(15, 23, 42, 0.08);
   --shadow-panel: 0 18px 44px rgba(15, 23, 42, 0.06);
+  /* Tool-state colors for authoring map active states */
+  --tool-glass: #5bb7c5;       --tool-glass-soft: #e8f7fa;
+  --tool-mirror: #9b1c1c;      --tool-mirror-soft: #fff1f1;
+  --tool-goal: #2f80ed;        --tool-goal-soft: #e8f0fd;
+  --tool-hazard: #dd7a22;      --tool-hazard-soft: #fff4e6;
+  --tool-traversable: #37a169; --tool-traversable-soft: #eef8f0;
+  --tool-forbidden: #c53030;   --tool-forbidden-soft: #fef2f2;
 }
 
 [data-theme="dark"] {
@@ -340,12 +347,15 @@ img { display: block; max-width: 100%; }
   flex-direction: column;
   border-top: 1px solid var(--panel-border);
   background: var(--panel);
-  height: calc(var(--layout-bottompanel-min) + 2.25rem);
+  height: 360px;
   transition: height var(--duration-base) var(--easing-standard);
   overflow: hidden;
 }
 .shell[data-bottom="collapsed"] .shell-bottom {
-  height: 2.75rem;
+  height: 36px;
+}
+.shell[data-bottom-mode="maximized"] .shell-bottom {
+  height: 70vh;
 }
 .shell-rail-header {
   display: flex;

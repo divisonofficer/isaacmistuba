@@ -63,23 +63,105 @@
 		group.add(edges);
 	}
 
+	function addCylinder(group: any, radius: number, height: number, pos: [number, number, number], color: number, opts: Record<string, any> = {}, isSelected: boolean) {
+		const geo = new THREE.CylinderGeometry(radius, radius, height, 28);
+		const material = new THREE.MeshStandardMaterial({ color, roughness: 0.62, metalness: 0, ...opts });
+		const mesh = new THREE.Mesh(geo, material);
+		mesh.position.set(pos[0], pos[1], pos[2]);
+		group.add(mesh);
+		if (isSelected) {
+			const edges = new THREE.LineSegments(new THREE.EdgesGeometry(geo), new THREE.LineBasicMaterial({ color: 0xf59e0b, transparent: true, opacity: 0.9 }));
+			edges.position.copy(mesh.position);
+			group.add(edges);
+		}
+		return mesh;
+	}
+
+	function addSphere(group: any, radius: number, pos: [number, number, number], color: number, opts: Record<string, any> = {}) {
+		const geo = new THREE.SphereGeometry(radius, 24, 16);
+		const material = new THREE.MeshStandardMaterial({ color, roughness: 0.58, metalness: 0, ...opts });
+		const mesh = new THREE.Mesh(geo, material);
+		mesh.position.set(pos[0], pos[1], pos[2]);
+		group.add(mesh);
+		return mesh;
+	}
+
+	function addTorus(group: any, radius: number, tube: number, pos: [number, number, number], color: number) {
+		const geo = new THREE.TorusGeometry(radius, tube, 12, 32);
+		const material = new THREE.MeshStandardMaterial({ color, roughness: 0.55, metalness: 0 });
+		const mesh = new THREE.Mesh(geo, material);
+		mesh.position.set(pos[0], pos[1], pos[2]);
+		group.add(mesh);
+		return mesh;
+	}
+
 	function buildThumbShape(group: any, isSelected: boolean) {
 		const color = colorForCategory(category);
-		if (assetType === 'chair') {
+		const key = assetType.toLowerCase();
+		if (key.includes('chair') || key.includes('couch') || key.includes('bench') || key.includes('sideboard')) {
 			addBox(group, [0.46, 0.12, 0.42], [0, 0.32, 0], color, {}, isSelected);
 			addBox(group, [0.46, 0.58, 0.10], [0, 0.60, -0.20], color, {}, isSelected);
 			for (const x of [-0.17, 0.17]) for (const z of [-0.14, 0.14]) addBox(group, [0.07, 0.32, 0.07], [x, 0.16, z], color, {}, isSelected);
 			return;
 		}
-		if (assetType === 'table') {
+		if (key.includes('table') || key.includes('desk')) {
 			addBox(group, [0.76, 0.12, 0.50], [0, 0.52, 0], color, {}, isSelected);
 			for (const x of [-0.29, 0.29]) for (const z of [-0.18, 0.18]) addBox(group, [0.07, 0.50, 0.07], [x, 0.25, z], color, {}, isSelected);
 			return;
 		}
-		if (assetType === 'plant') {
+		if (key.includes('plant') || key.includes('palm') || key.includes('pot')) {
 			addBox(group, [0.28, 0.34, 0.28], [0, 0.17, 0], 0x64748b, {}, isSelected);
 			addBox(group, [0.12, 0.34, 0.12], [0, 0.48, 0], 0x166534, {}, isSelected);
 			addBox(group, [0.44, 0.34, 0.44], [0, 0.72, 0], 0x15803d, {}, isSelected);
+			return;
+		}
+		if (key.includes('teapot')) {
+			addSphere(group, 0.24, [0, 0.36, 0], 0xf8fafc);
+			addCylinder(group, 0.11, 0.12, [0, 0.58, 0], 0xf8fafc, {}, isSelected);
+			const spout = addCylinder(group, 0.035, 0.32, [0.27, 0.42, 0], 0xf8fafc, {}, isSelected);
+			spout.rotation.z = Math.PI / 2.8;
+			const handle = addTorus(group, 0.17, 0.025, [-0.26, 0.42, 0], 0xf8fafc);
+			handle.rotation.y = Math.PI / 2;
+			return;
+		}
+		if (key.includes('bowl') || key.includes('dish')) {
+			const bowl = addCylinder(group, 0.28, 0.12, [0, 0.22, 0], key.includes('dish') ? 0x3b82f6 : 0x22c55e, {}, isSelected);
+			bowl.scale.y = key.includes('dish') ? 0.45 : 1;
+			addTorus(group, 0.28, 0.018, [0, key.includes('dish') ? 0.25 : 0.3, 0], 0xf8fafc);
+			return;
+		}
+		if (key.includes('cup') || key.includes('candle') || key.includes('can') || key.includes('bottle') || key.includes('air duster')) {
+			addCylinder(group, key.includes('cup') ? 0.17 : 0.13, key.includes('bottle') ? 0.56 : 0.38, [0, key.includes('bottle') ? 0.32 : 0.25, 0], key.includes('cup') ? 0xfb923c : 0x64748b, {}, isSelected);
+			if (key.includes('cup')) {
+				const handle = addTorus(group, 0.11, 0.018, [0.2, 0.29, 0], 0xfb923c);
+				handle.rotation.y = Math.PI / 2;
+			}
+			return;
+		}
+		if (key.includes('vase') || key.includes('pottery')) {
+			addCylinder(group, 0.18, 0.52, [0, 0.32, 0], key.includes('blue') ? 0x3b82f6 : 0xb45309, {}, isSelected);
+			addCylinder(group, 0.1, 0.18, [0, 0.64, 0], key.includes('blue') ? 0x60a5fa : 0xd97706, {}, isSelected);
+			return;
+		}
+		if (key.includes('spoon') || key.includes('knife') || key.includes('marker') || key.includes('key')) {
+			const metal = key.includes('knife') || key.includes('key') ? 0xcbd5e1 : key.includes('marker') ? 0xf97316 : 0x22c55e;
+			addBox(group, [0.12, 0.05, 0.64], [0, 0.26, 0], metal, { metalness: key.includes('knife') || key.includes('key') ? 0.35 : 0 }, isSelected);
+			if (key.includes('spoon')) addSphere(group, 0.12, [0, 0.27, 0.34], metal);
+			return;
+		}
+		if (key.includes('hammer') || key.includes('dumbbell')) {
+			addBox(group, [0.12, 0.08, 0.58], [0, 0.25, 0], 0x92400e, {}, isSelected);
+			addBox(group, key.includes('hammer') ? [0.36, 0.16, 0.12] : [0.2, 0.2, 0.2], [0, 0.33, -0.25], 0x64748b, { metalness: 0.3 }, isSelected);
+			if (key.includes('dumbbell')) addBox(group, [0.2, 0.2, 0.2], [0, 0.33, 0.25], 0x64748b, { metalness: 0.3 }, isSelected);
+			return;
+		}
+		if (key.includes('speaker') || key.includes('camera')) {
+			addBox(group, [0.48, 0.34, 0.24], [0, 0.32, 0], 0x1f2937, {}, isSelected);
+			addCylinder(group, 0.11, 0.035, [0, 0.33, -0.13], 0x0f172a, {}, isSelected).rotation.x = Math.PI / 2;
+			return;
+		}
+		if (key.includes('rug')) {
+			addBox(group, [0.72, 0.05, 0.48], [0, 0.08, 0], 0x6ee7b7, {}, isSelected);
 			return;
 		}
 		const size = sizeForBounds(bounds);
@@ -147,8 +229,10 @@
 
 <style>
 	.asset-thumb {
-		width: 42px;
-		height: 42px;
+		width: 100%;
+		height: 100%;
+		min-width: 42px;
+		min-height: 42px;
 		border-radius: 8px;
 		background: linear-gradient(180deg, rgba(248,250,252,0.96), rgba(226,232,240,0.9));
 		overflow: hidden;

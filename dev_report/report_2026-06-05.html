@@ -1,0 +1,757 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Dev Report · 2026-06-05 · OpticalNav Editor, Camera Rig, Asset Materialization</title>
+<style>
+  :root {
+    --bg:#f4f6fb; --panel:#fff; --sub:#f8fafc; --text:#1f2937; --muted:#64748b;
+    --line:#dbe3ef; --blue:#2563eb; --green:#16a34a; --amber:#d97706; --red:#dc2626; --purple:#7c3aed;
+    --mono:"JetBrains Mono",Consolas,Menlo,monospace; --sans:Inter,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:var(--sans); background:var(--bg); color:var(--text); line-height:1.62; font-size:14px; }
+  .layout { display:flex; min-height:100vh; }
+  aside { width:250px; flex:0 0 250px; position:sticky; top:0; height:100vh; overflow:auto; padding:22px 14px; border-right:1px solid var(--line); background:#eef2f7; }
+  main { width:min(1180px, calc(100vw - 250px)); padding:30px 38px 60px; }
+  .logo { font-weight:800; color:var(--blue); letter-spacing:-.02em; }
+  .date { margin-top:3px; color:var(--muted); font-family:var(--mono); font-size:11px; }
+  .nav-title { margin:22px 8px 7px; color:var(--muted); font-size:10px; text-transform:uppercase; letter-spacing:.12em; font-weight:800; }
+  .nav-link { display:block; padding:6px 8px; border-radius:6px; color:#475569; text-decoration:none; font-size:12px; }
+  .nav-link:hover { color:var(--blue); background:#dbeafe; }
+  .hero, section { background:var(--panel); border:1px solid var(--line); border-radius:12px; box-shadow:0 2px 10px rgba(15,23,42,.04); }
+  .hero { padding:28px 30px; margin-bottom:22px; }
+  h1 { margin:0 0 8px; font-size:25px; letter-spacing:-.04em; line-height:1.22; }
+  h2 { margin:0 0 4px; font-size:18px; letter-spacing:-.02em; }
+  h3 { margin:22px 0 9px; font-size:14px; }
+  section { padding:22px 24px; margin-bottom:18px; }
+  .subtitle { color:#475569; font-size:13px; }
+  .tags { display:flex; flex-wrap:wrap; gap:7px; margin-top:18px; }
+  .tag { border:1px solid #bfdbfe; color:#1d4ed8; background:#eff6ff; padding:3px 9px; border-radius:999px; font-size:11px; font-weight:700; }
+  .tag.green { color:#15803d; background:#f0fdf4; border-color:#bbf7d0; }
+  .tag.amber { color:#b45309; background:#fffbeb; border-color:#fde68a; }
+  .tag.red { color:#b91c1c; background:#fef2f2; border-color:#fecaca; }
+  .tag.purple { color:#6d28d9; background:#f5f3ff; border-color:#ddd6fe; }
+  .grid { display:grid; grid-template-columns:repeat(4,1fr); gap:12px; margin:15px 0; }
+  .card { background:var(--sub); border:1px solid var(--line); border-radius:8px; padding:13px; }
+  .metric { font-size:24px; font-weight:850; color:var(--blue); letter-spacing:-.04em; }
+  .label { color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.08em; font-weight:800; }
+  .note { color:#475569; font-size:12px; margin-top:4px; }
+  table { width:100%; border-collapse:collapse; margin:13px 0 18px; font-size:13px; }
+  th { text-align:left; background:#eff6ff; color:#475569; font-size:11px; text-transform:uppercase; letter-spacing:.06em; }
+  th, td { padding:9px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:var(--mono); font-size:12px; }
+  code { background:#eef2ff; padding:1px 5px; border-radius:4px; }
+  pre { background:#0f172a; color:#dbeafe; border-radius:8px; padding:13px 14px; overflow:auto; line-height:1.55; }
+  .alert { border-left:4px solid var(--amber); background:#fffbeb; padding:12px 14px; border-radius:8px; margin:12px 0; }
+  .alert.red { border-color:var(--red); background:#fef2f2; }
+  .alert.green { border-color:var(--green); background:#f0fdf4; }
+  .flow { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin:14px 0; }
+  .step { border:1px solid var(--line); background:var(--sub); border-radius:7px; padding:7px 10px; font-weight:750; font-size:12px; }
+  .arrow { color:var(--muted); }
+  .module-diagram { margin:16px 0 20px; padding:18px; border:1px solid var(--line); border-radius:12px; background:linear-gradient(180deg,#f8fafc 0%,#eef2ff 100%); }
+  .diagram-row { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:12px; align-items:stretch; }
+  .diagram-row.two { grid-template-columns:repeat(2,minmax(0,1fr)); margin-top:12px; }
+  .diagram-row.three { grid-template-columns:repeat(3,minmax(0,1fr)); margin-top:12px; }
+  .module-box { position:relative; min-height:118px; padding:13px 14px; border:1px solid #cbd5e1; border-radius:10px; background:#fff; box-shadow:0 2px 8px rgba(15,23,42,.05); }
+  .module-box::after { content:attr(data-step); position:absolute; top:10px; right:10px; width:24px; height:24px; border-radius:999px; display:flex; align-items:center; justify-content:center; background:#eff6ff; color:#1d4ed8; font-family:var(--mono); font-size:11px; font-weight:800; }
+  .module-box.blue { border-color:#93c5fd; }
+  .module-box.green { border-color:#86efac; }
+  .module-box.amber { border-color:#fcd34d; }
+  .module-box.purple { border-color:#c4b5fd; }
+  .module-box.red { border-color:#fca5a5; }
+  .module-title { font-weight:850; letter-spacing:-.02em; margin-bottom:5px; padding-right:28px; }
+  .module-path { font-family:var(--mono); color:#64748b; font-size:11px; margin-bottom:8px; }
+  .module-note { color:#475569; font-size:12px; line-height:1.5; }
+  .diagram-connector { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:12px; margin:8px 0; color:#64748b; font-family:var(--mono); font-size:11px; text-align:center; }
+  .diagram-connector div::after { content:"↓"; display:block; color:#2563eb; font-size:18px; line-height:1; margin-top:2px; }
+  .contract-strip { display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); gap:8px; margin-top:14px; }
+  .contract-item { padding:9px; border:1px dashed #94a3b8; border-radius:8px; background:rgba(255,255,255,.7); font-size:12px; text-align:center; }
+  .evolution-grid { display:grid; grid-template-columns:170px 1fr 1fr; gap:0; border:1px solid var(--line); border-radius:10px; overflow:hidden; margin:14px 0 18px; }
+  .evolution-grid > div { padding:11px 13px; border-bottom:1px solid var(--line); background:#fff; }
+  .evolution-grid > div:nth-child(3n+1) { background:#eff6ff; color:#1d4ed8; font-family:var(--mono); font-size:12px; font-weight:800; }
+  .evolution-grid > div:nth-child(3n+2) { background:#f8fafc; font-weight:750; }
+  .evolution-grid > div:nth-last-child(-n+3) { border-bottom:0; }
+  .pipeline-summary { display:grid; grid-template-columns:repeat(6,minmax(0,1fr)); gap:8px; margin:14px 0; }
+  .pipeline-summary .step { min-height:66px; display:flex; align-items:center; justify-content:center; text-align:center; }
+  .small { font-size:12px; color:var(--muted); }
+  .footer { color:var(--muted); text-align:center; margin-top:34px; font-size:12px; }
+  @media (max-width:900px) {
+    .layout{display:block} aside{position:relative;width:auto;height:auto} main{width:auto;padding:20px}
+    .grid,.diagram-row,.diagram-row.two,.diagram-row.three,.diagram-connector,.contract-strip,.evolution-grid,.pipeline-summary{grid-template-columns:1fr}
+  }
+</style>
+</head>
+<body>
+<div class="layout">
+<aside>
+  <div class="logo">Robomituba</div>
+  <div class="date">2026-06-05</div>
+  <div class="small">OpticalNav editor · camera rig · asset materialization</div>
+
+  <div class="nav-title">요약</div>
+  <a class="nav-link" href="#summary">오늘의 결론</a>
+  <a class="nav-link" href="#what-done">무엇을 했나</a>
+  <a class="nav-link" href="#agent-history">세션 히스토리 복원</a>
+
+  <div class="nav-title">이슈 분석</div>
+  <a class="nav-link" href="#yellow-boxes">노란 기둥 / proxy cube</a>
+  <a class="nav-link" href="#moorelane-bg">MooreLane 배경 구조물</a>
+  <a class="nav-link" href="#mesh-path">Mesh 부착 경로</a>
+
+  <div class="nav-title">아키텍처</div>
+  <a class="nav-link" href="#module-diagram">모듈 다이어그램</a>
+  <a class="nav-link" href="#render-evolution">렌더 파이프라인 변화</a>
+  <a class="nav-link" href="#xml-native-strategy">XML-native 전략</a>
+  <a class="nav-link" href="#ui-mvvm-audit">UI / MVVM 평가</a>
+  <a class="nav-link" href="#architecture">모듈 구조</a>
+  <a class="nav-link" href="#editor-arch">Web editor</a>
+  <a class="nav-link" href="#mapeditor-mvvm">3D editor MVVM</a>
+  <a class="nav-link" href="#render-arch">Render daemon</a>
+  <a class="nav-link" href="#camera-arch">Camera rig</a>
+  <a class="nav-link" href="#graph-arch">Graph / sensor sweep</a>
+
+  <div class="nav-title">다음 단계</div>
+  <a class="nav-link" href="#risks">리스크</a>
+  <a class="nav-link" href="#next">권장 작업</a>
+</aside>
+
+<main>
+  <div class="hero">
+    <div class="date">Daily Development Report · 2026-06-05</div>
+    <h1>OpticalNav Editor 구조화, Camera Rig 렌더 연결, Built-in Asset 확장, 그리고 GLB/MooreLane mesh materialization 이슈 분석</h1>
+    <div class="subtitle">
+      6월 5일 작업은 에디터 사용성을 실제 장면 저작 도구에 가깝게 바꾸는 방향으로 진행되었다.
+      동시에 렌더 결과에서 DTC 물체가 mesh 대신 큰 cube로 나타나는 문제가 확인되었고,
+      이를 Editor → Authoring Map → Render XML → Mitsuba 경로에서 분석했다.
+    </div>
+    <div class="tags">
+      <span class="tag">Svelte component split</span>
+      <span class="tag">Camera Rig readonly bridge</span>
+      <span class="tag">Sims-style placement</span>
+      <span class="tag">GLB materialization</span>
+      <span class="tag amber">proxy cube fallback</span>
+      <span class="tag red">metadata.proxy_size ignored</span>
+      <span class="tag purple">custom preview viewpoint</span>
+      <span class="tag green">editor_generated_xml</span>
+    </div>
+  </div>
+
+  <section id="summary">
+    <h2>오늘의 결론</h2>
+    <div class="grid">
+      <div class="card"><div class="label">Changed files</div><div class="metric">7+</div><div class="note">tracked diff 기준 핵심 파일. 신규 datasets 컴포넌트 13개 추가.</div></div>
+      <div class="card"><div class="label">Refactor</div><div class="metric">2,144</div><div class="note"><code>apps/webui/src/lib/datasets</code>로 분리된 LOC.</div></div>
+      <div class="card"><div class="label">Current scene</div><div class="metric">104</div><div class="note"><code>moorelane_kitchen_001</code> authoring objects.</div></div>
+      <div class="card"><div class="label">Render XML</div><div class="metric">89/15</div><div class="note">OBJ shapes / cube fallback shapes.</div></div>
+    </div>
+    <div class="alert red">
+      렌더 이미지의 거대한 노란색 박스/기둥은 DTC object가 실제 GLB mesh로 붙지 못하고
+      Mitsuba XML에서 <code>&lt;shape type="cube"&gt;</code> fallback으로 들어간 것이 직접 원인이다.
+      특히 authoring map에는 <code>metadata.proxy_size</code>가 들어가지만, 현재 XML 생성 경로는
+      <code>geometry.size_m</code> 또는 editor geometry bounds만 읽고 <code>metadata.proxy_size</code>를 사용하지 않는다.
+    </div>
+  </section>
+
+  <section id="what-done">
+    <h2>무엇을 했나</h2>
+    <table>
+      <tr><th>영역</th><th>작업 내용</th><th>상태</th></tr>
+      <tr><td>Dataset page refactor</td><td><code>datasets/+page.svelte</code>의 asset catalog, sensor panel, preview tab, status/export/lights rail, bottom batch panel, helper 함수를 별도 모듈로 분리하기 시작했다.</td><td><span class="tag green">진행됨</span></td></tr>
+      <tr><td>Camera Rig 연결</td><td>Dataset sensors 화면은 직접 편집 UI에서 readonly rig 요약 + <code>/camera_rig</code> 진입으로 변경되는 흐름이다.</td><td><span class="tag green">진행됨</span></td></tr>
+      <tr><td>Preview viewpoint</td><td>Preview tab에 selected viewpoint, free probe, current editor view 기반 render probe 구조가 정리되었다.</td><td><span class="tag green">진행됨</span></td></tr>
+      <tr><td>Object placement</td><td><code>MapEditor3D</code>에 object transform mode, X/Z 이동, Y 높이, yaw ring, surface snap, grid snap, placement ghost 높이 반영이 추가되었다.</td><td><span class="tag green">진행됨</span></td></tr>
+      <tr><td>Built-in asset catalog</td><td>기존 primitive 4종에서 MooreLane/DTC 기반 curated rich asset까지 넓히는 구조가 도입되었다.</td><td><span class="tag amber">렌더 검증 필요</span></td></tr>
+      <tr><td>GLB materialization</td><td><code>render_daemon.py</code>에 GLB/GLTF를 <code>trimesh</code>로 OBJ materialize하여 <code>out/control_plane_cache/glb_obj_cache</code>에 캐시하는 경로가 추가되었다.</td><td><span class="tag amber">stale/fallback 원인 추적 필요</span></td></tr>
+    </table>
+  </section>
+
+  <section id="agent-history">
+    <h2>다른 개발 세션 히스토리에서 복원한 흐름</h2>
+    <table>
+      <tr><th>세션</th><th>관찰된 주제</th><th>현재 코드에 남은 흔적</th></tr>
+      <tr><td>Analyze CSS scoping in Svelte components</td><td>Dataset page의 tab/rail/export/status UI가 한 파일에 과밀했고 CSS scoping 충돌 가능성이 있었다.</td><td><code>apps/webui/src/lib/datasets/*.svelte</code> 및 helper TS 모듈로 분리.</td></tr>
+      <tr><td>Strategy for OpticalNav dataset scene development</td><td>DTC GLB → OBJ materialization, materialization audit state를 탐색한 기록이 있다.</td><td><code>_materialize_glb_obj_for_overlay()</code>, <code>glb_obj_cache</code>, <code>trimesh</code> dependency.</td></tr>
+      <tr><td>렌더 프리뷰 뷰포인트 개선</td><td>Preview tab inline UI, custom position metadata, hot-camera props/overlay/click filter 연결.</td><td><code>RailPreviewTab.svelte</code>, <code>build_custom_position_render_requests()</code>의 <code>preview_id</code>/<code>render_mode</code> 보존.</td></tr>
+    </table>
+  </section>
+
+  <section id="yellow-boxes">
+    <h2>이슈 분석: 거대한 노란 박스 / 기둥</h2>
+    <pre>scene: out/opticalnav/opticalnav-v0.2/scenes/moorelane_kitchen_001
+objects: 104
+render_sync_mode: editor_generated_xml
+render_scene.xml: 89 obj shapes, 15 cube shapes, 2 area emitters
+DTC examples:
+  Tall Blue Vase    → &lt;shape type="cube"&gt;
+  Blue Dish         → &lt;shape type="cube"&gt;
+  Squeeze Bottle    → &lt;shape type="cube"&gt;</pre>
+    <table>
+      <tr><th>원인</th><th>설명</th><th>영향</th></tr>
+      <tr><td>GLB mesh 미부착</td><td>DTC object의 <code>source_ref</code>는 <code>vendor_datasets/.../3d-asset.glb</code>로 정상 저장되어 있다. 그러나 현재 XML에는 OBJ가 아니라 cube가 생성되어 있다.</td><td>실제 bottle/vase mesh 대신 primitive box 렌더.</td></tr>
+      <tr><td><code>metadata.proxy_size</code> 미사용</td><td>배치 시 작은 크기는 <code>metadata.proxy_size</code>에 저장된다. 하지만 <code>_proxy_box_xml_element()</code>는 <code>geometry.size_m</code> 또는 editor geometry bounds만 사용한다.</td><td>작은 물체 fallback도 기본 <code>0.5 × 1.2 × 0.5m</code> cube가 됨.</td></tr>
+      <tr><td>Readiness audit 부정확</td><td>89 OBJ가 있음에도 proxy warning은 95 objects라고 말한다.</td><td>진짜 문제와 정상 USD prim 추출을 구분하기 어렵다.</td></tr>
+      <tr><td>Stale XML 가능성</td><td>기존 <code>render_scene.xml</code>은 GLB materializer 도입 전/실패 상태에서 생성되었을 수 있다.</td><td>코드와 산출물 상태가 어긋남.</td></tr>
+    </table>
+  </section>
+
+  <section id="moorelane-bg">
+    <h2>이슈 분석: 에디터에 없는 MooreLane 배경 구조물</h2>
+    <p>
+      현재 <code>scene_variant.json</code>은 <code>render_sync_mode: editor_generated_xml</code>,
+      <code>base_scene_xml_ref: null</code>, <code>overlay_scene_xml_ref: render_scene.xml</code>로 설정되어 있다.
+      즉 현재 파일 기준으로는 Mitsuba가 원본 MooreLane full scene을 base로 쓰는 상태는 아니다.
+    </p>
+    <div class="alert">
+      다만 <code>authoring_map.json</code> 자체에 <code>kitchenInterior_Facade</code>,
+      <code>kitchen_sheetrock</code>, <code>kitchen_windowframe</code> 같은 MooreLane 구조물 prim이 object로 포함되어 있다.
+      에디터 3D viewer가 이 구조물을 단순화하거나 특정 레이어에서 숨기면 “에디터에는 없는데 렌더에는 보이는” 것처럼 느껴질 수 있다.
+    </div>
+  </section>
+
+  <section id="mesh-path">
+    <h2>Mesh 부착 과정</h2>
+    <div class="flow">
+      <div class="step">Editor placement</div><div class="arrow">→</div>
+      <div class="step">authoring_map.json</div><div class="arrow">→</div>
+      <div class="step">render_daemon sync</div><div class="arrow">→</div>
+      <div class="step">OBJ cache or cube fallback</div><div class="arrow">→</div>
+      <div class="step">render_scene.xml</div><div class="arrow">→</div>
+      <div class="step">Mitsuba render</div>
+    </div>
+    <h3>MooreLane USD prim</h3>
+    <pre>source_ref = "assets/.../4004MooreLane_ASWF_publish3.usda#/ROOT/Kitchen/.../Chair_Stitch"
+
+_ensure_prim_obj_cached(project_dir, scene_id, usd_ref, prim_path)
+  → open cached Usd.Stage
+  → extract_prim_mesh_to_obj()
+  → extract_material_for_prim()
+  → out/opticalnav/.../mesh_cache/&lt;digest&gt;.obj
+  → &lt;shape type="obj"&gt;</pre>
+    <h3>DTC GLB</h3>
+    <pre>source_ref = "vendor_datasets/dtc_objects/Vase_.../3d-asset.glb"
+
+_materialize_glb_obj_for_overlay(source_ref)
+  → resolve_repo_path()
+  → trimesh.load(..., force="scene")
+  → scene.to_geometry()
+  → out/control_plane_cache/glb_obj_cache/&lt;digest&gt;/mesh.obj
+  → &lt;shape type="obj"&gt; if success
+  → &lt;shape type="cube"&gt; if missing/fail/stale</pre>
+  </section>
+
+  <section id="module-diagram">
+    <h2>모듈 다이어그램</h2>
+    <p class="small">현재 OpticalNav dataset editor가 사용하는 주요 모듈과 데이터 계약을 한 장으로 표현하면 아래와 같다.</p>
+    <div class="module-diagram">
+      <div class="diagram-row">
+        <div class="module-box blue" data-step="1">
+          <div class="module-title">Web UI Shell</div>
+          <div class="module-path">apps/webui</div>
+          <div class="module-note">Svelte route, right rail, bottom batch monitor. 사용자가 scene, asset, camera rig, graph render를 조작한다.</div>
+        </div>
+        <div class="module-box blue" data-step="2">
+          <div class="module-title">MapEditor3D</div>
+          <div class="module-path">src/lib/MapEditor3D.svelte</div>
+          <div class="module-note">Three.js viewer. Object gizmo, surface snap, grid snap, sensor rays, graph overlay를 표시한다.</div>
+        </div>
+        <div class="module-box green" data-step="3">
+          <div class="module-title">Authoring Map Contract</div>
+          <div class="module-path">navigation_dataset/authoring_map.py</div>
+          <div class="module-note">objects, regions, materials, environment, camera_rig, base_height_m, source_ref를 저장하는 canonical scene authoring schema.</div>
+        </div>
+        <div class="module-box amber" data-step="4">
+          <div class="module-title">Render Daemon</div>
+          <div class="module-path">mitsuba_converter/render_daemon.py</div>
+          <div class="module-note">HTTP API, scene sync, render readiness, graph/custom render queue, mesh cache materialization을 담당한다.</div>
+        </div>
+      </div>
+
+      <div class="diagram-connector">
+        <div>UI event</div><div>onObjectTransform</div><div>save/sync</div><div>XML build</div>
+      </div>
+
+      <div class="diagram-row">
+        <div class="module-box purple" data-step="5">
+          <div class="module-title">Built-in / Library Assets</div>
+          <div class="module-path">AssetCatalog + opticalnavBuiltInAssets</div>
+          <div class="module-note">Primitive, MooreLane USD prim, DTC GLB를 배치 후보로 제공한다. 배치 결과는 source_ref와 proxy metadata로 저장된다.</div>
+        </div>
+        <div class="module-box amber" data-step="6">
+          <div class="module-title">Mesh Materialization</div>
+          <div class="module-path">mesh_cache / glb_obj_cache</div>
+          <div class="module-note">MooreLane: USD#prim → OBJ. DTC: GLB → OBJ. 실패하면 cube fallback으로 render_scene.xml에 들어간다.</div>
+        </div>
+        <div class="module-box green" data-step="7">
+          <div class="module-title">Sensor Sweep</div>
+          <div class="module-path">navigation_dataset/sensor_sweep.py</div>
+          <div class="module-note">Viewpoint graph 또는 custom preview pose를 RenderRequest로 변환하고 sensor mount/render_settings를 합성한다.</div>
+        </div>
+        <div class="module-box red" data-step="8">
+          <div class="module-title">Mitsuba Rendering</div>
+          <div class="module-path">mitsuba_converter/multimodal.py</div>
+          <div class="module-note">render_scene.xml + CameraSpec + RenderConfig를 받아 RGB/AOV/Polar/NIR 계열 output과 observation manifest를 생성한다.</div>
+        </div>
+      </div>
+
+      <div class="diagram-row three">
+        <div class="module-box blue" data-step="A">
+          <div class="module-title">Camera Rig Editor</div>
+          <div class="module-path">/camera_rig + camera_rigs/*.json</div>
+          <div class="module-note">Ranger Mini 기준 sensor mount/intrinsics/render SPP를 JSON preset으로 저장한다.</div>
+        </div>
+        <div class="module-box green" data-step="B">
+          <div class="module-title">Bridge Types</div>
+          <div class="module-path">robomituba_bridge</div>
+          <div class="module-note">SceneState, CameraSpec, RenderRequest, RobotState. Web/daemon/render 사이의 공통 계약이다.</div>
+        </div>
+        <div class="module-box amber" data-step="C">
+          <div class="module-title">Readiness / Audit</div>
+          <div class="module-path">render_readiness.json</div>
+          <div class="module-note">XML 존재, OBJ/cube count, camera rig, material warnings, asset existence를 UI에 노출한다.</div>
+        </div>
+      </div>
+
+      <div class="contract-strip">
+        <div class="contract-item"><code>source_ref</code><br>USD#prim or GLB</div>
+        <div class="contract-item"><code>geometry.base_height_m</code><br>surface snap height</div>
+        <div class="contract-item"><code>metadata.proxy_size</code><br>fallback size contract</div>
+        <div class="contract-item"><code>camera_rig.sensors</code><br>sensor suite</div>
+        <div class="contract-item"><code>render_settings</code><br>SPP/resolution overrides</div>
+      </div>
+    </div>
+    <div class="alert">
+      다이어그램 기준으로 현재 문제 지점은 5→6→8 사이에 있다.
+      Built-in/DTC asset은 authoring map에는 들어가지만, 6번 materialization이 실패하거나
+      fallback size contract가 맞지 않으면 8번 Mitsuba 렌더에서 큰 cube로 보인다.
+    </div>
+  </section>
+
+  <section id="render-evolution">
+    <h2>렌더링 파이프라인 변화 흐름</h2>
+    <p class="small">
+      이전 개발 노트를 기준으로 보면 렌더링 파이프라인은 단순히 기능이 추가된 것이 아니라,
+      <strong>Isaac stage 중심의 snapshot 렌더</strong>에서
+      <strong>OpticalNav authoring map 중심의 editor-generated XML 렌더</strong>로 확장되었다.
+      현재는 두 경로가 공존하며, camera rig와 rich asset materialization이 그 위에 붙어 있다.
+    </p>
+
+    <div class="evolution-grid">
+      <div>2026-05-27</div>
+      <div>Isaac Snapshot → Mitsuba</div>
+      <div>Isaac Sim이 물리 상태와 USD stage의 source of truth였다. <code>SceneSnapshot</code>, <code>RobotState</code>, <code>CameraSpec</code>을 캡처해 <code>RenderRequest</code>로 daemon에 제출했다.</div>
+
+      <div>2026-05-27 후반</div>
+      <div>OpticalNav Authoring Map 도입</div>
+      <div>WebUI가 <code>authoring_map.json</code>을 직접 저작하고, compile/sync를 통해 렌더 scene을 구성하기 시작했다. Isaac 없이도 object, region, material, graph를 만들 수 있는 경로가 생겼다.</div>
+
+      <div>2026-05-29</div>
+      <div>Viewpoint Graph Sweep</div>
+      <div>단일 카메라 렌더가 아니라 <code>viewpoint_graph</code>의 <code>node_id + heading_id</code> 조합을 batch로 렌더하고, 결과를 3D frustum texture와 <code>sensor_observations</code>로 다시 UI에 표시했다.</div>
+
+      <div>2026-05-29~06-02</div>
+      <div>Base Scene Cache + Render Settings</div>
+      <div>카메라 없는 Mitsuba base XML을 <code>.staged_mitsuba/base/{sig_hash}.xml</code>로 공유하고, 각 viewpoint는 카메라만 교체했다. <code>render_settings</code>는 WebUI에서 <code>render_modalities()</code>까지 전파되었다.</div>
+
+      <div>2026-06-05</div>
+      <div>Camera Rig + Rich Asset Materialization</div>
+      <div><code>camera_rig_v1</code> JSON이 sensor source가 되었고, MooreLane USD prim / DTC GLB rich asset은 OBJ cache materialization을 거쳐 <code>render_scene.xml</code>에 들어가는 구조가 되었다.</div>
+    </div>
+
+    <h3>현재 최종 흐름</h3>
+    <div class="pipeline-summary">
+      <div class="step">WebUI<br>Camera Rig<br>Asset Catalog</div>
+      <div class="step">authoring_map.json</div>
+      <div class="step">render_daemon<br>sync / readiness</div>
+      <div class="step">render_scene.xml<br>OBJ or cube</div>
+      <div class="step">sensor_sweep<br>RenderRequest</div>
+      <div class="step">Mitsuba render<br>observations</div>
+    </div>
+
+    <div class="alert">
+      핵심 변화는 source of truth가 하나에서 여러 개로 늘어난 것이다.
+      현재 렌더에는 <code>Isaac stage</code>, <code>authoring_map.json</code>,
+      <code>camera_rig JSON</code>, <code>render_scene.xml</code>,
+      <code>viewpoint_graph.json</code>이 모두 관여한다.
+      따라서 향후 렌더 job manifest에는 사용한 authoring map hash, rig id, XML hash,
+      asset materialization status를 함께 남기는 것이 필요하다.
+    </div>
+
+    <table>
+      <tr><th>변화</th><th>좋아진 점</th><th>새로 생긴 취약점</th></tr>
+      <tr><td>Isaac snapshot 중심 → authoring map 중심 병행</td><td>WebUI만으로 scene 저작과 batch 렌더 가능.</td><td>Isaac stage와 authoring map이 어긋날 수 있음.</td></tr>
+      <tr><td>단일 카메라 → graph sweep</td><td>Navigation dataset용 대량 관측 생성 가능.</td><td>render result naming, frustum matching, observation cleanup 계약이 중요해짐.</td></tr>
+      <tr><td>매번 XML 생성 → base scene cache</td><td>수백 viewpoint 렌더 비용 감소.</td><td>scene switch, ambient 설정, stale XML/cache invalidation 문제가 생김.</td></tr>
+      <tr><td>primitive asset → rich asset</td><td>에디터와 렌더가 실제 물체 mesh를 사용할 수 있음.</td><td>USD#prim/GLB materialization 실패 시 cube fallback이 렌더 품질을 크게 망침.</td></tr>
+      <tr><td>legacy sensor form → camera rig JSON</td><td>센서 mount, intrinsics, SPP를 rig 단위로 관리 가능.</td><td>legacy sensor 변환과 render request 생성 사이의 naming/settings 호환성이 필요함.</td></tr>
+    </table>
+  </section>
+
+  <section id="xml-native-strategy">
+    <h2>XML-native Preview 전략 평가</h2>
+    <div class="alert green">
+      핵심 방향은 명확하다.
+      <strong>렌더 진실은 XML에 있고, 에디터는 그 XML이 실제로 참조하는 mesh/material/light/sensor를 보여줘야 한다.</strong>
+      따라서 현재 작업의 중심은 authoring map을 예쁘게 보여주는 것이 아니라,
+      <code>render_scene.xml</code>, <code>render_scene_materialization.json</code>,
+      <code>xml_scene_index.json</code>가 말하는 실제 렌더 입력을 에디터에 반영하는 것이다.
+    </div>
+
+    <h3>잘 잡힌 문제 정의</h3>
+    <table>
+      <tr><th>이전 상태</th><th>현재 디버깅 가능한 문제</th></tr>
+      <tr><td>렌더가 이상하다</td><td>DTC GLB materialization 실패, stale XML, fallback reason 부재.</td></tr>
+      <tr><td>에디터와 렌더가 다르다</td><td>에디터 preview와 Mitsuba render가 서로 다른 geometry source를 본다.</td></tr>
+      <tr><td>mesh가 박스로 보인다</td><td><code>xml_scene_index</code> 기준 shape가 OBJ인지 cube fallback인지 추적해야 한다.</td></tr>
+      <tr><td>readiness가 헷갈린다</td><td>Render readiness, Dataset readiness, Asset materialization status가 섞여 있다.</td></tr>
+    </table>
+
+    <h3>PR 흐름 평가</h3>
+    <table>
+      <tr><th>단계</th><th>상태 해석</th><th>의미</th></tr>
+      <tr><td>PR1 · materialization audit</td><td><span class="tag green">shipped</span></td><td><code>render_scene_materialization.json</code>과 <code>xml_scene_index.json</code>로 실제 XML shape 상태를 기록하는 기반.</td></tr>
+      <tr><td>PR2 · XML-native preview infra</td><td><span class="tag amber">mostly shipped</span></td><td><code>MapEditor3D</code>가 <code>xml_scene_index.shapes[].mesh_path</code>를 읽어 Mitsuba와 같은 <code>mesh_cache</code> OBJ를 볼 수 있게 하는 방향.</td></tr>
+      <tr><td>PR2 editor integration</td><td><span class="tag red">regressed</span></td><td><code>datasets/+page.svelte</code>에서 <code>xmlSceneIndex</code>, <code>xmlNativePreviewEnabled</code>, project/scene id prop binding이 누락되면 Dataset 화면에서는 PR2가 비활성화된다.</td></tr>
+      <tr><td>PR2.5a</td><td><span class="tag amber">first priority</span></td><td>빠진 prop binding을 복구하고 실제 화면에서 mesh-cache endpoint 요청과 chair/table mesh 표시를 확인한다.</td></tr>
+      <tr><td>PR2.5b</td><td><span class="tag">audit first</span></td><td>Material extraction은 대수술 전에 missing/black/opacity/texture unresolved 패턴을 먼저 집계한다.</td></tr>
+      <tr><td>PR3</td><td><span class="tag">needed</span></td><td>Render, Dataset, Materialization readiness를 분리해 UI에서 각각 보여준다.</td></tr>
+    </table>
+
+    <h3>XML-native preview 기본값에 대한 판단</h3>
+    <p>
+      XML-native preview는 방향이 맞지만, 아직 default on으로 켜기에는 이르다.
+      최소한 아래 acceptance를 통과하기 전까지는 opt-in toggle로 유지하는 것이 안전하다.
+    </p>
+    <table>
+      <tr><th>Acceptance</th><th>통과 기준</th></tr>
+      <tr><td>대표 scene</td><td><code>office_lobby_001</code>, <code>moorelane_kitchen_001</code>에서 실제 mesh가 표시된다.</td></tr>
+      <tr><td>Fallback 표현</td><td>GLB fallback object는 cube로 보이되 warning/reason이 같이 표시된다.</td></tr>
+      <tr><td>실패 내성</td><td>OBJ fetch 실패가 전체 editor crash로 이어지지 않는다.</td></tr>
+      <tr><td>편집성</td><td>selected object inspector와 transform gizmo가 XML-loaded mesh에서도 정상 동작한다.</td></tr>
+      <tr><td>성능</td><td>대형 scene에서 mesh_cache OBJ preview가 interaction을 망치지 않는다.</td></tr>
+    </table>
+
+    <h3>지금 바로 해야 할 순서</h3>
+    <ol>
+      <li><strong>PR2.5a:</strong> <code>&lt;MapEditor3D&gt;</code>에 <code>xmlSceneIndex</code>, <code>xmlNativePreviewEnabled</code>, <code>opticalNavProjectId</code>, <code>opticalNavSceneId</code> binding을 복구한다.</li>
+      <li><strong>화면 검증:</strong> XML-native preview toggle ON 상태에서 mesh-cache endpoint 요청이 발생하는지, chair/table이 box가 아니라 mesh로 보이는지 확인한다.</li>
+      <li><strong>Stale index 검증:</strong> <code>xml_scene_index.xml_mtime_ns</code>와 <code>render_scene.xml</code> stat mtime이 다르면 <code>XML index may be stale. Re-sync render scene.</code> 경고를 띄운다.</li>
+      <li><strong>Material audit:</strong> missing material prim, black basecolor suspected, opacity &lt; 1, texture connection unresolved list를 먼저 모은다.</li>
+      <li><strong>Readiness 분리:</strong> UI에 <code>Render: ready · 102 OBJ / 0 fallback</code>, <code>Dataset: graph stale</code>, <code>Material: 81 ok / 21 fallback color</code>처럼 별도 축으로 노출한다.</li>
+    </ol>
+
+    <div class="alert">
+      장기적으로는 <code>authoring_map → sync → render_scene.xml 재생성</code>만으로는 XML-native editor가 완성되지 않는다.
+      최종 형태는 <code>XML shape 선택 → transform/material/emitter patch → render_scene.xml 직접 수정 → xml_scene_index 재생성</code>이다.
+      다만 이 전환은 위험하므로, 지금은 shape id와 marker 안정성을 유지하면서 PR5의 XML patch API로 천천히 넘어가는 것이 맞다.
+    </div>
+  </section>
+
+  <section id="ui-mvvm-audit">
+    <h2>Dataset Web UI 의존성 / MVVM 평가</h2>
+    <p class="small">
+      <code>apps/webui/src/routes/datasets/+page.svelte</code>는 리팩토링이 한 단계 더 진행되어
+      <code>$lib/datasets/services/*</code> 서비스 계층이 생겼다.
+      따라서 가장 큰 위반이었던 raw API 호출의 route 직접 결합은 크게 줄었다.
+      다만 route component 하나가 여전히 ViewModel orchestration, command 상태 업데이트,
+      여러 domain의 UI state를 동시에 갖고 있으므로 <strong>Model은 개선됐고 ViewModel은 아직 비대하다</strong>고 보는 것이 정확하다.
+    </p>
+
+    <div class="grid">
+      <div class="card"><div class="label">route file</div><div class="metric">5516</div><div class="note"><code>+page.svelte</code> total lines.</div></div>
+      <div class="card"><div class="label">script</div><div class="metric">3350</div><div class="note">state, derived, command orchestration.</div></div>
+      <div class="card"><div class="label">style</div><div class="metric">1199</div><div class="note">route-local CSS still large.</div></div>
+      <div class="card"><div class="label">services</div><div class="metric">8</div><div class="note">project/authoring/graph/render/etc.</div></div>
+    </div>
+
+    <h3>현재 route 의존성 지도</h3>
+    <table>
+      <tr><th>영역</th><th>현재 의존성</th><th>평가</th></tr>
+      <tr><td>View components</td><td><code>MapEditor3D</code>, <code>AssetCatalog</code>, <code>InspectorPanel</code>, <code>SensorsPanel</code>, <code>Rail*Tab</code>, <code>BottomPanel</code>, <code>ExportPanel</code></td><td>시각적 분리는 시작됨. 그러나 props/callback 수가 많아 page ViewModel에 강하게 결합되어 있다.</td></tr>
+      <tr><td>Helper modules</td><td><code>authoringHelpers.ts</code>, <code>mapEditorHelpers.ts</code>, <code>materialHelpers.ts</code>, <code>sensorHelpers.ts</code>, <code>batchHelpers.ts</code>, <code>workflowHelpers.ts</code></td><td>순수 함수 추출은 유효하다. <code>workflowHelpers.ts</code>와 map editor helpers는 ViewModel 부담을 줄인다.</td></tr>
+      <tr><td>Service layer</td><td><code>projectService</code>, <code>authoringMapService</code>, <code>graphService</code>, <code>renderService</code>, <code>assetService</code>, <code>episodeService</code>, <code>walkabilityService</code>, <code>validationService</code></td><td>API query/mutation은 대부분 서비스로 이동했다. Model 계층은 이전보다 크게 개선됐다.</td></tr>
+      <tr><td>API compatibility imports</td><td><code>$lib/api.ts</code> import block은 아직 남아 있으나, core CRUD/build/render command는 서비스 경유로 전환 중이다.</td><td>URL helper, job helper, legacy unused import를 정리해 import surface를 줄여야 한다.</td></tr>
+      <tr><td>State</td><td><code>$state</code> 91개, <code>$derived</code> 71개, <code>$effect</code> 19개</td><td>project, scene, authoring, graph, sensor, render, asset, material, env, batch 상태가 여전히 한 namespace에 산재한다.</td></tr>
+      <tr><td>Commands</td><td><code>saveAuthoringMap()</code>, <code>syncRenderScene()</code>, <code>buildGraph()</code>, <code>renderSensorViewpoint()</code>, <code>renderEpisodes()</code>, <code>refreshBatch()</code> 등</td><td>사용자 command와 data query가 같은 함수 안에서 섞이는 경우가 많다.</td></tr>
+      <tr><td>CSS</td><td>route-local style 1199 lines + child component scoped CSS</td><td>CSS scoping 충돌 위험은 줄었지만, route-level layout/rail/floating panel style은 여전히 비대하다.</td></tr>
+    </table>
+
+    <h3>서비스 추출 후 Model 계층</h3>
+    <table>
+      <tr><th>서비스</th><th>exports</th><th>책임</th></tr>
+      <tr><td><code>assetService.ts</code></td><td>7</td><td>USD candidates, map assets, editor geometry, envmap, material library, camera rig.</td></tr>
+      <tr><td><code>authoringMapService.ts</code></td><td>5</td><td>authoring map load/save/compile, annotation load/save.</td></tr>
+      <tr><td><code>episodeService.ts</code></td><td>7</td><td>episode list/detail/plan, observation scan/clear.</td></tr>
+      <tr><td><code>graphService.ts</code></td><td>8</td><td>graph fetch/build, node/edge CRUD, edge check, region rebuild. WebSocket build progress 포함.</td></tr>
+      <tr><td><code>projectService.ts</code></td><td>5</td><td>project/scene CRUD and USD attach.</td></tr>
+      <tr><td><code>renderService.ts</code></td><td>14</td><td>render readiness/config/stats, room shell, materialization audit, XML index, sync, sweep, batch logs.</td></tr>
+      <tr><td><code>validationService.ts</code></td><td>3</td><td>validate, evaluate, export dataset.</td></tr>
+      <tr><td><code>walkabilityService.ts</code></td><td>5</td><td>traversable map, walkability overlay fetch/paint/clear.</td></tr>
+    </table>
+
+    <h3>리팩토링 후 MVVM 점수</h3>
+    <table>
+      <tr><th>계층</th><th>이전 평가</th><th>현재 평가</th><th>판단</th></tr>
+      <tr><td>Model</td><td>2/10</td><td><span class="tag green">8/10</span></td><td>8개 service 파일로 API 호출 책임이 분리됐다. 다만 서비스는 아직 얇은 API wrapper 성격이 강하고 domain validation/mapper는 더 필요하다.</td></tr>
+      <tr><td>ViewModel</td><td>3/10</td><td><span class="tag amber">4~5/10</span></td><td>raw API 호출은 줄었지만 91개 state와 69개 async command가 route에 남아 있다. God ViewModel 문제는 계속 남는다.</td></tr>
+      <tr><td>View</td><td>7/10</td><td><span class="tag green">8/10</span></td><td>Rail/Panel 컴포넌트 분리는 진전됐다. 남은 문제는 props/callback 과다와 route-local CSS 비대화다.</td></tr>
+      <tr><td>종합</td><td>2.5/10</td><td><span class="tag amber">5~5.5/10</span></td><td>가장 큰 MVVM 위반은 해소됐지만, 상태 조직화와 command 분해가 다음 병목이다.</td></tr>
+    </table>
+
+    <h3>전체 UI 평가</h3>
+    <table>
+      <tr><th>항목</th><th>현재 상태</th><th>판단</th></tr>
+      <tr><td>정보 구조</td><td>Map/Object/Paths/Sensors/Lights/Preview/Export mode가 한 화면에 공존한다.</td><td>작업 흐름은 강력하지만, 각 mode의 입력 상태가 서로 얽혀 사용자가 현재 무엇을 편집 중인지 놓치기 쉽다.</td></tr>
+      <tr><td>3D editor 중심성</td><td><code>MapEditor3D</code>가 object placement, graph, sensor rays, hot camera, walkability paint를 모두 표시한다.</td><td>올바른 방향이다. 하지만 mode-specific overlay state를 분리하지 않으면 선택/드래그 충돌이 계속 생길 수 있다.</td></tr>
+      <tr><td>Right rail</td><td>분리된 <code>Rail*Tab</code> 컴포넌트가 생겼지만, 대부분 page state와 callbacks를 그대로 받는다.</td><td>View 분리는 됐고 ViewModel 분리는 아직 아니다.</td></tr>
+      <tr><td>Sensor UI</td><td>Dataset Sensors는 readonly rig summary + graph sweep으로 바뀌고, 실제 rig 편집은 <code>/camera_rig</code>로 이동했다.</td><td>좋은 분리다. Dataset 화면은 render execution/status에 집중해야 한다.</td></tr>
+      <tr><td>Asset UI</td><td>Built-in rich asset과 Library asset이 같이 보이기 시작했다.</td><td>카탈로그는 풍부해졌지만, thumbnail/materialization/readiness 상태가 asset card와 더 직접 연결되어야 한다.</td></tr>
+      <tr><td>Render feedback</td><td>BottomPanel, materialization audit, XML stats, frustum preview가 생겼다.</td><td>렌더 파이프라인 디버깅에는 좋아졌지만, job/source/rig/XML hash를 묶어 보여주는 추적성은 아직 부족하다.</td></tr>
+    </table>
+
+    <h3>MVVM 기준 위반 지점</h3>
+    <table>
+      <tr><th>위반</th><th>근거</th><th>Severity</th></tr>
+      <tr><td>Model call이 ViewModel에 직접 존재</td><td>대부분 서비스로 이동했다. 남은 것은 URL helper/job helper/legacy import 정리와 일부 command 내부의 request body 조립 책임이다.</td><td><span class="tag green">mostly resolved</span></td></tr>
+      <tr><td>God ViewModel</td><td>하나의 route script가 project/scene/authoring/material/asset/graph/sensor/render/export/batch/envmap/undo/session persistence를 모두 관리한다.</td><td><span class="tag red">HIGH</span></td></tr>
+      <tr><td>Command와 Query 미분리</td><td><code>syncRenderScene()</code>, <code>buildGraph()</code>, <code>setPageMode()</code>는 fetch, mutation, polling, UI mode 전환을 함께 수행한다.</td><td><span class="tag amber">MEDIUM</span></td></tr>
+      <tr><td>Domain 변환 로직이 route에 남음</td><td><code>addUsdAssetObject()</code>, <code>handleObjectTransform()</code>, <code>cameraSpecFromRigSensor()</code> 계열 로직이 authoring schema/render request contract를 직접 조립한다.</td><td><span class="tag amber">MEDIUM</span></td></tr>
+      <tr><td>View formatting과 readiness text가 ViewModel에 섞임</td><td>workflow readiness, status message, activity log, display labels가 state orchestration과 같은 파일에 있다.</td><td><span class="tag">LOW</span></td></tr>
+    </table>
+
+    <h3>남은 God Command 후보</h3>
+    <table>
+      <tr><th>함수</th><th>길이</th><th>문제</th></tr>
+      <tr><td><code>renderHotCameraPreview()</code></td><td>66 lines</td><td>camera spec 조립, request body 구성, render service 호출, hot-camera state update가 섞여 있다.</td></tr>
+      <tr><td><code>runProbeRender()</code></td><td>66 lines</td><td>free/editor probe request 조립과 batch state update가 한 함수에 있다.</td></tr>
+      <tr><td><code>renderSensorViewpoint()</code></td><td>49 lines</td><td>selected/custom node 분기, camera spec, graph sweep submit, result update가 섞인다.</td></tr>
+      <tr><td><code>renderEpisodes()</code></td><td>44 lines</td><td>graph sweep과 episode render 분기, render settings, batch polling 시작이 한 command에 있다.</td></tr>
+      <tr><td><code>saveAuthoringMap()</code></td><td>38 lines</td><td>save, dirty flag, readiness reload, config reload가 한 함수에 묶여 있다.</td></tr>
+      <tr><td><code>setPageMode()</code></td><td>33 lines</td><td>mode 변경과 lazy build/load/scan/start animation side effect가 함께 있다.</td></tr>
+    </table>
+
+    <h3>권장 MVVM 구조</h3>
+    <pre>apps/webui/src/routes/datasets/
+  +page.svelte
+    → View composition only: shell layout, component wiring, minimal lifecycle
+  pageStore.svelte.ts
+    → ViewModel: $state, $derived, selected mode, undo/redo, commands
+  viewModels/
+    authoringVm.svelte.ts
+    graphVm.svelte.ts
+    renderVm.svelte.ts
+    cameraRigVm.svelte.ts
+    assetCatalogVm.svelte.ts
+    materialVm.svelte.ts
+  services/
+    projectService.ts
+    authoringService.ts
+    graphService.ts
+    renderService.ts
+    assetService.ts
+    cameraRigService.ts
+    materialService.ts
+  mappers/
+    authoringMapper.ts
+    renderRequestMapper.ts
+    cameraRigMapper.ts
+    assetPlacementMapper.ts
+  components/
+    existing Rail*Tab / Inspector / Catalog / BottomPanel</pre>
+
+    <h3>리팩토링 단계</h3>
+    <table>
+      <tr><th>Phase</th><th>작업</th><th>목표</th></tr>
+      <tr><td>Phase 0</td><td>현재 route dependency map을 유지하면서 더 이상 새 API/model logic을 <code>+page.svelte</code>에 추가하지 않는다.</td><td>악화 방지.</td></tr>
+      <tr><td>Phase 1</td><td>상태를 안 건드리는 순수 함수 추출: asset label/size/source_ref, envmap file conversion, geometry patch, readiness label.</td><td>route script 1차 감량.</td></tr>
+      <tr><td>Phase 2</td><td>API query를 service로 분리: load project, load graph, load render stats, load materialization audit, load rig.</td><td>Model layer 복원.</td></tr>
+      <tr><td>Phase 2 status</td><td><span class="tag green">대부분 완료</span>: 8개 service 파일이 생겼고 API 호출 책임이 route에서 빠졌다.</td><td>Model layer는 8/10 수준으로 개선.</td></tr>
+      <tr><td>Phase 3</td><td>ViewModel slice 생성: authoring, graph, render, cameraRig, assetCatalog, material, batch.</td><td>상태 소유권을 domain별로 분리.</td></tr>
+      <tr><td>Phase 4</td><td>route는 component composition만 담당하고, rail/tab 컴포넌트는 필요한 VM slice만 받도록 props를 줄인다.</td><td>MVVM 구조 정착.</td></tr>
+      <tr><td>Phase 5</td><td>render job traceability를 VM/service에 통합: authoring hash, rig id, XML hash, materialization status를 UI에 노출.</td><td>렌더 디버깅 가능성 확보.</td></tr>
+    </table>
+
+    <div class="alert">
+      결론적으로 현재 UI는 서비스 추출 덕분에 <strong>Model 계층은 상당히 정상화</strong>됐다.
+      남은 핵심은 컴포넌트를 더 쪼개는 것보다 <strong>God Command 분해</strong>,
+      <strong>state domain grouping</strong>, <strong>pageStore.svelte.ts 기반 ViewModel slice</strong> 도입이다.
+      기능 동작보다 유지보수성/회귀 방지에 직접 영향을 주는 단계다.
+    </div>
+  </section>
+
+  <section id="architecture">
+    <h2>현재 건드리는 모듈들의 아키텍처</h2>
+    <table>
+      <tr><th>모듈</th><th>역할</th><th>이번 변경과 관련된 책임</th></tr>
+      <tr><td><code>apps/webui</code></td><td>OpticalNav authoring UI. Svelte + Three.js 기반 3D editor, right rail, bottom render job monitor.</td><td>Camera Rig 표시, object placement/gizmo, asset catalog, preview render request 생성.</td></tr>
+      <tr><td><code>modules/navigation_dataset</code></td><td>Authoring map schema, graph, sensor sweep request construction, episode planning.</td><td><code>base_height_m</code>, <code>metadata</code>, camera rig, custom preview id/render mode를 보존.</td></tr>
+      <tr><td><code>modules/mitsuba_converter</code></td><td>Render daemon, USD/GLB materialization, render scene XML generation, Mitsuba job execution.</td><td>Editor-generated XML, USD prim OBJ cache, GLB OBJ cache, readiness audit, graph/custom render commands.</td></tr>
+      <tr><td><code>robomituba_bridge</code></td><td>RenderRequest, SceneState, CameraSpec, RobotState 계약.</td><td>Sensor sweep에서 camera pose/render settings를 request로 전달받는 공통 타입 계층.</td></tr>
+    </table>
+  </section>
+
+  <section id="editor-arch">
+    <h2>Web Editor 구조</h2>
+    <table>
+      <tr><th>파일</th><th>책임</th></tr>
+      <tr><td><code>AssetCatalog.svelte</code></td><td>Build Catalog, Built-in Assets, Library Assets 표시 및 선택.</td></tr>
+      <tr><td><code>InspectorPanel.svelte</code></td><td>선택 object/region의 정밀 입력. Surface snap, grid snap, base height reset 포함.</td></tr>
+      <tr><td><code>SensorsPanel.svelte</code></td><td>Camera Rig 기반 sensor summary, sensor rays, graph sweep 실행 UI.</td></tr>
+      <tr><td><code>RailPreviewTab.svelte</code></td><td>Selected/free/editor-view probe render와 render scene stats 표시.</td></tr>
+      <tr><td><code>BottomPanel.svelte</code></td><td>Batch render progress grid, per-job stage timeline, logs.</td></tr>
+      <tr><td><code>sensorHelpers.ts</code></td><td>camera rig v1 → legacy sensor shape 변환, SPP default, sensor modality mapping.</td></tr>
+    </table>
+  </section>
+
+  <section id="mapeditor-mvvm">
+    <h2>MapEditor3D MVVM 요소 분석</h2>
+    <p class="small">
+      <code>MapEditor3D.svelte</code>는 현재 3D canvas View 역할만 하는 컴포넌트가 아니다.
+      Three.js renderer lifecycle, interaction state machine, geometry/material preview mapping, mesh cache loading,
+      frustum texture visualization까지 담당한다. 따라서 MVVM 기준으로는 <strong>View + ViewModel + Renderer Adapter + 일부 Model query</strong>가 섞인 상태다.
+    </p>
+
+    <div class="grid">
+      <div class="card"><div class="label">component size</div><div class="metric">2710</div><div class="note"><code>MapEditor3D.svelte</code> total lines.</div></div>
+      <div class="card"><div class="label">props</div><div class="metric">72</div><div class="note">mode, overlays, callbacks, render data all passed in.</div></div>
+      <div class="card"><div class="label">functions</div><div class="metric">82</div><div class="note">builders, interaction handlers, render updates.</div></div>
+      <div class="card"><div class="label">THREE objects</div><div class="metric">254</div><div class="note"><code>new THREE.*</code> calls.</div></div>
+    </div>
+
+    <h3>현재 내부 계층</h3>
+    <table>
+      <tr><th>MVVM 요소</th><th>현재 코드 위치/예시</th><th>평가</th></tr>
+      <tr><td>View</td><td><code>&lt;div bind:this={host}&gt;</code>, canvas host, pointer bindings, 40 lines CSS.</td><td>실제 Svelte template은 얇다. 화면의 대부분은 imperative Three.js scene으로 그려진다.</td></tr>
+      <tr><td>ViewModel</td><td><code>objectDrag</code>, <code>dragHandle</code>, <code>movementKeys</code>, hover/paint/region/edge/hot-camera state.</td><td>interaction state machine이 컴포넌트 내부에 있다. route ViewModel과 분리된 local VM으로 볼 수 있다.</td></tr>
+      <tr><td>Renderer Adapter</td><td><code>ensureThree()</code>, <code>rebuildScene()</code>, <code>buildPointObject()</code>, <code>updateFrustums()</code>, <code>disposeNode()</code>.</td><td>Three.js 세부 구현이 강하게 들어있다. 이것은 ViewModel과 별도 adapter 모듈로 빼기 좋다.</td></tr>
+      <tr><td>Model Query</td><td><code>getOpticalNavEditorGeometry()</code>, <code>loadCachedPrimMeshPayload()</code>, <code>loadObjMeshGeometry()</code>.</td><td>컴포넌트가 backend/cache query를 직접 호출한다. MVVM 기준으로 Model bleeding이다.</td></tr>
+      <tr><td>Domain Mapper</td><td><code>surfaceSnapForPoint()</code>, <code>objectProxySize()</code>, <code>buildObjectFromXmlShape()</code>, <code>buildFrustumForHeading()</code>.</td><td>authoring object, XML shape, observation scan을 Three.js object로 변환하는 mapper가 컴포넌트 안에 있다.</td></tr>
+    </table>
+
+    <h3>주요 결합 지점</h3>
+    <table>
+      <tr><th>결합</th><th>근거</th><th>영향</th></tr>
+      <tr><td>Props 과다</td><td>약 72개 props/callback: authoring, graph, sensor, preview, walkability, XML-native, object transform이 모두 들어온다.</td><td>mode 하나를 추가할 때마다 부모 route와 3D editor 양쪽 binding이 깨지기 쉽다. PR2 prop 누락도 이 구조에서 발생했다.</td></tr>
+      <tr><td>3D View와 Model Query 결합</td><td><code>loadEditorGeometry()</code>가 API를 직접 호출하고, prim/OBJ cache load도 내부에서 수행한다.</td><td>테스트가 어렵고, XML-native preview/debug 상태를 route/service와 일관되게 추적하기 어렵다.</td></tr>
+      <tr><td>Interaction mode 충돌 가능성</td><td>object drag, line handle, hot camera, paint, region select, add edge, frustum click이 같은 pointer pipeline을 공유한다.</td><td>사용자가 클릭/드래그할 때 엉뚱한 object/camera/frustum이 선택되는 문제가 생기기 쉽다.</td></tr>
+      <tr><td>Renderer cache lifetime 혼재</td><td><code>textureCache</code>, <code>primMeshCache</code>, <code>frustumHeadingMap</code>, <code>objMeshCache</code> trigger가 component lifecycle에 묶여 있다.</td><td>성능 최적화는 가능하지만, stale mesh/XML index 상태를 명확히 표시하기 어렵다.</td></tr>
+      <tr><td>Render truth와 editor truth 병행</td><td>기본 authoring preview와 <code>xmlNativePreviewEnabled</code> 경로가 같은 builder 안에서 fallback된다.</td><td>어떤 object가 authoring proxy인지 XML mesh인지 UI에서 명확히 분리해 보여줘야 한다.</td></tr>
+    </table>
+
+    <h3>권장 3D Editor 구조</h3>
+    <pre>MapEditor3D.svelte
+  → View shell only: canvas host, pointer bindings, props to controller
+
+mapEditorViewModel.svelte.ts
+  → local VM: active mode, drag state, hover/selection target, keyboard movement
+
+mapEditorController.ts
+  → pointer event routing:
+     object transform | line handle | hot camera | paint | region select | edge | frustum
+
+threeSceneAdapter.ts
+  → renderer/camera/controls/groups lifecycle, dispose, render loop
+
+mapEditorSceneBuilder.ts
+  → authoring objects / regions / graph / room shell → THREE.Object3D
+
+xmlNativePreviewAdapter.ts
+  → xml_scene_index shape → mesh_cache OBJ preview, stale index warning
+
+surfaceSnapModel.ts
+  → object proxy bounds, floor/tabletop target, snap label/base_height_m
+
+frustumOverlayAdapter.ts
+  → observationScan + graph headings + camera rig intrinsics → frustum meshes/textures</pre>
+
+    <h3>리팩토링 순서</h3>
+    <table>
+      <tr><th>단계</th><th>작업</th><th>이유</th></tr>
+      <tr><td>1</td><td><code>surfaceSnapModel.ts</code> 추출: <code>objectProxySize</code>, <code>objectBaseHeight</code>, <code>objectSurfaceTargets</code>, <code>surfaceSnapForPoint</code>.</td><td>현재 object placement/gizmo와 렌더 fallback size 계약을 연결하는 핵심 모델이다.</td></tr>
+      <tr><td>2</td><td><code>xmlNativePreviewAdapter.ts</code> 추출: XML shape index build, OBJ cache load request, placeholder/fallback semantics.</td><td>PR2.5a/PR3와 직접 연결된다. prop 누락과 stale XML 경고를 테스트하기 쉬워진다.</td></tr>
+      <tr><td>3</td><td><code>mapEditorController.ts</code>로 pointer event routing을 분리.</td><td>object/camera/frustum/edge/paint 선택 충돌을 줄인다.</td></tr>
+      <tr><td>4</td><td><code>threeSceneAdapter.ts</code>로 renderer lifecycle과 group dispose를 분리.</td><td>Three.js imperative code를 Svelte state orchestration에서 분리한다.</td></tr>
+      <tr><td>5</td><td>props를 domain object로 묶기: <code>sceneLayer</code>, <code>graphLayer</code>, <code>sensorLayer</code>, <code>xmlPreviewLayer</code>, <code>interactionConfig</code>.</td><td>72개 prop binding을 줄이고 PR2 같은 누락을 방지한다.</td></tr>
+    </table>
+
+    <div class="alert">
+      결론적으로 <code>MapEditor3D</code>는 route보다 상태 수는 적지만, 책임 밀도는 매우 높다.
+      리팩토링 목표는 컴포넌트를 작게 만드는 것보다 <strong>interaction controller</strong>,
+      <strong>scene builder</strong>, <strong>XML-native preview adapter</strong>를 분리해
+      “사용자 입력 → ViewModel patch → authoring/XML preview model → Three.js render”의 경계를 명확하게 만드는 것이다.
+    </div>
+  </section>
+
+  <section id="render-arch">
+    <h2>Render Daemon 구조</h2>
+    <table>
+      <tr><th>함수/상태</th><th>역할</th></tr>
+      <tr><td><code>_generate_opticalnav_render_scene_xml()</code></td><td>authoring objects/regions/material/environment/camera rig를 Mitsuba XML로 변환.</td></tr>
+      <tr><td><code>_proxy_box_xml_element()</code></td><td>각 point object를 OBJ shape 또는 cube fallback으로 생성.</td></tr>
+      <tr><td><code>_ensure_prim_obj_cached()</code></td><td>MooreLane USD 단일 파일에서 prim별 OBJ를 추출해 scene별 <code>mesh_cache</code>에 저장.</td></tr>
+      <tr><td><code>_materialize_glb_obj_for_overlay()</code></td><td>DTC GLB/GLTF를 <code>trimesh</code>로 OBJ 변환해 전역 <code>glb_obj_cache</code>에 저장.</td></tr>
+      <tr><td><code>scene_variant.json</code></td><td>현재 render scene이 editor-generated XML인지 catalog fallback인지 결정.</td></tr>
+      <tr><td><code>render_readiness.json</code></td><td>XML 존재, camera rig, asset/material status, proxy warning을 UI에 노출.</td></tr>
+    </table>
+  </section>
+
+  <section id="camera-arch">
+    <h2>Camera Rig / Sensor Render 구조</h2>
+    <pre>camera_rig_v1 sensor
+  sensor_type: rgb_camera | nir_camera | polar_camera | lidar_3d
+  intrinsics: fov/resolution/clip
+  mount: parent_frame + xyz_m + rpy_deg
+  render: path_spp/aov_spp/polar_spp
+
+sensorHelpers.legacySensorFromCameraRigSensor()
+  → authoring_map camera_rig sensor shape
+  → sensor_sweep camera template
+  → RenderRequest.camera_specs[0]</pre>
+    <div class="alert">
+      기본 <code>path_spp=4096</code>는 <code>normalizeRigRenderSettings()</code>의 fallback이다.
+      rig JSON의 <code>sensor.render</code>에 값이 있으면 이를 우선해야 한다.
+    </div>
+  </section>
+
+  <section id="graph-arch">
+    <h2>Graph / Sensor Sweep 구조</h2>
+    <table>
+      <tr><th>경로</th><th>설명</th></tr>
+      <tr><td><code>build_sweep_render_requests()</code></td><td>graph node + heading 기반. <code>node_heights</code>, <code>render_settings</code> 반영.</td></tr>
+      <tr><td><code>build_custom_position_render_requests()</code></td><td>free probe/editor view/custom camera 위치 기반. <code>preview_id</code>, <code>request_id</code>, <code>render_mode</code> 보존.</td></tr>
+      <tr><td><code>_sensor_pose_from_xy_yaw()</code></td><td>camera rig mount offset을 graph/world pose에 합성.</td></tr>
+      <tr><td><code>viewpoint_graph.json</code></td><td>렌더 완료 후 heading별 <code>sensor_observations</code> 갱신.</td></tr>
+    </table>
+  </section>
+
+  <section id="risks">
+    <h2>현재 리스크</h2>
+    <table>
+      <tr><th>리스크</th><th>근거</th><th>영향</th></tr>
+      <tr><td>DTC mesh fallback</td><td>현재 XML에서 DTC bottle/vase/dish가 cube fallback.</td><td>렌더 이미지 품질과 collision/occlusion이 에디터 의도와 다름.</td></tr>
+      <tr><td>Proxy size contract mismatch</td><td>Editor는 <code>metadata.proxy_size</code>, renderer는 <code>geometry.size_m</code> 중심.</td><td>fallback cube가 과대 스케일.</td></tr>
+      <tr><td>Readiness audit false positives</td><td>89 OBJ가 있음에도 proxy warning이 95 objects라고 표시.</td><td>진짜 문제와 정상 USD prim 추출을 구분하기 어려움.</td></tr>
+      <tr><td>MooreLane single USD dependency</td><td>수백 prim을 path로 직접 참조하며 on-demand 추출.</td><td>prim path 변경, stage open 비용, material extraction 실패에 취약.</td></tr>
+    </table>
+  </section>
+
+  <section id="next">
+    <h2>권장 다음 단계</h2>
+    <ol>
+      <li><strong>DTC GLB materialization audit를 readiness에 노출:</strong> <code>glb_obj_materialized</code>, <code>glb_obj_cache_hit</code>, <code>glb_missing</code>, <code>glb_empty</code>, <code>glb_materialize_error</code>를 저장한다.</li>
+      <li><strong>Fallback cube size 수정:</strong> OBJ materialization 실패 시 <code>metadata.proxy_size</code>를 먼저 사용한다.</li>
+      <li><strong>GLB render_scene 재생성 테스트:</strong> DTC object 1개만 둔 minimal scene을 sync하여 XML이 <code>&lt;shape type="obj"&gt;</code>가 되는지 확인한다.</li>
+      <li><strong>MooreLane built-in pre-extract:</strong> curated MooreLane object는 <code>usd#prim</code> 대신 사전 추출 OBJ + material sidecar manifest로 고정한다.</li>
+      <li><strong>Readiness proxy warning 재정의:</strong> XML 실제 shape count와 authoring object id별 materialization 상태를 기준으로 warning을 만든다.</li>
+      <li><strong>Camera Rig render settings 검증:</strong> UI에서 수정한 SPP/resolution/FOV가 graph sweep/custom preview request와 observation manifest에 남는지 acceptance test를 추가한다.</li>
+    </ol>
+  </section>
+
+  <div class="footer">
+    2026-06-05 · Robomituba Dev Report · OpticalNav Editor / Camera Rig / Asset Materialization
+  </div>
+</main>
+</div>
+</body>
+</html>

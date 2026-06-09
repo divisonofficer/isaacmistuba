@@ -1,0 +1,338 @@
+{
+  "version": "opticalnav-authoring-map-v0.2",
+  "scene_id": "shared_office_floor_001",
+  "unit": "meter",
+  "floorplan_ref": "/api/scenes/shared_office_floor_001/floorplan",
+  "objects": [
+    {
+      "id": "wall_north",
+      "type": "wall",
+      "label": "North wall",
+      "placement": "line",
+      "geometry": {"type": "line", "start": [0.0, 0.0], "end": [12.0, 0.0], "height_m": 2.8, "thickness_m": 0.12},
+      "material": "painted_wall",
+      "navigation": {"blocks_navigation": true},
+      "metadata": {"office_role": "shell"}
+    },
+    {
+      "id": "wall_south",
+      "type": "wall",
+      "label": "South wall",
+      "placement": "line",
+      "geometry": {"type": "line", "start": [0.0, 7.0], "end": [12.0, 7.0], "height_m": 2.8, "thickness_m": 0.12},
+      "material": "painted_wall",
+      "navigation": {"blocks_navigation": true},
+      "metadata": {"office_role": "shell"}
+    },
+    {
+      "id": "wall_west",
+      "type": "wall",
+      "label": "West wall",
+      "placement": "line",
+      "geometry": {"type": "line", "start": [0.0, 0.0], "end": [0.0, 7.0], "height_m": 2.8, "thickness_m": 0.12},
+      "material": "painted_wall",
+      "navigation": {"blocks_navigation": true},
+      "metadata": {"office_role": "shell"}
+    },
+    {
+      "id": "wall_east",
+      "type": "wall",
+      "label": "East wall",
+      "placement": "line",
+      "geometry": {"type": "line", "start": [12.0, 0.0], "end": [12.0, 7.0], "height_m": 2.8, "thickness_m": 0.12},
+      "material": "painted_wall",
+      "navigation": {"blocks_navigation": true},
+      "metadata": {"office_role": "shell"}
+    },
+    {
+      "id": "meeting_glass_front",
+      "type": "glass_wall",
+      "label": "Meeting room glass front",
+      "placement": "line",
+      "geometry": {"type": "line", "start": [1.0, 3.2], "end": [5.2, 3.2], "height_m": 2.5, "thickness_m": 0.05},
+      "material": "clear_glass",
+      "navigation": {"blocks_navigation": true, "hazard_type": "transparent_obstacle", "include_in_hazard_mask": true, "instruction_candidate": true},
+      "metadata": {"office_role": "glass_partition"}
+    },
+    {
+      "id": "meeting_glass_side",
+      "type": "glass_wall",
+      "label": "Meeting room glass side",
+      "placement": "line",
+      "geometry": {"type": "line", "start": [5.2, 0.4], "end": [5.2, 3.2], "height_m": 2.5, "thickness_m": 0.05},
+      "material": "frosted_glass",
+      "navigation": {"blocks_navigation": true, "hazard_type": "transparent_obstacle", "include_in_hazard_mask": true, "instruction_candidate": true},
+      "metadata": {"office_role": "glass_partition"}
+    },
+    {
+      "id": "glass_door_meeting",
+      "type": "glass_door",
+      "label": "Meeting glass door",
+      "placement": "line",
+      "geometry": {"type": "line", "start": [3.2, 3.2], "end": [4.0, 3.2], "height_m": 2.3, "thickness_m": 0.04},
+      "material": "clear_glass",
+      "navigation": {"blocks_navigation": true, "hazard_type": "glass_door", "include_in_hazard_mask": true, "instruction_candidate": true},
+      "metadata": {"office_role": "door"}
+    },
+    {
+      "id": "reflective_lobby_wall",
+      "type": "mirror_wall",
+      "label": "Polished reflective lobby wall",
+      "placement": "line",
+      "geometry": {"type": "line", "start": [7.0, 0.3], "end": [11.5, 0.3], "height_m": 2.4, "thickness_m": 0.06},
+      "material": "mirror",
+      "navigation": {"blocks_navigation": true, "hazard_type": "reflective_obstacle", "include_in_hazard_mask": true, "instruction_candidate": true},
+      "metadata": {"office_role": "reflective_surface"}
+    },
+    {
+      "id": "open_desk_cluster",
+      "type": "table",
+      "label": "Open desk cluster placeholder",
+      "placement": "point",
+      "geometry": {"type": "point", "center": [8.2, 4.6], "yaw_deg": 0, "size_m": [2.6, 0.74, 1.2]},
+      "material": "pbrdf_2020:peek",
+      "navigation": {"blocks_navigation": true, "instruction_candidate": true, "goal_candidate": true},
+      "source_ref": "out/moorelane_full_export/objs/materials_diningTable_mtl.obj",
+      "metadata": {"office_role": "desk", "asset_source_path": "/ROOT/Dining/Table_Set", "source_dataset": "MooreLane", "material_hint": "wood", "proxy_size": [2.6, 0.74, 1.2]}
+    },
+    {
+      "id": "conference_table",
+      "type": "table",
+      "label": "Conference table placeholder",
+      "placement": "point",
+      "geometry": {"type": "point", "center": [2.8, 1.7], "yaw_deg": 0, "size_m": [2.8, 0.74, 1.2]},
+      "material": "pbrdf_2020:peek",
+      "navigation": {"blocks_navigation": true, "instruction_candidate": true, "goal_candidate": true},
+      "source_ref": "out/moorelane_full_export/objs/materials_diningTable_mtl.obj",
+      "metadata": {"office_role": "desk", "asset_source_path": "/ROOT/Dining/Table_Set", "source_dataset": "MooreLane", "material_hint": "wood", "proxy_size": [2.8, 0.74, 1.2]}
+    },
+    {
+      "id": "office_chair_001",
+      "type": "chair",
+      "label": "Office chair placeholder",
+      "placement": "point",
+      "geometry": {"type": "point", "center": [7.5, 5.45], "yaw_deg": 180, "size_m": [0.55, 0.95, 0.55]},
+      "material": "hpbrdf_2025:black_rough_plastic",
+      "navigation": {"blocks_navigation": true, "instruction_candidate": true, "goal_candidate": true},
+      "source_ref": "out/moorelane_full_export/objs/materials_blanketA_chair_mtl.obj",
+      "metadata": {"office_role": "office_chair", "asset_source_path": "/ROOT/LivingRoom/Chairs/AccentArmchair", "source_dataset": "MooreLane", "material_hint": "fabric", "proxy_size": [0.55, 0.95, 0.55], "asset_gap": "replace_with_task_chair_when_available"}
+    },
+    {
+      "id": "office_chair_002",
+      "type": "chair",
+      "label": "Office chair placeholder",
+      "placement": "point",
+      "geometry": {"type": "point", "center": [8.9, 3.75], "yaw_deg": 0, "size_m": [0.55, 0.95, 0.55]},
+      "material": "hpbrdf_2025:black_rough_plastic",
+      "navigation": {"blocks_navigation": true, "instruction_candidate": true, "goal_candidate": true},
+      "source_ref": "out/moorelane_full_export/objs/materials_blanketA_chair_mtl.obj",
+      "metadata": {"office_role": "office_chair", "asset_source_path": "/ROOT/LivingRoom/Chairs/AccentArmchair", "source_dataset": "MooreLane", "material_hint": "fabric", "proxy_size": [0.55, 0.95, 0.55], "asset_gap": "replace_with_task_chair_when_available"}
+    },
+    {
+      "id": "monitor_pair",
+      "type": "landmark",
+      "label": "Monitor pair placeholder",
+      "placement": "point",
+      "geometry": {"type": "point", "center": [8.2, 4.05], "yaw_deg": 180, "base_height_m": 0.74, "size_m": [0.9, 0.45, 0.08]},
+      "material": "pbrdf_2020:black_billiard",
+      "navigation": {"blocks_navigation": false, "instruction_candidate": true, "goal_candidate": true},
+      "metadata": {"office_role": "monitor_computer", "proxy_size": [0.9, 0.45, 0.08], "asset_gap": "replace_with_monitor_or_big_screen_asset"}
+    },
+    {
+      "id": "storage_sideboard",
+      "type": "shelf",
+      "label": "Office storage sideboard",
+      "placement": "point",
+      "geometry": {"type": "point", "center": [10.8, 5.9], "yaw_deg": 90, "size_m": [1.4, 0.9, 0.16]},
+      "material": "pbrdf_2020:peek",
+      "navigation": {"blocks_navigation": true, "instruction_candidate": true, "goal_candidate": true},
+      "source_ref": "out/moorelane_full_export/objs/materials_cabinets_mtl.obj",
+      "metadata": {"office_role": "storage", "asset_source_path": "/ROOT/Dining/Storage/Sideboard_L", "source_dataset": "MooreLane", "material_hint": "wood", "proxy_size": [1.4, 0.9, 0.16]}
+    },
+    {
+      "id": "printer_placeholder",
+      "type": "landmark",
+      "label": "Printer copier placeholder",
+      "placement": "point",
+      "geometry": {"type": "point", "center": [10.7, 5.3], "yaw_deg": 90, "base_height_m": 0.9, "size_m": [0.65, 0.45, 0.5]},
+      "material": "pbrdf_2020:white_billiard",
+      "navigation": {"blocks_navigation": false, "instruction_candidate": true, "goal_candidate": true},
+      "metadata": {"office_role": "printer_copier", "asset_gap": "external_asset_needed"}
+    },
+    {
+      "id": "fire_safety_placeholder",
+      "type": "landmark",
+      "label": "Fire extinguisher placeholder",
+      "placement": "point",
+      "geometry": {"type": "point", "center": [0.7, 6.2], "yaw_deg": 0, "size_m": [0.2, 0.7, 0.2]},
+      "material": "pbrdf_2020:red_billiard",
+      "navigation": {"blocks_navigation": false, "instruction_candidate": true, "goal_candidate": true},
+      "metadata": {"office_role": "fire_safety", "asset_gap": "external_asset_needed"}
+    },
+    {
+      "id": "ceiling_light_strip_001",
+      "type": "landmark",
+      "label": "Ceiling light strip",
+      "placement": "point",
+      "geometry": {"type": "point", "center": [4.0, 5.4], "yaw_deg": 0, "base_height_m": 2.65, "size_m": [1.6, 0.06, 0.18]},
+      "material": "pbrdf_2020:brass",
+      "navigation": {"blocks_navigation": false, "instruction_candidate": true},
+      "is_emitter": true,
+      "emitter_radiance": [15.0, 14.0, 12.0],
+      "emitter_intensity": 1.2,
+      "metadata": {"office_role": "ceiling_light", "normalized_y_min": 2.55}
+    },
+    {
+      "id": "ceiling_light_strip_002",
+      "type": "landmark",
+      "label": "Ceiling light strip",
+      "placement": "point",
+      "geometry": {"type": "point", "center": [8.4, 5.4], "yaw_deg": 0, "base_height_m": 2.65, "size_m": [1.6, 0.06, 0.18]},
+      "material": "pbrdf_2020:brass",
+      "navigation": {"blocks_navigation": false, "instruction_candidate": true},
+      "is_emitter": true,
+      "emitter_radiance": [15.0, 14.0, 12.0],
+      "emitter_intensity": 1.2,
+      "metadata": {"office_role": "ceiling_light", "normalized_y_min": 2.55}
+    },
+    {
+      "id": "lobby_planter",
+      "type": "plant",
+      "label": "Lobby planter",
+      "placement": "point",
+      "geometry": {"type": "point", "center": [6.5, 1.1], "yaw_deg": 0, "size_m": [0.6, 1.4, 0.6]},
+      "material": "pbrdf_2020:ceramic_alumina",
+      "navigation": {"blocks_navigation": true, "instruction_candidate": true, "goal_candidate": true},
+      "source_ref": "vendor_datasets/dtc_objects/Planter_B0C4G81ZPF_Cat/3d-asset.glb",
+      "metadata": {"office_role": "decor_plant", "source_dataset": "DTC", "metadata_ref": "vendor_datasets/dtc_objects/Planter_B0C4G81ZPF_Cat/metadata.json", "license_ref": "vendor_datasets/dtc_objects/Planter_B0C4G81ZPF_Cat/CC_BY-SA.txt", "material_hint": "ceramic", "proxy_size": [0.6, 1.4, 0.6]}
+    }
+    ,
+    {
+      "id": "desk_keyboard_001",
+      "type": "landmark",
+      "label": "Desk keyboard",
+      "placement": "point",
+      "geometry": {"type": "point", "center": [8.0, 4.15], "yaw_deg": 180, "base_height_m": 0.77, "size_m": [0.45, 0.04, 0.16]},
+      "material": "pbrdf_2020:black_billiard",
+      "source_ref": "vendor_datasets/dtc_objects/Keyboard_B07P6K5GMY_Black/3d-asset.glb",
+      "navigation": {"blocks_navigation": false, "instruction_candidate": true, "goal_candidate": false},
+      "metadata": {"office_role": "keyboard_mouse", "source_dataset": "DTC", "metadata_ref": "vendor_datasets/dtc_objects/Keyboard_B07P6K5GMY_Black/metadata.json", "license_ref": "vendor_datasets/dtc_objects/Keyboard_B07P6K5GMY_Black/CC_BY-SA.txt", "material_hint": "plastic"}
+    },
+    {
+      "id": "desk_mouse_001",
+      "type": "landmark",
+      "label": "Desk mouse",
+      "placement": "point",
+      "geometry": {"type": "point", "center": [8.45, 4.14], "yaw_deg": 180, "base_height_m": 0.77, "size_m": [0.12, 0.04, 0.08]},
+      "material": "pbrdf_2020:black_billiard",
+      "source_ref": "vendor_datasets/dtc_objects/Mouse_B07KM3S6DP_Black/3d-asset.glb",
+      "navigation": {"blocks_navigation": false, "instruction_candidate": true, "goal_candidate": false},
+      "metadata": {"office_role": "keyboard_mouse", "source_dataset": "DTC", "metadata_ref": "vendor_datasets/dtc_objects/Mouse_B07KM3S6DP_Black/metadata.json", "license_ref": "vendor_datasets/dtc_objects/Mouse_B07KM3S6DP_Black/CC_BY-SA.txt", "material_hint": "plastic"}
+    },
+    {
+      "id": "conference_book_001",
+      "type": "landmark",
+      "label": "Conference book",
+      "placement": "point",
+      "geometry": {"type": "point", "center": [2.4, 1.55], "yaw_deg": 10, "base_height_m": 0.77, "size_m": [0.24, 0.04, 0.18]},
+      "material": "pbrdf_2020:white_billiard",
+      "source_ref": "vendor_datasets/dtc_objects/Book_0262035618_DeepLearning_2/3d-asset.glb",
+      "navigation": {"blocks_navigation": false, "instruction_candidate": true, "goal_candidate": false},
+      "metadata": {"office_role": "decor_document", "source_dataset": "DTC", "metadata_ref": "vendor_datasets/dtc_objects/Book_0262035618_DeepLearning_2/metadata.json", "license_ref": "vendor_datasets/dtc_objects/Book_0262035618_DeepLearning_2/CC_BY-SA.txt", "material_hint": "paper"}
+    },
+    {
+      "id": "storage_calculator_001",
+      "type": "landmark",
+      "label": "Storage calculator",
+      "placement": "point",
+      "geometry": {"type": "point", "center": [10.65, 5.45], "yaw_deg": 90, "base_height_m": 0.92, "size_m": [0.16, 0.04, 0.22]},
+      "material": "pbrdf_2020:black_billiard",
+      "source_ref": "vendor_datasets/dtc_objects/Calculator_B00000JBNX_Black/3d-asset.glb",
+      "navigation": {"blocks_navigation": false, "instruction_candidate": true, "goal_candidate": false},
+      "metadata": {"office_role": "office_electronics", "source_dataset": "DTC", "metadata_ref": "vendor_datasets/dtc_objects/Calculator_B00000JBNX_Black/metadata.json", "license_ref": "vendor_datasets/dtc_objects/Calculator_B00000JBNX_Black/CC_BY-SA.txt", "material_hint": "plastic"}
+    },
+    {
+      "id": "lounge_speaker_001",
+      "type": "landmark",
+      "label": "Lounge speaker",
+      "placement": "point",
+      "geometry": {"type": "point", "center": [6.85, 1.45], "yaw_deg": 35, "base_height_m": 0.05, "size_m": [0.28, 0.22, 0.18]},
+      "material": "pbrdf_2020:black_billiard",
+      "source_ref": "vendor_datasets/dtc_objects/Speaker_B08H82ZRS2_Black_1/3d-asset.glb",
+      "navigation": {"blocks_navigation": false, "instruction_candidate": true, "goal_candidate": false},
+      "metadata": {"office_role": "office_electronics", "source_dataset": "DTC", "metadata_ref": "vendor_datasets/dtc_objects/Speaker_B08H82ZRS2_Black_1/metadata.json", "license_ref": "vendor_datasets/dtc_objects/Speaker_B08H82ZRS2_Black_1/CC_BY-SA.txt", "material_hint": "plastic"}
+    }
+  ],
+  "regions": [
+    {
+      "id": "floor_main",
+      "type": "traversable",
+      "label": "Shared office walkable floor",
+      "placement": "rectangle",
+      "geometry": {"type": "rectangle", "bounds": [0.2, 0.2, 11.8, 6.8]},
+      "floor_material_id": "tile",
+      "navigation": {"blocks_navigation": false},
+      "metadata": {"office_role": "walkable_floor"}
+    },
+    {
+      "id": "goal_lounge",
+      "type": "goal",
+      "label": "Goal at lounge",
+      "placement": "rectangle",
+      "geometry": {"type": "rectangle", "bounds": [6.1, 0.7, 7.0, 1.6]},
+      "navigation": {"goal_candidate": true, "instruction_candidate": true},
+      "metadata": {"office_role": "goal"}
+    },
+    {
+      "id": "goal_desk",
+      "type": "goal",
+      "label": "Goal at open desks",
+      "placement": "rectangle",
+      "geometry": {"type": "rectangle", "bounds": [8.7, 5.1, 9.6, 6.0]},
+      "navigation": {"goal_candidate": true, "instruction_candidate": true},
+      "metadata": {"office_role": "goal"}
+    }
+  ],
+  "materials": [
+    {"material_id": "clear_glass", "category": "transparent", "render_binding": {"kind": "preset", "bsdf_strategy": "dielectric", "capabilities": {"rgb": true, "nir": true, "polarization": true}}},
+    {"material_id": "frosted_glass", "category": "transparent", "render_binding": {"kind": "preset", "bsdf_strategy": "roughdielectric", "capabilities": {"rgb": true, "nir": true, "polarization": true}}},
+    {"material_id": "mirror", "category": "reflective", "render_binding": {"kind": "preset", "bsdf_strategy": "conductor", "capabilities": {"rgb": true, "nir": true, "polarization": true}}},
+    {"material_id": "painted_wall", "category": "opaque", "render_binding": {"kind": "preset", "bsdf_strategy": "roughplastic", "capabilities": {"rgb": true}}},
+    {"material_id": "wood", "category": "opaque", "render_binding": {"kind": "preset", "bsdf_strategy": "roughplastic", "capabilities": {"rgb": true}}},
+    {"material_id": "fabric", "category": "opaque", "render_binding": {"kind": "preset", "bsdf_strategy": "roughplastic", "capabilities": {"rgb": true}}},
+    {"material_id": "tile", "category": "opaque", "render_binding": {"kind": "preset", "bsdf_strategy": "roughplastic", "capabilities": {"rgb": true}}},
+    {"material_id": "pbrdf_2020:black_billiard", "category": "measured", "render_binding": {"kind": "measured", "dataset_id": "pbrdf_2020", "material_id": "black_billiard", "bsdf_strategy": "measured_polarized", "native_file": "data/pbrdf_2020/mitsuba/4_black_billiard_inpainted.pbsdf", "capabilities": {"rgb": true, "polarization": true}}},
+    {"material_id": "pbrdf_2020:white_billiard", "category": "measured", "render_binding": {"kind": "measured", "dataset_id": "pbrdf_2020", "material_id": "white_billiard", "bsdf_strategy": "measured_polarized", "native_file": "data/pbrdf_2020/mitsuba/2_white_billiard_inpainted.pbsdf", "capabilities": {"rgb": true, "polarization": true}}},
+    {"material_id": "pbrdf_2020:brass", "category": "measured", "render_binding": {"kind": "measured", "dataset_id": "pbrdf_2020", "material_id": "brass", "bsdf_strategy": "measured_polarized", "native_file": "data/pbrdf_2020/mitsuba/5_brass_inpainted.pbsdf", "capabilities": {"rgb": true, "polarization": true}}},
+    {"material_id": "pbrdf_2020:red_billiard", "category": "measured", "render_binding": {"kind": "measured", "dataset_id": "pbrdf_2020", "material_id": "red_billiard", "bsdf_strategy": "measured_polarized", "native_file": "data/pbrdf_2020/mitsuba/8_red_billiard_inpainted.pbsdf", "capabilities": {"rgb": true, "polarization": true}}},
+    {"material_id": "pbrdf_2020:ceramic_alumina", "category": "measured", "render_binding": {"kind": "measured", "dataset_id": "pbrdf_2020", "material_id": "ceramic_alumina", "bsdf_strategy": "measured_polarized", "native_file": "data/pbrdf_2020/mitsuba/14_ceramic_alumina_inpainted.pbsdf", "capabilities": {"rgb": true, "polarization": true}}},
+    {"material_id": "pbrdf_2020:peek", "category": "measured", "render_binding": {"kind": "measured", "dataset_id": "pbrdf_2020", "material_id": "peek", "bsdf_strategy": "measured_polarized", "native_file": "data/pbrdf_2020/mitsuba/17_peek_inpainted.pbsdf", "capabilities": {"rgb": true, "polarization": true}}},
+    {"material_id": "hpbrdf_2025:black_rough_plastic", "category": "measured", "render_binding": {"kind": "measured", "dataset_id": "hpbrdf_2025", "material_id": "black_rough_plastic", "bsdf_strategy": "measured_polarized", "channels_dir": "data/hpbrdf_2025/channels/black_rough_plastic", "capabilities": {"rgb": true, "nir": true, "polarization": true}}},
+    {"material_id": "hpbrdf_2025:black_glass", "category": "measured", "render_binding": {"kind": "measured", "dataset_id": "hpbrdf_2025", "material_id": "black_glass", "bsdf_strategy": "measured_polarized", "channels_dir": "data/hpbrdf_2025/channels/black_glass", "capabilities": {"rgb": true, "nir": true, "polarization": true}}}
+  ],
+  "environment": {"mode": "constant", "radiance": [0.9, 0.92, 0.95], "intensity": 0.9, "rotation_deg": 0, "background_visible": true},
+  "camera_rig": {
+    "rig_id": "shared_office_default",
+    "base_frame": "base_link",
+    "sensors": [
+      {"sensor_id": "rgb_front", "label": "RGB Front", "modality": "rgb", "mount": {"xyz_m": [0.18, 1.0, 0.0], "rpy_deg": [0, 0, 0]}, "fov_deg": 70, "resolution": [1280, 720], "clip_range": [0.05, 80]},
+      {"sensor_id": "pol_front", "label": "Polarization Front", "modality": "polarization", "mount": {"xyz_m": [0.16, 1.02, -0.04], "rpy_deg": [0, 0, 0]}, "fov_deg": 70, "resolution": [1280, 720], "clip_range": [0.05, 80]}
+    ]
+  },
+  "settings": {
+    "map_w": 14,
+    "map_h": 8,
+    "grid_size_m": 0.25,
+    "default_wall_height_m": 2.8,
+    "default_wall_thickness_m": 0.12,
+    "room_shell_enabled": true,
+    "auto_floor_enabled": true,
+    "default_floor_material_id": "tile",
+    "default_ceiling_material_id": "painted_wall"
+  },
+  "metadata": {
+    "source": "shared_office_asset_validation_seed",
+    "purpose": "Validate editor to Mitsuba asset/material flow for a modern glass-heavy coworking office floor.",
+    "known_asset_gaps": ["printer_copier", "fire_extinguisher", "production_office_chair", "desktop_monitor"]
+  }
+}

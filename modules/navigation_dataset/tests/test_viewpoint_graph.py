@@ -21,7 +21,7 @@ from navigation_dataset.edge_builder import build_viewpoint_edges  # noqa: E402
 from navigation_dataset.graph_episode_sampler import plan_graph_episodes, shortest_graph_path, write_graph_episodes  # noqa: E402
 from navigation_dataset.node_sampler import heading_sweep, sample_viewpoint_nodes  # noqa: E402
 from navigation_dataset.scene_annotations import GoalRegion, HazardRegion, SceneAnnotation, TraversableRegion, write_scene_annotation  # noqa: E402
-from navigation_dataset.sensor_sweep import build_sweep_render_requests, render_viewpoint_sweep_direct  # noqa: E402
+from navigation_dataset.sensor_sweep import build_custom_position_render_requests, build_sweep_render_requests, render_viewpoint_sweep_direct  # noqa: E402
 from navigation_dataset.traversability import build_traversability_grid, save_traversability_grid  # noqa: E402
 from navigation_dataset.validation import validate_dataset  # noqa: E402
 from navigation_dataset.viewpoint_graph import ViewpointGraph, ViewpointNode, read_viewpoint_graph, write_viewpoint_graph  # noqa: E402
@@ -157,6 +157,45 @@ class ViewpointGraphTests(unittest.TestCase):
             self.assertTrue(restored.path_nodes)
             report = validate_dataset(root, require_observations=True)
             self.assertTrue(report.ok, report.errors)
+
+    def test_custom_position_preview_metadata_is_preserved(self) -> None:
+        scene_state = {
+            "job_id": "job-preview-test",
+            "scene_id": "preview_room_001",
+            "frame_id": "frame_0",
+            "timestamp": "2026-05-27T00:00:00+00:00",
+            "scene_snapshot_ref": "snapshot/scene.json",
+            "mitsuba_scene_ref": "scene.xml",
+        }
+        camera_spec = {
+            "camera_id": "rig_front",
+            "name": "Rig Front",
+            "camera_to_world": [1, 0, 0, 0, 0, 1, 0, 0.8, 0, 0, 1, 0, 0, 0, 0, 1],
+            "fov_deg": 75.0,
+        }
+        requests = build_custom_position_render_requests(
+            [{
+                "node_id": "probe_123",
+                "heading_id": "h0",
+                "preview_id": "probe_123",
+                "render_mode": "preview_probe",
+                "x": 1.25,
+                "y": 2.5,
+                "yaw_deg": 35,
+            }],
+            scene_state_payload=scene_state,
+            camera_spec_payload=camera_spec,
+            modalities=["rgb"],
+            scene_id="preview_room_001",
+            camera_height_m=0.8,
+        )
+        self.assertEqual(len(requests), 1)
+        request = requests[0].request
+        self.assertEqual(requests[0].node_id, "probe_123")
+        self.assertEqual(requests[0].heading_id, "h0")
+        self.assertEqual(request.extras["render_mode"], "preview_probe")
+        self.assertEqual(request.extras["preview_id"], "probe_123")
+        self.assertEqual(request.camera_specs[0].camera_id, "rig_front")
 
 
 if __name__ == "__main__":

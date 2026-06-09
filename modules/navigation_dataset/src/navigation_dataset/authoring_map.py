@@ -175,6 +175,9 @@ class AuthoringRegion:
     geometry: AuthoringGeometry
     navigation: AuthoringNavigationFlags = field(default_factory=AuthoringNavigationFlags)
     metadata: JsonDict = field(default_factory=dict)
+    # Per-region floor material override (effective when type == "traversable", and
+    # later when type == "room"). None → fall back to settings.default_floor_material_id.
+    floor_material_id: str | None = None
 
 
 @dataclass
@@ -192,6 +195,10 @@ class AuthoringMap:
         "grid_size_m": 0.25,
         "default_wall_height_m": 2.4,
         "default_wall_thickness_m": 0.08,
+        # Phase 1: shell flags are now independent.
+        "room_shell_enabled": True,       # walls + ceiling
+        "auto_floor_enabled": True,       # floor slab
+        "default_floor_material_id": "default_floor",
     })
     metadata: JsonDict = field(default_factory=dict)
 
@@ -388,6 +395,7 @@ def _normalize_region(payload: Any) -> AuthoringRegion:
         return payload
     data = dict(payload or {})
     region_type = str(data.get("type") or "")
+    floor_mid = data.get("floor_material_id")
     return AuthoringRegion(
         id=str(data.get("id") or ""),
         type=region_type,
@@ -396,6 +404,7 @@ def _normalize_region(payload: Any) -> AuthoringRegion:
         geometry=_normalize_geometry(data.get("geometry")),
         navigation=_normalize_navigation(data.get("navigation")),
         metadata=dict(data.get("metadata", {})),
+        floor_material_id=str(floor_mid) if floor_mid else None,
     )
 
 

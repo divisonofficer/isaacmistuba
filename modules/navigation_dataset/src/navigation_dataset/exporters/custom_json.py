@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import asdict
 import json
 from pathlib import Path
+from typing import Iterable
 import zipfile
 
 from ..episode_schema import DatasetProject, EpisodeManifest, read_episode, read_project, write_project
@@ -17,19 +18,145 @@ def find_episode_files(dataset_root: str | Path) -> list[Path]:
     return sorted((root / "episodes").glob("*/*.json"))
 
 
-def build_dataset_index(dataset_root: str | Path) -> dict:
+_OBS_FILE_SUFFIXES = (".png", ".exr", ".jpg", ".jpeg", ".npy")
+
+
+def is_episode_complete(episode: EpisodeManifest, dataset_root: Path) -> bool:
+    """Return True when every step in the episode path has rendered observations
+    on disk.
+
+    Two data sources both turn out to be unreliable on the current pipeline so
+    we ignore them and look at the disk directly:
+
+    * ``episode.timesteps[i].observation_bundle_ref`` is filled at episode
+      *creation* time from ``graph.sensor_observations``. If the user creates
+      an episode first and renders later, the field stays empty in the saved
+      episode JSON.
+    * ``viewpoint_graph.json`` 's ``sensor_observations`` is only kept fresh by
+      the in-process ``render_viewpoint_sweep_direct`` path. The daemon-based
+      batch path (graph_sweep / episode_nodes) writes files to
+      ``scenes/<scene>/observations/<vp>/<h>/`` but never calls back to update
+      the graph.
+
+    Disk presence in ``scenes/<scene>/observations/<vp_id>/<heading_id>/`` is
+    the source of truth — that's where ``_opticalnav_copy_observation_rgb``
+    consolidates rendered modalities for every job.
+    """
+    project_dir = Path(dataset_root).resolve()
+
+    # Graph-mode episodes — check each (node, heading) along the path against
+    # the consolidated observations directory.
+    if (
+        episode.path_nodes
+        and episode.path_headings
+        and len(episode.path_nodes) == len(episode.path_headings)
+        and episode.scene_id
+    ):
+        obs_root = project_dir / "scenes" / str(episode.scene_id) / "observations"
+        if not obs_root.exists():
+            return False
+        for node_id, heading_id in zip(episode.path_nodes, episode.path_headings):
+            heading_dir = obs_root / str(node_id) / str(heading_id)
+            if not heading_dir.is_dir():
+                return False
+            # At least one rendered modality file present (rgb.png etc.).
+            has_modality = any(
+                p.is_file() and p.suffix.lower() in _OBS_FILE_SUFFIXES
+                for p in heading_dir.iterdir()
+            )
+            if not has_modality:
+                return False
+        return True
+
+    # Trajectory mode — fall back to the timestep ref check.
+    timesteps = episode.timesteps or []
+    if not timesteps:
+        return False
+    repo_root = project_dir.parent.parent
+    for step in timesteps:
+        ref = (step.observation_bundle_ref or "").strip()
+        if not ref:
+            return False
+        ref_path = Path(ref)
+        if ref_path.is_absolute():
+            candidates = [ref_path]
+        else:
+            candidates = [project_dir / ref_path, repo_root / ref_path]
+        if not any(p.exists() for p in candidates):
+            return False
+    return True
+
+
+def _filter_episode_files(
+    dataset_root: Path,
+    *,
+    episode_ids: Iterable[str] | None,
+    only_completed: bool,
+    scene_ids: Iterable[str] | None = None,
+) -> list[Path]:
+    paths = find_episode_files(dataset_root)
+    if episode_ids is None and not only_completed and scene_ids is None:
+        return paths
+    allow_episode = set(str(eid) for eid in episode_ids) if episode_ids is not None else None
+    allow_scene = set(str(sid) for sid in scene_ids) if scene_ids is not None else None
+    kept: list[Path] = []
+    for path in paths:
+        try:
+            episode = read_episode(path)
+        except Exception:
+            continue
+        if allow_episode is not None and episode.episode_id not in allow_episode:
+            continue
+        if allow_scene is not None and episode.scene_id not in allow_scene:
+            continue
+        if only_completed and not is_episode_complete(episode, dataset_root):
+            continue
+        kept.append(path)
+    return kept
+
+
+def build_dataset_index(
+    dataset_root: str | Path,
+    *,
+    episode_ids: Iterable[str] | None = None,
+    only_completed: bool = False,
+    scene_ids: Iterable[str] | None = None,
+) -> dict:
     root = Path(dataset_root).resolve()
     project_path = root / "dataset.json"
     project = read_project(project_path) if project_path.exists() else DatasetProject(project_name=root.name)
+    scene_filter = set(str(sid) for sid in scene_ids) if scene_ids is not None else None
     episodes_by_split: dict[str, list[str]] = {"train": [], "val_seen": [], "val_unseen": [], "test": []}
-    scene_ids: set[str] = set()
-    for path in find_episode_files(root):
+    discovered_scene_ids: set[str] = set()
+    all_episode_paths = find_episode_files(root)
+    kept_paths = _filter_episode_files(
+        root, episode_ids=episode_ids, only_completed=only_completed, scene_ids=scene_ids,
+    )
+    kept_set = {p.resolve() for p in kept_paths}
+    # When a scene scope is active, "total on disk" should reflect that scope so
+    # the UI can show "X of Y rendered for this scene".
+    scoped_total = 0
+    skipped_count = 0
+    for path in all_episode_paths:
+        if scene_filter is not None:
+            try:
+                ep_scene = read_episode(path).scene_id
+            except Exception:
+                ep_scene = ""
+            if ep_scene not in scene_filter:
+                continue
+        scoped_total += 1
+        if path.resolve() not in kept_set:
+            skipped_count += 1
+            continue
         episode = read_episode(path)
         episodes_by_split.setdefault(episode.split, []).append(_rel(root, path))
-        scene_ids.add(episode.scene_id)
+        discovered_scene_ids.add(episode.scene_id)
     scene_artifacts: list[dict] = []
     for scene_dir in sorted((root / "scenes").glob("*")):
         if not scene_dir.is_dir():
+            continue
+        if scene_filter is not None and scene_dir.name not in scene_filter:
             continue
         entry = {"scene_id": scene_dir.name}
         for filename, field_name in (
@@ -45,29 +172,53 @@ def build_dataset_index(dataset_root: str | Path) -> dict:
             if path.exists():
                 entry[field_name] = _rel(root, path)
         scene_artifacts.append(entry)
-        scene_ids.add(scene_dir.name)
+        discovered_scene_ids.add(scene_dir.name)
     return {
         **asdict(project),
-        "scenes": sorted(scene_ids),
+        "scenes": sorted(discovered_scene_ids),
         "scene_artifacts": scene_artifacts,
         "splits": episodes_by_split,
         "episode_count": sum(len(items) for items in episodes_by_split.values()),
+        "total_episode_count_on_disk": scoped_total,
+        "project_total_episode_count": len(all_episode_paths),
+        "skipped_episode_count": skipped_count,
+        "filter": {
+            "episode_ids": list(episode_ids) if episode_ids is not None else None,
+            "scene_ids": sorted(scene_filter) if scene_filter is not None else None,
+            "only_completed": bool(only_completed),
+        },
         "format": "custom_json",
     }
 
 
-def write_dataset_index(dataset_root: str | Path) -> Path:
+def write_dataset_index(
+    dataset_root: str | Path,
+    *,
+    episode_ids: Iterable[str] | None = None,
+    only_completed: bool = False,
+    scene_ids: Iterable[str] | None = None,
+) -> Path:
     root = Path(dataset_root)
-    index = build_dataset_index(root)
+    index = build_dataset_index(
+        root, episode_ids=episode_ids, only_completed=only_completed, scene_ids=scene_ids,
+    )
     path = root / "dataset.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(index, ensure_ascii=False, indent=2), encoding="utf-8")
     return path
 
 
-def write_split_files(dataset_root: str | Path) -> list[Path]:
+def write_split_files(
+    dataset_root: str | Path,
+    *,
+    episode_ids: Iterable[str] | None = None,
+    only_completed: bool = False,
+    scene_ids: Iterable[str] | None = None,
+) -> list[Path]:
     root = Path(dataset_root)
-    index = build_dataset_index(root)
+    index = build_dataset_index(
+        root, episode_ids=episode_ids, only_completed=only_completed, scene_ids=scene_ids,
+    )
     output_dir = root / "splits"
     output_dir.mkdir(parents=True, exist_ok=True)
     paths: list[Path] = []
@@ -78,13 +229,192 @@ def write_split_files(dataset_root: str | Path) -> list[Path]:
     return paths
 
 
-def export_dataset_zip(dataset_root: str | Path, output_zip: str | Path | None = None) -> Path:
+def export_dataset_zip(
+    dataset_root: str | Path,
+    output_zip: str | Path | None = None,
+    *,
+    episode_ids: Iterable[str] | None = None,
+    only_completed: bool = False,
+    scene_ids: Iterable[str] | None = None,
+) -> Path:
+    """Legacy project-wide zip. Kept for CLI / external scripts.
+
+    The new scene-bundle export goes through `_run_export_job` on the daemon
+    which uses `write_dataset_index_from`, `write_split_files_from`, and
+    `iter_export_files` against a staging directory.
+    """
     root = Path(dataset_root).resolve()
-    write_dataset_index(root)
-    write_split_files(root)
+    write_dataset_index(
+        root, episode_ids=episode_ids, only_completed=only_completed, scene_ids=scene_ids,
+    )
+    write_split_files(
+        root, episode_ids=episode_ids, only_completed=only_completed, scene_ids=scene_ids,
+    )
     zip_path = Path(output_zip) if output_zip is not None else root.with_suffix(".zip")
     zip_path.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         for path in sorted(item for item in root.rglob("*") if item.is_file()):
             zf.write(path, _rel(root, path))
     return zip_path
+
+
+# ---------------------------------------------------------------------------
+# Scene-bundle export helpers — used by the daemon's export job worker.
+# ---------------------------------------------------------------------------
+
+
+def write_dataset_index_from(payload: dict, root: str | Path) -> Path:
+    """Write a pre-built `build_dataset_index` payload as `dataset.json`.
+
+    Lets the worker compute the index once and persist it in a staging
+    directory without re-walking the project.
+    """
+    root_path = Path(root)
+    root_path.mkdir(parents=True, exist_ok=True)
+    path = root_path / "dataset.json"
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return path
+
+
+def write_split_files_from(payload: dict, root: str | Path) -> list[Path]:
+    """Write `splits/{split}.json` from a pre-built index payload."""
+    root_path = Path(root)
+    out_dir = root_path / "splits"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    paths: list[Path] = []
+    splits = payload.get("splits") or {}
+    for split, episodes in splits.items():
+        path = out_dir / f"{split}.json"
+        path.write_text(json.dumps({"split": split, "episodes": list(episodes)}, indent=2), encoding="utf-8")
+        paths.append(path)
+    return paths
+
+
+# Observation directories include both EXR (HDR) and PNG (LDR previews) plus
+# `sensors/<camera>/...` subfolders. We copy everything verbatim so external
+# readers (VLN evaluator) can pick whichever modality / format they need.
+
+def _bridge_job_observation_dirs(
+    repo_root: Path, scene_id: str, vp_id: str, h_id: str,
+) -> Iterable[Path]:
+    """Bridge-job observation dirs that match (scene, vp, heading).
+
+    The render daemon writes EXR under
+    `out/bridge_jobs/opticalnav-<scene>-template-<vp>-<h>-<mod>/observations/...`
+    but `_opticalnav_copy_observation_rgb` only copies PNG into the
+    consolidated `scenes/<scene>/observations/<vp>/<h>/` directory. The bundle
+    needs EXR too, so we pull it from bridge_jobs directly at export time.
+    """
+    bridge_root = repo_root / "out" / "bridge_jobs"
+    if not bridge_root.exists():
+        return
+    pattern = f"opticalnav-{scene_id}-template-{vp_id}-{h_id}-*"
+    for job_dir in bridge_root.glob(pattern):
+        obs_root = job_dir / "observations"
+        if obs_root.is_dir():
+            yield obs_root
+
+
+def iter_export_files(
+    project_dir: str | Path,
+    index_payload: dict,
+    kept_episodes: Iterable[EpisodeManifest],
+) -> Iterable[tuple[Path, str]]:
+    """Yield (src_path, dst_relative_posix_path) pairs for the scene bundle.
+
+    The destination layout mirrors the project tree under
+    `scenes/<scene_id>/` so external readers that already understand the
+    project layout work unchanged.
+
+    Excludes:
+      * other scenes under `scenes/`
+      * `control_plane_cache/`, `mesh_cache/`, `.staged_mitsuba/` (renderer caches)
+      * `job_status.json`, `render_progress.log` (in-flight job artifacts)
+      * the project's top-level `dataset.json` (replaced by the bundle's own)
+    """
+    pdir = Path(project_dir).resolve()
+    repo_root = pdir.parents[2] if len(pdir.parents) >= 3 else None
+    yielded_dst: set[str] = set()
+
+    def _emit(src: Path, dst_rel: str):
+        if dst_rel in yielded_dst:
+            return None
+        yielded_dst.add(dst_rel)
+        return (src, dst_rel)
+
+    # 1. Scene artifact files from index_payload.scene_artifacts.
+    for artifact in index_payload.get("scene_artifacts") or []:
+        for key, ref in artifact.items():
+            if not isinstance(ref, str) or not ref.endswith((".json", ".npy", ".xml")):
+                continue
+            src = pdir / ref
+            if src.is_file():
+                pair = _emit(src, ref)
+                if pair is not None:
+                    yield pair
+    # Pick up render_scene.xml (not in scene_artifacts).
+    for artifact in index_payload.get("scene_artifacts") or []:
+        scene_id = artifact.get("scene_id")
+        if not scene_id:
+            continue
+        for fname in ("render_scene.xml",):
+            src = pdir / "scenes" / scene_id / fname
+            if src.is_file():
+                pair = _emit(src, f"scenes/{scene_id}/{fname}")
+                if pair is not None:
+                    yield pair
+    # 2. Episode JSON for each kept episode.
+    kept_list = list(kept_episodes)
+    for ep in kept_list:
+        ep_path = pdir / "episodes" / ep.split / f"{ep.episode_id}.json"
+        if ep_path.is_file():
+            pair = _emit(ep_path, f"episodes/{ep.split}/{ep.episode_id}.json")
+            if pair is not None:
+                yield pair
+    # 3. Observation files for (vp, heading) along each episode's path —
+    # consolidated PNG/JSON layer + EXR pulled from bridge_jobs.
+    seen_pairs: set[tuple[str, str, str]] = set()
+    for ep in kept_list:
+        if not ep.scene_id or not ep.path_nodes or not ep.path_headings:
+            continue
+        if len(ep.path_nodes) != len(ep.path_headings):
+            continue
+        for vp_id, h_id in zip(ep.path_nodes, ep.path_headings):
+            key = (str(ep.scene_id), str(vp_id), str(h_id))
+            if key in seen_pairs:
+                continue
+            seen_pairs.add(key)
+            # 3a. Consolidated observation dir (PNG, sensor metadata, etc.).
+            obs_dir = pdir / "scenes" / str(ep.scene_id) / "observations" / str(vp_id) / str(h_id)
+            if obs_dir.is_dir():
+                for src in sorted(obs_dir.rglob("*")):
+                    if not src.is_file():
+                        continue
+                    rel = src.relative_to(pdir).as_posix()
+                    pair = _emit(src, rel)
+                    if pair is not None:
+                        yield pair
+            # 3b. EXR (HDR) from bridge_jobs — same (vp, heading) but the
+            # daemon's PNG-only consolidation skipped these. Map to the
+            # `scenes/<scene>/observations/<vp>/<h>/sensors/<camera>/` layout
+            # so the bundle keeps the existing per-camera structure.
+            if repo_root is None:
+                continue
+            for bridge_obs in _bridge_job_observation_dirs(repo_root, str(ep.scene_id), str(vp_id), str(h_id)):
+                for src in sorted(bridge_obs.rglob("*")):
+                    if not src.is_file() or src.suffix.lower() != ".exr":
+                        continue
+                    # Path shape: .../observations/<frame_id>/cameras/<camera>/<modality>.exr
+                    parts = src.parts
+                    try:
+                        cam_idx = parts.index("cameras")
+                        camera_id = parts[cam_idx + 1]
+                    except (ValueError, IndexError):
+                        continue
+                    dst_rel = (
+                        f"scenes/{ep.scene_id}/observations/{vp_id}/{h_id}/"
+                        f"sensors/{camera_id}/{src.name}"
+                    )
+                    pair = _emit(src, dst_rel)
+                    if pair is not None:
+                        yield pair

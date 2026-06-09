@@ -111,16 +111,16 @@
 	.mod-grid-empty {
 		padding: 0.75rem 0;
 		text-align: center;
-		color: var(--ink-muted, #6b7280);
+		color: var(--muted);
 		font-size: 0.78rem;
 	}
 	.mod-grid-empty.err {
-		color: #b91c1c;
+		color: var(--danger);
 	}
 	.mod-grid-hint {
 		font-size: 0.7rem;
-		color: #b45309;
-		background: #fff4e2;
+		color: var(--warning);
+		background: var(--warning-soft);
 		border-radius: 6px;
 		padding: 0.35rem 0.55rem;
 	}
@@ -133,7 +133,7 @@
 		font-size: 0.65rem;
 		text-transform: uppercase;
 		letter-spacing: 0.05em;
-		color: var(--ink-muted, #6b7280);
+		color: var(--muted);
 	}
 	.mod-grid-tiles {
 		display: grid;
@@ -171,7 +171,7 @@
 	.mod-grid-tile-label {
 		font-size: 0.65rem;
 		text-align: center;
-		color: var(--ink-strong, #1f2330);
+		color: var(--text);
 		display: flex;
 		justify-content: center;
 		align-items: center;
@@ -182,7 +182,7 @@
 		font-size: 0.55rem;
 		padding: 0.02rem 0.25rem;
 		border-radius: 999px;
-		background: rgba(185, 28, 28, 0.12);
-		color: #b91c1c;
+		background: var(--danger-soft);
+		color: var(--danger);
 	}
 </style>

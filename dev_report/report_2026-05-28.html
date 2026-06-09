@@ -1,0 +1,1567 @@
+<!DOCTYPE html>
+<html lang="ko" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Dev Report · 2026-05-28 · navigation_dataset + 오토 버텍스그래프 + USD 에셋 뷰포트</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/static/pretendard.css">
+<style>
+  /* ── Robomituba Design System tokens ── */
+  :root {
+    --font-sans: Pretendard,"Pretendard Variable",Inter,ui-sans-serif,system-ui,-apple-system,sans-serif;
+    --font-mono: "JetBrains Mono",ui-monospace,monospace;
+    --radius-xs:4px; --radius-sm:6px; --radius-md:10px; --radius-lg:14px; --radius-xl:20px; --radius-pill:999px;
+    --shadow-xs:0 1px 2px rgba(15,23,42,.06);
+    --shadow-sm:0 4px 12px rgba(15,23,42,.06);
+    --shadow-md:0 8px 22px rgba(15,23,42,.08);
+    --duration-fast:140ms;
+    --easing-standard:cubic-bezier(.2,0,0,1);
+
+    /* Light palette */
+    --bg:#f4f3f8; --bg-accent:#eef6ff;
+    --sidebar:rgba(235,235,242,.96);
+    --panel:rgba(255,255,255,.98);
+    --subpanel:rgba(248,250,252,.95);
+    --surface-2:rgba(241,245,249,.8);
+    --panel-border:rgba(148,163,184,.2);
+    --panel-border-strong:rgba(148,163,184,.3);
+    --text-raw:#1f2937; --muted:#667085; --muted-strong:#475467;
+    --brand:#2f7bf6; --brand-strong:#1f67dd;
+    --brand-soft:rgba(47,123,246,.12);
+    --cyan:#06b6d4; --cyan-soft:rgba(6,182,212,.12);
+    --success:#16a34a; --success-soft:rgba(34,197,94,.13);
+    --warning:#f97316; --warning-soft:rgba(249,115,22,.14);
+    --danger:#dc2626; --danger-soft:rgba(239,68,68,.13);
+    --purple:#8b5cf6; --purple-soft:rgba(139,92,246,.12);
+
+    --surface: var(--panel);
+    --surface2: var(--subpanel);
+    --border: var(--panel-border);
+    --accent: var(--brand);
+    --accent2: var(--purple);
+    --accent3: var(--success);
+    --accent4: var(--warning);
+    --accent5: var(--danger);
+    --text: var(--text-raw);
+    --text-muted: var(--muted-strong);
+    --text-dim: var(--muted);
+  }
+
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: var(--font-sans); background: var(--bg); color: var(--text-raw); font-size: 14px; line-height: 1.6; }
+
+  /* Layout */
+  .layout { display: flex; min-height: 100vh; }
+  .sidebar { width: 220px; min-width: 220px; background: var(--sidebar); border-right: 1px solid var(--panel-border); position: sticky; top: 0; height: 100vh; overflow-y: auto; padding: 20px 12px; backdrop-filter: blur(12px); flex-shrink: 0; }
+  .main { flex: 1; padding: 28px 36px; max-width: 1100px; }
+
+  /* Sidebar */
+  .sidebar-logo { margin-bottom: 20px; padding-bottom: 16px; border-bottom: 1px solid var(--panel-border); }
+  .logo-text { font-size: 13px; font-weight: 800; color: var(--brand); letter-spacing: -0.02em; }
+  .logo-date { font-size: 10px; color: var(--muted); font-family: var(--font-mono); margin-top: 2px; }
+  .logo-sub { font-size: 10px; color: var(--muted); margin-top: 2px; }
+  .sidebar-back { display: block; font-size: 11px; color: var(--muted); text-decoration: none; margin-bottom: 16px; }
+  .sidebar-back:hover { color: var(--brand); }
+  .nav-section { margin-bottom: 2px; }
+  .nav-section-title { font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.12em; color: var(--muted); padding: 8px 8px 4px; }
+  .nav-link { display: block; padding: 5px 8px; border-radius: var(--radius-xs); font-size: 11.5px; color: var(--muted-strong); text-decoration: none; border-left: 2px solid transparent; margin-bottom: 1px; transition: all var(--duration-fast) var(--easing-standard); }
+  .nav-link:hover { color: var(--brand-strong); background: var(--brand-soft); }
+
+  /* Hero */
+  .hero { background: var(--panel); border: 1px solid var(--panel-border); border-radius: var(--radius-lg); padding: 24px 28px; margin-bottom: 24px; position: relative; overflow: hidden; box-shadow: var(--shadow-sm); }
+  .hero::before { content: ''; position: absolute; top: 0; right: 0; width: 280px; height: 100%; background: radial-gradient(ellipse at right top, var(--brand-soft) 0%, transparent 70%); pointer-events: none; }
+  .hero-date { font-size: 11px; font-weight: 700; color: var(--brand-strong); letter-spacing: 0.1em; text-transform: uppercase; margin-bottom: 8px; font-family: var(--font-mono); }
+  .hero-title { font-size: 22px; font-weight: 800; color: var(--text-raw); margin-bottom: 6px; letter-spacing: -0.03em; }
+  .hero-subtitle { font-size: 13px; color: var(--muted-strong); margin-bottom: 16px; }
+  .hero-tags { display: flex; gap: 8px; flex-wrap: wrap; }
+  .hero-tag { padding: 3px 10px; border-radius: var(--radius-pill); font-size: 11.5px; font-weight: 600; background: var(--brand-soft); color: var(--brand-strong); border: 1px solid rgba(47,123,246,.2); }
+
+  /* Sections */
+  .section { background: var(--panel); border: 1px solid var(--panel-border); border-radius: var(--radius-md); padding: 22px 24px; margin-bottom: 20px; box-shadow: var(--shadow-xs); }
+  .section-header { display: flex; align-items: flex-start; gap: 14px; margin-bottom: 18px; padding-bottom: 14px; border-bottom: 1px solid var(--panel-border); }
+  .section-icon { width: 36px; height: 36px; border-radius: var(--radius-sm); display: flex; align-items: center; justify-content: center; font-size: 18px; flex-shrink: 0; }
+  .section-title { font-size: 16px; font-weight: 700; color: var(--text-raw); }
+  .section-subtitle { font-size: 11.5px; color: var(--muted); margin-top: 2px; }
+  h3 { font-size: 13px; font-weight: 700; color: var(--text-raw); margin: 18px 0 10px; }
+
+  /* Cards */
+  .card-grid { display: grid; grid-template-columns: repeat(4,1fr); gap: 12px; margin-bottom: 18px; }
+  .card { background: var(--subpanel); border: 1px solid var(--panel-border); border-radius: var(--radius-sm); padding: 12px 14px; }
+  .card-label { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.1em; color: var(--muted); margin-bottom: 5px; }
+  .card-value { font-size: 20px; font-weight: 800; color: var(--brand); letter-spacing: -0.03em; }
+  .card-desc { font-size: 11.5px; color: var(--muted-strong); margin-top: 4px; }
+
+  /* Tables */
+  table { width: 100%; border-collapse: collapse; font-size: 13px; margin-bottom: 14px; }
+  th { background: var(--bg-accent); padding: 8px 10px; text-align: left; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); border-bottom: 1px solid var(--panel-border); }
+  td { padding: 8px 10px; border-bottom: 1px solid var(--panel-border); vertical-align: top; }
+  tr:last-child td { border-bottom: none; }
+
+  /* Type blocks */
+  .type-block { border: 1px solid var(--panel-border); border-radius: var(--radius-sm); overflow: hidden; margin-bottom: 14px; }
+  .type-header { background: var(--bg-accent); padding: 10px 14px; display: flex; align-items: center; gap: 10px; }
+  .type-name { font-size: 13px; font-weight: 700; color: var(--text-raw); font-family: var(--font-mono); }
+  .type-meta { font-size: 11px; color: var(--muted); }
+  .type-body { padding: 14px; }
+
+  /* Code */
+  pre { background: var(--subpanel); border: 1px solid var(--panel-border); border-radius: var(--radius-sm); padding: 12px 14px; font-family: var(--font-mono); font-size: 12px; line-height: 1.55; overflow-x: auto; margin-bottom: 12px; }
+  code { font-family: var(--font-mono); font-size: 12px; background: var(--bg-accent); padding: 1px 5px; border-radius: 3px; }
+
+  /* Timeline */
+  .timeline { border-left: 2px solid var(--panel-border); padding-left: 20px; margin-left: 10px; }
+  .timeline-item { position: relative; margin-bottom: 20px; }
+  .timeline-item::before { content: ''; position: absolute; left: -26px; top: 6px; width: 10px; height: 10px; border-radius: 50%; background: var(--warning); border: 2px solid var(--bg); }
+  .timeline-time { font-size: 11px; color: var(--warning); font-weight: 700; margin-bottom: 4px; font-family: var(--font-mono); }
+  .timeline-title { font-size: 14px; font-weight: 600; color: var(--text-raw); margin-bottom: 4px; }
+  .timeline-body { font-size: 12.5px; color: var(--muted-strong); }
+
+  /* Alert */
+  .alert { background: var(--warning-soft); border-left: 3px solid var(--warning); padding: 12px 14px; border-radius: var(--radius-sm); margin-bottom: 14px; font-size: 13px; }
+  .alert.info { background: var(--brand-soft); border-color: var(--brand); }
+  .alert.success { background: var(--success-soft); border-color: var(--success); }
+
+  /* Flow */
+  .flow { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 14px; }
+  .flow-step { background: var(--subpanel); border: 1px solid var(--panel-border); border-radius: var(--radius-sm); padding: 6px 12px; font-size: 12px; font-weight: 600; }
+  .flow-arrow { color: var(--muted); font-size: 14px; }
+  .flow-step.highlight { background: var(--brand-soft); border-color: rgba(47,123,246,.3); color: var(--brand-strong); }
+
+  /* Mode badges */
+  .mode-grid { display: grid; grid-template-columns: repeat(3,1fr); gap: 10px; margin-bottom: 14px; }
+  .mode-card { border: 1px solid var(--panel-border); border-radius: var(--radius-sm); padding: 12px 14px; background: var(--subpanel); }
+  .mode-name { font-size: 12px; font-weight: 700; font-family: var(--font-mono); color: var(--brand); margin-bottom: 4px; }
+  .mode-desc { font-size: 12px; color: var(--muted-strong); }
+
+  /* Ref cards */
+  .ref-card { border: 1px solid var(--panel-border); border-radius: var(--radius-sm); padding: 14px 16px; margin-bottom: 12px; background: var(--subpanel); }
+  .ref-title { font-size: 13.5px; font-weight: 700; color: var(--text-raw); margin-bottom: 3px; }
+  .ref-venue { font-size: 11px; color: var(--brand); font-weight: 600; margin-bottom: 8px; }
+  .ref-body { font-size: 12.5px; color: var(--muted-strong); line-height: 1.6; }
+  .ref-tag { display: inline-block; padding: 2px 7px; border-radius: var(--radius-pill); font-size: 10px; font-weight: 700; margin-right: 4px; margin-top: 6px; }
+
+  /* Score table */
+  .score-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 14px; }
+  .score-row { display: flex; justify-content: space-between; align-items: center; padding: 6px 10px; border-radius: var(--radius-xs); background: var(--subpanel); font-size: 12.5px; }
+  .score-label { color: var(--muted-strong); }
+
+  /* Tags */
+  .tag { padding: 2px 8px; border-radius: var(--radius-pill); font-size: 11px; font-weight: 600; background: var(--brand-soft); color: var(--brand-strong); border: 1px solid rgba(47,123,246,.2); }
+  .tag.green { background: var(--success-soft); color: var(--success); border-color: rgba(34,197,94,.2); }
+  .tag.amber { background: var(--warning-soft); color: var(--warning); border-color: rgba(249,115,22,.2); }
+  .tag.red { background: var(--danger-soft); color: var(--danger); border-color: rgba(239,68,68,.2); }
+  .tag.purple { background: var(--purple-soft); color: var(--purple); border-color: rgba(139,92,246,.2); }
+
+  .report-footer { border-top: 1px solid var(--panel-border); margin-top: 36px; padding-top: 20px; color: var(--muted); font-size: 12px; text-align: center; }
+
+  ::-webkit-scrollbar { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-track { background: var(--bg); }
+  ::-webkit-scrollbar-thumb { background: var(--panel-border-strong); border-radius: 3px; }
+</style>
+</head>
+<body>
+<div class="layout">
+
+<!-- ── SIDEBAR ── -->
+<nav class="sidebar">
+  <div class="sidebar-logo">
+    <div class="logo-text">Robomituba</div>
+    <div class="logo-date">2026-05-28</div>
+    <div class="logo-sub">오토 버텍스그래프 + USD 에셋 뷰포트</div>
+  </div>
+  <a class="sidebar-back" href="index.html">← 프로젝트 문서로</a>
+
+  <div class="nav-section">
+    <div class="nav-section-title">오늘의 작업</div>
+    <a class="nav-link" href="#timeline">작업 타임라인</a>
+    <a class="nav-link" href="#vs-yesterday">어제 대비 변경</a>
+    <a class="nav-link" href="#stats">코드 통계</a>
+  </div>
+
+  <div class="nav-section">
+    <div class="nav-section-title">오늘의 하이라이트</div>
+    <a class="nav-link" href="#auto-vertex-graph">오토 버텍스그래프</a>
+    <a class="nav-link" href="#usd-asset-viewport">USD 에셋 3D 뷰포트</a>
+    <a class="nav-link" href="#sensor-profiles">실제 카메라 프로파일</a>
+    <a class="nav-link" href="#asset-library">에셋 라이브러리</a>
+  </div>
+
+  <div class="nav-section">
+    <div class="nav-section-title">navigation_dataset</div>
+    <a class="nav-link" href="#nav-module-overview">모듈 개요</a>
+    <a class="nav-link" href="#authoring-map">AuthoringMap</a>
+    <a class="nav-link" href="#viewpoint-graph">ViewpointGraph</a>
+    <a class="nav-link" href="#episode-pipeline">Episode 파이프라인</a>
+    <a class="nav-link" href="#cli">CLI</a>
+  </div>
+
+  <div class="nav-section">
+    <div class="nav-section-title">WebUI 에디터</div>
+    <a class="nav-link" href="#webui-modes">6-Mode 인터페이스</a>
+    <a class="nav-link" href="#usd-snapshot">usd_snapshot.py</a>
+  </div>
+
+  <div class="nav-section">
+    <div class="nav-section-title">관련 연구</div>
+    <a class="nav-link" href="#genesis">Genesis (ICRA 2025)</a>
+    <a class="nav-link" href="#genesis-vs-us">Genesis vs. 우리 접근</a>
+  </div>
+
+  <div class="nav-section">
+    <div class="nav-section-title">다음 단계</div>
+    <a class="nav-link" href="#next">남은 과제</a>
+  </div>
+</nav>
+
+<!-- ── MAIN ── -->
+<main class="main">
+
+<!-- HERO -->
+<div class="hero">
+  <div class="hero-date">2026-05-28 · Daily Dev Report</div>
+  <div class="hero-title">오토 버텍스그래프 + USD 에셋 3D 뷰포트 + 실제 카메라 프로파일</div>
+  <div class="hero-subtitle">TraversabilityGrid → ViewpointGraph 자동 생성 · USD prim 메시 실시간 미리보기 · JAI/LUCID 센서 프로파일 · DTC 에셋 라이브러리</div>
+  <div class="hero-tags">
+    <span class="hero-tag">오토 버텍스그래프</span>
+    <span class="hero-tag">node_sampler</span>
+    <span class="hero-tag">USD 3D 뷰포트</span>
+    <span class="hero-tag">usd_editor_geometry</span>
+    <span class="hero-tag">sensor_profiles</span>
+    <span class="hero-tag">DTC 에셋 라이브러리</span>
+    <span class="hero-tag">MapEditor3D +418줄</span>
+  </div>
+</div>
+
+
+<!-- ════ TIMELINE ════ -->
+<section class="section" id="timeline">
+  <div class="section-header">
+    <div class="section-icon" style="background:rgba(245,158,11,0.15)">🕐</div>
+    <div>
+      <div class="section-title">작업 타임라인</div>
+      <div class="section-subtitle">2026-05-28 개발 흐름</div>
+    </div>
+  </div>
+
+  <div class="timeline">
+    <div class="timeline-item">
+      <div class="timeline-time">금일 — 오토 버텍스그래프</div>
+      <div class="timeline-title">TraversabilityGrid → ViewpointGraph 자동 노드 배치 구현</div>
+      <div class="timeline-body">
+        <code>node_sampler.py</code>: Poisson-disk 방식으로 순회 가능 셀에서 뷰포인트 노드 자동 샘플링.
+        최소 간격 0.5m, 최대 300개, 클리어런스 필터. 161개 노드 자동 생성 + Delaunay 삼각형 엣지 연결.
+        렌더 데몬 <code>POST /opticalnav/projects/…/scenes/…/graph/build</code> 한 번 클릭으로 완료.
+      </div>
+    </div>
+    <div class="timeline-item">
+      <div class="timeline-time">금일 — USD 에셋 3D 뷰포트</div>
+      <div class="timeline-title">usd_editor_geometry.py + MapEditor3D USD prim 메시 캐시</div>
+      <div class="timeline-body">
+        <code>usd_editor_geometry.py</code> (534 LOC): USD Stage에서 카테고리 분류된 prim 메시 추출.
+        MapEditor3D에 <code>primMeshCache</code> 추가 — USD 에셋의 실제 3D 형태를 Three.js로 실시간 렌더.
+        의자/탁자/식물은 내장 proxy 형태(BoxGeometry 조합), 카메라 오브젝트는 피라미드+콘 아이콘.
+      </div>
+    </div>
+    <div class="timeline-item">
+      <div class="timeline-time">금일 — 실제 카메라 프로파일</div>
+      <div class="timeline-title">sensor_profiles.py — JAI FS-1600D / LUCID TRT053S 데이터시트 기반</div>
+      <div class="timeline-body">
+        실제 제조사 데이터시트로부터 파생된 <code>SensorProfile</code> 레지스트리.
+        스펙트럼 밴드(NIR/SWIR 파장 범위), 해상도, FPS, 비트 깊이, 렌즈 마운트 정의.
+        <code>mitsuba_modalities</code>·<code>mitsuba_variant_hint</code>로 렌더러 사이드 힌트 제공.
+      </div>
+    </div>
+    <div class="timeline-item">
+      <div class="timeline-time">금일 — 에셋 라이브러리</div>
+      <div class="timeline-title">render_daemon: DTC 에셋 라이브러리 + 썸네일 자동 생성</div>
+      <div class="timeline-body">
+        DTC(Digital Twin Collection) GLB 오브젝트 임포트, curated 에셋 매니페스트, 에셋 썸네일 PNG 자동 생성.
+        <code>bake_opticalnav_asset_thumbnails.py</code> 배치 베이크 스크립트.
+        <code>download_dtc_subset.py</code>로 서브셋 다운로드 자동화.
+      </div>
+    </div>
+    <div class="timeline-item">
+      <div class="timeline-time">오전 — 모듈 설계</div>
+      <div class="timeline-title">navigation_dataset 모듈 아키텍처 확정</div>
+      <div class="timeline-body">
+        AuthoringMap → SceneAnnotation → ViewpointGraph → EpisodeManifest 4단계 파이프라인 정의.
+        19개 Python 파일, 3,387 LOC. <code>opticalnav-v0.2</code> 포맷 버전 고정.
+        <code>DEFAULT_MODALITIES = (rgb, depth, active_nir_intensity, hazard_mask)</code> 확정.
+      </div>
+    </div>
+    <div class="timeline-item">
+      <div class="timeline-time">오전 — 핵심 타입</div>
+      <div class="timeline-title">authoring_map.py + episode_schema.py 구현</div>
+      <div class="timeline-body">
+        AuthoringMap: 10개 오브젝트 타입 + 7개 리전 타입. 오브젝트별 navigation flag 자동 추론.
+        EpisodeManifest: ACTION_SPACE 7종, SPLITS 4종(train/val_seen/val_unseen/test) 정의.
+      </div>
+    </div>
+    <div class="timeline-item">
+      <div class="timeline-time">낮 — 그래프 + 샘플러</div>
+      <div class="timeline-title">ViewpointGraph + GraphEpisodeSampler 구현</div>
+      <div class="timeline-body">
+        ViewpointGraph: 노드(위치+방향+관측)+엣지(가중치+위험도) 구조.
+        GRAPH_SCENARIOS 4종: <code>goal_only</code>, <code>hazard_aware</code>,
+        <code>stop_before_glass</code>, <code>detour</code>.
+        Dijkstra 기반 최단 경로 + 위험 우회 경로 분기.
+      </div>
+    </div>
+    <div class="timeline-item">
+      <div class="timeline-time">낮 — 순회 분석</div>
+      <div class="timeline-title">traversability.py — TraversabilityGrid 구현</div>
+      <div class="timeline-body">
+        2D 그리드 기반 순회 가능 영역 / 위험 영역 맵 생성.
+        SceneAnnotation으로부터 자동 래스터화. NumPy 기반 효율 처리.
+      </div>
+    </div>
+    <div class="timeline-item">
+      <div class="timeline-time">오후 — WebUI 재설계</div>
+      <div class="timeline-title">datasets/+page.svelte — activeTab → 6-Mode 전환</div>
+      <div class="timeline-body">
+        단일 <code>pageMode</code> 상태 (build/place/paths/sensor/sim/export) 도입.
+        3D MapEditor 캔버스가 모드 전환 시에도 전체화면 유지.
+        Paths 모드: episode 목록 패널 + 선택된 경로 3D 라인 시각화.
+        4,751 LOC → 어제 대비 +692줄 순증.
+      </div>
+    </div>
+    <div class="timeline-item">
+      <div class="timeline-time">오후 — USD 파이프라인</div>
+      <div class="timeline-title">usd_snapshot.py — USD Stage → SceneSnapshot 순수 Python 구현</div>
+      <div class="timeline-body">
+        Isaac Sim 없이도 OpenUSD만으로 SceneSnapshot 생성 가능한 독립 경로 추가.
+        629 LOC. geometry export (OBJ), material/light/camera 파싱 포함.
+      </div>
+    </div>
+    <div class="timeline-item">
+      <div class="timeline-time">저녁 — 관련 연구</div>
+      <div class="timeline-title">Genesis (ICRA 2025) 분석 — 렌더러·재질·센서·속도 검증</div>
+      <div class="timeline-body">
+        Genesis-Embodied-AI 공식 문서·소스·벤치마크 3차 교차 검증.
+        핵심 결론: Genesis ≠ Mitsuba 대체 렌더러.
+        로봇 rollout 엔진으로서의 Isaac Sim 대안 가능성 분석.
+      </div>
+    </div>
+  </div>
+</section>
+
+
+<!-- ════ AUTO VERTEX GRAPH ════ -->
+<section class="section" id="auto-vertex-graph">
+  <div class="section-header">
+    <div class="section-icon" style="background:rgba(47,123,246,0.15)">🕸️</div>
+    <div>
+      <div class="section-title">자동 네비게이션 버텍스 그래프</div>
+      <div class="section-subtitle">TraversabilityGrid → node_sampler → ViewpointGraph 원클릭 자동 생성</div>
+    </div>
+  </div>
+
+  <div class="alert success">
+    <strong>핵심 성과:</strong> AuthoringMap을 저작하면 "Build Graph" 버튼 한 번으로
+    순회 가능 영역 전체에 뷰포인트 노드가 자동 배치되고 Delaunay 삼각형 엣지로 연결된다.
+    아래는 실제 생성 결과 — <strong>161개 노드</strong>, <strong>5개 리전</strong>, <strong>2개 유리문</strong>.
+  </div>
+
+  <!-- Screenshot 1: Simple scene -->
+  <div style="margin:18px 0;border:1px solid var(--panel-border);border-radius:var(--radius-md);overflow:hidden;box-shadow:var(--shadow-md)">
+    <img src="images/nav_vertex_graph_auto.png" alt="자동 생성된 네비게이션 버텍스 그래프 (단순 씬)"
+         style="width:100%;display:block;max-height:480px;object-fit:contain;background:var(--subpanel)">
+    <div style="padding:10px 14px;background:var(--subpanel);border-top:1px solid var(--panel-border);font-size:12.5px;color:var(--muted-strong)">
+      <strong>자동으로 네비게이션 버텍스그래프가 생긴거</strong> —
+      161개 뷰포인트 노드(파란 점) + 삼각형 엣지. traversable 리전(파란 면), glass hazard 구역(주황 엣지).
+    </div>
+  </div>
+
+  <!-- Screenshot 2: Full 3D scene with USD assets -->
+  <div style="margin:18px 0;border:1px solid var(--panel-border);border-radius:var(--radius-md);overflow:hidden;box-shadow:var(--shadow-md)">
+    <img src="images/nav_vertex_graph_sensor_mode.png" alt="Sensor 모드 — USD 실제 에셋 + 버텍스그래프 200n·204e"
+         style="width:100%;display:block;background:var(--subpanel)">
+    <div style="padding:10px 14px;background:var(--subpanel);border-top:1px solid var(--panel-border);font-size:12.5px;color:var(--muted-strong)">
+      <strong>Sensor 모드 — 실제 USD 3D 씬 위에 버텍스그래프 오버레이 (200n · 204e)</strong> —
+      DTC 에셋(소파·의자·조명 등)이 실제 3D 형태로 렌더되고,
+      주황 노드 200개 + 파란 삼각 엣지 204개가 자동 생성됨.
+      오른쪽 패널: Grid ready → Graph ready (200n 204e) → Episodes 생성 (train 120 / val_seen 20 / val_unseen 20).
+    </div>
+  </div>
+
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px">
+    <div>
+      <h3>node_sampler.py — 핵심 알고리즘</h3>
+      <pre>sample_viewpoint_nodes(
+    grid: TraversabilityGrid,
+    *,
+    max_nodes: int = 300,
+    heading_count: int = 12,   # 방향별 360°/12 = 30° 스텝
+    min_node_spacing_m: float = 0.5,
+    min_clearance_m: float = 0.0,
+    seed: int = 0,
+) → list[ViewpointNode]
+
+# 알고리즘:
+# 1. traversable 셀 목록을 랜덤 셔플
+# 2. 각 후보 셀: clearance_m 계산 (가장 가까운 obstacle 거리)
+# 3. 이미 선택된 노드와 min_spacing 초과인 것만 채택
+# 4. 각 노드에 12방향 ViewpointHeading 자동 부착
+# → ViewpointNode list 반환</pre>
+    </div>
+    <div>
+      <h3>렌더 데몬 빌드 플로</h3>
+      <div class="flow" style="flex-direction:column;align-items:flex-start;gap:6px">
+        <div class="flow-step">POST /opticalnav/projects/{id}/scenes/{sid}/map/build</div>
+        <div class="flow-arrow">↓ AuthoringMap → SceneAnnotation → TraversabilityGrid</div>
+        <div class="flow-step">POST /opticalnav/projects/{id}/scenes/{sid}/graph/build</div>
+        <div class="flow-arrow">↓ sample_viewpoint_nodes() → ViewpointGraph</div>
+        <div class="flow-step highlight">viewpoint_graph.json 저장</div>
+        <div class="flow-arrow">↓ WebUI 즉시 반영</div>
+        <div class="flow-step">MapEditor3D — 161 nodes + edges 3D 시각화</div>
+      </div>
+
+      <h3 style="margin-top:14px">결과 수치 (moorelane 씬)</h3>
+      <div class="card-grid" style="grid-template-columns:repeat(2,1fr);margin-bottom:0">
+        <div class="card">
+          <div class="card-label">노드</div>
+          <div class="card-value">200</div>
+          <div class="card-desc">자동 샘플링</div>
+        </div>
+        <div class="card">
+          <div class="card-label">엣지</div>
+          <div class="card-value">204</div>
+          <div class="card-desc">삼각 연결</div>
+        </div>
+        <div class="card">
+          <div class="card-label">에피소드</div>
+          <div class="card-value">160</div>
+          <div class="card-desc">train 120 · val 40</div>
+        </div>
+        <div class="card">
+          <div class="card-label">헤딩</div>
+          <div class="card-value">6</div>
+          <div class="card-desc">60° 스텝 × 노드</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <h3>각 ViewpointNode에 자동 부착되는 방향</h3>
+  <pre>heading_sweep(heading_count=6)   ← 스크린샷 기준 (60° 스텝)
+→ h_000 (0°), h_060 (60°), h_120 (120°), h_180 (180°), h_240 (240°), h_300 (300°)
+각 heading마다 mat4 카메라 변환 생성 → SensorSweep 렌더 요청 시 사용</pre>
+
+  <h3>Sensor 모드 패널 — 그래프 빌드 파라미터 UI</h3>
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px">
+    <div class="type-block">
+      <div class="type-header"><div class="type-name">TRAVERSABLE GRID</div></div>
+      <div class="type-body">
+        <table>
+          <tr><th>파라미터</th><th>값</th><th>의미</th></tr>
+          <tr><td>resolution m</td><td>0.1</td><td>그리드 셀 크기 (10cm)</td></tr>
+        </table>
+        <div style="margin-top:8px"><span class="tag green">Grid ready</span> 상태 칩 — 빌드 성공 표시</div>
+      </div>
+    </div>
+    <div class="type-block">
+      <div class="type-header"><div class="type-name">VIEWPOINT GRAPH</div></div>
+      <div class="type-body">
+        <table>
+          <tr><th>파라미터</th><th>값</th><th>의미</th></tr>
+          <tr><td>max nodes</td><td>300</td><td>최대 뷰포인트 노드 수</td></tr>
+          <tr><td>headings</td><td>6</td><td>노드당 방향 수 (60° 스텝)</td></tr>
+          <tr><td>spacing m</td><td>1</td><td>노드 간 최소 거리</td></tr>
+          <tr><td>robot r</td><td>0.25</td><td>로봇 반경 (클리어런스 기준)</td></tr>
+        </table>
+        <div style="margin-top:8px">
+          <span class="tag green">Graph ready</span>
+          <span class="tag" style="margin-left:6px">200n</span>
+          <span class="tag" style="margin-left:4px">204e</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="type-block" style="margin-top:14px">
+    <div class="type-header"><div class="type-name">EPISODES 자동 생성</div></div>
+    <div class="type-body">
+      <table>
+        <tr><th>파라미터</th><th>값</th><th>의미</th></tr>
+        <tr><td>num pairs</td><td>80</td><td>start-goal 쌍 수 (에피소드 수)</td></tr>
+      </table>
+      <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap">
+        <span class="tag green">train 120</span>
+        <span class="tag amber">val_seen 20</span>
+        <span class="tag purple">val_unseen 20</span>
+      </div>
+      <div style="font-size:12px;color:var(--muted-strong);margin-top:8px">
+        80 pairs × 시나리오 다중화 → train 120 / val_seen 20 / val_unseen 20 자동 split 분배
+      </div>
+    </div>
+  </div>
+</section>
+
+
+<!-- ════ USD ASSET VIEWPORT ════ -->
+<section class="section" id="usd-asset-viewport">
+  <div class="section-header">
+    <div class="section-icon" style="background:rgba(139,92,246,0.15)">🧊</div>
+    <div>
+      <div class="section-title">USD 에셋 3D 뷰포트 미리보기</div>
+      <div class="section-subtitle">usd_editor_geometry.py + MapEditor3D primMeshCache — 실제 USD 형태를 Three.js로 실시간 렌더</div>
+    </div>
+  </div>
+
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px">
+    <div>
+      <h3>usd_editor_geometry.py (534 LOC)</h3>
+      <table>
+        <tr><th>기능</th><th>내용</th></tr>
+        <tr>
+          <td><code>build_usd_editor_geometry()</code></td>
+          <td>USD Stage에서 씬 전체 geometry 추출 → category별 JSON payload</td>
+        </tr>
+        <tr>
+          <td><code>extract_prim_mesh_for_editor()</code></td>
+          <td>개별 prim의 vertex/index 버퍼 추출 → Three.js BufferGeometry 직접 사용 가능</td>
+        </tr>
+        <tr>
+          <td>카테고리 자동 분류</td>
+          <td>floor / glass / mirror / shell / furniture / object — 이름·재질 키워드 기반</td>
+        </tr>
+        <tr>
+          <td>material hint</td>
+          <td>카테고리 → clear_glass / mirror / tile / wood / painted_wall 매핑</td>
+        </tr>
+      </table>
+
+      <h3>MapEditor3D primMeshCache</h3>
+      <pre>// USD prim mesh cache: source_path → BufferGeometry
+const primMeshCache = new Map&lt;string, any&gt;();
+const primMeshPending = new Set&lt;string&gt;();
+let primMeshCacheVersion = $state(0);
+
+// 오브젝트 배치 시 source_path 있으면 캐시 히트 → 실제 메시 렌더
+// 미스 → proxy box로 fallback, 비동기 로드 후 재렌더</pre>
+    </div>
+    <div>
+      <h3>내장 Proxy 형태 (3종)</h3>
+      <table>
+        <tr><th>타입</th><th>형태</th><th>부품 수</th></tr>
+        <tr>
+          <td><code>chair</code></td>
+          <td>좌판 + 등받이 + 다리 4개</td>
+          <td>6 BoxGeometry</td>
+        </tr>
+        <tr>
+          <td><code>table</code></td>
+          <td>상판 + 다리 4개</td>
+          <td>5 BoxGeometry</td>
+        </tr>
+        <tr>
+          <td><code>plant</code></td>
+          <td>화분 + 줄기 + 수관</td>
+          <td>3 BoxGeometry</td>
+        </tr>
+      </table>
+
+      <h3>카메라 오브젝트 3D 아이콘</h3>
+      <pre>// Camera: BoxBody + ConeGeometry (렌즈 방향 +Z)
+const body = BoxGeometry(0.08, 0.06, 0.1)  // 카메라 몸통
+    → MeshStandard #1e293b
+const cone = ConeGeometry(r=0.04, h=0.12, 4) // 렌즈 콘
+    → MeshStandard #f59e0b (앰버색)
+    → rotation.x = -π/2 → +Z 방향</pre>
+
+      <h3>카테고리별 Three.js 재질</h3>
+      <table>
+        <tr><th>카테고리</th><th>roughness</th><th>metalness</th><th>transparent</th></tr>
+        <tr><td>glass</td><td>0.04</td><td>0</td><td>opacity 0.55</td></tr>
+        <tr><td>mirror</td><td>0.12</td><td>0.8</td><td>—</td></tr>
+        <tr><td>furniture</td><td>0.65</td><td>0</td><td>—</td></tr>
+        <tr><td>shell/wall</td><td>0.85</td><td>0</td><td>—</td></tr>
+      </table>
+    </div>
+  </div>
+</section>
+
+
+<!-- ════ SENSOR PROFILES ════ -->
+<section class="section" id="sensor-profiles">
+  <div class="section-header">
+    <div class="section-icon" style="background:rgba(6,182,212,0.15)">📷</div>
+    <div>
+      <div class="section-title">실제 카메라 센서 프로파일 레지스트리</div>
+      <div class="section-subtitle">sensor_profiles.py · JAI FS-1600D-10GE + LUCID TRT053S · 데이터시트 기반</div>
+    </div>
+  </div>
+
+  <div class="alert info">
+    <strong>목적:</strong> 시뮬레이션에 사용할 카메라를 실제 제조사 스펙으로 정의.
+    <code>mitsuba_modalities</code>·<code>nir_wavelength_range_nm</code>로 Mitsuba 렌더러 설정과 직결된다.
+  </div>
+
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
+    <div class="type-block">
+      <div class="type-header">
+        <div class="type-name">JAI FS-1600D-10GE</div>
+        <div class="type-meta">RGB+NIR Dual-CCD · 1600×1200 · 10GigE</div>
+      </div>
+      <div class="type-body">
+        <table>
+          <tr><th>항목</th><th>값</th></tr>
+          <tr><td>sensor_type</td><td><code>rgb_nir_dual</code></td></tr>
+          <tr><td>resolution</td><td>1600×1200</td></tr>
+          <tr><td>pixel_size</td><td>4.5 μm</td></tr>
+          <tr><td>bit_depth</td><td>12 bit</td></tr>
+          <tr><td>NIR band</td><td>700–1000 nm</td></tr>
+          <tr><td>mitsuba_modalities</td><td>rgb, active_nir_intensity</td></tr>
+          <tr><td>variant_hint</td><td>cuda_spectral</td></tr>
+        </table>
+      </div>
+    </div>
+    <div class="type-block">
+      <div class="type-header">
+        <div class="type-name">LUCID TRT053S</div>
+        <div class="type-meta">SWIR InGaAs · 640×512 · GigE</div>
+      </div>
+      <div class="type-body">
+        <table>
+          <tr><th>항목</th><th>값</th></tr>
+          <tr><td>sensor_type</td><td><code>swir</code></td></tr>
+          <tr><td>resolution</td><td>640×512</td></tr>
+          <tr><td>SWIR band</td><td>900–1700 nm</td></tr>
+          <tr><td>peak</td><td>1300 nm</td></tr>
+          <tr><td>mitsuba_modalities</td><td>swir_intensity</td></tr>
+          <tr><td>variant_hint</td><td>cuda_spectral</td></tr>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <h3>SensorProfile 데이터 구조</h3>
+  <pre>@dataclass
+class SensorProfile:
+    sensor_id: str           # e.g. "jai_fs1600d"
+    sensor_type: str         # "rgb" | "nir" | "rgb_nir_dual" | "swir" | "hdr"
+    resolution_wh: tuple[int, int]
+    pixel_size_um: float
+    bit_depth: int
+    fps_max: float
+    spectral_bands: list[SpectralBand]     # 파장 밴드 목록
+    mitsuba_modalities: list[str]          # 렌더러 사이드 모달리티 ID
+    mitsuba_variant_hint: str              # 권장 mi.variant()</pre>
+</section>
+
+
+<!-- ════ ASSET LIBRARY ════ -->
+<section class="section" id="asset-library">
+  <div class="section-header">
+    <div class="section-icon" style="background:rgba(249,115,22,0.15)">📦</div>
+    <div>
+      <div class="section-title">에셋 라이브러리 + DTC 임포트</div>
+      <div class="section-subtitle">render_daemon +1,211줄 · DTC GLB 임포트 · 썸네일 자동 생성 · curated 매니페스트</div>
+    </div>
+  </div>
+
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px">
+    <div>
+      <h3>에셋 소스 체계</h3>
+      <table>
+        <tr><th>소스</th><th>경로</th><th>방식</th></tr>
+        <tr>
+          <td>DTC (Digital Twin)</td>
+          <td>vendor_datasets/dtc/</td>
+          <td>GLB 임포트 + 메타데이터 파싱</td>
+        </tr>
+        <tr>
+          <td>Curated 에셋</td>
+          <td>assets/opticalnav/</td>
+          <td>manifest.json 기반 직접 참조</td>
+        </tr>
+        <tr>
+          <td>USD 라이브러리</td>
+          <td>assets/usd_library/</td>
+          <td>usd_ref 경로 기반 카탈로그</td>
+        </tr>
+      </table>
+      <h3>새 배치 스크립트</h3>
+      <table>
+        <tr><th>스크립트</th><th>역할</th></tr>
+        <tr>
+          <td><code>bake_opticalnav_asset_thumbnails.py</code></td>
+          <td>에셋 라이브러리 전체 썸네일 PNG 배치 생성</td>
+        </tr>
+        <tr>
+          <td><code>download_dtc_subset.py</code></td>
+          <td>DTC 서브셋 선택적 다운로드 자동화</td>
+        </tr>
+      </table>
+    </div>
+    <div>
+      <h3>썸네일 생성 파이프라인</h3>
+      <pre>_generate_asset_thumbnail_png()
+  1. extract_prim_mesh_for_editor()
+     → vertex/index 버퍼 추출
+  2. _render_mesh_to_png()
+     → 소프트웨어 래스터라이저 (numpy)
+     → 84×84 PNG (ETag 캐싱)
+  3. fallback: _generate_asset_thumbnail_fallback()
+     → 카테고리별 색상 solid PNG</pre>
+      <h3>DTC 메타데이터 파싱</h3>
+      <pre>_dtc_metadata_label()      → 에셋 표시 이름
+_dtc_metadata_category()   → furniture/glass/etc
+_dtc_metadata_material()   → 재질 힌트
+_dtc_metadata_dimensions() → 실제 크기 [w, d, h]
+_dtc_metadata_description() → 자연어 설명</pre>
+    </div>
+  </div>
+</section>
+
+
+<!-- ════ VS YESTERDAY ════ -->
+<section class="section" id="vs-yesterday">
+  <div class="section-header">
+    <div class="section-icon" style="background:rgba(139,92,246,0.15)">📊</div>
+    <div>
+      <div class="section-title">어제 대비 주요 변경</div>
+      <div class="section-subtitle">2026-05-27 → 2026-05-28 델타</div>
+    </div>
+  </div>
+
+  <table>
+    <tr>
+      <th>영역</th>
+      <th>어제 (05.27)</th>
+      <th>오늘 (05.28)</th>
+      <th>변화</th>
+    </tr>
+    <tr>
+      <td><strong>MapEditor3D.svelte</strong></td>
+      <td>958줄 (경로 시각화)</td>
+      <td>1,128줄 (USD prim 메시 캐시 + 내장 proxy 형태)</td>
+      <td><span style="color:var(--brand)">+170줄 · USD 3D 뷰포트</span></td>
+    </tr>
+    <tr>
+      <td><strong>datasets/+page.svelte</strong></td>
+      <td>4,751줄 (6-Mode pageMode)</td>
+      <td>4,812줄</td>
+      <td><span style="color:var(--brand)">+61줄 · 에셋 카탈로그 + buildGraph</span></td>
+    </tr>
+    <tr>
+      <td><strong>usd_editor_geometry.py</strong></td>
+      <td>미존재</td>
+      <td>534줄</td>
+      <td><span style="color:var(--success)">✅ 신규 · USD prim 메시 추출</span></td>
+    </tr>
+    <tr>
+      <td><strong>sensor_profiles.py</strong></td>
+      <td>미존재</td>
+      <td>~200줄</td>
+      <td><span style="color:var(--success)">✅ 신규 · JAI/LUCID 실제 센서 프로파일</span></td>
+    </tr>
+    <tr>
+      <td><strong>render_daemon.py</strong></td>
+      <td>9,450줄</td>
+      <td>10,600줄+</td>
+      <td><span style="color:var(--brand)">+1,211줄 · 에셋 라이브러리 + 썸네일</span></td>
+    </tr>
+    <tr>
+      <td><strong>node_sampler.py (navigation_dataset)</strong></td>
+      <td>미존재</td>
+      <td>~80줄</td>
+      <td><span style="color:var(--success)">✅ 신규 · 오토 뷰포인트 노드 샘플러</span></td>
+    </tr>
+    <tr>
+      <td><strong>sensor_sweep.py</strong></td>
+      <td>121줄</td>
+      <td>174줄</td>
+      <td><span style="color:var(--brand)">+53줄 · custom position 렌더 요청</span></td>
+    </tr>
+    <tr>
+      <td><strong>bake_opticalnav_asset_thumbnails.py</strong></td>
+      <td>미존재</td>
+      <td>신규</td>
+      <td><span style="color:var(--success)">✅ 신규 · 에셋 썸네일 배치 베이크</span></td>
+    </tr>
+    <tr>
+      <td><strong>navigation_dataset (누적)</strong></td>
+      <td>19파일 / 3,387 LOC</td>
+      <td>node_sampler + 오토 그래프 빌드 추가</td>
+      <td><span style="color:var(--brand)">핵심 기능 완성</span></td>
+    </tr>
+  </table>
+
+  <div class="alert info">
+    <strong>금일 커밋 델타:</strong> 10개 파일, +3,197줄 삽입 / −445줄 삭제 (git diff HEAD 기준)
+  </div>
+</section>
+
+
+<!-- ════ STATS ════ -->
+<section class="section" id="stats">
+  <div class="section-header">
+    <div class="section-icon" style="background:rgba(6,182,212,0.15)">📈</div>
+    <div>
+      <div class="section-title">코드 통계 (2026-05-28 기준)</div>
+      <div class="section-subtitle">현재 핵심 파일 규모</div>
+    </div>
+  </div>
+
+  <div class="card-grid" style="grid-template-columns:repeat(4,1fr)">
+    <div class="card">
+      <div class="card-label">MapEditor3D.svelte</div>
+      <div class="card-value">1,128</div>
+      <div class="card-desc">LOC · USD 3D 뷰포트 추가</div>
+    </div>
+    <div class="card">
+      <div class="card-label">datasets/+page.svelte</div>
+      <div class="card-value">4,812</div>
+      <div class="card-desc">LOC · 6-Mode 에디터</div>
+    </div>
+    <div class="card">
+      <div class="card-label">render_daemon.py</div>
+      <div class="card-value">10,600+</div>
+      <div class="card-desc">LOC · 에셋 라이브러리 추가</div>
+    </div>
+    <div class="card">
+      <div class="card-label">usd_editor_geometry.py</div>
+      <div class="card-value">534</div>
+      <div class="card-desc">LOC · 신규 · prim 메시 추출</div>
+    </div>
+  </div>
+
+  <table>
+    <tr>
+      <th>파일</th>
+      <th>LOC</th>
+      <th>역할</th>
+    </tr>
+    <tr><td><code>navigation_dataset/authoring_compile.py</code></td><td>338</td><td>AuthoringMap → SceneAnnotation 컴파일</td></tr>
+    <tr><td><code>navigation_dataset/authoring_map.py</code></td><td>373</td><td>10 오브젝트 + 7 리전 타입 정의·직렬화</td></tr>
+    <tr><td><code>navigation_dataset/cli.py</code></td><td>439</td><td>init/scene/map/episodes/graph/export CLI</td></tr>
+    <tr><td><code>navigation_dataset/episode_schema.py</code></td><td>227</td><td>EpisodeManifest, EpisodeTimestep, ACTION_SPACE</td></tr>
+    <tr><td><code>navigation_dataset/graph_episode_sampler.py</code></td><td>285</td><td>4-시나리오 에피소드 샘플링 (Dijkstra)</td></tr>
+    <tr><td><code>navigation_dataset/scene_annotations.py</code></td><td>199</td><td>SceneAnnotation, Goal/Hazard/Traversable 리전</td></tr>
+    <tr><td><code>navigation_dataset/traversability.py</code></td><td>185</td><td>TraversabilityGrid (2D 래스터 맵)</td></tr>
+    <tr><td><code>navigation_dataset/viewpoint_graph.py</code></td><td>163</td><td>ViewpointGraph (노드+엣지+방향)</td></tr>
+    <tr><td><code>navigation_dataset/sensor_sweep.py</code></td><td>174</td><td>뷰포인트별 센서 렌더 요청 생성</td></tr>
+    <tr><td><code>navigation_dataset/scene_sync.py</code></td><td>182</td><td>렌더 데몬 씬 동기화 페이로드</td></tr>
+    <tr><td><code>navigation_dataset/planner.py</code></td><td>157</td><td>경로 계획 (A* + 제약)</td></tr>
+    <tr><td><code>navigation_dataset/rollout.py</code></td><td>126</td><td>에피소드 rollout + split 분배</td></tr>
+    <tr><td><code>navigation_dataset/renderer.py</code></td><td>116</td><td>렌더 요청 → EXR 결과 수집</td></tr>
+    <tr><td><code>navigation_dataset/evaluator.py</code></td><td>82</td><td>에피소드 품질 평가 (SR/SPL 계산)</td></tr>
+    <tr><td><code>mitsuba_converter/usd_snapshot.py</code></td><td>629</td><td>USD Stage → SceneSnapshot (Isaac Sim 불필요)</td></tr>
+    <tr><td><code>isaac_extension/ranger_mini_stage.py</code></td><td>1,283</td><td>Isaac Sim 로봇 스테이지 + 물리 제어</td></tr>
+    <tr><td><code>isaac_extension/ui_panel.py</code></td><td>2,956</td><td>Isaac Sim UI 패널 (씬·렌더·내비게이션)</td></tr>
+  </table>
+</section>
+
+
+<!-- ════ NAVIGATION_DATASET MODULE ════ -->
+<section class="section" id="nav-module-overview">
+  <div class="section-header">
+    <div class="section-icon" style="background:rgba(47,123,246,0.15)">🗺️</div>
+    <div>
+      <div class="section-title">navigation_dataset 모듈 개요</div>
+      <div class="section-subtitle">VLN 에피소드 생성 풀 파이프라인 — opticalnav-v0.2</div>
+    </div>
+  </div>
+
+  <div class="alert info">
+    <strong>목적:</strong> Isaac Sim에서 저작한 AuthoringMap을 입력으로 받아,
+    뷰포인트 그래프 → 에피소드 샘플링 → 센서 렌더링 → 내보내기까지 완전한 데이터셋 생성 파이프라인을 제공한다.
+  </div>
+
+  <div class="flow">
+    <div class="flow-step">AuthoringMap</div>
+    <div class="flow-arrow">→</div>
+    <div class="flow-step highlight">compile</div>
+    <div class="flow-arrow">→</div>
+    <div class="flow-step">SceneAnnotation</div>
+    <div class="flow-arrow">→</div>
+    <div class="flow-step highlight">ViewpointGraph</div>
+    <div class="flow-arrow">→</div>
+    <div class="flow-step highlight">EpisodeSampler</div>
+    <div class="flow-arrow">→</div>
+    <div class="flow-step">EpisodeManifest</div>
+    <div class="flow-arrow">→</div>
+    <div class="flow-step highlight">SensorSweep</div>
+    <div class="flow-arrow">→</div>
+    <div class="flow-step">EXR + JSON</div>
+  </div>
+
+  <h3>핵심 설계 원칙</h3>
+  <table>
+    <tr><th>원칙</th><th>구현</th></tr>
+    <tr>
+      <td><strong>포맷 버전 고정</strong></td>
+      <td><code>AUTHORING_MAP_VERSION = "opticalnav-authoring-map-v0.2"</code><br>
+          <code>GENERATION_VERSION = "opticalnav-v0.2"</code> — 하위 호환 보장</td>
+    </tr>
+    <tr>
+      <td><strong>광학 위험 우선 시나리오</strong></td>
+      <td>유리문·투명 파티션·거울벽을 hazard로 명시. stop_before_glass 시나리오 전용 경로 분기</td>
+    </tr>
+    <tr>
+      <td><strong>멀티모달 기본값</strong></td>
+      <td><code>DEFAULT_MODALITIES = (rgb, depth, active_nir_intensity, hazard_mask)</code></td>
+    </tr>
+    <tr>
+      <td><strong>R2R 호환 ACTION_SPACE</strong></td>
+      <td>7종: move_forward / turn_left / turn_right / stop / move_to_neighbor / turn_left_30 / turn_right_30</td>
+    </tr>
+    <tr>
+      <td><strong>표준 split 지원</strong></td>
+      <td>train / val_seen / val_unseen / test — R2R 벤치마크 규약 준수</td>
+    </tr>
+  </table>
+</section>
+
+
+<!-- AUTHORING MAP -->
+<section class="section" id="authoring-map">
+  <div class="section-header">
+    <div class="section-icon" style="background:rgba(16,163,74,0.15)">🏗️</div>
+    <div>
+      <div class="section-title">AuthoringMap</div>
+      <div class="section-subtitle">씬 저작 계층 — 10 오브젝트 타입 · 7 리전 타입</div>
+    </div>
+  </div>
+
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px">
+    <div class="type-block">
+      <div class="type-header">
+        <div class="type-name">OBJECT_TYPES (10종)</div>
+        <div class="type-meta">geometry: point | line | rectangle</div>
+      </div>
+      <div class="type-body">
+        <table>
+          <tr><th>타입</th><th>블록 내비게이션</th><th>위험</th></tr>
+          <tr><td><code>glass_wall</code></td><td>✅</td><td>✅ hazard</td></tr>
+          <tr><td><code>glass_door</code></td><td>조건부</td><td>✅ hazard</td></tr>
+          <tr><td><code>mirror_wall</code></td><td>✅</td><td>✅ hazard</td></tr>
+          <tr><td><code>transparent_partition</code></td><td>✅</td><td>✅ hazard</td></tr>
+          <tr><td><code>wall</code></td><td>✅</td><td>—</td></tr>
+          <tr><td><code>chair</code></td><td>✅</td><td>—</td></tr>
+          <tr><td><code>table</code></td><td>✅</td><td>—</td></tr>
+          <tr><td><code>plant</code></td><td>✅</td><td>—</td></tr>
+          <tr><td><code>shelf</code></td><td>✅</td><td>—</td></tr>
+          <tr><td><code>landmark</code></td><td>—</td><td>—</td></tr>
+        </table>
+      </div>
+    </div>
+    <div class="type-block">
+      <div class="type-header">
+        <div class="type-name">REGION_TYPES (7종)</div>
+        <div class="type-meta">geometry: rectangle 전용</div>
+      </div>
+      <div class="type-body">
+        <table>
+          <tr><th>타입</th><th>용도</th></tr>
+          <tr><td><code>traversable</code></td><td>로봇 이동 가능 구역</td></tr>
+          <tr><td><code>obstacle</code></td><td>이동 불가 구역 (정적)</td></tr>
+          <tr><td><code>hazard</code></td><td>광학 위험 구역 (투명/반사체)</td></tr>
+          <tr><td><code>goal</code></td><td>목표 도달 판정 구역</td></tr>
+          <tr><td><code>start</code></td><td>에피소드 출발 구역</td></tr>
+          <tr><td><code>restricted</code></td><td>제약 구역 (출입 금지 등)</td></tr>
+          <tr><td><code>annotation</code></td><td>자유 주석 구역</td></tr>
+        </table>
+        <div style="margin-top:10px;font-size:12px;color:var(--muted-strong)">
+          <strong>compile_ready 조건:</strong> traversable ≥ 1 + goal ≥ 1
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <h3>authoring_compile.py — 컴파일 흐름</h3>
+  <pre>AuthoringMap (저작 계층)
+  │  오브젝트: 10종 배치 + geometry (point/line/rectangle)
+  │  리전: 7종 구역 정의
+  ↓ compile_authoring_map()
+SceneAnnotation (렌더·에피소드 공통 계층)
+  │  AnnotatedObject: 타입 + geometry + navigation flags
+  │  TraversableRegion, HazardRegion, GoalRegion, Landmark
+  │  validate_scene_annotation() — 필수 요소 검증
+  ↓
+ViewpointGraph 생성 / EpisodeSampler 진입</pre>
+</section>
+
+
+<!-- VIEWPOINT GRAPH -->
+<section class="section" id="viewpoint-graph">
+  <div class="section-header">
+    <div class="section-icon" style="background:rgba(139,92,246,0.15)">🕸️</div>
+    <div>
+      <div class="section-title">ViewpointGraph</div>
+      <div class="section-subtitle">뷰포인트 노드 + 방향 + 관측 링크 그래프</div>
+    </div>
+  </div>
+
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px">
+    <div>
+      <h3>데이터 구조</h3>
+      <pre>ViewpointNode
+  node_id: str
+  position: [x, y, z]
+  clearance_m: float
+  tags: list[str]
+  headings: list[ViewpointHeading]
+
+ViewpointHeading
+  heading_id: str
+  yaw_deg: float
+  sensor_observations: dict[str, str]
+    # key: modality ("rgb", "depth", ...)
+    # value: 렌더 출력 경로
+
+ViewpointEdge
+  source: str
+  target: str
+  weight: float
+  has_hazard: bool
+  passage_type: str  # "open"|"glass_door"|...</pre>
+    </div>
+    <div>
+      <h3>4-시나리오 에피소드 샘플러</h3>
+      <table>
+        <tr><th>시나리오</th><th>경로 선택 규칙</th></tr>
+        <tr>
+          <td><code>goal_only</code></td>
+          <td>최단 경로로 목표 도달. 위험 무시.</td>
+        </tr>
+        <tr>
+          <td><code>hazard_aware</code></td>
+          <td>유리/거울 통과 경로를 포함하되 에피소드에 hazard_crossing=true 기록.</td>
+        </tr>
+        <tr>
+          <td style="color:var(--brand);font-weight:700"><code>stop_before_glass</code></td>
+          <td>유리문 앞 노드를 goal로 설정. "유리를 만나면 멈춰라" 지시문 생성.</td>
+        </tr>
+        <tr>
+          <td><code>detour</code></td>
+          <td>위험 구역 우회 경로. "안전한 우회로를 통해 이동하라" 지시문 생성.</td>
+        </tr>
+      </table>
+      <div class="alert info" style="margin-top:10px">
+        <strong>핵심:</strong> <code>stop_before_glass</code>와 <code>detour</code>는
+        OpticalNav 고유 시나리오 — 기존 VLN 벤치마크에 존재하지 않는다.
+      </div>
+    </div>
+  </div>
+
+  <h3>SensorSweep — 뷰포인트별 렌더 요청 생성</h3>
+  <pre>build_sweep_render_requests(graph, scene_id, modalities, spp, resolution)
+  → list[SweepRenderRequest]
+      node_id + heading_id + RenderRequest (→ render_daemon POST /render)
+
+각 노드의 각 방향(yaw_deg)에 대해 mat4 카메라 변환 생성 후 렌더 요청.
+결과 EXR 경로를 heading.sensor_observations[modality]에 기록.
+→ write_viewpoint_graph()로 저장.</pre>
+</section>
+
+
+<!-- EPISODE PIPELINE -->
+<section class="section" id="episode-pipeline">
+  <div class="section-header">
+    <div class="section-icon" style="background:rgba(249,115,22,0.15)">🎬</div>
+    <div>
+      <div class="section-title">Episode 파이프라인</div>
+      <div class="section-subtitle">EpisodeManifest · EpisodeTimestep · split 분배</div>
+    </div>
+  </div>
+
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
+    <div>
+      <h3>EpisodeManifest 구조</h3>
+      <pre>EpisodeManifest
+  episode_id: str
+  scene_id: str
+  split: "train"|"val_seen"|"val_unseen"|"test"
+  scenario: GRAPH_SCENARIOS
+  instruction: str         # 자연어 지시문
+  start_node_id: str
+  goal_node_id: str
+  distance_m: float
+  hazard_crossing: bool    # stop_before_glass / detour 마킹
+  generation_version: "opticalnav-v0.2"
+
+EpisodeTimestep
+  step_idx: int
+  node_id: str
+  heading_id: str
+  action: ACTION_SPACE     # 7종
+  observations: dict[str, str]   # modality → EXR 경로</pre>
+    </div>
+    <div>
+      <h3>ACTION_SPACE (7종)</h3>
+      <table>
+        <tr><th>액션</th><th>설명</th></tr>
+        <tr><td><code>move_forward</code></td><td>앞으로 한 스텝 이동</td></tr>
+        <tr><td><code>turn_left</code></td><td>45° 좌회전</td></tr>
+        <tr><td><code>turn_right</code></td><td>45° 우회전</td></tr>
+        <tr><td><code>stop</code></td><td>에피소드 종료 (목표 도달)</td></tr>
+        <tr><td><code>move_to_neighbor</code></td><td>인접 노드로 직접 이동</td></tr>
+        <tr><td><code>turn_left_30</code></td><td>30° 좌회전 (세밀 방향 조정)</td></tr>
+        <tr><td><code>turn_right_30</code></td><td>30° 우회전 (세밀 방향 조정)</td></tr>
+      </table>
+      <div style="margin-top:10px">
+        <h3>기본 모달리티</h3>
+        <table>
+          <tr><th>모달리티</th><th>의미</th></tr>
+          <tr><td><code>rgb</code></td><td>HDR RGB 이미지 (EXR)</td></tr>
+          <tr><td><code>depth</code></td><td>깊이 맵</td></tr>
+          <tr><td><code>active_nir_intensity</code></td><td>NIR 조명 반사 강도</td></tr>
+          <tr><td><code>hazard_mask</code></td><td>투명/반사 위험 구역 마스크</td></tr>
+        </table>
+      </div>
+    </div>
+  </div>
+</section>
+
+
+<!-- CLI -->
+<section class="section" id="cli">
+  <div class="section-header">
+    <div class="section-icon" style="background:rgba(6,182,212,0.15)">⌨️</div>
+    <div>
+      <div class="section-title">CLI — 데이터셋 생성 워크플로</div>
+      <div class="section-subtitle">python -m navigation_dataset &lt;command&gt;</div>
+    </div>
+  </div>
+
+  <pre>python -m navigation_dataset init --project-dir ./datasets/office_lobby
+# → DatasetProject 초기화 (pyproject.toml + scenes/ 디렉토리)
+
+python -m navigation_dataset scene add --scene-id office_lobby_001
+# → scene_annotations/ 하위 scene.json 초기화
+
+python -m navigation_dataset map build \
+  --scene-id office_lobby_001 \
+  --authoring-map authoring_maps/office_lobby_001.json
+# → compile_authoring_map() → SceneAnnotation 생성
+
+python -m navigation_dataset graph build \
+  --scene-id office_lobby_001
+# → ViewpointGraph 초기화 (노드 배치 필요)
+
+python -m navigation_dataset graph sweep \
+  --scene-id office_lobby_001 \
+  --daemon-url http://localhost:8765
+# → 각 뷰포인트·방향별 Mitsuba 렌더 요청 → EXR 수집
+
+python -m navigation_dataset graph episodes plan \
+  --scene-id office_lobby_001 \
+  --scenarios stop_before_glass detour goal_only \
+  --num-episodes 500
+# → EpisodeManifest 500개 생성
+
+python -m navigation_dataset export \
+  --scene-id office_lobby_001 \
+  --format custom_json \
+  --out ./datasets/office_lobby/export/</pre>
+</section>
+
+
+<!-- WEBUI MODES -->
+<section class="section" id="webui-modes">
+  <div class="section-header">
+    <div class="section-icon" style="background:rgba(16,163,74,0.15)">🖥️</div>
+    <div>
+      <div class="section-title">데이터셋 에디터 — 6-Mode 인터페이스</div>
+      <div class="section-subtitle">datasets/+page.svelte · 4,751 LOC · Svelte 5 runes</div>
+    </div>
+  </div>
+
+  <div class="alert info">
+    <strong>핵심 변경:</strong> 이전의 <code>activeTab + editorMode</code> 이중 상태를
+    단일 <code>pageMode: 'build' | 'place' | 'paths' | 'sensor' | 'sim' | 'export'</code>로 통합.
+    3D MapEditor 캔버스가 모드 전환 시에도 전체화면을 유지하면서 내부 표시만 바뀐다.
+  </div>
+
+  <div class="mode-grid">
+    <div class="mode-card">
+      <div class="mode-name">Build</div>
+      <div class="mode-desc">씬 선택 + AuthoringMap 오브젝트 배치 인터페이스.
+      씬 준비도 상태바 (Scene / Overlay / Map / Graph / Episodes / Render config) 표시.</div>
+    </div>
+    <div class="mode-card">
+      <div class="mode-name">Place</div>
+      <div class="mode-desc">3D 캔버스에서 USD 에셋 드래그 배치.
+      AssetThumb3D 사전 렌더 썸네일. MapEditor3D와 실시간 동기화.</div>
+    </div>
+    <div class="mode-card">
+      <div class="mode-name">Paths</div>
+      <div class="mode-desc">Episode 목록 패널 + 선택된 에피소드 경로를 3D 라인으로 시각화.
+      hazard_crossing 여부에 따라 주황/파란색 구분.</div>
+    </div>
+    <div class="mode-card">
+      <div class="mode-name">Sensor</div>
+      <div class="mode-desc">카메라 센서 배치 (NIR/RGB/Polar/LiDAR 타입).
+      3D 뷰포인트 노드 클릭 → 센서 파라미터 편집.</div>
+    </div>
+    <div class="mode-card">
+      <div class="mode-name">Sim</div>
+      <div class="mode-desc">로봇 궤적 애니메이션 재생.
+      EpisodeTimestep 시퀀스를 3D 캔버스에서 step-by-step 재생.</div>
+    </div>
+    <div class="mode-card">
+      <div class="mode-name">Export</div>
+      <div class="mode-desc">에피소드 내보내기. allEpisodePaths 전체 경로를 3D 오버레이.
+      split 별 통계 (train/val_seen/val_unseen/test) 표시.</div>
+    </div>
+  </div>
+
+  <h3>pageMode 전환 로직</h3>
+  <pre>// setPageMode() — 모드별 사이드이펙트 처리
+async function setPageMode(mode: PageMode) {
+  if (mode !== 'sim') stopRobotAnimation();
+  pageMode = mode;
+
+  if (mode === 'sim') { startRobotAnimation(); }
+
+  // Paths / Sensor 모드 진입 시 그래프가 없으면 자동 로드
+  if ((mode === 'paths' || mode === 'sensor') && !graphPayload && hasGraph) {
+    await loadViewpointGraph();
+  }
+
+  // Paths 모드인데 에피소드 미로드
+  if (mode === 'paths' && episodes.length === 0) {
+    await loadEpisodes();
+  }
+
+  // Export 모드인데 에피소드 미로드
+  if (mode === 'export' && episodes.length === 0) {
+    await loadEpisodes();
+  }
+}</pre>
+</section>
+
+
+<!-- USD SNAPSHOT -->
+<section class="section" id="usd-snapshot">
+  <div class="section-header">
+    <div class="section-icon" style="background:rgba(245,158,11,0.15)">📦</div>
+    <div>
+      <div class="section-title">usd_snapshot.py</div>
+      <div class="section-subtitle">USD Stage → SceneSnapshot · Isaac Sim 없이도 동작 · 629 LOC</div>
+    </div>
+  </div>
+
+  <p style="margin-bottom:14px">
+    기존에는 SceneSnapshot 생성이 Isaac Sim Python 환경 내부에서만 가능했다.
+    <code>usd_snapshot.py</code>는 <strong>순수 OpenUSD Python 바인딩</strong>(<code>pxr</code>)만으로
+    동일한 SceneSnapshot을 생성하는 독립 경로를 제공한다.
+  </p>
+
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
+    <div>
+      <h3>지원 기능</h3>
+      <table>
+        <tr><th>요소</th><th>파싱 내용</th></tr>
+        <tr><td>Mesh</td><td>UsdGeom.Mesh → OBJ export, 변환 행렬, material 바인딩</td></tr>
+        <tr><td>Material</td><td>UsdShade.Material → PBR 파라미터 (albedo/roughness/metallic/IOR)</td></tr>
+        <tr><td>Camera</td><td>UsdGeom.Camera → fov, near/far, 변환 행렬</td></tr>
+        <tr><td>Light</td><td>UsdLux.* → 타입별 파라미터 (intensity, color, radius 등)</td></tr>
+        <tr><td>Instancer</td><td>UsdGeom.PointInstancer → 인스턴스 매핑 레코드</td></tr>
+        <tr><td>RobotState</td><td>robomituba: namespace 커스텀 속성 → RobotState</td></tr>
+      </table>
+    </div>
+    <div>
+      <h3>사용 경로</h3>
+      <pre>from mitsuba_converter.usd_snapshot import (
+    open_stage,
+    snapshot_from_stage,
+)
+
+stage = open_stage("path/to/scene.usda")
+snapshot = snapshot_from_stage(
+    stage,
+    scene_id="office_lobby_001",
+    repo_root=Path("."),
+    out_dir=Path("out/snapshots"),
+)
+# → SceneSnapshot (robomituba_bridge 타입)</pre>
+      <div class="alert success" style="margin-top:10px">
+        <strong>효과:</strong> CI/CD · 배치 처리 · Blender 파이프라인에서
+        Isaac Sim 없이 USD 씬 → Mitsuba 렌더링 가능.
+      </div>
+    </div>
+  </div>
+</section>
+
+
+<!-- ════ GENESIS ════ -->
+<section class="section" id="genesis">
+  <div class="section-header">
+    <div class="section-icon" style="background:rgba(47,123,246,0.15)">🌌</div>
+    <div>
+      <div class="section-title">관련 연구: Genesis</div>
+      <div class="section-subtitle">A Generative and Universal Physics Engine for Robotics and Beyond · ICRA 2025</div>
+    </div>
+  </div>
+
+  <div class="ref-card">
+    <div class="ref-title">
+      <a href="https://genesis-world.readthedocs.io" target="_blank" style="color:var(--text-raw)">
+        Genesis: A Generative and Universal Physics Engine for Robotics and Beyond
+      </a>
+    </div>
+    <div class="ref-venue">
+      ICRA 2025 · Zhou Xian (CMU), Yiling Qiao + 20개 기관 (CMU / Stanford / MIT CSAIL / NVIDIA / Tsinghua) · 공개: 2024-12-18
+    </div>
+    <div class="ref-body">
+      범용 물리 엔진 + 생성형 시뮬레이션 플랫폼. 강체·유연체(FEM/MPM)·유체(SPH)·
+      입상 물질·박막을 단일 파이프라인에서 처리. PyTorch 텐서 기반 미분가능 시뮬레이션
+      (MPM·Tool solver 확인). 자연어 프롬프트로 씬·과제·보상 자동 생성.
+    </div>
+    <span class="ref-tag" style="background:var(--brand-soft);color:var(--brand)">ICRA 2025</span>
+    <span class="ref-tag" style="background:var(--success-soft);color:var(--success)">Open Source (Apache 2.0)</span>
+    <span class="ref-tag" style="background:var(--purple-soft);color:var(--purple)">Differentiable</span>
+    <span class="ref-tag" style="background:var(--warning-soft);color:var(--warning)">PyTorch + Taichi</span>
+  </div>
+
+  <h3>렌더링 백엔드 (3종)</h3>
+  <table>
+    <tr><th>백엔드</th><th>타입</th><th>상태</th><th>특징</th></tr>
+    <tr>
+      <td><strong>Nyx</strong></td>
+      <td>GPU 경로 추적 (in-house)</td>
+      <td><span style="color:var(--success)">현행 · 주력</span></td>
+      <td>Camera 센서로 attach. PBR / HDRI / 3D Gaussian Splat. 멀티 env 병렬 렌더.</td>
+    </tr>
+    <tr>
+      <td><strong>LuisaRender</strong></td>
+      <td>LuisaCompute DSL 기반 광선 추적</td>
+      <td><span style="color:var(--warning)">지원 중 → 단계적 폐기 예정</span></td>
+      <td>Python 바인딩 의존. 일부 환경에서 import 오류.</td>
+    </tr>
+    <tr>
+      <td><strong>Pyrender</strong></td>
+      <td>CPU/GPU 래스터라이저</td>
+      <td><span style="color:var(--muted)">폴백</span></td>
+      <td>뷰어 기본값. 빠른 미리보기용.</td>
+    </tr>
+  </table>
+
+  <h3>Nyx 재질 지원 (surfaces.py 기준)</h3>
+  <table>
+    <tr><th>Surface 타입</th><th>파라미터</th><th>Nyx 처리</th></tr>
+    <tr>
+      <td><code>Surface</code> (불투명)</td>
+      <td>diffuse/specular/roughness/metallic/normal/emissive texture</td>
+      <td><span style="color:var(--success)">✅ 완전 지원</span></td>
+    </tr>
+    <tr>
+      <td><code>Glass</code></td>
+      <td>IOR (기본 1.5), roughness, subsurface, transmission texture</td>
+      <td><span style="color:var(--warning)">⚠ path-tracing 굴절 가능 · caustics / thin-glass 공식 미문서</span></td>
+    </tr>
+    <tr>
+      <td><code>Metal</code></td>
+      <td>named metal 8종 (gold/silver/copper 등) → color lookup</td>
+      <td><span style="color:var(--warning)">⚠ spectral complex IOR 아님 — color 근사</span></td>
+    </tr>
+    <tr>
+      <td><code>Emission</code></td>
+      <td>color + intensity</td>
+      <td><span style="color:var(--success)">✅ 지원</span></td>
+    </tr>
+  </table>
+
+  <h3>센서 지원</h3>
+  <table>
+    <tr><th>센서</th><th>상태</th><th>비고</th></tr>
+    <tr><td>Camera (RGB)</td><td><span style="color:var(--success)">✅</span></td><td>Rasterizer 또는 Nyx 경로 선택 가능</td></tr>
+    <tr><td>Depth Camera</td><td><span style="color:var(--success)">✅</span></td><td>ray cast depth image 출력</td></tr>
+    <tr><td>Segmentation</td><td><span style="color:var(--success)">✅</span></td><td><code>.seg</code> 채널</td></tr>
+    <tr><td>IMU</td><td><span style="color:var(--success)">✅</span></td><td>linear acc + angular vel</td></tr>
+    <tr><td>LiDAR</td><td><span style="color:var(--warning)">⚠ 부분</span></td><td>Raycaster로 근사. 공식 LiDAR 센서 Issue #1111 오픈</td></tr>
+    <tr><td>NIR / 초분광 / 편광</td><td><span style="color:var(--danger)">❌ 미지원</span></td><td>스펙트럼 파이프라인 없음. 코드·문서 어디에도 없음.</td></tr>
+  </table>
+
+  <h3>자산 형식 지원</h3>
+  <table>
+    <tr><th>형식</th><th>API</th><th>Nyx 호환</th></tr>
+    <tr><td>URDF / .xacro</td><td><code>gs.morphs.URDF</code></td><td><span style="color:var(--success)">✅</span></td></tr>
+    <tr><td>MJCF (.xml)</td><td><code>gs.morphs.MJCF</code></td><td><span style="color:var(--success)">✅</span></td></tr>
+    <tr><td>USD / USDA / USDZ</td><td><code>gs.morphs.USD</code></td><td><span style="color:var(--danger)">❌ Nyx에 USD importer 없음. GLB fallback 필요.</span></td></tr>
+    <tr><td>OBJ / PLY / STL / GLB / GLTF</td><td><code>gs.morphs.Mesh</code></td><td><span style="color:var(--success)">✅ GLB embedded material 유지</span></td></tr>
+  </table>
+
+  <h3>속도 주장 vs. 실제 벤치마크</h3>
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+    <div class="type-block">
+      <div class="type-header"><div class="type-name">공식 주장 (README)</div></div>
+      <div class="type-body">
+        <ul style="font-size:13px;padding-left:16px;line-height:2">
+          <li><strong>430,000×</strong> 실시간 — RTX 4090 로봇팔 (물리만, 렌더링 없음)</li>
+          <li>Isaac Gym / Isaac Lab / MuJoCo MJX 대비 <strong>10–80×</strong> 빠름</li>
+        </ul>
+      </div>
+    </div>
+    <div class="type-block">
+      <div class="type-header"><div class="type-name">독립 벤치마크 (Stone Tao, 2024)</div></div>
+      <div class="type-body">
+        <ul style="font-size:13px;padding-left:16px;line-height:2">
+          <li>렌더링 켜면 <strong>~10×</strong> 실시간으로 급락</li>
+          <li>ManiSkill / Isaac Lab (렌더 포함) 대비 <strong>3–10× 느림</strong></li>
+          <li>로코모션 학습 속도는 Isaac Lab과 <em>비슷</em>하다고 저자 인정</li>
+        </ul>
+        <div style="font-size:11.5px;color:var(--muted);margin-top:6px">
+          → 430K 숫자는 물리 전용, 렌더링 포함 시 현실적 수치 아님
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+
+<!-- GENESIS VS US -->
+<section class="section" id="genesis-vs-us">
+  <div class="section-header">
+    <div class="section-icon" style="background:rgba(239,68,68,0.15)">⚖️</div>
+    <div>
+      <div class="section-title">Genesis vs. 우리 접근 (Isaac Sim + Mitsuba 3)</div>
+      <div class="section-subtitle">연구 목적 기준 비교 분석</div>
+    </div>
+  </div>
+
+  <table>
+    <tr>
+      <th>항목</th>
+      <th>Genesis / Nyx</th>
+      <th>Isaac Sim + Mitsuba 3 (우리)</th>
+    </tr>
+    <tr>
+      <td><strong>RGB 합성 데이터</strong></td>
+      <td><span style="color:var(--warning)">중간</span> — Nyx/Pyrender 가능하나 품질 제한</td>
+      <td><span style="color:var(--success)">높음</span> — Mitsuba 3 path tracing</td>
+    </tr>
+    <tr>
+      <td><strong>유리/투명체 물리 렌더링</strong></td>
+      <td><span style="color:var(--warning)">불확실</span> — caustics/thin-glass 미문서</td>
+      <td><span style="color:var(--success)">높음</span> — Mitsuba dielectric BSDF, 측정 BRDF 지원</td>
+    </tr>
+    <tr>
+      <td><strong>NIR 렌더링</strong></td>
+      <td><span style="color:var(--danger)">미지원</span></td>
+      <td><span style="color:var(--success)">지원</span> — wavelength-dependent illuminant</td>
+    </tr>
+    <tr>
+      <td><strong>편광 (Stokes/Mueller)</strong></td>
+      <td><span style="color:var(--danger)">미지원</span></td>
+      <td><span style="color:var(--success)">지원</span> — Mitsuba polarimetric variant</td>
+    </tr>
+    <tr>
+      <td><strong>측정 BRDF 입력</strong></td>
+      <td><span style="color:var(--danger)">미지원</span> — Disney-style 파라미터 고정</td>
+      <td><span style="color:var(--success)">지원</span> — tabulated / HP-BRDF</td>
+    </tr>
+    <tr>
+      <td><strong>로봇 물리 rollout 속도</strong></td>
+      <td><span style="color:var(--success)">높음</span> — MPM/rigid/fluid 통합, 10–80× 빠름(물리만)</td>
+      <td><span style="color:var(--warning)">중간</span> — Isaac Lab 수준</td>
+    </tr>
+    <tr>
+      <td><strong>USD 파이프라인 통합</strong></td>
+      <td><span style="color:var(--danger)">약함</span> — Nyx에 USD importer 없음</td>
+      <td><span style="color:var(--success)">강함</span> — Isaac 네이티브 USD, robomituba_bridge</td>
+    </tr>
+    <tr>
+      <td><strong>오픈소스 / 접근성</strong></td>
+      <td><span style="color:var(--success)">높음</span> — Apache 2.0, 일반 GPU</td>
+      <td><span style="color:var(--warning)">중간</span> — Isaac: NVIDIA 라이선스 필요</td>
+    </tr>
+    <tr>
+      <td><strong>미분 가능 시뮬레이션</strong></td>
+      <td><span style="color:var(--success)">지원</span> — MPM/Tool solver, PyTorch 통합</td>
+      <td><span style="color:var(--muted)">범위 밖</span></td>
+    </tr>
+  </table>
+
+  <div class="alert info">
+    <strong>판정:</strong> Genesis는 광학 관측 생성기(NIR/편광/초분광)로는 부적합하다.
+    그러나 <em>로봇 상태·rollout 생성기</em>로서는 Isaac Sim 대안 후보가 된다.
+    "Genesis(rollout) + Mitsuba 3(광학 센서)" 연동 계층이 가능한 구조적 근거도 있다:
+    Nyx는 카메라 센서처럼 scene에 attach되고 CUDA interop buffer로 장면 상태를 내보내므로,
+    동일 인터페이스를 따라 Mitsuba render-on-read 경로를 붙일 수 있다.
+  </div>
+
+  <h3>OpticalNav 연구 포지셔닝에 미치는 영향</h3>
+  <div class="type-block">
+    <div class="type-header" style="background:var(--success-soft)">
+      <div class="type-name" style="color:var(--success)">✅ 독창성 추가 확인</div>
+    </div>
+    <div class="type-body">
+      <ul style="font-size:13px;line-height:2;padding-left:16px">
+        <li>Genesis는 spectral/polarimetric 렌더링 계획 자체가 없음 — 우리 NIR·편광 관측 생성기가 공백을 채움</li>
+        <li>Genesis의 Metal 재질은 color lookup 근사 → 유리문·반사 표면의 물리적 관측 생성 불가</li>
+        <li>VLN 에피소드 생성 파이프라인과 광학 위험 시나리오 (stop_before_glass / detour)는 Genesis에 없음</li>
+        <li>우리 navigation_dataset 모듈 + Mitsuba 렌더 파이프라인 = 경쟁 없는 영역</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+
+<!-- ════ NEXT ════ -->
+<section class="section" id="next">
+  <div class="section-header">
+    <div class="section-icon" style="background:rgba(245,158,11,0.15)">🎯</div>
+    <div>
+      <div class="section-title">남은 과제</div>
+      <div class="section-subtitle">2026-05-28 기준 우선순위</div>
+    </div>
+  </div>
+
+  <table>
+    <tr><th>항목</th><th>상태</th><th>다음 작업</th></tr>
+    <tr>
+      <td>SensorSweep → 실제 렌더 연동</td>
+      <td><span style="color:var(--warning)">🔄 설계 완료</span></td>
+      <td>render_daemon POST /render 실제 호출 테스트. EXR 수집 검증.</td>
+    </tr>
+    <tr>
+      <td>ViewpointGraph UI 편집</td>
+      <td><span style="color:var(--warning)">🔄 부분 완료</span></td>
+      <td>MapEditor3D에서 노드 추가/삭제/이동 인터페이스 완성.</td>
+    </tr>
+    <tr>
+      <td>traversability → NavMesh 연동</td>
+      <td><span style="color:var(--warning)">🔄 기반 완료</span></td>
+      <td>TraversabilityGrid → ViewpointGraph 자동 노드 배치 구현.</td>
+    </tr>
+    <tr>
+      <td>episode_schema export → R2R JSON</td>
+      <td><span style="color:var(--danger)">🚫 미구현</span></td>
+      <td>R2R 형식 exporter (custom_json 외 표준 포맷 추가).</td>
+    </tr>
+    <tr>
+      <td>Isaac Sim Timeline 연동</td>
+      <td><span style="color:var(--danger)">🚫 미구현</span></td>
+      <td>매 프레임 SceneSnapshot 자동 캡처 + SceneSync.</td>
+    </tr>
+    <tr>
+      <td>hazard_mask 렌더 채널</td>
+      <td><span style="color:var(--warning)">🔄 스키마 정의</span></td>
+      <td>Mitsuba custom AOV로 투명/반사 오브젝트 마스크 출력.</td>
+    </tr>
+    <tr>
+      <td>active_nir_intensity 렌더</td>
+      <td><span style="color:var(--warning)">🔄 스키마 정의</span></td>
+      <td>NIR 조명 + wavelength-dependent material 연동 검증.</td>
+    </tr>
+    <tr>
+      <td>Genesis 연동 PoC</td>
+      <td><span style="color:var(--muted)">🔲 탐색</span></td>
+      <td>Genesis rollout 상태 → Mitsuba scene export 경로 PoC.</td>
+    </tr>
+  </table>
+</section>
+
+<div class="report-footer">
+  Robomituba Dev Report · 2026-05-28 · 오토 버텍스그래프 + USD 3D 뷰포트 + 실제 센서 프로파일 + DTC 에셋 라이브러리
+</div>
+</main>
+</div>
+</body>
+</html>

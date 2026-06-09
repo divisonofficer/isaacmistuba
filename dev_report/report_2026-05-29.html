@@ -1,0 +1,885 @@
+<!DOCTYPE html>
+<html lang="ko" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Dev Report · 2026-05-29 · 뷰 프러스텀 렌더 프리뷰 + 그래프 빌드 진행 스트리밍</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/static/pretendard.css">
+<style>
+  :root {
+    --font-sans: Pretendard,"Pretendard Variable",Inter,ui-sans-serif,system-ui,-apple-system,sans-serif;
+    --font-mono: "JetBrains Mono",ui-monospace,monospace;
+    --radius-xs:4px; --radius-sm:6px; --radius-md:10px; --radius-lg:14px; --radius-xl:20px; --radius-pill:999px;
+    --shadow-xs:0 1px 2px rgba(15,23,42,.06);
+    --shadow-sm:0 4px 12px rgba(15,23,42,.06);
+    --shadow-md:0 8px 22px rgba(15,23,42,.08);
+    --duration-fast:140ms;
+    --easing-standard:cubic-bezier(.2,0,0,1);
+
+    --bg:#f4f3f8; --bg-accent:#eef6ff;
+    --sidebar:rgba(235,235,242,.96);
+    --panel:rgba(255,255,255,.98);
+    --subpanel:rgba(248,250,252,.95);
+    --surface-2:rgba(241,245,249,.8);
+    --panel-border:rgba(148,163,184,.2);
+    --panel-border-strong:rgba(148,163,184,.3);
+    --text-raw:#1f2937; --muted:#667085; --muted-strong:#475467;
+    --brand:#2f7bf6; --brand-strong:#1f67dd;
+    --brand-soft:rgba(47,123,246,.12);
+    --cyan:#06b6d4; --cyan-soft:rgba(6,182,212,.12);
+    --success:#16a34a; --success-soft:rgba(34,197,94,.13);
+    --warning:#f97316; --warning-soft:rgba(249,115,22,.14);
+    --danger:#dc2626; --danger-soft:rgba(239,68,68,.13);
+    --purple:#8b5cf6; --purple-soft:rgba(139,92,246,.12);
+
+    --surface: var(--panel);
+    --surface2: var(--subpanel);
+    --border: var(--panel-border);
+    --accent: var(--brand);
+    --accent2: var(--purple);
+    --accent3: var(--success);
+    --accent4: var(--warning);
+    --accent5: var(--danger);
+    --text: var(--text-raw);
+    --text-muted: var(--muted-strong);
+    --text-dim: var(--muted);
+  }
+
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: var(--font-sans); background: var(--bg); color: var(--text-raw); font-size: 14px; line-height: 1.6; }
+
+  .layout { display: flex; min-height: 100vh; }
+  .sidebar { width: 220px; min-width: 220px; background: var(--sidebar); border-right: 1px solid var(--panel-border); position: sticky; top: 0; height: 100vh; overflow-y: auto; padding: 20px 12px; backdrop-filter: blur(12px); flex-shrink: 0; }
+  .main { flex: 1; padding: 28px 36px; max-width: 1100px; }
+
+  .sidebar-logo { margin-bottom: 20px; padding-bottom: 16px; border-bottom: 1px solid var(--panel-border); }
+  .logo-text { font-size: 13px; font-weight: 800; color: var(--brand); letter-spacing: -0.02em; }
+  .logo-date { font-size: 10px; color: var(--muted); font-family: var(--font-mono); margin-top: 2px; }
+  .logo-sub { font-size: 10px; color: var(--muted); margin-top: 2px; }
+  .sidebar-back { display: block; font-size: 11px; color: var(--muted); text-decoration: none; margin-bottom: 16px; }
+  .sidebar-back:hover { color: var(--brand); }
+  .nav-section { margin-bottom: 2px; }
+  .nav-section-title { font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.12em; color: var(--muted); padding: 8px 8px 4px; }
+  .nav-link { display: block; padding: 5px 8px; border-radius: var(--radius-xs); font-size: 11.5px; color: var(--muted-strong); text-decoration: none; border-left: 2px solid transparent; margin-bottom: 1px; transition: all var(--duration-fast) var(--easing-standard); }
+  .nav-link:hover { color: var(--brand-strong); background: var(--brand-soft); }
+
+  .hero { background: var(--panel); border: 1px solid var(--panel-border); border-radius: var(--radius-lg); padding: 24px 28px; margin-bottom: 24px; position: relative; overflow: hidden; box-shadow: var(--shadow-sm); }
+  .hero::before { content: ''; position: absolute; top: 0; right: 0; width: 280px; height: 100%; background: radial-gradient(ellipse at right top, var(--brand-soft) 0%, transparent 70%); pointer-events: none; }
+  .hero-date { font-size: 11px; font-weight: 700; color: var(--brand-strong); letter-spacing: 0.1em; text-transform: uppercase; margin-bottom: 8px; font-family: var(--font-mono); }
+  .hero-title { font-size: 22px; font-weight: 800; color: var(--text-raw); margin-bottom: 6px; letter-spacing: -0.03em; }
+  .hero-subtitle { font-size: 13px; color: var(--muted-strong); margin-bottom: 16px; }
+  .hero-tags { display: flex; gap: 8px; flex-wrap: wrap; }
+  .hero-tag { padding: 3px 10px; border-radius: var(--radius-pill); font-size: 11.5px; font-weight: 600; background: var(--brand-soft); color: var(--brand-strong); border: 1px solid rgba(47,123,246,.2); }
+
+  .section { background: var(--panel); border: 1px solid var(--panel-border); border-radius: var(--radius-md); padding: 22px 24px; margin-bottom: 20px; box-shadow: var(--shadow-xs); }
+  .section-header { display: flex; align-items: flex-start; gap: 14px; margin-bottom: 18px; padding-bottom: 14px; border-bottom: 1px solid var(--panel-border); }
+  .section-icon { width: 36px; height: 36px; border-radius: var(--radius-sm); display: flex; align-items: center; justify-content: center; font-size: 18px; flex-shrink: 0; }
+  .section-title { font-size: 16px; font-weight: 700; color: var(--text-raw); }
+  .section-subtitle { font-size: 11.5px; color: var(--muted); margin-top: 2px; }
+  h3 { font-size: 13px; font-weight: 700; color: var(--text-raw); margin: 18px 0 10px; }
+
+  .card-grid { display: grid; grid-template-columns: repeat(4,1fr); gap: 12px; margin-bottom: 18px; }
+  .card { background: var(--subpanel); border: 1px solid var(--panel-border); border-radius: var(--radius-sm); padding: 12px 14px; }
+  .card-label { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.1em; color: var(--muted); margin-bottom: 5px; }
+  .card-value { font-size: 20px; font-weight: 800; color: var(--brand); letter-spacing: -0.03em; }
+  .card-desc { font-size: 11.5px; color: var(--muted-strong); margin-top: 4px; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 13px; margin-bottom: 14px; }
+  th { background: var(--bg-accent); padding: 8px 10px; text-align: left; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); border-bottom: 1px solid var(--panel-border); }
+  td { padding: 8px 10px; border-bottom: 1px solid var(--panel-border); vertical-align: top; }
+  tr:last-child td { border-bottom: none; }
+
+  .type-block { border: 1px solid var(--panel-border); border-radius: var(--radius-sm); overflow: hidden; margin-bottom: 14px; }
+  .type-header { background: var(--bg-accent); padding: 10px 14px; display: flex; align-items: center; gap: 10px; }
+  .type-name { font-size: 13px; font-weight: 700; color: var(--text-raw); font-family: var(--font-mono); }
+  .type-meta { font-size: 11px; color: var(--muted); }
+  .type-body { padding: 14px; }
+
+  pre { background: var(--subpanel); border: 1px solid var(--panel-border); border-radius: var(--radius-sm); padding: 12px 14px; font-family: var(--font-mono); font-size: 12px; line-height: 1.55; overflow-x: auto; margin-bottom: 12px; }
+  code { font-family: var(--font-mono); font-size: 12px; background: var(--bg-accent); padding: 1px 5px; border-radius: 3px; }
+
+  .timeline { border-left: 2px solid var(--panel-border); padding-left: 20px; margin-left: 10px; }
+  .timeline-item { position: relative; margin-bottom: 20px; }
+  .timeline-item::before { content: ''; position: absolute; left: -26px; top: 6px; width: 10px; height: 10px; border-radius: 50%; background: var(--warning); border: 2px solid var(--bg); }
+  .timeline-time { font-size: 11px; color: var(--warning); font-weight: 700; margin-bottom: 4px; font-family: var(--font-mono); }
+  .timeline-title { font-size: 14px; font-weight: 600; color: var(--text-raw); margin-bottom: 4px; }
+  .timeline-body { font-size: 12.5px; color: var(--muted-strong); }
+
+  .alert { background: var(--warning-soft); border-left: 3px solid var(--warning); padding: 12px 14px; border-radius: var(--radius-sm); margin-bottom: 14px; font-size: 13px; }
+  .alert.info { background: var(--brand-soft); border-color: var(--brand); }
+  .alert.success { background: var(--success-soft); border-color: var(--success); }
+
+  .flow { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 14px; }
+  .flow-step { background: var(--subpanel); border: 1px solid var(--panel-border); border-radius: var(--radius-sm); padding: 6px 12px; font-size: 12px; font-weight: 600; }
+  .flow-arrow { color: var(--muted); font-size: 14px; }
+  .flow-step.highlight { background: var(--brand-soft); border-color: rgba(47,123,246,.3); color: var(--brand-strong); }
+
+  .mode-grid { display: grid; grid-template-columns: repeat(3,1fr); gap: 10px; margin-bottom: 14px; }
+  .mode-card { border: 1px solid var(--panel-border); border-radius: var(--radius-sm); padding: 12px 14px; background: var(--subpanel); }
+  .mode-name { font-size: 12px; font-weight: 700; font-family: var(--font-mono); color: var(--brand); margin-bottom: 4px; }
+  .mode-desc { font-size: 12px; color: var(--muted-strong); }
+
+  .tag { padding: 2px 8px; border-radius: var(--radius-pill); font-size: 11px; font-weight: 600; background: var(--brand-soft); color: var(--brand-strong); border: 1px solid rgba(47,123,246,.2); }
+  .tag.green { background: var(--success-soft); color: var(--success); border-color: rgba(34,197,94,.2); }
+  .tag.amber { background: var(--warning-soft); color: var(--warning); border-color: rgba(249,115,22,.2); }
+  .tag.red { background: var(--danger-soft); color: var(--danger); border-color: rgba(239,68,68,.2); }
+  .tag.purple { background: var(--purple-soft); color: var(--purple); border-color: rgba(139,92,246,.2); }
+
+  .report-footer { border-top: 1px solid var(--panel-border); margin-top: 36px; padding-top: 20px; color: var(--muted); font-size: 12px; text-align: center; }
+
+  ::-webkit-scrollbar { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-track { background: var(--bg); }
+  ::-webkit-scrollbar-thumb { background: var(--panel-border-strong); border-radius: 3px; }
+</style>
+</head>
+<body>
+<div class="layout">
+
+<!-- ── SIDEBAR ── -->
+<nav class="sidebar">
+  <div class="sidebar-logo">
+    <div class="logo-text">Robomituba</div>
+    <div class="logo-date">2026-05-29</div>
+    <div class="logo-sub">뷰 프러스텀 렌더 프리뷰</div>
+  </div>
+  <a class="sidebar-back" href="report_2026-05-28.html">← 05-28 리포트</a>
+
+  <div class="nav-section">
+    <div class="nav-section-title">오늘의 작업</div>
+    <a class="nav-link" href="#timeline">작업 타임라인</a>
+    <a class="nav-link" href="#vs-yesterday">어제 대비 변경</a>
+    <a class="nav-link" href="#stats">코드 통계</a>
+  </div>
+
+  <div class="nav-section">
+    <div class="nav-section-title">핵심 기능</div>
+    <a class="nav-link" href="#frustum-preview">뷰 프러스텀 렌더 프리뷰</a>
+    <a class="nav-link" href="#graph-progress-ws">그래프 빌드 진행 스트리밍</a>
+    <a class="nav-link" href="#prim-mesh-cache">primMeshCache (IndexedDB)</a>
+    <a class="nav-link" href="#multimodal-staging">Multimodal 기반씬 공유 스테이징</a>
+  </div>
+
+  <div class="nav-section">
+    <div class="nav-section-title">모듈 개선</div>
+    <a class="nav-link" href="#worker-routing">GPU 워커 부하 라우팅</a>
+    <a class="nav-link" href="#edge-builder">edge_builder 벡터화</a>
+    <a class="nav-link" href="#datasets-page">datasets/+page 대규모 확장</a>
+  </div>
+
+  <div class="nav-section">
+    <div class="nav-section-title">다음 단계</div>
+    <a class="nav-link" href="#next">남은 과제</a>
+  </div>
+</nav>
+
+<!-- ── MAIN ── -->
+<main class="main">
+
+<!-- HERO -->
+<div class="hero">
+  <div class="hero-date">2026-05-29 · Daily Dev Report</div>
+  <div class="hero-title">뷰 프러스텀 렌더 프리뷰 + 그래프 빌드 진행 스트리밍 + Multimodal 기반씬 공유</div>
+  <div class="hero-subtitle">각 뷰포인트에서 Mitsuba 렌더 결과를 3D 프러스텀으로 표시 · WebSocket 실시간 진행률 · 씬 스테이징 공유로 렌더 비용 절감</div>
+  <div class="hero-tags">
+    <span class="hero-tag">뷰 프러스텀 프리뷰</span>
+    <span class="hero-tag">observationScan</span>
+    <span class="hero-tag">Graph Build WebSocket</span>
+    <span class="hero-tag">primMeshCache IndexedDB</span>
+    <span class="hero-tag">_stage_base_path_scene</span>
+    <span class="hero-tag">GPU 워커 라우팅</span>
+    <span class="hero-tag">MapEditor3D +406줄</span>
+  </div>
+</div>
+
+
+<!-- ════ TIMELINE ════ -->
+<section class="section" id="timeline">
+  <div class="section-header">
+    <div class="section-icon" style="background:rgba(245,158,11,0.15)">🕐</div>
+    <div>
+      <div class="section-title">작업 타임라인</div>
+      <div class="section-subtitle">2026-05-29 개발 흐름</div>
+    </div>
+  </div>
+
+  <div class="timeline">
+    <div class="timeline-item">
+      <div class="timeline-time">오전 — 핵심 비주얼</div>
+      <div class="timeline-title">MapEditor3D — 뷰 프러스텀 3D 렌더 프리뷰</div>
+      <div class="timeline-body">
+        각 뷰포인트 노드에서 실제 Mitsuba 렌더 이미지를 3D 공간에 표시.
+        <code>updateFrustums()</code>: observationScan 데이터를 읽어 프러스텀 와이어프레임(하늘색) +
+        이미지 텍스처 플레인 생성. 카메라 컨벤션 보정(<code>-right</code> 기저)까지 정확하게 처리.
+        완료 링(green/amber) — 노드별 렌더 진행도 한눈에 확인.
+      </div>
+    </div>
+    <div class="timeline-item">
+      <div class="timeline-time">오전 — 캐시 모듈</div>
+      <div class="timeline-title">primMeshCache.ts — IndexedDB + Memory LRU 2-레이어 캐시</div>
+      <div class="timeline-body">
+        USD prim 메시를 브라우저 세션 간 영구 캐싱.
+        IndexedDB (14일 TTL) + 메모리 LRU (96 엔트리). pending Map으로 중복 fetch 방지.
+        <code>MapEditor3D</code>에서 inline cache → 독립 모듈로 분리.
+      </div>
+    </div>
+    <div class="timeline-item">
+      <div class="timeline-time">낮 — 렌더 파이프라인</div>
+      <div class="timeline-title">multimodal.py — 기반씬 공유 스테이징 + 텍스처 감사</div>
+      <div class="timeline-body">
+        <code>_shared_base_scene_path()</code>: 카메라 없는 씬을 서명(signature) 해시로 공유 →
+        뷰포인트 수천 개를 렌더해도 씬 빌드는 1회.
+        <code>_stage_base_path_scene()</code> / <code>_stage_base_diffuse_override_scene()</code> 분기.
+        텍스처 감사(<code>_texture_audit_*</code>) 시스템으로 GT 프로파일 초과 텍스처 검출.
+      </div>
+    </div>
+    <div class="timeline-item">
+      <div class="timeline-time">낮 — 실시간 피드백</div>
+      <div class="timeline-title">render_daemon — Graph Build Progress WebSocket</div>
+      <div class="timeline-body">
+        <code>/api/ws/graph-build-progress</code> 웹소켓 엔드포인트 추가.
+        <code>edge_builder.py</code>의 <code>on_progress</code> 콜백 → 데몬 WebSocket 이벤트 스트리밍.
+        프론트엔드: "Nodes 45%" / "Edges 72%" 실시간 진행 표시.
+      </div>
+    </div>
+    <div class="timeline-item">
+      <div class="timeline-time">오후 — 인프라</div>
+      <div class="timeline-title">worker_manager.py — GPU 부하 기반 워커 라우팅</div>
+      <div class="timeline-body">
+        <code>_worker_queue_depth()</code> / <code>_worker_load()</code> / <code>_pick_target_worker()</code>.
+        GPU 인덱스 환경 변수(<code>_render_gpu_indices_from_env()</code>) + sharding 자동 계산.
+        활성 워커 필터(<code>_live_workers()</code>) — 죽은 프로세스에 잡 배분 방지.
+      </div>
+    </div>
+    <div class="timeline-item">
+      <div class="timeline-time">오후 — 성능</div>
+      <div class="timeline-title">edge_builder.py — 장애물 팽창 벡터화 (NumPy)</div>
+      <div class="timeline-body">
+        <code>_dilated_traversable()</code>의 O(n²) 이중 루프를
+        <code>inflate_traversable_grid()</code> 벡터화로 교체.
+        300노드 씬 기준 엣지 빌드 시간 대폭 단축.
+      </div>
+    </div>
+    <div class="timeline-item">
+      <div class="timeline-time">저녁 — WebUI</div>
+      <div class="timeline-title">datasets/+page.svelte — 머티리얼 피커 + 배치 잡 그리드</div>
+      <div class="timeline-body">
+        머티리얼 피커: search / category / collection 3단계 필터.
+        배치 잡 그리드: 노드×헤딩 매트릭스 시각화, 단계별 상태 표시.
+        <code>cancelStaleBatchJobs()</code> / <code>selectBatchJob()</code> 추가.
+        6,180 LOC (어제 대비 +1,368줄 순증).
+      </div>
+    </div>
+  </div>
+</section>
+
+
+<!-- ════ VS YESTERDAY ════ -->
+<section class="section" id="vs-yesterday">
+  <div class="section-header">
+    <div class="section-icon" style="background:rgba(139,92,246,0.15)">📊</div>
+    <div>
+      <div class="section-title">어제 대비 주요 변경</div>
+      <div class="section-subtitle">2026-05-28 → 2026-05-29 델타</div>
+    </div>
+  </div>
+
+  <table>
+    <tr>
+      <th>영역</th>
+      <th>어제 (05.28)</th>
+      <th>오늘 (05.29)</th>
+      <th>변화</th>
+    </tr>
+    <tr>
+      <td><strong>MapEditor3D.svelte</strong></td>
+      <td>1,128줄</td>
+      <td>1,364줄</td>
+      <td><span style="color:var(--brand)">+236줄 · 프러스텀 + frustumGroup</span></td>
+    </tr>
+    <tr>
+      <td><strong>datasets/+page.svelte</strong></td>
+      <td>4,812줄</td>
+      <td>6,180줄</td>
+      <td><span style="color:var(--brand)">+1,368줄 · 머티리얼 피커 + 배치 그리드</span></td>
+    </tr>
+    <tr>
+      <td><strong>multimodal.py</strong></td>
+      <td>~기존</td>
+      <td>+460줄</td>
+      <td><span style="color:var(--success)">기반씬 공유 스테이징 + 텍스처 감사</span></td>
+    </tr>
+    <tr>
+      <td><strong>render_daemon.py</strong></td>
+      <td>11,152줄</td>
+      <td>+1,842줄 추가</td>
+      <td><span style="color:var(--brand)">WS 진행 스트리밍 + GPU 라우팅</span></td>
+    </tr>
+    <tr>
+      <td><strong>sphere_preview.py</strong></td>
+      <td>~1,567줄</td>
+      <td>1,722줄</td>
+      <td><span style="color:var(--brand)">+155줄 · BSDF 소프트웨어 프리뷰</span></td>
+    </tr>
+    <tr>
+      <td><strong>usd_editor_geometry.py</strong></td>
+      <td>534줄</td>
+      <td>~935줄</td>
+      <td><span style="color:var(--brand)">+401줄 · 카테고리 분류 개선</span></td>
+    </tr>
+    <tr>
+      <td><strong>primMeshCache.ts</strong></td>
+      <td>미존재 (inline)</td>
+      <td>신규 독립 모듈</td>
+      <td><span style="color:var(--success)">✅ IndexedDB + Memory LRU</span></td>
+    </tr>
+    <tr>
+      <td><strong>edge_builder.py</strong></td>
+      <td>O(n²) 장애물 팽창</td>
+      <td>NumPy 벡터화</td>
+      <td><span style="color:var(--success)">✅ 속도 향상 + on_progress 콜백</span></td>
+    </tr>
+    <tr>
+      <td><strong>worker_manager.py</strong></td>
+      <td>단순 워커 분배</td>
+      <td>GPU 부하 기반 라우팅</td>
+      <td><span style="color:var(--brand)">+105줄 · _pick_target_worker</span></td>
+    </tr>
+  </table>
+
+  <div class="alert info">
+    <strong>금일 커밋 델타 (HEAD 기준):</strong> 22개 파일, +6,509줄 삽입 / −792줄 삭제
+  </div>
+</section>
+
+
+<!-- ════ STATS ════ -->
+<section class="section" id="stats">
+  <div class="section-header">
+    <div class="section-icon" style="background:rgba(6,182,212,0.15)">📈</div>
+    <div>
+      <div class="section-title">코드 통계 (2026-05-29 기준)</div>
+      <div class="section-subtitle">현재 핵심 파일 규모</div>
+    </div>
+  </div>
+
+  <div class="card-grid" style="grid-template-columns:repeat(4,1fr)">
+    <div class="card">
+      <div class="card-label">datasets/+page.svelte</div>
+      <div class="card-value">6,180</div>
+      <div class="card-desc">LOC · 최대 단일 파일</div>
+    </div>
+    <div class="card">
+      <div class="card-label">render_daemon.py</div>
+      <div class="card-value">11,152+</div>
+      <div class="card-desc">LOC · HTTP + WS 서버</div>
+    </div>
+    <div class="card">
+      <div class="card-label">sphere_preview.py</div>
+      <div class="card-value">1,722</div>
+      <div class="card-desc">LOC · BSDF 프리뷰</div>
+    </div>
+    <div class="card">
+      <div class="card-label">MapEditor3D.svelte</div>
+      <div class="card-value">1,364</div>
+      <div class="card-desc">LOC · Three.js 뷰포트</div>
+    </div>
+  </div>
+
+  <table>
+    <tr><th>파일</th><th>LOC</th><th>역할</th></tr>
+    <tr><td><code>apps/webui/src/routes/datasets/+page.svelte</code></td><td>6,180</td><td>6-Mode 에디터 · 머티리얼 피커 · 배치 그리드</td></tr>
+    <tr><td><code>mitsuba_converter/render_daemon.py</code></td><td>11,152+</td><td>HTTP 렌더 서버 · WS 진행 스트리밍 · 에셋 라이브러리</td></tr>
+    <tr><td><code>mitsuba_converter/sphere_preview.py</code></td><td>1,722</td><td>BSDF 구체 프리뷰 + 소프트웨어 래스터라이저</td></tr>
+    <tr><td><code>apps/webui/src/lib/MapEditor3D.svelte</code></td><td>1,364</td><td>Three.js 3D 뷰포트 · 프러스텀 · USD prim 메시</td></tr>
+    <tr><td><code>mitsuba_converter/usd_editor_geometry.py</code></td><td>~935</td><td>USD Stage prim 메시 추출 + 카테고리 분류</td></tr>
+    <tr><td><code>apps/webui/src/routes/+layout.svelte</code></td><td>691</td><td>WebUI 레이아웃</td></tr>
+    <tr><td><code>apps/webui/src/lib/api.ts</code></td><td>380</td><td>API 클라이언트 · 에셋/관찰/배치 엔드포인트</td></tr>
+    <tr><td><code>apps/webui/src/lib/primMeshCache.ts</code></td><td>신규</td><td>IndexedDB + Memory LRU prim 메시 캐시</td></tr>
+    <tr><td><code>robomituba_bridge/__init__.py</code></td><td>234</td><td>공개 API + camera_spec / scene_state 팩토리</td></tr>
+  </table>
+</section>
+
+
+<!-- ════ FRUSTUM PREVIEW ════ -->
+<section class="section" id="frustum-preview">
+  <div class="section-header">
+    <div class="section-icon" style="background:rgba(56,189,248,0.15)">🔭</div>
+    <div>
+      <div class="section-title">뷰 프러스텀 Mitsuba 렌더 프리뷰</div>
+      <div class="section-subtitle">MapEditor3D · updateFrustums() · observationScan → Three.js 텍스처 플레인</div>
+    </div>
+  </div>
+
+  <div class="alert success">
+    <strong>핵심 성과:</strong> Mitsuba로 렌더된 뷰포인트 이미지가 3D 공간에 실시간으로 표시된다.
+    각 노드에서 카메라 방향으로 와이어프레임 프러스텀이 펼쳐지고, 그 안에 실제 렌더 RGB 이미지가 텍스처로 입혀진다.
+    385개 오브젝트·3개 리전·3개 유리·300개 노드 씬 기준.
+  </div>
+
+  <!-- Screenshot: View frustum preview -->
+  <div style="margin:18px 0;border:1px solid var(--panel-border);border-radius:var(--radius-md);overflow:hidden;box-shadow:var(--shadow-md)">
+    <img src="images/frustum_render_preview.png" alt="뷰 프러스텀 Mitsuba 렌더 프리뷰"
+         style="width:100%;display:block;background:var(--subpanel)">
+    <div style="padding:10px 14px;background:var(--subpanel);border-top:1px solid var(--panel-border);font-size:12.5px;color:var(--muted-strong)">
+      <strong>뷰 스트럼을 이용해서 미츠바 렌더된거 보여주는 뷰</strong> —
+      Sensor 모드 · 300 노드(주황 점) + 하늘색 와이어프레임 프러스텀 + 실제 Mitsuba RGB 텍스처.
+      바닥 완료 링: 초록(전 방향 렌더 완료) / 주황(부분 완료) / 회색(미렌더).
+      385obj · 3reg · 3glass · 300nodes.
+    </div>
+  </div>
+
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px">
+    <div>
+      <h3>updateFrustums() — 렌더링 로직</h3>
+      <pre>// 각 (vpId, headingId) 쌍 처리:
+// 1. nodePosMap에서 [x, z] 위치 조회
+// 2. yawMap에서 yaw_deg 조회
+// 3. 카메라 기저 계산
+const fwd   = (-sin(yaw), 0, -cos(yaw))
+const right = ( cos(yaw), 0, -sin(yaw))
+const negRight = -right  // 좌우 반전 보정
+// 4. 프러스텀 코너 4점 계산
+//    (fovY=60°, aspect=4/3, dist=0.5m)
+// 5. 와이어프레임 LineSegments 생성 (#38bdf8)
+// 6. TextureLoader → 이미지 플레인 생성
+//    BackSide: 카메라 방향에서 보이도록</pre>
+
+      <h3>완료 링 색상 규칙</h3>
+      <table>
+        <tr><th>상태</th><th>색상</th><th>조건</th></tr>
+        <tr><td>전체 완료</td><td style="color:#22c55e"><strong>초록 #22c55e</strong></td><td>doneH === totalH</td></tr>
+        <tr><td>부분 완료</td><td style="color:#fbbf24"><strong>주황 #fbbf24</strong></td><td>doneH &gt; 0</td></tr>
+        <tr><td>미렌더</td><td style="color:#cbd5e1"><strong>회색 #cbd5e1</strong></td><td>doneH === 0</td></tr>
+      </table>
+    </div>
+    <div>
+      <h3>데이터 플로</h3>
+      <div class="flow" style="flex-direction:column;align-items:flex-start;gap:6px">
+        <div class="flow-step">render_daemon: graph_sweep 배치 렌더</div>
+        <div class="flow-arrow">↓ 각 (node_id, heading_id) → Mitsuba 렌더 → EXR</div>
+        <div class="flow-step">GET /opticalnav/…/observation-scan</div>
+        <div class="flow-arrow">↓ observationScan: { viewpoints: { vpId: { headings: { hId: { has_rgb } } } } }</div>
+        <div class="flow-step highlight">updateFrustums() — observationScan 소비</div>
+        <div class="flow-arrow">↓ opticalNavObservationRgbUrl(projectId, sceneId, vpId, headingId)</div>
+        <div class="flow-step">Three.js TextureLoader → 이미지 플레인</div>
+        <div class="flow-arrow">↓</div>
+        <div class="flow-step">3D 뷰포트에 프러스텀 + 렌더 이미지 표시</div>
+      </div>
+
+      <h3>frustum 클릭 인터랙션</h3>
+      <pre>getFrustumHit(event)
+  → Raycaster.intersectObjects(frustumSelectables)
+  → userData.frustum + vpId + headingId
+  → onFrustumClick?.(vpId, headingId)
+// 클릭 시: 해당 뷰포인트/헤딩 상세 패널 열기</pre>
+    </div>
+  </div>
+
+  <h3>카메라 컨벤션 처리 (핵심 수학)</h3>
+  <div class="alert info">
+    <strong>문제:</strong> <code>_mat4_from_xy_yaw</code>의 결과를 <code>normalize_mat4_storage</code>가 전치(transpose)해서
+    저장하므로, Three.js에서 col0(right)을 그대로 쓰면 이미지가 좌우 반전됨.
+    <strong>해결:</strong> 이미지 플레인의 로컬 X축을 <code>-right</code>(<code>negRight</code>)로 사용해 보정.
+  </div>
+  <pre>// Before (잘못된): right = (cos, 0, -sin) → 이미지 좌우 반전
+// After (수정됨): negRight = -right → 올바른 화면 방향
+const tl = center + (-halfW * negRight) + (halfH * up)
+const tr = center + ( halfW * negRight) + (halfH * up)
+const bl = center + (-halfW * negRight) + (-halfH * up)
+const br = center + ( halfW * negRight) + (-halfH * up)</pre>
+</section>
+
+
+<!-- ════ GRAPH PROGRESS WS ════ -->
+<section class="section" id="graph-progress-ws">
+  <div class="section-header">
+    <div class="section-icon" style="background:rgba(47,123,246,0.15)">📡</div>
+    <div>
+      <div class="section-title">그래프 빌드 진행 WebSocket 스트리밍</div>
+      <div class="section-subtitle">render_daemon + edge_builder on_progress 콜백 → 실시간 진행률 UI</div>
+    </div>
+  </div>
+
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
+    <div>
+      <h3>렌더 데몬 WebSocket 엔드포인트</h3>
+      <pre>WS /api/ws/graph-build-progress
+  → _handle_graph_build_progress_websocket()
+
+이벤트 형식:
+{
+  "status": "building",
+  "stage": "nodes" | "edges",
+  "progress": 0.0 ~ 1.0    // 0–100%
+}
+→ status: "done" | "error" 로 종료</pre>
+
+      <h3>edge_builder on_progress 콜백</h3>
+      <pre>build_viewpoint_edges(
+    nodes, grid,
+    on_progress=ws_progress_cb   # 추가됨
+)
+# node_idx / total_nodes 마다 호출
+# → WebSocket send_json(event)</pre>
+    </div>
+    <div>
+      <h3>프론트엔드 진행 표시</h3>
+      <pre>// datasets/+page.svelte
+let graphBuildProgress = $state&lt;{
+  stage: string;
+  progress: number;
+  status: string;
+} | null&gt;(null);
+
+// WebSocket 연결 (graphBuildProgressWsUrl)
+progressWs = new WebSocket(
+  graphBuildProgressWsUrl(projectId, sceneId)
+);
+if (msg?.status === 'building')
+  graphBuildProgress = msg;</pre>
+
+      <h3>버튼 표시 상태</h3>
+      <table>
+        <tr><th>상태</th><th>텍스트</th></tr>
+        <tr><td>대기</td><td>Build Graph / Rebuild Graph</td></tr>
+        <tr><td>노드 단계</td><td>🔄 Nodes 45%</td></tr>
+        <tr><td>엣지 단계</td><td>🔄 Edges 72%</td></tr>
+        <tr><td>완료</td><td>Graph ready</td></tr>
+      </table>
+    </div>
+  </div>
+</section>
+
+
+<!-- ════ PRIM MESH CACHE ════ -->
+<section class="section" id="prim-mesh-cache">
+  <div class="section-header">
+    <div class="section-icon" style="background:rgba(139,92,246,0.15)">💾</div>
+    <div>
+      <div class="section-title">primMeshCache.ts — 2-레이어 브라우저 캐시</div>
+      <div class="section-subtitle">IndexedDB (영구·14일 TTL) + Memory LRU (96 엔트리) · 중복 fetch 방지</div>
+    </div>
+  </div>
+
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
+    <div>
+      <h3>아키텍처</h3>
+      <pre>loadCachedPrimMeshPayload(
+    projectId, sceneId, sourcePath, usdRef?
+)
+1. memory.get(key) → 즉시 반환 (hit)
+2. pending.get(key) → 진행 중인 Promise 재사용
+3. readIdb(key) → IndexedDB 조회
+4. getOpticalNavPrimMesh() → API 호출
+5. setMemory(key, payload) + writeIdb()
+
+캐시 키: "prim-mesh-cache-v1:{usdRef}#{sourcePath}"</pre>
+      <h3>파라미터</h3>
+      <table>
+        <tr><th>상수</th><th>값</th></tr>
+        <tr><td>MAX_MEMORY_ENTRIES</td><td>96</td></tr>
+        <tr><td>MAX_IDB_AGE_MS</td><td>14일</td></tr>
+        <tr><td>DB_NAME</td><td>robomituba-opticalnav</td></tr>
+        <tr><td>STORE_NAME</td><td>prim_mesh</td></tr>
+        <tr><td>CACHE_VERSION</td><td>prim-mesh-cache-v1</td></tr>
+      </table>
+    </div>
+    <div>
+      <h3>기존 대비 개선점</h3>
+      <table>
+        <tr><th>항목</th><th>이전 (inline)</th><th>지금 (모듈)</th></tr>
+        <tr><td>영속성</td><td>세션 내 메모리만</td><td>IndexedDB 14일</td></tr>
+        <tr><td>중복 fetch</td><td>Set으로 방지</td><td>pending Map (Promise 공유)</td></tr>
+        <tr><td>용량 제한</td><td>무제한</td><td>LRU 96 + IDB 14일 만료</td></tr>
+        <tr><td>사용 위치</td><td>MapEditor3D 내부</td><td>모든 컴포넌트 import 가능</td></tr>
+      </table>
+      <div class="alert success" style="margin-top:12px">
+        <strong>효과:</strong> 300노드 씬 첫 로드 후 페이지 새로고침해도 IndexedDB에서 즉시 복원.
+        USD prim 메시 API 재요청 없이 3D 뷰포트 바로 구성.
+      </div>
+    </div>
+  </div>
+</section>
+
+
+<!-- ════ MULTIMODAL STAGING ════ -->
+<section class="section" id="multimodal-staging">
+  <div class="section-header">
+    <div class="section-icon" style="background:rgba(16,163,74,0.15)">🎬</div>
+    <div>
+      <div class="section-title">Multimodal 기반씬 공유 스테이징</div>
+      <div class="section-subtitle">multimodal.py +460줄 · _stage_base_path_scene · 텍스처 감사 · _ViewpointSensorSpec</div>
+    </div>
+  </div>
+
+  <div class="alert info">
+    <strong>문제:</strong> 뷰포인트 수백 개를 렌더할 때 각 뷰포인트마다 Mitsuba XML 씬을 빌드하면
+    중복 작업(geometry/material/light 직렬화)이 수백 배 반복된다.
+    <strong>해결:</strong> 카메라 없는 기반씬을 서명(sig_hash) 기준으로 1회만 빌드하고 공유.
+  </div>
+
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px">
+    <div>
+      <h3>기반씬 공유 구조</h3>
+      <pre>_shared_base_scene_path(source_scene, base_sig)
+  sig_hash = sha1(str(base_sig))[:16]
+  → .staged_mitsuba/base/{sig_hash}.xml
+
+_stage_base_path_scene(
+    scene_path, *,
+    max_depth, rr_depth,
+    samples_per_pass,
+    scene_override,
+    integrator_type="path"
+) → staged XML (카메라 없음)
+
+각 뷰포인트 렌더 시:
+  1. 기반씬 로드 (1회 빌드, 이후 캐시)
+  2. _ViewpointSensorSpec으로 카메라만 교체
+  3. render() 호출 → EXR 저장</pre>
+    </div>
+    <div>
+      <h3>_stage_base_diffuse_override_scene</h3>
+      <pre>디퓨즈 오버라이드 변형:
+  모든 재질을 순수 Lambertian으로 덮어씀
+  → 조명 분리(albedo만 추출) / 음영 없는
+    정답 이미지 생성에 사용
+
+서명(signature):
+  base_sig = (scene_id, override_params, ...)
+  → 다른 sig_hash → 별도 캐시 파일</pre>
+
+      <h3>_ViewpointSensorSpec</h3>
+      <pre>@dataclass
+class _ViewpointSensorSpec:
+    camera_to_world: np.ndarray  # mat4
+    fov_deg: float
+    width: int
+    height: int
+# 뷰포인트별로 이것만 교체 → 기반씬 재사용</pre>
+    </div>
+  </div>
+
+  <h3>텍스처 감사 시스템</h3>
+  <table>
+    <tr><th>함수</th><th>역할</th></tr>
+    <tr>
+      <td><code>_build_texture_audit(root, out_scene)</code></td>
+      <td>씬 XML에서 모든 텍스처 파일 경로 수집 → 해상도·존재 여부 검사</td>
+    </tr>
+    <tr>
+      <td><code>_write_texture_audit(..., fail_on_gt_profile)</code></td>
+      <td>감사 결과를 JSON으로 저장. <code>fail_on_gt_profile=True</code>면 GT 프로파일 초과 텍스처 검출 시 예외</td>
+    </tr>
+    <tr>
+      <td><code>_ensure_texture_audit(scene_path)</code></td>
+      <td>감사 파일이 없거나 씬보다 오래됐으면 재감사 실행</td>
+    </tr>
+    <tr>
+      <td><code>_texture_audit_progress_payload(scene_path)</code></td>
+      <td>감사 결과를 WebSocket 진행 페이로드 형식으로 변환</td>
+    </tr>
+  </table>
+</section>
+
+
+<!-- ════ WORKER ROUTING ════ -->
+<section class="section" id="worker-routing">
+  <div class="section-header">
+    <div class="section-icon" style="background:rgba(249,115,22,0.15)">⚡</div>
+    <div>
+      <div class="section-title">GPU 워커 부하 기반 라우팅</div>
+      <div class="section-subtitle">worker_manager.py +105줄 · _pick_target_worker · GPU 인덱스 env 설정</div>
+    </div>
+  </div>
+
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
+    <div>
+      <h3>새 메서드</h3>
+      <table>
+        <tr><th>메서드</th><th>역할</th></tr>
+        <tr><td><code>_worker_queue_depth(w)</code></td><td>워커의 현재 큐 잡 수</td></tr>
+        <tr><td><code>_worker_load(w)</code></td><td>큐 깊이 + 실행 중 잡 가중치</td></tr>
+        <tr><td><code>_live_workers()</code></td><td>살아있는 워커만 반환 (프로세스 체크)</td></tr>
+        <tr><td><code>_target_gpu_index(job)</code></td><td>잡의 <code>routed_gpu_index</code> 필드 읽기</td></tr>
+        <tr><td><code>_pick_target_worker(gpu_idx)</code></td><td>해당 GPU의 가장 부하 낮은 워커 선택</td></tr>
+      </table>
+    </div>
+    <div>
+      <h3>GPU 인덱스 설정</h3>
+      <pre>_render_gpu_indices_from_env()
+  → ROBOMITUBA_GPU_INDICES="0,1,2,3"
+  → [0, 1, 2, 3]
+
+_contiguous_gpu_shard_assignments(
+    item_count=300,  # 뷰포인트 수
+    gpu_indices=[0,1,2,3]
+)
+→ [{gpu: 0, start: 0, end: 74},
+   {gpu: 1, start: 75, end: 149},
+   {gpu: 2, start: 150, end: 224},
+   {gpu: 3, start: 225, end: 299}]</pre>
+      <div class="alert success" style="margin-top:10px">
+        GPU 라우팅 이벤트(<code>routed_gpu_index</code>)가 잡 상태 extras에 기록돼
+        어떤 GPU에서 처리됐는지 추적 가능.
+      </div>
+    </div>
+  </div>
+</section>
+
+
+<!-- ════ EDGE BUILDER ════ -->
+<section class="section" id="edge-builder">
+  <div class="section-header">
+    <div class="section-icon" style="background:rgba(6,182,212,0.15)">🔗</div>
+    <div>
+      <div class="section-title">edge_builder.py — 장애물 팽창 벡터화</div>
+      <div class="section-subtitle">O(n²) 이중 루프 → inflate_traversable_grid() NumPy · on_progress 콜백 추가</div>
+    </div>
+  </div>
+
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
+    <div>
+      <h3>Before (O(n²) 이중 루프)</h3>
+      <pre style="color:var(--danger)">for oy, ox in obstacle_cells:          # O(m)
+    for dy in range(-r, r+1):          # O(r)
+        for dx in range(-r, r+1):      # O(r)
+            if dx*dx+dy*dy > r*r:
+                continue
+            traversable[oy+dy, ox+dx] = False
+# 총 O(m × r²) — r=5(0.5m/0.1m), m=장애물 수</pre>
+    </div>
+    <div>
+      <h3>After (NumPy 벡터화)</h3>
+      <pre style="color:var(--success)">inflate_traversable_grid(
+    traversable, robot_radius_m, resolution
+)
+# scipy.ndimage.binary_dilation 또는
+# 자체 구현 벡터 연산
+# O(W×H) — 그리드 크기만큼만, 장애물 수 무관
+
+# 300노드 씬 (30×20m, 0.1m res = 300×200 grid):
+# Before: ~수백ms (장애물 수 비례)
+# After:  ~수ms (상수)</pre>
+    </div>
+  </div>
+</section>
+
+
+<!-- ════ DATASETS PAGE ════ -->
+<section class="section" id="datasets-page">
+  <div class="section-header">
+    <div class="section-icon" style="background:rgba(47,123,246,0.15)">🖥️</div>
+    <div>
+      <div class="section-title">datasets/+page.svelte 대규모 확장</div>
+      <div class="section-subtitle">6,180 LOC · +1,368줄 · 머티리얼 피커 · 배치 잡 그리드 · RailTab 시스템</div>
+    </div>
+  </div>
+
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px">
+    <div>
+      <h3>머티리얼 피커 (신규)</h3>
+      <table>
+        <tr><th>상태</th><th>역할</th></tr>
+        <tr><td><code>materialPickerSearch</code></td><td>이름 텍스트 검색</td></tr>
+        <tr><td><code>materialPickerCategory</code></td><td>recommended / all / glass / wood / …</td></tr>
+        <tr><td><code>materialPickerCollection</code></td><td>preset / curated / measured</td></tr>
+        <tr><td><code>materialPreviewValue</code></td><td>현재 프리뷰 중인 머티리얼</td></tr>
+        <tr><td><code>filteredMaterialCards</code></td><td>필터 결과 파생 상태 ($derived)</td></tr>
+      </table>
+
+      <h3>RailTab 시스템</h3>
+      <pre>type RailTab =
+  'selected' | 'scene' | 'paths' |
+  'sensor' | 'export' | 'status'
+
+activateRailTab(tab)
+  → pageMode 동기화
+  → rail-pageMode 양방향 바인딩</pre>
+    </div>
+    <div>
+      <h3>배치 잡 그리드 (신규)</h3>
+      <pre>buildBatchJobGrid(batch)
+  nodeMap: Map&lt;node_id, Map&lt;heading_id, job&gt;&gt;
+  headings: [...unique heading IDs]
+  rows: [{nid, cells: [job | null]}]
+
+// 노드 × 헤딩 매트릭스 시각화
+// 각 셀: jobStatusClass() → 색상 코딩
+//   pending → 회색
+//   running → 파란 점멸
+//   done    → 초록
+//   error   → 빨간</pre>
+
+      <h3>잡 단계 레이블</h3>
+      <table>
+        <tr><th>key</th><th>표시</th></tr>
+        <tr><td>rendering</td><td>렌더링</td></tr>
+        <tr><td>queued</td><td>대기 중</td></tr>
+        <tr><td>done</td><td>완료</td></tr>
+        <tr><td>error</td><td>오류</td></tr>
+      </table>
+    </div>
+  </div>
+</section>
+
+
+<!-- ════ NEXT ════ -->
+<section class="section" id="next">
+  <div class="section-header">
+    <div class="section-icon" style="background:rgba(245,158,11,0.15)">🎯</div>
+    <div>
+      <div class="section-title">남은 과제</div>
+      <div class="section-subtitle">2026-05-29 기준 우선순위</div>
+    </div>
+  </div>
+
+  <table>
+    <tr><th>항목</th><th>상태</th><th>다음 작업</th></tr>
+    <tr>
+      <td>프러스텀 클릭 → 상세 뷰</td>
+      <td><span style="color:var(--warning)">🔄 클릭 감지 완료</span></td>
+      <td>onFrustumClick 핸들러에서 사이드패널에 RGB/Depth/NIR 멀티 모달리티 표시.</td>
+    </tr>
+    <tr>
+      <td>SensorSweep 실제 연동</td>
+      <td><span style="color:var(--warning)">🔄 설계 완료</span></td>
+      <td>graph_sweep 배치 잡 제출 → 데몬 렌더 → observationScan 갱신 전체 플로 검증.</td>
+    </tr>
+    <tr>
+      <td>텍스처 감사 UI 노출</td>
+      <td><span style="color:var(--warning)">🔄 백엔드 완료</span></td>
+      <td>Status 탭에 감사 결과 표시 (missing / oversized 텍스처 목록).</td>
+    </tr>
+    <tr>
+      <td>episode export → R2R JSON</td>
+      <td><span style="color:var(--danger)">🚫 미구현</span></td>
+      <td>R2R 형식 exporter — EpisodeManifest → R2R-compatible JSON.</td>
+    </tr>
+    <tr>
+      <td>hazard_mask 렌더 채널</td>
+      <td><span style="color:var(--warning)">🔄 스키마 정의</span></td>
+      <td>Mitsuba custom AOV로 투명/반사 오브젝트 마스크 출력.</td>
+    </tr>
+    <tr>
+      <td>active_nir_intensity 렌더</td>
+      <td><span style="color:var(--warning)">🔄 스키마 정의</span></td>
+      <td>NIR 조명 + wavelength-dependent material 연동 검증.</td>
+    </tr>
+    <tr>
+      <td>Isaac Sim Timeline 연동</td>
+      <td><span style="color:var(--danger)">🚫 미구현</span></td>
+      <td>매 프레임 SceneSnapshot 자동 캡처 + SceneSync.</td>
+    </tr>
+  </table>
+</section>
+
+<div class="report-footer">
+  Robomituba Dev Report · 2026-05-29 · 뷰 프러스텀 렌더 프리뷰 + 그래프 빌드 WebSocket + Multimodal 기반씬 공유
+</div>
+</main>
+</div>
+</body>
+</html>

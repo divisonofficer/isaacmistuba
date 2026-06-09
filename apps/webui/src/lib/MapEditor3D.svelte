@@ -9,11 +9,24 @@
 		primMeshCacheKey,
 		type PrimMeshPayload
 	} from '$lib/primMeshCache';
+	import {
+		getCachedObjMeshGeometry,
+		loadObjMeshGeometry,
+		objMeshCacheKey,
+	} from '$lib/objMeshCache';
 
 	type GhostGeom =
 		| { type: 'line'; x1: number; y1: number; x2: number; y2: number; valid: boolean }
 		| { type: 'rect'; minX: number; minY: number; maxX: number; maxY: number; valid: boolean }
-		| { type: 'point'; x: number; y: number; valid: boolean; sourcePath?: string; assetCat?: string; normalizedYMin?: number };
+		| { type: 'point'; x: number; y: number; valid: boolean; sourcePath?: string; assetCat?: string; normalizedYMin?: number; baseHeightM?: number; proxySize?: [number, number, number] };
+
+	type ObjectTransformPatch = {
+		center?: [number, number];
+		base_height_m?: number;
+		yaw_deg?: number;
+	};
+	type ObjectTransformReason = 'drag_start' | 'drag_move' | 'drag_end' | 'height_move' | 'yaw_move';
+	type ObjectGizmoHandle = 'move_xz' | 'move_y' | 'yaw';
 
 	type VisibleLayers = {
 		objects: boolean;
@@ -23,6 +36,36 @@
 		graphNodes: boolean;
 		graphEdges: boolean;
 		usdBackground?: boolean;
+	};
+	type CameraFrustumIntrinsics = {
+		fov_deg?: number;
+		fov_v_deg?: number;
+		resolution?: number[];
+	};
+	type PreviewCameraOverlay = {
+		id: string;
+		x: number;
+		z: number;
+		yaw_deg: number;
+		height_m: number;
+		fov_deg?: number;
+		fov_v_deg?: number;
+		resolution?: number[];
+		label?: string;
+		imageUrl?: string;
+		vpId?: string;
+		headingId?: string;
+		active?: boolean;
+	};
+	type XmlSceneShape = {
+		shape_id: string;
+		object_id?: string;
+		shape_type: string;
+		mesh_path?: string | null;
+		transform?: { translate?: number[]; scale?: number[]; rotate_y_deg?: number };
+		xml_role?: string;
+		material_id?: string;
+		fallback?: boolean;
 	};
 
 	let {
@@ -58,6 +101,10 @@
 		frustumMode = 'view-aligned' as 'none' | 'view-aligned' | 'selected',
 		frustumModality = 'rgb',
 		frustumSensorId = '',
+		frustumIntrinsics = null,
+		hotCameraPlacement = false,
+		previewCameraOverlay = null,
+		onHotCameraDrag,
 		cameraHeight = 1.0,
 		wallHeight = 2.4,
 		footprintInflationM = 0,
@@ -76,13 +123,47 @@
 		addEdgeMode = false,
 		onEdgeFirstNode,
 		onEdgeSecondNode,
-		roomShell = null as { wall_height_m: number; wall_thickness_m: number; bounds: number[]; shapes: Array<{ role: string; center: [number, number, number]; size: [number, number, number] }> } | null,
+		roomShell = null as {
+			wall_height_m: number;
+			wall_thickness_m: number;
+			bounds: number[];
+			shapes: Array<{ role: string; center: [number, number, number]; size: [number, number, number] }>;
+			floor_slabs?: Array<{ role: 'floor'; id?: string; region_id?: string | null; center: [number, number, number]; size: [number, number, number]; material_id?: string }>;
+			auto_floor_enabled?: boolean;
+			default_floor_material_id?: string;
+		} | null,
 		showRoomShell = true,
+		// PR2: when enabled, look up each authoring object in xmlSceneIndex.shapes
+		// and prefer the real mesh_cache OBJ over the proxy box. Opt-in default off.
+		xmlNativePreviewEnabled = false,
+		xmlSceneIndex = null as {
+			scene_id?: string;
+			xml_path?: string;
+			xml_mtime_ns?: number;
+			shapes?: Array<{
+				shape_id: string;
+				object_id?: string;
+				shape_type: string;
+				mesh_path?: string | null;
+				transform?: { translate?: number[]; scale?: number[]; rotate_y_deg?: number };
+				xml_role?: string;
+				material_id?: string;
+				fallback?: boolean;
+			}>;
+		} | null,
+		opticalNavProjectId = '',
+		opticalNavSceneId = '',
 		graphComponents = null as Record<string, number> | null,
 		traversableOverlayUrl = null as string | null,
 		traversableOverlayBbox = null as [number, number, number, number] | null,
 		addEdgeGhostColor = 0x22c55e,
-		addEdgeMaxLengthM = 1.5
+		addEdgeMaxLengthM = 1.5,
+		objectTransformMode = true,
+		surfaceSnapEnabled = true,
+		gridSnapEnabled = true,
+		gridSizeM = 0.05,
+		angleSnapDeg = 15,
+		onObjectTransform
 	}: {
 		projectId?: string;
 		sceneId?: string;
@@ -104,7 +185,7 @@
 		customSensorNodes?: { id: string; x: number; z: number; headingDeg: number; selected: boolean }[];
 		preloadSourcePath?: string;
 		preloadUsdRef?: string;
-		onGroundPointerDown?: (pt: { x: number; y: number }, shiftKey: boolean) => void;
+		onGroundPointerDown?: (pt: { x: number; y: number }, shiftKey: boolean, placement?: { base_height_m?: number; snap_label?: string }) => void;
 		onGroundPointerMove?: (pt: { x: number; y: number }, shiftKey: boolean) => void;
 		onGroundPointerUp?: (pt: { x: number; y: number }, shiftKey: boolean) => void;
 		onObjectSelect?: (id: string) => void;
@@ -116,6 +197,10 @@
 		frustumMode?: 'none' | 'view-aligned' | 'selected';
 		frustumModality?: string;
 		frustumSensorId?: string;
+		frustumIntrinsics?: CameraFrustumIntrinsics | null;
+		hotCameraPlacement?: boolean;
+		previewCameraOverlay?: PreviewCameraOverlay | PreviewCameraOverlay[] | null;
+		onHotCameraDrag?: (pose: { x: number; z: number; yaw_deg: number; final?: boolean }) => void;
 		cameraHeight?: number;
 		wallHeight?: number;
 		footprintInflationM?: number;
@@ -134,13 +219,45 @@
 		addEdgeMode?: boolean;
 		onEdgeFirstNode?: (nodeId: string) => void;
 		onEdgeSecondNode?: (sourceId: string, targetId: string) => void;
-		roomShell?: { wall_height_m: number; wall_thickness_m: number; bounds: number[]; shapes: Array<{ role: string; center: [number, number, number]; size: [number, number, number] }> } | null;
+		roomShell?: {
+			wall_height_m: number;
+			wall_thickness_m: number;
+			bounds: number[];
+			shapes: Array<{ role: string; center: [number, number, number]; size: [number, number, number] }>;
+			floor_slabs?: Array<{ role: 'floor'; id?: string; region_id?: string | null; center: [number, number, number]; size: [number, number, number]; material_id?: string }>;
+			auto_floor_enabled?: boolean;
+			default_floor_material_id?: string;
+		} | null;
 		showRoomShell?: boolean;
+		xmlNativePreviewEnabled?: boolean;
+		xmlSceneIndex?: {
+			scene_id?: string;
+			xml_path?: string;
+			xml_mtime_ns?: number;
+			shapes?: Array<{
+				shape_id: string;
+				object_id?: string;
+				shape_type: string;
+				mesh_path?: string | null;
+				transform?: { translate?: number[]; scale?: number[]; rotate_y_deg?: number };
+				xml_role?: string;
+				material_id?: string;
+				fallback?: boolean;
+			}>;
+		} | null;
+		opticalNavProjectId?: string;
+		opticalNavSceneId?: string;
 		graphComponents?: Record<string, number> | null;
 		traversableOverlayUrl?: string | null;
 		traversableOverlayBbox?: [number, number, number, number] | null;
 		addEdgeGhostColor?: number;
 		addEdgeMaxLengthM?: number;
+		objectTransformMode?: boolean;
+		surfaceSnapEnabled?: boolean;
+		gridSnapEnabled?: boolean;
+		gridSizeM?: number;
+		angleSnapDeg?: number;
+		onObjectTransform?: (id: string, patch: ObjectTransformPatch, reason: ObjectTransformReason) => void;
 	} = $props();
 
 	let host = $state<HTMLDivElement | null>(null);
@@ -180,6 +297,14 @@
 
 	let rightDragStartPos: { x: number; y: number } | null = null;
 	let dragHandle: { id: string; handle: 'line_start' | 'line_end' } | null = null;
+	let objectDrag: {
+		id: string;
+		handle: ObjectGizmoHandle;
+		startCenter: [number, number];
+		startBaseHeight: number;
+		startYaw: number;
+		startClientY: number;
+	} | null = null;
 	const movementKeys = new Set<string>();
 
 	// ─── coordinate helpers ───────────────────────────────────────────────
@@ -203,7 +328,7 @@
 		return clampAuthoringPoint(pt.x, pt.z);
 	}
 
-	function getHitObject(event: PointerEvent | MouseEvent): { id: string; type: 'object' | 'region'; handle?: 'line_start' | 'line_end' } | null {
+	function getHitObject(event: PointerEvent | MouseEvent): { id: string; type: 'object' | 'region' | 'object_gizmo'; handle?: 'line_start' | 'line_end' | ObjectGizmoHandle } | null {
 		if (!renderer || !camera || !selectableObjects.length) return null;
 		const rect = renderer.domElement.getBoundingClientRect();
 		const ndc = new THREE.Vector2(
@@ -215,8 +340,99 @@
 		if (!hits.length) return null;
 		let obj: any = hits[0].object;
 		while (obj.parent && !obj.userData.id) obj = obj.parent;
-		if (obj.userData.id) return { id: obj.userData.id as string, type: (obj.userData.itemType as 'object' | 'region') ?? 'object', handle: obj.userData.handle };
+		if (obj.userData.id) return { id: obj.userData.id as string, type: (obj.userData.itemType as 'object' | 'region' | 'object_gizmo') ?? 'object', handle: obj.userData.handle };
 		return null;
+	}
+
+	function pointObjectById(id: string): any | null {
+		return authoringObjects.find((obj: any) => obj?.id === id && obj?.geometry?.type === 'point') ?? null;
+	}
+
+	function snapScalar(value: number, step: number): number {
+		if (!Number.isFinite(step) || step <= 0) return value;
+		return Number((Math.round(value / step) * step).toFixed(3));
+	}
+
+	function movementSnapStep(event: PointerEvent | MouseEvent): number {
+		if (!gridSnapEnabled || event.altKey) return 0;
+		const base = Math.max(0.001, Number(gridSizeM) || 0.05);
+		return event.shiftKey ? base / 5 : base;
+	}
+
+	function angleSnapStep(event: PointerEvent | MouseEvent): number {
+		if (!gridSnapEnabled || event.altKey) return 0;
+		const base = Math.max(1, Number(angleSnapDeg) || 15);
+		return event.shiftKey ? Math.max(1, base / 3) : base;
+	}
+
+	function objectProxySize(obj: any): [number, number, number] {
+		const geomSize = obj?.geometry?.size_m;
+		const proxy = obj?.metadata?.proxy_size;
+		const raw = Array.isArray(geomSize) && geomSize.length >= 3 ? geomSize
+			: Array.isArray(proxy) && proxy.length >= 3 ? proxy
+			: obj?.type === 'table' ? [0.76, 0.58, 0.50]
+			: obj?.type === 'chair' ? [0.46, 0.90, 0.42]
+			: obj?.type === 'plant' ? [0.44, 0.90, 0.44]
+			: obj?.type === 'camera' ? [0.14, 0.12, 0.18]
+			: [0.50, 0.50, 0.50];
+		return [
+			Math.max(0.04, Number(raw[0]) || 0.5),
+			Math.max(0.04, Number(raw[1]) || 0.5),
+			Math.max(0.04, Number(raw[2]) || 0.5)
+		];
+	}
+
+	function objectBaseHeight(obj: any): number {
+		return Math.max(0, Number(obj?.geometry?.base_height_m ?? 0) || 0);
+	}
+
+	function objectSurfaceTargets(excludeId = '') {
+		const targets: Array<{ id: string; label: string; height: number; minX: number; maxX: number; minZ: number; maxZ: number }> = [{
+			id: '__floor__',
+			label: 'Floor',
+			height: 0,
+			minX: -Infinity,
+			maxX: Infinity,
+			minZ: -Infinity,
+			maxZ: Infinity
+		}];
+		for (const obj of authoringObjects) {
+			if (!obj || obj.id === excludeId || obj.geometry?.type !== 'point') continue;
+			const center = obj.geometry?.center;
+			if (!Array.isArray(center) || center.length < 2) continue;
+			const [sx, sy, sz] = objectProxySize(obj);
+			const top = objectBaseHeight(obj) + sy;
+			if (!Number.isFinite(top) || top <= 0.03) continue;
+			targets.push({
+				id: String(obj.id),
+				label: String(obj.label || obj.id),
+				height: Number(top.toFixed(3)),
+				minX: Number(center[0]) - sx / 2,
+				maxX: Number(center[0]) + sx / 2,
+				minZ: Number(center[1]) - sz / 2,
+				maxZ: Number(center[1]) + sz / 2
+			});
+		}
+		return targets;
+	}
+
+	function surfaceSnapForPoint(pt: { x: number; y: number }, excludeId = '', fallbackHeight = 0): { base_height_m: number; snap_label: string } {
+		if (!surfaceSnapEnabled) {
+			return { base_height_m: Math.max(0, fallbackHeight), snap_label: 'Free Height' };
+		}
+		let best = objectSurfaceTargets(excludeId)[0];
+		for (const target of objectSurfaceTargets(excludeId)) {
+			if (pt.x < target.minX || pt.x > target.maxX || pt.y < target.minZ || pt.y > target.maxZ) continue;
+			if (!best || target.height >= best.height) best = target;
+		}
+		const height = Number(Math.max(0, best?.height ?? 0).toFixed(3));
+		return { base_height_m: height, snap_label: best?.id === '__floor__' ? 'Floor' : `On ${best.label}` };
+	}
+
+	function snapPointXZ(pt: { x: number; y: number }, event: PointerEvent | MouseEvent): { x: number; y: number } {
+		const step = movementSnapStep(event);
+		if (!step) return pt;
+		return clampAuthoringPoint(snapScalar(pt.x, step), snapScalar(pt.y, step));
 	}
 
 	// ─── colour helpers ───────────────────────────────────────────────────
@@ -238,6 +454,20 @@
 	function pointColor(type: string): number {
 		const m: Record<string, number> = { chair: 0x94a3b8, table: 0x92400e, plant: 0x166534, landmark: 0x64748b, camera: 0xf59e0b };
 		return m[type] ?? 0x888888;
+	}
+
+	// Phase 1: per-region floor hint colours. Used by render-floor-slab preview meshes
+	// so the editor signals which traversable region got which material without running
+	// the real Mitsuba BSDF.
+	function floorMaterialColor(materialId: string | null | undefined): number {
+		const id = String(materialId ?? '').toLowerCase();
+		if (id.includes('wood')) return 0x8b5a2b;
+		if (id.includes('tile') || id.includes('ceramic')) return 0xcbd5e1;
+		if (id.includes('fabric') || id.includes('carpet')) return 0xd97706;
+		if (id.includes('glass')) return 0x93c5fd;
+		if (id.includes('mirror') || id.includes('metal')) return 0x94a3b8;
+		if (id.includes('concrete')) return 0x9ca3af;
+		return 0xb8a98a;
 	}
 
 	function usdProxyColor(category: string): number {
@@ -278,6 +508,24 @@
 
 	function usdRefFromSourceRef(sourceRef: unknown): string {
 		return typeof sourceRef === 'string' ? sourceRef.split('#')[0] : '';
+	}
+
+	// Derive the prim path from a ``source_ref`` like ``assets/foo.usda#/ROOT/...``
+	// when ``metadata.asset_source_path`` is missing. Historical authoring_maps
+	// (e.g. moorelane_kitchen_001) only carry the combined source_ref, so the
+	// editor would otherwise fall straight to fallback boxes even though the
+	// USD prim is reachable through the same API.
+	function primPathFromSourceRef(sourceRef: unknown): string {
+		if (typeof sourceRef !== 'string') return '';
+		const hashIdx = sourceRef.indexOf('#');
+		return hashIdx >= 0 ? sourceRef.slice(hashIdx + 1) : '';
+	}
+
+	function effectiveAssetSourcePath(obj: any): string | undefined {
+		const stored = obj?.metadata?.asset_source_path;
+		if (typeof stored === 'string' && stored) return stored;
+		const derived = primPathFromSourceRef(obj?.source_ref);
+		return derived || undefined;
 	}
 
 	function primMeshKey(sourcePath: string, usdRef = ''): string {
@@ -436,11 +684,122 @@
 		}
 	}
 
+	// PR2: map of object_id (or shape_id when unmaterialized) → XML shape record.
+	// Built once per rebuildScene() so the authoring object loop can do O(1) lookups.
+	let _xmlShapeIndex = new Map<string, XmlSceneShape>();
+	function rebuildXmlShapeIndex(): void {
+		_xmlShapeIndex = new Map();
+		const shapes = xmlSceneIndex?.shapes ?? [];
+		for (const sh of shapes) {
+			// xml_role-tagged shapes (floor / shell_*) are drawn by other code paths;
+			// only authoring object shapes go into this lookup.
+			if (sh.xml_role && (sh.xml_role === 'floor' || sh.xml_role.startsWith('shell'))) continue;
+			const key = sh.object_id || sh.shape_id;
+			if (key) _xmlShapeIndex.set(key, sh as XmlSceneShape);
+		}
+	}
+
+	// PR2: when the toggle is on, build the editor mesh from xml_scene_index.shapes
+	// directly. Returns null when no XML shape matches (caller falls back to the
+	// existing buildPointObject / buildWall path). When the underlying OBJ is not
+	// yet loaded into objMeshCache, we render a placeholder cube sized from the
+	// XML scale and kick off a background fetch — the next rebuildScene() picks up
+	// the resolved geometry from cache automatically.
+	function buildObjectFromXmlShape(obj: any): any | null {
+		if (!xmlNativePreviewEnabled) return null;
+		const sh = _xmlShapeIndex.get(obj.id);
+		if (!sh) return null;
+		const t = sh.transform ?? {};
+		const sc = Array.isArray(t.scale) ? t.scale : [1, 1, 1];
+		// Position / rotation comes from the LIVE authoring object, not the
+		// xml_scene_index transform — the index reflects sync-time placement and
+		// drifts the moment the user drags or rotates the object in the editor.
+		// xml index is consulted only for mesh_path / shape_type / material.
+		const center = obj.geometry?.center;
+		if (!Array.isArray(center) || center.length < 2) return null;
+		const baseHeight = objectBaseHeight(obj);
+		const yaw = (obj.geometry?.yaw_deg ?? 0) as number;
+		const group = new THREE.Group();
+		group.position.set(Number(center[0]) || 0, baseHeight, Number(center[1]) || 0);
+		if (Math.abs(yaw) > 1e-5) group.rotation.y = (yaw * Math.PI) / 180;
+
+		const colorHint = sh.material_id ? floorMaterialColor(sh.material_id) : 0xb8b3a8;
+		const isMesh = sh.shape_type === 'obj' && !!sh.mesh_path;
+		let mesh: any;
+		if (isMesh) {
+			const filename = (sh.mesh_path as string).split('/').pop() || sh.mesh_path as string;
+			const key = objMeshCacheKey(opticalNavProjectId, opticalNavSceneId, filename);
+			const cached = getCachedObjMeshGeometry(key);
+			if (cached) {
+				const mat = new THREE.MeshStandardMaterial({ color: colorHint, roughness: 0.85, metalness: 0 });
+				mesh = new THREE.Mesh(cached, mat);
+			} else {
+				// Placeholder cube; kick off the async fetch + bump primMeshCacheVersion-style
+				// retrigger by setting _xmlNativePreviewVersion so rebuildScene re-runs.
+				const authoredSize = Array.isArray(obj?.geometry?.size_m) ? obj.geometry.size_m : null;
+				const phSize = authoredSize && authoredSize.length >= 3
+					? [
+						Math.max(0.02, Number(authoredSize[0]) || 0.25),
+						Math.max(0.02, Number(authoredSize[1]) || 0.25),
+						Math.max(0.02, Number(authoredSize[2]) || 0.25),
+					]
+					: [
+						Math.max(0.05, (Number(sc[0]) || 0.18) * 2),
+						Math.max(0.05, (Number(sc[1]) || 0.18) * 2),
+						Math.max(0.05, (Number(sc[2]) || 0.18) * 2),
+					];
+				const ph = new THREE.BoxGeometry(
+					phSize[0],
+					phSize[1],
+					phSize[2],
+				);
+				const mat = new THREE.MeshStandardMaterial({
+					color: colorHint, roughness: 1, metalness: 0,
+					transparent: true, opacity: 0.55,
+				});
+				mesh = new THREE.Mesh(ph, mat);
+				// Schedule an async load; on completion, bump the version state so the
+				// reactive $effect fires rebuildScene() again to swap in the real mesh.
+				if (opticalNavProjectId && opticalNavSceneId) {
+					void loadObjMeshGeometry(opticalNavProjectId, opticalNavSceneId, filename)
+						.then((geo) => { if (geo) _xmlNativePreviewVersion++; });
+				}
+			}
+		} else {
+			// shape_type cube/sphere/etc. — size from XML scale (BoxGeometry takes full extent).
+			const sx = Math.max(0.01, (Number(sc[0]) || 0.5) * 2);
+			const sy = Math.max(0.01, (Number(sc[1]) || 0.5) * 2);
+			const sz = Math.max(0.01, (Number(sc[2]) || 0.5) * 2);
+			const geo = new THREE.BoxGeometry(sx, sy, sz);
+			const mat = new THREE.MeshStandardMaterial({
+				color: colorHint, roughness: 1, metalness: 0,
+				transparent: true, opacity: sh.fallback ? 0.55 : 0.85,
+			});
+			mesh = new THREE.Mesh(geo, mat);
+		}
+		mesh.userData = {
+			id: sh.object_id ?? sh.shape_id,
+			itemType: 'object',
+			xml_shape_id: sh.shape_id,
+			xml_role: sh.xml_role ?? null,
+		};
+		group.add(mesh);
+		group.userData = { ...mesh.userData };
+		return group;
+	}
+
+	// Bumped whenever an async OBJ load resolves so rebuildScene() re-runs and the
+	// placeholder cube swaps to the real mesh. Must be reactive ($state) — a plain
+	// `let` won't trigger the $effect that watches it, so placeholders would stay
+	// forever and every object would look like a fallback box.
+	let _xmlNativePreviewVersion = $state(0);
+
 	function buildPointObject(obj: any): any | null {
 		const center = obj.geometry?.center;
 		if (!center) return null;
 		const [x, z] = center;
 		const proxy = obj.metadata?.proxy_size;
+		const baseHeight = objectBaseHeight(obj);
 		const group = new THREE.Group();
 		group.position.set(x, 0, z);
 		group.rotation.y = ((obj.geometry?.yaw_deg ?? 0) * Math.PI) / 180;
@@ -451,23 +810,39 @@
 				new THREE.BoxGeometry(0.08, 0.06, 0.1),
 				new THREE.MeshStandardMaterial({ color: 0x1e293b, roughness: 0.6 })
 			);
-			body.position.set(0, 0.07, 0);
+			body.position.set(0, baseHeight + 0.07, 0);
 			group.add(body);
 			const cone = new THREE.Mesh(
 				new THREE.ConeGeometry(0.04, 0.12, 4),
 				new THREE.MeshStandardMaterial({ color: 0xf59e0b, roughness: 0.4 })
 			);
 			cone.rotation.x = -Math.PI / 2;
-			cone.position.set(0, 0.07, 0.1);
+			cone.position.set(0, baseHeight + 0.07, 0.1);
 			group.add(cone);
 			return group;
 		}
-		if (!Array.isArray(proxy) && ['chair', 'table', 'plant'].includes(obj.type)) {
-			buildBuiltInPointShape(obj, group);
+		// Preview source priority for points (XML-native toggle is handled one level
+		// up in rebuildScene). For toggle-off path:
+		//   1) USD prim mesh from primMeshCache → real geometry (covers most USD-import
+		//      objects including chair / table / plant when they have a source_ref)
+		//   2) buildBuiltInPointShape primitives → only for the no-asset case
+		//   3) Generic proxy box → unknown type with no mesh
+		// Historical order put step 2 first for hardcoded types, masking real USD
+		// prim meshes for moorelane chairs/tables. Now the built-in shape only fires
+		// when no USD prim mesh is reachable.
+		const _sourcePath: string | undefined = effectiveAssetSourcePath(obj);
+		const _usdRef = usdRefFromSourceRef(obj.source_ref);
+		const _cachedGeoPeek = _sourcePath ? primMeshCache.get(primMeshKey(_sourcePath, _usdRef)) : undefined;
+		const _hasUsdMeshOrIsLoadable = !!_cachedGeoPeek || !!_sourcePath;
+		if (!Array.isArray(proxy) && ['chair', 'table', 'plant'].includes(obj.type) && !_hasUsdMeshOrIsLoadable) {
+			const shapeGroup = new THREE.Group();
+			shapeGroup.position.y = baseHeight;
+			group.add(shapeGroup);
+			buildBuiltInPointShape(obj, shapeGroup);
 		} else {
-				const sourcePath: string | undefined = obj.metadata?.asset_source_path;
-				const usdRef = usdRefFromSourceRef(obj.source_ref);
-				const cachedGeo = sourcePath ? primMeshCache.get(primMeshKey(sourcePath, usdRef)) : undefined;
+				const sourcePath: string | undefined = _sourcePath;
+				const usdRef = _usdRef;
+				const cachedGeo = _cachedGeoPeek;
 			if (cachedGeo) {
 				// Render actual USD mesh geometry
 				const usdCat = obj.metadata?.asset_category ?? 'object';
@@ -483,7 +858,7 @@
 				// Place mesh at correct world height using normalized_y_min from USD metadata.
 				// normalized_y_min is the object's bottom height above its room floor (meters).
 				// box.min.y is the prim-local mesh bottom (may be non-zero if prim origin ≠ bottom).
-				const worldY: number = Number(obj.metadata?.normalized_y_min ?? 0);
+				const worldY: number = baseHeight + Number(obj.metadata?.normalized_y_min ?? 0);
 				const box = new THREE.Box3().setFromBufferAttribute(cachedGeo.attributes.position as any);
 				mesh.position.y = worldY - box.min.y;
 				group.add(mesh);
@@ -494,13 +869,13 @@
 				const sz = Array.isArray(proxy) ? Math.max(0.16, Math.min(1.2, Number(proxy[2] ?? 0.35))) : 0.35;
 				const usdCat = obj.metadata?.asset_category;
 				const color = usdCat ? usdProxyColor(usdCat) : pointColor(obj.type);
-				const worldY: number = Number(obj.metadata?.normalized_y_min ?? 0);
+				const worldY: number = baseHeight + Number(obj.metadata?.normalized_y_min ?? 0);
 				addProxyBox(group, [sx, h, sz], [0, worldY + h / 2, 0], color);
 			}
 		}
 		// Emitter halo: small yellow translucent sphere + ring to mark enabled light sources.
 		if (obj.is_emitter) {
-			const haloY = Number(obj.metadata?.normalized_y_min ?? 0) + 0.08;
+			const haloY = baseHeight + Number(obj.metadata?.normalized_y_min ?? 0) + 0.08;
 			const halo = new THREE.Mesh(
 				new THREE.SphereGeometry(0.18, 16, 12),
 				new THREE.MeshBasicMaterial({ color: 0xfde047, transparent: true, opacity: 0.35, depthWrite: false })
@@ -546,6 +921,79 @@
 		);
 		edges.position.copy(center);
 		rootGroup.add(edges);
+	}
+
+	function surfaceLabelForObject(obj: any): string {
+		const center = obj?.geometry?.center;
+		if (!Array.isArray(center) || center.length < 2) return 'Free Height';
+		const base = objectBaseHeight(obj);
+		const snap = surfaceSnapForPoint({ x: Number(center[0]), y: Number(center[1]) }, String(obj.id), base);
+		if (Math.abs(snap.base_height_m - base) <= 0.03) return snap.snap_label;
+		return base <= 0.03 ? 'Floor' : `Free Height · ${base.toFixed(2)}m`;
+	}
+
+	function addObjectTransformGizmo(obj: any) {
+		if (!rootGroup || obj?.geometry?.type !== 'point') return;
+		const center = obj.geometry?.center;
+		if (!Array.isArray(center) || center.length < 2) return;
+		const [sx, sy, sz] = objectProxySize(obj);
+		const base = objectBaseHeight(obj);
+		const x = Number(center[0]) || 0;
+		const z = Number(center[1]) || 0;
+		const footprintW = Math.max(0.22, sx + 0.16);
+		const footprintD = Math.max(0.22, sz + 0.16);
+
+		const footprint = new THREE.Mesh(
+			new THREE.PlaneGeometry(footprintW, footprintD),
+			new THREE.MeshBasicMaterial({ color: 0x3b82f6, transparent: true, opacity: 0.14, side: THREE.DoubleSide, depthWrite: false })
+		);
+		footprint.rotation.x = -Math.PI / 2;
+		footprint.rotation.z = -(((obj.geometry?.yaw_deg ?? 0) * Math.PI) / 180);
+		footprint.position.set(x, base + 0.012, z);
+		footprint.userData = { id: obj.id, itemType: 'object_gizmo', handle: 'move_xz' };
+		rootGroup.add(footprint);
+		selectableObjects.push(footprint);
+
+		const yTop = base + sy;
+		const yHandle = new THREE.Group();
+		yHandle.userData = { id: obj.id, itemType: 'object_gizmo', handle: 'move_y' };
+		const shaft = new THREE.Mesh(
+			new THREE.CylinderGeometry(0.018, 0.018, 0.58, 10),
+			new THREE.MeshBasicMaterial({ color: 0x22c55e, transparent: true, opacity: 0.85 })
+		);
+		shaft.position.set(0, 0.29, 0);
+		yHandle.add(shaft);
+		const cone = new THREE.Mesh(
+			new THREE.ConeGeometry(0.06, 0.14, 16),
+			new THREE.MeshBasicMaterial({ color: 0x22c55e, transparent: true, opacity: 0.9 })
+		);
+		cone.position.set(0, 0.64, 0);
+		yHandle.add(cone);
+		yHandle.position.set(x, yTop + 0.04, z);
+		rootGroup.add(yHandle);
+		selectableObjects.push(yHandle);
+
+		const ringRadius = Math.max(0.22, Math.max(sx, sz) * 0.65);
+		const yawRing = new THREE.Mesh(
+			new THREE.TorusGeometry(ringRadius, 0.018, 8, 64),
+			new THREE.MeshBasicMaterial({ color: 0xf59e0b, transparent: true, opacity: 0.9 })
+		);
+		yawRing.rotation.x = Math.PI / 2;
+		yawRing.position.set(x, yTop + 0.12, z);
+		yawRing.userData = { id: obj.id, itemType: 'object_gizmo', handle: 'yaw' };
+		rootGroup.add(yawRing);
+		selectableObjects.push(yawRing);
+
+		if (base > 0.02) {
+			const line = new THREE.Line(
+				new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(x, 0.012, z), new THREE.Vector3(x, base, z)]),
+				new THREE.LineBasicMaterial({ color: 0x22c55e, transparent: true, opacity: 0.65 })
+			);
+			rootGroup.add(line);
+		}
+		const label = _makeTextSprite(surfaceLabelForObject(obj), base <= 0.03 ? '#475569' : '#15803d');
+		label.position.set(x + footprintW * 0.35, yTop + 0.38, z);
+		rootGroup.add(label);
 	}
 
 	function addLineHandles(obj: any) {
@@ -639,13 +1087,58 @@
 		const fcx = minX + fw / 2;
 		const fcz = minZ + fh / 2;
 
-		const floorGeo = new THREE.BoxGeometry(fw, 0.02, fh);
-		const floorMat = new THREE.MeshStandardMaterial({ color: 0xf8fafc, roughness: 1, metalness: 0, transparent: true, opacity: 0.92 });
+		// Editor ground plane — pure picking surface. When render floor slabs are
+		// present we keep it almost invisible (just a raycast target); otherwise
+		// it doubles as a faint floor reference. Always sits below the render
+		// slabs so it never z-fights with them (slab tops at y=0, this at y=-0.02).
+		const hasRenderFloorSlabs = Boolean(roomShell?.floor_slabs?.length);
+		const floorGeo = new THREE.BoxGeometry(fw, 0.01, fh);
+		const floorMat = new THREE.MeshStandardMaterial({
+			color: 0xf8fafc, roughness: 1, metalness: 0,
+			transparent: true,
+			opacity: hasRenderFloorSlabs ? 0.04 : 0.28,
+			depthWrite: false,
+		});
 		const floorMesh = new THREE.Mesh(floorGeo, floorMat);
-		floorMesh.position.set(fcx, 0.001, fcz);
-		floorMesh.userData = { floorTarget: true };
+		floorMesh.position.set(fcx, -0.02, fcz);
+		floorMesh.userData = { floorTarget: true, editorGround: true };
 		baseGroup.add(floorMesh);
 		floorTargets.push(floorMesh);
+
+		// Per-region render floor slabs (Phase 1) — 1:1 with the XML floor shapes.
+		// Each slab uses a material-derived hint colour so the editor previews the
+		// scene's floor variety without running Mitsuba.
+		if (roomShell?.floor_slabs?.length) {
+			for (const slab of roomShell.floor_slabs) {
+				const [sx_w, sy_w, sz_w] = slab.size;
+				if (!(sx_w > 0 && sy_w > 0 && sz_w > 0)) continue;
+				const [cx_w, cy_w, cz_w] = slab.center;
+				const hex = floorMaterialColor(slab.material_id);
+				const slabGeo = new THREE.BoxGeometry(sx_w, sy_w, sz_w);
+				const slabMat = new THREE.MeshStandardMaterial({
+					color: hex, roughness: 0.9, metalness: 0,
+					transparent: true, opacity: 0.78,
+				});
+				const slabMesh = new THREE.Mesh(slabGeo, slabMat);
+				slabMesh.position.set(cx_w, cy_w, cz_w);
+				slabMesh.userData = {
+					id: slab.region_id ?? slab.id,
+					itemType: 'region',
+					role: 'region_floor',
+					material_id: slab.material_id,
+				};
+				baseGroup.add(slabMesh);
+				selectableObjects.push(slabMesh);
+				floorTargets.push(slabMesh);
+				const edges = new THREE.LineSegments(
+					new THREE.EdgesGeometry(slabGeo),
+					new THREE.LineBasicMaterial({ color: 0x475569, transparent: true, opacity: 0.35 }),
+				);
+				edges.position.copy(slabMesh.position);
+				edges.userData = { id: slab.region_id ?? slab.id, itemType: 'region', role: 'region_floor_edges' };
+				baseGroup.add(edges);
+			}
+		}
 
 		// Walkability overlay PNG (user-painted walkable/blocked regions).
 		if (walkabilityOverlayUrl && walkabilityOverlayBbox) {
@@ -899,10 +1392,18 @@
 
 		// Objects (walls + points)
 		if (visibleLayers.objects) {
+			rebuildXmlShapeIndex();
 			for (const obj of authoringObjects) {
 				let mesh: any = null;
-				if (obj.geometry?.type === 'line') mesh = buildWall(obj);
-				else if (obj.geometry?.type === 'point') mesh = buildPointObject(obj);
+				// PR2: when the XML-native preview toggle is on, draw from the actual
+				// render-side mesh first. authoringObjects without a matching XML shape
+				// (placement-only items, edits not yet synced) fall through to the
+				// existing buildWall / buildPointObject path.
+				if (xmlNativePreviewEnabled) mesh = buildObjectFromXmlShape(obj);
+				if (!mesh) {
+					if (obj.geometry?.type === 'line') mesh = buildWall(obj);
+					else if (obj.geometry?.type === 'point') mesh = buildPointObject(obj);
+				}
 				if (!mesh) continue;
 				rootGroup.add(mesh);
 				selectableObjects.push(mesh);
@@ -910,6 +1411,7 @@
 					if (mesh.geometry) addSelectionEdges(mesh.geometry, mesh.position.clone(), mesh.rotation.clone());
 					else addSelectionBox(mesh);
 					addLineHandles(obj);
+					if (objectTransformMode && obj.geometry?.type === 'point') addObjectTransformGizmo(obj);
 				}
 			}
 		}
@@ -1044,20 +1546,35 @@
 		} else if (draftGhost.type === 'point') {
 				const sp = (draftGhost as any).sourcePath as string | undefined;
 				const cachedGeo = sp ? primMeshCache.get(primMeshKey(sp, preloadUsdRef)) : undefined;
+				const snap = surfaceSnapForPoint({ x: draftGhost.x, y: draftGhost.y }, '', Number((draftGhost as any).baseHeightM ?? 0));
+				const baseHeight = Number((draftGhost as any).baseHeightM ?? snap.base_height_m ?? 0);
 			if (cachedGeo) {
 				const ghostMat = new THREE.MeshStandardMaterial({ color, transparent: true, opacity: 0.55, depthWrite: false });
 				const mesh = new THREE.Mesh(cachedGeo, ghostMat);
 				const box = new THREE.Box3().setFromBufferAttribute(cachedGeo.attributes.position as any);
-				const ghostWorldY = (draftGhost as any).normalizedYMin ?? 0;
+				const ghostWorldY = baseHeight + ((draftGhost as any).normalizedYMin ?? 0);
 				mesh.position.set(draftGhost.x, ghostWorldY - box.min.y, draftGhost.y);
 				ghostGroup.add(mesh);
 			} else {
 				const geo = new THREE.SphereGeometry(0.14, 10, 10);
 				const mat = new THREE.MeshBasicMaterial({ color, transparent: true, opacity });
 				const sphere = new THREE.Mesh(geo, mat);
-				sphere.position.set(draftGhost.x, 0.14, draftGhost.y);
+				sphere.position.set(draftGhost.x, baseHeight + 0.14, draftGhost.y);
 				ghostGroup.add(sphere);
 			}
+			const proxy = (draftGhost as any).proxySize;
+			const sx = Array.isArray(proxy) ? Math.max(0.12, Number(proxy[0]) || 0.4) : 0.4;
+			const sz = Array.isArray(proxy) ? Math.max(0.12, Number(proxy[2]) || 0.4) : 0.4;
+			const footprint = new THREE.Mesh(
+				new THREE.PlaneGeometry(sx, sz),
+				new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.18, side: THREE.DoubleSide, depthWrite: false })
+			);
+			footprint.rotation.x = -Math.PI / 2;
+			footprint.position.set(draftGhost.x, baseHeight + 0.01, draftGhost.y);
+			ghostGroup.add(footprint);
+			const label = _makeTextSprite(snap.snap_label ?? 'Floor', baseHeight > 0.03 ? '#15803d' : '#475569');
+			label.position.set(draftGhost.x + 0.24, baseHeight + 0.45, draftGhost.y);
+			ghostGroup.add(label);
 		}
 
 		// Draft point indicator (first click for line tools)
@@ -1214,7 +1731,155 @@
 		};
 	}
 
+	function startObjectTransform(id: string, handle: ObjectGizmoHandle, event: PointerEvent) {
+		const obj = pointObjectById(id);
+		const center = obj?.geometry?.center;
+		if (!obj || !Array.isArray(center) || center.length < 2) return false;
+		objectDrag = {
+			id,
+			handle,
+			startCenter: [Number(center[0]) || 0, Number(center[1]) || 0],
+			startBaseHeight: objectBaseHeight(obj),
+			startYaw: Number(obj.geometry?.yaw_deg ?? 0) || 0,
+			startClientY: event.clientY
+		};
+		if (controls) controls.enabled = false;
+		if (renderer) renderer.domElement.style.cursor = handle === 'move_y' ? 'ns-resize' : handle === 'yaw' ? 'crosshair' : 'grabbing';
+		onObjectTransform?.(id, {}, 'drag_start');
+		return true;
+	}
+
+	function updateObjectTransform(event: PointerEvent) {
+		if (!objectDrag) return;
+		const { id, handle, startBaseHeight, startYaw, startClientY } = objectDrag;
+		if (handle === 'move_xz') {
+			const pt = getWorldPoint(event);
+			if (!pt) return;
+			const snapped = snapPointXZ(pt, event);
+			const patch: ObjectTransformPatch = { center: [snapped.x, snapped.y] };
+			if (surfaceSnapEnabled && !event.altKey) {
+				const surface = surfaceSnapForPoint(snapped, id, startBaseHeight);
+				patch.base_height_m = surface.base_height_m;
+			} else {
+				patch.base_height_m = startBaseHeight;
+			}
+			onObjectTransform?.(id, patch, 'drag_move');
+			return;
+		}
+		if (handle === 'move_y') {
+			const sensitivity = event.shiftKey ? 0.003 : 0.01;
+			let height = Math.max(0, startBaseHeight + (startClientY - event.clientY) * sensitivity);
+			const step = movementSnapStep(event);
+			if (step) height = snapScalar(height, step);
+			onObjectTransform?.(id, { base_height_m: Number(height.toFixed(3)) }, 'height_move');
+			return;
+		}
+		if (handle === 'yaw') {
+			const pt = getWorldPoint(event);
+			const obj = pointObjectById(id);
+			const center = obj?.geometry?.center ?? objectDrag.startCenter;
+			if (!pt || !Array.isArray(center)) return;
+			const dx = pt.x - Number(center[0]);
+			const dz = pt.y - Number(center[1]);
+			if (Math.hypot(dx, dz) < 0.03) return;
+			let yaw = (Math.atan2(dx, dz) * 180) / Math.PI;
+			const step = angleSnapStep(event);
+			if (step) yaw = snapScalar(yaw, step);
+			yaw = Number((((yaw % 360) + 360) % 360).toFixed(1));
+			if (!Number.isFinite(yaw)) yaw = startYaw;
+			onObjectTransform?.(id, { yaw_deg: yaw }, 'yaw_move');
+		}
+	}
+
+	function finishObjectTransform() {
+		if (!objectDrag) return;
+		const id = objectDrag.id;
+		objectDrag = null;
+		if (controls) controls.enabled = true;
+		if (renderer) renderer.domElement.style.cursor = '';
+		onObjectTransform?.(id, {}, 'drag_end');
+	}
+
 	// ─── pointer events ───────────────────────────────────────────────────
+	function objectAndParentsVisible(obj: any): boolean {
+		let n = obj;
+		while (n) {
+			if (n.visible === false) return false;
+			n = n.parent;
+		}
+		return true;
+	}
+
+	function previewOverlayList(): PreviewCameraOverlay[] {
+		if (!previewCameraOverlay) return [];
+		return Array.isArray(previewCameraOverlay) ? previewCameraOverlay : [previewCameraOverlay];
+	}
+
+	function activePreviewOverlay(): PreviewCameraOverlay | null {
+		const overlays = previewOverlayList();
+		return overlays.find((item) => item.active) ?? overlays[overlays.length - 1] ?? null;
+	}
+
+	function frustumHalfExtents(distance: number, intrinsics: CameraFrustumIntrinsics | null = frustumIntrinsics) {
+		const resolution = Array.isArray(intrinsics?.resolution) && intrinsics!.resolution.length >= 2
+			? intrinsics!.resolution
+			: [4, 3];
+		const aspect = Math.max(0.1, (Number(resolution[0]) || 4) / Math.max(1, Number(resolution[1]) || 3));
+		const fovH = Math.max(1, Math.min(175, Number(intrinsics?.fov_deg ?? 70)));
+		const fovV = Number(intrinsics?.fov_v_deg ?? 0) > 0
+			? Math.max(1, Math.min(175, Number(intrinsics?.fov_v_deg)))
+			: (Math.atan(Math.tan((fovH * Math.PI / 180) / 2) / aspect) * 2 * 180 / Math.PI);
+		return {
+			halfW: Math.tan((fovH * Math.PI / 180) / 2) * distance,
+			halfH: Math.tan((fovV * Math.PI / 180) / 2) * distance,
+		};
+	}
+
+	function buildCameraFrustumGroup(args: {
+		x: number; z: number; yawDeg: number; height: number; hasImage?: boolean;
+		imageUrl?: string; vpId?: string; headingId?: string; intrinsics?: CameraFrustumIntrinsics | null;
+		color?: number; opacity?: number;
+	}) {
+		const displayDist = 0.5;
+		const { halfW, halfH } = frustumHalfExtents(displayDist, args.intrinsics ?? frustumIntrinsics);
+		const yaw = (args.yawDeg * Math.PI) / 180;
+		const origin = new THREE.Vector3(args.x, args.height, args.z);
+		const fwd = new THREE.Vector3(-Math.sin(yaw), 0, -Math.cos(yaw));
+		const right = new THREE.Vector3(Math.cos(yaw), 0, -Math.sin(yaw));
+		const up = new THREE.Vector3(0, 1, 0);
+		const negFwd = fwd.clone().negate();
+		const center = origin.clone().addScaledVector(fwd, displayDist);
+		const group = new THREE.Group();
+		const tl = center.clone().addScaledVector(right, -halfW).addScaledVector(up, halfH);
+		const tr = center.clone().addScaledVector(right, halfW).addScaledVector(up, halfH);
+		const bl = center.clone().addScaledVector(right, -halfW).addScaledVector(up, -halfH);
+		const br = center.clone().addScaledVector(right, halfW).addScaledVector(up, -halfH);
+		const linePoints = [origin, tl, origin, tr, origin, bl, origin, br, tl, tr, tr, br, br, bl, bl, tl];
+		group.add(new THREE.LineSegments(
+			new THREE.BufferGeometry().setFromPoints(linePoints),
+			new THREE.LineBasicMaterial({ color: args.color ?? 0x38bdf8, transparent: true, opacity: args.opacity ?? 0.9 })
+		));
+		if (args.hasImage && args.imageUrl) {
+			let texture = textureCache.get(args.imageUrl);
+			if (!texture) {
+				texture = new THREE.TextureLoader().load(args.imageUrl);
+				(texture as any).colorSpace = 'srgb';
+				textureCache.set(args.imageUrl, texture);
+			}
+			const rotMat = new THREE.Matrix4().makeBasis(right, up, negFwd);
+			const plane = new THREE.Mesh(
+				new THREE.PlaneGeometry(halfW * 2, halfH * 2),
+				new THREE.MeshBasicMaterial({ map: texture, side: THREE.DoubleSide })
+			);
+			plane.position.copy(center);
+			plane.quaternion.setFromRotationMatrix(rotMat);
+			plane.userData = { frustum: true, vpId: args.vpId, headingId: args.headingId, hasRgb: true };
+			group.add(plane);
+			if (args.vpId && args.headingId) frustumSelectables.push(plane);
+		}
+		return group;
+	}
+
 	function getFrustumHit(event: PointerEvent | MouseEvent): { vpId: string; headingId: string } | null {
 		if (!renderer || !camera || !frustumSelectables.length) return null;
 		const rect = renderer.domElement.getBoundingClientRect();
@@ -1223,7 +1888,7 @@
 			-((event.clientY - rect.top) / rect.height) * 2 + 1
 		);
 		raycaster.setFromCamera(ndc, camera);
-		const hits = raycaster.intersectObjects(frustumSelectables, false);
+		const hits = raycaster.intersectObjects(frustumSelectables.filter(objectAndParentsVisible), false);
 		if (!hits.length) return null;
 		const ud = hits[0].object.userData;
 		if (ud?.frustum && ud.vpId && ud.headingId) return { vpId: ud.vpId, headingId: ud.headingId };
@@ -1234,6 +1899,14 @@
 		host?.focus();
 		if (event.button !== 0) return;
 		if (editorMode === 'simulate') return;
+		if (hotCameraPlacement) {
+			const pt = getWorldPoint(event);
+			if (!pt) return;
+			hotCameraDragStart = { x: pt.x, z: pt.y };
+			if (controls) controls.enabled = false;
+			onHotCameraDrag?.({ x: pt.x, z: pt.y, yaw_deg: activePreviewOverlay()?.yaw_deg ?? 0 });
+			return;
+		}
 		// Check frustum click first
 		const fHit = getFrustumHit(event);
 		if (fHit) {
@@ -1284,22 +1957,32 @@
 		// Default: object selection.
 		const hit = getHitObject(event);
 		if (hit?.handle && placementTool === 'select') {
-			dragHandle = { id: hit.id, handle: hit.handle };
-			if (controls) controls.enabled = false;
 			onObjectSelect?.(hit.id);
+			if (hit.type === 'object_gizmo' && objectTransformMode && ['move_xz', 'move_y', 'yaw'].includes(String(hit.handle))) {
+				startObjectTransform(hit.id, hit.handle as ObjectGizmoHandle, event);
+				return;
+			}
+			if (hit.handle === 'line_start' || hit.handle === 'line_end') {
+				dragHandle = { id: hit.id, handle: hit.handle };
+				if (controls) controls.enabled = false;
+			}
 			return;
 		}
 		if (hit && placementTool === 'select') {
 			onObjectSelect?.(hit.id);
+			if (objectTransformMode && hit.id === selectedId && hit.type === 'object' && pointObjectById(hit.id)) {
+				startObjectTransform(hit.id, 'move_xz', event);
+			}
 			return;
 		}
 		const pt = getWorldPoint(event);
 		if (!pt) return;
-		onGroundPointerDown?.(pt, event.shiftKey);
+		onGroundPointerDown?.(pt, event.shiftKey, surfaceSnapForPoint(pt));
 	}
 
 	let edgeFirstNodeId = '';
 	let edgeGhostMesh: any = null;
+	let hotCameraDragStart: { x: number; z: number } | null = null;
 	let paintActive = false;
 	let paintStrokeBuffer: Array<[number, number]> = [];
 	let paintCursorMesh: any = null;
@@ -1326,6 +2009,21 @@
 
 	function onPointerMove(event: PointerEvent) {
 		if (editorMode === 'simulate') return;
+		if (hotCameraDragStart) {
+			const pt = getWorldPoint(event);
+			if (!pt) return;
+			const dx = pt.x - hotCameraDragStart.x;
+			const dz = pt.y - hotCameraDragStart.z;
+			const yaw = Math.hypot(dx, dz) < 0.03
+				? (activePreviewOverlay()?.yaw_deg ?? 0)
+				: (Math.atan2(-dx, -dz) * 180) / Math.PI;
+			onHotCameraDrag?.({ x: hotCameraDragStart.x, z: hotCameraDragStart.z, yaw_deg: yaw });
+			return;
+		}
+		if (objectDrag) {
+			updateObjectTransform(event);
+			return;
+		}
 
 		// Frustum hover cursor
 		if (getFrustumHit(event)) {
@@ -1476,6 +2174,25 @@
 	function onPointerUp(event: PointerEvent) {
 		if (event.button !== 0) return;
 		if (editorMode === 'simulate') return;
+		if (hotCameraDragStart) {
+			const pt = getWorldPoint(event);
+			const start = hotCameraDragStart;
+			hotCameraDragStart = null;
+			if (controls) controls.enabled = true;
+			if (pt) {
+				const dx = pt.x - start.x;
+				const dz = pt.y - start.z;
+				const yaw = Math.hypot(dx, dz) < 0.03
+					? (activePreviewOverlay()?.yaw_deg ?? 0)
+					: (Math.atan2(-dx, -dz) * 180) / Math.PI;
+				onHotCameraDrag?.({ x: start.x, z: start.z, yaw_deg: yaw, final: true });
+			}
+			return;
+		}
+		if (objectDrag) {
+			finishObjectTransform();
+			return;
+		}
 		if (dragHandle) {
 			dragHandle = null;
 			if (controls) controls.enabled = true;
@@ -1525,7 +2242,7 @@
 			if (dist > 8) return;
 		}
 		const hit = getHitObject(event);
-		if (hit) onObjectContextMenu?.(event, hit.id, hit.type);
+		if (hit && hit.type !== 'object_gizmo') onObjectContextMenu?.(event, hit.id, hit.type);
 	}
 
 	function onMouseLeave() {
@@ -1621,6 +2338,13 @@
 		if (renderer) addEnvironment();
 	});
 
+	// Max concurrent /prim-mesh requests. The first request in a batch causes the
+	// server to open the USD stage; subsequent requests in the same batch benefit
+	// from the cached stage. Keeping this low avoids hammering the daemon with
+	// hundreds of simultaneous Stage.Open calls before the cache is warm.
+	const PRIM_MESH_CONCURRENCY = 6;
+	let primMeshActiveLoads = $state(0);
+
 	async function loadPrimMesh(sourcePath: string, usdRef: string) {
 		const key = primMeshKey(sourcePath, usdRef);
 		if (primMeshPending.has(key) || primMeshCache.has(key)) return;
@@ -1631,6 +2355,11 @@
 			primMeshCacheVersion += 1;
 			return;
 		}
+		// Concurrency gate: skip this call if too many loads are in-flight.
+		// The $effect that calls us re-runs on each primMeshCacheVersion bump,
+		// so deferred items will be picked up as slots free up.
+		if (primMeshActiveLoads >= PRIM_MESH_CONCURRENCY) return;
+		primMeshActiveLoads += 1;
 		primMeshPending.add(key);
 		try {
 			const data = await loadCachedPrimMeshPayload(projectId, sceneId, sourcePath, usdRef || undefined);
@@ -1639,7 +2368,8 @@
 			primMeshCache.set(key, null);
 		} finally {
 			primMeshPending.delete(key);
-			primMeshCacheVersion += 1; // trigger re-render
+			primMeshActiveLoads -= 1;
+			primMeshCacheVersion += 1; // trigger re-render + continues queued loads
 		}
 	}
 
@@ -1652,12 +2382,15 @@
 	});
 
 	$effect(() => {
-		// Queue mesh loads for USD objects not yet cached
+		// Queue mesh loads for USD objects not yet cached (concurrency-limited).
+		// Re-runs on primMeshCacheVersion so each completed load drains the queue.
+		primMeshCacheVersion;
 		for (const obj of authoringObjects) {
-			const sourcePath = obj?.metadata?.asset_source_path;
+			const sourcePath = effectiveAssetSourcePath(obj);
 			const usdRef = typeof obj.source_ref === 'string' ? obj.source_ref.split('#')[0] : '';
 			const key = sourcePath ? primMeshKey(sourcePath, usdRef) : '';
 			if (!sourcePath || primMeshCache.has(key) || primMeshPending.has(key)) continue;
+			if (primMeshActiveLoads >= PRIM_MESH_CONCURRENCY) break; // wait for slots to free
 			void loadPrimMesh(sourcePath, usdRef);
 		}
 	});
@@ -1673,6 +2406,14 @@
 		allEpisodePaths;
 		customSensorNodes;
 		primMeshCacheVersion; // re-render when new meshes arrive
+		_xmlNativePreviewVersion; // PR2: re-render when async OBJ load resolves
+		xmlNativePreviewEnabled;
+		xmlSceneIndex;
+		objectTransformMode;
+		surfaceSnapEnabled;
+		gridSnapEnabled;
+		gridSizeM;
+		angleSnapDeg;
 		if (renderer) rebuildScene();
 	});
 
@@ -1680,6 +2421,7 @@
 		draftGhost;
 		draftPoint;
 		editorMode;
+		surfaceSnapEnabled;
 		primMeshCacheVersion; // refresh ghost when mesh arrives in cache
 		if (renderer) updateGhost();
 	});
@@ -1721,57 +2463,34 @@
 			return;
 		}
 
-		const displayDist = 0.5;
-		const fovYRad = (60 * Math.PI) / 180;
-		const aspect = 4 / 3;
-		const halfH = Math.tan(fovYRad / 2) * displayDist;
-		const halfW = halfH * aspect;
 		const camY = cameraHeight;
 
 		const yaw = (yawDeg * Math.PI) / 180;
 		const origin = new THREE.Vector3(nx, camY, nz);
 		const fwd = new THREE.Vector3(-Math.sin(yaw), 0, -Math.cos(yaw));
-		const right = new THREE.Vector3(Math.cos(yaw), 0, -Math.sin(yaw));
-		const up = new THREE.Vector3(0, 1, 0);
-		const negRight = right.clone().negate();
-		const negFwd = fwd.clone().negate();
 
-		const center = origin.clone().addScaledVector(fwd, displayDist);
 		const group = new THREE.Group();
 		group.userData = { vpId, headingId, yawDeg };
 
 		if (!hasModality) {
 			// Short direction ray only for missing renders
+			const displayDist = 0.5;
 			const tip = origin.clone().addScaledVector(fwd, displayDist * 0.6);
 			const rayGeo = new THREE.BufferGeometry().setFromPoints([origin, tip]);
 			group.add(new THREE.LineSegments(rayGeo, new THREE.LineBasicMaterial({ color: 0x64748b, transparent: true, opacity: 0.5 })));
 		} else {
-			const tl = center.clone().addScaledVector(right, -halfW).addScaledVector(up, halfH);
-			const tr = center.clone().addScaledVector(right, halfW).addScaledVector(up, halfH);
-			const bl = center.clone().addScaledVector(right, -halfW).addScaledVector(up, -halfH);
-			const br = center.clone().addScaledVector(right, halfW).addScaledVector(up, -halfH);
-
-			const linePoints = [origin, tl, origin, tr, origin, bl, origin, br, tl, tr, tr, br, br, bl, bl, tl];
-			const lineGeo = new THREE.BufferGeometry().setFromPoints(linePoints);
-			group.add(new THREE.LineSegments(lineGeo, new THREE.LineBasicMaterial({ color: 0x38bdf8, transparent: true, opacity: 0.9 })));
-
 			const url = opticalNavObservationModalityUrl(projectId, sceneId, vpId, headingId, modality, sensorId);
-			let texture = textureCache.get(url);
-			if (!texture) {
-				texture = new THREE.TextureLoader().load(url);
-				(texture as any).colorSpace = modality === 'rgb' ? 'srgb' : '';
-				textureCache.set(url, texture);
-			}
-			const rotMat = new THREE.Matrix4().makeBasis(right, up, negFwd);
-			const plane = new THREE.Mesh(
-				new THREE.PlaneGeometry(halfW * 2, halfH * 2),
-				new THREE.MeshBasicMaterial({ map: texture, side: THREE.DoubleSide })
-			);
-			plane.position.copy(center);
-			plane.quaternion.setFromRotationMatrix(rotMat);
-			plane.userData = { frustum: true, vpId, headingId, hasRgb: true };
-			group.add(plane);
-			frustumSelectables.push(plane);
+			group.add(buildCameraFrustumGroup({
+				x: nx,
+				z: nz,
+				yawDeg,
+				height: camY,
+				hasImage: true,
+				imageUrl: url,
+				vpId,
+				headingId,
+				intrinsics: frustumIntrinsics,
+			}));
 		}
 
 		frustumHeadingMap.set(key, group);
@@ -1826,6 +2545,23 @@
 		}
 		frustumHeadingMap.clear();
 		frustumSelectables = [];
+		for (const overlay of previewOverlayList()) {
+			const group = buildCameraFrustumGroup({
+				x: Number(overlay.x) || 0,
+				z: Number(overlay.z) || 0,
+				yawDeg: Number(overlay.yaw_deg) || 0,
+				height: Number(overlay.height_m ?? cameraHeight) || cameraHeight,
+				hasImage: Boolean(overlay.imageUrl),
+				imageUrl: overlay.imageUrl,
+				vpId: overlay.vpId,
+				headingId: overlay.headingId,
+				intrinsics: overlay,
+				color: overlay.active ? 0xf59e0b : overlay.imageUrl ? 0x38bdf8 : 0x94a3b8,
+				opacity: overlay.active ? 0.98 : 0.7,
+			});
+			group.userData = { previewCamera: true, id: overlay.id };
+			frustumGroup.add(group);
+		}
 		const scan = observationScan;
 		if (!scan?.viewpoints) return;
 
@@ -1934,6 +2670,8 @@
 		frustumMode;
 		frustumModality;
 		frustumSensorId;
+		frustumIntrinsics;
+		previewCameraOverlay;
 		selectedId;
 		if (renderer) updateFrustums();
 	});

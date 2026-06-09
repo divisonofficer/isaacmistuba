@@ -1,0 +1,2382 @@
+<!DOCTYPE html>
+<html lang="ko" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Dev Report · 2026-05-27 · Isaac Sim + Ranger Mini</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/static/pretendard.css">
+<style>
+  /* ── Robomituba Design System tokens ── */
+  :root {
+    --font-sans: Pretendard,"Pretendard Variable",Inter,ui-sans-serif,system-ui,-apple-system,sans-serif;
+    --font-mono: "JetBrains Mono",ui-monospace,monospace;
+    --radius-xs:4px; --radius-sm:6px; --radius-md:10px; --radius-lg:14px; --radius-xl:20px; --radius-pill:999px;
+    --shadow-xs:0 1px 2px rgba(15,23,42,.06);
+    --shadow-sm:0 4px 12px rgba(15,23,42,.06);
+    --shadow-md:0 8px 22px rgba(15,23,42,.08);
+    --duration-fast:140ms;
+    --easing-standard:cubic-bezier(.2,0,0,1);
+
+    /* Light palette */
+    --bg:#f4f3f8; --bg-accent:#eef6ff;
+    --sidebar:rgba(235,235,242,.96);
+    --panel:rgba(255,255,255,.98);
+    --subpanel:rgba(248,250,252,.95);
+    --surface-2:rgba(241,245,249,.8);
+    --panel-border:rgba(148,163,184,.2);
+    --panel-border-strong:rgba(148,163,184,.3);
+    --text-raw:#1f2937; --muted:#667085; --muted-strong:#475467;
+    --brand:#2f7bf6; --brand-strong:#1f67dd;
+    --brand-soft:rgba(47,123,246,.12);
+    --cyan:#06b6d4; --cyan-soft:rgba(6,182,212,.12);
+    --success:#16a34a; --success-soft:rgba(34,197,94,.13);
+    --warning:#f97316; --warning-soft:rgba(249,115,22,.14);
+    --danger:#dc2626; --danger-soft:rgba(239,68,68,.13);
+    --purple:#8b5cf6; --purple-soft:rgba(139,92,246,.12);
+
+    /* Legacy aliases — keep body HTML working */
+    --surface: var(--panel);
+    --surface2: var(--subpanel);
+    --border: var(--panel-border);
+    --accent: var(--brand);
+    --accent2: var(--purple);
+    --accent3: var(--success);
+    --accent4: var(--warning);
+    --accent5: var(--danger);
+    --text: var(--text-raw);
+    --text-muted: var(--muted-strong);
+    --text-dim: var(--muted);
+    --code-bg: var(--subpanel);
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html { scroll-behavior: smooth; }
+  body {
+    font-family: var(--font-sans);
+    background: var(--bg); color: var(--text-raw);
+    line-height: 1.6; font-size: 14px;
+  }
+
+  .layout { display: flex; flex-direction: row; min-height: 100vh; align-items: flex-start; }
+
+  .sidebar {
+    width: 240px; min-width: 240px; flex-shrink: 0;
+    background: var(--sidebar);
+    border-right: 1px solid var(--panel-border);
+    backdrop-filter: blur(16px);
+    position: sticky; top: 0; height: 100vh; overflow-y: auto;
+    padding: 20px 0; align-self: flex-start;
+  }
+  .sidebar-logo {
+    padding: 0 16px 16px; border-bottom: 1px solid var(--panel-border); margin-bottom: 12px;
+  }
+  .sidebar-logo .logo-text { font-size: 13px; font-weight: 700; color: var(--brand-strong); letter-spacing: -0.02em; }
+  .sidebar-logo .logo-date { font-size: 11px; color: var(--warning); margin-top: 3px; font-weight: 600; font-family: var(--font-mono); }
+  .sidebar-logo .logo-sub { font-size: 11px; color: var(--muted); margin-top: 1px; }
+  .sidebar-back {
+    display: block; margin: 0 8px 12px; padding: 6px 12px;
+    border: 1px solid var(--panel-border); border-radius: var(--radius-md);
+    color: var(--muted-strong); text-decoration: none; font-size: 12px; text-align: center;
+    background: var(--panel); transition: all var(--duration-fast) var(--easing-standard);
+  }
+  .sidebar-back:hover { border-color: var(--brand); color: var(--brand-strong); background: var(--brand-soft); }
+  .nav-section { margin-bottom: 2px; }
+  .nav-section-title {
+    font-size: 10px; font-weight: 700; letter-spacing: 0.12em; text-transform: uppercase;
+    color: var(--muted); padding: 10px 16px 4px;
+  }
+  .nav-link {
+    display: block; padding: 5px 16px; color: var(--muted-strong); text-decoration: none;
+    font-size: 12.5px; font-weight: 500;
+    border-radius: var(--radius-md); margin: 1px 6px;
+    border: 1px solid transparent;
+    transition: all var(--duration-fast) var(--easing-standard);
+  }
+  .nav-link:hover { color: var(--brand-strong); background: var(--brand-soft); }
+  .nav-link.active { color: var(--brand-strong); background: var(--brand-soft); border-color: rgba(47,123,246,.18); }
+
+  .main { flex: 1; min-width: 0; overflow-x: hidden; padding: 32px 40px; }
+
+  .section {
+    margin-bottom: 48px; scroll-margin-top: 24px;
+    background: var(--panel); border: 1px solid var(--panel-border);
+    border-radius: var(--radius-lg); padding: 24px 28px;
+    box-shadow: var(--shadow-sm);
+  }
+  .section-header { display: flex; align-items: center; gap: 12px; margin-bottom: 20px; padding-bottom: 14px; border-bottom: 1px solid var(--panel-border); }
+  .section-icon { width: 32px; height: 32px; border-radius: var(--radius-sm); display: flex; align-items: center; justify-content: center; font-size: 16px; flex-shrink: 0; }
+  .section-title { font-size: 18px; font-weight: 700; color: var(--text-raw); letter-spacing: -0.02em; }
+  .section-subtitle { font-size: 12.5px; color: var(--muted); margin-top: 2px; }
+
+  h3 { font-size: 14px; font-weight: 700; color: var(--text-raw); margin: 24px 0 10px; letter-spacing: -0.01em; }
+  h4 { font-size: 11px; font-weight: 700; color: var(--brand-strong); margin: 16px 0 6px; text-transform: uppercase; letter-spacing: 0.08em; }
+  p { color: var(--muted-strong); margin-bottom: 12px; line-height: 1.7; }
+
+  pre, code { font-family: var(--font-mono); }
+
+  .screenshot-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin: 20px 0; }
+  @media (max-width: 900px) { .screenshot-grid { grid-template-columns: 1fr; } }
+
+  .screenshot-block {
+    margin: 20px 0;
+    border: 1px solid var(--panel-border);
+    border-radius: var(--radius-lg);
+    overflow: hidden;
+    background: var(--surface-2);
+    box-shadow: var(--shadow-sm);
+  }
+  .screenshot-block img {
+    width: 100%; display: block;
+    max-height: 500px; object-fit: cover;
+    object-position: center;
+  }
+  .screenshot-caption {
+    padding: 12px 16px;
+    border-top: 1px solid var(--panel-border);
+    background: var(--panel);
+  }
+  .screenshot-caption-title {
+    font-size: 13px; font-weight: 600; color: var(--text-raw); margin-bottom: 4px;
+  }
+  .screenshot-caption-body {
+    font-size: 12px; color: var(--muted-strong); line-height: 1.6;
+  }
+  .screenshot-tag {
+    display: inline-flex; align-items: center;
+    font-size: 10px; font-weight: 700;
+    padding: 2px 8px; border-radius: var(--radius-pill);
+    letter-spacing: 0.06em; margin-right: 6px; text-transform: uppercase;
+    border: 1px solid transparent;
+  }
+  .tag-wip { background: var(--warning-soft); color: var(--warning); border-color: rgba(249,115,22,.25); }
+  .tag-isaac { background: var(--brand-soft); color: var(--brand-strong); border-color: rgba(47,123,246,.25); }
+  .tag-physx { background: var(--success-soft); color: var(--success); border-color: rgba(34,197,94,.25); }
+  .tag-done { background: var(--success-soft); color: var(--success); border-color: rgba(34,197,94,.25); }
+
+  /* Related works */
+  .ref-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 16px; margin: 16px 0 24px; }
+  .ref-card {
+    border: 1px solid var(--panel-border); border-radius: var(--radius-lg);
+    background: var(--panel); overflow: hidden;
+    display: flex; flex-direction: column;
+    box-shadow: var(--shadow-xs);
+  }
+  .ref-card-head {
+    padding: 14px 16px 12px;
+    border-bottom: 1px solid var(--panel-border);
+    background: var(--surface-2);
+  }
+  .ref-card-venue {
+    font-size: 10px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase;
+    margin-bottom: 6px;
+  }
+  .ref-card-title { font-size: 13px; font-weight: 700; color: var(--text-raw); line-height: 1.4; margin-bottom: 4px; }
+  .ref-card-authors { font-size: 11px; color: var(--muted); }
+  .ref-card-body { padding: 12px 16px; flex: 1; display: flex; flex-direction: column; gap: 10px; }
+  .ref-card-abstract { font-size: 12px; color: var(--muted-strong); line-height: 1.65; }
+  .ref-card-tags { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 4px; }
+  .ref-tag {
+    font-size: 10px; font-weight: 600; padding: 2px 8px; border-radius: var(--radius-pill);
+    letter-spacing: 0.04em; text-transform: uppercase;
+    background: var(--brand-soft); color: var(--brand-strong); border: 1px solid rgba(47,123,246,.2);
+  }
+  .ref-card-relevance {
+    margin-top: auto; padding: 10px 12px;
+    border-radius: var(--radius-sm); background: var(--success-soft);
+    border: 1px solid rgba(34,197,94,.2);
+    font-size: 12px; color: var(--success); line-height: 1.55;
+  }
+  .ref-card-relevance strong { color: var(--success); font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em; display: block; margin-bottom: 3px; }
+  .positioning-table { width: 100%; border-collapse: collapse; margin: 16px 0; font-size: 12.5px; }
+  .positioning-table th { background: var(--surface-2); color: var(--muted-strong); font-weight: 600; font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase; padding: 8px 12px; text-align: left; border: 1px solid var(--panel-border); }
+  .positioning-table td { padding: 8px 12px; border: 1px solid var(--panel-border); vertical-align: top; color: var(--muted-strong); }
+  .positioning-table tr:nth-child(even) td { background: var(--surface-2); }
+  .positioning-table td:first-child { color: var(--text-raw); font-weight: 600; }
+  .check { color: var(--success); }
+  .cross { color: var(--danger); }
+  .partial { color: var(--warning); }
+  pre { background: #1e293b; border: 1px solid rgba(148,163,184,.15); border-radius: var(--radius-md); padding: 16px 20px; overflow-x: auto; font-size: 12.5px; line-height: 1.7; margin-bottom: 16px; color: #cbd5e1; }
+  code { background: var(--brand-soft); color: var(--brand-strong); padding: 1px 5px; border-radius: var(--radius-xs); font-size: 12px; font-family: var(--font-mono); }
+  pre code { background: none; color: inherit; padding: 0; }
+
+  /* Code syntax highlight (dark pre) */
+  .kw { color: #c084fc; }
+  .str { color: #86efac; }
+  .cmt { color: #64748b; font-style: italic; }
+  .cls { color: #67e8f9; }
+  .fn { color: #93c5fd; }
+  .num { color: #fb923c; }
+  .py { color: #fcd34d; }
+
+  .hero {
+    background: linear-gradient(135deg, var(--bg-accent) 0%, rgba(255,255,255,.9) 100%);
+    border: 1px solid var(--panel-border); border-radius: var(--radius-xl);
+    padding: 32px 36px; margin-bottom: 36px; position: relative; overflow: hidden;
+    box-shadow: var(--shadow-sm);
+  }
+  .hero::before {
+    content: ''; position: absolute; top: -40px; right: -40px;
+    width: 200px; height: 200px;
+    background: radial-gradient(circle, rgba(47,123,246,0.1), transparent 70%);
+    border-radius: 50%;
+  }
+  .hero-date { font-size: 11px; font-weight: 700; color: var(--brand-strong); letter-spacing: 0.1em; text-transform: uppercase; margin-bottom: 8px; font-family: var(--font-mono); }
+  .hero-title { font-size: 26px; font-weight: 800; color: var(--text-raw); margin-bottom: 6px; letter-spacing: -0.03em; }
+  .hero-subtitle { font-size: 14px; color: var(--muted-strong); margin-bottom: 20px; }
+  .hero-tags { display: flex; gap: 8px; flex-wrap: wrap; }
+  .hero-tag { padding: 3px 10px; border-radius: var(--radius-pill); font-size: 11.5px; font-weight: 600; background: var(--brand-soft); color: var(--brand-strong); border: 1px solid rgba(47,123,246,.2); }
+
+  .alert { border-radius: var(--radius-md); padding: 12px 16px; margin-bottom: 16px; border-left: 3px solid; font-size: 13px; line-height: 1.6; }
+  .alert-info { background: var(--brand-soft); border-color: var(--brand); color: var(--brand-strong); }
+  .alert-warn { background: var(--warning-soft); border-color: var(--warning); color: #9a3412; }
+  .alert-tip { background: var(--success-soft); border-color: var(--success); color: #14532d; }
+  .alert-red { background: var(--danger-soft); border-color: var(--danger); color: #7f1d1d; }
+
+  .card-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 12px; margin-bottom: 20px; }
+  .card { background: var(--panel); border: 1px solid var(--panel-border); border-radius: var(--radius-md); padding: 16px; box-shadow: var(--shadow-xs); }
+  .card-label { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.1em; color: var(--muted); margin-bottom: 6px; }
+  .card-value { font-size: 22px; font-weight: 800; color: var(--brand); letter-spacing: -0.03em; }
+  .card-desc { font-size: 12px; color: var(--muted-strong); margin-top: 4px; }
+
+  .why-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 20px; }
+  @media (max-width: 720px) { .why-grid { grid-template-columns: 1fr; } }
+  .why-card { background: var(--subpanel); border: 1px solid var(--panel-border); border-radius: var(--radius-md); padding: 16px; }
+  .why-card-title { font-size: 13.5px; font-weight: 700; margin-bottom: 8px; display: flex; align-items: center; gap: 8px; color: var(--text-raw); }
+  .why-card-body { font-size: 13px; color: var(--muted-strong); line-height: 1.7; }
+
+  .type-block { background: var(--panel); border: 1px solid var(--panel-border); border-radius: var(--radius-md); margin-bottom: 16px; overflow: hidden; box-shadow: var(--shadow-xs); }
+  .type-header { display: flex; align-items: center; gap: 12px; padding: 10px 16px; background: var(--surface-2); border-bottom: 1px solid var(--panel-border); }
+  .type-name { font-family: var(--font-mono); font-size: 13px; font-weight: 700; color: var(--brand-strong); }
+  .type-badge { font-size: 10px; padding: 2px 7px; border-radius: var(--radius-pill); font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; }
+  .badge-fn { background: var(--success-soft); color: var(--success); }
+  .badge-cls { background: var(--purple-soft); color: var(--purple); }
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  th { text-align: left; padding: 8px 14px; font-size: 10px; text-transform: uppercase; letter-spacing: 0.1em; color: var(--muted); font-weight: 700; background: var(--surface-2); border-bottom: 1px solid var(--panel-border); }
+  td { padding: 8px 14px; border-bottom: 1px solid var(--panel-border); color: var(--muted-strong); vertical-align: top; }
+  tr:last-child td { border-bottom: none; }
+  tr:hover td { background: var(--brand-soft); }
+  td:first-child { font-family: var(--font-mono); color: var(--success); font-size: 12px; }
+  td:nth-child(2) { color: var(--purple); font-family: var(--font-mono); font-size: 11.5px; }
+
+  .flow { background: var(--subpanel); border: 1px solid var(--panel-border); border-radius: var(--radius-md); padding: 20px; margin-bottom: 16px; }
+  .flow-step { display: flex; align-items: flex-start; gap: 16px; margin-bottom: 12px; position: relative; }
+  .flow-step::before { content: ''; position: absolute; left: 19px; top: 40px; width: 2px; height: calc(100% + 4px); background: var(--panel-border); }
+  .flow-step:last-child::before { display: none; }
+  .flow-num { width: 40px; height: 40px; min-width: 40px; border-radius: 50%; background: var(--panel); border: 2px solid var(--brand); display: flex; align-items: center; justify-content: center; font-size: 14px; font-weight: 700; color: var(--brand-strong); box-shadow: var(--shadow-xs); }
+  .flow-content { flex: 1; }
+  .flow-title { font-weight: 600; color: var(--text-raw); margin-bottom: 4px; font-size: 13.5px; }
+  .flow-body { font-size: 12px; color: var(--muted-strong); line-height: 1.65; }
+  .flow-code { font-family: var(--font-mono); font-size: 11px; background: var(--brand-soft); padding: 1px 6px; border-radius: var(--radius-xs); color: var(--brand-strong); display: inline-block; margin: 2px 2px 0 0; }
+
+  .compare-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 16px; }
+  @media (max-width: 720px) { .compare-grid { grid-template-columns: 1fr; } }
+  .compare-card { background: var(--panel); border: 1px solid var(--panel-border); border-radius: var(--radius-md); overflow: hidden; box-shadow: var(--shadow-xs); }
+  .compare-header { padding: 10px 16px; font-size: 13px; font-weight: 700; border-bottom: 1px solid var(--panel-border); }
+  .compare-header.good { background: var(--success-soft); color: var(--success); }
+  .compare-header.bad { background: var(--danger-soft); color: var(--danger); }
+  .compare-body { padding: 14px 16px; font-size: 12.5px; color: var(--muted-strong); line-height: 1.7; }
+  .compare-body ul { padding-left: 16px; }
+  .compare-body li { margin-bottom: 6px; }
+
+  .timeline { border-left: 2px solid var(--panel-border); padding-left: 20px; margin-left: 10px; }
+  .timeline-item { position: relative; margin-bottom: 20px; }
+  .timeline-item::before { content: ''; position: absolute; left: -26px; top: 6px; width: 10px; height: 10px; border-radius: 50%; background: var(--warning); border: 2px solid var(--bg); }
+  .timeline-time { font-size: 11px; color: var(--warning); font-weight: 700; margin-bottom: 4px; font-family: var(--font-mono); }
+  .timeline-title { font-size: 14px; font-weight: 600; color: var(--text-raw); margin-bottom: 4px; }
+  .timeline-body { font-size: 12.5px; color: var(--muted-strong); }
+
+  .tag-list { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 12px; }
+  .tag { padding: 2px 8px; border-radius: var(--radius-pill); font-size: 11px; font-weight: 600; background: var(--brand-soft); color: var(--brand-strong); border: 1px solid rgba(47,123,246,.2); }
+  .tag.green { background: var(--success-soft); color: var(--success); border-color: rgba(34,197,94,.2); }
+  .tag.amber { background: var(--warning-soft); color: var(--warning); border-color: rgba(249,115,22,.2); }
+  .tag.red { background: var(--danger-soft); color: var(--danger); border-color: rgba(239,68,68,.2); }
+  .tag.purple { background: var(--purple-soft); color: var(--purple); border-color: rgba(139,92,246,.2); }
+
+  /* Footer */
+  .report-footer { border-top: 1px solid var(--panel-border); margin-top: 36px; padding-top: 20px; color: var(--muted); font-size: 12px; text-align: center; }
+
+  ::-webkit-scrollbar { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-track { background: var(--bg); }
+  ::-webkit-scrollbar-thumb { background: var(--panel-border-strong); border-radius: 3px; }
+</style>
+</head>
+<body>
+<div class="layout">
+
+<!-- ── SIDEBAR ── -->
+<nav class="sidebar">
+  <div class="sidebar-logo">
+    <div class="logo-text">Robomituba</div>
+    <div class="logo-date">2026-05-27</div>
+    <div class="logo-sub">Isaac Sim + Ranger Mini</div>
+  </div>
+  <a class="sidebar-back" href="index.html">← 프로젝트 문서로</a>
+
+  <div class="nav-section">
+    <div class="nav-section-title">오늘의 작업</div>
+    <a class="nav-link" href="#timeline">작업 타임라인</a>
+    <a class="nav-link" href="#why-isaac">Isaac이 필요한 이유</a>
+    <a class="nav-link" href="#ranger-asset">Ranger Mini 에셋</a>
+    <a class="nav-link" href="#motion-modes">운동 모드</a>
+  </div>
+
+  <div class="nav-section">
+    <div class="nav-section-title">로봇 제어</div>
+    <a class="nav-link" href="#kinematic">Kinematic 제어</a>
+    <a class="nav-link" href="#physics">PhysX 물리 설정</a>
+    <a class="nav-link" href="#physics-spawn-screenshot">스폰 스크린샷</a>
+    <a class="nav-link" href="#physx-drive">PhysX 드라이브</a>
+    <a class="nav-link" href="#cmdvel">cmd_vel 연결</a>
+    <a class="nav-link" href="#auto-discover">로봇 자동 탐색</a>
+  </div>
+
+  <div class="nav-section">
+    <div class="nav-section-title">센서·렌더 연동</div>
+    <a class="nav-link" href="#sensor-render">카메라 센서 렌더 연동</a>
+    <a class="nav-link" href="#platform-vision">플랫폼 비전</a>
+    <a class="nav-link" href="#dataset-readiness">데이터셋 준비도</a>
+    <a class="nav-link" href="#opticalnav-agent-api">OpticalNav Agent API</a>
+    <a class="nav-link" href="#scene-authoring-demo">씬 저작 데모</a>
+    <a class="nav-link" href="#map-editor-3d">3D 맵 에디터</a>
+    <a class="nav-link" href="#vln-survey">VLN 데이터셋 조사</a>
+  </div>
+
+  <div class="nav-section">
+    <div class="nav-section-title">환경·설계</div>
+    <a class="nav-link" href="#phase-r-env">Phase R 환경</a>
+    <a class="nav-link" href="#arch">제어 아키텍처</a>
+    <a class="nav-link" href="#related-works">관련 연구</a>
+    <a class="nav-link" href="#next">다음 단계</a>
+  </div>
+</nav>
+
+<!-- ── MAIN ── -->
+<main class="main">
+
+<!-- HERO -->
+<div class="hero">
+  <div class="hero-date">2026-05-27 · Daily Dev Report</div>
+  <div class="hero-title">Isaac Sim 로봇 시뮬레이션 기반 구축 + OpticalNav 데이터셋 기반 확보</div>
+  <div class="hero-subtitle">AgileX Ranger Mini V3 · 물리 제어 · cmd_vel → PhysX 드라이브 · Agent API · VLN 관련 연구 조사</div>
+  <div class="hero-tags">
+    <span class="hero-tag">Isaac Sim</span>
+    <span class="hero-tag">Ranger Mini V3</span>
+    <span class="hero-tag">PhysX Drive</span>
+    <span class="hero-tag">cmd_vel</span>
+    <span class="hero-tag">Ackermann / Oblique / Spin</span>
+    <span class="hero-tag">USD Collision</span>
+    <span class="hero-tag">OpticalNav Agent API</span>
+    <span class="hero-tag">MapEditor3D</span>
+    <span class="hero-tag">VLN Survey ×20</span>
+  </div>
+</div>
+
+
+<!-- ════ TIMELINE ════ -->
+<section class="section" id="timeline">
+  <div class="section-header">
+    <div class="section-icon" style="background:rgba(245,158,11,0.15)">🕐</div>
+    <div>
+      <div class="section-title">작업 타임라인</div>
+      <div class="section-subtitle">오늘 진행된 개발 흐름</div>
+    </div>
+  </div>
+
+  <div class="timeline">
+    <div class="timeline-item">
+      <div class="timeline-time">오전 — 에셋 세팅</div>
+      <div class="timeline-title">Ranger Mini USD 에셋 Isaac에 드래그앤드롭</div>
+      <div class="timeline-body">
+        <code>D:\robomituba_asset_cache\assets\isaac_browser\Robots\AgileX\RangerMini\RangerMiniSensorRig.usda</code>
+        를 Isaac에 드래그. 로봇 + RGB/NIR/Polar/LiDAR 센서 포함 버전.
+        Robot body asset은 <code>assets\robots\ranger_mini_v3</code> 에 복사.
+      </div>
+    </div>
+    <div class="timeline-item">
+      <div class="timeline-time">오전 — 이동 제어</div>
+      <div class="timeline-title">command_robot() API 설계 + prim path 자동 탐색</div>
+      <div class="timeline-body">
+        <code>/World</code>처럼 root를 넣었을 때도 Ranger가 하나뿐이면 자동으로 찾아가도록
+        <code>resolve_ranger_mini_path()</code> 구현. <code>robomituba:robotName</code> USD attr 기반 탐색.
+      </div>
+    </div>
+    <div class="timeline-item">
+      <div class="timeline-time">낮 — 물리 설정</div>
+      <div class="timeline-title">중력 / 충돌 설정 — enable_ranger_mini_physics()</div>
+      <div class="timeline-body">
+        로봇이 공중에 떠 있는 문제. PhysicsScene (gravity), Robot collision prims,
+        Ground collider 3개를 한 번에 켜는 헬퍼 구현. Isaac Timeline Play 필요.
+      </div>
+    </div>
+    <div class="timeline-item">
+      <div class="timeline-time">오후 — PhysX 드라이브</div>
+      <div class="timeline-title">drive_ranger_mini_physx() — 관절 드라이브 직접 쓰기</div>
+      <div class="timeline-body">
+        root xform을 이동하는 게 아니라 steering joint에 <code>drive:angular:targetPosition</code>,
+        wheel joint에 <code>drive:angular:targetVelocity</code>를 써서 PhysX가 적분하게 하는 방식.
+      </div>
+    </div>
+    <div class="timeline-item">
+      <div class="timeline-time">오후 — cmd_vel 연결</div>
+      <div class="timeline-title">drive_ranger_mini_cmd_vel() — ROS cmd_vel 인터페이스</div>
+      <div class="timeline-body">
+        <code>linear.x / angular.z</code> → <code>RangerMiniRosAdapter.command_from_twist()</code> →
+        <code>RangerMiniCommand</code> → <code>compute_joint_targets()</code> → PhysX drive.
+        실물 ROS 로봇과 동일한 토픽 구조로 조작 가능.
+      </div>
+    </div>
+    <div class="timeline-item">
+      <div class="timeline-time">오후 — Agent API</div>
+      <div class="timeline-title">OpticalNav Agent API 6종 추가 · render_daemon.py</div>
+      <div class="timeline-body">
+        materials 조회, agent-context 요약, 오브젝트 CRUD(단건·batch·재질·삭제) 엔드포인트 신규 추가.
+        LLM·외부 스크립트가 WebUI 없이 authoring_map을 직접 조작 가능.
+      </div>
+    </div>
+    <div class="timeline-item">
+      <div class="timeline-time">오후 — 씬 저작 데모</div>
+      <div class="timeline-title">office_lobby_001 — API만으로 navigation 씬 완성</div>
+      <div class="timeline-body">
+        10 × 6 m 오피스 로비. 외벽 4개, 유리 파티션 + 자동문, 거울 벽, 가구 4개, 리전 5개.
+        <code>compile_ready: true</code> 상태까지 API 3단계(씬 생성 → batch 배치 → 재질 지정)로 완성.
+      </div>
+    </div>
+    <div class="timeline-item">
+      <div class="timeline-time">오후 — UI 개선</div>
+      <div class="timeline-title">씬 선택 드롭다운 — 패널 하단에서 헤더로 이동</div>
+      <div class="timeline-body">
+        우측 패널 하단에 파묻혀 있던 scene-list 버튼들을 제거하고,
+        패널 헤더에 <code>&lt;select&gt;</code> 드롭다운 + ↺ 새로고침 버튼으로 교체.
+        외부 API로 씬을 추가한 뒤 새로고침 버튼 한 번으로 목록 갱신 가능.
+      </div>
+    </div>
+    <div class="timeline-item">
+      <div class="timeline-time">저녁 — 관련 연구 조사</div>
+      <div class="timeline-title">VLN 20개 데이터셋 투명·반사 표면 커버리지 조사</div>
+      <div class="timeline-body">
+        R2R·RxR·REVERIE·VLN-CE 등 20개 VLN 벤치마크 및 3D 환경을 대상으로
+        유리·거울을 안전-장애물로 명시 라벨링한 데이터셋 존재 여부 조사.
+        결론: 해당 조건을 만족하는 VLN 데이터셋 0개 → OpticalNav 독창성 근거 확보.
+        보고서 VLN Survey 섹션에 한국어로 통합.
+      </div>
+    </div>
+    <div class="timeline-item">
+      <div class="timeline-time">저녁 — 문서 개선</div>
+      <div class="timeline-title">관련 연구 arXiv 링크 + 연도·학회 추가 (20개)</div>
+      <div class="timeline-body">
+        VLN 조사 테이블 전체 행에 arXiv 하이퍼링크(R2R·RxR·REVERIE·VLN-CE·SOON·Replica·TOPGN·FSR-VLN·VISTAv2 등)
+        및 연도·학회 뱃지(<em>2018 CVPR</em>, <em>2020 ECCV</em> 등) 추가.
+        주요 ref-card 4개(Krantz·NaVid·LH-VLN·DROID)도 arXiv 링크 연결.
+      </div>
+    </div>
+    <div class="timeline-item">
+      <div class="timeline-time">저녁 — 에디터 문서화</div>
+      <div class="timeline-title">MapEditor3D 스크린샷 2장 보고서 삽입</div>
+      <div class="timeline-body">
+        3D Navigation Map 에디터 스크린샷(glass_corridor_001 기본 씬 / USD 에셋 배치 씬)
+        2장을 <em>#map-editor-3d</em> 섹션에 추가. Three.js OrbitControls 기반 뷰포트,
+        오렌지 웨이포인트 노드, 유리 파티션·테이블·의자 USD 에셋 확인 가능.
+      </div>
+    </div>
+  </div>
+</section>
+
+
+<!-- ════ WHY ISAAC ════ -->
+<section class="section" id="why-isaac">
+  <div class="section-header">
+    <div class="section-icon" style="background:rgba(108,142,247,0.15)">🤔</div>
+    <div>
+      <div class="section-title">Isaac Sim이 필요한 이유</div>
+      <div class="section-subtitle">Mitsuba 단독으로는 할 수 없는 것들</div>
+    </div>
+  </div>
+
+  <p>
+    Mitsuba 3는 <strong>렌더러</strong>입니다. 씬을 받아 빛을 추적하고 픽셀을 계산합니다.
+    로봇이 어느 위치에 있는지, 관절이 어떤 각도인지, 바퀴가 어디를 굴러가는지를 <em>결정</em>하지 않습니다.
+    그 물리 세계를 시뮬레이션하는 역할이 Isaac Sim입니다.
+  </p>
+
+  <div class="compare-grid">
+    <div class="compare-card">
+      <div class="compare-header bad">❌ Mitsuba 단독</div>
+      <div class="compare-body">
+        <ul>
+          <li>씬의 모든 오브젝트 위치를 <strong>사람이 직접 지정</strong>해야 함</li>
+          <li>로봇이 이동하면 매 프레임마다 외부에서 transform을 수동으로 계산해서 넣어야 함</li>
+          <li>물리 충돌, 중력, 관절 제약 없음 — 로봇이 벽을 통과하거나 공중에 떠도 모름</li>
+          <li>관절 각도 상한/하한, 토크 제한 없음 — 물리적으로 불가능한 자세도 렌더링</li>
+          <li>바퀴가 미끄러지는지, 지면과 접하는지 계산 불가</li>
+          <li>센서(LiDAR, IMU) 모델링 없음 — 렌더된 이미지 외 데이터 없음</li>
+          <li>실시간 피드백 루프 없음</li>
+        </ul>
+      </div>
+    </div>
+    <div class="compare-card">
+      <div class="compare-header good">✅ Isaac Sim + Mitsuba</div>
+      <div class="compare-body">
+        <ul>
+          <li>PhysX가 매 프레임 중력·충돌·관절을 적분 → 로봇 위치 자동 결정</li>
+          <li>cmd_vel 입력 → 바퀴 드라이브 → 실제 이동 거리/방향 계산</li>
+          <li>Ackermann / Oblique / Spin 운동학이 물리 법칙 안에서 작동</li>
+          <li>실시간으로 USD 스냅샷 캡처 → Mitsuba에 넘겨 고품질 렌더링</li>
+          <li>로봇 관절 상태(joint_positions)를 ML 학습 데이터로 함께 저장</li>
+          <li>센서 리그(RGB·NIR·Polar) 포즈가 로봇과 함께 움직임</li>
+          <li>Isaac timeline + ROS 연동 → 실물 로봇 제어와 동일한 인터페이스</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+
+  <div class="alert alert-info">
+    <strong>핵심 분업:</strong>
+    Isaac Sim = "로봇이 어디 있는가" (물리 시뮬레이션) ·
+    Mitsuba 3 = "그 위치에서 카메라에 뭐가 보이는가" (광선 추적 렌더링).
+    둘을 연결하는 계약이 robomituba_bridge의 SceneSnapshot입니다.
+  </div>
+
+  <h3>데이터 흐름으로 보는 역할 분담</h3>
+  <div class="flow">
+    <div class="flow-step">
+      <div class="flow-num">①</div>
+      <div class="flow-content">
+        <div class="flow-title">Isaac Sim: 물리 세계 시뮬레이션</div>
+        <div class="flow-body">
+          PhysX 엔진이 중력·충돌·관절 마찰을 계산.
+          cmd_vel → 바퀴 토크 → 로봇 이동.
+          매 타임스텝 후 로봇 pose, 관절 각도 결정.
+        </div>
+      </div>
+    </div>
+    <div class="flow-step">
+      <div class="flow-num">②</div>
+      <div class="flow-content">
+        <div class="flow-title">Isaac → Bridge: SceneSnapshot 캡처</div>
+        <div class="flow-body">
+          <span class="flow-code">stage_capture.py</span> 가 현재 USD stage에서
+          메시, 재질, 카메라, 조명, 로봇 상태를 추출.
+          <span class="flow-code">SceneSnapshot</span> + <span class="flow-code">RobotState</span> 로 패키징.
+        </div>
+      </div>
+    </div>
+    <div class="flow-step">
+      <div class="flow-num">③</div>
+      <div class="flow-content">
+        <div class="flow-title">Bridge → Mitsuba: 렌더 요청</div>
+        <div class="flow-body">
+          <span class="flow-code">RenderRequest</span> 를 render_daemon에 POST.
+          Mitsuba는 SceneSnapshot에서 geometry, material, camera를 읽어 장면을 재구성.
+        </div>
+      </div>
+    </div>
+    <div class="flow-step">
+      <div class="flow-num">④</div>
+      <div class="flow-content">
+        <div class="flow-title">Mitsuba: 고품질 센서 렌더링</div>
+        <div class="flow-body">
+          RGB (4096 spp), Depth, Normal, Polarization 등 17개 모달리티.
+          물리 기반 BRDF, 편광 시뮬레이션.
+          Isaac의 실시간 렌더러로는 불가능한 품질.
+        </div>
+      </div>
+    </div>
+    <div class="flow-step">
+      <div class="flow-num">⑤</div>
+      <div class="flow-content">
+        <div class="flow-title">출력: ML 학습 데이터</div>
+        <div class="flow-body">
+          EXR 이미지 + <span class="flow-code">RobotState</span> (joint_positions, base_pose) +
+          <span class="flow-code">ObservationBundleManifest</span>.
+          물리적으로 일관된 고품질 멀티모달 데이터.
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+
+<!-- ════ RANGER ASSET ════ -->
+<section class="section" id="ranger-asset">
+  <div class="section-header">
+    <div class="section-icon" style="background:rgba(52,211,153,0.15)">🤖</div>
+    <div>
+      <div class="section-title">Ranger Mini V3 에셋</div>
+      <div class="section-subtitle">AgileX 4륜 독립조향 모바일 로봇</div>
+    </div>
+  </div>
+
+  <div class="card-grid">
+    <div class="card">
+      <div class="card-label">드라이브 방식</div>
+      <div class="card-value" style="font-size:16px">4WS+4WD</div>
+      <div class="card-desc">4개 독립 조향 + 4개 독립 구동 바퀴</div>
+    </div>
+    <div class="card">
+      <div class="card-label">운동 모드</div>
+      <div class="card-value">4</div>
+      <div class="card-desc">Ackermann, Oblique, Spin, Parking</div>
+    </div>
+    <div class="card">
+      <div class="card-label">관절 수</div>
+      <div class="card-value">8</div>
+      <div class="card-desc">4 steer + 4 wheel joints</div>
+    </div>
+    <div class="card">
+      <div class="card-label">배터리</div>
+      <div class="card-value">48V</div>
+      <div class="card-desc">robomituba:batteryVoltage attr</div>
+    </div>
+  </div>
+
+  <h3>에셋 경로</h3>
+  <pre><code><span class="cmt"># Windows (Isaac에서 드래그앤드롭)</span>
+D:\robomituba_asset_cache\assets\isaac_browser\Robots\AgileX\RangerMini\
+├── RangerMiniSensorRig.usda   <span class="cmt"># 로봇 + 센서 (RGB/NIR/Polar/LiDAR)</span>
+└── RangerMini.usda            <span class="cmt"># 로봇 본체만</span>
+
+D:\robomituba_asset_cache\assets\robots\ranger_mini_v3\
+├── ranger_mini_v3.usda        <span class="cmt"># 최상위 참조</span>
+└── ranger_mini_rokace.usdc    <span class="cmt"># 시각 메시 (visual asset)</span>
+
+<span class="cmt"># WSL 경로</span>
+/mnt/d/robomituba_asset_cache/
+
+<span class="cmt"># Repo 내 경로</span>
+assets/robots/ranger_mini_v3/</code></pre>
+
+  <h3>USD Custom Attributes</h3>
+  <div class="type-block">
+    <div class="type-body">
+      <table>
+        <tr><th>Attribute</th><th>Type</th><th>설명</th></tr>
+        <tr><td>robomituba:robotName</td><td>string</td><td>"ranger_mini_v3" — 로봇 탐색 키</td></tr>
+        <tr><td>robomituba:motionMode</td><td>int</td><td>현재 운동 모드 (0=Ackermann, 1=Oblique, 2=Spin, 3=Parking)</td></tr>
+        <tr><td>robomituba:headingRad</td><td>float</td><td>현재 heading 방향 (rad)</td></tr>
+        <tr><td>robomituba:jointPositions</td><td>float[]</td><td>8개 관절 현재 각도 (rad)</td></tr>
+        <tr><td>robomituba:steeringAngles</td><td>float[]</td><td>4개 조향 각도</td></tr>
+        <tr><td>robomituba:wheelSpeeds</td><td>float[]</td><td>4개 바퀴 속도 (rad/s)</td></tr>
+        <tr><td>robomituba:batteryVoltage</td><td>float</td><td>배터리 전압 (기본 48.0V)</td></tr>
+        <tr><td>robomituba:batterySoc</td><td>float</td><td>배터리 잔량 (0~1)</td></tr>
+        <tr><td>robomituba:estop</td><td>bool</td><td>비상 정지 상태</td></tr>
+        <tr><td>robomituba:hasError</td><td>bool</td><td>오류 상태</td></tr>
+      </table>
+    </div>
+  </div>
+</section>
+
+
+<!-- ════ MOTION MODES ════ -->
+<section class="section" id="motion-modes">
+  <div class="section-header">
+    <div class="section-icon" style="background:rgba(167,139,250,0.15)">🚗</div>
+    <div>
+      <div class="section-title">운동 모드 (RangerMiniMotionMode)</div>
+      <div class="section-subtitle">4가지 독립 운동 모드와 운동학</div>
+    </div>
+  </div>
+
+  <div class="why-grid">
+    <div class="why-card">
+      <div class="why-card-title" style="color:var(--accent3)">🚗 ACKERMANN (0)</div>
+      <div class="why-card-body">
+        일반 자동차형 조향. 앞 2바퀴가 같은 방향으로 꺾이고 뒤 2바퀴는 직진.
+        <code>linear_speed_mps + steering_angle_rad</code> 입력.
+        <br><br>
+        <strong>cmd_vel 매핑:</strong> linear.x → 속도, angular.z → 조향각 (Ackermann 역기구학).
+      </div>
+    </div>
+    <div class="why-card">
+      <div class="why-card-title" style="color:var(--accent)">↔️ OBLIQUE (1)</div>
+      <div class="why-card-body">
+        게걸음(crab walk) 이동. 4바퀴 모두 같은 방향으로 꺾어서 로봇 전체가 옆으로 이동.
+        평행주차, 좁은 통로 횡단 이동에 유용.
+        <br><br>
+        <strong>입력:</strong> <code>steering_angle_rad = ±π/2</code> (완전 횡이동).
+      </div>
+    </div>
+    <div class="why-card">
+      <div class="why-card-title" style="color:var(--accent4)">🔄 SPIN (2)</div>
+      <div class="why-card-body">
+        제자리 회전. 4바퀴가 로봇 중심을 기준으로 탄젠트 방향으로 배치되어
+        로봇 중심을 축으로 회전.
+        <br><br>
+        <strong>입력:</strong> <code>spin_speed_radps</code> (양수=반시계, 음수=시계).
+      </div>
+    </div>
+    <div class="why-card">
+      <div class="why-card-title" style="color:var(--accent2)">🅿️ PARKING (3)</div>
+      <div class="why-card-body">
+        주차 잠금. 4바퀴가 X자(비대칭 잠금) 방향으로 꺾여 외력에 의한 밀림 방지.
+        <br><br>
+        <strong>입력:</strong> <code>park()</code> 호출. wheel velocity = 0.
+      </div>
+    </div>
+  </div>
+
+  <h3>운동학 파이프라인</h3>
+  <pre><code><span class="cmt"># cmd_vel (ROS) → RangerMiniCommand → JointTargets</span>
+
+<span class="kw">from</span> isaac_extension.ranger_mini_stage <span class="kw">import</span> drive_ranger_mini_cmd_vel
+
+<span class="cmt"># linear.x = 전진 속도 (m/s), angular.z = 회전 속도 (rad/s)</span>
+result = drive_ranger_mini_cmd_vel(
+    stage,
+    robot_prim_path,
+    linear_x=<span class="num">0.5</span>,    <span class="cmt"># 0.5 m/s 전진</span>
+    angular_z=<span class="num">0.3</span>,   <span class="cmt"># 0.3 rad/s 좌회전</span>
+)
+
+<span class="cmt"># 내부 흐름:</span>
+<span class="cmt"># RangerMiniRosAdapter.command_from_twist(twist, params)</span>
+<span class="cmt">#   → RangerMiniCommand(linear_speed_mps, steering_angle_rad)</span>
+<span class="cmt">#   → saturate_command(command, params)   # 속도/각도 상한 적용</span>
+<span class="cmt">#   → compute_joint_targets(command, params)</span>
+<span class="cmt">#   → JointTargets(fr_steer, fl_steer, rr_steer, rl_steer,</span>
+<span class="cmt">#                  fr_wheel, fl_wheel, rr_wheel, rl_wheel)</span>
+<span class="cmt">#   → USD joint drive attrs 기록</span></code></pre>
+</section>
+
+
+<!-- ════ KINEMATIC ════ -->
+<section class="section" id="kinematic">
+  <div class="section-header">
+    <div class="section-icon" style="background:rgba(52,211,153,0.15)">📐</div>
+    <div>
+      <div class="section-title">Kinematic 제어 (기존 방식)</div>
+      <div class="section-subtitle">command_robot() — root xform을 직접 적분</div>
+    </div>
+  </div>
+
+  <div class="alert alert-warn">
+    <strong>이 방식은 프리뷰/테스트용입니다.</strong>
+    물리 엔진을 통하지 않고 root transform을 직접 이동시키므로
+    중력·충돌 반응이 없습니다. 정확한 물리 시뮬레이션은 PhysX Drive를 사용하세요.
+  </div>
+
+  <div class="type-block">
+    <div class="type-header">
+      <div class="type-name">command_robot(stage, prim_path, action)</div>
+      <div class="type-badge badge-fn">function</div>
+      <div style="color:var(--text-dim);font-size:12px">ranger_mini_stage.py:349</div>
+    </div>
+    <div class="type-body">
+      <table>
+        <tr><th>action</th><th>속도</th><th>설명</th></tr>
+        <tr><td>"forward"</td><td>0.8 m/s</td><td>ACKERMANN 직진</td></tr>
+        <tr><td>"backward"</td><td>-0.6 m/s</td><td>ACKERMANN 후진</td></tr>
+        <tr><td>"left"</td><td>0.5 m/s</td><td>좌조향 Ackermann</td></tr>
+        <tr><td>"right"</td><td>0.5 m/s</td><td>우조향 Ackermann</td></tr>
+        <tr><td>"strafe_left"</td><td>0.5 m/s</td><td>OBLIQUE 좌측 횡이동</td></tr>
+        <tr><td>"strafe_right"</td><td>0.5 m/s</td><td>OBLIQUE 우측 횡이동</td></tr>
+        <tr><td>"spin_left"</td><td>0.8 rad/s</td><td>SPIN 제자리 반시계</td></tr>
+        <tr><td>"spin_right"</td><td>-0.8 rad/s</td><td>SPIN 제자리 시계</td></tr>
+        <tr><td>"park"</td><td>0</td><td>PARKING 잠금</td></tr>
+        <tr><td>"stop"</td><td>0</td><td>즉시 정지</td></tr>
+      </table>
+    </div>
+  </div>
+
+  <pre><code><span class="cmt"># Script Editor에서 사용</span>
+<span class="kw">import</span> omni.usd
+<span class="kw">from</span> isaac_extension.ranger_mini_stage <span class="kw">import</span> command_robot
+
+stage = omni.usd.get_context().get_stage()
+
+<span class="cmt"># /World 같은 상위 경로 넣어도 자동 탐색</span>
+result = command_robot(stage, <span class="str">"/World"</span>, <span class="str">"forward"</span>)
+<span class="cmt"># → {"prim_path": "/World/RangerMini_01", "action": "forward", ...}</span>
+
+<span class="cmt"># 60프레임 연속 전진</span>
+<span class="kw">for</span> _ <span class="kw">in</span> range(<span class="num">60</span>):
+    command_robot(stage, <span class="str">"/World"</span>, <span class="str">"forward"</span>)</code></pre>
+</section>
+
+
+<!-- ════ PHYSICS ════ -->
+<section class="section" id="physics">
+  <div class="section-header">
+    <div class="section-icon" style="background:rgba(248,113,113,0.15)">⚡</div>
+    <div>
+      <div class="section-title">PhysX 물리 설정</div>
+      <div class="section-subtitle">중력 + 충돌 + 바닥 콜라이더 활성화</div>
+    </div>
+  </div>
+
+  <p>Isaac Sim에서 로봇이 공중에 떠 있는 이유: USD 씬에 물리가 꺼져 있거나
+  충돌 콜라이더가 없기 때문입니다. 아래 3개가 모두 있어야 중력이 작동합니다.</p>
+
+  <div class="why-grid">
+    <div class="why-card">
+      <div class="why-card-title">① PhysicsScene</div>
+      <div class="why-card-body">
+        중력 방향(0,0,-1)과 크기(9.81 m/s²)를 정의하는 씬 전역 오브젝트.
+        없으면 아무것도 떨어지지 않음.
+        경로: <code>/World/PhysicsScene</code>
+      </div>
+    </div>
+    <div class="why-card">
+      <div class="why-card-title">② Robot Collision Prims</div>
+      <div class="why-card-body">
+        로봇 USD의 <code>collision</code> 이름 포함 prim들에
+        <code>PhysicsCollisionAPI</code> 적용.
+        없으면 로봇이 바닥을 통과함.
+      </div>
+    </div>
+    <div class="why-card">
+      <div class="why-card-title">③ Ground Collider</div>
+      <div class="why-card-body">
+        <code>/World/RobomitubaGroundCollider</code> — 보이지 않는 거대한 평면 큐브.
+        로봇이 떨어질 바닥 역할.
+      </div>
+    </div>
+    <div class="why-card">
+      <div class="why-card-title">④ Timeline Play</div>
+      <div class="why-card-body">
+        Isaac 상단 Play 버튼을 눌러야 PhysX 시뮬레이션이 시작됨.
+        Play 전에는 설정이 있어도 물리가 돌지 않음.
+      </div>
+    </div>
+  </div>
+
+  <div class="type-block">
+    <div class="type-header">
+      <div class="type-name">enable_ranger_mini_physics()</div>
+      <div class="type-badge badge-fn">function</div>
+      <div style="color:var(--text-dim);font-size:12px">ranger_mini_stage.py:279</div>
+    </div>
+    <div class="type-body">
+      <table>
+        <tr><th>Parameter</th><th>Default</th><th>설명</th></tr>
+        <tr><td>stage</td><td>—</td><td>현재 USD 스테이지</td></tr>
+        <tr><td>robot_prim_path</td><td>—</td><td>Ranger root prim 경로</td></tr>
+        <tr><td>create_ground_collider</td><td>True</td><td>바닥 콜라이더 자동 생성</td></tr>
+        <tr><td>gravity_magnitude</td><td>9.81</td><td>중력 가속도 (m/s²)</td></tr>
+        <tr><td>→</td><td>dict</td><td>physics_scene, collision_prims, ground_collider 경로 반환</td></tr>
+      </table>
+    </div>
+  </div>
+
+  <pre><code><span class="cmt"># Script Editor에서 물리 활성화</span>
+<span class="kw">import</span> omni.usd
+<span class="kw">from</span> isaac_extension.ranger_mini_stage <span class="kw">import</span> enable_ranger_mini_physics
+
+stage = omni.usd.get_context().get_stage()
+result = enable_ranger_mini_physics(stage, <span class="str">"/World"</span>)
+<span class="cmt"># → {
+<span class="cmt">#     "prim_path": "/World/RangerMini_01",</span>
+<span class="cmt">#     "physics_scene": "/World/PhysicsScene",</span>
+<span class="cmt">#     "collision_prims": 12,</span>
+<span class="cmt">#     "ground_collider": "/World/RobomitubaGroundCollider",</span>
+<span class="cmt">#     "gravity_magnitude": 9.81</span>
+<span class="cmt"># }</span>
+
+<span class="cmt"># 그 다음 Isaac 상단 Timeline ▶ Play 클릭</span></code></pre>
+</section>
+
+
+<!-- ════ SPAWN SCREENSHOT ════ -->
+<section class="section" id="physics-spawn-screenshot">
+  <div class="section-header">
+    <div class="section-icon" style="background:rgba(245,158,11,0.15)">📸</div>
+    <div>
+      <div class="section-title">Ranger Mini — Isaac Sim 스폰 스크린샷</div>
+      <div class="section-subtitle">물리엔진 적용 과정 — WIP → 정상 착지까지</div>
+    </div>
+  </div>
+
+  <div class="screenshot-grid">
+    <div class="screenshot-block">
+      <img src="images/ranger_mini_physics.jpg" alt="Ranger Mini spawned with invisible ground collider" />
+      <div class="screenshot-caption">
+        <div class="screenshot-caption-title">
+          <span class="screenshot-tag tag-isaac">Isaac Sim</span>
+          <span class="screenshot-tag tag-physx">PhysX</span>
+          <span class="screenshot-tag tag-wip">WIP</span>
+          1차 스폰 — 보이지 않는 바닥 위
+        </div>
+        <div class="screenshot-caption-body">
+          PhysicsScene + Ground Collider 자동 생성 후 첫 착지.
+          바닥 콜라이더(<code>/World/RobomitubaGroundCollider</code>)가 씬 geometry와 정렬되지 않아
+          보이지 않는 투명 평면 위에 올라간 상태. 물리 적용 자체는 성공.
+        </div>
+      </div>
+    </div>
+
+    <div class="screenshot-block">
+      <img src="images/ranger_mini_grounded.jpg" alt="Ranger Mini properly grounded on scene floor" />
+      <div class="screenshot-caption">
+        <div class="screenshot-caption-title">
+          <span class="screenshot-tag tag-isaac">Isaac Sim</span>
+          <span class="screenshot-tag tag-physx">PhysX</span>
+          <span class="screenshot-tag tag-done">완료</span>
+          2차 스폰 — 씬 바닥에 정상 착지
+        </div>
+        <div class="screenshot-caption-body">
+          MooreLane 씬의 실제 바닥 geometry 위에 Ranger Mini가 정상적으로 착지한 모습.
+          PhysX 중력·충돌이 올바르게 적용되어 네 바퀴가 바닥에 닿아 있음.
+          RTX 5090, 59 FPS 실시간 렌더링.
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <h3>현재 상태 진단</h3>
+  <div class="why-grid">
+    <div class="why-card">
+      <div class="why-card-title" style="color:var(--success)">✅ 완료</div>
+      <div class="why-card-body">
+        PhysicsScene 생성, 로봇 콜라이더 적용, Ground Collider 자동 생성, 중력 활성화.
+        씬 바닥 geometry 위에 네 바퀴가 닿아 <strong>정상 착지</strong> 확인.
+      </div>
+    </div>
+    <div class="why-card">
+      <div class="why-card-title" style="color:var(--warning)">⚠️ WIP</div>
+      <div class="why-card-body">
+        씬 콜라이더가 MooreLane 실제 바닥 메시를 완전히 커버하지 않는 엣지 케이스 존재.
+        복잡한 씬 geometry에 대한 콜라이더 자동 추출 개선 필요.
+      </div>
+    </div>
+    <div class="why-card">
+      <div class="why-card-title" style="color:var(--danger)">❌ 다음 단계</div>
+      <div class="why-card-body">
+        PhysX 드라이브 기반 실제 wheel/steer 조인트 제어.
+        현재 <code>command_robot()</code>(kinematic) 테스트 단계.
+      </div>
+    </div>
+  </div>
+</section>
+
+
+<!-- ════ PHYSX DRIVE ════ -->
+<section class="section" id="physx-drive">
+  <div class="section-header">
+    <div class="section-icon" style="background:rgba(108,142,247,0.15)">⚙️</div>
+    <div>
+      <div class="section-title">PhysX 드라이브 (오늘 핵심)</div>
+      <div class="section-subtitle">관절 드라이브 타겟 직접 기록 — root 이동 없음</div>
+    </div>
+  </div>
+
+  <div class="alert alert-tip">
+    <strong>Kinematic 방식과의 결정적 차이:</strong>
+    root transform을 직접 움직이는 게 아니라, 각 관절의 물리 드라이브 타겟을 설정하면
+    PhysX가 토크를 계산하고 로봇을 실제로 굴립니다.
+    충돌, 중력, 마찰이 모두 적용됩니다.
+  </div>
+
+  <h3>관절 구조</h3>
+  <pre><code>/World/RangerMini_01/
+├── fr_steer_joint   <span class="cmt"># 앞 우측 조향 — drive:angular:targetPosition (도)</span>
+├── fl_steer_joint   <span class="cmt"># 앞 좌측 조향</span>
+├── rr_steer_joint   <span class="cmt"># 뒤 우측 조향</span>
+├── rl_steer_joint   <span class="cmt"># 뒤 좌측 조향</span>
+├── fr_wheel_joint   <span class="cmt"># 앞 우측 바퀴 — drive:angular:targetVelocity (도/s)</span>
+├── fl_wheel_joint   <span class="cmt"># 앞 좌측 바퀴</span>
+├── rr_wheel_joint   <span class="cmt"># 뒤 우측 바퀴</span>
+└── rl_wheel_joint   <span class="cmt"># 뒤 좌측 바퀴</span></code></pre>
+
+  <div class="type-block">
+    <div class="type-header">
+      <div class="type-name">drive_ranger_mini_physx()</div>
+      <div class="type-badge badge-fn">function</div>
+      <div style="color:var(--text-dim);font-size:12px">ranger_mini_stage.py:396</div>
+    </div>
+    <div class="type-body">
+      <table>
+        <tr><th>Parameter</th><th>Type</th><th>설명</th></tr>
+        <tr><td>stage</td><td>Any</td><td>USD 스테이지</td></tr>
+        <tr><td>robot_prim_path</td><td>str</td><td>Ranger root (자동 탐색 지원)</td></tr>
+        <tr><td>linear_speed_mps</td><td>float</td><td>전진 속도 (m/s), 기본 0</td></tr>
+        <tr><td>steering_angle_rad</td><td>float</td><td>조향각 (rad), 기본 0</td></tr>
+        <tr><td>spin_speed_radps</td><td>float</td><td>SPIN 모드 회전속도 (rad/s)</td></tr>
+        <tr><td>motion_mode</td><td>int|None</td><td>None이면 자동 결정</td></tr>
+        <tr><td>→</td><td>dict</td><td>steering_target_deg + wheel_target_deg_per_s 반환</td></tr>
+      </table>
+    </div>
+  </div>
+
+  <pre><code><span class="cmt"># PhysX 드라이브 사용 예시</span>
+<span class="kw">from</span> isaac_extension.ranger_mini_stage <span class="kw">import</span> drive_ranger_mini_physx, command_robot_physx
+
+<span class="cmt"># 방법 1: 직접 속도/각도 지정</span>
+drive_ranger_mini_physx(stage, <span class="str">"/World"</span>,
+    linear_speed_mps=<span class="num">0.5</span>,
+    steering_angle_rad=<span class="num">0.2</span>,
+)
+
+<span class="cmt"># 방법 2: action 이름으로 (PhysX 버전)</span>
+command_robot_physx(stage, <span class="str">"/World"</span>, <span class="str">"forward"</span>)
+command_robot_physx(stage, <span class="str">"/World"</span>, <span class="str">"spin_left"</span>)
+
+<span class="cmt"># 내부에서 일어나는 일:</span>
+<span class="cmt"># compute_joint_targets(command, params)</span>
+<span class="cmt"># → JointTargets.fr_steer, fl_steer, rr_steer, rl_steer  (rad)</span>
+<span class="cmt"># → JointTargets.fr_wheel, fl_wheel, rr_wheel, rl_wheel  (rad/s)</span>
+<span class="cmt">#</span>
+<span class="cmt"># fr_steer_joint.drive:angular:targetPosition = degrees(fr_steer)</span>
+<span class="cmt"># fr_wheel_joint.drive:angular:targetVelocity = degrees(fr_wheel)</span></code></pre>
+</section>
+
+
+<!-- ════ CMD_VEL ════ -->
+<section class="section" id="cmdvel">
+  <div class="section-header">
+    <div class="section-icon" style="background:rgba(245,158,11,0.15)">📡</div>
+    <div>
+      <div class="section-title">cmd_vel 인터페이스</div>
+      <div class="section-subtitle">ROS 실물 로봇과 동일한 토픽 구조</div>
+    </div>
+  </div>
+
+  <p>실물 AgileX Ranger Mini는 ROS <code>/cmd_vel</code> 토픽으로 조종합니다.
+  오늘 구현한 <code>drive_ranger_mini_cmd_vel()</code>은 동일한 인터페이스를
+  시뮬레이터에서도 사용할 수 있게 해줍니다.</p>
+
+  <div class="type-block">
+    <div class="type-header">
+      <div class="type-name">drive_ranger_mini_cmd_vel()</div>
+      <div class="type-badge badge-fn">function</div>
+      <div style="color:var(--text-dim);font-size:12px">ranger_mini_stage.py:465</div>
+    </div>
+    <div class="type-body">
+      <table>
+        <tr><th>Parameter</th><th>Type</th><th>대응 ROS 필드</th></tr>
+        <tr><td>linear_x</td><td>float</td><td>cmd_vel.linear.x (m/s)</td></tr>
+        <tr><td>angular_z</td><td>float</td><td>cmd_vel.angular.z (rad/s)</td></tr>
+      </table>
+    </div>
+  </div>
+
+  <pre><code><span class="cmt"># 실물 로봇 (ROS)</span>
+<span class="py">ros_pub.publish</span>(Twist(linear=Vector3(x=<span class="num">0.5</span>), angular=Vector3(z=<span class="num">0.3</span>)))
+
+<span class="cmt"># Isaac 시뮬레이션 (동일한 의미)</span>
+<span class="kw">from</span> isaac_extension.ranger_mini_stage <span class="kw">import</span> drive_ranger_mini_cmd_vel
+drive_ranger_mini_cmd_vel(stage, <span class="str">"/World"</span>, linear_x=<span class="num">0.5</span>, angular_z=<span class="num">0.3</span>)</code></pre>
+
+  <h3>내부 변환 체인</h3>
+  <div class="flow">
+    <div class="flow-step">
+      <div class="flow-num">A</div>
+      <div class="flow-content">
+        <div class="flow-title">cmd_vel (linear.x, angular.z)</div>
+        <div class="flow-body">ROS geometry_msgs/Twist 구조. 실물 로봇과 동일한 입력.</div>
+      </div>
+    </div>
+    <div class="flow-step">
+      <div class="flow-num">B</div>
+      <div class="flow-content">
+        <div class="flow-title">RangerMiniRosAdapter.command_from_twist()</div>
+        <div class="flow-body">
+          angular.z → Ackermann 조향각으로 변환.
+          속도와 각속도로 운동 모드 결정 (|spin| > 0이면 SPIN, 아니면 ACKERMANN).
+          → <span class="flow-code">RangerMiniCommand</span>
+        </div>
+      </div>
+    </div>
+    <div class="flow-step">
+      <div class="flow-num">C</div>
+      <div class="flow-content">
+        <div class="flow-title">saturate_command(command, params)</div>
+        <div class="flow-body">
+          최대 속도 (params.max_linear_speed_mps),
+          최대 조향각 (params.max_steering_angle_rad) 적용.
+          물리적으로 불가능한 명령 차단.
+        </div>
+      </div>
+    </div>
+    <div class="flow-step">
+      <div class="flow-num">D</div>
+      <div class="flow-content">
+        <div class="flow-title">compute_joint_targets(command, params)</div>
+        <div class="flow-body">
+          운동 모드별 운동학으로 8개 관절 타겟 계산.
+          → <span class="flow-code">JointTargets</span> (fr/fl/rr/rl steer deg + wheel rad/s)
+        </div>
+      </div>
+    </div>
+    <div class="flow-step">
+      <div class="flow-num">E</div>
+      <div class="flow-content">
+        <div class="flow-title">USD joint drive attrs 기록</div>
+        <div class="flow-body">
+          <span class="flow-code">drive:angular:targetPosition</span> (조향) +
+          <span class="flow-code">drive:angular:targetVelocity</span> (바퀴) →
+          PhysX가 다음 타임스텝에 토크 계산 → 실제 이동.
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+
+<!-- ════ AUTO DISCOVER ════ -->
+<section class="section" id="auto-discover">
+  <div class="section-header">
+    <div class="section-icon" style="background:rgba(52,211,153,0.15)">🔍</div>
+    <div>
+      <div class="section-title">로봇 자동 탐색</div>
+      <div class="section-subtitle">prim path를 몰라도 자동으로 찾기</div>
+    </div>
+  </div>
+
+  <p>드래그앤드롭으로 넣은 로봇의 prim path가 <code>/World/RangerMini_01</code>인지
+  <code>/World/AgileX_RangerMini</code>인지 모를 때도, <code>/World</code>를 넣으면
+  자동으로 찾아가게 구현했습니다.</p>
+
+  <div class="type-block">
+    <div class="type-header">
+      <div class="type-name">resolve_ranger_mini_path(stage, prim_path)</div>
+      <div class="type-badge badge-fn">function</div>
+      <div style="color:var(--text-dim);font-size:12px">ranger_mini_stage.py:166</div>
+    </div>
+    <div class="type-body">
+      <table>
+        <tr><th>입력</th><th>결과</th></tr>
+        <tr><td>"/World/RangerMini_01" (정확한 Ranger prim)</td><td>그대로 반환</td></tr>
+        <tr><td>"/World" (상위 경로)</td><td>하위에서 Ranger 탐색, 1개뿐이면 해당 경로 반환</td></tr>
+        <tr><td>"/World" (Ranger 2개 이상)</td><td>RuntimeError (명확한 경로 요구)</td></tr>
+        <tr><td>None</td><td>전체 stage 탐색, 1개뿐이면 반환</td></tr>
+      </table>
+    </div>
+  </div>
+
+  <pre><code><span class="cmt"># 탐색 기준: robomituba:robotName == "ranger_mini_v3"</span>
+<span class="kw">def</span> <span class="fn">_is_ranger_mini_prim</span>(prim) -> bool:
+    <span class="kw">return</span> str(_attr_value(prim, <span class="str">"robomituba:robotName"</span>, <span class="str">""</span>)) == <span class="str">"ranger_mini_v3"</span>
+
+<span class="cmt"># 리스트 조회</span>
+<span class="kw">from</span> isaac_extension.ranger_mini_stage <span class="kw">import</span> list_ranger_mini_robots
+robots = list_ranger_mini_robots(stage)
+<span class="cmt"># → [{"prim_path": "/World/RangerMini_01", "translation": [0,0,0], ...}]</span></code></pre>
+</section>
+
+
+<!-- ════ ARCH ════ -->
+<section class="section" id="arch">
+  <div class="section-header">
+    <div class="section-icon" style="background:rgba(167,139,250,0.15)">🏗️</div>
+    <div>
+      <div class="section-title">제어 아키텍처</div>
+      <div class="section-subtitle">Kinematic vs PhysX — 두 제어 경로</div>
+    </div>
+  </div>
+
+  <div class="compare-grid">
+    <div class="compare-card">
+      <div class="compare-header bad">Kinematic (command_robot)</div>
+      <div class="compare-body">
+        <ul>
+          <li>root xform을 직접 이동 (Δt * speed)</li>
+          <li>관절 각도를 USD attr에 기록 (visual 전용)</li>
+          <li>물리 엔진 불필요, 어느 모드에서나 동작</li>
+          <li>충돌·중력 없음</li>
+          <li>프리뷰, UI 테스트, 정적 씬 캡처에 적합</li>
+        </ul>
+      </div>
+    </div>
+    <div class="compare-card">
+      <div class="compare-header good">PhysX Drive (drive_ranger_mini_physx)</div>
+      <div class="compare-body">
+        <ul>
+          <li>joint drive target만 기록, 이동은 PhysX가 결정</li>
+          <li>중력 + 충돌 + 마찰 모두 적용</li>
+          <li>Timeline Play 필요</li>
+          <li>물리적으로 일관된 로봇 상태</li>
+          <li>실물 로봇 동작과 가장 유사한 학습 데이터 생성</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+
+  <pre><code><span class="cmt"># 파일 구조</span>
+apps/
+├── isaac_extension/
+│   └── ranger_mini_stage.py    <span class="cmt"># 공개 API (command_robot, drive_*)</span>
+└── isaac_standalone/
+    └── ranger_mini/
+        ├── robot.py             <span class="cmt"># RangerMiniRobot 클래스</span>
+        ├── kinematics.py        <span class="cmt"># compute_joint_targets()</span>
+        ├── ros_adapter.py       <span class="cmt"># RangerMiniRosAdapter</span>
+        ├── constants.py         <span class="cmt"># JOINT_ORDER, RangerMiniParams</span>
+        └── types.py             <span class="cmt"># RangerMiniCommand, JointTargets, RangerMiniState</span></code></pre>
+</section>
+
+
+<!-- ════ SENSOR RENDER INTEGRATION ════ -->
+<section class="section" id="sensor-render">
+  <div class="section-header">
+    <div class="section-icon" style="background:rgba(108,142,247,0.15)">📡</div>
+    <div>
+      <div class="section-title">카메라 센서 렌더 연동</div>
+      <div class="section-subtitle">Isaac 뷰포트 → CameraSpec → Mitsuba 렌더링</div>
+    </div>
+  </div>
+
+  <p>
+    Ranger Mini에는 <code>RangerMiniSensorRig.usda</code> 기준으로 RGB / NIR / Polarization / LiDAR 센서가
+    물리적으로 부착되어 있습니다. 로봇이 이동하면 센서도 함께 이동하고, 그 시점의
+    카메라 포즈를 <code>IsaacSensorSpec</code>으로 캡처한 뒤 Mitsuba 렌더 요청에 넣습니다.
+  </p>
+
+  <h3>캡처 → 렌더 전체 파이프라인</h3>
+  <div class="flow">
+    <div class="flow-step">
+      <div class="flow-num">①</div>
+      <div class="flow-content">
+        <div class="flow-title">Isaac 뷰포트/센서에서 카메라 포즈 추출</div>
+        <div class="flow-body">
+          <span class="flow-code">capture_active_view_camera()</span> →
+          <span class="flow-code">camera_to_world</span> (4×4 행렬),
+          <span class="flow-code">fov_deg</span>, <span class="flow-code">resolution</span>
+        </div>
+      </div>
+    </div>
+    <div class="flow-step">
+      <div class="flow-num">②</div>
+      <div class="flow-content">
+        <div class="flow-title">IsaacSensorSpec / CameraSpec 생성</div>
+        <div class="flow-body">
+          <span class="flow-code">capture_current_view_sensor_spec()</span> →
+          <span class="flow-code">IsaacSensorSpec(sensor_id, camera_to_world, fov_deg, resolution, sensor_modality="multimodal")</span>
+        </div>
+      </div>
+    </div>
+    <div class="flow-step">
+      <div class="flow-num">③</div>
+      <div class="flow-content">
+        <div class="flow-title">IsaacStateSnapshot 캡처</div>
+        <div class="flow-body">
+          <span class="flow-code">capture_isaac_state(stage, scene_id, mitsuba_scene_ref, modalities=[...])</span> →
+          씬의 모든 오브젝트 transform + BSDF override + 카메라 포즈를 하나의 스냅샷으로 패키징
+        </div>
+      </div>
+    </div>
+    <div class="flow-step">
+      <div class="flow-num">④</div>
+      <div class="flow-content">
+        <div class="flow-title">Render Daemon에 제출</div>
+        <div class="flow-body">
+          <span class="flow-code">daemon_client.submit_isaac_state(snapshot)</span> →
+          HTTP POST → <span class="flow-code">RenderRequest</span> 자동 생성 →
+          WorkerManager 큐 →  Mitsuba 서브프로세스
+        </div>
+      </div>
+    </div>
+    <div class="flow-step">
+      <div class="flow-num">⑤</div>
+      <div class="flow-content">
+        <div class="flow-title">멀티모달 렌더링 출력</div>
+        <div class="flow-body">
+          <span class="flow-code">rgb.exr</span>
+          <span class="flow-code">depth.exr</span>
+          <span class="flow-code">active_nir_intensity.exr</span>
+          <span class="flow-code">polar_rgb_preview.exr</span>
+          <span class="flow-code">dop.exr</span>
+          <span class="flow-code">observation_bundle.json</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <h3>센서 모달리티별 Isaac 연동</h3>
+  <div class="type-block">
+    <div class="type-body">
+      <table>
+        <tr><th>센서</th><th>Isaac 역할</th><th>Mitsuba 모달리티</th><th>상태</th></tr>
+        <tr><td>RGB 카메라</td><td>카메라 포즈·FOV·해상도 제공</td><td>rgb, albedo, direct/indirect</td><td><span style="color:var(--accent3)">✅ 준비됨</span></td></tr>
+        <tr><td>Depth 센서</td><td>카메라 포즈 공유</td><td>depth, sensor_depth_approx</td><td><span style="color:var(--accent3)">✅ 준비됨</span></td></tr>
+        <tr><td>NIR 카메라</td><td>AssistLightSpec 설정</td><td>active_nir_intensity</td><td><span style="color:var(--accent4)">🔄 proxy</span></td></tr>
+        <tr><td>Polarization 카메라</td><td>카메라 포즈 공유</td><td>polar_rgb, dop, aolp, s1, s2</td><td><span style="color:var(--accent4)">🔄 variant 의존</span></td></tr>
+        <tr><td>LiDAR</td><td>USD PointCloud 정보</td><td>(depth 후처리 point cloud)</td><td><span style="color:var(--accent5)">❌ 미구현</span></td></tr>
+      </table>
+    </div>
+  </div>
+
+  <h3>capture_isaac_state() 핵심 로직</h3>
+  <pre><code><span class="cmt"># apps/isaac_extension/stage_capture.py</span>
+
+<span class="kw">def</span> <span class="fn">capture_isaac_state</span>(stage, *, scene_id, mitsuba_scene_ref,
+                          modalities=None, illumination_setup="ambient_room",
+                          assist_light=None, depth_approx=None):
+
+    <span class="cmt"># 1. 현재 뷰포트 카메라 추출</span>
+    cam_dict = capture_active_view_camera()
+    camera = CameraSpec(
+        camera_to_world=cam_dict["camera_to_world"],
+        fov_deg=cam_dict["fov_deg"],
+        sensor_modality=<span class="str">"multimodal"</span>,
+    )
+
+    <span class="cmt"># 2. 씬 스냅샷 (geometry + material)</span>
+    scene_snap = _extract_snapshot(stage, scene_id=scene_id, frame_id=<span class="str">"live"</span>)
+
+    <span class="cmt"># 3. 오브젝트별 BSDF override (유리문, 금속 등)</span>
+    objects = [IsaacObjectState(
+        prim_path=mesh.source_path,
+        transform=mesh.transform,
+        bsdf_override=_stage_material_override(stage, mesh.source_path, scene_id=scene_id),
+    ) for mesh in scene_snap.meshes]
+
+    <span class="cmt"># 4. IsaacStateSnapshot 패키징</span>
+    snapshot = IsaacStateSnapshot(
+        scene_id=scene_id,
+        mitsuba_scene_ref=mitsuba_scene_ref,
+        camera=camera,
+        objects=objects,
+        modalities=modalities or [<span class="str">"rgb"</span>],
+        illumination_setup=illumination_setup,
+    )
+    <span class="kw">return</span> snapshot  <span class="cmt"># → daemon_client.submit_isaac_state(snapshot) 으로 전달</span></code></pre>
+
+  <div class="alert alert-tip">
+    <strong>핵심 설계:</strong> Isaac Sim은 카메라가 어디 있는지, 씬 오브젝트가 어떤 재질인지를 결정합니다.
+    Mitsuba는 그 정보를 받아 <em>그 카메라에서 보이는 빛</em>을 물리 기반으로 계산합니다.
+    두 시스템이 같은 프레임·포즈를 공유하기 때문에 물리적으로 일관된 멀티모달 데이터가 나옵니다.
+  </div>
+</section>
+
+
+<!-- ════ PLATFORM VISION ════ -->
+<section class="section" id="platform-vision">
+  <div class="section-header">
+    <div class="section-icon" style="background:rgba(52,211,153,0.15)">🎯</div>
+    <div>
+      <div class="section-title">플랫폼 비전 — Robomituba의 역할</div>
+      <div class="section-subtitle">로봇 시뮬레이션 → 멀티모달 관측 데이터셋 생성 플랫폼</div>
+    </div>
+  </div>
+
+  <p>
+    Codex/AGENTS.md 기록을 종합하면, 이 프로젝트의 핵심 연구 목표는
+    <strong>투명 장애물(유리문) 안전 평가를 위한 편광·NIR 관측</strong>입니다.
+    Isaac Sim이 로봇 상태·시간·충돌을 결정하고, Mitsuba가 동일 프레임의 광학적 관측을
+    사이드카 렌더링하는 구조입니다.
+  </p>
+
+  <div class="why-grid">
+    <div class="why-card">
+      <div class="why-card-title" style="color:var(--accent4)">🔬 연구 목표</div>
+      <div class="why-card-body">
+        투명 장애물(유리문, 반사면)이 있는 실내 환경에서 로봇이 안전하게 주행하려면
+        일반 RGB만으로는 부족합니다. NIR, 편광(DOP/AoLP)은 유리면을 다르게 보이게 해서
+        hazard detection을 가능하게 합니다.<br><br>
+        실물 실험 전에 시뮬레이션에서 충분한 데이터를 만들어 모델을 먼저 학습하는 것이 목표입니다.
+      </div>
+    </div>
+    <div class="why-card">
+      <div class="why-card-title" style="color:var(--accent)">🏗️ 아키텍처 철학</div>
+      <div class="why-card-body">
+        Isaac Sim을 "렌더 엔진"으로 쓰지 않습니다. Isaac은 <em>씬의 진실의 원천(source of truth)</em>
+        — geometry, robot state, collision, time을 담당하고,
+        Mitsuba는 그것을 <em>광학적으로 재현</em>합니다.<br><br>
+        둘 사이를 연결하는 계약이 <code>robomituba_bridge</code>입니다.
+      </div>
+    </div>
+    <div class="why-card">
+      <div class="why-card-title" style="color:var(--accent3)">📦 Sidecar Renderer</div>
+      <div class="why-card-body">
+        Isaac Sim의 뷰포트를 대체하지 않습니다. Isaac이 한 프레임을 결정하면,
+        같은 프레임에 대해 Mitsuba가 오프라인 배치로 고품질 렌더를 생산합니다.<br><br>
+        → 실시간 시뮬레이션 + 오프라인 고품질 렌더 데이터를 병행합니다.
+      </div>
+    </div>
+    <div class="why-card">
+      <div class="why-card-title" style="color:var(--accent2)">🗺️ 장기 방향: VLN/Navigation</div>
+      <div class="why-card-body">
+        단일 프레임 observation → <strong>시퀀스 기반 episode</strong>로 확장이 다음 단계입니다.
+        로봇이 경로를 따라 이동하며 각 timestep마다 멀티모달 관측을 저장하는
+        VLN(Vision-Language Navigation) 학습 데이터를 생성하는 플랫폼이 목표입니다.
+      </div>
+    </div>
+  </div>
+
+  <h3>단계별 로드맵</h3>
+  <div class="type-block">
+    <div class="type-body">
+      <table>
+        <tr><th>단계</th><th>목표</th><th>상태</th></tr>
+        <tr><td>1단계 (완료)</td><td>Isaac → Mitsuba 단일 프레임 렌더링 (RGB-first)</td><td><span style="color:var(--accent3)">✅ 완료</span></td></tr>
+        <tr><td>2단계 (진행)</td><td>로봇 + 센서 리그 통합, cmd_vel 제어, PhysX 물리</td><td><span style="color:var(--accent4)">🔄 오늘 작업</span></td></tr>
+        <tr><td>3단계 (예정)</td><td>NIR/편광 modality 안정화, Mitsuba spectral variant 빌드</td><td><span style="color:var(--text-dim)">⏳</span></td></tr>
+        <tr><td>4단계 (예정)</td><td>Episode 계약 추가, trajectory rollout, 충돌 로깅</td><td><span style="color:var(--text-dim)">⏳</span></td></tr>
+        <tr><td>5단계 (예정)</td><td>VLN 데이터셋 export, 언어 지시문 생성, train/val split</td><td><span style="color:var(--text-dim)">⏳</span></td></tr>
+      </table>
+    </div>
+  </div>
+</section>
+
+
+<!-- ════ DATASET READINESS ════ -->
+<section class="section" id="dataset-readiness">
+  <div class="section-header">
+    <div class="section-icon" style="background:rgba(167,139,250,0.15)">📊</div>
+    <div>
+      <div class="section-title">멀티모달 데이터셋 준비도</div>
+      <div class="section-subtitle">2026-05-26 Codex 분석 기준 — VLN/Navigation 데이터셋 readiness</div>
+    </div>
+  </div>
+
+  <div class="card-grid">
+    <div class="card">
+      <div class="card-label">렌더링 기반</div>
+      <div class="card-value" style="color:var(--accent3)">높음</div>
+      <div class="card-desc">단일 프레임 멀티모달 렌더링은 준비됨</div>
+    </div>
+    <div class="card">
+      <div class="card-label">광학 연구</div>
+      <div class="card-value" style="color:var(--accent4)">중간</div>
+      <div class="card-desc">NIR-like·편광은 지원, scene 검증 진행 중</div>
+    </div>
+    <div class="card">
+      <div class="card-label">VLN 데이터셋</div>
+      <div class="card-value" style="color:var(--accent5)">낮음</div>
+      <div class="card-desc">episode 계층, 경로 계획, 충돌 로깅 미구현</div>
+    </div>
+    <div class="card">
+      <div class="card-label">환경 테스트</div>
+      <div class="card-value" style="color:var(--accent5)">7/24 실패</div>
+      <div class="card-desc">Mitsuba variant 미탑재 환경에서 테스트 실패</div>
+    </div>
+  </div>
+
+  <h3>Timestep Observation 준비도</h3>
+  <div class="type-block">
+    <div class="type-body">
+      <table>
+        <tr><th>항목</th><th>상태</th><th>현재 구현</th></tr>
+        <tr><td>RGB image</td><td><span style="color:var(--accent3)">✅ 준비됨</span></td><td>rgb modality, path tracing 4096 spp</td></tr>
+        <tr><td>Depth image</td><td><span style="color:var(--accent3)">✅ 준비됨</span></td><td>depth AOV, sensor_depth_approx</td></tr>
+        <tr><td>NIR-like</td><td><span style="color:var(--accent4)">🔄 proxy</span></td><td>active_nir_intensity (카메라 정렬 보조광 기반). 물리적 NIR 센서 모델은 아님</td></tr>
+        <tr><td>Polarization</td><td><span style="color:var(--accent4)">🔄 variant 의존</span></td><td>polar_rgb, dop, aolp, s1, s2. cuda_polarized_spectral 필요</td></tr>
+        <tr><td>Semantic Segmentation</td><td><span style="color:var(--accent5)">❌ 미구현</span></td><td>camera-view per-pixel semantic pass 없음</td></tr>
+        <tr><td>Instance Segmentation</td><td><span style="color:var(--accent5)">❌ 미구현</span></td><td>mesh ID는 snapshot에 있지만 per-pixel instance pass 없음</td></tr>
+        <tr><td>LiDAR / Point Cloud</td><td><span style="color:var(--accent5)">❌ 미구현</span></td><td>depth 후처리로 가능하나 공식 modality·contract 없음</td></tr>
+        <tr><td>Agent Pose</td><td><span style="color:var(--accent4)">🔄 부분</span></td><td>RobotState.base_pose 가능, episode-level 필드 없음</td></tr>
+        <tr><td>Collision Flag</td><td><span style="color:var(--accent5)">❌ 미구현</span></td><td>Isaac physics 충돌 이벤트 캡처 없음</td></tr>
+        <tr><td>Glass/Mirror Mask</td><td><span style="color:var(--accent4)">🔄 내부</span></td><td>sensor_depth_approx 내부 target_mask raw channel 존재. 공식 modality 아님</td></tr>
+      </table>
+    </div>
+  </div>
+
+  <h3>VLN Episode 계약 — 현재 vs 필요</h3>
+  <div class="type-block">
+    <div class="type-body">
+      <table>
+        <tr><th>Episode 필드</th><th>현재 상태</th><th>필요 작업</th></tr>
+        <tr><td>episode_id</td><td><span style="color:var(--accent5)">❌</span> 없음</td><td>EpisodeManifest 신규 타입 추가</td></tr>
+        <tr><td>scene_id</td><td><span style="color:var(--accent3)">✅</span> 있음</td><td>SceneSnapshot, ObservationBundleManifest에 존재</td></tr>
+        <tr><td>start_pose / goal_pose</td><td><span style="color:var(--accent4)">🔄</span> 부분</td><td>RobotState.base_pose로 담을 수 있으나 episode-level 필드 없음</td></tr>
+        <tr><td>natural_language_instruction</td><td><span style="color:var(--accent5)">❌</span> 없음</td><td>template 생성기 + optional LLM paraphrase</td></tr>
+        <tr><td>trajectory</td><td><span style="color:var(--accent5)">❌</span> 없음</td><td>경로 계획기 + rollout 레코더</td></tr>
+        <tr><td>actions</td><td><span style="color:var(--accent4)">🔄</span> 부분</td><td>action_ref 문자열만 있음. structured action sequence 없음</td></tr>
+        <tr><td>timesteps[] (observations)</td><td><span style="color:var(--accent4)">🔄</span> 부분</td><td>프레임 observation bundle은 있음. episode sequence packaging 없음</td></tr>
+      </table>
+    </div>
+  </div>
+
+  <h3>MVP 권장 범위</h3>
+  <pre><code><span class="cmt"># 목표 Episode JSON 구조 (설계 중)</span>
+{
+  <span class="str">"episode_id"</span>: <span class="str">"episode-000001"</span>,
+  <span class="str">"scene_id"</span>: <span class="str">"small_indoor_001"</span>,
+  <span class="str">"start_pose"</span>: [...],
+  <span class="str">"goal_pose"</span>: [...],
+  <span class="str">"natural_language_instruction"</span>: <span class="str">"Go to the glass door near the table."</span>,
+  <span class="str">"actions"</span>: [<span class="str">"move_forward"</span>, <span class="str">"turn_left"</span>, ...],
+  <span class="str">"timesteps"</span>: [
+    {
+      <span class="str">"timestep"</span>: <span class="num">0</span>,
+      <span class="str">"agent_pose"</span>: [...],
+      <span class="str">"action"</span>: <span class="str">"move_forward"</span>,
+      <span class="str">"collision"</span>: <span class="kw">false</span>,
+      <span class="str">"observation_bundle_ref"</span>: <span class="str">"out/bridge_jobs/.../frame_0000/manifest.json"</span>
+    }
+  ],
+  <span class="str">"metadata"</span>: {
+    <span class="str">"modalities"</span>: [<span class="str">"rgb"</span>, <span class="str">"depth"</span>, <span class="str">"active_nir_intensity"</span>, <span class="str">"transparent_object_mask"</span>]
+  }
+}</code></pre>
+
+  <div class="alert alert-warn">
+    <strong>핵심 누락:</strong> navigation graph/traversable map, start-goal 샘플링,
+    collision-free trajectory rollout, action 시퀀스 로깅, 언어 지시문, semantic segmentation.
+    렌더링 backend는 준비됐지만 <em>dataset generator 자체</em>는 별도 구현이 필요합니다.
+  </div>
+</section>
+
+
+<!-- ════ OPTICALNAV AGENT API ════ -->
+<section class="section" id="opticalnav-agent-api">
+  <div class="section-header">
+    <div class="section-icon" style="background:rgba(47,123,246,0.15)">🤖</div>
+    <div>
+      <div class="section-title">OpticalNav Agent API — 6개 신규 엔드포인트</div>
+      <div class="section-subtitle">2026-05-27 추가 · render_daemon.py (port 8765) · LLM·에이전트 호출용</div>
+    </div>
+  </div>
+
+  <p style="color:var(--muted-strong);margin-bottom:16px">
+    authoring_map을 외부 에이전트(LLM, 자동화 스크립트)에서 직접 조작할 수 있도록
+    6개 REST 엔드포인트를 추가했다. 기존 WebUI 수동 편집과 동일한 저장 계층을 공유한다.
+  </p>
+
+  <div class="type-block">
+    <div class="type-body">
+      <table>
+        <tr><th>메서드</th><th>경로</th><th>기능</th><th>테스트 결과</th></tr>
+        <tr>
+          <td><span style="color:var(--brand);font-family:var(--font-mono);font-weight:600">GET</span></td>
+          <td style="font-family:var(--font-mono);font-size:0.8rem">/api/opticalnav/agent/materials</td>
+          <td>사용 가능한 재질 목록 (presets 7 + hpbrdf 14 + pbrdf 25)</td>
+          <td><span style="color:var(--success)">✅ 46개 반환</span></td>
+        </tr>
+        <tr>
+          <td><span style="color:var(--brand);font-family:var(--font-mono);font-weight:600">GET</span></td>
+          <td style="font-family:var(--font-mono);font-size:0.8rem">/api/opticalnav/projects/{pid}/scenes/{sid}/agent-context</td>
+          <td>씬 전체 상태 요약 (오브젝트·리전·compile 블로커·suggested_actions)</td>
+          <td><span style="color:var(--success)">✅ compile_ready 반환</span></td>
+        </tr>
+        <tr>
+          <td><span style="color:var(--success);font-family:var(--font-mono);font-weight:600">POST</span></td>
+          <td style="font-family:var(--font-mono);font-size:0.8rem">.../scenes/{sid}/objects</td>
+          <td>오브젝트 또는 리전 단건 추가 (type 자동 분류)</td>
+          <td><span style="color:var(--success)">✅ glass_wall_001 생성</span></td>
+        </tr>
+        <tr>
+          <td><span style="color:var(--success);font-family:var(--font-mono);font-weight:600">POST</span></td>
+          <td style="font-family:var(--font-mono);font-size:0.8rem">.../scenes/{sid}/objects/batch</td>
+          <td>여러 오브젝트·리전 한 번에 추가, auto_compile 옵션</td>
+          <td><span style="color:var(--success)">✅ 3개 동시 배치</span></td>
+        </tr>
+        <tr>
+          <td><span style="color:var(--success);font-family:var(--font-mono);font-weight:600">POST</span></td>
+          <td style="font-family:var(--font-mono);font-size:0.8rem">.../scenes/{sid}/objects/{oid}/material</td>
+          <td>오브젝트에 hpbrdf / pbrdf 재질 지정 + authoring_map 저장</td>
+          <td><span style="color:var(--success)">✅ black_glass 적용</span></td>
+        </tr>
+        <tr>
+          <td><span style="color:var(--danger);font-family:var(--font-mono);font-weight:600">DELETE</span></td>
+          <td style="font-family:var(--font-mono);font-size:0.8rem">.../scenes/{sid}/objects/{oid}</td>
+          <td>오브젝트 또는 리전 삭제</td>
+          <td><span style="color:var(--success)">✅ chair_001 삭제</span></td>
+        </tr>
+      </table>
+    </div>
+  </div>
+
+  <h3>geometry 필드 규칙</h3>
+  <p style="color:var(--muted-strong);font-size:0.85rem;margin:8px 0 12px">batch/objects payload에서 geometry는 placement에 따라 다른 필드를 쓴다.</p>
+  <pre><code><span class="cmt"># point  →  position: [x, y]  (center가 아님)</span>
+{ "type": "chair", "placement": "point", <span class="str">"position"</span>: [2.0, 1.5] }
+
+<span class="cmt"># line   →  start / end</span>
+{ "type": "glass_wall", "placement": "line", <span class="str">"start"</span>: [5,0], <span class="str">"end"</span>: [5,2.5] }
+
+<span class="cmt"># rectangle  →  min / max  (bounds가 아님)</span>
+{ "type": "traversable", "placement": "rectangle", <span class="str">"min"</span>: [0,0], <span class="str">"max"</span>: [10,6] }</code></pre>
+
+  <div class="alert alert-warn">
+    <strong>주의:</strong> <code>point</code>는 <code>center</code> 대신 <code>position</code>,
+    <code>rectangle</code>은 <code>bounds</code> 대신 <code>min</code>/<code>max</code> 두 필드를 사용한다.
+    authoring_map.json 내부 저장 형식(<code>center</code>, <code>bounds</code>)과 API 입력 형식이 다르니 주의.
+  </div>
+</section>
+
+
+<!-- ════ SCENE AUTHORING DEMO ════ -->
+<section class="section" id="scene-authoring-demo">
+  <div class="section-header">
+    <div class="section-icon" style="background:rgba(139,92,246,0.15)">🏢</div>
+    <div>
+      <div class="section-title">씬 저작 데모 — office_lobby_001</div>
+      <div class="section-subtitle">API만으로 navigation 씬 구성 · opticalnav-v0.2 프로젝트</div>
+    </div>
+  </div>
+
+  <p style="color:var(--muted-strong);margin-bottom:16px">
+    Agent API 6개를 순서대로 호출해 10 × 6 m 오피스 로비 씬을 완성했다.
+    WebUI를 전혀 열지 않고도 <code>compile_ready: true</code> 상태까지 도달.
+  </p>
+
+  <h3>레이아웃 설계</h3>
+  <pre style="font-size:0.78rem;line-height:1.7"><code>y=6: ┌──────────────wall──────────────────────┐
+     │  Room A              │glass│  Room B  │
+y=5: │  ≡≡≡ MIRROR ≡≡≡     │wall │          │
+     │                      │wall │   🌱     │
+y=3: │  🪑  🪑              ⊏DOOR⊐          │
+     │                      │wall │          │
+y=0: └──────────────wall──────────────────────┘
+    x=0         x=2        x=5          x=10
+
+<span class="cmt">출발(start): x0.2–1.5, y2.3–3.7   목표(goal): x8.5–9.8, y2.3–3.7
+유리 위험구역(hazard): x4.3–5.7    유리문 정지선(stop_before): x4.0–6.0</span></code></pre>
+
+  <h3>배치 결과 (agent-context 응답)</h3>
+  <div class="card-grid" style="grid-template-columns:repeat(4,1fr)">
+    <div class="card">
+      <div class="card-label">오브젝트</div>
+      <div class="card-value" style="color:var(--brand)">12개</div>
+      <div class="card-desc">wall×4, glass_wall×2, glass_door, mirror_wall, table, chair×2, plant</div>
+    </div>
+    <div class="card">
+      <div class="card-label">리전</div>
+      <div class="card-value" style="color:var(--purple)">5개</div>
+      <div class="card-desc">traversable, start, goal, hazard, stop_before</div>
+    </div>
+    <div class="card">
+      <div class="card-label">재질</div>
+      <div class="card-value" style="color:var(--success)">지정 완료</div>
+      <div class="card-desc">glass_wall·door → hpbrdf_2025/black_glass<br>mirror_wall → preset:mirror</div>
+    </div>
+    <div class="card">
+      <div class="card-label">컴파일 상태</div>
+      <div class="card-value" style="color:var(--success)">ready</div>
+      <div class="card-desc">traversable + goal 충족<br>다음: build traversability map</div>
+    </div>
+  </div>
+
+  <h3>단계별 API 호출 요약</h3>
+  <pre><code><span class="cmt"># 1. 씬 생성</span>
+POST /api/opticalnav/projects/opticalnav-v0.2/scenes
+  → { scene_id: "office_lobby_001" }
+
+<span class="cmt"># 2. 오브젝트 + 리전 일괄 배치 (17개)</span>
+POST .../scenes/office_lobby_001/objects/batch
+  → { placed: ["wall_001", ..., "stop_before_001"] }
+
+<span class="cmt"># 3. 유리벽·문에 hpbrdf 재질 지정</span>
+POST .../objects/glass_wall_001/material  { material_id: "black_glass" }
+POST .../objects/glass_door_001/material  { material_id: "black_glass" }
+POST .../objects/glass_wall_002/material  { material_id: "black_glass" }
+
+<span class="cmt"># 4. 최종 상태 확인</span>
+GET .../scenes/office_lobby_001/agent-context
+  → compile_ready: true, suggested_actions: ["build_traversability_map", "build_viewpoint_graph"]</code></pre>
+
+  <div class="alert" style="background:var(--success-soft);border-left:3px solid var(--success);padding:12px 16px;border-radius:var(--radius-sm);margin-top:16px">
+    <strong style="color:var(--success)">다음 단계:</strong>
+    <code>sync/render-scene</code>으로 Isaac stage 내보내기 → traversability map 빌드 →
+    viewpoint graph 생성 → 에피소드 샘플링으로 이어진다.
+  </div>
+</section>
+
+
+<!-- ════ MAP EDITOR 3D ════ -->
+<section class="section" id="map-editor-3d">
+  <div class="section-header">
+    <div class="section-icon" style="background:rgba(16,163,74,0.15)">🗺️</div>
+    <div>
+      <div class="section-title">3D 내비게이션 맵 에디터</div>
+      <div class="section-subtitle">MapEditor3D.svelte · Three.js · OrbitControls · USD 프록시 오버레이</div>
+    </div>
+  </div>
+
+  <p style="color:var(--muted-strong);margin-bottom:16px">
+    authoring_map을 2D SVG 위에서만 편집하던 방식에서 <strong>Three.js 기반 3D 뷰포트</strong>로 확장.
+    USD 씬 프록시 지오메트리를 오버레이해 실제 배치 위치를 3D 공간에서 확인하며 오브젝트·리전을 배치할 수 있다.
+  </p>
+
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:20px">
+    <div style="border-radius:var(--radius-md);overflow:hidden;border:1px solid var(--panel-border);box-shadow:var(--shadow-md)">
+      <img src="images/map_editor_3d_screenshot.png" alt="3D 맵 에디터 — 기본 뷰" style="width:100%;display:block">
+      <div style="padding:8px 12px;background:var(--subpanel);font-size:0.78rem;color:var(--muted)">
+        유리벽·traversable 리전 배치 (glass_corridor_001)
+      </div>
+    </div>
+    <div style="border-radius:var(--radius-md);overflow:hidden;border:1px solid var(--panel-border);box-shadow:var(--shadow-md)">
+      <img src="images/map_editor_3d_assets.png" alt="3D 맵 에디터 — USD 에셋 오버레이" style="width:100%;display:block">
+      <div style="padding:8px 12px;background:var(--subpanel);font-size:0.78rem;color:var(--muted)">
+        USD 에셋(테이블·의자·파티션) 3D 프록시 오버레이 + viewpoint 노드(주황)
+      </div>
+    </div>
+  </div>
+
+  <div class="card-grid" style="grid-template-columns:repeat(3,1fr)">
+    <div class="card">
+      <div class="card-label">렌더링 엔진</div>
+      <div class="card-value" style="color:var(--brand)">Three.js</div>
+      <div class="card-desc">WebGL 기반 · OrbitControls로 자유 시점 회전·줌</div>
+    </div>
+    <div class="card">
+      <div class="card-label">USD 프록시</div>
+      <div class="card-value" style="color:var(--purple)">오버레이</div>
+      <div class="card-desc">getOpticalNavEditorGeometry API → USD 씬 바운드를 3D 박스로 시각화</div>
+    </div>
+    <div class="card">
+      <div class="card-label">편집 기능</div>
+      <div class="card-value" style="color:var(--success)">846줄</div>
+      <div class="card-desc">오브젝트 선택·이동 핸들 · 리전 색상 구분 · line endpoint 드래그</div>
+    </div>
+  </div>
+</section>
+
+
+<!-- ════ PHASE R ENV ════ -->
+<section class="section" id="phase-r-env">
+  <div class="section-header">
+    <div class="section-icon" style="background:rgba(248,113,113,0.15)">⚙️</div>
+    <div>
+      <div class="section-title">Phase R 렌더링 환경</div>
+      <div class="section-subtitle">OptiX 제약 · 환경 변수 · GPU 설정</div>
+    </div>
+  </div>
+
+  <div class="alert alert-red">
+    <strong>GPU 드라이버 제약:</strong> 호스트 NVIDIA driver R525는 OptiX 8.0 요구사항(R535+) 미달.
+    <code>cuda_*</code> 변종이 런타임 init 실패 (<code>jit_optix_api_init(): Failed to load OptiX library!</code>).
+    대신 Mitsuba <strong>3.4.1 wheel</strong> + <strong>OptiX 7.4 ABI</strong>로 작동 확인.
+  </div>
+
+  <h3>Mitsuba 환경 구성</h3>
+  <pre><code><span class="cmt"># mitsuba_optix7 conda 환경 (검증 완료)</span>
+conda create -y -n mitsuba_optix7 python=3.10
+conda activate mitsuba_optix7
+pip install mitsuba==3.4.1   <span class="cmt"># drjit==0.4.4 자동 설치</span>
+
+<span class="cmt"># 데몬 실행 (OptiX 7 모드)</span>
+ROBOMITUBA_RENDER_GPU_INDICES=2 \
+scripts/run_daemon_optix7.sh --host 0.0.0.0 --port 8765</code></pre>
+
+  <h3>가용 Mitsuba Variant</h3>
+  <div class="type-block">
+    <div class="type-body">
+      <table>
+        <tr><th>Variant</th><th>가용</th><th>OptiX</th><th>비고</th></tr>
+        <tr><td>scalar_rgb</td><td><span style="color:var(--accent3)">✅</span></td><td>—</td><td>CPU, 기본 테스트용</td></tr>
+        <tr><td>scalar_spectral</td><td><span style="color:var(--accent3)">✅</span></td><td>—</td><td>CPU spectral</td></tr>
+        <tr><td>cuda_ad_rgb</td><td><span style="color:var(--accent3)">✅</span></td><td>7.4 ABI</td><td>GPU 렌더링 (주 사용)</td></tr>
+        <tr><td>llvm_ad_rgb</td><td><span style="color:var(--accent3)">✅</span></td><td>—</td><td>CPU LLVM (fallback)</td></tr>
+        <tr><td>cuda_ad_spectral</td><td><span style="color:var(--accent5)">❌</span></td><td>—</td><td>wheel에 미포함</td></tr>
+        <tr><td>cuda_polarized_spectral</td><td><span style="color:var(--accent5)">❌</span></td><td>—</td><td>편광 GPU: source build 필요</td></tr>
+      </table>
+    </div>
+  </div>
+
+  <h3>핵심 환경 변수</h3>
+  <div class="type-block">
+    <div class="type-body">
+      <table>
+        <tr><th>환경 변수</th><th>기본값</th><th>설명</th></tr>
+        <tr><td>ROBOMITUBA_RENDER_INPROCESS</td><td>1</td><td>0이면 워커 서브프로세스 모드 (Phase R)</td></tr>
+        <tr><td>ROBOMITUBA_MITSUBA_PYTHON</td><td>—</td><td>워커 Python 인터프리터 경로</td></tr>
+        <tr><td>ROBOMITUBA_RENDER_GPU_INDICES</td><td>0</td><td>워커 GPU index ("0", "1,2,3")</td></tr>
+        <tr><td>ROBOMITUBA_TEXTURE_MAX_RESOLUTION</td><td>0</td><td>&gt;0이면 텍스처 downsample (run_daemon_optix7.sh 기본 2048)</td></tr>
+        <tr><td>ROBOMITUBA_FULL_RENDER_DISABLE_CUDA</td><td>—</td><td>풀 렌더 잡만 CUDA 끄기 (GPU OOM 우회)</td></tr>
+        <tr><td>ROBOMITUBA_WORKER_HEARTBEAT_TIMEOUT_S</td><td>30.0</td><td>워커 heartbeat 타임아웃 (CPU full render는 600s 권장)</td></tr>
+        <tr><td>ROBOMITUBA_KEEP_KERNEL_CACHE</td><td>1</td><td>OptiX 커널 캐시 유지 (2번째 호출 ~1초)</td></tr>
+        <tr><td>ROBOMITUBA_DISABLE_CPU_FALLBACK</td><td>—</td><td>CUDA 실패 시 LLVM fallback 차단</td></tr>
+      </table>
+    </div>
+  </div>
+
+  <div class="alert alert-warn">
+    <strong>GPU OOM 이슈:</strong> moorelane 씬 텍스처 합계 5.6 GB / 2301 파일.
+    8K PNG decoded ≈ 1 GB, 4K ≈ 256 MB → 전체 decoded 24 GB+ 가능.
+    현재 해결: <code>ROBOMITUBA_TEXTURE_MAX_RESOLUTION=2048</code> downsample cache + full render CUDA 끄기.
+  </div>
+
+  <h3>Phase R 검증 결과</h3>
+  <div class="type-block">
+    <div class="type-body">
+      <table>
+        <tr><th>시나리오</th><th>결과</th></tr>
+        <tr><td>큐레이션 RGB 프리뷰 (subprocess + OptiX7 wheel)</td><td><span style="color:var(--accent3)">✅</span> cuda_ad_rgb, 초기 ~7s, 캐시 후 ~1s</td></tr>
+        <tr><td>워커 lifecycle (spawn/ready/heartbeat/kill/respawn)</td><td><span style="color:var(--accent3)">✅</span> 전체 정상</td></tr>
+        <tr><td>풀 /render (texture cap 2048 + CPU SPP 256)</td><td><span style="color:var(--accent3)">✅</span> ~230.6s, rgb+depth+manifest 완료</td></tr>
+        <tr><td>OBJ export sanitize (207개 재질)</td><td><span style="color:var(--accent3)">✅</span> zero/NaN/inf normal 21개 sanitize</td></tr>
+        <tr><td>daemon HTTP 응답성 (풀 렌더 중)</td><td><span style="color:var(--accent3)">✅</span> 워커 중에도 daemon 응답 보존</td></tr>
+      </table>
+    </div>
+  </div>
+</section>
+
+
+<!-- ════ RELATED WORKS ════ -->
+<section class="section" id="related-works">
+  <div class="section-header">
+    <div class="section-icon" style="background:rgba(167,139,250,0.15)">📚</div>
+    <div>
+      <div class="section-title">관련 연구</div>
+      <div class="section-subtitle">VLN 데이터 생성 · 연속 환경 내비게이션 · 로봇 데이터셋</div>
+    </div>
+  </div>
+
+  <p>아래 4편의 논문은 Robomituba/OpticalNav의 설계 결정과 직접 연관됩니다.
+  각 논문이 우리 파이프라인의 어느 부분에 대응하는지 함께 정리합니다.</p>
+
+  <div class="ref-grid">
+
+    <!-- Krantz 2021 -->
+    <div class="ref-card">
+      <div class="ref-card-head">
+        <div class="ref-card-venue" style="color:#60a5fa">arXiv 2021 · ICCV 2021 &nbsp;<a href="https://arxiv.org/abs/2110.02207" target="_blank" style="color:#60a5fa;font-size:0.75rem">[arXiv]</a></div>
+        <div class="ref-card-title"><a href="https://arxiv.org/abs/2110.02207" target="_blank" style="color:var(--text-raw);text-decoration:none">Waypoint Models for Instruction-guided Navigation in Continuous Environments</a></div>
+        <div class="ref-card-authors">Krantz, Gokaslan, Batra, Lee, Maksymets — Georgia Tech / Facebook AI</div>
+      </div>
+      <div class="ref-card-body">
+        <div class="ref-card-abstract">
+          VLN-CE 환경(연속 3D 공간)에서 언어 조건부 waypoint 예측 네트워크(WPN)를 제안.
+          에이전트는 현재 위치에서 <strong>파노라믹 RGBD 12프레임 × 30° 간격</strong>으로 주변을 관측하고,
+          다음 waypoint를 극좌표 (r, θ)로 예측. 이 고수준 waypoint를 받아 저수준 navigator가 실제 이동을 수행하는 2단계 구조.
+        </div>
+        <div class="ref-card-tags">
+          <span class="ref-tag">VLN-CE</span>
+          <span class="ref-tag">Waypoint</span>
+          <span class="ref-tag">Panoramic RGBD</span>
+          <span class="ref-tag">Continuous Env</span>
+        </div>
+        <div class="ref-card-relevance">
+          <strong>우리 연결점</strong>
+          OpticalNav의 viewpoint graph가 <strong>12 헤딩 × 30° 간격</strong> 파노라믹 스윕을 기본값으로 사용하는 이유가 이 논문.
+          각 그래프 노드에서 헤딩별 관측을 캐싱하는 sensor sweep 설계가 이 WPN 입력 포맷과 일치.
+        </div>
+      </div>
+    </div>
+
+    <!-- NaVid 2024 -->
+    <div class="ref-card">
+      <div class="ref-card-head">
+        <div class="ref-card-venue" style="color:#a78bfa">arXiv 2024 (Jun) &nbsp;<a href="https://arxiv.org/abs/2402.15852" target="_blank" style="color:#a78bfa;font-size:0.75rem">[arXiv]</a></div>
+        <div class="ref-card-title"><a href="https://arxiv.org/abs/2402.15852" target="_blank" style="color:var(--text-raw);text-decoration:none">NaVid: Video-based VLM Plans the Next Step for Vision-and-Language Navigation</a></div>
+        <div class="ref-card-authors">Zhang, Wang, Xu, Zhou, Hong, Fang, Wu, Zhang, Wang — PKU / BAAI / Adelaide</div>
+      </div>
+      <div class="ref-card-body">
+        <div class="ref-card-abstract">
+          지도·깊이·오도메트리 없이 <strong>단안 RGB 비디오만</strong>으로 VLN을 수행하는 최초의 비디오 기반 VLM 에이전트.
+          510k 내비게이션 샘플 + 763k 웹 데이터로 Vicuna-7B를 파인튜닝.
+          과거 프레임을 시공간 컨텍스트로 인코딩해 Sim-to-Real 일반화를 달성.
+          VLN-CE R2R에서 SOTA.
+        </div>
+        <div class="ref-card-tags">
+          <span class="ref-tag">Video VLM</span>
+          <span class="ref-tag">RGB-only</span>
+          <span class="ref-tag">Sim2Real</span>
+          <span class="ref-tag">510k samples</span>
+        </div>
+        <div class="ref-card-relevance">
+          <strong>우리 연결점</strong>
+          NaVid가 Sim-to-Real을 해결하는 방식은 "다양한 합성 데이터로 학습 + RGB만 입력".
+          OpticalNav의 <strong>hazard_mask, active_nir_intensity</strong> 등 광학 특화 modality는
+          유리/거울 환경에서 NaVid 같은 모델이 실패하는 케이스를 커버하기 위한 파인튜닝 데이터로 설계됨.
+        </div>
+      </div>
+    </div>
+
+    <!-- LH-VLN 2025 -->
+    <div class="ref-card">
+      <div class="ref-card-head">
+        <div class="ref-card-venue" style="color:#34d399">CVPR 2025 &nbsp;<a href="https://arxiv.org/abs/2412.09082" target="_blank" style="color:#34d399;font-size:0.75rem">[arXiv]</a></div>
+        <div class="ref-card-title"><a href="https://arxiv.org/abs/2412.09082" target="_blank" style="color:var(--text-raw);text-decoration:none">Towards Long-Horizon Vision-Language Navigation: Platform, Benchmark and Method</a></div>
+        <div class="ref-card-authors">Song, Chen, Liu, Chen, Li, Lin — Sun Yat-sen Univ. / Peng Cheng Lab</div>
+      </div>
+      <div class="ref-card-body">
+        <div class="ref-card-abstract">
+          멀티스테이지 VLN인 LH-VLN 태스크를 정의하고, <strong>NavGen</strong> 자동 데이터 생성 플랫폼과
+          LHPR-VLN 벤치마크(3,260 태스크, 평균 150 스텝)를 구축.
+          에이전트는 <strong>MGDM(Multi-Granularity Dynamic Memory)</strong>으로 장기·단기 메모리를 통합해
+          복잡한 멀티스텝 지시를 처리. 평가 메트릭: ISR(독립 성공률), CSR(조건부), CGT(GT 가중치).
+        </div>
+        <div class="ref-card-tags">
+          <span class="ref-tag">LH-VLN</span>
+          <span class="ref-tag">NavGen</span>
+          <span class="ref-tag">Multi-stage</span>
+          <span class="ref-tag">LHPR-VLN</span>
+        </div>
+        <div class="ref-card-relevance">
+          <strong>우리 연결점</strong>
+          NavGen의 forward/backward 양방향 생성 구조는 OpticalNav의 graph episode 샘플러 설계와 유사.
+          LH-VLN이 다루는 멀티스테이지 문제는 OpticalNav의 단기 목표(단일 에피소드)를 넘는
+          <strong>장기 로드맵</strong>. ISR/CSR 메트릭은 향후 평가 지표 설계에 참고.
+        </div>
+      </div>
+    </div>
+
+    <!-- DROID 2024 -->
+    <div class="ref-card">
+      <div class="ref-card-head">
+        <div class="ref-card-venue" style="color:#f59e0b">arXiv 2024 (Mar) · RSS 2024 &nbsp;<a href="https://arxiv.org/abs/2403.12945" target="_blank" style="color:#f59e0b;font-size:0.75rem">[arXiv]</a></div>
+        <div class="ref-card-title"><a href="https://arxiv.org/abs/2403.12945" target="_blank" style="color:var(--text-raw);text-decoration:none">DROID: A Large-Scale In-The-Wild Robot Manipulation Dataset</a></div>
+        <div class="ref-card-authors">Khazatsky, Pertsch, Nair et al. — Stanford / UC Berkeley / CMU / 13개 기관</div>
+      </div>
+      <div class="ref-card-body">
+        <div class="ref-card-abstract">
+          76k 데모 트래젝토리(350시간), <strong>564 씬, 52개 빌딩, 86 태스크</strong>를 18개 연구실이 공동 수집한
+          로봇 조작 데이터셋. 에피소드당 3개 동기화 RGB 스트림 + 깊이 + 언어 지시문.
+          씬 다양성이 기존 데이터셋 대비 압도적으로 크며, DROID로 학습한 정책이 일반화 성능 20%+ 향상.
+        </div>
+        <div class="ref-card-tags">
+          <span class="ref-tag">76k Traj</span>
+          <span class="ref-tag">564 Scenes</span>
+          <span class="ref-tag">Multi-view RGB</span>
+          <span class="ref-tag">Open-source</span>
+        </div>
+        <div class="ref-card-relevance">
+          <strong>우리 연결점</strong>
+          DROID가 "씬 다양성 → 일반화"를 실증했듯, Robomituba는 <strong>합성 렌더링으로 씬 다양성을 확장</strong>하는 전략.
+          실물 로봇 조작 대신 광학적으로 어려운 실내 씬(유리·거울)에서 내비게이션 정책 학습용 합성 데이터를 생성.
+          멀티뷰 + 언어 지시문 에피소드 구조가 DROID 포맷과 유사.
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+  <h3>연구 포지셔닝 요약</h3>
+  <table class="positioning-table">
+    <thead>
+      <tr>
+        <th>항목</th>
+        <th>Krantz 2021</th>
+        <th>NaVid 2024</th>
+        <th>LH-VLN 2025</th>
+        <th>DROID 2024</th>
+        <th><strong>OpticalNav (우리)</strong></th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>환경</td>
+        <td>Matterport3D (합성)</td>
+        <td>HM3D + 실내 실물</td>
+        <td>HM3D (합성)</td>
+        <td>실제 빌딩 52곳</td>
+        <td>Isaac Sim + Mitsuba3 (합성)</td>
+      </tr>
+      <tr>
+        <td>광학 위험(유리·거울)</td>
+        <td><span class="cross">✗</span></td>
+        <td><span class="cross">✗</span></td>
+        <td><span class="cross">✗</span></td>
+        <td><span class="cross">✗</span></td>
+        <td><span class="check">✓ (핵심 타겟)</span></td>
+      </tr>
+      <tr>
+        <td>Sensor modalities</td>
+        <td>RGB + Depth</td>
+        <td>RGB only</td>
+        <td>RGB</td>
+        <td>RGB × 3 + Depth</td>
+        <td>RGB, Depth, NIR, Hazard Mask, Polarization</td>
+      </tr>
+      <tr>
+        <td>데이터 생성 방식</td>
+        <td>시뮬레이터 재생</td>
+        <td>510k 수집 + 웹</td>
+        <td>NavGen 자동화</td>
+        <td>실물 human teleop</td>
+        <td>Mitsuba3 광선추적 자동 렌더링</td>
+      </tr>
+      <tr>
+        <td>파노라믹 스윕</td>
+        <td><span class="check">✓ 12 × 30°</span></td>
+        <td><span class="cross">✗ (비디오)</span></td>
+        <td><span class="partial">△</span></td>
+        <td><span class="cross">✗</span></td>
+        <td><span class="check">✓ headingCount × 30°</span></td>
+      </tr>
+      <tr>
+        <td>에피소드 타입</td>
+        <td>단일 목표</td>
+        <td>단일 목표</td>
+        <td>멀티스테이지</td>
+        <td>조작 태스크</td>
+        <td>단일 목표 (graph-based)</td>
+      </tr>
+    </tbody>
+  </table>
+</section>
+
+
+<!-- ════ VLN DATASET SURVEY ════ -->
+<section class="section" id="vln-survey">
+  <div class="section-header">
+    <div class="section-icon" style="background:rgba(6,182,212,0.15)">🔍</div>
+    <div>
+      <div class="section-title">VLN 데이터셋 투명·반사 표면 커버리지 조사</div>
+      <div class="section-subtitle">2026-05-27 · 20개 데이터셋 분석 · OpticalNav 벤치마크 포지셔닝</div>
+    </div>
+  </div>
+
+  <p style="color:var(--muted-strong);margin-bottom:20px">
+    기존 VLN(Vision-and-Language Navigation) 벤치마크에서 유리문·거울·투명 파티션 같은
+    투명·반사 표면이 어떻게 다뤄지는지 20개 데이터셋을 조사했다.
+    OpticalNav 벤치마크의 차별점을 정량적으로 확인하기 위한 선행 조사.
+  </p>
+
+  <!-- 인라인 SVG 일러스트 (원본 이미지 부재 → 직접 작성) -->
+  <div style="text-align:center;margin-bottom:24px">
+    <svg viewBox="0 0 640 220" width="100%" style="max-width:640px;border-radius:var(--radius-md);background:var(--subpanel);border:1px solid var(--panel-border)" xmlns="http://www.w3.org/2000/svg">
+      <!-- 복도 외벽 -->
+      <rect x="30" y="30" width="580" height="160" rx="4" fill="none" stroke="#94a3b8" stroke-width="2"/>
+      <!-- 로봇 (출발점) -->
+      <g transform="translate(80,90)">
+        <rect x="-18" y="-18" width="36" height="36" rx="4" fill="#2f7bf6" opacity="0.85"/>
+        <circle cx="0" cy="-14" r="5" fill="white"/>
+        <text x="0" y="28" text-anchor="middle" font-size="10" fill="#475467" font-family="sans-serif">로봇</text>
+      </g>
+      <!-- 이동 경로 화살표 -->
+      <path d="M 108 108 Q 200 80 280 108 Q 360 136 430 108 L 510 108" fill="none" stroke="#2f7bf6" stroke-width="1.5" stroke-dasharray="5 3" opacity="0.5"/>
+      <polygon points="510,104 520,108 510,112" fill="#2f7bf6" opacity="0.5"/>
+      <!-- 유리벽 파티션 (x=260) -->
+      <line x1="260" y1="35" x2="260" y2="97" stroke="#06b6d4" stroke-width="3" stroke-dasharray="6 3"/>
+      <rect x="255" y="97" width="10" height="26" rx="2" fill="#06b6d4" opacity="0.3" stroke="#06b6d4" stroke-width="1.5"/>
+      <line x1="260" y1="123" x2="260" y2="185" stroke="#06b6d4" stroke-width="3" stroke-dasharray="6 3"/>
+      <text x="268" y="60" font-size="9" fill="#06b6d4" font-family="sans-serif">유리벽</text>
+      <text x="263" y="115" font-size="8" fill="#06b6d4" font-family="sans-serif">자동문</text>
+      <!-- 거울 (북쪽 벽) -->
+      <rect x="360" y="30" width="100" height="8" rx="2" fill="#8b5cf6" opacity="0.8"/>
+      <text x="410" y="52" text-anchor="middle" font-size="9" fill="#8b5cf6" font-family="sans-serif">거울 벽</text>
+      <!-- 반사 효과 (거울) -->
+      <line x1="370" y1="38" x2="355" y2="80" stroke="#8b5cf6" stroke-width="1" stroke-dasharray="3 2" opacity="0.5"/>
+      <line x1="410" y1="38" x2="395" y2="90" stroke="#8b5cf6" stroke-width="1" stroke-dasharray="3 2" opacity="0.5"/>
+      <line x1="450" y1="38" x2="460" y2="78" stroke="#8b5cf6" stroke-width="1" stroke-dasharray="3 2" opacity="0.5"/>
+      <!-- 목표 지점 -->
+      <circle cx="530" cy="108" r="16" fill="#16a34a" opacity="0.2" stroke="#16a34a" stroke-width="2"/>
+      <text x="530" y="112" text-anchor="middle" font-size="11" fill="#16a34a" font-family="sans-serif">⚑</text>
+      <text x="530" y="140" text-anchor="middle" font-size="9" fill="#16a34a" font-family="sans-serif">목표</text>
+      <!-- 레전드 -->
+      <line x1="50" y1="200" x2="80" y2="200" stroke="#06b6d4" stroke-width="2" stroke-dasharray="5 3"/>
+      <text x="85" y="204" font-size="9" fill="#475467" font-family="sans-serif">유리/투명</text>
+      <rect x="160" y="194" width="28" height="8" rx="1" fill="#8b5cf6" opacity="0.8"/>
+      <text x="193" y="204" font-size="9" fill="#475467" font-family="sans-serif">반사/거울</text>
+      <rect x="270" y="194" width="16" height="16" rx="3" fill="#2f7bf6" opacity="0.85"/>
+      <text x="291" y="204" font-size="9" fill="#475467" font-family="sans-serif">로봇</text>
+    </svg>
+    <p style="font-size:0.8rem;color:var(--muted);margin-top:8px">
+      유리문·거울 표면이 있는 실내 환경에서 자연어 지시를 따라 이동하는 로봇 내비게이션 시나리오 개념도
+    </p>
+  </div>
+
+  <h3>커버리지 분류 기준</h3>
+  <div class="card-grid" style="grid-template-columns:repeat(4,1fr);margin-bottom:20px">
+    <div class="card" style="border-left:3px solid var(--success)">
+      <div class="card-label" style="color:var(--success)">존재 (Present)</div>
+      <div class="card-desc">투명·반사 표면이 핵심 요소로 포함되어 있으며 라벨링도 제공</div>
+    </div>
+    <div class="card" style="border-left:3px solid var(--warning)">
+      <div class="card-label" style="color:var(--warning)">부분 포함 (Partial)</div>
+      <div class="card-desc">일부 장면·지시에 등장하나 안전 장애물로 명시적 라벨 없음</div>
+    </div>
+    <div class="card" style="border-left:3px solid var(--danger)">
+      <div class="card-label" style="color:var(--danger)">부재 / 불확실</div>
+      <div class="card-desc">존재하지 않거나 문서에서 확인 불가</div>
+    </div>
+    <div class="card" style="border-left:3px solid var(--brand)">
+      <div class="card-label" style="color:var(--brand)">우리 타겟</div>
+      <div class="card-desc">OpticalNav: 유리·거울을 핵심 장애물로 설계한 최초의 VLN 데이터셋</div>
+    </div>
+  </div>
+
+  <h3>20개 데이터셋 분석 결과</h3>
+  <div class="type-block">
+    <div class="type-body">
+      <table>
+        <tr>
+          <th>데이터셋</th>
+          <th>개요</th>
+          <th>유리·거울 커버리지</th>
+          <th>비고</th>
+        </tr>
+        <!-- VLN Benchmarks -->
+        <tr><td colspan="4" style="background:var(--bg-accent);font-size:0.78rem;font-weight:600;color:var(--brand)">▸ VLN 벤치마크 (R2R 계열)</td></tr>
+        <tr>
+          <td><strong><a href="https://arxiv.org/abs/1711.07280" target="_blank" style="color:var(--text-raw)">R2R</a></strong> <span style="font-size:0.75rem;color:var(--muted)">(Room-to-Room)</span><br><span style="font-size:0.7rem;color:var(--brand);background:var(--brand-soft);padding:1px 5px;border-radius:3px">2018 · CVPR</span></td>
+          <td>최초 VLN 벤치마크. Matterport3D 스캔 환경에서 사람이 작성한 지시문을 따라 이동.</td>
+          <td><span style="color:var(--warning)">⚠ 부분 포함</span></td>
+          <td>일부 지시문에 "이중 유리문"이 언급되나 투명 표면 라벨 없음</td>
+        </tr>
+        <tr>
+          <td><strong><a href="https://arxiv.org/abs/2010.07954" target="_blank" style="color:var(--text-raw)">RxR</a></strong> <span style="font-size:0.75rem;color:var(--muted)">(Room-Across-Room)</span><br><span style="font-size:0.7rem;color:var(--brand);background:var(--brand-soft);padding:1px 5px;border-radius:3px">2020 · EMNLP</span></td>
+          <td>R2R의 다국어 확장 (영·힌·텔루구). 밀집 궤적 정렬 포함.</td>
+          <td><span style="color:var(--muted)">❓ 불확실</span></td>
+          <td>다국어 대규모 지시문에 집중. 투명 표면 언급 없음</td>
+        </tr>
+        <tr>
+          <td><strong><a href="https://arxiv.org/abs/1904.10151" target="_blank" style="color:var(--text-raw)">REVERIE</a></strong><br><span style="font-size:0.7rem;color:var(--brand);background:var(--brand-soft);padding:1px 5px;border-radius:3px">2020 · CVPR</span></td>
+          <td>원격 오브젝트 식별 + 내비게이션. Matterport3D 기반.</td>
+          <td><span style="color:var(--warning)">⚠ 부분 포함</span></td>
+          <td>"거울을 Windex로 닦아라" 같은 지시 존재. 거울 체계적 라벨 없음</td>
+        </tr>
+        <tr>
+          <td><strong><a href="https://arxiv.org/abs/2004.02857" target="_blank" style="color:var(--text-raw)">VLN-CE</a></strong><br><span style="font-size:0.7rem;color:var(--brand);background:var(--brand-soft);padding:1px 5px;border-radius:3px">2020 · ECCV</span></td>
+          <td>R2R를 Habitat 연속 환경으로 이식. 연속 동작 공간 사용.</td>
+          <td><span style="color:var(--warning)">⚠ 부분 포함</span></td>
+          <td>R2R 씬 상속. 유리·거울 우발적 포함 가능하나 비라벨링</td>
+        </tr>
+        <tr>
+          <td><strong>GSA-R2R</strong><br><span style="font-size:0.7rem;color:var(--muted);background:var(--bg-accent);padding:1px 5px;border-radius:3px">2022 · ECCV</span></td>
+          <td>도메인 적응을 위한 범용 씬 확장 버전.</td>
+          <td><span style="color:var(--muted)">❓ 불확실</span></td>
+          <td>씬 다양성 확장 목적. 투명 표면 언급 없음</td>
+        </tr>
+        <tr>
+          <td><strong>HA-VLN / HA-R2R</strong><br><span style="font-size:0.7rem;color:var(--brand);background:var(--brand-soft);padding:1px 5px;border-radius:3px">2023 · CVPR</span></td>
+          <td>추가 씬·오브젝트가 포함된 사람 주석 R2R.</td>
+          <td><span style="color:var(--muted)">❓ 불확실</span></td>
+          <td>신규 씬에 유리·거울 포함 가능하나 문서에 세부 없음</td>
+        </tr>
+        <!-- Extended / Semantic -->
+        <tr><td colspan="4" style="background:var(--bg-accent);font-size:0.78rem;font-weight:600;color:var(--purple)">▸ 확장 / 시맨틱 VLN</td></tr>
+        <tr>
+          <td><strong>NavOne</strong> <span style="font-size:0.75rem;color:var(--muted)">(R2R-TopDown)</span><br><span style="font-size:0.7rem;color:var(--muted);background:var(--bg-accent);padding:1px 5px;border-radius:3px">2023 · ICCV</span></td>
+          <td>R2R를 탑다운 시맨틱 그래프로 변환. 오브젝트 카테고리 포함.</td>
+          <td><span style="color:var(--warning)">⚠ 부분 포함</span></td>
+          <td>시맨틱 카테고리에 "mirror" 포함. 유리벽 관련 예시 추론 존재. 일반 라벨 수준</td>
+        </tr>
+        <tr>
+          <td><strong>B-SCAN</strong><br><span style="font-size:0.7rem;color:var(--muted);background:var(--bg-accent);padding:1px 5px;border-radius:3px">2023 · ACL</span></td>
+          <td>시맨틱 제약 내비게이션. 오브젝트 순서 제약 강조.</td>
+          <td><span style="color:var(--muted)">❓ 불확실</span></td>
+          <td>거울·유리 세부 아직 미검토</td>
+        </tr>
+        <tr>
+          <td><strong><a href="https://arxiv.org/abs/2509.13733" target="_blank" style="color:var(--text-raw)">FSR-VLN</a></strong><br><span style="font-size:0.7rem;color:var(--muted);background:var(--bg-accent);padding:1px 5px;border-radius:3px">2025 · arXiv</span></td>
+          <td>장기 수평 VLN을 위한 빠른·느린 추론 벤치마크.</td>
+          <td><span style="color:var(--muted)">❓ 불확실</span></td>
+          <td>추론 전략 집중. 투명 표면 장면 언급 없음</td>
+        </tr>
+        <tr>
+          <td><strong><a href="https://arxiv.org/abs/2512.00041" target="_blank" style="color:var(--text-raw)">VISTAv2</a></strong><br><span style="font-size:0.7rem;color:var(--muted);background:var(--bg-accent);padding:1px 5px;border-radius:3px">2024 · arXiv</span></td>
+          <td>폐색·충돌 예측용 세계 상상 모델.</td>
+          <td><span style="color:var(--warning)">⚠ 부분 포함</span></td>
+          <td>거울·유리 파티션이 에이전트를 오인케 하는 실패 사례 언급. 씬별 주석 없음</td>
+        </tr>
+        <tr>
+          <td><strong>NavGen / LH-VLN</strong><br><span style="font-size:0.7rem;color:var(--muted);background:var(--bg-accent);padding:1px 5px;border-radius:3px">2024 · EMNLP</span></td>
+          <td>장기 내비게이션 시퀀스 데이터셋.</td>
+          <td><span style="color:var(--muted)">❓ 불확실</span></td>
+          <td>문서 미검토</td>
+        </tr>
+        <tr>
+          <td><strong><a href="https://arxiv.org/abs/2103.17138" target="_blank" style="color:var(--text-raw)">SOON</a></strong><br><span style="font-size:0.7rem;color:var(--brand);background:var(--brand-soft);padding:1px 5px;border-radius:3px">2021 · CVPR</span></td>
+          <td>특정 오브젝트 앞에서 멈추는 태스크. Matterport3D 일부 공유.</td>
+          <td><span style="color:var(--muted)">❓ 불확실</span></td>
+          <td>유리·거울 오브젝트 포함 여부 불명확</td>
+        </tr>
+        <tr>
+          <td><strong>R2R-Back</strong><br><span style="font-size:0.7rem;color:var(--muted);background:var(--bg-accent);padding:1px 5px;border-radius:3px">2021 · ACL</span></td>
+          <td>목표 도달 후 출발점으로 귀환하는 R2R 확장.</td>
+          <td><span style="color:var(--muted)">❓ 불확실</span></td>
+          <td>R2R 씬 상속. 별도 라벨 없음</td>
+        </tr>
+        <tr>
+          <td><strong>GatedVLN / Fine-Grained VLN</strong><br><span style="font-size:0.7rem;color:var(--muted);background:var(--bg-accent);padding:1px 5px;border-radius:3px">2022 · NAACL</span></td>
+          <td>세밀한 액션·게이팅 메커니즘 강조 벤치마크.</td>
+          <td><span style="color:var(--muted)">❓ 불확실</span></td>
+          <td>투명·반사 표면 언급 없음</td>
+        </tr>
+        <!-- Environments -->
+        <tr><td colspan="4" style="background:var(--bg-accent);font-size:0.78rem;font-weight:600;color:var(--success)">▸ 3D 환경 / 스캔 데이터</td></tr>
+        <tr>
+          <td><strong><a href="https://arxiv.org/abs/1906.05797" target="_blank" style="color:var(--text-raw)">Replica</a></strong><br><span style="font-size:0.7rem;color:var(--brand);background:var(--brand-soft);padding:1px 5px;border-radius:3px">2019 · arXiv (Meta)</span></td>
+          <td>18개 실내 공간 고품질 3D 스캔. HDR 텍스처 + 시맨틱 라벨.</td>
+          <td><span style="color:var(--success)">✅ 존재</span></td>
+          <td>평면 거울 및 유리 반사체 명시 포함. 광학 내비게이션 기반 환경으로 적합</td>
+        </tr>
+        <tr>
+          <td><strong>HM3D</strong><br><span style="font-size:0.7rem;color:var(--brand);background:var(--brand-soft);padding:1px 5px;border-radius:3px">2021 · NeurIPS</span></td>
+          <td>Habitat의 대규모 Matterport3D 업그레이드. 현실적 스캔 룸.</td>
+          <td><span style="color:var(--muted)">❓ 불확실</span></td>
+          <td>반사 표면 존재 가능하나 현재 내비게이션 태스크에 라벨 없음</td>
+        </tr>
+        <tr>
+          <td><strong>HM3D-OVON</strong><br><span style="font-size:0.7rem;color:var(--brand);background:var(--brand-soft);padding:1px 5px;border-radius:3px">2023 · ICLR</span></td>
+          <td>HM3D 기반 오픈 보캐뷸러리 오브젝트 내비게이션.</td>
+          <td><span style="color:var(--muted)">❓ 불확실</span></td>
+          <td>HM3D 환경 상속. 반사 표면 라벨 미제공</td>
+        </tr>
+        <tr>
+          <td><strong>Gibson Env.</strong><br><span style="font-size:0.7rem;color:var(--brand);background:var(--brand-soft);padding:1px 5px;border-radius:3px">2018 · CVPR</span></td>
+          <td>Habitat에서 사용하는 3D 스캔 환경. 일반화 강조.</td>
+          <td><span style="color:var(--muted)">❓ 불확실</span></td>
+          <td>일부 씬에 반사 표면 존재 가능. 내비게이션 벤치마크 라벨 없음</td>
+        </tr>
+        <!-- Transparent-specific -->
+        <tr><td colspan="4" style="background:var(--bg-accent);font-size:0.78rem;font-weight:600;color:var(--cyan)">▸ 투명 표면 특화 데이터셋 (VLN 아님)</td></tr>
+        <tr>
+          <td><strong>GlassRecon</strong><br><span style="font-size:0.7rem;color:var(--muted);background:var(--bg-accent);padding:1px 5px;border-radius:3px">2022 · ECCV</span></td>
+          <td>유리 표면 재구성 전용 데이터셋. 깊이 GT + 세그멘테이션 마스크.</td>
+          <td><span style="color:var(--success)">✅ 전문 특화</span></td>
+          <td>VLN 데이터셋은 아니지만 투명 표면 라벨 제공. 내비게이션과 결합 시 벤치마크 라벨 생성 가능. 쉬운/어려운 split 제공</td>
+        </tr>
+        <tr>
+          <td><strong><a href="https://arxiv.org/abs/2408.05608" target="_blank" style="color:var(--text-raw)">TOPGN</a></strong> <span style="font-size:0.75rem;color:var(--muted)">(Transparent Obstacle)</span><br><span style="font-size:0.7rem;color:var(--muted);background:var(--bg-accent);padding:1px 5px;border-radius:3px">2024 · arXiv</span></td>
+          <td>LiDAR 기반 투명 장애물 감지 데이터셋. 강도 맵 포함.</td>
+          <td><span style="color:var(--success)">✅ 전문 특화</span></td>
+          <td>언어 지시·내비게이션 에피소드는 없음. 투명 장애물 라벨을 내비게이션 태스크와 결합 가능</td>
+        </tr>
+      </table>
+    </div>
+  </div>
+
+  <h3>결론 및 OpticalNav 포지셔닝</h3>
+  <div class="alert" style="background:var(--brand-soft);border-left:3px solid var(--brand);padding:14px 16px;border-radius:var(--radius-sm);margin-bottom:16px">
+    <strong>핵심 공백:</strong> 20개 데이터셋 중 투명·반사 표면을 <em>안전 장애물로 명시적으로 라벨링하고</em>
+    자연어 지시와 함께 제공하는 VLN 데이터셋은 <strong>존재하지 않는다.</strong>
+    Replica와 GlassRecon이 가장 가까운 기반이지만, 내비게이션 에피소드·언어 지시가 없다.
+  </div>
+
+  <div class="card-grid" style="grid-template-columns:repeat(3,1fr)">
+    <div class="card">
+      <div class="card-label">활용 가능 기반</div>
+      <div class="card-value" style="color:var(--success);font-size:1.1rem">Replica + GlassRecon</div>
+      <div class="card-desc">고품질 3D 환경(Replica)과 투명 표면 라벨(GlassRecon)을 결합해 OpticalNav 평가 기반으로 활용 가능</div>
+    </div>
+    <div class="card">
+      <div class="card-label">경쟁 공백</div>
+      <div class="card-value" style="color:var(--brand);font-size:1.1rem">0개</div>
+      <div class="card-desc">유리·거울을 핵심 장애물로 다루는 언어 조건부 내비게이션 데이터셋 전무</div>
+    </div>
+    <div class="card">
+      <div class="card-label">다음 조사 대상</div>
+      <div class="card-value" style="color:var(--warning);font-size:1.1rem">GSA-R2R, HM3D</div>
+      <div class="card-desc">대규모 미검토 데이터셋에서 유리·거울 출현 빈도 정량화 → OpticalNav 샘플링 전략 수립</div>
+    </div>
+  </div>
+</section>
+
+
+<!-- ════ NEXT ════ -->
+<section class="section" id="next">
+  <div class="section-header">
+    <div class="section-icon" style="background:rgba(245,158,11,0.15)">🎯</div>
+    <div>
+      <div class="section-title">현재 상태 &amp; 남은 과제</div>
+      <div class="section-subtitle">2026-05-27 기준 전체 파이프라인 진행 현황</div>
+    </div>
+  </div>
+
+  <h3>Isaac Sim / Ranger Mini 로봇 제어</h3>
+  <div class="type-block">
+    <div class="type-body">
+      <table>
+        <tr><th>항목</th><th>상태</th><th>파일</th></tr>
+        <tr><td>로봇 자동 탐색 (robomituba:robotName)</td><td><span style="color:var(--accent3)">✅ 완료</span></td><td>ranger_mini_stage.py</td></tr>
+        <tr><td>PhysX 물리 설정 (중력·충돌·Ground Collider)</td><td><span style="color:var(--accent3)">✅ 완료</span></td><td>ranger_mini_stage.py</td></tr>
+        <tr><td>cmd_vel → PhysX joint drive 변환</td><td><span style="color:var(--accent3)">✅ 완료</span></td><td>ranger_mini_stage.py</td></tr>
+        <tr><td>ROS2 cmd_vel bridge (스레드 기반)</td><td><span style="color:var(--accent3)">✅ 완료</span></td><td>ros_cmd_vel_bridge.py <em>(신규)</em></td></tr>
+        <tr><td>로봇 센서 USD 등록 (RGB/NIR/Polar/LiDAR)</td><td><span style="color:var(--accent3)">✅ 완료</span></td><td>robot_sensors.py <em>(신규)</em></td></tr>
+        <tr><td>Isaac Asset Browser 연동</td><td><span style="color:var(--accent3)">✅ 완료</span></td><td>asset_browser.py <em>(신규)</em></td></tr>
+        <tr><td>Isaac 씬 바닥 geometry 콜라이더 정렬</td><td><span style="color:var(--success)">✅ 기본 완료</span></td><td>MooreLane 바닥 정상 착지 확인 · 복잡 씬 엣지케이스 추가 필요</td></tr>
+        <tr><td>PhysX ArticulationController (토크/관성)</td><td><span style="color:var(--accent4)">🔄 다음</span></td><td>omni.isaac.core.articulations 연결</td></tr>
+        <tr><td>Isaac Timeline 연동 루프 (매 프레임)</td><td><span style="color:var(--accent4)">🔄 다음</span></td><td>자동 drive update + SceneSnapshot 캡처</td></tr>
+      </table>
+    </div>
+  </div>
+
+  <h3>렌더링 파이프라인 (Phase R)</h3>
+  <div class="type-block">
+    <div class="type-body">
+      <table>
+        <tr><th>항목</th><th>상태</th><th>파일</th></tr>
+        <tr><td>worker_manager.py — subprocess JSONL 아키텍처</td><td><span style="color:var(--accent3)">✅ 완료</span></td><td>worker_manager.py (675줄)</td></tr>
+        <tr><td>render_daemon.py — HTTP 렌더 서버 확장</td><td><span style="color:var(--accent3)">✅ 완료</span></td><td>render_daemon.py (9,392줄)</td></tr>
+        <tr><td>preview_worker.py — 프리뷰 렌더 서브프로세스</td><td><span style="color:var(--accent3)">✅ 완료</span></td><td>preview_worker.py</td></tr>
+        <tr><td>mitsuba_runtime.py — 변종/초기화 추상화</td><td><span style="color:var(--accent3)">✅ 완료</span></td><td>mitsuba_runtime.py</td></tr>
+        <tr><td>Isaac UI Panel (2,941줄) — 씬·렌더·네비게이션 통합</td><td><span style="color:var(--accent3)">✅ 완료</span></td><td>ui_panel.py</td></tr>
+        <tr><td>Isaac daemon_client — 렌더 데몬 RPC</td><td><span style="color:var(--accent3)">✅ 완료</span></td><td>daemon_client.py</td></tr>
+        <tr><td>로봇 이동 중 SceneSnapshot 자동 캡처</td><td><span style="color:var(--text-dim)">⏳ 예정</span></td><td>Timeline loop + stage_capture.py 연동</td></tr>
+      </table>
+    </div>
+  </div>
+
+  <h3>OpticalNav 데이터셋 에디터 (WebUI)</h3>
+  <div class="type-block">
+    <div class="type-body">
+      <table>
+        <tr><th>항목</th><th>상태</th><th>비고</th></tr>
+        <tr><td>authoring_map.py 데이터 모델</td><td><span style="color:var(--accent3)">✅ 완료</span></td><td>10종 오브젝트, 7종 리전 · 373줄</td></tr>
+        <tr><td>API (GET/PUT/compile/sync)</td><td><span style="color:var(--accent3)">✅ 완료</span></td><td>syncOpticalNavRenderScene 포함</td></tr>
+        <tr><td>datasets/+page.svelte — 전체 데이터셋 에디터 페이지</td><td><span style="color:var(--accent3)">✅ 완료</span></td><td>4,059줄 · Scene·Plan·Render·Review 4탭</td></tr>
+        <tr><td>MapEditor3D.svelte — Three.js 기반 3D 맵 에디터</td><td><span style="color:var(--accent3)">✅ 신규</span></td><td>846줄 · OrbitControls · USD 프록시 오버레이</td></tr>
+        <tr><td>AssetThumb3D.svelte — 에셋 3D 썸네일</td><td><span style="color:var(--accent3)">✅ 신규</span></td><td>140줄 · 배치 도구 선택 UI용</td></tr>
+        <tr><td>mirror_wall 도구 + 실시간 라인 프리뷰</td><td><span style="color:var(--accent3)">✅ 완료</span></td><td>linePreview state, addWallObject()</td></tr>
+        <tr><td>readinessState() — 단계별 블로커 안내</td><td><span style="color:var(--accent3)">✅ 완료</span></td><td>Project→Scene→Overlay→Map→Graph→Episodes→Render</td></tr>
+        <tr><td>viewpoint graph SVG 오버레이 (노드·엣지)</td><td><span style="color:var(--accent3)">✅ 완료</span></td><td>graphNodes, graphEdges 렌더링</td></tr>
+        <tr><td>traversable map 빌드·graph 빌드·에피소드 생성</td><td><span style="color:var(--accent3)">✅ 완료</span></td><td>전체 API 연결 완료</td></tr>
+        <tr><td>CurrentSceneNavigationMap.svelte</td><td><span style="color:var(--accent3)">✅ 완료</span></td><td>[05.22] 커밋 포함</td></tr>
+        <tr><td>Agent API 6종 (materials·context·objects CRUD)</td><td><span style="color:var(--accent3)">✅ 오늘 추가</span></td><td>render_daemon.py · LLM·스크립트 직접 호출용</td></tr>
+        <tr><td>씬 선택 드롭다운 — 우측 패널 헤더로 이동</td><td><span style="color:var(--accent3)">✅ 오늘 수정</span></td><td>+page.svelte scene-select + ↺ 새로고침 버튼</td></tr>
+      </table>
+    </div>
+  </div>
+
+  <h3>navigation_dataset 모듈</h3>
+  <div class="type-block">
+    <div class="type-body">
+      <table>
+        <tr><th>항목</th><th>상태</th></tr>
+        <tr><td>authoring_compile.py — authoring_map → scene_annotation 변환</td><td><span style="color:var(--accent3)">✅ 완료</span></td><td>338줄</td></tr>
+        <tr><td>traversability.py — 그리드 맵 생성</td><td><span style="color:var(--accent3)">✅ 완료</span></td><td>185줄</td></tr>
+        <tr><td>viewpoint_graph.py — 파노라믹 waypoint graph</td><td><span style="color:var(--accent3)">✅ 완료</span></td><td>163줄</td></tr>
+        <tr><td>graph_episode_sampler.py — 그래프 기반 에피소드 샘플링</td><td><span style="color:var(--accent3)">✅ 완료</span></td><td>285줄</td></tr>
+        <tr><td>sensor_sweep.py — 뷰포인트별 렌더 배치</td><td><span style="color:var(--accent3)">✅ 완료</span></td><td></td></tr>
+        <tr><td>scene_sync.py — render-scene / Isaac-stage sync 계층</td><td><span style="color:var(--accent3)">✅ 완료</span></td><td>182줄</td></tr>
+        <tr><td>cli.py — opticalnav CLI 엔트리포인트</td><td><span style="color:var(--accent3)">✅ 완료</span></td><td>439줄 · 19개 모듈 합계 3,427줄</td></tr>
+        <tr><td>실제 로봇 이동 → trajectory rollout 연동</td><td><span style="color:var(--text-dim)">⏳ 예정</span></td><td></td></tr>
+        <tr><td>semantic segmentation modality</td><td><span style="color:var(--text-dim)">⏳ 예정</span></td><td></td></tr>
+      </table>
+    </div>
+  </div>
+
+  <h3>전체 파이프라인 연결 현황</h3>
+  <pre><code>Isaac Sim (로봇 이동 + 씬 저작)
+  ↓ robot_sensors.py · ranger_mini_stage.py
+<span class="cmt">  [✅ 물리 스폰, cmd_vel 제어]</span>
+  ↓ stage_capture.py → SceneSnapshot
+<span class="cmt">  [⏳ 이동 중 자동 캡처 미연결]</span>
+  ↓ robomituba_bridge → JobManifest
+<span class="cmt">  [✅ 브릿지 계약 완성]</span>
+  ↓ worker_manager.py subprocess
+<span class="cmt">  [✅ Phase R 완성]</span>
+  ↓ Mitsuba 3 GPU 렌더링
+<span class="cmt">  [✅ 17 modality, OptiX7 workaround]</span>
+  ↓ navigation_dataset pipeline
+<span class="cmt">  [✅ graph → episodes → sensor sweep]</span>
+  ↓ OpticalNav WebUI (datasets/+page.svelte 4,059줄)
+<span class="cmt">  [✅ Three.js 3D 맵 에디터 + Agent API + readiness flow 완성]</span>
+  ↓ 학습 데이터 Export
+<span class="cmt">  [✅ validate · evaluate · export]</span></code></pre>
+
+  <div class="alert alert-warn">
+    <strong>핵심 미연결 구간:</strong>
+    Isaac 로봇 이동 → SceneSnapshot 자동 캡처 → 렌더 데몬 제출 루프가
+    아직 수동 호출만 가능. Timeline step 이벤트에 캡처+렌더를 자동화하는
+    <code>ui_panel.py</code> 내 연속 캡처 루프 구현이 다음 우선순위.
+  </div>
+</section>
+
+<div class="report-footer">
+  2026-05-27 · Robomituba Dev Report · Isaac Sim + AgileX Ranger Mini V3
+  <br><a href="index.html" style="color:var(--brand-strong);text-decoration:none;margin-top:6px;display:inline-block;">← 프로젝트 메인 문서로</a>
+</div>
+
+</main>
+</div>
+
+<script>
+const sections = document.querySelectorAll('.section');
+const navLinks = document.querySelectorAll('.nav-link');
+const observer = new IntersectionObserver((entries) => {
+  entries.forEach(entry => {
+    if (entry.isIntersecting) {
+      navLinks.forEach(l => l.classList.remove('active'));
+      const active = document.querySelector(`.nav-link[href="#${entry.target.id}"]`);
+      if (active) active.classList.add('active');
+    }
+  });
+}, { threshold: 0.2, rootMargin: '-80px 0px -60% 0px' });
+sections.forEach(s => observer.observe(s));
+document.querySelectorAll('a[href^="#"]').forEach(a => {
+  a.addEventListener('click', e => {
+    e.preventDefault();
+    const t = document.querySelector(a.getAttribute('href'));
+    if (t) t.scrollIntoView({ behavior: 'smooth' });
+  });
+});
+</script>
+</body>
+</html>

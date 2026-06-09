@@ -22,7 +22,7 @@ import numpy as np
 
 from .usd_export_obj import _triangulate
 
-OBJ_WRITER_VERSION = 2
+OBJ_WRITER_VERSION = 3  # v3: also centers x/z on bbox center (v2 only shifted y)
 
 
 @dataclass
@@ -34,6 +34,7 @@ class PrimMeshStats:
     bbox_max: list[float]
     bbox_size: list[float]
     bottom_shift_y: float  # how much we subtracted from y to put min.y at 0
+    center_shift_xz: tuple[float, float] = (0.0, 0.0)  # x,z subtracted to center bbox in XZ
     has_uv: bool = False
     has_normal: bool = False
     writer_version: int = OBJ_WRITER_VERSION
@@ -49,6 +50,7 @@ class PrimMeshStats:
                 "size": self.bbox_size,
             },
             "bottom_shift_y": float(self.bottom_shift_y),
+            "center_shift_xz": [float(self.center_shift_xz[0]), float(self.center_shift_xz[1])],
             "has_uv": bool(self.has_uv),
             "has_normal": bool(self.has_normal),
             "writer_version": int(self.writer_version),
@@ -314,11 +316,25 @@ def extract_prim_mesh_to_obj(
         bbox_max = verts.max(axis=0)
 
         bottom_shift = 0.0
+        center_shift_xz = (0.0, 0.0)
         if center_bottom_at_origin:
             bottom_shift = float(bbox_min[1])
             verts[:, 1] = verts[:, 1] - bottom_shift
             bbox_min[1] = 0.0
             bbox_max[1] = bbox_max[1] - bottom_shift
+            # v3: also center the bbox in XZ. USD prims often have their pivot at
+            # a mesh corner (e.g. Main Couch's prim origin sat at one end of a
+            # 15m sofa, so vertices ran z∈[-15.62, 0]); the authoring placement
+            # translate then dropped the *mesh center* far from the user's
+            # intended point. Shifting xz to bbox-center here makes the
+            # transform.translate match the visible center of the mesh.
+            cx = float((bbox_min[0] + bbox_max[0]) / 2.0)
+            cz = float((bbox_min[2] + bbox_max[2]) / 2.0)
+            verts[:, 0] = verts[:, 0] - cx
+            verts[:, 2] = verts[:, 2] - cz
+            bbox_min[0] -= cx; bbox_max[0] -= cx
+            bbox_min[2] -= cz; bbox_max[2] -= cz
+            center_shift_xz = (cx, cz)
 
         # If any mesh contributed UV or normals, we emit them for *all* meshes —
         # missing UVs become (0,0); missing normals become +Y. This keeps face
@@ -408,6 +424,7 @@ def extract_prim_mesh_to_obj(
                 float(bbox_max[2] - bbox_min[2]),
             ],
             bottom_shift_y=float(bottom_shift),
+            center_shift_xz=(float(center_shift_xz[0]), float(center_shift_xz[1])),
             has_uv=bool(write_uv),
             has_normal=bool(write_normal),
             writer_version=OBJ_WRITER_VERSION,

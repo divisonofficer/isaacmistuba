@@ -348,8 +348,8 @@
 		content: '';
 		width: 1.75rem;
 		height: 1.75rem;
-		border: 3px solid rgba(58, 122, 254, 0.25);
-		border-top-color: var(--brand, #3a7afe);
+		border: 3px solid var(--brand-soft);
+		border-top-color: var(--brand);
 		border-radius: 50%;
 		animation: mat-card-spin 0.9s linear infinite;
 	}
@@ -365,7 +365,7 @@
 		font-weight: 600;
 		font-size: 0.875rem;
 		line-height: 1.2;
-		color: var(--ink-strong, #1f2330);
+		color: var(--text);
 	}
 	.mat-badges {
 		display: flex;
@@ -416,19 +416,19 @@
 		font-size: 1.1rem;
 		line-height: 1;
 		cursor: pointer;
-		color: var(--ink-muted, #6b7280);
+		color: var(--muted);
 	}
 	.mat-menu-btn:hover {
-		background: #fff;
-		color: var(--ink-strong, #1f2330);
+		background: var(--panel);
+		color: var(--text);
 	}
 	.mat-menu {
 		position: absolute;
 		top: 2.1rem;
 		right: 0.5rem;
 		min-width: 9rem;
-		background: #fff;
-		border: 1px solid var(--border-soft, rgba(0, 0, 0, 0.08));
+		background: var(--panel);
+		border: 1px solid var(--panel-border);
 		border-radius: 8px;
 		box-shadow: 0 6px 20px rgba(0, 0, 0, 0.1);
 		padding: 0.25rem;

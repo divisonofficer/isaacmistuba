@@ -1,0 +1,2045 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Robomituba Developer Report</title>
+<link rel="preconnect" href="https://cdn.jsdelivr.net">
+<link href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/static/pretendard.min.css" rel="stylesheet">
+<style>
+  :root {
+    --bg: #0f1117;
+    --surface: #1a1d2e;
+    --surface2: #252840;
+    --border: #2e3154;
+    --accent: #6c8ef7;
+    --accent2: #a78bfa;
+    --accent3: #34d399;
+    --accent4: #f59e0b;
+    --accent5: #f87171;
+    --text: #e2e8f0;
+    --text-muted: #8892a4;
+    --text-dim: #5a6480;
+    --code-bg: #141622;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    font-family: 'Pretendard', 'Segoe UI', system-ui, -apple-system, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.6;
+    font-size: 14px;
+  }
+
+  /* ── Layout ── */
+  .layout { display: flex; flex-direction: row; min-height: 100vh; align-items: flex-start; }
+
+  /* ── Sidebar ── */
+  .sidebar {
+    width: 240px;
+    min-width: 240px;
+    flex-shrink: 0;
+    align-self: flex-start;
+    background: var(--surface);
+    border-right: 1px solid var(--border);
+    position: sticky;
+    top: 0;
+    height: 100vh;
+    overflow-y: auto;
+    padding: 24px 0;
+  }
+
+  .sidebar-logo {
+    padding: 0 20px 20px;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 16px;
+  }
+  .sidebar-logo .logo-text {
+    font-size: 15px;
+    font-weight: 700;
+    color: var(--accent);
+    letter-spacing: -0.3px;
+  }
+  .sidebar-logo .logo-sub {
+    font-size: 11px;
+    color: var(--text-muted);
+    margin-top: 2px;
+  }
+
+  .nav-section { margin-bottom: 4px; }
+  .nav-section-title {
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    color: var(--text-dim);
+    padding: 8px 20px 4px;
+  }
+  .nav-link {
+    display: block;
+    padding: 6px 20px;
+    color: var(--text-muted);
+    text-decoration: none;
+    font-size: 13px;
+    border-left: 2px solid transparent;
+    transition: all 0.15s;
+  }
+  .nav-link:hover {
+    color: var(--text);
+    background: var(--surface2);
+    border-left-color: var(--accent);
+  }
+  .nav-link.active {
+    color: var(--accent);
+    background: rgba(108, 142, 247, 0.08);
+    border-left-color: var(--accent);
+  }
+
+  /* ── Main content ── */
+  .main {
+    flex: 1;
+    min-width: 0;
+    overflow-x: hidden;
+    padding: 32px 40px;
+  }
+
+  /* ── Sections ── */
+  .section {
+    margin-bottom: 64px;
+    scroll-margin-top: 24px;
+  }
+
+  .section-header {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 24px;
+    padding-bottom: 12px;
+    border-bottom: 1px solid var(--border);
+  }
+  .section-icon {
+    width: 32px;
+    height: 32px;
+    border-radius: 8px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 16px;
+    flex-shrink: 0;
+  }
+  .section-title {
+    font-size: 20px;
+    font-weight: 700;
+    color: var(--text);
+  }
+  .section-subtitle {
+    font-size: 13px;
+    color: var(--text-muted);
+    margin-top: 2px;
+  }
+
+  h3 {
+    font-size: 15px;
+    font-weight: 600;
+    color: var(--text);
+    margin: 28px 0 12px;
+  }
+  h4 {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--accent2);
+    margin: 20px 0 8px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+
+  p { color: var(--text-muted); margin-bottom: 12px; }
+
+  /* ── Callout cards ── */
+  .card-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+    gap: 12px;
+    margin-bottom: 20px;
+  }
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 16px;
+    transition: border-color 0.15s;
+  }
+  .card:hover { border-color: var(--accent); }
+  .card-label {
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: var(--text-dim);
+    margin-bottom: 6px;
+  }
+  .card-value {
+    font-size: 22px;
+    font-weight: 700;
+    color: var(--accent);
+  }
+  .card-desc {
+    font-size: 12px;
+    color: var(--text-muted);
+    margin-top: 4px;
+  }
+
+  /* ── Module cards ── */
+  .module-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 20px;
+    margin-bottom: 16px;
+    position: relative;
+    overflow: hidden;
+  }
+  .module-card::before {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 3px;
+    height: 100%;
+  }
+  .module-card.bridge::before { background: var(--accent); }
+  .module-card.converter::before { background: var(--accent3); }
+  .module-card.mitsuba::before { background: var(--accent2); }
+  .module-card.navdataset::before { background: var(--accent4); }
+
+  .module-name {
+    font-size: 15px;
+    font-weight: 700;
+    margin-bottom: 4px;
+  }
+  .module-path {
+    font-size: 11px;
+    font-family: 'Cascadia Code', 'Fira Code', monospace;
+    color: var(--text-dim);
+    margin-bottom: 10px;
+  }
+  .module-desc { font-size: 13px; color: var(--text-muted); margin-bottom: 12px; }
+  .tag-list { display: flex; flex-wrap: wrap; gap: 6px; }
+  .tag {
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-size: 11px;
+    font-weight: 600;
+    background: rgba(108, 142, 247, 0.12);
+    color: var(--accent);
+    border: 1px solid rgba(108, 142, 247, 0.2);
+  }
+  .tag.green {
+    background: rgba(52, 211, 153, 0.12);
+    color: var(--accent3);
+    border-color: rgba(52, 211, 153, 0.2);
+  }
+  .tag.purple {
+    background: rgba(167, 139, 250, 0.12);
+    color: var(--accent2);
+    border-color: rgba(167, 139, 250, 0.2);
+  }
+  .tag.amber {
+    background: rgba(245, 158, 11, 0.12);
+    color: var(--accent4);
+    border-color: rgba(245, 158, 11, 0.2);
+  }
+  .tag.red {
+    background: rgba(248, 113, 113, 0.12);
+    color: var(--accent5);
+    border-color: rgba(248, 113, 113, 0.2);
+  }
+
+  /* ── Code blocks ── */
+  pre, code {
+    font-family: 'Cascadia Code', 'Fira Code', 'JetBrains Mono', monospace;
+  }
+  pre {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px 20px;
+    overflow-x: auto;
+    font-size: 12.5px;
+    line-height: 1.7;
+    margin-bottom: 16px;
+    color: #b4c2d8;
+  }
+  code {
+    background: rgba(108, 142, 247, 0.1);
+    color: var(--accent);
+    padding: 1px 5px;
+    border-radius: 3px;
+    font-size: 12px;
+  }
+  pre code {
+    background: none;
+    color: inherit;
+    padding: 0;
+    border-radius: 0;
+  }
+
+  /* ── Syntax highlight (manual) ── */
+  .kw { color: #a78bfa; }
+  .str { color: #86efac; }
+  .cmt { color: #4b5563; font-style: italic; }
+  .cls { color: #67e8f9; }
+  .fn { color: #93c5fd; }
+  .num { color: #fb923c; }
+  .py { color: #fcd34d; }
+
+  /* ── Data flow diagram ── */
+  .flow {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 24px;
+    margin-bottom: 20px;
+  }
+  .flow-step {
+    display: flex;
+    align-items: flex-start;
+    gap: 16px;
+    margin-bottom: 12px;
+    position: relative;
+  }
+  .flow-step::before {
+    content: '';
+    position: absolute;
+    left: 19px;
+    top: 36px;
+    width: 2px;
+    height: calc(100% + 4px);
+    background: var(--border);
+  }
+  .flow-step:last-child::before { display: none; }
+  .flow-num {
+    width: 40px;
+    height: 40px;
+    min-width: 40px;
+    border-radius: 50%;
+    background: var(--surface2);
+    border: 2px solid var(--accent);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 14px;
+    font-weight: 700;
+    color: var(--accent);
+  }
+  .flow-content { flex: 1; }
+  .flow-title { font-weight: 600; color: var(--text); margin-bottom: 4px; }
+  .flow-body { font-size: 12px; color: var(--text-muted); }
+  .flow-artifact {
+    display: inline-block;
+    font-family: monospace;
+    font-size: 11px;
+    background: var(--code-bg);
+    padding: 1px 6px;
+    border-radius: 3px;
+    margin: 2px 2px 0 0;
+    color: var(--accent3);
+  }
+
+  /* ── Type tables ── */
+  .type-block {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    margin-bottom: 16px;
+    overflow: hidden;
+  }
+  .type-header {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 12px 16px;
+    background: var(--surface2);
+    border-bottom: 1px solid var(--border);
+  }
+  .type-name {
+    font-family: monospace;
+    font-size: 14px;
+    font-weight: 700;
+    color: var(--accent);
+  }
+  .type-badge {
+    font-size: 10px;
+    padding: 1px 6px;
+    border-radius: 3px;
+    font-weight: 600;
+    text-transform: uppercase;
+  }
+  .badge-dataclass { background: rgba(167,139,250,0.2); color: var(--accent2); }
+  .badge-enum { background: rgba(245,158,11,0.2); color: var(--accent4); }
+  .type-body { padding: 0; }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12.5px;
+  }
+  th {
+    text-align: left;
+    padding: 8px 16px;
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.8px;
+    color: var(--text-dim);
+    font-weight: 700;
+    background: rgba(255,255,255,0.02);
+    border-bottom: 1px solid var(--border);
+  }
+  td {
+    padding: 8px 16px;
+    border-bottom: 1px solid rgba(46,49,84,0.5);
+    color: var(--text-muted);
+    vertical-align: top;
+  }
+  tr:last-child td { border-bottom: none; }
+  td:first-child { font-family: monospace; color: var(--accent3); font-size: 12px; }
+  td:nth-child(2) { color: var(--accent2); font-family: monospace; font-size: 11.5px; }
+
+  /* ── Modality grid ── */
+  .modality-group { margin-bottom: 20px; }
+  .modality-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+    gap: 8px;
+  }
+  .modality-item {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 12px;
+  }
+  .modality-name {
+    font-family: monospace;
+    font-size: 12px;
+    font-weight: 700;
+    color: var(--accent3);
+    margin-bottom: 4px;
+  }
+  .modality-desc { font-size: 11px; color: var(--text-dim); }
+
+  /* ── File tree ── */
+  .file-tree {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px 20px;
+    font-family: monospace;
+    font-size: 12.5px;
+    line-height: 1.8;
+    color: #8892a4;
+    overflow-x: auto;
+  }
+  .tree-dir { color: var(--accent); font-weight: 600; }
+  .tree-file { color: #b4c2d8; }
+  .tree-note { color: var(--text-dim); font-style: italic; }
+  .tree-key { color: var(--accent3); font-weight: 600; }
+  .tree-star { color: var(--accent4); }
+
+  /* ── Commit log ── */
+  .commit-list { list-style: none; }
+  .commit-item {
+    display: flex;
+    align-items: flex-start;
+    gap: 12px;
+    padding: 10px 0;
+    border-bottom: 1px solid var(--border);
+  }
+  .commit-item:last-child { border-bottom: none; }
+  .commit-hash {
+    font-family: monospace;
+    font-size: 11px;
+    color: var(--accent);
+    background: rgba(108,142,247,0.1);
+    padding: 2px 6px;
+    border-radius: 4px;
+    min-width: 60px;
+    text-align: center;
+  }
+  .commit-msg { font-size: 13px; color: var(--text-muted); }
+  .commit-tag {
+    font-size: 10px;
+    padding: 1px 6px;
+    border-radius: 3px;
+    background: var(--surface2);
+    color: var(--text-dim);
+    white-space: nowrap;
+  }
+
+  /* ── Alert box ── */
+  .alert {
+    border-radius: 8px;
+    padding: 12px 16px;
+    margin-bottom: 16px;
+    border-left: 3px solid;
+    font-size: 13px;
+  }
+  .alert-info {
+    background: rgba(108,142,247,0.08);
+    border-color: var(--accent);
+    color: #93aef5;
+  }
+  .alert-warn {
+    background: rgba(245,158,11,0.08);
+    border-color: var(--accent4);
+    color: #fbbf24;
+  }
+  .alert-tip {
+    background: rgba(52,211,153,0.08);
+    border-color: var(--accent3);
+    color: #6ee7b7;
+  }
+
+  /* ── Arch diagram ── */
+  .arch-diagram {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 28px;
+    text-align: center;
+    position: relative;
+    overflow: hidden;
+  }
+  .arch-layer {
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 14px 20px;
+    margin: 8px auto;
+    max-width: 560px;
+    position: relative;
+  }
+  .arch-layer.top { border-color: var(--accent4); }
+  .arch-layer.mid { border-color: var(--accent); }
+  .arch-layer.bot { border-color: var(--accent3); }
+  .arch-layer.out { border-color: var(--accent2); }
+  .arch-layer-label {
+    position: absolute;
+    top: -9px;
+    left: 16px;
+    background: var(--surface);
+    padding: 0 6px;
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+  }
+  .arch-layer.top .arch-layer-label { color: var(--accent4); }
+  .arch-layer.mid .arch-layer-label { color: var(--accent); }
+  .arch-layer.bot .arch-layer-label { color: var(--accent3); }
+  .arch-layer.out .arch-layer-label { color: var(--accent2); }
+  .arch-items {
+    display: flex;
+    justify-content: center;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+  .arch-item {
+    background: var(--surface2);
+    border-radius: 6px;
+    padding: 5px 12px;
+    font-size: 12px;
+    font-family: monospace;
+    color: var(--text-muted);
+  }
+  .arch-arrow {
+    font-size: 18px;
+    color: var(--text-dim);
+    margin: 4px 0;
+    display: block;
+  }
+  .arch-arrow-label {
+    font-size: 10px;
+    color: var(--text-dim);
+    margin: -2px 0 2px;
+  }
+
+  /* ── Header hero ── */
+  .hero {
+    background: linear-gradient(135deg, var(--surface) 0%, #1a1d3a 100%);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    padding: 32px 36px;
+    margin-bottom: 48px;
+    position: relative;
+    overflow: hidden;
+  }
+  .hero::before {
+    content: '';
+    position: absolute;
+    top: -60px;
+    right: -60px;
+    width: 200px;
+    height: 200px;
+    background: radial-gradient(circle, rgba(108,142,247,0.12), transparent 70%);
+    border-radius: 50%;
+  }
+  .hero-title {
+    font-size: 28px;
+    font-weight: 800;
+    background: linear-gradient(135deg, var(--accent), var(--accent2));
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+    margin-bottom: 8px;
+  }
+  .hero-subtitle {
+    font-size: 14px;
+    color: var(--text-muted);
+    margin-bottom: 20px;
+  }
+  .hero-meta {
+    display: flex;
+    gap: 24px;
+    flex-wrap: wrap;
+  }
+  .hero-meta-item { font-size: 12px; color: var(--text-dim); }
+  .hero-meta-item span { color: var(--text-muted); font-weight: 600; }
+
+  /* ── Scrollbar ── */
+  ::-webkit-scrollbar { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-track { background: var(--bg); }
+  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+  ::-webkit-scrollbar-thumb:hover { background: #3e4470; }
+</style>
+</head>
+<body>
+
+<div class="layout">
+
+<!-- ────────────── SIDEBAR ────────────── -->
+<nav class="sidebar">
+  <div class="sidebar-logo">
+    <div class="logo-text">Robomituba</div>
+    <div class="logo-sub">Developer Report · 2026-06-02</div>
+  </div>
+
+  <div class="nav-section">
+    <div class="nav-section-title">Daily Reports</div>
+    <a class="nav-link" href="report_2026-06-09.html">2026-06-09 변경 파일 추적 · XML-native editor · partial export</a>
+    <a class="nav-link" href="report_2026-06-08.html">2026-06-08 Hot Camera Preview · Render Monitor · 공유오피스 렌더링</a>
+    <a class="nav-link" href="report_2026-06-05.html">📄 2026-06-05 OpticalNav 에디터 · 카메라 리그 · 에셋 materialization</a>
+    <a class="nav-link" href="report_2026-06-02.html">📄 2026-06-02 GPU 캐시 · 렌더 관리 · 파이프라인</a>
+    <a class="nav-link" href="report_2026-05-29.html">📄 2026-05-29 프러스텀 프리뷰 + 기반씬 공유</a>
+    <a class="nav-link" href="report_2026-05-28.html">📄 2026-05-28 navigation_dataset + 에디터</a>
+    <a class="nav-link" href="report_2026-05-27.html">📄 2026-05-27 Isaac + Ranger Mini</a>
+  </div>
+
+  <div class="nav-section">
+    <div class="nav-section-title">Overview</div>
+    <a class="nav-link" href="#overview">Project Overview</a>
+    <a class="nav-link" href="#architecture">Architecture</a>
+    <a class="nav-link" href="#filestructure">File Structure</a>
+    <a class="nav-link" href="#changelog">Changelog</a>
+  </div>
+
+  <div class="nav-section">
+    <div class="nav-section-title">Modules</div>
+    <a class="nav-link" href="#bridge">robomituba_bridge</a>
+    <a class="nav-link" href="#converter">mitsuba_converter</a>
+    <a class="nav-link" href="#daemon">Render Daemon</a>
+    <a class="nav-link" href="#navdataset">navigation_dataset</a>
+  </div>
+
+  <div class="nav-section">
+    <div class="nav-section-title">Data Contracts</div>
+    <a class="nav-link" href="#types-scene">Scene Types</a>
+    <a class="nav-link" href="#types-job">Job Types</a>
+    <a class="nav-link" href="#types-render">Render Types</a>
+    <a class="nav-link" href="#types-isaac">Isaac Types</a>
+  </div>
+
+  <div class="nav-section">
+    <div class="nav-section-title">Rendering</div>
+    <a class="nav-link" href="#modalities">Modalities</a>
+    <a class="nav-link" href="#materials">Materials & BSDF</a>
+    <a class="nav-link" href="#dataflow">Data Flow</a>
+  </div>
+
+  <div class="nav-section">
+    <div class="nav-section-title">Applications</div>
+    <a class="nav-link" href="#apps">Apps Directory</a>
+    <a class="nav-link" href="#api">HTTP API</a>
+  </div>
+</nav>
+
+<!-- ────────────── MAIN ────────────── -->
+<main class="main">
+
+<!-- HERO -->
+<div class="hero">
+  <div class="hero-title">Robomituba</div>
+  <div class="hero-subtitle">Isaac Sim ↔ Mitsuba 3 Bridge · 고품질 멀티모달 센서 데이터 생성 플랫폼</div>
+  <div class="hero-meta">
+    <div class="hero-meta-item">Branch: <span>main</span></div>
+    <div class="hero-meta-item">Latest commit: <span>[05.22] Phase R</span></div>
+    <div class="hero-meta-item">Path: <span>/jarvis/project/robomituba</span></div>
+    <div class="hero-meta-item">Python: <span>3.10+</span></div>
+    <div class="hero-meta-item">Renderer: <span>Mitsuba 3 (CUDA/OptiX)</span></div>
+  </div>
+</div>
+
+
+<!-- ════════════════ OVERVIEW ════════════════ -->
+<section class="section" id="overview">
+  <div class="section-header">
+    <div class="section-icon" style="background:rgba(108,142,247,0.15)">🎯</div>
+    <div>
+      <div class="section-title">Project Overview</div>
+      <div class="section-subtitle">로봇 시뮬레이션 고품질 센서 데이터 생성 시스템</div>
+    </div>
+  </div>
+
+  <div class="card-grid">
+    <div class="card">
+      <div class="card-label">Core Modules</div>
+      <div class="card-value">4</div>
+      <div class="card-desc">bridge, converter, mitsuba3, navigation_dataset</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Rendering Apps</div>
+      <div class="card-value">9+</div>
+      <div class="card-desc">CLI rendering scripts + Isaac extension</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Modalities</div>
+      <div class="card-value">17+</div>
+      <div class="card-desc">RGB, Depth, Normal, Polarization, etc.</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Bridge Types</div>
+      <div class="card-value">40+</div>
+      <div class="card-desc">Pure Python dataclasses</div>
+    </div>
+  </div>
+
+  <div class="alert alert-info">
+    <strong>핵심 원칙:</strong> robomituba_bridge는 Isaac Sim과 Mitsuba 어느 쪽에도 의존하지 않는 순수 Python 계약 계층입니다.
+    모든 경로는 repo-relative로 저장되어 어디서나 이동 가능합니다.
+  </div>
+
+  <p>이 프로젝트는 NVIDIA Isaac Sim에서 생성한 로봇 씬을 Mitsuba 3 물리 기반 렌더러로 렌더링하여
+  RGB, Depth, Normal, Polarization 등 다양한 모달리티의 고품질 센서 데이터를 생성합니다.
+  생성된 데이터는 로봇 학습(ML/Vision)에 활용됩니다.</p>
+
+  <p>전체 시스템은 3개의 독립 계층으로 분리되어 있어, Isaac Sim 없이도 렌더링이 가능하고
+  Blender 등 다른 USD 작성 도구에서도 동일한 bridge를 활용할 수 있습니다.</p>
+</section>
+
+
+<!-- ════════════════ ARCHITECTURE ════════════════ -->
+<section class="section" id="architecture">
+  <div class="section-header">
+    <div class="section-icon" style="background:rgba(52,211,153,0.15)">🏗️</div>
+    <div>
+      <div class="section-title">Architecture</div>
+      <div class="section-subtitle">3-Layer 독립 계층 구조</div>
+    </div>
+  </div>
+
+  <div class="arch-diagram">
+    <div class="arch-layer top">
+      <div class="arch-layer-label">Authoring</div>
+      <div class="arch-items">
+        <div class="arch-item">Isaac Sim</div>
+        <div class="arch-item">Blender</div>
+        <div class="arch-item">isaac_extension/</div>
+        <div class="arch-item">isaac_standalone/</div>
+      </div>
+    </div>
+    <span class="arch-arrow">↓</span>
+    <div class="arch-arrow-label">SceneSnapshot (JSON + geometry)</div>
+    <div class="arch-layer mid">
+      <div class="arch-layer-label">Bridge Contract</div>
+      <div class="arch-items">
+        <div class="arch-item">robomituba_bridge</div>
+        <div class="arch-item">JobManifest</div>
+        <div class="arch-item">SceneSnapshot</div>
+        <div class="arch-item">RenderRequest</div>
+      </div>
+    </div>
+    <span class="arch-arrow">↓</span>
+    <div class="arch-arrow-label">Job Bundle (files on disk)</div>
+    <div class="arch-layer bot">
+      <div class="arch-layer-label">Rendering Engine</div>
+      <div class="arch-items">
+        <div class="arch-item">mitsuba_converter</div>
+        <div class="arch-item">WorkerManager</div>
+        <div class="arch-item">RenderDaemon (HTTP)</div>
+        <div class="arch-item">mitsuba3 (GPU)</div>
+      </div>
+    </div>
+    <span class="arch-arrow">↓</span>
+    <div class="arch-arrow-label">EXR files + ObservationBundleManifest</div>
+    <div class="arch-layer out">
+      <div class="arch-layer-label">Output</div>
+      <div class="arch-items">
+        <div class="arch-item">RGB.exr</div>
+        <div class="arch-item">Depth.exr</div>
+        <div class="arch-item">Normal.exr</div>
+        <div class="arch-item">Polarization.exr</div>
+        <div class="arch-item">observation_bundle.json</div>
+      </div>
+    </div>
+  </div>
+
+  <h3>Module Dependencies</h3>
+  <div class="module-card bridge">
+    <div class="module-name">robomituba_bridge</div>
+    <div class="module-path">modules/robomituba_bridge/</div>
+    <div class="module-desc">Isaac ↔ Mitsuba 공유 계약 계층. Isaac이나 Mitsuba 중 어느 것도 import하지 않습니다.</div>
+    <div class="tag-list">
+      <span class="tag">Pure Python</span>
+      <span class="tag">dataclasses</span>
+      <span class="tag">JSON I/O</span>
+      <span class="tag">No external deps</span>
+    </div>
+  </div>
+  <div class="module-card converter">
+    <div class="module-name">mitsuba_converter</div>
+    <div class="module-path">modules/mitsuba_converter/</div>
+    <div class="module-desc">USD 씬 → Mitsuba 변환 + 멀티모달 렌더링 파이프라인. robomituba_bridge를 import합니다.</div>
+    <div class="tag-list">
+      <span class="tag green">Mitsuba 3</span>
+      <span class="tag green">numpy</span>
+      <span class="tag green">USD/OpenUSD</span>
+      <span class="tag green">FastAPI (daemon)</span>
+    </div>
+  </div>
+  <div class="module-card mitsuba">
+    <div class="module-name">mitsuba3</div>
+    <div class="module-path">modules/mitsuba3/ (git submodule)</div>
+    <div class="module-desc">EPFL RGL의 Mitsuba 3 렌더러. C++/Python 혼합. CUDA/OptiX GPU 지원.</div>
+    <div class="tag-list">
+      <span class="tag purple">C++ / Dr.Jit</span>
+      <span class="tag purple">CUDA</span>
+      <span class="tag purple">OptiX</span>
+      <span class="tag purple">GPL v3</span>
+    </div>
+  </div>
+  <div class="module-card navdataset">
+    <div class="module-name">navigation_dataset</div>
+    <div class="module-path">modules/navigation_dataset/</div>
+    <div class="module-desc">OpticalNav-v0.1 에피소드 스키마. 순회 격자, A* 계획, 지시 템플릿, 데이터셋 내보내기.</div>
+    <div class="tag-list">
+      <span class="tag amber">JSON contracts</span>
+      <span class="tag amber">A* planning</span>
+      <span class="tag amber">Traversability</span>
+    </div>
+  </div>
+</section>
+
+
+<!-- ════════════════ FILE STRUCTURE ════════════════ -->
+<section class="section" id="filestructure">
+  <div class="section-header">
+    <div class="section-icon" style="background:rgba(245,158,11,0.15)">📁</div>
+    <div>
+      <div class="section-title">File Structure</div>
+      <div class="section-subtitle">/jarvis/project/robomituba</div>
+    </div>
+  </div>
+
+  <div class="file-tree">
+<span class="tree-dir">robomituba/</span><br>
+├── <span class="tree-dir">modules/</span>                       <span class="tree-note"># ⭐ 핵심 모듈</span><br>
+│   ├── <span class="tree-dir">robomituba_bridge/</span><br>
+│   │   └── <span class="tree-dir">src/robomituba_bridge/</span><br>
+│   │       ├── <span class="tree-key">types.py</span>           <span class="tree-note"># 40+ 데이터클래스</span><br>
+│   │       ├── <span class="tree-key">manifest.py</span>        <span class="tree-note"># job_id 생성, 검증</span><br>
+│   │       ├── <span class="tree-key">io.py</span>              <span class="tree-note"># JSON 직렬화/역직렬화</span><br>
+│   │       ├── <span class="tree-file">paths.py</span>           <span class="tree-note"># repo-relative 경로</span><br>
+│   │       ├── <span class="tree-file">shape_mapping.py</span>   <span class="tree-note"># 형상 ID 매핑</span><br>
+│   │       └── <span class="tree-file">material_mapping.py</span> <span class="tree-note"># 재질 분류</span><br>
+│   ├── <span class="tree-dir">mitsuba_converter/</span><br>
+│   │   └── <span class="tree-dir">src/mitsuba_converter/</span><br>
+│   │       ├── <span class="tree-key">multimodal.py</span>      <span class="tree-note"># 멀티모달 렌더링 (2700+ LOC)</span><br>
+│   │       ├── <span class="tree-key">render_daemon.py</span>   <span class="tree-note"># HTTP 렌더링 서버</span><br>
+│   │       ├── <span class="tree-key">worker_manager.py</span>  <span class="tree-note"># Phase R: 워커 서브프로세스</span><br>
+│   │       ├── <span class="tree-key">observation_bridge.py</span> <span class="tree-note"># 번들 생성 오케스트레이션</span><br>
+│   │       ├── <span class="tree-file">mitsuba_builder.py</span> <span class="tree-note"># IR → Mitsuba scene dict</span><br>
+│   │       ├── <span class="tree-file">usd_loader.py</span>      <span class="tree-note"># USD → IR</span><br>
+│   │       ├── <span class="tree-file">usd_snapshot.py</span>    <span class="tree-note"># USD 스냅샷 추출</span><br>
+│   │       ├── <span class="tree-file">pipeline.py</span>        <span class="tree-note"># 통합 파이프라인</span><br>
+│   │       └── <span class="tree-file">cli.py</span>             <span class="tree-note"># CLI 인터페이스</span><br>
+│   ├── <span class="tree-dir">mitsuba3/</span>                  <span class="tree-note"># git submodule (EPFL)</span><br>
+│   └── <span class="tree-dir">navigation_dataset/</span>         <span class="tree-note"># OpticalNav-v0.1</span><br>
+├── <span class="tree-dir">apps/</span>                          <span class="tree-note"># 렌더링 애플리케이션</span><br>
+│   ├── <span class="tree-star">run_render_daemon.py</span>       <span class="tree-note"># ⭐ 메인 데몬 서버</span><br>
+│   ├── <span class="tree-file">render_selected_cameras_multimodal.py</span><br>
+│   ├── <span class="tree-file">render_curated_multimodal.py</span><br>
+│   ├── <span class="tree-file">render_candidate_cameras.py</span><br>
+│   ├── <span class="tree-file">render_reflective_island_frontal_demo.py</span><br>
+│   ├── <span class="tree-dir">isaac_extension/</span>           <span class="tree-note"># Isaac Sim 확장</span><br>
+│   │   ├── <span class="tree-file">extension.py</span>       <span class="tree-note"># omni.ext.IExt 진입점</span><br>
+│   │   ├── <span class="tree-file">ui_panel.py</span>        <span class="tree-note"># UI 패널</span><br>
+│   │   ├── <span class="tree-file">stage_capture.py</span>   <span class="tree-note"># 씬 캡처</span><br>
+│   │   └── <span class="tree-file">daemon_client.py</span>   <span class="tree-note"># HTTP 클라이언트</span><br>
+│   └── <span class="tree-dir">isaac_standalone/</span>          <span class="tree-note"># 독립 실행 유틸리티</span><br>
+├── <span class="tree-dir">scenes/</span>                        <span class="tree-note"># USD 씬 파일</span><br>
+├── <span class="tree-dir">assets/</span>                        <span class="tree-note"># 3D 모델, 텍스처</span><br>
+├── <span class="tree-dir">data/</span>                          <span class="tree-note"># BRDF 데이터 (pbrdf_2020, hpbrdf_2025)</span><br>
+├── <span class="tree-dir">out/</span>                           <span class="tree-note"># 렌더링 결과물</span><br>
+│   └── <span class="tree-dir">bridge_jobs/</span>               <span class="tree-note"># job-YYYYMMDDTHHMMSSz-token/</span><br>
+├── <span class="tree-dir">docs/</span>                          <span class="tree-note"># 문서</span><br>
+├── <span class="tree-dir">scripts/</span>                       <span class="tree-note"># 유틸리티 스크립트</span><br>
+└── <span class="tree-file">CLAUDE.md / AGENTS.md / Makefile</span>
+  </div>
+</section>
+
+
+<!-- ════════════════ CHANGELOG ════════════════ -->
+<section class="section" id="changelog">
+  <div class="section-header">
+    <div class="section-icon" style="background:rgba(248,113,113,0.15)">🕐</div>
+    <div>
+      <div class="section-title">Recent Changelog</div>
+      <div class="section-subtitle">최근 커밋 이력</div>
+    </div>
+  </div>
+
+  <ul class="commit-list">
+    <li class="commit-item">
+      <span class="commit-hash">9ec454d</span>
+      <div class="commit-msg">[05.22] Phase R: 렌더링 워커 서브프로세스 분리 + Isaac 패널 개편</div>
+      <span class="commit-tag">major</span>
+    </li>
+    <li class="commit-item">
+      <span class="commit-hash">4c5049e</span>
+      <div class="commit-msg">[04.30] 3d blueprint 개선, 로봇 개선</div>
+      <span class="commit-tag">feature</span>
+    </li>
+    <li class="commit-item">
+      <span class="commit-hash">eda170b</span>
+      <div class="commit-msg">[04.30] hpbrdf 적용하는 파이프라인</div>
+      <span class="commit-tag">feature</span>
+    </li>
+    <li class="commit-item">
+      <span class="commit-hash">9909c7e</span>
+      <div class="commit-msg">[04.28] BRDF preview renderer</div>
+      <span class="commit-tag">feature</span>
+    </li>
+    <li class="commit-item">
+      <span class="commit-hash">2ecae78</span>
+      <div class="commit-msg">[04.24] GPU 로딩 sub-progress + Dr.Jit 가드 + 진행 카드 폴리싱</div>
+      <span class="commit-tag">polish</span>
+    </li>
+    <li class="commit-item">
+      <span class="commit-hash">9017f9c</span>
+      <div class="commit-msg">[04.23] webui density polish + Quick Actions SVG icons</div>
+      <span class="commit-tag">ui</span>
+    </li>
+    <li class="commit-item">
+      <span class="commit-hash">e277237</span>
+      <div class="commit-msg">[04.23] webui and daemon updates</div>
+      <span class="commit-tag">ui</span>
+    </li>
+    <li class="commit-item">
+      <span class="commit-hash">124ae85</span>
+      <div class="commit-msg">[04.17] 데몬 대시보드 ui</div>
+      <span class="commit-tag">ui</span>
+    </li>
+    <li class="commit-item">
+      <span class="commit-hash">f39f4c0</span>
+      <div class="commit-msg">[04.14] init commit</div>
+      <span class="commit-tag">init</span>
+    </li>
+  </ul>
+
+  <div class="alert alert-tip">
+    <strong>Phase R (2026-05-22):</strong> 렌더링 워커를 서브프로세스로 분리하여 GPU 충돌을 방지하고
+    각 워커가 독립적으로 실행됩니다. WorkerManager가 JSONL stdin/stdout으로 통신합니다.
+  </div>
+</section>
+
+
+<!-- ════════════════ BRIDGE MODULE ════════════════ -->
+<section class="section" id="bridge">
+  <div class="section-header">
+    <div class="section-icon" style="background:rgba(108,142,247,0.15)">🌉</div>
+    <div>
+      <div class="section-title">robomituba_bridge</div>
+      <div class="section-subtitle">Isaac ↔ Mitsuba 공유 계약 계층</div>
+    </div>
+  </div>
+
+  <div class="alert alert-info">
+    <strong>설계 원칙:</strong> Isaac-only, Mitsuba-only import 없음. 순수 Python dataclasses + JSON.
+    양쪽에서 동일한 패키지를 사용합니다.
+  </div>
+
+  <h3>Public API</h3>
+  <pre><code><span class="kw">from</span> robomituba_bridge <span class="kw">import</span> (
+    <span class="cmt"># Types</span>
+    SceneSnapshot, MeshRecord, MaterialRecord, CameraRecord, LightRecord,
+    FrameRecord, PoseRecord, JobManifest, JobPaths,
+    RenderRequest, RenderJobStatus, ObservationBundleManifest,
+    CameraSpec, SceneOverrideSpec, AssistLightSpec, DepthApproxSpec,
+    BsdfOverride, IsaacStateSnapshot, IsaacCaptureRequest,
+
+    <span class="cmt"># Manifest</span>
+    make_job_id, create_job_manifest,
+
+    <span class="cmt"># I/O</span>
+    load_job_bundle, write_job_bundle,
+    read_job_manifest, write_observation_bundle_manifest,
+
+    <span class="cmt"># Paths</span>
+    repo_root_from, resolve_repo_path, ensure_job_layout,
+    to_repo_relative_posix, BRIDGE_JOBS_ROOT,
+
+    <span class="cmt"># Validation</span>
+    validate_job_manifest, validate_render_request,
+)</code></pre>
+
+  <h3>Job Lifecycle</h3>
+  <div class="flow">
+    <div class="flow-step">
+      <div class="flow-num">1</div>
+      <div class="flow-content">
+        <div class="flow-title">Job ID 생성</div>
+        <div class="flow-body">
+          <code>make_job_id()</code> → <span class="flow-artifact">job-20260522T120000z-abc123</span>
+        </div>
+      </div>
+    </div>
+    <div class="flow-step">
+      <div class="flow-num">2</div>
+      <div class="flow-content">
+        <div class="flow-title">디렉터리 레이아웃 생성</div>
+        <div class="flow-body">
+          <code>ensure_job_layout(repo_root, job_id)</code> →
+          <span class="flow-artifact">out/bridge_jobs/job-.../</span>
+          <span class="flow-artifact">snapshot/</span>
+          <span class="flow-artifact">usd/</span>
+          <span class="flow-artifact">renders/</span>
+          <span class="flow-artifact">logs/</span>
+        </div>
+      </div>
+    </div>
+    <div class="flow-step">
+      <div class="flow-num">3</div>
+      <div class="flow-content">
+        <div class="flow-title">씬 스냅샷 추출</div>
+        <div class="flow-body">
+          Isaac Sim 또는 USD에서 <code>SceneSnapshot</code> 생성 (meshes, materials, cameras, lights, poses)
+        </div>
+      </div>
+    </div>
+    <div class="flow-step">
+      <div class="flow-num">4</div>
+      <div class="flow-content">
+        <div class="flow-title">매니페스트 생성 + 번들 저장</div>
+        <div class="flow-body">
+          <code>create_job_manifest()</code> + <code>write_job_bundle()</code> →
+          <span class="flow-artifact">manifest.json</span>
+          <span class="flow-artifact">scene.json</span>
+          <span class="flow-artifact">materials.json</span>
+          <span class="flow-artifact">cameras.json</span>
+          <span class="flow-artifact">lights.json</span>
+        </div>
+      </div>
+    </div>
+    <div class="flow-step">
+      <div class="flow-num">5</div>
+      <div class="flow-content">
+        <div class="flow-title">렌더링</div>
+        <div class="flow-body">
+          <code>load_job_bundle(manifest_path)</code> → Mitsuba 렌더링 → EXR 저장
+        </div>
+      </div>
+    </div>
+    <div class="flow-step">
+      <div class="flow-num">6</div>
+      <div class="flow-content">
+        <div class="flow-title">결과 번들 저장</div>
+        <div class="flow-body">
+          <code>write_observation_bundle_manifest()</code> →
+          <span class="flow-artifact">observation_bundle.json</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+
+<!-- ════════════════ CONVERTER MODULE ════════════════ -->
+<section class="section" id="converter">
+  <div class="section-header">
+    <div class="section-icon" style="background:rgba(52,211,153,0.15)">⚙️</div>
+    <div>
+      <div class="section-title">mitsuba_converter</div>
+      <div class="section-subtitle">USD → Mitsuba 변환 + 멀티모달 렌더링</div>
+    </div>
+  </div>
+
+  <h3>핵심 컴포넌트</h3>
+
+  <div class="type-block">
+    <div class="type-header">
+      <div class="type-name">UsdSceneLoader</div>
+      <div class="type-badge badge-dataclass">class</div>
+      <div style="color:var(--text-dim);font-size:12px">usd_loader.py</div>
+    </div>
+    <div class="type-body">
+      <table>
+        <tr><th>Method</th><th>Return</th><th>Description</th></tr>
+        <tr><td>load()</td><td>SceneIR</td><td>USD 파일에서 SceneIR 추출 (meshes with geometry)</td></tr>
+      </table>
+    </div>
+  </div>
+
+  <div class="type-block">
+    <div class="type-header">
+      <div class="type-name">MitsubaSceneBuilder</div>
+      <div class="type-badge badge-dataclass">class</div>
+      <div style="color:var(--text-dim);font-size:12px">mitsuba_builder.py</div>
+    </div>
+    <div class="type-body">
+      <table>
+        <tr><th>Method</th><th>Return</th><th>Description</th></tr>
+        <tr><td>build(ir: SceneIR)</td><td>Dict</td><td>IR → Mitsuba scene dict (mi.load_dict용)</td></tr>
+        <tr><td>build_snapshot(snapshot, repo_root, ...)</td><td>Dict</td><td>SceneSnapshot에서 직접 빌드</td></tr>
+      </table>
+    </div>
+  </div>
+
+  <div class="type-block">
+    <div class="type-header">
+      <div class="type-name">render_modalities()</div>
+      <div class="type-badge badge-dataclass">function</div>
+      <div style="color:var(--text-dim);font-size:12px">multimodal.py</div>
+    </div>
+    <div class="type-body">
+      <table>
+        <tr><th>Parameter</th><th>Type</th><th>Description</th></tr>
+        <tr><td>scene_dict</td><td>Dict</td><td>Mitsuba scene dictionary</td></tr>
+        <tr><td>modalities</td><td>List[str]</td><td>렌더링할 모달리티 목록</td></tr>
+        <tr><td>config</td><td>RenderConfig</td><td>해상도, SPP 등 설정</td></tr>
+        <tr><td>→</td><td>MultimodalRenderResult</td><td>모달리티별 ModalityResult</td></tr>
+      </table>
+    </div>
+  </div>
+
+  <h3>RenderConfig</h3>
+  <div class="type-block">
+    <div class="type-header">
+      <div class="type-name">RenderConfig</div>
+      <div class="type-badge badge-dataclass">dataclass</div>
+    </div>
+    <div class="type-body">
+      <table>
+        <tr><th>Field</th><th>Default</th><th>Description</th></tr>
+        <tr><td>width</td><td>—</td><td>출력 이미지 폭 (px)</td></tr>
+        <tr><td>height</td><td>—</td><td>출력 이미지 높이 (px)</td></tr>
+        <tr><td>path_spp</td><td>4096</td><td>RGB 경로 추적 샘플 수</td></tr>
+        <tr><td>aov_spp</td><td>16</td><td>AOV (normal, depth, albedo) 샘플 수</td></tr>
+        <tr><td>polar_spp</td><td>256</td><td>Polarization 렌더링 샘플 수</td></tr>
+        <tr><td>path_max_depth</td><td>6</td><td>경로 최대 반사 깊이</td></tr>
+        <tr><td>direct_max_depth</td><td>2</td><td>직접 조명 최대 깊이</td></tr>
+        <tr><td>rr_depth</td><td>8</td><td>Russian roulette 깊이</td></tr>
+      </table>
+    </div>
+  </div>
+
+  <h3>Mitsuba BSDF 지원</h3>
+  <div class="tag-list" style="margin-bottom:16px">
+    <span class="tag">diffuse</span>
+    <span class="tag">plastic</span>
+    <span class="tag">roughplastic</span>
+    <span class="tag">conductor</span>
+    <span class="tag">roughconductor</span>
+    <span class="tag">dielectric</span>
+    <span class="tag">principled</span>
+    <span class="tag green">measured (pbrdf_2020)</span>
+    <span class="tag green">measured_polarized (hpbrdf_2025)</span>
+  </div>
+</section>
+
+
+<!-- ════════════════ DAEMON ════════════════ -->
+<section class="section" id="daemon">
+  <div class="section-header">
+    <div class="section-icon" style="background:rgba(167,139,250,0.15)">🖥️</div>
+    <div>
+      <div class="section-title">Render Daemon (Phase R)</div>
+      <div class="section-subtitle">HTTP 렌더링 서버 + 워커 서브프로세스 관리</div>
+    </div>
+  </div>
+
+  <div class="alert alert-warn">
+    <strong>Phase R 변경사항 (2026-05-22):</strong> 렌더링 로직이 별도의 서브프로세스로 분리되었습니다.
+    각 워커는 GPU 1개를 점유하며 JSONL stdin/stdout으로 통신합니다.
+  </div>
+
+  <h3>WorkerManager</h3>
+  <div class="type-block">
+    <div class="type-header">
+      <div class="type-name">WorkerManager</div>
+      <div class="type-badge badge-dataclass">class</div>
+      <div style="color:var(--text-dim);font-size:12px">worker_manager.py</div>
+    </div>
+    <div class="type-body">
+      <table>
+        <tr><th>Method</th><th>Description</th></tr>
+        <tr><td>start()</td><td>워커 서브프로세스 즉시 생성</td></tr>
+        <tr><td>submit(job_dict)</td><td>렌더 작업 큐에 추가</td></tr>
+        <tr><td>health()</td><td>워커 상태 조회</td></tr>
+        <tr><td>shutdown()</td><td>graceful 종료</td></tr>
+        <tr><td>add_listener(callback)</td><td>이벤트 리스너 등록</td></tr>
+      </table>
+    </div>
+  </div>
+
+  <h3>워커 스레드 구조</h3>
+  <pre><code>WorkerProcess
+├── Thread: writer   → outbound queue → stdin (JSONL)
+├── Thread: reader   → stdout (JSONL) → event dispatcher
+└── Thread: watchdog → heartbeat 모니터 (timeout: 30s)
+                       → kill + restart on timeout
+                       → cooldown: 30s
+                       → 5분 내 3회 비정상 종료 → degraded</code></pre>
+
+  <h3>충돌 정책</h3>
+  <pre><code><span class="cmt"># 워커 종료 시 in-flight 작업 처리</span>
+<span class="cmt"># 실행 중 작업: reason='worker_exited' 로 failed 처리</span>
+<span class="cmt"># 대기 중 작업: reason='worker_restarting' 로 failed 처리</span>
+HEARTBEAT_TIMEOUT_S  = 30.0
+RESTART_COOLDOWN_S   = 30.0
+DEGRADED_WINDOW_S    = 300   <span class="cmt"># 5분</span>
+DEGRADED_MAX_EXITS   = 3</code></pre>
+
+  <h3>시작 방법</h3>
+  <pre><code><span class="cmt"># 기본 실행</span>
+python apps/run_render_daemon.py
+<span class="cmt"># → http://localhost:8001/render</span>
+
+<span class="cmt"># 커스텀 Python/PYTHONPATH (OptiX7 빌드용)</span>
+ENV_WORKER_PYTHON=/alt/python \
+ENV_WORKER_PYTHONPATH=/home/jinnyeong/robomituba-build/mitsuba3/build/python \
+python apps/run_render_daemon.py</code></pre>
+</section>
+
+
+<!-- ════════════════ NAV DATASET ════════════════ -->
+<section class="section" id="navdataset">
+  <div class="section-header">
+    <div class="section-icon" style="background:rgba(245,158,11,0.15)">🗺️</div>
+    <div>
+      <div class="section-title">navigation_dataset</div>
+      <div class="section-subtitle">OpticalNav-v0.1 에피소드 스키마</div>
+    </div>
+  </div>
+
+  <p>로봇 네비게이션 학습을 위한 데이터셋 저작 모듈입니다. 씬 어노테이션, 순회 격자,
+  A* 경로 계획, 지시 템플릿, 데이터셋 내보내기 유틸리티를 제공합니다.</p>
+
+  <div class="tag-list">
+    <span class="tag amber">Episode contracts (JSON)</span>
+    <span class="tag amber">Traversability grids</span>
+    <span class="tag amber">A* planning</span>
+    <span class="tag amber">Instruction templates</span>
+    <span class="tag amber">Dataset export</span>
+    <span class="tag amber">Evaluator utilities</span>
+  </div>
+
+  <div class="alert alert-info">
+    <strong>범위 외 (Phase 2):</strong> Full physics, LiDAR, benchmark-native formats는 포함되지 않습니다.
+  </div>
+</section>
+
+
+<!-- ════════════════ SCENE TYPES ════════════════ -->
+<section class="section" id="types-scene">
+  <div class="section-header">
+    <div class="section-icon" style="background:rgba(52,211,153,0.15)">🗄️</div>
+    <div>
+      <div class="section-title">Scene Types</div>
+      <div class="section-subtitle">robomituba_bridge/types.py — Scene-level dataclasses</div>
+    </div>
+  </div>
+
+  <div class="type-block">
+    <div class="type-header">
+      <div class="type-name">SceneSnapshot</div>
+      <div class="type-badge badge-dataclass">dataclass</div>
+      <div style="color:var(--text-dim);font-size:12px">schema_version: "2.0"</div>
+    </div>
+    <div class="type-body">
+      <table>
+        <tr><th>Field</th><th>Type</th><th>Description</th></tr>
+        <tr><td>scene_id</td><td>str</td><td>고유 씬 식별자</td></tr>
+        <tr><td>frame</td><td>FrameRecord</td><td>프레임 메타데이터</td></tr>
+        <tr><td>meshes</td><td>List[MeshRecord]</td><td>지오메트리 목록</td></tr>
+        <tr><td>materials</td><td>List[MaterialRecord]</td><td>재질 목록</td></tr>
+        <tr><td>cameras</td><td>List[CameraRecord]</td><td>카메라 목록</td></tr>
+        <tr><td>lights</td><td>List[LightRecord]</td><td>조명 목록</td></tr>
+        <tr><td>poses</td><td>List[PoseRecord]</td><td>오브젝트 포즈</td></tr>
+        <tr><td>instancer_mappings</td><td>List[...]</td><td>USD PointInstancer 매핑</td></tr>
+        <tr><td>references</td><td>List[ReferenceRecord]</td><td>외부 에셋 참조</td></tr>
+        <tr><td>extras</td><td>JsonDict</td><td>확장 필드</td></tr>
+      </table>
+    </div>
+  </div>
+
+  <div class="type-block">
+    <div class="type-header">
+      <div class="type-name">MeshRecord</div>
+      <div class="type-badge badge-dataclass">dataclass</div>
+    </div>
+    <div class="type-body">
+      <table>
+        <tr><th>Field</th><th>Type</th><th>Description</th></tr>
+        <tr><td>mesh_id</td><td>str</td><td>고유 메시 식별자</td></tr>
+        <tr><td>name</td><td>str</td><td>프림 이름</td></tr>
+        <tr><td>geometry_path</td><td>str</td><td>OBJ 파일 경로 (repo-relative)</td></tr>
+        <tr><td>material_id</td><td>Optional[str]</td><td>연결된 재질 ID</td></tr>
+        <tr><td>transform</td><td>List[float]</td><td>4×4 변환 행렬 (16 floats)</td></tr>
+        <tr><td>extras</td><td>JsonDict</td><td>geometry payload 등 확장 데이터</td></tr>
+      </table>
+    </div>
+  </div>
+
+  <div class="type-block">
+    <div class="type-header">
+      <div class="type-name">MaterialRecord</div>
+      <div class="type-badge badge-dataclass">dataclass</div>
+    </div>
+    <div class="type-body">
+      <table>
+        <tr><th>Field</th><th>Type</th><th>Description</th></tr>
+        <tr><td>material_id</td><td>str</td><td>고유 재질 식별자</td></tr>
+        <tr><td>name</td><td>str</td><td>재질 이름</td></tr>
+        <tr><td>base_color</td><td>[R,G,B]</td><td>기본 색상</td></tr>
+        <tr><td>roughness</td><td>float</td><td>거칠기 (0~1)</td></tr>
+        <tr><td>metallic</td><td>float</td><td>금속성 (0~1)</td></tr>
+        <tr><td>ior</td><td>float</td><td>굴절률</td></tr>
+        <tr><td>opacity</td><td>float</td><td>불투명도 (0~1)</td></tr>
+        <tr><td>emissive_color</td><td>Optional[...]</td><td>방출 색상</td></tr>
+        <tr><td>texture_path</td><td>Optional[str]</td><td>텍스처 경로 (repo-relative)</td></tr>
+      </table>
+    </div>
+  </div>
+
+  <div class="type-block">
+    <div class="type-header">
+      <div class="type-name">CameraRecord</div>
+      <div class="type-badge badge-dataclass">dataclass</div>
+    </div>
+    <div class="type-body">
+      <table>
+        <tr><th>Field</th><th>Type</th><th>Description</th></tr>
+        <tr><td>camera_id</td><td>str</td><td>고유 카메라 식별자</td></tr>
+        <tr><td>name</td><td>str</td><td>카메라 이름</td></tr>
+        <tr><td>projection</td><td>str</td><td>"perspective" | "orthographic"</td></tr>
+        <tr><td>fov_deg</td><td>float</td><td>수평 FOV (도)</td></tr>
+        <tr><td>resolution</td><td>[W, H]</td><td>해상도 픽셀</td></tr>
+        <tr><td>clip_range</td><td>[near, far]</td><td>클립 거리</td></tr>
+        <tr><td>transform</td><td>List[float]</td><td>4×4 camera-to-world 행렬</td></tr>
+        <tr><td>look_at</td><td>Optional[...]</td><td>target 위치 (대안)</td></tr>
+      </table>
+    </div>
+  </div>
+
+  <div class="type-block">
+    <div class="type-header">
+      <div class="type-name">LightRecord</div>
+      <div class="type-badge badge-dataclass">dataclass</div>
+    </div>
+    <div class="type-body">
+      <table>
+        <tr><th>Field</th><th>Type</th><th>Description</th></tr>
+        <tr><td>light_id</td><td>str</td><td>고유 조명 식별자</td></tr>
+        <tr><td>light_type</td><td>str</td><td>"sphere" | "rect" | "distant" | "dome"</td></tr>
+        <tr><td>color</td><td>[R,G,B]</td><td>색상</td></tr>
+        <tr><td>intensity</td><td>float</td><td>강도</td></tr>
+        <tr><td>exposure</td><td>float</td><td>노출 (EV)</td></tr>
+        <tr><td>radius</td><td>Optional[float]</td><td>sphere light 반지름</td></tr>
+        <tr><td>size</td><td>Optional[[W,H]]</td><td>rect light 크기</td></tr>
+        <tr><td>texture_path</td><td>Optional[str]</td><td>dome light HDR 경로</td></tr>
+        <tr><td>transform</td><td>List[float]</td><td>4×4 변환</td></tr>
+      </table>
+    </div>
+  </div>
+</section>
+
+
+<!-- ════════════════ JOB TYPES ════════════════ -->
+<section class="section" id="types-job">
+  <div class="section-header">
+    <div class="section-icon" style="background:rgba(108,142,247,0.15)">📦</div>
+    <div>
+      <div class="section-title">Job Types</div>
+      <div class="section-subtitle">매니페스트 & 파일 레이아웃</div>
+    </div>
+  </div>
+
+  <div class="type-block">
+    <div class="type-header">
+      <div class="type-name">JobManifest</div>
+      <div class="type-badge badge-dataclass">dataclass</div>
+    </div>
+    <div class="type-body">
+      <table>
+        <tr><th>Field</th><th>Type</th><th>Description</th></tr>
+        <tr><td>job_id</td><td>str</td><td>job-YYYYMMDDTHHMMSSz-hextoken</td></tr>
+        <tr><td>scene_id</td><td>str</td><td>씬 식별자</td></tr>
+        <tr><td>frame_id</td><td>str</td><td>프레임 식별자</td></tr>
+        <tr><td>created_at</td><td>str</td><td>ISO 8601 타임스탬프</td></tr>
+        <tr><td>paths</td><td>JobPaths</td><td>모든 경로 (repo-relative)</td></tr>
+      </table>
+    </div>
+  </div>
+
+  <div class="type-block">
+    <div class="type-header">
+      <div class="type-name">JobPaths</div>
+      <div class="type-badge badge-dataclass">dataclass</div>
+    </div>
+    <div class="type-body">
+      <table>
+        <tr><th>Field</th><th>Example value</th></tr>
+        <tr><td>job_dir</td><td>out/bridge_jobs/job-20260522T120000z-abc123</td></tr>
+        <tr><td>manifest</td><td>out/bridge_jobs/.../manifest.json</td></tr>
+        <tr><td>snapshot_dir</td><td>out/bridge_jobs/.../snapshot/</td></tr>
+        <tr><td>scene_snapshot</td><td>out/bridge_jobs/.../snapshot/scene.json</td></tr>
+        <tr><td>usd_dir</td><td>out/bridge_jobs/.../usd/</td></tr>
+        <tr><td>usd_stage</td><td>out/bridge_jobs/.../usd/stage.usda</td></tr>
+        <tr><td>renders_dir</td><td>out/bridge_jobs/.../renders/</td></tr>
+        <tr><td>logs_dir</td><td>out/bridge_jobs/.../logs/</td></tr>
+      </table>
+    </div>
+  </div>
+
+  <div class="alert alert-warn">
+    <strong>경로 규칙:</strong> 모든 경로는 repo root 기준 상대 경로입니다.
+    절대 경로나 <code>../</code> 상위 탐색은 validation에서 거부됩니다.
+    경로 해석: <code>resolve_repo_path(repo_root, relative_path)</code>
+  </div>
+</section>
+
+
+<!-- ════════════════ RENDER TYPES ════════════════ -->
+<section class="section" id="types-render">
+  <div class="section-header">
+    <div class="section-icon" style="background:rgba(52,211,153,0.15)">🎬</div>
+    <div>
+      <div class="section-title">Render Types</div>
+      <div class="section-subtitle">렌더 요청 & 결과 타입</div>
+    </div>
+  </div>
+
+  <div class="type-block">
+    <div class="type-header">
+      <div class="type-name">RenderRequest</div>
+      <div class="type-badge badge-dataclass">dataclass</div>
+    </div>
+    <div class="type-body">
+      <table>
+        <tr><th>Field</th><th>Type</th><th>Description</th></tr>
+        <tr><td>request_id</td><td>str</td><td>요청 고유 ID</td></tr>
+        <tr><td>job_id</td><td>str</td><td>대응 job ID</td></tr>
+        <tr><td>camera_specs</td><td>List[CameraSpec]</td><td>렌더링할 카메라 목록</td></tr>
+        <tr><td>modalities</td><td>List[str]</td><td>원하는 모달리티 (rgb, depth, ...)</td></tr>
+        <tr><td>render_settings</td><td>Dict</td><td>spp, max_depth 등</td></tr>
+        <tr><td>scene_override</td><td>Optional[SceneOverrideSpec]</td><td>씬 오버라이드</td></tr>
+        <tr><td>assist_light</td><td>Optional[AssistLightSpec]</td><td>보조 광원</td></tr>
+        <tr><td>depth_approx</td><td>Optional[DepthApproxSpec]</td><td>깊이 근사 설정</td></tr>
+      </table>
+    </div>
+  </div>
+
+  <div class="type-block">
+    <div class="type-header">
+      <div class="type-name">CameraSpec</div>
+      <div class="type-badge badge-dataclass">dataclass</div>
+    </div>
+    <div class="type-body">
+      <table>
+        <tr><th>Field</th><th>Type</th><th>Description</th></tr>
+        <tr><td>camera_to_world</td><td>List[float] (16)</td><td>4×4 카메라 변환 행렬</td></tr>
+        <tr><td>fov_deg</td><td>float</td><td>수평 시야각</td></tr>
+        <tr><td>resolution</td><td>[W, H]</td><td>출력 해상도</td></tr>
+        <tr><td>sensor_modality</td><td>str</td><td>"rgb" | "polarized" | "nir"</td></tr>
+        <tr><td>sensor_sync_group</td><td>Optional[str]</td><td>동기화 그룹 ID</td></tr>
+      </table>
+    </div>
+  </div>
+
+  <div class="type-block">
+    <div class="type-header">
+      <div class="type-name">SceneOverrideSpec</div>
+      <div class="type-badge badge-dataclass">dataclass</div>
+    </div>
+    <div class="type-body">
+      <table>
+        <tr><th>Field</th><th>Type</th><th>Description</th></tr>
+        <tr><td>target_shape_filenames</td><td>List[str]</td><td>대상 OBJ 파일명</td></tr>
+        <tr><td>material_profile</td><td>str</td><td>재질 프리셋 이름</td></tr>
+        <tr><td>prim_to_shape_ids</td><td>Dict</td><td>프림→형상 ID 매핑</td></tr>
+        <tr><td>bsdf_overrides</td><td>Dict[str, BsdfOverride]</td><td>형상별 BSDF 오버라이드</td></tr>
+        <tr><td>transform_overrides</td><td>Dict[str, List[float]]</td><td>형상별 변환 오버라이드</td></tr>
+      </table>
+    </div>
+  </div>
+
+  <div class="type-block">
+    <div class="type-header">
+      <div class="type-name">AssistLightSpec</div>
+      <div class="type-badge badge-dataclass">dataclass</div>
+    </div>
+    <div class="type-body">
+      <table>
+        <tr><th>Field</th><th>Type</th><th>Description</th></tr>
+        <tr><td>distance_m</td><td>float</td><td>카메라에서 조명까지 거리 (m) — must &gt; 0</td></tr>
+        <tr><td>size_world</td><td>[W, H]</td><td>조명 크기 (world units) — must &gt; 0</td></tr>
+        <tr><td>spectrum_mode</td><td>str</td><td>"nir" | "white" | "warm_white"</td></tr>
+        <tr><td>polarized</td><td>bool</td><td>편광 조명 여부</td></tr>
+      </table>
+    </div>
+  </div>
+
+  <div class="type-block">
+    <div class="type-header">
+      <div class="type-name">RenderJobStatus</div>
+      <div class="type-badge badge-dataclass">dataclass</div>
+    </div>
+    <div class="type-body">
+      <table>
+        <tr><th>Field</th><th>Type</th><th>Description</th></tr>
+        <tr><td>job_id</td><td>str</td><td>작업 ID</td></tr>
+        <tr><td>status</td><td>str</td><td>"queued" | "running" | "succeeded" | "failed" | "cancelled"</td></tr>
+        <tr><td>progress_stage</td><td>Optional[str]</td><td>현재 처리 단계</td></tr>
+        <tr><td>error_message</td><td>Optional[str]</td><td>실패 시 오류 메시지</td></tr>
+        <tr><td>created_at</td><td>str</td><td>생성 시간 (ISO 8601)</td></tr>
+        <tr><td>started_at</td><td>Optional[str]</td><td>시작 시간</td></tr>
+        <tr><td>finished_at</td><td>Optional[str]</td><td>완료 시간</td></tr>
+      </table>
+    </div>
+  </div>
+
+  <div class="type-block">
+    <div class="type-header">
+      <div class="type-name">ObservationBundleManifest</div>
+      <div class="type-badge badge-dataclass">dataclass</div>
+    </div>
+    <div class="type-body">
+      <table>
+        <tr><th>Field</th><th>Type</th><th>Description</th></tr>
+        <tr><td>bundle_id</td><td>str</td><td>번들 고유 ID</td></tr>
+        <tr><td>job_id</td><td>str</td><td>대응 job ID</td></tr>
+        <tr><td>bundle_root</td><td>str</td><td>번들 루트 디렉터리 (repo-relative)</td></tr>
+        <tr><td>artifacts</td><td>List[RenderArtifactManifest]</td><td>카메라×모달리티별 아티팩트</td></tr>
+        <tr><td>created_at</td><td>str</td><td>ISO 8601 타임스탬프</td></tr>
+      </table>
+    </div>
+  </div>
+</section>
+
+
+<!-- ════════════════ ISAAC TYPES ════════════════ -->
+<section class="section" id="types-isaac">
+  <div class="section-header">
+    <div class="section-icon" style="background:rgba(245,158,11,0.15)">🤖</div>
+    <div>
+      <div class="section-title">Isaac Integration Types</div>
+      <div class="section-subtitle">Isaac Sim 런타임 상태 & 캡처 요청</div>
+    </div>
+  </div>
+
+  <div class="type-block">
+    <div class="type-header">
+      <div class="type-name">IsaacStateSnapshot</div>
+      <div class="type-badge badge-dataclass">dataclass</div>
+    </div>
+    <div class="type-body">
+      <table>
+        <tr><th>Field</th><th>Type</th><th>Description</th></tr>
+        <tr><td>session_id</td><td>str</td><td>Isaac 세션 ID</td></tr>
+        <tr><td>objects</td><td>List[IsaacObjectState]</td><td>오브젝트별 상태</td></tr>
+        <tr><td>robot_state</td><td>Optional[RobotState]</td><td>로봇 관절 상태</td></tr>
+        <tr><td>timestamp</td><td>float</td><td>캡처 시간 (Unix time)</td></tr>
+      </table>
+    </div>
+  </div>
+
+  <div class="type-block">
+    <div class="type-header">
+      <div class="type-name">BsdfOverride</div>
+      <div class="type-badge badge-dataclass">dataclass</div>
+    </div>
+    <div class="type-body">
+      <table>
+        <tr><th>Field</th><th>Type</th><th>Description</th></tr>
+        <tr><td>bsdf_type</td><td>str</td><td>"diffuse" | "conductor" | "principled" | "measured" | ...</td></tr>
+        <tr><td>params</td><td>Dict</td><td>BSDF 타입별 파라미터</td></tr>
+      </table>
+    </div>
+  </div>
+
+  <div class="type-block">
+    <div class="type-header">
+      <div class="type-name">IsaacCaptureRequest</div>
+      <div class="type-badge badge-dataclass">dataclass</div>
+    </div>
+    <div class="type-body">
+      <table>
+        <tr><th>Field</th><th>Type</th><th>Description</th></tr>
+        <tr><td>request_id</td><td>str</td><td>캡처 요청 ID</td></tr>
+        <tr><td>sensors</td><td>List[IsaacSensorSpec]</td><td>사용할 센서 목록</td></tr>
+        <tr><td>modalities</td><td>List[str]</td><td>원하는 모달리티</td></tr>
+        <tr><td>trigger_mode</td><td>str</td><td>"immediate" | "next_frame"</td></tr>
+      </table>
+    </div>
+  </div>
+
+  <div class="type-block">
+    <div class="type-header">
+      <div class="type-name">RobotState</div>
+      <div class="type-badge badge-dataclass">dataclass</div>
+    </div>
+    <div class="type-body">
+      <table>
+        <tr><th>Field</th><th>Type</th><th>Description</th></tr>
+        <tr><td>base_pose</td><td>List[float] (16)</td><td>베이스 4×4 변환</td></tr>
+        <tr><td>joint_names</td><td>List[str]</td><td>관절 이름 목록</td></tr>
+        <tr><td>joint_positions</td><td>List[float]</td><td>관절 각도 (rad)</td></tr>
+        <tr><td>gripper_state</td><td>Optional[float]</td><td>그리퍼 개폐도 (0~1)</td></tr>
+        <tr><td>ee_pose</td><td>Optional[List[float]]</td><td>end-effector 4×4 변환</td></tr>
+      </table>
+    </div>
+  </div>
+</section>
+
+
+<!-- ════════════════ MODALITIES ════════════════ -->
+<section class="section" id="modalities">
+  <div class="section-header">
+    <div class="section-icon" style="background:rgba(108,142,247,0.15)">📸</div>
+    <div>
+      <div class="section-title">Rendering Modalities</div>
+      <div class="section-subtitle">17개 지원 모달리티 (SUPPORTED_MODALITIES)</div>
+    </div>
+  </div>
+
+  <div class="modality-group">
+    <h4>RGB / Illumination</h4>
+    <div class="modality-grid">
+      <div class="modality-item">
+        <div class="modality-name">rgb</div>
+        <div class="modality-desc">경로 추적 RGB 방사조도 (4096 spp)</div>
+      </div>
+      <div class="modality-item">
+        <div class="modality-name">albedo</div>
+        <div class="modality-desc">산란 반사율 근사</div>
+      </div>
+      <div class="modality-item">
+        <div class="modality-name">direct_light_map</div>
+        <div class="modality-desc">직접 조명 (max_depth=2)</div>
+      </div>
+      <div class="modality-item">
+        <div class="modality-name">indirect_light_map</div>
+        <div class="modality-desc">간접 조명 (전체 - 직접)</div>
+      </div>
+      <div class="modality-item">
+        <div class="modality-name">diffuse_map</div>
+        <div class="modality-desc">비유리 BSDF를 확산으로</div>
+      </div>
+      <div class="modality-item">
+        <div class="modality-name">specular_map</div>
+        <div class="modality-desc">정반사 (전체 - 확산)</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="modality-group">
+    <h4>Geometry</h4>
+    <div class="modality-grid">
+      <div class="modality-item">
+        <div class="modality-name">depth</div>
+        <div class="modality-desc">핀홀 카메라 깊이</div>
+      </div>
+      <div class="modality-item">
+        <div class="modality-name">sensor_depth_approx</div>
+        <div class="modality-desc">반사면 프록시 포함 능동 센서 깊이</div>
+      </div>
+      <div class="modality-item">
+        <div class="modality-name">normal</div>
+        <div class="modality-desc">표면 법선 벡터</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="modality-group">
+    <h4>Material</h4>
+    <div class="modality-grid">
+      <div class="modality-item">
+        <div class="modality-name">roughness</div>
+        <div class="modality-desc">재질 거칠기 파라미터</div>
+      </div>
+      <div class="modality-item">
+        <div class="modality-name">metallic</div>
+        <div class="modality-desc">재질 금속성 파라미터</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="modality-group">
+    <h4>Active / Special</h4>
+    <div class="modality-grid">
+      <div class="modality-item">
+        <div class="modality-name">active_nir_intensity</div>
+        <div class="modality-desc">보조 조명 NIR 프록시 렌더링</div>
+      </div>
+      <div class="modality-item">
+        <div class="modality-name">hazard_mask</div>
+        <div class="modality-desc">투명/반사면 이진 마스크</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="modality-group">
+    <h4>Polarization</h4>
+    <div class="modality-grid">
+      <div class="modality-item">
+        <div class="modality-name">polar_rgb_preview</div>
+        <div class="modality-desc">Stokes에서 RGB 미리보기</div>
+      </div>
+      <div class="modality-item">
+        <div class="modality-name">dop</div>
+        <div class="modality-desc">Degree of Polarization</div>
+      </div>
+      <div class="modality-item">
+        <div class="modality-name">aolp</div>
+        <div class="modality-desc">Angle of Linear Polarization</div>
+      </div>
+      <div class="modality-item">
+        <div class="modality-name">s1</div>
+        <div class="modality-desc">Stokes S1 성분</div>
+      </div>
+      <div class="modality-item">
+        <div class="modality-name">s2</div>
+        <div class="modality-desc">Stokes S2 성분</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="alert alert-info">
+    <strong>Polarization 렌더링:</strong> <code>cuda_polarized_spectral</code> 또는
+    <code>llvm_polarized_spectral</code> Mitsuba variant 필요.
+    OptiX 가속이 적용되지 않으므로 별도의 워커 Python 설정이 필요할 수 있습니다.
+  </div>
+</section>
+
+
+<!-- ════════════════ MATERIALS ════════════════ -->
+<section class="section" id="materials">
+  <div class="section-header">
+    <div class="section-icon" style="background:rgba(167,139,250,0.15)">🎨</div>
+    <div>
+      <div class="section-title">Materials & BSDF</div>
+      <div class="section-subtitle">재질 분류 및 측정 BRDF 지원</div>
+    </div>
+  </div>
+
+  <h3>BsdfOverride Types</h3>
+  <div class="type-block">
+    <div class="type-body">
+      <table>
+        <tr><th>bsdf_type</th><th>설명</th><th>주요 파라미터</th></tr>
+        <tr><td>diffuse</td><td>순수 확산 반사</td><td>reflectance [R,G,B]</td></tr>
+        <tr><td>plastic</td><td>플라스틱 (내부 반사)</td><td>diffuse_reflectance, ior</td></tr>
+        <tr><td>roughplastic</td><td>무광 플라스틱</td><td>diffuse_reflectance, roughness, ior</td></tr>
+        <tr><td>conductor</td><td>금속 (copper, gold, Al)</td><td>material preset string</td></tr>
+        <tr><td>roughconductor</td><td>거친 금속</td><td>material, roughness</td></tr>
+        <tr><td>dielectric</td><td>투명 (유리)</td><td>ior</td></tr>
+        <tr><td>principled</td><td>Principled BSDF</td><td>base_color, metallic, roughness, ior</td></tr>
+        <tr><td>measured</td><td>측정 BRDF (pbrdf_2020)</td><td>filename</td></tr>
+        <tr><td>measured_polarized</td><td>편광 BRDF (hpbrdf_2025)</td><td>filename, polarization</td></tr>
+      </table>
+    </div>
+  </div>
+
+  <h3>BRDF 데이터셋</h3>
+  <div class="module-card bridge">
+    <div class="module-name">pbrdf_2020</div>
+    <div class="module-path">data/pbrdf_2020/</div>
+    <div class="module-desc">측정 물리 기반 BRDF 데이터셋. 금속, 플라스틱 등 다양한 재질 포함.</div>
+    <div class="tag-list">
+      <span class="tag">Measured BRDF</span>
+      <span class="tag">Non-polarized</span>
+    </div>
+  </div>
+  <div class="module-card mitsuba">
+    <div class="module-name">hpbrdf_2025</div>
+    <div class="module-path">data/hpbrdf_2025/</div>
+    <div class="module-desc">고해상도 편광 BRDF 측정 데이터. 2025년 새로운 측정 캠페인 데이터.</div>
+    <div class="tag-list">
+      <span class="tag purple">Polarized BRDF</span>
+      <span class="tag purple">High-resolution</span>
+      <span class="tag purple">New 2025</span>
+    </div>
+  </div>
+
+  <h3>재질 프로파일 프리셋</h3>
+  <div class="type-block">
+    <div class="type-body">
+      <table>
+        <tr><th>Profile 이름</th><th>설명</th></tr>
+        <tr><td>glossy_black_lacquer</td><td>광택 검정 래커 마감</td></tr>
+        <tr><td>mirror_black_enamel</td><td>거울 반사 검정 에나멜</td></tr>
+        <tr><td>matte_white_plastic</td><td>무광 흰색 플라스틱</td></tr>
+      </table>
+    </div>
+  </div>
+</section>
+
+
+<!-- ════════════════ DATA FLOW ════════════════ -->
+<section class="section" id="dataflow">
+  <div class="section-header">
+    <div class="section-icon" style="background:rgba(52,211,153,0.15)">🔄</div>
+    <div>
+      <div class="section-title">Data Flow</div>
+      <div class="section-subtitle">Isaac Sim → 렌더링 출력 전체 흐름</div>
+    </div>
+  </div>
+
+  <div class="flow">
+    <div class="flow-step">
+      <div class="flow-num">①</div>
+      <div class="flow-content">
+        <div class="flow-title">Isaac Sim 씬 작성</div>
+        <div class="flow-body">
+          USD 씬 생성 (geometry, materials, lights), 카메라 배치, 로봇 배치.
+          Isaac extension 또는 standalone 스크립트로 내보내기.
+        </div>
+      </div>
+    </div>
+    <div class="flow-step">
+      <div class="flow-num">②</div>
+      <div class="flow-content">
+        <div class="flow-title">SceneSnapshot 추출</div>
+        <div class="flow-body">
+          <code>usd_snapshot.extract_snapshot_from_usd()</code> →
+          <span class="flow-artifact">meshes + OBJ files</span>
+          <span class="flow-artifact">materials.json</span>
+          <span class="flow-artifact">cameras.json</span>
+          <span class="flow-artifact">lights.json</span>
+        </div>
+      </div>
+    </div>
+    <div class="flow-step">
+      <div class="flow-num">③</div>
+      <div class="flow-content">
+        <div class="flow-title">Job Bundle 저장</div>
+        <div class="flow-body">
+          <code>write_job_bundle(layout, manifest, snapshot)</code> →
+          <span class="flow-artifact">out/bridge_jobs/job-.../manifest.json</span>
+          <span class="flow-artifact">snapshot/scene.json</span>
+        </div>
+      </div>
+    </div>
+    <div class="flow-step">
+      <div class="flow-num">④</div>
+      <div class="flow-content">
+        <div class="flow-title">Render Daemon에 요청</div>
+        <div class="flow-body">
+          HTTP POST → RenderRequest (JSON) →
+          WorkerManager.submit() → JSONL to worker subprocess
+        </div>
+      </div>
+    </div>
+    <div class="flow-step">
+      <div class="flow-num">⑤</div>
+      <div class="flow-content">
+        <div class="flow-title">Mitsuba 씬 빌드</div>
+        <div class="flow-body">
+          <code>load_job_bundle()</code> → <code>MitsubaSceneBuilder.build_snapshot()</code> →
+          mi.load_dict(scene_dict)
+        </div>
+      </div>
+    </div>
+    <div class="flow-step">
+      <div class="flow-num">⑥</div>
+      <div class="flow-content">
+        <div class="flow-title">멀티모달 렌더링</div>
+        <div class="flow-body">
+          <code>render_modalities(scene_dict, modalities, config)</code> →
+          Pass 1: RGB (4096 spp) | Pass 2: AOV (16 spp) | Pass 3: Polarization (256 spp)
+        </div>
+      </div>
+    </div>
+    <div class="flow-step">
+      <div class="flow-num">⑦</div>
+      <div class="flow-content">
+        <div class="flow-title">결과 저장</div>
+        <div class="flow-body">
+          <span class="flow-artifact">renders/camera_0/rgb.exr</span>
+          <span class="flow-artifact">depth.exr</span>
+          <span class="flow-artifact">normal.exr</span>
+          <span class="flow-artifact">albedo.exr</span>
+          <span class="flow-artifact">polar_*.exr</span>
+          <span class="flow-artifact">observation_bundle.json</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+
+<!-- ════════════════ APPS ════════════════ -->
+<section class="section" id="apps">
+  <div class="section-header">
+    <div class="section-icon" style="background:rgba(245,158,11,0.15)">🚀</div>
+    <div>
+      <div class="section-title">Applications</div>
+      <div class="section-subtitle">apps/ 디렉터리 렌더링 스크립트</div>
+    </div>
+  </div>
+
+  <div class="type-block">
+    <div class="type-body">
+      <table>
+        <tr><th>스크립트</th><th>용도</th></tr>
+        <tr><td>run_render_daemon.py</td><td>⭐ HTTP 렌더링 서버 시작 (localhost:8001)</td></tr>
+        <tr><td>render_selected_cameras_multimodal.py</td><td>선택 카메라 멀티모달 렌더링</td></tr>
+        <tr><td>render_curated_multimodal.py</td><td>큐레이션 씬 멀티모달 렌더링</td></tr>
+        <tr><td>render_candidate_cameras.py</td><td>후보 카메라 생성 + 렌더링</td></tr>
+        <tr><td>render_reflective_island_frontal_demo.py</td><td>반사면 정면 데모 렌더링</td></tr>
+        <tr><td>render_saved_request_multibranch.py</td><td>저장된 RenderRequest 멀티브랜치</td></tr>
+        <tr><td>make_selected_camera_sheets.py</td><td>카메라 참조 시트 생성</td></tr>
+        <tr><td>visualize_camera_floorplan.py</td><td>평면도에 카메라 시각화</td></tr>
+        <tr><td>bake_curated_previews.py</td><td>재질 미리보기 사전 렌더링</td></tr>
+        <tr><td>isaac_capture_current_view_request.py</td><td>Isaac 실시간 뷰 캡처</td></tr>
+        <tr><td>opticalnav.py</td><td>OpticalNav 데이터셋 유틸리티</td></tr>
+      </table>
+    </div>
+  </div>
+
+  <h3>Isaac Extension (apps/isaac_extension/)</h3>
+  <div class="type-block">
+    <div class="type-body">
+      <table>
+        <tr><th>파일</th><th>역할</th></tr>
+        <tr><td>extension.py</td><td>omni.ext.IExt 진입점, RobomitubaPanel 등록</td></tr>
+        <tr><td>ui_panel.py</td><td>Isaac UI 패널 (Phase R: 개편됨)</td></tr>
+        <tr><td>stage_capture.py</td><td>현재 USD 스테이지 캡처</td></tr>
+        <tr><td>daemon_client.py</td><td>render_daemon HTTP 클라이언트</td></tr>
+        <tr><td>material_override_layer.py</td><td>재질 오버라이드 레이어 관리</td></tr>
+        <tr><td>ranger_mini_stage.py</td><td>Ranger Mini 로봇 스테이지 설정</td></tr>
+        <tr><td>asset_browser.py</td><td>에셋 브라우저</td></tr>
+      </table>
+    </div>
+  </div>
+</section>
+
+
+<!-- ════════════════ HTTP API ════════════════ -->
+<section class="section" id="api">
+  <div class="section-header">
+    <div class="section-icon" style="background:rgba(108,142,247,0.15)">🌐</div>
+    <div>
+      <div class="section-title">HTTP API</div>
+      <div class="section-subtitle">Render Daemon HTTP 엔드포인트 (localhost:8001)</div>
+    </div>
+  </div>
+
+  <div class="alert alert-tip">
+    데몬 시작: <code>python apps/run_render_daemon.py</code> → <code>http://localhost:8001</code>
+  </div>
+
+  <h3>렌더링 요청</h3>
+  <pre><code><span class="cmt"># 렌더 요청</span>
+curl -X POST http://localhost:8001/render \
+  -H "Content-Type: application/json" \
+  -d '{
+    "manifest_path": "out/bridge_jobs/job-abc123/manifest.json",
+    "modalities": ["rgb", "depth", "normal"],
+    "camera_specs": [...]
+  }'
+
+<span class="cmt"># → RenderJobAccepted</span>
+{
+  "job_id": "req-...",
+  "status": "queued",
+  "queue_position": 0
+}</code></pre>
+
+  <h3>상태 조회</h3>
+  <pre><code><span class="cmt"># 작업 상태 확인</span>
+curl http://localhost:8001/jobs/{job_id}
+
+<span class="cmt"># → RenderJobStatus</span>
+{
+  "job_id": "req-...",
+  "status": "running",
+  "progress_stage": "rendering rgb",
+  "started_at": "2026-05-22T12:00:00Z"
+}</code></pre>
+
+  <h3>워커 상태</h3>
+  <pre><code><span class="cmt"># 워커 건강 상태</span>
+curl http://localhost:8001/health
+
+<span class="cmt"># Preview sphere 렌더링</span>
+curl -X POST http://localhost:8001/preview \
+  -H "Content-Type: application/json" \
+  -d '{"bsdf_type": "principled", "params": {...}}'</code></pre>
+
+  <h3>CLI 사용법</h3>
+  <pre><code><span class="cmt"># USD → Mitsuba 변환 및 렌더링</span>
+python -m mitsuba_converter.cli --usd scenes/cornell_box.usd --out out/cornell/
+
+<span class="cmt"># Job manifest 기반 렌더링</span>
+python -m mitsuba_converter.cli render-job \
+  --manifest out/bridge_jobs/job-abc123/manifest.json \
+  --modalities rgb depth normal \
+  --spp 256</code></pre>
+</section>
+
+<!-- Footer -->
+<div style="border-top:1px solid var(--border);margin-top:48px;padding-top:24px;color:var(--text-dim);font-size:12px;text-align:center;">
+  Robomituba Developer Report · Generated 2026-05-27 · /jarvis/project/robomituba
+</div>
+
+</main>
+</div>
+
+<script>
+// Sidebar active link highlight on scroll
+const sections = document.querySelectorAll('.section');
+const navLinks = document.querySelectorAll('.nav-link');
+
+const observer = new IntersectionObserver((entries) => {
+  entries.forEach(entry => {
+    if (entry.isIntersecting) {
+      navLinks.forEach(l => l.classList.remove('active'));
+      const active = document.querySelector(`.nav-link[href="#${entry.target.id}"]`);
+      if (active) active.classList.add('active');
+    }
+  });
+}, { threshold: 0.2, rootMargin: '-80px 0px -60% 0px' });
+
+sections.forEach(s => observer.observe(s));
+
+// Smooth scroll
+document.querySelectorAll('a[href^="#"]').forEach(a => {
+  a.addEventListener('click', e => {
+    e.preventDefault();
+    const t = document.querySelector(a.getAttribute('href'));
+    if (t) t.scrollIntoView({ behavior: 'smooth' });
+  });
+});
+</script>
+</body>
+</html>

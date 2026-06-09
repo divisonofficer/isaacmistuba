@@ -1,0 +1,937 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Dev Report · 2026-06-08 · Hot Camera Preview, Render Monitor, Shared Office Rendering</title>
+<style>
+  :root {
+    --bg:#f4f6fb; --panel:#fff; --sub:#f8fafc; --text:#1f2937; --muted:#64748b;
+    --line:#dbe3ef; --blue:#2563eb; --green:#16a34a; --amber:#d97706; --red:#dc2626; --purple:#7c3aed;
+    --mono:"JetBrains Mono",Consolas,Menlo,monospace; --sans:Inter,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:var(--sans); background:var(--bg); color:var(--text); line-height:1.62; font-size:14px; }
+  .layout { display:flex; min-height:100vh; }
+  aside { width:250px; flex:0 0 250px; position:sticky; top:0; height:100vh; overflow:auto; padding:22px 14px; border-right:1px solid var(--line); background:#eef2f7; }
+  main { width:min(1180px, calc(100vw - 250px)); padding:30px 38px 60px; }
+  .logo { font-weight:800; color:var(--blue); letter-spacing:-.02em; }
+  .date { margin-top:3px; color:var(--muted); font-family:var(--mono); font-size:11px; }
+  .nav-title { margin:22px 8px 7px; color:var(--muted); font-size:10px; text-transform:uppercase; letter-spacing:.12em; font-weight:800; }
+  .nav-link { display:block; padding:6px 8px; border-radius:6px; color:#475569; text-decoration:none; font-size:12px; }
+  .nav-link:hover { color:var(--blue); background:#dbeafe; }
+  .hero, section { background:var(--panel); border:1px solid var(--line); border-radius:12px; box-shadow:0 2px 10px rgba(15,23,42,.04); }
+  .hero { padding:28px 30px; margin-bottom:22px; }
+  h1 { margin:0 0 8px; font-size:25px; letter-spacing:-.04em; line-height:1.22; }
+  h2 { margin:0 0 4px; font-size:18px; letter-spacing:-.02em; }
+  h3 { margin:20px 0 9px; font-size:14px; }
+  section { padding:22px 24px; margin-bottom:18px; }
+  .subtitle { color:#475569; font-size:13px; }
+  .tags { display:flex; flex-wrap:wrap; gap:7px; margin-top:18px; }
+  .tag { border:1px solid #bfdbfe; color:#1d4ed8; background:#eff6ff; padding:3px 9px; border-radius:999px; font-size:11px; font-weight:700; }
+  .tag.green { color:#15803d; background:#f0fdf4; border-color:#bbf7d0; }
+  .tag.amber { color:#b45309; background:#fffbeb; border-color:#fde68a; }
+  .tag.red { color:#b91c1c; background:#fef2f2; border-color:#fecaca; }
+  .tag.purple { color:#6d28d9; background:#f5f3ff; border-color:#ddd6fe; }
+  .grid { display:grid; grid-template-columns:repeat(4,1fr); gap:12px; margin:15px 0; }
+  .card { background:var(--sub); border:1px solid var(--line); border-radius:8px; padding:13px; }
+  .metric { font-size:24px; font-weight:850; color:var(--blue); letter-spacing:-.04em; }
+  .label { color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.08em; font-weight:800; }
+  .note { color:#475569; font-size:12px; margin-top:4px; }
+  table { width:100%; border-collapse:collapse; margin:13px 0 18px; font-size:13px; }
+  th { text-align:left; background:#eff6ff; color:#475569; font-size:11px; text-transform:uppercase; letter-spacing:.06em; }
+  th, td { padding:9px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:var(--mono); font-size:12px; }
+  code { background:#eef2ff; padding:1px 5px; border-radius:4px; }
+  pre { background:#0f172a; color:#dbeafe; border-radius:8px; padding:13px 14px; overflow:auto; line-height:1.55; }
+  .alert { border-left:4px solid var(--amber); background:#fffbeb; padding:12px 14px; border-radius:8px; margin:12px 0; }
+  .alert.red { border-color:var(--red); background:#fef2f2; }
+  .alert.green { border-color:var(--green); background:#f0fdf4; }
+  .flow { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin:14px 0; }
+  .step { border:1px solid var(--line); background:var(--sub); border-radius:7px; padding:7px 10px; font-weight:750; font-size:12px; }
+  .arrow { color:var(--muted); }
+  .figure-grid { display:grid; grid-template-columns:1.15fr .85fr; gap:14px; margin:16px 0 18px; align-items:start; }
+  figure { margin:0; background:var(--sub); border:1px solid var(--line); border-radius:10px; overflow:hidden; }
+  figure img { display:block; width:100%; height:auto; }
+  figcaption { padding:9px 11px; color:#475569; font-size:12px; border-top:1px solid var(--line); }
+  .mode-grid { display:grid; grid-template-columns:repeat(3,1fr); gap:12px; margin:15px 0 18px; }
+  .mode-card { background:var(--sub); border:1px solid var(--line); border-radius:10px; padding:14px; }
+  .mode-title { font-weight:850; color:#1d4ed8; margin-bottom:6px; }
+  .mode-card:nth-child(2) .mode-title { color:#15803d; }
+  .mode-card:nth-child(3) .mode-title { color:#7c3aed; }
+  .quote { border-left:4px solid var(--blue); background:#eff6ff; padding:12px 14px; border-radius:8px; margin:12px 0; font-weight:750; }
+  .visual-panel { border:1px solid var(--line); background:linear-gradient(180deg,#f8fafc 0%,#eef6ff 100%); border-radius:12px; padding:16px; margin:16px 0 20px; }
+  .visual-title { font-weight:850; letter-spacing:-.02em; margin-bottom:4px; }
+  .visual-subtitle { color:#64748b; font-size:12px; margin-bottom:14px; }
+  .visual-split { display:grid; grid-template-columns:1fr 44px 1fr 44px 1fr; gap:10px; align-items:stretch; }
+  .visual-box { background:#fff; border:1px solid #cbd5e1; border-radius:10px; padding:13px; min-height:128px; box-shadow:0 2px 8px rgba(15,23,42,.04); }
+  .visual-box.texture { border-color:#93c5fd; }
+  .visual-box.brdf { border-color:#86efac; }
+  .visual-box.output { border-color:#c4b5fd; }
+  .visual-label { font-size:11px; font-weight:850; text-transform:uppercase; letter-spacing:.08em; color:#64748b; margin-bottom:6px; }
+  .visual-main { font-size:17px; font-weight:850; color:#1f2937; line-height:1.25; margin-bottom:8px; }
+  .visual-arrow { display:flex; align-items:center; justify-content:center; color:#2563eb; font-size:24px; font-weight:900; }
+  .chips { display:flex; flex-wrap:wrap; gap:6px; }
+  .chip { border:1px solid #dbe3ef; border-radius:999px; padding:2px 7px; background:#f8fafc; font-size:11px; color:#475569; font-weight:700; }
+  .chip.blue { color:#1d4ed8; background:#eff6ff; border-color:#bfdbfe; }
+  .chip.green { color:#15803d; background:#f0fdf4; border-color:#bbf7d0; }
+  .chip.purple { color:#6d28d9; background:#f5f3ff; border-color:#ddd6fe; }
+  .router { display:grid; grid-template-columns:1.1fr .9fr; gap:14px; align-items:start; }
+  .router-left, .router-right { display:grid; gap:10px; }
+  .router-node { border:1px solid #cbd5e1; background:#fff; border-radius:10px; padding:12px 13px; }
+  .router-node.policy { border-color:#fcd34d; background:#fffbeb; }
+  .router-node.rgb { border-color:#93c5fd; }
+  .router-node.optical { border-color:#86efac; }
+  .router-node.hybrid { border-color:#c4b5fd; }
+  .router-node-title { font-weight:850; margin-bottom:4px; }
+  .slot-diagram { display:grid; grid-template-columns:1fr 44px 1.3fr; gap:10px; align-items:stretch; }
+  .object-card { background:#fff; border:1px solid #fecaca; border-radius:10px; padding:13px; }
+  .slot-card { background:#fff; border:1px solid #bbf7d0; border-radius:10px; padding:13px; }
+  .slot-list { display:grid; gap:8px; margin-top:8px; }
+  .slot-row { display:grid; grid-template-columns:120px 1fr; gap:8px; align-items:center; border:1px solid #e2e8f0; border-radius:8px; padding:7px 8px; background:#f8fafc; }
+  .slot-name { font-weight:850; color:#334155; }
+  .small { font-size:12px; color:var(--muted); }
+  .footer { color:var(--muted); text-align:center; margin-top:34px; font-size:12px; }
+  @media (max-width:900px) {
+    .layout{display:block} aside{position:relative;width:auto;height:auto} main{width:auto;padding:20px}
+    .grid,.figure-grid,.mode-grid,.visual-split,.router,.slot-diagram{grid-template-columns:1fr}
+    .visual-arrow{min-height:24px}
+  }
+</style>
+</head>
+<body>
+<div class="layout">
+<aside>
+  <div class="logo">Robomituba</div>
+  <div class="date">2026-06-08</div>
+  <div class="small">Hot camera preview · render monitor · shared office scene</div>
+
+  <div class="nav-title">요약</div>
+  <a class="nav-link" href="#summary">오늘의 결론</a>
+  <a class="nav-link" href="#timeline">작업 흐름</a>
+  <a class="nav-link" href="#current-state">현재 상태</a>
+
+  <div class="nav-title">핵심 작업</div>
+  <a class="nav-link" href="#hot-camera">Hot Camera Preview</a>
+  <a class="nav-link" href="#render-monitor">Render Monitor</a>
+  <a class="nav-link" href="#sync">Save / Sync 안정화</a>
+  <a class="nav-link" href="#office">공유오피스 씬</a>
+
+  <div class="nav-title">렌더 파이프라인</div>
+  <a class="nav-link" href="#mesh">Mesh materialization</a>
+  <a class="nav-link" href="#material">Material / texture 진단</a>
+  <a class="nav-link" href="#material-policy">Material policy 개선 계획</a>
+
+  <div class="nav-title">오후 진행</div>
+  <a class="nav-link" href="#xml-native">Editor mesh preview (XML-native)</a>
+  <a class="nav-link" href="#episode-nodes">Episode path-only sweep</a>
+  <a class="nav-link" href="#ws-jobstatus">Job status WebSocket 전환</a>
+  <a class="nav-link" href="#partial-export">부분 sweep 결과만 export</a>
+
+  <a class="nav-link" href="#remaining">남은 이슈</a>
+</aside>
+
+<main>
+  <div class="hero">
+    <div class="date">Daily Development Report · 2026-06-08</div>
+    <h1>Hot Camera Preview와 Render Monitor가 붙고, 공유오피스 씬이 Mitsuba 렌더까지 도달하기 시작했다</h1>
+    <div class="subtitle">
+      오늘 작업의 중심은 dataset editor를 실제 렌더 저작 도구로 쓰기 위한 흐름 정리였다.
+      preview camera를 viewpoint graph에서 분리했고, 하단 job 패널을 render monitor로 재구성했으며,
+      shared office floor seed scene에서 mesh/cache/material 경로를 실제 렌더 결과 기준으로 추적했다.
+      오후에는 editor가 실제 렌더 mesh를 보여주는 XML-native preview, episode path만 sweep하는 새 렌더 모드,
+      4초 폴링을 대체하는 job status WebSocket, 그리고 부분 sweep 결과만 export하는 흐름까지 붙였다.
+    </div>
+    <div class="tags">
+      <span class="tag green">rendering visible</span>
+      <span class="tag">hot camera preview</span>
+      <span class="tag">preview job history</span>
+      <span class="tag">render monitor</span>
+      <span class="tag">dataset log sync</span>
+      <span class="tag">shared_office_floor_001</span>
+      <span class="tag amber">mesh cache / fallback audit</span>
+      <span class="tag red">material texture mismatch</span>
+      <span class="tag amber">RGB texture + measured optical</span>
+      <span class="tag purple">XML-native editor preview</span>
+      <span class="tag purple">episode_nodes render mode</span>
+      <span class="tag purple">/ws/job-status</span>
+      <span class="tag purple">partial export</span>
+    </div>
+  </div>
+
+  <section id="summary">
+    <h2>오늘의 결론</h2>
+    <div class="grid">
+      <div class="card">
+        <div class="label">Preview flow</div>
+        <div class="metric">분리</div>
+        <div class="note">graph viewpoint sweep에서 임시 hot camera preview 흐름을 분리했다.</div>
+      </div>
+      <div class="card">
+        <div class="label">Bottom panel</div>
+        <div class="metric">3 tabs</div>
+        <div class="note">Overview / Jobs / Logs render monitor 구조로 재편했다.</div>
+      </div>
+      <div class="card">
+        <div class="label">Office scene</div>
+        <div class="metric">v1</div>
+        <div class="note"><code>shared_office_floor_001</code> seed scene을 렌더 검증 대상으로 세웠다.</div>
+      </div>
+      <div class="card">
+        <div class="label">Main risk</div>
+        <div class="metric">BRDF</div>
+        <div class="note">mesh는 보이기 시작했지만 material/texture 매칭은 아직 부정확하다.</div>
+      </div>
+      <div class="card">
+        <div class="label">Editor mesh preview</div>
+        <div class="metric">XML-native</div>
+        <div class="note">editor가 <code>xml_scene_index.json</code> 기반으로 mesh_cache OBJ를 직접 표시한다.</div>
+      </div>
+      <div class="card">
+        <div class="label">Render mode</div>
+        <div class="metric">episode_nodes</div>
+        <div class="note">선택된 episode의 path_nodes만 sweep하는 모드를 추가했다.</div>
+      </div>
+      <div class="card">
+        <div class="label">Job status</div>
+        <div class="metric">WS push</div>
+        <div class="note">4초 폴링 × N batch → <code>/ws/job-status</code> 한 connection으로.</div>
+      </div>
+      <div class="card">
+        <div class="label">Export</div>
+        <div class="metric">filtered</div>
+        <div class="note">렌더된 episode만 <code>dataset.json</code>/<code>splits/*.json</code>에 등재한다.</div>
+      </div>
+    </div>
+    <div class="alert green">
+      중요한 진전은 이제 렌더링이 더 이상 추상적인 API 상태가 아니라, editor에서 배치한 office object가
+      Mitsuba 결과 이미지로 확인되는 단계까지 왔다는 점이다. 렌더가 되는 상태가 되었기 때문에,
+      이제 문제는 "안 돈다"가 아니라 "어떤 mesh/material/source가 실제 XML에 들어갔는가"로 좁혀졌다.
+    </div>
+  </section>
+
+  <section id="timeline">
+    <h2>작업 흐름</h2>
+    <table>
+      <tr><th>영역</th><th>오늘 정리한 내용</th><th>결과</th></tr>
+      <tr>
+        <td>Preview render</td>
+        <td>기존 Render Probe를 viewpoint graph/grid에 묶지 않고, click + drag로 위치와 yaw를 지정하는 hot camera preview로 재정의했다.</td>
+        <td><span class="tag green">방향 확정</span></td>
+      </tr>
+      <tr>
+        <td>Camera rig</td>
+        <td>Preview camera가 별도 임의 spec을 만들지 않고 active Robot Camera Rig sensor의 FOV, resolution, modality, render settings를 사용하도록 정리했다.</td>
+        <td><span class="tag green">sweep과 일관화</span></td>
+      </tr>
+      <tr>
+        <td>Job visibility</td>
+        <td>preview result가 3D frustum texture와 Dataset Job 패널 양쪽에서 추적되도록 render metadata와 UI 흐름을 맞췄다.</td>
+        <td><span class="tag green">추적성 개선</span></td>
+      </tr>
+      <tr>
+        <td>Bottom panel</td>
+        <td>기존 진행률, grid, detail, log가 섞인 패널을 Overview / Jobs / Logs 구조로 나누고, right drawer detail 패턴을 도입했다.</td>
+        <td><span class="tag green">정보 구조 개선</span></td>
+      </tr>
+      <tr>
+        <td>Dataset logs</td>
+        <td>Dataset viewer가 job log의 <code>entries</code>를 찾던 문제를 Jobs 페이지와 같은 <code>{ lines: [...] }</code> 응답 기준으로 맞췄다.</td>
+        <td><span class="tag green">동기화 원인 파악</span></td>
+      </tr>
+      <tr>
+        <td>Shared office scene</td>
+        <td>공유오피스 한 층 seed scene, asset coverage, MooreLane/DTC 후보, office material mapping을 검증 대상으로 올렸다.</td>
+        <td><span class="tag amber">렌더 품질 검증 중</span></td>
+      </tr>
+    </table>
+  </section>
+
+  <section id="current-state">
+    <h2>현재 상태</h2>
+    <div class="flow">
+      <div class="step">Editor authoring</div><div class="arrow">→</div>
+      <div class="step">authoring_map.json</div><div class="arrow">→</div>
+      <div class="step">render sync</div><div class="arrow">→</div>
+      <div class="step">render_scene.xml</div><div class="arrow">→</div>
+      <div class="step">hot camera / sweep</div><div class="arrow">→</div>
+      <div class="step">Mitsuba image</div>
+    </div>
+    <p>
+      오늘 기준으로 editor에서 배치한 공유오피스 오브젝트가 Mitsuba 렌더 결과에 보이는 흐름은 살아났다.
+      특히 MooreLane 출신 chair/table/storage mesh는 fallback box가 아니라 실제 mesh로 도달하는 케이스가 확인되었다.
+      다만 시각적으로는 텍스처가 빠진 검은 물체처럼 보이는 문제가 남아 있으며, 이는 geometry보다 material binding 쪽 문제로 좁혀졌다.
+    </p>
+    <div class="figure-grid">
+      <figure>
+        <img src="images/0608_capture_shared_office_rendered.png" alt="Mitsuba render result for shared_office_floor_001">
+        <figcaption>
+          Mitsuba preview render. MooreLane 계열 table/chair/storage mesh는 렌더 이미지까지 도달했지만,
+          material binding은 아직 어둡고 단조로운 measured BRDF 중심으로 보인다.
+        </figcaption>
+      </figure>
+      <figure>
+        <img src="images/0608_capture_shared_office_editor_view.png" alt="3D editor view of shared_office_floor_001">
+        <figcaption>
+          Dataset editor view. 공유오피스 floor shell, graph viewpoints, camera frustums, office object 배치가 한 화면에서 확인된다.
+        </figcaption>
+      </figure>
+    </div>
+  </section>
+
+  <section id="hot-camera">
+    <h2>Hot Camera Preview</h2>
+    <table>
+      <tr><th>문제</th><th>정리된 방향</th></tr>
+      <tr>
+        <td>preview render를 하려면 graph/grid viewpoint를 만들어야 해서 빠른 시점 확인이 어려웠다.</td>
+        <td>임시 preview camera를 graph에 저장하지 않고, 3D view의 click + drag pose로 custom preview sweep을 보낸다.</td>
+      </tr>
+      <tr>
+        <td>Preview 탭과 "preview from here" 기능이 따로 놀았다.</td>
+        <td>"preview from here"가 Preview 탭의 hot camera 상태로 이어지도록 기능 흐름을 합치는 방향으로 정리했다.</td>
+      </tr>
+      <tr>
+        <td>preview camera가 하나뿐이라 새 위치를 찍으면 이전 history가 사라졌다.</td>
+        <td>preview camera를 단일 mutable state가 아니라 preview object/job history로 남기는 모델이 필요하다는 결론을 냈다.</td>
+      </tr>
+      <tr>
+        <td>프러스텀이 panorama render plane처럼 보여 실제 rig FOV와 맞지 않았다.</td>
+        <td>active rig sensor의 intrinsics, FOV, resolution aspect로 frustum을 계산해야 한다.</td>
+      </tr>
+      <tr>
+        <td>숨겨진 heading plane이 클릭되는 문제가 있었다.</td>
+        <td>raycast 후보에서 visible mesh/group만 선택되도록 click filter를 강화하는 방향으로 정리했다.</td>
+      </tr>
+    </table>
+  </section>
+
+  <section id="render-monitor">
+    <h2>Dataset Bottom Panel Render Monitor</h2>
+    <p>
+      하단 패널은 단순 collapse panel이 아니라 렌더 job을 계속 추적하는 monitor로 역할이 바뀌었다.
+      graph sweep, episode render, hot camera preview가 같은 패널에서 섞이면서 grid만으로는 표현이 불가능해졌기 때문이다.
+    </p>
+    <table>
+      <tr><th>컴포넌트</th><th>책임</th></tr>
+      <tr><td><code>RenderSummaryBar</code></td><td>batch 종류, progress, running/queued/failed, 주요 액션 요약.</td></tr>
+      <tr><td><code>RenderBottleneckBanner</code></td><td>현재 stage, 실패/대기 원인, cache/texture/GPU 상태 요약.</td></tr>
+      <tr><td><code>SweepJobGrid</code></td><td><code>graph_sweep</code> 전용 viewpoint x heading grid.</td></tr>
+      <tr><td><code>GenericJobList</code></td><td>episode render와 preview render처럼 grid가 아닌 job 목록 표시.</td></tr>
+      <tr><td><code>JobDetailDrawer</code></td><td>job id, status, sensor/modality, timeline, preview image, raw log 표시.</td></tr>
+      <tr><td><code>LogViewer</code></td><td>Batch / Selected Job / UI source와 error/warn/info/search filter 처리.</td></tr>
+    </table>
+    <div class="alert">
+      겹쳐 보이던 preview render 창 문제는 bottom panel과 right drawer의 z-index, width, scroll containment가
+      독립적으로 잡혀야 하는 UI layout 문제로 확인되었다. 기능 분리는 맞지만 panel composition polish가 더 필요하다.
+    </div>
+  </section>
+
+  <section id="sync">
+    <h2>Save / Sync 안정화</h2>
+    <table>
+      <tr><th>증상</th><th>원인 해석</th><th>상태</th></tr>
+      <tr>
+        <td>Save Map 직후 success처럼 보이다가 나중에 async failed로 바뀜.</td>
+        <td>render sync와 Isaac sync/readiness가 서로 다른 비동기 상태인데 UI가 하나의 success/fail처럼 보여주고 있었다.</td>
+        <td><span class="tag amber">상태 분리 필요</span></td>
+      </tr>
+      <tr>
+        <td>그 사이 render request를 보내면 정상 렌더가 됨.</td>
+        <td>Mitsuba render scene sync는 이미 성공했고, 뒤늦게 실패하는 것은 Isaac 또는 별도 readiness 축일 가능성이 크다.</td>
+        <td><span class="tag green">원인 구분</span></td>
+      </tr>
+      <tr>
+        <td>hard reload 후 회전/맵 크기 변경이 초기화됨.</td>
+        <td>저장된 authoring map보다 XML comment/fallback 또는 seed default를 우선하는 load path가 남아 있던 문제로 봤다.</td>
+        <td><span class="tag green">canonical map 우선 필요</span></td>
+      </tr>
+    </table>
+    <p>
+      이 문제는 "저장이 안 됨"이 아니라 "저장된 canonical source와 UI load/sync source가 일관되지 않음"으로 보는 것이 정확하다.
+      앞으로는 Render synced, Isaac pending, Dataset graph stale을 같은 문장으로 섞지 않고 별도 readiness로 보여줘야 한다.
+    </p>
+  </section>
+
+  <section id="office">
+    <h2>공유오피스 씬</h2>
+    <p>
+      목표 씬은 현대적인 공유오피스 한 층이다. 유리벽 회의실, 오픈 데스크, 라운지, 복도, 반사 표면,
+      천장 조명, 사무용 소품 밀도가 모두 필요하다. 오늘은 이를 위해 asset coverage와 seed scene을 세웠다.
+    </p>
+    <table>
+      <tr><th>카테고리</th><th>현재 사용 가능</th><th>부족한 부분</th></tr>
+      <tr><td>Shell</td><td>floor, wall, ceiling, glass wall, mirror wall, traversable region.</td><td>상용급 office layout variation.</td></tr>
+      <tr><td>Furniture</td><td>MooreLane table/chair/storage 후보, 일부 DTC office 후보.</td><td>책상/의자/수납장의 실제 office-domain asset 품질.</td></tr>
+      <tr><td>Electronics</td><td>keyboard, mouse, speaker, calculator, monitor placeholder.</td><td>프린터/복합기, 노트북, 전화기, 케이블/소품.</td></tr>
+      <tr><td>Safety</td><td>fire alarm 계열 후보, placeholder.</td><td>실제 소화기 mesh.</td></tr>
+      <tr><td>Materials</td><td>clear glass, frosted glass, mirror, pBRDF/hpBRDF measured library.</td><td>목재, 패브릭, 고무, 종이, 도장 금속 같은 사무실 재질 다양성.</td></tr>
+    </table>
+  </section>
+
+  <section id="mesh">
+    <h2>Mesh Materialization</h2>
+    <pre>Office object source paths
+  MooreLane USD prim / exported OBJ
+    → mesh_cache OBJ
+    → render_scene.xml obj shape
+
+  DTC GLB
+    → trimesh materialize
+    → glb_obj_cache OBJ
+    → render_scene.xml obj shape or fallback cube
+
+  Primitive / placeholder
+    → cube fallback
+    → proxy size must match editor intent</pre>
+    <table>
+      <tr><th>관찰</th><th>해석</th></tr>
+      <tr>
+        <td>초기에는 chair/table/speaker 등이 fallback box로 보였다.</td>
+        <td>mesh-cache 404, GLB materialization 실패, stale render_scene.xml, source_ref 절대/상대 경로 혼합이 겹쳐 있었다.</td>
+      </tr>
+      <tr>
+        <td>새로고침 후 맵 바깥으로 나간 mesh가 돌아왔다.</td>
+        <td>MooreLane mesh가 원래 전역 좌표를 들고 들어온 것처럼 보였으나, 실제로는 editor/session/cache state와 scene load order 영향이 컸다.</td>
+      </tr>
+      <tr>
+        <td>Office storage sideboard 이동이 벽에 막히는 듯 보였다.</td>
+        <td>mesh 두께보다 map W/H가 6 x 4로 강제되어 이동 영역이 작게 잡힌 것이 직접 원인이었다. 실제 office map은 14 x 8에 가깝다.</td>
+      </tr>
+      <tr>
+        <td>fallback box 크기가 실제 DTC object보다 과하게 컸다.</td>
+        <td>asset-native bounds 또는 metadata proxy size가 fallback geometry에 일관되게 반영되지 않는 문제가 남아 있다.</td>
+      </tr>
+    </table>
+  </section>
+
+  <section id="material">
+    <h2>Material / Texture 진단</h2>
+    <div class="alert red">
+      현재 가장 큰 품질 병목은 mesh가 아니라 material이다.
+      office object가 실제 텍스처를 쓰는 것이 아니라, coarse taxonomy가 고른 measured BSDF 하나로 통째로 렌더되는 경향이 강하다.
+      그래서 렌더 결과가 검은색 플라스틱/당구공/PEEK처럼 어둡고 단조롭게 보인다.
+    </div>
+    <table>
+      <tr><th>원인</th><th>세부 내용</th></tr>
+      <tr>
+        <td>Coarse material mapping</td>
+        <td>desk/table/storage는 <code>pbrdf_2020:peek</code>, chair는 <code>hpbrdf_2025:black_rough_plastic</code>, electronics는 <code>pbrdf_2020:black_billiard</code>처럼 하드코딩되어 있다.</td>
+      </tr>
+      <tr>
+        <td>Source texture 미반영</td>
+        <td>MooreLane OBJ/MTL에는 base color texture가 있지만 현재 생성 XML/materialization audit에는 source material/texture metadata가 비어 있었다.</td>
+      </tr>
+      <tr>
+        <td>GLB material loss</td>
+        <td>DTC GLB는 OBJ geometry cache로 변환되면서 내부 PBR material/texture가 cache metadata와 BSDF 생성 경로에 보존되지 않는다.</td>
+      </tr>
+      <tr>
+        <td>hpBRDF channel behavior</td>
+        <td>scene render에서 channel-split hpBRDF가 RGB composite이 아니라 특정 wavelength placeholder처럼 쓰일 수 있다.</td>
+      </tr>
+      <tr>
+        <td>Dataset overlap</td>
+        <td><code>white_billiard</code>처럼 pBRDF/hpBRDF 이름이 겹치면 의도치 않게 hpBRDF channel path로 대체되는 케이스가 있다.</td>
+      </tr>
+    </table>
+    <p>
+      결론적으로 현재 렌더가 어두운 것은 조명만의 문제가 아니다. 오브젝트에 office-domain material이 붙은 것이 아니라
+      제한된 measured material library에서 가까운 이름의 어두운 재질이 object-level override로 들어간 것이 더 큰 원인이다.
+    </p>
+  </section>
+
+  <section id="material-policy">
+    <h2>Material Policy 개선 계획 · 발표용 요약</h2>
+    <div class="quote">
+      Texture는 "공간적으로 어디가 어떤 색/패턴인가"를 말하고,
+      BRDF는 "그 재질이 빛을 어떤 각도, 파장, 편광 상태로 반사/투과하는가"를 말한다.
+      두 정보는 같지 않으므로 하나로 덮어쓰면 office scene 품질이 망가진다.
+    </div>
+    <p>
+      현재 문제는 hpBRDF/pBRDF를 쓰는 것 자체가 아니라, object 하나에 measured BRDF 하나를 통째로 꽂으면서
+      USD/GLB/OBJ가 갖고 있던 native texture와 material slot 정보를 잃는 데 있다.
+      v1에서는 단일 material mode로 해결하려 하지 않고, RGB appearance와 optical cue를 분리해서 다룬다.
+    </p>
+
+    <div class="visual-panel">
+      <div class="visual-title">Slide 1 · Texture와 BRDF는 서로 다른 정보</div>
+      <div class="visual-subtitle">RGB appearance와 optical response를 같은 재질 필드로 덮어쓰면 공유오피스 씬이 검고 단조롭게 무너진다.</div>
+      <div class="visual-split">
+        <div class="visual-box texture">
+          <div class="visual-label">Texture / Appearance</div>
+          <div class="visual-main">공간 패턴과 색</div>
+          <div class="chips">
+            <span class="chip blue">base color</span>
+            <span class="chip blue">roughness map</span>
+            <span class="chip blue">normal map</span>
+            <span class="chip blue">opacity</span>
+          </div>
+        </div>
+        <div class="visual-arrow">+</div>
+        <div class="visual-box brdf">
+          <div class="visual-label">BRDF / Optical model</div>
+          <div class="visual-main">각도, 파장, 편광 응답</div>
+          <div class="chips">
+            <span class="chip green">hpBRDF</span>
+            <span class="chip green">pBRDF</span>
+            <span class="chip green">glass</span>
+            <span class="chip green">mirror / metal</span>
+          </div>
+        </div>
+        <div class="visual-arrow">→</div>
+        <div class="visual-box output">
+          <div class="visual-label">Dataset output</div>
+          <div class="visual-main">보기 좋은 RGB + 의미 있는 optical cue</div>
+          <div class="chips">
+            <span class="chip purple">rgb_native</span>
+            <span class="chip purple">nir_measured</span>
+            <span class="chip purple">polarization</span>
+            <span class="chip purple">hazard cue</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <h3>3개 재질 모드</h3>
+    <div class="mode-grid">
+      <div class="mode-card">
+        <div class="mode-title">1. Appearance-preserving</div>
+        <div class="small">RGB beauty render용.</div>
+        <p>원본 USD/GLB/OBJ의 base color texture, roughness, normal, opacity, metallic 값을 최대한 보존한다.</p>
+      </div>
+      <div class="mode-card">
+        <div class="mode-title">2. Optical-measured</div>
+        <div class="small">NIR / polarization / hazard cue용.</div>
+        <p>hpBRDF, pBRDF, physical glass/mirror/metal BSDF를 우선 사용해 파장/편광/각도 응답을 살린다.</p>
+      </div>
+      <div class="mode-card">
+        <div class="mode-title">3. Hybrid</div>
+        <div class="small">중기 목표.</div>
+        <p>texture를 공간 modulation으로 쓰고 measured BRDF를 optical response로 쓰는 근사 모드다.</p>
+      </div>
+    </div>
+
+    <div class="visual-panel">
+      <div class="visual-title">Slide 2 · Material Policy Router</div>
+      <div class="visual-subtitle">한 scene에서 출력 modality에 따라 다른 material interpretation을 선택한다.</div>
+      <div class="router">
+        <div class="router-left">
+          <div class="router-node">
+            <div class="router-node-title">Asset-native material slots</div>
+            <div class="small">USD material binding · OBJ MTL · GLB PBR texture slots · material hints</div>
+          </div>
+          <div class="router-node policy">
+            <div class="router-node-title">Policy router</div>
+            <div class="small">render purpose와 material class를 보고 appearance / optical / hybrid 경로를 선택한다.</div>
+          </div>
+        </div>
+        <div class="router-right">
+          <div class="router-node rgb">
+            <div class="router-node-title">RGB beauty</div>
+            <div class="chips">
+              <span class="chip blue">native texture</span>
+              <span class="chip blue">textured roughplastic</span>
+              <span class="chip blue">opacity</span>
+            </div>
+          </div>
+          <div class="router-node optical">
+            <div class="router-node-title">NIR / Polarization</div>
+            <div class="chips">
+              <span class="chip green">hpBRDF</span>
+              <span class="chip green">pBRDF</span>
+              <span class="chip green">physical BSDF</span>
+            </div>
+          </div>
+          <div class="router-node hybrid">
+            <div class="router-node-title">Hybrid, later</div>
+            <div class="chips">
+              <span class="chip purple">texture modulation</span>
+              <span class="chip purple">measured response</span>
+              <span class="chip purple">approximate metadata</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <h3>v1 기본 정책</h3>
+    <table>
+      <tr><th>출력 / 목적</th><th>우선 재질</th><th>이유</th></tr>
+      <tr>
+        <td>RGB beauty</td>
+        <td>Native texture + textured roughplastic / principled proxy</td>
+        <td>공유오피스가 검은 PEEK/black billiard 덩어리처럼 보이는 문제를 먼저 줄인다.</td>
+      </tr>
+      <tr>
+        <td>NIR / polarization</td>
+        <td>Measured hpBRDF/pBRDF + physical glass/mirror/metal</td>
+        <td>연구 핵심인 optical cue는 texture보다 물리 응답과 센서 채널 일관성이 중요하다.</td>
+      </tr>
+      <tr>
+        <td>Hybrid render</td>
+        <td>Texture albedo modulation x measured BRDF</td>
+        <td>RGB 공간 패턴과 measured angular/spectral/polarization response를 함께 쓰되, approximate로 명시한다.</td>
+      </tr>
+    </table>
+
+    <h3>Object-level mapping에서 material-slot mapping으로</h3>
+    <div class="visual-panel">
+      <div class="visual-title">Slide 3 · Object 하나에 BRDF 하나를 꽂지 않는다</div>
+      <div class="visual-subtitle">실제 office object는 여러 material slot의 조합이다. mapping 단위를 object에서 submesh/material slot으로 낮춰야 한다.</div>
+      <div class="slot-diagram">
+        <div class="object-card">
+          <div class="visual-label">Current object-level override</div>
+          <div class="visual-main">chair object</div>
+          <div class="chips">
+            <span class="chip">hpbrdf_2025:black_rough_plastic</span>
+          </div>
+          <p class="small">좌석, 프레임, 다리, 바퀴가 모두 같은 검은 재질처럼 렌더된다.</p>
+        </div>
+        <div class="visual-arrow">→</div>
+        <div class="slot-card">
+          <div class="visual-label">Target material-slot mapping</div>
+          <div class="visual-main">chair = slot bundle</div>
+          <div class="slot-list">
+            <div class="slot-row">
+              <div class="slot-name">seat</div>
+              <div><span class="chip blue">native fabric texture</span> <span class="chip green">low-pol proxy</span></div>
+            </div>
+            <div class="slot-row">
+              <div class="slot-name">frame</div>
+              <div><span class="chip blue">dark paint</span> <span class="chip green">metal/plastic model</span></div>
+            </div>
+            <div class="slot-row">
+              <div class="slot-name">legs</div>
+              <div><span class="chip blue">native color</span> <span class="chip green">measured metal proxy</span></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <pre>현재 피해야 할 형태
+  table object       → pbrdf_2020:peek
+  chair object       → hpbrdf_2025:black_rough_plastic
+  electronics object → pbrdf_2020:black_billiard
+
+가야 할 형태
+  chair.seat   → native fabric/leather texture + diffuse/low-pol optical model
+  chair.frame  → metal or plastic optical model
+  table.top    → native wood/laminate texture + wood-like proxy
+  table.legs   → metal measured/physical proxy
+  cabinet.body → native painted wood/laminate texture
+  cabinet.knob → metal measured/physical proxy</pre>
+
+    <h3>권장 material record</h3>
+    <pre>{
+  "material_slot": "table_top",
+  "native_appearance": {
+    "base_color_texture": "textures/wood_oak_albedo.png",
+    "roughness_texture": "textures/wood_oak_roughness.png",
+    "normal_texture": "textures/wood_oak_normal.png",
+    "metallic": 0.0,
+    "opacity": 1.0
+  },
+  "optical_model": {
+    "kind": "wood",
+    "measured_brdf_id": "pbrdf_2020:wood_like_or_fallback",
+    "polarization_model": "diffuse_low_polarization",
+    "nir_model": "rgb_luminance_proxy"
+  },
+  "combine_policy": "appearance_rgb_measured_optical"
+}</pre>
+
+    <h3>재질군별 정책</h3>
+    <table>
+      <tr><th>물체 / 재질</th><th>RGB render</th><th>NIR / Polar render</th><th>판단</th></tr>
+      <tr><td>glass / transparent</td><td>physical glass BSDF</td><td>physical or measured glass</td><td>연구 핵심. texture보다 물리성 우선.</td></tr>
+      <tr><td>mirror / metal</td><td>conductor / measured metal</td><td>measured polarized</td><td>편광 cue 중요.</td></tr>
+      <tr><td>wood floor / table</td><td>native texture 우선</td><td>diffuse or wood-like proxy</td><td>RGB 자연스러움 우선.</td></tr>
+      <tr><td>fabric / chair</td><td>native texture 우선</td><td>diffuse / low-pol proxy</td><td>measured fabric이 있으면 대체.</td></tr>
+      <tr><td>plastic / electronics</td><td>native texture + roughplastic</td><td>closest hpBRDF plastic</td><td>검은 덩어리 방지.</td></tr>
+      <tr><td>wall / paint</td><td>native texture or flat paint</td><td>diffuse proxy</td><td>단순해도 충분.</td></tr>
+      <tr><td>floor / tile / stone</td><td>texture pack + roughness</td><td>material-class measured proxy</td><td>dataset 다양성에 중요.</td></tr>
+    </table>
+
+    <div class="alert green">
+      성공 기준은 단계적으로 둔다. 먼저 polarization/NIR 같은 BRDF 채널이 재질군에 맞게 들어가면 절반의 성공이다.
+      그 다음 RGB native texture까지 안정적으로 보존되면 office scene 품질이 크게 올라간다.
+    </div>
+  </section>
+
+  <section id="xml-native">
+    <h2>Editor mesh preview · XML-native + cache pipeline</h2>
+    <p>
+      그동안 editor가 보던 mesh와 Mitsuba가 실제로 렌더한 mesh가 서로 다른 경로를 사용하고 있었다.
+      editor는 USD prim cache를 보고, render는 <code>render_scene.xml</code> + <code>mesh_cache/*.obj</code>를 보는 이중 구조여서
+      "에디터에선 정상으로 보이는데 렌더에선 안 보인다" 또는 그 반대 케이스가 자주 발생했다.
+      오후 작업으로 editor가 sync 결과인 <code>xml_scene_index.json</code>을 source of truth로 삼고,
+      mesh_cache OBJ를 그대로 가져와 표시하도록 흐름을 일원화했다.
+    </p>
+    <table>
+      <tr><th>레이어</th><th>변경 내용</th></tr>
+      <tr>
+        <td>Frontend cache</td>
+        <td>
+          <code>apps/webui/src/lib/objMeshCache.ts</code> 신규 — Memory LRU (96) + IndexedDB (14일 TTL) 두 계층.
+          OBJLoader.parse 결과를 BufferGeometry로 직렬화/역직렬화. <code>primMeshCache</code>와 별도 DB 이름으로 충돌 방지.
+        </td>
+      </tr>
+      <tr>
+        <td>Burst protection</td>
+        <td>한 scene당 100+ OBJ가 동시 fetch되면서 데몬 health가 timeout. semaphore(4 in-flight) + Content-Length 가드(8 MB)로
+          큰 mesh는 placeholder로 처리하도록 했다. 결과적으로 트래픽 1.7 GB → 수백 MB 수준.</td>
+      </tr>
+      <tr>
+        <td>TCP drain</td>
+        <td><code>BaseHTTPRequestHandler.wfile</code>이 unbuffered(<code>wbufsize=0</code>)인데도 다중 MB 응답에서
+          ERR_CONTENT_LENGTH_MISMATCH가 반복 발생. <code>Connection: close</code> + <code>socket.sendall</code> +
+          <code>shutdown(SHUT_WR)</code>로 graceful half-close하니 해결되었다.</td>
+      </tr>
+      <tr>
+        <td>GLB OBJ mirror</td>
+        <td>GLB → trimesh → <code>glb_obj_cache/&lt;digest&gt;/mesh.obj</code>는 그대로 두되,
+          scene별 <code>mesh_cache/glb_&lt;digest&gt;.obj</code>로 hardlink/copy해서
+          editor가 basename 한 가지 endpoint(<code>/scenes/&lt;id&gt;/mesh-cache/&lt;filename&gt;</code>)로 다 받을 수 있게 했다.</td>
+      </tr>
+      <tr>
+        <td>OBJ writer v3</td>
+        <td>이전 writer는 <code>bottom-at-y=0</code>만 적용(Y 정규화). Main Couch는 prim pivot이 한쪽 끝이라 vertex가
+          <code>z ∈ [-15.62, 0]</code>으로 export되어 placement translate와 어긋났다. v3에서 x/z도 bbox center로 평행이동.
+          기존 캐시는 digest mismatch로 자동 invalidate.</td>
+      </tr>
+      <tr>
+        <td>Floor fallback</td>
+        <td>traversable region이 없을 때 <code>_compute_floor_slabs</code>가 하드코딩 20×20을 쓰던 fallback을
+          <code>settings.map_w</code>/<code>map_h</code> 우선으로 바꿔서 editor 그리드와 floor 크기가 일치.</td>
+      </tr>
+      <tr>
+        <td>Staging XML 경로</td>
+        <td>render 단계의 <code>.staged_mitsuba/base/&lt;hash&gt;.xml</code>이 repo-relative OBJ 경로를 다시 쓰는 문제로
+          Mitsuba 로더가 파일을 못 찾는 회귀가 있었다. staged XML의 <code>&lt;string name="filename"&gt;</code>을 absolute path로
+          작성하도록 수정.</td>
+      </tr>
+    </table>
+    <div class="alert green">
+      결과적으로 editor에서 본 mesh와 Mitsuba 렌더에 들어가는 mesh가 같은 OBJ 파일이 되었다.
+      Main Couch / Blue Dumbbell처럼 "보이지 않거나 위치가 어긋나던" 케이스들이 대부분 해소.
+    </div>
+  </section>
+
+  <section id="episode-nodes">
+    <h2>Episode path-only sweep · <code>episode_nodes</code></h2>
+    <p>
+      VLN dataset을 만들려면 모든 viewpoint × heading을 sweep해야 했는데, scene이 커지면
+      수백 노드 × 4 heading × 멀티 모달이라 시간이 비현실적이었다. 사용자는 우선 만든 episode가 지나가는
+      path_nodes 위주로만 렌더하기를 원했다.
+    </p>
+    <table>
+      <tr><th>지점</th><th>구현</th></tr>
+      <tr>
+        <td>Backend</td>
+        <td><code>build_sweep_render_requests(node_ids=...)</code>와 <code>_handle_opticalnav_graph_sweep</code>이
+          이미 <code>node_ids</code> 필터를 받을 수 있게 만들어져 있어서 <strong>백엔드 무수정</strong>으로 진행.</td>
+      </tr>
+      <tr>
+        <td>Frontend render mode</td>
+        <td><code>renderMode</code> 값에 <code>'episode_nodes'</code> 추가. <code>isGraphSweepRenderMode</code> 헬퍼로
+          gate를 통일 (activeBatch, refreshBatch, WS subscribe, BottomPanel grid 모두 같은 경로).</td>
+      </tr>
+      <tr>
+        <td>Submission</td>
+        <td><code>renderEpisodes('episode_nodes')</code>가 body에
+          <code>node_ids: selectedEpisode.path_nodes</code> + <code>source_episode_id</code> 동봉.</td>
+      </tr>
+      <tr>
+        <td>UI · Sensors 탭</td>
+        <td>기존 "Graph Sweep · all viewpoints" 옆에 "Graph Sweep · episode path (N × M jobs)" 추가.
+          episode 비선택 / trajectory-only면 disabled + 툴팁.</td>
+      </tr>
+      <tr>
+        <td>UI · Paths 탭</td>
+        <td>Sensors 탭까지 가지 않아도 episode 선택 직후 "▶ Render episode path" 버튼이 같은 자리에 뜨도록 추가.</td>
+      </tr>
+    </table>
+    <p>
+      효과는 단순하다. 70 노드짜리 scene에서 path 12개만 렌더하면 48 jobs (12 × 4 heading) 수준으로 끝난다.
+      VLN evaluation을 시도하는 데 필요한 최소 데이터만 빠르게 만들 수 있게 되었다.
+    </p>
+  </section>
+
+  <section id="ws-jobstatus">
+    <h2>Job status WebSocket 전환</h2>
+    <p>
+      DevTools Network에서 9분 동안 ~3,000 requests / 302 MB transferred가 관측되고
+      데몬 health 체크가 간헐 timeout. 주범은 <code>datasets/+page.svelte</code>의
+      <code>_refreshBatchLogs()</code>와 <code>fetchRenderBatch()</code>가 4초마다
+      <strong>active batch 수 × 2개의 HTTP</strong>를 병렬 발사하던 것.
+      이미 백엔드에 <code>/api/ws/job-status</code>가 있어 같은 데이터를 푸시 중이었으므로,
+      datasets 페이지를 그쪽으로 옮겼다.
+    </p>
+    <table>
+      <tr><th>모듈</th><th>역할</th></tr>
+      <tr>
+        <td><code>lib/stores/jobStatusWs.ts</code> (신규)</td>
+        <td>싱글톤 WS 클라이언트 + subscriber set + 자동 재연결(3s) + <code>_last</code> replay.
+          여러 페이지가 같은 connection을 공유.</td>
+      </tr>
+      <tr>
+        <td><code>applyJobStatusUpdates</code> (배치 helper)</td>
+        <td>WS의 flat job record (<code>{job_id, status: "succeeded", progress_stage, ...}</code>)를
+          batch의 nested status object 형태로 reshape하면서 graph_id/node_id/heading_id 등 batch 메타데이터를 보존.</td>
+      </tr>
+      <tr>
+        <td><code>logTailsToBatchEntries</code></td>
+        <td>WS의 <code>log_tails: {job_id: [lines...]}</code>을 batch의 <code>{job_id, line}[]</code> 형태로 변환,
+          현재 batch에 속한 job_id만 필터.</td>
+      </tr>
+      <tr>
+        <td><code>startBatchPolling</code></td>
+        <td><code>graph_sweep</code> / <code>episode_nodes</code>면 setInterval 폐지하고 WS subscribe.
+          첫 frame이 batch metadata fetch 이전에 도착해도 드롭되지 않도록 async + 750ms retry로 race 해소.</td>
+      </tr>
+      <tr>
+        <td>Fallback</td>
+        <td>WS frame에서 batch의 succeeded job 발견 시 <code>refreshBatch()</code>를 한 번 더 호출하는
+          belt-and-suspenders. 실제 completion event 시점에만 발생해서 4초 폴링보다 가볍다.</td>
+      </tr>
+    </table>
+    <div class="alert">
+      디버깅용 <code>window.__jobStatusDebug</code>를 임시로 노출해
+      WS 매 프레임 단위로 <code>matched_in_batch</code> / <code>succeeded_in_batch_frame</code> /
+      <code>batch_completed</code>를 확인할 수 있게 했다. 안정화되면 제거 예정.
+    </div>
+  </section>
+
+  <section id="partial-export">
+    <h2>부분 sweep 결과만 export</h2>
+    <p>
+      위 흐름의 결과로 사용자는 episode path 일부만 점진적으로 렌더하는 사용 패턴을 갖게 되었다.
+      그런데 기존 <code>POST /opticalnav/&lt;project&gt;/export</code>는 모든 episode를 무조건 포함해서,
+      observation_bundle_ref가 비어 있는 episode까지 zip에 들어가 외부 VLN evaluator가 missing observation으로 실패하는 문제가 있었다.
+    </p>
+    <table>
+      <tr><th>레이어</th><th>변경 내용</th></tr>
+      <tr>
+        <td>Backend (<code>exporters/custom_json.py</code>)</td>
+        <td>
+          <code>is_episode_complete(episode, dataset_root)</code> helper — 모든 timestep의
+          <code>observation_bundle_ref</code>가 디스크에 실제로 있어야 True.
+          <code>build_dataset_index</code> / <code>write_dataset_index</code> /
+          <code>write_split_files</code> / <code>export_dataset_zip</code>에
+          <code>episode_ids</code>와 <code>only_completed</code> 인자 추가.
+          dataset.json에 <code>total_episode_count_on_disk</code> / <code>skipped_episode_count</code> /
+          <code>filter</code> 메타 기록.
+        </td>
+      </tr>
+      <tr>
+        <td>Daemon endpoint</td>
+        <td>POST <code>/export</code> payload에 <code>episode_ids</code>, <code>only_completed</code> 수용 후
+          export 함수들에 그대로 전달. 응답에 kept/skipped 카운트 동봉.</td>
+      </tr>
+      <tr>
+        <td>Frontend (<code>ExportPanel</code> / <code>RailExportTab</code>)</td>
+        <td>"Only rendered episodes" 체크박스(디폴트 ON) + "Exporting X of Y episodes" hint.
+          export 직후 "kept N · skipped M · on disk K" 요약 표시.</td>
+      </tr>
+      <tr>
+        <td>Zip scope</td>
+        <td>zip 자체는 <code>dataset_root</code> 전체를 그대로 보관. 외부 reader는 dataset.json /
+          splits/*.json만 따라가면 자동으로 완성된 episode subset만 본다. 구현 단순 + 추후 zip slim down은 후속 작업.</td>
+      </tr>
+    </table>
+    <pre>$ python smoke
+is_complete(a):  True
+is_complete(b):  False
+all:             2 episodes, skipped 0
+only_completed:  1 episode (a), skipped 1
+episode_ids:     ['ep_b'] → 1 episode, skipped 1
+splits.train:    ['episodes/train/ep_a.json']
+</pre>
+    <div class="alert green">
+      이번 라운드의 종착점은 사실상 "부분 sweep으로도 dataset이 유효하게 export된다"는 것이다.
+      <code>episode_nodes</code> 모드로 일부 path만 렌더해도 그것만 모아 외부 VLN evaluator에 넘길 수 있는
+      파이프라인이 통째로 닫혔다.
+    </div>
+  </section>
+
+  <section id="remaining">
+    <h2>남은 이슈</h2>
+    <table>
+      <tr><th>우선순위</th><th>이슈</th><th>판단</th></tr>
+      <tr>
+        <td>1</td>
+        <td>3모드 material policy를 구현해야 한다: RGB native texture, NIR/Polar measured BRDF, 중기 Hybrid.</td>
+        <td>office 씬 품질의 핵심이다. OBJ/GLB native texture를 무시하면 계속 검게 보이고, measured BRDF를 버리면 optical cue가 약해진다.</td>
+      </tr>
+      <tr>
+        <td>2</td>
+        <td>preview camera history를 editor object처럼 관리해야 한다.</td>
+        <td>hot camera가 하나의 mutable state이면 이전 렌더 위치와 결과 추적성이 사라진다.</td>
+      </tr>
+      <tr>
+        <td>3</td>
+        <td>render monitor drawer layout polish가 필요하다.</td>
+        <td>기능은 분리됐지만 drawer/panel 겹침과 scroll containment가 아직 거칠다.</td>
+      </tr>
+      <tr>
+        <td>4</td>
+        <td>canonical authoring map load/save path를 더 단단히 해야 한다.</td>
+        <td>hard reload 후 회전/크기 초기화는 에디터 신뢰도를 크게 떨어뜨린다.</td>
+      </tr>
+      <tr>
+        <td>5</td>
+        <td>fallback box 크기와 mesh bounds를 asset-native scale 기준으로 통일해야 한다.</td>
+        <td>DTC object가 작게 의도된 경우 fallback도 작아야 한다.</td>
+      </tr>
+      <tr>
+        <td>6</td>
+        <td>USD material extraction 정확도 — 102 OBJ shape 중 21개가 BSDF 누락 또는 black basecolor로 떨어진다.</td>
+        <td>PR2.5b의 audit-first 진단(<code>extracted_material_status</code> 분류)이 다음 단계 대상이다.</td>
+      </tr>
+      <tr>
+        <td>7</td>
+        <td><code>window.__jobStatusDebug</code> 임시 노출과 belt-and-suspenders <code>refreshBatch()</code> 호출 제거.</td>
+        <td>WS-only 경로가 안정화되면 둘 다 떼어내야 한다.</td>
+      </tr>
+      <tr>
+        <td>8</td>
+        <td>표준 VLN 포맷(R2R / VLN-CE) 어댑터 부재.</td>
+        <td>현재 <code>format: "custom_json"</code>만 export. 외부 evaluator 호환을 위해 별도 exporter가 필요하다.</td>
+      </tr>
+      <tr>
+        <td>9</td>
+        <td>health / debugEvents / scenes / bridge / CurrentScene 폴링도 visibility-gate + 주기 조정 필요.</td>
+        <td>이번 라운드는 datasets 페이지 batch만 처리했다. 나머지 sweep은 다음 라운드.</td>
+      </tr>
+    </table>
+  </section>
+
+  <section>
+    <h2>짧은 평가</h2>
+    <p>
+      6월 8일의 성과는 렌더 시스템이 눈에 보이는 단계로 들어왔다는 점이다.
+      editor, camera rig, render daemon, Mitsuba output 사이의 데이터 흐름이 실제 office scene에서 맞물리기 시작했다.
+      남은 문제들은 대부분 "렌더가 안 된다"가 아니라 "정확히 어떤 geometry/material/source를 렌더했는지"의 문제로 바뀌었다.
+    </p>
+    <p>
+      오후에는 그 흐름을 사용자가 실제로 돌릴 수 있는 형태까지 닫았다.
+      editor가 렌더 mesh를 그대로 보여주고(<code>xml_scene_index</code> + <code>objMeshCache</code>),
+      <code>episode_nodes</code> 모드로 path만 우선 렌더하고,
+      WS로 진행 상태를 받고, 완성된 episode만 골라 export — 이 한 줄짜리 사이클이 처음으로 끝까지 흘러간다.
+    </p>
+    <p>
+      다음 단계는 두 갈래로 갈린다.
+      하나는 material policy를 정교하게 만드는 것이다 — asset-native texture + measured BRDF library 조합.
+      다른 하나는 VLN 외부 호환이다 — R2R / VLN-CE 같은 표준 포맷 exporter, observation bundle layout 명세,
+      그리고 외부 agent rollout adapter. 데이터셋이 닫혔으니 이제 평가 루프를 열 차례다.
+    </p>
+  </section>
+
+  <div class="footer">
+    Robomituba Daily Development Report · 2026-06-08 · /jarvis/project/robomituba
+  </div>
+</main>
+</div>
+</body>
+</html>

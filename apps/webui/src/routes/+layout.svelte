@@ -5,7 +5,7 @@
 	import { debugToasts, startDebugPolling, stopDebugPolling, kindIcon } from '$lib/stores/debugEvents';
 	import { lang } from '$lib/stores/lang';
 	import { initTheme } from '$lib/stores/theme';
-	import { rightRailCollapsed, bottomPanelCollapsed, toggleRightRail, toggleBottomPanel } from '$lib/stores/shell';
+	import { rightRailCollapsed, bottomPanelCollapsed, bottomPanelMode, toggleRightRail, toggleBottomPanel } from '$lib/stores/shell';
 	import { sceneRailSnippet, sceneBottomSnippet } from '$lib/stores/scenePortals';
 	import { onMount, onDestroy } from 'svelte';
 	import { smokeRender } from '$lib/api';
@@ -344,6 +344,7 @@
 	class="shell"
 	data-rail={$rightRailCollapsed ? 'collapsed' : 'open'}
 	data-bottom={$bottomPanelCollapsed ? 'collapsed' : 'open'}
+	data-bottom-mode={$bottomPanelMode}
 >
 	<header class="shell-topbar">
 		<div class="shell-topbar-brand">

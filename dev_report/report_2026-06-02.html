@@ -1,0 +1,1537 @@
+<!DOCTYPE html>
+<html lang="ko" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Dev Report · 2026-06-02 · GPU 씬 캐시 정책 + 렌더 결과 관리 + Editor→Mitsuba 파이프라인</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/static/pretendard.css">
+<style>
+  :root {
+    --font-sans: Pretendard,"Pretendard Variable",Inter,ui-sans-serif,system-ui,-apple-system,sans-serif;
+    --font-mono: "JetBrains Mono",ui-monospace,monospace;
+    --radius-xs:4px; --radius-sm:6px; --radius-md:10px; --radius-lg:14px; --radius-xl:20px; --radius-pill:999px;
+    --shadow-xs:0 1px 2px rgba(15,23,42,.06);
+    --shadow-sm:0 4px 12px rgba(15,23,42,.06);
+    --shadow-md:0 8px 22px rgba(15,23,42,.08);
+    --duration-fast:140ms;
+    --easing-standard:cubic-bezier(.2,0,0,1);
+
+    --bg:#f4f3f8; --bg-accent:#eef6ff;
+    --sidebar:rgba(235,235,242,.96);
+    --panel:rgba(255,255,255,.98);
+    --subpanel:rgba(248,250,252,.95);
+    --surface-2:rgba(241,245,249,.8);
+    --panel-border:rgba(148,163,184,.2);
+    --panel-border-strong:rgba(148,163,184,.3);
+    --text-raw:#1f2937; --muted:#667085; --muted-strong:#475467;
+    --brand:#2f7bf6; --brand-strong:#1f67dd;
+    --brand-soft:rgba(47,123,246,.12);
+    --cyan:#06b6d4; --cyan-soft:rgba(6,182,212,.12);
+    --success:#16a34a; --success-soft:rgba(34,197,94,.13);
+    --warning:#f97316; --warning-soft:rgba(249,115,22,.14);
+    --danger:#dc2626; --danger-soft:rgba(239,68,68,.13);
+    --purple:#8b5cf6; --purple-soft:rgba(139,92,246,.12);
+
+    --surface: var(--panel);
+    --surface2: var(--subpanel);
+    --border: var(--panel-border);
+    --accent: var(--brand);
+    --accent2: var(--purple);
+    --accent3: var(--success);
+    --accent4: var(--warning);
+    --accent5: var(--danger);
+    --text: var(--text-raw);
+    --text-muted: var(--muted-strong);
+    --text-dim: var(--muted);
+  }
+
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: var(--font-sans); background: var(--bg); color: var(--text-raw); font-size: 14px; line-height: 1.6; }
+
+  .layout { display: flex; min-height: 100vh; }
+  .sidebar { width: 220px; min-width: 220px; background: var(--sidebar); border-right: 1px solid var(--panel-border); position: sticky; top: 0; height: 100vh; overflow-y: auto; padding: 20px 12px; backdrop-filter: blur(12px); flex-shrink: 0; }
+  .main { flex: 1; padding: 28px 36px; max-width: 1100px; }
+
+  .sidebar-logo { margin-bottom: 20px; padding-bottom: 16px; border-bottom: 1px solid var(--panel-border); }
+  .logo-text { font-size: 13px; font-weight: 800; color: var(--brand); letter-spacing: -0.02em; }
+  .logo-date { font-size: 10px; color: var(--muted); font-family: var(--font-mono); margin-top: 2px; }
+  .logo-sub { font-size: 10px; color: var(--muted); margin-top: 2px; }
+  .sidebar-back { display: block; font-size: 11px; color: var(--muted); text-decoration: none; margin-bottom: 16px; }
+  .sidebar-back:hover { color: var(--brand); }
+  .nav-section { margin-bottom: 2px; }
+  .nav-section-title { font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.12em; color: var(--muted); padding: 8px 8px 4px; }
+  .nav-link { display: block; padding: 5px 8px; border-radius: var(--radius-xs); font-size: 11.5px; color: var(--muted-strong); text-decoration: none; border-left: 2px solid transparent; margin-bottom: 1px; transition: all var(--duration-fast) var(--easing-standard); }
+  .nav-link:hover { color: var(--brand-strong); background: var(--brand-soft); }
+
+  .hero { background: var(--panel); border: 1px solid var(--panel-border); border-radius: var(--radius-lg); padding: 24px 28px; margin-bottom: 24px; position: relative; overflow: hidden; box-shadow: var(--shadow-sm); }
+  .hero::before { content: ''; position: absolute; top: 0; right: 0; width: 280px; height: 100%; background: radial-gradient(ellipse at right top, var(--brand-soft) 0%, transparent 70%); pointer-events: none; }
+  .hero-date { font-size: 11px; font-weight: 700; color: var(--brand-strong); letter-spacing: 0.1em; text-transform: uppercase; margin-bottom: 8px; font-family: var(--font-mono); }
+  .hero-title { font-size: 22px; font-weight: 800; color: var(--text-raw); margin-bottom: 6px; letter-spacing: -0.03em; }
+  .hero-subtitle { font-size: 13px; color: var(--muted-strong); margin-bottom: 16px; }
+  .hero-tags { display: flex; gap: 8px; flex-wrap: wrap; }
+  .hero-tag { padding: 3px 10px; border-radius: var(--radius-pill); font-size: 11.5px; font-weight: 600; background: var(--brand-soft); color: var(--brand-strong); border: 1px solid rgba(47,123,246,.2); }
+
+  .section { background: var(--panel); border: 1px solid var(--panel-border); border-radius: var(--radius-md); padding: 22px 24px; margin-bottom: 20px; box-shadow: var(--shadow-xs); }
+  .section-header { display: flex; align-items: flex-start; gap: 14px; margin-bottom: 18px; padding-bottom: 14px; border-bottom: 1px solid var(--panel-border); }
+  .section-icon { width: 36px; height: 36px; border-radius: var(--radius-sm); display: flex; align-items: center; justify-content: center; font-size: 18px; flex-shrink: 0; }
+  .section-title { font-size: 16px; font-weight: 700; color: var(--text-raw); }
+  .section-subtitle { font-size: 11.5px; color: var(--muted); margin-top: 2px; }
+  h3 { font-size: 13px; font-weight: 700; color: var(--text-raw); margin: 18px 0 10px; }
+
+  .card-grid { display: grid; grid-template-columns: repeat(4,1fr); gap: 12px; margin-bottom: 18px; }
+  .card { background: var(--subpanel); border: 1px solid var(--panel-border); border-radius: var(--radius-sm); padding: 12px 14px; }
+  .card-label { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.1em; color: var(--muted); margin-bottom: 5px; }
+  .card-value { font-size: 20px; font-weight: 800; color: var(--brand); letter-spacing: -0.03em; }
+  .card-desc { font-size: 11.5px; color: var(--muted-strong); margin-top: 4px; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 13px; margin-bottom: 14px; }
+  th { background: var(--bg-accent); padding: 8px 10px; text-align: left; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); border-bottom: 1px solid var(--panel-border); }
+  td { padding: 8px 10px; border-bottom: 1px solid var(--panel-border); vertical-align: top; }
+  tr:last-child td { border-bottom: none; }
+
+  pre { background: var(--subpanel); border: 1px solid var(--panel-border); border-radius: var(--radius-sm); padding: 12px 14px; font-family: var(--font-mono); font-size: 12px; line-height: 1.55; overflow-x: auto; margin-bottom: 12px; }
+  code { font-family: var(--font-mono); font-size: 12px; background: var(--bg-accent); padding: 1px 5px; border-radius: 3px; }
+
+  .timeline { border-left: 2px solid var(--panel-border); padding-left: 20px; margin-left: 10px; }
+  .timeline-item { position: relative; margin-bottom: 20px; }
+  .timeline-item::before { content: ''; position: absolute; left: -26px; top: 6px; width: 10px; height: 10px; border-radius: 50%; background: var(--warning); border: 2px solid var(--bg); }
+  .timeline-time { font-size: 11px; color: var(--warning); font-weight: 700; margin-bottom: 4px; font-family: var(--font-mono); }
+  .timeline-title { font-size: 14px; font-weight: 600; color: var(--text-raw); margin-bottom: 4px; }
+  .timeline-body { font-size: 12.5px; color: var(--muted-strong); }
+
+  .alert { background: var(--warning-soft); border-left: 3px solid var(--warning); padding: 12px 14px; border-radius: var(--radius-sm); margin-bottom: 14px; font-size: 13px; }
+  .alert.info { background: var(--brand-soft); border-color: var(--brand); }
+  .alert.success { background: var(--success-soft); border-color: var(--success); }
+  .alert.danger { background: var(--danger-soft); border-color: var(--danger); }
+
+  .flow { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 14px; }
+  .flow-step { background: var(--subpanel); border: 1px solid var(--panel-border); border-radius: var(--radius-sm); padding: 6px 12px; font-size: 12px; font-weight: 600; }
+  .flow-arrow { color: var(--muted); font-size: 14px; }
+  .flow-step.highlight { background: var(--brand-soft); border-color: rgba(47,123,246,.3); color: var(--brand-strong); }
+  .flow-step.green { background: var(--success-soft); border-color: rgba(34,197,94,.3); color: var(--success); }
+  .flow-step.purple { background: var(--purple-soft); border-color: rgba(139,92,246,.3); color: var(--purple); }
+  .flow-step.amber { background: var(--warning-soft); border-color: rgba(249,115,22,.3); color: var(--warning); }
+
+  .tag { padding: 2px 8px; border-radius: var(--radius-pill); font-size: 11px; font-weight: 600; background: var(--brand-soft); color: var(--brand-strong); border: 1px solid rgba(47,123,246,.2); }
+  .tag.green { background: var(--success-soft); color: var(--success); border-color: rgba(34,197,94,.2); }
+  .tag.amber { background: var(--warning-soft); color: var(--warning); border-color: rgba(249,115,22,.2); }
+  .tag.red { background: var(--danger-soft); color: var(--danger); border-color: rgba(239,68,68,.2); }
+  .tag.purple { background: var(--purple-soft); color: var(--purple); border-color: rgba(139,92,246,.2); }
+
+  .pipeline-row { display: grid; grid-template-columns: 200px 1fr; gap: 0; border: 1px solid var(--panel-border); border-radius: var(--radius-sm); overflow: hidden; margin-bottom: 10px; }
+  .pipeline-label { background: var(--bg-accent); padding: 10px 14px; font-size: 12px; font-weight: 700; font-family: var(--font-mono); color: var(--brand-strong); border-right: 1px solid var(--panel-border); display: flex; align-items: flex-start; }
+  .pipeline-body { padding: 10px 14px; font-size: 12.5px; color: var(--muted-strong); }
+
+  .report-footer { border-top: 1px solid var(--panel-border); margin-top: 36px; padding-top: 20px; color: var(--muted); font-size: 12px; text-align: center; }
+
+  ::-webkit-scrollbar { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-track { background: var(--bg); }
+  ::-webkit-scrollbar-thumb { background: var(--panel-border-strong); border-radius: 3px; }
+</style>
+</head>
+<body>
+<div class="layout">
+
+<!-- ── SIDEBAR ── -->
+<nav class="sidebar">
+  <div class="sidebar-logo">
+    <div class="logo-text">Robomituba</div>
+    <div class="logo-date">2026-06-02</div>
+    <div class="logo-sub">GPU 캐시 · 렌더 관리 · 파이프라인 · OpticalNav</div>
+  </div>
+  <a class="sidebar-back" href="report_2026-05-29.html">← 05-29 리포트</a>
+
+  <div class="nav-section">
+    <div class="nav-section-title">오늘의 작업</div>
+    <a class="nav-link" href="#timeline">작업 타임라인</a>
+    <a class="nav-link" href="#changes">변경 파일 목록</a>
+  </div>
+
+  <div class="nav-section">
+    <div class="nav-section-title">버그픽스 / 신규 기능</div>
+    <a class="nav-link" href="#scene-cache">GPU 씬 캐시 자동 퇴거</a>
+    <a class="nav-link" href="#ambient-fallback">Ambient 폴백 조명</a>
+    <a class="nav-link" href="#render-mgmt">렌더 결과 관리 UI</a>
+  </div>
+
+  <div class="nav-section">
+    <div class="nav-section-title">파이프라인 심층 설명</div>
+    <a class="nav-link" href="#pipeline-overview">전체 흐름 개요</a>
+    <a class="nav-link" href="#editor-placement">에디터 오브젝트 배치</a>
+    <a class="nav-link" href="#material-assign">머티리얼 지정</a>
+    <a class="nav-link" href="#hpbrdf-bsdf">hpBRDF → BSDF 변환</a>
+    <a class="nav-link" href="#xml-staging">XML 스테이징</a>
+    <a class="nav-link" href="#render-passes">렌더 패스 구조</a>
+  </div>
+
+  <div class="nav-section">
+    <div class="nav-section-title">OpticalNav-toy-v0.0</div>
+    <a class="nav-link" href="#opticalnav-goal">목표 및 연구 질문</a>
+    <a class="nav-link" href="#opticalnav-validation">인프라 검증 결과</a>
+    <a class="nav-link" href="#opticalnav-plan">3일 실행 계획</a>
+    <a class="nav-link" href="#opticalnav-gaps">갭 분석</a>
+  </div>
+
+  <div class="nav-section">
+    <div class="nav-section-title">다음 단계</div>
+    <a class="nav-link" href="#next">남은 과제</a>
+  </div>
+</nav>
+
+<!-- ── MAIN ── -->
+<main class="main">
+
+<!-- HERO -->
+<div class="hero">
+  <div class="hero-date">2026-06-02 · Daily Dev Report</div>
+  <div class="hero-title">GPU 씬 캐시 정책 · Ambient 폴백 · 렌더 결과 관리 + Editor→Mitsuba 파이프라인 해설 + OpticalNav-toy-v0.0 플랜</div>
+  <div class="hero-subtitle">씬 전환 시 GPU 캐시 자동 퇴거 · 조명 없는 씬 상수 ambient 주입 · 잘못된 렌더 결과 삭제 UI · 에디터부터 hpBRDF 샘플링까지 렌더 파이프라인 전체 흐름 · OpticalNav toy 데이터셋 인프라 검증</div>
+  <div class="hero-tags">
+    <span class="hero-tag">_last_source_scene_dir</span>
+    <span class="hero-tag">ambient_radiance fallback</span>
+    <span class="hero-tag">DELETE /observations</span>
+    <span class="hero-tag">Clear renders UI</span>
+    <span class="hero-tag">hpBRDF → measured_polarized</span>
+    <span class="hero-tag">_stage_base_path_scene</span>
+    <span class="hero-tag">render passes</span>
+    <span class="hero-tag">OpticalNav-toy-v0.0</span>
+    <span class="hero-tag">hazard_mask 인프라 검증</span>
+  </div>
+</div>
+
+
+<!-- ════ TIMELINE ════ -->
+<section class="section" id="timeline">
+  <div class="section-header">
+    <div class="section-icon" style="background:rgba(245,158,11,0.15)">🕐</div>
+    <div>
+      <div class="section-title">작업 타임라인 (05.27 – 06.02)</div>
+      <div class="section-subtitle">이번 주 개발 흐름</div>
+    </div>
+  </div>
+
+  <div class="timeline">
+    <div class="timeline-item">
+      <div class="timeline-time">05.27–05.29 — 멀티모달 기반씬 공유</div>
+      <div class="timeline-title">_stage_base_path_scene / _stage_base_diffuse_override_scene 도입</div>
+      <div class="timeline-body">
+        카메라 없는 기반씬을 SHA1 서명으로 캐싱.
+        수백 개 뷰포인트를 렌더해도 geometry · material · light 직렬화는 1회만 수행.
+        <code>.staged_mitsuba/base/{sig_hash}.xml</code> 에 카메라 없는 XML 저장.
+      </div>
+    </div>
+    <div class="timeline-item">
+      <div class="timeline-time">05.30 — GPU 씬 캐시 퇴거 버그</div>
+      <div class="timeline-title">씬 A→B 전환 시 GPU 캐시가 남아있는 문제 수정</div>
+      <div class="timeline-body">
+        <code>_last_source_scene_dir</code> 모듈 변수 추가.
+        <code>render_modalities()</code> 진입부에서 현재 source_scene 디렉터리와 비교 → 다르면
+        <code>_RESIDENT_SCENE_CACHE.clear()</code> 즉시 실행.
+      </div>
+    </div>
+    <div class="timeline-item">
+      <div class="timeline-time">05.30 — 조명 없는 씬 블랙 렌더 문제</div>
+      <div class="timeline-title">ambient_radiance 폴백 상수 조명 주입</div>
+      <div class="timeline-body">
+        <code>_has_emitter(root)</code>: XML 트리에서 emitter 태그 검사.
+        emitter 없으면 <code>_inject_constant_emitter(root, radiance)</code> 자동 삽입.
+        <code>RenderConfig.ambient_radiance: float = 1.0</code> 필드 추가 + UI 슬라이더 연동.
+        ambient_radiance 값이 staged XML 서명에 포함 → 값이 달라지면 별도 캐시 파일.
+      </div>
+    </div>
+    <div class="timeline-item">
+      <div class="timeline-time">05.31 — 렌더 결과 관리</div>
+      <div class="timeline-title">DELETE /observations 엔드포인트 + Clear UI</div>
+      <div class="timeline-body">
+        <code>_handle_opticalnav_clear_observations()</code>: viewpoint_graph.json
+        에서 선택된 노드(또는 전체)의 <code>sensor_observations</code> 비우기 +
+        디스크 <code>observations/{vp_id}/</code> 디렉터리 <code>shutil.rmtree</code>.
+        프론트엔드: Sensor 패널 "Clear" 버튼 · Scene 패널 "Clear all" 버튼 · 우클릭 컨텍스트 메뉴 항목.
+      </div>
+    </div>
+    <div class="timeline-item">
+      <div class="timeline-time">06.02 — 오늘</div>
+      <div class="timeline-title">렌더 설정 전파 + sensor_sweep render_settings 연동</div>
+      <div class="timeline-body">
+        <code>render_settings</code>(ambient_radiance 포함)가 WebUI → 데몬 → build_sweep_render_requests →
+        RenderRequest → render_modalities 까지 전달되는 경로 완성.
+        <code>build_sweep_render_requests()</code> 에 <code>render_settings</code> 파라미터 추가.
+      </div>
+    </div>
+  </div>
+</section>
+
+
+<!-- ════ CHANGES ════ -->
+<section class="section" id="changes">
+  <div class="section-header">
+    <div class="section-icon" style="background:rgba(139,92,246,0.15)">📊</div>
+    <div>
+      <div class="section-title">변경 파일 목록</div>
+      <div class="section-subtitle">05.27 ~ 06.02 수정된 핵심 파일</div>
+    </div>
+  </div>
+
+  <table>
+    <tr><th>파일</th><th>변경 내용</th><th>태그</th></tr>
+    <tr>
+      <td><code>mitsuba_converter/multimodal.py</code></td>
+      <td><code>_last_source_scene_dir</code> 모듈 변수 · <code>RenderConfig.ambient_radiance</code> 필드 · <code>_has_emitter()</code> · <code>_inject_constant_emitter()</code> · 스테이징 함수 6곳에 <code>ambient_radiance</code> 전파</td>
+      <td><span class="tag amber">버그픽스</span> <span class="tag">신규 기능</span></td>
+    </tr>
+    <tr>
+      <td><code>mitsuba_converter/render_daemon.py</code></td>
+      <td><code>_handle_opticalnav_clear_observations()</code> 신규 메서드 · <code>_route_opticalnav()</code> DELETE 라우팅 · <code>_handle_opticalnav_graph_sweep()</code>에 <code>render_settings</code> 전달</td>
+      <td><span class="tag">신규 기능</span></td>
+    </tr>
+    <tr>
+      <td><code>navigation_dataset/sensor_sweep.py</code></td>
+      <td><code>build_sweep_render_requests()</code> / <code>build_custom_position_render_requests()</code>에 <code>render_settings: dict | None</code> 파라미터 추가</td>
+      <td><span class="tag">API 확장</span></td>
+    </tr>
+    <tr>
+      <td><code>webui/src/lib/api.ts</code></td>
+      <td><code>deleteOpticalNavObservations(projectId, sceneId, nodeIds)</code> 함수 추가 — <code>DELETE /api/opticalnav/projects/{pid}/scenes/{sid}/observations</code> 호출</td>
+      <td><span class="tag">신규 API</span></td>
+    </tr>
+    <tr>
+      <td><code>webui/src/routes/datasets/+page.svelte</code></td>
+      <td>Ambient light 슬라이더 · <code>clearNodeObservations()</code> · <code>clearAllObservations()</code> · <code>hasNodeObservations()</code> · Sensor/Scene 패널 Clear 버튼 · 컨텍스트 메뉴 항목</td>
+      <td><span class="tag">UI</span></td>
+    </tr>
+  </table>
+</section>
+
+
+<!-- ════ SCENE CACHE ════ -->
+<section class="section" id="scene-cache">
+  <div class="section-header">
+    <div class="section-icon" style="background:rgba(220,38,38,0.15)">🔁</div>
+    <div>
+      <div class="section-title">GPU 씬 캐시 자동 퇴거</div>
+      <div class="section-subtitle">multimodal.py · _last_source_scene_dir · 씬 전환 시 _RESIDENT_SCENE_CACHE.clear()</div>
+    </div>
+  </div>
+
+  <div class="alert danger">
+    <strong>문제:</strong> glass_corridor_2를 렌더한 뒤 office_lobby_001로 씬을 바꿨는데
+    "GPU 캐시 히트"가 표시됐다. 잘못된 씬 geometry를 GPU 메모리에서 재사용할 위험.
+  </div>
+
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px">
+    <div>
+      <h3>캐시 구조 (기존)</h3>
+      <pre>_RESIDENT_SCENE_CACHE: OrderedDict[str, mi.Scene]
+  # 키: source_xml_path 절대경로
+  # 값: GPU에 올라간 Mitsuba 씬 객체
+  # 한도: 32개 (LRU)
+  # 보호: _SCENE_CACHE_LOCK (threading.Lock)</pre>
+
+      <h3>퇴거 로직 (추가)</h3>
+      <pre>_last_source_scene_dir: str = ""  # 모듈 레벨
+
+def render_modalities(...):
+    global _last_source_scene_dir
+    current_dir = str(source_scene.parent.resolve())
+    if (_last_source_scene_dir
+            and _last_source_scene_dir != current_dir):
+        with _SCENE_CACHE_LOCK:
+            _RESIDENT_SCENE_CACHE.clear()
+    _last_source_scene_dir = current_dir
+    ...</pre>
+    </div>
+    <div>
+      <h3>설계 판단 포인트</h3>
+      <div class="alert info">
+        <strong>왜 worker 전체 캐시를 지우나?</strong><br>
+        같은 worker 프로세스가 glass_corridor → office_lobby로 전환하는 경우에만
+        <code>_last_source_scene_dir</code>가 달라진다. 다른 worker 프로세스는 각자
+        별도의 모듈 인스턴스를 갖기 때문에 독립적이며 올바른 캐시를 유지한다.
+      </div>
+      <div class="alert success">
+        <strong>캐시 히트는 버그가 아니다</strong><br>
+        같은 worker가 office_lobby를 두 번 연달아 렌더하면 두 번째 요청은 정당하게
+        캐시 히트한다. 씬 자체는 변하지 않았기 때문.
+        문제는 <em>다른 씬으로 전환했을 때</em> 캐시가 남는 것.
+      </div>
+
+      <h3>퇴거 시점 요약</h3>
+      <table>
+        <tr><th>상황</th><th>동작</th></tr>
+        <tr><td>같은 씬 반복 렌더</td><td>캐시 히트 (정상)</td></tr>
+        <tr><td>같은 worker, 씬 변경</td><td>캐시 전체 퇴거</td></tr>
+        <tr><td>다른 worker, 씬 변경</td><td>영향 없음 (독립)</td></tr>
+        <tr><td>프로세스 재시작</td><td>캐시 초기화 (당연)</td></tr>
+      </table>
+    </div>
+  </div>
+</section>
+
+
+<!-- ════ AMBIENT FALLBACK ════ -->
+<section class="section" id="ambient-fallback">
+  <div class="section-header">
+    <div class="section-icon" style="background:rgba(249,115,22,0.15)">💡</div>
+    <div>
+      <div class="section-title">Ambient 폴백 조명 자동 주입</div>
+      <div class="section-subtitle">RenderConfig.ambient_radiance · _has_emitter · _inject_constant_emitter · UI 슬라이더</div>
+    </div>
+  </div>
+
+  <div class="alert">
+    <strong>문제:</strong> 사용자가 emitter(조명) 없이 geometry만 있는 씬을 렌더하면
+    검정 이미지가 나왔다. 데몬 로그에서 "no emitter in XML" 경고 없이 그냥 검정.
+  </div>
+
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px">
+    <div>
+      <h3>Emitter 감지</h3>
+      <pre>def _has_emitter(root: ET.Element) -> bool:
+    # 최상위 emitter 태그
+    if root.find("./emitter") is not None:
+        return True
+    # shape 내부 area light
+    return any(
+        shape.find("./emitter") is not None
+        for shape in root.findall("./shape")
+    )</pre>
+
+      <h3>상수 조명 주입</h3>
+      <pre>def _inject_constant_emitter(
+        root: ET.Element, radiance: float
+) -> None:
+    emitter = ET.SubElement(root, "emitter",
+                            {"type": "constant"})
+    ET.SubElement(emitter, "rgb", {
+        "name": "radiance",
+        "value": f"{float(radiance):.6f}"
+    })
+# 결과: 무한 구면에서 균일한 환경광 방사</pre>
+    </div>
+    <div>
+      <h3>staged XML 서명에 radiance 포함</h3>
+      <pre>base_sig = (
+    scene_id,
+    max_depth,
+    rr_depth,
+    samples_per_pass,
+    integrator_type,
+    round(float(ambient_radiance), 4),  # ← 추가
+    ...
+)
+sig_hash = sha1(str(base_sig))[:16]
+# ambient_radiance=1.0 → sig_hash A
+# ambient_radiance=2.5 → sig_hash B (별도 파일)</pre>
+
+      <h3>UI 연동 (Sensor 패널)</h3>
+      <pre>// +page.svelte
+let ambientRadiance = $state(1.0);
+
+// Ambient light 슬라이더
+&lt;input type="number" min="0" max="20" step="0.1"
+       bind:value={ambientRadiance} /&gt;
+
+// renderSensorViewpoint() 호출 시:
+render_settings: { ambient_radiance: ambientRadiance }
+
+// render_daemon → build_sweep_render_requests
+// → RenderRequest.render_settings
+// → render_modalities() → RenderConfig.ambient_radiance</pre>
+    </div>
+  </div>
+
+  <h3>전파 경로 (end-to-end)</h3>
+  <div class="flow">
+    <div class="flow-step amber">UI 슬라이더<br><small>ambientRadiance</small></div>
+    <div class="flow-arrow">→</div>
+    <div class="flow-step">render_settings<br><small>{ ambient_radiance }</small></div>
+    <div class="flow-arrow">→</div>
+    <div class="flow-step">POST graph_sweep<br><small>payload</small></div>
+    <div class="flow-arrow">→</div>
+    <div class="flow-step">build_sweep_render_requests<br><small>render_settings=</small></div>
+    <div class="flow-arrow">→</div>
+    <div class="flow-step">RenderRequest<br><small>.render_settings</small></div>
+    <div class="flow-arrow">→</div>
+    <div class="flow-step highlight">render_modalities<br><small>RenderConfig.ambient_radiance</small></div>
+    <div class="flow-arrow">→</div>
+    <div class="flow-step green">staged XML<br><small>constant emitter 주입</small></div>
+  </div>
+</section>
+
+
+<!-- ════ RENDER MGMT ════ -->
+<section class="section" id="render-mgmt">
+  <div class="section-header">
+    <div class="section-icon" style="background:rgba(139,92,246,0.15)">🗑️</div>
+    <div>
+      <div class="section-title">렌더 결과 관리 UI</div>
+      <div class="section-subtitle">DELETE /observations · clearNodeObservations · clearAllObservations · Context menu</div>
+    </div>
+  </div>
+
+  <div class="alert info">
+    <strong>배경:</strong> 렌더 정책(ambient light, camera height, modality 세트)을 바꾸면서
+    이전 렌더 결과들이 씬에 계속 쌓이는 문제. 잘못된 설정으로 찍은 결과를 지우는 방법이 없었다.
+  </div>
+
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px">
+    <div>
+      <h3>백엔드 DELETE 엔드포인트</h3>
+      <pre>DELETE /api/opticalnav/projects/{pid}
+        /scenes/{sid}/observations
+Body (optional):
+  { "node_ids": ["vp_000001", "vp_000002"] }
+  # 없으면 씬 전체 삭제
+
+_handle_opticalnav_clear_observations():
+  1. read viewpoint_graph.json
+  2. 대상 노드 heading.sensor_observations = {}
+  3. shutil.rmtree(obs_root/node_id)
+  4. write_viewpoint_graph()
+  5. JSON { "cleared_nodes": N, "node_ids": [...] }</pre>
+
+      <h3>api.ts 함수</h3>
+      <pre>export const deleteOpticalNavObservations = (
+    projectId: string,
+    sceneId: string,
+    nodeIds: string[] | null
+) =>
+    fetch(`${opticalProject(projectId)}/scenes/`
+        + `${encodeURIComponent(sceneId)}/observations`,
+    {
+        method: 'DELETE',
+        headers: nodeIds
+            ? { 'Content-Type': 'application/json' } : {},
+        body: nodeIds
+            ? JSON.stringify({ node_ids: nodeIds })
+            : undefined
+    }).then(json);</pre>
+    </div>
+    <div>
+      <h3>3가지 UI 진입점</h3>
+      <table>
+        <tr><th>위치</th><th>동작</th><th>범위</th></tr>
+        <tr>
+          <td>Sensor 패널<br>"Clear" 버튼</td>
+          <td><code>clearNodeObservations(selectedSensorNodeId)</code></td>
+          <td>선택된 뷰포인트만</td>
+        </tr>
+        <tr>
+          <td>Scene 패널<br>"Clear all" 버튼</td>
+          <td><code>clearAllObservations()</code> → confirm 다이얼로그</td>
+          <td>씬 전체</td>
+        </tr>
+        <tr>
+          <td>우클릭 컨텍스트 메뉴<br>"Clear renders"</td>
+          <td><code>contextMenuClearRenders()</code></td>
+          <td>우클릭된 노드만</td>
+        </tr>
+      </table>
+
+      <h3>삭제 후 갱신</h3>
+      <pre>async function clearNodeObservations(nodeId: string) {
+    await deleteOpticalNavObservations(
+        selectedProjectId, sceneId, [nodeId]
+    );
+    await scanObservations();  // observationScan 재로드
+    // → updateFrustums() 자동 호출로 3D 뷰 갱신
+}
+
+// hasNodeObservations() — 컨텍스트 메뉴 조건
+function hasNodeObservations(nodeId: string | undefined) {
+    return (observationScan
+        ?.viewpoints?.[nodeId]?.completed ?? 0) > 0;
+}</pre>
+    </div>
+  </div>
+</section>
+
+
+<!-- ════ PIPELINE OVERVIEW ════ -->
+<section class="section" id="pipeline-overview">
+  <div class="section-header">
+    <div class="section-icon" style="background:rgba(47,123,246,0.15)">🗺️</div>
+    <div>
+      <div class="section-title">Editor → Mitsuba 전체 파이프라인 개요</div>
+      <div class="section-subtitle">WebUI 에디터부터 GPU 렌더 결과까지 전체 흐름</div>
+    </div>
+  </div>
+
+  <div style="margin-bottom:20px">
+    <div class="flow" style="flex-direction:column;align-items:flex-start;gap:8px">
+      <div style="display:flex;align-items:center;gap:8px;width:100%">
+        <div class="flow-step highlight" style="min-width:220px;text-align:center">① 에디터 — 오브젝트 배치<br><small>MapEditor3D / Scene 탭</small></div>
+        <div class="flow-arrow">→</div>
+        <div style="font-size:12px;color:var(--muted-strong)">POST <code>/opticalnav/projects/{pid}/scenes/{sid}/sync</code> → USD Stage에 prim 추가/이동/삭제</div>
+      </div>
+      <div style="display:flex;align-items:center;gap:8px;width:100%">
+        <div class="flow-step highlight" style="min-width:220px;text-align:center">② 머티리얼 지정<br><small>머티리얼 피커 / Object 탭</small></div>
+        <div class="flow-arrow">→</div>
+        <div style="font-size:12px;color:var(--muted-strong)">PUT <code>/authoring/{item_id}/material</code> → sidecar JSON에 material_id 기록</div>
+      </div>
+      <div style="display:flex;align-items:center;gap:8px;width:100%">
+        <div class="flow-step highlight" style="min-width:220px;text-align:center">③ OBJ 추출<br><small>usd_editor_geometry.py</small></div>
+        <div class="flow-arrow">→</div>
+        <div style="font-size:12px;color:var(--muted-strong)"><code>usd_export_obj.py</code>: USD prim → OBJ 파일. <code>scenes/{sid}/geometry/{prim_path}.obj</code></div>
+      </div>
+      <div style="display:flex;align-items:center;gap:8px;width:100%">
+        <div class="flow-step highlight" style="min-width:220px;text-align:center">④ XML 스테이징<br><small>mitsuba_builder.py</small></div>
+        <div class="flow-arrow">→</div>
+        <div style="font-size:12px;color:var(--muted-strong)">sidecar 머티리얼 오버라이드 + OBJ 참조 → <code>.staged_mitsuba/base/{sha1}.xml</code> (카메라 없음)</div>
+      </div>
+      <div style="display:flex;align-items:center;gap:8px;width:100%">
+        <div class="flow-step highlight" style="min-width:220px;text-align:center">⑤ 뷰포인트별 렌더<br><small>multimodal.py</small></div>
+        <div class="flow-arrow">→</div>
+        <div style="font-size:12px;color:var(--muted-strong)">기반 XML 재사용 + 카메라 교체 → Mitsuba GPU 렌더 → EXR 파일</div>
+      </div>
+      <div style="display:flex;align-items:center;gap:8px;width:100%">
+        <div class="flow-step green" style="min-width:220px;text-align:center">⑥ Observation 저장<br><small>observation_bridge.py</small></div>
+        <div class="flow-arrow">→</div>
+        <div style="font-size:12px;color:var(--muted-strong)"><code>ObservationBundleManifest</code> → <code>viewpoint_graph.json</code> sensor_observations 업데이트</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+
+<!-- ════ EDITOR PLACEMENT ════ -->
+<section class="section" id="editor-placement">
+  <div class="section-header">
+    <div class="section-icon" style="background:rgba(6,182,212,0.15)">📐</div>
+    <div>
+      <div class="section-title">에디터 오브젝트 배치 → USD 동기화</div>
+      <div class="section-subtitle">MapEditor3D / Scene 탭 → _handle_opticalnav_sync → USD Stage</div>
+    </div>
+  </div>
+
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
+    <div>
+      <h3>에디터 동기화 플로</h3>
+      <div class="pipeline-row">
+        <div class="pipeline-label">WebUI</div>
+        <div class="pipeline-body">
+          MapEditor3D Three.js에서 오브젝트 드래그 / 배치.<br>
+          <code>syncScene()</code> 호출 → POST <code>/api/opticalnav/…/sync</code>
+        </div>
+      </div>
+      <div class="pipeline-row">
+        <div class="pipeline-label">render_daemon</div>
+        <div class="pipeline-body">
+          <code>_handle_opticalnav_sync()</code>: authoring items 목록을 읽어
+          USD Stage에 prim 추가 / 이동 / 삭제 / 스케일 변경.
+        </div>
+      </div>
+      <div class="pipeline-row">
+        <div class="pipeline-label">usd_editor_geometry</div>
+        <div class="pipeline-body">
+          <code>apply_authoring_items_to_stage(stage, items)</code>:<br>
+          각 item의 <code>transform</code>(4×4 mat4) → <code>UsdGeom.Xformable.SetTransform()</code>.<br>
+          category별 분류: <code>static / dynamic / glass / region</code>.
+        </div>
+      </div>
+      <div class="pipeline-row">
+        <div class="pipeline-label">Geometry 추출</div>
+        <div class="pipeline-body">
+          <code>GET /opticalnav/…/prim-mesh/{prim_path}</code>: USD prim → OBJ.<br>
+          브라우저 캐싱: <code>primMeshCache.ts</code> (IndexedDB 14일 TTL).
+        </div>
+      </div>
+
+      <h3>오브젝트 Transform 표현</h3>
+      <pre>// RobotState.base_pose, CameraSpec.camera_to_world
+// 동일한 mat4 row-major 레이아웃:
+[  c, 0, -s, 0,   // col 0 (forward in Mitsuba Y-up)
+   0, 1,  0, 0,
+   s, 0,  c, 0,
+   x, h,  y, 1 ]  // col 3: position (x, height, y)
+// normalize_mat4_storage() 에서 전치 후 저장</pre>
+    </div>
+    <div>
+      <h3>Authoring Item 데이터 구조</h3>
+      <pre>// sidecar JSON (per scene)
+{
+  "items": [
+    {
+      "item_id": "obj_00001",
+      "label": "chair_001",
+      "usd_ref": "assets/furniture/chair.usd",
+      "transform": [c,0,-s,0, 0,1,0,0, s,0,c,0, x,h,y,1],
+      "material_id": "wood_oak_measured",
+      "category": "static",
+      "visible": true
+    },
+    ...
+  ]
+}</pre>
+
+      <h3>씬 동기화 후 geometry 캐시 무효화</h3>
+      <pre>// 에디터에서 오브젝트 이동/삭제 시:
+// 1. syncScene() → POST /sync
+// 2. 데몬: USD Stage 업데이트
+// 3. .staged_mitsuba/ 디렉터리 삭제
+//    → 다음 렌더 시 XML 재생성 강제
+// (서명이 달라져서 자동으로 재빌드됨)</pre>
+
+      <h3>지원하는 조작 타입</h3>
+      <table>
+        <tr><th>조작</th><th>USD 호출</th></tr>
+        <tr><td>오브젝트 추가</td><td><code>stage.DefinePrim() + UsdGeom.Xform</code></td></tr>
+        <tr><td>위치/회전 이동</td><td><code>xformable.SetTransform(mat4)</code></td></tr>
+        <tr><td>오브젝트 삭제</td><td><code>stage.RemovePrim(path)</code></td></tr>
+        <tr><td>머티리얼 변경</td><td>sidecar JSON 갱신 (USD 수정 없음)</td></tr>
+        <tr><td>region 추가</td><td>XZ 폴리곤 → USD Curve prim</td></tr>
+      </table>
+    </div>
+  </div>
+</section>
+
+
+<!-- ════ MATERIAL ASSIGN ════ -->
+<section class="section" id="material-assign">
+  <div class="section-header">
+    <div class="section-icon" style="background:rgba(139,92,246,0.15)">🎨</div>
+    <div>
+      <div class="section-title">머티리얼 지정 시스템</div>
+      <div class="section-subtitle">material_mapping.py · infer_material_kind() · 3가지 컬렉션 (preset / curated / measured)</div>
+    </div>
+  </div>
+
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px">
+    <div>
+      <h3>머티리얼 컬렉션</h3>
+      <table>
+        <tr><th>컬렉션</th><th>소스</th><th>특징</th></tr>
+        <tr>
+          <td><span class="tag">preset</span></td>
+          <td>하드코딩된 파라미터</td>
+          <td>roughplastic, conductor, glass 등 기본형. 빠른 테스트용.</td>
+        </tr>
+        <tr>
+          <td><span class="tag purple">curated</span></td>
+          <td>텍스처 세트 (albedo, roughness, normal PBR 맵)</td>
+          <td>아티스트 제작. 실사급 but 편광 미지원.</td>
+        </tr>
+        <tr>
+          <td><span class="tag green">measured</span></td>
+          <td>실측 BRDF<br>(.pbrdf 채널 파일)</td>
+          <td>hpBRDF 2025 측정 데이터. 편광 스토크스 지원.</td>
+        </tr>
+      </table>
+
+      <h3>infer_material_kind()</h3>
+      <pre># robomituba_bridge/material_mapping.py
+def infer_material_kind(material_id: str, extras: dict)
+    -> str:
+  # 1. extras["material_kind"] 명시값 우선
+  # 2. material_id 접두사 패턴 매칭:
+  #    glass_* / crystal_* → "glass"
+  #    metal_* / steel_* / copper_* → "metal"
+  #    plastic_* → "plastic"
+  #    wood_* / fabric_* → "diffuse"
+  # 3. roughness > 0.9 → "diffuse"
+  # 4. metallic > 0.5 → "metal"
+  # 5. transmission > 0.5 → "glass"
+  return kind  # "diffuse" | "plastic" | "metal" | "glass"</pre>
+    </div>
+    <div>
+      <h3>kind → Mitsuba BSDF 매핑</h3>
+      <table>
+        <tr><th>kind</th><th>Mitsuba BSDF</th><th>조건</th></tr>
+        <tr><td>diffuse</td><td><code>diffuse</code></td><td>단순 람베르시안</td></tr>
+        <tr><td>plastic</td><td><code>roughplastic</code></td><td>IOR 1.46, 알베도 텍스처</td></tr>
+        <tr><td>metal</td><td><code>roughconductor</code></td><td>conductor material 목록</td></tr>
+        <tr><td>metal (measured)</td><td><code>measured_polarized</code></td><td>.pbrdf 파일 있을 때</td></tr>
+        <tr><td>glass</td><td><code>roughdielectric</code></td><td>IOR 1.52, thin=False</td></tr>
+      </table>
+
+      <h3>사이드카 오버라이드 흐름</h3>
+      <pre># 에디터에서 오브젝트에 "wood_oak_measured" 지정
+# → PUT /authoring/{item_id}/material
+# → sidecar item["material_id"] = "wood_oak_measured"
+#
+# 렌더 시 _apply_scene_override(root, sidecar):
+#   for each shape in XML:
+#     item_id 매핑으로 material_id 조회
+#     → BSDF 노드 교체
+#     → (measured면) .pbrdf 경로 삽입</pre>
+    </div>
+  </div>
+</section>
+
+
+<!-- ════ HPBRDF BSDF ════ -->
+<section class="section" id="hpbrdf-bsdf">
+  <div class="section-header">
+    <div class="section-icon" style="background:rgba(16,163,74,0.15)">🔬</div>
+    <div>
+      <div class="section-title">hpBRDF / pBRDF → Mitsuba BSDF 변환</div>
+      <div class="section-subtitle">KAIST SIGGRAPH Asia 2025 측정 편광 BRDF · .pbrdf 채널 파일 · measured_polarized BSDF</div>
+    </div>
+  </div>
+
+  <div class="alert info">
+    <strong>hpBRDF (Hyperspectral Polarized BRDF)</strong>: KAIST RGL이 SIGGRAPH Asia 2025에 발표한
+    실측 편광 BRDF 데이터셋. 파장별(RGB+NIR) 스토크스 파라미터를 실제 측정한 값으로 제공.
+    Mitsuba 3의 <code>measured_polarized</code> BSDF 타입과 연동 (패치 필요).
+  </div>
+
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px">
+    <div>
+      <h3>데이터 구조 (.pbrdf 채널 파일)</h3>
+      <pre>data/hpbrdf_2025/channels/{material_id}/
+  ├── r.pbrdf       # Red 채널 (780nm 근방)
+  ├── g.pbrdf       # Green 채널 (550nm 근방)
+  ├── b.pbrdf       # Blue 채널 (470nm 근방)
+  └── nir.pbrdf     # NIR 채널 (850nm 근방, 선택)
+
+# 각 .pbrdf: 이진 blob
+#   - 반구 샘플 그리드 (theta_i × phi_i × theta_o × phi_o)
+#   - 각 샘플: 4×4 Mueller matrix (float32)
+#   - 전체 크기: ~수십 MB / 채널</pre>
+
+      <h3>Mitsuba XML BSDF 노드</h3>
+      <pre>&lt;bsdf type="measured_polarized" id="mat_001"&gt;
+  &lt;string name="filename_r"
+    value=".../channels/steel_brushed/r.pbrdf"/&gt;
+  &lt;string name="filename_g"
+    value=".../channels/steel_brushed/g.pbrdf"/&gt;
+  &lt;string name="filename_b"
+    value=".../channels/steel_brushed/b.pbrdf"/&gt;
+  &lt;!-- nir은 NIR 패스에서만 삽입 --&gt;
+&lt;/bsdf&gt;</pre>
+    </div>
+    <div>
+      <h3>measured_polarized.cpp 패치</h3>
+      <pre># scripts/apply_hpbrdf_patch.sh
+# Mitsuba 3 소스에 hpBRDF 플러그인 패치 적용:
+#
+# src/bsdfs/measured_polarized.cpp 추가
+#   → BSDFFlags::Polarized 지원
+#   → Mueller matrix 보간 (bilinear θ/φ 그리드)
+#   → 3채널 동시 로드 (r/g/b 독립 Mueller)
+#
+# Variant 요구: mono_polarized / scalar_mono_polarized
+# (rgb variant는 단일 채널만 — polarization 미지원)</pre>
+
+      <h3>BSDF 샘플링 흐름 (내부)</h3>
+      <pre>eval(wi, wo, si):
+  # 1. (θi, φi) 로 BRDF 그리드 인덱스 계산
+  #    θi = acos(dot(wi, n)), φi = atan2(...)
+  # 2. r/g/b 채널 각각 Mueller 보간
+  #    M_r = bilinear(grid_r, θi, φi, θo, φo)
+  # 3. 입사 스토크스 벡터 Si 에 M_r 적용
+  #    So_r = M_r @ Si
+  # 4. Stokes 채널별 분리 → RGB 최종 radiance
+  # → mi.Spectrum 반환 (polarized 빌드에서만 유효)</pre>
+
+      <h3>Variant 제약</h3>
+      <table>
+        <tr><th>Mitsuba Variant</th><th>편광 지원</th><th>hpBRDF</th></tr>
+        <tr><td>cuda_rgb</td><td>❌</td><td>❌ (단일채널 가능)</td></tr>
+        <tr><td>scalar_mono_polarized</td><td>✅</td><td>✅ 완전 지원</td></tr>
+        <tr><td>llvm_mono_polarized</td><td>✅</td><td>✅ (CPU)</td></tr>
+        <tr><td>cuda_mono_polarized</td><td>✅</td><td>✅ (GPU+편광)</td></tr>
+      </table>
+    </div>
+  </div>
+
+  <h3>NIR 채널 처리</h3>
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
+    <div>
+      <pre># NIR 렌더 패스: nir.pbrdf 별도 로드
+# NIR은 일반 RGB 패스에서 나오는 게 아니라:
+#   1. 카메라 위치에 보조 스팟 라이트 배치
+#      (active NIR illuminator 시뮬)
+#   2. nir.pbrdf 의 Mueller 행렬 사용
+#   3. scalar_mono_polarized variant로 렌더
+#   → observations/{vp}/{h}/nir.exr 저장</pre>
+    </div>
+    <div>
+      <pre># Isaac Sim 한계: USD Material에서
+# Mueller matrix 직접 표현 불가.
+# Mitsuba 전용 BSDF 타입이라 Isaac 측에서는
+# material_id만 전달, 실제 .pbrdf 로드는
+# mitsuba_converter 빌드 단계에서만 수행.</pre>
+    </div>
+  </div>
+</section>
+
+
+<!-- ════ XML STAGING ════ -->
+<section class="section" id="xml-staging">
+  <div class="section-header">
+    <div class="section-icon" style="background:rgba(47,123,246,0.15)">🗂️</div>
+    <div>
+      <div class="section-title">Mitsuba XML 스테이징 구조</div>
+      <div class="section-subtitle">mitsuba_builder.py · _stage_base_path_scene · SHA1 서명 캐시</div>
+    </div>
+  </div>
+
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px">
+    <div>
+      <h3>씬 XML 빌드 단계</h3>
+      <div class="pipeline-row">
+        <div class="pipeline-label">source XML</div>
+        <div class="pipeline-body">
+          씬 원본 XML: geometry OBJ 참조 · emitter · 기본 BSDF.<br>
+          위치: <code>scenes/{sid}/mitsuba_scene.xml</code>
+        </div>
+      </div>
+      <div class="pipeline-row">
+        <div class="pipeline-label">_apply_scene_override</div>
+        <div class="pipeline-body">
+          sidecar 머티리얼 오버라이드 적용.<br>
+          BSDF 노드를 <code>measured_polarized</code> / <code>roughplastic</code> 등으로 교체.
+        </div>
+      </div>
+      <div class="pipeline-row">
+        <div class="pipeline-label">ambient 주입</div>
+        <div class="pipeline-body">
+          <code>_has_emitter()</code> 검사 후 없으면<br>
+          <code>&lt;emitter type="constant"&gt;</code> 추가 (ambient_radiance 값).
+        </div>
+      </div>
+      <div class="pipeline-row">
+        <div class="pipeline-label">base XML 저장</div>
+        <div class="pipeline-body">
+          카메라 태그 제거.<br>
+          <code>.staged_mitsuba/base/{sha1}.xml</code> 저장.
+        </div>
+      </div>
+      <div class="pipeline-row">
+        <div class="pipeline-label">per-viewpoint</div>
+        <div class="pipeline-body">
+          base XML 재사용 + <code>&lt;sensor&gt;</code> 삽입.<br>
+          <code>mi.load_dict()</code> → GPU 씬 로드 → 렌더.
+        </div>
+      </div>
+
+      <h3>staged XML 디렉터리 구조</h3>
+      <pre>scenes/{scene_id}/
+  .staged_mitsuba/
+    base/
+      a3f8c2d0...xml   # 기본 경로 트레이싱 base
+      b7e1a09f...xml   # 디퓨즈 오버라이드 base
+      c9d4...xml       # ambient_radiance=2.5 버전
+    cache/
+      {sha1}.mitsuba   # GPU 캐시 (선택적)</pre>
+    </div>
+    <div>
+      <h3>SHA1 서명 구성 요소</h3>
+      <pre>base_sig = (
+    scene_id,
+    # integrator
+    integrator_type,    # "path" | "direct"
+    max_depth,
+    rr_depth,
+    samples_per_pass,
+    # environment
+    round(ambient_radiance, 4),
+    # override fingerprint
+    sidecar_mtime,      # 최종 수정 시각
+    source_xml_mtime,
+)
+sig_hash = sha1(str(base_sig).encode())[:16]</pre>
+
+      <h3>재빌드 트리거 조건</h3>
+      <table>
+        <tr><th>변경 사항</th><th>재빌드?</th></tr>
+        <tr><td>오브젝트 이동</td><td>✅ sidecar_mtime 변경</td></tr>
+        <tr><td>머티리얼 교체</td><td>✅ sidecar_mtime 변경</td></tr>
+        <tr><td>ambient_radiance 조정</td><td>✅ 서명에 포함</td></tr>
+        <tr><td>다른 뷰포인트 렌더</td><td>❌ base XML 재사용</td></tr>
+        <tr><td>카메라 높이 변경만</td><td>❌ base XML 재사용</td></tr>
+      </table>
+
+      <h3>디퓨즈 오버라이드 base (별도)</h3>
+      <pre># AOV 렌더 패스에서 사용:
+# 모든 BSDF → 순수 diffuse("diffuse" type)
+# 목적: 조명 없는 albedo map 추출
+#        (간접광 / 글로시 반사 제거)
+# sig에 is_diffuse_override=True 포함
+# → 별도 {sha1}.xml 생성</pre>
+    </div>
+  </div>
+</section>
+
+
+<!-- ════ RENDER PASSES ════ -->
+<section class="section" id="render-passes">
+  <div class="section-header">
+    <div class="section-icon" style="background:rgba(245,158,11,0.15)">📸</div>
+    <div>
+      <div class="section-title">렌더 패스 구조</div>
+      <div class="section-subtitle">multimodal.py · 6가지 패스 · modality별 출력 채널</div>
+    </div>
+  </div>
+
+  <table>
+    <tr>
+      <th>패스</th>
+      <th>Integrator</th>
+      <th>Variant</th>
+      <th>출력 파일</th>
+      <th>SPP</th>
+    </tr>
+    <tr>
+      <td><strong>RGB Path</strong></td>
+      <td><code>path</code></td>
+      <td>cuda_rgb</td>
+      <td><code>rgb.exr</code></td>
+      <td>4096</td>
+    </tr>
+    <tr>
+      <td><strong>Direct + Indirect 분리</strong></td>
+      <td><code>path</code> (재사용)</td>
+      <td>cuda_rgb</td>
+      <td><code>direct.exr</code>, <code>indirect.exr</code></td>
+      <td>RGB와 공유</td>
+    </tr>
+    <tr>
+      <td><strong>AOV (albedo, depth, normal)</strong></td>
+      <td><code>aov</code></td>
+      <td>cuda_rgb</td>
+      <td><code>albedo.exr</code>, <code>depth.exr</code>, <code>normal.exr</code></td>
+      <td>16</td>
+    </tr>
+    <tr>
+      <td><strong>Polarization (Stokes)</strong></td>
+      <td><code>stokes</code></td>
+      <td>cuda_mono_polarized</td>
+      <td><code>stokes_s0.exr</code> … <code>s3.exr</code></td>
+      <td>256</td>
+    </tr>
+    <tr>
+      <td><strong>NIR</strong></td>
+      <td><code>path</code></td>
+      <td>scalar_mono_polarized</td>
+      <td><code>nir.exr</code></td>
+      <td>128</td>
+    </tr>
+    <tr>
+      <td><strong>LiDAR (depth 고정밀)</strong></td>
+      <td><code>depth</code> AOV</td>
+      <td>cuda_rgb</td>
+      <td><code>lidar_depth.exr</code></td>
+      <td>1</td>
+    </tr>
+  </table>
+
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:16px">
+    <div>
+      <h3>Direct / Indirect 분리 구현</h3>
+      <pre># 같은 씬에서 한 번에 두 채널:
+# direct: max_depth=1 (1-bounce 직접광만)
+# indirect: full_render - direct
+
+# 구체적으로:
+rgb_full = render(max_depth=config.max_depth, spp=spp)
+rgb_direct = render(max_depth=1, spp=spp)
+rgb_indirect = rgb_full - rgb_direct
+
+# 두 이미지가 같은 씬/카메라이므로
+# 기반 XML은 재사용, 렌더만 2회</pre>
+
+      <h3>AOV 패스 aov_names 설정</h3>
+      <pre>&lt;integrator type="aov"&gt;
+  &lt;string name="aovs"
+    value="albedo:albedo,
+           depth:depth,
+           normal:sh_normal,
+           position:position"/&gt;
+  &lt;integrator type="path" name="integrator"&gt;
+    &lt;integer name="max_depth" value="1"/&gt;
+  &lt;/integrator&gt;
+&lt;/integrator&gt;
+# spp=16으로 빠르게 처리 (노이즈 무관)</pre>
+    </div>
+    <div>
+      <h3>패스별 Mitsuba Variant 전환</h3>
+      <pre># multimodal.py: render_modalities() 내부
+# 각 패스 호출 전 mi.set_variant() 호출:
+
+if "rgb" in modalities or "decomp" in modalities:
+    mi.set_variant("cuda_rgb")
+    _render_rgb_pass(...)
+
+if "polar" in modalities:
+    mi.set_variant("cuda_mono_polarized")
+    _render_stokes_pass(...)
+
+if "nir" in modalities:
+    mi.set_variant("scalar_mono_polarized")
+    _render_nir_pass(...)
+
+# ⚠️ variant 전환 시 _RESIDENT_SCENE_CACHE 무효화
+# → 같은 씬이어도 variant가 다르면 GPU 재로드 필요</pre>
+
+      <h3>ObservationBundleManifest</h3>
+      <pre># observation_bridge.py
+# 렌더 완료 후 생성:
+{
+  "bundle_root": "scenes/{sid}/observations/{vp}/{h}/",
+  "modalities": {
+    "rgb":    "rgb.exr",
+    "depth":  "depth.exr",
+    "normal": "normal.exr",
+    "albedo": "albedo.exr",
+    "nir":    "nir.exr",
+    ...
+  },
+  "metadata": { "width": 640, "height": 480, "spp": 4096 }
+}
+# → viewpoint_graph.json heading.sensor_observations 업데이트</pre>
+    </div>
+  </div>
+
+  <h3>Observation 저장 경로 규칙</h3>
+  <div class="alert success">
+    <code>scenes/{scene_id}/observations/{node_id}/{heading_id}/{modality}.exr</code><br>
+    예: <code>scenes/office_lobby_001/observations/vp_000042/h_090/rgb.exr</code>
+  </div>
+  <div class="flow" style="flex-wrap:wrap">
+    <div class="flow-step">render_modalities()</div>
+    <div class="flow-arrow">→</div>
+    <div class="flow-step">EXR 파일 저장</div>
+    <div class="flow-arrow">→</div>
+    <div class="flow-step">ObservationBundleManifest 생성</div>
+    <div class="flow-arrow">→</div>
+    <div class="flow-step highlight">_set_heading_observation()</div>
+    <div class="flow-arrow">→</div>
+    <div class="flow-step green">viewpoint_graph.json 업데이트</div>
+    <div class="flow-arrow">→</div>
+    <div class="flow-step">GET /observation-scan → UI 갱신</div>
+  </div>
+</section>
+
+
+<!-- ════ OPTICALNAV GOAL ════ -->
+<section class="section" id="opticalnav-goal">
+  <div class="section-header">
+    <div class="section-icon" style="background:rgba(47,123,246,0.15)">🎯</div>
+    <div>
+      <div class="section-title">OpticalNav-toy-v0.0 목표 및 연구 질문</div>
+      <div class="section-subtitle">논문급 데이터셋이 아닌 "빠른 failure 확인용 toy testset"</div>
+    </div>
+  </div>
+
+  <div class="alert info">
+    <strong>포지셔닝:</strong> glass / mirror / transparent partition에 특화된 targeted synthetic fine-tuning dataset.
+    1차 규모 5–10 synthetic scene, 1,000–3,000 episode. 지금 당장은 3 scene · 300 planned episodes · 100 rendered episodes가 목표.
+  </div>
+
+  <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;margin-bottom:20px">
+    <div class="card">
+      <div class="card-label">Q1. RGB-only 실패</div>
+      <div class="card-value" style="font-size:14px;color:var(--danger)">유리벽을 free space로 보나?</div>
+      <div class="card-desc">transparent wall을 obstacle로 인식 못함 · goal grounding 오류 · hazard collision 발생 여부 확인</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Q2. 접근법 비교</div>
+      <div class="card-value" style="font-size:14px;color:var(--brand)">E2E vs Detection+Planner</div>
+      <div class="card-desc">RGB only → action vs hazard_mask prediction → graph planner 어느 쪽이 더 feasible한가</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Q3. Optical Cue 효과</div>
+      <div class="card-value" style="font-size:14px;color:var(--success)">downstream 개선?</div>
+      <div class="card-desc">RGB → RGB+depth → RGB+hazard_mask oracle → RGB+NIR 단계적 ablation</div>
+    </div>
+  </div>
+
+  <h3>Scene 3개 명세</h3>
+  <table>
+    <tr><th>씬</th><th>핵심 hazard</th><th>실패 조건</th><th>목표 오브젝트</th></tr>
+    <tr>
+      <td><strong>glass_corridor_001</strong></td>
+      <td>복도 중간 투명 유리벽/유리문</td>
+      <td>RGB-only: 빈 복도로 인식 → 유리벽 통과 시도</td>
+      <td>유리 너머 의자/표지판</td>
+    </tr>
+    <tr>
+      <td><strong>transparent_partition_office_001</strong></td>
+      <td>사무실 투명 칸막이 (RGB로 빈 공간처럼 보임)</td>
+      <td>graph에서는 막힌 길 → RGB agent는 직선 경로 선택</td>
+      <td>칸막이 건너편 테이블/책상</td>
+    </tr>
+    <tr>
+      <td><strong>mirror_room_001</strong></td>
+      <td>반사벽으로 인한 landmark grounding 오류</td>
+      <td>거울 반사 이미지를 실제 goal로 착각</td>
+      <td>고유한 랜드마크 오브젝트</td>
+    </tr>
+  </table>
+
+  <h3>지금 하지 말 것 (명시적 보류)</h3>
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+    <div style="background:var(--danger-soft);border:1px solid rgba(220,38,38,.2);border-radius:var(--radius-sm);padding:12px 14px">
+      <div style="font-size:12px;font-weight:700;color:var(--danger);margin-bottom:6px">❌ 보류 항목</div>
+      <div style="font-size:12px;color:var(--muted-strong)">photorealistic scene · large-scale benchmark 주장 · 긴 R2R-style instruction · full physics rollout · LiDAR/hyperspectral/full polarization 전부 · Moorelane 전체 씬 · VLN-CE/LeRobot export · Isaac physics rollout</div>
+    </div>
+    <div style="background:var(--success-soft);border:1px solid rgba(34,197,94,.2);border-radius:var(--radius-sm);padding:12px 14px">
+      <div style="font-size:12px;font-weight:700;color:var(--success);margin-bottom:6px">✅ 지금 할 것</div>
+      <div style="font-size:12px;color:var(--muted-strong)">작은 synthetic scene 3개 · start-goal episode 자동 생성 · RGB/depth/hazard_mask 렌더 · RGB-only baseline failure 확인 · detection+planner feasibility 비교</div>
+    </div>
+  </div>
+</section>
+
+
+<!-- ════ OPTICALNAV VALIDATION ════ -->
+<section class="section" id="opticalnav-validation">
+  <div class="section-header">
+    <div class="section-icon" style="background:rgba(16,163,74,0.15)">✅</div>
+    <div>
+      <div class="section-title">인프라 검증 결과 — 현재 코드베이스 분석</div>
+      <div class="section-subtitle">navigation_dataset 모듈 실제 코드 분석 · 구현 완성도 검증</div>
+    </div>
+  </div>
+
+  <div class="alert success">
+    <strong>결론: 핵심 인프라가 이미 모두 구현되어 있다.</strong>
+    episode 생성·hazard 태깅·hazard_mask 렌더·씬 저작·instruction 생성·split 생성 전부 production-ready.
+    OpticalNav-toy-v0.0은 새 코드 작성이 아니라 <em>씬 데이터를 만드는 작업</em>이다.
+  </div>
+
+  <table>
+    <tr><th>필요 기능</th><th>상태</th><th>구현 위치</th><th>핵심 내용</th></tr>
+    <tr>
+      <td><strong>Episode 생성</strong></td>
+      <td><span class="tag green">EXISTS</span></td>
+      <td><code>graph_episode_sampler.py</code><br><code>node_sampler.py</code><br><code>rollout.py</code></td>
+      <td>k-최단경로, 시나리오 기반 필터링, coverage 기반 선택. 4가지 시나리오 (goal_only · hazard_aware · stop_before_glass · detour).</td>
+    </tr>
+    <tr>
+      <td><strong>Hazard 태깅</strong></td>
+      <td><span class="tag green">EXISTS</span></td>
+      <td><code>authoring_map.py</code><br><code>authoring_compile.py</code></td>
+      <td><code>glass_wall</code> · <code>glass_door</code> · <code>transparent_partition</code> · <code>mirror_wall</code> 타입 지원. <code>include_in_hazard_mask: bool</code> 플래그. <code>HazardRegion</code> 자동 생성.</td>
+    </tr>
+    <tr>
+      <td><strong>hazard_mask 렌더</strong></td>
+      <td><span class="tag green">EXISTS</span></td>
+      <td><code>multimodal.py</code><br><code>observation_bridge.py</code></td>
+      <td>40+ modality 중 하나. Binary camera-space mask. <code>scene_override.target_shape_filenames</code>로 hazard 오브젝트 지정 후 전용 렌더 패스 수행.</td>
+    </tr>
+    <tr>
+      <td><strong>씬 저작 스키마</strong></td>
+      <td><span class="tag green">EXISTS</span></td>
+      <td><code>authoring_map.py</code></td>
+      <td>JSON 기반 <code>AuthoringMap</code>. 오브젝트 타입·재질·navigation flag·geometry (point/line/rectangle). traversable · obstacle · hazard · goal · start 리전.</td>
+    </tr>
+    <tr>
+      <td><strong>Episode 포맷</strong></td>
+      <td><span class="tag green">EXISTS</span></td>
+      <td><code>episode_schema.py</code></td>
+      <td>schema v0.2. <code>episode_id · scene_id · split · start/goal_node · path_nodes · timesteps · observation_refs · hazard_crossing</code> 전부 있음.</td>
+    </tr>
+    <tr>
+      <td><strong>저해상도/저SPP 렌더</strong></td>
+      <td><span class="tag green">EXISTS</span></td>
+      <td><code>multimodal.py</code> RenderConfig</td>
+      <td><code>RenderConfig(width=320, height=240, path_spp=4, aov_spp=4)</code> 최소 설정 가능. <code>render_settings</code> dict로 per-request 오버라이드.</td>
+    </tr>
+    <tr>
+      <td><strong>Instruction 생성</strong></td>
+      <td><span class="tag green">EXISTS</span></td>
+      <td><code>instruction_templates.py</code><br><code>graph_episode_sampler.py</code></td>
+      <td>template 기반 4종. hazard label은 <code>annotation.hazard_regions[0].hazard_type</code> 에서 자동. 예: "Go to {goal} without crossing the {hazard}."</td>
+    </tr>
+    <tr>
+      <td><strong>Split 생성</strong></td>
+      <td><span class="tag green">EXISTS</span></td>
+      <td><code>rollout.py</code><br><code>graph_episode_sampler.py</code></td>
+      <td><code>split_counts = {"train":100, "val_seen":20, "val_unseen":10, "test":10}</code> → 순차 분배. <code>DatasetProject</code>에 split별 episode ID 목록 저장.</td>
+    </tr>
+    <tr>
+      <td><strong>Traversability grid</strong></td>
+      <td><span class="tag green">EXISTS</span></td>
+      <td><code>traversability.py</code><br><code>edge_builder.py</code></td>
+      <td><code>TraversabilityGrid</code>에 <code>traversable[y,x]</code> + <code>hazard[y,x]</code> 이중 배열. hazard crossing 엣지 플래그 자동 마킹.</td>
+    </tr>
+  </table>
+
+  <h3>Episode 스키마 (현재 v0.2)</h3>
+  <pre>{
+  "episode_id": "glass_corridor_001_train_graph_000001",
+  "scene_id": "glass_corridor_001",
+  "split": "train",
+  "start_node": "vp_000012", "goal_node": "vp_000088",
+  "goal_region": "goal_001",
+  "natural_language_instruction": "Go to the chair without crossing the glass wall.",
+  "path_nodes": ["vp_000012", "vp_000021", "vp_000088"],
+  "actions": ["move_to_neighbor", "move_to_neighbor", "stop"],
+  "timesteps": [
+    {
+      "timestep_index": 0,
+      "agent_pose": [x, y, yaw],
+      "action": "move_to_neighbor",
+      "hazard_collision": false,
+      "observation_bundle_ref": "observations/glass_corridor_001/.../bundle.json"
+    }
+  ],
+  "metadata": {
+    "modalities": ["rgb", "depth", "hazard_mask"],
+    "scenario": "hazard_aware",
+    "hazard_crossing": false
+  }
+}</pre>
+</section>
+
+
+<!-- ════ OPTICALNAV PLAN ════ -->
+<section class="section" id="opticalnav-plan">
+  <div class="section-header">
+    <div class="section-icon" style="background:rgba(245,158,11,0.15)">📅</div>
+    <div>
+      <div class="section-title">3일 실행 계획</div>
+      <div class="section-subtitle">Day 1 Scene+Graph · Day 2 Render smoke · Day 3 Package+eval</div>
+    </div>
+  </div>
+
+  <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px;margin-bottom:20px">
+    <div style="border:1px solid var(--panel-border);border-radius:var(--radius-sm);overflow:hidden">
+      <div style="background:rgba(47,123,246,.12);padding:10px 14px;border-bottom:1px solid var(--panel-border)">
+        <div style="font-size:12px;font-weight:800;color:var(--brand)">Day 1 — Scene + Graph</div>
+        <div style="font-size:11px;color:var(--muted)">산출물: 30 planned episodes (render 없음)</div>
+      </div>
+      <div style="padding:12px 14px;font-size:12px;color:var(--muted-strong)">
+        <div>☐ glass_corridor_001 AuthoringMap 작성</div>
+        <div>☐ glass_wall/door hazard 태깅 + include_in_hazard_mask</div>
+        <div>☐ traversable region 지정</div>
+        <div>☐ goal candidate 오브젝트 3–5개 배치</div>
+        <div>☐ viewpoint graph 생성</div>
+        <div>☐ disconnected component 확인</div>
+        <div>☐ start-goal pair 30–50개 생성</div>
+        <div>☐ template instruction 자동 생성</div>
+      </div>
+    </div>
+    <div style="border:1px solid var(--panel-border);border-radius:var(--radius-sm);overflow:hidden">
+      <div style="background:rgba(249,115,22,.12);padding:10px 14px;border-bottom:1px solid var(--panel-border)">
+        <div style="font-size:12px;font-weight:800;color:var(--warning)">Day 2 — Render Smoke</div>
+        <div style="font-size:11px;color:var(--muted)">산출물: 10 rendered episodes + 1 qualitative demo</div>
+      </div>
+      <div style="padding:12px 14px;font-size:12px;color:var(--muted-strong)">
+        <div>☐ RGB/depth/hazard_mask smoke test (1 viewpoint)</div>
+        <div>☐ 저해상도 설정 (512×288, spp=32/4)</div>
+        <div>☐ 10 episodes 렌더 (30 중)</div>
+        <div>☐ observation_bundle_ref → 실제 파일 resolve 확인</div>
+        <div>☐ hazard_mask binary mask 시각화 확인</div>
+        <div>☐ scene 2개 추가 시작</div>
+      </div>
+    </div>
+    <div style="border:1px solid var(--panel-border);border-radius:var(--radius-sm);overflow:hidden">
+      <div style="background:rgba(16,163,74,.12);padding:10px 14px;border-bottom:1px solid var(--panel-border)">
+        <div style="font-size:12px;font-weight:800;color:var(--success)">Day 3 — Package + Eval</div>
+        <div style="font-size:11px;color:var(--muted)">산출물: OpticalNav-toy-v0.0.zip + metrics</div>
+      </div>
+      <div style="padding:12px 14px;font-size:12px;color:var(--muted-strong)">
+        <div>☐ train/val_seen/val_unseen split</div>
+        <div>☐ shortest path oracle metric</div>
+        <div>☐ random baseline metric</div>
+        <div>☐ RGB-only failure 예시 3개 캡처</div>
+        <div>☐ README + dataset_card 작성</div>
+        <div>☐ zip export</div>
+      </div>
+    </div>
+  </div>
+
+  <h3>주차별 목표 비교</h3>
+  <table>
+    <tr><th>항목</th><th>v0.0 (이번 주)</th><th>v0.1 (다음 주)</th></tr>
+    <tr><td>Scenes</td><td>3 toy scenes</td><td>5 toy scenes</td></tr>
+    <tr><td>Planned episodes</td><td>300</td><td>1,000</td></tr>
+    <tr><td>Rendered episodes</td><td>100</td><td>300–500</td></tr>
+    <tr><td>Modalities</td><td>rgb · depth · hazard_mask</td><td>+ active_nir_intensity</td></tr>
+    <tr><td>Instruction</td><td>짧은 template (4종)</td><td>template + 약간 augmented</td></tr>
+    <tr><td>Baseline</td><td>shortest oracle + random</td><td>+ detection+planner feasibility test</td></tr>
+    <tr><td>VLA/VLN 테스트</td><td>정성적 RGB-only failure</td><td>작은 RGB-only 정량 테스트</td></tr>
+  </table>
+
+  <h3>미팅 발표용 문장 (Day 3 이후)</h3>
+  <div class="alert success">
+    "현실적이지는 않지만, glass navigation failure를 빠르게 테스트할 수 있는 toy synthetic dataset을 만들었습니다.
+    이제 RGB-only end-to-end agent와 detection+planner 방식 중 어느 쪽이 더 feasible한지 비교할 수 있습니다."
+  </div>
+</section>
+
+
+<!-- ════ OPTICALNAV GAPS ════ -->
+<section class="section" id="opticalnav-gaps">
+  <div class="section-header">
+    <div class="section-icon" style="background:rgba(220,38,38,0.15)">🔍</div>
+    <div>
+      <div class="section-title">갭 분석 — 추가 구현이 필요한 항목</div>
+      <div class="section-subtitle">인프라 검증 후 식별된 실제 작업 항목</div>
+    </div>
+  </div>
+
+  <div class="alert info">
+    핵심 인프라는 완성되어 있으므로 OpticalNav-toy-v0.0의 실제 작업은 대부분 <strong>씬 데이터 제작</strong>이다.
+    코드 갭은 최소화 — 아래는 실제로 확인·작성이 필요한 항목만 정리한다.
+  </div>
+
+  <table>
+    <tr><th>항목</th><th>상태</th><th>구체적 작업</th><th>예상 공수</th></tr>
+    <tr>
+      <td><strong>glass_corridor_001 AuthoringMap JSON</strong></td>
+      <td><span class="tag amber">DATA</span></td>
+      <td>유리벽·유리문 배치 · traversable region · goal candidates · start region. 에디터 또는 JSON 직접 작성.</td>
+      <td>반나절</td>
+    </tr>
+    <tr>
+      <td><strong>Scene 2·3 AuthoringMap</strong></td>
+      <td><span class="tag amber">DATA</span></td>
+      <td>transparent_partition_office + mirror_room. Scene 1 완성 후 패턴 복사.</td>
+      <td>1일</td>
+    </tr>
+    <tr>
+      <td><strong>hazard_mask 렌더 파이프라인 smoke test</strong></td>
+      <td><span class="tag amber">VERIFY</span></td>
+      <td><code>scene_override.target_shape_filenames</code>에 glass 오브젝트 OBJ 경로 연결되는지 end-to-end 확인. binary mask 시각화.</td>
+      <td>2시간</td>
+    </tr>
+    <tr>
+      <td><strong>evaluation/metrics.py</strong></td>
+      <td><span class="tag red">MISSING</span></td>
+      <td>Success Rate · SPL · Collision Rate · Hazard Collision Rate · Goal Distance · Stop Accuracy 계산 함수. 간단한 스크립트 수준.</td>
+      <td>반나절</td>
+    </tr>
+    <tr>
+      <td><strong>RGB-only failure demo 스크립트</strong></td>
+      <td><span class="tag red">MISSING</span></td>
+      <td>shortest path 에이전트가 hazard crossing하는 3개 example path 추출 · 시각화 스크립트.</td>
+      <td>2시간</td>
+    </tr>
+    <tr>
+      <td><strong>dataset_card.md 템플릿</strong></td>
+      <td><span class="tag red">MISSING</span></td>
+      <td>HuggingFace 스타일 dataset card. 규모·구조·좌표계·action 의미·성공 기준 문서화.</td>
+      <td>1시간</td>
+    </tr>
+    <tr>
+      <td><strong>detection+planner Route B 인터페이스</strong></td>
+      <td><span class="tag amber">PARTIAL</span></td>
+      <td>hazard_mask → binary obstacle map 변환 + A* planner 연결. hazard_mask 자체는 있지만 planner 입력 포맷 정의 필요.</td>
+      <td>반나절</td>
+    </tr>
+    <tr>
+      <td><strong>active_nir_intensity hazard cue 검증</strong></td>
+      <td><span class="tag amber">PARTIAL</span></td>
+      <td>NIR 렌더 패스 기존 구현은 있으나 glass surface에서 NIR 반사 거동 정성 확인 필요.</td>
+      <td>1시간</td>
+    </tr>
+  </table>
+
+  <h3>실험 갈림길 — Route A vs Route B</h3>
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px">
+    <div style="border:1px solid rgba(47,123,246,.3);border-radius:var(--radius-sm);background:var(--brand-soft);padding:14px">
+      <div style="font-size:12px;font-weight:800;color:var(--brand);margin-bottom:8px">Route A — End-to-end VLN/VLA</div>
+      <div style="font-size:12px;color:var(--muted-strong);margin-bottom:8px">
+        입력: RGB observation + instruction + current node<br>
+        출력: next action / next node / stop
+      </div>
+      <div style="font-size:12px;color:var(--muted-strong)">
+        <strong>보고 싶은 것:</strong> RGB-only agent가 유리벽을 free space로 잘못 판단하나?<br>
+        <strong>데이터 필요:</strong> rgb 렌더 · episode JSON
+      </div>
+    </div>
+    <div style="border:1px solid rgba(16,163,74,.3);border-radius:var(--radius-sm);background:var(--success-soft);padding:14px">
+      <div style="font-size:12px;font-weight:800;color:var(--success);margin-bottom:8px">Route B — Detection + Planner</div>
+      <div style="font-size:12px;color:var(--muted-strong);margin-bottom:8px">
+        입력: RGB / NIR / hazard_mask prediction<br>
+        중간 출력: transparent obstacle map<br>
+        planner: A* / Dijkstra
+      </div>
+      <div style="font-size:12px;color:var(--muted-strong)">
+        <strong>보고 싶은 것:</strong> hazard detection을 붙이면 collision이 줄어드나?<br>
+        <strong>데이터 필요:</strong> hazard_mask oracle · graph edges
+      </div>
+    </div>
+  </div>
+
+  <div class="alert info" style="margin-top:14px">
+    <strong>미팅 결론:</strong> Route B (detection + 기존 planner)가 우리 optical cue의 downstream 기여를
+    더 직접적으로 증명할 수 있다. End-to-end에만 집착하지 말고 Route B도 feasibility test 대상으로 열어두기.
+  </div>
+</section>
+
+
+<!-- ════ NEXT ════ -->
+<section class="section" id="next">
+  <div class="section-header">
+    <div class="section-icon" style="background:rgba(245,158,11,0.15)">🎯</div>
+    <div>
+      <div class="section-title">남은 과제</div>
+      <div class="section-subtitle">2026-06-02 기준 우선순위</div>
+    </div>
+  </div>
+
+  <div style="font-size:12px;font-weight:700;color:var(--brand);margin-bottom:8px;margin-top:4px">🔥 OpticalNav-toy-v0.0 (이번 주 최우선)</div>
+  <table>
+    <tr><th>항목</th><th>상태</th><th>다음 작업</th></tr>
+    <tr>
+      <td>glass_corridor_001 AuthoringMap 작성</td>
+      <td><span style="color:var(--danger)">🚫 미착수</span></td>
+      <td>유리벽·유리문·traversable region·goal candidates JSON 작성. Day 1 핵심.</td>
+    </tr>
+    <tr>
+      <td>hazard_mask 렌더 smoke test</td>
+      <td><span style="color:var(--danger)">🚫 미착수</span></td>
+      <td><code>target_shape_filenames</code> → glass OBJ 연결 end-to-end 확인. binary mask 시각화.</td>
+    </tr>
+    <tr>
+      <td>evaluation/metrics.py</td>
+      <td><span style="color:var(--danger)">🚫 미착수</span></td>
+      <td>Success Rate · SPL · Hazard Collision Rate · Goal Distance 계산 함수 작성.</td>
+    </tr>
+    <tr>
+      <td>RGB-only failure demo 스크립트</td>
+      <td><span style="color:var(--danger)">🚫 미착수</span></td>
+      <td>hazard crossing path 3개 추출·시각화. Day 3 패키징 핵심 자료.</td>
+    </tr>
+    <tr>
+      <td>Scene 2·3 (partition office, mirror room)</td>
+      <td><span style="color:var(--danger)">🚫 미착수</span></td>
+      <td>glass_corridor 완성 후 패턴 복사. Day 2에서 시작.</td>
+    </tr>
+    <tr>
+      <td>dataset_card.md 템플릿</td>
+      <td><span style="color:var(--danger)">🚫 미착수</span></td>
+      <td>규모·좌표계·action 의미·성공 기준 문서화. Day 3.</td>
+    </tr>
+  </table>
+
+  <div style="font-size:12px;font-weight:700;color:var(--muted);margin-bottom:8px;margin-top:16px">렌더 시스템 (필요할 때 처리)</div>
+  <table>
+    <tr><th>항목</th><th>상태</th><th>다음 작업</th></tr>
+    <tr>
+      <td>variant 전환 시 씬 캐시 자동 무효화</td>
+      <td><span style="color:var(--warning)">🔄 부분 해결</span></td>
+      <td>variant를 캐시 키에 포함 — 같은 씬 다른 variant 요청 시 별도 캐시 슬롯 사용.</td>
+    </tr>
+    <tr>
+      <td>Clear renders 후 3D 프러스텀 즉시 제거</td>
+      <td><span style="color:var(--warning)">🔄 스캔 트리거는 있음</span></td>
+      <td>삭제된 노드의 Three.js frustum 오브젝트를 <code>updateFrustums()</code> 즉시 호출로 제거.</td>
+    </tr>
+    <tr>
+      <td>measured_polarized GPU 빌드 안정화</td>
+      <td><span style="color:var(--warning)">🔄 패치 적용</span></td>
+      <td>cuda_mono_polarized variant 에서 편광 패스 엔드투엔드 검증. Mueller 보간 수치 검증.</td>
+    </tr>
+    <tr>
+      <td>NIR illuminator 파라미터 UI</td>
+      <td><span style="color:var(--danger)">🚫 미구현</span></td>
+      <td>NIR 보조광 파워·빔각도 슬라이더 → render_settings에 전달.</td>
+    </tr>
+  </table>
+</section>
+
+<div class="report-footer">
+  Robomituba Dev Report · 2026-06-02 · GPU 씬 캐시 퇴거 · Ambient 폴백 · 렌더 결과 관리 UI · Editor→Mitsuba 파이프라인 · OpticalNav-toy-v0.0 플랜 및 인프라 검증
+</div>
+</main>
+</div>
+</body>
+</html>

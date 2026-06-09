@@ -8,8 +8,95 @@
 		builtInRichPlaceAssets,
 		type BuiltInPlaceAsset
 	} from '$lib/opticalnavBuiltInAssets';
+	import { assetVM } from '$lib/datasets/vm/AssetVM.svelte';
 	import { sceneBottomSnippet, sceneRailSnippet } from '$lib/stores/scenePortals';
-	import { bottomPanelCollapsed, toggleBottomPanel } from '$lib/stores/shell';
+	import { bottomPanelCollapsed, bottomPanelMode, toggleBottomPanel } from '$lib/stores/shell';
+	import {
+		cameraRigSensorTypeToLegacyModality,
+		legacySensorFromCameraRigSensor,
+		normalizeRigRenderSettings,
+		sensorMountHeight,
+		robotMountForRender,
+		sensorRenderModality,
+		sensorRenderChipLabel,
+		headingHasSensorModality,
+		formatRigVec,
+		formatResolution,
+		formatRenderSpp,
+		positiveInt,
+	} from '$lib/datasets/sensorHelpers';
+	import { computeWorkflowReadiness } from '$lib/datasets/workflowHelpers';
+	import * as validationService from '$lib/datasets/services/validationService';
+	import * as episodeService from '$lib/datasets/services/episodeService';
+	import * as walkabilityService from '$lib/datasets/services/walkabilityService';
+	import * as graphService from '$lib/datasets/services/graphService';
+	import * as renderService from '$lib/datasets/services/renderService';
+	import * as assetService from '$lib/datasets/services/assetService';
+	import * as authoringMapService from '$lib/datasets/services/authoringMapService';
+	import * as projectService from '$lib/datasets/services/projectService';
+	import {
+		mergeBatch,
+		applyJobStatusUpdates,
+		logTailsToBatchEntries,
+		isGraphSweepRenderMode,
+		errorMessage,
+		errorPayload,
+	} from '$lib/datasets/batchHelpers';
+	import { subscribeJobStatus, type JobStatusMessage } from '$lib/stores/jobStatusWs';
+	import ExportPanel from '$lib/datasets/ExportPanel.svelte';
+	import SensorsPanel from '$lib/datasets/SensorsPanel.svelte';
+	import InspectorPanel from '$lib/datasets/InspectorPanel.svelte';
+	import AssetCatalog from '$lib/datasets/AssetCatalog.svelte';
+	import RailStatusTab from '$lib/datasets/RailStatusTab.svelte';
+	import RailExportTab from '$lib/datasets/RailExportTab.svelte';
+	import RailLightsTab from '$lib/datasets/RailLightsTab.svelte';
+	import RailPreviewTab from '$lib/datasets/RailPreviewTab.svelte';
+	import BottomPanel from '$lib/datasets/BottomPanel.svelte';
+	import RailSceneTab from '$lib/datasets/RailSceneTab.svelte';
+	import RailSensorsTab from '$lib/datasets/RailSensorsTab.svelte';
+	import RailPathsTab from '$lib/datasets/RailPathsTab.svelte';
+	import RailSelectedTab from '$lib/datasets/RailSelectedTab.svelte';
+	import {
+		makeStarterAuthoringMap,
+		makeVisibleStarterAuthoringMap,
+		rectangleFromPoints,
+		usdAssetLabel,
+		typeForUsdAsset,
+		placementHintForTool,
+		builtInThumbType,
+	} from '$lib/datasets/authoringHelpers';
+	import {
+		clampMapNumber as _clampMapNumber,
+		svgPoint as _svgPoint,
+		snapLineEndpoint as _snapLineEndpoint,
+		nextAuthoringId as _nextAuthoringId,
+		getItemCenter,
+		rectangleStyle,
+		isRegionLayerVisible as _isRegionLayerVisible,
+		isObjectLayerVisible as _isObjectLayerVisible,
+	} from '$lib/datasets/mapEditorHelpers';
+	import {
+		MATERIAL_PRESET_IDS,
+		EMITTER_KEYWORD_RE,
+		objectLooksLikeEmitter,
+		materialValue,
+		materialOptionLabel,
+		materialCategoryFromText,
+		materialTagsFor,
+		recommendedMaterialCategory,
+		findMaterialOption,
+		materialPreviewSource,
+		materialDisplayLabel,
+		materialInfo,
+		ensureAuthoringMaterial,
+		buildMaterialCards,
+		filterMaterialCards,
+		materialMatchesSearch,
+		materialSuggestion as _materialSuggestion,
+		optionalJson,
+		envmapSizeLabel,
+		fileToDataBase64,
+	} from '$lib/datasets/materialHelpers';
 	import {
 		addOpticalNavScene,
 		attachOpticalNavSceneUsd,
@@ -56,6 +143,8 @@
 		getOpticalNavGraphBatchLogs,
 		scanOpticalNavObservations,
 		getOpticalNavRenderSceneStats,
+		getOpticalNavMaterializationAudit,
+		getOpticalNavXmlSceneIndex,
 		getOpticalNavRoomShell,
 		addOpticalNavGraphNode,
 		deleteOpticalNavGraphNode,
@@ -65,6 +154,7 @@
 		opticalNavWalkabilityOverlayPngUrl,
 		getOpticalNavTraversableGridMeta,
 		opticalNavTraversableGridPngUrl,
+		opticalNavEnvmapPreviewUrl,
 		checkOpticalNavGraphEdge,
 		regenerateOpticalNavGraphRegion,
 		addOpticalNavGraphEdge,
@@ -72,6 +162,7 @@
 		opticalNavObservationRgbUrl,
 		opticalNavObservationModalityUrl,
 		getJobLog,
+		retryJob as retryRenderJob,
 		cancelJob,
 		getCameraRig,
 		type CameraRig,
@@ -87,7 +178,7 @@
 		{ id: 'polarization', label: 'Polarization', enabled: false },
 		{ id: 'lidar_like', label: 'LiDAR-like', enabled: false }
 	];
-	const materialPresetIds = ['painted_wall', 'clear_glass', 'frosted_glass', 'mirror', 'wood', 'fabric', 'tile'];
+	const materialPresetIds = MATERIAL_PRESET_IDS;
 	const hazardTypes = ['', 'transparent_obstacle', 'reflective_obstacle', 'hazard_region', 'forbidden_region', 'glass_door'];
 	// Read URL params at declaration time — must happen before any $effect fires
 	const _urlInit = typeof window !== 'undefined' ? new URLSearchParams(window.location.search) : new URLSearchParams();
@@ -109,9 +200,7 @@
 	let selectedSensorNodeId = $state('');
 	let activeModalityTab = $state('rgb');
 	let activeRigSensorId = $state('');
-	let globalCameraRig = $state<CameraRig | null>(null);
-	let globalCameraRigStatus = $state('Camera rig preset not loaded.');
-	let globalCameraRigError = $state('');
+	// assetVM.globalCameraRig, assetVM.globalCameraRigStatus, assetVM.globalCameraRigError → assetVM
 	let sensorRenderResult = $state<any>(null);
 	let frustumMode = $state<'none' | 'view-aligned' | 'selected'>('view-aligned');
 	let renderingViewpoint = $state(false);
@@ -175,25 +264,44 @@
 	let cameraHeightM = $state(1.0);
 	/** Ref to the MapEditor3D component (used by Preview tab to grab the current orbit camera). */
 	let mapEditorRef = $state<any>(null);
-	// ─── Render Probe (Preview tab) ─────────────────────────────────────────
-	type ProbeMode = 'selected' | 'free' | 'editor_view' | 'isaac_view';
-	let probeMode = $state<ProbeMode>('selected');
-	let freeProbe = $state({ x: 0, z: 0, yaw_deg: 0, height_m: 1.0 });
-	let editorViewProbe = $state<{ x: number; z: number; yaw_deg: number; height_m: number } | null>(null);
+	// ─── Hot Camera Preview (Preview tab) ───────────────────────────────────
 	let probeRendering = $state(false);
 	let probeResult = $state<{ batch_id: string; vp_id: string; heading_id: string; modality: string; sensor_id?: string; submittedAt: number } | null>(null);
 	let probeError = $state('');
+	type HotCameraPose = {
+		preview_id: string;
+		x: number;
+		z: number;
+		yaw_deg: number;
+		height_m: number;
+		batch_id?: string;
+		vp_id?: string;
+		heading_id?: string;
+		modality?: string;
+		sensor_id?: string;
+		rendered?: boolean;
+	};
+	let hotCameraPoses = $state<HotCameraPose[]>([]);
+	let activeHotCameraId = $state('');
 	let renderSceneStats = $state<any>(null);
 	let renderSceneStatsLoading = $state(false);
 	let roomShell = $state<any>(null);
 	let showRoomShell = $state(true);
+	// Tracks whether the user has explicitly toggled the viewer overlay since the
+	// last scene/refresh. When false, the viewer default mirrors the authoring
+	// flag (roomShell.enabled) so disabling the render shell also hides the editor
+	// overlay by default.
+	let _showRoomShellUserTouched = $state(false);
 	let syncProgress = $state<{ processed: number; total: number; label: string; stage: string } | null>(null);
 	let syncRunning = $state(false);
 	async function refreshRoomShell() {
 		if (!selectedProjectId || !sceneId) { roomShell = null; return; }
 		try {
-			const res = await getOpticalNavRoomShell(selectedProjectId, sceneId);
+			const res = await renderService.fetchRoomShell(selectedProjectId, sceneId);
 			roomShell = res?.room_shell ?? null;
+			if (!_showRoomShellUserTouched && roomShell && typeof roomShell.enabled === 'boolean') {
+				showRoomShell = roomShell.enabled;
+			}
 		} catch (err) { roomShell = null; }
 	}
 	$effect(() => {
@@ -203,13 +311,72 @@
 		if (!selectedProjectId || !sceneId) return;
 		renderSceneStatsLoading = true;
 		try {
-			renderSceneStats = await getOpticalNavRenderSceneStats(selectedProjectId, sceneId);
+			renderSceneStats = await renderService.fetchRenderSceneStats(selectedProjectId, sceneId);
 		} catch (err) {
 			renderSceneStats = { exists: false, error: errorMessage(err) };
 		} finally {
 			renderSceneStatsLoading = false;
 		}
 	}
+
+	// PR1: per-object materialization audit + XML scene index. Surfaced in the Sync
+	// Inspector so the user can see which objects rendered as real meshes vs cube
+	// fallbacks (and why), and so the editor preview can later read shapes from XML.
+	let materializationAudit = $state<any>(null);
+	let xmlSceneIndex = $state<any>(null);
+	async function refreshMaterializationAudit() {
+		if (!selectedProjectId || !sceneId) { materializationAudit = null; return; }
+		try {
+			materializationAudit = await renderService.fetchMaterializationAudit(selectedProjectId, sceneId);
+		} catch { materializationAudit = null; }
+	}
+	async function refreshXmlSceneIndex() {
+		if (!selectedProjectId || !sceneId) { xmlSceneIndex = null; return; }
+		try {
+			xmlSceneIndex = await renderService.fetchXmlSceneIndex(selectedProjectId, sceneId);
+		} catch { xmlSceneIndex = null; }
+	}
+	$effect(() => {
+		if (selectedProjectId && sceneId) {
+			refreshMaterializationAudit();
+			refreshXmlSceneIndex();
+		}
+	});
+
+	// PR2: opt-in toggle for the XML-native editor preview. Persisted in session
+	// storage so reloading the page keeps the user's choice. Default flipped to ON
+	// — render-side mesh_cache is the source of truth and the editor should mirror
+	// it out of the box. Only an explicit '0' (user opted out) keeps it off.
+	const _SS_XML_NATIVE_PREVIEW = 'opticalnav:xmlNativePreview';
+	let xmlNativePreviewEnabled = $state(_ssGet(_SS_XML_NATIVE_PREVIEW) !== '0');
+
+	// PR2.5a': compare xml_scene_index.xml_mtime_ns vs the render_scene.xml stat
+	// surfaced by /render-scene-stats. If they differ by more than 5 seconds the
+	// index is older than the current XML — meshes the editor draws may not match
+	// the renderer. Warn instead of silently misleading.
+	const xmlIndexStale = $derived.by(() => {
+		const ns = Number(xmlSceneIndex?.xml_mtime_ns);
+		const isoStat = renderSceneStats?.modified_at;
+		if (!ns || !isoStat) return false;
+		const idxMs = ns / 1_000_000;
+		const xmlMs = Date.parse(isoStat);
+		if (!Number.isFinite(xmlMs)) return false;
+		return Math.abs(idxMs - xmlMs) > 5000;
+	});
+	let _xmlStaleWarnedAt = 0;
+	$effect(() => {
+		if (xmlIndexStale && Date.now() - _xmlStaleWarnedAt > 30_000) {
+			_xmlStaleWarnedAt = Date.now();
+			console.warn('[XML-native preview] xml_scene_index.json is older than render_scene.xml — meshes shown in the editor may not reflect the current sync. Run Sync Render Scene to refresh.');
+		}
+	});
+	$effect(() => {
+		if (typeof window === 'undefined') return;
+		try {
+			window.sessionStorage.setItem(_SS_XML_NATIVE_PREVIEW, xmlNativePreviewEnabled ? '1' : '0');
+		} catch { /* silent */ }
+	});
+
 	$effect(() => {
 		if (railTab === 'preview' && selectedProjectId && sceneId) {
 			refreshRenderSceneStats();
@@ -243,7 +410,7 @@
 	let mapHeight = $state(4);
 	// Auto-expand map bounds when USD geometry loads
 	$effect(() => {
-		const b = editorGeometryPayload?.bounds;
+		const b = assetVM.editorGeometryPayload?.bounds;
 		if (!b?.size) return;
 		const sx = Number(b.size[0] ?? 0);
 		const sz = Number(b.size[2] ?? 0);
@@ -295,7 +462,7 @@
 	async function refreshTraversableMeta() {
 		if (!selectedProjectId || !sceneId) { traversableMeta = null; return; }
 		try {
-			traversableMeta = await getOpticalNavTraversableGridMeta(selectedProjectId, sceneId, Number(robotRadius));
+			traversableMeta = await walkabilityService.fetchTraversableMeta(selectedProjectId, sceneId, Number(robotRadius));
 			traversableVersion = traversableVersion + 1;
 		} catch (err) { traversableMeta = null; }
 	}
@@ -312,12 +479,10 @@
 	async function handleInspectorSecondNode(source: string, target: string) {
 		edgeInspectorSource = '';
 		try {
-			const res = await checkOpticalNavGraphEdge(selectedProjectId, sceneId, {
-				source, target,
-				robot_radius_m: Number(robotRadius),
-				max_edge_length_m: Number(maxEdgeLength),
+			edgeCheckResult = await graphService.checkEdge(selectedProjectId, sceneId, source, target, {
+				robotRadiusM: Number(robotRadius),
+				maxEdgeLengthM: Number(maxEdgeLength),
 			});
-			edgeCheckResult = res;
 		} catch (err) {
 			pushActivity('error', 'edge:inspect', errorMessage(err));
 		}
@@ -325,7 +490,7 @@
 	async function addEdgeAnyway() {
 		if (!edgeCheckResult?.source || !edgeCheckResult?.target) return;
 		try {
-			await addOpticalNavGraphEdge(selectedProjectId, sceneId, { source: edgeCheckResult.source, target: edgeCheckResult.target });
+			await graphService.addEdge(selectedProjectId, sceneId, edgeCheckResult.source, edgeCheckResult.target);
 			pushActivity('ok', 'edge:inspect', `Edge created: ${edgeCheckResult.source} ↔ ${edgeCheckResult.target}`);
 			await loadGraph();
 			edgeCheckResult = null;
@@ -345,11 +510,18 @@
 	let renderConfig = $state<any>(null);
 	let renderConfigError = $state('');
 	let selectedBatchJobId = $state('');
-	let selectedBatchJobLog = $state<any[]>([]);
+	let selectedBatchJobLog = $state<string[]>([]);
 	let selectedBatchJobLoading = $state(false);
 	let validationReport = $state<any>(null);
 	let evaluationReport = $state<any>(null);
 	let exportResult = $state<any>(null);
+	// Default ON: a partial sweep is the common case during dataset authoring;
+	// shipping only rendered episodes keeps the exported dataset coherent.
+	let exportOnlyCompleted = $state(true);
+	// Default ON: validate/export should focus on the scene the user is
+	// editing. Other scenes in the same project may have broken sync state
+	// that has nothing to do with the current work.
+	let exportCurrentSceneOnly = $state(true);
 	let mapResult = $state<any>(null);
 	let buildingMap = $state(false);
 	let planResult = $state<any>(null);
@@ -359,19 +531,10 @@
 	let graphRebuildConfirmOpen = $state(false);
 	let graphPayload = $state<any>(null);
 	let editor3DStatus = $state('');
-	let editorGeometryPayload = $state<any>(null);
-	let editorGeometryCatalogStatus = $state('USD asset catalog not loaded.');
-	let editorGeometryCatalogKey = '';
-	let editorGeometryRefreshToken = $state(0);
-	let assetThumbRefreshTick = $state(0);
-	let selectedUsdAssetId = $state('');
-	let mapAssets = $state<any[]>([]);
-	let mapAssetStatus = $state('No library assets loaded.');
-	let usdCandidates = $state<any[]>([]);
-	let selectedMoorelaneUsdRef = $state('');
-	let usdCandidateStatus = $state('USD candidates not loaded.');
-	let materialGroups = $state<any[]>([]);
-	let materialLibraryStatus = $state('Material library not loaded.');
+	// editorGeometryPayload, editorGeometryCatalogStatus, editorGeometryRefreshToken,
+	// assetThumbRefreshTick, selectedUsdAssetId, mapAssets, mapAssetStatus,
+	// usdCandidates, selectedMoorelaneUsdRef, usdCandidateStatus,
+	// materialGroups, materialLibraryStatus → assetVM
 	let inspectorTab = $state<'object' | 'material'>('object');
 	let materialPickerSearch = $state('');
 	let materialPickerCategory = $state('recommended');
@@ -383,8 +546,7 @@
 	let compileResult = $state<any>(null);
 	let syncResult = $state<any>(null);
 	let renderReadiness = $state<any>(null);
-	let envmapFiles = $state<any[]>([]);
-	let envmapUploading = $state(false);
+	// envmapFiles, envmapUploading → assetVM
 	let isaacSyncResult = $state<any>(null);
 	let authoringMapDirty = $state(false);
 	let inspectorError = $state('');
@@ -410,6 +572,11 @@
 	let linePreview = $state<{ x: number; y: number } | null>(null);
 	let dragStart = $state<{ x: number; y: number } | null>(null);
 	let dragPreview = $state<{ x: number; y: number } | null>(null);
+	let objectTransformMode = $state(true);
+	let surfaceSnapEnabled = $state(true);
+	let gridSnapEnabled = $state(true);
+	let transformGridSizeM = $state(0.05);
+	let transformAngleSnapDeg = $state(15);
 	let visibleLayers = $state({
 		objects: true,
 		traversable: true,
@@ -468,7 +635,7 @@
 
 	type GhostGeom = { type: 'line'; x1: number; y1: number; x2: number; y2: number; valid: boolean }
 		| { type: 'rect'; minX: number; minY: number; maxX: number; maxY: number; valid: boolean }
-		| { type: 'point'; x: number; y: number; valid: boolean; sourcePath?: string; assetCat?: string; normalizedYMin?: number };
+		| { type: 'point'; x: number; y: number; valid: boolean; sourcePath?: string; assetCat?: string; normalizedYMin?: number; baseHeightM?: number; proxySize?: [number, number, number] };
 	let draftGhost = $state<GhostGeom | null>(null);
 
 	let undoStack = $state<any[]>([]);
@@ -511,10 +678,11 @@
 	const hasEpisodes = $derived(episodes.length > 0);
 	const renderReadinessSummary = $derived(currentScene?.render_readiness ?? null);
 	const effectiveRenderReadiness = $derived(renderReadiness ?? syncResult?.render_readiness ?? renderReadinessSummary);
-	const renderReadinessOk = $derived(Boolean(effectiveRenderReadiness?.ok ?? (currentScene?.sync_status?.render_scene === 'synced')));
-	// After Phase 3 migration, PUT /authoring-map regenerates XML automatically.
-	// renderSceneSynced is true whenever render_readiness is OK — no separate sync needed.
-	const renderSceneSynced = $derived(renderReadinessOk || (currentScene?.sync_status?.render_scene === 'synced'));
+	const currentRenderSceneStatus = $derived(String(currentScene?.sync_status?.render_scene ?? ''));
+	const renderReadinessOk = $derived(Boolean(effectiveRenderReadiness?.ok));
+	// Local readiness alone is not enough: annotation compile or async sync can
+	// invalidate render-scene artifacts after a previous OK response.
+	const renderSceneSynced = $derived(renderReadinessOk && currentRenderSceneStatus === 'synced');
 	const renderConfigReady = $derived(Boolean(renderSceneSynced && sceneStateText.trim() && cameraSpecText.trim()));
 	const validationPassed = $derived(Boolean(validationReport && validationReport.ok !== false));
 	const authoringObjects = $derived(authoringMap?.objects ?? []);
@@ -529,11 +697,11 @@
 	);
 	const selectedCustomSensorNode = $derived(customSensorNodes.find(n => n.id === selectedSensorNodeId) ?? null);
 	const rigSensorOptions = $derived.by(() => {
-		const sensors = ((globalCameraRig?.sensors?.length
-			? globalCameraRig.sensors.map((sensor) => legacySensorFromCameraRigSensor(sensor))
+		const sensors = ((assetVM.globalCameraRig?.sensors?.length
+			? assetVM.globalCameraRig.sensors.map((sensor) => legacySensorFromCameraRigSensor(sensor, assetVM.globalCameraRig?.base_frame))
 			: authoringMap?.camera_rig?.sensors?.length
 				? authoringMap.camera_rig.sensors
-				: makeStarterAuthoringMap().camera_rig.sensors) ?? []) as any[];
+				: makeStarterAuthoringMap(sceneId).camera_rig.sensors) ?? []) as any[];
 		return sensors.map((sensor: any, index: number) => {
 			const sensorId = String(sensor?.sensor_id || `sensor_${index + 1}`);
 			const renderModality = sensorRenderModality(sensor);
@@ -548,6 +716,50 @@
 	});
 	const activeRigSensorOption = $derived(rigSensorOptions.find((item: any) => item.sensor_id === activeRigSensorId) ?? rigSensorOptions[0] ?? null);
 	const activeRenderModality = $derived(String(activeRigSensorOption?.render_modality ?? activeModalityTab ?? 'rgb'));
+	const activeCameraFrustum = $derived.by(() => {
+		const sensor: any = activeRigSensorOption?.sensor ?? {};
+		const rawResolution = Array.isArray(sensor.resolution) ? sensor.resolution : sensor.intrinsics?.resolution;
+		const resolution = Array.isArray(rawResolution) && rawResolution.length >= 2
+			? [Number(rawResolution[0] ?? 1280), Number(rawResolution[1] ?? 720)]
+			: [1280, 720];
+		return {
+			fov_deg: Number(sensor.fov_deg ?? sensor.intrinsics?.fov_h_deg ?? 70),
+			fov_v_deg: Number(sensor.fov_v_deg ?? sensor.intrinsics?.fov_v_deg ?? 0) || undefined,
+			resolution,
+		};
+	});
+	const activeHotCameraPose = $derived(
+		(activeHotCameraId ? hotCameraPoses.find((item) => item.preview_id === activeHotCameraId) : null)
+			?? hotCameraPoses[hotCameraPoses.length - 1]
+			?? null
+	);
+	const hotCameraOverlays = $derived.by(() => {
+		return hotCameraPoses.map((pose) => {
+			const vp = pose.vp_id;
+			const hid = pose.heading_id;
+			const modality = pose.modality ?? activeRenderModality;
+			const sensorId = pose.sensor_id ?? activeRigSensorId;
+			const job = (graphBatch?.jobs ?? []).find((item: any) => item.preview_id === pose.preview_id);
+			const completed = isRenderJobComplete(job);
+			return {
+				id: pose.preview_id,
+				x: pose.x,
+				z: pose.z,
+				yaw_deg: pose.yaw_deg,
+				height_m: pose.height_m,
+				fov_deg: activeCameraFrustum.fov_deg,
+				fov_v_deg: activeCameraFrustum.fov_v_deg,
+				resolution: activeCameraFrustum.resolution,
+				label: completed ? 'Hot preview' : 'Hot camera',
+				imageUrl: completed && vp && hid
+					? opticalNavObservationModalityUrl(selectedProjectId, sceneId, vp, hid, modality, sensorId)
+					: '',
+				vpId: vp,
+				headingId: hid,
+				active: pose.preview_id === activeHotCameraPose?.preview_id,
+			};
+		});
+	});
 	$effect(() => {
 		if (!rigSensorOptions.length) return;
 		const selected = rigSensorOptions.find((item: any) => item.sensor_id === activeRigSensorId) ?? rigSensorOptions[0];
@@ -557,7 +769,7 @@
 	});
 	/** Active rig sensor mount height. Used as default before per-viewpoint overrides. */
 	const rigMountHeightM = $derived<number>(
-		sensorMountHeight(activeRigSensorOption?.sensor ?? (globalCameraRig?.sensors?.[0] ? legacySensorFromCameraRigSensor(globalCameraRig.sensors[0]) : authoringMap?.camera_rig?.sensors?.[0])) || cameraHeightM
+		sensorMountHeight(activeRigSensorOption?.sensor ?? (assetVM.globalCameraRig?.sensors?.[0] ? legacySensorFromCameraRigSensor(assetVM.globalCameraRig.sensors[0]) : authoringMap?.camera_rig?.sensors?.[0])) || cameraHeightM
 	);
 	/** Height to render the currently-selected viewpoint at (per-vp override > rig default). */
 	const selectedSensorHeightM = $derived<number>(
@@ -616,37 +828,19 @@
 				: ''
 	);
 	const selectedMaterialSuggestion = $derived(materialSuggestion(selectedAuthoringItem));
-	const selectedMaterialInfo = $derived(materialInfo(selectedAuthoringItem?.material));
-	const materialCards = $derived(buildMaterialCards());
+	const selectedMaterialInfo = $derived(materialInfo(selectedAuthoringItem?.material, assetVM.materialGroups));
+	// materialCards, materialCollections, usdAssetSelectionPool, usdAssetCandidates,
+	// selectedUsdAsset → assetVM
 	const materialCollections = $derived(
-		[...new Map(materialCards.filter((item: any) => item.collection !== 'preset').map((item: any) => [item.collection, item.collectionLabel])).entries()]
+		[...new Map(assetVM.materialCards.filter((item: any) => item.collection !== 'preset').map((item: any) => [item.collection, item.collectionLabel])).entries()]
 	);
-	const filteredMaterialCards = $derived(filterMaterialCards(materialCards, selectedAuthoringItem));
+	const filteredMaterialCards = $derived(filterMaterialCards(assetVM.materialCards, selectedAuthoringItem, { search: materialPickerSearch, collection: materialPickerCollection, category: materialPickerCategory }));
 	const materialPreviewEntry = $derived(
-		materialCards.find((item: any) => item.value === (materialPreviewValue || selectedAuthoringItem?.material))
+		assetVM.materialCards.find((item: any) => item.value === (materialPreviewValue || selectedAuthoringItem?.material))
 		?? filteredMaterialCards[0]
-		?? materialCards[0]
+		?? assetVM.materialCards[0]
 		?? null
 	);
-	const LIBRARY_DISPLAY_LIMIT = 40;
-	let usdCatalogSearch = $state('');
-	const usdAssetSelectionPool = $derived([...builtInRichPlaceAssets, ...mapAssets]);
-	const usdAssetCandidatesAll = $derived.by(() => {
-		const all = mapAssets;
-		if (!usdCatalogSearch.trim()) return all;
-		const q = usdCatalogSearch.toLowerCase();
-		return all.filter((item: any) =>
-			usdAssetLabel(item).toLowerCase().includes(q) ||
-			(item.category ?? '').toLowerCase().includes(q) ||
-			(item.source_path ?? '').toLowerCase().includes(q) ||
-			(item.tags ?? []).join(' ').toLowerCase().includes(q)
-		);
-	});
-	// Cap at LIBRARY_DISPLAY_LIMIT when no search to avoid WebGL context flood
-	const usdAssetCandidates = $derived(
-		usdCatalogSearch.trim() ? usdAssetCandidatesAll : usdAssetCandidatesAll.slice(0, LIBRARY_DISPLAY_LIMIT)
-	);
-	const selectedUsdAsset = $derived(usdAssetSelectionPool.find((item: any) => (item.asset_id ?? item.id) === selectedUsdAssetId) ?? usdAssetCandidatesAll[0] ?? null);
 	const authoringSummary = $derived({
 		objects: authoringObjects.length,
 		regions: authoringRegions.length,
@@ -655,9 +849,20 @@
 		traversable: authoringRegions.filter((item: any) => item.type === 'traversable').length
 	});
 	const hasAuthoringContent = $derived(authoringSummary.objects + authoringSummary.regions > 0);
-	const activeBatch = $derived(renderMode === 'graph_sweep' ? graphBatch : renderBatch);
-	const bottomProgress = $derived(activeBatch?.progress ?? null);
-	const batchJobGrid = $derived(buildBatchJobGrid(activeBatch));
+	const activeBatch = $derived(isGraphSweepRenderMode(renderMode) ? graphBatch : renderBatch);
+	// Episode path sweep is only meaningful when an episode with explicit graph
+	// nodes is loaded. trajectory-only episodes have no path_nodes to filter on.
+	const episodeNodesAvailable = $derived(
+		Boolean(
+			selectedEpisode &&
+			(selectedEpisode.navigation_mode ?? 'trajectory') === 'viewpoint_graph' &&
+			Array.isArray(selectedEpisode.path_nodes) &&
+			selectedEpisode.path_nodes.length > 0
+		)
+	);
+	const episodePathNodeCount = $derived(
+		episodeNodesAvailable ? (selectedEpisode.path_nodes as string[]).length : 0
+	);
 	const selectedEpisodeSummary = $derived(
 		selectedEpisode
 			? {
@@ -688,82 +893,34 @@
 			exportResult?.path ??
 			''
 	);
-	const currentReadiness = $derived(readinessState());
+	const currentReadiness = $derived(computeWorkflowReadiness({
+		selectedProjectId, hasScene, hasAuthoringMap, hasAuthoringContent,
+		hasPersistedAuthoringMap, authoringMapDirty, currentScene,
+		hasMap, hasGraph, hasEpisodes, renderSceneSynced, renderConfigReady,
+		validationReport, validationPassed,
+	}));
 
-	function _mergeIntoBatch(existing: any, incoming: any): any {
-		const jobMap = new Map<string, any>();
-		for (const j of existing?.jobs ?? []) jobMap.set(j.job_id, j);
-		for (const j of incoming?.jobs ?? []) jobMap.set(j.job_id, j);
-		const jobs = [...jobMap.values()];
-		const counts: Record<string, number> = { queued: 0, running: 0, completed: 0, failed: 0, cancelled: 0, unknown: 0 };
-		for (const j of jobs) {
-			const s = String(j?.status?.status ?? j?.status ?? 'unknown');
-			counts[s] = (counts[s] ?? 0) + 1;
-		}
-		const total = Math.max(1, jobs.length);
-		return {
-			...(incoming ?? existing ?? {}),
-			jobs,
-			counts,
-			progress: { completed: counts.completed, failed: counts.failed, total: jobs.length, fraction: (counts.completed + counts.failed) / total }
-		};
-	}
-
-	function buildBatchJobGrid(batch: any) {
-		const jobs: any[] = batch?.jobs ?? [];
-		if (!jobs.length) return { rows: [], headings: [] as string[], counts: {} as Record<string, number> };
-		const headingSet = new Set<string>();
-		const nodeMap = new Map<string, Map<string, any>>();
-		for (const job of jobs) {
-			const nid = String(job.node_id ?? job.job_id ?? '');
-			const hid = String(job.heading_id ?? '');
-			headingSet.add(hid);
-			if (!nodeMap.has(nid)) nodeMap.set(nid, new Map());
-			nodeMap.get(nid)!.set(hid, job);
-		}
-		const headings = [...headingSet].sort();
-		const rows = [...nodeMap.entries()].map(([nid, hMap]) => ({ nid, cells: headings.map(h => hMap.get(h) ?? null) }));
-		return { rows, headings, counts: (batch?.counts ?? {}) as Record<string, number> };
-	}
-
-	function jobStatusClass(job: any): string {
-		const s = String(job?.status?.status ?? job?.status ?? 'unknown');
-		if (s === 'completed') return 'js-done';
-		if (s === 'running') return 'js-running';
-		if (s === 'failed') return 'js-failed';
-		if (s === 'cancelled') return 'js-cancelled';
-		if (s === 'queued') return 'js-queued';
-		return 'js-unknown';
-	}
-
-	function jobStageLabel(job: any): string {
-		return String(job?.status?.progress_stage ?? job?.status?.status ?? '');
-	}
-
-	const RENDER_STAGES = [
-		{ key: 'queued',           label: '대기' },
-		{ key: 'staging_scene',    label: 'XML 준비' },
-		{ key: 'loading_scene',    label: 'GPU 로드' },
-		{ key: 'rendering',        label: '렌더링' },
-		{ key: 'saving_output',    label: 'EXR 저장' },
-		{ key: 'writing_manifest', label: '매니페스트' },
-		{ key: 'complete',         label: '완료' },
-	];
-
-	function stageIndex(job: any): number {
-		const stage = jobStageLabel(job);
-		const s = String(job?.status?.status ?? '');
-		if (s === 'succeeded') return RENDER_STAGES.length - 1;
-		if (s === 'failed' || s === 'cancelled') return -1;
-		const idx = RENDER_STAGES.findIndex(r => r.key === stage);
-		return idx >= 0 ? idx : 0;
-	}
+	// _mergeIntoBatch, buildBatchJobGrid, jobStatusClass, jobStageLabel, stageIndex,
+	// progressPercent, compactDetail, errorMessage, errorPayload → $lib/datasets/batchHelpers
 
 	const selectedBatchJob = $derived(
 		selectedBatchJobId
-			? (activeBatch?.jobs ?? []).find((j: any) => j.job_id === selectedBatchJobId) ?? null
+			? (activeBatch?.jobs ?? []).find((job: any) => job.job_id === selectedBatchJobId) ?? null
 			: null
 	);
+	function isRenderJobComplete(job: any): boolean {
+		const status = String(job?.status?.status ?? job?.status ?? '');
+		return status === 'completed' || status === 'succeeded';
+	}
+	const selectedBatchJobImageUrl = $derived.by(() => {
+		if (!selectedBatchJob || !isRenderJobComplete(selectedBatchJob)) return '';
+		const nodeId = String(selectedBatchJob.preview_id ?? selectedBatchJob.node_id ?? '');
+		const headingId = String(selectedBatchJob.heading_id ?? '');
+		if (!nodeId || !headingId) return '';
+		const modality = String(selectedBatchJob.modality ?? activeRenderModality);
+		const sensorId = String(selectedBatchJob.sensor_id ?? activeRigSensorId);
+		return opticalNavObservationModalityUrl(selectedProjectId, sceneId, nodeId, headingId, modality, sensorId);
+	});
 
 	async function selectBatchJob(job: any) {
 		if (!job?.job_id) return;
@@ -771,8 +928,7 @@
 		selectedBatchJobLog = [];
 		selectedBatchJobLoading = true;
 		try {
-			const data = await getJobLog(job.job_id, 200);
-			selectedBatchJobLog = Array.isArray(data?.entries) ? data.entries : (Array.isArray(data) ? data : []);
+			await refreshSelectedBatchJobLog(job.job_id);
 		} catch {
 			selectedBatchJobLog = [];
 		} finally {
@@ -780,43 +936,55 @@
 		}
 	}
 
+	async function refreshSelectedBatchJobLog(jobId = selectedBatchJobId) {
+		if (!jobId) return;
+		const data = await getJobLog(jobId, 200);
+		selectedBatchJobLog = Array.isArray(data?.lines) ? data.lines.map((line: unknown) => String(line)) : [];
+	}
+
 	async function cancelStaleBatchJobs() {
 		const jobs: any[] = activeBatch?.jobs ?? [];
-		const stale = jobs.filter((j: any) => {
-			const s = String(j?.status?.status ?? '');
-			return s === 'running' || s === 'queued' || s === 'pending';
+		const stale = jobs.filter((job: any) => {
+			const status = String(job?.status?.status ?? '');
+			return status === 'running' || status === 'queued' || status === 'pending';
 		});
-		if (!stale.length) { pushActivity('info', 'batch', 'No stale jobs to cancel.'); return; }
+		if (!stale.length) {
+			pushActivity('info', 'batch', 'No stale jobs to cancel.');
+			return;
+		}
 		let cancelled = 0;
-		for (const j of stale) {
-			try { await cancelJob(j.job_id); cancelled++; } catch { /* best-effort */ }
+		for (const job of stale) {
+			try {
+				await cancelJob(job.job_id);
+				cancelled += 1;
+			} catch {
+				// best effort
+			}
 		}
 		pushActivity('ok', 'batch', `Cancelled ${cancelled} stale job(s).`);
 		await refreshBatch();
 	}
 
-	function progressPercent(progress: any) {
-		const total = Number(progress?.total ?? 0);
-		const completed = Number(progress?.completed ?? 0);
-		if (!total) return 0;
-		return Math.max(0, Math.min(100, Math.round((completed / total) * 100)));
-	}
-
-	function compactDetail(text?: string) {
-		if (!text) return '';
-		return text.length > 180 ? `${text.slice(0, 180)}...` : text;
-	}
-
-	function errorMessage(err: unknown) {
-		const payload = typeof err === 'object' && err !== null ? (err as any).payload : null;
-		if (payload && typeof payload === 'object') {
-			return String((payload as any).message ?? (payload as any).error ?? (err instanceof Error ? err.message : 'Request failed'));
+	async function retryBatchJob(job: any) {
+		if (!job?.job_id) return;
+		try {
+			await retryRenderJob(job.job_id);
+			pushActivity('ok', 'batch:retry', `Retry requested for ${job.job_id?.slice(-8)}`);
+		} catch (err) {
+			pushActivity('error', 'batch:retry', errorMessage(err));
 		}
-		return err instanceof Error ? err.message : String(err);
+		await refreshBatch();
 	}
 
-	function errorPayload(err: unknown) {
-		return typeof err === 'object' && err !== null && 'payload' in err ? (err as any).payload : undefined;
+	async function cancelBatchJob(job: any) {
+		if (!job?.job_id) return;
+		try {
+			await cancelJob(job.job_id);
+			pushActivity('ok', 'batch:cancel', `Cancel requested for ${job.job_id?.slice(-8)}`);
+		} catch (err) {
+			pushActivity('error', 'batch:cancel', errorMessage(err));
+		}
+		await refreshBatch();
 	}
 
 	function pushActivity(level: ActivityEntry['level'], source: string, message: string, detail?: unknown) {
@@ -844,146 +1012,10 @@
 		return false;
 	}
 
-	function makeStarterAuthoringMap() {
-		return {
-			version: 'opticalnav-authoring-map-v0.2',
-			scene_id: sceneId,
-			unit: 'meter',
-			floorplan_ref: `/api/scenes/${sceneId}/floorplan`,
-			objects: [],
-			regions: [],
-			environment: {
-				mode: 'constant',
-				radiance: [0.8, 0.8, 0.85],
-				intensity: 1.0,
-				rotation_deg: 0,
-				background_visible: true
-			},
-			camera_rig: {
-				rig_id: 'mobile_base_default',
-				base_frame: 'base_link',
-				sensors: [
-					{ sensor_id: 'rgb_front', label: 'RGB Front', modality: 'rgb', mount: { xyz_m: [0.18, 1.0, 0.0], rpy_deg: [0, 0, 0] }, fov_deg: 70, resolution: [1280, 720], clip_range: [0.05, 80], sensor_sync_group: 'default', calibration_ref: null },
-					{ sensor_id: 'nir_front', label: 'NIR Front', modality: 'nir', mount: { xyz_m: [0.16, 0.98, 0.04], rpy_deg: [0, 0, 0] }, fov_deg: 70, resolution: [1280, 720], clip_range: [0.05, 80], sensor_sync_group: 'default', calibration_ref: null, active_emitter: { wavelength_nm: 850, power: 1.0 } },
-					{ sensor_id: 'pol_front', label: 'Polarization Front', modality: 'polarization', mount: { xyz_m: [0.16, 1.02, -0.04], rpy_deg: [0, 0, 0] }, fov_deg: 70, resolution: [1280, 720], clip_range: [0.05, 80], sensor_sync_group: 'default', calibration_ref: null }
-				]
-			},
-			materials: [
-				{ material_id: 'clear_glass', category: 'transparent', render_binding: { kind: 'preset', bsdf_strategy: 'dielectric', capabilities: { rgb: true, nir: true, polarization: true } } },
-				{ material_id: 'mirror', category: 'reflective', render_binding: { kind: 'preset', bsdf_strategy: 'conductor', capabilities: { rgb: true, nir: true, polarization: true } } },
-				{ material_id: 'painted_wall', category: 'opaque', render_binding: { kind: 'preset', bsdf_strategy: 'roughplastic', capabilities: { rgb: true, nir: true, polarization: false } } },
-				{ material_id: 'wood', category: 'opaque', render_binding: { kind: 'preset', bsdf_strategy: 'roughplastic', capabilities: { rgb: true, nir: true, polarization: false } } }
-			],
-			settings: {
-				grid_size_m: 0.25,
-				default_wall_height_m: 2.4,
-				default_wall_thickness_m: 0.08
-			},
-			metadata: {
-				source: 'webui_map_editor'
-			}
-		};
-	}
-
-	function makeVisibleStarterAuthoringMap() {
-		const base = makeStarterAuthoringMap();
-		return {
-			...base,
-			objects: [
-				{
-					id: 'glass_wall_001',
-					type: 'glass_wall',
-					label: 'Glass wall',
-					placement: 'line',
-					geometry: {
-						type: 'line',
-						start: [2.25, 0.75],
-						end: [2.25, 3.25],
-						height_m: 2.4,
-						thickness_m: 0.08
-					},
-					material: 'clear_glass',
-					navigation: {
-						blocks_navigation: true,
-						hazard_type: 'transparent_obstacle',
-						include_in_hazard_mask: true,
-						instruction_candidate: true,
-						goal_candidate: false
-					},
-					metadata: {
-						created_by: 'webui_starter_overlay'
-					}
-				},
-				{
-					id: 'mirror_wall_001',
-					type: 'mirror_wall',
-					label: 'Mirror wall',
-					placement: 'line',
-					geometry: {
-						type: 'line',
-						start: [0.85, 3.35],
-						end: [4.9, 3.35],
-						height_m: 2.4,
-						thickness_m: 0.08
-					},
-					material: 'mirror',
-					navigation: {
-						blocks_navigation: true,
-						hazard_type: 'reflective_obstacle',
-						include_in_hazard_mask: true,
-						instruction_candidate: true,
-						goal_candidate: false
-					},
-					metadata: {
-						created_by: 'webui_starter_overlay'
-					}
-				}
-			],
-			regions: [
-				{
-					id: 'traversable_001',
-					type: 'traversable',
-					label: 'Main floor',
-					placement: 'rectangle',
-					geometry: { type: 'rectangle', bounds: [0.45, 0.45, 5.55, 3.55] },
-					navigation: {
-						blocks_navigation: false,
-						hazard_type: null,
-						include_in_hazard_mask: false,
-						instruction_candidate: false,
-						goal_candidate: false
-					},
-					metadata: {
-						created_by: 'webui_starter_overlay'
-					}
-				},
-				{
-					id: 'goal_001',
-					type: 'goal',
-					label: 'Goal near table',
-					placement: 'rectangle',
-					geometry: { type: 'rectangle', bounds: [4.45, 1.15, 5.2, 1.85] },
-					navigation: {
-						blocks_navigation: false,
-						hazard_type: null,
-						include_in_hazard_mask: false,
-						instruction_candidate: true,
-						goal_candidate: true
-					},
-					metadata: {
-						created_by: 'webui_starter_overlay'
-					}
-				}
-			],
-			metadata: {
-				...base.metadata,
-				starter_overlay: true
-			}
-		};
-	}
+	// makeStarterAuthoringMap, makeVisibleStarterAuthoringMap → $lib/datasets/authoringHelpers
 
 	function createStarterOverlay() {
-		setAuthoringMapPayload(makeVisibleStarterAuthoringMap());
+		setAuthoringMapPayload(makeVisibleStarterAuthoringMap(sceneId));
 		selectedAuthoringId = 'glass_wall_001';
 		placementTool = 'select';
 		draftPoint = null;
@@ -1032,7 +1064,7 @@
 	}
 
 	function withRenderDefaults(payload: any) {
-		const starter = makeStarterAuthoringMap();
+		const starter = makeStarterAuthoringMap(sceneId);
 		return {
 			...payload,
 			environment: { ...(starter.environment ?? {}), ...(payload?.environment ?? {}) },
@@ -1055,17 +1087,75 @@
 		if (savedH > 0) mapHeight = savedH;
 	}
 
+	function currentAuthoringMap() {
+		const text = String(authoringMapText || '').trim();
+		if (text) return withRenderDefaults(JSON.parse(text));
+		return ensureAuthoringMap();
+	}
+
+	function ensureAuthoringMap() {
+		if (authoringMap) return authoringMap;
+		const starter = makeStarterAuthoringMap(sceneId);
+		setAuthoringMapPayload(starter, true);
+		return starter;
+	}
+
+	// State-bound wrappers around mapEditorHelpers pure functions
+	function nextAuthoringId(type: string) {
+		const ids = [
+			...((authoringMap?.objects ?? []).map((item: any) => String(item.id ?? ''))),
+			...((authoringMap?.regions ?? []).map((item: any) => String(item.id ?? '')))
+		];
+		return _nextAuthoringId(type, ids);
+	}
+
+	function svgPoint(event: PointerEvent): { x: number; y: number } {
+		return _svgPoint(event, mapWidth, mapHeight);
+	}
+
+	function selectBuiltInAsset(tool: string) {
+		placementTool = tool as PlacementTool;
+		draftPoint = null;
+		linePreview = null;
+		dragStart = null;
+		dragPreview = null;
+	}
+
+	function selectBuiltInPlaceAsset(asset: BuiltInPlaceAsset) {
+		if (asset.kind === 'primitive') {
+			selectBuiltInAsset(asset.tool);
+			return;
+		}
+		assetVM.selectedUsdAssetId = asset.asset_id;
+		placementTool = 'usd_asset';
+		draftPoint = null;
+		linePreview = null;
+		dragStart = null;
+		dragPreview = null;
+	}
+
 	function markAuthoringJsonDirty() {
 		authoringMapDirty = true;
 	}
 
+	function setMapWidthFromInput(value: unknown) {
+		const next = clampMapNumber(value, 'positive', mapWidth);
+		if (next > 0 && next !== mapWidth) {
+			mapWidth = next;
+			markAuthoringJsonDirty();
+		}
+	}
+
+	function setMapHeightFromInput(value: unknown) {
+		const next = clampMapNumber(value, 'positive', mapHeight);
+		if (next > 0 && next !== mapHeight) {
+			mapHeight = next;
+			markAuthoringJsonDirty();
+		}
+	}
+
 	function clampMapNumber(value: unknown, axis: 'x' | 'y' | 'yaw' | 'positive', fallback = 0) {
-		const numeric = Number(value);
-		if (!Number.isFinite(numeric)) return fallback;
-		if (axis === 'x') return Number(Math.max(0, Math.min(mapWidth, numeric)).toFixed(3));
-		if (axis === 'y') return Number(Math.max(0, Math.min(mapHeight, numeric)).toFixed(3));
-		if (axis === 'yaw') return Number((((numeric % 360) + 360) % 360).toFixed(1));
-		return Number(Math.max(0.001, numeric).toFixed(3));
+		return _clampMapNumber(value, axis, mapWidth, mapHeight, fallback);
 	}
 
 	function replaceSelectedAuthoringItem(updater: (item: any) => any) {
@@ -1077,16 +1167,19 @@
 		setAuthoringMapPayload({ ...authoringMap, objects, regions }, true);
 	}
 
+	function replaceAuthoringObjectLive(id: string, updater: (item: any) => any) {
+		if (!authoringMap || !id) return;
+		inspectorError = '';
+		const objects = (authoringMap.objects ?? []).map((item: any) => (item.id === id ? updater(item) : item));
+		const regions = (authoringMap.regions ?? []).map((item: any) => (item.id === id ? updater(item) : item));
+		setAuthoringMapPayload({ ...authoringMap, objects, regions }, true);
+	}
+
 	function updateSelectedField(field: string, value: unknown) {
 		replaceSelectedAuthoringItem((item) => ({ ...item, [field]: value }));
 	}
 
-	// Light-source detection: matches authoring_map.py's detect_emitter_candidates().
-	const EMITTER_KEYWORD_RE = /light|lamp|bulb|lumin|fluoresc|fixture|emitter|illum|sconce|chandel|\bled\b/i;
-	function objectLooksLikeEmitter(obj: any): boolean {
-		const tokens = `${obj?.label ?? ''} ${obj?.source_ref ?? ''}`;
-		return EMITTER_KEYWORD_RE.test(tokens);
-	}
+	// objectLooksLikeEmitter, kelvinToRgb, rgbToKelvinApprox — moved to $lib/datasets/materialHelpers
 	const detectedEmitterIds = $derived<Set<string>>(
 		new Set((authoringMap?.objects ?? []).filter(objectLooksLikeEmitter).map((o: any) => o.id))
 	);
@@ -1097,6 +1190,43 @@
 	const editorObjectsCount = $derived((authoringMap?.objects ?? []).length);
 	const editorEmitterCount = $derived((authoringMap?.objects ?? []).filter((o: any) => o?.is_emitter).length);
 	const editorMaterialCount = $derived((authoringMap?.materials ?? []).length);
+	function setEmitters(ids: Set<string>, enabled: boolean) {
+		if (!authoringMap) return;
+		pushHistory();
+		const objects = (authoringMap.objects ?? []).map((item: any) =>
+			ids.has(item.id) ? { ...item, is_emitter: enabled } : item
+		);
+		setAuthoringMapPayload({ ...authoringMap, objects }, true);
+		pushActivity(enabled ? 'ok' : 'info', 'lights', `${enabled ? 'Enabled' : 'Disabled'} ${ids.size} light source candidate(s).`);
+	}
+	function enableAllDetectedEmitters() {
+		setEmitters(detectedEmitterIds, true);
+	}
+	function disableAllEmitters() {
+		const ids = new Set<string>((authoringMap?.objects ?? []).filter((item: any) => item?.is_emitter).map((item: any) => String(item.id)));
+		setEmitters(ids, false);
+	}
+	async function handleToggleEmitter(lightId: string, isOn: boolean) {
+		if (!authoringMap) return;
+		const objects = (authoringMap.objects ?? []).map((o: any) => o.id === lightId ? { ...o, is_emitter: isOn } : o);
+		setAuthoringMapPayload({ ...authoringMap, objects }, true);
+		await saveAuthoringMap();
+	}
+	function handleSetEmitterIntensity(lightId: string, intensity: number) {
+		if (!authoringMap) return;
+		const objects = (authoringMap.objects ?? []).map((o: any) => o.id === lightId ? { ...o, emitter_intensity: intensity } : o);
+		setAuthoringMapPayload({ ...authoringMap, objects }, true);
+	}
+	function handleSetEmitterRadiance(lightId: string, rgb: [number, number, number]) {
+		if (!authoringMap) return;
+		const objects = (authoringMap.objects ?? []).map((o: any) => o.id === lightId ? { ...o, emitter_radiance: rgb } : o);
+		setAuthoringMapPayload({ ...authoringMap, objects }, true);
+	}
+	function handleSetEmitterHeight(lightId: string, height: number) {
+		if (!authoringMap) return;
+		const objects = (authoringMap.objects ?? []).map((o: any) => o.id === lightId ? { ...o, geometry: { ...(o.geometry ?? {}), base_height_m: height } } : o);
+		setAuthoringMapPayload({ ...authoringMap, objects }, true);
+	}
 	const selectedObjectGuide = $derived.by(() => {
 		const item = selectedAuthoringItem;
 		if (!item) return null;
@@ -1114,254 +1244,7 @@
 			label: item.label ?? item.id ?? 'object',
 		};
 	});
-	/** Tanner Helland approximation. Returns linear RGB in [0,1] for the given Kelvin temperature.
-	 *  Used by the Lights editor to convert a temperature slider into emitter_radiance.
-	 */
-	function kelvinToRgb(kelvin: number): [number, number, number] {
-		const t = Math.max(1000, Math.min(40000, kelvin)) / 100;
-		let r: number, g: number, b: number;
-		if (t <= 66) {
-			r = 255;
-			g = Math.max(0, 99.4708025861 * Math.log(t) - 161.1195681661);
-			b = t <= 19 ? 0 : Math.max(0, 138.5177312231 * Math.log(t - 10) - 305.0447927307);
-		} else {
-			r = Math.max(0, 329.698727446 * Math.pow(t - 60, -0.1332047592));
-			g = Math.max(0, 288.1221695283 * Math.pow(t - 60, -0.0755148492));
-			b = 255;
-		}
-		return [Math.min(255, r) / 255, Math.min(255, g) / 255, Math.min(255, b) / 255];
-	}
-	/** Inverse: derive Kelvin from an RGB ratio (used to seed the slider from stored emitter_radiance).
-	 *  Quick lookup via 100-step scan — accuracy sufficient for UI slider sync. */
-	function rgbToKelvinApprox(rgb: [number, number, number]): number {
-		let best = 3000;
-		let bestErr = Infinity;
-		for (let k = 1500; k <= 10000; k += 100) {
-			const ref = kelvinToRgb(k);
-			const err = Math.abs(ref[0] - rgb[0]) + Math.abs(ref[1] - rgb[1]) + Math.abs(ref[2] - rgb[2]);
-			if (err < bestErr) { bestErr = err; best = k; }
-		}
-		return best;
-	}
-
-	async function enableAllDetectedEmitters() {
-		if (!authoringMap) return;
-		const objects = (authoringMap.objects ?? []).map((o: any) =>
-			detectedEmitterIds.has(o.id) && !o.is_emitter ? { ...o, is_emitter: true, emitter_intensity: o.emitter_intensity ?? 1.0 } : o
-		);
-		setAuthoringMapPayload({ ...authoringMap, objects }, true);
-		await saveAuthoringMap();
-	}
-	async function disableAllEmitters() {
-		if (!authoringMap) return;
-		const objects = (authoringMap.objects ?? []).map((o: any) =>
-			o.is_emitter ? { ...o, is_emitter: false } : o
-		);
-		setAuthoringMapPayload({ ...authoringMap, objects }, true);
-		await saveAuthoringMap();
-	}
-
-	function materialValue(group: any, material: any) {
-		return `${group.dataset_id}:${material.material_id}`;
-	}
-
-	function materialOptionLabel(material: any) {
-		const status = material.status && material.status !== 'available' ? ` · ${material.status}` : '';
-		const source = material.preview_source ? ` · ${material.preview_source}` : '';
-		return `${material.display_name ?? material.material_id}${status}${source}`;
-	}
-
-	function findMaterialOption(value: string | null | undefined) {
-		if (!value || materialPresetIds.includes(value)) return null;
-		for (const group of materialGroups) {
-			for (const material of group.materials ?? []) {
-				if (materialValue(group, material) === value) return { group, material };
-			}
-		}
-		return null;
-	}
-
-	function materialPreviewSource(value: string | null | undefined) {
-		if (!value) return '';
-		if (materialPresetIds.includes(value)) return materialPreviewUrl(value);
-		const found = findMaterialOption(value);
-		if (!found) return '';
-		const { group, material } = found;
-		if (material.kind === 'curated' || group.dataset_id === 'curated_basic') return curatedMaterialPreviewUrl(material.material_id);
-		return measuredMaterialPreviewUrl(group.dataset_id, material.material_id, material.native_file);
-	}
-
-	function materialDisplayLabel(value: string | null | undefined) {
-		if (!value) return 'No material';
-		if (materialPresetIds.includes(value)) return value.replace(/_/g, ' ');
-		const found = findMaterialOption(value);
-		return found?.material?.display_name ?? value;
-	}
-
-	function materialCategoryFromText(value: string, fallback = 'all') {
-		const key = value.toLowerCase();
-		if (key.includes('glass') || key.includes('transparent') || key.includes('frost')) return 'glass';
-		if (key.includes('mirror') || key.includes('reflect')) return 'mirror';
-		if (key.includes('wall') || key.includes('paint') || key.includes('brick') || key.includes('plaster')) return 'wall';
-		if (key.includes('floor') || key.includes('tile') || key.includes('carpet') || key.includes('stone')) return 'floor';
-		if (key.includes('wood') || key.includes('fabric') || key.includes('leather') || key.includes('chair') || key.includes('table')) return 'furniture';
-		if (key.includes('hazard') || key.includes('obstacle')) return 'hazard';
-		return fallback;
-	}
-
-	function materialTagsFor(category: string, group: any = {}, material: any = {}) {
-		const tags = new Set<string>();
-		const key = `${category} ${group.dataset_id ?? ''} ${material.material_id ?? ''} ${material.display_name ?? ''} ${material.category ?? ''}`.toLowerCase();
-		if (category !== 'all') tags.add(category);
-		if (key.includes('glass') || key.includes('transparent')) tags.add('transparent');
-		if (key.includes('mirror') || key.includes('reflect')) tags.add('reflective');
-		if (key.includes('rough') || key.includes('frost')) tags.add('rough');
-		if (key.includes('smooth') || key.includes('gloss')) tags.add('smooth');
-		if (String(group.dataset_id ?? '').includes('hpbrdf')) {
-			tags.add('polarization-ready');
-			tags.add('NIR-ready');
-		}
-		if (String(group.dataset_id ?? '').includes('pbrdf')) tags.add('polarization-ready');
-		if (category === 'glass' || category === 'mirror' || category === 'hazard') tags.add('hazard');
-		if (category === 'floor') tags.add('floor-safe');
-		return [...tags];
-	}
-
-	function recommendedMaterialCategory(item: any) {
-		const key = `${item?.type ?? ''} ${item?.label ?? ''} ${item?.metadata?.asset_category ?? ''}`.toLowerCase();
-		if (!key.trim()) return 'recommended';
-		if (key.includes('glass')) return 'glass';
-		if (key.includes('mirror')) return 'mirror';
-		if (key.includes('wall')) return 'wall';
-		if (key.includes('floor') || key.includes('traversable')) return 'floor';
-		if (key.includes('chair') || key.includes('table') || key.includes('furniture')) return 'furniture';
-		if (key.includes('hazard')) return 'hazard';
-		return 'recommended';
-	}
-
-	function buildMaterialCards() {
-		const presetCards = materialPresetIds.map((id) => {
-			const category = materialCategoryFromText(id, id === 'fabric' ? 'furniture' : 'all');
-			return {
-				value: id,
-				label: id.replace(/_/g, ' '),
-				subtitle: 'OpticalNav preset',
-				collection: 'preset',
-				collectionLabel: 'Presets',
-				category,
-				tags: materialTagsFor(category, { dataset_id: 'preset' }, { material_id: id }),
-				status: 'ready',
-				kind: 'preset',
-				preview: materialPreviewUrl(id),
-				material: null,
-				group: null
-			};
-		});
-		const libraryCards = materialGroups.flatMap((group: any) =>
-			(group.materials ?? []).map((material: any) => {
-				const label = material.display_name ?? material.material_id;
-				const category = materialCategoryFromText(`${label} ${material.material_id} ${material.category ?? ''} ${group.dataset_id}`, material.category ?? 'all');
-				const value = materialValue(group, material);
-				return {
-					value,
-					label,
-					subtitle: group.display_name ?? group.dataset_id,
-					collection: group.dataset_id,
-					collectionLabel: group.display_name ?? group.dataset_id,
-					category,
-					tags: materialTagsFor(category, group, material),
-					status: material.status ?? 'unknown',
-					kind: material.kind ?? 'measured',
-					preview: materialPreviewSource(value),
-					material,
-					group
-				};
-			})
-		);
-		return [...presetCards, ...libraryCards];
-	}
-
-	function materialMatchesSearch(value: string, label: string, extra = '') {
-		const q = materialPickerSearch.trim().toLowerCase();
-		if (!q) return true;
-		return `${value} ${label} ${extra}`.toLowerCase().includes(q);
-	}
-
-	function filterMaterialCards(cards: any[], item: any) {
-		const q = materialPickerSearch.trim().toLowerCase();
-		const recommended = recommendedMaterialCategory(item);
-		return cards
-			.filter((card) => {
-				if (materialPickerCollection !== 'all' && card.collection !== materialPickerCollection) return false;
-				if (materialPickerCategory === 'recommended') {
-					if (recommended !== 'recommended' && card.category !== recommended && !card.tags.includes(recommended)) return false;
-				} else if (materialPickerCategory !== 'all' && card.category !== materialPickerCategory && !card.tags.includes(materialPickerCategory)) {
-					return false;
-				}
-				if (!q) return true;
-				return `${card.value} ${card.label} ${card.subtitle} ${card.tags.join(' ')}`.toLowerCase().includes(q);
-			})
-			.slice(0, 80);
-	}
-
-	function selectedMaterialPreviewSource() {
-		return materialPreviewSource(selectedAuthoringItem?.material);
-	}
-
-	function materialInfo(value: string | null | undefined) {
-		if (!value) return null;
-		if (materialPresetIds.includes(value)) {
-			return { kind: 'preset', label: value, detail: 'Built-in OpticalNav material preset.' };
-		}
-		const found = findMaterialOption(value);
-		if (!found) return { kind: 'custom', label: value, detail: 'Registered custom authoring material.' };
-		return {
-			kind: found.material.kind ?? 'measured',
-			label: found.material.display_name ?? found.material.material_id,
-			detail: `${found.group.display_name ?? found.group.dataset_id} · ${found.material.status ?? 'unknown'} · ${found.group.mitsuba_strategy ?? 'material library'}`,
-			capabilities: found.group.capabilities,
-			native_file: found.material.native_file,
-			preview_source: found.material.preview_source
-		};
-	}
-
-	function ensureAuthoringMaterial(materialId: string, materials: any[]) {
-		if (!materialId || materialPresetIds.includes(materialId) || materials.some((item: any) => item.material_id === materialId)) return materials;
-		const found = findMaterialOption(materialId);
-		if (!found) return [...materials, { material_id: materialId, category: 'custom', params: {}, render_binding: { kind: 'custom', material_id: materialId, bsdf_strategy: 'roughplastic', unresolved: true } }];
-		const { group, material } = found;
-		const kind = material.kind === 'curated' ? 'curated' : 'measured';
-		const bsdfStrategy = group.mitsuba_strategy || (kind === 'measured' ? 'measured_polarized' : 'roughplastic');
-		return [
-			...materials,
-			{
-				material_id: materialId,
-				category: material.kind === 'curated' ? material.category ?? 'curated' : 'measured',
-				params: {
-					dataset_id: group.dataset_id,
-					source_material_id: material.material_id,
-					display_name: material.display_name,
-					native_file: material.native_file,
-					status: material.status,
-					kind: material.kind,
-					mitsuba_strategy: group.mitsuba_strategy,
-					capabilities: group.capabilities,
-					preview_source: material.preview_source,
-					channels_dir: material.channels_dir ?? null
-				},
-				render_binding: {
-					kind,
-					dataset_id: group.dataset_id,
-					material_id: material.material_id,
-					native_file: material.native_file,
-					bsdf_strategy: bsdfStrategy,
-					capabilities: group.capabilities ?? {},
-					preview_source: material.preview_source,
-					status: material.status
-				}
-			}
-		];
-	}
+	// kelvinToRgb … ensureAuthoringMaterial → $lib/datasets/materialHelpers
 
 	function updateSelectedMaterial(value: string) {
 		if (!authoringMap || !selectedAuthoringId) return;
@@ -1370,7 +1253,7 @@
 		const material = value || null;
 		const objects = (authoringMap.objects ?? []).map((item: any) => (item.id === selectedAuthoringId ? { ...item, material } : item));
 		const regions = (authoringMap.regions ?? []).map((item: any) => (item.id === selectedAuthoringId ? { ...item, material } : item));
-		const materials = material ? ensureAuthoringMaterial(material, authoringMap.materials ?? []) : (authoringMap.materials ?? []);
+		const materials = material ? ensureAuthoringMaterial(material, authoringMap.materials ?? [], assetVM.materialGroups) : (authoringMap.materials ?? []);
 		setAuthoringMapPayload({ ...authoringMap, objects, regions, materials }, true);
 	}
 
@@ -1383,7 +1266,7 @@
 		if (!authoringMap || !selectedAuthoringId) return;
 		pushHistory();
 		inspectorError = '';
-		const card = materialCards.find((item: any) => item.value === value);
+		const card = assetVM.materialCards.find((item: any) => item.value === value);
 		const semanticCategory = card?.category ?? materialCategoryFromText(value, 'all');
 		const material = value || null;
 		const applyTo = (item: any) => {
@@ -1424,9 +1307,9 @@
 		};
 		const objects = (authoringMap.objects ?? []).map(applyTo);
 		const regions = (authoringMap.regions ?? []).map(applyTo);
-		const materials = material ? ensureAuthoringMaterial(material, authoringMap.materials ?? []) : (authoringMap.materials ?? []);
+		const materials = material ? ensureAuthoringMaterial(material, authoringMap.materials ?? [], assetVM.materialGroups) : (authoringMap.materials ?? []);
 		setAuthoringMapPayload({ ...authoringMap, objects, regions, materials }, true);
-		pushActivity('ok', 'material', `Applied ${materialDisplayLabel(value)} with suggested tags.`);
+		pushActivity('ok', 'material', `Applied ${materialDisplayLabel(value, assetVM.materialGroups)} with suggested tags.`);
 	}
 
 	function updateSelectedNavigation(field: string, value: unknown) {
@@ -1440,8 +1323,8 @@
 	}
 
 	function updateEnvironmentField(field: string, value: unknown) {
-		if (!authoringMap) setAuthoringMapPayload(makeStarterAuthoringMap());
-		const current = authoringMap ?? makeStarterAuthoringMap();
+		if (!authoringMap) setAuthoringMapPayload(makeStarterAuthoringMap(sceneId));
+		const current = authoringMap ?? makeStarterAuthoringMap(sceneId);
 		const environment = { ...(current.environment ?? {}) };
 		if (field === 'radiance') environment.radiance = String(value).split(',').map((v) => Number(v.trim())).filter((v) => Number.isFinite(v)).slice(0, 3);
 		else if (['intensity', 'rotation_deg'].includes(field)) environment[field] = Number(value);
@@ -1450,33 +1333,20 @@
 		setAuthoringMapPayload({ ...current, environment }, true);
 	}
 
-	function envmapSizeLabel(bytes: unknown): string {
-		const n = Number(bytes ?? 0);
-		if (!Number.isFinite(n) || n <= 0) return '';
-		if (n >= 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)} MB`;
-		return `${Math.max(1, Math.round(n / 1024))} KB`;
+	function updateSettingsField(field: string, value: unknown) {
+		if (!authoringMap) setAuthoringMapPayload(makeStarterAuthoringMap(sceneId));
+		const current = authoringMap ?? makeStarterAuthoringMap(sceneId);
+		const settings = { ...(current.settings ?? {}) };
+		if (field === 'room_shell_enabled') settings[field] = Boolean(value);
+		else if (['grid_size_m', 'default_wall_height_m', 'default_wall_thickness_m'].includes(field)) settings[field] = Number(value);
+		else settings[field] = value;
+		setAuthoringMapPayload({ ...current, settings }, true);
 	}
 
-	function fileToDataBase64(file: File): Promise<string> {
-		return new Promise((resolve, reject) => {
-			const reader = new FileReader();
-			reader.onerror = () => reject(reader.error ?? new Error('File read failed'));
-			reader.onload = () => {
-				const result = String(reader.result ?? '');
-				resolve(result.includes(',') ? result.split(',', 2)[1] : result);
-			};
-			reader.readAsDataURL(file);
-		});
-	}
+	// envmapSizeLabel, fileToDataBase64 → materialHelpers.ts (imported above)
 
 	async function loadEnvmaps() {
-		if (!selectedProjectId || !sceneId) { envmapFiles = []; return; }
-		try {
-			const data = await listOpticalNavEnvmaps(selectedProjectId, sceneId);
-			envmapFiles = data?.envmaps ?? [];
-		} catch {
-			envmapFiles = [];
-		}
+		await assetVM.loadEnvmaps(selectedProjectId, sceneId);
 	}
 
 	async function uploadEnvmapFromInput(input: HTMLInputElement) {
@@ -1490,16 +1360,15 @@
 			pushActivity('warn', 'envmap', 'Use an EXR, HDR, PNG, JPG, or JPEG environment map.');
 			return;
 		}
-		envmapUploading = true;
 		try {
 			const dataBase64 = await fileToDataBase64(file);
-			const data = await uploadOpticalNavEnvmap(selectedProjectId, sceneId, {
+			const data = await assetVM.uploadEnvmap(selectedProjectId, sceneId, {
 				filename: file.name,
-				content_type: file.type || undefined,
-				data_base64: dataBase64
+				contentType: file.type || undefined,
+				dataBase64,
 			});
 			if (data?.envmap_ref) {
-				const current = authoringMap ?? makeStarterAuthoringMap();
+				const current = authoringMap ?? makeStarterAuthoringMap(sceneId);
 				const nextMap = {
 					...current,
 					environment: {
@@ -1510,7 +1379,7 @@
 					settings: { ...(current.settings ?? {}), map_w: mapWidth, map_h: mapHeight }
 				};
 				setAuthoringMapPayload(nextMap, true);
-				const saved = await saveOpticalNavAuthoringMap(selectedProjectId, sceneId, nextMap);
+				const saved = await authoringMapService.saveAuthoringMap(selectedProjectId, sceneId, nextMap);
 				if (saved?.authoring_map) setAuthoringMapPayload(saved.authoring_map, false);
 				syncResult = null;
 				renderReadiness = null;
@@ -1519,125 +1388,27 @@
 			await loadEnvmaps();
 		} catch (err) {
 			pushActivity('error', 'envmap', errorMessage(err));
-		} finally {
-			envmapUploading = false;
 		}
 	}
 
-	function cameraRigSensorTypeToLegacyModality(sensor: CameraRigSensor | any): string {
-		const sensorType = String(sensor?.sensor_type ?? '').toLowerCase();
-		if (sensorType === 'nir_camera') return 'nir';
-		if (sensorType === 'polar_camera') return 'polarization';
-		if (sensorType === 'lidar_3d') return 'lidar';
-		const modalities = Array.isArray(sensor?.modalities) ? sensor.modalities.map((m: unknown) => String(m).toLowerCase()) : [];
-		if (modalities.includes('nir_intensity') || modalities.includes('active_nir_intensity') || modalities.includes('nir')) return 'nir';
-		if (modalities.includes('polarization') || modalities.includes('stokes')) return 'polarization';
-		if (modalities.includes('lidar_point_cloud') || modalities.includes('lidar')) return 'lidar';
-		return 'rgb';
-	}
-
-	function legacySensorFromCameraRigSensor(sensor: CameraRigSensor): any {
-		const modality = cameraRigSensorTypeToLegacyModality(sensor);
-		const intrinsics = sensor.intrinsics ?? {};
-		const mount = sensor.mount ?? { parent_frame: globalCameraRig?.base_frame ?? 'base_link', xyz_m: [0, 0, 1], rpy_deg: [0, 0, 0] };
-		return {
-			sensor_id: sensor.sensor_id,
-			label: sensor.sensor_id,
-			modality,
-			enabled: sensor.enabled !== false,
-			mount,
-			resolution: intrinsics.resolution ?? [1280, 720],
-			fov_deg: Number(intrinsics.fov_h_deg ?? 75),
-			fov_v_deg: Number(intrinsics.fov_v_deg ?? 60),
-			focal_length_px: Number(intrinsics.focal_length_px ?? 0),
-			clip_range: [Number(intrinsics.clip_near_m ?? 0.05), Number(intrinsics.clip_far_m ?? 80)],
-			sensor_sync_group: 'camera_rig',
-			calibration_ref: null,
-			active_emitter: sensor.nir,
-			polarization: sensor.polarization,
-			lidar: sensor.lidar,
-			render: normalizeRigRenderSettings(sensor.render, sensor.sensor_type),
-			source_schema: 'camera_rig_v1',
-			canonical_sensor_type: sensor.sensor_type,
-			modalities: sensor.modalities ?? [],
-			intrinsics
-		};
-	}
-
-	function normalizeRigRenderSettings(render: CameraRigRenderSettings | any, sensorType = 'rgb_camera'): CameraRigRenderSettings {
-		const lidar = sensorType === 'lidar_3d';
-		return {
-			path_spp: positiveInt(render?.path_spp, lidar ? 1 : 4096),
-			aov_spp: positiveInt(render?.aov_spp, lidar ? 1 : 16),
-			polar_spp: positiveInt(render?.polar_spp, lidar ? 1 : 256),
-			samples_per_pass: render?.samples_per_pass == null || render?.samples_per_pass === ''
-				? null
-				: positiveInt(render.samples_per_pass, 1)
-		};
-	}
-
-	function positiveInt(value: unknown, fallback: number): number {
-		const parsed = Number(value);
-		return Number.isFinite(parsed) && parsed > 0 ? Math.round(parsed) : fallback;
-	}
-
-	function sensorMountHeight(sensor: any): number {
-		const xyz = sensor?.mount?.xyz_m;
-		if (!Array.isArray(xyz)) return 0;
-		// CameraRig v1 is Z-up: [lateral, forward, up].
-		// OpticalNav legacy sweep expects robot_mount as [lateral, height, forward].
-		const heightIndex = sensor?.source_schema === 'camera_rig_v1' ? 2 : 1;
-		return Number(xyz[heightIndex] ?? 0) || 0;
-	}
-
-	function robotMountForRender(sensor: any): any {
-		const mount = sensor?.mount ?? {};
-		const xyz = Array.isArray(mount.xyz_m) ? mount.xyz_m : [0, rigMountHeightM, 0];
-		const rpy = Array.isArray(mount.rpy_deg) ? mount.rpy_deg : [0, 0, 0];
-		if (sensor?.source_schema === 'camera_rig_v1') {
-			return {
-				...mount,
-				// Convert CameraRig v1 [x lateral, y forward, z up] to sweep convention
-				// [x lateral, y height, z forward].
-				xyz_m: [Number(xyz[0] ?? 0), Number(xyz[2] ?? rigMountHeightM), Number(xyz[1] ?? 0)],
-				rpy_deg: [Number(rpy[0] ?? 0), Number(rpy[1] ?? 0), Number(rpy[2] ?? 0)],
-				source_schema: 'camera_rig_v1'
-			};
-		}
-		return { ...mount, xyz_m: [Number(xyz[0] ?? 0), Number(xyz[1] ?? rigMountHeightM), Number(xyz[2] ?? 0)], rpy_deg: [Number(rpy[0] ?? 0), Number(rpy[1] ?? 0), Number(rpy[2] ?? 0)] };
-	}
-
-	function formatRigVec(values: unknown, digits = 2): string {
-		if (!Array.isArray(values)) return '-';
-		return values.map((v) => Number(v ?? 0).toFixed(digits)).join(', ');
-	}
-
-	function formatResolution(values: unknown): string {
-		if (!Array.isArray(values) || values.length < 2) return '-';
-		return `${Number(values[0] ?? 0)} × ${Number(values[1] ?? 0)}`;
-	}
-
-	function formatRenderSpp(sensor: any): string {
-		const render = normalizeRigRenderSettings(sensor?.render, String(sensor?.canonical_sensor_type ?? sensor?.sensor_type ?? 'rgb_camera'));
-		return `path ${render.path_spp} · aov ${render.aov_spp} · polar ${render.polar_spp}`;
-	}
+	// sensor helpers → $lib/datasets/batchHelpers or sensorHelpers
 
 	async function loadGlobalCameraRig() {
-		globalCameraRigError = '';
-		globalCameraRigStatus = 'Loading camera rig preset...';
+		assetVM.globalCameraRigError = '';
+		assetVM.globalCameraRigStatus = 'Loading camera rig preset...';
 		try {
-			const rig = await getCameraRig('ranger_mini_default');
-			globalCameraRig = rig;
-			globalCameraRigStatus = `Using ${rig.label || rig.rig_id} (${rig.sensors?.length ?? 0} sensors) from global Camera Rig preset.`;
+			const rig = await assetService.fetchCameraRig('ranger_mini_default');
+			assetVM.globalCameraRig = rig;
+			assetVM.globalCameraRigStatus = `Using ${rig.label || rig.rig_id} (${rig.sensors?.length ?? 0} sensors) from global Camera Rig preset.`;
 			if (rig.sensors?.length && !rig.sensors.some((sensor) => sensor.sensor_id === activeRigSensorId)) {
 				activeRigSensorId = rig.sensors[0].sensor_id;
 			}
 			pushActivity('ok', 'camera-rig', `Loaded ${rig.rig_id} for dataset render sensor specs.`);
 		} catch (err) {
-			globalCameraRig = null;
-			globalCameraRigError = errorMessage(err);
-			globalCameraRigStatus = 'Global Camera Rig preset unavailable; falling back to legacy authoring map sensors.';
-			pushActivity('warn', 'camera-rig', globalCameraRigStatus, err);
+			assetVM.globalCameraRig = null;
+			assetVM.globalCameraRigError = errorMessage(err);
+			assetVM.globalCameraRigStatus = 'Global Camera Rig preset unavailable; falling back to legacy authoring map sensors.';
+			pushActivity('warn', 'camera-rig', assetVM.globalCameraRigStatus, err);
 		}
 	}
 
@@ -1653,29 +1424,7 @@
 		pushActivity('warn', 'camera-rig', `Cannot remove rig sensor ${index + 1} from Dataset Sensors. Open /camera_rig to edit the preset.`);
 	}
 
-	function sensorRenderModality(sensor: any): string {
-		const modality = String(sensor?.modality ?? 'rgb').toLowerCase();
-		if (modality === 'nir') return 'active_nir_intensity';
-		if (modality === 'polarization') return 'polar_rgb_preview';
-		if (modality === 'depth') return 'depth';
-		if (modality === 'lidar') return 'lidar_like';
-		return 'rgb';
-	}
-
-	function sensorRenderChipLabel(option: any): string {
-		const modality = String(option?.modality ?? '').toUpperCase();
-		const renderModality = String(option?.render_modality ?? 'rgb');
-		return modality && modality.toLowerCase() !== renderModality ? `${modality} → ${renderModality}` : renderModality;
-	}
-
-	function headingHasSensorModality(hdata: any, modality: string, sensorId = activeRigSensorId): boolean {
-		const key = `has_${modality}`;
-		const sensors = hdata?.sensors;
-		if (sensorId && sensors && typeof sensors === 'object') {
-			return Boolean(sensors[sensorId]?.[key]);
-		}
-		return Boolean(hdata?.[key]);
-	}
+	// sensorRenderModality, sensorRenderChipLabel, headingHasSensorModality → $lib/datasets/sensorHelpers
 
 	function selectRigRenderSensor(sensorId: string) {
 		const option = rigSensorOptions.find((item: any) => item.sensor_id === sensorId) ?? rigSensorOptions[0];
@@ -1693,9 +1442,9 @@
 			? [Math.max(1, Number(rawResolution[0]) || 1280), Math.max(1, Number(rawResolution[1]) || 720)]
 			: [1280, 720];
 		const base = baseSpec && typeof baseSpec === 'object' ? { ...baseSpec } : {};
-		const renderMount = robotMountForRender(sensor);
-		const rigId = String(globalCameraRig?.rig_id ?? authoringMap?.camera_rig?.rig_id ?? 'mobile_base_default');
-		const baseFrame = String(sensor?.mount?.parent_frame ?? globalCameraRig?.base_frame ?? authoringMap?.camera_rig?.base_frame ?? 'base_link');
+		const renderMount = robotMountForRender(sensor, rigMountHeightM);
+		const rigId = String(assetVM.globalCameraRig?.rig_id ?? authoringMap?.camera_rig?.rig_id ?? 'mobile_base_default');
+		const baseFrame = String(sensor?.mount?.parent_frame ?? assetVM.globalCameraRig?.base_frame ?? authoringMap?.camera_rig?.base_frame ?? 'base_link');
 		const renderModality = sensorRenderModality(sensor);
 		const extras: any = {
 			...(base.extras ?? {}),
@@ -1777,6 +1526,49 @@
 		pushActivity('ok', 'map-editor', `Rotated ${selectedAuthoringId} ${deltaDeg > 0 ? '+' : ''}${deltaDeg}°.`);
 	}
 
+	let activeObjectTransformId = '';
+	let activeObjectTransformChanged = false;
+	function handleObjectTransform(
+		id: string,
+		patch: { center?: [number, number]; base_height_m?: number; yaw_deg?: number },
+		reason: 'drag_start' | 'drag_move' | 'drag_end' | 'height_move' | 'yaw_move'
+	) {
+		if (!id) return;
+		if (reason === 'drag_start') {
+			pushHistory();
+			activeObjectTransformId = id;
+			activeObjectTransformChanged = false;
+			return;
+		}
+		if (reason === 'drag_end') {
+			if (activeObjectTransformId === id && activeObjectTransformChanged) {
+				pushActivity('ok', 'map-editor', `Moved ${id}.`);
+			}
+			activeObjectTransformId = '';
+			activeObjectTransformChanged = false;
+			return;
+		}
+		if (!patch || (!patch.center && patch.base_height_m == null && patch.yaw_deg == null)) return;
+		activeObjectTransformChanged = true;
+		replaceAuthoringObjectLive(id, (item) => {
+			const geometry = { ...(item.geometry ?? {}), type: 'point' };
+			const nextGeometry = { ...geometry };
+			if (patch.center) {
+				nextGeometry.center = [
+					clampMapNumber(patch.center[0], 'x', geometry.center?.[0] ?? 0),
+					clampMapNumber(patch.center[1], 'y', geometry.center?.[1] ?? 0)
+				];
+			}
+			if (patch.base_height_m != null) {
+				nextGeometry.base_height_m = Number(Math.max(0, Number(patch.base_height_m) || 0).toFixed(3));
+			}
+			if (patch.yaw_deg != null) {
+				nextGeometry.yaw_deg = clampMapNumber(patch.yaw_deg, 'yaw', geometry.yaw_deg ?? 0);
+			}
+			return { ...item, geometry: nextGeometry };
+		});
+	}
+
 	function updateSelectedLineGeometry(field: 'start_x' | 'start_y' | 'end_x' | 'end_y' | 'height_m' | 'thickness_m', value: unknown) {
 		replaceSelectedAuthoringItem((item) => {
 			const geometry = { ...(item.geometry ?? {}), type: 'line' };
@@ -1804,21 +1596,7 @@
 		fixedPt: [number, number] | null | undefined,
 		shiftKey: boolean
 	): [number, number] {
-		const x = clampMapNumber(rawPt.x, 'x');
-		const y = clampMapNumber(rawPt.y, 'y');
-		if (shiftKey || !fixedPt) return [x, y];
-		const dx = x - fixedPt[0];
-		const dy = y - fixedPt[1];
-		const len = Math.sqrt(dx * dx + dy * dy);
-		if (len < 0.01) return [x, y];
-		// Snap to nearest 45° step (8 directions: ortho + diagonal)
-		const angle = Math.atan2(dy, dx);
-		const STEP = Math.PI / 4;
-		const snapped = Math.round(angle / STEP) * STEP;
-		return [
-			clampMapNumber(fixedPt[0] + len * Math.cos(snapped), 'x'),
-			clampMapNumber(fixedPt[1] + len * Math.sin(snapped), 'y'),
-		];
+		return _snapLineEndpoint(rawPt, fixedPt, shiftKey, mapWidth, mapHeight);
 	}
 
 	function dragLineHandle(id: string, handle: 'line_start' | 'line_end', point: { x: number; y: number }, shiftKey = false) {
@@ -1910,62 +1688,19 @@
 		pushActivity('ok', 'inspector', `Applied ${preset} preset to ${selectedAuthoringId}.`);
 	}
 
-	function materialSuggestion(item: any) {
-		const material = item?.material;
-		if (material === 'clear_glass' || material === 'frosted_glass') return 'Glass material selected. Apply the glass hazard preset if this surface blocks the robot.';
-		if (material === 'mirror') return 'Mirror material selected. Apply the mirror hazard preset to include it in hazard labels.';
-		if (material === 'wood' || material === 'fabric' || material === 'tile') return 'Opaque material selected. Use landmark goal or normal obstacle labels as needed.';
-		const found = findMaterialOption(material);
-		if (found?.group?.dataset_id === 'hpbrdf_2025') return 'hpBRDF material selected. This is a measured hyperspectral/polarimetric material; verify local channel availability before final sensor rendering.';
-		if (found?.group?.dataset_id === 'pbrdf_2020') return 'pBRDF material selected. This is a measured polarimetric material; use it for optical appearance, while navigation labels still come from the hazard flags below.';
-		if (found) return 'Measured material selected from the material library. Navigation semantics still come from the object type and flags.';
-		return '';
-	}
+	// materialSuggestion → materialHelpers.ts (state-bound wrapper):
+	function materialSuggestion(item: any) { return _materialSuggestion(item, assetVM.materialGroups); }
 
 	async function loadMaterialLibrary() {
-		try {
-			const payload = await materialLibrary();
-			materialGroups = payload.groups ?? [];
-			const count = materialGroups.reduce((acc: number, group: any) => acc + (group.materials?.length ?? 0), 0);
-			materialLibraryStatus = `${count} library materials loaded.`;
-		} catch (err) {
-			materialGroups = [];
-			materialLibraryStatus = err instanceof Error ? `Material library unavailable: ${err.message}` : 'Material library unavailable.';
-		}
+		await assetVM.loadMaterialLibrary();
 	}
 
 	async function loadUsdCandidates() {
-		try {
-			const payload = await listOpticalNavUsdCandidates();
-			usdCandidates = payload.candidates ?? [];
-			if (!selectedMoorelaneUsdRef && usdCandidates.length) selectedMoorelaneUsdRef = usdCandidates[0].usd_ref;
-			usdCandidateStatus = `${usdCandidates.length} Moorelane USD files found.`;
-		} catch (err) {
-			usdCandidates = [];
-			usdCandidateStatus = err instanceof Error ? `USD candidates unavailable: ${err.message}` : 'USD candidates unavailable.';
-		}
+		await assetVM.loadUsdCandidates();
 	}
 
 	async function loadMapAssets() {
-		if (!selectedProjectId) {
-			mapAssets = [];
-			mapAssetStatus = 'Select a project to load map assets.';
-			return;
-		}
-		try {
-			const payload = await getOpticalNavMapAssets(selectedProjectId);
-			mapAssets = payload.assets ?? [];
-			mapAssetStatus = mapAssets.length
-				? `${mapAssets.length} selected asset(s) from Asset Library.`
-				: 'No selected USD assets. Open Asset Library to enable assets.';
-			if (!selectedUsdAssetId && mapAssets.length) selectedUsdAssetId = mapAssets[0].asset_id ?? mapAssets[0].id;
-			if (selectedUsdAssetId && !mapAssets.some((item: any) => (item.asset_id ?? item.id) === selectedUsdAssetId)) {
-				selectedUsdAssetId = mapAssets[0]?.asset_id ?? mapAssets[0]?.id ?? '';
-			}
-		} catch (err) {
-			mapAssets = [];
-			mapAssetStatus = err instanceof Error ? `Map assets unavailable: ${err.message}` : 'Map assets unavailable.';
-		}
+		await assetVM.loadMapAssets(selectedProjectId);
 	}
 
 	function friendlyUsdCatalogMessage(payload: any) {
@@ -1984,24 +1719,8 @@
 	}
 
 	async function loadEditorGeometryCatalog(force = false, refreshExtraction = false) {
-		const key = `${selectedProjectId}:${sceneId}:${currentUsdRef}`;
-		if (!selectedProjectId || !sceneId || (!force && !refreshExtraction && key === editorGeometryCatalogKey)) return;
-		editorGeometryCatalogKey = key;
-		try {
-			editorGeometryCatalogStatus = refreshExtraction ? 'Extracting USD proxy geometry...' : 'Loading USD asset proxies...';
-			const payload = await getOpticalNavEditorGeometry(selectedProjectId, sceneId, refreshExtraction);
-			editorGeometryPayload = payload;
-			editorGeometryCatalogStatus = friendlyUsdCatalogMessage(payload);
-			const count = (payload.objects ?? []).filter((item: any) => item.category !== 'floor').length;
-			if (payload.status === 'ready') editorGeometryRefreshToken += 1;
-			if (!selectedUsdAssetId && count) {
-				const first = (payload.objects ?? []).find((item: any) => item.category !== 'floor');
-				selectedUsdAssetId = first?.id ?? '';
-			}
-		} catch (err) {
-			editorGeometryPayload = null;
-			editorGeometryCatalogStatus = err instanceof Error ? `USD asset catalog unavailable: ${err.message}` : 'USD asset catalog unavailable.';
-		}
+		await assetVM.loadEditorGeometryCatalog(selectedProjectId, sceneId, currentUsdRef, { force, refreshExtraction });
+		assetVM.editorGeometryCatalogStatus = friendlyUsdCatalogMessage(assetVM.editorGeometryPayload);
 	}
 
 	async function extractUsdProxies() {
@@ -2010,103 +1729,15 @@
 		if (!requireReady(Boolean(currentUsdRef), 'Attach a USD scene before extracting proxies.')) return;
 		pushActivity('info', 'usd-extract', 'Extracting USD proxy geometry.');
 		await loadEditorGeometryCatalog(true, true);
-		const count = (editorGeometryPayload?.objects ?? []).filter((item: any) => item.category !== 'floor').length;
-		if (editorGeometryPayload?.status === 'ready') {
+		const count = (assetVM.editorGeometryPayload?.objects ?? []).filter((item: any) => item.category !== 'floor').length;
+		if (assetVM.editorGeometryPayload?.status === 'ready') {
 			pushActivity('ok', 'usd-extract', `USD proxy geometry ready with ${count} placeable objects.`);
 		} else {
-			pushActivity('warn', 'usd-extract', friendlyUsdCatalogMessage(editorGeometryPayload), editorGeometryPayload?.extractor);
+			pushActivity('warn', 'usd-extract', friendlyUsdCatalogMessage(assetVM.editorGeometryPayload), assetVM.editorGeometryPayload?.extractor);
 		}
 	}
 
-	function usdAssetLabel(asset: any) {
-		return String(asset?.label || asset?.source_path || asset?.id || 'USD object').split('/').pop() ?? 'USD object';
-	}
-
-	function placementHintForTool(tool: string) {
-		if (tool === 'wall' || tool === 'glass_wall' || tool === 'mirror_wall') return 'line placement';
-		if (['goal', 'start', 'hazard', 'forbidden', 'stop_before', 'traversable'].includes(tool)) return 'drag region';
-		return 'point placement';
-	}
-
-	function typeForUsdAsset(asset: any) {
-		const key = `${asset?.label ?? ''} ${asset?.source_path ?? ''} ${asset?.category ?? ''}`.toLowerCase();
-		if (key.includes('chair') || key.includes('seat')) return 'chair';
-		if (key.includes('table') || key.includes('desk')) return 'table';
-		if (key.includes('plant') || key.includes('palm') || key.includes('succulent')) return 'plant';
-		return 'landmark';
-	}
-
-	function selectBuiltInPlaceAsset(asset: BuiltInPlaceAsset) {
-		if (asset.kind === 'rich_asset') {
-			selectedUsdAssetId = asset.asset_id ?? asset.id;
-			placementTool = 'usd_asset';
-		} else {
-			placementTool = asset.tool as PlacementTool;
-		}
-		draftPoint = null;
-		linePreview = null;
-		dragStart = null;
-		dragPreview = null;
-	}
-
-	function selectBuiltInAsset(tool: string) {
-		placementTool = tool as PlacementTool;
-		draftPoint = null;
-		linePreview = null;
-		dragStart = null;
-		dragPreview = null;
-	}
-
-	function currentAuthoringMap() {
-		if (authoringMapText.trim()) {
-			return JSON.parse(authoringMapText);
-		}
-		return authoringMap ?? makeStarterAuthoringMap();
-	}
-
-	function ensureAuthoringMap() {
-		if (!authoringMap) setAuthoringMapPayload(makeStarterAuthoringMap());
-		return authoringMap;
-	}
-
-	function nextAuthoringId(prefix: string) {
-		const map = ensureAuthoringMap();
-		const ids = new Set([...(map.objects ?? []), ...(map.regions ?? [])].map((item: any) => item.id));
-		let index = 1;
-		let id = `${prefix}_${String(index).padStart(3, '0')}`;
-		while (ids.has(id)) {
-			index += 1;
-			id = `${prefix}_${String(index).padStart(3, '0')}`;
-		}
-		return id;
-	}
-
-	function svgPoint(event: PointerEvent) {
-		const svg = event.currentTarget as SVGSVGElement;
-		const rect = svg.getBoundingClientRect();
-		const x = ((event.clientX - rect.left) / rect.width) * 6;
-		const y = ((event.clientY - rect.top) / rect.height) * 4;
-		return {
-			x: Math.max(0, Math.min(6, Number(x.toFixed(3)))),
-			y: Math.max(0, Math.min(4, Number(y.toFixed(3))))
-		};
-	}
-
-	function worldX(value: number) {
-		return (value / 6) * 600;
-	}
-
-	function worldY(value: number) {
-		return (value / 4) * 400;
-	}
-
-	function rectangleFromPoints(a: { x: number; y: number }, b: { x: number; y: number }) {
-		const minX = Math.min(a.x, b.x);
-		const minY = Math.min(a.y, b.y);
-		const maxX = Math.max(a.x, b.x);
-		const maxY = Math.max(a.y, b.y);
-		return [Number(minX.toFixed(3)), Number(minY.toFixed(3)), Number(maxX.toFixed(3)), Number(maxY.toFixed(3))];
-	}
+	// usdAssetLabel, placementHintForTool, builtInThumbType, typeForUsdAsset, rectangleFromPoints → $lib/datasets/authoringHelpers
 
 	function addWallObject(
 		type: 'wall' | 'glass_wall' | 'mirror_wall',
@@ -2150,7 +1781,7 @@
 		pushActivity('ok', 'map-editor', `Added ${id}.`);
 	}
 
-	function addPointObject(type: 'chair' | 'table' | 'plant', center: { x: number; y: number }) {
+	function addPointObject(type: 'chair' | 'table' | 'plant', center: { x: number; y: number }, baseHeightM = 0) {
 		pushHistory();
 		const map = ensureAuthoringMap();
 		const id = nextAuthoringId(type);
@@ -2162,7 +1793,8 @@
 			geometry: {
 				type: 'point',
 				center: [center.x, center.y],
-				yaw_deg: 0
+				yaw_deg: 0,
+				base_height_m: Number(Math.max(0, baseHeightM).toFixed(3))
 			},
 			material: type === 'plant' ? 'fabric' : type === 'table' ? 'wood' : 'fabric',
 			navigation: {
@@ -2182,7 +1814,7 @@
 		pushActivity('ok', 'map-editor', `Added ${id}.`);
 	}
 
-	function addCameraObject(center: { x: number; y: number }) {
+	function addCameraObject(center: { x: number; y: number }, baseHeightM = 0) {
 		pushHistory();
 		const map = ensureAuthoringMap();
 		const id = nextAuthoringId('camera');
@@ -2191,7 +1823,7 @@
 			type: 'camera',
 			label: 'Camera',
 			placement: 'point',
-			geometry: { type: 'point', center: [center.x, center.y], yaw_deg: 0 },
+			geometry: { type: 'point', center: [center.x, center.y], yaw_deg: 0, base_height_m: Number(Math.max(0, baseHeightM).toFixed(3)) },
 			material: null,
 			navigation: { blocks_navigation: false, hazard_type: null, include_in_hazard_mask: false, instruction_candidate: false, goal_candidate: false },
 			metadata: { created_by: 'webui_map_editor', fov_deg: 90, resolution: [1440, 1080] }
@@ -2202,7 +1834,8 @@
 		pushActivity('ok', 'map-editor', `Added camera ${id}.`);
 	}
 
-	function addUsdAssetObject(center: { x: number; y: number }) {
+	function addUsdAssetObject(center: { x: number; y: number }, baseHeightM = 0) {
+		const selectedUsdAsset = assetVM.selectedUsdAsset;
 		if (!selectedUsdAsset) {
 			pushActivity('warn', 'asset-catalog', 'Select a USD asset before placing.');
 			return;
@@ -2225,7 +1858,8 @@
 			geometry: {
 				type: 'point',
 				center: [center.x, center.y],
-				yaw_deg: Number(selectedUsdAsset.default_rotation ?? 0)
+				yaw_deg: Number(selectedUsdAsset.default_rotation ?? 0),
+				base_height_m: Number(Math.max(0, baseHeightM).toFixed(3))
 			},
 			material: selectedUsdAsset.material_hint ?? (type === 'table' ? 'wood' : 'fabric'),
 			source_ref: sourceRef,
@@ -2251,7 +1885,7 @@
 				normalized_y_min: selectedUsdAsset.bounds?.min?.[1] ?? 0
 			}
 		};
-		const materials = object.material ? ensureAuthoringMaterial(object.material, map.materials ?? []) : (map.materials ?? []);
+		const materials = object.material ? ensureAuthoringMaterial(object.material, map.materials ?? [], assetVM.materialGroups) : (map.materials ?? []);
 		setAuthoringMapPayload({ ...map, materials, objects: [...(map.objects ?? []), object] });
 		selectedAuthoringId = id;
 		placementTool = 'select';
@@ -2323,8 +1957,9 @@
 	}
 
 	// World-coordinate handlers (used by MapEditor3D callbacks)
-	function handleGroundPointerDown(point: { x: number; y: number }, shiftKey = false) {
+	function handleGroundPointerDown(point: { x: number; y: number }, shiftKey = false, placement: { base_height_m?: number; snap_label?: string } = {}) {
 		contextMenu = null;
+		const baseHeightM = surfaceSnapEnabled ? Number(placement?.base_height_m ?? 0) : 0;
 		if (pageMode === 'sensors' && placingSensor) {
 			const id = `custom_${Date.now()}`;
 			customSensorNodes = [...customSensorNodes, { id, x: point.x, z: point.y, headingDeg: 0 }];
@@ -2338,15 +1973,15 @@
 			return;
 		}
 		if (placementTool === 'chair' || placementTool === 'table' || placementTool === 'plant') {
-			addPointObject(placementTool, point);
+			addPointObject(placementTool, point, baseHeightM);
 			return;
 		}
 		if (placementTool === 'camera') {
-			addCameraObject(point);
+			addCameraObject(point, baseHeightM);
 			return;
 		}
 		if (placementTool === 'usd_asset') {
-			addUsdAssetObject(point);
+			addUsdAssetObject(point, baseHeightM);
 			return;
 		}
 		if (placementTool === 'wall' || placementTool === 'glass_wall' || placementTool === 'mirror_wall') {
@@ -2385,10 +2020,14 @@
 				draftGhost = { type: 'point', x: point.x, y: point.y, valid: inBounds };
 			}
 		} else if (placementTool === 'chair' || placementTool === 'table' || placementTool === 'plant' || placementTool === 'camera' || placementTool === 'usd_asset') {
-			const sp = placementTool === 'usd_asset' ? (selectedUsdAsset?.source_path ?? undefined) : undefined;
-			const ac = placementTool === 'usd_asset' ? (selectedUsdAsset?.category ?? undefined) : undefined;
-			const ghostYMin = placementTool === 'usd_asset' ? (selectedUsdAsset?.bounds?.min?.[1] ?? 0) : undefined;
-			draftGhost = { type: 'point', x: point.x, y: point.y, valid: inBounds, sourcePath: sp, assetCat: ac, normalizedYMin: ghostYMin };
+			const sp = placementTool === 'usd_asset' ? (assetVM.selectedUsdAsset?.source_path ?? undefined) : undefined;
+			const ac = placementTool === 'usd_asset' ? (assetVM.selectedUsdAsset?.category ?? undefined) : undefined;
+			const ghostYMin = placementTool === 'usd_asset' ? (assetVM.selectedUsdAsset?.bounds?.min?.[1] ?? 0) : undefined;
+			const rawSize = placementTool === 'usd_asset' ? (assetVM.selectedUsdAsset?.bounds?.size ?? assetVM.selectedUsdAsset?.default_proxy_size ?? undefined) : undefined;
+			const proxySize = Array.isArray(rawSize) && rawSize.length >= 3
+				? [Number(rawSize[0]) || 0.4, Number(rawSize[1]) || 0.5, Number(rawSize[2]) || 0.4] as [number, number, number]
+				: undefined;
+			draftGhost = { type: 'point', x: point.x, y: point.y, valid: inBounds, sourcePath: sp, assetCat: ac, normalizedYMin: ghostYMin, proxySize };
 		} else if (isRectanglePlacementTool(placementTool)) {
 			if (dragStart) {
 				const b = rectangleFromPoints(dragStart, point);
@@ -2439,16 +2078,49 @@
 	}
 
 	function selectedItemCenter(item = selectedAuthoringItem): { x: number; y: number } | null {
-		const geometry = item?.geometry;
-		if (!geometry) return null;
-		if (geometry.type === 'point' && geometry.center) return { x: Number(geometry.center[0] ?? 0), y: Number(geometry.center[1] ?? 0) };
-		if (geometry.type === 'line' && geometry.start && geometry.end) {
-			return { x: (Number(geometry.start[0] ?? 0) + Number(geometry.end[0] ?? 0)) / 2, y: (Number(geometry.start[1] ?? 0) + Number(geometry.end[1] ?? 0)) / 2 };
-		}
-		if (geometry.type === 'rectangle' && geometry.bounds) {
-			return { x: (Number(geometry.bounds[0] ?? 0) + Number(geometry.bounds[2] ?? 0)) / 2, y: (Number(geometry.bounds[1] ?? 0) + Number(geometry.bounds[3] ?? 0)) / 2 };
-		}
-		return null;
+		return getItemCenter(item);
+	}
+
+	function normalizeYawDeg(value: unknown, fallback = 0): number {
+		const raw = Number(value);
+		const yaw = Number.isFinite(raw) ? raw : fallback;
+		return Number((((yaw % 360) + 360) % 360).toFixed(1));
+	}
+
+	function editorViewYawDeg(): number | null {
+		const cam = mapEditorRef?.getCurrentCamera?.();
+		if (!cam) return null;
+		const fx = Number(cam.target?.[0] ?? 0) - Number(cam.origin?.[0] ?? 0);
+		const fz = Number(cam.target?.[2] ?? 0) - Number(cam.origin?.[2] ?? 0);
+		if (!Number.isFinite(fx) || !Number.isFinite(fz) || Math.hypot(fx, fz) < 1e-6) return null;
+		return normalizeYawDeg((Math.atan2(fx, -fz) * 180) / Math.PI);
+	}
+
+	function createHotCameraPreviewPose(center: { x: number; y: number }, opts: { idPrefix?: string; yaw_deg?: number | null; source?: string } = {}) {
+		const selectedYaw = selectedAuthoringItem?.geometry?.yaw_deg;
+		const yaw = normalizeYawDeg(
+			opts.yaw_deg ?? editorViewYawDeg() ?? selectedYaw ?? activeHotCameraPose?.yaw_deg ?? 0
+		);
+		const previewId = `${opts.idPrefix ?? 'probe'}_${Date.now()}`;
+		const nextPose: HotCameraPose = {
+			preview_id: previewId,
+			x: Number(center.x.toFixed(3)),
+			z: Number(center.y.toFixed(3)),
+			yaw_deg: yaw,
+			height_m: rigMountHeightM,
+			modality: activeRenderModality,
+			sensor_id: activeRigSensorId,
+			rendered: false,
+		};
+		hotCameraPoses = [...hotCameraPoses, nextPose];
+		activeHotCameraId = previewId;
+		probeError = '';
+		probeResult = null;
+		pageMode = 'preview';
+		lastRailSelectedId = selectedAuthoringItem?.id ?? lastRailSelectedId;
+		railTab = 'preview';
+		pushActivity('info', 'preview:hot-camera', `${opts.source ?? 'Hot camera'} placed at x=${nextPose.x.toFixed(2)} z=${nextPose.z.toFixed(2)} yaw=${nextPose.yaw_deg.toFixed(1)}.`);
+		return nextPose;
 	}
 
 	function previewFromSelected() {
@@ -2457,12 +2129,7 @@
 		stopRobotAnimation();
 		robotPos = center;
 		placementTool = 'select';
-		// Create a custom sensor node at this position and switch to sensor mode
-		const id = `preview_${Date.now()}`;
-		customSensorNodes = [...customSensorNodes, { id, x: center.x, z: center.y, headingDeg: 0 }];
-		selectedSensorNodeId = id;
-		pageMode = 'sensors';
-		pushActivity('info', 'preview', `Sensor placed near ${selectedAuthoringId}. Adjust heading and click "Render this viewpoint".`);
+		createHotCameraPreviewPose(center, { idPrefix: 'preview_from_here', source: `Preview from ${selectedAuthoringId || 'selection'}` });
 		closeContextMenu();
 	}
 
@@ -2617,28 +2284,10 @@
 		pushActivity('ok', 'map-editor', `Duplicated ${selectedAuthoringId} → ${newId}.`);
 	}
 
-	function rectangleStyle(type: string) {
-		if (type === 'goal') return 'region-goal';
-		if (type === 'start') return 'region-start';
-		if (type === 'stop_before') return 'region-stop';
-		if (type === 'traversable') return 'region-traversable';
-		if (type === 'hazard') return 'region-hazard';
-		if (type === 'forbidden') return 'region-forbidden';
-		return 'region-generic';
-	}
-
-	function isRegionLayerVisible(type: string) {
-		if (type === 'goal' || type === 'start' || type === 'stop_before') return visibleLayers.goals;
-		if (type === 'traversable') return visibleLayers.traversable;
-		if (type === 'hazard' || type === 'forbidden' || type === 'obstacle') return visibleLayers.hazards;
-		return true;
-	}
-
-	function isObjectLayerVisible(type: string) {
-		if (type === 'wall') return visibleLayers.objects;
-		if (type === 'glass_wall' || type === 'mirror_wall' || type === 'transparent_partition') return visibleLayers.hazards && visibleLayers.objects;
-		return visibleLayers.objects;
-	}
+	// rectangleStyle, isRegionLayerVisible, isObjectLayerVisible → mapEditorHelpers (imported above)
+	// State-bound wrappers:
+	function isRegionLayerVisible(type: string) { return _isRegionLayerVisible(type, visibleLayers); }
+	function isObjectLayerVisible(type: string) { return _isObjectLayerVisible(type, visibleLayers); }
 
 	function graphNode(nodeId: string) {
 		return graphNodes.find((node: any) => node.node_id === nodeId);
@@ -2648,142 +2297,8 @@
 		visibleLayers = { ...visibleLayers, [layer]: !visibleLayers[layer] };
 	}
 
-	function readinessState() {
-		if (!selectedProjectId) {
-			return {
-				step: 'Project',
-				status: 'needs_input',
-				message: 'Create or select an OpticalNav project.',
-				action: 'Create Project',
-				tab: 'scene',
-				kind: 'create_project'
-			};
-		}
-		if (!hasScene) {
-			return {
-				step: 'Scene',
-				status: 'needs_input',
-				message: 'Add a scene before editing navigation overlays.',
-				action: 'Add Scene',
-				tab: 'scene',
-				kind: 'add_scene'
-			};
-		}
-		if (!hasAuthoringMap || !hasAuthoringContent) {
-			return {
-				step: 'Map Overlay',
-				status: 'needs_input',
-				message: 'Create a visible 2D map overlay with traversable, hazard, and goal layers.',
-				action: 'Create Map Overlay',
-				tab: 'scene',
-				kind: 'create_overlay'
-			};
-		}
-		if (!hasPersistedAuthoringMap || authoringMapDirty) {
-			return {
-				step: 'Map Overlay',
-				status: 'ready',
-				message: 'Save the edited overlay so backend compile/map/graph steps use the same source of truth.',
-				action: 'Save Map Overlay',
-				tab: 'scene',
-				kind: 'save_overlay'
-			};
-		}
-		if (!currentScene?.annotation_ok || currentScene?.sync_status?.annotation_stale) {
-			return {
-				step: 'Annotation',
-				status: 'ready',
-				message: currentScene?.sync_status?.annotation_stale
-					? 'Map overlay changed after annotation compile. Compile again.'
-					: 'Compile the map overlay into scene_annotation.json.',
-				action: 'Compile Annotation',
-				tab: 'scene',
-				kind: 'compile_annotation'
-			};
-		}
-		if (!hasMap || currentScene?.sync_status?.traversable_map_stale) {
-			return {
-				step: 'Traversable Map',
-				status: 'ready',
-				message: currentScene?.sync_status?.traversable_map_stale
-					? 'Annotation changed after map build. Rebuild the traversable grid.'
-					: 'Build the traversable grid from the compiled annotation.',
-				action: 'Build Traversable Map',
-				tab: 'plan',
-				kind: 'build_map'
-			};
-		}
-		if (!hasGraph || currentScene?.sync_status?.viewpoint_graph_stale) {
-			return {
-				step: 'Viewpoint Graph',
-				status: 'ready',
-				message: currentScene?.sync_status?.viewpoint_graph_stale
-					? 'Traversable map changed after graph build. Rebuild the viewpoint graph.'
-					: 'Build the panoramic viewpoint graph from the traversable map.',
-				action: 'Build Viewpoint Graph',
-				tab: 'plan',
-				kind: 'build_graph'
-			};
-		}
-		if (!hasEpisodes) {
-			return {
-				step: 'Episodes',
-				status: 'ready',
-				message: 'Generate graph episodes from the cached viewpoint graph.',
-				action: 'Generate Graph Episodes',
-				tab: 'plan',
-				kind: 'plan_graph_episodes'
-			};
-		}
-		if (!renderSceneSynced) {
-			return {
-				step: 'Render Scene Sync',
-				status: 'ready',
-				message: 'Sync editor overlays into render-scene artifacts before sensor sweep.',
-				action: 'Sync Render Scene',
-				tab: 'scene',
-				kind: 'sync_render_scene'
-			};
-		}
-		if (!renderConfigReady) {
-			return {
-				step: 'Sensor Sweep',
-				status: 'blocked',
-				message: 'Render-scene artifacts are synced, but scene state and camera spec are missing.',
-				action: 'Configure Sensor Sweep',
-				tab: 'render',
-				kind: 'configure_render'
-			};
-		}
-		if (!validationReport) {
-			return {
-				step: 'Validation',
-				status: 'ready',
-				message: 'Validate dataset structure before export.',
-				action: 'Validate Dataset',
-				tab: 'review',
-				kind: 'validate'
-			};
-		}
-		if (!validationPassed) {
-			return {
-				step: 'Validation',
-				status: 'failed',
-				message: 'Validation failed. Review errors before export.',
-				action: 'Review Validation',
-				tab: 'review',
-				kind: 'review_validation'
-			};
-		}
-		return {
-			step: 'Export',
-			status: 'ready',
-			message: 'Dataset is validated and ready for packaging.',
-			action: 'Export Dataset',
-			tab: 'review',
-			kind: 'export'
-		};
-	}
+	// readinessState() → workflowHelpers.ts (computeWorkflowReadiness)
+	// currentReadiness $derived is declared above near line 881
 
 	const tabToMode: Record<string, PageMode> = { scene: 'map', plan: 'paths', render: 'sensors', review: 'export' };
 	async function runPrimaryAction() {
@@ -2829,7 +2344,7 @@
 	}
 
 	async function refreshProjects(selectId = selectedProjectId) {
-		const data = await run(() => listOpticalNavProjects(), undefined, 'projects:list');
+		const data = await run(() => projectService.fetchProjects(), undefined, 'projects:list');
 		if (!data) return;
 		projects = data.projects ?? [];
 		if (selectId && projects.some((item) => item.project_id === selectId)) {
@@ -2842,7 +2357,7 @@
 
 	async function refreshProject() {
 		if (!selectedProjectId) return;
-		const data = await run(() => getOpticalNavProject(selectedProjectId), undefined, 'project:detail');
+		const data = await run(() => projectService.fetchProject(selectedProjectId), undefined, 'project:detail');
 		if (!data) return;
 		project = data;
 		if (!sceneId && data.scenes?.length) sceneId = data.scenes[0].scene_id;
@@ -2855,7 +2370,7 @@
 		// Guard: skip if authoringMap is already populated (e.g. unsaved edits in this session).
 		if (scene?.authoring_map_exists && !authoringMap) {
 			const mapData = await run(
-				() => getOpticalNavAuthoringMap(selectedProjectId, sceneId),
+				() => authoringMapService.fetchAuthoringMap(selectedProjectId, sceneId),
 				undefined,
 				'authoring-map:load'
 			);
@@ -2869,13 +2384,7 @@
 	async function createProject() {
 		const data = await run(
 			() =>
-				createOpticalNavProject({
-					project_name: projectName,
-					dataset_type: 'Synthetic fine-tuning dataset',
-					target_scenario: 'glass / mirror / transparent partition navigation',
-					robot_profile: 'mobile_base_front_camera',
-					modalities: selectedModalities
-				}),
+				projectService.createProject({ name: projectName }),
 			'Project created.',
 			'project:create'
 		);
@@ -2885,7 +2394,7 @@
 	async function addScene() {
 		if (!selectedProjectId) return;
 		const data = await run(
-			() => addOpticalNavScene(selectedProjectId, { scene_id: sceneId, usd_ref: usdRef }),
+			() => projectService.addScene(selectedProjectId, { sceneId, usdRef }),
 			'Scene added with starter annotation.',
 			'scene:add'
 		);
@@ -2893,19 +2402,18 @@
 		await refreshProject();
 	}
 
-	async function attachUsdScene(ref = selectedMoorelaneUsdRef || usdRef) {
+	async function attachUsdScene(ref = assetVM.selectedMoorelaneUsdRef || usdRef) {
 		if (!requireReady(Boolean(selectedProjectId), 'Create or select a project first.')) return;
 		if (!requireReady(hasScene, 'Add the scene before attaching USD.')) return;
 		const nextRef = String(ref || '').trim();
 		if (!requireReady(Boolean(nextRef), 'Choose a USD file before attaching it.')) return;
 		const data = await run(
-			() => attachOpticalNavSceneUsd(selectedProjectId, sceneId, { usd_ref: nextRef }),
+			() => projectService.attachUsdScene(selectedProjectId, sceneId, nextRef),
 			'USD scene attached.',
 			'scene:usd-ref'
 		);
 		if (data?.usd_ref) usdRef = data.usd_ref;
-		editorGeometryPayload = null;
-		editorGeometryCatalogKey = '';
+		assetVM.editorGeometryPayload = null;
 		await refreshProject();
 		await loadEditorGeometryCatalog(true);
 	}
@@ -2914,7 +2422,7 @@
 		if (!requireReady(Boolean(selectedProjectId), 'Create or select a project first.')) return;
 		if (!requireReady(hasScene, 'Add the scene before loading the map overlay.')) return;
 		const data = await run(
-			() => getOpticalNavAuthoringMap(selectedProjectId, sceneId),
+			() => authoringMapService.fetchAuthoringMap(selectedProjectId, sceneId),
 			undefined,
 			'authoring-map:load'
 		);
@@ -2922,60 +2430,83 @@
 		await loadEnvmaps();
 	}
 
-	async function saveAuthoringMap() {
-		if (!requireReady(Boolean(selectedProjectId), 'Create or select a project first.')) return;
-		if (!requireReady(hasScene, 'Add the scene before saving the map overlay.')) return;
+	async function saveAuthoringMap(options: { updateRenderReadiness?: boolean; deferRenderSync?: boolean } = {}): Promise<boolean> {
+		const updateRenderReadiness = options.updateRenderReadiness !== false;
+		if (!requireReady(Boolean(selectedProjectId), 'Create or select a project first.')) return false;
+		if (!requireReady(hasScene, 'Add the scene before saving the map overlay.')) return false;
 		let payload: any;
 		try {
 			payload = currentAuthoringMap();
 		} catch (err) {
 			error = `Invalid authoring_map JSON: ${errorMessage(err)}`;
 			pushActivity('error', 'authoring-map:save', error);
-			return;
+			return false;
 		}
 		payload = {
 			...payload,
-			settings: { ...(payload.settings ?? {}), map_w: mapWidth, map_h: mapHeight }
+			settings: { ...(payload.settings ?? {}), map_w: mapWidth, map_h: mapHeight },
+			...(options.deferRenderSync ? { defer_render_scene_sync: true } : {}),
 		};
 		const data = await run(
-			() => saveOpticalNavAuthoringMap(selectedProjectId, sceneId, payload),
+			() => authoringMapService.saveAuthoringMap(selectedProjectId, sceneId, payload),
 			'Map overlay saved.',
 			'authoring-map:save'
 		);
+		if (!data) return false;
 		if (data?.authoring_map) setAuthoringMapPayload(data.authoring_map, false);
 		// Phase 3: PUT /authoring-map now regenerates render_scene.xml automatically.
 		// Update render readiness from the response so Sync button is no longer needed.
-		if (data?.render_readiness) renderReadiness = data.render_readiness;
+		if (updateRenderReadiness && data?.render_readiness) {
+			syncResult = null;
+			renderReadiness = data.render_readiness;
+			if (data.render_readiness.ok === false) {
+				pushActivity('warn', 'render-readiness', 'Map saved, but render readiness is blocked.', data.render_readiness);
+			}
+		}
 		await refreshProject();
 		// Reload render config (sceneStateText/cameraSpecText) if XML was freshly generated.
-		if (data?.render_readiness?.ok && !sceneStateText.trim()) await loadRenderConfig();
+		if (updateRenderReadiness && data?.render_readiness?.ok && !sceneStateText.trim()) await loadRenderConfig();
+		return true;
 	}
 
 	async function saveMap() {
-		await saveAuthoringMap();
-		await compileAuthoringMap();
+		const saved = await saveAuthoringMap({ updateRenderReadiness: false, deferRenderSync: true });
+		if (!saved) return;
+		// Phase 3 readiness split: Save Map is now render-only. The render sync
+		// path no longer needs scene_annotation.json (backend builds a minimal
+		// SceneAnnotation when missing). Dataset compile, which requires a
+		// traversable region, is a separate user action exposed elsewhere — no
+		// point gating render iteration on it. Users still get explicit access
+		// via the "Compile annotation" button.
+		await syncRenderScene();
 	}
 
-	async function compileAuthoringMap() {
-		if (!requireReady(Boolean(selectedProjectId), 'Create or select a project first.')) return;
-		if (!requireReady(hasScene, 'Add the scene before compiling annotation.')) return;
-		if (!requireReady(hasAuthoringMap, 'Create or load a map overlay before compiling annotation.')) return;
+	async function compileAuthoringMap(): Promise<boolean> {
+		if (!requireReady(Boolean(selectedProjectId), 'Create or select a project first.')) return false;
+		if (!requireReady(hasScene, 'Add the scene before compiling annotation.')) return false;
+		if (!requireReady(hasAuthoringMap, 'Create or load a map overlay before compiling annotation.')) return false;
 		const data = await run(
-			() => compileOpticalNavAuthoringMap(selectedProjectId, sceneId),
+			() => authoringMapService.compileAuthoringMap(selectedProjectId, sceneId),
 			'Map overlay compiled to scene_annotation.json.',
 			'authoring-map:compile'
 		);
+		if (!data) return false;
 		if (data) {
 			compileResult = data;
 			if (data.annotation) annotationText = JSON.stringify(data.annotation, null, 2);
+			syncResult = null;
+			renderReadiness = null;
+			sceneStateText = '';
+			cameraSpecText = '';
 		}
 		await refreshProject();
+		return true;
 	}
 
 	async function loadAnnotation() {
 		if (!requireReady(Boolean(selectedProjectId), 'Create or select a project first.')) return;
 		if (!requireReady(hasScene, 'Add the scene before loading annotation.')) return;
-		const data = await run(() => getSceneAnnotation(selectedProjectId, sceneId), undefined, 'annotation:load');
+		const data = await run(() => authoringMapService.fetchAnnotation(selectedProjectId, sceneId), undefined, 'annotation:load');
 		if (data) annotationText = JSON.stringify(data, null, 2);
 	}
 
@@ -2989,7 +2520,7 @@
 			error = `Invalid annotation JSON: ${errorMessage(err)}`;
 			return;
 		}
-		await run(() => saveSceneAnnotation(selectedProjectId, sceneId, payload), 'Annotation saved and validated.', 'annotation:save');
+		await run(() => authoringMapService.saveAnnotation(selectedProjectId, sceneId, payload), 'Annotation saved and validated.', 'annotation:save');
 		await refreshProject();
 	}
 
@@ -2998,7 +2529,7 @@
 		if (!requireReady(hasScene, 'Add and validate the scene before building a traversable grid.')) return;
 		buildingMap = true;
 		const data = await run(
-			() => buildOpticalNavMap(selectedProjectId, sceneId, { resolution: Number(resolution) }),
+			() => walkabilityService.buildTraversableMap(selectedProjectId, sceneId, Number(resolution)),
 			'Traversable grid built.',
 			'map:build'
 		);
@@ -3013,32 +2544,10 @@
 		syncRunning = true;
 		syncProgress = { processed: 0, total: 0, label: 'starting', stage: 'queued' };
 		try {
-			const accepted = await syncOpticalNavRenderScene(selectedProjectId, sceneId, {});
-			const jobId = accepted?.sync_job_id as string | undefined;
-			if (!jobId) {
-				// Legacy synchronous response — treat as immediate result.
-				await _finalizeSyncResult(accepted);
-				return;
-			}
-			const result = await new Promise<any>((resolve, reject) => {
-				try {
-					const ws = new WebSocket(opticalNavSyncProgressWsUrl(jobId));
-					ws.onmessage = (ev) => {
-						try {
-							const msg = JSON.parse(ev.data);
-							if (msg?.status === 'running' || msg?.status === 'started') {
-								syncProgress = { processed: msg.processed ?? 0, total: msg.total ?? 0, label: msg.label ?? '', stage: msg.stage ?? '' };
-							} else if (msg?.status === 'done' || msg?.status === 'error') {
-								try { ws.close(); } catch {}
-								if (msg.status === 'done') resolve(msg.result);
-								else reject(new Error((msg.result && (msg.result as any).error) || 'Sync failed'));
-							}
-						} catch {}
-					};
-					ws.onerror = () => reject(new Error('Sync progress WebSocket error'));
-					ws.onclose = () => { /* may close before final msg in races */ };
-				} catch (err) { reject(err as Error); }
-			});
+			const result = await renderService.syncRenderScene(
+				selectedProjectId, sceneId, {},
+				(p) => { syncProgress = p; }
+			);
 			await _finalizeSyncResult(result);
 		} catch (err) {
 			pushActivity('error', 'sync:render-scene', errorMessage(err));
@@ -3068,7 +2577,7 @@
 	async function loadRenderReadiness() {
 		if (!selectedProjectId || !sceneId) return;
 		try {
-			renderReadiness = await getOpticalNavRenderReadiness(selectedProjectId, sceneId);
+			renderReadiness = await renderService.fetchRenderReadiness(selectedProjectId, sceneId);
 		} catch {
 			renderReadiness = null;
 		}
@@ -3077,7 +2586,7 @@
 	async function loadRenderConfig() {
 		if (!selectedProjectId || !sceneId) return;
 		try {
-			const data = await getOpticalNavRenderConfig(selectedProjectId, sceneId);
+			const data = await renderService.fetchRenderConfig(selectedProjectId, sceneId);
 			if (data?.ok && data.scene_state && data.camera_spec) {
 				renderConfig = data;
 				renderConfigError = '';
@@ -3096,7 +2605,7 @@
 		try {
 			const scene_state = JSON.parse(sceneStateText);
 			const camera_spec = JSON.parse(cameraSpecText);
-			const data = await saveOpticalNavRenderConfig(selectedProjectId, sceneId, { scene_state, camera_spec });
+			const data = await renderService.saveRenderConfig(selectedProjectId, sceneId, scene_state, camera_spec);
 			if (data?.ok) {
 				renderConfig = data;
 				pushActivity('ok', 'render-config', 'Render config saved.');
@@ -3111,7 +2620,7 @@
 		if (!requireReady(hasScene, 'Add the scene before syncing Isaac stage.')) return;
 		if (!requireReady(renderSceneSynced, 'Sync render scene before syncing the Isaac stage.')) return;
 		const data = await run(
-			() => syncOpticalNavIsaacStage(selectedProjectId, sceneId, {}),
+			() => renderService.syncIsaacStage(selectedProjectId, sceneId),
 			'Isaac stage sync command queued.',
 			'sync:isaac-stage'
 		);
@@ -3141,34 +2650,16 @@
 		if (!requireReady(hasMap, 'Build the traversable grid before building a viewpoint graph.')) return;
 		buildingGraph = true;
 		graphBuildProgress = null;
-		let progressWs: WebSocket | null = null;
-		try {
-			progressWs = new WebSocket(graphBuildProgressWsUrl(selectedProjectId, sceneId));
-			progressWs.onmessage = (ev) => {
-				try {
-					const msg = JSON.parse(ev.data);
-					if (msg?.status === 'building') graphBuildProgress = msg;
-				} catch {}
-			};
-			progressWs.onerror = () => {};
-		} catch {}
 		const data = await run(
-			() =>
-				buildOpticalNavViewpointGraph(selectedProjectId, sceneId, {
-					max_nodes: Number(maxNodes),
-					heading_count: Number(headingCount),
-					min_node_spacing_m: Number(minNodeSpacing),
-					robot_radius_m: Number(robotRadius),
-					min_clearance_m: Number(minClearance),
-					k_neighbors: Number(kNeighbors),
-					max_edge_length_m: Number(maxEdgeLength),
-					resolution: Number(resolution),
-					seed: Number(seed)
-				}),
+			() => graphService.buildGraph(selectedProjectId, sceneId, {
+				maxNodes: Number(maxNodes), headingCount: Number(headingCount),
+				minNodeSpacingM: Number(minNodeSpacing), robotRadiusM: Number(robotRadius),
+				minClearanceM: Number(minClearance), kNeighbors: Number(kNeighbors),
+				maxEdgeLengthM: Number(maxEdgeLength), resolution: Number(resolution), seed: Number(seed),
+			}, (p) => { graphBuildProgress = p; }),
 			'Viewpoint graph built.',
 			'graph:build'
 		);
-		if (progressWs) { try { progressWs.close(); } catch {} progressWs = null; }
 		buildingGraph = false;
 		graphBuildProgress = null;
 		if (data) graphResult = data;
@@ -3179,14 +2670,14 @@
 	async function loadGraph() {
 		if (!requireReady(Boolean(selectedProjectId), 'Create or select a project first.')) return;
 		if (!requireReady(hasGraph, 'Build the viewpoint graph before loading graph JSON.')) return;
-		const data = await run(() => getOpticalNavViewpointGraph(selectedProjectId, sceneId), undefined, 'graph:load');
+		const data = await run(() => graphService.fetchGraph(selectedProjectId, sceneId), undefined, 'graph:load');
 		if (data) graphPayload = data;
 	}
 
 	async function scanObservations() {
 		if (!selectedProjectId || !sceneId) return;
 		try {
-			const data = await scanOpticalNavObservations(selectedProjectId, sceneId);
+			const data = await episodeService.scanObservations(selectedProjectId, sceneId);
 			if (data) observationScan = data;
 		} catch (_) {
 			// ignore scan errors silently
@@ -3196,7 +2687,7 @@
 	async function clearNodeObservations(nodeId: string) {
 		if (!selectedProjectId || !sceneId) return;
 		try {
-			await deleteOpticalNavObservations(selectedProjectId, sceneId, [nodeId]);
+			await episodeService.clearNodeObservations(selectedProjectId, sceneId, nodeId);
 			pushActivity('ok', 'sensor:clear', `Renders cleared for ${nodeId}`);
 		} catch (err) {
 			pushActivity('error', 'sensor:clear', errorMessage(err));
@@ -3208,7 +2699,7 @@
 		if (!selectedProjectId || !sceneId) return;
 		if (!confirm('씬의 모든 렌더 결과를 삭제하시겠습니까?')) return;
 		try {
-			await deleteOpticalNavObservations(selectedProjectId, sceneId, null);
+			await episodeService.clearAllObservations(selectedProjectId, sceneId);
 			pushActivity('ok', 'scene:clear_renders', 'All renders cleared.');
 		} catch (err) {
 			pushActivity('error', 'scene:clear_renders', errorMessage(err));
@@ -3231,15 +2722,11 @@
 			})
 		);
 		const data = await run(
-			() =>
-				planOpticalNavEpisodes(selectedProjectId, {
-					scene_id: sceneId,
-					num_pairs: Number(episodeCount),
-					splits: splitObject,
-					instruction_types: instructionTypes.split(',').map((item) => item.trim()).filter(Boolean),
-					modalities: selectedModalities,
-					seed: Number(seed)
-				}),
+			() => episodeService.planEpisodes(selectedProjectId, {
+				sceneId, numPairs: Number(episodeCount), splits: splitObject,
+				instructionTypes: instructionTypes.split(',').map((s) => s.trim()).filter(Boolean),
+				modalities: selectedModalities, seed: Number(seed),
+			}),
 			'Episodes planned.',
 			'episodes:plan-v0.1'
 		);
@@ -3264,15 +2751,11 @@
 			})
 		);
 		const data = await run(
-			() =>
-				planOpticalNavGraphEpisodes(selectedProjectId, {
-					scene_id: sceneId,
-					num_pairs: Number(episodeCount),
-					splits: splitObject,
-					scenarios: graphScenarios.split(',').map((item) => item.trim()).filter(Boolean),
-					modalities: selectedModalities,
-					seed: Number(seed)
-				}),
+			() => episodeService.planGraphEpisodes(selectedProjectId, {
+				sceneId, numPairs: Number(episodeCount), splits: splitObject,
+				scenarios: graphScenarios.split(',').map((s) => s.trim()).filter(Boolean),
+				modalities: selectedModalities, seed: Number(seed),
+			}),
 			'Graph episodes planned.',
 			'episodes:plan-graph'
 		);
@@ -3282,10 +2765,9 @@
 
 	async function refreshEpisodes() {
 		if (!selectedProjectId) return;
-		const data = await run(() => listOpticalNavEpisodes(selectedProjectId), undefined, 'episodes:list');
+		const data = await run(() => episodeService.fetchEpisodes(selectedProjectId), undefined, 'episodes:list');
 		if (!data) return;
 		const all: any[] = data.episodes ?? [];
-		// Filter to current scene if sceneId is set
 		episodes = sceneId ? all.filter((ep: any) => !ep.scene_id || ep.scene_id === sceneId) : all;
 		if (!selectedEpisodeId && episodes.length) selectedEpisodeId = episodes[0].episode_id;
 	}
@@ -3293,33 +2775,104 @@
 	async function loadEpisode(id = selectedEpisodeId) {
 		if (!selectedProjectId || !id) return;
 		selectedEpisodeId = id;
-		// Ensure graph is loaded so path_nodes can be resolved to 3D positions
 		if (!graphPayload && hasGraph) await loadGraph();
-		const data = await run(() => getOpticalNavEpisode(selectedProjectId, id), undefined, 'episode:detail');
+		const data = await run(() => episodeService.fetchEpisode(selectedProjectId, id), undefined, 'episode:detail');
 		if (data) selectedEpisode = data;
 	}
 
-	function captureEditorViewProbe() {
-		const cam = mapEditorRef?.getCurrentCamera?.();
-		if (!cam) {
-			probeError = 'Map editor camera is not ready yet.';
-			return;
-		}
-		const fx = cam.target[0] - cam.origin[0];
-		const fz = cam.target[2] - cam.origin[2];
-		const yawRad = Math.atan2(fx, -fz);
-		editorViewProbe = {
-			x: Number(cam.origin[0].toFixed(3)),
-			z: Number(cam.origin[2].toFixed(3)),
-			yaw_deg: Number(((yawRad * 180) / Math.PI).toFixed(2)),
-			height_m: Number(Math.max(0.05, cam.origin[1]).toFixed(3)),
+	function updateHotCameraFromDrag(pose: { x: number; z: number; yaw_deg: number; final?: boolean }) {
+		const active = activeHotCameraPose;
+		const shouldCreate = !active || Boolean(active.rendered || active.batch_id);
+		const previewId = shouldCreate ? `probe_${Date.now()}` : active.preview_id;
+		const nextPose: HotCameraPose = {
+			...(shouldCreate ? {} : active),
+			preview_id: previewId,
+			x: Number(pose.x.toFixed(3)),
+			z: Number(pose.z.toFixed(3)),
+			yaw_deg: normalizeYawDeg(pose.yaw_deg),
+			height_m: rigMountHeightM,
+			modality: activeRenderModality,
+			sensor_id: activeRigSensorId,
+			rendered: false,
 		};
+		hotCameraPoses = shouldCreate
+			? [...hotCameraPoses, nextPose]
+			: hotCameraPoses.map((item) => item.preview_id === previewId ? nextPose : item);
+		activeHotCameraId = previewId;
 		probeError = '';
 	}
+
+	async function renderHotCameraPreview() {
+		const hotCameraPose = activeHotCameraPose;
+		if (!hotCameraPose) { probeError = 'Click-drag on the 3D view to place a hot camera first.'; return; }
+		if (!selectedProjectId || !sceneId) { probeError = 'Select a project + scene first.'; return; }
+		if (!renderSceneSynced) { probeError = 'Render readiness is blocked. Sync Render Scene first.'; return; }
+		let scene_state: unknown;
+		let camera_spec: unknown;
+		try {
+			scene_state = optionalJson(sceneStateText);
+			camera_spec = optionalJson(cameraSpecText);
+		} catch (err) {
+			probeError = `Invalid render config: ${errorMessage(err)}`;
+			return;
+		}
+		const activeCameraSpec = cameraSpecFromRigSensor(activeRigSensorOption?.sensor, camera_spec);
+		const vpId = hotCameraPose.preview_id;
+		const headingId = 'h0';
+		const body: Record<string, unknown> = {
+			modalities: [activeRenderModality],
+			backend,
+			camera_height_m: rigMountHeightM,
+			render_settings: renderSettingsFromRigSensor(activeRigSensorOption?.sensor),
+			custom_positions: [{
+				node_id: vpId,
+				heading_id: headingId,
+				preview_id: vpId,
+				render_mode: 'preview_probe',
+				x: hotCameraPose.x,
+				y: hotCameraPose.z,
+				yaw_deg: hotCameraPose.yaw_deg,
+				height_m: rigMountHeightM,
+			}],
+		};
+		if (scene_state) body.scene_state = scene_state;
+		if (activeCameraSpec) body.camera_spec = activeCameraSpec;
+		probeRendering = true;
+		try {
+			const data = await renderService.sweepViewpointGraph(selectedProjectId, sceneId, body);
+			if (data?.batch_id) {
+				graphBatchId = data.batch_id;
+				graphBatchIds = [...new Set([...graphBatchIds, data.batch_id])];
+				graphBatch = mergeBatch(graphBatch, data);
+				const renderedPose: HotCameraPose = {
+					...hotCameraPose,
+					batch_id: data.batch_id,
+					vp_id: vpId,
+					heading_id: headingId,
+					modality: activeRenderModality,
+					sensor_id: activeRigSensorId,
+					rendered: true,
+				};
+				hotCameraPoses = hotCameraPoses.map((item) => item.preview_id === vpId ? renderedPose : item);
+				activeHotCameraId = vpId;
+				probeResult = { batch_id: data.batch_id, vp_id: vpId, heading_id: headingId, modality: activeRenderModality, sensor_id: activeRigSensorId, submittedAt: Date.now() };
+				pushActivity('ok', 'preview:probe', `Hot camera submitted → batch ${data.batch_id}`);
+				startBatchPolling();
+				const job = data.jobs?.find((item: any) => item.preview_id === vpId) ?? data.jobs?.[0];
+				if (job) void selectBatchJob(job);
+			}
+		} catch (err) {
+			probeError = errorMessage(err);
+			pushActivity('error', 'preview:probe', probeError);
+		} finally {
+			probeRendering = false;
+		}
+	}
+
 	async function handleAddNodeAtFloor(x: number, z: number) {
 		if (!selectedProjectId || !sceneId) return;
 		try {
-			const data = await addOpticalNavGraphNode(selectedProjectId, sceneId, { x, y: z, heading_count: Number(headingCount) });
+			const data = await graphService.addGraphNode(selectedProjectId, sceneId, x, z, Number(headingCount));
 			if (data?.node_id) {
 				pushActivity('ok', 'graph:add-node', `Added ${data.node_id} at (${x.toFixed(2)}, ${z.toFixed(2)})`);
 				await loadGraph();
@@ -3331,7 +2884,7 @@
 	async function refreshWalkabilityOverlay() {
 		if (!selectedProjectId || !sceneId) return;
 		try {
-			walkabilityOverlayMeta = await getOpticalNavWalkabilityOverlay(selectedProjectId, sceneId);
+			walkabilityOverlayMeta = await walkabilityService.fetchWalkabilityOverlay(selectedProjectId, sceneId);
 			walkabilityOverlayVersion = walkabilityOverlayVersion + 1;
 		} catch (err) {
 			walkabilityOverlayMeta = null;
@@ -3343,12 +2896,7 @@
 	async function handlePaintStroke(points: Array<[number, number]>) {
 		if (paintMode === 'none' || !selectedProjectId || !sceneId) return;
 		try {
-			const res = await paintOpticalNavWalkabilityOverlay(selectedProjectId, sceneId, {
-				brush: paintMode,
-				radius_m: paintRadiusM,
-				points,
-				shape: 'stroke',
-			});
+			const res = await walkabilityService.paintWalkability(selectedProjectId, sceneId, paintMode as 'walkable' | 'blocked' | 'erase', paintRadiusM, points);
 			if (res?.ok) {
 				walkabilityOverlayMeta = { ...(walkabilityOverlayMeta ?? {}), stats: res.stats, has_overlay: true };
 				walkabilityOverlayVersion = walkabilityOverlayVersion + 1;
@@ -3360,7 +2908,7 @@
 	async function clearWalkabilityOverlay() {
 		if (!selectedProjectId || !sceneId) return;
 		try {
-			await clearOpticalNavWalkabilityOverlay(selectedProjectId, sceneId);
+			await walkabilityService.clearWalkabilityOverlay(selectedProjectId, sceneId);
 			walkabilityOverlayMeta = { has_overlay: false };
 			walkabilityOverlayVersion = walkabilityOverlayVersion + 1;
 			pushActivity('ok', 'paths:paint', 'Walkability overlay cleared.');
@@ -3371,14 +2919,11 @@
 	async function rebuildRegion() {
 		if (!pendingRegionBbox || !selectedProjectId || !sceneId) return;
 		try {
-			const res = await regenerateOpticalNavGraphRegion(selectedProjectId, sceneId, {
+			const res = await graphService.rebuildRegion(selectedProjectId, sceneId, {
 				bbox: pendingRegionBbox,
-				max_nodes: Number(maxNodes),
-				min_node_spacing_m: Number(minNodeSpacing),
-				robot_radius_m: Number(robotRadius),
-				min_clearance_m: Number(minClearance),
-				heading_count: Number(headingCount),
-				seed: Number(seed),
+				maxNodes: Number(maxNodes), minNodeSpacingM: Number(minNodeSpacing),
+				robotRadiusM: Number(robotRadius), minClearanceM: Number(minClearance),
+				headingCount: Number(headingCount), seed: Number(seed),
 			});
 			pushActivity('ok', 'graph:regen-region', `Region rebuilt: +${res.added_nodes ?? 0} / -${res.removed_nodes ?? 0} nodes, -${res.removed_edges ?? 0} edges`);
 			await loadGraph();
@@ -3393,7 +2938,7 @@
 	}
 	async function handleEdgeSecondNode(source: string, target: string) {
 		try {
-			const res = await addOpticalNavGraphEdge(selectedProjectId, sceneId, { source, target });
+			const res = await graphService.addEdge(selectedProjectId, sceneId, source, target);
 			if (res?.edge_id) {
 				pushActivity('ok', 'graph:add-edge', `${source} → ${target} (${res.edge_id})`);
 				await loadGraph();
@@ -3410,7 +2955,7 @@
 		if (!selectedProjectId || !sceneId) return;
 		const nid = selectedSensorNode.node_id;
 		try {
-			await deleteOpticalNavGraphNode(selectedProjectId, sceneId, nid);
+			await graphService.deleteGraphNode(selectedProjectId, sceneId, nid);
 			pushActivity('ok', 'graph:delete-node', `Deleted ${nid}`);
 			selectedSensorNodeId = '';
 			await loadGraph();
@@ -3418,73 +2963,12 @@
 			pushActivity('error', 'graph:delete-node', errorMessage(err));
 		}
 	}
-	async function runProbeRender() {
-		probeError = '';
-		if (!selectedProjectId || !sceneId) { probeError = 'Select a project + scene first.'; return; }
-		if (!renderSceneSynced) { probeError = 'Render readiness is blocked. Sync Render Scene first.'; return; }
-		let scene_state: unknown;
-		let camera_spec: unknown;
+	async function handleDeleteGraphEdge(edgeId: string) {
 		try {
-			scene_state = optionalJson(sceneStateText);
-			camera_spec = optionalJson(cameraSpecText);
-		} catch (err) {
-			probeError = `Invalid render config: ${errorMessage(err)}`;
-			return;
-		}
-		const activeCameraSpec = cameraSpecFromRigSensor(activeRigSensorOption?.sensor, camera_spec);
-		const modality = activeRenderModality;
-		const body: Record<string, unknown> = {
-			modalities: [modality],
-			backend,
-			camera_height_m: rigMountHeightM,
-			render_settings: renderSettingsFromRigSensor(activeRigSensorOption?.sensor),
-		};
-		if (scene_state) body.scene_state = scene_state;
-		if (activeCameraSpec) body.camera_spec = activeCameraSpec;
-
-		let vp_id = 'custom_0';
-		let heading_id = 'h0';
-		if (probeMode === 'selected') {
-			if (!selectedSensorNode) { probeError = 'Select a viewpoint or custom sensor first.'; return; }
-			const isCustom = (selectedSensorNode as any).isCustom;
-			const customNode = selectedCustomSensorNode;
-			if (isCustom && customNode) {
-				body.custom_positions = [{ x: customNode.x, y: customNode.z, yaw_deg: customNode.headingDeg, height_m: customNode.height_m ?? rigMountHeightM }];
-			} else {
-				body.node_ids = [selectedSensorNode.node_id];
-				const h = graphNodeHeights[selectedSensorNode.node_id];
-				if (typeof h === 'number') body.node_heights = { [selectedSensorNode.node_id]: h };
-				vp_id = selectedSensorNode.node_id;
-				heading_id = 'h_000';  // graph nodes pick first heading by default
-			}
-		} else if (probeMode === 'free') {
-			body.custom_positions = [{ x: freeProbe.x, y: freeProbe.z, yaw_deg: freeProbe.yaw_deg, height_m: freeProbe.height_m }];
-		} else if (probeMode === 'editor_view') {
-			if (!editorViewProbe) captureEditorViewProbe();
-			if (!editorViewProbe) return;
-			body.custom_positions = [{ x: editorViewProbe.x, y: editorViewProbe.z, yaw_deg: editorViewProbe.yaw_deg, height_m: editorViewProbe.height_m }];
-		} else if (probeMode === 'isaac_view') {
-			probeError = 'Current Isaac View probe is not implemented yet (Slice 1 backlog).';
-			return;
-		}
-		probeRendering = true;
-		try {
-			const data = await sweepOpticalNavViewpointGraph(selectedProjectId, sceneId, body);
-			if (data?.batch_id) {
-				probeResult = { batch_id: data.batch_id, vp_id, heading_id, modality, sensor_id: activeRigSensorId, submittedAt: Date.now() };
-				graphBatchId = data.batch_id;
-				graphBatchIds = [...new Set([...graphBatchIds, data.batch_id])];
-				graphBatch = _mergeIntoBatch(graphBatch, data);
-				pushActivity('ok', 'preview:probe', `Probe submitted (${probeMode}) → batch ${data.batch_id}`);
-			}
-		} catch (err) {
-			probeError = errorMessage(err);
-			pushActivity('error', 'preview:probe', probeError);
-		} finally {
-			probeRendering = false;
-		}
+			await graphService.deleteEdge(selectedProjectId, sceneId, edgeId);
+			await loadGraph();
+		} catch (err) { pushActivity('error', 'graph:edge-del', errorMessage(err)); }
 	}
-
 	async function renderSensorViewpoint() {
 		if (!selectedSensorNode || !selectedProjectId || !sceneId) return;
 		if (!requireReady(renderSceneSynced, 'Render readiness is blocked. Sync Render Scene and resolve readiness errors.')) return;
@@ -3519,11 +3003,11 @@
 			if (typeof h === 'number') body.node_heights = { [selectedSensorNode.node_id]: h };
 		}
 		try {
-			const data = await sweepOpticalNavViewpointGraph(selectedProjectId, sceneId, body);
+			const data = await renderService.sweepViewpointGraph(selectedProjectId, sceneId, body);
 			if (data?.batch_id) {
 				graphBatchId = data.batch_id;
 				graphBatchIds = [...new Set([...graphBatchIds, data.batch_id])];
-				graphBatch = _mergeIntoBatch(graphBatch, data);
+				graphBatch = mergeBatch(graphBatch, data);
 				sensorRenderResult = { batch_id: data.batch_id, status: 'submitted' };
 				pushActivity('ok', 'sensor:render', `Render submitted: batch ${data.batch_id}`);
 				startBatchPolling();
@@ -3541,14 +3025,16 @@
 			: [...selectedModalities, id];
 	}
 
-	function optionalJson(text: string) {
-		const trimmed = text.trim();
-		return trimmed ? JSON.parse(trimmed) : undefined;
-	}
-
-	async function renderEpisodes() {
+	async function renderEpisodes(modeOverride?: 'graph_sweep' | 'episode_nodes' | 'episodes') {
+		// Persist the chosen mode in state so downstream code (WS subscribe,
+		// batch grid, refreshBatch) treats this submission consistently.
+		if (modeOverride && modeOverride !== renderMode) renderMode = modeOverride;
 		if (!requireReady(Boolean(selectedProjectId), 'Create or select a project first.')) return;
 		if (renderMode === 'graph_sweep' && !requireReady(hasGraph, 'Build the viewpoint graph before running Sensor Sweep.')) return;
+		if (renderMode === 'episode_nodes') {
+			if (!requireReady(hasGraph, 'Build the viewpoint graph before running Episode Path Sweep.')) return;
+			if (!requireReady(episodeNodesAvailable, 'Select a graph-based episode with path nodes before running Episode Path Sweep.')) return;
+		}
 		if (!requireReady(renderSceneSynced, 'Render readiness is blocked. Sync Render Scene and resolve readiness errors.')) return;
 		if (renderMode === 'episodes' && !requireReady(hasEpisodes, 'Plan episodes before rendering episode timesteps.')) return;
 		let scene_state: unknown;
@@ -3570,18 +3056,27 @@
 		if (scene_state) body.scene_state = scene_state;
 		if (activeCameraSpec) body.camera_spec = activeCameraSpec;
 		if (Object.keys(graphNodeHeights).length) body.node_heights = { ...graphNodeHeights };
-		if (renderMode === 'graph_sweep') {
+		if (isGraphSweepRenderMode(renderMode)) {
 			if (!sceneId) return;
-			const data = await run(() => sweepOpticalNavViewpointGraph(selectedProjectId, sceneId, body), 'Graph sensor sweep submitted.', 'graph:sweep');
+			if (renderMode === 'episode_nodes') {
+				// Filter to the selected episode's graph nodes; backend's
+				// build_sweep_render_requests already honours node_ids.
+				body.node_ids = [...(selectedEpisode!.path_nodes as string[])];
+				body.source_episode_id = selectedEpisodeId;
+			}
+			const successMsg = renderMode === 'episode_nodes'
+				? 'Episode path sweep submitted.'
+				: 'Graph sensor sweep submitted.';
+			const data = await run(() => renderService.sweepViewpointGraph(selectedProjectId, sceneId, body), successMsg, 'graph:sweep');
 			if (data?.batch_id) {
 				graphBatchId = data.batch_id;
 				graphBatchIds = [...new Set([...graphBatchIds, data.batch_id])];
-				graphBatch = _mergeIntoBatch(graphBatch, data);
+				graphBatch = mergeBatch(graphBatch, data);
 				startBatchPolling();
 			}
 		} else {
 			body.split = renderSplit;
-			const data = await run(() => renderOpticalNavEpisodes(selectedProjectId, body), 'Episode render request submitted.', 'episodes:render');
+			const data = await run(() => renderService.renderEpisodes(selectedProjectId, body), 'Episode render request submitted.', 'episodes:render');
 			if (data?.batch_id) {
 				renderBatchId = data.batch_id;
 				renderBatch = data;
@@ -3593,23 +3088,129 @@
 
 	async function refreshBatch() {
 		if (!selectedProjectId) return;
-		if (renderMode === 'graph_sweep') {
+		if (isGraphSweepRenderMode(renderMode)) {
 			if (!graphBatchIds.length) return;
 			const prevCompleted = graphBatch?.progress?.completed ?? 0;
 			const batches = await Promise.all(
-				graphBatchIds.map(id => getOpticalNavGraphRenderBatch(selectedProjectId, id).catch(() => null))
+				graphBatchIds.map(id => renderService.fetchGraphBatch(selectedProjectId, id).catch(() => null))
 			);
 			let merged: any = null;
 			for (const b of batches) {
-				if (b) merged = merged ? _mergeIntoBatch(merged, b) : b;
+				if (b) merged = merged ? mergeBatch(merged, b) : b;
 			}
 			if (merged) graphBatch = merged;
 			_refreshBatchLogs();
+			if (selectedBatchJobId) void refreshSelectedBatchJobLog().catch(() => {});
 			if ((merged?.progress?.completed ?? 0) !== prevCompleted) scanObservations();
 		} else {
 			if (!renderBatchId) return;
-			const data = await run(() => getOpticalNavRenderBatch(selectedProjectId, renderBatchId), undefined, 'batch:episodes');
+			const data = await run(() => renderService.fetchRenderBatch(selectedProjectId, renderBatchId), undefined, 'batch:episodes');
 			if (data) renderBatch = data;
+		}
+	}
+
+	// WS-driven batch tracking for graph_sweep. Subscribes to /api/ws/job-status
+	// instead of polling fetchGraphBatch + fetchBatchLogs every 4s. The WS frame
+	// carries the same data (job statuses + log tails) but only on actual
+	// changes, eliminating the ~2 HTTP/req × active_batch_count × 4s burst that
+	// stalled the daemon.
+	let _jobStatusUnsub: (() => void) | null = null;
+	let _jobStatusPrevCompleted = 0;
+
+	function _onJobStatusUpdate(msg: JobStatusMessage) {
+		// Batch log feed first — runs even before the batch metadata fetch has
+		// completed, so log lines start flowing immediately.
+		const batchJobIds = new Set<string>(
+			Array.isArray(graphBatch?.jobs)
+				? graphBatch.jobs.map((j: any) => String(j?.job_id ?? ''))
+				: []
+		);
+		if (batchJobIds.size > 0) {
+			batchLogEntries = logTailsToBatchEntries(batchJobIds, msg.log_tails);
+		}
+		if (selectedBatchJobId) {
+			const tail = msg.log_tails?.[selectedBatchJobId];
+			if (Array.isArray(tail) && tail.length) selectedBatchJobLog = tail.map((line) => String(line));
+		}
+		// Diagnostic snapshot for "WS shows succeeded but UI doesn't follow" —
+		// the WS payload carries the last 250 jobs across all scenes, so a
+		// succeeded entry in the frame may legitimately belong to a different
+		// batch. This counter lets us tell the two cases apart in DevTools:
+		// `window.__jobStatusDebug` shows the last frame summary.
+		if (typeof window !== 'undefined') {
+			const wsIds = (msg.jobs ?? []).map((j: any) => String(j?.job_id ?? ''));
+			const matched = wsIds.filter((id) => batchJobIds.has(id));
+			const succeededInBatch = (msg.jobs ?? []).filter(
+				(j: any) => batchJobIds.has(String(j?.job_id ?? '')) && String(j?.status ?? '') === 'succeeded'
+			).length;
+			(window as any).__jobStatusDebug = {
+				at: new Date().toISOString(),
+				ws_jobs_total: wsIds.length,
+				batch_jobs_total: batchJobIds.size,
+				matched_in_batch: matched.length,
+				succeeded_in_batch_frame: succeededInBatch,
+				batch_completed: graphBatch?.progress?.completed ?? 0,
+				batch_total: graphBatch?.progress?.total ?? 0,
+				sample_batch_id: [...batchJobIds][0] ?? null,
+				sample_ws_ids_first_3: wsIds.slice(0, 3),
+			};
+		}
+		if (!graphBatch || batchJobIds.size === 0) return;
+		// Status update. Always reassign graphBatch even when applyJobStatusUpdates
+		// returns the same reference: $derived chains (activeBatch → selectedBatchJob)
+		// must re-fire so the per-job stage badge follows the WS-pushed
+		// progress_stage. The status object is reshaped from the flat WS record
+		// into the nested form the batch UI expects.
+		const prevCompletedBeforeUpdate = graphBatch?.progress?.completed ?? 0;
+		graphBatch = applyJobStatusUpdates(graphBatch, msg.jobs);
+		const completed = graphBatch?.progress?.completed ?? 0;
+		// observationScan reflects the on-disk count of rendered modalities per
+		// viewpoint (what drives "X/Y rendered" badges). It only refreshes via
+		// scanObservations() — the listener used to gate that on a strict
+		// inequality with _jobStatusPrevCompleted, which missed the first WS
+		// frame after restoring a batch (the gate was pre-seeded to the same
+		// value by startBatchPolling's initial fetch). Trigger whenever the
+		// in-frame delta is non-zero, or when we see any succeeded/failed
+		// progress beyond the previous frame.
+		// Be aggressive about triggering scanObservations — the gate used to
+		// require a strict increment in `completed`, but the listener may see
+		// the same value across multiple frames (and we still want a fresh
+		// scan because the per-VP on-disk count may have changed even without
+		// changing the total). Always fire when WS reports any succeeded jobs
+		// for our batch; the endpoint is cheap (single disk walk) and the
+		// HTTP traffic stays orders of magnitude lower than the old 4s poll.
+		const succeededInBatch = (msg.jobs ?? []).filter(
+			(j: any) => batchJobIds.has(String(j?.job_id ?? '')) && String(j?.status ?? '') === 'succeeded'
+		).length;
+		if (succeededInBatch > 0 || completed !== _jobStatusPrevCompleted) {
+			_jobStatusPrevCompleted = completed;
+			void scanObservations().catch(() => {});
+			// Belt-and-suspenders: also refetch batch via HTTP. The in-listener
+			// `graphBatch = applyJobStatusUpdates(...)` correctly reaches the new
+			// `progress.completed` value (verified via window.__jobStatusDebug),
+			// but multiple downstream components weren't visibly following until
+			// the user hit Refresh — which is exactly what refreshBatch does.
+			// Trigger only when the WS frame carries fresh succeeded entries,
+			// so this is bounded by actual completions, not a fixed cadence.
+			void refreshBatch().catch(() => {});
+		}
+		if (typeof window !== 'undefined') {
+			(window as any).__jobStatusDebug = {
+				...((window as any).__jobStatusDebug ?? {}),
+				last_listener_completed: completed,
+				prev_completed_seen: prevCompletedBeforeUpdate,
+				scan_fired: succeededInBatch > 0 || completed !== _jobStatusPrevCompleted,
+				succeeded_count_in_frame: succeededInBatch,
+			};
+		}
+		const status = graphBatch?.status;
+		if (status === 'building') return;
+		const total = graphBatch?.progress?.total ?? 0;
+		const done = completed + (graphBatch?.progress?.failed ?? 0);
+		if (status === 'error' || (total > 0 && done >= total)) {
+			stopBatchPolling();
+			const key = _batchStorageKey();
+			if (key) { try { window.sessionStorage.removeItem(key); } catch { /* silent */ } }
 		}
 	}
 
@@ -3618,22 +3219,48 @@
 			clearInterval(batchPollTimer);
 			batchPollTimer = null;
 		}
+		if (_jobStatusUnsub !== null) {
+			_jobStatusUnsub();
+			_jobStatusUnsub = null;
+		}
 	}
 
-	function startBatchPolling() {
+	async function startBatchPolling() {
 		stopBatchPolling();
+		if (isGraphSweepRenderMode(renderMode)) {
+			// Ensure batch metadata (graph_id / node_id / heading_id / preview_id)
+			// AND the full job_id list are present *before* subscribing — the WS
+			// listener short-circuits when graphBatch.jobs is empty, so a frame
+			// arriving in that gap would be dropped and the user would see no
+			// updates until the next status change. The submit response is often
+			// just a stub (no jobs yet) because the daemon enqueues asynchronously;
+			// awaiting fetch closes that race.
+			if (!graphBatch || !Array.isArray(graphBatch.jobs) || graphBatch.jobs.length === 0) {
+				await refreshBatch().catch(() => {});
+				// The daemon's submission thread populates batch.json shortly after
+				// the synchronous handler returns. Retry once with a small delay
+				// when the first fetch caught the stub.
+				if (!graphBatch?.jobs?.length) {
+					await new Promise((r) => setTimeout(r, 750));
+					await refreshBatch().catch(() => {});
+				}
+			}
+			_jobStatusPrevCompleted = graphBatch?.progress?.completed ?? 0;
+			_jobStatusUnsub = subscribeJobStatus(_onJobStatusUpdate);
+			return;
+		}
+		// Episode mode: keep the 4s poll, but skip when tab is hidden so a
+		// backgrounded page doesn't keep hitting the daemon.
 		batchPollTimer = setInterval(async () => {
+			if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return;
 			await refreshBatch();
-			const batch = renderMode === 'graph_sweep' ? graphBatch : renderBatch;
-			// 'building': daemon is still enqueuing jobs in background — keep polling.
-			// 'error': submission failed — stop polling.
+			const batch = renderBatch;
 			const status = batch?.status;
 			if (status === 'building') return;
 			const total = batch?.progress?.total ?? 0;
 			const done = (batch?.progress?.completed ?? 0) + (batch?.progress?.failed ?? 0);
 			if (status === 'error' || (total > 0 && done >= total)) {
 				stopBatchPolling();
-				// Release persisted entry — work has reached a terminal state.
 				const key = _batchStorageKey();
 				if (key) { try { window.sessionStorage.removeItem(key); } catch { /* silent */ } }
 			}
@@ -3641,17 +3268,25 @@
 	}
 
 	async function _refreshBatchLogs() {
-		if (!selectedProjectId || !graphBatchId || renderMode !== 'graph_sweep') return;
+		// Retained for the one-shot manual refresh on the existing refreshBatch()
+		// path; the WS-driven flow updates batchLogEntries directly without HTTP.
+		if (!selectedProjectId || !isGraphSweepRenderMode(renderMode)) return;
+		const ids = [...new Set([graphBatchId, ...graphBatchIds].filter(Boolean))];
+		if (!ids.length) return;
 		try {
-			const data = await getOpticalNavGraphBatchLogs(selectedProjectId, graphBatchId, 20);
-			if (Array.isArray(data?.entries)) batchLogEntries = data.entries;
+			const batches = await Promise.all(ids.map((id) => renderService.fetchBatchLogs(selectedProjectId, id, 20).catch(() => null)));
+			batchLogEntries = batches.flatMap((data: any) => Array.isArray(data?.entries) ? data.entries : []);
 		} catch { /* silent */ }
 	}
 
 	async function validateDataset(requireObservations = false) {
 		if (!selectedProjectId) return;
+		const sceneScope = exportCurrentSceneOnly && sceneId ? [sceneId] : null;
 		const data = await run(
-			() => validateOpticalNavDataset(selectedProjectId, { require_observations: requireObservations }),
+			() => validationService.validateDataset(selectedProjectId, {
+				require_observations: requireObservations,
+				scene_ids: sceneScope,
+			}),
 			'Dataset validation completed.',
 			'dataset:validate'
 		);
@@ -3661,16 +3296,51 @@
 	async function evaluateDataset() {
 		if (!selectedProjectId) return;
 		const data = await run(
-			() => evaluateOpticalNavDataset(selectedProjectId, { policy: 'shortest_oracle', success_radius: 0.5 }),
+			() => validationService.evaluateDataset(selectedProjectId),
 			'Evaluation completed.',
 			'dataset:evaluate'
 		);
 		if (data) evaluationReport = data;
 	}
 
+	// Light-weight heuristic for the count hint — exact judgement (file existence)
+	// is done backend-side, so this can drift slightly while a sweep is still
+	// flushing observation files to disk. Good enough to show "X of Y" before
+	// submit; the real numbers come back in `exportResult.episode_count` /
+	// `total_episode_count_on_disk`.
+	const exportableEpisodeCount = $derived(
+		episodes
+			.filter((ep: any) => !exportCurrentSceneOnly || !sceneId || ep?.scene_id === sceneId)
+			.filter((ep: any) => {
+				// Backend now computes observation_complete from the
+				// consolidated observations dir (disk-truth), matching the
+				// exporter's is_episode_complete. Falls back to the legacy
+				// refs.length / path_nodes.length heuristic if an older
+				// daemon hasn't been updated yet.
+				if (typeof ep?.observation_complete === 'boolean') return ep.observation_complete;
+				const pathNodes = Array.isArray(ep?.path_nodes) ? ep.path_nodes : [];
+				const refs = Array.isArray(ep?.observation_refs) ? ep.observation_refs : [];
+				if (!pathNodes.length) return refs.length > 0;
+				return refs.length >= pathNodes.length;
+			}).length
+	);
+	const scopedEpisodeCount = $derived(
+		exportCurrentSceneOnly && sceneId
+			? episodes.filter((ep: any) => ep?.scene_id === sceneId).length
+			: episodes.length
+	);
+
 	async function exportDataset() {
 		if (!selectedProjectId) return;
-		const data = await run(() => exportOpticalNavDataset(selectedProjectId, { zip: true }), 'Dataset exported.', 'dataset:export');
+		const sceneScope = exportCurrentSceneOnly && sceneId ? [sceneId] : null;
+		const data = await run(
+			() => validationService.exportDataset(selectedProjectId, {
+				only_completed: exportOnlyCompleted,
+				scene_ids: sceneScope,
+			}),
+			'Dataset exported.',
+			'dataset:export'
+		);
 		if (data) exportResult = data;
 	}
 
@@ -3703,12 +3373,18 @@
 		loadGlobalCameraRig();
 		loadMaterialLibrary();
 		let ticks = 0;
-		const thumbTimer = window.setInterval(() => {
-			ticks += 1;
-			assetThumbRefreshTick += 1;
-			if (ticks >= 12) window.clearInterval(thumbTimer);
-		}, 2500);
-		return () => window.clearInterval(thumbTimer);
+			const thumbTimer = window.setInterval(() => {
+				ticks += 1;
+				assetVM.bumpAssetThumbTick();
+				if (ticks >= 12) window.clearInterval(thumbTimer);
+			}, 2500);
+		return () => {
+			window.clearInterval(thumbTimer);
+			// Release the job-status WS subscription when the page unmounts so a
+			// route change doesn't leave the connection (and its keepalive churn)
+			// dangling.
+			stopBatchPolling();
+		};
 	});
 
 	$effect(() => {
@@ -3759,6 +3435,14 @@
 		if (mode === 'sensors' || mode === 'preview') {
 			scanObservations();
 		}
+		if (mode === 'export') {
+			// ExportPanel's "Exporting X of Y" hint and the exportable filter
+			// both depend on observationScan to detect rendered episode paths.
+			// Without this trigger the count stays at 0 on a fresh page load
+			// when the user lands directly on the Export tab.
+			if (episodes.length === 0) await refreshEpisodes();
+			scanObservations();
+		}
 		if (mode === 'paths' && episodes.length === 0) {
 			await refreshEpisodes();
 		}
@@ -3774,7 +3458,183 @@
 
 <svelte:window onkeydown={handleEditorKeydown} />
 
-<div class="dataset-page" class:bottom-open={!$bottomPanelCollapsed} class:bottom-closed={$bottomPanelCollapsed} class:scene-active={true}>
+{#snippet environmentPanel()}
+	{@const env = authoringMap?.environment ?? {}}
+	{@const mode = env.mode ?? 'constant'}
+	{@const envmapRef = env.envmap_ref ?? ''}
+		{@const selectedEnvmap = assetVM.envmapFiles.find((f: any) => f.envmap_ref === envmapRef)}
+	{@const shellOn = authoringMap?.settings?.room_shell_enabled ?? true}
+	{@const floorOn = authoringMap?.settings?.auto_floor_enabled ?? true}
+	<div class="env-section">
+		<div class="env-section-title">Lighting source</div>
+		<div class="env-radio-row">
+			<label class="env-radio"><input type="radio" name="env-mode" value="constant" checked={mode === 'constant'} onchange={() => updateEnvironmentField('mode', 'constant')} /> Constant</label>
+			<label class="env-radio"><input type="radio" name="env-mode" value="envmap" checked={mode === 'envmap'} onchange={() => updateEnvironmentField('mode', 'envmap')} /> Envmap</label>
+		</div>
+
+		{#if mode === 'constant'}
+			<div class="env-fields-grid">
+				<label><span>RGB</span><input value={(env.radiance ?? [0.8, 0.8, 0.85]).join(', ')} oninput={(event) => updateEnvironmentField('radiance', (event.currentTarget as HTMLInputElement).value)} /></label>
+				<label><span>Intensity</span><input type="number" min="0" step="0.1" value={env.intensity ?? 1} oninput={(event) => updateEnvironmentField('intensity', (event.currentTarget as HTMLInputElement).value)} /></label>
+			</div>
+		{:else}
+			<div class="env-envmap-row">
+				<select class="env-envmap-select" value={envmapRef} onchange={(event) => updateEnvironmentField('envmap_ref', (event.currentTarget as HTMLSelectElement).value || null)}>
+					<option value="">— Select uploaded envmap —</option>
+					{#each assetVM.envmapFiles as item}
+						<option value={item.envmap_ref}>{item.filename}{#if item.size_bytes} · {envmapSizeLabel(item.size_bytes)}{/if}</option>
+					{/each}
+				</select>
+				<label class="env-upload-button">
+						<input type="file" accept=".exr,.hdr,.png,.jpg,.jpeg,image/png,image/jpeg" disabled={assetVM.envmapUploading || !selectedProjectId || !hasScene} onchange={(event) => uploadEnvmapFromInput(event.currentTarget as HTMLInputElement)} />
+						<span>{assetVM.envmapUploading ? 'Uploading…' : 'Upload new'}</span>
+				</label>
+			</div>
+			{#if selectedEnvmap}
+				<div class="env-envmap-preview">
+					{#if selectedEnvmap.previewable && selectedProjectId && sceneId}
+						<img src={opticalNavEnvmapPreviewUrl(selectedProjectId, sceneId, selectedEnvmap.filename)} alt={selectedEnvmap.filename} />
+					{:else}
+						<div class="env-envmap-placeholder">EXR/HDR preview not available in browser</div>
+					{/if}
+					<div class="env-envmap-meta">
+						<div class="env-envmap-filename" title={selectedEnvmap.envmap_ref}>{selectedEnvmap.filename}</div>
+						<div class="env-envmap-sub">{envmapSizeLabel(selectedEnvmap.size_bytes)}</div>
+					</div>
+				</div>
+			{:else if envmapRef}
+				<div class="hint-row">⚠ envmap_ref is set but not in the uploaded list. Re-upload or fix the path.</div>
+			{/if}
+			<div class="env-fields-grid">
+				<label><span>Intensity</span><input type="number" min="0" step="0.1" value={env.intensity ?? 1} oninput={(event) => updateEnvironmentField('intensity', (event.currentTarget as HTMLInputElement).value)} /></label>
+				<label><span>Rotation°</span><input type="number" step="1" value={env.rotation_deg ?? 0} oninput={(event) => updateEnvironmentField('rotation_deg', (event.currentTarget as HTMLInputElement).value)} /></label>
+			</div>
+		{/if}
+	</div>
+
+	<div class="env-section">
+		<div class="env-section-title">Scene enclosure</div>
+		<label class="inline-check enclosure-toggle">
+			<input type="checkbox" checked={floorOn} onchange={(event) => updateSettingsField('auto_floor_enabled', (event.currentTarget as HTMLInputElement).checked)} />
+			<span><strong>Auto floor</strong><span class="env-toggle-sub">Keep a base floor visible for editing and rendering.</span></span>
+		</label>
+		<label class="inline-check enclosure-toggle">
+			<input type="checkbox" checked={shellOn} onchange={(event) => updateSettingsField('room_shell_enabled', (event.currentTarget as HTMLInputElement).checked)} />
+			<span><strong>Walls & ceiling</strong><span class="env-toggle-sub">Add simple boundary walls and ceiling around the map.</span></span>
+		</label>
+		{#if mode === 'envmap' && shellOn}
+			<div class="hint-row">💡 Turn off Walls &amp; ceiling so the envmap can light the scene and show as the background.</div>
+		{:else if !shellOn && !floorOn && mode === 'constant'}
+			<div class="hint-row">⚠ Floor + walls/ceiling both off under constant lighting → scene will render almost empty. Switch to envmap.</div>
+		{:else if !shellOn && mode === 'constant'}
+			<div class="hint-row">⚠ Walls/ceiling off + constant lighting → flat. Consider switching to envmap.</div>
+		{/if}
+	</div>
+{/snippet}
+
+{#snippet renderGeometryPanel()}
+	{@const summary = materializationAudit?.summary}
+	{@const fallbackRecords = (materializationAudit?.objects ?? []).filter((o: any) => o.status === 'fallback_cube')}
+	{@const breakdown = materializationAudit?.fallback_breakdown ?? {}}
+	{@const materialBreakdown = materializationAudit?.material_extraction_breakdown ?? {}}
+	{@const materialProblemRecords = (materializationAudit?.objects ?? []).filter((o: any) => {
+		const s = o?.extras?.extracted_material_status;
+		return s && s !== 'ok' && s !== 'n/a';
+	})}
+	{#if summary}
+		<div class="render-geometry-panel">
+			<div class="render-geometry-header">
+				<span class="render-geometry-title">Render geometry</span>
+				<span class="render-geometry-chip render-geometry-chip-ok">{summary.obj_shapes ?? 0} OBJ meshes</span>
+				{#if (summary.fallback_cubes ?? 0) > 0}
+					<span class="render-geometry-chip render-geometry-chip-warn">{summary.fallback_cubes} fallback cubes</span>
+				{/if}
+				{#if (summary.emitter_cubes ?? 0) > 0}
+					<span class="render-geometry-chip render-geometry-chip-dim">{summary.emitter_cubes} emitter cubes</span>
+				{/if}
+				{#if (summary.wall_cubes ?? 0) > 0}
+					<span class="render-geometry-chip render-geometry-chip-dim">{summary.wall_cubes} wall cubes</span>
+				{/if}
+			</div>
+			{#if Object.keys(breakdown).length}
+				<div class="render-geometry-breakdown">
+					{#each Object.entries(breakdown) as [reason, count]}
+						<span class="render-geometry-reason">{reason}: {count}</span>
+					{/each}
+				</div>
+			{/if}
+			{#if fallbackRecords.length}
+				<details class="render-geometry-fallbacks">
+					<summary>Show fallback objects ({fallbackRecords.length})</summary>
+					<ul>
+						{#each fallbackRecords.slice(0, 50) as fb}
+							<li>
+								<button class="link-button" onclick={() => { selectedAuthoringId = fb.object_id ?? fb.shape_id; }}>
+									<strong>{fb.object_id ?? fb.shape_id}</strong>
+								</button>
+								<span class="render-geometry-reason">{fb.reason ?? 'unknown'}</span>
+								{#if fb.source_ref}
+									<small>{fb.source_ref}</small>
+								{/if}
+							</li>
+						{/each}
+					</ul>
+				</details>
+			{/if}
+			{#if Object.keys(materialBreakdown).length}
+				<div class="render-geometry-header" style="margin-top:8px;">
+					<span class="render-geometry-title">Material extraction</span>
+					{#if (materialBreakdown.ok ?? 0) > 0}
+						<span class="render-geometry-chip render-geometry-chip-ok">{materialBreakdown.ok} ok</span>
+					{/if}
+					{#each Object.entries(materialBreakdown).filter(([k]) => k !== 'ok') as [status, count]}
+						<span class="render-geometry-chip render-geometry-chip-warn">{count} {status}</span>
+					{/each}
+				</div>
+				{#if materialProblemRecords.length}
+					<details class="render-geometry-fallbacks">
+						<summary>Show material problems ({materialProblemRecords.length})</summary>
+						<ul>
+							{#each materialProblemRecords.slice(0, 50) as mp}
+								<li>
+									<button class="link-button" onclick={() => { selectedAuthoringId = mp.object_id ?? mp.shape_id; }}>
+										<strong>{mp.object_id ?? mp.shape_id}</strong>
+									</button>
+									<span class="render-geometry-reason">{mp?.extras?.extracted_material_status ?? 'unknown'}</span>
+									{#if mp?.extras?.extracted_material_summary?.base_color_factor}
+										<small>RGB {mp.extras.extracted_material_summary.base_color_factor.map((c: number) => Number(c).toFixed(2)).join(', ')}</small>
+									{/if}
+								</li>
+							{/each}
+						</ul>
+					</details>
+				{/if}
+			{/if}
+			<label class="xml-native-preview-toggle">
+				<input
+					type="checkbox"
+					checked={xmlNativePreviewEnabled}
+					onchange={(e) => { xmlNativePreviewEnabled = (e.currentTarget as HTMLInputElement).checked; }}
+				/>
+				<span>
+					<strong>XML-native preview</strong>
+					<small>Render editor objects from the same mesh_cache OBJ files Mitsuba uses.</small>
+				</span>
+			</label>
+			{#if xmlNativePreviewEnabled && xmlIndexStale}
+				<div class="hint-row">⚠ XML index may be stale. Re-sync render scene so the editor reflects the current mesh_cache.</div>
+			{/if}
+		</div>
+	{/if}
+{/snippet}
+
+<div
+	class="dataset-page"
+	class:bottom-open={!$bottomPanelCollapsed}
+	class:bottom-closed={$bottomPanelCollapsed}
+	class:bottom-maximized={$bottomPanelMode === 'maximized'}
+	class:scene-active={true}
+>
 	<header class="page-header">
 		<div>
 			<div class="panel-label">OpticalNav-v0.2</div>
@@ -3837,7 +3697,7 @@
 				bind:this={mapEditorRef}
 				projectId={selectedProjectId}
 				{sceneId}
-				geometryKey={`${currentUsdRef}:${editorGeometryRefreshToken}`}
+					geometryKey={`${currentUsdRef}:${assetVM.editorGeometryRefreshToken}`}
 				{authoringObjects}
 				{authoringRegions}
 				{graphNodes}
@@ -3849,11 +3709,17 @@
 				editorMode={mapEditorMode}
 				{placementTool}
 				{draftPoint}
+				{objectTransformMode}
+				{surfaceSnapEnabled}
+				gridSnapEnabled={gridSnapEnabled}
+				gridSizeM={transformGridSizeM}
+				angleSnapDeg={transformAngleSnapDeg}
 				onGroundPointerDown={handleGroundPointerDown}
 				onGroundPointerMove={handleGroundPointerMove}
 				onGroundPointerUp={handleGroundPointerUp}
-				preloadSourcePath={placementTool === 'usd_asset' && selectedUsdAsset?.source_format !== 'glb' ? (selectedUsdAsset?.source_path ?? '') : ''}
-				preloadUsdRef={placementTool === 'usd_asset' && selectedUsdAsset?.source_format !== 'glb' ? (selectedUsdAsset?.usd_ref ?? '') : ''}
+				onObjectTransform={handleObjectTransform}
+					preloadSourcePath={placementTool === 'usd_asset' && assetVM.selectedUsdAsset?.source_format !== 'glb' ? (assetVM.selectedUsdAsset?.source_path ?? '') : ''}
+					preloadUsdRef={placementTool === 'usd_asset' && assetVM.selectedUsdAsset?.source_format !== 'glb' ? (assetVM.selectedUsdAsset?.usd_ref ?? '') : ''}
 				customSensorNodes={customSensorNodes.map(n => ({ id: n.id, x: n.x, z: n.z, headingDeg: n.headingDeg, selected: n.id === selectedSensorNodeId }))}
 			cameraHeight={cameraHeightM}
 				onObjectSelect={(id) => {
@@ -3877,6 +3743,10 @@
 				frustumMode={pageMode === 'sensors' ? frustumMode : 'none'}
 				frustumModality={activeRenderModality}
 				frustumSensorId={activeRigSensorId}
+				frustumIntrinsics={activeCameraFrustum}
+				hotCameraPlacement={pageMode === 'preview'}
+				previewCameraOverlay={hotCameraOverlays}
+				onHotCameraDrag={updateHotCameraFromDrag}
 				wallHeight={Number(authoringMap?.settings?.default_wall_height_m ?? 2.4)}
 				footprintInflationM={showFootprint ? Number(robotRadius) + Number(minClearance) : 0}
 				addNodeMode={pageMode === 'paths' && addNodeMode}
@@ -3904,6 +3774,10 @@
 				addEdgeMaxLengthM={Number(maxEdgeLength)}
 				roomShell={roomShell}
 				showRoomShell={showRoomShell}
+				{xmlSceneIndex}
+				{xmlNativePreviewEnabled}
+				opticalNavProjectId={selectedProjectId}
+				opticalNavSceneId={sceneId}
 				graphComponents={graphPayload?.components ?? null}
 				traversableOverlayUrl={pageMode === 'paths' && showTraversableMask && traversableMeta?.png_url ? `${traversableMeta.png_url}&v=${traversableVersion}` : null}
 				traversableOverlayBbox={pageMode === 'paths' && showTraversableMask && traversableMeta?.bbox ? traversableMeta.bbox : null}
@@ -3946,7 +3820,7 @@
 					{:else if placementTool === 'wall' || placementTool === 'glass_wall' || placementTool === 'mirror_wall'}
 						{draftPoint ? 'Click end point · Esc cancel' : `Placing ${placementTool.replace('_', ' ')} · click start`}
 					{:else if ['chair','table','plant','camera','usd_asset'].includes(placementTool)}
-						Click to place {placementTool === 'usd_asset' ? usdAssetLabel(selectedUsdAsset) : placementTool} · Esc cancel
+							Click to place {placementTool === 'usd_asset' ? usdAssetLabel(assetVM.selectedUsdAsset) : placementTool} · Esc cancel
 					{:else if placementTool !== 'select'}
 						Drag rectangle · Esc cancel
 					{:else}
@@ -3956,109 +3830,24 @@
 				<div style="flex:1"></div>
 			</div>
 
-			{#if pageMode === 'map'}
-				<div class="map-float-asset-catalog build-catalog">
-					<div class="catalog-head">
-						<div>
-							<div class="panel-label">Build Catalog</div>
-							<small>Structure and navigation layers.</small>
-						</div>
-					</div>
-					<div class="catalog-tools">
-						<button class:active={placementTool === 'select'} onclick={() => { placementTool = 'select'; draftPoint = null; linePreview = null; }}>Select</button>
-						<button class="danger" disabled={!selectedAuthoringId} onclick={deleteSelectedAuthoringItem}>Delete</button>
-					</div>
-					<div class="asset-card-list">
-						{#each builtInBuildAssets as asset}
-							<button
-								class:selected={placementTool === asset.tool}
-								class="asset-card"
-								title={asset.label}
-								onclick={() => selectBuiltInAsset(asset.tool)}
-							>
-								<AssetThumb3D category={asset.category} assetType={asset.tool} bounds={asset.bounds} selected={placementTool === asset.tool} />
-								<span>{asset.label}</span>
-								<small>{asset.hint}</small>
-							</button>
-						{/each}
-					</div>
-				</div>
-			{:else if pageMode === 'objects'}
-				<div class="map-float-asset-catalog">
-					<div class="catalog-head">
-						<div>
-							<div class="panel-label">Place Catalog</div>
-							<small>Furniture and landmarks.</small>
-						</div>
-					</div>
-					<div class="catalog-tools">
-						<button class:active={placementTool === 'select'} onclick={() => { placementTool = 'select'; draftPoint = null; linePreview = null; }}>Select</button>
-						<button class="danger" disabled={!selectedAuthoringId} onclick={deleteSelectedAuthoringItem}>Delete</button>
-					</div>
-					<div class="asset-section-title">Built-in Assets</div>
-					{#each builtInPlaceAssetGroups as group}
-						<div class="asset-subsection-title">{group.label}</div>
-						<div class="asset-card-list">
-							{#each group.assets as asset}
-								{@const isRichAsset = asset.kind === 'rich_asset'}
-								{@const richSelected = isRichAsset && selectedUsdAssetId === asset.asset_id && placementTool === 'usd_asset'}
-								{@const primitiveSelected = !isRichAsset && placementTool === asset.tool}
-								<button
-									class:selected={richSelected || primitiveSelected}
-									class="asset-card"
-									title={isRichAsset ? `${asset.label} · ${asset.source_dataset}` : asset.label}
-									onclick={() => selectBuiltInPlaceAsset(asset)}
-								>
-									<AssetThumb3D
-										category={asset.category}
-										assetType={isRichAsset ? asset.category : asset.tool}
-										bounds={asset.bounds}
-										selected={richSelected || primitiveSelected}
-									/>
-									<span>{asset.label}</span>
-									<small>{isRichAsset ? `${asset.source_dataset} · point placement` : placementHintForTool(asset.tool)}</small>
-								</button>
-							{/each}
-						</div>
-					{/each}
-					<div class="catalog-divider"></div>
-					<div class="asset-section-title">Library Assets</div>
-					<input class="asset-search" type="search" placeholder="Search {mapAssets.length} assets..." bind:value={usdCatalogSearch} />
-					{#if !usdCatalogSearch.trim() && mapAssets.length > LIBRARY_DISPLAY_LIMIT}
-						<small class="catalog-status">Showing {LIBRARY_DISPLAY_LIMIT} of {mapAssets.length} — search to filter all</small>
-					{:else}
-						<small class="catalog-status">{mapAssetStatus}</small>
-					{/if}
-					<div class="asset-card-list library-assets">
-						{#each usdAssetCandidates as asset}
-							{@const assetId = asset.asset_id ?? asset.id}
-							<button
-								class:selected={selectedUsdAssetId === assetId && placementTool === 'usd_asset'}
-								class="asset-card"
-								title={asset.source_path}
-								onclick={() => { selectedUsdAssetId = assetId; placementTool = 'usd_asset'; draftPoint = null; }}
-							>
-								<div class="asset-thumb-img" aria-hidden="true">
-									<img
-										src={selectedProjectId ? `${opticalNavAssetThumbnailUrl(selectedProjectId, assetId)}&r=${assetThumbRefreshTick}` : ''}
-										alt=""
-										loading="lazy"
-										draggable="false"
-									/>
-								</div>
-								<span>{usdAssetLabel(asset)}</span>
-								<small>{asset.category} · {asset.placement}</small>
-							</button>
-						{/each}
-						{#if usdAssetCandidates.length === 0}
-							<div class="catalog-empty">
-								No selected USD assets yet.
-								<a href="/assets">Open Asset Library</a>
-							</div>
-						{/if}
-					</div>
-				</div>
-			{/if}
+			<AssetCatalog
+				{pageMode}
+				{placementTool} {selectedAuthoringId}
+				{builtInBuildAssets} {builtInPlaceAssetGroups}
+					selectedUsdAssetId={assetVM.selectedUsdAssetId}
+					usdCatalogSearch={assetVM.usdCatalogSearch}
+					mapAssets={assetVM.mapAssets}
+					mapAssetStatus={assetVM.mapAssetStatus}
+					usdAssetCandidates={assetVM.usdAssetCandidates}
+					libraryDisplayLimit={40}
+					{selectedProjectId}
+					assetThumbRefreshTick={assetVM.assetThumbRefreshTick}
+				onSelectTool={(tool) => { placementTool = tool as PlacementTool; draftPoint = null; linePreview = null; }}
+				onDelete={deleteSelectedAuthoringItem}
+				onSelectBuiltInPlaceAsset={selectBuiltInPlaceAsset}
+					onSelectUsdAsset={(id) => { assetVM.selectedUsdAssetId = id; placementTool = 'usd_asset'; draftPoint = null; }}
+					onSearchChange={(v) => (assetVM.usdCatalogSearch = v)}
+			/>
 
 			<!-- Paths mode: episode list panel -->
 			{#if pageMode === 'paths'}
@@ -4096,412 +3885,88 @@
 
 			<!-- Sensor mode: viewpoint render panel -->
 			{#if pageMode === 'sensors'}
-				<div class="map-float-inspector sensor-panel">
-					<!-- Render scene sync status -->
-					{#if !renderSceneSynced}
-						<div class="sensor-sync-warning">
-							<span>Render scene not synced</span>
-							<button class="button button-subtle" disabled={loading || !selectedProjectId || !hasScene} onclick={syncRenderScene} style="display:none">Sync Render Scene</button>
-						</div>
-					{/if}
-	
-				<div class="camera-rig-panel">
-					<div class="rail-title">Robot Camera Rig</div>
-					<div class="render-profile-row">
-						<span class="chip-dim">{globalCameraRig?.base_frame ?? authoringMap?.camera_rig?.base_frame ?? 'base_link'}</span>
-						<a class="button button-subtle" href="/camera_rig">Open Camera Rig Editor</a>
-						<button class="button button-subtle" disabled={loading} onclick={loadGlobalCameraRig}>Reload</button>
-					</div>
-					<div class="sensor-sync-warning camera-rig-readonly-note">
-						<span>{globalCameraRigStatus}</span>
-						{#if globalCameraRigError}<small>{globalCameraRigError}</small>{/if}
-					</div>
-					{#each rigSensorOptions as option, i}
-						{@const sensor = option.sensor}
-						<details class="rig-sensor-card" open={i === 0 || activeRigSensorId === option.sensor_id}>
-							<summary>{option.label} · {option.modality}</summary>
-							<div class="geometry-grid rig-readonly-grid">
-								<div class="readonly-field"><span>ID</span><strong>{option.sensor_id}</strong></div>
-								<div class="readonly-field"><span>Render</span><strong>{sensorRenderChipLabel(option)}</strong></div>
-								<div class="readonly-field"><span>Type</span><strong>{sensor.canonical_sensor_type ?? sensor.modality ?? 'rgb'}</strong></div>
-								<div class="readonly-field"><span>Parent</span><strong>{sensor.mount?.parent_frame ?? globalCameraRig?.base_frame ?? 'base_link'}</strong></div>
-								<div class="readonly-field"><span>XYZ m</span><strong>{formatRigVec(sensor.mount?.xyz_m)}</strong></div>
-								<div class="readonly-field"><span>RPY deg</span><strong>{formatRigVec(sensor.mount?.rpy_deg, 1)}</strong></div>
-								<div class="readonly-field"><span>FOV</span><strong>{Number(sensor.fov_deg ?? sensor.intrinsics?.fov_h_deg ?? 0).toFixed(0)}°</strong></div>
-								<div class="readonly-field"><span>Resolution</span><strong>{formatResolution(sensor.resolution ?? sensor.intrinsics?.resolution)}</strong></div>
-								<div class="readonly-field wide"><span>SPP</span><strong>{formatRenderSpp(sensor)}</strong></div>
-							</div>
-						</details>
-					{/each}
-				</div>
-				<!-- Sensor rays display mode -->
-					<div class="sensor-rays-row">
-						<span class="sensor-rays-label">Sensor Rays</span>
-						<select class="sensor-rays-select" bind:value={frustumMode}>
-							<option value="none">None</option>
-							<option value="view-aligned">View-aligned</option>
-							<option value="selected">Selected only</option>
-						</select>
-					</div>
-					<!-- Add custom sensor button -->
-					<div class="sensor-add-bar">
-						<button
-							class="button full"
-							class:button-primary={placingSensor}
-							class:button-subtle={!placingSensor}
-							onclick={() => { placingSensor = !placingSensor; selectedSensorNodeId = ''; }}
-						>
-							{placingSensor ? 'Click on floor to place...' : '+ Add Sensor Camera'}
-						</button>
-					</div>
-					{#if selectedSensorNode}
-						<div class="panel-label">
-							{(selectedSensorNode as any).isCustom ? 'Custom Camera' : 'Graph Viewpoint'}
-						</div>
-						<div class="sensor-node-id">{selectedSensorNodeId}</div>
-						<div class="sensor-pos">x={selectedSensorNode.position?.[0]?.toFixed(2)} z={selectedSensorNode.position?.[1]?.toFixed(2)}</div>
-						{#if selectedCustomSensorNode}
-							<label class="sensor-heading-label">
-								<span>Heading {selectedCustomSensorNode.headingDeg}°</span>
-								<input type="range" min="0" max="359" step="5"
-									bind:value={selectedCustomSensorNode.headingDeg}
-									oninput={() => { customSensorNodes = [...customSensorNodes]; sensorRenderResult = null; }}
-								/>
-							</label>
-							<button class="button button-subtle full sensor-del"
-								onclick={() => { customSensorNodes = customSensorNodes.filter(n => n.id !== selectedSensorNodeId); selectedSensorNodeId = ''; }}>
-								Remove
-							</button>
-						{/if}
-						<!-- Modality tabs -->
-						<div class="modality-tabs rig-derived-tabs" title="Derived from Robot Camera Rig sensors">
-							{#each rigSensorOptions as option}
-								<button class:active-tab={activeRigSensorId === option.sensor_id} onclick={() => selectRigRenderSensor(option.sensor_id)}>
-									<span>{option.label}</span>
-									<small>{sensorRenderChipLabel(option)}</small>
-								</button>
-							{/each}
-						</div>
-						<!-- Render config status -->
-						<div class="sensor-config-row">
-							{#if sceneStateText.trim() && cameraSpecText.trim()}
-								<span class="chip-ok">Config ready ({renderConfig?.source ?? 'custom'})</span>
-							{:else}
-								<span class="chip-warn" title={renderConfigError || undefined}>No render config{renderConfigError ? ' ⚠' : ''}</span>
-							{/if}
-							<button class="button button-subtle" onclick={loadRenderConfig} title="Auto-load render config from scene catalog">Load</button>
-						</div>
-						{#if sceneStateText.trim()}
-							{@const _ref = (optionalJson(sceneStateText) as any)?.mitsuba_scene_ref}
-							{#if _ref}
-								<div class="config-scene-ref" title={_ref}>Scene XML: {_ref.split('/').slice(-2).join('/')}</div>
-							{/if}
-						{:else if renderConfigError}
-							<div class="config-scene-ref config-scene-error">{renderConfigError}</div>
-						{/if}
-						{@const vpScan2 = observationScan?.viewpoints?.[selectedSensorNodeId]}
-						{@const vpCompleted2 = vpScan2?.completed ?? 0}
-						{@const vpTotal2 = vpScan2?.total ?? 0}
-						{#if vpTotal2 > 0}
-							<div class="sensor-progress">{vpCompleted2}/{vpTotal2} rendered</div>
-						{/if}
-						{#if vpScan2?.headings && Object.keys(vpScan2.headings).length > 0}
-							<div class="obs-heading-gallery">
-								{#each Object.entries(vpScan2.headings).sort(([a], [b]) => a.localeCompare(b)) as [hid, hinfo]}
-									{@const hdata = hinfo as any}
-									{@const hasModality = headingHasSensorModality(hdata, activeModalityTab)}
-									{#if hasModality}
-										<img class="obs-thumb" src={opticalNavObservationModalityUrl(selectedProjectId, sceneId, selectedSensorNodeId, hid, activeModalityTab, activeRigSensorId)} alt={`${hid} ${activeModalityTab}`} title={`${hid} · ${activeRigSensorId || 'legacy'} · ${activeModalityTab}`} loading="lazy" />
-									{:else}
-										<div class="obs-thumb obs-thumb-empty" title={`${hid} · ${activeModalityTab} not rendered`}><span>{parseInt(hid.replace('h_',''))||0}°</span></div>
-									{/if}
-								{/each}
-							</div>
-						{/if}
-						{#if sensorRenderResult}
-							<div class="sensor-result">
-								<span class="chip-ok">Batch {sensorRenderResult.batch_id?.slice(0,8)}...</span>
-								<button class="button button-subtle" onclick={refreshBatch}>Refresh</button>
-							</div>
-						{/if}
-						<button class="button button-primary full" disabled={renderingViewpoint || !selectedProjectId || !renderSceneSynced || (!(selectedSensorNode as any).isCustom && !hasGraph) || (!sceneStateText.trim() || !cameraSpecText.trim())} onclick={renderSensorViewpoint}>
-							{renderingViewpoint ? 'Sweeping...' : 'Graph Sweep · this viewpoint'}
-						</button>
-						<button class="button button-subtle full" disabled={loading || !selectedProjectId || !renderSceneSynced || !hasGraph} onclick={renderEpisodes}>
-							Graph Sweep · all viewpoints
-						</button>
-					{:else}
-						<div class="sensor-hint">Click a viewpoint (blue dot) to select it</div>
-					{/if}
-				</div>
+					<SensorsPanel
+						{renderSceneSynced} {loading} {selectedProjectId} {hasScene} {hasGraph}
+						globalCameraRig={assetVM.globalCameraRig}
+						globalCameraRigStatus={assetVM.globalCameraRigStatus}
+						globalCameraRigError={assetVM.globalCameraRigError}
+					{rigSensorOptions} {activeRigSensorId}
+					bind:frustumMode bind:placingSensor bind:selectedSensorNodeId
+					{selectedSensorNode} {selectedCustomSensorNode}
+					{sceneId} {sceneStateText} {cameraSpecText}
+					{renderConfig} {renderConfigError}
+					{observationScan} bind:activeModalityTab
+					{sensorRenderResult} {renderingViewpoint}
+					onLoadGlobalCameraRig={loadGlobalCameraRig}
+					onSyncRenderScene={syncRenderScene}
+					onSelectRigRenderSensor={selectRigRenderSensor}
+					onLoadRenderConfig={loadRenderConfig}
+					onOptionalJson={optionalJson}
+					onRenderSensorViewpoint={renderSensorViewpoint}
+					onRenderEpisodes={() => renderEpisodes('graph_sweep')}
+					onRenderEpisodeNodes={() => renderEpisodes('episode_nodes')}
+					{episodeNodesAvailable}
+					{episodePathNodeCount}
+					headingsPerNode={graphPayload?.node_heading_count ?? 0}
+					onRefreshBatch={refreshBatch}
+					onRemoveCustomSensor={(id) => { customSensorNodes = customSensorNodes.filter(n => n.id !== id); }}
+					onCustomSensorHeadingChange={(id, deg) => { customSensorNodes = customSensorNodes.map(n => n.id === id ? {...n, headingDeg: deg} : n); sensorRenderResult = null; }}
+				/>
 			{/if}
 
 			<!-- Export mode panel -->
 			{#if pageMode === 'export'}
-				<div class="map-float-inspector export-panel">
-					<div class="panel-label">Export Readiness</div>
-					<div class="export-readiness-list">
-						<div class="readiness-item" class:ok={hasScene}>
-							<span class="readiness-dot"></span><span>Scene</span>
-						</div>
-						<div class="readiness-item" class:ok={hasMap}>
-							<span class="readiness-dot"></span><span>Traversable grid</span>
-						</div>
-						<div class="readiness-item" class:ok={hasGraph}>
-							<span class="readiness-dot"></span><span>Viewpoint graph</span>
-						</div>
-						<div class="readiness-item" class:ok={hasEpisodes}>
-							<span class="readiness-dot"></span><span>Episodes ({episodes.length})</span>
-						</div>
-						<div class="readiness-item" class:ok={validationPassed}>
-							<span class="readiness-dot"></span><span>Validated</span>
-						</div>
-					</div>
-					{#if effectiveRenderReadiness?.errors?.length}
-					<div class="readiness-errors">
-						{#each effectiveRenderReadiness.errors.slice(0, 4) as item}
-							<div>{item.label ?? item.key}: {item.message}</div>
-						{/each}
-					</div>
-				{/if}
-				{#if graphPayloadSummary}
-						<div class="panel-label mt-2">Dataset Stats</div>
-						<div class="export-stats">
-							<div class="stat-row"><span>Viewpoints</span><span>{graphPayloadSummary.node_count}</span></div>
-							<div class="stat-row"><span>Edges</span><span>{graphPayloadSummary.edge_count}</span></div>
-							<div class="stat-row"><span>Hazard edges</span><span>{graphPayloadSummary.hazard_edge_count ?? 0}</span></div>
-							<div class="stat-row"><span>Episodes</span><span>{episodes.length}</span></div>
-							{#if splitCounts.train != null}
-								<div class="stat-row"><span>Train</span><span>{splitCounts.train}</span></div>
-								<div class="stat-row"><span>Val seen</span><span>{splitCounts.val_seen ?? 0}</span></div>
-								<div class="stat-row"><span>Val unseen</span><span>{splitCounts.val_unseen ?? 0}</span></div>
-							{/if}
-						</div>
-					{/if}
-					{#if allEpisodePaths.length > 0}
-						<div class="export-path-legend mt-2">
-							<span class="legend-swatch normal"></span><span>Normal path</span>
-							<span class="legend-swatch hazard"></span><span>Hazard path ({allEpisodePaths.filter(p => p.hasHazard).length})</span>
-						</div>
-					{/if}
-					{#if validationReport}
-						<div class="export-validation" class:validation-ok={validationReport.ok !== false} class:validation-fail={validationReport.ok === false}>
-							Validation: {validationReport.ok !== false ? 'passed' : 'failed'}
-							{#if validationReport.errors?.length}<span class="val-errors"> · {validationReport.errors.length} error(s)</span>{/if}
-						</div>
-					{/if}
-					<button class="button button-subtle full mt-2" disabled={!selectedProjectId || loading} onclick={() => validateDataset(false)}>
-						{loading ? 'Validating...' : 'Validate Dataset'}
-					</button>
-					<button class="button button-primary full" disabled={!selectedProjectId || !hasEpisodes || loading} onclick={exportDataset}>
-						{loading ? 'Exporting...' : 'Export Dataset'}
-					</button>
-					{#if exportPath}
-						<div class="export-path-display">
-							<span class="chip-ok">Exported</span>
-							<span class="export-path-text" title={exportPath}>{exportPath.split('/').slice(-2).join('/')}</span>
-						</div>
-					{/if}
-				</div>
+				<ExportPanel
+					{hasScene} {hasMap} {hasGraph} {hasEpisodes} {validationPassed}
+					{effectiveRenderReadiness} {validationReport} {graphPayloadSummary}
+					{splitCounts} {allEpisodePaths} {exportPath} {loading}
+					episodesCount={scopedEpisodeCount}
+					bind:onlyCompleted={exportOnlyCompleted}
+					bind:currentSceneOnly={exportCurrentSceneOnly}
+					currentSceneId={sceneId}
+					{exportableEpisodeCount}
+					exportSummary={exportResult}
+					onValidate={() => validateDataset(false)}
+					onExport={exportDataset}
+				/>
 			{/if}
 
 			<!-- Floating right inspector (only when item selected in build/place mode) -->
 			{#if selectedAuthoringItem && (pageMode === 'map' || pageMode === 'objects')}
-					<div class="map-float-inspector" class:material-panel={inspectorTab === 'material'}>
-						<div class="inspector-head">
-							<div>
-								<div class="panel-label">Selected</div>
-								<div class="inspector-id">{selectedAuthoringItem.id}</div>
-							</div>
-							{#if authoringMapDirty}<span class="dirty-pill">Unsaved</span>{/if}
-						</div>
-						<div class="inspector-badges">
-							<span>{selectedAuthoringKind || 'item'}</span>
-							<span>{selectedAuthoringItem.type}</span>
-						</div>
-						<div class="inspector-tabs">
-							<button class:active={inspectorTab === 'object'} onclick={() => (inspectorTab = 'object')}>Object</button>
-							<button class:active={inspectorTab === 'material'} disabled={selectedAuthoringKind !== 'object'} onclick={() => (inspectorTab = 'material')}>Material</button>
-						</div>
-						{#if inspectorTab === 'object'}
-							<label>
-								<span>label</span>
-								<input
-									value={selectedAuthoringItem.label ?? ''}
-									oninput={(event) => updateSelectedField('label', (event.currentTarget as HTMLInputElement).value)}
-								/>
-							</label>
-							{#if selectedAuthoringKind === 'object'}
-								<div class="material-summary-row">
-									{#if materialPreviewSource(selectedAuthoringItem.material)}
-										<img src={materialPreviewSource(selectedAuthoringItem.material)} alt="" loading="lazy" />
-									{:else}
-										<span class="material-empty-thumb">none</span>
-									{/if}
-									<div>
-										<div class="material-mini-label">Material</div>
-										<strong>{materialDisplayLabel(selectedAuthoringItem.material)}</strong>
-										<small>{selectedMaterialInfo?.kind ?? 'preset/custom'}</small>
-									</div>
-									<button class="button button-subtle" onclick={() => (inspectorTab = 'material')}>Change</button>
-								</div>
-								{#if selectedAuthoringItem.source_ref}
-									<div class="material-info">
-										<strong>USD source</strong>
-										<small>{selectedAuthoringItem.source_ref}</small>
-									</div>
-								{/if}
-							{/if}
-							<div class="preset-row">
-								<button class="button button-subtle" onclick={() => applyInspectorPreset('glass')}>Glass</button>
-								<button class="button button-subtle" onclick={() => applyInspectorPreset('mirror')}>Mirror</button>
-								<button class="button button-subtle" onclick={() => applyInspectorPreset('landmark')}>Landmark</button>
-								<button class="button button-subtle" onclick={() => applyInspectorPreset('traversable')}>Walkable</button>
-							</div>
-							{#if selectedAuthoringItem.geometry?.type === 'point'}
-								<div class="rotation-row">
-									<button title="Rotate left 45° (Q)" onclick={() => rotateSelectedPoint(-45)}>↺ 45°</button>
-									<div>
-										<strong>{Math.round(selectedAuthoringItem.geometry.yaw_deg ?? 0)}°</strong>
-										<small>Q/E rotate · [/]</small>
-									</div>
-									<button title="Rotate right 45° (E)" onclick={() => rotateSelectedPoint(45)}>45° ↻</button>
-								</div>
-							{/if}
-							<details class="inspector-section geometry-advanced">
-								<summary>Advanced geometry</summary>
-								<p class="inline-hint">Use the scene handles for common edits. Numeric values are for precise adjustment.</p>
-								{#if selectedAuthoringItem.geometry?.type === 'point'}
-									<div class="geometry-grid">
-										<label><span>Position X</span><input type="number" min="0" max="6" step="0.01" value={selectedAuthoringItem.geometry.center?.[0] ?? 0} oninput={(event) => updateSelectedPointGeometry('x', (event.currentTarget as HTMLInputElement).value)} /></label>
-										<label><span>Position Y</span><input type="number" min="0" max="4" step="0.01" value={selectedAuthoringItem.geometry.center?.[1] ?? 0} oninput={(event) => updateSelectedPointGeometry('y', (event.currentTarget as HTMLInputElement).value)} /></label>
-										<label><span>Yaw</span><input type="number" step="1" value={selectedAuthoringItem.geometry.yaw_deg ?? 0} oninput={(event) => updateSelectedPointGeometry('yaw_deg', (event.currentTarget as HTMLInputElement).value)} /></label>
-								<label><span>Width</span><input type="number" min="0.01" step="0.01" value={selectedAuthoringItem.geometry.size_m?.[0] ?? 0.5} oninput={(event) => updateSelectedDimension('size_x', (event.currentTarget as HTMLInputElement).value)} /></label>
-								<label><span>Height</span><input type="number" min="0.01" step="0.01" value={selectedAuthoringItem.geometry.size_m?.[1] ?? 1.2} oninput={(event) => updateSelectedDimension('size_y', (event.currentTarget as HTMLInputElement).value)} /></label>
-								<label><span>Depth</span><input type="number" min="0.01" step="0.01" value={selectedAuthoringItem.geometry.size_m?.[2] ?? 0.5} oninput={(event) => updateSelectedDimension('size_z', (event.currentTarget as HTMLInputElement).value)} /></label>
-								<label><span>Base H</span><input type="number" step="0.01" value={selectedAuthoringItem.geometry.base_height_m ?? 0} oninput={(event) => updateSelectedDimension('base_height_m', (event.currentTarget as HTMLInputElement).value)} /></label>
-								<label><span>Pitch</span><input type="number" step="1" value={selectedAuthoringItem.geometry.pitch_deg ?? 0} oninput={(event) => updateSelectedDimension('pitch_deg', (event.currentTarget as HTMLInputElement).value)} /></label>
-								<label><span>Roll</span><input type="number" step="1" value={selectedAuthoringItem.geometry.roll_deg ?? 0} oninput={(event) => updateSelectedDimension('roll_deg', (event.currentTarget as HTMLInputElement).value)} /></label>
-									</div>
-								{:else if selectedAuthoringItem.geometry?.type === 'line'}
-									<div class="geometry-grid">
-										<label><span>Start X</span><input type="number" min="0" max="6" step="0.01" value={selectedAuthoringItem.geometry.start?.[0] ?? 0} oninput={(event) => updateSelectedLineGeometry('start_x', (event.currentTarget as HTMLInputElement).value)} /></label>
-										<label><span>Start Y</span><input type="number" min="0" max="4" step="0.01" value={selectedAuthoringItem.geometry.start?.[1] ?? 0} oninput={(event) => updateSelectedLineGeometry('start_y', (event.currentTarget as HTMLInputElement).value)} /></label>
-										<label><span>End X</span><input type="number" min="0" max="6" step="0.01" value={selectedAuthoringItem.geometry.end?.[0] ?? 0} oninput={(event) => updateSelectedLineGeometry('end_x', (event.currentTarget as HTMLInputElement).value)} /></label>
-										<label><span>End Y</span><input type="number" min="0" max="4" step="0.01" value={selectedAuthoringItem.geometry.end?.[1] ?? 0} oninput={(event) => updateSelectedLineGeometry('end_y', (event.currentTarget as HTMLInputElement).value)} /></label>
-										<label><span>Height</span><input type="number" min="0.001" step="0.1" value={selectedAuthoringItem.geometry.height_m ?? 2.4} oninput={(event) => updateSelectedLineGeometry('height_m', (event.currentTarget as HTMLInputElement).value)} /></label>
-										<label><span>Thickness</span><input type="number" min="0.001" step="0.01" value={selectedAuthoringItem.geometry.thickness_m ?? 0.08} oninput={(event) => updateSelectedLineGeometry('thickness_m', (event.currentTarget as HTMLInputElement).value)} /></label>
-									</div>
-								{:else if selectedAuthoringItem.geometry?.type === 'rectangle'}
-									<div class="geometry-grid">
-										<label><span>x0</span><input type="number" min="0" max="6" step="0.01" value={selectedAuthoringItem.geometry.bounds?.[0] ?? 0} oninput={(event) => updateSelectedRectangleBound(0, (event.currentTarget as HTMLInputElement).value)} /></label>
-										<label><span>y0</span><input type="number" min="0" max="4" step="0.01" value={selectedAuthoringItem.geometry.bounds?.[1] ?? 0} oninput={(event) => updateSelectedRectangleBound(1, (event.currentTarget as HTMLInputElement).value)} /></label>
-										<label><span>x1</span><input type="number" min="0" max="6" step="0.01" value={selectedAuthoringItem.geometry.bounds?.[2] ?? 1} oninput={(event) => updateSelectedRectangleBound(2, (event.currentTarget as HTMLInputElement).value)} /></label>
-										<label><span>y1</span><input type="number" min="0" max="4" step="0.01" value={selectedAuthoringItem.geometry.bounds?.[3] ?? 1} oninput={(event) => updateSelectedRectangleBound(3, (event.currentTarget as HTMLInputElement).value)} /></label>
-									</div>
-								{/if}
-								{#if inspectorError}<p class="inline-error">{inspectorError}</p>{/if}
-							</details>
-							<div class="inspector-section">
-								<div class="panel-label">Navigation</div>
-								<div class="flag-grid">
-									<label><input type="checkbox" checked={selectedAuthoringItem.navigation?.blocks_navigation ?? false} onchange={(event) => updateSelectedNavigation('blocks_navigation', (event.currentTarget as HTMLInputElement).checked)} /> Blocks robot</label>
-									<label><input type="checkbox" checked={selectedAuthoringItem.navigation?.include_in_hazard_mask ?? false} onchange={(event) => updateSelectedNavigation('include_in_hazard_mask', (event.currentTarget as HTMLInputElement).checked)} /> Hazard mask</label>
-									<label><input type="checkbox" checked={selectedAuthoringItem.navigation?.instruction_candidate ?? false} onchange={(event) => updateSelectedNavigation('instruction_candidate', (event.currentTarget as HTMLInputElement).checked)} /> Instruction</label>
-									<label><input type="checkbox" checked={selectedAuthoringItem.navigation?.goal_candidate ?? false} onchange={(event) => updateSelectedNavigation('goal_candidate', (event.currentTarget as HTMLInputElement).checked)} /> Goal</label>
-								</div>
-								<label>
-									<span>hazard_type</span>
-									<select
-										value={selectedAuthoringItem.navigation?.hazard_type ?? ''}
-										onchange={(event) => updateSelectedNavigation('hazard_type', (event.currentTarget as HTMLSelectElement).value)}
-									>
-										{#each hazardTypes as ht}
-											<option value={ht}>{ht || 'none'}</option>
-										{/each}
-									</select>
-								</label>
-							</div>
-							<div class="inspector-section">
-								<div class="panel-label">Light source</div>
-								{#if detectedEmitterIds.has(selectedAuthoringItem.id) && !selectedAuthoringItem.is_emitter}
-									<p class="emitter-hint">🔆 Detected light fixture — enable to render as an area emitter.</p>
-								{/if}
-								<label class="flag-grid"><input type="checkbox" checked={selectedAuthoringItem.is_emitter ?? false} onchange={(event) => updateSelectedField('is_emitter', (event.currentTarget as HTMLInputElement).checked)} /> Use as light source</label>
-								{#if selectedAuthoringItem.is_emitter}
-									<label>
-										<span>Intensity ({(selectedAuthoringItem.emitter_intensity ?? 1.0).toFixed(2)}×)</span>
-										<input type="range" min="0.1" max="20" step="0.1"
-											value={selectedAuthoringItem.emitter_intensity ?? 1.0}
-											oninput={(event) => updateSelectedField('emitter_intensity', parseFloat((event.currentTarget as HTMLInputElement).value))}
-										/>
-									</label>
-								{/if}
-							</div>
-							<button class="button button-subtle full danger" onclick={deleteSelectedAuthoringItem}>Delete {selectedAuthoringId}</button>
-						{:else}
-							<div class="material-workspace">
-								<div class="material-picker-top">
-									<input class="material-search" placeholder="Search material name, tag, collection..." bind:value={materialPickerSearch} />
-									<select bind:value={materialPickerCollection}>
-										<option value="all">All collections</option>
-										<option value="preset">Presets</option>
-										{#each materialCollections as [collectionId, collectionLabel]}
-											<option value={collectionId}>{collectionLabel}</option>
-										{/each}
-									</select>
-								</div>
-								<div class="material-category-tabs">
-									{#each ['recommended','glass','mirror','wall','floor','furniture','hazard','all'] as category}
-										<button class:active={materialPickerCategory === category} onclick={() => (materialPickerCategory = category)}>{category}</button>
-									{/each}
-								</div>
-								<div class="material-grid-browser">
-									<div class="material-card-grid">
-										<button class:selected={!selectedAuthoringItem.material && !materialPreviewValue} onclick={() => chooseMaterial('')}>
-											<span class="material-empty-thumb">none</span>
-											<strong>No material</strong>
-											<small>clear override</small>
-										</button>
-										{#each filteredMaterialCards as card}
-											<button class:selected={(materialPreviewValue || selectedAuthoringItem.material) === card.value} onclick={() => (materialPreviewValue = card.value)}>
-												{#if card.preview}<img src={card.preview} alt="" loading="lazy" />{:else}<span class="material-empty-thumb">none</span>{/if}
-												<strong>{card.label}</strong>
-												<small>{card.collectionLabel}</small>
-												<div class="material-tag-row">
-													{#each card.tags.slice(0, 3) as tag}<span>{tag}</span>{/each}
-												</div>
-											</button>
-										{/each}
-									</div>
-									<div class="material-preview-panel">
-										{#if materialPreviewEntry}
-											{#if materialPreviewEntry.preview}<img class="material-large-preview" src={materialPreviewEntry.preview} alt="" loading="lazy" />{:else}<span class="material-large-empty">No preview</span>{/if}
-											<h3>{materialPreviewEntry.label}</h3>
-											<p>{materialPreviewEntry.collectionLabel} · {materialPreviewEntry.kind} · {materialPreviewEntry.status}</p>
-											<div class="material-tag-row expanded">
-												{#each materialPreviewEntry.tags as tag}<span>{tag}</span>{/each}
-											</div>
-											<div class="material-metadata">
-												<div><span>Category</span><strong>{materialPreviewEntry.category}</strong></div>
-												<div><span>RGB</span><strong>ready</strong></div>
-												<div><span>Polarization</span><strong>{materialPreviewEntry.tags.includes('polarization-ready') ? 'ready' : 'proxy'}</strong></div>
-												<div><span>NIR-like</span><strong>{materialPreviewEntry.tags.includes('NIR-ready') ? 'ready' : 'proxy'}</strong></div>
-											</div>
-											{#if selectedMaterialSuggestion}<p class="suggestion">{selectedMaterialSuggestion}</p>{/if}
-											<div class="material-action-row">
-												<button class="button button-subtle" onclick={() => chooseMaterial(materialPreviewEntry.value)}>Apply Material</button>
-												<button class="button button-primary" onclick={() => applyMaterialWithSuggestedTags(materialPreviewEntry.value)}>Apply + Suggested Tags</button>
-											</div>
-										{:else}
-											<div class="material-empty-state">No matching materials. {materialLibraryStatus}</div>
-										{/if}
-									</div>
-								</div>
-							</div>
-						{/if}
-					</div>
-				{/if}
+				<InspectorPanel
+					item={selectedAuthoringItem}
+					itemKind={selectedAuthoringKind}
+					dirty={authoringMapDirty}
+					{inspectorError} {inspectorTab}
+						materialGroups={assetVM.materialGroups} {selectedMaterialInfo} {selectedMaterialSuggestion}
+					{materialPickerSearch} {materialPickerCollection} {materialPickerCategory}
+					{filteredMaterialCards} {materialCollections} {materialPreviewEntry}
+						{materialPreviewValue} materialLibraryStatus={assetVM.materialLibraryStatus}
+					{detectedEmitterIds} {hazardTypes}
+					{surfaceSnapEnabled} {gridSnapEnabled}
+					{transformGridSizeM} {transformAngleSnapDeg}
+					onUpdateField={updateSelectedField}
+					onUpdateNavigation={updateSelectedNavigation}
+					onUpdatePointGeometry={(f, v) => updateSelectedPointGeometry(f as any, v)}
+					onUpdateLineGeometry={(f, v) => updateSelectedLineGeometry(f as any, v)}
+					onUpdateRectangleBound={updateSelectedRectangleBound}
+					onUpdateDimension={(f, v) => updateSelectedDimension(f as any, v)}
+					onApplyPreset={(p) => applyInspectorPreset(p as any)}
+					onRotatePoint={rotateSelectedPoint}
+					onChooseMaterial={chooseMaterial}
+					onApplyMaterialWithTags={applyMaterialWithSuggestedTags}
+					onDelete={deleteSelectedAuthoringItem}
+					onSetInspectorTab={(tab) => (inspectorTab = tab as 'object' | 'material')}
+					onSetMaterialPreviewValue={(v) => (materialPreviewValue = v)}
+					onSetMaterialPickerSearch={(v) => (materialPickerSearch = v)}
+					onSetMaterialPickerCollection={(v) => (materialPickerCollection = v)}
+					onSetMaterialPickerCategory={(v) => (materialPickerCategory = v)}
+					onSetSurfaceSnapEnabled={(v) => (surfaceSnapEnabled = v)}
+					onSetGridSnapEnabled={(v) => (gridSnapEnabled = v)}
+					onSetTransformGridSizeM={(v) => (transformGridSizeM = v)}
+					onSetTransformAngleSnapDeg={(v) => (transformAngleSnapDeg = v)}
+				/>
+			{/if}
 
 			<!-- Floating bottom status bar -->
 			<div class="map-float-status">
@@ -4527,7 +3992,7 @@
 					{#if projectScenes.length > 0}
 						<label>
 							<span>scene</span>
-							<select class="scene-select" value={sceneId} onchange={(e) => { sceneId = e.currentTarget.value; sceneStateText = ''; cameraSpecText = ''; renderConfig = null; syncResult = null; renderReadiness = null; renderConfigError = ''; loadAuthoringMap(); loadRenderConfig(); episodes = []; selectedEpisode = null; selectedEpisodeId = ''; graphPayload = null; observationScan = null; graphBatch = null; graphBatchId = ''; graphBatchIds = []; stopBatchPolling(); if (pageMode === 'sensors') scanObservations(); }}>
+							<select class="scene-select" value={sceneId} onchange={(e) => { sceneId = e.currentTarget.value; sceneStateText = ''; cameraSpecText = ''; renderConfig = null; syncResult = null; renderReadiness = null; renderConfigError = ''; loadAuthoringMap(); loadRenderConfig(); episodes = []; selectedEpisode = null; selectedEpisodeId = ''; graphPayload = null; observationScan = null; graphBatch = null; graphBatchId = ''; graphBatchIds = []; stopBatchPolling(); _showRoomShellUserTouched = false; if (pageMode === 'sensors') scanObservations(); }}>
 								{#each projectScenes as item}
 									<option value={item.scene_id}>{item.scene_id}</option>
 								{/each}
@@ -4570,20 +4035,7 @@
 
 					<details open class="render-ready-panel">
 						<summary>Environment / Render readiness</summary>
-						<div class="geometry-grid">
-							<label><span>Environment</span><select value={authoringMap?.environment?.mode ?? 'constant'} onchange={(event) => updateEnvironmentField('mode', (event.currentTarget as HTMLSelectElement).value)}><option value="constant">constant</option><option value="envmap">envmap</option></select></label>
-							<label><span>Intensity</span><input type="number" min="0" step="0.1" value={authoringMap?.environment?.intensity ?? 1} oninput={(event) => updateEnvironmentField('intensity', (event.currentTarget as HTMLInputElement).value)} /></label>
-							<label><span>Rotation</span><input type="number" step="1" value={authoringMap?.environment?.rotation_deg ?? 0} oninput={(event) => updateEnvironmentField('rotation_deg', (event.currentTarget as HTMLInputElement).value)} /></label>
-							<label><span>RGB</span><input value={(authoringMap?.environment?.radiance ?? [0.8,0.8,0.85]).join(', ')} oninput={(event) => updateEnvironmentField('radiance', (event.currentTarget as HTMLInputElement).value)} /></label>
-						</div>
-						<label><span>HDR/EXR envmap ref</span><input value={authoringMap?.environment?.envmap_ref ?? ''} oninput={(event) => updateEnvironmentField('envmap_ref', (event.currentTarget as HTMLInputElement).value || null)} /></label>
-						<div class="geometry-grid">
-							<label><span>Upload envmap</span><input type="file" accept=".exr,.hdr,.png,.jpg,.jpeg,image/png,image/jpeg" disabled={envmapUploading || !selectedProjectId || !hasScene} onchange={(event) => uploadEnvmapFromInput(event.currentTarget as HTMLInputElement)} /></label>
-							{#if envmapFiles.length}
-								<label><span>Uploaded</span><select value={authoringMap?.environment?.envmap_ref ?? ''} onchange={(event) => { updateEnvironmentField('mode', 'envmap'); updateEnvironmentField('envmap_ref', (event.currentTarget as HTMLSelectElement).value || null); }}><option value="">Select envmap</option>{#each envmapFiles as item}<option value={item.envmap_ref}>{item.filename}{#if item.size_bytes} · {envmapSizeLabel(item.size_bytes)}{/if}</option>{/each}</select></label>
-							{/if}
-						</div>
-						<label class="inline-check"><input type="checkbox" checked={authoringMap?.environment?.background_visible ?? true} onchange={(event) => updateEnvironmentField('background_visible', (event.currentTarget as HTMLInputElement).checked)} /> Background visible</label>
+						{@render environmentPanel()}
 						<div class="render-profile-row">
 							<span class="chip-ok">GPU-only</span>
 							<span class="chip-ok">Scene reuse</span>
@@ -4594,7 +4046,18 @@
 								Render readiness: {effectiveRenderReadiness.status ?? (effectiveRenderReadiness.ok ? 'ready' : 'blocked')}
 								{#if effectiveRenderReadiness.error_count != null}<span class="val-errors"> · {effectiveRenderReadiness.error_count} error(s)</span>{/if}
 							</div>
+							{#if !effectiveRenderReadiness.ok && effectiveRenderReadiness.errors?.length}
+								<div class="readiness-errors">
+									{#each effectiveRenderReadiness.errors as err}
+										<div class="readiness-error-item">
+											<span class="readiness-error-label">{err.label ?? err.key}:</span>
+											<span class="readiness-error-msg">{err.message}</span>
+										</div>
+									{/each}
+								</div>
+							{/if}
 						{/if}
+						{@render renderGeometryPanel()}
 					</details>
 					<details>
 						<summary>authoring_map.json</summary>
@@ -4771,1157 +4234,226 @@
 		</div>
 
 		{#if railTab === 'selected' && selectedAuthoringItem}
-			<section class="rail-section rail-tool-panel">
-				<div class="inspector-head">
-					<div>
-						<div class="rail-title">Selected</div>
-						<div class="inspector-id">{selectedAuthoringItem.id}</div>
-					</div>
-					{#if authoringMapDirty}<span class="dirty-pill">Unsaved</span>{/if}
-				</div>
-				<div class="inspector-badges">
-					<span>{selectedAuthoringKind || 'item'}</span>
-					<span>{selectedAuthoringItem.type}</span>
-				</div>
-				<div class="inspector-tabs">
-					<button class:active={inspectorTab === 'object'} onclick={() => (inspectorTab = 'object')}>Object</button>
-					<button class:active={inspectorTab === 'material'} disabled={selectedAuthoringKind !== 'object'} onclick={() => (inspectorTab = 'material')}>Material</button>
-				</div>
-
-				{#if inspectorTab === 'object'}
-					<label>
-						<span>label</span>
-						<input
-							value={selectedAuthoringItem.label ?? ''}
-							oninput={(event) => updateSelectedField('label', (event.currentTarget as HTMLInputElement).value)}
-						/>
-					</label>
-					{#if selectedAuthoringKind === 'object'}
-						<div class="material-summary-row">
-							{#if materialPreviewSource(selectedAuthoringItem.material)}
-								<img src={materialPreviewSource(selectedAuthoringItem.material)} alt="" loading="lazy" />
-							{:else}
-								<span class="material-empty-thumb">none</span>
-							{/if}
-							<div>
-								<div class="material-mini-label">Material</div>
-								<strong>{materialDisplayLabel(selectedAuthoringItem.material)}</strong>
-								<small>{selectedMaterialInfo?.kind ?? 'preset/custom'}</small>
-							</div>
-							<button class="button button-subtle" onclick={() => (inspectorTab = 'material')}>Change</button>
-						</div>
-						{#if selectedAuthoringItem.source_ref}
-							<div class="material-info">
-								<strong>USD source</strong>
-								<small>{selectedAuthoringItem.source_ref}</small>
-							</div>
-						{/if}
-					{/if}
-					<div class="preset-row">
-						<button class="button button-subtle" onclick={() => applyInspectorPreset('glass')}>Glass</button>
-						<button class="button button-subtle" onclick={() => applyInspectorPreset('mirror')}>Mirror</button>
-						<button class="button button-subtle" onclick={() => applyInspectorPreset('landmark')}>Landmark</button>
-						<button class="button button-subtle" onclick={() => applyInspectorPreset('traversable')}>Walkable</button>
-					</div>
-					{#if selectedAuthoringItem.geometry?.type === 'point'}
-						<div class="rotation-row">
-							<button title="Rotate left 45° (Q)" onclick={() => rotateSelectedPoint(-45)}>↺ 45°</button>
-							<div>
-								<strong>{Math.round(selectedAuthoringItem.geometry.yaw_deg ?? 0)}°</strong>
-								<small>Q/E rotate · [/]</small>
-							</div>
-							<button title="Rotate right 45° (E)" onclick={() => rotateSelectedPoint(45)}>45° ↻</button>
-						</div>
-					{/if}
-					<details class="inspector-section geometry-advanced">
-						<summary>Advanced geometry</summary>
-						<p class="inline-hint">Use the scene handles for common edits. Numeric values are for precise adjustment.</p>
-						{#if selectedAuthoringItem.geometry?.type === 'point'}
-							<div class="geometry-grid">
-								<label><span>Position X</span><input type="number" min="0" max="6" step="0.01" value={selectedAuthoringItem.geometry.center?.[0] ?? 0} oninput={(event) => updateSelectedPointGeometry('x', (event.currentTarget as HTMLInputElement).value)} /></label>
-								<label><span>Position Y</span><input type="number" min="0" max="4" step="0.01" value={selectedAuthoringItem.geometry.center?.[1] ?? 0} oninput={(event) => updateSelectedPointGeometry('y', (event.currentTarget as HTMLInputElement).value)} /></label>
-								<label><span>Yaw</span><input type="number" step="1" value={selectedAuthoringItem.geometry.yaw_deg ?? 0} oninput={(event) => updateSelectedPointGeometry('yaw_deg', (event.currentTarget as HTMLInputElement).value)} /></label>
-								<label><span>Width</span><input type="number" min="0.01" step="0.01" value={selectedAuthoringItem.geometry.size_m?.[0] ?? 0.5} oninput={(event) => updateSelectedDimension('size_x', (event.currentTarget as HTMLInputElement).value)} /></label>
-								<label><span>Height</span><input type="number" min="0.01" step="0.01" value={selectedAuthoringItem.geometry.size_m?.[1] ?? 1.2} oninput={(event) => updateSelectedDimension('size_y', (event.currentTarget as HTMLInputElement).value)} /></label>
-								<label><span>Depth</span><input type="number" min="0.01" step="0.01" value={selectedAuthoringItem.geometry.size_m?.[2] ?? 0.5} oninput={(event) => updateSelectedDimension('size_z', (event.currentTarget as HTMLInputElement).value)} /></label>
-								<label><span>Base H</span><input type="number" step="0.01" value={selectedAuthoringItem.geometry.base_height_m ?? 0} oninput={(event) => updateSelectedDimension('base_height_m', (event.currentTarget as HTMLInputElement).value)} /></label>
-								<label><span>Pitch</span><input type="number" step="1" value={selectedAuthoringItem.geometry.pitch_deg ?? 0} oninput={(event) => updateSelectedDimension('pitch_deg', (event.currentTarget as HTMLInputElement).value)} /></label>
-								<label><span>Roll</span><input type="number" step="1" value={selectedAuthoringItem.geometry.roll_deg ?? 0} oninput={(event) => updateSelectedDimension('roll_deg', (event.currentTarget as HTMLInputElement).value)} /></label>
-							</div>
-						{:else if selectedAuthoringItem.geometry?.type === 'line'}
-							<div class="geometry-grid">
-								<label><span>Start X</span><input type="number" min="0" max="6" step="0.01" value={selectedAuthoringItem.geometry.start?.[0] ?? 0} oninput={(event) => updateSelectedLineGeometry('start_x', (event.currentTarget as HTMLInputElement).value)} /></label>
-								<label><span>Start Y</span><input type="number" min="0" max="4" step="0.01" value={selectedAuthoringItem.geometry.start?.[1] ?? 0} oninput={(event) => updateSelectedLineGeometry('start_y', (event.currentTarget as HTMLInputElement).value)} /></label>
-								<label><span>End X</span><input type="number" min="0" max="6" step="0.01" value={selectedAuthoringItem.geometry.end?.[0] ?? 0} oninput={(event) => updateSelectedLineGeometry('end_x', (event.currentTarget as HTMLInputElement).value)} /></label>
-								<label><span>End Y</span><input type="number" min="0" max="4" step="0.01" value={selectedAuthoringItem.geometry.end?.[1] ?? 0} oninput={(event) => updateSelectedLineGeometry('end_y', (event.currentTarget as HTMLInputElement).value)} /></label>
-								<label><span>Height</span><input type="number" min="0.001" step="0.1" value={selectedAuthoringItem.geometry.height_m ?? 2.4} oninput={(event) => updateSelectedLineGeometry('height_m', (event.currentTarget as HTMLInputElement).value)} /></label>
-								<label><span>Thickness</span><input type="number" min="0.001" step="0.01" value={selectedAuthoringItem.geometry.thickness_m ?? 0.08} oninput={(event) => updateSelectedLineGeometry('thickness_m', (event.currentTarget as HTMLInputElement).value)} /></label>
-							</div>
-						{:else if selectedAuthoringItem.geometry?.type === 'rectangle'}
-							<div class="geometry-grid">
-								<label><span>x0</span><input type="number" min="0" max="6" step="0.01" value={selectedAuthoringItem.geometry.bounds?.[0] ?? 0} oninput={(event) => updateSelectedRectangleBound(0, (event.currentTarget as HTMLInputElement).value)} /></label>
-								<label><span>y0</span><input type="number" min="0" max="4" step="0.01" value={selectedAuthoringItem.geometry.bounds?.[1] ?? 0} oninput={(event) => updateSelectedRectangleBound(1, (event.currentTarget as HTMLInputElement).value)} /></label>
-								<label><span>x1</span><input type="number" min="0" max="6" step="0.01" value={selectedAuthoringItem.geometry.bounds?.[2] ?? 1} oninput={(event) => updateSelectedRectangleBound(2, (event.currentTarget as HTMLInputElement).value)} /></label>
-								<label><span>y1</span><input type="number" min="0" max="4" step="0.01" value={selectedAuthoringItem.geometry.bounds?.[3] ?? 1} oninput={(event) => updateSelectedRectangleBound(3, (event.currentTarget as HTMLInputElement).value)} /></label>
-							</div>
-						{/if}
-						{#if inspectorError}<p class="inline-error">{inspectorError}</p>{/if}
-					</details>
-					<div class="inspector-section">
-						<div class="rail-title">Navigation</div>
-						<div class="flag-grid">
-							<label><input type="checkbox" checked={selectedAuthoringItem.navigation?.blocks_navigation ?? false} onchange={(event) => updateSelectedNavigation('blocks_navigation', (event.currentTarget as HTMLInputElement).checked)} /> Blocks robot</label>
-							<label><input type="checkbox" checked={selectedAuthoringItem.navigation?.include_in_hazard_mask ?? false} onchange={(event) => updateSelectedNavigation('include_in_hazard_mask', (event.currentTarget as HTMLInputElement).checked)} /> Hazard mask</label>
-							<label><input type="checkbox" checked={selectedAuthoringItem.navigation?.instruction_candidate ?? false} onchange={(event) => updateSelectedNavigation('instruction_candidate', (event.currentTarget as HTMLInputElement).checked)} /> Instruction</label>
-							<label><input type="checkbox" checked={selectedAuthoringItem.navigation?.goal_candidate ?? false} onchange={(event) => updateSelectedNavigation('goal_candidate', (event.currentTarget as HTMLInputElement).checked)} /> Goal</label>
-						</div>
-						<label>
-							<span>hazard_type</span>
-							<select
-								value={selectedAuthoringItem.navigation?.hazard_type ?? ''}
-								onchange={(event) => updateSelectedNavigation('hazard_type', (event.currentTarget as HTMLSelectElement).value)}
-							>
-								{#each hazardTypes as ht}
-									<option value={ht}>{ht || 'none'}</option>
-								{/each}
-							</select>
-						</label>
-					</div>
-					<button class="button button-subtle full danger" onclick={deleteSelectedAuthoringItem}>Delete {selectedAuthoringId}</button>
-				{:else}
-					<div class="material-workspace">
-						<div class="material-picker-top">
-							<input class="material-search" placeholder="Search material name, tag, collection..." bind:value={materialPickerSearch} />
-							<select bind:value={materialPickerCollection}>
-								<option value="all">All collections</option>
-								<option value="preset">Presets</option>
-								{#each materialCollections as [collectionId, collectionLabel]}
-									<option value={collectionId}>{collectionLabel}</option>
-								{/each}
-							</select>
-						</div>
-						<div class="material-category-tabs">
-							{#each ['recommended','glass','mirror','wall','floor','furniture','hazard','all'] as category}
-								<button class:active={materialPickerCategory === category} onclick={() => (materialPickerCategory = category)}>{category}</button>
-							{/each}
-						</div>
-						<div class="material-grid-browser">
-							<div class="material-card-grid">
-								<button class:selected={!selectedAuthoringItem.material && !materialPreviewValue} onclick={() => chooseMaterial('')}>
-									<span class="material-empty-thumb">none</span>
-									<strong>No material</strong>
-									<small>clear override</small>
-								</button>
-								{#each filteredMaterialCards as card}
-									<button class:selected={(materialPreviewValue || selectedAuthoringItem.material) === card.value} onclick={() => (materialPreviewValue = card.value)}>
-										{#if card.preview}<img src={card.preview} alt="" loading="lazy" />{:else}<span class="material-empty-thumb">none</span>{/if}
-										<strong>{card.label}</strong>
-										<small>{card.collectionLabel}</small>
-										<div class="material-tag-row">
-											{#each card.tags.slice(0, 3) as tag}<span>{tag}</span>{/each}
-										</div>
-									</button>
-								{/each}
-							</div>
-							<div class="material-preview-panel">
-								{#if materialPreviewEntry}
-									{#if materialPreviewEntry.preview}<img class="material-large-preview" src={materialPreviewEntry.preview} alt="" loading="lazy" />{:else}<span class="material-large-empty">No preview</span>{/if}
-									<h3>{materialPreviewEntry.label}</h3>
-									<p>{materialPreviewEntry.collectionLabel} · {materialPreviewEntry.kind} · {materialPreviewEntry.status}</p>
-									<div class="material-tag-row expanded">
-										{#each materialPreviewEntry.tags as tag}<span>{tag}</span>{/each}
-									</div>
-									<div class="material-metadata">
-										<div><span>Category</span><strong>{materialPreviewEntry.category}</strong></div>
-										<div><span>RGB</span><strong>ready</strong></div>
-										<div><span>Polarization</span><strong>{materialPreviewEntry.tags.includes('polarization-ready') ? 'ready' : 'proxy'}</strong></div>
-										<div><span>NIR-like</span><strong>{materialPreviewEntry.tags.includes('NIR-ready') ? 'ready' : 'proxy'}</strong></div>
-									</div>
-									{#if selectedMaterialSuggestion}<p class="suggestion">{selectedMaterialSuggestion}</p>{/if}
-									<div class="material-action-row">
-										<button class="button button-subtle" onclick={() => chooseMaterial(materialPreviewEntry.value)}>Apply Material</button>
-										<button class="button button-primary" onclick={() => applyMaterialWithSuggestedTags(materialPreviewEntry.value)}>Apply + Suggested Tags</button>
-									</div>
-								{:else}
-									<div class="material-empty-state">No matching materials. {materialLibraryStatus}</div>
-								{/if}
-							</div>
-						</div>
-					</div>
-				{/if}
-			</section>
+			<RailSelectedTab
+				item={selectedAuthoringItem}
+				itemKind={selectedAuthoringKind}
+				itemId={selectedAuthoringId}
+				dirty={authoringMapDirty}
+				{inspectorTab} {inspectorError}
+					materialGroups={assetVM.materialGroups} {selectedMaterialInfo} {selectedMaterialSuggestion}
+				{materialPickerSearch} {materialPickerCollection} {materialPickerCategory}
+				{filteredMaterialCards} {materialCollections} {materialPreviewEntry}
+					{materialPreviewValue} materialLibraryStatus={assetVM.materialLibraryStatus}
+				{detectedEmitterIds} {hazardTypes}
+				{surfaceSnapEnabled} {gridSnapEnabled} {transformGridSizeM} {transformAngleSnapDeg}
+				onUpdateField={updateSelectedField}
+				onUpdateNavigation={updateSelectedNavigation}
+				onUpdatePointGeometry={(f, v) => updateSelectedPointGeometry(f as any, v)}
+				onUpdateLineGeometry={(f, v) => updateSelectedLineGeometry(f as any, v)}
+				onUpdateRectangleBound={updateSelectedRectangleBound}
+				onUpdateDimension={(f, v) => updateSelectedDimension(f as any, v)}
+				onApplyPreset={(p) => applyInspectorPreset(p as any)}
+				onRotatePoint={rotateSelectedPoint}
+				onChooseMaterial={chooseMaterial}
+				onApplyMaterialWithTags={applyMaterialWithSuggestedTags}
+				onDelete={deleteSelectedAuthoringItem}
+				onSetInspectorTab={(tab) => (inspectorTab = tab as 'object' | 'material')}
+				onSetMaterialPreviewValue={(v) => (materialPreviewValue = v)}
+				onSetMaterialPickerSearch={(v) => (materialPickerSearch = v)}
+				onSetMaterialPickerCollection={(v) => (materialPickerCollection = v)}
+				onSetMaterialPickerCategory={(v) => (materialPickerCategory = v)}
+				onSetSurfaceSnapEnabled={(v) => (surfaceSnapEnabled = v)}
+				onSetGridSnapEnabled={(v) => (gridSnapEnabled = v)}
+				onSetTransformGridSizeM={(v) => (transformGridSizeM = v)}
+				onSetTransformAngleSnapDeg={(v) => (transformAngleSnapDeg = v)}
+			/>
 		{/if}
 
 		{#if railTab === 'paths'}
-			<section class="rail-section rail-tool-panel footprint-panel">
-				<div class="rail-title">Robot footprint</div>
-				<div class="footprint-grid">
-					<label><span>Robot radius (m)</span><input type="number" min="0" max="2" step="0.05" bind:value={robotRadius} /></label>
-					<label><span>Min clearance (m)</span><input type="number" min="0" max="2" step="0.05" bind:value={minClearance} /></label>
-				</div>
-				<div class="footprint-info">Total inflated: <strong>{(Number(robotRadius) + Number(minClearance)).toFixed(2)} m</strong></div>
-				<label class="footprint-toggle"><input type="checkbox" bind:checked={showFootprint} /> Show inflation overlay (3D view)</label>
-				<div class="rail-title mt-2">Traversable grid</div>
-				<label><span>Resolution (m)</span><input type="number" step="0.01" min="0.01" bind:value={resolution} /></label>
-				<button class="button button-subtle" disabled={!selectedProjectId || !hasScene || buildingMap} onclick={buildMap}>
-					{#if buildingMap}<span class="spinner-xs"></span> Building...{:else}{hasMap ? 'Rebuild grid' : 'Build grid'}{/if}
-				</button>
-				<div class="rail-title mt-2">Viewpoint graph</div>
-				<button class="button button-subtle" disabled={!hasMap || buildingGraph} onclick={requestBuildGraph}>
-					{buildingGraph ? 'Rebuilding…' : 'Rebuild graph'}
-				</button>
-				{#if selectedSensorNode && !(selectedSensorNode as any).isCustom}
-					<button class="button button-subtle danger" onclick={() => deleteSelectedGraphNode()}>
-						Delete {selectedSensorNode.node_id}
-					</button>
-				{/if}
-			</section>
-			<section class="rail-section rail-tool-panel footprint-panel">
-				<div class="rail-title">Map interaction</div>
-				<div class="mode-radio-group">
-					<label class="mode-radio" title="Default. Click nodes or objects to select; orbit/zoom the 3D view.">
-						<input type="radio" name="pathsMode" value="select" bind:group={pathsMode} />
-						<span>🖱 Select</span>
-					</label>
-					<label class="mode-radio" title="Click anywhere on the floor to insert a new viewpoint node at that (x, z). Node gets default headings.">
-						<input type="radio" name="pathsMode" value="place_node" bind:group={pathsMode} />
-						<span>📍 Place node</span>
-					</label>
-					<label class="mode-radio" title="Drag on the floor to mark cells as walkable (force traversable). Survives map rebuilds.">
-						<input type="radio" name="pathsMode" value="paint_walkable" bind:group={pathsMode} />
-						<span><span class="paint-swatch walkable"></span> Paint walkable</span>
-					</label>
-					<label class="mode-radio" title="Drag on the floor to mark cells as blocked (force non-traversable). Useful for closing off areas the planner shouldn't use.">
-						<input type="radio" name="pathsMode" value="paint_blocked" bind:group={pathsMode} />
-						<span><span class="paint-swatch blocked"></span> Paint blocked</span>
-					</label>
-					<label class="mode-radio" title="Drag to clear walkability paint marks in that area (restore the auto-computed mask).">
-						<input type="radio" name="pathsMode" value="paint_erase" bind:group={pathsMode} />
-						<span>🧽 Erase paint</span>
-					</label>
-					<label class="mode-radio" title="Drag a rectangle on the floor to select an area, then click 'Rebuild this region' to re-sample only that area's viewpoints.">
-						<input type="radio" name="pathsMode" value="select_region" bind:group={pathsMode} />
-						<span>▭ Select region</span>
-					</label>
-					<label class="mode-radio" title="Click two graph nodes in sequence to create a manual edge between them (shown in purple).">
-						<input type="radio" name="pathsMode" value="add_edge" bind:group={pathsMode} />
-						<span>⤴ Add edge</span>
-					</label>
-					<label class="mode-radio" title="Click two graph nodes to diagnose why no edge exists between them (distance, blocking cells, hazard).">
-						<input type="radio" name="pathsMode" value="inspect_edge" bind:group={pathsMode} />
-						<span>🔍 Inspect edge</span>
-					</label>
-				</div>
-				{#if pathsMode !== 'select'}
-					<div class="mode-active-banner">
-						{#if pathsMode === 'place_node'}Click on the floor to place a node…
-						{:else if pathsMode.startsWith('paint_')}Drag on the floor (brush radius {paintRadiusM} m)…
-						{:else if pathsMode === 'select_region'}Drag a rectangle on the floor…
-						{:else if pathsMode === 'add_edge'}{pendingEdgeSource ? `Source: ${pendingEdgeSource} · click target…` : 'Click first node…'}
-						{:else if pathsMode === 'inspect_edge'}{edgeInspectorSource ? `Source: ${edgeInspectorSource} · click target to diagnose…` : 'Click first node…'}
-						{/if}
-					</div>
-				{/if}
-				{#if pathsMode.startsWith('paint_')}
-					<label class="footprint-toggle">
-						<span>Brush radius (m)</span>
-						<input type="number" min="0.05" max="2" step="0.05" bind:value={paintRadiusM} class="paint-radius" />
-					</label>
-				{/if}
-				{#if walkabilityOverlayMeta?.stats?.walkable_cells || walkabilityOverlayMeta?.stats?.blocked_cells}
-					<div class="paint-info">
-						<span class="chip-ok">walkable paint: {walkabilityOverlayMeta.stats.walkable_cells ?? 0}</span>
-						<span class="chip-warn">blocked paint: {walkabilityOverlayMeta.stats.blocked_cells ?? 0}</span>
-						<button class="button button-subtle danger" onclick={clearWalkabilityOverlay}>Clear</button>
-					</div>
-				{/if}
-				{#if pendingRegionBbox}
-					<div class="paint-info">Region: [{pendingRegionBbox[0].toFixed(1)}, {pendingRegionBbox[1].toFixed(1)} → {pendingRegionBbox[2].toFixed(1)}, {pendingRegionBbox[3].toFixed(1)}]</div>
-					<button class="button button-subtle" onclick={rebuildRegion}>Rebuild this region</button>
-					<button class="button button-subtle" onclick={() => (pendingRegionBbox = null)}>Cancel selection</button>
-				{/if}
-			</section>
-			<section class="rail-section rail-tool-panel footprint-panel">
-				<div class="rail-title">Display layers</div>
-				<label class="footprint-toggle" title="Show a translucent red ring inset from the floor by (robot_radius + min_clearance), approximating where the robot can't go.">
-					<input type="checkbox" bind:checked={showFootprint} />
-					<span>Footprint inflation outline</span>
-				</label>
-				<label class="footprint-toggle" title="Overlay the inflated traversable grid on the floor: red = real obstacles, orange = robot-radius halo. Lets you see exactly why the planner blocks certain edges.">
-					<input type="checkbox" bind:checked={showTraversableMask} onchange={() => refreshTraversableMeta()} />
-					<span>Inflated obstacles mask</span>
-				</label>
-				{#if showTraversableMask && traversableMeta?.stats}
-					<div class="paint-info">
-						<span class="chip-warn">obstacles: {traversableMeta.stats.raw_obstacle_cells ?? 0}</span>
-						<span style:background="#fef3c7" style:color="#92400e" style:padding="2px 6px" style:border-radius="4px">inflation halo: {traversableMeta.stats.inflation_only_cells ?? 0}</span>
-					</div>
-				{/if}
-			</section>
-			<section class="rail-section rail-tool-panel footprint-panel">
-				<div class="rail-title">Edge diagnostics</div>
-				{#if edgeCheckResult}
-					<div class="edge-diag">
-						<div class="edge-diag-title">{edgeCheckResult.source} ↔ {edgeCheckResult.target}</div>
-						<div>Distance: <strong>{edgeCheckResult.distance_m?.toFixed(2)} m</strong> {edgeCheckResult.within_max_edge_length ? '✓' : `✗ (max ${edgeCheckResult.max_edge_length_m} m)`}</div>
-						<div>Line check: {edgeCheckResult.blocked_cell_count > 0 ? `⚠ ${edgeCheckResult.blocked_cell_count} cells blocked` : '✓ clear'}</div>
-						{#if edgeCheckResult.first_blocked_cell}
-							<div class="edge-diag-detail">
-								First blocked at world ({edgeCheckResult.first_blocked_cell.world?.[0]?.toFixed(2)}, {edgeCheckResult.first_blocked_cell.world?.[1]?.toFixed(2)})
-								· {edgeCheckResult.first_blocked_cell.reason === 'raw_obstacle' ? 'real obstacle' : edgeCheckResult.first_blocked_cell.reason === 'inflation_halo' ? 'robot-radius halo' : edgeCheckResult.first_blocked_cell.reason}
-							</div>
-						{/if}
-						<div>Hazard crossing: {edgeCheckResult.hazard_crossing ? '⚠ yes' : 'no'}</div>
-						<div class="edge-diag-verdict" class:ok={edgeCheckResult.would_connect}>
-							{edgeCheckResult.would_connect ? '✓ Would connect on next graph build' : `✗ ${edgeCheckResult.reason}`}
-						</div>
-						<div class="edge-diag-actions">
-							<button class="button button-subtle" onclick={addEdgeAnyway}>Add edge anyway</button>
-							<button class="button button-subtle" onclick={() => (edgeCheckResult = null)}>Dismiss</button>
-						</div>
-					</div>
-				{/if}
-				{#if graphPayload?.component_summary && graphPayload.component_summary.length > 0}
-					<div class="footprint-divider"></div>
-					<div class="panel-label">Connectivity</div>
-					<div class="paint-info">
-						{graphPayload.component_summary.length} component{graphPayload.component_summary.length === 1 ? '' : 's'} · {graphNodes.length} nodes total
-					</div>
-					{#each graphPayload.component_summary.slice(0, 5) as comp}
-						<div class="component-row">
-							<span class="component-dot" style:background={['#6366f1','#ef4444','#fbbf24','#a855f7','#14b8a6','#ec4899','#84cc16'][comp.index % 7]}></span>
-							<span>{comp.size} node{comp.size === 1 ? '' : 's'}{comp.index === 0 ? ' (main)' : comp.size === 1 ? ' (isolated)' : ''}</span>
-						</div>
-					{/each}
-				{/if}
-				{#if graphEdges?.some?.((e: any) => e?.extras?.manual)}
-					<div class="footprint-divider"></div>
-					<div class="panel-label">Manual edges</div>
-					<div class="lights-list">
-						{#each graphEdges.filter((e: any) => e?.extras?.manual) as me (me.edge_id)}
-							<div class="light-item">
-								<span class="light-label">{me.source} → {me.target}</span>
-								<button class="button button-subtle danger" onclick={async () => {
-									try {
-										await deleteOpticalNavGraphEdge(selectedProjectId, sceneId, me.edge_id);
-										await loadGraph();
-									} catch (err) { pushActivity('error', 'graph:edge-del', errorMessage(err)); }
-								}}>Delete</button>
-							</div>
-						{/each}
-					</div>
-				{/if}
-			</section>
-			<section class="rail-section rail-tool-panel paths-panel">
-				<div class="rail-title">Episodes ({filteredEpisodes.length})</div>
-				<input class="episode-search" type="search" placeholder="Search..." bind:value={episodeSearch} />
-				<div class="episode-list">
-					{#each filteredEpisodes as ep}
-						<div
-							class="episode-row"
-							class:selected={selectedEpisodeId === ep.episode_id}
-							role="button"
-							tabindex="0"
-							onclick={() => loadEpisode(ep.episode_id)}
-							onkeydown={(e) => e.key === 'Enter' && loadEpisode(ep.episode_id)}
-						>
-							<span class="ep-id">{ep.episode_id}</span>
-							<span class="ep-mode">{ep.navigation_mode ?? 'traj'}</span>
-							{#if ep.hazard_collision}<span class="badge-hazard">⚠</span>{/if}
-						</div>
-					{/each}
-					{#if filteredEpisodes.length === 0}
-						<div class="episode-empty">{episodes.length === 0 ? 'No episodes yet.' : 'No matches.'}</div>
-					{/if}
-				</div>
-				<div class="episode-generate-bar">
-					<input type="number" min="1" bind:value={episodeCount} title="Count" />
-					<button class="button button-primary" disabled={!selectedProjectId || !hasGraph || loading} onclick={planGraphEpisodes}>+ Generate</button>
-					{#if episodes.length > 0}
-						<button class="button button-subtle" onclick={clearEpisodes} title="Clear all episodes">✕</button>
-					{/if}
-				</div>
-			</section>
+			<RailPathsTab
+				{hasMap} {hasGraph} {hasScene} {selectedProjectId} {sceneId} {loading}
+				{buildingMap} {buildingGraph} {graphBuildProgress} {graphResult} {mapResult}
+				{graphPayloadSummary} {graphPayload} graphNodes={graphNodes} graphEdges={graphEdges}
+				{pathsMode} {paintRadiusM} {pendingEdgeSource} {edgeInspectorSource}
+				{pendingRegionBbox} {walkabilityOverlayMeta} {traversableMeta}
+				{showTraversableMask} {showFootprint} {edgeCheckResult}
+				{filteredEpisodes} {episodes} {episodeSearch} {episodeCount}
+				{selectedEpisodeId} {splitCounts}
+				{robotRadius} {minClearance} {resolution}
+				{maxNodes} {headingCount} {minNodeSpacing} {selectedSensorNode}
+				onBuildMap={buildMap}
+				onRequestBuildGraph={requestBuildGraph}
+				onSetPathsMode={(m) => (pathsMode = m as PathsInteractionMode)}
+				onSetPaintRadius={(r) => (paintRadiusM = r)}
+				onRebuildRegion={rebuildRegion}
+				onClearRegion={() => (pendingRegionBbox = null)}
+				onClearWalkabilityOverlay={clearWalkabilityOverlay}
+				onRefreshTraversableMeta={refreshTraversableMeta}
+				onSetShowFootprint={(v) => (showFootprint = v)}
+				onSetShowTraversableMask={(v) => (showTraversableMask = v)}
+				onAddEdgeAnyway={addEdgeAnyway}
+				onDismissEdgeCheck={() => (edgeCheckResult = null)}
+				onDeleteGraphEdge={handleDeleteGraphEdge}
+				onDeleteGraphNode={deleteSelectedGraphNode}
+				onLoadEpisode={loadEpisode}
+				onGenerateEpisodes={planGraphEpisodes}
+				onClearEpisodes={clearEpisodes}
+				onSetEpisodeSearch={(v) => (episodeSearch = v)}
+				onSetEpisodeCount={(n) => (episodeCount = n)}
+				onSetRobotRadius={(v) => (robotRadius = v)}
+				onSetMinClearance={(v) => (minClearance = v)}
+				onSetResolution={(v) => (resolution = v)}
+				onSetMaxNodes={(n) => (maxNodes = n)}
+				onSetHeadingCount={(n) => (headingCount = n)}
+				onSetMinNodeSpacing={(v) => (minNodeSpacing = v)}
+				onRenderEpisodeNodes={() => renderEpisodes('episode_nodes')}
+				{episodeNodesAvailable}
+				{episodePathNodeCount}
+				headingsPerNode={graphPayload?.node_heading_count ?? 0}
+				{renderSceneSynced}
+			/>
 		{/if}
 
-		{#if railTab === 'sensors'}
-			<section class="rail-section rail-tool-panel sensor-panel">
-				<div class="rail-title">Sensor Render</div>
-				{#if !renderSceneSynced}
-					<div class="sensor-sync-warning">
-						<span>Render scene not synced</span>
-						<button class="button button-subtle" disabled={loading || !selectedProjectId || !hasScene} onclick={syncRenderScene} style="display:none">Sync Render Scene</button>
-					</div>
-				{/if}
-
-				<div class="camera-rig-panel">
-					<div class="rail-title">Robot Camera Rig</div>
-					<div class="render-profile-row">
-						<span class="chip-dim">{globalCameraRig?.base_frame ?? authoringMap?.camera_rig?.base_frame ?? 'base_link'}</span>
-						<a class="button button-subtle" href="/camera_rig">Open Camera Rig Editor</a>
-						<button class="button button-subtle" disabled={loading} onclick={loadGlobalCameraRig}>Reload</button>
-					</div>
-					<div class="sensor-sync-warning camera-rig-readonly-note">
-						<span>{globalCameraRigStatus}</span>
-						{#if globalCameraRigError}<small>{globalCameraRigError}</small>{/if}
-					</div>
-					{#each rigSensorOptions as option, i}
-						{@const sensor = option.sensor}
-						<details class="rig-sensor-card" open={i === 0 || activeRigSensorId === option.sensor_id}>
-							<summary>{option.label} · {option.modality}</summary>
-							<div class="geometry-grid rig-readonly-grid">
-								<div class="readonly-field"><span>ID</span><strong>{option.sensor_id}</strong></div>
-								<div class="readonly-field"><span>Render</span><strong>{sensorRenderChipLabel(option)}</strong></div>
-								<div class="readonly-field"><span>Type</span><strong>{sensor.canonical_sensor_type ?? sensor.modality ?? 'rgb'}</strong></div>
-								<div class="readonly-field"><span>Parent</span><strong>{sensor.mount?.parent_frame ?? globalCameraRig?.base_frame ?? 'base_link'}</strong></div>
-								<div class="readonly-field"><span>XYZ m</span><strong>{formatRigVec(sensor.mount?.xyz_m)}</strong></div>
-								<div class="readonly-field"><span>RPY deg</span><strong>{formatRigVec(sensor.mount?.rpy_deg, 1)}</strong></div>
-								<div class="readonly-field"><span>FOV</span><strong>{Number(sensor.fov_deg ?? sensor.intrinsics?.fov_h_deg ?? 0).toFixed(0)}°</strong></div>
-								<div class="readonly-field"><span>Resolution</span><strong>{formatResolution(sensor.resolution ?? sensor.intrinsics?.resolution)}</strong></div>
-								<div class="readonly-field wide"><span>SPP</span><strong>{formatRenderSpp(sensor)}</strong></div>
-							</div>
-						</details>
-					{/each}
-				</div>
-				<!-- Sensor rays display mode -->
-				<div class="sensor-rays-row">
-					<span class="sensor-rays-label">Sensor Rays</span>
-					<select class="sensor-rays-select" bind:value={frustumMode}>
-						<option value="none">None</option>
-						<option value="view-aligned">View-aligned</option>
-						<option value="selected">Selected only</option>
-					</select>
-				</div>
-				<div class="sensor-add-bar">
-					<button
-						class="button full"
-						class:button-primary={placingSensor}
-						class:button-subtle={!placingSensor}
-						onclick={() => { placingSensor = !placingSensor; selectedSensorNodeId = ''; }}
-					>
-						{placingSensor ? 'Click on floor to place...' : '+ Add Sensor Camera'}
-					</button>
-				</div>
-				{#if selectedSensorNode}
-					<div class="rail-title">
-						{(selectedSensorNode as any).isCustom ? 'Custom Camera' : 'Graph Viewpoint'}
-					</div>
-					<div class="sensor-node-id">{selectedSensorNodeId}</div>
-					<div class="sensor-pos">x={selectedSensorNode.position?.[0]?.toFixed(2)} z={selectedSensorNode.position?.[1]?.toFixed(2)}</div>
-					{#if selectedCustomSensorNode}
-						<label class="sensor-heading-label">
-							<span>Heading {selectedCustomSensorNode.headingDeg}°</span>
-							<input type="range" min="0" max="359" step="5"
-								bind:value={selectedCustomSensorNode.headingDeg}
-								oninput={() => { customSensorNodes = [...customSensorNodes]; sensorRenderResult = null; }}
-							/>
-						</label>
-						<button class="button button-subtle full sensor-del"
-							onclick={() => { customSensorNodes = customSensorNodes.filter(n => n.id !== selectedSensorNodeId); selectedSensorNodeId = ''; }}>
-							Remove
-						</button>
-					{/if}
-					<div class="modality-tabs rig-derived-tabs" title="Derived from Robot Camera Rig sensors">
-						{#each rigSensorOptions as option}
-							<button class:active-tab={activeRigSensorId === option.sensor_id} onclick={() => selectRigRenderSensor(option.sensor_id)}>
-								<span>{option.label}</span>
-								<small>{sensorRenderChipLabel(option)}</small>
-							</button>
-						{/each}
-					</div>
-					<div class="sensor-config-row">
-						{#if sceneStateText.trim() && cameraSpecText.trim()}
-							<span class="chip-ok">Config ready ({renderConfig?.source ?? 'custom'})</span>
-						{:else}
-							<span class="chip-warn">No render config</span>
-						{/if}
-						<button class="button button-subtle" onclick={loadRenderConfig} title="Auto-load render config from scene catalog">Load</button>
-					</div>
-					<div class="sensor-config-row">
-						<label class="sensor-height-label" title={selectedSensorNodeId ? 'Per-viewpoint override (rig default = ' + rigMountHeightM.toFixed(2) + 'm)' : 'Rig defaults are read-only here. Edit them in /camera_rig.'}>
-							Camera height (m) {selectedSensorNodeId ? `· ${selectedSensorNodeId}` : `· ${activeRigSensorOption?.label ?? 'rig sensor'}`}
-						</label>
-						<input type="number" class="sensor-height-input" min="0.05" max="8" step="0.05"
-							value={selectedSensorHeightM}
-							oninput={(e) => setSelectedSensorHeight(Number((e.currentTarget as HTMLInputElement).value))}
-						/>
-					</div>
-					<div class="sensor-config-row">
-						<label class="sensor-height-label">Ambient light</label>
-						<input type="number" class="sensor-height-input" min="0" max="20" step="0.1" bind:value={ambientRadiance} title="Fallback constant radiance injected when the scene has no emitters" />
-					</div>
-					{@const vpScan = observationScan?.viewpoints?.[selectedSensorNodeId]}
-					{@const vpCompleted = vpScan?.completed ?? (graphBatch ? (buildBatchJobGrid(graphBatch).rows.find((r: any) => r.nid === selectedSensorNodeId)?.cells?.filter((c: any) => c?.status?.status === 'completed')?.length ?? 0) : 0)}
-					{@const vpTotal = vpScan?.total ?? graphBatch?.progress?.total ?? 0}
-					{#if vpTotal > 0}
-						<div class="sensor-obs-header">
-							<span class="sensor-progress">{vpCompleted}/{vpTotal} rendered</span>
-							{#if vpCompleted > 0}
-								<button class="button button-subtle" onclick={() => clearNodeObservations(selectedSensorNodeId)}>Clear</button>
-							{/if}
-						</div>
-					{/if}
-					{#if vpScan?.headings && Object.keys(vpScan.headings).length > 0}
-						<div class="obs-heading-gallery">
-							{#each Object.entries(vpScan.headings).sort(([a], [b]) => a.localeCompare(b)) as [hid, hinfo]}
-								{@const hdata = hinfo as any}
-								{@const hasModality = headingHasSensorModality(hdata, activeModalityTab)}
-								{#if hasModality}
-									<img
-										class="obs-thumb"
-										src={opticalNavObservationModalityUrl(selectedProjectId, sceneId, selectedSensorNodeId, hid, activeModalityTab, activeRigSensorId)}
-										alt={`${hid} ${activeModalityTab}`}
-										title={`${hid} · ${activeRigSensorId || 'legacy'} · ${activeModalityTab}`}
-										loading="lazy"
-									/>
-								{:else}
-									<div class="obs-thumb obs-thumb-empty" title={`${hid} · ${activeModalityTab} not rendered`}>
-										<span>{parseInt(hid.replace('h_', '')) || 0}°</span>
-									</div>
-								{/if}
-							{/each}
-						</div>
-					{/if}
-					{#if sensorRenderResult}
-						<div class="sensor-result">
-							<span class="chip-ok">Batch {sensorRenderResult.batch_id?.slice(0,8)}...</span>
-							<button class="button button-subtle" onclick={refreshBatch}>Refresh</button>
-						</div>
-					{/if}
-					<button class="button button-primary full" disabled={renderingViewpoint || !selectedProjectId || !renderSceneSynced || (!(selectedSensorNode as any).isCustom && !hasGraph) || (!sceneStateText.trim() || !cameraSpecText.trim())} onclick={renderSensorViewpoint}>
-						{renderingViewpoint ? 'Sweeping...' : 'Graph Sweep · this viewpoint'}
-					</button>
-					<button class="button button-subtle full" disabled={loading || !selectedProjectId || !renderSceneSynced || !hasGraph} onclick={renderEpisodes}>
-						Graph Sweep · all viewpoints
-					</button>
-				{:else}
-					<div class="sensor-hint">Click a viewpoint (blue dot) to select it</div>
-					{#if observationScan?.viewpoints}
-						{@const totalCompleted = Object.values(observationScan.viewpoints as Record<string, any>).reduce((s: number, vp: any) => s + (vp.completed ?? 0), 0)}
-						{@const totalHeadings = Object.values(observationScan.viewpoints as Record<string, any>).reduce((s: number, vp: any) => s + (vp.total ?? 0), 0)}
-						{#if totalHeadings > 0}
-							<div class="sensor-obs-header">
-								<span class="sensor-progress">{totalCompleted}/{totalHeadings} total renders</span>
-								{#if totalCompleted > 0}
-									<button class="button button-subtle" onclick={clearAllObservations}>Clear all</button>
-								{/if}
-							</div>
-						{/if}
-					{/if}
-				{/if}
-			</section>
+			{#if railTab === 'sensors'}
+				<RailSensorsTab
+					{renderSceneSynced}
+					globalCameraRig={assetVM.globalCameraRig}
+					globalCameraRigStatus={assetVM.globalCameraRigStatus}
+					globalCameraRigError={assetVM.globalCameraRigError}
+				{rigSensorOptions} {activeRigSensorId} {selectedSensorNode} {selectedSensorNodeId}
+				{selectedCustomSensorNode} {selectedSensorHeightM}
+				{sceneStateText} {cameraSpecText} {renderConfig}
+				{observationScan} {graphBatch} {sensorRenderResult} {renderingViewpoint}
+				{placingSensor} {frustumMode} {ambientRadiance} {activeModalityTab}
+				{activeRigSensorOption} {rigMountHeightM} {authoringMap}
+				{selectedProjectId} {sceneId} {loading} {hasScene} {hasGraph}
+				{renderSceneStats} {renderSceneStatsLoading}
+				{showRoomShell} {roomShell}
+				{editorObjectsCount} {editorEmitterCount} {editorMaterialCount}
+				onLoadGlobalCameraRig={loadGlobalCameraRig}
+				onSelectRigSensor={selectRigRenderSensor}
+				onSetFrustumMode={(m) => (frustumMode = m as 'none' | 'view-aligned' | 'selected')}
+				onTogglePlacingSensor={() => { placingSensor = !placingSensor; selectedSensorNodeId = ''; }}
+				onRemoveCustomSensor={(id) => { customSensorNodes = customSensorNodes.filter(n => n.id !== id); selectedSensorNodeId = ''; }}
+				onCustomSensorHeadingChange={(id, deg) => { customSensorNodes = customSensorNodes.map(n => n.id === id ? {...n, headingDeg: deg} : n); sensorRenderResult = null; }}
+				onLoadRenderConfig={loadRenderConfig}
+				onSetSensorHeight={setSelectedSensorHeight}
+				onSetAmbientRadiance={(v) => (ambientRadiance = v)}
+				onClearNodeObservations={clearNodeObservations}
+				onClearAllObservations={clearAllObservations}
+				onRenderViewpoint={renderSensorViewpoint}
+				onRenderEpisodes={() => renderEpisodes('graph_sweep')}
+				onRenderEpisodeNodes={() => renderEpisodes('episode_nodes')}
+				{episodeNodesAvailable}
+				{episodePathNodeCount}
+				headingsPerNode={graphPayload?.node_heading_count ?? 0}
+				onRefreshBatch={() => refreshBatch()}
+				onRefreshStats={refreshRenderSceneStats}
+				onSetShowRoomShell={(v) => { showRoomShell = v; _showRoomShellUserTouched = true; }}
+			/>
 		{/if}
 
 		{#if railTab === 'lights'}
-			<section class="rail-section rail-tool-panel lights-panel">
-				<div class="rail-title">Lights</div>
-				{#if detectedEmitterCount > 0}
-					<div class="emitter-bulk-row">
-						<span>{enabledEmitterCount}/{detectedEmitterCount} fixtures enabled</span>
-						<button class="button button-subtle" disabled={enabledEmitterCount >= detectedEmitterCount} onclick={enableAllDetectedEmitters}>Enable all</button>
-						{#if enabledEmitterCount > 0}
-							<button class="button button-subtle" onclick={disableAllEmitters}>Disable all</button>
-						{/if}
-					</div>
-				{:else}
-					<p class="probe-empty">No light-keyword objects detected in this scene's authoring map.</p>
-				{/if}
-				<div class="lights-list">
-					{#each (authoringMap?.objects ?? []).filter((o: any) => detectedEmitterIds.has(o.id) || o.is_emitter) as light (light.id)}
-						<div class="light-item" class:enabled={light.is_emitter}>
-							<label class="light-toggle">
-								<input type="checkbox" checked={light.is_emitter ?? false} onchange={async (e) => {
-									if (!authoringMap) return;
-									const isOn = (e.currentTarget as HTMLInputElement).checked;
-									const objects = (authoringMap.objects ?? []).map((o: any) => o.id === light.id ? { ...o, is_emitter: isOn } : o);
-									setAuthoringMapPayload({ ...authoringMap, objects }, true);
-									await saveAuthoringMap();
-								}} />
-								<span class="light-label">{light.label || light.id}</span>
-							</label>
-							{#if light.is_emitter}
-								<input type="range" class="light-intensity" min="0.1" max="20" step="0.1"
-									value={light.emitter_intensity ?? 1.0}
-									title={`Intensity: ${(light.emitter_intensity ?? 1.0).toFixed(1)}×`}
-									oninput={(e) => {
-										if (!authoringMap) return;
-										const v = Number((e.currentTarget as HTMLInputElement).value);
-										const objects = (authoringMap.objects ?? []).map((o: any) => o.id === light.id ? { ...o, emitter_intensity: v } : o);
-										setAuthoringMapPayload({ ...authoringMap, objects }, true);
-									}}
-								/>
-							{/if}
-						</div>
-						{#if light.is_emitter}
-							{@const kelvin = light.emitter_radiance ? rgbToKelvinApprox(light.emitter_radiance) : 3000}
-							{@const swatch = kelvinToRgb(kelvin)}
-							<div class="light-aux-row">
-								<span class="light-color-swatch" style:background={`rgb(${Math.round(swatch[0] * 255)},${Math.round(swatch[1] * 255)},${Math.round(swatch[2] * 255)})`} title={`${kelvin}K`}></span>
-								<input type="range" class="light-temp" min="1500" max="10000" step="100"
-									value={kelvin}
-									title={`Color temp: ${kelvin}K`}
-									oninput={(e) => {
-										if (!authoringMap) return;
-										const k = Number((e.currentTarget as HTMLInputElement).value);
-										const rgb = kelvinToRgb(k);
-										const objects = (authoringMap.objects ?? []).map((o: any) => o.id === light.id ? { ...o, emitter_radiance: rgb } : o);
-										setAuthoringMapPayload({ ...authoringMap, objects }, true);
-									}}
-								/>
-								<label class="light-height-label">h<input type="number" class="light-height" min="0.05" max="4" step="0.05"
-									value={Number(light.geometry?.base_height_m ?? 0)}
-									title="Height (base_height_m)"
-									oninput={(e) => {
-										if (!authoringMap) return;
-										const h = Math.max(0, Math.min(8, Number((e.currentTarget as HTMLInputElement).value)));
-										const objects = (authoringMap.objects ?? []).map((o: any) => o.id === light.id ? { ...o, geometry: { ...(o.geometry ?? {}), base_height_m: h } } : o);
-										setAuthoringMapPayload({ ...authoringMap, objects }, true);
-									}}
-								/></label>
-							</div>
-						{/if}
-					{:else}
-						<p class="probe-empty">Toggle "Use as light source" on individual landmarks (or use Enable all above).</p>
-					{/each}
-				</div>
-				<div class="sync-actions">
-					<button class="button button-subtle" disabled={!hasScene || loading} onclick={saveAuthoringMap}>Save</button>
-					<button class="button button-subtle" disabled={!hasScene || loading} onclick={syncRenderScene} style="display:none">Sync Render Scene</button>
-				</div>
-			</section>
+			<RailLightsTab
+				{authoringMap} {detectedEmitterIds} {detectedEmitterCount} {enabledEmitterCount}
+				{hasScene} {loading}
+				onEnableAll={enableAllDetectedEmitters}
+				onDisableAll={disableAllEmitters}
+				onToggleEmitter={handleToggleEmitter}
+				onSetEmitterIntensity={handleSetEmitterIntensity}
+				onSetEmitterRadiance={handleSetEmitterRadiance}
+				onSetEmitterHeight={handleSetEmitterHeight}
+				onSave={saveAuthoringMap}
+			/>
 		{/if}
 
 		{#if railTab === 'preview'}
-			<section class="rail-section rail-tool-panel preview-panel">
-				<div class="rail-title">Render Probe</div>
-				<div class="probe-mode-row">
-					<label><input type="radio" bind:group={probeMode} value="selected" /> Selected viewpoint</label>
-					<label><input type="radio" bind:group={probeMode} value="free" /> Free probe</label>
-					<label><input type="radio" bind:group={probeMode} value="editor_view" /> Current editor view</label>
-					<label class="probe-mode-stub"><input type="radio" bind:group={probeMode} value="isaac_view" disabled /> Current Isaac view (soon)</label>
-				</div>
-				{#if probeMode === 'selected'}
-					<div class="probe-info">
-						{#if selectedSensorNode}
-							<div>Source: {(selectedSensorNode as any).isCustom ? 'custom sensor' : 'graph viewpoint'}</div>
-							<div>ID: {selectedSensorNodeId}</div>
-							<div>Pose: x={selectedSensorNode.position?.[0]?.toFixed(2)} z={selectedSensorNode.position?.[1]?.toFixed(2)}</div>
-							<div>Height: {selectedSensorHeightM.toFixed(2)} m</div>
-						{:else}
-							<p class="probe-empty">Click a viewpoint dot or custom sensor on the map.</p>
-						{/if}
-					</div>
-				{:else if probeMode === 'free'}
-					<div class="probe-info probe-form">
-						<label>x <input type="number" step="0.1" bind:value={freeProbe.x} /></label>
-						<label>z <input type="number" step="0.1" bind:value={freeProbe.z} /></label>
-						<label>yaw° <input type="number" step="5" bind:value={freeProbe.yaw_deg} /></label>
-						<label>height <input type="number" step="0.05" min="0.05" max="8" bind:value={freeProbe.height_m} /></label>
-					</div>
-				{:else if probeMode === 'editor_view'}
-					<div class="probe-info">
-						<button class="button button-subtle" onclick={captureEditorViewProbe}>Snapshot orbit camera</button>
-						{#if editorViewProbe}
-							<div>x={editorViewProbe.x} z={editorViewProbe.z} yaw={editorViewProbe.yaw_deg}° h={editorViewProbe.height_m}m</div>
-							<p class="probe-empty">Pitch is dropped (Mitsuba camera renders horizontal).</p>
-						{:else}
-							<p class="probe-empty">Orbit the 3D view, then click Snapshot.</p>
-						{/if}
-					</div>
-				{/if}
-				<div class="probe-actions">
-					<span class="chip-dim">modality: {activeRenderModality}</span>
-					<button class="button button-primary" disabled={probeRendering} onclick={runProbeRender}>
-						{probeRendering ? 'Rendering…' : 'Render now'}
-					</button>
-				</div>
-				{#if probeError}
-					<div class="probe-error">{probeError}</div>
-				{/if}
-				{#if probeResult}
-					<div class="probe-result">
-						<div class="probe-result-meta">Batch {probeResult.batch_id.slice(0, 8)}… · {probeResult.vp_id}/{probeResult.heading_id}</div>
-						<img class="probe-result-img" src={opticalNavObservationModalityUrl(selectedProjectId, sceneId, probeResult.vp_id, probeResult.heading_id, probeResult.modality, probeResult.sensor_id ?? activeRigSensorId)} alt={`probe ${probeResult.modality}`} loading="lazy"
-							onerror={(e) => { (e.currentTarget as HTMLImageElement).style.opacity = '0.3'; }} />
-						<button class="button button-subtle" onclick={() => refreshBatch()}>Refresh batch status</button>
-					</div>
-				{/if}
-			</section>
-			<section class="rail-section rail-tool-panel sync-inspector">
-				<div class="rail-title">Sync Inspector</div>
-				<div class="sync-row"><span>Authoring objects</span><span>{editorObjectsCount}</span></div>
-				<div class="sync-row"><span>Render shapes (XML)</span><span>{renderSceneStats?.shape_count ?? '—'}</span></div>
-				<div class="sync-row" class:warn={renderSceneStats?.exists && renderSceneStats.obj_shape_count === 0 && editorObjectsCount > 0}>
-					<span>Real USD meshes (OBJ)</span><span>{renderSceneStats?.obj_shape_count ?? '—'}</span>
-				</div>
-				<div class="sync-row"><span>Cube fallbacks</span><span>{renderSceneStats?.cube_shape_count ?? '—'}</span></div>
-				<div class="sync-row" class:warn={renderSceneStats?.exists && editorObjectsCount > 0 && renderSceneStats.shape_count < editorObjectsCount}>
-					<span>Δ object mismatch</span>
-					<span>{renderSceneStats?.shape_count != null ? renderSceneStats.shape_count - editorObjectsCount : '—'}</span>
-				</div>
-				<div class="sync-divider"></div>
-				<div class="sync-row"><span>is_emitter=true objects</span><span>{editorEmitterCount}</span></div>
-				<div class="sync-row" class:warn={renderSceneStats?.exists && renderSceneStats.area_emitter_count !== editorEmitterCount}>
-					<span>Area emitters (XML)</span><span>{renderSceneStats?.area_emitter_count ?? '—'}</span>
-				</div>
-				<div class="sync-row"><span>Environment (envmap)</span><span>{renderSceneStats?.envmap_count ?? '—'}</span></div>
-				<div class="sync-divider"></div>
-				<div class="sync-row"><span>Authoring materials</span><span>{editorMaterialCount}</span></div>
-				<div class="sync-row" class:warn={renderSceneStats?.raw_hpbrdf_refs > 0}>
-					<span>Raw .hpbrdf refs (heavy)</span><span>{renderSceneStats?.raw_hpbrdf_refs ?? '—'}</span>
-				</div>
-				<div class="sync-row"><span>Channel-split refs</span><span>{renderSceneStats?.channel_split_refs ?? '—'}</span></div>
-				<div class="sync-row"><span>Measured polarized BSDFs</span><span>{renderSceneStats?.measured_polarized_count ?? '—'}</span></div>
-				<div class="sync-divider"></div>
-				<div class="sync-row"><span>Active rig</span><span>{authoringMap?.camera_rig?.rig_id ?? '—'}</span></div>
-				<div class="sync-row"><span>Rig mount height</span><span>{rigMountHeightM.toFixed(2)} m</span></div>
-				<div class="sync-row"><span>Ceiling height</span><span>{Number(authoringMap?.settings?.default_wall_height_m ?? 2.4).toFixed(2)} m</span></div>
-				<div class="sync-row">
-					<label class="footprint-toggle"><input type="checkbox" bind:checked={showRoomShell} /> Show auto room shell</label>
-					<span>{roomShell?.shapes?.length ?? 0} shapes</span>
-				</div>
-				<div class="sync-divider"></div>
-				<div class="sync-row"><span>XML file</span><span class="mono">{renderSceneStats?.path ? renderSceneStats.path.split('/').slice(-2).join('/') : 'not generated'}</span></div>
-				<div class="sync-row"><span>XML size</span><span>{renderSceneStats?.size_bytes != null ? Math.round(renderSceneStats.size_bytes / 1024) + ' KB' : '—'}</span></div>
-				<div class="sync-row"><span>Last sync</span><span class="mono">{renderSceneStats?.modified_at?.slice(0, 19).replace('T', ' ') ?? '—'}</span></div>
-				<div class="sync-actions">
-					<button class="button button-subtle" disabled={renderSceneStatsLoading} onclick={refreshRenderSceneStats}>{renderSceneStatsLoading ? 'Loading…' : 'Refresh stats'}</button>
-					<button class="button button-subtle" disabled={!hasScene || loading} onclick={syncRenderScene} style="display:none">Sync Render Scene</button>
-				</div>
-			</section>
+			<RailPreviewTab
+				hotCameraPose={activeHotCameraPose}
+				{hotCameraPoses} {activeHotCameraId}
+				{activeRigSensorOption} {activeCameraFrustum} {activeRenderModality}
+				{probeRendering} {probeError} {probeResult} {activeRigSensorId}
+				{selectedProjectId} {sceneId}
+				{editorObjectsCount} {editorEmitterCount} {editorMaterialCount}
+				{renderSceneStats} {renderSceneStatsLoading}
+				{showRoomShell} {roomShell} {rigMountHeightM} {authoringMap}
+				{hasScene} {loading}
+				onRunProbe={renderHotCameraPreview}
+				onRefreshBatch={() => refreshBatch()}
+				onRefreshStats={refreshRenderSceneStats}
+				onSetShowRoomShell={(v) => { showRoomShell = v; _showRoomShellUserTouched = true; }}
+				onSelectHotCamera={(id) => { activeHotCameraId = id; }}
+			/>
 		{/if}
 
 		{#if railTab === 'export'}
-			<section class="rail-section rail-tool-panel export-panel">
-				<div class="rail-title">Export Readiness</div>
-				<div class="export-readiness-list">
-					<div class="readiness-item" class:ok={hasScene}><span class="readiness-dot"></span><span>Scene</span></div>
-					<div class="readiness-item" class:ok={renderSceneSynced}><span class="readiness-dot"></span><span>Render readiness {renderSceneSynced ? 'ready' : 'blocked'}</span></div>
-					<div class="readiness-item" class:ok={Boolean(effectiveRenderReadiness?.xml_path || currentScene?.render_scene_xml_ref)}><span class="readiness-dot"></span><span>render_scene.xml</span></div>
-					<div class="readiness-item" class:ok={Boolean(rigSensorOptions.some((s: any) => s.modality === 'rgb'))}><span class="readiness-dot"></span><span>RGB camera rig</span></div>
-					<div class="readiness-item" class:ok={hasMap}><span class="readiness-dot"></span><span>Traversable grid</span></div>
-					<div class="readiness-item" class:ok={hasGraph}><span class="readiness-dot"></span><span>Viewpoint graph</span></div>
-					<div class="readiness-item" class:ok={hasEpisodes}><span class="readiness-dot"></span><span>Episodes ({episodes.length})</span></div>
-					<div class="readiness-item" class:ok={validationPassed}><span class="readiness-dot"></span><span>Validated</span></div>
-				</div>
-				{#if graphPayloadSummary}
-					<div class="rail-title mt-2">Dataset Stats</div>
-					<div class="export-stats">
-						<div class="stat-row"><span>Viewpoints</span><span>{graphPayloadSummary.node_count}</span></div>
-						<div class="stat-row"><span>Edges</span><span>{graphPayloadSummary.edge_count}</span></div>
-						<div class="stat-row"><span>Hazard edges</span><span>{graphPayloadSummary.hazard_edge_count ?? 0}</span></div>
-						<div class="stat-row"><span>Episodes</span><span>{episodes.length}</span></div>
-						{#if splitCounts.train != null}
-							<div class="stat-row"><span>Train</span><span>{splitCounts.train}</span></div>
-							<div class="stat-row"><span>Val seen</span><span>{splitCounts.val_seen ?? 0}</span></div>
-							<div class="stat-row"><span>Val unseen</span><span>{splitCounts.val_unseen ?? 0}</span></div>
-						{/if}
-					</div>
-				{/if}
-				{#if allEpisodePaths.length > 0}
-					<div class="export-path-legend mt-2">
-						<span class="legend-swatch normal"></span><span>Normal path</span>
-						<span class="legend-swatch hazard"></span><span>Hazard path ({allEpisodePaths.filter(p => p.hasHazard).length})</span>
-					</div>
-				{/if}
-				{#if validationReport}
-					<div class="export-validation" class:validation-ok={validationReport.ok !== false} class:validation-fail={validationReport.ok === false}>
-						Validation: {validationReport.ok !== false ? 'passed' : 'failed'}
-						{#if validationReport.errors?.length}<span class="val-errors"> · {validationReport.errors.length} error(s)</span>{/if}
-					</div>
-				{/if}
-				<button class="button button-subtle full mt-2" disabled={!selectedProjectId || loading} onclick={() => validateDataset(false)}>
-					{loading ? 'Validating...' : 'Validate Dataset'}
-				</button>
-				<button class="button button-primary full" disabled={!selectedProjectId || !hasEpisodes || loading} onclick={exportDataset}>
-					{loading ? 'Exporting...' : 'Export Dataset'}
-				</button>
-				{#if exportPath}
-					<div class="export-path-display">
-						<span class="chip-ok">Exported</span>
-						<span class="export-path-text" title={exportPath}>{exportPath.split('/').slice(-2).join('/')}</span>
-					</div>
-				{/if}
-			</section>
+			<RailExportTab
+				{hasScene} {hasMap} {hasGraph} {hasEpisodes} {validationPassed}
+				{renderSceneSynced} {effectiveRenderReadiness} {currentScene}
+				{rigSensorOptions} {graphPayloadSummary}
+				episodesCount={scopedEpisodeCount}
+				{splitCounts} {allEpisodePaths} {validationReport} {exportPath}
+				{selectedProjectId} {loading}
+				bind:onlyCompleted={exportOnlyCompleted}
+				bind:currentSceneOnly={exportCurrentSceneOnly}
+				currentSceneId={sceneId}
+				{exportableEpisodeCount}
+				exportSummary={exportResult}
+				onValidate={() => validateDataset(false)}
+				onExport={exportDataset}
+			/>
 		{/if}
 
 		{#if railTab === 'scene'}
-		<section class="rail-section rail-tool-panel">
-			<details open>
-				<summary class="rail-summary">Scene</summary>
-				<div class="map-settings-body rail-settings-body">
-					{#if projectScenes.length > 0}
-						<label>
-							<span>scene</span>
-							<select class="scene-select" value={sceneId} onchange={(e) => { sceneId = e.currentTarget.value; sceneStateText = ''; cameraSpecText = ''; renderConfig = null; syncResult = null; renderReadiness = null; renderConfigError = ''; loadAuthoringMap(); loadRenderConfig(); episodes = []; selectedEpisode = null; selectedEpisodeId = ''; graphPayload = null; observationScan = null; graphBatch = null; graphBatchId = ''; graphBatchIds = []; stopBatchPolling(); if (pageMode === 'sensors') scanObservations(); }}>
-								{#each projectScenes as item}
-									<option value={item.scene_id}>{item.scene_id}</option>
-								{/each}
-							</select>
-						</label>
-					{/if}
-					<label><span>scene_id</span><input bind:value={sceneId} /></label>
-					<div class="geometry-grid">
-						<label><span>map W (m)</span><input type="number" min="1" max="2000" step="1" bind:value={mapWidth} /></label>
-						<label><span>map H (m)</span><input type="number" min="1" max="2000" step="1" bind:value={mapHeight} /></label>
-					</div>
-					<div class="action-row">
-						<button class="button button-subtle" disabled={!selectedProjectId || loading} onclick={addScene}>Add Scene</button>
-						<button class="button button-primary" disabled={!selectedProjectId || !hasScene || loading} onclick={saveMap}>
-							{authoringMapDirty ? '● ' : ''}Save Map
-						</button>
-					</div>
-					{#if authoringMapDirty}<p class="inline-hint">Unsaved changes.</p>{/if}
-					{#if currentScene?.sync_status}
-						<div class="sync-card">
-							<div class="panel-label">Sync</div>
-							<div class:ready={currentScene.sync_status.render_scene === 'synced'}>Render {currentScene.sync_status.render_scene ?? 'pending'}</div>
-							<div class:ready={currentScene.sync_status.isaac_stage === 'synced'}>Isaac {currentScene.sync_status.isaac_stage ?? 'pending'}</div>
-							<button class="button button-subtle" disabled={!selectedProjectId || !hasScene || loading} onclick={syncRenderScene} style="display:none">Sync Render Scene</button>
-						</div>
-					{/if}
-
-					{#if detectedEmitterCount > 0}
-						<div class="emitter-bulk-card">
-							<div class="panel-label">🔆 Light fixtures</div>
-							<div class="emitter-bulk-row">
-								<span>{enabledEmitterCount}/{detectedEmitterCount} enabled</span>
-								<button class="button button-subtle" disabled={enabledEmitterCount >= detectedEmitterCount} onclick={enableAllDetectedEmitters}>Enable all</button>
-								{#if enabledEmitterCount > 0}
-									<button class="button button-subtle" onclick={disableAllEmitters}>Disable all</button>
-								{/if}
-							</div>
-						</div>
-					{/if}
-
-					<details open class="render-ready-panel">
-						<summary>Environment / Render readiness</summary>
-						<div class="geometry-grid">
-							<label><span>Environment</span><select value={authoringMap?.environment?.mode ?? 'constant'} onchange={(event) => updateEnvironmentField('mode', (event.currentTarget as HTMLSelectElement).value)}><option value="constant">constant</option><option value="envmap">envmap</option></select></label>
-							<label><span>Intensity</span><input type="number" min="0" step="0.1" value={authoringMap?.environment?.intensity ?? 1} oninput={(event) => updateEnvironmentField('intensity', (event.currentTarget as HTMLInputElement).value)} /></label>
-							<label><span>Rotation</span><input type="number" step="1" value={authoringMap?.environment?.rotation_deg ?? 0} oninput={(event) => updateEnvironmentField('rotation_deg', (event.currentTarget as HTMLInputElement).value)} /></label>
-							<label><span>RGB</span><input value={(authoringMap?.environment?.radiance ?? [0.8,0.8,0.85]).join(', ')} oninput={(event) => updateEnvironmentField('radiance', (event.currentTarget as HTMLInputElement).value)} /></label>
-						</div>
-						<label><span>HDR/EXR envmap ref</span><input value={authoringMap?.environment?.envmap_ref ?? ''} oninput={(event) => updateEnvironmentField('envmap_ref', (event.currentTarget as HTMLInputElement).value || null)} /></label>
-						<div class="geometry-grid">
-							<label><span>Upload envmap</span><input type="file" accept=".exr,.hdr,.png,.jpg,.jpeg,image/png,image/jpeg" disabled={envmapUploading || !selectedProjectId || !hasScene} onchange={(event) => uploadEnvmapFromInput(event.currentTarget as HTMLInputElement)} /></label>
-							{#if envmapFiles.length}
-								<label><span>Uploaded</span><select value={authoringMap?.environment?.envmap_ref ?? ''} onchange={(event) => { updateEnvironmentField('mode', 'envmap'); updateEnvironmentField('envmap_ref', (event.currentTarget as HTMLSelectElement).value || null); }}><option value="">Select envmap</option>{#each envmapFiles as item}<option value={item.envmap_ref}>{item.filename}{#if item.size_bytes} · {envmapSizeLabel(item.size_bytes)}{/if}</option>{/each}</select></label>
-							{/if}
-						</div>
-						<label class="inline-check"><input type="checkbox" checked={authoringMap?.environment?.background_visible ?? true} onchange={(event) => updateEnvironmentField('background_visible', (event.currentTarget as HTMLInputElement).checked)} /> Background visible</label>
-						<div class="render-profile-row">
-							<span class="chip-ok">GPU-only</span>
-							<span class="chip-ok">Scene reuse</span>
-							<span class="chip-dim">Texture max{effectiveRenderReadiness?.texture_profile ?? currentScene?.render_readiness?.texture_profile ?? 1024}</span>
-						</div>
-						{#if effectiveRenderReadiness}
-							<div class="export-validation" class:validation-ok={effectiveRenderReadiness.ok} class:validation-fail={!effectiveRenderReadiness.ok}>
-								Render readiness: {effectiveRenderReadiness.status ?? (effectiveRenderReadiness.ok ? 'ready' : 'blocked')}
-								{#if effectiveRenderReadiness.error_count != null}<span class="val-errors"> · {effectiveRenderReadiness.error_count} error(s)</span>{/if}
-							</div>
-						{/if}
-					</details>
-					<details>
-						<summary>authoring_map.json</summary>
-						<textarea class="code-editor small" bind:value={authoringMapText} oninput={markAuthoringJsonDirty} placeholder="authoring_map.json"></textarea>
-					</details>
-					<details>
-						<summary>scene_annotation.json</summary>
-						<div class="action-row mt-2">
-							<button class="button button-subtle" disabled={!selectedProjectId || !hasScene || loading} onclick={loadAnnotation}>Load</button>
-							<button class="button button-subtle" disabled={!selectedProjectId || !hasScene || loading} onclick={saveAnnotation}>Validate</button>
-						</div>
-						<textarea class="code-editor small" bind:value={annotationText} placeholder="scene_annotation.json"></textarea>
-					</details>
-				</div>
-			</details>
-		</section>
+			<RailSceneTab
+				{sceneId} {projectScenes} {selectedProjectId} {hasScene}
+				{authoringMapDirty} {authoringMapText} {annotationText}
+				{authoringMap} {currentScene} {detectedEmitterCount} {enabledEmitterCount}
+				{effectiveRenderReadiness} {mapWidth} {mapHeight} {loading}
+					envmapFiles={assetVM.envmapFiles}
+					envmapUploading={assetVM.envmapUploading}
+				onSceneChange={(id) => { sceneId = id; sceneStateText = ''; cameraSpecText = ''; renderConfig = null; syncResult = null; renderReadiness = null; renderConfigError = ''; loadAuthoringMap(); loadRenderConfig(); episodes = []; selectedEpisode = null; selectedEpisodeId = ''; graphPayload = null; observationScan = null; graphBatch = null; graphBatchId = ''; graphBatchIds = []; stopBatchPolling(); _showRoomShellUserTouched = false; if (pageMode === 'sensors') scanObservations(); }}
+				onSetMapWidth={setMapWidthFromInput}
+				onSetMapHeight={setMapHeightFromInput}
+				onAddScene={addScene}
+				onSaveMap={saveMap}
+				onEnableAllEmitters={enableAllDetectedEmitters}
+				onDisableAllEmitters={disableAllEmitters}
+				onUpdateEnvironmentField={updateEnvironmentField}
+				onUpdateSettingsField={updateSettingsField}
+				onUploadEnvmap={uploadEnvmapFromInput}
+				onMarkAuthoringJsonDirty={markAuthoringJsonDirty}
+				onAuthoringMapTextChange={(v) => (authoringMapText = v)}
+				onAnnotationTextChange={(v) => (annotationText = v)}
+				onLoadAnnotation={loadAnnotation}
+				onSaveAnnotation={saveAnnotation}
+			/>
 		{/if}
 
-		{#if railTab === 'paths'}
-		<section class="rail-section rail-tool-panel">
-			<details open>
-				<summary class="rail-summary">Paths</summary>
-				<div class="map-settings-body rail-settings-body">
-					<div class="path-status-chips">
-						<span class:chip-ok={hasMap} class:chip-off={!hasMap}>Map {hasMap ? 'ready' : 'missing'}</span>
-						<span class:chip-ok={hasGraph} class:chip-off={!hasGraph}>Graph {hasGraph ? 'ready' : 'missing'}</span>
-						{#if graphPayloadSummary}<span class="chip-ok">{graphPayloadSummary.node_count}n · {graphPayloadSummary.edge_count}e</span>{/if}
-					</div>
-					<div class="rail-title">Traversable Grid</div>
-					<label><span>resolution m</span><input type="number" step="0.01" min="0.01" bind:value={resolution} /></label>
-					<button class="button button-subtle" disabled={!selectedProjectId || !hasScene || buildingMap} onclick={buildMap}>
-						{#if buildingMap}<span class="spinner-xs"></span> Building...{:else}{hasMap ? 'Rebuild Grid' : 'Build Grid'}{/if}
-					</button>
-					{#if mapResult}
-						<div class="build-result-row">
-							<span class="chip-ok">Grid ready</span>
-							{#if mapResult.cell_count}<span class="chip-dim">{mapResult.cell_count} cells</span>{/if}
-							{#if mapResult.traversable_ratio != null}<span class="chip-dim">{(mapResult.traversable_ratio * 100).toFixed(0)}% walkable</span>{/if}
-						</div>
-					{/if}
-					<div class="rail-title mt-2">Viewpoint Graph</div>
-					<div class="geometry-grid">
-						<label><span>max nodes</span><input type="number" min="1" bind:value={maxNodes} /></label>
-						<label><span>headings</span><input type="number" min="1" bind:value={headingCount} /></label>
-						<label><span>spacing m</span><input type="number" step="0.05" min="0" bind:value={minNodeSpacing} /></label>
-						<label><span>robot r</span><input type="number" step="0.05" min="0" bind:value={robotRadius} /></label>
-					</div>
-					<button class="button button-subtle" disabled={!selectedProjectId || !hasMap || buildingGraph} onclick={requestBuildGraph}>
-						{#if buildingGraph}<span class="spinner-xs"></span>{#if graphBuildProgress} {graphBuildProgress.stage === 'edges' ? 'Edges' : 'Nodes'} {Math.round(graphBuildProgress.progress * 100)}%{:else} Building...{/if}{:else}{hasGraph ? 'Rebuild Graph' : 'Build Graph'}{/if}
-					</button>
-					{#if graphResult || graphPayloadSummary}
-						<div class="build-result-row">
-							<span class="chip-ok">Graph ready</span>
-							<span class="chip-dim">{graphPayloadSummary?.node_count ?? graphResult?.node_count ?? '?'}n</span>
-							<span class="chip-dim">{graphPayloadSummary?.edge_count ?? graphResult?.edge_count ?? '?'}e</span>
-							{#if (graphPayloadSummary?.hazard_edge_count ?? graphResult?.hazard_edge_count ?? 0) > 0}
-								<span class="chip-warn">{graphPayloadSummary?.hazard_edge_count ?? graphResult?.hazard_edge_count} hazard</span>
-							{/if}
-						</div>
-					{/if}
-					<div class="rail-title mt-2">Episodes</div>
-					<label><span>num pairs</span><input type="number" min="1" bind:value={episodeCount} /></label>
-					<button class="button button-primary" disabled={!selectedProjectId || !hasGraph || loading} onclick={planGraphEpisodes}>
-						Generate Episodes
-					</button>
-					{#if splitCounts.train != null}
-						<div class="path-status-chips mt-1">
-							<span class="chip-ok">train {splitCounts.train}</span>
-							<span class="chip-ok">val_seen {splitCounts.val_seen ?? 0}</span>
-							<span class="chip-ok">val_unseen {splitCounts.val_unseen ?? 0}</span>
-						</div>
-					{/if}
-				</div>
-			</details>
-		</section>
-		{/if}
-
-		{#if railTab === 'status'}
-		<section class="rail-section">
-			<div class="rail-title">OpticalNav Status</div>
-			<div class="rail-readiness">
-				<span class:ready={hasScene}>Scene</span>
-				<span class:ready={hasMap}>Map</span>
-				<span class:ready={hasGraph}>Graph</span>
-				<span class:ready={hasEpisodes}>Episodes</span>
-			</div>
-		</section>
-
-		<section class="rail-section">
-			<div class="rail-title">Project</div>
-			<dl class="rail-kv">
-				<div><dt>ID</dt><dd>{selectedProjectId || 'No project'}</dd></div>
-				<div><dt>Scene</dt><dd>{sceneId || '-'}</dd></div>
-				<div><dt>Episodes</dt><dd>{episodes.length}</dd></div>
-				<div><dt>Splits</dt><dd>{Object.keys(splitCounts).length ? JSON.stringify(splitCounts) : '-'}</dd></div>
-			</dl>
-		</section>
-
-		{#if currentScene}
-			<section class="rail-section">
-				<div class="rail-title">Scene Artifacts</div>
-				<dl class="rail-kv">
-					<div><dt>Map overlay</dt><dd>{currentScene.authoring_map_exists || authoringMap ? 'ready' : 'missing'}</dd></div>
-					<div><dt>USD</dt><dd>{currentScene.usd_ref || 'not attached'}</dd></div>
-					<div><dt>Annotation</dt><dd>{currentScene.annotation_ok ? 'valid' : 'needs check'}</dd></div>
-					<div><dt>Render scene</dt><dd>{currentScene.sync_status?.render_scene ?? '-'}</dd></div>
-					<div><dt>Isaac stage</dt><dd>{currentScene.sync_status?.isaac_stage ?? '-'}</dd></div>
-					<div><dt>Map</dt><dd>{currentScene.map_exists ? 'ready' : 'missing'}</dd></div>
-					<div><dt>Graph</dt><dd>{currentScene.viewpoint_graph_exists ? 'ready' : 'missing'}</dd></div>
-				</dl>
-			</section>
-		{/if}
-
-		{#if graphPayloadSummary || currentScene?.viewpoint_graph}
-			<section class="rail-section">
-				<div class="rail-title">Viewpoint Graph</div>
-				<dl class="rail-kv">
-					<div><dt>Nodes</dt><dd>{graphPayloadSummary?.node_count ?? currentScene?.viewpoint_graph?.node_count ?? '-'}</dd></div>
-					<div><dt>Edges</dt><dd>{graphPayloadSummary?.edge_count ?? currentScene?.viewpoint_graph?.edge_count ?? '-'}</dd></div>
-					<div><dt>Headings</dt><dd>{graphPayloadSummary?.heading_count ?? currentScene?.viewpoint_graph?.heading_count ?? headingCount}</dd></div>
-					<div><dt>Hazard edges</dt><dd>{graphPayloadSummary?.hazard_edge_count ?? currentScene?.viewpoint_graph?.hazard_edge_count ?? '-'}</dd></div>
-				</dl>
-			</section>
-		{/if}
-
-		{#if selectedEpisodeSummary}
-			<section class="rail-section">
-				<div class="rail-title">Selected Episode</div>
-				<dl class="rail-kv">
-					<div><dt>ID</dt><dd>{selectedEpisodeSummary.episode_id}</dd></div>
-					<div><dt>Mode</dt><dd>{selectedEpisodeSummary.mode}</dd></div>
-					<div><dt>Split</dt><dd>{selectedEpisodeSummary.split}</dd></div>
-					<div><dt>Path nodes</dt><dd>{selectedEpisodeSummary.path_nodes}</dd></div>
-					<div><dt>Refs</dt><dd>{selectedEpisodeSummary.observation_refs}</dd></div>
-				</dl>
-			</section>
-		{/if}
-
-		{#if validationReport || evaluationReport || exportPath}
-			<section class="rail-section">
-				<div class="rail-title">Review Output</div>
-				<dl class="rail-kv">
-					<div><dt>Validation</dt><dd>{validationReport ? (validationReport.ok === false ? 'failed' : 'complete') : '-'}</dd></div>
-					<div><dt>Success</dt><dd>{evaluationReport?.metrics?.success_rate ?? '-'}</dd></div>
-					<div><dt>SPL</dt><dd>{evaluationReport?.metrics?.spl ?? '-'}</dd></div>
-					<div><dt>Export</dt><dd>{exportPath || '-'}</dd></div>
-				</dl>
-			</section>
-		{/if}
-		{/if}
 	</div>
 {/snippet}
 
 {#snippet datasetBottomContent()}
-	<div class="dataset-bottom">
-		<!-- Floating overlay buttons — no header bar -->
-		<div class="bottom-overlay-buttons">
-			<button class="bottom-icon-btn" onclick={toggleBottomPanel} aria-label="Toggle bottom panel" title={$bottomPanelCollapsed ? 'Expand' : 'Collapse'}>
-				{$bottomPanelCollapsed ? '▲' : '▼'}
-			</button>
-			{#if activeBatch && !$bottomPanelCollapsed}
-				<button class="bottom-icon-btn" disabled={loading} onclick={refreshBatch} aria-label="Refresh batch" title="Refresh batch">↻</button>
-			{/if}
-		</div>
-
-		{#if !$bottomPanelCollapsed}
-			<div class="dataset-bottom-body">
-				<section class="bottom-progress">
-					<div class="progress-head">
-						<span>{renderMode === 'graph_sweep' ? 'Sensor Sweep' : 'Episode Render'}</span>
-						<span>{progressPercent(bottomProgress)}%</span>
-					</div>
-					<div class="progress-track">
-						<div class="progress-fill" style={`width: ${progressPercent(bottomProgress)}%`}></div>
-					</div>
-					<div class="progress-metrics">
-						<span>total {bottomProgress?.total ?? 0}</span>
-						<span class="js-chip js-done">{batchJobGrid.counts?.completed ?? 0} done</span>
-						<span class="js-chip js-running">{batchJobGrid.counts?.running ?? 0} running</span>
-						<span class="js-chip js-queued">{batchJobGrid.counts?.queued ?? 0} queued</span>
-						{#if (batchJobGrid.counts?.failed ?? 0) > 0}
-							<span class="js-chip js-failed">{batchJobGrid.counts.failed} failed</span>
-						{/if}
-					</div>
-
-					<!-- Job grid: rows=viewpoints, cols=headings -->
-					{#if batchJobGrid.rows.length > 0}
-						<div class="batch-job-grid" title="Each cell = one render job (viewpoint × heading)">
-							{#if batchJobGrid.headings.length > 1}
-								<div class="bjg-header">
-									<span class="bjg-node-label"></span>
-									{#each batchJobGrid.headings as h}
-										<span class="bjg-heading-label" title={h}>{parseInt(h.replace('h_','')) || 0}</span>
-									{/each}
-								</div>
-							{/if}
-							{#each batchJobGrid.rows as row}
-								<div class="bjg-row">
-									<span class="bjg-node-label" title={row.nid}>{row.nid.replace(/^vp_0*/, '').replace(/^custom_/, 'c') || row.nid.slice(-4)}</span>
-									{#each row.cells as job}
-										<button
-											type="button"
-											class={`bjg-cell ${job ? jobStatusClass(job) : 'js-unknown'}${job && job.job_id === selectedBatchJobId ? ' bjg-selected' : ''}`}
-											title={job ? `${job.node_id} ${job.heading_id} · ${jobStageLabel(job)}` : 'no job'}
-											aria-label={job ? `${job.node_id} ${job.heading_id} ${jobStageLabel(job)}` : 'no job'}
-											disabled={!job}
-											onclick={() => { if (job) selectBatchJob(job); }}
-										></button>
-									{/each}
-								</div>
-							{/each}
-						</div>
-					{/if}
-
-					<!-- Stale job controls -->
-					{#if (batchJobGrid.counts?.running ?? 0) + (batchJobGrid.counts?.queued ?? 0) > 0}
-						<div class="stale-controls">
-							<button class="button button-subtle" onclick={cancelStaleBatchJobs}>Cancel running/queued</button>
-						</div>
-					{/if}
-
-					<!-- Selected job detail -->
-					{#if selectedBatchJob}
-						{@const textureAudit = selectedBatchJob.status?.extras?.texture_audit}
-						{@const textureProfile = selectedBatchJob.status?.extras?.texture_profile ?? textureAudit?.texture_profile}
-						<div class="job-detail-panel">
-							<div class="job-detail-head">
-								<span class="job-detail-id" title={selectedBatchJob.job_id}>{selectedBatchJob.job_id?.slice(-16) ?? '—'}</span>
-								<span class={`js-chip js-${jobStatusClass(selectedBatchJob).replace('js-', '')}`}>{String(selectedBatchJob?.status?.status ?? '')}</span>
-								<button class="bjg-close" onclick={() => { selectedBatchJobId = ''; selectedBatchJobLog = []; }}>✕</button>
-							</div>
-							<div class="job-detail-meta">
-								<span>{selectedBatchJob.node_id ?? ''}</span>
-								{#if selectedBatchJob.heading_id}<span>· {selectedBatchJob.heading_id}</span>{/if}
-								{#if selectedBatchJob.status?.progress_stage}<span>· {selectedBatchJob.status.progress_stage}</span>{/if}
-								{#if textureProfile}<span>· Texture max{textureProfile}</span>{/if}
-								{#if textureAudit?.texture_refs}<span>· Downsampled {textureAudit.downsampled_refs ?? 0}/{textureAudit.texture_refs}</span>{/if}
-							</div>
-							<!-- Stage timeline -->
-							<div class="stage-timeline">
-								{#each RENDER_STAGES as stage, i}
-									{@const si = stageIndex(selectedBatchJob)}
-									{@const isFailed = String(selectedBatchJob?.status?.status ?? '') === 'failed'}
-									{@const done = !isFailed && si >= i}
-									{@const active = !isFailed && si === i}
-									{@const isCached = stage.key === 'loading_scene' && selectedBatchJob?.status?.extras?.scene_cache_hit}
-									<div class={`stage-step${done ? ' done' : ''}${active ? ' active' : ''}${isFailed && si === -1 && i === 0 ? ' failed' : ''}`}>
-										<div class="stage-dot"></div>
-										<span>{stage.label}{#if isCached} ⚡{/if}</span>
-									</div>
-								{/each}
-							</div>
-							<!-- Log entries -->
-							{#if selectedBatchJobLoading}
-								<div class="job-log-row muted">Loading logs…</div>
-							{:else if selectedBatchJobLog.length === 0}
-								<div class="job-log-row muted">No log entries.</div>
-							{:else}
-								<div class="job-log-list">
-									{#each selectedBatchJobLog.slice(-40) as entry}
-										<div class="job-log-row">
-											<span class="job-log-level">{entry.level ?? 'info'}</span>
-											<span class="job-log-msg">{entry.message ?? entry.msg ?? JSON.stringify(entry)}</span>
-										</div>
-									{/each}
-								</div>
-							{/if}
-						</div>
-					{/if}
-				</section>
-
-				<section class="activity-log" aria-label="OpticalNav activity log">
-					<!-- Batch job logs from backend -->
-					{#if batchLogEntries.length > 0}
-						<div class="log-section-head">렌더 잡 로그</div>
-						{#each batchLogEntries as entry}
-							<div class="activity-row level-info batch-log-row">
-								<span class="activity-source batch-log-job" title={entry.job_id}>{entry.job_id.slice(-12)}</span>
-								<span class="activity-message batch-log-line">{entry.line}</span>
-							</div>
-						{/each}
-						<div class="log-section-head">UI 이벤트</div>
-					{/if}
-					<!-- UI event log -->
-					{#each activityLog as entry}
-						<div class={`activity-row level-${entry.level}`}>
-							<span class="activity-time">{entry.ts}</span>
-							<span class="activity-source">{entry.source}</span>
-							<span class="activity-message">{entry.message}</span>
-							{#if entry.detail}
-								<span class="activity-detail" title={entry.detail}>{compactDetail(entry.detail)}</span>
-							{/if}
-						</div>
-					{/each}
-				</section>
-			</div>
-		{/if}
-	</div>
+	<BottomPanel
+		bottomPanelCollapsed={$bottomPanelCollapsed}
+		{activeBatch} {renderMode}
+		{selectedBatchJobId} {selectedBatchJob} {selectedBatchJobLog} {selectedBatchJobLoading}
+		{selectedBatchJobImageUrl}
+		{batchLogEntries} {activityLog} {loading}
+		onTogglePanel={toggleBottomPanel}
+		onRefreshBatch={refreshBatch}
+		onSelectBatchJob={selectBatchJob}
+		onCancelStaleBatchJobs={cancelStaleBatchJobs}
+		onCloseJobDetail={() => { selectedBatchJobId = ''; selectedBatchJobLog = []; }}
+		onRetryJob={retryBatchJob}
+		onCancelJob={cancelBatchJob}
+		onRefreshSelectedJobLog={() => refreshSelectedBatchJobLog()}
+	/>
 {/snippet}
 
 <style>
+	:global {
+
 	/* --- Mode bar --- */
 	.mode-bar {
 		display: flex;
@@ -6058,7 +4590,7 @@
 		color: var(--fg);
 	}
 	.context-menu button:hover { background: var(--surface-2, #f1f5f9); }
-	.context-menu button.danger { color: #dc2626; }
+	.context-menu button.danger { color: var(--danger); }
 
 	.dataset-page {
 		display: grid;
@@ -6067,6 +4599,9 @@
 	}
 	.dataset-page.bottom-open {
 		padding-bottom: 360px;
+	}
+	.dataset-page.bottom-maximized {
+		padding-bottom: 70vh;
 	}
 	/* When map editor is active: fixed height, no scroll, flex column */
 	.dataset-page.scene-active {
@@ -6114,7 +4649,7 @@
 	}
 	.primary-next.status-failed {
 		border-color: #f0b4b4;
-		background: #fff1f1;
+		background: var(--danger-soft);
 	}
 	.project-strip { display: grid; grid-template-columns: 1.1fr 1fr 1.2fr 1fr auto; gap: var(--space-3); align-items: end; }
 	.readiness-strip { display: flex; gap: var(--space-2); flex-wrap: wrap; }
@@ -6126,9 +4661,9 @@
 		color: var(--muted-strong);
 	}
 	.readiness-strip button.ready {
-		border-color: #abd7b5;
-		background: #eef8f0;
-		color: #236b35;
+		border-color: var(--tool-traversable);
+		background: var(--tool-traversable-soft);
+		color: var(--tool-traversable);
 	}
 	label { display: grid; gap: var(--space-1); font-size: var(--font-size-xs); color: var(--muted-strong); }
 	input, select, textarea {
@@ -6163,13 +4698,13 @@
 		font-size: var(--font-size-sm);
 	}
 	.tool.active { border-color: var(--brand); color: var(--brand-strong); background: var(--brand-soft); }
-	.tool.danger { color: #9b1c1c; }
-	.tool-glass.active { border-color: #5bb7c5; color: #1a6b7a; background: #e8f7fa; }
-	.tool-mirror.active { border-color: #94a3b8; color: #334155; background: #f1f5f9; }
-	.tool-traversable.active { border-color: #37a169; color: #1a5c38; background: #eef8f0; }
-	.tool-goal.active { border-color: #2f80ed; color: #1a4a8a; background: #e8f0fd; }
-	.tool-hazard.active { border-color: #dd7a22; color: #8a4a0a; background: #fff4e6; }
-	.tool-forbidden.active { border-color: #c53030; color: #8a1c1c; background: #fff1f1; }
+	.tool.danger { color: var(--danger); }
+	.tool-glass.active { border-color: var(--tool-glass); color: var(--tool-glass); background: var(--tool-glass-soft); }
+	.tool-mirror.active { border-color: var(--muted); color: #334155; background: #f1f5f9; }
+	.tool-traversable.active { border-color: var(--tool-traversable); color: var(--tool-traversable); background: var(--tool-traversable-soft); }
+	.tool-goal.active { border-color: var(--tool-goal); color: var(--tool-goal); background: var(--tool-goal-soft); }
+	.tool-hazard.active { border-color: var(--tool-hazard); color: var(--tool-hazard); background: var(--tool-hazard-soft); }
+	.tool-forbidden.active { border-color: var(--danger); color: #8a1c1c; background: var(--danger-soft); }
 	.editor-help {
 		margin-bottom: var(--space-3);
 		color: var(--muted-strong);
@@ -6242,18 +4777,18 @@
 	.map-start-card span {
 		display: block;
 		margin-top: 2px;
-		color: #475569;
+		color: var(--muted-strong);
 		font-size: var(--font-size-xs);
 	}
 	.floorplan-outline {
 		fill: rgba(248, 250, 252, 0.72);
-		stroke: #94a3b8;
+		stroke: var(--muted);
 		stroke-width: 1.5;
 		stroke-dasharray: 8 6;
 		pointer-events: none;
 	}
 	.map-axis-label {
-		fill: #64748b;
+		fill: var(--muted-strong);
 		font-size: 12px;
 		font-weight: 700;
 		pointer-events: none;
@@ -6284,17 +4819,17 @@
 	}
 	.inline-hint {
 		margin: 0;
-		color: #9a5b00;
+		color: var(--tool-hazard);
 		font-size: var(--font-size-xs);
 	}
 	.map-line {
-		stroke: #5bb7c5;
+		stroke: var(--tool-glass);
 		stroke-width: 8;
 		stroke-linecap: round;
 		filter: drop-shadow(0 1px 2px rgba(15, 23, 42, 0.18));
 		cursor: pointer;
 	}
-	.map-line.mirror_wall { stroke: #94a3b8; }
+	.map-line.mirror_wall { stroke: var(--muted); }
 	.map-line.selected { stroke: var(--brand); stroke-width: 11; }
 	.map-line.draft-line {
 		stroke-dasharray: 10 6;
@@ -6309,11 +4844,11 @@
 	}
 	.region-traversable {
 		fill: rgba(54, 164, 92, 0.18);
-		stroke: #37a169;
+		stroke: var(--tool-traversable);
 	}
 	.region-goal {
 		fill: rgba(47, 128, 237, 0.18);
-		stroke: #2f80ed;
+		stroke: var(--tool-goal);
 	}
 	.region-start {
 		fill: rgba(79, 70, 229, 0.14);
@@ -6325,15 +4860,15 @@
 	}
 	.region-hazard {
 		fill: rgba(221, 122, 34, 0.18);
-		stroke: #dd7a22;
+		stroke: var(--tool-hazard);
 	}
 	.region-forbidden {
 		fill: rgba(197, 48, 48, 0.16);
-		stroke: #c53030;
+		stroke: var(--danger);
 	}
 	.region-generic {
 		fill: rgba(100, 116, 139, 0.12);
-		stroke: #64748b;
+		stroke: var(--muted-strong);
 	}
 	.map-region.selected {
 		stroke-width: 4;
@@ -6350,7 +4885,7 @@
 	}
 	.map-point circle {
 		fill: #ffffff;
-		stroke: #475569;
+		stroke: var(--muted-strong);
 		stroke-width: 2;
 	}
 	.map-point text {
@@ -6361,7 +4896,7 @@
 		pointer-events: none;
 	}
 	.map-point.chair circle { stroke: #7c3aed; }
-	.map-point.table circle { stroke: #92400e; }
+	.map-point.table circle { stroke: var(--tool-hazard); }
 	.map-point.plant circle { stroke: #15803d; }
 	.map-point.selected circle {
 		fill: var(--brand-soft);
@@ -6384,7 +4919,7 @@
 		pointer-events: none;
 	}
 	.graph-node.hazard-adjacent {
-		fill: #dd7a22;
+		fill: var(--tool-hazard);
 	}
 	.draft-point {
 		fill: var(--brand);
@@ -6414,404 +4949,15 @@
 		padding: var(--space-3);
 		background: var(--surface-1);
 	}
-	.inspector-head {
-		display: flex;
-		align-items: flex-start;
-		justify-content: space-between;
-		gap: var(--space-3);
-	}
-	.inspector-id {
-		margin-top: 2px;
-		color: var(--text);
-		font-family: var(--font-mono);
-		font-size: var(--font-size-xs);
-		overflow-wrap: anywhere;
-	}
-	.dirty-pill {
-		border: 1px solid #f4c26f;
-		border-radius: 999px;
-		background: #fff8e8;
-		color: #9a5b00;
-		font-size: var(--font-size-xs);
-		font-weight: 700;
-		padding: 2px var(--space-2);
-		white-space: nowrap;
-	}
-	.inspector-badges {
-		display: flex;
-		flex-wrap: wrap;
-		gap: var(--space-1);
-	}
-	.inspector-badges span {
-		border: 1px solid var(--panel-border);
-		border-radius: 999px;
-		background: var(--surface-2);
-		color: var(--muted-strong);
-		font-size: var(--font-size-xs);
-		padding: 2px var(--space-2);
-	}
-	.preset-row {
-		display: flex;
-		flex-wrap: wrap;
-		gap: var(--space-2);
-	}
-	.preset-row .button {
-		height: 30px;
-		padding-inline: var(--space-2);
-		font-size: var(--font-size-xs);
-	}
-	.rotation-row {
-		display: grid;
-		grid-template-columns: 1fr auto 1fr;
-		align-items: center;
-		gap: var(--space-2);
-		border: 1px solid var(--panel-border);
-		border-radius: var(--radius-sm);
-		background: var(--surface-1);
-		padding: var(--space-2);
-	}
-	.rotation-row button {
-		min-height: 34px;
-		border: 1px solid var(--panel-border);
-		border-radius: var(--radius-sm);
-		background: var(--panel);
-		color: var(--text);
-		font-weight: 800;
-		cursor: pointer;
-	}
-	.rotation-row button:hover { background: var(--hover-bg); }
-	.rotation-row div {
-		display: grid;
-		justify-items: center;
-		gap: 1px;
-		min-width: 54px;
-	}
-	.rotation-row strong {
-		color: var(--brand);
-		font-size: var(--font-size-md);
-	}
-	.rotation-row small {
-		color: var(--text-muted);
-		font-size: 10px;
-		white-space: nowrap;
-	}
-	.inspector-section {
-		display: grid;
-		gap: var(--space-2);
-		padding-top: var(--space-2);
-		border-top: 1px solid var(--panel-border);
-	}
+
+
 	.geometry-grid {
 		display: grid;
 		grid-template-columns: repeat(2, minmax(0, 1fr));
 		gap: var(--space-2);
 	}
-	.flag-grid {
-		display: grid;
-		grid-template-columns: repeat(2, minmax(0, 1fr));
-		gap: var(--space-2);
-	}
-	.flag-grid label {
-		display: flex;
-		grid-template-columns: none;
-		align-items: center;
-		gap: 6px;
-		border: 1px solid var(--panel-border);
-		border-radius: var(--radius-sm);
-		padding: var(--space-1) var(--space-2);
-		background: var(--surface-2);
-		color: var(--muted-strong);
-		font-size: var(--font-size-xs);
-	}
-	.flag-grid input {
-		width: 14px;
-		height: 14px;
-		padding: 0;
-	}
-	.suggestion {
-		margin: 0;
-		border: 1px solid #bfdbfe;
-		border-radius: var(--radius-sm);
-		background: #eff6ff;
-		color: #1e3a8a;
-		padding: var(--space-2);
-		font-size: var(--font-size-xs);
-	}
-	.material-info {
-		display: grid;
-		gap: 2px;
-		border: 1px solid var(--panel-border);
-		border-radius: var(--radius-sm);
-		background: rgba(248, 250, 252, 0.92);
-		padding: var(--space-2);
-		font-size: var(--font-size-xs);
-	}
-	.material-info strong {
-		color: var(--text);
-		font-size: 12px;
-	}
-	.material-info span {
-		color: var(--muted-strong);
-	}
-	.material-info small {
-		overflow: hidden;
-		color: var(--text-muted);
-		text-overflow: ellipsis;
-		white-space: nowrap;
-	}
-	.material-mini-label {
-		color: var(--muted-strong);
-		font-size: var(--font-size-xs);
-		font-weight: 700;
-	}
-	.material-summary-row {
-		display: grid;
-		grid-template-columns: 44px minmax(0, 1fr) auto;
-		align-items: center;
-		gap: 9px;
-		border: 1px solid var(--panel-border);
-		border-radius: var(--radius-sm);
-		background: rgba(248,250,252,0.92);
-		padding: 6px;
-	}
-	.material-summary-row img,
-	.material-empty-thumb {
-		width: 44px;
-		height: 44px;
-		border-radius: var(--radius-sm);
-		object-fit: cover;
-		background: #f1f5f9;
-		border: 1px solid var(--panel-border);
-	}
-	.material-empty-thumb {
-		display: grid;
-		place-items: center;
-		color: var(--text-muted);
-		font-size: 10px;
-		font-weight: 800;
-		text-transform: uppercase;
-	}
-	.material-summary-row strong {
-		color: var(--text);
-		font-size: 12px;
-		line-height: 1.15;
-	}
-	.material-summary-row small {
-		color: var(--text-muted);
-		font-size: 10px;
-		overflow: hidden;
-		text-overflow: ellipsis;
-		white-space: nowrap;
-	}
-	.material-summary-row div {
-		display: grid;
-		gap: 2px;
-		min-width: 0;
-	}
-	.inspector-tabs {
-		display: grid;
-		grid-template-columns: repeat(2, minmax(0, 1fr));
-		gap: 6px;
-	}
-	.inspector-tabs button,
-	.material-category-tabs button {
-		border: 1px solid var(--panel-border);
-		border-radius: var(--radius-sm);
-		background: var(--surface-1);
-		color: var(--text-muted);
-		padding: 6px;
-		font-weight: 800;
-		cursor: pointer;
-	}
-	.inspector-tabs button.active,
-	.material-category-tabs button.active {
-		border-color: var(--brand);
-		background: #eff6ff;
-		color: var(--brand);
-	}
-	.inspector-tabs button:disabled {
-		cursor: not-allowed;
-		opacity: 0.45;
-	}
-	.material-workspace {
-		display: grid;
-		gap: 8px;
-		min-height: 0;
-	}
-	.material-picker-top {
-		display: grid;
-		grid-template-columns: minmax(0, 1fr) minmax(120px, 0.45fr);
-		gap: 6px;
-	}
-	.material-search {
-		width: 100%;
-		border: 1px solid var(--panel-border);
-		border-radius: var(--radius-sm);
-		padding: 7px 9px;
-		background: #fff;
-		color: var(--text);
-	}
-	.material-picker-top select {
-		border: 1px solid var(--panel-border);
-		border-radius: var(--radius-sm);
-		background: #fff;
-		color: var(--text);
-		padding: 7px;
-		min-width: 0;
-	}
-	.material-category-tabs {
-		display: flex;
-		gap: 5px;
-		overflow-x: auto;
-		padding-bottom: 2px;
-	}
-	.material-category-tabs button {
-		white-space: nowrap;
-		text-transform: capitalize;
-		font-size: 11px;
-		padding-inline: 8px;
-	}
-	.material-grid-browser {
-		display: grid;
-		grid-template-columns: minmax(0, 1.2fr) minmax(170px, 0.8fr);
-		gap: 10px;
-		min-height: 0;
-	}
-	.material-card-grid {
-		display: grid;
-		grid-template-columns: repeat(2, minmax(0, 1fr));
-		align-content: start;
-		gap: 8px;
-		max-height: calc(100vh - 300px);
-		overflow: auto;
-		padding-right: 2px;
-	}
-	.material-card-grid button {
-		display: grid;
-		grid-template-rows: 74px auto auto auto;
-		gap: 4px;
-		min-width: 0;
-		border: 1px solid var(--panel-border);
-		border-radius: var(--radius-sm);
-		background: rgba(248,250,252,0.94);
-		color: var(--text);
-		padding: 7px;
-		text-align: left;
-		cursor: pointer;
-	}
-	.material-card-grid button:hover,
-	.material-card-grid button.selected {
-		border-color: var(--brand);
-		background: #eff6ff;
-	}
-	.material-card-grid img,
-	.material-card-grid .material-empty-thumb {
-		width: 100%;
-		height: 74px;
-		object-fit: cover;
-		border-radius: var(--radius-sm);
-	}
-	.material-card-grid strong {
-		overflow: hidden;
-		color: var(--text);
-		font-size: 12px;
-		line-height: 1.2;
-		text-overflow: ellipsis;
-		white-space: nowrap;
-	}
-	.material-card-grid small,
-	.material-preview-panel p {
-		overflow: hidden;
-		color: var(--text-muted);
-		font-size: 10px;
-		text-overflow: ellipsis;
-		white-space: nowrap;
-		margin: 0;
-	}
-	.material-tag-row {
-		display: flex;
-		flex-wrap: wrap;
-		gap: 3px;
-		min-width: 0;
-	}
-	.material-tag-row span {
-		border: 1px solid var(--panel-border);
-		border-radius: 999px;
-		background: #fff;
-		color: var(--text-muted);
-		font-size: 9px;
-		line-height: 1;
-		padding: 3px 5px;
-	}
-	.material-tag-row.expanded span {
-		font-size: 10px;
-	}
-	.material-preview-panel {
-		display: grid;
-		align-content: start;
-		gap: 8px;
-		min-width: 0;
-		border: 1px solid var(--panel-border);
-		border-radius: var(--radius-sm);
-		background: rgba(248,250,252,0.92);
-		padding: 8px;
-	}
-	.material-empty-state {
-		display: grid;
-		place-items: center;
-		min-height: 160px;
-		border: 1px dashed var(--panel-border);
-		border-radius: 10px;
-		color: var(--text-muted);
-		font-size: var(--font-size-xs);
-	}
-	.material-large-preview,
-	.material-large-empty {
-		width: 100%;
-		aspect-ratio: 1 / 1;
-		border: 1px solid var(--panel-border);
-		border-radius: var(--radius-sm);
-		background: #f1f5f9;
-		object-fit: cover;
-	}
-	.material-large-empty {
-		display: grid;
-		place-items: center;
-		color: var(--text-muted);
-		font-size: var(--font-size-xs);
-	}
-	.material-preview-panel h3 {
-		margin: 0;
-		color: var(--text);
-		font-size: 15px;
-		line-height: 1.2;
-	}
-	.material-metadata {
-		display: grid;
-		grid-template-columns: 1fr 1fr;
-		gap: 5px;
-	}
-	.material-metadata div {
-		display: grid;
-		gap: 1px;
-		border: 1px solid var(--panel-border);
-		border-radius: var(--radius-sm);
-		background: #fff;
-		padding: 6px;
-	}
-	.material-metadata span {
-		color: var(--text-muted);
-		font-size: 10px;
-	}
-	.material-metadata strong {
-		color: var(--text);
-		font-size: 11px;
-	}
-	.material-action-row {
-		display: grid;
-		grid-template-columns: 1fr 1fr;
-		gap: 6px;
-	}
+
+
 	.inline-error {
 		margin: 0;
 		color: #b42318;
@@ -6829,11 +4975,11 @@
 		display: flex;
 		justify-content: space-between;
 		gap: var(--space-2);
-		color: #9a5b00;
+		color: var(--tool-hazard);
 		font-size: var(--font-size-sm);
 	}
 	.requirement-card div.ready {
-		color: #236b35;
+		color: var(--tool-traversable);
 	}
 	.requirement-card p {
 		margin: 0;
@@ -6852,11 +4998,11 @@
 		display: flex;
 		justify-content: space-between;
 		gap: var(--space-2);
-		color: #9a5b00;
+		color: var(--tool-hazard);
 		font-size: var(--font-size-sm);
 	}
 	.sync-card div.ready {
-		color: #236b35;
+		color: var(--tool-traversable);
 	}
 	.sync-card p {
 		margin: 0;
@@ -6880,86 +5026,17 @@
 	.emitter-hint {
 		margin: 0 0 var(--space-2) 0;
 		padding: var(--space-2);
-		background: #fef3c7;
-		color: #92400e;
+		background: var(--warning-soft);
+		color: var(--tool-hazard);
 		border-radius: var(--radius-sm);
 		font-size: var(--font-size-xs);
 	}
-	.preview-panel { display: grid; gap: var(--space-3); }
-	.probe-mode-row { display: grid; gap: 4px; font-size: var(--font-size-sm); }
-	.probe-mode-row label { display: flex; gap: 6px; align-items: center; }
-	.probe-mode-stub { color: var(--muted-strong); }
-	.probe-info { display: grid; gap: 4px; font-size: var(--font-size-sm); padding: var(--space-2); background: var(--surface-1); border-radius: var(--radius-sm); }
-	.probe-info.probe-form { grid-template-columns: repeat(2, 1fr); }
-	.probe-info.probe-form label { display: grid; gap: 2px; font-size: var(--font-size-xs); }
-	.probe-info.probe-form input { padding: 2px 4px; border: 1px solid var(--border); border-radius: var(--radius-sm); }
-	.probe-empty { margin: 4px 0 0 0; color: var(--muted-strong); font-size: var(--font-size-xs); }
-	.probe-actions { display: flex; gap: var(--space-2); align-items: center; }
-	.probe-error { color: #b91c1c; background: #fef2f2; padding: var(--space-2); border-radius: var(--radius-sm); font-size: var(--font-size-xs); }
-	.probe-result { display: grid; gap: var(--space-2); }
-	.probe-result-meta { font-size: var(--font-size-xs); color: var(--muted-strong); }
-	.probe-result-img { width: 100%; max-height: 280px; object-fit: contain; background: #0f172a; border-radius: var(--radius-sm); }
-	.sync-inspector { display: grid; gap: 6px; }
-	.sync-row { display: flex; justify-content: space-between; font-size: var(--font-size-xs); padding: 2px 0; }
-	.sync-row.warn { color: #b91c1c; font-weight: 600; }
-	.sync-row .mono { font-family: monospace; max-width: 60%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-	.sync-divider { height: 1px; background: var(--border); margin: 4px 0; }
-	.sync-actions { display: flex; gap: var(--space-2); margin-top: var(--space-2); }
-	.lights-panel { display: grid; gap: var(--space-2); }
-	.lights-list { display: grid; gap: 4px; max-height: 360px; overflow-y: auto; padding-right: 4px; }
-	.light-item { display: grid; grid-template-columns: 1fr 90px; gap: 6px; align-items: center; padding: 4px 6px; border-radius: var(--radius-sm); background: var(--surface-1); font-size: var(--font-size-xs); }
-	.light-item.enabled { background: #fef3c7; }
-	.light-toggle { display: flex; gap: 6px; align-items: center; overflow: hidden; }
-	.light-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-	.light-intensity { width: 100%; }
-	.light-aux-row { grid-column: 1 / -1; display: grid; grid-template-columns: 20px 1fr 70px; gap: 6px; align-items: center; padding: 2px 6px 4px; font-size: var(--font-size-xs); }
-	.light-color-swatch { width: 18px; height: 18px; border-radius: 50%; border: 1px solid var(--border); }
-	.light-temp { width: 100%; }
-	.light-height-label { display: flex; align-items: center; gap: 2px; }
-	.light-height { width: 50px; padding: 1px 4px; border: 1px solid var(--border); border-radius: var(--radius-sm); font-size: 11px; }
-	.footprint-panel { display: grid; gap: var(--space-2); }
-	.footprint-grid { display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-2); }
-	.footprint-grid label { display: grid; gap: 2px; font-size: var(--font-size-xs); }
-	.footprint-grid input { padding: 2px 4px; border: 1px solid var(--border); border-radius: var(--radius-sm); }
-	.footprint-info { font-size: var(--font-size-xs); color: var(--muted-strong); }
-	.footprint-toggle { display: flex; gap: 6px; align-items: center; font-size: var(--font-size-xs); }
-	.footprint-divider { height: 1px; background: var(--border); margin: 4px 0; }
+
+
 	.paint-mode-row { display: grid; gap: 4px; font-size: var(--font-size-xs); }
 	.paint-mode-row label { display: flex; gap: 6px; align-items: center; }
-	.paint-swatch { width: 14px; height: 14px; border-radius: 50%; border: 1px solid var(--border); }
-	.paint-swatch.walkable { background: #22c55e; }
-	.paint-swatch.blocked { background: #ef4444; }
-	.paint-radius { width: 70px; }
-	.paint-info { display: flex; gap: 6px; align-items: center; font-size: var(--font-size-xs); }
-	.component-row { display: flex; gap: 6px; align-items: center; font-size: var(--font-size-xs); padding: 2px 0; }
-	.component-dot { width: 12px; height: 12px; border-radius: 50%; border: 1px solid var(--border); }
-	.mode-radio-group { display: grid; gap: 2px; }
-	.mode-radio {
-		display: flex;
-		gap: 8px;
-		align-items: center;
-		padding: 4px 6px;
-		border-radius: var(--radius-sm);
-		cursor: pointer;
-		font-size: var(--font-size-sm);
-	}
-	.mode-radio:hover { background: var(--surface-1); }
-	.mode-radio input[type="radio"] { margin: 0; cursor: pointer; }
-	.mode-radio span { display: flex; gap: 6px; align-items: center; }
-	.mode-active-banner {
-		padding: 6px 10px;
-		background: #dbeafe;
-		color: #1e40af;
-		border-radius: var(--radius-sm);
-		font-size: var(--font-size-xs);
-		border-left: 3px solid #3b82f6;
-	}
-	.edge-diag { display: grid; gap: 4px; padding: var(--space-2); background: var(--surface-1); border-radius: var(--radius-sm); font-size: var(--font-size-xs); border: 1px solid var(--panel-border); }
-	.edge-diag-title { font-weight: 600; font-family: monospace; }
-	.edge-diag-detail { color: var(--muted-strong); font-style: italic; }
-	.edge-diag-verdict { padding: 4px 8px; border-radius: var(--radius-sm); background: #fef2f2; color: #b91c1c; font-weight: 600; margin-top: 4px; }
-	.edge-diag-verdict.ok { background: #f0fdf4; color: #166534; }
-	.edge-diag-actions { display: flex; gap: var(--space-2); margin-top: 4px; }
+
+
 	.sync-progress-chip {
 		display: inline-flex;
 		gap: 6px;
@@ -6967,7 +5044,7 @@
 		padding: 2px 8px;
 		font-size: var(--font-size-xs);
 		color: #b45309;
-		background: #fef3c7;
+		background: var(--warning-soft);
 		border-radius: var(--radius-sm);
 		white-space: nowrap;
 	}
@@ -6991,15 +5068,15 @@
 		overflow: hidden;
 	}
 	.floor-band { position: absolute; left: 6%; right: 6%; top: 46%; height: 24%; background: #f4f6f3; border: 1px solid #c6ccc3; }
-	.glass-panel { position: absolute; left: 44%; top: 18%; width: 9%; height: 66%; border: 2px solid #5bb7c5; background: rgba(91, 183, 197, 0.16); }
-	.goal-dot { position: absolute; right: 22%; top: 50%; width: 18px; height: 18px; border-radius: 50%; background: #37a169; }
-	.hazard-zone { position: absolute; left: 39%; top: 39%; width: 18%; height: 28%; border: 2px solid #dd7a22; background: rgba(221, 122, 34, 0.18); }
+	.glass-panel { position: absolute; left: 44%; top: 18%; width: 9%; height: 66%; border: 2px solid var(--tool-glass); background: rgba(91, 183, 197, 0.16); }
+	.goal-dot { position: absolute; right: 22%; top: 50%; width: 18px; height: 18px; border-radius: 50%; background: var(--tool-traversable); }
+	.hazard-zone { position: absolute; left: 39%; top: 39%; width: 18%; height: 28%; border: 2px solid var(--tool-hazard); background: rgba(221, 122, 34, 0.18); }
 	.map-grid { display: grid; grid-template-columns: repeat(12, 1fr); gap: 2px; height: 320px; }
 	.map-grid div { background: #f7faf7; border: 1px solid #d6ddd4; }
 	.map-grid .cell-obstacle { background: #1f2933; }
-	.map-grid .cell-hazard { background: #dd7a22; }
-	.map-grid .cell-start { background: #2f80ed; }
-	.map-grid .cell-goal { background: #37a169; }
+	.map-grid .cell-hazard { background: var(--tool-hazard); }
+	.map-grid .cell-start { background: var(--tool-goal); }
+	.map-grid .cell-goal { background: var(--tool-traversable); }
 	.render-grid, .review-grid { display: grid; grid-template-columns: 0.8fr 1fr 1fr; gap: var(--space-4); }
 	.modality-list { display: grid; gap: var(--space-2); margin-top: var(--space-3); }
 	.modality-list label { grid-template-columns: auto 1fr; align-items: center; color: var(--text); }
@@ -7015,8 +5092,8 @@
 	.metric-row { grid-template-columns: repeat(3, 1fr); }
 	.metric-row span { padding: var(--space-2); border: 1px solid var(--panel-border); border-radius: var(--radius-sm); background: var(--surface-1); }
 	.notice { border-radius: var(--radius-sm); padding: var(--space-2) var(--space-3); }
-	.notice.error { background: #fff1f1; color: #9b1c1c; border: 1px solid #f0b4b4; }
-	.notice.ok { background: #eef8f0; color: #236b35; border: 1px solid #abd7b5; }
+	.notice.error { background: var(--danger-soft); color: var(--danger); border: 1px solid #f0b4b4; }
+	.notice.ok { background: var(--tool-traversable-soft); color: var(--tool-traversable); border: 1px solid var(--tool-traversable); }
 	pre {
 		max-height: 360px;
 		overflow: auto;
@@ -7077,25 +5154,8 @@
 		gap: var(--space-2);
 		align-content: start;
 	}
-	.rail-summary {
-		cursor: pointer;
-		color: var(--muted-strong);
-		font-size: var(--font-size-xs);
-		font-weight: 800;
-		list-style: none;
-		text-transform: uppercase;
-	}
-	.rail-summary::-webkit-details-marker { display: none; }
-	.rail-settings-body {
-		width: auto;
-		max-height: none;
-		overflow: visible;
-		border: 0;
-		border-radius: 0;
-		background: transparent;
-		box-shadow: none;
-		padding: var(--space-2) 0 0;
-	}
+
+
 	.dataset-rail .inspector-head {
 		display: flex;
 		justify-content: space-between;
@@ -7143,12 +5203,13 @@
 		gap: 4px;
 	}
 	.dataset-rail .rotation-row { margin-top: 2px; }
+	.dataset-rail .snap-controls { margin-top: 4px; gap: 4px; }
 	.dataset-rail button.full { width: 100%; }
 	.dataset-rail button.danger {
-		color: #dc2626;
+		color: var(--danger);
 		border-color: #fca5a5;
 	}
-	.dataset-rail button.danger:hover { background: #fef2f2; }
+	.dataset-rail button.danger:hover { background: var(--danger-soft); }
 	.dataset-rail .material-grid-browser {
 		grid-template-columns: minmax(0, 1fr);
 		gap: 8px;
@@ -7211,313 +5272,14 @@
 		text-transform: uppercase;
 		letter-spacing: 0;
 	}
-	.rail-readiness {
-		display: grid;
-		grid-template-columns: 1fr 1fr;
-		gap: var(--space-2);
-	}
-	.rail-readiness span {
-		border: 1px solid var(--panel-border);
-		border-radius: var(--radius-sm);
-		background: var(--surface-1);
-		color: var(--muted-strong);
-		padding: var(--space-2);
-		text-align: center;
-	}
-	.rail-readiness span.ready {
-		border-color: #abd7b5;
-		background: #eef8f0;
-		color: #236b35;
-	}
-	.rail-kv {
-		display: grid;
-		gap: var(--space-2);
-		margin: 0;
-	}
-	.rail-kv div {
-		display: grid;
-		grid-template-columns: 88px minmax(0, 1fr);
-		gap: var(--space-2);
-		align-items: start;
-	}
-	.rail-kv dt {
-		color: var(--muted);
-		font-size: var(--font-size-xs);
-	}
-	.rail-kv dd {
-		margin: 0;
-		min-width: 0;
-		overflow-wrap: anywhere;
-		font-size: var(--font-size-xs);
-		color: var(--text);
-	}
-	.dataset-bottom {
-		display: grid;
-		height: 100%;
-		min-height: 32px;
-		position: relative;
-		background: var(--surface-1);
-		color: var(--text);
-	}
-	/* Floating icon buttons — top-right overlay */
-	.bottom-overlay-buttons {
-		position: absolute;
-		top: var(--space-2);
-		right: var(--space-2);
-		z-index: 10;
-		display: flex;
-		gap: var(--space-1);
-	}
-	.bottom-icon-btn {
-		width: 26px;
-		height: 26px;
-		display: flex;
-		align-items: center;
-		justify-content: center;
-		border: 1px solid var(--panel-border);
-		border-radius: var(--radius-sm);
-		background: var(--surface-1, #fff);
-		color: var(--muted-strong);
-		font-size: 14px;
-		cursor: pointer;
-		opacity: 0.85;
-		box-shadow: 0 1px 3px rgba(0,0,0,.08);
-		transition: opacity 100ms;
-	}
-	.bottom-icon-btn:hover { opacity: 1; }
-	.bottom-icon-btn:disabled { opacity: 0.4; cursor: default; }
-	.dataset-bottom-body {
-		display: grid;
-		grid-template-columns: 360px minmax(0, 1fr);
-		gap: var(--space-3);
-		min-height: 0;
-		overflow: hidden;
-		padding: var(--space-3);
-	}
-	.bottom-progress {
-		display: grid;
-		gap: var(--space-2);
-		align-content: start;
-		border-right: 1px solid var(--panel-border);
-		padding-right: var(--space-3);
-		overflow-y: auto;
-		min-height: 0;
-	}
-	.progress-head, .progress-metrics {
-		display: flex;
-		justify-content: space-between;
-		gap: var(--space-2);
-		color: var(--muted-strong);
-		font-size: var(--font-size-xs);
-	}
-	.progress-metrics {
-		display: flex;
-		flex-wrap: wrap;
-		gap: var(--space-2);
-		align-items: center;
-	}
-	/* Job status chips */
-	.js-chip { padding: 1px 6px; border-radius: 99px; font-size: 10px; font-weight: 600; }
-	.js-chip.js-done { background: #d1fae5; color: #065f46; }
-	.js-chip.js-running { background: #dbeafe; color: #1e40af; }
-	.js-chip.js-queued { background: #f1f5f9; color: #475569; border: 1px solid #cbd5e1; }
-	.js-chip.js-failed { background: #fee2e2; color: #991b1b; }
-	/* Batch job grid */
-	.batch-job-grid {
-		margin-top: var(--space-2);
-		overflow: auto;
-		max-height: 160px;
-	}
-	.bjg-header, .bjg-row {
-		display: flex;
-		align-items: center;
-		gap: 2px;
-		margin-bottom: 2px;
-	}
-	.bjg-node-label {
-		width: 28px;
-		flex-shrink: 0;
-		color: var(--muted);
-		font-size: 9px;
-		text-align: right;
-		padding-right: 3px;
-		overflow: hidden;
-		text-overflow: ellipsis;
-		white-space: nowrap;
-	}
-	.bjg-heading-label {
-		width: 14px;
-		flex-shrink: 0;
-		color: var(--muted);
-		font-size: 8px;
-		text-align: center;
-	}
-	.bjg-cell {
-		width: 12px;
-		height: 12px;
-		border: 0;
-		border-radius: 2px;
-		flex-shrink: 0;
-		padding: 0;
-		cursor: default;
-		transition: opacity 80ms;
-	}
-	.bjg-cell:not(:disabled) { cursor: pointer; }
-	.bjg-cell:hover { opacity: 0.7; }
-	.bjg-cell.js-done { background: #34d399; }
-	.bjg-cell.js-running { background: #60a5fa; animation: pulse-cell 1s ease-in-out infinite; }
-	.bjg-cell.js-queued { background: #cbd5e1; }
-	.bjg-cell.js-failed { background: #f87171; }
-	.bjg-cell.js-cancelled { background: #fbbf24; }
-	.bjg-cell.js-unknown { background: #e2e8f0; }
-	.bjg-cell.bjg-selected { outline: 2px solid var(--brand, #6366f1); outline-offset: 1px; }
+
+
 	@keyframes pulse-cell {
 		0%, 100% { opacity: 1; }
 		50% { opacity: 0.4; }
 	}
-	/* Stale job controls */
-	.stale-controls { margin-top: var(--space-1); }
-	.stale-controls .button { font-size: 10px; padding: 2px 8px; }
-	/* Job detail panel */
-	.job-detail-panel {
-		margin-top: var(--space-2);
-		border: 1px solid var(--panel-border);
-		border-radius: var(--radius-md);
-		padding: var(--space-2);
-		background: var(--surface-1);
-		display: grid;
-		gap: var(--space-2);
-		font-size: var(--font-size-xs);
-	}
-	.job-detail-head {
-		display: flex;
-		align-items: center;
-		gap: var(--space-2);
-	}
-	.job-detail-id {
-		font-family: monospace;
-		font-size: 10px;
-		color: var(--muted-strong);
-		flex: 1;
-		overflow: hidden;
-		text-overflow: ellipsis;
-		white-space: nowrap;
-	}
-	.job-detail-meta {
-		color: var(--muted);
-		font-size: 10px;
-		display: flex;
-		gap: 4px;
-	}
-	.bjg-close {
-		background: none;
-		border: none;
-		cursor: pointer;
-		color: var(--muted);
-		padding: 0 2px;
-		font-size: 11px;
-		line-height: 1;
-	}
-	.bjg-close:hover { color: var(--fg); }
-	/* Stage timeline */
-	.stage-timeline {
-		display: flex;
-		gap: 2px;
-		align-items: flex-start;
-	}
-	.stage-step {
-		display: flex;
-		flex-direction: column;
-		align-items: center;
-		gap: 3px;
-		flex: 1;
-		color: var(--muted);
-		font-size: 9px;
-		text-align: center;
-	}
-	.stage-dot {
-		width: 8px;
-		height: 8px;
-		border-radius: 50%;
-		background: #e2e8f0;
-		border: 1px solid #cbd5e1;
-	}
-	.stage-step.done .stage-dot { background: #34d399; border-color: #10b981; }
-	.stage-step.active .stage-dot { background: #60a5fa; border-color: #3b82f6; animation: pulse-cell 1s ease-in-out infinite; }
-	.stage-step.failed .stage-dot { background: #f87171; border-color: #ef4444; }
-	.stage-step.done { color: var(--muted-strong); }
-	.stage-step.active { color: #1d4ed8; font-weight: 600; }
-	/* Job logs */
-	.job-log-list {
-		max-height: 100px;
-		overflow-y: auto;
-		display: grid;
-		gap: 1px;
-	}
-	.job-log-row {
-		display: flex;
-		gap: var(--space-2);
-		font-size: 10px;
-		padding: 1px var(--space-1);
-		background: var(--surface-2);
-		color: var(--muted-strong);
-	}
-	.job-log-row.muted { color: var(--muted); font-style: italic; }
-	.job-log-level { color: var(--muted); width: 30px; flex-shrink: 0; }
-	.job-log-msg { overflow-wrap: anywhere; }
-	.progress-track {
-		height: 8px;
-		overflow: hidden;
-		border-radius: 999px;
-		background: var(--surface-3);
-		border: 1px solid var(--panel-border);
-	}
-	.progress-fill {
-		height: 100%;
-		background: var(--brand);
-		transition: width 160ms ease;
-	}
-	.activity-log {
-		display: grid;
-		align-content: start;
-		gap: 1px;
-		min-height: 0;
-		overflow: auto;
-		font-size: var(--font-size-xs);
-	}
-	.activity-row {
-		display: grid;
-		grid-template-columns: 72px 148px minmax(180px, 0.8fr) minmax(220px, 1.2fr);
-		gap: var(--space-2);
-		align-items: start;
-		padding: var(--space-1) var(--space-2);
-		border-left: 3px solid var(--panel-border);
-		background: var(--surface-2);
-	}
-	.activity-row.level-ok { border-left-color: #37a169; }
-	.activity-row.level-warn { border-left-color: #dd7a22; }
-	.activity-row.level-error { border-left-color: #c53030; }
-	.activity-time, .activity-source, .activity-detail {
-		color: var(--muted);
-		overflow-wrap: anywhere;
-	}
-	.activity-message {
-		color: var(--text);
-		overflow-wrap: anywhere;
-	}
-	/* Batch log rows (backend job logs) */
-	.log-section-head {
-		padding: 2px var(--space-2);
-		font-size: 9px;
-		font-weight: 600;
-		text-transform: uppercase;
-		letter-spacing: 0.05em;
-		color: var(--muted);
-		background: var(--surface-3, #e2e8f0);
-	}
-	.batch-log-row { grid-template-columns: 100px minmax(0, 1fr); border-left-color: #94a3b8; }
-	.batch-log-job { font-family: monospace; font-size: 9px; }
-	.batch-log-line { font-family: monospace; font-size: 10px; }
+
+
 	@media (max-width: 1100px) {
 		.project-strip, .tab-grid, .render-grid, .review-grid { grid-template-columns: 1fr; }
 		.page-header { align-items: flex-start; flex-direction: column; }
@@ -7603,167 +5365,7 @@
 		padding-left: 4px;
 	}
 
-	.map-float-asset-catalog {
-		position: absolute;
-		left: 20px;
-		top: 86px;
-		z-index: 12;
-		width: 292px;
-		max-height: min(640px, calc(100vh - 180px));
-		overflow: auto;
-		border: 1px solid var(--panel-border);
-		border-radius: 16px;
-		background: rgba(255,255,255,0.92);
-		box-shadow: 0 18px 45px rgba(15,23,42,0.14);
-		backdrop-filter: blur(14px);
-		padding: 10px;
-	}
-	.catalog-head {
-		display: flex;
-		align-items: flex-start;
-		justify-content: space-between;
-		gap: 8px;
-		margin-bottom: 8px;
-	}
-	.catalog-head small {
-		color: var(--muted-strong);
-		font-size: 11px;
-	}
-	.catalog-tools {
-		display: grid;
-		grid-template-columns: 1fr 1fr;
-		gap: 8px;
-		margin-bottom: 10px;
-	}
-	.catalog-tools button {
-		border: 1px solid var(--panel-border);
-		border-radius: 10px;
-		background: rgba(248,250,252,0.82);
-		color: var(--text);
-		font-weight: 800;
-		padding: 8px 10px;
-		cursor: pointer;
-	}
-	.catalog-tools button.active {
-		border-color: var(--brand);
-		background: #eff6ff;
-		color: var(--brand);
-	}
-	.catalog-tools button.danger {
-		color: #dc2626;
-	}
-	.catalog-tools button:disabled {
-		opacity: 0.42;
-		cursor: default;
-	}
-	.asset-section-title {
-		margin: 8px 2px 6px;
-		color: var(--brand);
-		font-size: 11px;
-		font-weight: 800;
-		letter-spacing: 0.12em;
-		text-transform: uppercase;
-	}
-	.asset-subsection-title {
-		margin: 8px 2px 5px;
-		color: var(--muted);
-		font-size: 11px;
-		font-weight: 800;
-	}
-	.catalog-divider {
-		height: 1px;
-		background: var(--panel-border);
-		margin: 10px 0;
-	}
-	.asset-card-list {
-		display: grid;
-		gap: 7px;
-	}
-	.library-assets {
-		max-height: 310px;
-		overflow: auto;
-		padding-right: 2px;
-	}
-	.asset-search {
-		width: 100%;
-		border: 1px solid var(--panel-border);
-		border-radius: 10px;
-		background: #fff;
-		color: var(--text);
-		padding: 7px 9px;
-	}
-	.catalog-status {
-		display: block;
-		margin: 5px 2px;
-		color: var(--text-muted);
-	}
-	.catalog-empty {
-		display: grid;
-		gap: 6px;
-		border: 1px dashed var(--panel-border);
-		border-radius: 10px;
-		color: var(--text-muted);
-		padding: var(--space-3);
-		font-size: var(--font-size-xs);
-		text-align: center;
-	}
-	.catalog-empty a {
-		color: var(--brand);
-		font-weight: 800;
-	}
-	.asset-card {
-		display: grid;
-		grid-template-columns: 42px 1fr auto;
-		grid-template-rows: auto auto;
-		column-gap: 9px;
-		align-items: center;
-		min-height: 56px;
-		border: 1px solid var(--panel-border);
-		border-radius: 10px;
-		background: rgba(248,250,252,0.78);
-		padding: 6px;
-		text-align: left;
-		cursor: pointer;
-	}
-	.asset-card:hover,
-	.asset-card.selected {
-		border-color: var(--brand);
-		background: #eff6ff;
-	}
-	.asset-card :global(.asset-thumb),
-	.asset-thumb-img {
-		grid-row: 1 / span 2;
-	}
-	.asset-thumb-img {
-		width: 42px;
-		height: 42px;
-		border-radius: 8px;
-		background: linear-gradient(180deg, rgba(248,250,252,0.96), rgba(226,232,240,0.9));
-		overflow: hidden;
-		flex-shrink: 0;
-	}
-	.asset-thumb-img img {
-		display: block;
-		width: 100%;
-		height: 100%;
-		border-radius: inherit;
-		object-fit: contain;
-	}
-	.asset-card span,
-	.asset-card small {
-		overflow: hidden;
-		text-overflow: ellipsis;
-		white-space: nowrap;
-	}
-	.asset-card span {
-		color: var(--text);
-		font-size: 12px;
-		font-weight: 700;
-	}
-	.asset-card small {
-		color: var(--text-muted);
-		font-size: 10px;
-	}
+
 	.pgroup-sep {
 		width: 24px;
 		height: 1px;
@@ -7794,166 +5396,18 @@
 		width: min(720px, calc(100% - 24px));
 	}
 
-	/* Paths panel */
-	.paths-panel .episode-search {
-		width: 100%;
-		padding: 4px 8px;
-		border: 1px solid var(--panel-border);
-		border-radius: var(--radius-sm);
-		font-size: var(--font-size-xs);
-	}
-	.paths-panel .episode-list {
-		display: flex;
-		flex-direction: column;
-		gap: 2px;
-		max-height: 300px;
-		overflow-y: auto;
-	}
-	.paths-panel .episode-row {
-		display: flex;
-		align-items: center;
-		gap: 6px;
-		padding: 4px 6px;
-		border-radius: var(--radius-sm);
-		cursor: pointer;
-		font-size: var(--font-size-xs);
-		color: var(--text);
-	}
-	.paths-panel .episode-row:hover { background: var(--hover-bg); }
-	.paths-panel .episode-row.selected { background: var(--accent-subtle); color: var(--accent); font-weight: 600; }
-	.paths-panel .ep-id { font-family: monospace; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-	.paths-panel .ep-mode { color: var(--text-muted); font-size: 10px; }
-	.paths-panel .badge-hazard { color: #f97316; }
-	.paths-panel .episode-empty { color: var(--text-muted); font-size: var(--font-size-xs); padding: 8px 0; text-align: center; }
-	.paths-panel .episode-generate-bar {
-		display: flex;
-		gap: 6px;
-		align-items: center;
-		border-top: 1px solid var(--panel-border);
-		padding-top: var(--space-2);
-	}
-	.paths-panel .episode-generate-bar input { width: 60px; padding: 3px 6px; font-size: var(--font-size-xs); border: 1px solid var(--panel-border); border-radius: var(--radius-sm); }
-	.paths-panel .episode-generate-bar button { flex: 1; }
 
-	/* Sensor panel */
-	.sensor-sync-warning {
-		display: flex;
-		align-items: center;
-		justify-content: space-between;
-		gap: 6px;
-		padding: 6px 8px;
-		background: rgba(251,191,36,0.12);
-		border: 1px solid rgba(251,191,36,0.4);
-		border-radius: var(--radius-sm);
-		font-size: var(--font-size-xs);
-		margin-bottom: 8px;
-		color: #92400e;
-	}
-	.sensor-sync-warning.camera-rig-readonly-note {
-		align-items: flex-start;
-		flex-direction: column;
-		background: rgba(59,130,246,0.08);
-		border-color: rgba(59,130,246,0.24);
-		color: #1e40af;
-	}
-	.sensor-sync-warning.camera-rig-readonly-note small {
-		color: #991b1b;
-	}
-	.sensor-panel .camera-rig-panel {
-		display: grid;
-		gap: 8px;
-		margin-bottom: 10px;
-	}
-	.sensor-panel .rig-sensor-card {
-		border: 1px solid var(--panel-border);
-		border-radius: var(--radius-sm);
-		background: var(--surface-1);
-		padding: 6px 8px;
-	}
-	.sensor-panel .rig-sensor-card summary {
-		cursor: pointer;
-		font-weight: 700;
-		color: var(--text-primary);
-	}
-	.sensor-panel .rig-readonly-grid {
-		margin-top: 6px;
-	}
-	.sensor-panel .readonly-field {
-		display: grid;
-		gap: 2px;
-		min-width: 0;
-		border: 1px solid var(--panel-border);
-		border-radius: var(--radius-sm);
-		background: var(--surface-2);
-		padding: 6px 7px;
-	}
-	.sensor-panel .readonly-field.wide {
-		grid-column: 1 / -1;
-	}
-	.sensor-panel .readonly-field span {
-		color: var(--text-muted);
-		font-size: 10px;
-		text-transform: uppercase;
-	}
-	.sensor-panel .readonly-field strong {
-		color: var(--text-primary);
-		font-size: 11px;
-		font-weight: 700;
-		overflow-wrap: anywhere;
-	}
-	.sensor-panel .sensor-node-id { font-family: monospace; font-size: var(--font-size-xs); color: var(--text-muted); word-break: break-all; }
-	.sensor-panel .sensor-pos { font-size: 11px; color: var(--text-muted); margin-bottom: 4px; }
-	.sensor-panel .modality-tabs { display: flex; gap: 4px; flex-wrap: wrap; }
-	.sensor-panel .modality-tabs button {
-		padding: 3px 8px; font-size: 11px; border: 1px solid var(--panel-border); border-radius: var(--radius-sm);
-		background: none; cursor: pointer; color: var(--text-muted);
-	}
-	.sensor-panel .rig-derived-tabs button {
-		display: inline-flex; flex-direction: column; align-items: flex-start; gap: 2px; min-width: 112px;
-	}
-	.sensor-panel .rig-derived-tabs button small { font-size: 10px; opacity: 0.75; }
-	.sensor-panel .modality-tabs button.active-tab { background: var(--accent); color: #fff; border-color: var(--accent); }
-	.sensor-panel .sensor-result { display: flex; align-items: center; gap: 6px; }
-	.sensor-panel .sensor-progress { font-size: 11px; color: var(--text-muted); }
-	.sensor-obs-header { display: flex; align-items: center; justify-content: space-between; gap: 6px; margin: 4px 0; }
-	.sensor-obs-header .button { font-size: 10px; padding: 2px 8px; }
-	.sensor-panel .sensor-hint { font-size: var(--font-size-xs); color: var(--text-muted); padding: 12px 0; text-align: center; }
-	.sensor-height-label { font-size: 11px; color: var(--text-muted); }
-	.sensor-height-input { width: 60px; padding: 2px 4px; border: 1px solid var(--border); border-radius: var(--radius-sm); font-size: 11px; text-align: right; }
-	.obs-heading-gallery { display: grid; grid-template-columns: repeat(4, 1fr); gap: 3px; margin: 6px 0; }
-	.obs-thumb { width: 100%; aspect-ratio: 4/3; object-fit: cover; border-radius: 3px; border: 1px solid var(--border); cursor: pointer; }
-	.obs-thumb-empty { display: flex; align-items: center; justify-content: center; background: var(--surface-2, #f1f5f9); border-radius: 3px; border: 1px solid var(--border); }
-	.obs-thumb-empty span { font-size: 9px; color: var(--text-muted); }
-	.sensor-panel .full { width: 100%; }
-	.sensor-panel .sensor-add-bar { margin-bottom: 8px; }
-	.sensor-panel .sensor-rays-row { display: flex; align-items: center; justify-content: space-between; gap: 6px; margin-bottom: 8px; }
-	.sensor-panel .sensor-rays-label { font-size: 11px; color: var(--text-muted); white-space: nowrap; }
-	.sensor-panel .sensor-rays-select { flex: 1; font-size: 11px; padding: 2px 4px; background: var(--bg-secondary); border: 1px solid var(--border); border-radius: 4px; color: var(--text-primary); }
-	.sensor-panel .sensor-heading-label { display: flex; flex-direction: column; gap: 2px; font-size: 11px; color: var(--text-muted); margin: 6px 0; }
-	.sensor-panel .sensor-heading-label input[type=range] { width: 100%; }
-	.sensor-panel .sensor-del { margin-top: 2px; color: var(--text-muted); }
-	.sensor-panel .sensor-config-row { display: flex; align-items: center; justify-content: space-between; gap: 6px; margin: 6px 0; }
+	.readiness-errors { margin-top: 4px; display: flex; flex-direction: column; gap: 3px; }
+	.readiness-error-item { font-size: 11px; color: var(--danger); line-height: 1.4; }
+	.readiness-error-label { font-weight: 600; margin-right: 4px; }
+	.readiness-error-msg { color: #7f1d1d; }
 
-	/* Export mode panel */
-	.export-panel .full { width: 100%; }
-	.export-readiness-list { display: flex; flex-direction: column; gap: 4px; margin: 6px 0; }
-	.readiness-item { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-muted); }
-	.readiness-item.ok { color: #166534; }
-	.readiness-dot { width: 8px; height: 8px; border-radius: 50%; background: #cbd5e1; flex-shrink: 0; }
-	.readiness-item.ok .readiness-dot { background: #22c55e; }
-	.export-stats { display: flex; flex-direction: column; gap: 2px; margin: 4px 0 8px; }
-	.stat-row { display: flex; justify-content: space-between; font-size: 11px; color: var(--text-muted); padding: 1px 0; }
-	.stat-row span:last-child { font-weight: 600; color: var(--text-primary); }
-	.export-path-legend { display: flex; align-items: center; gap: 6px; font-size: 11px; color: var(--text-muted); flex-wrap: wrap; }
-	.legend-swatch { width: 20px; height: 3px; border-radius: 2px; flex-shrink: 0; }
-	.legend-swatch.normal { background: #94a3b8; }
-	.legend-swatch.hazard { background: #fca5a5; }
+
 	.export-validation { font-size: 11px; padding: 4px 8px; border-radius: 4px; margin-top: 6px; }
 	.export-validation.validation-ok { background: #dcfce7; color: #166534; }
 	.export-validation.validation-fail { background: #fee2e2; color: #991b1b; }
 	.val-errors { opacity: 0.8; }
-	.export-path-display { display: flex; align-items: center; gap: 6px; margin-top: 6px; font-size: 11px; overflow: hidden; }
-	.export-path-text { color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
 
 	/* Floating bottom status bar */
 	.map-float-status {
@@ -8057,16 +5511,7 @@
 		gap: var(--space-2);
 		box-shadow: 0 4px 12px rgba(0,0,0,0.1);
 	}
-	.rail-settings-body {
-		width: auto;
-		max-height: none;
-		overflow: visible;
-		border: 0;
-		border-radius: 0;
-		background: transparent;
-		box-shadow: none;
-		padding: var(--space-2) 0 0;
-	}
+
 	.map-float-inspector,
 	.map-float-settings {
 		display: none;
@@ -8099,7 +5544,7 @@
 	.map-start-card span {
 		display: block;
 		margin-top: 2px;
-		color: #475569;
+		color: var(--muted-strong);
 		font-size: var(--font-size-xs);
 	}
 
@@ -8116,11 +5561,54 @@
 		font-weight: 500;
 	}
 	.chip-ok { background: #dcfce7; color: #166534; }
-	.chip-off { background: #f1f5f9; color: #94a3b8; }
-	.chip-warn { background: #fef3c7; color: #92400e; padding: 1px 7px; border-radius: 99px; font-size: 10px; font-weight: 500; }
-	.config-scene-ref { font-size: 10px; color: #64748b; padding: 2px 4px; background: #f1f5f9; border-radius: 4px; font-family: monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%; margin: 2px 0; }
-	.config-scene-error { color: #b91c1c; background: #fef2f2; }
-	.chip-dim { background: #f1f5f9; color: #475569; padding: 1px 7px; border-radius: 99px; font-size: 10px; font-weight: 500; }
+	.chip-off { background: #f1f5f9; color: var(--muted); }
+	.chip-warn { background: var(--warning-soft); color: var(--tool-hazard); padding: 1px 7px; border-radius: 99px; font-size: 10px; font-weight: 500; }
+	.config-scene-ref { font-size: 10px; color: var(--muted-strong); padding: 2px 4px; background: #f1f5f9; border-radius: 4px; font-family: monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%; margin: 2px 0; }
+	.config-scene-error { color: var(--danger); background: var(--danger-soft); }
+	.chip-dim { background: #f1f5f9; color: var(--muted-strong); padding: 1px 7px; border-radius: 99px; font-size: 10px; font-weight: 500; }
+	.hint-row { font-size: 11px; color: var(--muted-strong); background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 6px; padding: 4px 8px; margin: 4px 0; }
+	.render-geometry-panel { margin-top: 8px; padding: 8px; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 6px; font-size: 11px; color: #334155; }
+	.render-geometry-header { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+	.render-geometry-title { font-size: 11px; font-weight: 600; color: #1e293b; text-transform: uppercase; letter-spacing: 0.04em; }
+	.render-geometry-chip { padding: 1px 7px; border-radius: 99px; font-size: 10px; font-weight: 500; }
+	.render-geometry-chip-ok { background: #dcfce7; color: #166534; }
+	.render-geometry-chip-warn { background: var(--warning-soft); color: var(--tool-hazard); }
+	.render-geometry-chip-dim { background: #f1f5f9; color: var(--muted-strong); }
+	.render-geometry-breakdown { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
+	.render-geometry-reason { font-size: 10px; color: var(--muted-strong); background: #fff; padding: 1px 6px; border-radius: 4px; border: 1px solid #e2e8f0; }
+	.render-geometry-fallbacks { margin-top: 6px; }
+	.render-geometry-fallbacks summary { cursor: pointer; font-size: 11px; color: var(--muted-strong); }
+	.render-geometry-fallbacks ul { list-style: none; padding: 4px 0 0 0; margin: 0; max-height: 220px; overflow: auto; }
+	.render-geometry-fallbacks li { padding: 3px 0; display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+	.render-geometry-fallbacks li small { font-size: 10px; color: var(--muted); word-break: break-all; }
+	.link-button { background: none; border: none; cursor: pointer; padding: 0; color: #1d4ed8; font-size: 11px; text-decoration: underline; }
+	.xml-native-preview-toggle { display: flex; align-items: flex-start; gap: 8px; margin-top: 8px; padding: 6px; background: #fff; border: 1px solid #e2e8f0; border-radius: 6px; cursor: pointer; font-size: 12px; }
+	.xml-native-preview-toggle > span { display: flex; flex-direction: column; gap: 1px; }
+	.xml-native-preview-toggle strong { font-size: 12px; font-weight: 600; color: #1e293b; }
+	.xml-native-preview-toggle small { font-size: 11px; color: #64748b; font-weight: 400; }
+	.env-section { padding: 8px 0; border-bottom: 1px solid #f1f5f9; }
+	.env-section:last-child { border-bottom: none; }
+	.env-section-title { font-size: 11px; font-weight: 600; text-transform: uppercase; color: var(--muted-strong); letter-spacing: 0.04em; margin-bottom: 6px; }
+	.env-radio-row { display: flex; gap: 16px; margin-bottom: 8px; }
+	.env-radio { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; cursor: pointer; }
+	.env-fields-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 8px 0; }
+	.env-fields-grid label { display: flex; flex-direction: column; gap: 2px; font-size: 12px; }
+	.env-fields-grid label span { color: var(--muted-strong); font-size: 11px; }
+	.env-envmap-row { display: flex; gap: 8px; margin-bottom: 8px; }
+	.env-envmap-select { flex: 1; min-width: 0; }
+	.env-upload-button { position: relative; display: inline-flex; align-items: center; padding: 4px 10px; background: #e2e8f0; border-radius: 6px; font-size: 12px; cursor: pointer; white-space: nowrap; }
+	.env-upload-button input[type="file"] { position: absolute; inset: 0; opacity: 0; cursor: pointer; }
+	.env-envmap-preview { display: flex; gap: 8px; align-items: center; padding: 6px; background: #f8fafc; border-radius: 6px; margin-bottom: 8px; }
+	.env-envmap-preview img { width: 120px; height: 60px; object-fit: cover; border-radius: 4px; background: #1e293b; }
+	.env-envmap-placeholder { width: 120px; height: 60px; display: flex; align-items: center; justify-content: center; font-size: 10px; color: var(--muted-strong); background: #e2e8f0; border-radius: 4px; text-align: center; padding: 4px; }
+	.env-envmap-meta { flex: 1; min-width: 0; }
+	.env-envmap-filename { font-size: 12px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+	.env-envmap-sub { font-size: 11px; color: var(--muted-strong); }
+	.inline-check { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; cursor: pointer; }
+
+
+	.env-toggle-sub { font-size: 11px; color: var(--muted-strong); font-weight: 400; }
+	.inline-check input[type="checkbox"] { flex: 0 0 auto; }
 	.build-result-row { display: flex; gap: 4px; flex-wrap: wrap; margin-top: 4px; align-items: center; }
 	.spinner-xs {
 		display: inline-block;
@@ -8155,8 +5643,11 @@
 	.map-float-inspector .flag-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; font-size: var(--font-size-xs); }
 	.map-float-inspector .preset-row { display: flex; gap: 4px; flex-wrap: wrap; }
 	.map-float-inspector .rotation-row { margin-top: 2px; }
+	.map-float-inspector .snap-controls { margin-top: 4px; gap: 4px; }
 	.map-float-inspector .geometry-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; }
 	.map-float-inspector button.full { width: 100%; }
-	.map-float-inspector button.danger { color: #dc2626; border-color: #fca5a5; }
-	.map-float-inspector button.danger:hover { background: #fef2f2; }
+	.map-float-inspector button.danger { color: var(--danger); border-color: #fca5a5; }
+	.map-float-inspector button.danger:hover { background: var(--danger-soft); }
+
+	}
 </style>

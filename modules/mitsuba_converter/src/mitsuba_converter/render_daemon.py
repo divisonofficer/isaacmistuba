@@ -370,6 +370,114 @@ def _absolutize_texture_path(value: str | None, repo_root: "Path | None") -> str
     return str(p.resolve())
 
 
+def _resolve_material_asset_path(raw: str | None, *, base_dir: "Path", repo_root: "Path | None") -> "Path | None":
+    """Resolve an OBJ/MTL sidecar asset path without assuming repo-relative input."""
+    value = (raw or "").strip()
+    if not value:
+        return None
+    path = Path(value)
+    candidates: list[Path] = []
+    if path.is_absolute():
+        candidates.append(path)
+    else:
+        candidates.append(base_dir / path)
+        if repo_root is not None:
+            candidates.append(repo_root / path)
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except Exception:
+            resolved = candidate
+        if resolved.exists():
+            return resolved
+    return None
+
+
+def _mtl_texture_value(raw: str) -> str:
+    """Return the filename-like part of a Wavefront MTL texture statement."""
+    value = raw.strip()
+    if not value:
+        return ""
+    # Most exported MooreLane MTLs are plain `map_Kd /abs/path.png`. Keep that
+    # path intact. For option-heavy MTLs, fall back to the trailing filename.
+    if not value.startswith("-"):
+        return value
+    parts = value.split()
+    return parts[-1] if parts else ""
+
+
+def _extract_obj_mtl_material(obj_path: "Path", *, repo_root: "Path | None" = None) -> dict[str, Any] | None:
+    """Extract a simple diffuse texture material from an OBJ's first MTL sidecar.
+
+    Direct MooreLane OBJ exports carry useful `map_Kd` texture references in
+    their `.mtl` files. If we attach a scene-level measured BSDF to the OBJ
+    shape, Mitsuba ignores those sidecar materials and the object can render as
+    an almost black silhouette. This helper converts the sidecar into the same
+    compact material descriptor used by USD material extraction.
+    """
+    try:
+        obj_text = obj_path.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return None
+
+    mtl_refs: list[str] = []
+    for line in obj_text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped.lower().startswith("mtllib "):
+            ref = stripped.split(None, 1)[1].strip()
+            if ref:
+                mtl_refs.append(ref)
+    if not mtl_refs:
+        return None
+
+    for mtl_ref in mtl_refs:
+        mtl_path = _resolve_material_asset_path(mtl_ref, base_dir=obj_path.parent, repo_root=repo_root)
+        if mtl_path is None:
+            continue
+        try:
+            mtl_text = mtl_path.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            continue
+        kd: list[float] | None = None
+        map_kd: Path | None = None
+        for line in mtl_text.splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            key, _, raw_value = stripped.partition(" ")
+            key_l = key.lower()
+            if key_l == "kd":
+                parts = raw_value.split()
+                if len(parts) >= 3:
+                    try:
+                        kd = [float(parts[0]), float(parts[1]), float(parts[2])]
+                    except (TypeError, ValueError):
+                        kd = None
+            elif key_l == "map_kd":
+                tex_value = _mtl_texture_value(raw_value)
+                map_kd = _resolve_material_asset_path(tex_value, base_dir=mtl_path.parent, repo_root=repo_root)
+        if map_kd is not None:
+            return {
+                "source": "obj_mtl",
+                "base_color_texture_ref": str(map_kd),
+                "base_color_factor": kd or [0.78, 0.78, 0.78],
+                "roughness_factor": 0.35,
+                "metallic_factor": 0.0,
+                "mtl_ref": str(mtl_path),
+            }
+        if kd is not None:
+            return {
+                "source": "obj_mtl",
+                "base_color_factor": kd,
+                "roughness_factor": 0.35,
+                "metallic_factor": 0.0,
+                "mtl_ref": str(mtl_path),
+            }
+    return None
+
+
 def _append_extracted_bsdf_xml(
     shape: "ET.Element",
     extracted_material: dict[str, Any],
@@ -550,9 +658,16 @@ def _append_bsdf_xml(
     binding = _resolve_material_binding(material_id, material_idx)
     strategy = str(binding.get("bsdf_strategy") or "roughplastic")
 
-    # Per-material branch: hpbrdf categories keep the channel-split measured BSDF,
-    # all other prims get to use the USD UsdShade material when it's present.
-    if extracted_material and not _binding_is_measured(binding):
+    # Per-material branch: hpbrdf categories usually keep the channel-split
+    # measured BSDF. Direct OBJ sidecar textures are the exception: they are
+    # the actual source albedo for MooreLane exports, so prefer them over a
+    # coarse object-level measured hint.
+    prefer_source_texture = bool(
+        extracted_material
+        and extracted_material.get("source") == "obj_mtl"
+        and extracted_material.get("base_color_texture_ref")
+    )
+    if extracted_material and (prefer_source_texture or not _binding_is_measured(binding)):
         if _append_extracted_bsdf_xml(shape, extracted_material, fallback_color=fallback_color, repo_root=repo_root):
             return
     if strategy == "dielectric":
@@ -697,6 +812,582 @@ def _extract_opticalnav_scene_meta_from_xml(xml_path: "Path") -> "dict[str, Any]
     return None
 
 
+_MATERIALIZATION_STATUS_LABELS = {
+    "obj": "OBJ mesh",
+    "fallback_cube": "Cube fallback",
+    "emitter_cube": "Emitter cube (intentional)",
+    "cube": "Cube (wall/line)",
+    "dropped": "Dropped",
+}
+
+
+def _classify_extracted_material(em: dict[str, Any] | None) -> str:
+    """PR2.5b: bucket the result of UsdShade extraction so the UI / next-round fix
+    can target the dominant failure mode.
+
+    Returns one of:
+      ``"missing"``                       — no extraction record at all.
+      ``"black_basecolor_suspected"``     — base_color_factor sums to ~0 or RGB
+                                             all under 0.05 (visually black).
+      ``"opacity_below_1"``               — opacity_factor < 1 → glass/dielectric
+                                             candidate that's currently rendered
+                                             as opaque roughplastic.
+      ``"texture_connection_unresolved"`` — extraction kept a texture asset path
+                                             but the daemon couldn't resolve /
+                                             copy it (asset string remains but
+                                             the ``_ref`` field is null).
+      ``"ok"``                            — anything else with a non-trivial
+                                             base color or texture.
+    """
+    if not em:
+        return "missing"
+    try:
+        opacity = em.get("opacity_factor")
+        if opacity is not None and float(opacity) < 0.99:
+            return "opacity_below_1"
+    except (TypeError, ValueError):
+        pass
+    base_factor = em.get("base_color_factor")
+    has_base_tex = bool(em.get("base_color_texture_ref"))
+    if isinstance(base_factor, (list, tuple)) and len(base_factor) >= 3:
+        try:
+            rgb = [float(c) for c in base_factor[:3]]
+        except (TypeError, ValueError):
+            rgb = None
+        if rgb is not None and not has_base_tex:
+            if sum(rgb) < 0.05 or all(c < 0.05 for c in rgb):
+                return "black_basecolor_suspected"
+    # An asset path was extracted but the daemon couldn't resolve it (PR1's
+    # ``_opticalnav_cache_texture`` returns None and leaves the ``_ref`` null).
+    has_base_asset = bool(em.get("base_color_asset"))
+    if has_base_asset and not has_base_tex:
+        return "texture_connection_unresolved"
+    return "ok"
+
+
+def _build_materialization_audit(
+    *,
+    scene_id: str,
+    overlay_objects: list[dict[str, Any]],
+    materialization_records: list[dict[str, Any]],
+    mesh_stats: dict[str, int] | None,
+) -> dict[str, Any]:
+    """Aggregate per-object materialization records into PR1's audit sidecar."""
+    summary = {
+        "total": len(materialization_records),
+        "obj_shapes": sum(1 for r in materialization_records if r.get("status") == "obj"),
+        "fallback_cubes": sum(1 for r in materialization_records if r.get("status") == "fallback_cube"),
+        "emitter_cubes": sum(1 for r in materialization_records if r.get("status") == "emitter_cube"),
+        "wall_cubes": sum(1 for r in materialization_records if r.get("status") == "cube"),
+        "dropped": sum(1 for r in materialization_records if r.get("status") == "dropped"),
+    }
+    by_reason: dict[str, int] = {}
+    for r in materialization_records:
+        reason = r.get("reason")
+        if reason:
+            by_reason[str(reason)] = by_reason.get(str(reason), 0) + 1
+    # PR2.5b: aggregate the per-object extracted_material_status into a breakdown
+    # so the UI can show "81 ok · 13 missing · 6 black_basecolor_suspected" without
+    # walking the full per-object list. Only USD-prim records carry a status.
+    material_breakdown: dict[str, int] = {}
+    for r in materialization_records:
+        ex = r.get("extras") or {}
+        if not isinstance(ex, dict):
+            continue
+        status = ex.get("extracted_material_status")
+        if status and status != "n/a":
+            material_breakdown[str(status)] = material_breakdown.get(str(status), 0) + 1
+    return {
+        "version": "opticalnav-materialization-v1",
+        "scene_id": scene_id,
+        "generated_at": _utc_now_iso(),
+        "summary": summary,
+        "fallback_breakdown": by_reason,
+        "material_extraction_breakdown": material_breakdown,
+        "mesh_stats": dict(mesh_stats or {}),
+        "objects": materialization_records,
+    }
+
+
+def _build_xml_scene_index(
+    xml_path: Path,
+    *,
+    scene_id: str,
+    materialization_records: list[dict[str, Any]] | None = None,
+) -> dict[str, Any] | None:
+    """Walk render_scene.xml and emit a per-shape index for the editor / patch API.
+
+    Reuses :func:`_extract_opticalnav_scene_meta_from_xml` for the head comment and
+    :func:`_extract_opticalnav_objects_from_xml` for the per-shape comment fields,
+    then walks the actual ``<shape>``/``<emitter>``/``<sensor>`` elements to pick
+    up XML-side data (shape_type, mesh filename, bsdf_ref, transform). Floor and
+    room-shell shapes are tagged via their ``__room_shell__`` / ``opticalnav-floor``
+    comment markers.
+    """
+    if not xml_path.exists():
+        return None
+    import xml.etree.ElementTree as ET
+    try:
+        parser = ET.XMLParser(target=ET.TreeBuilder(insert_comments=True))
+        tree = ET.parse(str(xml_path), parser=parser)
+    except Exception:
+        return None
+    root = tree.getroot()
+    try:
+        mtime_ns = int(xml_path.stat().st_mtime_ns)
+    except OSError:
+        mtime_ns = 0
+
+    # Map shape_id → object record (from PR1's materialization_records) for cross-ref.
+    mat_by_shape: dict[str, dict[str, Any]] = {}
+    for rec in materialization_records or []:
+        sid = str(rec.get("shape_id") or rec.get("object_id") or "")
+        if sid:
+            mat_by_shape[sid] = rec
+
+    # Helper: read a <transform name="to_world"> into a flat dict.
+    def _read_transform(elem: "ET.Element") -> dict[str, Any] | None:
+        xf = elem.find("./transform[@name='to_world']")
+        if xf is None:
+            return None
+        out: dict[str, Any] = {}
+        for child in xf:
+            if not isinstance(child.tag, str):
+                continue
+            if child.tag == "translate":
+                out["translate"] = [float(child.attrib.get("x", 0)), float(child.attrib.get("y", 0)), float(child.attrib.get("z", 0))]
+            elif child.tag == "scale":
+                out["scale"] = [float(child.attrib.get("x", 1)), float(child.attrib.get("y", 1)), float(child.attrib.get("z", 1))]
+            elif child.tag == "rotate":
+                axis = "y" if "y" in child.attrib else ("x" if "x" in child.attrib else ("z" if "z" in child.attrib else "y"))
+                key = f"rotate_{axis}_deg"
+                try:
+                    out[key] = float(child.attrib.get("angle", 0))
+                except (TypeError, ValueError):
+                    out[key] = 0.0
+        return out
+
+    # Walk children. Comments alternate with shapes — we use a pending marker.
+    shapes: list[dict[str, Any]] = []
+    emitters: list[dict[str, Any]] = []
+    sensors: list[dict[str, Any]] = []
+    pending_marker: dict[str, Any] | None = None
+
+    for child in root:
+        if not isinstance(child.tag, str):
+            # Comment node — peek for floor/room-shell markers.
+            text = (child.text or "").strip()
+            if text.startswith("opticalnav-floor:"):
+                try:
+                    pending_marker = json.loads(text[len("opticalnav-floor:"):])
+                    pending_marker["_marker_type"] = "floor"
+                except Exception:
+                    pending_marker = None
+            elif text.startswith("opticalnav-obj:"):
+                try:
+                    data = json.loads(text[len("opticalnav-obj:"):])
+                    if isinstance(data, dict):
+                        data["_marker_type"] = "object"
+                        pending_marker = data
+                except Exception:
+                    pending_marker = None
+            else:
+                # Other comments (room-shell, scene head, dedupe noise) — leave pending alone.
+                if text.startswith("{"):
+                    try:
+                        meta = json.loads(text)
+                        if isinstance(meta, dict) and meta.get("type") == "__room_shell__":
+                            pending_marker = {"_marker_type": "room_shell", "role": meta.get("role")}
+                    except Exception:
+                        pass
+            continue
+
+        if child.tag == "shape":
+            shape_type = child.attrib.get("type") or "unknown"
+            shape_id = child.attrib.get("id") or ""
+            mesh_path: str | None = None
+            fn = child.find("./string[@name='filename']")
+            if fn is not None:
+                mesh_path = fn.attrib.get("value")
+            bsdf_ref: str | None = None
+            ref = child.find("./ref")
+            if ref is not None:
+                bsdf_ref = ref.attrib.get("id")
+            rec: dict[str, Any] = {
+                "shape_id": shape_id,
+                "shape_type": shape_type,
+                "mesh_path": mesh_path,
+                "bsdf_ref": bsdf_ref,
+                "transform": _read_transform(child),
+            }
+            mat_rec = mat_by_shape.get(shape_id) if shape_id else None
+            if mat_rec:
+                rec["fallback"] = mat_rec.get("status") == "fallback_cube"
+                rec["fallback_reason"] = mat_rec.get("reason") if rec["fallback"] else None
+                rec["source_ref"] = mat_rec.get("source_ref")
+                rec["material_id"] = mat_rec.get("material_id")
+                rec["object_id"] = mat_rec.get("object_id")
+            elif pending_marker and pending_marker.get("_marker_type") == "floor":
+                rec["xml_role"] = "floor"
+                rec["material_id"] = pending_marker.get("material_id")
+                rec["extras"] = {"region_id": pending_marker.get("region_id"), "shape_id_marker": pending_marker.get("shape_id")}
+                rec["fallback"] = False
+            elif pending_marker and pending_marker.get("_marker_type") == "room_shell":
+                rec["xml_role"] = f"shell_{pending_marker.get('role') or 'unknown'}"
+                rec["fallback"] = False
+            pending_marker = None
+            shapes.append(rec)
+        elif child.tag == "emitter":
+            emit_type = child.attrib.get("type") or "unknown"
+            emit_rec: dict[str, Any] = {"emitter_id": child.attrib.get("id") or f"emitter_{emit_type}", "type": emit_type}
+            fn = child.find("./string[@name='filename']")
+            if fn is not None:
+                emit_rec["filename"] = fn.attrib.get("value")
+            scale = child.find("./float[@name='scale']")
+            if scale is not None:
+                try:
+                    emit_rec["intensity"] = float(scale.attrib.get("value", 1.0))
+                except (TypeError, ValueError):
+                    pass
+            emitters.append(emit_rec)
+            pending_marker = None
+        elif child.tag == "sensor":
+            sensor_rec: dict[str, Any] = {
+                "sensor_id": child.attrib.get("id") or "sensor_default",
+                "type": child.attrib.get("type") or "unknown",
+            }
+            fov = child.find("./float[@name='fov']")
+            if fov is not None:
+                try:
+                    sensor_rec["fov_deg"] = float(fov.attrib.get("value", 0))
+                except (TypeError, ValueError):
+                    pass
+            film = child.find("./film")
+            if film is not None:
+                w = film.find("./integer[@name='width']")
+                h = film.find("./integer[@name='height']")
+                try:
+                    sensor_rec["resolution"] = [int(w.attrib.get("value", 0)) if w is not None else 0,
+                                                int(h.attrib.get("value", 0)) if h is not None else 0]
+                except (TypeError, ValueError):
+                    pass
+            sensors.append(sensor_rec)
+            pending_marker = None
+
+    return {
+        "version": "opticalnav-xml-index-v1",
+        "scene_id": scene_id,
+        "xml_path": str(xml_path),
+        "xml_mtime_ns": mtime_ns,
+        "shapes": shapes,
+        "emitters": emitters,
+        "sensors": sensors,
+        "scene_meta": _extract_opticalnav_scene_meta_from_xml(xml_path),
+    }
+
+
+_SCENE_MESH_CACHE_OBJ_VERSION = 2
+
+
+def _write_normalized_obj_for_scene_cache(src: Path, dst: Path) -> dict[str, Any]:
+    """Write OBJ with vertices centered in X/Z and bottom-aligned to Y=0."""
+    text = src.read_text(encoding="utf-8", errors="replace")
+    rows = text.splitlines(keepends=True)
+    vertices: list[tuple[float, float, float]] = []
+    for line in rows:
+        stripped = line.lstrip()
+        if not stripped.startswith("v "):
+            continue
+        prefix_len = len(line) - len(stripped)
+        parts = stripped.split()
+        if len(parts) < 4:
+            continue
+        try:
+            vertices.append((float(parts[1]), float(parts[2]), float(parts[3])))
+        except (TypeError, ValueError):
+            continue
+    if not vertices:
+        shutil.copy2(src, dst)
+        return {"normalized": False, "vertex_count": 0}
+
+    min_x = min(v[0] for v in vertices)
+    max_x = max(v[0] for v in vertices)
+    min_y = min(v[1] for v in vertices)
+    min_z = min(v[2] for v in vertices)
+    max_z = max(v[2] for v in vertices)
+    off_x = (min_x + max_x) / 2.0
+    off_y = min_y
+    off_z = (min_z + max_z) / 2.0
+
+    out: list[str] = []
+    for line in rows:
+        stripped = line.lstrip()
+        if not stripped.startswith("v "):
+            out.append(line)
+            continue
+        leading = line[:len(line) - len(stripped)]
+        newline = "\n" if line.endswith("\n") else ""
+        parts = stripped.split()
+        if len(parts) < 4:
+            out.append(line)
+            continue
+        try:
+            x = float(parts[1]) - off_x
+            y = float(parts[2]) - off_y
+            z = float(parts[3]) - off_z
+        except (TypeError, ValueError):
+            out.append(line)
+            continue
+        suffix = ""
+        if len(parts) > 4:
+            suffix = " " + " ".join(parts[4:])
+        out.append(f"{leading}v {x:.8g} {y:.8g} {z:.8g}{suffix}{newline}")
+    dst.write_text("".join(out), encoding="utf-8")
+    return {
+        "normalized": True,
+        "vertex_count": len(vertices),
+        "source_bounds": {
+            "min": [min_x, min_y, min_z],
+            "max": [max_x, max(v[1] for v in vertices), max_z],
+            "center_xz": [off_x, off_z],
+        },
+        "offset_applied": [off_x, off_y, off_z],
+    }
+
+
+def _stage_xml_obj_filenames_to_scene_mesh_cache(
+    xml_path: Path,
+    *,
+    scene_mesh_cache_dir: Path,
+    repo_root: Path,
+) -> dict[str, Any]:
+    """Copy OBJ files referenced by render_scene.xml into scene-local mesh_cache.
+
+    The browser editor fetches OBJ preview geometry only through
+    ``/scenes/<scene_id>/mesh-cache/<filename>``. Mitsuba can load absolute or
+    repo-relative OBJ paths, but the editor cannot serve those directly. This
+    pass stages every OBJ filename from the XML into the scene's ``mesh_cache``
+    and rewrites the XML filename to the staged repo-relative path.
+    """
+    if not xml_path.exists():
+        return {"staged": 0, "missing": 0, "rewritten": 0}
+    import xml.etree.ElementTree as ET
+
+    try:
+        parser = ET.XMLParser(target=ET.TreeBuilder(insert_comments=True))
+        tree = ET.parse(str(xml_path), parser=parser)
+    except Exception as exc:
+        return {"staged": 0, "missing": 0, "rewritten": 0, "error": str(exc)}
+
+    scene_mesh_cache_dir.mkdir(parents=True, exist_ok=True)
+    staged = 0
+    missing = 0
+    rewritten = 0
+    root = tree.getroot()
+    for shape in root.findall(".//shape"):
+        if shape.attrib.get("type") != "obj":
+            continue
+        fn = shape.find("./string[@name='filename']")
+        if fn is None:
+            continue
+        raw = fn.attrib.get("value") or ""
+        if not raw.lower().endswith(".obj"):
+            continue
+        try:
+            src = resolve_repo_path(repo_root, raw)
+        except Exception:
+            src = Path(raw)
+        if not src.exists() or not src.is_file():
+            missing += 1
+            continue
+        try:
+            stat = src.stat()
+        except OSError:
+            missing += 1
+            continue
+        digest = hashlib.sha1(
+            f"{src.resolve()}|{stat.st_mtime_ns}|{stat.st_size}|stage_obj_v{_SCENE_MESH_CACHE_OBJ_VERSION}".encode("utf-8")
+        ).hexdigest()[:16]
+        dst = scene_mesh_cache_dir / f"{digest}.obj"
+        if src.resolve() != dst.resolve() and not dst.exists():
+            tmp = scene_mesh_cache_dir / f"{digest}.tmp.{os.getpid()}.{threading.get_ident()}.obj"
+            try:
+                _write_normalized_obj_for_scene_cache(src, tmp)
+                try:
+                    tmp.replace(dst)
+                except FileNotFoundError:
+                    pass
+                staged += 1
+            except OSError:
+                try:
+                    tmp.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                missing += 1
+                continue
+        # Write the staged path as absolute. Mitsuba loads the XML from
+        # `.staged_mitsuba/base/<hash>.xml` and resolves relative paths against
+        # *that* directory — a repo-relative `out/opticalnav/.../<digest>.obj`
+        # silently fails to load. The editor reads mesh paths from
+        # xml_scene_index.json (where mesh_path is recorded separately as a
+        # repo-relative path for the /mesh-cache/<filename> endpoint), so the
+        # XML filename does not need to be repo-relative.
+        staged_ref = str(dst.resolve())
+        if raw != staged_ref:
+            fn.set("value", staged_ref)
+            rewritten += 1
+
+    if rewritten:
+        try:
+            ET.indent(tree, space="  ")
+        except Exception:
+            pass
+        tree.write(str(xml_path), encoding="utf-8", xml_declaration=True)
+    return {"staged": staged, "missing": missing, "rewritten": rewritten}
+
+
+def _glb_cache_write_meta(cache_dir: Path, payload: dict[str, Any]) -> None:
+    """Drop a small ``meta.json`` next to the cached OBJ so PR1 / debug UIs can read it."""
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        meta_path = cache_dir / "meta.json"
+        meta_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _mirror_glb_obj_to_scene_mesh_cache(
+    obj_path: Path, digest: str, scene_mesh_cache_dir: "Path | None"
+) -> Path:
+    """Mirror a global glb_obj_cache OBJ into the scene's mesh_cache so the
+    frontend's basename-based ``/mesh-cache/<filename>`` endpoint can serve it
+    alongside USD-prim OBJs. Returns the scene-local path when mirroring works,
+    otherwise the original global path."""
+    if scene_mesh_cache_dir is None:
+        return obj_path
+    try:
+        scene_mesh_cache_dir.mkdir(parents=True, exist_ok=True)
+        local = scene_mesh_cache_dir / f"glb_{digest}.obj"
+        if not local.exists() or local.stat().st_size != obj_path.stat().st_size:
+            try:
+                if local.exists():
+                    local.unlink()
+                os.link(obj_path, local)
+            except (OSError, AttributeError):
+                import shutil
+                shutil.copyfile(obj_path, local)
+        return local
+    except OSError:
+        return obj_path
+
+
+def _materialize_glb_obj_for_overlay(
+    source_ref: str,
+    *,
+    repo_root: "Path | None",
+    mesh_stats: "dict[str, int] | None" = None,
+    detail_out: "dict[str, Any] | None" = None,
+    scene_mesh_cache_dir: "Path | None" = None,
+) -> "Path | None":
+    """Convert a repo-local GLB source into a cached OBJ for Mitsuba overlay shapes.
+
+    When ``detail_out`` is provided the function fills it with the staged outcome —
+    ``stage`` (``"load" | "scene_concat" | "export" | "cache_hit" | "ok"``),
+    ``error`` (string when a stage failed), and basic mesh stats. PR1 consumes this
+    to surface per-object reason in the materialization audit and the GLB cache
+    sidecar.
+    """
+    if repo_root is None:
+        if detail_out is not None:
+            detail_out.update({"stage": "skipped", "error": "repo_root not set"})
+        return None
+    lower = source_ref.lower()
+    if not (lower.endswith(".glb") or lower.endswith(".gltf")):
+        if detail_out is not None:
+            detail_out.update({"stage": "skipped", "error": "not a GLB/GLTF source"})
+        return None
+    try:
+        glb_path = resolve_repo_path(repo_root, source_ref)
+    except Exception:
+        glb_path = Path(source_ref)
+    if not glb_path.exists():
+        if mesh_stats is not None:
+            mesh_stats["glb_missing"] = mesh_stats.get("glb_missing", 0) + 1
+        if detail_out is not None:
+            detail_out.update({"stage": "load", "error": "glb file not found", "source_path": str(glb_path)})
+        return None
+
+    cache_dir: Path | None = None
+    try:
+        stat = glb_path.stat()
+        digest = hashlib.sha1(f"{glb_path.resolve()}|{stat.st_mtime_ns}|{stat.st_size}".encode("utf-8")).hexdigest()[:16]
+        cache_dir = repo_root / "out" / "control_plane_cache" / "glb_obj_cache" / digest
+        obj_path = cache_dir / "mesh.obj"
+        if obj_path.exists() and obj_path.stat().st_size > 0:
+            if mesh_stats is not None:
+                mesh_stats["glb_obj_cache_hit"] = mesh_stats.get("glb_obj_cache_hit", 0) + 1
+            mirrored = _mirror_glb_obj_to_scene_mesh_cache(obj_path, digest, scene_mesh_cache_dir)
+            if detail_out is not None:
+                detail_out.update({"stage": "cache_hit", "cache_obj": str(mirrored), "digest": digest})
+            return mirrored
+
+        import trimesh  # type: ignore
+
+        loaded = trimesh.load(str(glb_path), force="scene")
+        mesh = loaded.to_geometry() if hasattr(loaded, "to_geometry") else loaded
+        if not hasattr(mesh, "vertices") or not hasattr(mesh, "faces") or len(mesh.vertices) == 0 or len(mesh.faces) == 0:
+            if hasattr(loaded, "dump"):
+                mesh = loaded.dump(concatenate=True)
+        if not hasattr(mesh, "vertices") or not hasattr(mesh, "faces") or len(mesh.vertices) == 0 or len(mesh.faces) == 0:
+            if mesh_stats is not None:
+                mesh_stats["glb_empty"] = mesh_stats.get("glb_empty", 0) + 1
+            if detail_out is not None:
+                detail_out.update({"stage": "scene_concat", "error": "no vertices or faces after concat"})
+            if cache_dir is not None:
+                _glb_cache_write_meta(cache_dir, {
+                    "source_ref": source_ref, "source_path": str(glb_path),
+                    "mtime_ns": int(stat.st_mtime_ns), "size_bytes": int(stat.st_size),
+                    "status": "failed", "stage": "scene_concat",
+                    "error": "no vertices or faces after concat",
+                    "generated_at": _utc_now_iso(),
+                })
+            return None
+
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        mesh.export(str(obj_path), file_type="obj")
+        if mesh_stats is not None:
+            mesh_stats["glb_obj_materialized"] = mesh_stats.get("glb_obj_materialized", 0) + 1
+        vertex_count = int(len(getattr(mesh, "vertices", [])))
+        face_count = int(len(getattr(mesh, "faces", [])))
+        _glb_cache_write_meta(cache_dir, {
+            "source_ref": source_ref, "source_path": str(glb_path),
+            "mtime_ns": int(stat.st_mtime_ns), "size_bytes": int(stat.st_size),
+            "status": "ok", "stage": "export",
+            "vertex_count": vertex_count, "face_count": face_count,
+            "obj_path": str(obj_path),
+            "generated_at": _utc_now_iso(),
+        })
+        mirrored = _mirror_glb_obj_to_scene_mesh_cache(obj_path, digest, scene_mesh_cache_dir)
+        if detail_out is not None:
+            detail_out.update({
+                "stage": "ok", "cache_obj": str(mirrored), "digest": digest,
+                "vertex_count": vertex_count, "face_count": face_count,
+            })
+        return mirrored if obj_path.exists() and obj_path.stat().st_size > 0 else None
+    except Exception as exc:
+        if mesh_stats is not None:
+            mesh_stats["glb_materialize_error"] = mesh_stats.get("glb_materialize_error", 0) + 1
+        if cache_dir is not None:
+            _glb_cache_write_meta(cache_dir, {
+                "source_ref": source_ref, "source_path": str(glb_path),
+                "status": "failed", "stage": "export", "error": str(exc),
+                "generated_at": _utc_now_iso(),
+            })
+        if detail_out is not None:
+            detail_out.update({"stage": "export", "error": str(exc)})
+        return None
+
+
 def _wall_shape_xml_element(obj: dict[str, Any], material_idx: dict[str, dict[str, Any]], *, repo_root: "Path | None" = None) -> "ET.Element | None":
     """Return a Mitsuba cube <shape> element for a wall/glass overlay object, or None."""
     import math
@@ -745,6 +1436,8 @@ def _proxy_box_xml_element(
     repo_root: "Path | None" = None,
     mesh_resolver: "Callable[[str, str], tuple[Path, dict] | None] | None" = None,
     mesh_stats: "dict[str, int] | None" = None,
+    materialization_records: "list[dict[str, Any]] | None" = None,
+    scene_mesh_cache_dir: "Path | None" = None,
 ) -> "ET.Element | None":
     """Return a Mitsuba shape (OBJ when USD mesh is available, cube otherwise).
 
@@ -754,17 +1447,48 @@ def _proxy_box_xml_element(
 
     Counts (when ``mesh_stats`` provided): ``mesh_attached`` / ``cube_fallback``
     / ``mesh_resolver_error``.
+
+    When ``materialization_records`` is provided, one record per emitted shape is
+    appended. PR1 (render_scene_materialization.json) consumes this directly.
     """
     import xml.etree.ElementTree as ET
 
     geom = obj.get("geometry") or {}
     geom_type = geom.get("type")
 
+    def _record(status: str, source_type: str, *, reason: str | None = None,
+                cache_obj: str | None = None, shape_id: str | None = None,
+                extras: dict[str, Any] | None = None) -> None:
+        if materialization_records is None:
+            return
+        rec: dict[str, Any] = {
+            "object_id": str(obj.get("id") or obj.get("label") or "object"),
+            "label": _maybe_str(obj.get("label")),
+            "type": _maybe_str(obj.get("type")),
+            "source_ref": _maybe_str(obj.get("source_ref")),
+            "shape_id": shape_id or str(obj.get("id") or obj.get("label") or "object"),
+            "status": status,
+            "source_type": source_type,
+            "reason": reason,
+            "cache_obj": cache_obj,
+            "material_id": _maybe_str(obj.get("material")),
+            "is_emitter": bool(obj.get("is_emitter")),
+        }
+        if extras:
+            rec["extras"] = extras
+        materialization_records.append(rec)
+
     if geom_type == "line":
-        return _wall_shape_xml_element(obj, material_idx, repo_root=repo_root)
+        elem = _wall_shape_xml_element(obj, material_idx, repo_root=repo_root)
+        if elem is not None:
+            _record("cube", "wall_line", reason=None, shape_id=elem.get("id"))
+        else:
+            _record("dropped", "wall_line", reason="line_geometry_degenerate")
+        return elem
 
     center = geom.get("center")
     if not center or len(center) < 2:
+        _record("dropped", "primitive", reason="geometry_missing_center")
         return None
     cx, cz = float(center[0]), float(center[1])
 
@@ -792,6 +1516,7 @@ def _proxy_box_xml_element(
             pass
 
     if sx > 80.0 or sz > 80.0:
+        _record("dropped", "primitive", reason="geometry_too_large")
         return None
 
     base_height = float(geom.get("base_height_m") or 0.0)
@@ -817,14 +1542,52 @@ def _proxy_box_xml_element(
     obj_id = str(obj.get("id") or obj.get("label") or "object")
     is_emitter = bool(obj.get("is_emitter"))
 
-    # OBJ path: only when the object has a USD source_ref AND the resolver
-    # successfully produces a cached .obj. Emitters keep cube + area emitter so
-    # that radiance × area stays predictable across scenes.
+    # OBJ path: when the object has a USD source_ref and the resolver produces
+    # a cached .obj, or when a local GLB source can be materialized to OBJ.
+    # Emitters keep cube + area emitter so radiance x area stays predictable.
     obj_mesh_filename: str | None = None
     obj_extracted_material: dict[str, Any] | None = None
-    if mesh_resolver is not None and not is_emitter:
-        source_ref = _maybe_str(obj.get("source_ref"))
-        if source_ref and "#" in source_ref:
+    materialize_reason: str | None = None
+    materialize_source_type: str = "primitive"
+    materialize_cache_obj: str | None = None
+    source_ref = _maybe_str(obj.get("source_ref"))
+    if source_ref and not is_emitter:
+        source_ref_l = source_ref.lower()
+        if source_ref_l.endswith(".obj"):
+            materialize_source_type = "obj_file"
+            if repo_root is not None:
+                try:
+                    obj_path = resolve_repo_path(repo_root, source_ref)
+                except Exception:
+                    obj_path = Path(source_ref)
+                if obj_path.exists():
+                    try:
+                        obj_mesh_filename = obj_path.relative_to(repo_root).as_posix()
+                    except ValueError:
+                        obj_mesh_filename = str(obj_path)
+                    materialize_cache_obj = obj_mesh_filename
+                    obj_extracted_material = _extract_obj_mtl_material(obj_path, repo_root=repo_root)
+                else:
+                    materialize_reason = "obj_source_missing"
+            else:
+                materialize_reason = "obj_source_requires_repo_root"
+        glb_detail: dict[str, Any] = {}
+        if obj_mesh_filename is None and not source_ref_l.endswith(".obj"):
+            glb_obj_path = _materialize_glb_obj_for_overlay(
+                source_ref, repo_root=repo_root, mesh_stats=mesh_stats, detail_out=glb_detail,
+                scene_mesh_cache_dir=scene_mesh_cache_dir,
+            )
+            if glb_obj_path is not None and repo_root is not None:
+                try:
+                    obj_mesh_filename = glb_obj_path.relative_to(repo_root).as_posix()
+                except ValueError:
+                    obj_mesh_filename = str(glb_obj_path)
+                materialize_source_type = "glb"
+                materialize_cache_obj = obj_mesh_filename
+        if obj_mesh_filename is None and source_ref_l.endswith((".glb", ".gltf")):
+            materialize_source_type = "glb"
+            materialize_reason = glb_detail.get("error") or "glb_to_obj_failed"
+        elif obj_mesh_filename is None and mesh_resolver is not None and "#" in source_ref:
             try:
                 usd_ref, prim_path = source_ref.split("#", 1)
                 resolved = mesh_resolver(usd_ref, prim_path)
@@ -834,14 +1597,28 @@ def _proxy_box_xml_element(
                         obj_mesh_filename = cached_path.relative_to(repo_root).as_posix()
                     except ValueError:
                         obj_mesh_filename = str(cached_path)
+                    materialize_source_type = "usd_prim"
+                    materialize_cache_obj = obj_mesh_filename
                     em = _meta.get("extracted_material") if isinstance(_meta, dict) else None
                     if isinstance(em, dict) and not em.get("error"):
                         obj_extracted_material = em
-            except Exception:
+                else:
+                    materialize_source_type = "usd_prim"
+                    materialize_reason = "usd_prim_extraction_returned_none"
+            except Exception as exc:
                 if mesh_stats is not None:
                     mesh_stats["resolver_error"] = mesh_stats.get("resolver_error", 0) + 1
+                materialize_source_type = "usd_prim"
+                materialize_reason = f"usd_prim_resolver_error: {exc}"
+        elif obj_mesh_filename is None and materialize_reason is None:
+            materialize_reason = "invalid_source_ref"
+    elif source_ref and is_emitter:
+        # Emitters are intentionally cubes (so radiance × area stays predictable).
+        materialize_reason = "is_emitter"
+    elif not source_ref and not is_emitter:
+        materialize_reason = "no_source_ref"
 
-    if obj_mesh_filename and mesh_resolver is not None:
+    if obj_mesh_filename:
         # OBJ shape: the file already encodes geometry in metres with bottom-at-y=0.
         shape = ET.Element("shape", type="obj", id=obj_id)
         ET.SubElement(shape, "string", attrib={"name": "filename", "value": obj_mesh_filename})
@@ -875,6 +1652,28 @@ def _proxy_box_xml_element(
         )
         if mesh_stats is not None and obj_extracted_material:
             mesh_stats["usd_material_attached"] = mesh_stats.get("usd_material_attached", 0) + 1
+        material_status = _classify_extracted_material(obj_extracted_material) if obj_extracted_material else "n/a"
+        _record(
+            "obj", materialize_source_type,
+            shape_id=obj_id, cache_obj=materialize_cache_obj,
+            extras={
+                "usd_material_attached": bool(obj_extracted_material),
+                "source_material_attached": bool(obj_extracted_material),
+                "source_material_type": obj_extracted_material.get("source") if obj_extracted_material else None,
+                "extracted_material_status": material_status,
+                # Surface a tiny snippet so the UI can show "RGB 0,0,0" hints without
+                # carrying the full extracted_material blob in the audit.
+                "extracted_material_summary": (
+                    {
+                        "base_color_factor": obj_extracted_material.get("base_color_factor") if obj_extracted_material else None,
+                        "opacity_factor": obj_extracted_material.get("opacity_factor") if obj_extracted_material else None,
+                        "has_base_texture": bool(obj_extracted_material.get("base_color_texture_ref")) if obj_extracted_material else False,
+                        "has_base_asset": bool(obj_extracted_material.get("base_color_asset")) if obj_extracted_material else False,
+                        "mtl_ref": obj_extracted_material.get("mtl_ref") if obj_extracted_material else None,
+                    } if obj_extracted_material else None
+                ),
+            },
+        )
         return shape
 
     # Cube fallback (or emitter, which always uses a cube).
@@ -893,6 +1692,7 @@ def _proxy_box_xml_element(
         _append_area_emitter_xml(shape, obj)
         if mesh_stats is not None:
             mesh_stats["emitter_cube"] = mesh_stats.get("emitter_cube", 0) + 1
+        _record("emitter_cube", "primitive", shape_id=obj_id, reason="is_emitter")
         return shape
     obj_type = str(obj.get("type", ""))
     material = str(obj.get("material") or "")
@@ -906,6 +1706,11 @@ def _proxy_box_xml_element(
     _append_bsdf_xml(shape, material, material_idx, fallback_color=fallback, repo_root=repo_root)
     if mesh_stats is not None:
         mesh_stats["cube_fallback"] = mesh_stats.get("cube_fallback", 0) + 1
+    _record(
+        "fallback_cube", materialize_source_type,
+        shape_id=obj_id,
+        reason=materialize_reason or ("no_source_ref" if not source_ref else "unknown_fallback"),
+    )
     return shape
 
 
@@ -931,12 +1736,142 @@ def _append_environment_xml(root: "ET.Element", authoring_map_payload: dict[str,
 _ROOM_SHELL_WALL_THICKNESS_M = 0.08  # full thickness; renderer's old code passed wt=0.04 as a half-extent → 0.08m
 
 
+def _room_shell_enabled(authoring_map_payload: dict[str, Any]) -> bool:
+    """Walls + ceiling on/off. Phase 1: no longer controls the floor.
+
+    Defaults to True for backward compatibility. Set ``settings.room_shell_enabled = false``
+    to drop the synthetic walls + ceiling so an envmap can illuminate / be visible through
+    the bounds. The floor stays independently — see :func:`_auto_floor_enabled`.
+    """
+    settings = authoring_map_payload.get("settings") or {}
+    val = settings.get("room_shell_enabled")
+    if val is None:
+        return True
+    return bool(val)
+
+
+def _auto_floor_enabled(authoring_map_payload: dict[str, Any]) -> bool:
+    """Auto floor slab(s) on/off. Independent of walls/ceiling.
+
+    Defaults to True so existing scenes still get a base floor. Set
+    ``settings.auto_floor_enabled = false`` for a fully open scene (e.g. naked envmap).
+    """
+    settings = authoring_map_payload.get("settings") or {}
+    val = settings.get("auto_floor_enabled")
+    if val is None:
+        return True
+    return bool(val)
+
+
+def _default_floor_material_id(authoring_map_payload: dict[str, Any]) -> str:
+    """Per-region fallback when a traversable region has no ``floor_material_id``."""
+    settings = authoring_map_payload.get("settings") or {}
+    val = settings.get("default_floor_material_id")
+    return str(val) if val else "default_floor"
+
+
+def _compute_floor_slabs(authoring_map_payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """Per-traversable-region floor slabs with material assignment.
+
+    - Each traversable region's ``geometry.bounds`` rectangle → one cube slab,
+      bottom at y=-slab_h, top at y=0. Shape id = ``floor_{region_id}``.
+    - region.floor_material_id is preferred; missing → settings default.
+    - No traversable region: fall back to a single union-bounds slab using the
+      default material (matches historical behaviour).
+    - ``auto_floor_enabled == False`` → empty list (caller must skip the emit loop).
+    """
+    if not _auto_floor_enabled(authoring_map_payload):
+        return []
+    default_mid = _default_floor_material_id(authoring_map_payload)
+    slab_h = 0.05  # full thickness; top sits at y=0
+    cy = -slab_h / 2.0
+
+    regions = authoring_map_payload.get("regions") or []
+    traversable_regions: list[dict[str, Any]] = []
+    union: list[float] | None = None  # [min_x, min_z, max_x, max_z]
+    for r in regions:
+        if not isinstance(r, Mapping) or r.get("type") != "traversable":
+            continue
+        bounds = ((r.get("geometry") or {}).get("bounds")) if isinstance(r.get("geometry"), Mapping) else None
+        if not (isinstance(bounds, list) and len(bounds) == 4):
+            continue
+        try:
+            mn_x, mn_z, mx_x, mx_z = (float(bounds[0]), float(bounds[1]), float(bounds[2]), float(bounds[3]))
+        except (TypeError, ValueError):
+            continue
+        if not (mx_x > mn_x and mx_z > mn_z):
+            continue
+        traversable_regions.append({
+            "region_id": str(r.get("id") or ""),
+            "bounds": (mn_x, mn_z, mx_x, mx_z),
+            "material_id": _maybe_str(r.get("floor_material_id")) or default_mid,
+        })
+        if union is None:
+            union = [mn_x, mn_z, mx_x, mx_z]
+        else:
+            union[0] = min(union[0], mn_x); union[1] = min(union[1], mn_z)
+            union[2] = max(union[2], mx_x); union[3] = max(union[3], mx_z)
+
+    slabs: list[dict[str, Any]] = []
+    if traversable_regions:
+        for t in traversable_regions:
+            mn_x, mn_z, mx_x, mx_z = t["bounds"]
+            cx = (mn_x + mx_x) / 2.0
+            cz = (mn_z + mx_z) / 2.0
+            sx = mx_x - mn_x
+            sz = mx_z - mn_z
+            rid = t["region_id"] or "anonymous"
+            slabs.append({
+                "role": "floor",
+                "id": f"floor_{rid}",
+                "region_id": rid,
+                "center": [cx, cy, cz],
+                "size": [sx, slab_h, sz],
+                "material_id": t["material_id"],
+            })
+        return slabs
+
+    # Fallback: no traversable regions → single union slab.
+    # Prefer the editor's authoring map_w/map_h when set; otherwise the union of
+    # placed objects; otherwise a 20×20 default. Hardcoded 20×20 was producing
+    # floors that extended far past the user-configured editor extent.
+    settings_for_floor = authoring_map_payload.get("settings") or {}
+    map_w_setting = settings_for_floor.get("map_w")
+    map_h_setting = settings_for_floor.get("map_h")
+    try:
+        map_w_val = float(map_w_setting) if map_w_setting is not None else None
+        map_h_val = float(map_h_setting) if map_h_setting is not None else None
+    except (TypeError, ValueError):
+        map_w_val = map_h_val = None
+    if union is not None:
+        mn_x, mn_z, mx_x, mx_z = union[0], union[1], union[2], union[3]
+    elif map_w_val and map_h_val and map_w_val > 0 and map_h_val > 0:
+        mn_x, mn_z, mx_x, mx_z = 0.0, 0.0, map_w_val, map_h_val
+    else:
+        mn_x, mn_z, mx_x, mx_z = 0.0, 0.0, 20.0, 20.0
+    cx = (mn_x + mx_x) / 2.0
+    cz = (mn_z + mx_z) / 2.0
+    slabs.append({
+        "role": "floor",
+        "id": "floor_default",
+        "region_id": None,
+        "center": [cx, cy, cz],
+        "size": [mx_x - mn_x, slab_h, mx_z - mn_z],
+        "material_id": default_mid,
+    })
+    return slabs
+
+
 def _compute_room_shell_geometry(authoring_map_payload: dict[str, Any]) -> dict[str, Any]:
     """Compute the 6 auto-room-shape geometry (floor/ceiling slab + 4 perimeter walls).
 
     Single source of truth shared by the Mitsuba XML emitter and the editor 3D
     overlay. ``center`` is the world-space midpoint of each shape; ``size`` is
     the full extent on each axis (NOT half-extent).
+
+    The returned dict carries ``enabled`` so the editor can default its own viewer
+    overlay toggle to match the authoring intent. Shapes are always computed even
+    when disabled — the editor still needs them to draw a translucent preview.
     """
     regions = authoring_map_payload.get("regions") or []
     settings = authoring_map_payload.get("settings") or {}
@@ -970,7 +1905,13 @@ def _compute_room_shell_geometry(authoring_map_payload: dict[str, Any]) -> dict[
         "bounds": [min_x, min_z, max_x, max_z],
         "center_xz": [cx, cz],
         "extent_xz": [dx, dz],
+        # ``shapes`` keeps the legacy floor entry so older clients still see something to
+        # draw, but Phase 1 sources the actual rendered floors from ``floor_slabs``.
         "shapes": shapes,
+        "floor_slabs": _compute_floor_slabs(authoring_map_payload),
+        "auto_floor_enabled": _auto_floor_enabled(authoring_map_payload),
+        "default_floor_material_id": _default_floor_material_id(authoring_map_payload),
+        "enabled": _room_shell_enabled(authoring_map_payload),
     }
 
 
@@ -983,6 +1924,7 @@ def _generate_opticalnav_render_scene_xml(
     repo_root: "Path | None" = None,
     mesh_resolver: "Callable[[str, str], tuple[Path, dict] | None] | None" = None,
     mesh_stats: "dict[str, int] | None" = None,
+    materialization_records: "list[dict[str, Any]] | None" = None,
 ) -> int:
     """Generate a full Mitsuba render scene from authoring_map in authoring coordinates.
 
@@ -1036,38 +1978,75 @@ def _generate_opticalnav_render_scene_xml(
     _append_environment_xml(root, authoring_map_payload)
 
     def _cube(parent: "ET.Element", ex: float, ey: float, ez: float,
-              sx: float, sy: float, sz: float, material_id: str, color: str = "0.75 0.75 0.75") -> None:
-        s = ET.SubElement(parent, "shape", type="cube")
+              sx: float, sy: float, sz: float, material_id: str, color: str = "0.75 0.75 0.75",
+              shape_id: str | None = None) -> None:
+        attrib = {"type": "cube"}
+        if shape_id:
+            attrib["id"] = shape_id
+        s = ET.SubElement(parent, "shape", attrib=attrib)
         xf = ET.SubElement(s, "transform", attrib={"name": "to_world"})
         ET.SubElement(xf, "scale", x=f"{sx:.6f}", y=f"{sy:.6f}", z=f"{sz:.6f}")
         ET.SubElement(xf, "translate", x=f"{ex:.6f}", y=f"{ey:.6f}", z=f"{ez:.6f}")
         _append_bsdf_xml(s, material_id, material_idx, fallback_color=color, repo_root=repo_root)
 
-    # Build the auto room shell shapes from the helper so render + editor share
-    # a single source of truth.
+    # Phase 1: floor is its own layer with per-region materials and stable shape ids.
+    # Gated by ``settings.auto_floor_enabled`` independently of walls/ceiling.
+    _FLOOR_FALLBACK_COLOR = "0.55 0.50 0.45"
+    if shell.get("auto_floor_enabled", True):
+        for slab in (shell.get("floor_slabs") or []):
+            ex, ey, ez = slab["center"]
+            ssx, ssy, ssz = slab["size"]
+            material_id = str(slab.get("material_id") or "default_floor")
+            shape_id = str(slab.get("id") or f"floor_{slab.get('region_id') or 'auto'}")
+            root.append(ET.Comment("opticalnav-floor:" + json.dumps(
+                {"shape_id": shape_id, "region_id": slab.get("region_id"), "material_id": material_id},
+                ensure_ascii=False, separators=(",", ":"))))
+            _cube(root, ex, ey, ez, ssx / 2.0, ssy / 2.0, ssz / 2.0,
+                  material_id, color=_FLOOR_FALLBACK_COLOR, shape_id=shape_id)
+    else:
+        root.append(ET.Comment("opticalnav-floor:" + json.dumps(
+            {"shape_id": None, "region_id": None, "material_id": None, "disabled": True},
+            ensure_ascii=False, separators=(",", ":"))))
+
+    # Walls + ceiling. Phase 1 dropped floor from this loop — floor is emitted above.
     _ROOM_COLORS = {
-        "floor": ("default_floor", "0.55 0.50 0.45"),
         "ceiling": ("default_ceiling", "0.85 0.85 0.85"),
         "wall_n": ("default_wall", "0.78 0.76 0.73"),
         "wall_s": ("default_wall", "0.78 0.76 0.73"),
         "wall_e": ("default_wall", "0.78 0.76 0.73"),
         "wall_w": ("default_wall", "0.78 0.76 0.73"),
     }
-    for sh in shell["shapes"]:
-        ex, ey, ez = sh["center"]
-        wsx, wsy, wsz = sh["size"]
-        mat, color = _ROOM_COLORS.get(sh["role"], ("default_wall", "0.78 0.76 0.73"))
-        root.append(ET.Comment(json.dumps({"type": "__room_shell__", "role": sh["role"]},
+    if shell.get("enabled", True):
+        for sh in shell["shapes"]:
+            if sh.get("role") == "floor":
+                # Phase 1: floor is no longer part of the room shell. It's emitted from
+                # ``floor_slabs`` above so the user can disable walls/ceiling without
+                # losing the ground.
+                continue
+            ex, ey, ez = sh["center"]
+            wsx, wsy, wsz = sh["size"]
+            mat, color = _ROOM_COLORS.get(sh["role"], ("default_wall", "0.78 0.76 0.73"))
+            root.append(ET.Comment(json.dumps({"type": "__room_shell__", "role": sh["role"]},
+                                              ensure_ascii=False, separators=(",", ":"))))
+            _cube(root, ex, ey, ez, wsx / 2.0, wsy / 2.0, wsz / 2.0, mat, color)
+    else:
+        root.append(ET.Comment(json.dumps({"type": "__room_shell__", "role": "disabled"},
                                           ensure_ascii=False, separators=(",", ":"))))
-        _cube(root, ex, ey, ez, wsx / 2.0, wsy / 2.0, wsz / 2.0, mat, color)
 
     added = 0
+    # Mirror GLB-materialized OBJs into the scene's mesh_cache so the frontend's
+    # basename-based `/mesh-cache/<filename>` endpoint can find them (they live
+    # in a global glb_obj_cache/<digest>/mesh.obj by default — 18 GLB objects
+    # in one scene all share the basename "mesh.obj" and 404 in the editor).
+    scene_mesh_cache_dir = out_path.parent / "mesh_cache"
     for obj in overlay.get("objects") or []:
         elem = _proxy_box_xml_element(
             obj, eg_by_label, material_idx,
             repo_root=repo_root,
             mesh_resolver=mesh_resolver,
             mesh_stats=mesh_stats,
+            materialization_records=materialization_records,
+            scene_mesh_cache_dir=scene_mesh_cache_dir,
         )
         if elem is not None:
             root.append(ET.Comment(_opticalnav_obj_comment_data(obj)))
@@ -1186,6 +2165,7 @@ def _build_opticalnav_render_readiness(
     render_scene_ref: str | None,
     overlay_shape_count: int,
     generation_error: str | None = None,
+    materialization_records: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     errors: list[dict[str, Any]] = []
     warnings: list[dict[str, Any]] = []
@@ -1211,6 +2191,46 @@ def _build_opticalnav_render_readiness(
         add_check("environment", env_ok, "Environment valid", message="Envmap path is missing or unresolved.")
     else:
         add_check("environment", True, "Environment valid")
+
+    # Phase 1: floor and walls/ceiling are independent toggles. Warn when both are
+    # off under constant lighting — the scene will render almost empty/flat.
+    shell_on = _room_shell_enabled(authoring_map_payload)
+    floor_on = _auto_floor_enabled(authoring_map_payload)
+    if not shell_on and not floor_on and env_mode == "constant":
+        add_check(
+            "empty_enclosure_constant", False,
+            "No floor or enclosure",
+            level="warning",
+            message="Floor and walls/ceiling are both disabled under constant lighting; the scene may look empty or flat. Switch to envmap or re-enable at least one layer.",
+        )
+    elif not shell_on and env_mode == "constant":
+        add_check(
+            "room_shell_lighting", False,
+            "Walls & ceiling off — envmap recommended",
+            level="warning",
+            message="Walls/ceiling are disabled but environment mode is 'constant'. Switch to envmap for non-flat lighting.",
+        )
+    else:
+        add_check("room_shell_lighting", True, "Enclosure / lighting consistent", level="info")
+
+    # Floor material sanity: every traversable region with a non-default floor_material_id
+    # should resolve in the catalog. Missing entries fall back to default_floor (not blocking)
+    # so we surface as warnings instead of errors.
+    material_idx_for_floor = _material_index(authoring_map_payload)
+    default_floor_mid = _default_floor_material_id(authoring_map_payload)
+    for region in authoring_map_payload.get("regions") or []:
+        if not isinstance(region, Mapping) or region.get("type") != "traversable":
+            continue
+        floor_mid = _maybe_str(region.get("floor_material_id"))
+        if not floor_mid or floor_mid == default_floor_mid:
+            continue
+        binding = _resolve_material_binding(floor_mid, material_idx_for_floor)
+        if binding.get("unresolved"):
+            warnings.append({
+                "key": f"floor_material_unknown.{region.get('id')}",
+                "label": "Floor material unknown",
+                "message": f"Region '{region.get('id')}' floor_material_id '{floor_mid}' is not in the catalog; falling back to default_floor.",
+            })
 
     rig = dict(authoring_map_payload.get("camera_rig") or {})
     sensors = [dict(item) for item in rig.get("sensors") or [] if isinstance(item, Mapping)]
@@ -1263,12 +2283,16 @@ def _build_opticalnav_render_readiness(
         oid = str(obj.get("id") or obj.get("label") or "object")
         source_ref = _maybe_str(obj.get("source_ref"))
         if source_ref:
-            looks_like_file = any(source_ref.lower().endswith(ext) for ext in (".obj", ".ply", ".usd", ".usda", ".usdc", ".glb", ".gltf"))
+            # ``usda#/prim/path`` style source_refs end on the prim path, not the file
+            # extension; strip any ``#fragment`` so the extension test sees the actual
+            # asset filename (otherwise USD-prim objects get miscounted as proxies).
+            ref_for_check = source_ref.split("#", 1)[0]
+            looks_like_file = any(ref_for_check.lower().endswith(ext) for ext in (".obj", ".ply", ".usd", ".usda", ".usdc", ".glb", ".gltf"))
             if looks_like_file:
                 try:
-                    exists = resolve_repo_path(repo_root, source_ref).exists()
+                    exists = resolve_repo_path(repo_root, ref_for_check).exists()
                 except Exception:
-                    exists = Path(source_ref).exists()
+                    exists = Path(ref_for_check).exists()
                 if not exists:
                     asset_errors += 1
                     errors.append({"key": f"asset.{oid}", "label": "Asset path missing", "message": f"Asset source_ref does not exist: {source_ref}"})
@@ -1280,19 +2304,51 @@ def _build_opticalnav_render_readiness(
         if mat_id:
             binding = _resolve_material_binding(mat_id, material_idx)
             if binding.get("unresolved"):
-                material_errors += 1
-                errors.append({"key": f"material.{oid}", "label": "Material binding unresolved", "message": f"No render binding found for {mat_id}"})
+                # Unresolved binding → render falls back to default diffuse. Warning only.
+                proxy_warnings += 1
+                warnings.append({"key": f"material.{oid}", "label": "Material fallback", "message": f"No render binding for {mat_id!r} — default diffuse used."})
             if str(binding.get("bsdf_strategy") or "") in {"measured", "measured_polarized"}:
                 native = _maybe_str(binding.get("native_file"))
-                if not native:
+                channels_dir = _maybe_str(binding.get("channels_dir"))
+                channel_paths: list[Path] = []
+                if channels_dir:
+                    ch_root = Path(channels_dir)
+                    if not ch_root.is_absolute():
+                        ch_root = repo_root / ch_root
+                    channel_paths = [ch_root / f"{w}.pbrdf" for w in (446, 542, 614, 854)]
+                if channels_dir and all(path.exists() for path in channel_paths):
+                    continue
+                if channels_dir and channel_paths:
+                    material_errors += 1
+                    missing_channels = ", ".join(str(path) for path in channel_paths if not path.exists())
+                    errors.append({"key": f"material_source.{oid}", "label": "Measured BSDF source missing", "message": f"Measured material channel files are missing for {mat_id}: {missing_channels}"})
+                elif not native:
                     material_errors += 1
                     errors.append({"key": f"material_source.{oid}", "label": "Measured BSDF source missing", "message": f"Measured material {mat_id} has no native_file."})
                 elif not (Path(native).exists() or (repo_root / native).exists()):
                     material_errors += 1
                     errors.append({"key": f"material_source.{oid}", "label": "Measured BSDF source missing", "message": f"Measured material source does not exist: {native}"})
     checks.append({"key": "assets_exist", "ok": asset_errors == 0, "label": "All assets exist", "level": "error", "message": None if asset_errors == 0 else f"{asset_errors} asset refs are missing."})
-    checks.append({"key": "material_bindings", "ok": material_errors == 0, "label": "All material bindings resolved", "level": "error", "message": None if material_errors == 0 else f"{material_errors} material binding issues."})
-    if proxy_warnings:
+    checks.append({"key": "material_bindings", "ok": material_errors == 0, "label": "Measured material sources present", "level": "error", "message": None if material_errors == 0 else f"{material_errors} measured material source(s) missing."})
+    # Prefer PR1's per-object audit when available — it's the only signal that knows
+    # which objects ACTUALLY ended up as fallback cubes after sync. The static guess
+    # above can't tell a successful USD-prim materialization apart from a never-tried
+    # source_ref, so when the audit is present we replace the proxy count and surface
+    # a per-reason breakdown.
+    if materialization_records:
+        fallback_records = [r for r in materialization_records if r.get("status") == "fallback_cube"]
+        if fallback_records:
+            by_reason: dict[str, int] = {}
+            for r in fallback_records:
+                reason = str(r.get("reason") or "unknown")
+                by_reason[reason] = by_reason.get(reason, 0) + 1
+            top_reasons = ", ".join(f"{k}: {v}" for k, v in sorted(by_reason.items(), key=lambda kv: -kv[1])[:3])
+            warnings.append({
+                "key": "proxy_primitive",
+                "label": "Proxy primitive used",
+                "message": f"{len(fallback_records)} objects rendered as proxy primitives ({top_reasons}).",
+            })
+    elif proxy_warnings:
         warnings.append({"key": "proxy_primitive", "label": "Proxy primitive used", "message": f"{proxy_warnings} objects have no materialized asset mesh and will render as proxy primitives."})
 
     texture_profile = os.environ.get("ROBOMITUBA_TEXTURE_MAX_RESOLUTION") or "1024"
@@ -2101,6 +3157,9 @@ class RenderDaemon:
         # USD stage cache: repo-relative usd_ref → opened Usd.Stage (or None on failure)
         self._usd_stage_cache: dict[str, Any] = {}
         self._usd_stage_lock = threading.Lock()
+        # mesh_cache index: keyed by (scene_cache_dir_str) → dict[(usd_ref, prim_path) → (obj_path, meta)]
+        self._mesh_cache_index: dict[str, dict[tuple[str, str], tuple[Path, dict[str, Any]]]] = {}
+        self._mesh_cache_index_lock = threading.Lock()
         # Thumbnail background generation: asset_id → threading.Event (set when done)
         self._thumb_gen_pending: set[str] = set()
         self._thumb_gen_lock = threading.Lock()
@@ -2128,6 +3187,15 @@ class RenderDaemon:
         self._opticalnav_sync_lock = threading.Lock()
         self._opticalnav_sync_subscribers: dict[str, set[_GraphBuildSubscriber]] = {}
         self._opticalnav_sync_sub_lock = threading.Lock()
+
+        # Scene-bundle export jobs — per-job status dict + WS subscribers.
+        # The worker thread updates `_export_jobs[job_id]` and broadcasts each
+        # change to any `_export_job_subscribers[job_id]` over the matching WS
+        # connection. status.json is persisted to disk for polling fallback.
+        self._export_jobs: dict[str, dict[str, Any]] = {}
+        self._export_jobs_lock = threading.Lock()
+        self._export_job_subscribers: dict[str, set[_GraphBuildSubscriber]] = {}
+        self._export_job_sub_lock = threading.Lock()
 
         asset_root = Path(__file__).resolve().parent
         self._static_dir = asset_root / "static"
@@ -3423,6 +4491,12 @@ class RenderDaemon:
                     ):
                         self.daemon._handle_opticalnav_sync_progress_websocket(self, parsed)
                         return
+                    if (
+                        parsed.path == "/api/ws/opticalnav-export"
+                        and self.headers.get("Upgrade", "").lower() == "websocket"
+                    ):
+                        self.daemon._handle_export_job_websocket(self, parsed)
+                        return
                     self.daemon._handle_get(self)
                 except Exception:
                     self._log_exception("GET")
@@ -3555,6 +4629,20 @@ class RenderDaemon:
             with self._scene_telemetry_lock:
                 self._scene_telemetry_subscribers.discard(subscriber)
 
+    def _patch_opticalnav_annotation_sync(self, project_dir: Path, scene_id: str, patch: Mapping[str, Any]) -> bool:
+        annotation_path = project_dir / "scenes" / scene_id / "scene_annotation.json"
+        if not annotation_path.exists():
+            return False
+        try:
+            raw = json.loads(annotation_path.read_text(encoding="utf-8"))
+            sync = dict(raw.get("metadata", {}).get("sync", {}))
+            sync.update(dict(patch))
+            raw.setdefault("metadata", {})["sync"] = sync
+            annotation_path.write_text(json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8")
+            return True
+        except Exception:
+            return False
+
     def _run_render_scene_sync_inner(
         self,
         project_dir: Path,
@@ -3570,13 +4658,21 @@ class RenderDaemon:
             load_authoring_map,
             save_authoring_map,
         )
-        from navigation_dataset.scene_annotations import read_scene_annotation, write_scene_annotation
+        from navigation_dataset.scene_annotations import SceneAnnotation, read_scene_annotation, write_scene_annotation
         from navigation_dataset.scene_sync import write_render_scene_sync
 
         scene_dir = project_dir / "scenes" / scene_id
         map_path = scene_dir / "authoring_map.json"
         annotation_path = scene_dir / "scene_annotation.json"
         envmap_invalidated: dict[str, Any] | None = None
+        # Phase 3 readiness split: render sync used to require a fully compiled
+        # scene_annotation.json (which itself required a traversable region) before
+        # producing render_scene.xml. That coupled Dataset readiness with Render
+        # readiness — a user with no traversable region drawn yet couldn't even
+        # render their scene. We now read the annotation when present, and fall
+        # back to a minimal one (scene_id only) so XML emit always succeeds.
+        # Dataset compile remains as a separate workflow.
+        annotation_missing = False
         # Wipe the .staged_mitsuba/ cache up-front: any in-flight render job that
         # already resolved a staged_xml path under the previous render_scene.xml
         # would otherwise keep loading stale envmap / texture refs.
@@ -3586,7 +4682,14 @@ class RenderDaemon:
             envmap_invalidated = self._opticalnav_invalidate_missing_envmap(
                 authoring_map, map_path, scene_dir,
             )
-            annotation = read_scene_annotation(annotation_path)
+            try:
+                annotation = read_scene_annotation(annotation_path)
+            except (FileNotFoundError, ValueError, OSError):
+                annotation_missing = True
+                # Minimal annotation: render only needs scene_id and the
+                # coordinate_system default. Hazard / goal / traversable lists
+                # stay empty; dataset workflows still flag this separately.
+                annotation = SceneAnnotation(scene_id=scene_id)
             result = write_render_scene_sync(
                 scene_dir, authoring_map, annotation,
                 project_dir=project_dir,
@@ -3629,6 +4732,7 @@ class RenderDaemon:
                 return res
 
             t_mesh_start = time.perf_counter()
+            materialization_records: list[dict[str, Any]] = []
             overlay_shape_count = _generate_opticalnav_render_scene_xml(
                 authoring_payload,
                 result.overlay,
@@ -3637,9 +4741,43 @@ class RenderDaemon:
                 repo_root=self.repo_root,
                 mesh_resolver=_resolve_prim_obj,
                 mesh_stats=mesh_extraction_stats,
+                materialization_records=materialization_records,
             )
             mesh_extraction_stats["extraction_time_ms"] = int((time.perf_counter() - t_mesh_start) * 1000)
             render_scene_ref = render_scene_path.relative_to(self.repo_root).as_posix()
+            mesh_extraction_stats["scene_mesh_cache"] = _stage_xml_obj_filenames_to_scene_mesh_cache(
+                render_scene_path,
+                scene_mesh_cache_dir=self._opticalnav_mesh_cache_dir(project_dir, scene_id),
+                repo_root=self.repo_root,
+            )
+
+            # PR1: per-object materialization audit + XML scene index sidecars.
+            # Both consume the records collected during XML emit and the freshly written
+            # render_scene.xml, so they sit at the tail of the generation block.
+            try:
+                audit_payload = _build_materialization_audit(
+                    scene_id=scene_id,
+                    overlay_objects=list(result.overlay.get("objects") or []),
+                    materialization_records=materialization_records,
+                    mesh_stats=mesh_extraction_stats,
+                )
+                (scene_dir / "render_scene_materialization.json").write_text(
+                    json.dumps(audit_payload, ensure_ascii=False, indent=2), encoding="utf-8",
+                )
+            except Exception as exc:
+                mesh_extraction_stats["materialization_audit_error"] = str(exc)
+            try:
+                xml_index = _build_xml_scene_index(
+                    render_scene_path,
+                    scene_id=scene_id,
+                    materialization_records=materialization_records,
+                )
+                if xml_index is not None:
+                    (scene_dir / "xml_scene_index.json").write_text(
+                        json.dumps(xml_index, ensure_ascii=False, indent=2), encoding="utf-8",
+                    )
+            except Exception as exc:
+                mesh_extraction_stats["xml_scene_index_error"] = str(exc)
         except Exception as exc:
             generation_error = str(exc)
 
@@ -3653,6 +4791,7 @@ class RenderDaemon:
             render_scene_ref=render_scene_ref,
             overlay_shape_count=overlay_shape_count,
             generation_error=generation_error,
+            materialization_records=materialization_records,
         )
         render_readiness_path.write_text(json.dumps(readiness, ensure_ascii=False, indent=2), encoding="utf-8")
         readiness_ref = render_readiness_path.relative_to(project_dir).as_posix()
@@ -3675,7 +4814,7 @@ class RenderDaemon:
             _raw = json.loads(annotation_path.read_text(encoding="utf-8"))
         except Exception:
             _raw = {"scene_id": scene_id}
-        _raw.setdefault("metadata", {})["sync"] = {
+        sync_payload = {
             **dict(_raw.get("metadata", {}).get("sync", {})),
             **result.sync,
             "render_scene": "synced" if readiness.get("ok") else "blocked",
@@ -3686,6 +4825,7 @@ class RenderDaemon:
             "render_readiness_ref": readiness_ref,
             "render_readiness_status": readiness.get("status"),
         }
+        _raw.setdefault("metadata", {})["sync"] = sync_payload
         annotation_path.write_text(json.dumps(_raw, ensure_ascii=False, indent=2), encoding="utf-8")
         body = {
             "ok": bool(readiness.get("ok")),
@@ -3701,7 +4841,7 @@ class RenderDaemon:
             "render_scene_overlay_ref": result.overlay_ref,
             "render_scene_xml_ref": render_scene_ref,
             "render_readiness_ref": readiness_ref,
-            "sync": annotation.metadata["sync"],
+            "sync": sync_payload,
             "scene_variant": sv,
             "overlay": result.overlay,
             "render_readiness": readiness,
@@ -3711,6 +4851,7 @@ class RenderDaemon:
             "sync_job_id": sync_job_id,
             "envmap_invalidated": envmap_invalidated,
             "staged_cleared": staged_cleared,
+            "annotation_missing": annotation_missing,
         }
         return int(HTTPStatus.OK), body
 
@@ -3808,6 +4949,357 @@ class RenderDaemon:
         finally:
             with self._graph_build_sub_lock:
                 bucket = self._graph_build_subscribers.get(progress_key, set())
+                bucket.discard(subscriber)
+
+    # ── Scene-bundle export jobs ─────────────────────────────────────────
+
+    _EXPORT_STAGE_LABELS = {
+        "scope": "Export 범위 확인",
+        "validate": "데이터셋 검사",
+        "select_episodes": "내보낼 episode 선택",
+        "build_manifest": "index/split 작성",
+        "generate_thumbnails": "에피소드 썸네일 생성",
+        "collect_files": "파일 수집",
+        "zip_files": "파일 압축",
+        "finalize": "다운로드 준비",
+    }
+
+    def _export_status_path(self, project_dir: Path, job_id: str) -> Path:
+        return project_dir / "exports" / job_id / "export_status.json"
+
+    def _publish_export_progress(self, job_id: str, project_dir: Path, **updates: Any) -> None:
+        """Apply updates to the in-memory job state, write status.json atomically,
+        and broadcast to any WS subscribers."""
+        with self._export_jobs_lock:
+            state = dict(self._export_jobs.get(job_id) or {})
+            state.update({k: v for k, v in updates.items() if v is not None or k in ("error", "summary", "current_file")})
+            state["job_id"] = job_id
+            state["updated_at"] = _utc_now_iso()
+            if "stage" in updates and updates["stage"]:
+                state["stage_label"] = self._EXPORT_STAGE_LABELS.get(updates["stage"], updates["stage"])
+            self._export_jobs[job_id] = state
+            snapshot = dict(state)
+        # Atomic write to disk (tmp + rename) so polling readers never see a
+        # half-written JSON.
+        try:
+            status_path = self._export_status_path(project_dir, job_id)
+            status_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = status_path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
+            tmp.replace(status_path)
+        except OSError:
+            pass
+        with self._export_job_sub_lock:
+            subs = list(self._export_job_subscribers.get(job_id, ()))
+        for s in subs:
+            try:
+                s.send_json(snapshot)
+            except Exception:
+                pass
+
+    def _export_cancel_requested(self, job_id: str) -> bool:
+        with self._export_jobs_lock:
+            return bool((self._export_jobs.get(job_id) or {}).get("cancel_requested"))
+
+    def _run_export_job(
+        self,
+        job_id: str,
+        project_id: str,
+        project_dir: Path,
+        scene_id: str,
+        only_completed: bool,
+        episode_ids: list[str] | None,
+        include_episode_thumbnails: bool,
+    ) -> None:
+        """Background worker — runs the 7-/8-stage scene bundle export.
+
+        Stages, in order: scope → validate → select_episodes → build_manifest
+        → [generate_thumbnails] → collect_files → zip_files → finalize.
+        Each stage publishes progress so the WS / polling consumers can render
+        a meaningful progress card; cancel is checked at every file boundary.
+        """
+        import shutil
+        from navigation_dataset.episode_schema import read_episode
+        from navigation_dataset.exporters.custom_json import (
+            build_dataset_index,
+            find_episode_files,
+            is_episode_complete,
+            iter_export_files,
+            write_dataset_index_from,
+            write_split_files_from,
+        )
+        from navigation_dataset.validation import validate_dataset
+
+        exports_root = project_dir / "exports" / job_id
+        staging = exports_root / "staging"
+        ts = _utc_now().strftime("%Y%m%dT%H%M%SZ")
+        zip_path = exports_root / f"{scene_id}_{ts}.zip"
+
+        def publish(**kwargs: Any) -> None:
+            self._publish_export_progress(job_id, project_dir, **kwargs)
+
+        class Cancelled(Exception):
+            pass
+
+        def check_cancel() -> None:
+            if self._export_cancel_requested(job_id):
+                raise Cancelled()
+
+        try:
+            publish(
+                status="running",
+                stage="scope",
+                message=f"scene={scene_id}, only_completed={only_completed}",
+                current=0,
+                total=0,
+                bytes_current=0,
+                bytes_total=0,
+            )
+            check_cancel()
+
+            publish(stage="validate", message="checking dataset")
+            report = validate_dataset(project_dir, scene_ids=[scene_id])
+            if not report.ok:
+                publish(status="failed", error="validation failed", summary={"errors": report.errors})
+                return
+            check_cancel()
+
+            # ── select_episodes ────────────────────────────────────────────
+            all_paths = find_episode_files(project_dir)
+            scene_paths = [
+                p for p in all_paths
+                if read_episode(p).scene_id == scene_id
+            ]
+            allow_ep = set(episode_ids) if episode_ids else None
+            publish(stage="select_episodes", current=0, total=len(scene_paths), message="filtering")
+            kept_paths: list[Path] = []
+            kept_episodes = []
+            for i, path in enumerate(scene_paths):
+                check_cancel()
+                try:
+                    ep = read_episode(path)
+                except Exception:
+                    continue
+                ok = True
+                if allow_ep is not None and ep.episode_id not in allow_ep:
+                    ok = False
+                if ok and only_completed and not is_episode_complete(ep, project_dir):
+                    ok = False
+                if ok:
+                    kept_paths.append(path)
+                    kept_episodes.append(ep)
+                publish(
+                    stage="select_episodes",
+                    current=i + 1,
+                    total=len(scene_paths),
+                    message=ep.episode_id,
+                )
+            episodes_kept = len(kept_paths)
+            episodes_skipped = len(scene_paths) - episodes_kept
+
+            # ── build_manifest ─────────────────────────────────────────────
+            publish(stage="build_manifest", message="writing dataset.json + splits/*.json", current=0, total=0)
+            staging.mkdir(parents=True, exist_ok=True)
+            index_payload = build_dataset_index(
+                project_dir,
+                scene_ids=[scene_id],
+                only_completed=only_completed,
+                episode_ids=episode_ids,
+            )
+            write_dataset_index_from(index_payload, staging)
+            write_split_files_from(index_payload, staging)
+            check_cancel()
+
+            # ── generate_thumbnails (opt-in) ───────────────────────────────
+            if include_episode_thumbnails and kept_episodes:
+                publish(stage="generate_thumbnails", current=0, total=len(kept_episodes), message="copying RGB along episode paths")
+                for ep_idx, ep in enumerate(kept_episodes):
+                    check_cancel()
+                    if not ep.path_nodes or not ep.path_headings:
+                        continue
+                    pairs = list(zip(ep.path_nodes, ep.path_headings))
+                    pad = len(str(max(len(pairs) - 1, 0)))
+                    thumb_dir = staging / "thumbnails" / ep.episode_id
+                    thumb_dir.mkdir(parents=True, exist_ok=True)
+                    for step_idx, (vp, h) in enumerate(pairs):
+                        rgb = (
+                            project_dir / "scenes" / scene_id / "observations" /
+                            str(vp) / str(h) / "rgb.png"
+                        )
+                        if rgb.is_file():
+                            dst_name = f"{str(step_idx).zfill(max(pad, 2))}_{vp}_{h}_rgb.png"
+                            shutil.copy2(rgb, thumb_dir / dst_name)
+                    publish(
+                        stage="generate_thumbnails",
+                        current=ep_idx + 1,
+                        total=len(kept_episodes),
+                        message=ep.episode_id,
+                    )
+
+            # ── collect_files ──────────────────────────────────────────────
+            publish(stage="collect_files", message="resolving bundle contents", current=0, total=0)
+            files = list(iter_export_files(project_dir, index_payload, kept_episodes))
+            bytes_total = sum(src.stat().st_size for src, _ in files)
+            publish(
+                stage="collect_files",
+                current=0,
+                total=len(files),
+                bytes_total=bytes_total,
+                message=f"{len(files)} files queued",
+            )
+            # Persist file manifest for audit.
+            try:
+                manifest_payload = {
+                    "scene_id": scene_id,
+                    "file_count": len(files),
+                    "bytes_total": bytes_total,
+                    "files": [{"src": str(src), "dst": dst, "bytes": src.stat().st_size} for src, dst in files],
+                }
+                (exports_root / "export_file_manifest.json").write_text(
+                    json.dumps(manifest_payload, ensure_ascii=False, indent=2), encoding="utf-8",
+                )
+            except OSError:
+                pass
+            # Copy into staging with throttled publishes (~200ms).
+            last_pub = 0.0
+            bytes_current = 0
+            for i, (src, dst_rel) in enumerate(files):
+                check_cancel()
+                dst = staging / dst_rel
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    shutil.copy2(src, dst)
+                    bytes_current += src.stat().st_size
+                except OSError:
+                    pass
+                now = time.monotonic()
+                if now - last_pub > 0.2 or i + 1 == len(files):
+                    publish(
+                        stage="collect_files",
+                        current=i + 1,
+                        total=len(files),
+                        bytes_current=bytes_current,
+                        bytes_total=bytes_total,
+                        current_file=dst_rel,
+                    )
+                    last_pub = now
+
+            # ── zip_files ──────────────────────────────────────────────────
+            staging_files = sorted(p for p in staging.rglob("*") if p.is_file())
+            zip_bytes_total = sum(p.stat().st_size for p in staging_files)
+            publish(
+                stage="zip_files",
+                current=0,
+                total=len(staging_files),
+                bytes_current=0,
+                bytes_total=zip_bytes_total,
+                message=f"compressing {len(staging_files)} files",
+            )
+            zip_path.parent.mkdir(parents=True, exist_ok=True)
+            zip_bytes_current = 0
+            last_pub = 0.0
+            with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                for i, p in enumerate(staging_files):
+                    check_cancel()
+                    arcname = p.relative_to(staging).as_posix()
+                    zf.write(p, arcname)
+                    zip_bytes_current += p.stat().st_size
+                    now = time.monotonic()
+                    if now - last_pub > 0.2 or i + 1 == len(staging_files):
+                        publish(
+                            stage="zip_files",
+                            current=i + 1,
+                            total=len(staging_files),
+                            bytes_current=zip_bytes_current,
+                            bytes_total=zip_bytes_total,
+                            current_file=p.name,
+                        )
+                        last_pub = now
+
+            # ── finalize ──────────────────────────────────────────────────
+            publish(stage="finalize", message="writing report")
+            zip_size = zip_path.stat().st_size if zip_path.exists() else 0
+            zip_ref = zip_path.relative_to(self.repo_root).as_posix()
+            duration = time.monotonic() - 0  # filled by caller
+            report_payload = {
+                "job_id": job_id,
+                "project_id": project_id,
+                "scene_id": scene_id,
+                "only_completed": only_completed,
+                "include_episode_thumbnails": include_episode_thumbnails,
+                "episodes_total_in_scope": len(scene_paths),
+                "episodes_exported": episodes_kept,
+                "episodes_skipped": episodes_skipped,
+                "files_packaged": len(staging_files),
+                "zip_size_bytes": zip_size,
+                "zip_ref": zip_ref,
+                "download_url": f"/artifacts?path={quote(zip_ref)}",
+                "generated_at": _utc_now_iso(),
+            }
+            try:
+                (exports_root / "export_report.json").write_text(
+                    json.dumps(report_payload, ensure_ascii=False, indent=2), encoding="utf-8",
+                )
+            except OSError:
+                pass
+            publish(
+                status="succeeded",
+                stage="finalize",
+                message="export complete",
+                summary=report_payload,
+                current=len(staging_files),
+                total=len(staging_files),
+                bytes_current=zip_bytes_current,
+                bytes_total=zip_bytes_total,
+            )
+            # Cleanup staging (optional — keep for now so user can inspect on error).
+            try:
+                shutil.rmtree(staging, ignore_errors=True)
+            except OSError:
+                pass
+        except Cancelled:
+            publish(status="cancelled", message="export cancelled")
+        except Exception as exc:
+            import traceback
+            traceback.print_exc(file=sys.stderr)
+            publish(status="failed", error=f"{type(exc).__name__}: {exc}")
+
+    def _handle_export_job_websocket(self, handler: BaseHTTPRequestHandler, parsed: Any) -> None:
+        key = handler.headers.get("Sec-WebSocket-Key", "").strip()
+        if not key:
+            handler.send_error(HTTPStatus.BAD_REQUEST, "Missing Sec-WebSocket-Key")
+            return
+        accept = base64.b64encode(hashlib.sha1(f"{key}{_WS_GUID}".encode("ascii")).digest()).decode("ascii")
+        handler.send_response(HTTPStatus.SWITCHING_PROTOCOLS)
+        handler.send_header("Upgrade", "websocket")
+        handler.send_header("Connection", "Upgrade")
+        handler.send_header("Sec-WebSocket-Accept", accept)
+        handler.end_headers()
+        query = parse_qs(parsed.query or "")
+        job_id = _maybe_str((query.get("job_id") or [None])[0]) or ""
+        subscriber = _GraphBuildSubscriber(handler=handler, lock=threading.Lock())
+        with self._export_job_sub_lock:
+            bucket = self._export_job_subscribers.setdefault(job_id, set())
+            bucket.add(subscriber)
+        try:
+            with self._export_jobs_lock:
+                state = self._export_jobs.get(job_id)
+            try:
+                subscriber.send_json(state if state is not None else {"job_id": job_id, "status": "unknown"})
+            except Exception:
+                pass
+            while not self._shutdown:
+                frame = self._read_ws_frame(handler)
+                if frame is None:
+                    break
+                opcode, payload = frame
+                if opcode == 0x8:
+                    break
+                if opcode == 0x9:
+                    self._write_ws_frame(handler, payload, opcode=0xA)
+        finally:
+            with self._export_job_sub_lock:
+                bucket = self._export_job_subscribers.get(job_id, set())
                 bucket.discard(subscriber)
 
     def _handle_job_status_websocket(self, handler: BaseHTTPRequestHandler) -> None:
@@ -4576,13 +6068,33 @@ class RenderDaemon:
     _ASSET_THUMBNAIL_VERSION = "mesh_thumb_v2"
 
     def _get_cached_usd_stage(self, usd_ref: str) -> Any | None:
-        """Return a cached opened USD stage, opening it lazily (thread-safe, no duplicate opens)."""
+        """Return a cached opened USD stage, opening it lazily.
+
+        Thread-safe: only ONE thread opens each USD file; others wait on a
+        threading.Event until it's ready, preventing duplicate Stage.Open calls
+        for the same large binary USD (e.g. 856 MB moorelane).
+        """
+        # Fast-path: already cached (stage or None for failed open)
         with self._usd_stage_lock:
-            if usd_ref in self._usd_stage_cache:
-                return self._usd_stage_cache[usd_ref]
-            # Insert sentinel while holding the lock so concurrent threads wait rather than
-            # all opening the same large file simultaneously.
-            self._usd_stage_cache[usd_ref] = None  # placeholder
+            entry = self._usd_stage_cache.get(usd_ref, _MISSING := object())
+            if entry is not _MISSING:
+                if isinstance(entry, threading.Event):
+                    event: threading.Event = entry
+                else:
+                    return entry  # None or real stage
+            else:
+                # We are the loading thread — store an Event as sentinel
+                event = threading.Event()
+                self._usd_stage_cache[usd_ref] = event
+
+        if isinstance(entry, threading.Event):
+            # Another thread is loading — wait (up to 120 s for large USD files)
+            event.wait(timeout=120.0)
+            with self._usd_stage_lock:
+                result = self._usd_stage_cache.get(usd_ref)
+            return result if not isinstance(result, threading.Event) else None
+
+        # This thread opens the stage
         try:
             from pxr import Usd  # type: ignore
             usd_path = resolve_repo_path(self.repo_root, usd_ref)
@@ -4591,6 +6103,7 @@ class RenderDaemon:
             stage = None
         with self._usd_stage_lock:
             self._usd_stage_cache[usd_ref] = stage
+        event.set()  # wake up all waiting threads
         return stage
 
     def _render_mesh_to_png(self, vertices_flat: list, indices_flat: list, color: tuple, size: int = 84) -> bytes | None:
@@ -4820,7 +6333,7 @@ class RenderDaemon:
     def _asset_tags_for(self, category: str, label: str, source_path: str) -> list[str]:
         key = f"{category} {label} {source_path}".lower()
         tags = [category] if category else []
-        for token in ("chair", "table", "plant", "sofa", "desk", "cabinet", "door", "window", "glass", "mirror", "wall"):
+        for token in ("chair", "table", "plant", "sofa", "desk", "cabinet", "shelf", "door", "window", "glass", "mirror", "wall", "keyboard", "mouse", "monitor", "printer", "copier", "fire", "lamp", "light"):
             if token in key and token not in tags:
                 tags.append(token)
         return tags
@@ -4832,6 +6345,12 @@ class RenderDaemon:
             return "mirror"
         if category == "floor":
             return "pbrdf_2020:ceramic_alumina"
+        if category == "electronics":
+            return "pbrdf_2020:black_billiard"
+        if category == "lighting":
+            return "pbrdf_2020:brass"
+        if category == "safety":
+            return "pbrdf_2020:red_billiard"
         if category in {"furniture", "plant"}:
             return "pbrdf_2020:peek"
         return "pbrdf_2020:white_billiard"
@@ -4978,8 +6497,10 @@ class RenderDaemon:
         key = label.lower()
         for category, tokens in {
             "furniture": ("chair", "table", "desk", "sofa", "stool", "cabinet", "shelf"),
+            "electronics": ("camera", "phone", "laptop", "keyboard", "remote", "mouse", "monitor", "screen", "computer", "speaker", "calculator"),
+            "safety": ("fire", "extinguisher", "alarm"),
+            "lighting": ("lamp", "light", "fixture", "chandelier", "led"),
             "kitchenware": ("cup", "bowl", "plate", "mug", "pan", "pot", "bottle"),
-            "electronics": ("camera", "phone", "laptop", "keyboard", "remote"),
             "plant": ("plant", "vase"),
             "object": (),
         }.items():
@@ -5504,10 +7025,22 @@ class RenderDaemon:
 
     def _opticalnav_episode_summary(self, project_dir: Path, episode_path: Path) -> dict[str, Any]:
         from navigation_dataset.episode_schema import read_episode
+        from navigation_dataset.exporters.custom_json import is_episode_complete
 
         episode = read_episode(episode_path)
-        observation_refs = [step.observation_bundle_ref for step in episode.timesteps]
-        complete = bool(observation_refs) and all(bool(ref) and (project_dir / str(ref)).exists() for ref in observation_refs)
+        # Disk-based check — episode.timesteps[i].observation_bundle_ref is
+        # populated at episode-creation time only, so the previous heuristic
+        # marked everything as "planned" once the user rendered via the daemon
+        # batch path (which doesn't back-write to episode JSON).
+        complete = is_episode_complete(episode, project_dir)
+        # Per-step rendered count from the consolidated observations dir so the
+        # UI can show partial-progress hints alongside the boolean flag.
+        rendered_steps = 0
+        if episode.path_nodes and episode.path_headings and len(episode.path_nodes) == len(episode.path_headings):
+            obs_root = project_dir / "scenes" / str(episode.scene_id) / "observations"
+            for node_id, heading_id in zip(episode.path_nodes, episode.path_headings):
+                if (obs_root / str(node_id) / str(heading_id)).is_dir():
+                    rendered_steps += 1
         return {
             "episode_id": episode.episode_id,
             "scene_id": episode.scene_id,
@@ -5515,6 +7048,8 @@ class RenderDaemon:
             "navigation_mode": episode.navigation_mode,
             "status": "rendered" if complete else "planned",
             "timestep_count": len(episode.timesteps),
+            "path_node_count": len(episode.path_nodes),
+            "rendered_step_count": rendered_steps,
             "hazard_collision": any(step.hazard_collision for step in episode.timesteps),
             "observation_complete": complete,
             "path": episode_path.relative_to(project_dir).as_posix(),
@@ -5703,6 +7238,12 @@ class RenderDaemon:
         for scene_id in sorted(set(scene_ids)):
             annotation_path = project_dir / "scenes" / scene_id / "scene_annotation.json"
             if not annotation_path.exists():
+                missing.append({
+                    "key": f"{scene_id}.scene_annotation",
+                    "label": f"{scene_id} annotation",
+                    "reason": "scene_annotation.json is missing.",
+                    "action": "compile_authoring_map",
+                })
                 continue
             sync: dict[str, Any] = {}
             try:
@@ -5802,7 +7343,11 @@ class RenderDaemon:
             "missing": missing,
             "next_action": {
                 "id": missing[0]["action"],
-                "label": "Sync Render Scene" if missing[0]["action"] == "sync_render_scene" else "Configure Sensor Sweep",
+                "label": (
+                    "Sync Render Scene" if missing[0]["action"] == "sync_render_scene"
+                    else "Compile Authoring Map" if missing[0]["action"] == "compile_authoring_map"
+                    else "Configure Sensor Sweep"
+                ),
             },
         }
 
@@ -6472,31 +8017,36 @@ class RenderDaemon:
             map_path = scene_dir / "authoring_map.json"
             xml_path = scene_dir / "render_scene.xml"
             try:
+                map_exists = map_path.exists()
                 if map_path.exists():
                     payload = authoring_map_to_payload(load_authoring_map(map_path))
                 else:
                     payload = authoring_map_to_payload(starter_authoring_map(scene_id, f"/api/scenes/{quote(scene_id, safe='')}/floorplan"))
-                # If render_scene.xml exists with embedded opticalnav-obj comments,
-                # use its objects as the authoritative source (they may be newer than
-                # authoring_map.json after Phase 3 migration).
+                # authoring_map.json is the editor's canonical state. Older
+                # builds embedded opticalnav-obj comments in render_scene.xml
+                # and this endpoint used those comments as a migration source.
+                # Keeping XML authoritative after the map exists is unsafe:
+                # Save Map can persist a transform to authoring_map.json while
+                # a stale render_scene.xml still contains the previous transform,
+                # causing a hard reload to "undo" saved edits.
+                map_has_objects = bool(payload.get("objects"))
                 if xml_path.exists():
-                    xml_objects = _extract_opticalnav_objects_from_xml(xml_path)
-                    if xml_objects:
+                    xml_objects = _extract_opticalnav_objects_from_xml(xml_path) if (not map_exists or not map_has_objects) else []
+                    if xml_objects and (not map_exists or not map_has_objects):
                         payload = dict(payload)
-                        # Rebuild authoring objects from XML metadata while keeping
-                        # regions/settings/camera_rig from authoring_map.json.
+                        # Migration fallback only: rebuild authoring objects
+                        # from XML metadata when no canonical map objects exist.
                         payload["objects"] = xml_objects
                     xml_scene_meta = _extract_opticalnav_scene_meta_from_xml(xml_path)
-                    if xml_scene_meta:
-                        # Prefer XML-embedded environment + camera_rig over JSON
-                        # (they may have been updated without a full re-save of authoring_map.json).
-                        if xml_scene_meta.get("environment"):
+                    if xml_scene_meta and (not map_exists):
+                        # Migration fallback for pre-authoring_map scenes.
+                        if xml_scene_meta.get("environment") and not payload.get("environment"):
                             payload = dict(payload)
                             payload["environment"] = xml_scene_meta["environment"]
-                        if xml_scene_meta.get("camera_rig"):
+                        if xml_scene_meta.get("camera_rig") and not payload.get("camera_rig"):
                             payload = dict(payload)
                             payload["camera_rig"] = xml_scene_meta["camera_rig"]
-                        if xml_scene_meta.get("materials"):
+                        if xml_scene_meta.get("materials") and not payload.get("materials"):
                             payload = dict(payload)
                             payload["materials"] = xml_scene_meta["materials"]
             except Exception as exc:
@@ -6535,7 +8085,8 @@ class RenderDaemon:
                     handler.send_header("ETag", f'"{etag}"')
                     handler.end_headers()
                     return True
-                result = extract_prim_mesh_for_editor(usd_path, source_path_raw)
+                cached_stage = self._get_cached_usd_stage(usd_ref)
+                result = extract_prim_mesh_for_editor(usd_path, source_path_raw, stage=cached_stage)
                 if result is None:
                     self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": f"Prim has no mesh geometry: {source_path_raw}"})
                     return True
@@ -6607,6 +8158,24 @@ class RenderDaemon:
                 self._send_json(handler, HTTPStatus.OK, self._opticalnav_render_batch_payload(project_dir, parts[2]))
             except KeyError:
                 self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": f"Unknown batch_id: {parts[2]}"})
+            return True
+        if len(parts) == 3 and parts[1] == "export-jobs":
+            job_id = parts[2]
+            with self._export_jobs_lock:
+                state = self._export_jobs.get(job_id)
+            if state is None:
+                # Cold fallback: read status.json from disk (e.g., after daemon
+                # restart or for a finished job that's no longer in memory).
+                status_path = self._export_status_path(project_dir, job_id)
+                if status_path.exists():
+                    try:
+                        state = _read_json(status_path)
+                    except Exception:
+                        state = None
+            if state is None:
+                self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": f"Unknown export job: {job_id}"})
+                return True
+            self._send_json(handler, HTTPStatus.OK, state)
             return True
         if len(parts) == 2 and parts[1] == "graph-render-batches":
             self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": "Missing graph batch id."})
@@ -6821,6 +8390,38 @@ class RenderDaemon:
             scene_id = parts[2]
             self._send_json(handler, HTTPStatus.OK, self._opticalnav_render_scene_stats(project_dir, scene_id))
             return True
+        if len(parts) == 4 and parts[1] == "scenes" and parts[3] == "render-scene-materialization":
+            scene_id = parts[2]
+            path = project_dir / "scenes" / scene_id / "render_scene_materialization.json"
+            if not path.exists():
+                self._send_json(handler, HTTPStatus.NOT_FOUND, {
+                    "error": "render_scene_materialization.json not found. Run Sync Render Scene.",
+                    "scene_id": scene_id,
+                })
+                return True
+            try:
+                payload = _read_json(path)
+            except Exception as exc:
+                self._send_json(handler, HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
+                return True
+            self._send_json(handler, HTTPStatus.OK, payload)
+            return True
+        if len(parts) == 4 and parts[1] == "scenes" and parts[3] == "xml-scene-index":
+            scene_id = parts[2]
+            path = project_dir / "scenes" / scene_id / "xml_scene_index.json"
+            if not path.exists():
+                self._send_json(handler, HTTPStatus.NOT_FOUND, {
+                    "error": "xml_scene_index.json not found. Run Sync Render Scene.",
+                    "scene_id": scene_id,
+                })
+                return True
+            try:
+                payload = _read_json(path)
+            except Exception as exc:
+                self._send_json(handler, HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
+                return True
+            self._send_json(handler, HTTPStatus.OK, payload)
+            return True
         if len(parts) == 4 and parts[1] == "scenes" and parts[3] == "material-debug":
             scene_id = parts[2]
             prim_path = _maybe_str((query.get("prim_path") or [None])[0])
@@ -6893,8 +8494,102 @@ class RenderDaemon:
                             "envmap_ref": ref,
                             "size_bytes": item.stat().st_size,
                             "updated_at": datetime.fromtimestamp(item.stat().st_mtime, timezone.utc).isoformat(),
+                            "previewable": item.suffix.lower() in {".png", ".jpg", ".jpeg"},
                         })
             self._send_json(handler, HTTPStatus.OK, {"ok": True, "scene_id": scene_id, "envmaps": files})
+            return True
+        if len(parts) == 5 and parts[1] == "scenes" and parts[3] == "envmaps":
+            # GET /scenes/<scene_id>/envmaps/<filename> — serve raw bytes for UI preview.
+            # EXR/HDR aren't browser-renderable but we still return them so an external tool
+            # could fetch; the UI only attempts <img> for png/jpg.
+            scene_id = parts[2]
+            filename = unquote(parts[4])
+            envmap_dir = project_dir / "scenes" / scene_id / "envmaps"
+            target = envmap_dir / filename
+            try:
+                target_resolved = target.resolve()
+                envmap_dir_resolved = envmap_dir.resolve()
+            except OSError:
+                self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": "envmap not found"})
+                return True
+            # Defense: keep the lookup inside scenes/<id>/envmaps/.
+            if envmap_dir_resolved not in target_resolved.parents:
+                self._send_json(handler, HTTPStatus.FORBIDDEN, {"error": "envmap path outside scene dir"})
+                return True
+            if not target_resolved.is_file():
+                self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": "envmap not found"})
+                return True
+            mime, _ = mimetypes.guess_type(target_resolved.name)
+            if not mime:
+                mime = "application/octet-stream"
+            data = target_resolved.read_bytes()
+            handler.send_response(HTTPStatus.OK)
+            handler.send_header("Content-Type", mime)
+            handler.send_header("Content-Length", str(len(data)))
+            handler.send_header("Cache-Control", "public, max-age=3600")
+            handler.end_headers()
+            handler.wfile.write(data)
+            return True
+        if len(parts) == 5 and parts[1] == "scenes" and parts[3] == "mesh-cache":
+            # PR2: GET /scenes/<scene_id>/mesh-cache/<filename> — serve OBJ text bytes
+            # so the editor's OBJLoader can render the actual render-side mesh instead
+            # of a fallback box. Pattern mirrors the envmaps endpoint above.
+            scene_id = parts[2]
+            filename = unquote(parts[4])
+            # Clamp to a basename; reject any path component (../ etc.) up front.
+            if "/" in filename or "\\" in filename or filename in ("", ".", ".."):
+                self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": "invalid mesh-cache filename"})
+                return True
+            mesh_cache_dir = project_dir / "scenes" / scene_id / "mesh_cache"
+            target = mesh_cache_dir / filename
+            try:
+                target_resolved = target.resolve()
+                mesh_cache_dir_resolved = mesh_cache_dir.resolve()
+            except OSError:
+                self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": "mesh-cache file not found"})
+                return True
+            # Defense in depth: even after basename clamp, confirm the resolved file
+            # sits inside the scene's mesh_cache dir.
+            if mesh_cache_dir_resolved not in target_resolved.parents:
+                self._send_json(handler, HTTPStatus.FORBIDDEN, {"error": "mesh-cache path outside scene dir"})
+                return True
+            if not target_resolved.is_file():
+                self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": "mesh-cache file not found"})
+                return True
+            data = target_resolved.read_bytes()
+            handler.send_response(HTTPStatus.OK)
+            # mesh_cache OBJ filenames already encode (usd_ref|prim_path|mtime|writer_version)
+            # so the content is effectively immutable — cache aggressively.
+            handler.send_header("Content-Type", "text/plain; charset=utf-8")
+            handler.send_header("Content-Length", str(len(data)))
+            handler.send_header("Cache-Control", "public, max-age=86400, immutable")
+            # Multi-MB OBJs over ThreadingHTTPServer reliably surfaced
+            # ERR_CONTENT_LENGTH_MISMATCH in the browser even though len(data)
+            # matched the file. Root cause: BaseHTTPRequestHandler's default
+            # protocol_version is HTTP/1.0, which closes the TCP connection
+            # immediately on handler return. With multi-MB bodies + multiple
+            # concurrent fetches per origin, the close FIN can arrive before
+            # the tail of the body is fully ACKed, and the browser flags the
+            # delta as a content-length mismatch. Sending `Connection: close`
+            # under HTTP/1.0 plus calling `socket.sendall()` directly (rather
+            # than going through the wfile wrapper) lets us drain the entire
+            # body before any teardown. We also do a graceful half-close
+            # (shutdown WR) so the kernel flushes the send buffer before close.
+            handler.send_header("Connection", "close")
+            handler.end_headers()
+            try:
+                handler.wfile.flush()
+            except OSError:
+                pass
+            try:
+                handler.connection.sendall(data)
+            except (BrokenPipeError, ConnectionResetError):
+                return True
+            try:
+                import socket as _socket
+                handler.connection.shutdown(_socket.SHUT_WR)
+            except OSError:
+                pass
             return True
         if len(parts) == 4 and parts[1] == "scenes" and parts[3] == "render-readiness":
             scene_id = parts[2]
@@ -7151,6 +8846,13 @@ class RenderDaemon:
                 self._send_json(handler, status_code, body)
                 return True
             sync_job_id = f"sync-{_utc_now().strftime('%Y%m%dT%H%M%S%f')}-{hashlib.sha1(str(scene_dir).encode()).hexdigest()[:6]}"
+            self._patch_opticalnav_annotation_sync(project_dir, scene_id, {
+                "render_scene": "pending",
+                "render_scene_status": "syncing",
+                "render_readiness_status": "pending",
+                "sync_job_id": sync_job_id,
+                "message": "Render-scene sync is running.",
+            })
             self._publish_opticalnav_sync_progress(sync_job_id, {
                 "status": "started",
                 "processed": 0,
@@ -7177,6 +8879,13 @@ class RenderDaemon:
                         "status_code": int(status_code),
                     })
                 except Exception as exc:
+                    self._patch_opticalnav_annotation_sync(project_dir, scene_id, {
+                        "render_scene": "blocked",
+                        "render_scene_status": "error",
+                        "render_readiness_status": "blocked",
+                        "sync_job_id": sync_job_id,
+                        "message": f"Render-scene sync failed: {exc}",
+                    })
                     self._publish_opticalnav_sync_progress(sync_job_id, {
                         "status": "error",
                         "result": {"error": str(exc)},
@@ -7804,7 +9513,17 @@ class RenderDaemon:
         if len(parts) == 2 and parts[1] == "validate":
             from navigation_dataset.validation import validate_dataset
 
-            report = validate_dataset(project_dir, require_observations=bool(payload.get("require_observations", False)))
+            raw_scene_ids = payload.get("scene_ids")
+            scene_ids = (
+                [str(sid) for sid in raw_scene_ids if sid]
+                if isinstance(raw_scene_ids, list) and raw_scene_ids
+                else None
+            )
+            report = validate_dataset(
+                project_dir,
+                require_observations=bool(payload.get("require_observations", False)),
+                scene_ids=scene_ids,
+            )
             self._send_json(handler, HTTPStatus.OK, report.to_payload())
             return True
         if len(parts) == 2 and parts[1] == "evaluate":
@@ -7818,20 +9537,104 @@ class RenderDaemon:
             self._send_json(handler, HTTPStatus.OK, {"policy": payload.get("policy") or "shortest_oracle", "evaluation_ref": eval_path.relative_to(project_dir).as_posix(), **result})
             return True
         if len(parts) == 2 and parts[1] == "export":
-            from navigation_dataset.exporters.custom_json import export_dataset_zip, write_dataset_index, write_split_files
+            from navigation_dataset.exporters.custom_json import (
+                build_dataset_index,
+                export_dataset_zip,
+                write_dataset_index,
+                write_split_files,
+            )
 
-            index_path = write_dataset_index(project_dir)
-            split_paths = write_split_files(project_dir)
+            raw_ids = payload.get("episode_ids")
+            episode_ids = (
+                [str(eid) for eid in raw_ids if eid]
+                if isinstance(raw_ids, list) and raw_ids
+                else None
+            )
+            raw_scene_ids = payload.get("scene_ids")
+            scene_ids = (
+                [str(sid) for sid in raw_scene_ids if sid]
+                if isinstance(raw_scene_ids, list) and raw_scene_ids
+                else None
+            )
+            only_completed = bool(payload.get("only_completed", False))
+            index_path = write_dataset_index(
+                project_dir, episode_ids=episode_ids, only_completed=only_completed, scene_ids=scene_ids,
+            )
+            split_paths = write_split_files(
+                project_dir, episode_ids=episode_ids, only_completed=only_completed, scene_ids=scene_ids,
+            )
+            index_payload = build_dataset_index(
+                project_dir, episode_ids=episode_ids, only_completed=only_completed, scene_ids=scene_ids,
+            )
             response = {
                 "dataset_ref": index_path.relative_to(project_dir).as_posix(),
                 "split_refs": [path.relative_to(project_dir).as_posix() for path in split_paths],
                 "project": self._opticalnav_project_summary(project_dir),
+                "episode_count": index_payload.get("episode_count", 0),
+                "total_episode_count_on_disk": index_payload.get("total_episode_count_on_disk", 0),
+                "skipped_episode_count": index_payload.get("skipped_episode_count", 0),
+                "filter": index_payload.get("filter"),
             }
             if bool(payload.get("zip", False)):
-                zip_path = export_dataset_zip(project_dir)
+                zip_path = export_dataset_zip(
+                    project_dir, episode_ids=episode_ids, only_completed=only_completed, scene_ids=scene_ids,
+                )
                 response["zip_ref"] = zip_path.relative_to(self.repo_root).as_posix()
                 response["download_url"] = f"/artifacts?path={quote(response['zip_ref'])}"
             self._send_json(handler, HTTPStatus.OK, response)
+            return True
+        if len(parts) == 2 and parts[1] == "export-jobs":
+            scene_id = _maybe_str(payload.get("scene_id"))
+            if not scene_id:
+                self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": "scene_id is required for scene-bundle export"})
+                return True
+            scene_dir = project_dir / "scenes" / scene_id
+            if not scene_dir.exists():
+                self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": f"Unknown scene_id: {scene_id}"})
+                return True
+            raw_ids = payload.get("episode_ids")
+            episode_ids = (
+                [str(eid) for eid in raw_ids if eid]
+                if isinstance(raw_ids, list) and raw_ids
+                else None
+            )
+            only_completed = bool(payload.get("only_completed", True))
+            include_episode_thumbnails = bool(payload.get("include_episode_thumbnails", False))
+            job_id = f"export-{scene_id}-{_utc_now().strftime('%Y%m%dT%H%M%S%f')}"
+            with self._export_jobs_lock:
+                self._export_jobs[job_id] = {
+                    "job_id": job_id,
+                    "project_id": parts[0],
+                    "scene_id": scene_id,
+                    "only_completed": only_completed,
+                    "include_episode_thumbnails": include_episode_thumbnails,
+                    "status": "queued",
+                    "stage": "scope",
+                    "stage_label": self._EXPORT_STAGE_LABELS["scope"],
+                    "current": 0,
+                    "total": 0,
+                    "bytes_current": 0,
+                    "bytes_total": 0,
+                    "message": "queued",
+                    "current_file": None,
+                    "summary": None,
+                    "error": None,
+                    "cancel_requested": False,
+                    "created_at": _utc_now_iso(),
+                }
+            threading.Thread(
+                target=self._run_export_job,
+                args=(job_id, parts[0], project_dir, scene_id, only_completed, episode_ids, include_episode_thumbnails),
+                name=f"export-job-{job_id}",
+                daemon=True,
+            ).start()
+            self._send_json(handler, HTTPStatus.ACCEPTED, {
+                "job_id": job_id,
+                "status": "queued",
+                "scene_id": scene_id,
+                "ws_url": f"/api/ws/opticalnav-export?job_id={job_id}",
+                "status_url": f"/api/opticalnav/projects/{parts[0]}/export-jobs/{job_id}",
+            })
             return True
         if len(parts) == 4 and parts[1] == "scenes" and parts[3] == "objects":
             from navigation_dataset.authoring_map import (
@@ -8021,6 +9824,7 @@ class RenderDaemon:
                 body = dict(payload)
                 if str(body.get("scene_id") or "") != scene_id:
                     raise ValueError(f"authoring_map.scene_id must match route scene_id {scene_id!r}.")
+                defer_render_scene_sync = bool(body.pop("defer_render_scene_sync", False) or body.pop("skip_render_scene_sync", False))
                 path_out = scene_dir / "authoring_map.json"
                 save_authoring_map(path_out, body)
                 saved = _read_json(path_out)
@@ -8029,6 +9833,23 @@ class RenderDaemon:
                 return True
             except Exception as exc:
                 self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return True
+
+            if defer_render_scene_sync:
+                self._patch_opticalnav_annotation_sync(project_dir, scene_id, {
+                    "render_scene": "pending",
+                    "render_scene_status": "deferred",
+                    "render_readiness_status": "pending",
+                    "message": "Authoring map changed; compile annotation and sync render scene before rendering.",
+                })
+                self._send_json(handler, HTTPStatus.OK, {
+                    "ok": True,
+                    "authoring_map": authoring_map_to_payload(saved),
+                    "authoring_map_ref": path_out.relative_to(project_dir).as_posix(),
+                    "render_readiness": None,
+                    "xml_shape_count": 0,
+                    "project": self._opticalnav_project_summary(project_dir),
+                })
                 return True
 
             # Phase 3: Immediately regenerate render_scene.xml so it stays in sync
@@ -8046,6 +9867,7 @@ class RenderDaemon:
                         pass
                 mesh_resolver = self._make_mesh_resolver(project_dir, scene_id)
                 mesh_stats: dict[str, int] = {}
+                materialization_records: list[dict[str, Any]] = []
                 xml_shape_count = _generate_opticalnav_render_scene_xml(
                     saved,
                     saved,  # overlay == authoring map itself (objects live here)
@@ -8054,8 +9876,38 @@ class RenderDaemon:
                     repo_root=self.repo_root,
                     mesh_resolver=mesh_resolver,
                     mesh_stats=mesh_stats,
+                    materialization_records=materialization_records,
+                )
+                mesh_stats["scene_mesh_cache"] = _stage_xml_obj_filenames_to_scene_mesh_cache(
+                    render_scene_path,
+                    scene_mesh_cache_dir=self._opticalnav_mesh_cache_dir(project_dir, scene_id),
+                    repo_root=self.repo_root,
                 )
                 render_scene_ref = render_scene_path.relative_to(self.repo_root).as_posix()
+                try:
+                    audit_payload = _build_materialization_audit(
+                        scene_id=scene_id,
+                        overlay_objects=list(saved.get("objects") or []),
+                        materialization_records=materialization_records,
+                        mesh_stats=mesh_stats,
+                    )
+                    (scene_dir / "render_scene_materialization.json").write_text(
+                        json.dumps(audit_payload, ensure_ascii=False, indent=2), encoding="utf-8",
+                    )
+                except Exception as exc:
+                    mesh_stats["materialization_audit_error"] = str(exc)
+                try:
+                    xml_index = _build_xml_scene_index(
+                        render_scene_path,
+                        scene_id=scene_id,
+                        materialization_records=materialization_records,
+                    )
+                    if xml_index is not None:
+                        (scene_dir / "xml_scene_index.json").write_text(
+                            json.dumps(xml_index, ensure_ascii=False, indent=2), encoding="utf-8",
+                        )
+                except Exception as exc:
+                    mesh_stats["xml_scene_index_error"] = str(exc)
                 render_readiness = _build_opticalnav_render_readiness(
                     saved,
                     repo_root=self.repo_root,
@@ -8108,7 +9960,23 @@ class RenderDaemon:
             except Exception as xml_exc:
                 # XML generation failure is non-fatal for the authoring save itself;
                 # the response will include the error so the UI can surface it.
-                render_readiness = {"ok": False, "errors": [{"key": "xml_gen", "message": str(xml_exc)}]}
+                render_readiness = {
+                    "ok": False,
+                    "status": "blocked",
+                    "errors": [{"key": "xml_gen", "message": str(xml_exc)}],
+                }
+                try:
+                    readiness_path = scene_dir / "render_readiness.json"
+                    readiness_path.write_text(json.dumps(render_readiness, ensure_ascii=False, indent=2), encoding="utf-8")
+                    self._patch_opticalnav_annotation_sync(project_dir, scene_id, {
+                        "render_scene": "blocked",
+                        "render_scene_status": "error",
+                        "render_readiness_ref": readiness_path.relative_to(project_dir).as_posix(),
+                        "render_readiness_status": "blocked",
+                        "message": f"Render-scene XML generation failed: {xml_exc}",
+                    })
+                except Exception:
+                    pass
 
             self._send_json(handler, HTTPStatus.OK, {
                 "ok": True,
@@ -8190,6 +10058,17 @@ class RenderDaemon:
             return True
         if not project_dir.exists():
             self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": f"Unknown OpticalNav project_id: {parts[0]}"})
+            return True
+        if len(parts) == 3 and parts[1] == "export-jobs":
+            job_id = parts[2]
+            with self._export_jobs_lock:
+                state = self._export_jobs.get(job_id)
+                if state is None:
+                    self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": f"Unknown export job: {job_id}"})
+                    return True
+                state["cancel_requested"] = True
+                self._export_jobs[job_id] = state
+            self._send_json(handler, HTTPStatus.ACCEPTED, {"job_id": job_id, "cancel_requested": True})
             return True
         if len(parts) == 5 and parts[1] == "scenes" and parts[3] == "observations" and parts[4] == "":
             # DELETE .../scenes/{scene_id}/observations/ — never happens (trailing slash guard)
@@ -8339,6 +10218,11 @@ class RenderDaemon:
         render_settings_raw = payload.get("render_settings")
         render_settings = dict(render_settings_raw) if isinstance(render_settings_raw, dict) else {}
 
+        precondition = self._opticalnav_render_precondition_payload(project_dir, [scene_id], payload, mode="graph_sweep")
+        if precondition is not None:
+            self._send_json(handler, HTTPStatus.BAD_REQUEST, precondition)
+            return
+
         # Resolve scene ref: ONLY from scene_variant.json (overlay_scene_xml_ref > base_scene_xml_ref).
         # Catalog match is NOT used here — render_scene.xml generated at sync time is authoritative.
         # If no XML is found, return an error requiring the user to run Sync Render Scene first.
@@ -8411,6 +10295,10 @@ class RenderDaemon:
                         "scene_id": scene_id,
                         "node_id": sweep_request.node_id,
                         "heading_id": sweep_request.heading_id,
+                        "render_mode": sweep_request.request.extras.get("render_mode"),
+                        "preview_id": sweep_request.request.extras.get("preview_id"),
+                        "sensor_id": sweep_request.request.camera_specs[0].camera_id if sweep_request.request.camera_specs else None,
+                        "modality": modalities[0] if len(modalities) == 1 else None,
                         "status_url": accepted.status_url,
                         **runtime_overrides,
                         "target_gpu_index": shard["target_gpu_index"],
@@ -10295,6 +12183,23 @@ class RenderDaemon:
                     # With multiple same-modality sensors this is only a fallback; the
                     # UI now queries sensors/{camera_id}/... for precise matching.
                     shutil.copy2(src, dst_dir / dst_name)
+            # Also propagate every HDR `.exr` modality next to the PNG previews.
+            # The export bundle and downstream VLN evaluators consume EXR (rgb,
+            # depth, normal, polarization stokes, ...) — the PNG-only copy_map
+            # above used to leave EXR stranded under `out/bridge_jobs/...`,
+            # so consolidated `observations/<vp>/<heading>/sensors/<cam>/` was
+            # missing all HDR data.
+            try:
+                for src in src_dir.iterdir():
+                    if not src.is_file() or src.suffix.lower() != ".exr":
+                        continue
+                    if not copied:
+                        dst_dir.mkdir(parents=True, exist_ok=True)
+                        sensor_dst_dir.mkdir(parents=True, exist_ok=True)
+                        copied = True
+                    shutil.copy2(src, sensor_dst_dir / src.name)
+            except OSError:
+                pass
             if copied:
                 index_path = dst_dir / "_sensor_index.json"
                 try:

@@ -1,0 +1,366 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Dev Report · 2026-06-09 · Change Tracking and Render Authoring Pipeline</title>
+<style>
+  :root {
+    --bg:#f4f6fb; --panel:#fff; --sub:#f8fafc; --text:#1f2937; --muted:#64748b;
+    --line:#dbe3ef; --blue:#2563eb; --green:#16a34a; --amber:#d97706; --red:#dc2626; --purple:#7c3aed;
+    --mono:"JetBrains Mono",Consolas,Menlo,monospace; --sans:Inter,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:var(--sans); background:var(--bg); color:var(--text); line-height:1.62; font-size:14px; }
+  .layout { display:flex; min-height:100vh; }
+  aside { width:250px; flex:0 0 250px; position:sticky; top:0; height:100vh; overflow:auto; padding:22px 14px; border-right:1px solid var(--line); background:#eef2f7; }
+  main { width:min(1180px, calc(100vw - 250px)); padding:30px 38px 60px; }
+  .logo { font-weight:800; color:var(--blue); letter-spacing:-.02em; }
+  .date { margin-top:3px; color:var(--muted); font-family:var(--mono); font-size:11px; }
+  .nav-title { margin:22px 8px 7px; color:var(--muted); font-size:10px; text-transform:uppercase; letter-spacing:.12em; font-weight:800; }
+  .nav-link { display:block; padding:6px 8px; border-radius:6px; color:#475569; text-decoration:none; font-size:12px; }
+  .nav-link:hover { color:var(--blue); background:#dbeafe; }
+  .hero, section { background:var(--panel); border:1px solid var(--line); border-radius:12px; box-shadow:0 2px 10px rgba(15,23,42,.04); }
+  .hero { padding:28px 30px; margin-bottom:22px; }
+  h1 { margin:0 0 8px; font-size:25px; letter-spacing:-.04em; line-height:1.22; }
+  h2 { margin:0 0 4px; font-size:18px; letter-spacing:-.02em; }
+  h3 { margin:20px 0 9px; font-size:14px; }
+  section { padding:22px 24px; margin-bottom:18px; }
+  .subtitle { color:#475569; font-size:13px; }
+  .tags { display:flex; flex-wrap:wrap; gap:7px; margin-top:18px; }
+  .tag { border:1px solid #bfdbfe; color:#1d4ed8; background:#eff6ff; padding:3px 9px; border-radius:999px; font-size:11px; font-weight:700; }
+  .tag.green { color:#15803d; background:#f0fdf4; border-color:#bbf7d0; }
+  .tag.amber { color:#b45309; background:#fffbeb; border-color:#fde68a; }
+  .tag.red { color:#b91c1c; background:#fef2f2; border-color:#fecaca; }
+  .tag.purple { color:#6d28d9; background:#f5f3ff; border-color:#ddd6fe; }
+  .grid { display:grid; grid-template-columns:repeat(4,1fr); gap:12px; margin:15px 0; }
+  .card { background:var(--sub); border:1px solid var(--line); border-radius:8px; padding:13px; }
+  .metric { font-size:24px; font-weight:850; color:var(--blue); letter-spacing:-.04em; }
+  .label { color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.08em; font-weight:800; }
+  .note { color:#475569; font-size:12px; margin-top:4px; }
+  table { width:100%; border-collapse:collapse; margin:13px 0 18px; font-size:13px; }
+  th { text-align:left; background:#eff6ff; color:#475569; font-size:11px; text-transform:uppercase; letter-spacing:.06em; }
+  th, td { padding:9px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  code, pre { font-family:var(--mono); font-size:12px; }
+  code { background:#eef2ff; padding:1px 5px; border-radius:4px; }
+  pre { background:#0f172a; color:#dbeafe; border-radius:8px; padding:13px 14px; overflow:auto; line-height:1.55; }
+  .alert { border-left:4px solid var(--amber); background:#fffbeb; padding:12px 14px; border-radius:8px; margin:12px 0; }
+  .alert.green { border-color:var(--green); background:#f0fdf4; }
+  .alert.red { border-color:var(--red); background:#fef2f2; }
+  .flow { display:grid; grid-template-columns:repeat(5,1fr); gap:10px; margin:15px 0; }
+  .step { border:1px solid var(--line); background:var(--sub); border-radius:8px; padding:11px; min-height:86px; }
+  .step strong { display:block; color:#1d4ed8; margin-bottom:4px; }
+  .file-grid { display:grid; grid-template-columns:repeat(2,1fr); gap:12px; }
+  .file-card { background:var(--sub); border:1px solid var(--line); border-radius:8px; padding:12px; }
+  .file-card h3 { margin-top:0; }
+  .small { font-size:12px; color:var(--muted); }
+  .footer { color:var(--muted); text-align:center; margin-top:34px; font-size:12px; }
+  @media (max-width:900px) {
+    .layout{display:block} aside{position:relative;width:auto;height:auto} main{width:auto;padding:20px}
+    .grid,.flow,.file-grid{grid-template-columns:1fr}
+  }
+</style>
+</head>
+<body>
+<div class="layout">
+<aside>
+  <div class="logo">Robomituba</div>
+  <div class="date">2026-06-09</div>
+  <div class="small">change tracking · editor/render pipeline</div>
+
+  <div class="nav-title">요약</div>
+  <a class="nav-link" href="#summary">변경 요약</a>
+  <a class="nav-link" href="#map">변경 파일 지도</a>
+  <a class="nav-link" href="#pipeline">파이프라인 변화</a>
+
+  <div class="nav-title">핵심 축</div>
+  <a class="nav-link" href="#frontend">Frontend 분해</a>
+  <a class="nav-link" href="#editor">3D Editor</a>
+  <a class="nav-link" href="#daemon">Render Daemon</a>
+  <a class="nav-link" href="#dataset">Dataset export</a>
+  <a class="nav-link" href="#office">Shared office</a>
+
+  <div class="nav-title">상태</div>
+  <a class="nav-link" href="#risks">리스크</a>
+  <a class="nav-link" href="#tests">검증 상태</a>
+</aside>
+
+<main>
+  <div class="hero">
+    <div class="date">Daily Development Report · 2026-06-09</div>
+    <h1>작업트리 변경 내용을 추적해 보니, 에디터는 분해되고 렌더 파이프라인은 XML-native / job push / partial export 쪽으로 이동했다</h1>
+    <div class="subtitle">
+      현재 변경은 단일 기능 패치라기보다 OpticalNav dataset editor의 구조 전환이다.
+      UI는 route 단일 파일에서 component/service/helper로 분리되고,
+      render daemon은 materialization audit, XML scene index, mesh-cache serving, sync precondition, WebSocket job status를 갖기 시작했다.
+      navigation_dataset은 partial episode sweep/export와 shared office sample tooling을 받았다.
+    </div>
+    <div class="tags">
+      <span class="tag green">20 tracked files changed</span>
+      <span class="tag amber">36 new dataset UI modules</span>
+      <span class="tag">XML-native preview</span>
+      <span class="tag">mesh-cache endpoint</span>
+      <span class="tag">job status WebSocket</span>
+      <span class="tag">episode_nodes</span>
+      <span class="tag">only_completed export</span>
+      <span class="tag purple">shared_office_floor_001</span>
+    </div>
+  </div>
+
+  <section id="summary">
+    <h2>변경 요약</h2>
+    <div class="grid">
+      <div class="card">
+        <div class="label">Tracked diff</div>
+        <div class="metric">20</div>
+        <div class="note">git diff 대상 파일. 약 4,475 insertions / 4,405 deletions.</div>
+      </div>
+      <div class="card">
+        <div class="label">Dataset UI split</div>
+        <div class="metric">36</div>
+        <div class="note"><code>apps/webui/src/lib/datasets</code> 신규 Svelte/TS 모듈.</div>
+      </div>
+      <div class="card">
+        <div class="label">Largest backend change</div>
+        <div class="metric">daemon</div>
+        <div class="note"><code>render_daemon.py</code>에 XML index, mesh-cache, job WS, export filter가 집중.</div>
+      </div>
+      <div class="card">
+        <div class="label">Main product shift</div>
+        <div class="metric">traceable</div>
+        <div class="note">editor에서 본 mesh, render XML, job 결과, export 대상이 같은 ID 체계로 묶인다.</div>
+      </div>
+    </div>
+    <div class="alert green">
+      핵심 변화는 "렌더가 되는지"보다 "무엇이 실제 렌더에 들어갔고, 어떤 job/export에 포함됐는지"를 추적하는 쪽으로 이동했다는 점이다.
+      6/8의 shared office 렌더 성공 이후, 6/9 변경은 그 흐름을 안정적으로 편집/모니터링/내보내기 위한 구조화 작업이다.
+    </div>
+  </section>
+
+  <section id="map">
+    <h2>변경 파일 지도</h2>
+    <div class="file-grid">
+      <div class="file-card">
+        <h3>Frontend route / stores</h3>
+        <p><code>datasets/+page.svelte</code>는 약 5,899 line diff로 route가 작아지고 component/service 호출 중심으로 이동했다.</p>
+        <p><code>shell.ts</code>는 boolean collapse에서 <code>bottomPanelMode: collapsed | expanded | maximized</code>로 확장됐다.</p>
+        <p><code>jobStatusWs.ts</code>, <code>objMeshCache.ts</code>가 새 runtime store/cache 축이다.</p>
+      </div>
+      <div class="file-card">
+        <h3>Dataset components</h3>
+        <p><code>BottomPanel</code>, <code>RenderSummaryBar</code>, <code>SweepJobGrid</code>, <code>GenericJobList</code>, <code>JobDetailDrawer</code>, <code>LogViewer</code> 등 render monitor UI가 분리됐다.</p>
+        <p><code>RailScene/Paths/Sensors/Lights/Preview/Export/Status</code>가 right rail tab 단위로 독립했다.</p>
+      </div>
+      <div class="file-card">
+        <h3>Render daemon</h3>
+        <p><code>render_daemon.py</code>는 materialization audit, <code>xml_scene_index.json</code>, scene mesh cache staging, OBJ/Envmap byte serving, sync status patching, export filters, render precondition을 포함한다.</p>
+      </div>
+      <div class="file-card">
+        <h3>navigation_dataset</h3>
+        <p><code>custom_json.py</code>는 rendered episode만 export할 수 있게 됐다. <code>validation.py</code>는 scene scope를 받는다.</p>
+        <p><code>office_assets.py</code>, <code>office_sample.py</code>가 shared office asset coverage와 seed scene install 경로를 제공한다.</p>
+      </div>
+    </div>
+  </section>
+
+  <section id="pipeline">
+    <h2>파이프라인 변화</h2>
+    <div class="flow">
+      <div class="step">
+        <strong>1. Authoring map</strong>
+        save 시 canonical authoring map을 유지하고, 필요하면 render sync를 deferred 상태로 남긴다.
+      </div>
+      <div class="step">
+        <strong>2. Sync sidecars</strong>
+        render_scene.xml과 함께 materialization audit, xml_scene_index, render_readiness가 생성된다.
+      </div>
+      <div class="step">
+        <strong>3. XML-native editor</strong>
+        editor는 xml_scene_index의 mesh_path를 읽고 scene mesh_cache OBJ를 표시한다.
+      </div>
+      <div class="step">
+        <strong>4. Render monitor</strong>
+        graph_sweep, episode_nodes, preview_probe job이 batch panel과 WebSocket 상태로 합쳐진다.
+      </div>
+      <div class="step">
+        <strong>5. Filtered export</strong>
+        rendered episode만 dataset.json / splits에 등재하고 zip은 전체 파일을 보존한다.
+      </div>
+    </div>
+  </section>
+
+  <section id="frontend">
+    <h2>Frontend 분해</h2>
+    <table>
+      <tr><th>묶음</th><th>변경 내용</th><th>의미</th></tr>
+      <tr>
+        <td>Component split</td>
+        <td><code>apps/webui/src/lib/datasets</code> 아래 36개 파일로 rail, inspector, asset catalog, bottom panel, job drawer, helper/service를 분리.</td>
+        <td>route 단일 파일의 View/VM/API 결합을 줄이고, 각 패널을 독립적으로 손댈 수 있게 됐다.</td>
+      </tr>
+      <tr>
+        <td>AssetVM</td>
+        <td><code>AssetVM.svelte.ts</code>가 material library, asset catalog, editor geometry, camera rig 같은 asset-side state를 모은다.</td>
+        <td>route가 모든 asset/material 상태를 직접 들고 있던 구조에서 한 단계 분리됐다.</td>
+      </tr>
+      <tr>
+        <td>Render monitor</td>
+        <td>Overview / Jobs / Logs, grid/list 전환, right drawer detail, raw log folding 구조.</td>
+        <td>graph sweep과 preview/episode render를 한 패널에서 구분해 추적한다.</td>
+      </tr>
+      <tr>
+        <td>Export UI</td>
+        <td><code>only_completed</code>, current scene scope, explicit episode_ids를 보낼 수 있는 export service로 정리.</td>
+        <td>partial sweep 결과만 dataset으로 내보낼 수 있다.</td>
+      </tr>
+    </table>
+  </section>
+
+  <section id="editor">
+    <h2>3D Editor 변경</h2>
+    <table>
+      <tr><th>기능</th><th>변경 내용</th><th>리스크</th></tr>
+      <tr>
+        <td>XML-native preview</td>
+        <td><code>MapEditor3D</code>가 <code>xmlSceneIndex.shapes[].mesh_path</code>를 보고 render-side OBJ를 표시한다. async OBJ load 후 reactive version bump로 placeholder를 실제 mesh로 교체한다.</td>
+        <td>xml index stale 상태에서 editor mesh가 render_scene.xml과 어긋날 수 있어 stale warning이 필요하다.</td>
+      </tr>
+      <tr>
+        <td>Mesh cache</td>
+        <td><code>objMeshCache.ts</code>가 memory LRU + IndexedDB 캐시, 동시 fetch 제한, large mesh guard를 제공한다.</td>
+        <td>대형 OBJ는 placeholder 처리되므로 editor/렌더 시각 차이를 UI에 명시해야 한다.</td>
+      </tr>
+      <tr>
+        <td>Hot camera</td>
+        <td>click-drag placement, preview pose history, active rig intrinsics 기반 frustum, result texture overlay를 지원한다.</td>
+        <td>preview camera history를 더 명확한 editor object 모델로 승격하는 후속 작업이 남아 있다.</td>
+      </tr>
+      <tr>
+        <td>Frustum click filter</td>
+        <td>visible object/parent만 raycast 대상으로 삼아 숨겨진 frustum plane이 클릭되는 문제를 줄인다.</td>
+        <td>layer별 visibility와 pickability를 계속 같은 규칙으로 유지해야 한다.</td>
+      </tr>
+    </table>
+  </section>
+
+  <section id="daemon">
+    <h2>Render Daemon 변경</h2>
+    <table>
+      <tr><th>영역</th><th>변경 내용</th></tr>
+      <tr>
+        <td>Materialization audit</td>
+        <td><code>render_scene_materialization.json</code>에 OBJ/fallback/emitter/wall cube count, fallback reason, extracted material status breakdown을 기록한다.</td>
+      </tr>
+      <tr>
+        <td>XML scene index</td>
+        <td><code>xml_scene_index.json</code>에 shape_id, shape_type, mesh_path, bsdf_ref, transform, fallback/source_ref/material_id를 기록한다.</td>
+      </tr>
+      <tr>
+        <td>Scene mesh cache</td>
+        <td>render XML의 OBJ filename을 scene별 <code>mesh_cache</code>로 staging하고 <code>/mesh-cache/&lt;filename&gt;</code> endpoint로 제공한다.</td>
+      </tr>
+      <tr>
+        <td>OBJ/MTL texture extraction</td>
+        <td>MooreLane direct OBJ의 <code>mtllib/map_Kd</code>를 읽어 measured BSDF보다 source texture를 우선할 수 있는 경로가 들어갔다.</td>
+      </tr>
+      <tr>
+        <td>Sync status</td>
+        <td>sync started/error/deferred/blocked 상태를 scene annotation metadata에 patch해서 save success와 async render readiness를 구분한다.</td>
+      </tr>
+      <tr>
+        <td>Job status push</td>
+        <td>job status snapshot/cache invalidation/push subscriber 경로가 추가되어 frontend가 4초 polling 대신 WebSocket frame을 받을 수 있다.</td>
+      </tr>
+    </table>
+  </section>
+
+  <section id="dataset">
+    <h2>Dataset export / validation</h2>
+    <table>
+      <tr><th>파일</th><th>변경 내용</th><th>효과</th></tr>
+      <tr>
+        <td><code>exporters/custom_json.py</code></td>
+        <td><code>is_episode_complete()</code>, episode_ids / scene_ids / only_completed filter, skipped count, scoped total을 추가.</td>
+        <td>부분 렌더 후 완성 episode만 dataset index와 split에 들어간다.</td>
+      </tr>
+      <tr>
+        <td><code>validation.py</code></td>
+        <td>scene_ids scope를 받아 해당 scene의 annotation/graph/episode만 검증한다.</td>
+        <td>한 프로젝트에 여러 scene이 있을 때 다른 scene의 stale 상태가 현재 export를 막지 않는다.</td>
+      </tr>
+      <tr>
+        <td><code>sensor_sweep.py</code></td>
+        <td>custom position에서 node_id, heading_id, request_id, render_mode, preview_id를 payload에서 보존한다.</td>
+        <td>hot camera preview job이 batch/job panel에서 안정적으로 추적된다.</td>
+      </tr>
+      <tr>
+        <td><code>test_viewpoint_graph.py</code></td>
+        <td>custom preview metadata 보존 단위 테스트를 추가.</td>
+        <td>preview_probe 계약을 navigation_dataset 레벨에서 고정한다.</td>
+      </tr>
+    </table>
+  </section>
+
+  <section id="office">
+    <h2>Shared Office tooling</h2>
+    <table>
+      <tr><th>파일</th><th>역할</th></tr>
+      <tr>
+        <td><code>office_assets.py</code> / <code>apps/office_asset_coverage.py</code></td>
+        <td>shell, glass partition, desk, chair, monitor, printer, storage, light, fire safety, reflective surface 등 office taxonomy별 available / download_candidate / external_needed를 집계한다.</td>
+      </tr>
+      <tr>
+        <td><code>office_sample.py</code> / <code>apps/install_shared_office_sample.py</code></td>
+        <td><code>shared_office_floor_001</code> authoring map fixture를 설치하고, 가능하면 render_scene.xml, materialization audit, xml_scene_index, readiness까지 생성한다.</td>
+      </tr>
+      <tr>
+        <td><code>usd_exporter.py</code> / <code>apps/export_scene_to_usd.py</code></td>
+        <td>authoring_map을 Isaac Sim에서 열 수 있는 USD stage로 export한다. source_ref가 있는 object는 원본 USD prim reference를 보존한다.</td>
+      </tr>
+    </table>
+  </section>
+
+  <section id="risks">
+    <h2>리스크 / 남은 정리</h2>
+    <table>
+      <tr><th>리스크</th><th>현재 상태</th><th>권장 정리</th></tr>
+      <tr>
+        <td>Untracked scope가 큼</td>
+        <td><code>dev_report</code>, <code>datasets</code> 컴포넌트, office tooling, USD exporter, optix submodule-like dir 등이 untracked로 존재한다.</td>
+        <td>커밋 전 포함 대상과 제외 대상을 명확히 분리해야 한다. 특히 <code>modules/mitsuba3-optix7/</code>와 <code>build/</code>는 의도 확인 필요.</td>
+      </tr>
+      <tr>
+        <td>Material policy는 아직 계획 단계</td>
+        <td>OBJ/MTL texture 우선 경로는 들어갔지만 GLB PBR material preservation과 RGB/Optical/Hybrid policy는 아직 완성되지 않았다.</td>
+        <td>6/8 리포트의 3모드 material policy를 구현 작업으로 분리한다.</td>
+      </tr>
+      <tr>
+        <td>Route VM still large</td>
+        <td><code>datasets/+page.svelte</code>는 많이 줄었지만 여전히 hot camera, WS, export, scene sync, panel orchestration을 맡는다.</td>
+        <td>다음 단계는 ViewModel 단위 분리다. AssetVM 다음으로 RenderVM / SceneSyncVM이 필요하다.</td>
+      </tr>
+      <tr>
+        <td>Temporary debug</td>
+        <td><code>window.__jobStatusDebug</code>, defensive <code>refreshBatch()</code> 호출이 남아 있다.</td>
+        <td>WebSocket-only 경로 안정화 후 제거한다.</td>
+      </tr>
+    </table>
+  </section>
+
+  <section id="tests">
+    <h2>검증 상태</h2>
+    <table>
+      <tr><th>항목</th><th>상태</th></tr>
+      <tr><td>Diff inspection</td><td><span class="tag green">완료</span> <code>git status</code>, <code>git diff --stat</code>, 주요 diff hunk와 신규 파일 목록을 확인했다.</td></tr>
+      <tr><td>Unit / frontend check</td><td><span class="tag amber">이번 보고서 업데이트 중에는 실행하지 않음</span> 보고서 목적이 변경 추적이어서 테스트 실행은 별도 단계로 남겼다.</td></tr>
+      <tr><td>Report update</td><td><span class="tag green">완료</span> 이 파일과 index 링크를 추가했다.</td></tr>
+    </table>
+  </section>
+
+  <div class="footer">
+    Robomituba Daily Development Report · 2026-06-09 · /jarvis/project/robomituba
+  </div>
+</main>
+</div>
+</body>
+</html>

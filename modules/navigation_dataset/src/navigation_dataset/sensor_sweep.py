@@ -159,8 +159,8 @@ def build_custom_position_render_requests(
     camera_template = camera_spec_from_payload(camera_spec_payload)
     requests: list[SweepRenderRequest] = []
     for idx, pos in enumerate(custom_positions):
-        node_id = f"custom_{idx}"
-        heading_id = "h0"
+        node_id = str(pos.get("node_id") or f"custom_{idx}")
+        heading_id = str(pos.get("heading_id") or "h0")
         x = float(pos.get("x", 0))
         y = float(pos.get("y", 0))
         yaw_deg = float(pos.get("yaw_deg", 0))
@@ -178,7 +178,7 @@ def build_custom_position_render_requests(
         timestep_scene_state = replace(scene_state, job_id=job_id, frame_id=frame_id, timestamp=timestamp)
         camera_spec = replace(camera_template, camera_to_world=pose, sensor_modality="multimodal")
         request = RenderRequest(
-            request_id=f"custom-{node_id}-{heading_id}",
+            request_id=str(pos.get("request_id") or f"custom-{node_id}-{heading_id}"),
             job_id=job_id,
             frame_id=frame_id,
             timestamp=timestamp,
@@ -192,9 +192,11 @@ def build_custom_position_render_requests(
                 "node_id": node_id,
                 "heading_id": heading_id,
                 "yaw_deg": yaw_deg,
-                "render_mode": "custom_position",
+                "render_mode": str(pos.get("render_mode") or "custom_position"),
             },
         )
+        if pos.get("preview_id") is not None:
+            request.extras["preview_id"] = str(pos["preview_id"])
         requests.append(SweepRenderRequest(node_id=node_id, heading_id=heading_id, request=request))
     return requests
 

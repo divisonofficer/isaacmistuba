@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Iterable
 
 from .episode_schema import read_episode
 from .exporters.custom_json import find_episode_files
@@ -15,6 +16,7 @@ class ValidationReport:
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     episode_count: int = 0
+    scene_ids: list[str] | None = None
 
     def to_payload(self) -> dict:
         return {
@@ -22,6 +24,7 @@ class ValidationReport:
             "errors": self.errors,
             "warnings": self.warnings,
             "episode_count": self.episode_count,
+            "scene_ids": list(self.scene_ids) if self.scene_ids is not None else None,
         }
 
 
@@ -35,10 +38,16 @@ def _artifact_exists(root: Path, ref: object) -> bool:
     return any(candidate.exists() for candidate in candidates)
 
 
-def validate_dataset(dataset_root: str | Path, *, require_observations: bool = False) -> ValidationReport:
+def validate_dataset(
+    dataset_root: str | Path,
+    *,
+    require_observations: bool = False,
+    scene_ids: Iterable[str] | None = None,
+) -> ValidationReport:
     root = Path(dataset_root)
     errors: list[str] = []
     warnings: list[str] = []
+    scene_filter = set(str(sid) for sid in scene_ids) if scene_ids is not None else None
     if not (root / "dataset.json").exists():
         warnings.append("dataset.json is missing; run opticalnav export or write_dataset_index.")
     for annotation_path in sorted((root / "scenes").glob("*/scene_annotation.json")):
@@ -46,6 +55,8 @@ def validate_dataset(dataset_root: str | Path, *, require_observations: bool = F
             annotation = read_scene_annotation(annotation_path)
         except Exception as exc:
             errors.append(f"{annotation_path}: {type(exc).__name__}: {exc}")
+            continue
+        if scene_filter is not None and annotation.scene_id not in scene_filter:
             continue
         sync = dict(annotation.metadata.get("sync", {}))
         if sync.get("render_scene") == "pending":
@@ -79,6 +90,8 @@ def validate_dataset(dataset_root: str | Path, *, require_observations: bool = F
         except Exception as exc:
             errors.append(f"{graph_path}: {type(exc).__name__}: {exc}")
             continue
+        if scene_filter is not None and graph.scene_id not in scene_filter:
+            continue
         for node in graph.nodes:
             for heading in node.headings:
                 for modality, ref in heading.sensor_observations.items():
@@ -86,13 +99,17 @@ def validate_dataset(dataset_root: str | Path, *, require_observations: bool = F
                         errors.append(f"{graph.graph_id}/{node.node_id}/{heading.heading_id}/{modality}: missing observation ref")
                     if ref and not (root / ref).exists():
                         errors.append(f"{graph.graph_id}/{node.node_id}/{heading.heading_id}/{modality}: missing observation bundle {ref}")
-    episode_paths = find_episode_files(root)
-    for episode_path in episode_paths:
+    all_episode_paths = find_episode_files(root)
+    episode_paths: list[Path] = []
+    for episode_path in all_episode_paths:
         try:
             episode = read_episode(episode_path)
         except Exception as exc:
             errors.append(f"{episode_path}: {type(exc).__name__}: {exc}")
             continue
+        if scene_filter is not None and episode.scene_id not in scene_filter:
+            continue
+        episode_paths.append(episode_path)
         for timestep in episode.timesteps:
             if require_observations and not timestep.observation_bundle_ref:
                 errors.append(f"{episode.episode_id}[{timestep.timestep_index}]: missing observation_bundle_ref")
@@ -102,5 +119,14 @@ def validate_dataset(dataset_root: str | Path, *, require_observations: bool = F
             if require_observations and not (root / ref).exists():
                 errors.append(f"{episode.episode_id}: missing cached graph observation {ref}")
     if not episode_paths:
-        warnings.append("No episode JSON files found.")
-    return ValidationReport(ok=not errors, errors=errors, warnings=warnings, episode_count=len(episode_paths))
+        msg = "No episode JSON files found."
+        if scene_filter is not None:
+            msg += f" (scope: {sorted(scene_filter)})"
+        warnings.append(msg)
+    return ValidationReport(
+        ok=not errors,
+        errors=errors,
+        warnings=warnings,
+        episode_count=len(episode_paths),
+        scene_ids=sorted(scene_filter) if scene_filter is not None else None,
+    )
