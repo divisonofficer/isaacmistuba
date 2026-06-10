@@ -42,3 +42,10 @@ assets/robots/ranger_mini_v3/*
 Thumbs.db
 scheduled_tasks.lock
 .claude/*
+
+# 대용량 바이너리 — git에서 추적하지 않음
+*.pdf
+related_works/
+docs/sensor_docs/
+dev_report/images/
+*.Zone.Identifier
