@@ -474,19 +474,19 @@ Isaac Sim
     <h2>1. Infinigen 시리즈 자체를 따라가기</h2>
     <ul class="reading">
       <li>
-        <strong>Infinigen 공식 홈페이지 / 문서</strong>
+        <strong><a href="https://infinigen.org" target="_blank">Infinigen 공식 홈페이지 / 문서</a></strong>
         <span class="why">실제 설치, 생성 단계, Nature/Indoors 사용 흐름을 확인하는 출발점.</span>
       </li>
       <li>
-        <strong>Infinigen GitHub</strong>
+        <strong><a href="https://github.com/princeton-vl/infinigen" target="_blank">Infinigen GitHub</a></strong>
         <span class="why">논문 버전 이후 코드가 계속 바뀌고 있으므로, 현재 구현을 볼 때 필수. README의 "Hello Room", "Hello World", simulator export 문서를 같이 확인.</span>
       </li>
       <li>
-        <strong>Infinigen-Sim: Procedural Generation of Articulated Simulation Assets</strong>
+        <strong><a href="https://arxiv.org/abs/2406.11714" target="_blank">Infinigen-Sim: Procedural Generation of Articulated Simulation Assets</a></strong>
         <span class="why">Infinigen 계열이 정적 장면 생성에서 관절 물체와 로봇 시뮬레이터 자산 생성으로 확장되는 흐름을 보여준다.</span>
       </li>
       <li>
-        <strong>Infinigen-Stereo / What Makes Good Synthetic Training Data for Zero-Shot Stereo Matching?</strong>
+        <strong><a href="https://arxiv.org/abs/2501.07699" target="_blank">Infinigen-Stereo / What Makes Good Synthetic Training Data for Zero-Shot Stereo Matching?</a></strong>
         <span class="why">절차적 생성기를 "데이터 품질을 실험적으로 튜닝하는 장치"로 쓰는 후속 흐름. RGB-NIR/HDR/stereo 배경과도 맞는다.</span>
       </li>
     </ul>
@@ -496,23 +496,23 @@ Isaac Sim
     <h2>2. 실내 장면 생성과 embodied AI 비교축</h2>
     <ul class="reading">
       <li>
-        <strong>ProcTHOR</strong>
+        <strong><a href="https://arxiv.org/abs/2206.06994" target="_blank">ProcTHOR</a></strong>
         <span class="why">절차적으로 집을 생성해 embodied AI 학습 규모를 키운 대표 기준점. 다만 AI2-THOR의 기존 에셋 라이브러리를 활용한다는 점에서 Infinigen Indoors와 좋은 대비가 된다.</span>
       </li>
       <li>
-        <strong>Holodeck</strong>
+        <strong><a href="https://arxiv.org/abs/2312.09067" target="_blank">Holodeck</a></strong>
         <span class="why">언어 지시로 실내 환경을 생성하는 흐름. LLM이 상식적 방 구성과 물체 관계를 만들고, Objaverse 같은 대규모 에셋을 활용한다는 점에서 "완전 절차적 생성"과 비교하기 좋다.</span>
       </li>
       <li>
-        <strong>BlenderProc</strong>
+        <strong><a href="https://github.com/DLR-RM/BlenderProc" target="_blank">BlenderProc</a></strong>
         <span class="why">Blender 기반 합성 데이터 생성 파이프라인의 실용 기준점. Infinigen을 "생성기"로, BlenderProc을 "데이터 생성 파이프라인"으로 놓고 비교하면 구조가 선명해진다.</span>
       </li>
       <li>
-        <strong>Hypersim</strong>
+        <strong><a href="https://github.com/apple/ml-hypersim" target="_blank">Hypersim</a></strong>
         <span class="why">전문가 제작 실내 장면 기반의 고품질 photorealistic synthetic dataset. Infinigen Indoors가 왜 "정적 에셋 의존"을 넘으려 했는지 설명할 때 대비 자료로 좋다.</span>
       </li>
       <li>
-        <strong>Kubric</strong>
+        <strong><a href="https://github.com/google-research/kubric" target="_blank">Kubric</a></strong>
         <span class="why">합성 영상과 깊이, 광학 흐름, 분할 정답을 만드는 범용 생성 도구. Infinigen의 "정답 추출" 장점과 나란히 읽기 좋다.</span>
       </li>
     </ul>
@@ -522,15 +522,15 @@ Isaac Sim
     <h2>3. 로봇 navigation 쪽으로 이어 읽기</h2>
     <ul class="reading">
       <li>
-        <strong>R2R / Matterport3D Simulator</strong>
+        <strong><a href="https://arxiv.org/abs/1711.07280" target="_blank">R2R / Matterport3D Simulator</a></strong>
         <span class="why">VLN의 기본 문제 설정. 실제 이미지 기반 환경이 왜 synthetic 환경의 visual richness 문제를 지적했는지 읽어두면, Infinigen의 "절차적 다양성" 가치가 더 잘 보인다.</span>
       </li>
       <li>
-        <strong>VLN-CE</strong>
+        <strong><a href="https://arxiv.org/abs/2004.02857" target="_blank">VLN-CE</a></strong>
         <span class="why">R2R식 이산 graph navigation을 연속 환경으로 확장한 기준점. synthetic navigation dataset의 episode 형식, instruction, action interface를 설계할 때 직접 도움이 된다.</span>
       </li>
       <li>
-        <strong>Habitat / HM3D</strong>
+        <strong><a href="https://aihabitat.org" target="_blank">Habitat</a> / <a href="https://arxiv.org/abs/2109.08238" target="_blank">HM3D</a></strong>
         <span class="why">대규모 실내 3D scan 기반 embodied AI 생태계. Infinigen Indoors와 비교하면 "실제 스캔 기반 다양성"과 "절차적 생성 기반 제어 가능성"의 차이가 보인다.</span>
       </li>
     </ul>
@@ -540,19 +540,19 @@ Isaac Sim
     <h2>4. OpticalNav로 이어지는 광학 렌더링 자료</h2>
     <ul class="reading">
       <li>
-        <strong>Mitsuba 3 Polarization 문서</strong>
+        <strong><a href="https://mitsuba.readthedocs.io/en/stable/src/rendering/polarization.html" target="_blank">Mitsuba 3 Polarization 문서</a></strong>
         <span class="why">Stokes 벡터와 Mueller 행렬 기반 편광 렌더링을 구현 관점에서 설명한다. Infinigen 장면에 편광/NIR 관측을 붙일 때 핵심 자료.</span>
       </li>
       <li>
-        <strong>Mitsuba 3 variant / spectral &amp; polarization 문서</strong>
+        <strong><a href="https://mitsuba.readthedocs.io/en/stable/src/key_topics/variants.html" target="_blank">Mitsuba 3 variant / spectral &amp; polarization 문서</a></strong>
         <span class="why">RGB, spectral, polarized variant의 차이를 확인할 수 있다. 장면 생성기와 광학 관측기를 분리해야 하는 이유를 설명하기 좋다.</span>
       </li>
       <li>
-        <strong>pbrt v4</strong>
+        <strong><a href="https://pbrt.org" target="_blank">pbrt v4</a></strong>
         <span class="why">물리 기반 렌더링의 교과서이자 구현 레퍼런스. BRDF, spectral rendering, participating media, path tracing 개념을 정리하는 데 안정적이다.</span>
       </li>
       <li>
-        <strong>Isaac Sim Infinigen SDG tutorial</strong>
+        <strong><a href="https://docs.isaacsim.omniverse.nvidia.com/latest/replicator_tutorials/tutorial_replicator_infinigen.html" target="_blank">Isaac Sim Infinigen SDG tutorial</a></strong>
         <span class="why">Infinigen 장면을 Isaac Sim의 synthetic data generation 파이프라인과 연결하는 실무 자료. RGB-first 데이터셋 구축과 잘 맞는다.</span>
       </li>
     </ul>
