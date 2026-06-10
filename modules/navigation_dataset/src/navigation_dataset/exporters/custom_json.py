@@ -319,12 +319,22 @@ def iter_export_files(
     project_dir: str | Path,
     index_payload: dict,
     kept_episodes: Iterable[EpisodeManifest],
+    *,
+    panorama_observations: bool = True,
 ) -> Iterable[tuple[Path, str]]:
     """Yield (src_path, dst_relative_posix_path) pairs for the scene bundle.
 
     The destination layout mirrors the project tree under
     `scenes/<scene_id>/` so external readers that already understand the
     project layout work unchanged.
+
+    `panorama_observations`:
+        * True (default) — include **every heading** at each viewpoint along
+          the episode path. Lets external readers consume full surround
+          context per waypoint.
+        * False — include only the (vp, heading) pairs the episode actually
+          visits. Same data the GT thumbnails reference; produces a much
+          slimmer bundle when only the rendered trajectory is needed.
 
     Excludes:
       * other scenes under `scenes/`
@@ -371,22 +381,38 @@ def iter_export_files(
             pair = _emit(ep_path, f"episodes/{ep.split}/{ep.episode_id}.json")
             if pair is not None:
                 yield pair
-    # 3. Observation files for (vp, heading) along each episode's path —
-    # consolidated PNG/JSON layer + EXR pulled from bridge_jobs.
-    seen_pairs: set[tuple[str, str, str]] = set()
+    # 3. Observation files for every viewpoint along the episode path —
+    # **all panorama headings** at that node (not just the heading the episode
+    # visits), so external readers have the full surround context for each
+    # waypoint. Path-specific heading order is preserved separately in
+    # `thumbnails/<episode_id>/` (see worker's `generate_thumbnails` stage).
+    seen_viewpoints: set[tuple[str, str]] = set()
     for ep in kept_list:
-        if not ep.scene_id or not ep.path_nodes or not ep.path_headings:
+        if not ep.scene_id or not ep.path_nodes:
             continue
-        if len(ep.path_nodes) != len(ep.path_headings):
-            continue
-        for vp_id, h_id in zip(ep.path_nodes, ep.path_headings):
-            key = (str(ep.scene_id), str(vp_id), str(h_id))
-            if key in seen_pairs:
+        path_pairs: list[tuple[str, str]] = []
+        if ep.path_headings and len(ep.path_headings) == len(ep.path_nodes):
+            path_pairs = [(str(vp), str(h)) for vp, h in zip(ep.path_nodes, ep.path_headings)]
+        for vp_idx, vp_id in enumerate(ep.path_nodes):
+            vp_key = (str(ep.scene_id), str(vp_id))
+            if vp_key in seen_viewpoints:
                 continue
-            seen_pairs.add(key)
-            # 3a. Consolidated observation dir (PNG, sensor metadata, etc.).
-            obs_dir = pdir / "scenes" / str(ep.scene_id) / "observations" / str(vp_id) / str(h_id)
-            if obs_dir.is_dir():
+            seen_viewpoints.add(vp_key)
+            vp_dir = pdir / "scenes" / str(ep.scene_id) / "observations" / str(vp_id)
+            heading_ids: list[str] = []
+            if vp_dir.is_dir():
+                disk_headings = sorted(p.name for p in vp_dir.iterdir() if p.is_dir())
+                if panorama_observations:
+                    heading_ids = disk_headings
+                else:
+                    # GT-only: just the heading this episode visits at vp_idx.
+                    if vp_idx < len(path_pairs):
+                        gt_h = path_pairs[vp_idx][1]
+                        if gt_h in disk_headings:
+                            heading_ids = [gt_h]
+            # 3a. Consolidated observation files for every heading at this vp.
+            for h_id in heading_ids:
+                obs_dir = vp_dir / h_id
                 for src in sorted(obs_dir.rglob("*")):
                     if not src.is_file():
                         continue
@@ -394,27 +420,45 @@ def iter_export_files(
                     pair = _emit(src, rel)
                     if pair is not None:
                         yield pair
-            # 3b. EXR (HDR) from bridge_jobs — same (vp, heading) but the
-            # daemon's PNG-only consolidation skipped these. Map to the
-            # `scenes/<scene>/observations/<vp>/<h>/sensors/<camera>/` layout
-            # so the bundle keeps the existing per-camera structure.
+            # 3b. EXR (HDR) pulled from bridge_jobs for every heading at this
+            # vp. The daemon's PNG-only consolidation skipped these so we
+            # mirror them under `sensors/<camera>/<modality>.exr`.
             if repo_root is None:
                 continue
-            for bridge_obs in _bridge_job_observation_dirs(repo_root, str(ep.scene_id), str(vp_id), str(h_id)):
-                for src in sorted(bridge_obs.rglob("*")):
-                    if not src.is_file() or src.suffix.lower() != ".exr":
-                        continue
-                    # Path shape: .../observations/<frame_id>/cameras/<camera>/<modality>.exr
-                    parts = src.parts
-                    try:
-                        cam_idx = parts.index("cameras")
-                        camera_id = parts[cam_idx + 1]
-                    except (ValueError, IndexError):
-                        continue
-                    dst_rel = (
-                        f"scenes/{ep.scene_id}/observations/{vp_id}/{h_id}/"
-                        f"sensors/{camera_id}/{src.name}"
-                    )
-                    pair = _emit(src, dst_rel)
-                    if pair is not None:
-                        yield pair
+            # bridge_jobs name pattern uses each heading individually, so we
+            # iterate the heading ids discovered above. When the consolidated
+            # dir is missing (no PNG was written yet), still fall back to a
+            # glob for any heading matching the scene/vp.
+            bridge_heading_pool: list[str] = list(heading_ids)
+            if not bridge_heading_pool:
+                if panorama_observations:
+                    bridge_root = repo_root / "out" / "bridge_jobs"
+                    if bridge_root.exists():
+                        for job_dir in bridge_root.glob(f"opticalnav-{ep.scene_id}-template-{vp_id}-*"):
+                            suffix = job_dir.name[len(f"opticalnav-{ep.scene_id}-template-{vp_id}-"):]
+                            parts = suffix.split("-")
+                            if parts:
+                                bridge_heading_pool.append(parts[0])
+                else:
+                    # GT-only fallback when consolidated dir is empty.
+                    if vp_idx < len(path_pairs):
+                        bridge_heading_pool.append(path_pairs[vp_idx][1])
+                bridge_heading_pool = sorted(set(bridge_heading_pool))
+            for h_id in bridge_heading_pool:
+                for bridge_obs in _bridge_job_observation_dirs(repo_root, str(ep.scene_id), str(vp_id), str(h_id)):
+                    for src in sorted(bridge_obs.rglob("*")):
+                        if not src.is_file() or src.suffix.lower() != ".exr":
+                            continue
+                        parts = src.parts
+                        try:
+                            cam_idx = parts.index("cameras")
+                            camera_id = parts[cam_idx + 1]
+                        except (ValueError, IndexError):
+                            continue
+                        dst_rel = (
+                            f"scenes/{ep.scene_id}/observations/{vp_id}/{h_id}/"
+                            f"sensors/{camera_id}/{src.name}"
+                        )
+                        pair = _emit(src, dst_rel)
+                        if pair is not None:
+                            yield pair

@@ -616,6 +616,32 @@ def _resolve_material_binding(material_id: str | None, material_idx: dict[str, d
 
 _BSDF_CHANNEL_PLACEHOLDER_NM = 542  # green, used when scene XML is generated outside per-modality dispatch
 
+_BSDF_METAL_TOKENS = ("gold", "silver", "copper", "aluminum", "aluminium", "chrome", "steel", "brass", "platinum", "metal")
+_BSDF_CERAMIC_TOKENS = ("ceramic", "alumina", "zro", "zirconia", "porcelain")
+_BSDF_SOFT_TOKENS = ("silicone", "rubber", "wax", "skin", "cloth", "fabric", "velvet")
+
+
+def _measured_alpha_sample_for_material(material_id: str | None) -> float:
+    mid = str(material_id or "").lower()
+    if "fake" in mid and "gold" in mid:
+        return 0.03
+    if any(tok in mid for tok in _BSDF_METAL_TOKENS):
+        return 0.02
+    if any(tok in mid for tok in _BSDF_CERAMIC_TOKENS):
+        return 0.08
+    if "billiard" in mid:
+        return 0.04
+    if any(tok in mid for tok in _BSDF_SOFT_TOKENS):
+        return 0.12
+    return 0.08
+
+
+def _append_twosided_child_bsdf(shape: "ET.Element", bsdf_type: str) -> "ET.Element":
+    import xml.etree.ElementTree as ET
+
+    twosided = ET.SubElement(shape, "bsdf", type="twosided")
+    return ET.SubElement(twosided, "bsdf", type=bsdf_type)
+
 # Warm-white incandescent-ish radiance baseline (Mitsuba absolute units).
 # Picked so a single small bulb noticeably lights an interior room while staying
 # below film clipping at common spp/exposure. Authoring `emitter_intensity` scales this.
@@ -680,7 +706,7 @@ def _append_bsdf_xml(
         ET.SubElement(bsdf, "float", attrib={"name": "int_ior", "value": "1.5"})
         return
     if strategy == "conductor":
-        bsdf = ET.SubElement(shape, "bsdf", type="conductor")
+        bsdf = _append_twosided_child_bsdf(shape, "conductor")
         ET.SubElement(bsdf, "string", attrib={"name": "material", "value": "Al"})
         return
     if strategy in {"measured", "measured_polarized"}:
@@ -704,15 +730,22 @@ def _append_bsdf_xml(
         else:
             chosen = _maybe_str(binding.get("native_file"))
         if chosen:
-            bsdf = ET.SubElement(shape, "bsdf", type="measured_polarized" if strategy == "measured_polarized" else "measured")
+            bsdf_type = "measured_polarized" if strategy == "measured_polarized" else "measured"
+            bsdf = _append_twosided_child_bsdf(shape, bsdf_type)
             ET.SubElement(bsdf, "string", attrib={"name": "filename", "value": chosen})
+            if bsdf_type == "measured_polarized":
+                ET.SubElement(
+                    bsdf,
+                    "float",
+                    attrib={"name": "alpha_sample", "value": f"{_measured_alpha_sample_for_material(src_mid):.4f}"},
+                )
             return
         # No measured data available — fall through to roughplastic fallback.
     if strategy == "diffuse":
-        bsdf = ET.SubElement(shape, "bsdf", type="diffuse")
+        bsdf = _append_twosided_child_bsdf(shape, "diffuse")
         ET.SubElement(bsdf, "rgb", attrib={"name": "reflectance", "value": fallback_color})
         return
-    bsdf = ET.SubElement(shape, "bsdf", type="roughplastic")
+    bsdf = _append_twosided_child_bsdf(shape, "roughplastic")
     ET.SubElement(bsdf, "rgb", attrib={"name": "diffuse_reflectance", "value": fallback_color})
     ET.SubElement(bsdf, "float", attrib={"name": "alpha", "value": "0.2"})
 
@@ -5010,6 +5043,7 @@ class RenderDaemon:
         only_completed: bool,
         episode_ids: list[str] | None,
         include_episode_thumbnails: bool,
+        panorama_observations: bool = True,
     ) -> None:
         """Background worker — runs the 7-/8-stage scene bundle export.
 
@@ -5112,23 +5146,254 @@ class RenderDaemon:
 
             # ── generate_thumbnails (opt-in) ───────────────────────────────
             if include_episode_thumbnails and kept_episodes:
-                publish(stage="generate_thumbnails", current=0, total=len(kept_episodes), message="copying RGB along episode paths")
+                publish(stage="generate_thumbnails", current=0, total=len(kept_episodes), message="building L|F|R triplets")
+                try:
+                    from PIL import Image as _PILImage, ImageDraw as _PILDraw
+                except Exception:
+                    _PILImage = None
+                    _PILDraw = None
+
+                def _heading_to_yaw(h_id: str) -> int | None:
+                    try:
+                        return int(str(h_id).replace("h_", "").lstrip("0") or "0")
+                    except ValueError:
+                        return None
+
+                def _nearest_heading(target_yaw: int, available: list[str]) -> str | None:
+                    if not available:
+                        return None
+                    best = None
+                    best_d = 360
+                    for hid in available:
+                        y = _heading_to_yaw(hid)
+                        if y is None:
+                            continue
+                        d = abs((target_yaw - y + 540) % 360 - 180)
+                        if d < best_d:
+                            best_d = d
+                            best = hid
+                    return best
+
                 for ep_idx, ep in enumerate(kept_episodes):
                     check_cancel()
                     if not ep.path_nodes or not ep.path_headings:
                         continue
                     pairs = list(zip(ep.path_nodes, ep.path_headings))
-                    pad = len(str(max(len(pairs) - 1, 0)))
+                    pad = max(len(str(max(len(pairs) - 1, 0))), 2)
                     thumb_dir = staging / "thumbnails" / ep.episode_id
                     thumb_dir.mkdir(parents=True, exist_ok=True)
-                    for step_idx, (vp, h) in enumerate(pairs):
-                        rgb = (
-                            project_dir / "scenes" / scene_id / "observations" /
-                            str(vp) / str(h) / "rgb.png"
+                    vp_obs_root = project_dir / "scenes" / scene_id / "observations"
+                    triplets: list[tuple[int, str, str, Path]] = []  # (step, vp, fwd_h, dst)
+                    # Five panels per step. Render convention: yaw=0 looks
+                    # +y_graph (N) and +yaw rotates CCW from above (N→W→S→E),
+                    # so the agent's LEFT corresponds to forward +90° and the
+                    # agent's RIGHT to forward -90°. Display order on the strip
+                    # is LL · L · F · R · RR (reading left-to-right matches
+                    # the agent panning their head left → right).
+                    panel_offsets = [(60, "LL"), (30, "L"), (0, "F"), (-30, "R"), (-60, "RR")]
+                    # Build a node_id → (x, y) map from viewpoint_graph.json so
+                    # we can recompute forward yaw from positions and ignore
+                    # episode.path_headings (which were saved with the old,
+                    # 90°-off `_edge_heading` formula).
+                    try:
+                        import math as _math
+                        from navigation_dataset.viewpoint_graph import read_viewpoint_graph as _read_vg
+                        _vg = _read_vg(project_dir / "scenes" / scene_id / "viewpoint_graph.json")
+                        _pos_by_id = {n.node_id: (float(n.position[0]), float(n.position[1])) for n in _vg.nodes}
+                    except Exception:
+                        _pos_by_id = {}
+
+                    def _forward_yaw_from_positions(step_i: int) -> float | None:
+                        nodes_p = ep.path_nodes
+                        if step_i + 1 < len(nodes_p):
+                            a, b = nodes_p[step_i], nodes_p[step_i + 1]
+                        elif step_i > 0:
+                            a, b = nodes_p[step_i - 1], nodes_p[step_i]
+                        else:
+                            return None
+                        if a not in _pos_by_id or b not in _pos_by_id:
+                            return None
+                        ax, ay = _pos_by_id[a]
+                        bx, by = _pos_by_id[b]
+                        dx, dy = bx - ax, by - ay
+                        if abs(dx) < 1e-9 and abs(dy) < 1e-9:
+                            return None
+                        return (_math.degrees(_math.atan2(-dx, dy)) + 360.0) % 360.0
+
+                    for step_idx, (vp, h_fwd_saved) in enumerate(pairs):
+                        # Prefer position-derived yaw; fall back to the saved
+                        # path_heading when graph nodes aren't reachable.
+                        fwd_yaw_pos = _forward_yaw_from_positions(step_idx)
+                        if fwd_yaw_pos is not None:
+                            fwd_yaw = int(round(fwd_yaw_pos))
+                        else:
+                            fwd_yaw = _heading_to_yaw(h_fwd_saved)
+                        vp_dir = vp_obs_root / str(vp)
+                        if fwd_yaw is None or not vp_dir.is_dir():
+                            continue
+                        available = sorted(d.name for d in vp_dir.iterdir() if d.is_dir())
+                        # Snap forward to the nearest rendered heading at this vp.
+                        h_fwd = _nearest_heading(int(fwd_yaw), available) or h_fwd_saved
+                        panels: list[tuple[str, Path | None, str]] = []
+                        for off, tag in panel_offsets:
+                            hid = h_fwd if off == 0 else _nearest_heading((fwd_yaw + off) % 360, available)
+                            rgb_path = (vp_dir / str(hid) / "rgb.png") if hid else None
+                            panels.append((tag, rgb_path if rgb_path and rgb_path.is_file() else None, hid or "?"))
+                        dst = thumb_dir / f"step_{str(step_idx).zfill(pad)}_yaw{str(fwd_yaw).zfill(3)}deg_{vp}.png"
+                        if _PILImage is None or not any(p[1] is not None for p in panels):
+                            if h_fwd in available:
+                                src = vp_dir / h_fwd / "rgb.png"
+                                if src.is_file():
+                                    shutil.copy2(src, dst)
+                                    triplets.append((step_idx, vp, h_fwd, dst))
+                            continue
+                        try:
+                            sample = next(_PILImage.open(p[1]).convert("RGB") for p in panels if p[1])
+                            sw, sh = sample.size
+                            scale = 240 / max(sw, sh)
+                            tw, th = max(1, int(sw * scale)), max(1, int(sh * scale))
+                            bar_h = 22
+                            gap = 4
+                            sheet_w = tw * len(panels) + gap * (len(panels) - 1)
+                            sheet_h = th + bar_h
+                            sheet = _PILImage.new("RGB", (sheet_w, sheet_h), (15, 23, 42))
+                            draw = _PILDraw.Draw(sheet) if _PILDraw is not None else None
+                            x = 0
+                            for tag, p, hid in panels:
+                                if p is not None:
+                                    im = _PILImage.open(p).convert("RGB").resize((tw, th), _PILImage.LANCZOS)
+                                    sheet.paste(im, (x, 0))
+                                if draw is not None:
+                                    yaw_lbl = (str(_heading_to_yaw(hid) or 0).zfill(3) + "°") if hid else "—"
+                                    draw.text((x + 4, th + 4), f"{tag} {yaw_lbl}", fill=(219, 234, 254))
+                                x += tw + gap
+                            if draw is not None:
+                                draw.text((4, 4), f"#{step_idx}", fill=(253, 224, 71))
+                            sheet.save(dst, optimize=True)
+                            triplets.append((step_idx, vp, h_fwd, dst))
+                        except Exception:
+                            pass
+                    # Goal preview — 4-direction (N/E/S/W) panorama at the goal
+                    # node so the "go to goal X" instruction is grounded in
+                    # actual imagery. Falls back to whatever headings exist.
+                    if _PILImage is not None and ep.path_nodes:
+                        goal_node = ep.goal_node or ep.path_nodes[-1]
+                        goal_dir = vp_obs_root / str(goal_node)
+                        if goal_dir.is_dir():
+                            try:
+                                goal_available = sorted(d.name for d in goal_dir.iterdir() if d.is_dir())
+                                cardinal_yaws = [0, 90, 180, 270]
+                                tiles_g = []
+                                sw_g = sh_g = None
+                                for yaw in cardinal_yaws:
+                                    hid = _nearest_heading(yaw, goal_available)
+                                    rgb_p = (goal_dir / str(hid) / "rgb.png") if hid else None
+                                    if rgb_p and rgb_p.is_file():
+                                        im = _PILImage.open(rgb_p).convert("RGB")
+                                        if sw_g is None:
+                                            sw_g, sh_g = im.size
+                                            scale = 320 / max(sw_g, sh_g)
+                                            tw_g, th_g = max(1, int(sw_g * scale)), max(1, int(sh_g * scale))
+                                        im = im.resize((tw_g, th_g), _PILImage.LANCZOS)
+                                        tile = _PILImage.new("RGB", (tw_g, th_g + 22), (15, 23, 42))
+                                        tile.paste(im, (0, 0))
+                                        if _PILDraw is not None:
+                                            dg = _PILDraw.Draw(tile)
+                                            dg.text((4, th_g + 4), f"yaw {str(yaw).zfill(3)}°", fill=(219, 234, 254))
+                                        tiles_g.append(tile)
+                                if tiles_g:
+                                    gap = 4
+                                    instr = (ep.natural_language_instruction or "").strip()
+                                    head_h = 28 + (16 if instr else 0)
+                                    sheet_w = sum(t.width for t in tiles_g) + gap * (len(tiles_g) - 1)
+                                    sheet_h = max(t.height for t in tiles_g) + head_h
+                                    sheet = _PILImage.new("RGB", (sheet_w, sheet_h), (15, 23, 42))
+                                    if _PILDraw is not None:
+                                        dh = _PILDraw.Draw(sheet)
+                                        label = f"GOAL: {goal_node}"
+                                        if ep.goal_region:
+                                            label += f"  ({ep.goal_region})"
+                                        dh.text((6, 6), label, fill=(252, 211, 77))
+                                        if instr:
+                                            # Truncate if longer than panel width.
+                                            max_chars = max(20, sheet_w // 7)
+                                            line = instr if len(instr) <= max_chars else instr[:max_chars - 1] + "…"
+                                            dh.text((6, 24), f"“{line}”", fill=(219, 234, 254))
+                                    x = 0
+                                    for t in tiles_g:
+                                        sheet.paste(t, (x, head_h))
+                                        x += t.width + gap
+                                    sheet.save(thumb_dir / "_goal_view.png", optimize=True)
+                            except Exception:
+                                pass
+                    # Goal context txt — durable structured info for anyone
+                    # programmatically reading the bundle. Captures the goal
+                    # node, region, pose, and the instruction text in one
+                    # spot per episode (the natural-language string alone can
+                    # be ambiguous, e.g., "Go to couch" with multiple couches
+                    # in the scene; the node id + pose + region resolve it).
+                    try:
+                        goal_node_id = ep.goal_node or (ep.path_nodes[-1] if ep.path_nodes else "")
+                        goal_info = {
+                            "episode_id": ep.episode_id,
+                            "scene_id": ep.scene_id,
+                            "instruction": ep.natural_language_instruction,
+                            "goal_node": goal_node_id,
+                            "goal_region": ep.goal_region,
+                            "goal_pose": ep.goal_pose,
+                            "start_node": ep.start_node,
+                            "start_pose": ep.start_pose,
+                            "path_node_count": len(ep.path_nodes),
+                            "scenario": (ep.metadata or {}).get("scenario"),
+                            "graph_distance_m": (ep.metadata or {}).get("graph_distance_m"),
+                        }
+                        (thumb_dir / "_goal_info.json").write_text(
+                            json.dumps(goal_info, ensure_ascii=False, indent=2), encoding="utf-8",
                         )
-                        if rgb.is_file():
-                            dst_name = f"{str(step_idx).zfill(max(pad, 2))}_{vp}_{h}_rgb.png"
-                            shutil.copy2(rgb, thumb_dir / dst_name)
+                    except Exception:
+                        pass
+                    # Optional path strip — one wide PNG concatenating every
+                    # step's triplet vertically (each row = one step), plus a
+                    # caption band carrying the natural-language instruction so
+                    # the user can see GT + the goal description in one place.
+                    if _PILImage is not None and triplets:
+                        try:
+                            row_imgs = [_PILImage.open(p).convert("RGB") for _, _, _, p in triplets]
+                            if row_imgs:
+                                instruction = (ep.natural_language_instruction or "").strip()
+                                head_h = 0
+                                wrapped_lines: list[str] = []
+                                if instruction and _PILDraw is not None:
+                                    # Word-wrap to fit panel width.
+                                    panel_w = max(im.width for im in row_imgs)
+                                    avg_chr = 7
+                                    chars_per_line = max(20, panel_w // avg_chr)
+                                    words = instruction.split()
+                                    line = ""
+                                    for w in words:
+                                        if len(line) + len(w) + 1 > chars_per_line:
+                                            wrapped_lines.append(line)
+                                            line = w
+                                        else:
+                                            line = (line + " " + w).strip()
+                                    if line:
+                                        wrapped_lines.append(line)
+                                    head_h = 18 + 14 * len(wrapped_lines)
+                                rw = max(im.width for im in row_imgs)
+                                rh = head_h + sum(im.height for im in row_imgs) + 2 * (len(row_imgs) - 1)
+                                strip = _PILImage.new("RGB", (rw, rh), (15, 23, 42))
+                                if head_h and _PILDraw is not None:
+                                    dh2 = _PILDraw.Draw(strip)
+                                    dh2.text((6, 4), "INSTRUCTION:", fill=(252, 211, 77))
+                                    for i, ln in enumerate(wrapped_lines):
+                                        dh2.text((6, 18 + 14 * i), ln, fill=(219, 234, 254))
+                                y = head_h
+                                for im in row_imgs:
+                                    strip.paste(im, (0, y))
+                                    y += im.height + 2
+                                strip.save(thumb_dir / "_path_strip.png", optimize=True)
+                        except Exception:
+                            pass
                     publish(
                         stage="generate_thumbnails",
                         current=ep_idx + 1,
@@ -5138,7 +5403,10 @@ class RenderDaemon:
 
             # ── collect_files ──────────────────────────────────────────────
             publish(stage="collect_files", message="resolving bundle contents", current=0, total=0)
-            files = list(iter_export_files(project_dir, index_payload, kept_episodes))
+            files = list(iter_export_files(
+                project_dir, index_payload, kept_episodes,
+                panorama_observations=panorama_observations,
+            ))
             bytes_total = sum(src.stat().st_size for src, _ in files)
             publish(
                 stage="collect_files",
@@ -9600,6 +9868,7 @@ class RenderDaemon:
             )
             only_completed = bool(payload.get("only_completed", True))
             include_episode_thumbnails = bool(payload.get("include_episode_thumbnails", False))
+            panorama_observations = bool(payload.get("panorama_observations", True))
             job_id = f"export-{scene_id}-{_utc_now().strftime('%Y%m%dT%H%M%S%f')}"
             with self._export_jobs_lock:
                 self._export_jobs[job_id] = {
@@ -9624,7 +9893,7 @@ class RenderDaemon:
                 }
             threading.Thread(
                 target=self._run_export_job,
-                args=(job_id, parts[0], project_dir, scene_id, only_completed, episode_ids, include_episode_thumbnails),
+                args=(job_id, parts[0], project_dir, scene_id, only_completed, episode_ids, include_episode_thumbnails, panorama_observations),
                 name=f"export-job-{job_id}",
                 daemon=True,
             ).start()

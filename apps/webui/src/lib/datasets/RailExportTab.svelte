@@ -1,4 +1,8 @@
 <script lang="ts">
+	import ExportProgressCard from './ExportProgressCard.svelte';
+	import ExportResultCard from './ExportResultCard.svelte';
+	import type { ExportJobStatus } from '$lib/datasets/services/exportJobsService';
+
 	interface Props {
 		hasScene: boolean;
 		hasMap: boolean;
@@ -19,11 +23,16 @@
 		loading: boolean;
 		onlyCompleted?: boolean;
 		currentSceneOnly?: boolean;
+		includeThumbnails?: boolean;
+		panoramaObservations?: boolean;
 		currentSceneId?: string;
 		exportableEpisodeCount?: number;
 		exportSummary?: any;
+		activeExportJob?: ExportJobStatus | null;
 		onValidate: () => void;
 		onExport: () => void;
+		onCancelExport?: () => void;
+		onResetExport?: () => void;
 	}
 
 	let {
@@ -34,14 +43,22 @@
 		selectedProjectId, loading,
 		onlyCompleted = $bindable(true),
 		currentSceneOnly = $bindable(true),
+		includeThumbnails = $bindable(false),
+		panoramaObservations = $bindable(true),
 		currentSceneId = '',
 		exportableEpisodeCount = 0,
 		exportSummary = null,
-		onValidate, onExport,
+		activeExportJob = null,
+		onValidate, onExport, onCancelExport, onResetExport,
 	}: Props = $props();
+
+	const jobInFlight = $derived(
+		activeExportJob && (activeExportJob.status === 'queued' || activeExportJob.status === 'running')
+	);
+	const jobDone = $derived(activeExportJob && activeExportJob.status === 'succeeded');
 </script>
 
-<section class="rail-section rail-tool-panel export-panel">
+<section class="rail-section rail-tool-panel export-panel" style="min-width:0; overflow:hidden;">
 	<div class="rail-title">Export Readiness</div>
 	<div class="export-readiness-list">
 		<div class="readiness-item" class:ok={hasScene}><span class="readiness-dot"></span><span>Scene</span></div>
@@ -118,13 +135,39 @@
 			Exporting all {episodesCount} episodes
 		{/if}
 	</div>
-	<button class="button button-primary full" disabled={!selectedProjectId || !hasEpisodes || loading || (onlyCompleted && exportableEpisodeCount === 0)} onclick={onExport}>
-		{loading ? 'Exporting...' : 'Export Dataset'}
-	</button>
-	{#if exportSummary}
-		<div class="export-summary-line">
-			kept <strong>{exportSummary.episode_count ?? 0}</strong> · skipped {exportSummary.skipped_episode_count ?? 0} · on disk {exportSummary.total_episode_count_on_disk ?? 0}
-		</div>
+	<label class="export-filter-row">
+		<input type="checkbox" bind:checked={panoramaObservations} />
+		<span>Full panorama observations</span>
+	</label>
+	<div class="export-filter-hint">
+		{#if panoramaObservations}
+			모든 heading 포함
+		{:else}
+			GT (vp, heading) 만 (slim)
+		{/if}
+	</div>
+	<label class="export-filter-row">
+		<input type="checkbox" bind:checked={includeThumbnails} />
+		<span>Include episode thumbnails</span>
+	</label>
+	{#if jobInFlight}
+		<ExportProgressCard job={activeExportJob!} onCancel={onCancelExport} />
+	{:else if jobDone}
+		<ExportResultCard job={activeExportJob!} onReset={onResetExport} />
+	{:else}
+		<button
+			class="button button-primary full"
+			disabled={!selectedProjectId || !hasEpisodes || loading || (onlyCompleted && exportableEpisodeCount === 0) || !currentSceneId}
+			onclick={onExport}
+		>
+			{loading ? 'Submitting…' : 'Export Dataset'}
+		</button>
+		{#if activeExportJob && (activeExportJob.status === 'failed' || activeExportJob.status === 'cancelled')}
+			<div class="export-summary-line">
+				{activeExportJob.status === 'failed' ? `Failed: ${activeExportJob.error ?? 'unknown'}` : 'Cancelled.'}
+				<button type="button" class="button button-subtle" onclick={onResetExport}>Dismiss</button>
+			</div>
+		{/if}
 	{/if}
 	{#if exportPath}
 		<div class="export-path-display">

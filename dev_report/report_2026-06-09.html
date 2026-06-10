@@ -55,6 +55,8 @@
   .file-card h3 { margin-top:0; }
   .small { font-size:12px; color:var(--muted); }
   .footer { color:var(--muted); text-align:center; margin-top:34px; font-size:12px; }
+  a { color:var(--blue); text-decoration:none; }
+  a:hover { text-decoration:underline; }
   @media (max-width:900px) {
     .layout{display:block} aside{position:relative;width:auto;height:auto} main{width:auto;padding:20px}
     .grid,.flow,.file-grid{grid-template-columns:1fr}
@@ -79,6 +81,18 @@
   <a class="nav-link" href="#daemon">Render Daemon</a>
   <a class="nav-link" href="#dataset">Dataset export</a>
   <a class="nav-link" href="#office">Shared office</a>
+  <a class="nav-link" href="#hpbrdf-rgb">hpBRDF RGB / VRAM</a>
+
+  <div class="nav-title">Navigation Instruction</div>
+  <a class="nav-link" href="#nav-instructions">Instruction 품질 문제</a>
+  <a class="nav-link" href="#nav-pipeline">생성 파이프라인</a>
+  <a class="nav-link" href="#nav-episode-format">에피소드 포맷</a>
+  <a class="nav-link" href="#nav-recommendations">권장 포맷 변경</a>
+  <a class="nav-link" href="#nav-related-work">관련 연구</a>
+
+  <div class="nav-title">연구 방향</div>
+  <a class="nav-link" href="#meeting-backlog">미팅 백로그</a>
+  <a class="nav-link" href="#meeting-directions">연구 후보 방향</a>
 
   <div class="nav-title">상태</div>
   <a class="nav-link" href="#risks">리스크</a>
@@ -320,19 +334,195 @@
     </table>
   </section>
 
+  <section id="hpbrdf-rgb">
+    <h2>hpBRDF RGB / VRAM 분석</h2>
+
+    <h3>개념 정리 — BRDF · BTDF · BSDF</h3>
+    <div class="grid" style="grid-template-columns:repeat(3,1fr);margin-bottom:14px">
+      <div class="card">
+        <div class="label">BRDF</div>
+        <div style="font-size:11px;font-family:var(--mono);color:var(--blue);margin:4px 0">f_r(ωᵢ, ωₒ)</div>
+        <div class="note">
+          입사광이 표면에서 <strong>같은 쪽 반구로 반사</strong>되는 양.
+          불투명 재질 전용.<br><br>
+          대상: 나무 책상, 플라스틱 의자, 금속 프레임, 페인트 벽, 천, 바닥재
+        </div>
+        <div style="margin-top:8px;font-size:11px;background:#f0f9ff;padding:6px 8px;border-radius:4px;font-family:var(--mono);color:#0369a1;line-height:1.6">
+          입사광 ↓<br>
+          ──────── 표면<br>
+          반사광 ↑
+        </div>
+      </div>
+      <div class="card">
+        <div class="label">BTDF</div>
+        <div style="font-size:11px;font-family:var(--mono);color:var(--purple);margin:4px 0">f_t(ωᵢ, ωₒ)</div>
+        <div class="note">
+          입사광이 표면을 통과해 <strong>반대쪽으로 투과</strong>되는 양.
+          반투명·투명 재질 전용.<br><br>
+          대상: 유리, 반투명 플라스틱, 얇은 커튼, 물, 렌즈
+        </div>
+        <div style="margin-top:8px;font-size:11px;background:#faf5ff;padding:6px 8px;border-radius:4px;font-family:var(--mono);color:#7c3aed;line-height:1.6">
+          입사광 ↓<br>
+          ──────── 표면<br>
+          투과광 ↓
+        </div>
+      </div>
+      <div class="card">
+        <div class="label">BSDF</div>
+        <div style="font-size:11px;font-family:var(--mono);color:var(--green);margin:4px 0">f_s = f_r + f_t</div>
+        <div class="note">
+          반사 + 투과를 모두 포함하는 <strong>일반화된 산란 모델</strong>.
+          BRDF와 BTDF의 상위 개념.<br><br>
+          Mitsuba의 모든 재질 플러그인이 BSDF 인터페이스를 구현.
+        </div>
+        <div style="margin-top:8px;font-size:11px;background:#f0fdf4;padding:6px 8px;border-radius:4px;font-family:var(--mono);color:#15803d;line-height:1.6">
+          반사광 ↑<br>
+          ──────── 표면 (BSDF)<br>
+          투과광 ↓
+        </div>
+      </div>
+    </div>
+
+    <h3>OpticalNav 맥락에서의 재질 분류</h3>
+    <table style="margin-bottom:14px">
+      <tr><th>재질 유형</th><th>예시</th><th>필요 모델</th><th>Mitsuba 플러그인</th><th>비고</th></tr>
+      <tr>
+        <td>일반 사무실 물체</td>
+        <td>책상·의자·벽·바닥·플라스틱·금속·천</td>
+        <td><span class="tag green">BRDF</span> 로 충분</td>
+        <td><code>diffuse</code>, <code>roughconductor</code>, <code>principled</code></td>
+        <td>불투명 — 반사만 모델링</td>
+      </tr>
+      <tr>
+        <td>유리문 / 투명 파티션</td>
+        <td>유리문, 반투명 칸막이</td>
+        <td><span class="tag amber">BSDF 필수</span></td>
+        <td><code>dielectric</code>, <code>roughdielectric</code>, <code>thindielectric</code></td>
+        <td>반사 + 투과 + 굴절 동시 발생</td>
+      </tr>
+      <tr>
+        <td>편광 측정 재질 (hpBRDF)</td>
+        <td>measured BSDF 데이터 (MERL, UTIA 등)</td>
+        <td><span class="tag">BRDF</span> (반사 측정)</td>
+        <td><code>measured</code>, 커스텀 <code>.pbrdf</code></td>
+        <td>측정 데이터가 반사만 포함하면 BRDF. 유리 등 투과 재질은 polarized BSDF / Mueller BSDF로 확장 필요.</td>
+      </tr>
+      <tr>
+        <td>편광 유리 / NIR 투과</td>
+        <td>편광 유리문, NIR 반투과 소재</td>
+        <td><span class="tag red">polarized BSDF</span></td>
+        <td>Mueller matrix BSDF (커스텀 구현)</td>
+        <td>편광 상태 변화까지 추적 — stokes vector 기반. OpticalNav 장기 목표.</td>
+      </tr>
+    </table>
+
+    <div class="alert green" style="margin-bottom:18px">
+      <strong>한 줄 정리:</strong>
+      불투명 사무실 물체는 BRDF로 충분하지만,
+      유리문은 반사와 투과가 동시에 발생하므로 BSDF(= BRDF + BTDF)가 필요하다.
+      편광·NIR 효과까지 포함하면 Mueller BSDF로 확장해야 한다.
+      우리가 "measured BRDF를 쓴다"고 말할 때는 불투명 재질의 반사 응답을 가리키는 것이다.
+    </div>
+
+    <p>
+      공유오피스 chair/material test에서 hpBRDF channel-split 재질을 RGB로 보이게 하기 위해
+      <code>614nm</code>, <code>542nm</code>, <code>446nm</code> 세 pass를 렌더한 뒤 R/G/B로 합성했다.
+      이 경로는 기존 Mitsuba RGB 렌더와 메모리 모델이 다르다.
+    </p>
+
+    <div class="grid">
+      <div class="card">
+        <div class="label">기존 RGB</div>
+        <div class="metric">1 scene</div>
+        <div class="note">RGB-valued BSDF/texture를 한 scene에서 계산한다. scene/BVH/OptiX/texture cache가 한 벌이다.</div>
+      </div>
+      <div class="card">
+        <div class="label">현재 hpBRDF RGB</div>
+        <div class="metric">3 scenes</div>
+        <div class="note">614/542/446nm XML을 각각 load/render하고 외부에서 RGB로 합성한다.</div>
+      </div>
+      <div class="card">
+        <div class="label">VRAM driver</div>
+        <div class="metric">BRDF</div>
+        <div class="note">spp보다 measured BSDF, BVH, OptiX accel, texture, resident scene 중복이 더 큰 요인이다.</div>
+      </div>
+      <div class="card">
+        <div class="label">Failure mode</div>
+        <div class="metric">OOM</div>
+        <div class="note">세 wavelength scene이 resident cache에 쌓이면 GPU memory pressure가 커지고 loading_scene에서 멈춘 것처럼 보일 수 있다.</div>
+      </div>
+    </div>
+
+    <h3>왜 기존 RGB와 다른가</h3>
+    <table>
+      <tr><th>항목</th><th>기존 Mitsuba RGB</th><th>hpBRDF channel-split RGB</th></tr>
+      <tr>
+        <td>채널 의미</td>
+        <td>renderer 내부 RGB vector channel.</td>
+        <td>단일 파장 measured BSDF scene을 외부 orchestration으로 3회 렌더.</td>
+      </tr>
+      <tr>
+        <td>Scene resource</td>
+        <td>scene object, geometry, BVH, OptiX accel, texture, BSDF가 한 벌.</td>
+        <td><code>scene_614</code>, <code>scene_542</code>, <code>scene_446</code>이 서로 다른 XML이라 cache가 세 벌을 잡을 수 있다.</td>
+      </tr>
+      <tr>
+        <td>spp 영향</td>
+        <td>주로 시간과 일부 integrator/sampler buffer에 영향.</td>
+        <td>마찬가지로 시간 영향이 크다. VRAM 주범은 spp보다 measured BRDF와 scene 중복이다.</td>
+      </tr>
+      <tr>
+        <td>속도/안정성 tradeoff</td>
+        <td>resident scene cache가 안정적으로 이득.</td>
+        <td>단일 GPU에서는 cache 유지보다 band 사이 scene release가 안정성에 더 중요할 수 있다.</td>
+      </tr>
+    </table>
+
+    <h3>운영 전략</h3>
+    <table>
+      <tr><th>용도</th><th>권장 전략</th><th>이유</th></tr>
+      <tr>
+        <td>Hot preview</td>
+        <td>기본은 low spp + single-band 또는 material proxy RGB. 3-band measured RGB는 옵션으로 둔다.</td>
+        <td>preview는 구도/방향 확인이 목적이므로 4096 spp × 3 pass는 과하다.</td>
+      </tr>
+      <tr>
+        <td>단일 GPU final</td>
+        <td>R → cache release → G → cache release → B → 합성.</td>
+        <td>resident cache 이득보다 OOM 방지가 우선이다.</td>
+      </tr>
+      <tr>
+        <td>멀티 GPU final</td>
+        <td>GPU0=614nm, GPU1=542nm, GPU2=446nm band sharding.</td>
+        <td>각 GPU에는 scene 한 벌만 올라가므로 메모리 중복이 GPU별로 분산된다.</td>
+      </tr>
+      <tr>
+        <td>장기 구조</td>
+        <td><code>measured_polarized_rgb</code> 또는 <code>measured_polarized_channels</code> custom BSDF plugin.</td>
+        <td>BSDF 내부에서 3개 pBRDF file을 읽고 한 scene에서 RGB/Spectrum 값을 반환하면 scene/BVH/OptiX 중복을 줄일 수 있다.</td>
+      </tr>
+    </table>
+
+    <div class="alert">
+      결론: hpBRDF RGB 3채널 합성은 불가능한 문제가 아니라 현재 구현이 <strong>외부 3-pass</strong>라서 VRAM 중복이 생기는 문제다.
+      단기적으로는 preview와 final 정책을 분리하고, 단일 GPU에서는 wavelength pass 사이 cache를 비워야 한다.
+      장기적으로는 channel-split <code>.pbrdf</code> 세 개를 묶는 Mitsuba BSDF plugin이 가장 적절하다.
+    </div>
+  </section>
+
   <section id="risks">
     <h2>리스크 / 남은 정리</h2>
     <table>
       <tr><th>리스크</th><th>현재 상태</th><th>권장 정리</th></tr>
       <tr>
-        <td>Untracked scope가 큼</td>
-        <td><code>dev_report</code>, <code>datasets</code> 컴포넌트, office tooling, USD exporter, optix submodule-like dir 등이 untracked로 존재한다.</td>
-        <td>커밋 전 포함 대상과 제외 대상을 명확히 분리해야 한다. 특히 <code>modules/mitsuba3-optix7/</code>와 <code>build/</code>는 의도 확인 필요.</td>
+        <td>Post-commit 제외 항목</td>
+        <td>주요 개발 변경은 커밋되었고, 현재 남은 untracked는 외부 렌더러 체크아웃 성격의 <code>modules/mitsuba3-optix7/</code>와 Windows ADS 파일 <code>extension.toml:Zone.Identifier</code>다.</td>
+        <td>두 항목은 기능 변경 커밋에 섞지 않는다. 필요하면 별도 확인 후 ignore 또는 정리한다.</td>
       </tr>
       <tr>
-        <td>Material policy는 아직 계획 단계</td>
-        <td>OBJ/MTL texture 우선 경로는 들어갔지만 GLB PBR material preservation과 RGB/Optical/Hybrid policy는 아직 완성되지 않았다.</td>
-        <td>6/8 리포트의 3모드 material policy를 구현 작업으로 분리한다.</td>
+        <td>Material policy 구현은 다음 단계</td>
+        <td>6/8 보고서에 native texture preservation, SVBRDF-style parameter maps, measured optical mapping, BTF 장기 방향, PR-A/B/C/D 로드맵을 문서화했다.</td>
+        <td>구현은 PR-A부터 시작한다. 먼저 material slot texture extraction과 RGB native texture pass를 고정한 뒤 classifier와 modality-specific compiler로 확장한다.</td>
       </tr>
       <tr>
         <td>Route VM still large</td>
@@ -355,6 +545,870 @@
       <tr><td>Unit / frontend check</td><td><span class="tag amber">이번 보고서 업데이트 중에는 실행하지 않음</span> 보고서 목적이 변경 추적이어서 테스트 실행은 별도 단계로 남겼다.</td></tr>
       <tr><td>Report update</td><td><span class="tag green">완료</span> 이 파일과 index 링크를 추가했다.</td></tr>
     </table>
+  </section>
+
+  <!-- ═══════════════════════════════════════════════════════════════
+       Navigation Instruction Generation — 품질 분석 및 권장 사항
+  ════════════════════════════════════════════════════════════════ -->
+  <style>
+    .slide-fig { margin:0; border:1px solid var(--line); border-radius:8px; overflow:hidden; background:#f8fafc; }
+    .slide-fig img { width:100%; display:block; }
+    .slide-fig figcaption { padding:5px 10px; font-size:10px; color:var(--muted); font-family:var(--mono); background:#f1f5f9; }
+    .two-col { display:grid; grid-template-columns:1fr 1fr; gap:16px; align-items:start; margin:14px 0; }
+    .three-col-img { display:grid; grid-template-columns:1fr 1fr 1fr; gap:10px; margin:14px 0; }
+    @media (max-width:900px) { .two-col,.three-col-img { grid-template-columns:1fr; } }
+  </style>
+
+  <section id="nav-instructions">
+    <h2>Navigation Instruction 품질 문제</h2>
+
+    <div class="two-col" style="align-items:start">
+      <div>
+        <div class="alert amber" style="margin-top:0">
+          현재 instruction은 <strong>"Go to Goal at open desks."</strong>처럼 단일 template string이다.
+          목적지 레이블만 있고 경로 단서(landmark), 정지 조건(stop condition), 위험 회피 지시가 없다.
+          R2R 기준 사람이 쓴 instruction 평균 29토큰 대비 현재는 6–8토큰.
+        </div>
+        <h3 style="margin-top:14px">구조적 한계</h3>
+        <table style="margin-top:0">
+          <tr><th>항목</th><th>현재</th><th>문제</th></tr>
+          <tr><td>목표 기술</td><td><code>"open desks"</code> 레이블</td><td>내부 코드 그대로 — goal description / adjacent landmark 없음</td></tr>
+          <tr><td>Landmark</td><td>없음</td><td>VLN 모델의 주요 navigation cue 부재 → trajectory alignment 급하락</td></tr>
+          <tr><td>Stop condition</td><td>암묵적 (종단 node 도달)</td><td>STOP 액션 학습 신호 없음 → SPL/SR 직접 영향</td></tr>
+          <tr><td>Hazard constraint</td><td>없음</td><td>유리문·반사 벽 회피 지시 불가 → optical-hazard 데이터 의미 반감</td></tr>
+          <tr><td>Instruction 다양성</td><td>1개 template</td><td>동일 episode 반복 학습 시 overfitting; R2R은 annotator 3명</td></tr>
+          <tr><td>Route Events</td><td>없음</td><td>Turn/Forward/Landmark 이벤트 미추출 → template 생성 불가</td></tr>
+        </table>
+      </div>
+      <figure class="slide-fig">
+        <img src="images/slide_path_overview.png" alt="Path Overview — 3D floorplan with start/goal path" />
+        <figcaption>Fig 1. Path Overview — vp_000099 → vp_000108, Turn right ~30°, 6 steps</figcaption>
+      </figure>
+    </div>
+  </section>
+
+  <section id="nav-pipeline">
+    <h2>Instruction 생성 파이프라인 — 3단계</h2>
+
+    <div class="two-col">
+      <figure class="slide-fig">
+        <img src="images/slide_route_summary.png" alt="Symbolic Route Summary" />
+        <figcaption>Fig 2. Symbolic Route Summary — Start Context · Route Events · Goal · Hazards · Stop Condition</figcaption>
+      </figure>
+      <div>
+        <p style="color:#475569;font-size:13px;margin-top:0">
+          <strong>1·2단계는 결정론적</strong>(재현 가능), <strong>3단계는 offline 배치</strong>로 렌더링과 분리.
+          LLM은 문장화 마지막 단계에만 사용하고, 사실 정보는 simulator metadata에서 가져와 hallucination을 방지.
+        </p>
+        <div class="flow" style="grid-template-columns:1fr">
+          <div class="step">
+            <strong>1. Symbolic Route Summary</strong> — 결정론적
+            그래프 경로에서 5가지 이벤트를 추출한다:
+            <strong>Start Context</strong> (시작 지점 주변 랜드마크),
+            <strong>Route Events</strong> (move_forward / turn / landmark_pass),
+            <strong>Goal</strong> (목표 지역 설명),
+            <strong>Hazards</strong> (유리·반사 면 회피 플래그),
+            <strong>Stop Condition</strong> (종단에서 정지 기준).
+          </div>
+          <div class="step">
+            <strong>2. Template Instruction</strong> — 결정론적
+            Route Summary → template 선택 → string 합성.
+            Hazard 플래그가 있으면 <em>hazard_aware</em> template 선택, 없으면 <em>landmark</em> 또는 <em>concise</em>.
+            출력이 <code>instruction.primary</code> (재현 가능).
+          </div>
+          <div class="step">
+            <strong>3. LLM Variants</strong> — offline 배치
+            <code>instruction.primary</code> + Route Summary JSON → LLM (GPT-4o-mini / Claude Haiku, temp 0.9) → N개 변형.
+            새 landmark 창작 금지, grounding 검증기 통과 후 <code>instruction.variants</code> 저장.
+            예산: 1만 episode ≈ $2–4.
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <h3>슬라이드 Route Summary 예시 (shared office floor, vp_000099 → vp_000108)</h3>
+    <div class="grid" style="grid-template-columns:repeat(5,1fr);margin:10px 0">
+      <div class="card"><div class="label">Start Context</div><div class="note">Walkway near lounge chair, storage cabinet, and table (shared office)</div></div>
+      <div class="card"><div class="label">Route Events</div><div class="note">Move forward across open floor → Pass by chair cluster → Turn right (~30°) at corridor end → Approach open desks</div></div>
+      <div class="card"><div class="label">Goal</div><div class="note">Open desk area with office chairs and monitors</div></div>
+      <div class="card"><div class="label">Hazards</div><div class="note">Avoid crossing any glass partitions</div></div>
+      <div class="card"><div class="label">Stop Condition</div><div class="note">Stop next to the open desk area</div></div>
+    </div>
+
+    <div class="two-col">
+      <figure class="slide-fig">
+        <img src="images/slide_instruction_variants.png" alt="Instruction Variants — Concise / Landmark / Hazard-aware" />
+        <figcaption>Fig 3. Instruction Variants — 3가지 style + Validator checks</figcaption>
+      </figure>
+      <div>
+        <h3 style="margin-top:0">생성된 Instruction Variants (슬라이드 실제 출력)</h3>
+        <table style="margin:0">
+          <tr><th>Style</th><th>Instruction text</th><th>토큰</th></tr>
+          <tr>
+            <td><span class="tag">Concise</span></td>
+            <td>"Go to the open desk area and stop beside the nearest desk."</td>
+            <td>15</td>
+          </tr>
+          <tr>
+            <td><span class="tag purple">Landmark</span></td>
+            <td>"Move through the shared office toward the row of open desks, then stop next to the desk area."</td>
+            <td>22</td>
+          </tr>
+          <tr>
+            <td><span class="tag red">Hazard-aware</span></td>
+            <td>"Head toward the open desks using the clear walkway and stop beside the desk area without crossing any glass partitions."</td>
+            <td>26</td>
+          </tr>
+        </table>
+        <div class="alert green" style="margin-top:12px">
+          <strong>Validator checks (슬라이드):</strong>
+          Goal phrase matches goal region ✓ · Landmarks exist in scene ✓ · Left/Right matches heading change ✓ · Stop condition is present ✓
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section id="nav-episode-format">
+    <h2>에피소드 포맷 — Custom → VLN-style Extension</h2>
+
+    <div class="two-col">
+      <figure class="slide-fig">
+        <img src="images/slide_format_comparison.png" alt="Custom vs Proposed VLN-style format comparison" />
+        <figcaption>Fig 4. Current (Custom) → Proposed (VLN-style Extension) 필드 비교</figcaption>
+      </figure>
+      <div>
+        <h3 style="margin-top:0">핵심 변경 포인트</h3>
+        <table style="margin:0">
+          <tr><th>필드</th><th>현재</th><th>제안</th></tr>
+          <tr><td>instructions</td><td>단일 string</td><td>Multiple NL instructions (variants)</td></tr>
+          <tr><td>instruction_style</td><td>없음</td><td>concise / landmark / hazard-aware</td></tr>
+          <tr><td>grounding</td><td>없음</td><td>goal_region, landmarks, stop_condition, hazards</td></tr>
+          <tr><td>observation_spec</td><td>없음</td><td>rgb, depth, nir, semseq, lid (modality list)</td></tr>
+          <tr><td>graph_id</td><td>없음</td><td>Navigation graph id</td></tr>
+          <tr><td>split</td><td>없음</td><td>train / val / seen / unseen</td></tr>
+          <tr><td>difficulty</td><td>없음</td><td>easy / medium / hard</td></tr>
+          <tr><td>extra_meta</td><td>없음</td><td>scene_variant_id, lighting 등</td></tr>
+        </table>
+        <div class="alert" style="margin-top:12px">
+          <strong>VLN-CE 호환성 이슈:</strong> <code>start_position</code> (world xyz), <code>start_rotation</code> (quaternion), <code>goals[].position</code> 필수 필드 — 현재 node_id 기반이라 직접 로드 불가. node→world 변환 테이블 추가 필요.
+        </div>
+      </div>
+    </div>
+
+    <h3>제안 Core Fields JSON (슬라이드)</h3>
+    <div class="two-col">
+      <figure class="slide-fig">
+        <img src="images/slide_core_fields_json.png" alt="Core Fields proposed episode JSON" />
+        <figcaption>Fig 5. Core Fields — 제안 episode JSON 구조 + modality 이미지 (Semantic, Instance, LiDAR, Agent Pose)</figcaption>
+      </figure>
+      <figure class="slide-fig">
+        <img src="images/slide_instruction_grounding.png" alt="Instructions Extended JSON + Evaluation Metrics" />
+        <figcaption>Fig 6. Instructions (Extended) — instruction grounding + Evaluation Metrics (SR / SPL / Collision Rate / Hazard Collision Rate / Goal Distance)</figcaption>
+      </figure>
+    </div>
+  </section>
+
+  <section id="nav-recommendations">
+    <h2>권장 포맷 변경 및 구현 우선순위</h2>
+
+    <h3>Modalities per Timestep</h3>
+    <figure class="slide-fig" style="margin-bottom:14px">
+      <img src="images/slide_modalities_strip.png" alt="Modalities: NIR-like, Semantic Seg, Instance Seg, LiDAR-like, Agent Pose, Action" style="width:100%;display:block" />
+      <figcaption>Fig 7. Modalities per Timestep — NIR-like · Semantic Seg · Instance Seg · LiDAR-like · Agent Pose · Action</figcaption>
+    </figure>
+    <table>
+      <tr><th>Modality</th><th>포맷</th><th>현재 상태</th><th>용도</th></tr>
+      <tr><td>RGB</td><td>EXR / PNG</td><td><span class="tag green">생성 중</span></td><td>VLN 모델 주 입력</td></tr>
+      <tr><td>Depth</td><td>EXR float32</td><td><span class="tag green">생성 중</span></td><td>RGB-D 모델, 거리 추정</td></tr>
+      <tr><td>NIR-like</td><td>EXR (IR band)</td><td><span class="tag green">생성 중</span></td><td>유리·반사면 구별 핵심 채널</td></tr>
+      <tr><td>Semantic Seg</td><td>PNG uint16</td><td><span class="tag amber">부분</span></td><td>object-goal nav, 공간 이해</td></tr>
+      <tr><td>Instance Seg</td><td>PNG uint16</td><td><span class="tag amber">계획 중</span></td><td>개별 object tracking, landmark 식별</td></tr>
+      <tr><td>LiDAR-like</td><td>NPZ point cloud</td><td><span class="tag red">미구현</span></td><td>depth → point cloud 변환 가능</td></tr>
+      <tr><td>Agent Pose</td><td>JSON (world xyz + heading)</td><td><span class="tag amber">node_id만</span></td><td>trajectory visualization</td></tr>
+      <tr><td>Action</td><td>int (0=STOP,1=FWD,2=TL,3=TR)</td><td><span class="tag amber">정렬 규약 불명확</span></td><td>imitation learning 정답 레이블</td></tr>
+    </table>
+
+    <h3>Evaluation Metrics (슬라이드)</h3>
+    <div class="grid" style="grid-template-columns:repeat(5,1fr)">
+      <div class="card"><div class="label">Success Rate</div><div class="note">goal node 3m 이내 정지 = 성공. 가장 직관적.</div></div>
+      <div class="card"><div class="label">SPL</div><div class="note">SR × 최적 경로 효율. VLN 기본 지표.</div></div>
+      <div class="card"><div class="label">Collision Rate</div><div class="note">장애물 충돌 비율. optical-hazard 평가에 필수.</div></div>
+      <div class="card"><div class="label">Hazard Collision Rate</div><div class="note">유리·반사 장애물 충돌 비율. OpticalNav 핵심 지표.</div></div>
+      <div class="card"><div class="label">Goal Distance</div><div class="note">종료 위치 ↔ goal node 거리(m). 부분 성공 측정.</div></div>
+    </div>
+
+    <h3>구현 우선순위</h3>
+    <table>
+      <tr><th>우선순위</th><th>항목</th><th>공수</th><th>효과</th></tr>
+      <tr><td><span class="tag red">즉시</span></td><td><code>observation_bundle_ref</code> 복원 (<code>custom_json.py</code>)</td><td>0.5일</td><td>render ↔ timestep 연결 복구 — 학습 파이프라인 필수</td></tr>
+      <tr><td><span class="tag red">즉시</span></td><td>actions/timesteps 정렬 규약 코드 주석 명시</td><td>0.1일</td><td>off-by-one 버그 예방; VLN-CE 길이 검증 통과</td></tr>
+      <tr><td><span class="tag amber">단기</span></td><td>Symbolic Route Summary 모듈 (<code>route_annotator.py</code>)</td><td>2일</td><td>Start Context / Route Events / Hazards / Stop Condition 자동 추출</td></tr>
+      <tr><td><span class="tag amber">단기</span></td><td>Template instruction 생성기 + 3-style 분기 (concise/landmark/hazard-aware)</td><td>1일</td><td>6tok → 15–26tok. stop condition 100%, hazard constraint 포함</td></tr>
+      <tr><td><span class="tag amber">단기</span></td><td>grounding 검증기 (landmark existence, heading direction, stop phrase)</td><td>1일</td><td>hallucination 방지 — 슬라이드 Validator checks 구현</td></tr>
+      <tr><td><span class="tag amber">단기</span></td><td>goal.description + target_landmarks + stop_condition + world_position</td><td>0.5일</td><td>VLN-CE 호환, SR 계산 기준 명확화, Hazard Collision Rate 측정 기반</td></tr>
+      <tr><td><span class="tag purple">중기</span></td><td>LLM paraphrase 배치 + instruction_style 필드</td><td>2–3일</td><td>훈련 데이터 다양성 ×3–4; $2–4 / 1만 episode</td></tr>
+      <tr><td><span class="tag purple">중기</span></td><td>node_id → world position 변환 테이블 export</td><td>1일</td><td>VLN-CE 직접 로드 가능</td></tr>
+      <tr><td><span class="tag purple">중기</span></td><td>Semantic / Instance / LiDAR-like modality 렌더 추가</td><td>3–4일</td><td>object-goal nav 학습 + nDTW 측정 기반 확보</td></tr>
+    </table>
+  </section>
+
+  <section id="nav-related-work">
+    <h2>관련 연구 — VLN Instruction Generation</h2>
+    <p style="color:#475569;font-size:13px;margin-bottom:14px">
+      "path-to-instruction generation", "speaker-based VLN augmentation", "LLM/LMM-assisted navigation instruction generation" 키워드 축을 중심으로 조사.
+      OpticalNav의 포지셔닝: 일반 VLN benchmark를 대체하는 것이 아니라,
+      <strong>투명·반사 장애물 환경에서 경로·언어·다중 모달 관측이 함께 정렬된 synthetic fine-tuning episode</strong> 생성.
+    </p>
+
+    <h3>연구 흐름 개요</h3>
+    <table>
+      <tr><th>묶음</th><th>대표 연구</th><th>핵심 아이디어</th><th>OpticalNav와의 관계</th></tr>
+      <tr>
+        <td><strong>Human annotation baseline</strong></td>
+        <td>
+          <a href="https://arxiv.org/abs/1711.07280" target="_blank">R2R</a> (CVPR 2018)<br>
+          <a href="https://arxiv.org/abs/2010.07954" target="_blank">RxR</a> (EMNLP 2020)
+        </td>
+        <td>실내 환경에서 사람이 경로를 보고 지시문 작성. R2R 2.2만 개 / 평균 29단어. 에피소드 = scene + path + heading + multi-instruction.</td>
+        <td>instruction 품질 기준선. 우리가 6–8토큰을 29토큰 수준으로 끌어올려야 하는 근거.</td>
+      </tr>
+      <tr>
+        <td><strong>Speaker-based augmentation</strong></td>
+        <td>
+          <a href="https://arxiv.org/abs/1806.02724" target="_blank">Speaker-Follower</a> (NeurIPS 2018)<br>
+          <a href="https://arxiv.org/abs/1904.04195" target="_blank">EnvDrop</a> (NAACL 2019)
+        </td>
+        <td>학습된 speaker가 새 경로에 synthetic instruction 생성. EnvDrop은 환경 dropout + back-translation으로 일반화 향상.</td>
+        <td>우리 파이프라인의 기본 형태 (경로→instruction). 단, hallucination·grounding 오류 문제 있음 — 아래로 이어짐.</td>
+      </tr>
+      <tr>
+        <td><strong>Hallucination / grounding 문제</strong></td>
+        <td>EACL 2021 평가 연구</td>
+        <td>Speaker 생성 instruction에서 landmark 오류, left/right 반전, 존재하지 않는 물체 언급 빈번.</td>
+        <td>optical hazard 데이터에서는 언어 오류 = 안전 레이블 오류. Validator 필수인 이유.</td>
+      </tr>
+      <tr>
+        <td><strong>Landmark-grounded generation</strong></td>
+        <td>
+          <a href="https://arxiv.org/abs/2111.12872" target="_blank">MARKY-MT5 "Less is More"</a> (CVPR 2022)
+        </td>
+        <td>경로에서 중요 landmark를 먼저 검출하고 이를 중심으로 지시문 생성. 97.1만 개 landmark annotation → 100만+ instruction. 사람 성공률 71% 근접.</td>
+        <td>LLM에 raw path를 넘기지 말고 먼저 symbolic route summary를 만들어야 한다는 핵심 교훈.</td>
+      </tr>
+      <tr>
+        <td><strong>Large-scale synthetic scaling</strong></td>
+        <td>
+          <a href="https://arxiv.org/abs/2210.03112" target="_blank">A New Path</a> (CVPR 2023)<br>
+          <a href="https://arxiv.org/abs/2307.15644" target="_blank">ScaleVLN</a> (ICCV 2023)
+        </td>
+        <td>unannotated 3D scene에서 graph/path/instruction을 자동 생성. ScaleVLN은 1200개+ scan → 494만 쌍. 렌더링 품질 보정(image recovery) 포함.</td>
+        <td>Isaac Sim 기반 synthetic scene 대량화의 선행 근거. 렌더링 품질도 데이터 품질임을 시사.</td>
+      </tr>
+      <tr>
+        <td><strong>LLM/LMM-based generation</strong></td>
+        <td>
+          <a href="https://arxiv.org/abs/2411.11394" target="_blank">InstruGen</a> (2024)<br>
+          <a href="https://arxiv.org/abs/2407.15087" target="_blank">BEVInstructor</a> (ECCV 2024)<br>
+          <a href="https://arxiv.org/abs/2501.17403" target="_blank">GSA-VLN</a> (ICLR 2025)<br>
+          CaneSpeaker (ACM TOMM)
+        </td>
+        <td>LMM으로 multi-granularity instruction 생성 + multi-stage verification (InstruGen). BEV/top-down geometry 추가로 perspective 한계 극복. LLM role-playing으로 style 다양화 (GSA-VLN).</td>
+        <td>template 이후 paraphrase + style variant 생성 방향. BEV 활용은 OpticalNav의 top-down authoring map과 직결.</td>
+      </tr>
+      <tr>
+        <td><strong>Closed-loop data flywheel</strong></td>
+        <td>
+          <a href="https://arxiv.org/abs/2412.08467" target="_blank">SRDF</a> (ICLR 2025)
+        </td>
+        <td>generator → navigator 학습 → 성공 여부로 데이터 필터링 → 재생성. 닫힌 루프.</td>
+        <td>collision / hazard_collision 레이블로 OpticalNav에서 동일 패턴 구현 가능.</td>
+      </tr>
+    </table>
+
+    <h3>ScaleVLN 심층 분석 — OpticalNav 설계 관련 인사이트</h3>
+    <p style="color:#475569;font-size:13px;margin-bottom:12px">
+      ScaleVLN 논문 질의응답으로 확인한 내용. OpticalNav 데이터 파이프라인 설계에 직접 참조.
+    </p>
+
+    <h4 style="margin-bottom:6px;color:#1e293b">1. Vision-Path 매핑 방식: Vertex-only 이산 파노라마 시퀀스</h4>
+    <div class="two-col">
+      <div>
+        <p style="font-size:13px;color:#475569;margin-top:0">
+          ScaleVLN의 경로 데이터에서 시각 정보는 <strong>경로에 포함된 vertex 개수만큼만</strong> 제공된다.
+          edge(두 노드 사이 이동 구간) 위에서의 연속적 이미지는 포함되지 않는다.
+          각 vertex에서 수평 12방향 × 수직 3고도 = <strong>36장 파노라마</strong>를 관측값으로 제공.
+        </p>
+        <table style="margin:0;font-size:12px">
+          <tr><th>표현</th><th>내용</th></tr>
+          <tr><td>경로 길이 5 hop</td><td>5개 vertex × 36장 파노라마 = 180장의 feature sequence</td></tr>
+          <tr><td>edge 위</td><td>시각 정보 없음 — 순간이동(teleport) 처리</td></tr>
+          <tr><td>저장 형태</td><td>PNG → ViT/CLIP 인코딩 → feature vector (.hdf5 / .lmdb)</td></tr>
+        </table>
+        <div class="note" style="margin-top:6px">
+          이유: 실제 Matterport3D 스캔은 수 미터 간격 이산 촬영이라 edge 위 이미지가 존재하지 않음.
+          학습 효율: 에이전트의 의사결정 포인트(어느 방향으로 갈까?)는 vertex에서만 발생하므로 vertex 시각 정보만으로 충분.
+        </div>
+      </div>
+      <div>
+        <div class="card" style="margin-bottom:10px">
+          <div class="label">연속 환경(R2R-CE)에서는?</div>
+          <div class="note" style="margin-top:4px">
+            vertex-only 데이터로 학습한 모델이 <strong>Candidate Waypoint Predictor</strong>를 통해 edge 위를 0.25m씩 이동하는 연속 환경에서도 잘 작동함을 논문이 입증.
+            "이산 학습 → 연속 실행"의 일반화 능력 확인.
+          </div>
+        </div>
+        <div class="card">
+          <div class="label">OpticalNav 시사점</div>
+          <div class="note" style="margin-top:4px">
+            Mitsuba 렌더는 노드(viewpoint)마다 실행 → <strong>자연스럽게 vertex-only 방식과 일치.</strong>
+            Isaac Sim은 합성 씬이므로 edge 위 연속 render도 가능하지만, ScaleVLN 실험 결과를 보면
+            초기 데이터셋은 vertex 단위로만 생성해도 무방. 연속 환경 학습은 2차 확장으로.
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <h4 style="margin-bottom:6px;color:#1e293b;margin-top:18px">2. 데이터 파이프라인 — 생성 → 학습 → 실행 단계 구분</h4>
+    <div class="flow" style="grid-template-columns:repeat(4,1fr)">
+      <div class="step">
+        <strong>① 데이터 생성 (Offline)</strong>
+        HM3D / Gibson 3D 스캔 → Habitat-Sim 원시 렌더링 → <strong>Co-Mod GAN</strong>으로 왜곡·누락 영역 복원
+        → 포토리얼리스틱 PNG 저장.
+        한 번만 수행. 이후 재실행 불필요.
+      </div>
+      <div class="step">
+        <strong>② Feature 추출 (Offline)</strong>
+        복원된 PNG를 <strong>CLIP / ViT</strong>로 인코딩 → feature vector 시퀀스를 <strong>.hdf5 / .lmdb</strong>에 저장.
+        학습 시 PNG를 직접 읽지 않고 feature DB를 조회 → 속도 최적화.
+      </div>
+      <div class="step">
+        <strong>③ 모델 학습 (Offline)</strong>
+        feature 시퀀스 + instruction → seq2seq 학습.
+        4.9M 쌍을 batch로 처리.
+        시뮬레이터 불필요 — 순수 supervised learning.
+      </div>
+      <div class="step">
+        <strong>④ 검증·실행 (Online)</strong>
+        <strong>Habitat-Sim</strong>이 3D 메쉬(.glb/.obj)를 실시간 렌더링.
+        에이전트의 action → 시뮬레이터가 새 좌표 계산 → RGB + Depth + 센서 데이터 반환.
+        R2R-CE 평가는 이 단계에서 수행.
+      </div>
+    </div>
+
+    <h4 style="margin-bottom:6px;color:#1e293b;margin-top:18px">3. Instruction 생성 방식 — EnvDrop Speaker (LSTM seq2seq)</h4>
+    <div class="two-col">
+      <div>
+        <p style="font-size:13px;color:#475569;margin-top:0">
+          4.9M 경로에 대해 수작업 annotation 없이 <strong>EnvDrop Speaker 모델</strong>이 자동 생성.
+          작동 방식: 경로상 각 vertex의 파노라마 feature를 순서대로 입력 →
+          LSTM decoder가 R2R 스타일 자연어 문장 출력.
+        </p>
+        <table style="margin:0;font-size:12px">
+          <tr><th>비교 모델</th><th>생성 품질</th><th>에이전트 성능</th></tr>
+          <tr><td>GPT-2</td><td>문장 다양성↑, 유창성↑</td><td><span class="tag red">낮음</span> — 경로 정렬 약함</td></tr>
+          <tr><td><strong>EnvDrop Speaker (LSTM)</strong></td><td>단순하지만 핵심 landmark 명시</td><td><span class="tag green">높음</span> — navigation cue 정확</td></tr>
+        </table>
+        <div class="note" style="margin-top:6px">
+          교훈: 문장의 유창함보다 <strong>경로-언어 정렬(alignment)</strong>이 VLN 학습에 더 중요.
+          LLM paraphrase를 쓸 때도 원본 경로 사실(방향, landmark, stop condition)은 반드시 고정해야 하는 이유.
+        </div>
+      </div>
+      <div>
+        <div class="card">
+          <div class="label">Seq2Seq 생성 과정 예시</div>
+          <div style="margin-top:6px;font-size:12px;line-height:1.7;color:#374151">
+            vertex 1: 거실 (소파·TV feature) →<br>
+            vertex 2: 복도 (액자 feature) →<br>
+            vertex 3: 주방 (식탁·냉장고 feature)<br>
+            <hr style="border:none;border-top:1px solid var(--line);margin:6px 0">
+            <em>"Exit the living room past the sofa, walk down the hallway, enter the kitchen and stop by the table."</em>
+          </div>
+        </div>
+        <div class="alert green" style="margin-top:8px">
+          <strong>OpticalNav 적용 방향:</strong>
+          초기에는 symbolic route summary → template instruction (결정론적) 방식으로 시작.
+          LSTM speaker 대신 우리는 simulator metadata(landmark, turn angle, hazard flag)를 직접 활용하므로
+          GPT-2 hallucination 문제를 구조적으로 우회 가능.
+        </div>
+      </div>
+    </div>
+
+    <h4 style="margin-bottom:6px;color:#1e293b;margin-top:18px">4. Habitat-Sim 시뮬레이터 — 구조 요약</h4>
+    <div class="grid" style="grid-template-columns:repeat(4,1fr)">
+      <div class="card">
+        <div class="label">엔진</div>
+        <div class="note">C++ 렌더링 엔진 + Python API. 수천 FPS 고속 렌더. 물리 충돌 처리 포함.</div>
+      </div>
+      <div class="card">
+        <div class="label">환경 데이터</div>
+        <div class="note">HM3D (1,000개 건물 스캔) + Gibson (500+ 실내). 3D Mesh(.glb/.obj) + Texture 형태.</div>
+      </div>
+      <div class="card">
+        <div class="label">에이전트 루프</div>
+        <div class="note">Action → 좌표 계산 → RGB+Depth+센서 렌더링 → Observation 반환. 연속 이동 0.25m 단위.</div>
+      </div>
+      <div class="card">
+        <div class="label">vs OpticalNav</div>
+        <div class="note">우리는 Habitat 대신 <strong>Isaac Sim + Mitsuba</strong>. 그래프 구조는 동일(navigation graph). 렌더 결과를 feature로 추출하는 파이프라인 필요.</div>
+      </div>
+    </div>
+
+    <h4 style="margin-bottom:6px;color:#1e293b;margin-top:18px">4b. Path 자동 생성 규칙 — 그래프에서 경로를 뽑는 방법</h4>
+    <div class="two-col">
+      <div>
+        <table style="margin:0">
+          <tr><th>규칙</th><th>값 / 방식</th><th>이유</th></tr>
+          <tr>
+            <td><strong>최단 경로 원칙</strong></td>
+            <td>출발지 → 목적지 사이 Geodesic Shortest Path</td>
+            <td>사람은 길 안내 시 보통 최단 경로를 선택. 비효율 헤매기가 아닌 직선적 이동 학습.</td>
+          </tr>
+          <tr>
+            <td><strong>경로 길이 필터</strong></td>
+            <td>중간 노드 3–5개 (총 5–7 hop), 실거리 약 10m</td>
+            <td>너무 짧으면 학습 정보 부족, 너무 길면 지시문 복잡도 폭증. 사람이 묘사하기 가장 적절한 구간.</td>
+          </tr>
+          <tr>
+            <td><strong>모든 조합 탐색</strong></td>
+            <td>그래프 내 임의의 두 정점 쌍 전수 열거</td>
+            <td>HM3D → 289만 경로, Gibson → 205만 경로. 조합 폭발로 대규모 데이터 확보.</td>
+          </tr>
+          <tr>
+            <td><strong>Edge 길이 제약</strong></td>
+            <td>평균 1.41m</td>
+            <td>너무 멀면 벽 관통 위험, 너무 가까우면 중복 데이터. 물리적 이동 단위에 맞춤.</td>
+          </tr>
+          <tr>
+            <td><strong>Node 연결성</strong></td>
+            <td>평균 degree 4.55</td>
+            <td>갈림길이 4–5개 → 경로마다 실질적인 선택 분기 포함. 방향 결정 학습 신호 확보.</td>
+          </tr>
+          <tr>
+            <td><strong>R4R 확장 (선택)</strong></td>
+            <td>경로 2개 이어 붙이기 (Long-horizon)</td>
+            <td>더 긴 지시문 수행 능력 테스트용. 기본 파이프라인과 별도 실험.</td>
+          </tr>
+        </table>
+      </div>
+      <div>
+        <div class="card" style="margin-bottom:10px">
+          <div class="label">ScaleVLN 규모 결과</div>
+          <table style="margin:6px 0 0;font-size:12px">
+            <tr><th>데이터셋</th><th>환경 수</th><th>경로 수</th></tr>
+            <tr><td>HM3D</td><td>800개 scene</td><td>2,890,000</td></tr>
+            <tr><td>Gibson</td><td>450개 scene</td><td>2,050,000</td></tr>
+            <tr><td><strong>합계</strong></td><td><strong>1,250+</strong></td><td><strong>4,940,000</strong></td></tr>
+          </table>
+        </div>
+        <div class="alert green">
+          <strong>OpticalNav 적용 방향</strong><br>
+          현재 graph_episode_sampler.py가 경로를 샘플링하고 있음.
+          ScaleVLN 규칙과의 차이 점검:
+          <ul style="font-size:12px;margin:6px 0 0 16px">
+            <li>최단 경로(Dijkstra/BFS)를 쓰고 있는가? ✓ 확인 필요</li>
+            <li>hop 수 3–5 필터가 있는가? — 현재 미적용이면 추가 필요</li>
+            <li>edge 길이 균일성 — Isaac Sim 그래프 node spacing 검토 필요</li>
+            <li>전수 조합 vs 샘플링 — scene 규모에 따라 결정</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+    <h4 style="margin-bottom:6px;color:#1e293b;margin-top:18px">5. OpticalNav 설계 결론 — ScaleVLN에서 얻은 구조 결정</h4>
+    <table>
+      <tr><th>질문</th><th>ScaleVLN 답</th><th>OpticalNav 결정</th></tr>
+      <tr>
+        <td>경로당 시각 정보 단위</td>
+        <td>vertex-only (edge 없음)</td>
+        <td><strong>vertex-only로 시작.</strong> 각 (node_id, heading_id)에서 Mitsuba render 1회. edge render는 2차.</td>
+      </tr>
+      <tr>
+        <td>학습용 feature 저장 형태</td>
+        <td>CLIP/ViT → .hdf5/.lmdb</td>
+        <td>EXR → PNG → CLIP encoding → <code>observation_features.hdf5</code> per scene. <code>observation_bundle_ref</code>가 이를 가리켜야 함.</td>
+      </tr>
+      <tr>
+        <td>Instruction 생성기 복잡도</td>
+        <td>LSTM speaker가 GPT-2보다 우수</td>
+        <td>초기엔 결정론적 template (LSTM보다 단순). LLM paraphrase는 사실 고정 후 변형만. hallucination validator 필수.</td>
+      </tr>
+      <tr>
+        <td>연속 환경 확장</td>
+        <td>CWP로 이산→연속 일반화</td>
+        <td>Isaac Sim 실시간 렌더로 연속 환경 구성 가능 — 로드맵 2단계 목표.</td>
+      </tr>
+      <tr>
+        <td>이미지 품질 보정</td>
+        <td>Co-Mod GAN으로 스캔 왜곡 복원</td>
+        <td>합성 씬이라 왜곡 없음. 대신 재질·조명 다양성이 품질 결정 요인.</td>
+      </tr>
+      <tr>
+        <td>경로 생성 규칙</td>
+        <td>최단 경로 + hop 3–5 + edge 1.41m + 전수 조합</td>
+        <td><code>graph_episode_sampler.py</code>: Dijkstra 최단 경로 + hop 3–5 필터 확인 필요. node spacing 검토.</td>
+      </tr>
+    </table>
+
+    <h3>GSA-R2R (ICLR 2025) 심층 분석 — 3단계 Instruction 오케스트레이션</h3>
+    <p style="color:#475569;font-size:13px;margin-bottom:12px">
+      ScaleVLN이 "얼마나 많이"를 해결했다면, GSA-R2R은 <strong>"얼마나 정확하고 다양하게"</strong>를 해결한다.
+      핵심 기여는 두 가지: ①Speaker→VLM→LLM 3단계 instruction 파이프라인, ②에피소드 간 환경 적응(GR-DUET).
+    </p>
+
+    <h4 style="margin-bottom:8px;color:#1e293b">1. 기존 방식 대비 발전 지점</h4>
+    <table>
+      <tr><th>구분</th><th>기존 VLN (ScaleVLN 등)</th><th>GSA-R2R 제안</th></tr>
+      <tr>
+        <td>Instruction 품질</td>
+        <td>Speaker(LSTM) 단일 생성 — 방향 오류, 모호한 landmark 포함</td>
+        <td>VLM이 경로 이미지와 대조해 오류 수정 → 정확도 보장</td>
+      </tr>
+      <tr>
+        <td>Instruction 다양성</td>
+        <td>R2R 스타일 균일한 어투</td>
+        <td>LLM role-playing으로 사용자·장소별 개성 있는 어투 생성</td>
+      </tr>
+      <tr>
+        <td>환경 범위</td>
+        <td>주거 공간(Matterport3D) 위주</td>
+        <td>HM3D 기반 + 영화관·실험실·상점 등 non-residential OOD 포함</td>
+      </tr>
+      <tr>
+        <td>에피소드 간 기억</td>
+        <td>매 에피소드 지도 리셋</td>
+        <td>GR-DUET: Global Topological Graph 유지 → 경험 누적 성능 향상</td>
+      </tr>
+    </table>
+
+    <h4 style="margin-bottom:8px;color:#1e293b;margin-top:16px">2. 3단계 Instruction 파이프라인</h4>
+    <div class="flow" style="grid-template-columns:repeat(3,1fr)">
+      <div class="step">
+        <strong>Stage 1 — Speaker (초안)</strong>
+        EnvDrop Speaker(LSTM)가 경로 feature sequence를 입력받아 자연어 지시문 초안 생성.
+        빠르고 저렴하나 방향 오류·landmark hallucination 포함 가능.
+        <div class="note" style="margin-top:4px">출력: 날것의 R2R 스타일 문장</div>
+      </div>
+      <div class="step">
+        <strong>Stage 2 — VLM (검수·수정)</strong>
+        내비게이터 모델이 Stage 1 지시문으로 주행 시도.
+        <strong>실패한 경우에만</strong> GPT-4o가 경로 파노라마 + top-down 뷰를 보고
+        오류를 CoT로 탐지·수정.
+        성공한 지시문은 그대로 통과 — 비용 최적화.
+        <div class="note" style="margin-top:4px">출력: 정확도 보장된 Basic instruction</div>
+      </div>
+      <div class="step">
+        <strong>Stage 3 — LLM (스타일 부여)</strong>
+        Basic instruction을 기반으로 LLM이 persona/context 변환.
+        사실 정보(방향·landmark·stop condition)는 고정, 어투만 변형.
+        건물 유형에 따라 분기:
+        <ul style="font-size:12px;margin:4px 0 0 14px;color:#475569">
+          <li>Residential → User Style만</li>
+          <li>Non-residential → User Style + Scene Style 둘 다</li>
+        </ul>
+        <div class="note" style="margin-top:4px">출력: 다양성 확보된 OOD-robust instruction</div>
+      </div>
+    </div>
+
+    <h4 style="margin-bottom:8px;color:#1e293b;margin-top:16px">3. VLM 실패-조건부 적용 — 왜 실패한 경우만?</h4>
+    <div class="two-col">
+      <div class="alert green" style="margin:0">
+        <strong>성공한 지시문</strong> = 내비게이터가 실제로 목적지에 도착 → 이미 "기계가 이해하기 충분히 정확"하다는 검증 완료.
+        VLM으로 재처리할 이유 없음.
+      </div>
+      <div class="alert amber" style="margin:0">
+        <strong>실패한 지시문</strong> = Speaker가 방향 역전·landmark 오류 등을 낸 신호.
+        이때만 GPT-4o 투입 → 경로 이미지와 대조하여 어디가 틀렸는지 탐지 후 수정.
+        결과: 품질 상향 평준화 + API 비용 최소화.
+      </div>
+    </div>
+
+    <h4 style="margin-bottom:8px;color:#1e293b;margin-top:16px">4. Residential vs Non-residential — Stage 3 분기 이유</h4>
+    <table>
+      <tr><th>구분</th><th>Residential</th><th>Non-residential</th></tr>
+      <tr>
+        <td>환경 예시</td>
+        <td>거실, 침실, 주방</td>
+        <td>영화관, 사무실, 실험실, 체육관, 상점</td>
+      </tr>
+      <tr>
+        <td>적용 스타일</td>
+        <td>User Style만 (드라마 캐릭터·가족 구성원 어투)</td>
+        <td>User Style + <strong>Scene Style</strong> (장소 맞춤 직업적 어투)</td>
+      </tr>
+      <tr>
+        <td>Scene Style 예시</td>
+        <td>해당 없음</td>
+        <td>체육관 트레이너: "거울 있는 쪽 스트레칭 구역에서 멈추세요."<br>상점 점원: "저기 카운터 쪽으로 가주실래요?"</td>
+      </tr>
+      <tr>
+        <td>OOD 특성</td>
+        <td>언어적 OOD (어투 다양성)</td>
+        <td><strong>시각적 OOD + 언어적 OOD</strong> 이중 부담 — 모델에게 가장 어려운 케이스</td>
+      </tr>
+      <tr>
+        <td>이유</td>
+        <td>집 = 특정 거주자의 개인 스타일</td>
+        <td>공공·상업 공간 = 장소 목적에 맞는 상황적 언어 습관이 더 현실적</td>
+      </tr>
+    </table>
+
+    <h4 style="margin-bottom:8px;color:#1e293b;margin-top:16px">5. OpticalNav 적용 — GSA-R2R에서 차용할 설계</h4>
+    <table>
+      <tr><th>GSA-R2R 요소</th><th>OpticalNav 적용 방안</th></tr>
+      <tr>
+        <td>Stage 2 실패-조건부 VLM 검수</td>
+        <td>template instruction을 내비게이터로 검증 후, 실패 케이스만 LLM에 보내 수정.
+            hazard 관련 오류(유리문 방향 반전 등) 집중 탐지.</td>
+      </tr>
+      <tr>
+        <td>Stage 3 Scene Style</td>
+        <td>OpticalNav의 비거주 공간(오피스·공장·로비)에서 Scene Style 적용 가능.
+            "industrial safety" 스타일: "유리 파티션 앞에서 정지하세요." 등.</td>
+      </tr>
+      <tr>
+        <td>Validator (사실 고정)</td>
+        <td>LLM이 어투 변형 시 hazard flag·stop condition·landmark가 삭제되지 않는지 검증.
+            우리 symbolic route summary가 이 "사실 기반"을 제공.</td>
+      </tr>
+      <tr>
+        <td>GR-DUET 글로벌 그래프 유지</td>
+        <td>현재 스코프 밖. 단, navigation graph를 에피소드 간 공유하는 구조는
+            Isaac Sim authoring map으로 이미 구현 가능.</td>
+      </tr>
+    </table>
+
+    <h3>OpticalNav 포지셔닝 — Related Work 논문 표현</h3>
+    <div class="alert green">
+      Prior VLN datasets (<a href="https://arxiv.org/abs/1711.07280" target="_blank">R2R</a>, <a href="https://arxiv.org/abs/2010.07954" target="_blank">RxR</a>) establish high-quality human-written navigation instructions, but annotation cost limits targeted coverage of rare optical hazards such as glass doors, mirrors, and transparent partitions.
+      Speaker-based augmentation methods (<a href="https://arxiv.org/abs/1806.02724" target="_blank">Speaker-Follower</a>, <a href="https://arxiv.org/abs/1904.04195" target="_blank">EnvDrop</a>) and large-scale synthetic pipelines (<a href="https://arxiv.org/abs/2307.15644" target="_blank">ScaleVLN</a>) generate instruction-trajectory pairs at scale, while recent work (<a href="https://arxiv.org/abs/2111.12872" target="_blank">MARKY-MT5</a>, <a href="https://arxiv.org/abs/2411.11394" target="_blank">InstruGen</a>, <a href="https://arxiv.org/abs/2407.15087" target="_blank">BEVInstructor</a>) improves grounding through landmarks, BEV geometry, and LMM verification.
+      In contrast, our goal is not to replace general VLN benchmarks, but to generate <strong>optically grounded synthetic fine-tuning episodes</strong> where language instructions, robot trajectories, and multi-modal observations (RGB, Depth, NIR-like, Semantic) are jointly aligned around transparent and reflective navigation hazards.
+    </div>
+
+    <h3>OpticalNav instruction variant 설계 — 5-style scheme</h3>
+    <table>
+      <tr><th>Style</th><th>예시</th><th>학습 목적</th></tr>
+      <tr><td><code>goal_only</code></td><td>"Go to the row of open desks and stop beside the nearest desk."</td><td>기본 goal-reaching 능력</td></tr>
+      <tr><td><code>landmark_path</code></td><td>"Move forward through the shared office, turn slightly right near the desk row, and stop beside the open desk area."</td><td>intermediate waypoint 활용 능력</td></tr>
+      <tr><td><code>hazard_aware</code></td><td>"Go to the open desk area using the clear walkway. Do not cross the glass partition."</td><td>언어 지시 기반 hazard 회피</td></tr>
+      <tr><td><code>stop_before_glass</code></td><td>"Move toward the desk visible beyond the glass partition, but stop before the glass wall."</td><td>visual ambiguity + language cue 조합</td></tr>
+      <tr><td><code>ambiguous</code></td><td>"Go to the desk area ahead."</td><td>낮은 품질 instruction에서의 실패 분석 (baseline 비교용)</td></tr>
+    </table>
+
+    <div class="note" style="margin-top:8px;font-size:12px;color:#475569">
+      실험 설계: 동일 장면·경로에서 (RGB-only + ambiguous) → (RGB-only + hazard-aware) → (RGB+NIR+hazard-aware) 순으로 비교하면 언어·관측·안전 행동이 묶인 데이터의 효과를 분리 측정 가능.
+    </div>
+  </section>
+
+  <section id="meeting-backlog">
+    <h2>미팅 백로그 — 2026-06-09</h2>
+    <p style="color:#475569;font-size:13px;margin-bottom:14px">
+      오늘 연구 미팅의 핵심 결론:
+      지금은 SVBRDF나 실제 공간 1:1 재현보다,
+      <strong>먼저 작동하는 multimodal synthetic navigation dataset을 만들어야 한다.</strong>
+      Infinigen 류 procedural scene generator + measured BRDF 자동 연결을 결합하면
+      단순 데이터셋을 넘어 광학 모달리티 기반 navigation dataset generation platform으로 확장 가능.
+    </p>
+
+    <h3>핵심 결정 사항</h3>
+    <div class="grid" style="grid-template-columns:repeat(3,1fr)">
+      <div class="card">
+        <div class="label" style="color:var(--green)">지금 O</div>
+        <ul style="font-size:12px;margin:6px 0 0 16px;color:#374151;line-height:1.8">
+          <li>다양한 modality를 가진 episode dataset <strong>실제로 생성</strong></li>
+          <li>glass / reflective / transparent scene에서 RGB-only 한계 실험</li>
+          <li>agent / coworker가 바로 사용 가능</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="label" style="color:var(--danger)">지금 X</div>
+        <ul style="font-size:12px;margin:6px 0 0 16px;color:#374151;line-height:1.8">
+          <li>실제 공간과 1:1로 똑같이 재현</li>
+          <li>모든 재질이 물리적으로 완벽</li>
+          <li>VLN instruction이 완벽</li>
+          <li>SVBRDF 구현 우선</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="label">업무 분담</div>
+        <div class="note" style="margin-top:6px;line-height:1.7">
+          <strong>우리 팀:</strong> scene, viewpoint graph, trajectory, modality render, observation bundle, metadata<br>
+          <strong>코워커:</strong> path instruction, VLN-style instruction generation, instruction validation
+        </div>
+      </div>
+    </div>
+
+    <h3>Realistic scene 평가 축 — 우선순위</h3>
+    <table>
+      <tr><th>축</th><th>내용</th><th>논문 중요도</th></tr>
+      <tr>
+        <td><strong>Task realism</strong></td>
+        <td>로봇이 실제로 헷갈릴 만한 glass / mirror / transparent obstacle 존재 여부. collision / hazard / detour 의미 있음.</td>
+        <td><span class="tag green">최우선</span></td>
+      </tr>
+      <tr>
+        <td><strong>광학 현상 커버리지</strong></td>
+        <td>transparent obstacle, reflection, specular highlight, mirror ambiguity, depth sensor failure 영역, NIR contrast, polarization cue</td>
+        <td><span class="tag green">연구 색깔</span></td>
+      </tr>
+      <tr>
+        <td><strong>Dataset diversity</strong></td>
+        <td>scene type / object category / material category / glass hazard 수, path length / distance distribution</td>
+        <td><span class="tag amber">데이터셋 논문</span></td>
+      </tr>
+      <tr>
+        <td><strong>Modality utility</strong></td>
+        <td>RGB vs RGB+Depth vs RGB+NIR vs RGB+HazardMask 비교 ablation</td>
+        <td><span class="tag amber">실험 필수</span></td>
+      </tr>
+      <tr>
+        <td><strong>Visual realism</strong></td>
+        <td>FID / KID, CLIP alignment, human preference. 이미지가 실내 공간처럼 보이는가.</td>
+        <td><span class="tag">부차적</span></td>
+      </tr>
+    </table>
+    <div class="note" style="margin-top:6px;font-size:12px">
+      주장 프레임 제안: "우리는 photorealistic scene generation 자체보다,
+      transparent-obstacle navigation failure를 재현하고 modality별 차이를 비교할 수 있는 <strong>task-realistic dataset</strong>을 목표로 한다."
+    </div>
+
+    <h3>Real-synthetic pair 접근법 비교</h3>
+    <p style="color:#475569;font-size:13px;margin-bottom:10px">
+      참고: <a href="https://locate3d.atmeta.com/" target="_blank">Locate3D (Meta)</a> — real 공간 기반 3D navigation 데이터셋.
+    </p>
+    <table>
+      <tr><th>방법</th><th>장점</th><th>문제점</th><th>OpticalNav 적합성</th></tr>
+      <tr>
+        <td><strong>3D Reconstruction</strong></td>
+        <td>실제 공간 geometry 취득, real-synthetic alignment 가능</td>
+        <td>유리·거울·투명체 geometry 붕괴. 재질·광학 속성은 별도 수작업 필요.</td>
+        <td><span class="tag amber">geometry OK, material 별도</span></td>
+      </tr>
+      <tr>
+        <td><strong>Blender manual modeling</strong></td>
+        <td>유리문·파티션 등 구조 명확히 제어. hazard label 만들기 쉬움.</td>
+        <td>작업 시간 큼. texture/material realism 별도 문제.</td>
+        <td><span class="tag green">hazard 제어 최적</span></td>
+      </tr>
+      <tr>
+        <td><strong>Novel View Synthesis</strong></td>
+        <td>RGB appearance realism. 실제 공간 외형 보존.</td>
+        <td>grounded geometry 부족. 유리·반사가 geometry/material로 분해 안 됨. NIR/polarization 생성 불가.</td>
+        <td><span class="tag red">RGB는 좋으나 modality 불가</span></td>
+      </tr>
+    </table>
+    <div class="alert" style="margin-top:10px">
+      NVS는 보기 좋은 RGB를 만들 수 있지만, navigation benchmark에 필요한 <strong>grounded geometry, collision, transparent obstacle label, optical modality generation</strong>에는 부족하다.
+    </div>
+
+    <h3>Material assignment 전략 — 단계별</h3>
+    <div class="flow" style="grid-template-columns:repeat(3,1fr)">
+      <div class="step">
+        <strong>1차 (즉시) — analytic BRDF + texture map</strong>
+        <code>base color texture</code> → RGB appearance<br>
+        <code>roughness / normal map</code> → 표면 질감<br>
+        <code>material class</code> → analytic BRDF<br><br>
+        wood → <code>roughplastic/diffuse</code><br>
+        metal → <code>roughconductor</code><br>
+        glass → <code>dielectric/roughdielectric</code><br>
+        plastic → <code>roughplastic</code>
+      </div>
+      <div class="step">
+        <strong>2차 (단기) — measured BRDF 자동 링크</strong>
+        object/material name + texture appearance<br>
+        → LLM / rule-based material classifier<br>
+        → closest measured BRDF candidate<br><br>
+        "brushed metal leg" → measured aluminum<br>
+        "clear glass partition" → dielectric glass<br>
+        "black plastic chair" → black rough plastic
+      </div>
+      <div class="step">
+        <strong>3차 (중기) — SVBRDF / hybrid</strong>
+        texture map = spatial parameter map<br>
+        measured BRDF = material class 광학 응답<br><br>
+        공간 변화하는 재질 속성까지 모델링.<br>
+        <div class="note" style="margin-top:6px">지금 1순위 구현 아님.</div>
+      </div>
+    </div>
+
+    <h3>ObjectNav 방향성</h3>
+    <p style="color:#475569;font-size:13px;margin-bottom:8px">
+      VLN에서 ObjectNav로 낮추면 instruction 품질 부담이 줄어들고 사용처가 넓어진다.
+      검토 연구: <strong>TrajRAG</strong>, <strong>OVsogDT</strong> (CVPR 2026).
+    </p>
+    <table>
+      <tr><th>구분</th><th>VLN</th><th>ObjectNav</th></tr>
+      <tr><td>Instruction</td><td>"Walk past the couch, turn right, stop by the desk..." — 자연어 품질 중요</td><td>"Find the chair." / "Go to the desk." — goal object grounding 중심</td></tr>
+      <tr><td>Our platform fit</td><td>instruction 생성 파이프라인 필요 (코워커 위임)</td><td>object goal + multimodal observation 바로 활용 가능</td></tr>
+      <tr><td>Optical hazard 연결</td><td>hazard-aware instruction 스타일 필요</td><td>glass/mirror confusion, hazard-aware planning → 직결</td></tr>
+    </table>
+
+    <h3>즉시 액션 아이템</h3>
+    <table>
+      <tr><th>우선순위</th><th>항목</th><th>담당</th></tr>
+      <tr><td><span class="tag red">즉시</span></td><td>Dataset v0.1 목표 고정 — realistic perfect twin 아님, running multimodal synthetic dataset</td><td>팀 전체</td></tr>
+      <tr><td><span class="tag red">즉시</span></td><td>episode 포맷에서 goal/landmark/hazard metadata 제공 범위 정리. instruction은 코워커에게 위임.</td><td>우리 팀</td></tr>
+      <tr><td><span class="tag amber">단기</span></td><td><a href="https://infinigen.org/" target="_blank">Infinigen</a> 깊게 리뷰 — scene generation, material metadata, Blender→Mitsuba conversion, semantic labels, transparent material 제어</td><td>우리 팀</td></tr>
+      <tr><td><span class="tag amber">단기</span></td><td>material assignment v0 정의 — analytic BRDF 우선, measured BRDF는 material class별 optional link</td><td>우리 팀</td></tr>
+      <tr><td><span class="tag amber">단기</span></td><td>evaluation metric 초안 — dataset diversity / RGB-only failure / hazard collision / modality ablation</td><td>우리 팀</td></tr>
+    </table>
+  </section>
+
+  <section id="meeting-directions">
+    <h2>연구 후보 방향 — 논의 중</h2>
+    <div class="grid" style="grid-template-columns:repeat(2,1fr)">
+      <div class="card">
+        <div class="label">후보 A — 빠른 fine-tuning dataset <span class="tag green" style="float:right">단기</span></div>
+        <div class="note" style="margin-top:6px">
+          shared office / glass corridor / mirror room 3개 scene. RGB + depth + NIR-like + hazard mask.
+          simple instruction. episode export.
+          <br><strong>장점:</strong> 빠른 결과. <strong>단점:</strong> 논문 novelty 약함.
+        </div>
+      </div>
+      <div class="card">
+        <div class="label">후보 B — Multimodal rendering generation platform <span class="tag amber" style="float:right">중기</span></div>
+        <div class="note" style="margin-top:6px">
+          Infinigen류 procedural scene + measured/analytic material linking + Mitsuba multimodal rendering + navigation episodes.
+          <br><strong>장점:</strong> platform novelty, 연구실 광학 강점 반영. <strong>단점:</strong> 구현 범위 큼.
+        </div>
+      </div>
+      <div class="card">
+        <div class="label">후보 C — Real-synthetic paired OpticalNav dataset <span class="tag" style="float:right">중기~장기</span></div>
+        <div class="note" style="margin-top:6px">
+          실제 연구실 회의실 ↔ synthetic digital twin. real capture + modeled scene + multimodal rendering + real RGB validation.
+          <br><strong>장점:</strong> 실증력 강함. <strong>단점:</strong> 3D recon / material matching / glass modeling 난이도 높음.
+        </div>
+      </div>
+      <div class="card">
+        <div class="label">후보 D — ObjectNav-style optical hazard dataset <span class="tag purple" style="float:right">대안</span></div>
+        <div class="note" style="margin-top:6px">
+          open-vocabulary object goal + glass/mirror/transparent obstacle + hazard-aware planning. TrajRAG / OVsogDT (CVPR 2026) 연결.
+          <br><strong>장점:</strong> instruction 품질 부담 낮음, ObjectNav 최신 연구 연결. <strong>단점:</strong> VLN 포지셔닝과 다름.
+        </div>
+      </div>
+    </div>
+
+    <h3>Infinigen 리뷰 체크리스트</h3>
+    <p style="color:#475569;font-size:13px;margin-bottom:8px">
+      <a href="https://infinigen.org/" target="_blank">https://infinigen.org/</a> — procedural synthetic 3D scene generation platform.
+      우리 플랫폼의 scene source로 활용 가능 여부 검토.
+    </p>
+    <table>
+      <tr><th>#</th><th>검토 항목</th><th>판단 기준</th></tr>
+      <tr><td>1</td><td>indoor scene generation 가능 여부</td><td>사무실·복도·로비 등 실내 공간이 절차적으로 생성 가능한가</td></tr>
+      <tr><td>2</td><td>geometry / material / texture 구조화 수준</td><td>object-level semantic이 보존되는가, material class가 식별 가능한가</td></tr>
+      <tr><td>3</td><td>Blender asset → Mitsuba 변환 용이성</td><td>USD/OBJ export + texture 경로 유지 → 현재 mitsuba_converter와 연결 가능한가</td></tr>
+      <tr><td>4</td><td>transparent / reflective / glass 제어</td><td>유리문·거울 등 optical hazard 재질을 명시적으로 배치·레이블링 가능한가</td></tr>
+      <tr><td>5</td><td>semantic labels 보존</td><td>navigation graph / collision geometry / object category export 가능한가</td></tr>
+      <tr><td>6</td><td>대량 생성 시 품질 관리</td><td>batch generation 시 품질 일관성 metric이 있는가</td></tr>
+    </table>
+
+    <h3>개방 논의 질문</h3>
+    <div class="grid" style="grid-template-columns:repeat(2,1fr)">
+      <div class="card"><div class="label">Q1</div><div class="note">dataset 논문을 목표로 할 것인가, generation platform 논문을 목표로 할 것인가?</div></div>
+      <div class="card"><div class="label">Q2</div><div class="note">초기 v0.1은 VLN으로 갈 것인가, ObjectNav로 낮출 것인가?</div></div>
+      <div class="card"><div class="label">Q3</div><div class="note">realistic scene의 기준은 visual realism인가, task realism인가?</div></div>
+      <div class="card"><div class="label">Q4</div><div class="note">real-synthetic paired dataset은 이번 연구의 핵심인가, 후속 검증인가?</div></div>
+    </div>
   </section>
 
   <div class="footer">

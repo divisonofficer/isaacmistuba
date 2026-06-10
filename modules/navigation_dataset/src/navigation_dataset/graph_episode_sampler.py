@@ -87,9 +87,20 @@ def _nearest_heading_id(node: ViewpointNode, yaw_deg: float) -> str:
 
 
 def _edge_heading(source: ViewpointNode, target: ViewpointNode) -> float:
+    """Yaw (in the render convention used by `sensor_sweep._mat4_from_xy_yaw`)
+    that faces `target` when standing at `source`.
+
+    Render convention:
+      * yaw=0  → forward (-sin(yaw), cos(yaw)) = (0, 1) = +y_graph
+      * +yaw   → CCW rotation viewed from above (N→W→S→E)
+
+    Hence yaw = atan2(-dx, dy). The previous version returned the math angle
+    atan2(dy, dx), which is 90° off and rotates in the opposite direction —
+    producing thumbnails where "forward" was sideways and L/R were swapped.
+    """
     dx = float(target.position[0]) - float(source.position[0])
     dy = float(target.position[1]) - float(source.position[1])
-    return (math.degrees(math.atan2(dy, dx)) + 360.0) % 360.0
+    return (math.degrees(math.atan2(-dx, dy)) + 360.0) % 360.0
 
 
 def _path_headings(graph: ViewpointGraph, path_nodes: list[str]) -> list[str]:

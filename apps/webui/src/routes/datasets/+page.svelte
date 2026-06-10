@@ -28,6 +28,8 @@
 	import { computeWorkflowReadiness } from '$lib/datasets/workflowHelpers';
 	import * as validationService from '$lib/datasets/services/validationService';
 	import * as episodeService from '$lib/datasets/services/episodeService';
+	import * as exportJobsService from '$lib/datasets/services/exportJobsService';
+	import { subscribeExportJob } from '$lib/stores/exportJobWs';
 	import * as walkabilityService from '$lib/datasets/services/walkabilityService';
 	import * as graphService from '$lib/datasets/services/graphService';
 	import * as renderService from '$lib/datasets/services/renderService';
@@ -522,6 +524,15 @@
 	// editing. Other scenes in the same project may have broken sync state
 	// that has nothing to do with the current work.
 	let exportCurrentSceneOnly = $state(true);
+	// Opt-in: produce a per-episode RGB strip folder for visual inspection.
+	let exportIncludeThumbnails = $state(false);
+	// Default ON — include every heading at each waypoint (full panorama
+	// context). OFF restricts to just the (vp, heading) pairs the episode
+	// visits along its GT path (much slimmer bundle).
+	let exportPanoramaObservations = $state(true);
+	// Active scene-bundle export job — populated when user clicks Export.
+	let activeExportJob = $state<import('$lib/datasets/services/exportJobsService').ExportJobStatus | null>(null);
+	let _exportJobUnsub: (() => void) | null = null;
 	let mapResult = $state<any>(null);
 	let buildingMap = $state(false);
 	let planResult = $state<any>(null);
@@ -3331,17 +3342,35 @@
 	);
 
 	async function exportDataset() {
-		if (!selectedProjectId) return;
-		const sceneScope = exportCurrentSceneOnly && sceneId ? [sceneId] : null;
-		const data = await run(
-			() => validationService.exportDataset(selectedProjectId, {
+		if (!selectedProjectId || !sceneId) return;
+		// Scene-bundle export: always tied to the current scene. The submit
+		// returns immediately with a job_id; progress arrives over WS.
+		try {
+			const accepted = await exportJobsService.submitExportJob(selectedProjectId, {
+				scene_id: sceneId,
 				only_completed: exportOnlyCompleted,
-				scene_ids: sceneScope,
-			}),
-			'Dataset exported.',
-			'dataset:export'
-		);
-		if (data) exportResult = data;
+				include_episode_thumbnails: exportIncludeThumbnails,
+				panorama_observations: exportPanoramaObservations,
+			});
+			const jobId = (accepted as any)?.job_id;
+			if (!jobId) return;
+			activeExportJob = { job_id: jobId, scene_id: sceneId, status: 'queued' };
+			if (_exportJobUnsub) { _exportJobUnsub(); _exportJobUnsub = null; }
+			_exportJobUnsub = subscribeExportJob(jobId, (msg) => { activeExportJob = msg; });
+		} catch (err) {
+			error = `Export submit failed: ${errorMessage(err)}`;
+		}
+	}
+
+	async function cancelActiveExportJob() {
+		if (!selectedProjectId || !activeExportJob?.job_id) return;
+		try { await exportJobsService.cancelExportJob(selectedProjectId, activeExportJob.job_id); }
+		catch { /* silent */ }
+	}
+
+	function resetExportJob() {
+		if (_exportJobUnsub) { _exportJobUnsub(); _exportJobUnsub = null; }
+		activeExportJob = null;
 	}
 
 	$effect(() => {
@@ -3923,11 +3952,16 @@
 					episodesCount={scopedEpisodeCount}
 					bind:onlyCompleted={exportOnlyCompleted}
 					bind:currentSceneOnly={exportCurrentSceneOnly}
+					bind:includeThumbnails={exportIncludeThumbnails}
+					bind:panoramaObservations={exportPanoramaObservations}
 					currentSceneId={sceneId}
 					{exportableEpisodeCount}
 					exportSummary={exportResult}
+					{activeExportJob}
 					onValidate={() => validateDataset(false)}
 					onExport={exportDataset}
+					onCancelExport={cancelActiveExportJob}
+					onResetExport={resetExportJob}
 				/>
 			{/if}
 
@@ -4396,11 +4430,16 @@
 				{selectedProjectId} {loading}
 				bind:onlyCompleted={exportOnlyCompleted}
 				bind:currentSceneOnly={exportCurrentSceneOnly}
+				bind:includeThumbnails={exportIncludeThumbnails}
+				bind:panoramaObservations={exportPanoramaObservations}
 				currentSceneId={sceneId}
 				{exportableEpisodeCount}
 				exportSummary={exportResult}
+				{activeExportJob}
 				onValidate={() => validateDataset(false)}
 				onExport={exportDataset}
+				onCancelExport={cancelActiveExportJob}
+				onResetExport={resetExportJob}
 			/>
 		{/if}
 

@@ -1,0 +1,572 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Infinigen Series 리뷰 — 자연 세계 생성에서 실내 세계 생성으로</title>
+<style>
+:root{
+  --bg:#f4f6fb; --panel:#fff; --sub:#f8fafc; --text:#1f2937; --muted:#64748b;
+  --line:#dbe3ef; --blue:#2563eb; --navy:#1e3a8a; --green:#16a34a; --teal:#0f766e;
+  --amber:#d97706; --red:#dc2626; --purple:#7c3aed; --softblue:#eff6ff;
+  --mono:"JetBrains Mono",Consolas,Menlo,monospace;
+  --sans:Inter,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html{scroll-behavior:smooth}
+body{font-family:var(--sans);background:var(--bg);color:var(--text);line-height:1.62;font-size:14px}
+.layout{display:flex;min-height:100vh}
+aside{width:260px;flex:0 0 260px;position:sticky;top:0;height:100vh;overflow:auto;padding:22px 14px;border-right:1px solid var(--line);background:#eef2f7}
+main{flex:1;padding:34px 42px;max-width:1180px}
+.logo{font-weight:850;color:var(--blue);letter-spacing:-.02em;font-size:16px}
+.date{margin-top:3px;color:var(--muted);font-family:var(--mono);font-size:11px}
+.nav-title{margin:22px 8px 7px;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.12em;font-weight:850}
+.nav-link{display:block;padding:5px 8px;border-radius:5px;color:#374151;font-size:12px;text-decoration:none;margin-bottom:2px}
+.nav-link:hover{background:#dde3ee;text-decoration:none}
+a{color:var(--blue);text-decoration:none} a:hover{text-decoration:underline}
+.hero{background:linear-gradient(135deg,#1e40af,#6d28d9);color:#fff;border-radius:14px;padding:24px 30px;margin-bottom:24px;box-shadow:0 12px 28px rgba(30,64,175,.18)}
+.hero h1{font-size:25px;font-weight:900;letter-spacing:-.04em;margin-bottom:8px}
+.hero p{color:#dbeafe;font-size:13px;max-width:860px}.hero .thesis{margin-top:12px;font-size:15px;color:#fff;font-weight:750;line-height:1.7}
+section{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:23px 25px;margin-bottom:20px}
+h2{font-size:19px;font-weight:850;margin-bottom:14px;letter-spacing:-.03em}
+h3{font-size:14px;font-weight:800;margin:17px 0 8px;letter-spacing:-.01em}.small{font-size:12px;color:var(--muted)}
+.note{font-size:13px;color:#475569}.muted{color:var(--muted)}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin:14px 0}.grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:13px;margin:14px 0}.grid4{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:14px 0}
+.card{background:var(--sub);border:1px solid var(--line);border-radius:10px;padding:14px;min-height:70px}.card strong{color:#111827}
+.label{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.08em;font-weight:850;margin-bottom:6px}
+.kpi{font-size:25px;font-weight:900;letter-spacing:-.05em;color:var(--blue)}
+.tag{display:inline-block;padding:2px 8px;border-radius:999px;font-size:11px;font-weight:800;background:#dbeafe;color:#1e40af;margin:2px 2px 2px 0}.tag.green{background:#dcfce7;color:#15803d}.tag.amber{background:#fef3c7;color:#b45309}.tag.purple{background:#f3e8ff;color:#7e22ce}.tag.red{background:#fee2e2;color:#b91c1c}.tag.teal{background:#ccfbf1;color:#0f766e}
+table{width:100%;border-collapse:collapse;margin:13px 0;font-size:13px}th{background:#eff6ff;padding:9px 10px;text-align:left;font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:.06em;color:#374151;border:1px solid var(--line)}td{padding:9px 10px;border:1px solid var(--line);vertical-align:top}tr:hover td{background:#fafcff}
+.alert{background:#fff7ed;border-left:4px solid var(--amber);border-radius:7px;padding:12px 14px;margin:13px 0;font-size:13px;color:#7c2d12}.alert.blue{background:#eff6ff;border-color:var(--blue);color:#1e3a8a}.alert.green{background:#f0fdf4;border-color:var(--green);color:#14532d}.alert.red{background:#fef2f2;border-color:var(--red);color:#7f1d1d}.alert.purple{background:#f5f3ff;border-color:var(--purple);color:#4c1d95}
+.timeline{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin:14px 0}.tstep{background:#f8fafc;border:1px solid var(--line);border-radius:10px;padding:13px;font-size:12px;min-height:115px}.tstep .year{font-family:var(--mono);font-size:11px;color:var(--muted);font-weight:800}.tstep .title{font-weight:850;margin:4px 0;color:#111827}.tstep .body{color:#475569;line-height:1.55}
+.ascii{font-family:var(--mono);white-space:pre;overflow:auto;background:#0f172a;color:#dbeafe;border-radius:10px;padding:15px 17px;font-size:12px;line-height:1.7;margin:12px 0}.ascii.light{background:#f8fafc;color:#334155;border:1px solid var(--line)}
+ul{margin:7px 0 0 18px;color:#475569}.li-tight li{margin-bottom:3px}.reading li{margin-bottom:8px}.reading .why{display:block;color:#64748b;font-size:12px;margin-top:2px}
+.divider{height:2px;background:var(--line);margin:28px 0 22px}.chapter{background:linear-gradient(135deg,#0f766e,#1d4ed8);color:#fff;border-radius:14px;padding:20px 26px;margin:22px 0}.chapter h2{color:#fff;margin-bottom:4px}.chapter p{color:#dbeafe;font-size:13px}.footer{text-align:center;color:var(--muted);font-size:12px;margin:28px 0 8px}
+@media(max-width:980px){.layout{display:block}aside{position:relative;width:auto;height:auto}main{padding:20px}.grid2,.grid3,.grid4,.timeline{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<div class="layout">
+<aside>
+  <div class="logo">Infinigen Series</div>
+  <div class="date">2026-06-10</div>
+  <div class="small" style="margin-top:4px">자연 세계 생성 → 실내 세계 생성 → 로봇/광학 연구 연결</div>
+
+  <div class="nav-title">재구성 방향</div>
+  <a class="nav-link" href="#diagnosis">현재 보고서 진단</a>
+  <a class="nav-link" href="#thesis">시리즈 중심 문장</a>
+  <a class="nav-link" href="#dedupe">중복 정리 원칙</a>
+
+  <div class="nav-title">시리즈 흐름</div>
+  <a class="nav-link" href="#timeline">두 논문의 진행선</a>
+  <a class="nav-link" href="#shared">공통 계층과 확장 계층</a>
+  <a class="nav-link" href="#natural">Infinigen 2023</a>
+  <a class="nav-link" href="#indoor">Infinigen Indoors 2024</a>
+  <a class="nav-link" href="#evidence">실험이 증명하는 것</a>
+
+  <div class="nav-title">우리 연구 연결</div>
+  <a class="nav-link" href="#opticalnav">OpticalNav 관점</a>
+  <a class="nav-link" href="#revised-outline">수정 목차안</a>
+
+  <div class="nav-title">Further Reading</div>
+  <a class="nav-link" href="#following">읽을거리 지도</a>
+</aside>
+
+<main>
+  <div class="hero">
+    <h1>Infinigen 시리즈 보고서</h1>
+    <p>두 논문을 따로 요약하지 않고, 하나의 연구 프로그램으로 읽도록 구성한다.</p>
+    <p class="thesis">Infinigen은 "정적 에셋 수집"을 "생성 규칙 설계"로 바꾸었고, Infinigen Indoors는 그 철학을 자연 세계에서 인간이 설계한 실내 세계로 확장했다.</p>
+    <p style="margin-top:10px;font-size:12px;color:#93c5fd">
+      Infinigen 2023: <a href="https://arxiv.org/abs/2306.09310" target="_blank" style="color:#7dd3fc">arxiv.org/abs/2306.09310</a> ·
+      Infinigen Indoors 2024: <a href="https://arxiv.org/abs/2406.11824" target="_blank" style="color:#7dd3fc">arxiv.org/abs/2406.11824</a>
+    </p>
+  </div>
+
+  <section id="diagnosis">
+    <h2>현재 보고서 진단: 내용은 좋은데, 두 논문이 살짝 따로 논다</h2>
+    <div class="grid2">
+      <div class="card">
+        <div class="label">좋은 점</div>
+        <ul class="li-tight">
+          <li>Infinigen 2023과 Infinigen Indoors 2024의 핵심 질문이 잘 분리되어 있다.</li>
+          <li>"에셋 라이브러리가 아니라 생성 규칙"이라는 중심 문장이 선명하다.</li>
+          <li>마지막에 "Geometric Diversity ≠ Optical Diversity"로 우리 연구 방향까지 연결한 점이 좋다.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="label">아쉬운 점</div>
+        <ul class="li-tight">
+          <li>두 논문이 모두 "100% 절차적 생성", "정답 기하", "데이터 생성"을 설명하므로 반복감이 생긴다.</li>
+          <li>Node Transpiler, Material Generator, Ground Truth는 시리즈 공통 기반으로 한 번만 설명하는 편이 읽기 쉽다.</li>
+          <li>OpticalNav 연결이 2023 파트와 2024 파트에 각각 들어가면서 결론의 힘이 분산된다.</li>
+        </ul>
+      </div>
+    </div>
+    <div class="alert blue">
+      가장 좋은 수정 방향은 "논문 1 요약 → 논문 2 요약"이 아니라, "시리즈 공통 철학 → 2023의 기초 시스템 → 2024의 실내 확장 → 우리 연구로의 피벗"이다.
+    </div>
+  </section>
+
+  <section id="thesis">
+    <h2>보고서 중심 문장을 하나로 묶기</h2>
+    <div class="grid3">
+      <div class="card" style="border-top:3px solid var(--blue)">
+        <div class="label" style="color:var(--blue)">Infinigen 2023</div>
+        <p class="note"><strong>자연 세계의 생성 규칙화.</strong><br>나무, 지형, 식물, 동물, 자연 현상을 외부 에셋 없이 생성한다.</p>
+      </div>
+      <div class="card" style="border-top:3px solid var(--teal)">
+        <div class="label" style="color:var(--teal)">Infinigen Indoors 2024</div>
+        <p class="note"><strong>인공 세계의 생성 문법화.</strong><br>가구·문·계단·방 구조와 실내 배치 상식을 생성 규칙과 제약으로 표현한다.</p>
+      </div>
+      <div class="card" style="border-top:3px solid var(--amber)">
+        <div class="label" style="color:var(--amber)">OpticalNav 관점</div>
+        <p class="note"><strong>기하 세계에서 광학 관측으로.</strong><br>무엇이 있는가를 넘어, 로봇 센서에는 어떻게 보이는가를 다룬다.</p>
+      </div>
+    </div>
+    <div class="ascii light">에셋 수집의 한계
+      ↓
+생성 규칙으로 자연 세계를 만든다  — Infinigen 2023
+      ↓
+생성 규칙 + 배치 제약으로 실내 세계를 만든다 — Infinigen Indoors 2024
+      ↓
+실내 세계에 광학 재질·센서 관측·로봇 상태를 붙인다 — OpticalNav 방향</div>
+  </section>
+
+  <section id="dedupe">
+    <h2>중복 정리 원칙</h2>
+    <table>
+      <tr><th>현재 반복되는 내용</th><th>수정 위치</th><th>정리 방식</th></tr>
+      <tr>
+        <td>합성 데이터 병목, 정적 에셋 라이브러리 한계</td>
+        <td>서론 한 번</td>
+        <td>두 논문의 공통 문제의식으로 합친다.</td>
+      </tr>
+      <tr>
+        <td>100% 절차적 생성, 외부 에셋 없음</td>
+        <td>시리즈 공통 철학</td>
+        <td>2023에서 처음 제시, 2024에서 계승·확장으로 설명한다.</td>
+      </tr>
+      <tr>
+        <td>Node Transpiler</td>
+        <td>공통 제작 도구</td>
+        <td>2023의 기반 도구로 설명하고, 2024에서는 "계승된 제작 방식" 정도로만 언급한다.</td>
+      </tr>
+      <tr>
+        <td>Material Generator / Real Geometry</td>
+        <td>공통 데이터 품질 원칙</td>
+        <td>가짜 기하를 피하는 이유는 한 번 설명하고, 실내 재질은 coverage 확장으로만 추가한다.</td>
+      </tr>
+      <tr>
+        <td>Ground Truth extraction</td>
+        <td>시리즈 공통 효용</td>
+        <td>depth, normal, segmentation, optical flow는 "왜 비전 학습 데이터가 되는가"에서 한 번만 설명한다.</td>
+      </tr>
+      <tr>
+        <td>OpticalNav 연결</td>
+        <td>마지막 단일 결론</td>
+        <td>2023/2024 각각에 붙이지 말고, 마지막에 "기하 다양성에서 광학 다양성으로" 한 번에 묶는다.</td>
+      </tr>
+    </table>
+  </section>
+
+  <section id="timeline">
+    <h2>시리즈 흐름: 자연에서 실내, 그리고 로봇으로</h2>
+    <div class="timeline">
+      <div class="tstep">
+        <div class="year">Before 2023</div>
+        <div class="title">정적 에셋 기반 합성 데이터</div>
+        <div class="body">3D 모델을 모으고 배치한다. 다양성은 에셋 수에 묶인다.</div>
+      </div>
+      <div class="tstep">
+        <div class="year">2023</div>
+        <div class="title">Infinigen</div>
+        <div class="body">자연 세계를 절차적으로 생성한다. 핵심은 생성 규칙, 실제 기하, 자동 정답이다.</div>
+      </div>
+      <div class="tstep">
+        <div class="year">2024</div>
+        <div class="title">Infinigen Indoors</div>
+        <div class="body">인공 실내 세계를 생성한다. 핵심은 실내 에셋 생성기와 제약 기반 배치다.</div>
+      </div>
+      <div class="tstep">
+        <div class="year">2025+</div>
+        <div class="title">Infinigen-Sim / Stereo</div>
+        <div class="body">관절 물체, 로봇 시뮬레이터 export, stereo 학습 데이터 최적화로 이어진다.</div>
+      </div>
+      <div class="tstep">
+        <div class="year">우리 방향</div>
+        <div class="title">OpticalNav</div>
+        <div class="body">실내 장면에 편광·NIR 재질과 로봇 상태 의존 관측을 붙인다.</div>
+      </div>
+    </div>
+  </section>
+
+  <section id="shared">
+    <h2>공통 계층과 확장 계층을 분리해서 읽기</h2>
+    <table>
+      <tr><th>계층</th><th>Infinigen 2023</th><th>Infinigen Indoors 2024</th><th>보고서에서의 처리</th></tr>
+      <tr>
+        <td><strong>생성 철학</strong></td>
+        <td>자연 세계를 규칙으로 생성</td>
+        <td>실내 세계도 규칙으로 생성</td>
+        <td>공통 철학으로 앞에서 한 번 설명</td>
+      </tr>
+      <tr>
+        <td><strong>에셋 생성</strong></td>
+        <td>지형, 식물, 동물, 유체, 날씨</td>
+        <td>가구, 가전, 문, 창문, 계단, 소품</td>
+        <td>각 논문의 고유 확장으로 비교</td>
+      </tr>
+      <tr>
+        <td><strong>제작 도구</strong></td>
+        <td>Blender 노드 그래프, Node Transpiler</td>
+        <td>Geometry Nodes, modifier, mesh manipulation 활용</td>
+        <td>2023 기반 도구로 설명하고 2024에서는 반복하지 않음</td>
+      </tr>
+      <tr>
+        <td><strong>장면 구성</strong></td>
+        <td>자연 장면 조합과 스캐터</td>
+        <td>방 구조, 가구 배치, 접근성, 기능성</td>
+        <td>2024의 핵심 새로움으로 강조</td>
+      </tr>
+      <tr>
+        <td><strong>데이터 효용</strong></td>
+        <td>3D 비전 정답, 자연 도메인 보완</td>
+        <td>실내 정답, shadow/occlusion boundary 학습</td>
+        <td>실험 섹션에서 "각 논문이 증명한 것"으로 압축</td>
+      </tr>
+      <tr>
+        <td><strong>로봇 연결</strong></td>
+        <td>물리 로봇/가상 에이전트 훈련용 자산 가능성</td>
+        <td>Omniverse/Unreal export로 실시간 시뮬레이터 연결</td>
+        <td>마지막 OpticalNav로 통합</td>
+      </tr>
+    </table>
+  </section>
+
+  <section id="natural">
+    <h2>Infinigen 2023은 "기초 운영체제"처럼 설명한다</h2>
+    <div class="grid3">
+      <div class="card"><div class="label">핵심 성취</div><p class="note">외부 에셋 없이 자연 세계의 형상·재질·장면을 절차적으로 만든다. 182개 생성기, 1,070개 자유도.</p></div>
+      <div class="card"><div class="label">핵심 도구</div><p class="note">Node Transpiler가 아티스트의 노드 그래프를 Python 생성 코드로 바꾼다. 그래프 구조까지 무작위화 가능.</p></div>
+      <div class="card"><div class="label">핵심 품질</div><p class="note">범프 맵 같은 가짜 디테일을 피하고 실제 메쉬 기반 정답 기하를 유지한다. depth / normal / segmentation 신뢰 가능.</p></div>
+    </div>
+    <div class="alert green">
+      여기서 너무 많은 자연물 세부 구현을 길게 풀면 2024 파트로 넘어가기 전에 독자가 지친다. 나무·잎·지형은 대표 예시만 남기고, 핵심은 "생성 규칙의 일반성"으로 압축하는 편이 좋다.
+    </div>
+
+    <h3>자연물 생성 5계층 (요약)</h3>
+    <table>
+      <tr><th>계층</th><th>생성 내용</th><th>핵심 방식</th></tr>
+      <tr><td>형상 생성기</td><td>나무·식물·동물·바위 큰 구조</td><td>성장 법칙, 공간 점유 알고리즘</td></tr>
+      <tr><td>재질 생성기</td><td>색·반사율·거칠기·투과·표면 패턴</td><td>절차적 셰이더, 파라미터 무작위화</td></tr>
+      <tr><td>국소 기하 생성기</td><td>표면 주름·바위 균열·나무껍질</td><td>스칼라 필드 → 정점 변위 (실제 메쉬)</td></tr>
+      <tr><td>표면 스캐터 생성기</td><td>풀·이끼·돌·낙엽</td><td>독립 3D 물체 인스턴싱</td></tr>
+      <tr><td>장면 구성 생성기</td><td>숲·사막·해안·수중 환경 전체</td><td>지형·식생·기상 조건 종합 배분</td></tr>
+    </table>
+
+    <h3>왜 가짜 기하를 피하는가 — 컴퓨터 비전 학습 데이터의 핵심</h3>
+    <div class="grid2">
+      <div class="card">
+        <div class="label" style="color:var(--red)">범프 맵 / Phong 보간</div>
+        <div class="note" style="margin-top:6px;line-height:1.7">
+          표면 법선을 조작해 울퉁불퉁해 보이게 한다. 실제 메쉬는 평평하다.<br>
+          → depth/normal 정답이 실제 기하와 어긋난다.<br>
+          → CV 학습 데이터로 신뢰하기 어렵다.
+        </div>
+      </div>
+      <div class="card">
+        <div class="label" style="color:var(--green)">Infinigen 실제 메쉬</div>
+        <div class="note" style="margin-top:6px;line-height:1.7">
+          보이는 것 = 실제 메쉬 구조.<br>
+          → depth, normal, occlusion boundary, segmentation 정답이 정확하다.<br>
+          → 별도 annotation 없이 정답 자동 추출 가능.
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section id="indoor">
+    <h2>Infinigen Indoors 2024는 "실내 문법 확장"으로 설명한다</h2>
+    <div class="grid3">
+      <div class="card"><div class="label">오브젝트 확장</div><p class="note">79개 절차적 오브젝트 생성기. 가구·가전·문·창문·계단·소품을 외부 에셋 없이 생성한다.</p></div>
+      <div class="card"><div class="label">배치 확장 (신규 기여 핵심)</div><p class="note">실내 상식을 Python 기반 제약 언어로 표현하고, Simulated Annealing 솔버가 배치를 찾는다.</p></div>
+      <div class="card"><div class="label">로봇 연결</div><p class="note">Omniverse, Unreal Engine 5, Isaac Sim으로 export. URDF 자동 생성. RTX 4090 대화형 프레임레이트.</p></div>
+    </div>
+    <div class="alert blue">
+      2024 파트의 주인공은 Node Transpiler가 아니라 "제약 기반 실내 배치"다. 자연물 생성 규칙에서 실내 공간 설계 문법으로 넘어간 것이 시리즈의 진짜 장면 전환이다.
+    </div>
+
+    <h3>인공물 vs 자연물 — 생성 방식의 차이</h3>
+    <div class="grid2">
+      <div class="card">
+        <div class="label">자연물 생성 (Infinigen 2023)</div>
+        <div class="note" style="margin-top:6px;line-height:1.7">
+          핵심 법칙: <strong>성장</strong>과 <strong>물리적 형성</strong><br>
+          나무: skeleton 성장 → skinning → 잎 배치<br>
+          지형: 침식·퇴적·풍화 규칙<br>
+          식물: 굴광성·중력 반응 성장 모델
+        </div>
+      </div>
+      <div class="card">
+        <div class="label">인공물 생성 (Infinigen Indoors 2024)</div>
+        <div class="note" style="margin-top:6px;line-height:1.7">
+          핵심 법칙: <strong>부품 구성</strong>과 <strong>설계 치수</strong><br>
+          의자: 좌석·등받이·다리·팔걸이·쿠션 두께·곡률 파라미터 조합<br>
+          계단: 발판 atomic component의 array repetition<br>
+          문·창문: 패널을 mesh boolean으로 잘라내기
+        </div>
+      </div>
+    </div>
+
+    <h3>제약 기반 배치 — Python API로 실내 상식 표현</h3>
+    <div class="grid2">
+      <div>
+        <table style="margin:0">
+          <tr><th>제약 유형</th><th>예시</th></tr>
+          <tr><td>거리</td><td>의자-식탁 간격 ≥ 0.6m</td></tr>
+          <tr><td>대칭</td><td>식탁 양옆 의자 대칭 배치</td></tr>
+          <tr><td>접근성</td><td>냉장고 앞 빈 공간 확보</td></tr>
+          <tr><td>지지 관계</td><td>컵은 테이블 위에</td></tr>
+          <tr><td>개수</td><td>의자 수 = 식탁 자리 수</td></tr>
+          <tr><td>문맥 의존</td><td>공부방 책상 vs 식당 테이블 규칙</td></tr>
+          <tr><td>파라미터 공동 최적화</td><td>방 크기에 맞는 식탁 크기</td></tr>
+        </table>
+      </div>
+      <div>
+        <pre style="margin:0;font-size:11px;line-height:1.6;background:#0f172a;color:#e2e8f0;border-radius:8px;padding:12px"># 식탁과 의자 배치 제약
+table = place(DiningTable, on=floor,
+              params={"seats": sample_int(4, 8)})
+
+chairs = place(Chair,
+               count=table.seats,
+               constraint=[
+                 symmetric_around(table),
+                 clearance(table, min=0.6),
+                 face_toward(table)])
+
+# SA 솔버가 제약 loss를 줄이며
+# 배치 + 오브젝트 파라미터를 동시에 최적화</pre>
+      </div>
+    </div>
+
+    <h3>재질 Coverage 확장</h3>
+    <div class="grid4" style="margin:10px 0">
+      <div class="card">
+        <div class="label">Infinigen 2023</div>
+        <div style="font-size:28px;font-weight:900;color:var(--muted)">21%</div>
+        <div class="note">OpenSurfaces coverage<br>자연물 중심 재질</div>
+      </div>
+      <div class="card">
+        <div class="label">Infinigen Indoors</div>
+        <div style="font-size:28px;font-weight:900;color:var(--green)">78%</div>
+        <div class="note">OpenSurfaces coverage<br>30개 재질, 120개 파라미터</div>
+      </div>
+      <div class="card">
+        <div class="label">새로 추가된 재질</div>
+        <div class="note" style="margin-top:6px;line-height:1.7">목재·금속·세라믹·패브릭·플라스틱·유리</div>
+      </div>
+      <div class="card">
+        <div class="label">주의</div>
+        <div class="note" style="margin-top:6px;line-height:1.7">Blender Cycles = RGB 기준.<br>편광·NIR 응답은 별도 처리 필요.</div>
+      </div>
+    </div>
+  </section>
+
+  <section id="evidence">
+    <h2>실험 섹션은 "무엇을 증명했는가"로 압축하기</h2>
+    <table>
+      <tr><th>논문</th><th>실험</th><th>핵심 결론</th></tr>
+      <tr>
+        <td>Infinigen 2023</td>
+        <td>30K stereo pair → RAFT-Stereo 학습 → Middlebury 비교</td>
+        <td>절차적 자연 데이터가 기존 합성 데이터의 자연 도메인 부족을 보완. Jadeplant 같은 복잡 자연물 장면 강점.</td>
+      </tr>
+      <tr>
+        <td>Infinigen Indoors 2024</td>
+        <td>Shadow removal (2K쌍), Occlusion boundary estimation (1464장)</td>
+        <td>실내 특화 합성 데이터가 실내 비전 일반화 향상. Infinigen-Nature, Hypersim 대비 ODS/OIS/mAP 우위.</td>
+      </tr>
+      <tr>
+        <td>시리즈 전체</td>
+        <td>에셋 수집이 아니라 생성 규칙을 튜닝하는 데이터 생성 방식</td>
+        <td>데이터셋을 "만들어진 이미지 묶음"이 아니라 "조절 가능한 세계 생성기"로 바꾸는 것이 핵심.</td>
+      </tr>
+    </table>
+    <div class="alert blue">
+      두 논문 모두 "모든 도메인 우위"를 주장하지 않는다. 각 논문이 타겟한 도메인(자연 장면 / 실내 장면)에서 기존 합성 데이터가 약했던 부분을 절차적 생성으로 보완할 수 있음을 보인 것이다.
+    </div>
+  </section>
+
+  <section id="opticalnav">
+    <h2>우리 연구로의 피벗: 기하 다양성만으로는 광학 다양성이 되지 않는다</h2>
+    <div class="alert purple">
+      Infinigen 시리즈는 <strong>무엇이 어디에 있는가</strong>를 다양하게 만든다. OpticalNav는 여기에 <strong>센서가 무엇을 어떻게 관측하는가</strong>를 붙이는 문제다.
+    </div>
+    <table>
+      <tr><th>필요 계층</th><th>Infinigen 시리즈가 주는 것</th><th>OpticalNav에서 추가해야 할 것</th></tr>
+      <tr>
+        <td>실내 구조</td>
+        <td>방, 복도, 문, 창문, 계단, 가구 배치</td>
+        <td>유리문/투명 파티션 중심 시나리오 선별</td>
+      </tr>
+      <tr>
+        <td>정답 기하</td>
+        <td>실제 메쉬 기반 depth, normal, segmentation</td>
+        <td>유리 경계, 위험 영역, 주행 가능 영역의 과업 정답</td>
+      </tr>
+      <tr>
+        <td>재질</td>
+        <td>RGB 렌더링 중심 procedural shader</td>
+        <td>편광·NIR 응답이 있는 BRDF / Mueller 재질 계층</td>
+      </tr>
+      <tr>
+        <td>관측</td>
+        <td>일반 RGB 렌더링과 표준 annotation</td>
+        <td>Stokes, DoLP, AoLP, NIR, 센서 노이즈와 보정</td>
+      </tr>
+      <tr>
+        <td>로봇 과업</td>
+        <td>실시간 시뮬레이터 export 가능성</td>
+        <td>Isaac Sim 상태 전개, 충돌, 회피 성공률, rollout 평가</td>
+      </tr>
+    </table>
+    <div class="ascii">Infinigen Indoors
+  실내 구조 + 자산 + 배치 제약
+        ↓
+Optical material layer
+  유리 / 금속 / 세라믹 / 플라스틱의 편광·NIR 응답
+        ↓
+Mitsuba 3
+  파장·편광 기반 광학 관측
+        ↓
+Isaac Sim
+  로봇 상태 전개 + 충돌 + 안전 주행 평가</div>
+
+    <div class="alert green" style="margin-top:16px;font-size:14px;font-weight:700;padding:14px 18px">
+      Infinigen Indoors가 <em>무엇이 있는가</em>를 만들었다면,<br>
+      OpticalNav는 <em>그것이 어떻게 보이는가</em>를 만든다.
+    </div>
+  </section>
+
+  <section id="revised-outline">
+    <h2>수정 목차안</h2>
+    <table>
+      <tr><th>파트</th><th>섹션</th><th>역할</th></tr>
+      <tr><td>0</td><td>시리즈로 읽는 Infinigen</td><td>두 논문의 공통 문제의식과 한 줄 주장</td></tr>
+      <tr><td>1</td><td>정적 에셋의 한계와 절차적 생성의 전환</td><td>합성 데이터 병목을 한 번만 설명</td></tr>
+      <tr><td>2</td><td>Infinigen 2023: 자연 세계 생성 규칙</td><td>2023의 고유 기여만 압축</td></tr>
+      <tr><td>3</td><td>시리즈 공통 기반: 노드, 재질, 실제 기하, 정답 추출</td><td>반복되던 기술 설명을 한곳에 모음</td></tr>
+      <tr><td>4</td><td>Infinigen Indoors 2024: 실내 세계 생성 문법</td><td>인공물 생성기와 실내 배치 제약을 강조</td></tr>
+      <tr><td>5</td><td>제약 기반 배치와 floorplan 생성</td><td>2024 논문의 가장 새로운 부분을 상세 설명</td></tr>
+      <tr><td>6</td><td>실험 결과: 각 논문이 증명한 것</td><td>결과를 길게 나열하지 않고 의미 중심으로 정리</td></tr>
+      <tr><td>7</td><td>로봇·광학 연구로의 연결</td><td>OpticalNav, Mitsuba 3, Isaac Sim 연결을 결론으로 통합</td></tr>
+      <tr><td>8</td><td>Further Reading</td><td>다음에 읽을 자료를 목적별로 정리</td></tr>
+    </table>
+  </section>
+
+  <div class="chapter">
+    <h2 id="following">Further Reading — 다음에 붙이면 좋은 읽을거리</h2>
+    <p>보고서 말미에는 단순 참고문헌보다 "읽는 목적" 중심으로 붙이는 편이 좋다.</p>
+  </div>
+
+  <section>
+    <h2>1. Infinigen 시리즈 자체를 따라가기</h2>
+    <ul class="reading">
+      <li>
+        <strong>Infinigen 공식 홈페이지 / 문서</strong>
+        <span class="why">실제 설치, 생성 단계, Nature/Indoors 사용 흐름을 확인하는 출발점.</span>
+      </li>
+      <li>
+        <strong>Infinigen GitHub</strong>
+        <span class="why">논문 버전 이후 코드가 계속 바뀌고 있으므로, 현재 구현을 볼 때 필수. README의 "Hello Room", "Hello World", simulator export 문서를 같이 확인.</span>
+      </li>
+      <li>
+        <strong>Infinigen-Sim: Procedural Generation of Articulated Simulation Assets</strong>
+        <span class="why">Infinigen 계열이 정적 장면 생성에서 관절 물체와 로봇 시뮬레이터 자산 생성으로 확장되는 흐름을 보여준다.</span>
+      </li>
+      <li>
+        <strong>Infinigen-Stereo / What Makes Good Synthetic Training Data for Zero-Shot Stereo Matching?</strong>
+        <span class="why">절차적 생성기를 "데이터 품질을 실험적으로 튜닝하는 장치"로 쓰는 후속 흐름. RGB-NIR/HDR/stereo 배경과도 맞는다.</span>
+      </li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>2. 실내 장면 생성과 embodied AI 비교축</h2>
+    <ul class="reading">
+      <li>
+        <strong>ProcTHOR</strong>
+        <span class="why">절차적으로 집을 생성해 embodied AI 학습 규모를 키운 대표 기준점. 다만 AI2-THOR의 기존 에셋 라이브러리를 활용한다는 점에서 Infinigen Indoors와 좋은 대비가 된다.</span>
+      </li>
+      <li>
+        <strong>Holodeck</strong>
+        <span class="why">언어 지시로 실내 환경을 생성하는 흐름. LLM이 상식적 방 구성과 물체 관계를 만들고, Objaverse 같은 대규모 에셋을 활용한다는 점에서 "완전 절차적 생성"과 비교하기 좋다.</span>
+      </li>
+      <li>
+        <strong>BlenderProc</strong>
+        <span class="why">Blender 기반 합성 데이터 생성 파이프라인의 실용 기준점. Infinigen을 "생성기"로, BlenderProc을 "데이터 생성 파이프라인"으로 놓고 비교하면 구조가 선명해진다.</span>
+      </li>
+      <li>
+        <strong>Hypersim</strong>
+        <span class="why">전문가 제작 실내 장면 기반의 고품질 photorealistic synthetic dataset. Infinigen Indoors가 왜 "정적 에셋 의존"을 넘으려 했는지 설명할 때 대비 자료로 좋다.</span>
+      </li>
+      <li>
+        <strong>Kubric</strong>
+        <span class="why">합성 영상과 깊이, 광학 흐름, 분할 정답을 만드는 범용 생성 도구. Infinigen의 "정답 추출" 장점과 나란히 읽기 좋다.</span>
+      </li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>3. 로봇 navigation 쪽으로 이어 읽기</h2>
+    <ul class="reading">
+      <li>
+        <strong>R2R / Matterport3D Simulator</strong>
+        <span class="why">VLN의 기본 문제 설정. 실제 이미지 기반 환경이 왜 synthetic 환경의 visual richness 문제를 지적했는지 읽어두면, Infinigen의 "절차적 다양성" 가치가 더 잘 보인다.</span>
+      </li>
+      <li>
+        <strong>VLN-CE</strong>
+        <span class="why">R2R식 이산 graph navigation을 연속 환경으로 확장한 기준점. synthetic navigation dataset의 episode 형식, instruction, action interface를 설계할 때 직접 도움이 된다.</span>
+      </li>
+      <li>
+        <strong>Habitat / HM3D</strong>
+        <span class="why">대규모 실내 3D scan 기반 embodied AI 생태계. Infinigen Indoors와 비교하면 "실제 스캔 기반 다양성"과 "절차적 생성 기반 제어 가능성"의 차이가 보인다.</span>
+      </li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>4. OpticalNav로 이어지는 광학 렌더링 자료</h2>
+    <ul class="reading">
+      <li>
+        <strong>Mitsuba 3 Polarization 문서</strong>
+        <span class="why">Stokes 벡터와 Mueller 행렬 기반 편광 렌더링을 구현 관점에서 설명한다. Infinigen 장면에 편광/NIR 관측을 붙일 때 핵심 자료.</span>
+      </li>
+      <li>
+        <strong>Mitsuba 3 variant / spectral &amp; polarization 문서</strong>
+        <span class="why">RGB, spectral, polarized variant의 차이를 확인할 수 있다. 장면 생성기와 광학 관측기를 분리해야 하는 이유를 설명하기 좋다.</span>
+      </li>
+      <li>
+        <strong>pbrt v4</strong>
+        <span class="why">물리 기반 렌더링의 교과서이자 구현 레퍼런스. BRDF, spectral rendering, participating media, path tracing 개념을 정리하는 데 안정적이다.</span>
+      </li>
+      <li>
+        <strong>Isaac Sim Infinigen SDG tutorial</strong>
+        <span class="why">Infinigen 장면을 Isaac Sim의 synthetic data generation 파이프라인과 연결하는 실무 자료. RGB-first 데이터셋 구축과 잘 맞는다.</span>
+      </li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>보고서 말미 요약 문단</h2>
+    <div class="alert green" style="font-size:14px;line-height:1.8">
+      Infinigen 시리즈는 합성 데이터를 "정적 에셋을 모아 만든 이미지 묶음"에서 "조절 가능한 세계 생성기"로 바꾼 연구 흐름으로 읽을 수 있다. 2023년 Infinigen은 자연 세계의 형상·재질·장면 구성을 생성 규칙으로 만들었고, 2024년 Infinigen Indoors는 이 철학을 실내 인공물과 배치 상식으로 확장했다. 이 흐름은 로봇 연구에서 특히 중요하다. 로봇 학습에는 단순히 예쁜 장면보다, 기하 정답과 장면 메타데이터가 있고, 필요한 실패 조건을 반복적으로 만들 수 있는 세계 생성기가 필요하기 때문이다. 다만 이 시리즈가 해결한 것은 주로 기하와 배치의 다양성이다. 유리문, 반사 표면, 편광·NIR 관측처럼 센서가 보는 방식 자체가 달라지는 문제는 별도의 광학 재질 계층과 물리 기반 렌더링이 필요하며, 이 지점이 OpticalNav 연구가 이어받을 수 있는 빈 공간이다.
+    </div>
+  </section>
+
+  <div class="footer">Robomituba Daily Development Report · 2026-06-10 · Infinigen Series (2023 + Indoors 2024)</div>
+</main>
+</div>
+</body>
+</html>

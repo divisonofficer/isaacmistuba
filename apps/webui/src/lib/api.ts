@@ -536,3 +536,21 @@ export const exportOpticalNavDataset = (
 	},
 ) =>
 	post(`${opticalProject(projectId)}/export`, payload);
+
+// Scene-bundle export jobs — async with WS / polling progress.
+export const submitOpticalNavExportJob = (
+	projectId: string,
+	payload: {
+		scene_id: string;
+		only_completed?: boolean;
+		episode_ids?: string[] | null;
+		include_episode_thumbnails?: boolean;
+		panorama_observations?: boolean;
+	},
+) => post(`${opticalProject(projectId)}/export-jobs`, payload);
+
+export const getOpticalNavExportJob = (projectId: string, jobId: string) =>
+	fetch(`${opticalProject(projectId)}/export-jobs/${encodeURIComponent(jobId)}`).then(json);
+
+export const cancelOpticalNavExportJob = (projectId: string, jobId: string) =>
+	fetch(`${opticalProject(projectId)}/export-jobs/${encodeURIComponent(jobId)}`, { method: 'DELETE' }).then(json);

@@ -289,7 +289,13 @@ def _parse_scene(scene_path: Path) -> ET.Element:
 
 
 _MEASURED_BSDF_TYPES = {"measured", "measured_polarized"}
+_CHANNEL_SPLIT_RGB_PLUGIN_TYPE = "measured_polarized_rgb"
 _CHANNEL_SPLIT_FILENAME_RE = re.compile(r"/channels/(?P<material>[^/]+)/(?P<wl>\d+)\.pbrdf$")
+_RGB_CHANNEL_SPLIT_WAVELENGTHS_NM: tuple[tuple[str, int], ...] = (
+    ("r", 614),
+    ("g", 542),
+    ("b", 446),
+)
 
 
 def _swap_measured_bsdf_wavelength(root: ET.Element, *, target_nm: int) -> int:
@@ -300,7 +306,7 @@ def _swap_measured_bsdf_wavelength(root: ET.Element, *, target_nm: int) -> int:
     references are left alone since they're not channel-keyed.
     """
     swapped = 0
-    for bsdf in list(root.findall("./bsdf")):
+    for bsdf in list(root.findall(".//bsdf")):
         if str(bsdf.get("type") or "") not in _MEASURED_BSDF_TYPES:
             continue
         for s in bsdf.findall("./string"):
@@ -315,6 +321,123 @@ def _swap_measured_bsdf_wavelength(root: ET.Element, *, target_nm: int) -> int:
                 s.set("value", new_value)
                 swapped += 1
     return swapped
+
+
+def _channel_split_filename_for(value: str, *, target_nm: int) -> str:
+    m = _CHANNEL_SPLIT_FILENAME_RE.search(value)
+    if not m:
+        return value
+    return value[: m.start("wl")] + str(target_nm) + ".pbrdf"
+
+
+def _convert_channel_split_measured_bsdfs_to_rgb_plugin(root: ET.Element) -> int:
+    """Convert channel-split measured BSDFs to the RGB single-pass plugin.
+
+    Source XML deliberately keeps the stable measured_polarized + 542 nm
+    placeholder. RGB staging rewrites that placeholder to a plugin that evaluates
+    the three channel-split pBRDF files in one Mitsuba RGB render.
+    """
+    converted = 0
+    for bsdf in list(root.findall(".//bsdf")):
+        if str(bsdf.get("type") or "") not in _MEASURED_BSDF_TYPES:
+            continue
+        filename = None
+        for child in bsdf.findall("./string"):
+            if child.get("name") == "filename":
+                filename = child
+                break
+        if filename is None:
+            continue
+        value = filename.get("value") or ""
+        if not _CHANNEL_SPLIT_FILENAME_RE.search(value):
+            continue
+
+        bsdf.set("type", _CHANNEL_SPLIT_RGB_PLUGIN_TYPE)
+        insert_at = list(bsdf).index(filename)
+        bsdf.remove(filename)
+        for child in list(bsdf.findall("./float")):
+            if child.get("name") == "wavelength":
+                bsdf.remove(child)
+        for offset, (label, wavelength_nm) in enumerate(_RGB_CHANNEL_SPLIT_WAVELENGTHS_NM):
+            bsdf.insert(
+                insert_at + offset,
+                ET.Element(
+                    "string",
+                    {
+                        "name": f"filename_{label}",
+                        "value": _channel_split_filename_for(value, target_nm=wavelength_nm),
+                    },
+                ),
+            )
+        converted += 1
+    return converted
+
+
+def _scene_has_channel_split_measured_bsdfs(scene_path: Path) -> bool:
+    try:
+        root = _parse_scene(scene_path)
+    except Exception:
+        return False
+    for bsdf in root.findall(".//bsdf"):
+        if str(bsdf.get("type") or "") not in _MEASURED_BSDF_TYPES:
+            continue
+        for s in bsdf.findall("./string"):
+            if s.get("name") == "filename" and _CHANNEL_SPLIT_FILENAME_RE.search(s.get("value") or ""):
+                return True
+    return False
+
+
+def _rgb_channel_intensity(image: np.ndarray) -> np.ndarray:
+    arr = np.asarray(image, dtype=np.float32)
+    if arr.ndim == 2:
+        return arr.astype(np.float32)
+    if arr.ndim != 3:
+        raise RuntimeError(f"Unexpected channel-split RGB tensor shape: {arr.shape}")
+    rgb = arr[:, :, :3] if arr.shape[2] >= 3 else np.repeat(arr[:, :, :1], 3, axis=2)
+    return np.tensordot(
+        rgb,
+        np.array([0.2126, 0.7152, 0.0722], dtype=np.float32),
+        axes=([2], [0]),
+    ).astype(np.float32)
+
+
+def _compose_channel_split_rgb(channel_images: Mapping[str, np.ndarray]) -> np.ndarray:
+    missing = [label for label, _nm in _RGB_CHANNEL_SPLIT_WAVELENGTHS_NM if label not in channel_images]
+    if missing:
+        raise RuntimeError(f"Missing channel-split RGB render(s): {', '.join(missing)}")
+    return np.stack(
+        [
+            _rgb_channel_intensity(channel_images["r"]),
+            _rgb_channel_intensity(channel_images["g"]),
+            _rgb_channel_intensity(channel_images["b"]),
+        ],
+        axis=2,
+    ).astype(np.float32)
+
+
+def _merge_channel_split_timing(channel_timings: Mapping[str, Mapping[str, Any]], *, spp: int) -> dict[str, Any]:
+    ordered = [channel_timings[label] for label, _nm in _RGB_CHANNEL_SPLIT_WAVELENGTHS_NM if label in channel_timings]
+    if not ordered:
+        return {
+            "variant": "unknown",
+            "load_scene_s": 0.0,
+            "scene_cache_hit": False,
+            "render_s": 0.0,
+            "total_s": 0.0,
+            "spp": spp,
+        }
+    variants = [str(t.get("variant", "unknown")) for t in ordered]
+    return {
+        "variant": variants[0] if len(set(variants)) == 1 else ",".join(variants),
+        "load_scene_s": float(sum(float(t.get("load_scene_s", 0.0)) for t in ordered)),
+        "scene_cache_hit": all(bool(t.get("scene_cache_hit", False)) for t in ordered),
+        "render_s": float(sum(float(t.get("render_s", 0.0)) for t in ordered)),
+        "total_s": float(sum(float(t.get("total_s", 0.0)) for t in ordered)),
+        "spp": spp,
+        "channel_split_rgb": True,
+        "channel_wavelengths_nm": {label: nm for label, nm in _RGB_CHANNEL_SPLIT_WAVELENGTHS_NM},
+        "channel_timings": {label: dict(channel_timings[label]) for label, _nm in _RGB_CHANNEL_SPLIT_WAVELENGTHS_NM if label in channel_timings},
+    }
 
 
 def _substitute_measured_bsdfs_with_diffuse(root: ET.Element, *, reflectance: str = "0.7 0.7 0.7") -> int:
@@ -1390,6 +1513,7 @@ def _stage_path_scene(
     integrator_type: str = "path",
     ambient_radiance: float = 1.0,
     measured_wavelength_nm: int | None = None,
+    channel_rgb_plugin: bool = False,
 ) -> Path:
     stage_signature = (
         "path",
@@ -1400,6 +1524,7 @@ def _stage_path_scene(
         _assist_light_signature(assist_light),
         round(float(ambient_radiance), 4),
         int(measured_wavelength_nm) if measured_wavelength_nm else 0,
+        bool(channel_rgb_plugin),
     )
     if _should_reuse_staged_scene(out_scene, signature=stage_signature):
         return out_scene
@@ -1415,13 +1540,22 @@ def _stage_path_scene(
             rr_depth=rr_depth,
             samples_per_pass=samples_per_pass,
         )
-        if measured_wavelength_nm is not None:
+        if channel_rgb_plugin:
+            _convert_channel_split_measured_bsdfs_to_rgb_plugin(root)
+        elif measured_wavelength_nm is not None:
             _swap_measured_bsdf_wavelength(root, target_nm=int(measured_wavelength_nm))
 
     root = _scene_template(
         scene_path,
         branch_kind="path",
-        branch_signature=(integrator_type, int(max_depth), int(rr_depth), int(samples_per_pass or 0), int(measured_wavelength_nm) if measured_wavelength_nm else 0),
+        branch_signature=(
+            integrator_type,
+            int(max_depth),
+            int(rr_depth),
+            int(samples_per_pass or 0),
+            int(measured_wavelength_nm) if measured_wavelength_nm else 0,
+            bool(channel_rgb_plugin),
+        ),
         builder=_build_template,
     )
     _update_sensor(
@@ -1889,6 +2023,8 @@ def _stage_base_path_scene(
     scene_override: SceneOverrideSpec | None = None,
     integrator_type: str = "path",
     ambient_radiance: float = 1.0,
+    measured_wavelength_nm: int | None = None,
+    channel_rgb_plugin: bool = False,
 ) -> Path:
     """Stage a camera-free path-tracer scene shared across viewpoints.
 
@@ -1898,7 +2034,14 @@ def _stage_base_path_scene(
     sig = (
         "base_path",
         _scene_cache_key(scene_path),
-        (integrator_type, int(max_depth), int(rr_depth), int(samples_per_pass or 0)),
+        (
+            integrator_type,
+            int(max_depth),
+            int(rr_depth),
+            int(samples_per_pass or 0),
+            int(measured_wavelength_nm) if measured_wavelength_nm else 0,
+            bool(channel_rgb_plugin),
+        ),
         _scene_override_signature(scene_override),
         _texture_cache_signature(),
         round(float(ambient_radiance), 4),
@@ -1919,11 +2062,22 @@ def _stage_base_path_scene(
             rr_depth=rr_depth,
             samples_per_pass=samples_per_pass,
         )
+        if channel_rgb_plugin:
+            _convert_channel_split_measured_bsdfs_to_rgb_plugin(root)
+        elif measured_wavelength_nm is not None:
+            _swap_measured_bsdf_wavelength(root, target_nm=int(measured_wavelength_nm))
 
     root = _scene_template(
         scene_path,
         branch_kind="path",
-        branch_signature=(integrator_type, int(max_depth), int(rr_depth), int(samples_per_pass or 0)),
+        branch_signature=(
+            integrator_type,
+            int(max_depth),
+            int(rr_depth),
+            int(samples_per_pass or 0),
+            int(measured_wavelength_nm) if measured_wavelength_nm else 0,
+            bool(channel_rgb_plugin),
+        ),
         builder=_build_template,
     )
     _apply_scene_override(root, scene_override, mode="rgb")
@@ -2895,6 +3049,12 @@ def _build_rgb_result(
             "raw_npz": str(raw_path),
         },
     }
+    timing_extras = {
+        key: value
+        for key, value in timing.items()
+        if key not in {"variant", "load_scene_s", "scene_cache_hit", "render_s", "save_s", "total_s", "spp"}
+    }
+    timing_record.update(timing_extras)
     result = ModalityResult(
         name=modality,
         array=rgb.astype(np.float32),
@@ -2909,6 +3069,7 @@ def _build_rgb_result(
             "total_s": timing_record["total_s"],
             "scene": str(scene_path),
             "spp": timing["spp"],
+            **timing_extras,
         },
         artifacts=timing_record["outputs"],
     )
@@ -3272,11 +3433,16 @@ def render_modalities(
         hazard_target_shape_filenames = list(depth_approx.target_shape_filenames)
     if "hazard_mask" in requested_set and not hazard_target_shape_filenames:
         raise ValueError("hazard_mask requires scene_override.target_shape_filenames or depth_approx.target_shape_filenames.")
+    use_channel_split_rgb = _needs_path_total(requested_set) and _scene_has_channel_split_measured_bsdfs(source_scene)
+    use_channel_rgb_plugin = (
+        use_channel_split_rgb
+        and not os.environ.get("ROBOMITUBA_DISABLE_HPBRDF_RGB_PLUGIN")
+    )
 
     # ── progress helpers ──────────────────────────────────────────────────
     _pass_index: list[int] = [0]
-    _total_passes = sum([
-        1 if _needs_path_total(requested_set) else 0,
+    _total_passes = [sum([
+        (1 if use_channel_rgb_plugin else len(_RGB_CHANNEL_SPLIT_WAVELENGTHS_NM) if use_channel_split_rgb else 1) if _needs_path_total(requested_set) else 0,
         1 if _needs_direct(requested_set) else 0,
         1 if _needs_diffuse(requested_set) else 0,
         1 if _needs_aov(requested_set) else 0,
@@ -3286,7 +3452,7 @@ def render_modalities(
         1 if (_needs_active_nir(requested_set) and assist_light is not None) else 0,
         1 if _needs_polar(requested_set) else 0,
         1 if _needs_lidar(requested_set) else 0,
-    ])
+    ])]
 
     def _cb(stage: str, ctx: Mapping[str, Any] | None = None) -> None:
         if progress_callback is not None:
@@ -3325,7 +3491,7 @@ def render_modalities(
             "spp": spp,
             "variant": v,
             "pass_index": _pass_index[0],
-            "total_passes": _total_passes,
+            "total_passes": _total_passes[0],
             **_texture_audit_progress_payload(scene_path),
         }
         cache_hit = _resident_scene_cache_has(scene_path, variant=v)
@@ -3378,7 +3544,7 @@ def render_modalities(
         _cb("saving_output", {
             "pass": pass_name,
             "pass_index": _pass_index[0],
-            "total_passes": _total_passes,
+            "total_passes": _total_passes[0],
         })
         return image, timing
     # ─────────────────────────────────────────────────────────────────────
@@ -3387,38 +3553,166 @@ def render_modalities(
         return workspace / config.scene_filename(key, default)
 
     if _needs_path_total(requested_set):
-        _cb("staging_scene", {"pass": "rgb"})
-        if _use_scene_reuse:
-            scene_rgb = _stage_base_path_scene(
-                source_scene,
-                max_depth=config.path_max_depth,
-                rr_depth=config.rr_depth,
-                samples_per_pass=config.samples_per_pass,
-                scene_override=scene_override,
-                ambient_radiance=config.ambient_radiance,
-            )
+        if use_channel_split_rgb:
+            rgb = None
+            timing: dict[str, Any] | None = None
+            scene_rgb: Path | None = None
+            plugin_error: str | None = None
+            if use_channel_rgb_plugin:
+                try:
+                    _cb("staging_scene", {
+                        "pass": "rgb",
+                        "channel_rgb_plugin": True,
+                        "channel_wavelengths_nm": {label: nm for label, nm in _RGB_CHANNEL_SPLIT_WAVELENGTHS_NM},
+                    })
+                    if _use_scene_reuse:
+                        scene_rgb = _stage_base_path_scene(
+                            source_scene,
+                            max_depth=config.path_max_depth,
+                            rr_depth=config.rr_depth,
+                            samples_per_pass=config.samples_per_pass,
+                            scene_override=scene_override,
+                            ambient_radiance=config.ambient_radiance,
+                            channel_rgb_plugin=True,
+                        )
+                    else:
+                        scene_rgb = _stage_path_scene(
+                            source_scene,
+                            stage_filename("rgb", "scene_rgb.xml"),
+                            camera_to_world=camera_to_world,
+                            fov_deg=fov_deg,
+                            spp=config.path_spp,
+                            width=config.width,
+                            height=config.height,
+                            max_depth=config.path_max_depth,
+                            rr_depth=config.rr_depth,
+                            samples_per_pass=config.samples_per_pass,
+                            scene_override=scene_override,
+                            ambient_radiance=config.ambient_radiance,
+                            channel_rgb_plugin=True,
+                        )
+                    staged_scenes["rgb"] = str(scene_rgb)
+                    image, timing = _render_pass(
+                        scene_rgb,
+                        pass_name="rgb",
+                        spp=config.path_spp,
+                        viewpoint=_viewpoint if _use_scene_reuse else None,
+                    )
+                    timing["spp"] = config.path_spp
+                    timing["channel_rgb_plugin"] = True
+                    timing["channel_split_rgb"] = True
+                    timing["channel_wavelengths_nm"] = {label: nm for label, nm in _RGB_CHANNEL_SPLIT_WAVELENGTHS_NM}
+                    rgb = image[:, :, :3] if image.ndim == 3 else np.repeat(image[:, :, None], 3, axis=2)
+                except Exception as exc:
+                    plugin_error = str(exc)
+                    _clear_scene_caches()
+                    _pass_index[0] = max(0, _pass_index[0] - 1)
+                    _total_passes[0] += len(_RGB_CHANNEL_SPLIT_WAVELENGTHS_NM) - 1
+                    _cb("render_fallback", {
+                        "pass": "rgb",
+                        "reason": "channel_rgb_plugin_failed",
+                        "error": plugin_error,
+                        "channel_split_rgb": True,
+                        "fallback_passes": len(_RGB_CHANNEL_SPLIT_WAVELENGTHS_NM),
+                    })
+
+            if rgb is None or timing is None or scene_rgb is None:
+                channel_images: dict[str, np.ndarray] = {}
+                channel_timings: dict[str, dict[str, Any]] = {}
+                channel_scenes: dict[str, Path] = {}
+                for label, wavelength_nm in _RGB_CHANNEL_SPLIT_WAVELENGTHS_NM:
+                    _cb("staging_scene", {
+                        "pass": "rgb",
+                        "channel": label,
+                        "wavelength_nm": wavelength_nm,
+                        "channel_split_rgb": True,
+                        "channel_rgb_fallback": plugin_error is not None,
+                    })
+                    if _use_scene_reuse:
+                        scene_channel = _stage_base_path_scene(
+                            source_scene,
+                            max_depth=config.path_max_depth,
+                            rr_depth=config.rr_depth,
+                            samples_per_pass=config.samples_per_pass,
+                            scene_override=scene_override,
+                            ambient_radiance=config.ambient_radiance,
+                            measured_wavelength_nm=wavelength_nm,
+                        )
+                    else:
+                        scene_channel = _stage_path_scene(
+                            source_scene,
+                            stage_filename(f"rgb_{label}", f"scene_rgb_{label}_{wavelength_nm}nm.xml"),
+                            camera_to_world=camera_to_world,
+                            fov_deg=fov_deg,
+                            spp=config.path_spp,
+                            width=config.width,
+                            height=config.height,
+                            max_depth=config.path_max_depth,
+                            rr_depth=config.rr_depth,
+                            samples_per_pass=config.samples_per_pass,
+                            scene_override=scene_override,
+                            ambient_radiance=config.ambient_radiance,
+                            measured_wavelength_nm=wavelength_nm,
+                        )
+                    staged_scenes[f"rgb_{label}"] = str(scene_channel)
+                    channel_scenes[label] = scene_channel
+                    image, channel_timing = _render_pass(
+                        scene_channel,
+                        pass_name=f"rgb_{label}_{wavelength_nm}nm",
+                        spp=config.path_spp,
+                        viewpoint=_viewpoint if _use_scene_reuse else None,
+                    )
+                    channel_timing["spp"] = config.path_spp
+                    channel_timing["channel"] = label
+                    channel_timing["wavelength_nm"] = wavelength_nm
+                    channel_timing["channel_split_rgb"] = True
+                    channel_timing["channel_rgb_fallback"] = plugin_error is not None
+                    if plugin_error is not None:
+                        channel_timing["channel_rgb_plugin_error"] = plugin_error
+                    channel_images[label] = image
+                    channel_timings[label] = channel_timing
+
+                scene_rgb = channel_scenes.get("g") or next(iter(channel_scenes.values()))
+                staged_scenes["rgb"] = str(scene_rgb)
+                rgb = _compose_channel_split_rgb(channel_images)
+                timing = _merge_channel_split_timing(channel_timings, spp=config.path_spp)
+                timing["channel_rgb_plugin"] = False
+                timing["channel_rgb_fallback"] = plugin_error is not None
+                if plugin_error is not None:
+                    timing["channel_rgb_plugin_error"] = plugin_error
         else:
-            scene_rgb = _stage_path_scene(
-                source_scene,
-                stage_filename("rgb", "scene_rgb.xml"),
-                camera_to_world=camera_to_world,
-                fov_deg=fov_deg,
-                spp=config.path_spp,
-                width=config.width,
-                height=config.height,
-                max_depth=config.path_max_depth,
-                rr_depth=config.rr_depth,
-                samples_per_pass=config.samples_per_pass,
-                scene_override=scene_override,
-                ambient_radiance=config.ambient_radiance,
+            _cb("staging_scene", {"pass": "rgb"})
+            if _use_scene_reuse:
+                scene_rgb = _stage_base_path_scene(
+                    source_scene,
+                    max_depth=config.path_max_depth,
+                    rr_depth=config.rr_depth,
+                    samples_per_pass=config.samples_per_pass,
+                    scene_override=scene_override,
+                    ambient_radiance=config.ambient_radiance,
+                )
+            else:
+                scene_rgb = _stage_path_scene(
+                    source_scene,
+                    stage_filename("rgb", "scene_rgb.xml"),
+                    camera_to_world=camera_to_world,
+                    fov_deg=fov_deg,
+                    spp=config.path_spp,
+                    width=config.width,
+                    height=config.height,
+                    max_depth=config.path_max_depth,
+                    rr_depth=config.rr_depth,
+                    samples_per_pass=config.samples_per_pass,
+                    scene_override=scene_override,
+                    ambient_radiance=config.ambient_radiance,
+                )
+            staged_scenes["rgb"] = str(scene_rgb)
+            image, timing = _render_pass(
+                scene_rgb, pass_name="rgb", spp=config.path_spp,
+                viewpoint=_viewpoint if _use_scene_reuse else None,
             )
-        staged_scenes["rgb"] = str(scene_rgb)
-        image, timing = _render_pass(
-            scene_rgb, pass_name="rgb", spp=config.path_spp,
-            viewpoint=_viewpoint if _use_scene_reuse else None,
-        )
-        timing["spp"] = config.path_spp
-        rgb = image[:, :, :3] if image.ndim == 3 else np.repeat(image[:, :, None], 3, axis=2)
+            timing["spp"] = config.path_spp
+            rgb = image[:, :, :3] if image.ndim == 3 else np.repeat(image[:, :, None], 3, axis=2)
         rgb_result, rgb_record = _build_rgb_result(
             "rgb",
             rgb,
@@ -3429,6 +3723,13 @@ def render_modalities(
             metadata=_branch_metadata(
                 illumination_tag="ambient_room",
                 scene_override=scene_override,
+                extra={
+                    "channel_split_rgb": True,
+                    "channel_rgb_plugin": bool(timing.get("channel_rgb_plugin", False)),
+                    "channel_rgb_fallback": bool(timing.get("channel_rgb_fallback", False)),
+                    **({"channel_rgb_plugin_error": timing["channel_rgb_plugin_error"]} if timing.get("channel_rgb_plugin_error") else {}),
+                    "channel_wavelengths_nm": {label: nm for label, nm in _RGB_CHANNEL_SPLIT_WAVELENGTHS_NM},
+                } if use_channel_split_rgb else None,
             ),
         )
         pass_records["rgb"] = rgb_record
@@ -3811,7 +4112,7 @@ def render_modalities(
             "spp": 1,
             "variant": variant,
             "pass_index": _pass_index[0],
-            "total_passes": _total_passes,
+            "total_passes": _total_passes[0],
         })
         lidar_result, lidar_record = _render_lidar_point_cloud(
             source_scene,

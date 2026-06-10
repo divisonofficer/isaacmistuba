@@ -1,0 +1,791 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Infinigen Indoors 논문 리뷰 — 2026-06-11</title>
+<style>
+:root {
+  --bg:#f4f6fb; --panel:#fff; --sub:#f8fafc; --text:#1f2937; --muted:#64748b;
+  --line:#dbe3ef; --blue:#2563eb; --green:#16a34a; --amber:#d97706;
+  --red:#dc2626; --purple:#7c3aed; --danger:#dc2626;
+  --mono:"JetBrains Mono",Consolas,Menlo,monospace;
+  --sans:Inter,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+}
+* { box-sizing:border-box; margin:0; padding:0 }
+body { margin:0; font-family:var(--sans); background:var(--bg); color:var(--text); line-height:1.62; font-size:14px; }
+.layout { display:flex; min-height:100vh }
+aside { width:250px; flex:0 0 250px; position:sticky; top:0; height:100vh; overflow:auto; padding:22px 14px; border-right:1px solid var(--line); background:#eef2f7; }
+main { flex:1; padding:32px 40px; max-width:1100px }
+.logo { font-weight:800; color:var(--blue); letter-spacing:-.02em; }
+.date { margin-top:3px; color:var(--muted); font-family:var(--mono); font-size:11px; }
+.nav-title { margin:22px 8px 7px; color:var(--muted); font-size:10px; text-transform:uppercase; letter-spacing:.12em; font-weight:800; }
+.nav-link { display:block; padding:5px 8px; border-radius:5px; color:#374151; font-size:12px; text-decoration:none; margin-bottom:2px; }
+.nav-link:hover { background:#dde3ee; }
+h2 { font-size:18px; font-weight:800; margin-bottom:14px; letter-spacing:-.02em; }
+h3 { font-size:14px; font-weight:700; margin:16px 0 8px; }
+h4 { font-size:13px; font-weight:700; }
+.hero { background:linear-gradient(135deg,#0f766e,#1d4ed8); color:#fff; border-radius:12px; padding:22px 28px; margin-bottom:28px; }
+.hero h1 { font-size:22px; font-weight:850; letter-spacing:-.03em; margin-bottom:6px; }
+.hero p { color:#bfdbfe; font-size:13px; line-height:1.6; }
+section { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:22px 24px; margin-bottom:20px; }
+.metric { font-size:24px; font-weight:850; color:var(--blue); letter-spacing:-.04em; }
+.label { color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.08em; font-weight:800; }
+.note { font-size:12px; color:#475569; }
+.small { font-size:12px; color:var(--muted); }
+.card { background:var(--sub); border:1px solid var(--line); border-radius:8px; padding:13px; }
+.grid { display:grid; grid-template-columns:repeat(4,1fr); gap:12px; margin:12px 0; }
+.flow { display:grid; grid-template-columns:repeat(5,1fr); gap:10px; margin:12px 0; }
+.file-grid { display:grid; grid-template-columns:1fr 1fr; gap:12px; margin:12px 0; }
+.step { border:1px solid var(--line); background:var(--sub); border-radius:8px; padding:11px; min-height:86px; font-size:12px; color:#374151; line-height:1.6; }
+.step strong { display:block; margin-bottom:5px; font-size:12px; color:#1f2937; }
+.alert { background:#fff7ed; border-left:4px solid var(--amber); border-radius:6px; padding:12px 14px; margin:12px 0; font-size:13px; color:#7c2d12; }
+.alert.green { background:#f0fdf4; border-color:var(--green); color:#14532d; }
+.alert.amber { background:#fffbeb; border-color:var(--amber); color:#78350f; }
+.alert.red { background:#fef2f2; border-color:var(--red); color:#7f1d1d; }
+.alert.blue { background:#eff6ff; border-color:var(--blue); color:#1e3a8a; }
+.tag { display:inline-block; padding:1px 7px; border-radius:999px; font-size:11px; font-weight:700; background:#dbeafe; color:#1e40af; }
+.tag.green { background:#dcfce7; color:#15803d; }
+.tag.amber { background:#fef3c7; color:#b45309; }
+.tag.red { background:#fee2e2; color:#b91c1c; }
+.tag.purple { background:#f3e8ff; color:#7e22ce; }
+.two-col { display:grid; grid-template-columns:1fr 1fr; gap:16px; align-items:start; margin:14px 0; }
+.three-col { display:grid; grid-template-columns:1fr 1fr 1fr; gap:12px; margin:14px 0; }
+table { width:100%; border-collapse:collapse; margin:12px 0; font-size:13px; }
+th { background:#eff6ff; padding:9px 10px; text-align:left; font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:.06em; color:#374151; border:1px solid var(--line); }
+td { padding:8px 10px; border:1px solid var(--line); vertical-align:top; }
+tr:hover td { background:#f8fafc; }
+code { font-family:var(--mono); background:#f1f5f9; padding:1px 5px; border-radius:4px; font-size:12px; color:#0f172a; }
+pre { font-family:var(--mono); background:#0f172a; color:#e2e8f0; padding:14px 16px; border-radius:8px; font-size:12px; line-height:1.6; overflow-x:auto; margin:12px 0; }
+.footer { color:var(--muted); text-align:center; margin-top:34px; font-size:12px; }
+a { color:var(--blue); text-decoration:none; }
+a:hover { text-decoration:underline; }
+.ascii-box { font-family:var(--mono); background:#f8fafc; border:1px solid var(--line); border-radius:6px; padding:12px 14px; font-size:12px; line-height:1.7; color:#334155; margin:8px 0; white-space:pre; }
+.pivot-banner { background:linear-gradient(90deg,#1e3a8a,#4f46e5); color:#fff; border-radius:10px; padding:18px 22px; margin:16px 0; font-size:14px; font-weight:700; letter-spacing:-.01em; }
+@media (max-width:900px) {
+  .layout{display:block} aside{position:relative;width:auto;height:auto} main{width:auto;padding:20px}
+  .grid,.flow,.file-grid,.two-col,.three-col{grid-template-columns:1fr}
+}
+</style>
+</head>
+<body>
+<div class="layout">
+<aside>
+  <div class="logo">Robomituba</div>
+  <div class="date">2026-06-11</div>
+  <div class="small" style="margin-top:3px">Infinigen Indoors 리뷰</div>
+
+  <div class="nav-title">이전 연구 배경</div>
+  <a class="nav-link" href="#predecessor">Infinigen 2023의 한계</a>
+
+  <div class="nav-title">핵심 주장</div>
+  <a class="nav-link" href="#core-claim">에셋 vs 생성 규칙 (실내)</a>
+
+  <div class="nav-title">에셋 생성 계층</div>
+  <a class="nav-link" href="#objects">79개 인공물 생성기</a>
+  <a class="nav-link" href="#material">실내 재질 다양화</a>
+
+  <div class="nav-title">배치 시스템 (핵심 기여)</div>
+  <a class="nav-link" href="#constraint">제약 언어 (Constraint API)</a>
+  <a class="nav-link" href="#solver">배치 솔버 (SA)</a>
+  <a class="nav-link" href="#floorplan">Floorplan 생성</a>
+
+  <div class="nav-title">연결과 한계</div>
+  <a class="nav-link" href="#export">Isaac Sim / Unreal Export</a>
+  <a class="nav-link" href="#experiment">학습 효과 실험</a>
+
+  <div class="nav-title">OpticalNav 시사점</div>
+  <a class="nav-link" href="#gap">Geometric ≠ Optical</a>
+  <a class="nav-link" href="#implications">연구 연결</a>
+</aside>
+
+<main>
+  <div class="hero">
+    <h1>Infinigen Indoors — 절차적 실내 세계 생성기</h1>
+    <p>2024 · Princeton Vision &amp; Learning Lab · Infinigen 자연 장면 후속 연구</p>
+    <p style="margin-top:8px;font-size:14px;color:#bfdbfe;font-weight:600">
+      실내 에셋 라이브러리가 아니라,<br>
+      인공물 생성 규칙과 실내 배치 제약의 결합 시스템이다.
+    </p>
+    <p style="margin-top:10px;font-size:12px;color:#93c5fd">
+      논문: <a href="https://arxiv.org/abs/2406.11030" target="_blank" style="color:#7dd3fc">arxiv.org/abs/2406.11030</a> ·
+      코드: <a href="https://github.com/princeton-vl/infinigen" target="_blank" style="color:#7dd3fc">github.com/princeton-vl/infinigen</a>
+    </p>
+  </div>
+
+  <section id="predecessor">
+    <h2>왜 Infinigen의 후속 연구가 필요했나</h2>
+    <div class="two-col">
+      <div>
+        <h3 style="margin-top:0">Infinigen 2023 (CVPR) — 무엇을 해결했나</h3>
+        <div class="card" style="margin-bottom:8px">
+          <div class="label">핵심 성취</div>
+          <ul style="font-size:12px;margin:6px 0 0 16px;color:#374151;line-height:1.8">
+            <li>자연 세계를 외부 에셋 없이 100% 절차적으로 생성</li>
+            <li>182개 자연물 생성기 (지형·식물·동물·날씨·유체)</li>
+            <li>1,070개 무작위화 가능 파라미터</li>
+            <li>Node Transpiler: 아티스트 노드 그래프 → Python 코드</li>
+            <li>실제 메쉬 기반 기하 → depth/normal 정답 신뢰 가능</li>
+          </ul>
+        </div>
+        <div class="card">
+          <div class="label">무엇이 빠져 있었나</div>
+          <div class="note" style="margin-top:6px;line-height:1.7">
+            Infinigen 2023은 <strong>자연 장면 중심</strong>이었다.
+            숲, 해안, 사막, 수중은 생성할 수 있지만,
+            거실·주방·화장실·사무실·복도·계단 같은
+            인간이 설계한 실내 공간은 다루지 않았다.
+          </div>
+        </div>
+      </div>
+      <div>
+        <h3 style="margin-top:0">왜 실내 데이터가 중요한가</h3>
+        <div class="alert amber">
+          로봇과 증강현실이 실제로 작동하는 공간은 자연 숲이 아니라
+          <strong>거실, 주방, 화장실, 사무실, 계단</strong>이다.<br><br>
+          "자연 장면만으로 foundation model 학습이 충분할 수 있다"는 가설은 아직 증명되지 않았고,
+          응용 도메인에 가까운 합성 데이터가 더 좋은 downstream 성능을 낼 가능성을 시사한다.
+        </div>
+        <div class="card" style="margin-top:8px">
+          <div class="label">기존 실내 합성 데이터셋의 한계</div>
+          <div class="note" style="margin-top:6px;line-height:1.7">
+            대부분이 <strong>정적 3D 에셋 라이브러리</strong>에 의존.
+            일부는 floorplan만 절차적으로 만들 뿐, 오브젝트·재질은 고정 에셋.
+            → 다양성 상한 = 라이브러리 크기
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section id="core-claim">
+    <h2>핵심 주장 — 실내도 100% 절차적으로 생성할 수 있는가</h2>
+
+    <div class="alert blue" style="margin-bottom:16px">
+      <strong>중심 명제:</strong>
+      미리 만들어진 의자·책상·냉장고 모델을 골라 배치하는 것이 아니다.
+      의자가 어떻게 구성되는지, 방 안에 어디에 놓이는지를 규칙으로 코드화했다.
+      <strong>인공물은 자라는 것이 아니라 부품과 설계 치수의 조합으로 생성된다.</strong>
+    </div>
+
+    <h3>Infinigen 2023 vs Infinigen Indoors 2024</h3>
+    <table>
+      <tr><th>구분</th><th>Infinigen 2023</th><th>Infinigen Indoors 2024</th></tr>
+      <tr><td>생성 대상</td><td>자연물·지형·식물·동물·날씨</td><td>가구·가전·문·창문·계단·소품</td></tr>
+      <tr><td>핵심 어려움</td><td>자연물의 형태 다양성</td><td>인공물 설계 규칙 + 실내 배치 상식</td></tr>
+      <tr><td>생성 방식</td><td>성장 법칙, 물리적 형성</td><td>부품 + 설계 치수 조합</td></tr>
+      <tr><td>새 기여</td><td>완전 절차적 자연 세계 + Node Transpiler</td><td>제약 기반 배치 언어 + 최적화 솔버</td></tr>
+      <tr><td>Node Transpiler</td><td>핵심 기여</td><td>계승 (배경 역할)</td></tr>
+      <tr><td>로봇 연결</td><td>학습용 자연 장면 데이터</td><td>Isaac Sim / Unreal Engine export</td></tr>
+    </table>
+
+    <div class="grid">
+      <div class="card">
+        <div class="label">오브젝트 생성기</div>
+        <div class="metric">79</div>
+        <div class="note">가구·가전·문·창문·계단·장식·소형 물체</div>
+      </div>
+      <div class="card">
+        <div class="label">재질 생성기</div>
+        <div class="metric">30</div>
+        <div class="note">목재·금속·세라믹·패브릭·플라스틱 등</div>
+      </div>
+      <div class="card">
+        <div class="label">재질 파라미터</div>
+        <div class="metric">120</div>
+        <div class="note">제어 가능한 재질 자유도 총합</div>
+      </div>
+      <div class="card">
+        <div class="label">외부 에셋 의존</div>
+        <div class="metric">0</div>
+        <div class="note">모든 오브젝트·재질을 코드로 생성</div>
+      </div>
+    </div>
+
+    <h3>자연물 vs 인공물 — 생성 방식의 차이</h3>
+    <div class="two-col">
+      <div class="card">
+        <div class="label">자연물 생성 (Infinigen 2023)</div>
+        <div class="ascii-box">나무 생성:
+skeleton 생성 (무작위 성장 규칙)
+    ↓ skinning (골격에 메쉬 씌우기)
+    ↓ 잎 배치 (공간 점유 알고리즘)
+    ↓ 재질 (나무껍질·잎 절차적 셰이더)</div>
+        <div class="note" style="margin-top:6px">핵심 법칙: <strong>성장</strong>과 <strong>물리적 형성</strong></div>
+      </div>
+      <div class="card">
+        <div class="label">인공물 생성 (Infinigen Indoors)</div>
+        <div class="ascii-box">의자 생성:
+좌석 메쉬 생성 (크기·모양 파라미터)
+    ↓ 등받이 (높이·기울기·패딩 여부)
+    ↓ 다리 (개수·형태·두께)
+    ↓ 팔걸이 (유무·높이·소재)
+    ↓ 재질 (패브릭·가죽·금속 파라미터)</div>
+        <div class="note" style="margin-top:6px">핵심 법칙: <strong>부품 구성</strong>과 <strong>설계 치수</strong></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="objects">
+    <h2>79개 절차적 오브젝트 생성기 — 인공물을 규칙으로 만들기</h2>
+    <p style="color:#475569;font-size:13px;margin-bottom:14px">
+      각 생성기는 Blender Geometry Nodes, modifier, mesh manipulation으로 구현된다.
+      아티스트 노드 그래프 기반 생성 원칙(Infinigen의 Node Transpiler 철학)을 계승한다.
+    </p>
+
+    <div class="flow">
+      <div class="step">
+        <strong>가전 (10개)</strong>
+        냉장고, 오븐, 세탁기, 전자레인지, 식기세척기, 에어컨 등.<br><br>
+        패널 + 손잡이 + 다이얼 같은 구성 요소 조합. 문 여닫이 articulation 포함.
+        크기·색·손잡이 형태 파라미터화.
+      </div>
+      <div class="step">
+        <strong>문·창문·계단 (14개)</strong>
+        문·창문: 패널을 mesh boolean 연산으로 잘라내 프레임과 개구부 생성.<br><br>
+        계단: atomic component(발판+난간)의 array repetition.
+        난간 세부 형태, 발판 높이, 단 수 파라미터화.
+      </div>
+      <div class="step">
+        <strong>가구 (17개)</strong>
+        의자: 좌석·등받이·다리·팔걸이·쿠션 두께·곡률 파라미터.<br><br>
+        소파·책상·선반·서랍장·침대·옷장 등.
+        각 카테고리별 구성 요소 분리 + 재질 분리.
+      </div>
+      <div class="step">
+        <strong>장식 (15개)</strong>
+        그림 액자, 화분, 조명 기구, 시계, 책 묶음, 수납함 등.<br><br>
+        소형 조합 구조. 조명은 실제 emitter로 동작.
+        책 묶음은 개별 책 생성기 반복 배열.
+      </div>
+      <div class="step">
+        <strong>소형 물체 (19개)</strong>
+        컵·접시·병·식기·포장지 등 소품.<br><br>
+        <strong>담요·베개</strong>: soft-body collision sim으로 축 처짐 형태.<br>
+        <strong>풍선·포장지</strong>: cloth sim으로 공기 넣은 형태.
+      </div>
+    </div>
+
+    <h3>물리 시뮬레이션을 활용한 형태 생성</h3>
+    <div class="two-col">
+      <div class="alert green">
+        <strong>Soft-body collision simulation:</strong>
+        담요, 베개, 접힌 옷처럼 중력에 의해 변형된 부드러운 물체.
+        평평한 천을 시뮬레이션해 늘어진 형태를 물리적으로 만든다.
+        단순 파라미터화로는 표현하기 어려운 자연스러운 변형이 가능.
+      </div>
+      <div class="alert blue">
+        <strong>Cloth simulation:</strong>
+        풍선처럼 내부 압력이 있거나 포장지처럼 표면이 들뜬 형태.
+        파라미터화된 고정점에 옷감 물리를 적용해 생성.
+        매번 다른 주름과 접힘 패턴.
+      </div>
+    </div>
+  </section>
+
+  <section id="material">
+    <h2>실내 재질 다양화 — 목재·금속·세라믹·패브릭</h2>
+
+    <div class="two-col" style="margin-bottom:14px">
+      <div>
+        <h3 style="margin-top:0">OpenSurfaces Coverage 비교</h3>
+        <div style="display:flex;gap:16px;align-items:flex-end;margin:8px 0">
+          <div>
+            <div class="label">Infinigen 2023</div>
+            <div style="font-size:32px;font-weight:850;color:var(--muted)">21%</div>
+            <div class="note">자연물 중심 재질</div>
+          </div>
+          <div style="font-size:24px;color:var(--muted);padding-bottom:8px">→</div>
+          <div>
+            <div class="label">Infinigen Indoors</div>
+            <div style="font-size:32px;font-weight:850;color:var(--green)">78%</div>
+            <div class="note">실내 재질 대폭 확장</div>
+          </div>
+        </div>
+        <div class="note" style="margin-top:4px">30개 절차적 재질 생성기, 120개 제어 파라미터</div>
+      </div>
+      <div>
+        <h3 style="margin-top:0">왜 실내 재질이 어려운가</h3>
+        <p style="font-size:13px;color:#475569;line-height:1.7">
+          자연물에서 중요한 재질이 흙·바위·나무껍질·식물 표면이었다면,
+          실내에서는 목재 가구, 금속 손잡이, 세라믹 세면대,
+          패브릭 소파, 플라스틱 포장지처럼 완전히 다른 재질 분포가 중요해진다.
+        </p>
+        <div class="note" style="margin-top:6px">
+          단순히 "오브젝트 종류가 늘었다"가 아니라,
+          <strong>실내 장면을 구성하는 재질 분포 자체를 새로 확장한 것이다.</strong>
+        </div>
+      </div>
+    </div>
+
+    <h3>실내 재질 카테고리</h3>
+    <div class="grid">
+      <div class="card">
+        <div class="label">목재</div>
+        <div class="note" style="margin-top:6px;line-height:1.7">
+          가구·바닥·천장 패널에 주로 사용.<br>
+          결 방향·나이테 간격·색·광택·표면 거칠기·오일 여부 파라미터화.
+        </div>
+      </div>
+      <div class="card">
+        <div class="label">금속</div>
+        <div class="note" style="margin-top:6px;line-height:1.7">
+          손잡이·다리·가전 패널·싱크대.<br>
+          스테인리스·알루미늄·철·황동 종류,<br>
+          metalness·roughness·헤어라인 방향.
+        </div>
+      </div>
+      <div class="card">
+        <div class="label">세라믹·타일</div>
+        <div class="note" style="margin-top:6px;line-height:1.7">
+          욕실·주방 바닥·벽.<br>
+          색·광택·거칠기·줄눈 패턴·크기·배열 방향 파라미터화.
+        </div>
+      </div>
+      <div class="card">
+        <div class="label">패브릭</div>
+        <div class="note" style="margin-top:6px;line-height:1.7">
+          소파·베개·커튼·카펫·침대보.<br>
+          직물 구조 종류·색·두께·광택·패턴 생성.
+        </div>
+      </div>
+    </div>
+
+    <div class="alert amber">
+      <strong>전환 질문:</strong>
+      이 30개 절차적 재질이 카메라 센서에 실제로 어떻게 보이는가?<br>
+      <strong>Blender Cycles는 RGB 기준 photo-realistic 렌더링이다.</strong>
+      편광·NIR·분광 응답은 모델링되지 않는다. 이 gap이 다음 섹션들에서 중요해진다.
+    </div>
+  </section>
+
+  <section id="constraint">
+    <h2>제약 기반 배치 — Python API로 실내 상식 표현하기</h2>
+
+    <div class="alert blue" style="margin-bottom:16px">
+      이것이 Infinigen Indoors의 진짜 신규 기여다.
+      오브젝트와 재질 생성 자체는 Infinigen의 절차적 철학 연장이지만,
+      <strong>"어디에 어떻게 놓는가"는 완전히 새로운 문제다.</strong><br><br>
+      논문: "실내 배치는 에르고노믹스, 미학, 기능성을 따르는 복잡한 규칙을 가진다.
+      같은 테이블도 공부방에서는 벽에 붙어 있지만, 식당에서는 벽에서 떨어져 의자에 둘러싸여야 한다."
+    </div>
+
+    <div class="two-col">
+      <div>
+        <h3 style="margin-top:0">제약 유형</h3>
+        <table style="margin:0">
+          <tr><th>유형</th><th>예시</th><th>구현</th></tr>
+          <tr><td>거리</td><td>의자-식탁 간격 ≥ 0.6m</td><td>geometry 거리 연산</td></tr>
+          <tr><td>대칭</td><td>식탁 양옆 의자 대칭</td><td>각도·위치 정렬</td></tr>
+          <tr><td>접근성</td><td>냉장고 앞 빈 공간</td><td>2D free-space 계산</td></tr>
+          <tr><td>지지 관계</td><td>컵은 테이블 위에</td><td>support plane 관계</td></tr>
+          <tr><td>개수</td><td>의자 수 = 식탁 자리 수</td><td>quantity constraint</td></tr>
+          <tr><td>문맥 의존</td><td>공부방 vs 식당 배치 규칙</td><td>semantic filter</td></tr>
+          <tr><td>부피·면적</td><td>방 크기에 맞는 가구 크기</td><td>파라미터 공동 최적화</td></tr>
+        </table>
+      </div>
+      <div>
+        <h3 style="margin-top:0">Constraint API 예시</h3>
+        <pre># 식탁과 의자 배치 제약 (논문 그림 9 기반)
+table = place(DiningTable, on=floor,
+              params={"width": sample(1.2, 2.0),
+                      "seats": sample_int(4, 8)})
+
+chairs = place(Chair,
+               count=table.seats,
+               constraint=[
+                 symmetric_around(table),
+                 clearance(table, min=0.6),
+                 face_toward(table)])
+
+# 냉장고 접근 공간 확보
+fridge = place(Refrigerator, on=floor,
+               constraint=[against_wall(),
+                           free_space_front(min=1.0)])</pre>
+        <div class="note">
+          사용자는 선언적으로 "좋은 배치가 무엇인가"를 정의한다.
+          솔버가 이를 만족하는 구체적 배치를 찾는다.
+        </div>
+      </div>
+    </div>
+
+    <div class="alert green" style="margin-top:10px">
+      <strong>핵심:</strong>
+      자연 장면에서는 나무가 무리 짓고 바위가 지면에 있는 분포가 직관적이었다.
+      실내에서는 이 상식적 제약을 코드로 명시해야 한다.
+      Constraint API는 그 명시의 언어다.
+    </div>
+  </section>
+
+  <section id="solver">
+    <h2>배치 솔버 — Simulated Annealing으로 가구와 소품 배치 찾기</h2>
+    <p style="color:#475569;font-size:13px;margin-bottom:14px">
+      제약을 쓴다고 끝나는 게 아니다. 방 안 오브젝트 수가 많아지면 가능한 배치 공간이 너무 커진다.
+      솔버는 Simulated Annealing + Metropolis-Hastings 기준으로 탐색한다.
+    </p>
+
+    <div class="two-col">
+      <div>
+        <h3 style="margin-top:0">제안 Move 종류</h3>
+        <div class="card">
+          <ul style="font-size:12px;margin:0 0 0 16px;color:#374151;line-height:2">
+            <li><strong>추가 / 삭제</strong> — 오브젝트를 장면에 넣거나 제거</li>
+            <li><strong>관계 변경</strong> — 다른 support plane으로 이동 (바닥 → 선반 위 등)</li>
+            <li><strong>파라미터 재샘플링</strong> — 오브젝트의 크기·형태 재생성</li>
+            <li><strong>Pose 재초기화</strong> — 위치·회전 완전히 새로 배치</li>
+            <li><strong>이동</strong> — 현재 위치에서 작은 이동</li>
+            <li><strong>회전</strong> — 현재 방향에서 작은 회전</li>
+          </ul>
+        </div>
+      </div>
+      <div>
+        <h3 style="margin-top:0">계층적 최적화 + 자유도 제한</h3>
+        <div class="ascii-box">1단계: 큰 가구 (소파·책장·침대)
+   → 방 전체 공간 고려, 이동 자유도 2D
+
+2단계: 중간 오브젝트 (의자·탁자·램프)
+   → 큰 가구와의 관계 제약 추가
+
+3단계: 작은 소품 (컵·책·장식)
+   → 상위 오브젝트 위에 고정
+
+예: 책장이 벽에 기대어 있으면
+  이동 자유도 = 벽과 바닥이 만나는 1D 선</div>
+        <div class="alert green" style="margin-top:8px">
+          <strong>중요:</strong> 오브젝트 파라미터도 최적화 대상.
+          "이 방 크기에 맞는 식탁 크기"까지 함께 결정.
+        </div>
+      </div>
+    </div>
+
+    <h3>최적화 기법</h3>
+    <div class="three-col">
+      <div class="card">
+        <div class="label">BVH Caching</div>
+        <div class="note" style="margin-top:6px;line-height:1.7">
+          충돌 검사에 사용하는 BVH(Bounding Volume Hierarchy)를 캐시.
+          오브젝트가 이동하면 해당 부분만 업데이트.
+        </div>
+      </div>
+      <div class="card">
+        <div class="label">Plane Hashing</div>
+        <div class="note" style="margin-top:6px;line-height:1.7">
+          support plane 탐색을 해시 구조로 가속.
+          "컵을 놓을 수 있는 수평면"을 빠르게 조회.
+        </div>
+      </div>
+      <div class="card">
+        <div class="label">전체 속도</div>
+        <div style="margin-top:6px">
+          <div class="metric">3×</div>
+          <div class="note">최적화 적용 후 비최적화 대비 속도 향상</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section id="floorplan">
+    <h2>Floorplan 생성 — 방 연결 그래프와 다층 건물 구조</h2>
+
+    <div class="two-col">
+      <div>
+        <h3 style="margin-top:0">생성 흐름</h3>
+        <div class="ascii-box">house outline (랜덤 다각형)
+         ↓
+Mondrian Process 공간 분할
+  (방들에 충분한 공간 할당)
+         ↓
+room adjacency graph 생성
+  (방 종류·연결성 그래프)
+  └─ probabilistic CFG로 추론
+  └─ 또는 사용자 입력에서 부분/전체 지정
+         ↓
+simulated annealing 최적화
+  목적 함수:
+  - 방 면적 / aspect ratio
+  - convexity (볼록 형태 선호)
+  - 출입구까지 최단 경로
+  - 좁은 통로 최소화
+  - 계단 점유 면적
+         ↓
+바닥·벽·천장·문·창문·계단 생성
+         ↓
+방 유형별 가구·소품 배치</div>
+      </div>
+      <div>
+        <h3 style="margin-top:0">다층 건물 지원</h3>
+        <div class="card" style="margin-bottom:8px">
+          <div class="label">층 구조</div>
+          <div class="note" style="margin-top:6px;line-height:1.7">
+            0층, 1층, 2층으로 분리된 다층 floorplan 생성.
+            계단이 인접 층을 연결. 계단 점유 면적이 각 층 최적화 목적 함수에 포함된다.
+          </div>
+        </div>
+        <div class="card" style="margin-bottom:8px">
+          <div class="label">Room Adjacency Graph</div>
+          <div class="note" style="margin-top:6px;line-height:1.7">
+            방 유형(거실·주방·침실·화장실·복도)과 연결성을 나타내는 그래프.
+            Probabilistic Context-Free Grammar로 상식적인 방 배치 분포를 학습.
+            사용자가 원하는 방 구성을 부분 또는 전체로 지정 가능.
+          </div>
+        </div>
+        <div class="card">
+          <div class="label">Mondrian Process</div>
+          <div class="note" style="margin-top:6px;line-height:1.7">
+            직사각형 공간을 재귀적으로 분할하는 확률 과정.
+            각 방이 충분한 면적을 가지도록 초기 공간 분배.
+            이후 SA 최적화로 실제 방 경계 확정.
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section id="export">
+    <h2>실시간 시뮬레이터 Export — Isaac Sim / Unreal Engine 연결</h2>
+
+    <p style="color:#475569;font-size:13px;margin-bottom:14px">
+      Infinigen Indoors는 Blender 안에서 장면을 생성하지만,
+      이를 실시간 로봇 시뮬레이터로 연결하는 export 도구를 함께 제공한다.
+    </p>
+
+    <div class="three-col">
+      <div class="card">
+        <div class="label">절차적 재질 → 표준 텍스처 맵</div>
+        <div class="note" style="margin-top:6px;line-height:1.7">
+          Blender 절차적 셰이더는 타 시스템과 portable하지 않다.
+          <strong>UV mapping + texture baking</strong>으로 변환:<br>
+          color, roughness, metallicity, normal 맵으로 bake.
+          이후 표준 PBR 파이프라인으로 사용 가능.
+        </div>
+      </div>
+      <div class="card">
+        <div class="label">Isaac Sim (Omniverse)</div>
+        <div class="note" style="margin-top:6px;line-height:1.7">
+          <strong>URDF 자동 생성</strong> (collision geometry + articulation 정보).<br>
+          단일 오브젝트 OBJ/FBX/STL export.<br>
+          RTX 4090 기준 <strong>대화형 프레임레이트</strong> 확인 (논문 그림 12).
+        </div>
+      </div>
+      <div class="card">
+        <div class="label">Unreal Engine 5</div>
+        <div class="note" style="margin-top:6px;line-height:1.7">
+          같은 baked 텍스처 맵 사용.<br>
+          RTX 4090 기준 대화형 프레임레이트 확인.<br>
+          UE5 Nanite + Lumen과 호환.
+        </div>
+      </div>
+    </div>
+
+    <div class="alert amber" style="margin-top:12px">
+      <strong>중요한 한계:</strong>
+      Texture baking으로 변환된 맵은 <strong>RGB 기준 외관 정보</strong>다.
+      편광 응답, NIR 반사율, 분광 특성 같은 <strong>광학적 물리 정보는 이 export에 포함되지 않는다.</strong>
+      유리·금속·세라믹의 편광·NIR 응답을 연구하려면 별도 광학 모델링이 필요하다.
+    </div>
+
+    <div class="ascii-box" style="margin-top:12px">Infinigen Indoors 실내 장면 생성 파이프라인 전체:
+
+Infinigen Indoors (Blender)
+  └─ 절차적 오브젝트 + 재질 + 배치
+            ↓ texture baking
+  표준 텍스처 맵 (color / roughness / metallicity / normal)
+            ↓ export
+  ┌─────────────────────┬────────────────────┐
+  ▼                     ▼                    ▼
+Isaac Sim           Unreal Engine 5       Mitsuba 3 (*)
+(로봇 rollout)       (시각화·게임)         (물리 기반 렌더링)
+
+(*) Mitsuba 3 경로는 논문이 직접 제시하지 않음.
+    geometry + 재질 파라미터를 가져와 별도 광학 재질 레이어 추가 필요.</div>
+  </section>
+
+  <section id="experiment">
+    <h2>실험 결과 — 생성 데이터가 실제 학습에 도움이 되는가</h2>
+
+    <div class="two-col">
+      <div>
+        <h3 style="margin-top:0">Shadow Removal</h3>
+        <div class="card">
+          <div class="label">실험 설계</div>
+          <div class="note" style="margin-top:6px;line-height:1.7">
+            2,000쌍 shadow/shadow-free 이미지 생성.<br>
+            SRD 데이터셋 zero-shot 평가.<br>
+            <strong>real+synthetic &gt; real-only</strong>: 합성 데이터 추가가 일반화 향상.
+          </div>
+        </div>
+        <div class="note" style="margin-top:6px">
+          실내 조명 아래 그림자 패턴은 수집 어려움.
+          절차적 생성으로 임의 조명·가구 배치의 그림자 쌍을 만들어 보완.
+        </div>
+      </div>
+      <div>
+        <h3 style="margin-top:0">Occlusion Boundary Estimation</h3>
+        <div class="card">
+          <div class="label">실험 설계</div>
+          <div class="note" style="margin-top:6px;line-height:1.7">
+            1,464장 정답 이미지로 U-Net 학습.<br>
+            ODS / OIS / mAP 평가:<br>
+            <strong>Infinigen Indoors &gt; Infinigen-Nature &gt; Hypersim</strong><br>
+            실내 특화 데이터가 실내 occlusion 이해에 유리.
+          </div>
+        </div>
+        <div class="note" style="margin-top:6px">
+          자연 장면 Infinigen으로 학습한 모델: 실내 모서리·가구 경계를 잘 잡지 못함.<br>
+          Infinigen Indoors: 실내 직선 경계 구조를 학습 데이터에 포함.
+        </div>
+      </div>
+    </div>
+
+    <div class="alert blue" style="margin-top:12px">
+      <strong>균형 있는 해석:</strong>
+      모든 실내 비전 문제를 해결한다는 게 아니다.
+      기존 실데이터에서 라벨링하기 어려운 <em>실내 경계와 그림자</em>를
+      절차적으로 만들어 학습 데이터로 쓸 수 있음을 보인 근거다.
+    </div>
+  </section>
+
+  <section id="gap">
+    <h2>Geometric Diversity ≠ Optical Diversity</h2>
+
+    <div class="pivot-banner">
+      Infinigen Indoors는 형태와 배치의 다양성을 해결했다.<br>
+      그러나 유리문, 금속 손잡이, 세라믹 타일이<br>
+      <strong>편광 카메라 · NIR 센서에 어떻게 보이는지</strong>는 전혀 다른 문제다.
+    </div>
+
+    <div class="alert red" style="margin-top:16px">
+      <strong>Blender Cycles는 RGB photo-realistic 렌더링 시스템이다.</strong>
+      물리 기반 렌더링을 표방하지만, 이는 "인간 눈에 사실적으로 보이는" 기준이다.
+      편광 상태, NIR 파장 반사율, 분광 응답 같은 <strong>센서 모달리티별 광학 물리</strong>는 모델링되지 않는다.
+    </div>
+
+    <h3>무엇이 다른가</h3>
+    <table>
+      <tr><th>비교 축</th><th>Infinigen Indoors</th><th>OpticalNav 연구 목표</th></tr>
+      <tr>
+        <td>재질 표현</td>
+        <td>Blender procedural shader<br>(color + roughness + metalness)</td>
+        <td>BRDF / Mueller matrix<br>(편광·분광 응답 포함)</td>
+      </tr>
+      <tr>
+        <td>렌더링 기준</td>
+        <td>Cycles: RGB 가시광선, 인간 눈 기준</td>
+        <td>Physics-based: 파장별 응답, 센서 기준</td>
+      </tr>
+      <tr>
+        <td>센서 모델</td>
+        <td>없음 (카메라 = RGB 수용기)</td>
+        <td>편광 카메라, NIR 센서, 분광 센서</td>
+      </tr>
+      <tr>
+        <td>유리 / 투명체</td>
+        <td>transmission shader (RGB 굴절·반사)</td>
+        <td>Mueller BSDF<br>(편광 응답 시뮬레이션 필요)</td>
+      </tr>
+      <tr>
+        <td>금속 반사</td>
+        <td>metalness·roughness 파라미터 (RGB)</td>
+        <td>파장별 복소 굴절률 + 편광 응답</td>
+      </tr>
+      <tr>
+        <td>정답 기하</td>
+        <td>실제 메쉬 기반 (Infinigen 철학 계승)</td>
+        <td><span class="tag green">계승 가능</span> — 동일 원칙 적용</td>
+      </tr>
+    </table>
+
+    <div class="two-col" style="margin-top:12px">
+      <div class="card" style="border-left:3px solid var(--green)">
+        <div class="label" style="color:var(--green)">Infinigen Indoors가 잘 한 것</div>
+        <ul style="font-size:12px;margin:8px 0 0 16px;color:#374151;line-height:1.8">
+          <li>실내 공간의 형태·배치 다양성 해결</li>
+          <li>가구·문·계단·소품의 기하 구조 다양화</li>
+          <li>실제 메쉬 기반 정답 기하 (depth/normal 신뢰)</li>
+          <li>Isaac Sim export로 로봇 rollout 연결</li>
+        </ul>
+      </div>
+      <div class="card" style="border-left:3px solid var(--red)">
+        <div class="label" style="color:var(--red)">Infinigen Indoors가 해결하지 않은 것</div>
+        <ul style="font-size:12px;margin:8px 0 0 16px;color:#374151;line-height:1.8">
+          <li>편광 카메라로 보이는 유리문 응답</li>
+          <li>NIR 센서에서 금속·세라믹의 반사율</li>
+          <li>파장별 재질 분광 특성</li>
+          <li>Mueller matrix 기반 편광 BRDF</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <section id="implications">
+    <h2>OpticalNav / Isaac Sim 연구 연결</h2>
+
+    <div class="three-col">
+      <div class="card" style="border-top:3px solid var(--green)">
+        <div class="label" style="color:var(--green)">활용 가능 — 실내 구조·자산 공급원</div>
+        <div style="margin-top:8px;font-size:13px;color:#1f2937;font-weight:600">기하와 배치 다양성</div>
+        <ul style="font-size:12px;margin:6px 0 0 16px;color:#374151;line-height:1.8">
+          <li>절차적 배치로 무한 실내 레이아웃 변형</li>
+          <li>가구·문·계단 위치 다양성 → 로봇 navigation 학습 데이터</li>
+          <li>방 구조와 floorplan 다양화 → domain randomization</li>
+          <li>Isaac Sim export로 실제 rollout·충돌 평가 연결</li>
+        </ul>
+      </div>
+      <div class="card" style="border-top:3px solid var(--amber)">
+        <div class="label" style="color:var(--amber)">주의 — 광학 재질 재사용 제한</div>
+        <div style="margin-top:8px;font-size:13px;color:#1f2937;font-weight:600">편광·NIR 재질 별도 정의</div>
+        <ul style="font-size:12px;margin:6px 0 0 16px;color:#374151;line-height:1.8">
+          <li>texture baking export = RGB 기준 맵</li>
+          <li>유리·금속·세라믹 편광/NIR 응답 없음</li>
+          <li>재질 geometry는 가져오되, optical property는 별도 BRDF 레이어 정의</li>
+          <li>Mitsuba 3 재질 파라미터로 재매핑 필요</li>
+        </ul>
+      </div>
+      <div class="card" style="border-top:3px solid var(--blue)">
+        <div class="label" style="color:var(--blue)">권장 구성 — 계층 분리</div>
+        <div class="ascii-box" style="margin-top:8px;font-size:11px">Infinigen Indoors
+  실내 공간 구조
+  + 오브젝트 geometry
+       ↓
+BRDF 파라미터 레이어
+  오브젝트별 편광/NIR 재질
+       ↓
+Mitsuba 3
+  physics-based 광학 렌더링
+  편광·NIR modality
+       ↓
+Isaac Sim
+  로봇 rollout + 제어</div>
+      </div>
+    </div>
+
+    <div class="alert green" style="margin-top:20px;font-size:15px;font-weight:700;padding:16px 20px">
+      Infinigen Indoors가 <em>무엇이 있는가</em>를 만들었다면,<br>
+      OpticalNav는 <em>그것이 어떻게 보이는가</em>를 만든다.
+    </div>
+
+    <h3>발표 흐름 요약</h3>
+    <div class="ascii-box">기존 합성 실내 데이터의 한계
+  (정적 에셋 + 단순 배치 + RGB 기준)
+         ↓
+Infinigen Indoors (2024)
+  ✓ 79개 절차적 오브젝트 생성기
+  ✓ 제약 기반 배치 API + SA 솔버
+  ✓ Isaac Sim / Unreal export
+  ✗ 편광·NIR 광학 재질 없음
+         ↓
+[Gap] Geometric diversity ≠ Optical diversity
+         ↓
+OpticalNav
+  Infinigen Indoors geometry backbone
+  + BRDF/Mueller matrix 광학 재질 레이어
+  + Mitsuba 3 편광·NIR physics-based 렌더링</div>
+  </section>
+
+  <div class="footer">
+    Robomituba Daily Development Report · 2026-06-11 · Infinigen Indoors 논문 리뷰 (2024)
+  </div>
+</main>
+</div>
+</body>
+</html>

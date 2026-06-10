@@ -121,6 +121,7 @@
   <a class="nav-link" href="#mesh">Mesh materialization</a>
   <a class="nav-link" href="#material">Material / texture 진단</a>
   <a class="nav-link" href="#material-policy">Material policy 개선 계획</a>
+  <a class="nav-link" href="#material-research-plan">SVBRDF / BTF 논의</a>
 
   <div class="nav-title">오후 진행</div>
   <a class="nav-link" href="#xml-native">Editor mesh preview (XML-native)</a>
@@ -656,6 +657,147 @@
     <div class="alert green">
       성공 기준은 단계적으로 둔다. 먼저 polarization/NIR 같은 BRDF 채널이 재질군에 맞게 들어가면 절반의 성공이다.
       그 다음 RGB native texture까지 안정적으로 보존되면 office scene 품질이 크게 올라간다.
+    </div>
+  </section>
+
+  <section id="material-research-plan">
+    <h2>Material 연구 / 구현 논의 · SVBRDF, BTF, measured BRDF</h2>
+    <p>
+      다음 단계의 핵심 질문은 "hpBRDF/pBRDF를 어떻게 Mitsuba에 넣는가"가 아니라
+      "asset-native RGB appearance를 유지하면서 같은 material slot에 별도의 measured optical response를 어떻게 붙일 것인가"다.
+      texture는 공간적으로 달라지는 색/패턴이고, BRDF는 각도/파장/편광에 따른 반사 응답이므로 서로 대체 관계가 아니다.
+    </p>
+
+    <div class="visual-panel">
+      <div class="visual-title">Slide 4 · Material Slot Intelligence Pipeline</div>
+      <div class="visual-subtitle">외형 보존과 optical mapping을 분리하려면 object 단위가 아니라 material slot 단위의 근거가 필요하다.</div>
+      <div class="flow">
+        <div class="step">USD / GLB / OBJ material slot</div><div class="arrow">→</div>
+        <div class="step">texture map feature extraction</div><div class="arrow">→</div>
+        <div class="step">optical class recommendation</div><div class="arrow">→</div>
+        <div class="step">catalog validation</div><div class="arrow">→</div>
+        <div class="step">RGB / NIR / Polar compiler</div>
+      </div>
+      <p class="small">
+        LLM은 material class 후보와 이유를 제안하는 단계에만 쓰고, 실제 measured material id는 catalog validator가 존재 여부와 modality 적합성을 확인한다.
+        confidence가 낮은 slot은 human review 대상으로 남긴다.
+      </p>
+    </div>
+
+    <h3>연구 프레이밍</h3>
+    <table>
+      <tr><th>방식</th><th>의미</th><th>이번 프로젝트에서의 위치</th></tr>
+      <tr>
+        <td>SVBRDF parameter maps</td>
+        <td>albedo, roughness, normal, specular/metallic처럼 공간적으로 변하는 BRDF parameter map을 유지한다.</td>
+        <td>가장 현실적인 v1 방향. RGB는 texture/PBR map을 보존하고, optical class는 별도 metadata로 붙인다.</td>
+      </tr>
+      <tr>
+        <td>Measured BRDF basis / dictionary</td>
+        <td>여러 measured BRDF를 basis로 두고, 공간 weight map으로 slot 내부의 응답을 합성한다.</td>
+        <td>연구성이 높다. material slot classifier와 feature JSON이 안정된 뒤 중기 실험으로 둔다.</td>
+      </tr>
+      <tr>
+        <td>Texture modulation of measured BRDF</td>
+        <td>measured BRDF의 angular/spectral/polar response 위에 texture luminance/albedo를 modulation으로 곱한다.</td>
+        <td>hybrid 근사 모드. 정확한 물리 모델로 주장하지 말고 approximation metadata를 남긴다.</td>
+      </tr>
+      <tr>
+        <td>BTF</td>
+        <td>view/light dependent texture variation까지 포함하는 더 무거운 표현이다.</td>
+        <td>장기 연구 방향. v1 공유오피스 검증에는 과하다.</td>
+      </tr>
+    </table>
+
+    <h3>Material slot feature JSON</h3>
+    <p>
+      material mapping을 자동화하려면 mesh/source_ref만으로는 부족하다. renderer에 넘기기 전에 slot별 근거를 구조화해야 한다.
+      최소 feature는 source binding, texture presence, texture statistics, geometry context를 포함한다.
+    </p>
+    <pre>{
+  "object_id": "office_chair_003",
+  "material_slot": "seat_fabric",
+  "source": {
+    "usd_material_path": "/Looks/ChairSeat",
+    "glb_material_name": "black_fabric",
+    "obj_mtl_name": null,
+    "texture_files": {
+      "base_color": "chair_seat_basecolor.png",
+      "roughness": "chair_seat_roughness.png",
+      "normal": "chair_seat_normal.png"
+    }
+  },
+  "texture_stats": {
+    "mean_rgb": [0.08, 0.075, 0.07],
+    "saturation_mean": 0.12,
+    "local_contrast": 0.31,
+    "roughness_mean": 0.74,
+    "metallic_ratio": 0.0,
+    "opacity_ratio": 1.0
+  },
+  "geometry_context": {
+    "object_category": "office_chair",
+    "slot_area_ratio": 0.42,
+    "bounds_m": [0.58, 0.45, 0.12]
+  },
+  "recommendation": {
+    "optical_class": "fabric_low_polarization",
+    "measured_brdf_candidate": "pbrdf_2020:black_fabric_proxy",
+    "confidence": 0.71,
+    "reason": "seat slot has non-metallic dark fabric-like texture and high roughness"
+  }
+}</pre>
+
+    <h3>PR 단위 구현 로드맵</h3>
+    <table>
+      <tr><th>단계</th><th>목표</th><th>완료 기준</th></tr>
+      <tr>
+        <td>PR-A · Native texture preservation</td>
+        <td>USD/GLB/OBJ texture slot을 materialization 단계에서 보존한다. OBJ MTL의 <code>map_Kd</code>, roughness, bump/normal, GLB PBR texture를 mesh cache metadata에 싣는다.</td>
+        <td>RGB pass가 measured override 없이 asset-native texture 기반 Mitsuba textured BSDF를 생성한다.</td>
+      </tr>
+      <tr>
+        <td>PR-B · Material slot classifier</td>
+        <td>slot feature JSON을 만들고 rule-based + LLM recommendation + catalog validation을 분리한다.</td>
+        <td>각 slot이 왜 glass/metal/fabric/wood/plastic으로 분류되었는지 audit에서 설명 가능하다.</td>
+      </tr>
+      <tr>
+        <td>PR-C · Modality-specific compiler</td>
+        <td>RGB, NIR, Polarization compiler를 분리한다. RGB는 native texture, NIR/Polar는 optical class와 measured material을 우선한다.</td>
+        <td>같은 scene에서 <code>rgb_native</code>, <code>nir</code>, <code>polar_s0/s1/s2</code>, <code>dolp/aolp</code>를 서로 다른 material policy로 생성한다.</td>
+      </tr>
+      <tr>
+        <td>PR-D · Hybrid experiment</td>
+        <td><code>textured_measured_polarized</code> 같은 실험 plugin 또는 compiler approximation으로 texture modulation을 검증한다.</td>
+        <td>모든 결과 metadata에 approximate hybrid임을 명시하고, optical cue가 texture에 의해 망가지지 않는지 ablation으로 확인한다.</td>
+      </tr>
+    </table>
+
+    <h3>Immediate ablation · shared_office_floor_001</h3>
+    <table>
+      <tr><th>항목</th><th>설정</th></tr>
+      <tr>
+        <td>대상 object</td>
+        <td>conference table, office chair, cabinet/sideboard, glass partition, metal leg/frame, lounge speaker.</td>
+      </tr>
+      <tr>
+        <td>비교 mode</td>
+        <td>A current measured-only mapping, B RGB native texture only, C RGB native + optical measured split, D hybrid texture-modulated measured.</td>
+      </tr>
+      <tr>
+        <td>출력</td>
+        <td><code>rgb_native</code>, <code>nir</code>, <code>polar_s0/s1/s2</code>, <code>dolp</code>, <code>aolp</code>.</td>
+      </tr>
+      <tr>
+        <td>평가 질문</td>
+        <td>RGB가 office-like로 보이는가, glass/mirror/metal optical cue가 살아있는가, texture가 polarization cue를 망치지 않는가, slot-level audit이 설명 가능한가.</td>
+      </tr>
+    </table>
+
+    <div class="alert">
+      정리하면 v1은 BTF나 full inverse rendering으로 가지 않는다.
+      먼저 SVBRDF-style parameter map preservation과 measured optical class mapping을 분리하고,
+      그 위에서 hybrid measured modulation을 실험하는 순서가 가장 현실적이다.
     </div>
   </section>
 
