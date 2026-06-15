@@ -1,0 +1,361 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Infinigen × Mitsuba 연동 계획 러프 스케치 — 2026-06-15</title>
+<style>
+:root{
+  --bg:#f4f6fb; --panel:#fff; --sub:#f8fafc; --text:#1f2937; --muted:#64748b;
+  --line:#dbe3ef; --blue:#2563eb; --navy:#1e3a8a; --green:#16a34a; --teal:#0f766e;
+  --amber:#d97706; --red:#dc2626; --purple:#7c3aed; --softblue:#eff6ff;
+  --mono:"JetBrains Mono",Consolas,Menlo,monospace;
+  --sans:Inter,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html{scroll-behavior:smooth}
+body{font-family:var(--sans);background:var(--bg);color:var(--text);line-height:1.62;font-size:14px}
+.layout{display:flex;min-height:100vh}
+aside{width:260px;flex:0 0 260px;position:sticky;top:0;height:100vh;overflow:auto;padding:22px 14px;border-right:1px solid var(--line);background:#eef2f7}
+main{flex:1;padding:34px 42px;max-width:1180px}
+.logo{font-weight:850;color:var(--blue);letter-spacing:-.02em;font-size:16px}
+.date{margin-top:3px;color:var(--muted);font-family:var(--mono);font-size:11px}
+.nav-title{margin:22px 8px 7px;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.12em;font-weight:850}
+.nav-link{display:block;padding:5px 8px;border-radius:5px;color:#374151;font-size:12px;text-decoration:none;margin-bottom:2px}
+.nav-link:hover{background:#dde3ee}
+a{color:var(--blue);text-decoration:none} a:hover{text-decoration:underline}
+.hero{background:linear-gradient(135deg,#0f766e,#1d4ed8);color:#fff;border-radius:14px;padding:24px 30px;margin-bottom:24px;box-shadow:0 12px 28px rgba(15,118,110,.18)}
+.hero h1{font-size:25px;font-weight:900;letter-spacing:-.04em;margin-bottom:8px}
+.hero p{color:#ccfbf1;font-size:13px;max-width:860px}
+.hero .thesis{margin-top:12px;font-size:15px;color:#fff;font-weight:750;line-height:1.7}
+section{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:23px 25px;margin-bottom:20px}
+h2{font-size:19px;font-weight:850;margin-bottom:14px;letter-spacing:-.03em}
+h3{font-size:14px;font-weight:800;margin:17px 0 8px;letter-spacing:-.01em}
+.small{font-size:12px;color:var(--muted)}
+.note{font-size:13px;color:#475569}
+.muted{color:var(--muted)}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin:14px 0}
+.grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:13px;margin:14px 0}
+.grid4{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:14px 0}
+.card{background:var(--sub);border:1px solid var(--line);border-radius:10px;padding:14px;min-height:70px}
+.card strong{color:#111827}
+.label{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.08em;font-weight:850;margin-bottom:6px}
+.kpi{font-size:25px;font-weight:900;letter-spacing:-.05em;color:var(--blue)}
+.tag{display:inline-block;padding:2px 8px;border-radius:999px;font-size:11px;font-weight:800;background:#dbeafe;color:#1e40af;margin:2px 2px 2px 0}
+.tag.green{background:#dcfce7;color:#15803d}
+.tag.amber{background:#fef3c7;color:#b45309}
+.tag.purple{background:#f3e8ff;color:#7e22ce}
+.tag.red{background:#fee2e2;color:#b91c1c}
+.tag.teal{background:#ccfbf1;color:#0f766e}
+table{width:100%;border-collapse:collapse;margin:13px 0;font-size:13px}
+th{background:#eff6ff;padding:9px 10px;text-align:left;font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:.06em;color:#374151;border:1px solid var(--line)}
+td{padding:9px 10px;border:1px solid var(--line);vertical-align:top}
+tr:hover td{background:#fafcff}
+.alert{background:#fff7ed;border-left:4px solid var(--amber);border-radius:7px;padding:12px 14px;margin:13px 0;font-size:13px;color:#7c2d12}
+.alert.blue{background:#eff6ff;border-color:var(--blue);color:#1e3a8a}
+.alert.green{background:#f0fdf4;border-color:var(--green);color:#14532d}
+.alert.red{background:#fef2f2;border-color:var(--red);color:#7f1d1d}
+.alert.purple{background:#f5f3ff;border-color:var(--purple);color:#4c1d95}
+.ascii{font-family:var(--mono);white-space:pre;overflow:auto;background:#0f172a;color:#dbeafe;border-radius:10px;padding:15px 17px;font-size:12px;line-height:1.7;margin:12px 0}
+.ascii.light{background:#f8fafc;color:#334155;border:1px solid var(--line)}
+ul{margin:7px 0 0 18px;color:#475569}
+.li-tight li{margin-bottom:3px}
+.divider{height:2px;background:var(--line);margin:28px 0 22px}
+.chapter{background:linear-gradient(135deg,#1e3a8a,#4c1d95);color:#fff;border-radius:14px;padding:20px 26px;margin:22px 0}
+.chapter h2{color:#fff;margin-bottom:4px}
+.chapter p{color:#c7d2fe;font-size:13px}
+.footer{text-align:center;color:var(--muted);font-size:12px;margin:28px 0 8px}
+.problem-block{border:1px solid var(--line);border-radius:10px;overflow:hidden;margin-bottom:16px}
+.problem-header{padding:12px 16px;font-weight:800;font-size:13px;display:flex;align-items:center;gap:10px}
+.problem-body{padding:14px 16px;background:var(--sub);font-size:13px;color:#475569;line-height:1.7}
+.problem-header.p1{background:#fee2e2;color:#7f1d1d;border-bottom:1px solid #fca5a5}
+.problem-header.p2{background:#fef3c7;color:#78350f;border-bottom:1px solid #fcd34d}
+.problem-header.p3{background:#eff6ff;color:#1e3a8a;border-bottom:1px solid #93c5fd}
+.step-row{display:flex;gap:0;margin:14px 0}
+.step-box{flex:1;text-align:center;padding:12px 8px;font-size:12px;border:1px solid var(--line);background:var(--sub);position:relative}
+.step-box:not(:last-child)::after{content:"→";position:absolute;right:-11px;top:50%;transform:translateY(-50%);font-size:14px;color:var(--muted);z-index:1;background:transparent}
+.step-box .step-title{font-weight:800;font-size:12px;margin-bottom:4px;color:#111827}
+.step-box .step-time{font-family:var(--mono);font-size:10px;color:var(--amber);font-weight:800}
+.step-box .step-note{font-size:11px;color:var(--muted);margin-top:3px}
+.step-box.blocker{background:#fff7ed;border-color:#fbbf24}
+.step-box:first-child{border-radius:8px 0 0 8px}
+.step-box:last-child{border-radius:0 8px 8px 0}
+@media(max-width:980px){.layout{display:block}aside{position:relative;width:auto;height:auto}main{padding:20px}.grid2,.grid3,.grid4{grid-template-columns:1fr}.step-row{flex-direction:column}}
+</style>
+</head>
+<body>
+<div class="layout">
+
+<aside>
+  <div class="logo">Robomituba</div>
+  <div class="date">2026-06-15</div>
+  <div class="small" style="margin-top:4px">Infinigen × Mitsuba 연동 러프 플랜</div>
+
+  <div class="nav-title">핵심 아이디어</div>
+  <a class="nav-link" href="#vision">비전: 무한 광학 장면 생성기</a>
+  <a class="nav-link" href="#pipeline">연동 파이프라인</a>
+
+  <div class="nav-title">문제점 분석</div>
+  <a class="nav-link" href="#problem1">① HPBRDF 가짓수 부족</a>
+  <a class="nav-link" href="#problem2">② SV-BRDF 미완성</a>
+  <a class="nav-link" href="#problem3">③ 시간 비용</a>
+
+  <div class="nav-title">정리</div>
+  <a class="nav-link" href="#tradeoff">현실적 트레이드오프</a>
+  <a class="nav-link" href="#next">다음 단계 러프 로드맵</a>
+
+  <div class="nav-title">이전 보고서</div>
+  <a class="nav-link" href="report_2026-06-10.html">06-10 Infinigen 시리즈 리뷰</a>
+  <a class="nav-link" href="report_2026-06-09.html">06-09 XML-native editor</a>
+  <a class="nav-link" href="index.html">← 전체 인덱스</a>
+</aside>
+
+<main>
+
+<div class="hero">
+  <h1>Infinigen × Mitsuba 연동 계획 — 러프 스케치</h1>
+  <p>Infinigen이 무한히 생성하는 RGB 기반 3D 장면에 측정 pBRDF를 링킹하고 Mitsuba로 렌더하면, 편광·초분광 3D 장면을 무한히 만들 수 있다는 가설.</p>
+  <p class="thesis">Geometric Diversity(Infinigen) × Optical Fidelity(HPBRDF + Mitsuba) → 무한 Polarimetric / Hyperspectral 3D 데이터셋</p>
+</div>
+
+
+<!-- ── 비전 ── -->
+<section id="vision">
+  <h2>핵심 아이디어</h2>
+  <p class="note">Infinigen은 형상과 배치의 무한 다양성을 준다. Mitsuba + 측정 pBRDF는 센서가 실제로 보는 방식(편광·NIR·초분광)을 물리적으로 정확하게 렌더한다. 두 개를 이어붙이면, 기존 합성 데이터셋이 갖지 못한 조합이 생긴다.</p>
+
+  <div class="grid3" style="margin-top:16px">
+    <div class="card">
+      <div class="label">Infinigen이 주는 것</div>
+      <strong>기하 다양성</strong>
+      <p class="note" style="margin-top:6px">182개 생성기, 1070 DOF, 절차적 배치. 장면 하나마다 형상·재질·조명이 모두 다르다.</p>
+    </div>
+    <div class="card">
+      <div class="label">HPBRDF가 주는 것</div>
+      <strong>측정 광학 재질</strong>
+      <p class="note" style="margin-top:6px">실제 표면을 분광·편광 측정한 pBRDF. 시뮬레이션이 아니라 실측값이므로 센서 응답이 현실적이다.</p>
+    </div>
+    <div class="card">
+      <div class="label">Mitsuba가 주는 것</div>
+      <strong>물리 기반 렌더</strong>
+      <p class="note" style="margin-top:6px">Stokes 벡터 편광, 분광 variant, Mueller 행렬 BSDF. 측정 pBRDF를 그대로 플러그인으로 쓸 수 있다.</p>
+    </div>
+  </div>
+
+  <div class="alert blue" style="margin-top:4px">
+    <strong>한 줄 주장:</strong> 장면 구조는 Infinigen이 무한 생성하고, 광학 재질은 측정값으로 교체하면 — 기존 합성 데이터셋에는 없던 <strong>편광·초분광 ground truth가 있는 실내 3D 데이터셋</strong>을 대량 생산할 수 있다.
+  </div>
+</section>
+
+
+<!-- ── 파이프라인 ── -->
+<section id="pipeline">
+  <h2>연동 파이프라인 개요</h2>
+
+  <div class="ascii">Infinigen 장면 생성
+  (procedural geometry + 기본 PBR 재질)
+           │
+           ▼
+  물체 분류 / 재질 매핑
+  (Infinigen 재질 태그 → HPBRDF 카테고리 룩업)
+  예) 금속 → steel_304, 유리 → borosilicate, 플라스틱 → abs_white ...
+           │
+           ▼
+  Mitsuba 씬 딕셔너리 빌드
+  (mitsuba_builder: geometry + measured_polarized_rgb BSDF 링크)
+           │
+           ▼
+  Mitsuba 멀티모달 렌더
+  cuda_ad_spectral_polarized variant
+  → RGB / Depth / Normal / Stokes(S0·S1·S2·S3) / 분광 채널별 radiance
+           │
+           ▼
+  OpticalNav 데이터셋 번들
+  (viewpoint graph + observation manifest + GT labels)</div>
+
+  <h3>재질 매핑 전략</h3>
+  <p class="note">Infinigen의 기본 재질은 <code>principled</code> BSDF (base_color, roughness, metallic). 이것을 측정 pBRDF로 교체할 때, <strong>두 가지 레벨</strong>로 나눌 수 있다:</p>
+  <div class="grid2" style="margin-top:10px">
+    <div class="card">
+      <div class="label">레벨 A — 재질 카테고리 매핑</div>
+      <strong>물체 유형 → 대표 pBRDF</strong>
+      <p class="note" style="margin-top:6px">금속 물체 → 대표 금속 pBRDF, 플라스틱 → 대표 플라스틱 pBRDF. <br>구현 난이도 낮음. 재질 내 공간적 변화 없음.</p>
+      <div style="margin-top:8px"><span class="tag green">현재 가능</span></div>
+    </div>
+    <div class="card">
+      <div class="label">레벨 B — Spatially Varying BRDF</div>
+      <strong>RGB texture → 위치별 pBRDF 보간</strong>
+      <p class="note" style="margin-top:6px">Infinigen의 RGB 텍스처 맵을 쓰면서 위치마다 다른 pBRDF를 적용. 나무결, 금속 스크래치, 도장 불균일 등 표현 가능.</p>
+      <div style="margin-top:8px"><span class="tag amber">미완성</span></div>
+    </div>
+  </div>
+</section>
+
+
+<!-- ── 문제점 ── -->
+<div class="chapter">
+  <h2>알려진 문제점 3가지</h2>
+  <p>아이디어는 성립하지만, 실제 파이프라인을 돌리기 전에 해결해야 할 병목이 명확히 있다.</p>
+</div>
+
+<section id="problem1">
+  <div class="problem-block">
+    <div class="problem-header p1">① HPBRDF 가짓수가 ~30종으로 부족하다</div>
+    <div class="problem-body">
+      <p>현재 <code>data/hpbrdf_2025/</code>에 있는 측정 pBRDF는 약 30종. 실내 장면 하나에는 수십~수백 종류의 표면이 등장한다 (목재, 직물, 세라믹, 플라스틱, 유리, 금속, 가죽, 페인트, 도배지…).</p>
+      <ul class="li-tight" style="margin-top:10px">
+        <li>30종으로 전체 장면을 커버하면, 사실상 동일한 광학 재질이 여러 다른 물체에 반복 할당된다.</li>
+        <li>데이터셋 다양성 논문 심사 기준에서 "<strong>재질 다양성이 없다</strong>"는 약점이 된다.</li>
+        <li>편광/NIR 관측에서 가장 큰 차이를 만드는 것은 재질 차이인데, 이게 30종이면 클래스 분리가 쉬워져 오히려 현실과 동떨어진 "쉬운 데이터셋"이 될 수 있다.</li>
+      </ul>
+      <div class="alert" style="margin-top:12px">
+        <strong>현실적 대응:</strong> 단기적으로는 "재질이 다양하지 않음을 명시적 한계로 인정"하고, 카테고리 다양성(금속/플라스틱/유리/직물 등 대분류) 위주로 데이터셋을 설계. 중기적으로 KAIST pBRDF 2020 + HPBRDF 2025 + 공개 측정 데이터(MERL BRDF 등) 합산해서 종류를 늘리는 방향.
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="problem2">
+  <div class="problem-block">
+    <div class="problem-header p2">② RGB texture map 기반 Spatially Varying BRDF 렌더링이 아직 완성 안 됨</div>
+    <div class="problem-body">
+      <p>Infinigen 장면의 핵심 시각적 품질은 <strong>texture map</strong>에서 온다 (나무결, 대리석 패턴, 패브릭 직조 등). 단순히 단일 pBRDF를 물체 전체에 적용하면 이 공간적 변화가 사라진다.</p>
+      <ul class="li-tight" style="margin-top:10px">
+        <li>Spatially Varying BRDF(SV-BRDF)는 위치 <code>(u, v)</code>마다 다른 BSDF 파라미터를 써야 한다.</li>
+        <li>측정 pBRDF를 SV-BRDF로 쓰려면 Mitsuba 플러그인 레벨에서 texture → pBRDF 파라미터 보간 로직이 필요하다.</li>
+        <li>현재 <code>measured_polarized_rgb</code> 플러그인은 단일 균일 재질만 지원 (<code>data_path</code> 고정).</li>
+        <li>가장 현실적인 경로: <strong>Albedo map을 pBRDF 색상 스케일로 곱하기</strong> — 정확한 SV-BRDF는 아니지만 시각적으로는 자연스럽고, 편광 패턴은 pBRDF에서, 색상 변화는 texture에서 나눠 갖는 근사.</li>
+      </ul>
+      <div class="alert" style="margin-top:12px">
+        <strong>현재 상태:</strong> 미구현. 구현 난이도는 중간 (플러그인 C++ 수정 또는 Python 래퍼에서 pre-compose). 이 없이도 레벨 A 매핑은 가능하지만, 결과물이 "텍스처 없는 단색 물체" 처럼 보일 수 있다.
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="problem3">
+  <div class="problem-block">
+    <div class="problem-header p3">③ 전체 파이프라인 시간 비용이 크다</div>
+    <div class="problem-body">
+      <p>각 단계마다 상당한 시간이 필요하고, 이 중 <strong>검수 단계가 자동화가 어렵다</strong>는 점이 특히 문제다.</p>
+
+      <div class="step-row" style="margin:16px 0">
+        <div class="step-box blocker">
+          <div class="step-title">Infinigen 씬 생성</div>
+          <div class="step-time">~3h / scene</div>
+          <div class="step-note">Python 프로세서 + Blender 백엔드. 고해상도 자연/실내 장면 기준.</div>
+        </div>
+        <div class="step-box blocker">
+          <div class="step-title">품질 검수</div>
+          <div class="step-time">수동 / 미정</div>
+          <div class="step-note">생성 장면이 NavEpisode로 쓸 수 있는지 확인. 자동화 기준 정의 필요.</div>
+        </div>
+        <div class="step-box blocker">
+          <div class="step-title">재질 매핑</div>
+          <div class="step-time">반자동</div>
+          <div class="step-note">Infinigen 재질 태그 → pBRDF 룩업. 룩업 테이블 구축 1회 필요.</div>
+        </div>
+        <div class="step-box blocker">
+          <div class="step-title">Mitsuba PBR 렌더</div>
+          <div class="step-time">오프라인 전용</div>
+          <div class="step-note">분광+편광 variant, SPP 수백~수천. 실시간 불가. GPU당 분~수십분/frame.</div>
+        </div>
+      </div>
+
+      <ul class="li-tight">
+        <li><strong>실시간 피드백 루프 없음:</strong> 장면을 생성하고 → 재질 교체하고 → 렌더해보기까지 반나절~하루 단위. 파라미터 실험이 느리다.</li>
+        <li><strong>검수 병목:</strong> Infinigen 씬이 항상 좋은 NavEpisode 후보를 만드는 것은 아니다. 통로가 없거나, 조명이 없거나, 씬이 너무 넓거나. 이 검수를 자동화하는 기준(traversability, lighting sufficiency, scale)을 정의해야 한다.</li>
+        <li><strong>비용 규모:</strong> OpticalNav 데이터셋에 장면 10개 × viewpoint 100개 × heading 4방향 = 4000 프레임. 프레임당 5분이면 333시간 = GPU 10개로 33시간.</li>
+      </ul>
+      <div class="alert blue" style="margin-top:12px">
+        <strong>구조적 선택:</strong> PBR 렌더링인 이상 실시간은 포기. 대신 <strong>배치 재렌더 인프라</strong>(<code>rerender_optical_nav_grid.py</code>)를 강화해서 씬 교체 → 재렌더를 최소 조작으로 돌리는 방향이 현실적.
+      </div>
+    </div>
+  </div>
+</section>
+
+
+<!-- ── 트레이드오프 ── -->
+<section id="tradeoff">
+  <h2>현실적 트레이드오프 정리</h2>
+  <table>
+    <tr>
+      <th>축</th>
+      <th>이상</th>
+      <th>현실적 타협점</th>
+      <th>비고</th>
+    </tr>
+    <tr>
+      <td>재질 다양성</td>
+      <td>물체마다 정확한 측정 pBRDF, SV-BRDF</td>
+      <td>~30종 대표 pBRDF, 대분류(금속/유리/플라스틱/직물) 4~5종만 확보해도 논문 1편 가능</td>
+      <td>MERL BRDF 100종 공개 데이터 추가 검토</td>
+    </tr>
+    <tr>
+      <td>공간 변화</td>
+      <td>위치마다 다른 pBRDF (SV-BRDF)</td>
+      <td>단일 pBRDF + albedo map 곱하기 근사 (색상 변화는 texture, 편광 패턴은 pBRDF)</td>
+      <td>플러그인 수정 없이 파이프라인에서 처리 가능</td>
+    </tr>
+    <tr>
+      <td>장면 수</td>
+      <td>수백 장면</td>
+      <td>검수 통과 기준 자동화 후 10~30장면으로 시작, 이후 배치 확장</td>
+      <td>장면당 ~3h 생성 고려</td>
+    </tr>
+    <tr>
+      <td>렌더 속도</td>
+      <td>실시간 미리보기</td>
+      <td>RGB 낮은 SPP(64) 프리뷰 → 확인 후 full SPP 배치 렌더</td>
+      <td>현재 render daemon 구조로 가능</td>
+    </tr>
+    <tr>
+      <td>OpticalNav 연결</td>
+      <td>Infinigen 씬에서 직접 navgraph 추출</td>
+      <td>Infinigen 씬 → USD 변환 → 기존 OpticalNav 에디터로 수동 어노테이션</td>
+      <td>Infinigen의 floor/wall 메타데이터 활용 가능성 검토 필요</td>
+    </tr>
+  </table>
+</section>
+
+
+<!-- ── 다음 단계 ── -->
+<section id="next">
+  <h2>다음 단계 러프 로드맵</h2>
+  <div class="alert green">
+    <strong>전제:</strong> 측정 pBRDF 플러그인(<code>measured_polarized_rgb</code>)이 프로덕션 빌드(<code>build/mitsuba3-optix7</code>)에서 로드 가능한 상태여야 한다. 현재 이게 안 됨이 선행 과제.
+  </div>
+
+  <div class="grid2" style="margin-top:14px">
+    <div class="card">
+      <div class="label">단기 (2주 이내)</div>
+      <strong>레벨 A 연동 프로토타입</strong>
+      <ul class="li-tight" style="margin-top:8px">
+        <li><code>measured_polarized_rgb</code> 프로덕션 빌드 완성</li>
+        <li>Infinigen 샘플 씬 1개 → USD export → Mitsuba 씬 빌드</li>
+        <li>재질 카테고리 룩업 테이블 초안 (금속/유리/플라스틱 3종)</li>
+        <li>편광 렌더 1프레임 end-to-end 확인</li>
+      </ul>
+    </div>
+    <div class="card">
+      <div class="label">중기 (1~2달)</div>
+      <strong>배치 파이프라인 + 검수 자동화</strong>
+      <ul class="li-tight" style="margin-top:8px">
+        <li>Infinigen 씬 검수 기준 정의 (traversability, 조명 충분성, 스케일)</li>
+        <li>Infinigen → OpticalNav navgraph 반자동 추출</li>
+        <li>배치 렌더 + export 파이프라인 연결</li>
+        <li>SV-BRDF 근사 (albedo map × pBRDF 컬러) 구현</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="alert" style="margin-top:14px">
+    <strong>가장 큰 불확실성:</strong> Infinigen에서 생성한 씬이 실제로 OpticalNav 에피소드에 쓸 만한 품질과 레이아웃을 얼마나 자주 만들어주는지. 씬 생성 3h 후 검수에서 탈락하면 비용이 크다. <strong>검수 자동화가 전체 파이프라인의 핵심 병목</strong>이 될 가능성이 높다.
+  </div>
+</section>
+
+<div class="footer">Robomituba Daily Development Report · 2026-06-15 · Infinigen × Mitsuba 연동 러프 플랜</div>
+</main>
+</div>
+</body>
+</html>
