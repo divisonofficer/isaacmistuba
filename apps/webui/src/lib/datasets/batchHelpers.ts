@@ -77,7 +77,10 @@ export function applyJobStatusUpdates(batch: any, wsJobs: any[]): any {
 			active_stage: ws.active_stage ?? ws.progress_stage ?? job?.status?.active_stage,
 			submitted_at: ws.submitted_at ?? job?.status?.submitted_at,
 			started_at: ws.started_at ?? job?.status?.started_at,
+			worker_started_at: ws.worker_started_at ?? job?.status?.worker_started_at,
 			finished_at: ws.finished_at ?? job?.status?.finished_at,
+			elapsed_s: ws.elapsed_s ?? job?.status?.elapsed_s,
+			queue_wait_s: ws.queue_wait_s ?? job?.status?.queue_wait_s,
 			error: ws.error ?? job?.status?.error,
 			extras: { ...prevExtras, ...(ws.extras ?? {}) },
 		};
@@ -195,6 +198,30 @@ export function jobStatusClass(job: any): string {
 
 export function jobStageLabel(job: any): string {
 	return String(job?.status?.progress_stage ?? job?.status?.status ?? '');
+}
+
+function parseTsMs(value: unknown): number | null {
+	if (typeof value !== 'string' || value.length === 0) return null;
+	const parsed = Date.parse(value);
+	return Number.isFinite(parsed) ? parsed : null;
+}
+
+export function jobRunStartedAt(job: any): string {
+	return String(job?.status?.worker_started_at ?? job?.worker_started_at ?? job?.status?.extras?.worker_started_at ?? job?.status?.started_at ?? job?.started_at ?? '');
+}
+
+export function jobRunDurationSeconds(job: any, nowMs = Date.now()): number | null {
+	const explicit = job?.status?.elapsed_s ?? job?.elapsed_s;
+	if (typeof explicit === 'number' && Number.isFinite(explicit)) return Math.max(0, Math.round(explicit));
+	const startMs = parseTsMs(jobRunStartedAt(job));
+	if (startMs === null) return null;
+	const endMs = parseTsMs(job?.status?.finished_at ?? job?.finished_at) ?? nowMs;
+	return Math.max(0, Math.round((endMs - startMs) / 1000));
+}
+
+export function formatJobRunDuration(job: any, nowMs = Date.now()): string {
+	const seconds = jobRunDurationSeconds(job, nowMs);
+	return seconds === null ? '' : `${seconds}s`;
 }
 
 export const RENDER_STAGES = [

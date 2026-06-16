@@ -4460,3 +4460,17 @@ details[open] .accordion-chevron { transform: rotate(180deg); }
   margin-top: 0.6rem;
   flex-wrap: wrap;
 }
+
+.sensor-resume-row {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	font-size: var(--font-size-xs);
+	color: var(--text-secondary);
+	padding: 4px 2px;
+}
+
+.sensor-resume-row input {
+	width: 14px;
+	height: 14px;
+}

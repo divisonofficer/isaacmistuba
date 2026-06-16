@@ -386,6 +386,7 @@ class RenderJobStatus:
     status: str
     submitted_at: str
     started_at: Optional[str] = None
+    worker_started_at: Optional[str] = None
     finished_at: Optional[str] = None
     progress_stage: str = "queued"
     manifest_path: Optional[str] = None

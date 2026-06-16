@@ -66,6 +66,8 @@
 		// Render the selected episode's path nodes directly from this tab so
 		// the user doesn't have to round-trip through Sensors to start a sweep.
 		onRenderEpisodeNodes?: () => void;
+		renderMissingOnly?: boolean;
+		onSetRenderMissingOnly?: (value: boolean) => void;
 		episodeNodesAvailable?: boolean;
 		episodePathNodeCount?: number;
 		headingsPerNode?: number;
@@ -92,6 +94,7 @@
 		onSetRobotRadius, onSetMinClearance, onSetResolution,
 		onSetMaxNodes, onSetHeadingCount, onSetMinNodeSpacing,
 		onRenderEpisodeNodes,
+		renderMissingOnly = true, onSetRenderMissingOnly,
 		episodeNodesAvailable = false, episodePathNodeCount = 0, headingsPerNode = 0,
 		renderSceneSynced = false,
 	}: Props = $props();
@@ -269,6 +272,10 @@
 		{/if}
 	</div>
 	{#if onRenderEpisodeNodes && selectedEpisodeId}
+		<label class="sensor-resume-row" title="Skip episode path viewpoints/headings that already have outputs.">
+			<input type="checkbox" checked={renderMissingOnly} onchange={(e) => onSetRenderMissingOnly?.((e.currentTarget as HTMLInputElement).checked)} />
+			<span>Only missing renders</span>
+		</label>
 		<button class="button button-primary full episode-render-btn"
 			disabled={loading || !selectedProjectId || !renderSceneSynced || !hasGraph || !episodeNodesAvailable}
 			title={!episodeNodesAvailable ? 'Selected episode has no graph path_nodes' : ''}

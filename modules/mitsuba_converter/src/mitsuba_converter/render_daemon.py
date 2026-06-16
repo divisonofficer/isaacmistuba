@@ -176,6 +176,21 @@ def _utc_now_iso() -> str:
     return _utc_now().isoformat(timespec="seconds")
 
 
+def _event_ts_iso(value: Any) -> str | None:
+    try:
+        return datetime.fromtimestamp(float(value), tz=timezone.utc).isoformat(timespec="seconds")
+    except (TypeError, ValueError, OSError):
+        return None
+
+
+def _render_progress_persist_interval_s() -> float:
+    raw = os.environ.get("ROBOMITUBA_RENDER_PROGRESS_PERSIST_INTERVAL_S", "30")
+    try:
+        return max(0.0, float(str(raw).strip()))
+    except (TypeError, ValueError):
+        return 30.0
+
+
 def _deep_merge(base: dict[str, Any], override: Mapping[str, Any]) -> dict[str, Any]:
     for key, value in override.items():
         if isinstance(value, Mapping) and isinstance(base.get(key), dict):
@@ -196,24 +211,38 @@ def _render_gpu_indices_from_env() -> list[int]:
     return indices or [0]
 
 
-def _contiguous_gpu_shard_assignments(item_count: int, gpu_indices: list[int]) -> list[dict[str, int]]:
+def _interleaved_gpu_shard_assignments(item_count: int, gpu_indices: list[int]) -> list[dict[str, int]]:
+    """Assign consecutive render jobs across GPUs in round-robin order.
+
+    The old contiguous layout produced all GPU0 jobs first, then GPU1, etc.
+    Because the daemon pending queue is FIFO, large OpticalNav sweeps then ran
+    as a single-GPU workload for hundreds of frames before the next GPU saw
+    work. Interleaving keeps each worker fed from the start while preserving
+    per-GPU shard metadata for UI/debugging.
+    """
     if item_count <= 0:
         return []
     active_gpus = list(gpu_indices or [0])[:item_count]
     shard_count = max(1, len(active_gpus))
     base = item_count // shard_count
     remainder = item_count % shard_count
+    shard_sizes = [
+        base + (1 if shard_index < remainder else 0)
+        for shard_index in range(shard_count)
+    ]
+    shard_item_indices = [0 for _ in range(shard_count)]
     assignments: list[dict[str, int]] = []
-    for shard_index, gpu_index in enumerate(active_gpus):
-        shard_size = base + (1 if shard_index < remainder else 0)
-        for shard_item_index in range(shard_size):
-            assignments.append({
-                "target_gpu_index": int(gpu_index),
-                "shard_index": int(shard_index),
-                "shard_count": int(shard_count),
-                "shard_item_index": int(shard_item_index),
-                "shard_size": int(shard_size),
-            })
+    for item_index in range(item_count):
+        shard_index = item_index % shard_count
+        shard_item_index = shard_item_indices[shard_index]
+        shard_item_indices[shard_index] += 1
+        assignments.append({
+            "target_gpu_index": int(active_gpus[shard_index]),
+            "shard_index": int(shard_index),
+            "shard_count": int(shard_count),
+            "shard_item_index": int(shard_item_index),
+            "shard_size": int(shard_sizes[shard_index]),
+        })
     return assignments
 
 
@@ -1766,6 +1795,31 @@ def _append_environment_xml(root: "ET.Element", authoring_map_payload: dict[str,
     ET.SubElement(emitter, "rgb", attrib={"name": "radiance", "value": _rgb_value(environment.get("radiance"), intensity=intensity)})
 
 
+def _ceiling_skylight_radiance(authoring_map_payload: dict[str, Any]) -> str | None:
+    """Radiance string for a luminous ceiling, or ``None`` to keep it opaque.
+
+    A sealed room (walls + ceiling) blocks the ``constant`` environment emitter,
+    so the interior is lit only by small authored fixtures → dark, slow-converging
+    and noisy even at high spp. When the environment is a constant ambient we turn
+    the ceiling slab into a large downward area emitter carrying that ambient into
+    the room. A big area light is cheap to importance-sample, so this brightens the
+    scene and cuts noise at the SAME spp — no render-time cost, unlike raising
+    spp/max_depth.
+
+    Controls (under ``environment``):
+      * ``ceiling_skylight``  — bool, default True. Set False to keep the opaque ceiling.
+      * ``ceiling_fill_gain`` — float, default 1.0. Multiplies the ambient radiance.
+    Only active for ``mode == "constant"`` (envmap rooms should drop the shell instead).
+    """
+    environment = dict(authoring_map_payload.get("environment") or {})
+    mode = str(environment.get("mode") or "constant")
+    if mode != "constant" or not bool(environment.get("ceiling_skylight", True)):
+        return None
+    intensity = float(environment.get("intensity") or 1.0)
+    gain = float(environment.get("ceiling_fill_gain", 1.0) or 1.0)
+    return _rgb_value(environment.get("radiance"), intensity=intensity * gain)
+
+
 _ROOM_SHELL_WALL_THICKNESS_M = 0.08  # full thickness; renderer's old code passed wt=0.04 as a half-extent → 0.08m
 
 
@@ -2012,7 +2066,7 @@ def _generate_opticalnav_render_scene_xml(
 
     def _cube(parent: "ET.Element", ex: float, ey: float, ez: float,
               sx: float, sy: float, sz: float, material_id: str, color: str = "0.75 0.75 0.75",
-              shape_id: str | None = None) -> None:
+              shape_id: str | None = None, emitter_radiance: str | None = None) -> None:
         attrib = {"type": "cube"}
         if shape_id:
             attrib["id"] = shape_id
@@ -2021,6 +2075,9 @@ def _generate_opticalnav_render_scene_xml(
         ET.SubElement(xf, "scale", x=f"{sx:.6f}", y=f"{sy:.6f}", z=f"{sz:.6f}")
         ET.SubElement(xf, "translate", x=f"{ex:.6f}", y=f"{ey:.6f}", z=f"{ez:.6f}")
         _append_bsdf_xml(s, material_id, material_idx, fallback_color=color, repo_root=repo_root)
+        if emitter_radiance:
+            em = ET.SubElement(s, "emitter", type="area")
+            ET.SubElement(em, "rgb", attrib={"name": "radiance", "value": emitter_radiance})
 
     # Phase 1: floor is its own layer with per-region materials and stable shape ids.
     # Gated by ``settings.auto_floor_enabled`` independently of walls/ceiling.
@@ -2049,6 +2106,7 @@ def _generate_opticalnav_render_scene_xml(
         "wall_e": ("default_wall", "0.78 0.76 0.73"),
         "wall_w": ("default_wall", "0.78 0.76 0.73"),
     }
+    ceiling_fill = _ceiling_skylight_radiance(authoring_map_payload)
     if shell.get("enabled", True):
         for sh in shell["shapes"]:
             if sh.get("role") == "floor":
@@ -2059,9 +2117,17 @@ def _generate_opticalnav_render_scene_xml(
             ex, ey, ez = sh["center"]
             wsx, wsy, wsz = sh["size"]
             mat, color = _ROOM_COLORS.get(sh["role"], ("default_wall", "0.78 0.76 0.73"))
-            root.append(ET.Comment(json.dumps({"type": "__room_shell__", "role": sh["role"]},
-                                              ensure_ascii=False, separators=(",", ":"))))
-            _cube(root, ex, ey, ez, wsx / 2.0, wsy / 2.0, wsz / 2.0, mat, color)
+            # Sealed-room interiors are lit only by small fixtures and converge slowly;
+            # make the ceiling a large luminous panel that carries the constant ambient
+            # into the room (brightens + denoises at the same spp). See
+            # _ceiling_skylight_radiance().
+            is_ceiling = sh.get("role") == "ceiling"
+            emit = ceiling_fill if is_ceiling else None
+            shell_meta = {"type": "__room_shell__", "role": sh["role"]}
+            if emit:
+                shell_meta["emissive"] = True
+            root.append(ET.Comment(json.dumps(shell_meta, ensure_ascii=False, separators=(",", ":"))))
+            _cube(root, ex, ey, ez, wsx / 2.0, wsy / 2.0, wsz / 2.0, mat, color, emitter_radiance=emit)
     else:
         root.append(ET.Comment(json.dumps({"type": "__room_shell__", "role": "disabled"},
                                           ensure_ascii=False, separators=(",", ":"))))
@@ -2458,6 +2524,7 @@ class _QueuedJob:
     variant: str
     runtime_overrides: dict[str, Any]
     lazy_persist: bool = False  # skip disk writes at enqueue; persist just before worker dispatch
+    last_progress_persist_s: float = 0.0
 
 
 @dataclass
@@ -3322,20 +3389,26 @@ class RenderDaemon:
         on-disk status, telemetry and the log.
         """
         if kind == "started":
-            # Dispatcher already set status=running; just append a marker
-            # for the log so operators see the worker handoff timestamp.
+            # Dispatcher already set status=running; store the actual worker
+            # handoff timestamp so UI duration excludes per-worker queue wait.
+            worker_started_at = _event_ts_iso(event.get("ts")) or _utc_now_iso()
             with self._condition:
                 job = self._jobs.get(job_id)
+                if job is not None and job.status.status != "cancelled":
+                    job.status.worker_started_at = worker_started_at
+                    job.status.extras["worker_started_at"] = worker_started_at
             if job is not None:
+                self._persist_status_unlocked(job)
                 self._append_job_log_line(
                     job, event_type="running", stage="worker_started",
                     message="worker subprocess accepted job",
+                    event_ts=event.get("ts"),
                 )
             return
         if kind == "progress":
             stage = str(event.get("stage") or "rendering")
             payload = event.get("payload") if isinstance(event.get("payload"), dict) else None
-            self._update_progress(job_id, stage, payload)
+            self._update_progress(job_id, stage, payload, event_ts=event.get("ts"))
             return
         if kind == "routing_fallback":
             with self._condition:
@@ -3358,9 +3431,9 @@ class RenderDaemon:
                 out_path = event.get("out_path") or ""
                 manifest_path = f"{out_path}/manifest.json" if out_path else ""
             if not manifest_path:
-                self._mark_failed(job_id, "worker_completed_without_manifest")
+                self._mark_failed(job_id, "worker_completed_without_manifest", event_ts=event.get("ts"))
                 return
-            self._mark_succeeded(job_id, manifest_path=str(manifest_path))
+            self._mark_succeeded(job_id, manifest_path=str(manifest_path), event_ts=event.get("ts"))
             return
         if kind == "failed":
             reason = str(event.get("reason") or "unknown")
@@ -3877,8 +3950,21 @@ class RenderDaemon:
         self._append_telemetry_row(row)
 
     def _record_render_job_telemetry(self, job: _QueuedJob, *, event_type: str) -> None:
-        scene_ctx = self._scene_telemetry_context(job.render_request.scene_state.scene_id)
-        timestamp = job.status.finished_at or job.status.started_at or job.status.submitted_at or _utc_now_iso()
+        # Keep render telemetry lightweight. Calling _scene_telemetry_context() here
+        # walks the scene/catalog/bundle cache, and complete/progress events arrive
+        # on the worker stdout reader thread. A heavy scan there delays all worker
+        # terminal events and makes fast renders look like multi-minute jobs.
+        scene_ctx = {
+            "windows_path_mode": "unknown",
+            "usd_stage_path": None,
+            "stage_path_local": None,
+            "render_ready": None,
+            "shape_map_exists": None,
+            "size_tier": None,
+            "asset_file_count": None,
+        }
+        run_started_at = job.status.worker_started_at or job.status.started_at
+        timestamp = job.status.finished_at or run_started_at or job.status.submitted_at or _utc_now_iso()
         timing_summary = job.status.extras.get("render_timing_summary") if isinstance(job.status.extras.get("render_timing_summary"), Mapping) else {}
         row = {
             "kind": "render_job",
@@ -3893,7 +3979,7 @@ class RenderDaemon:
             "progress_message": job.status.error or job.status.progress_stage,
             "progress_origin": "daemon_render",
             "progress_counts": dict(job.status.extras.get("progress_context", {}) or {}) if isinstance(job.status.extras.get("progress_context"), Mapping) else {},
-            "elapsed_s": self._seconds_between(job.status.submitted_at, timestamp),
+            "elapsed_s": self._seconds_between(run_started_at or job.status.submitted_at, timestamp),
             "sync_mode": str(job.status.extras.get("sync_mode") or "unknown"),
             "sync_policy": str(job.status.extras.get("sync_policy") or "default"),
             "windows_path_mode": scene_ctx["windows_path_mode"],
@@ -10486,6 +10572,11 @@ class RenderDaemon:
         node_heights = dict(node_heights_raw) if isinstance(node_heights_raw, Mapping) else None
         render_settings_raw = payload.get("render_settings")
         render_settings = dict(render_settings_raw) if isinstance(render_settings_raw, dict) else {}
+        skip_existing_observations = bool(
+            payload.get("skip_existing_observations")
+            or payload.get("only_missing")
+            or payload.get("resume_missing_only")
+        )
 
         precondition = self._opticalnav_render_precondition_payload(project_dir, [scene_id], payload, mode="graph_sweep")
         if precondition is not None:
@@ -10530,6 +10621,8 @@ class RenderDaemon:
                 return
             batch_id = f"opticalnav-custom-{_utc_now().strftime('%Y%m%dT%H%M%S%f')}"
             jobs = []
+            skipped_existing = 0
+            requested_count = 0
             try:
                 sweep_requests = build_custom_position_render_requests(
                     custom_positions,
@@ -10540,8 +10633,17 @@ class RenderDaemon:
                     camera_height_m=camera_height_m,
                     render_settings=render_settings,
                 )
+                requested_count = len(sweep_requests)
+                if skip_existing_observations:
+                    kept_requests = []
+                    for sweep_request in sweep_requests:
+                        if self._opticalnav_sweep_output_exists(project_dir, scene_id, sweep_request, modalities):
+                            skipped_existing += 1
+                        else:
+                            kept_requests.append(sweep_request)
+                    sweep_requests = kept_requests
                 gpu_indices = _render_gpu_indices_from_env()
-                shard_assignments = _contiguous_gpu_shard_assignments(len(sweep_requests), gpu_indices)
+                shard_assignments = _interleaved_gpu_shard_assignments(len(sweep_requests), gpu_indices)
                 for sweep_request, shard in zip(sweep_requests, shard_assignments):
                     runtime_overrides = {
                         "worker_gpu_index": shard["target_gpu_index"],
@@ -10582,8 +10684,11 @@ class RenderDaemon:
                 "backend": "daemon",
                 "created_at": _utc_now_iso(),
                 "modalities": modalities,
-                "scheduling_policy": "contiguous_gpu_shards",
+                "scheduling_policy": "interleaved_gpu_shards",
                 "gpu_indices": _render_gpu_indices_from_env(),
+                "skip_existing_observations": skip_existing_observations,
+                "requested_jobs": requested_count or len(jobs),
+                "skipped_existing": skipped_existing,
                 "jobs": jobs,
             }
             batch_path = project_dir / "graph_render_batches" / f"{batch_id}.json"
@@ -10644,6 +10749,7 @@ class RenderDaemon:
             "created_at": _utc_now_iso(),
             "modalities": modalities,
             "status": "building",
+            "skip_existing_observations": skip_existing_observations,
             "jobs": [],
             "counts": {"queued": 0, "running": 0, "completed": 0, "failed": 0, "cancelled": 0, "unknown": 0},
             "progress": {"completed": 0, "failed": 0, "total": 0, "fraction": 0.0},
@@ -10665,6 +10771,7 @@ class RenderDaemon:
                 render_settings=render_settings,
                 node_heights=node_heights,
                 variant=str(payload.get("variant") or self.variant),
+                skip_existing_observations=skip_existing_observations,
             ),
             daemon=True,
             name=f"sweep-{batch_id}",
@@ -10687,6 +10794,7 @@ class RenderDaemon:
         render_settings: dict,
         node_heights: "dict | None",
         variant: str,
+        skip_existing_observations: bool = False,
     ) -> None:
         """Background thread: read graph, build RenderRequests, submit all jobs."""
         from navigation_dataset.sensor_sweep import build_sweep_render_requests
@@ -10704,8 +10812,18 @@ class RenderDaemon:
                 render_settings=render_settings,
                 node_heights=node_heights,
             )
+            requested_count = len(sweep_requests)
+            skipped_existing = 0
+            if skip_existing_observations:
+                kept_requests = []
+                for sweep_request in sweep_requests:
+                    if self._opticalnav_sweep_output_exists(project_dir, scene_id, sweep_request, modalities):
+                        skipped_existing += 1
+                    else:
+                        kept_requests.append(sweep_request)
+                sweep_requests = kept_requests
             gpu_indices = _render_gpu_indices_from_env()
-            shard_assignments = _contiguous_gpu_shard_assignments(len(sweep_requests), gpu_indices)
+            shard_assignments = _interleaved_gpu_shard_assignments(len(sweep_requests), gpu_indices)
             jobs = []
             for sweep_request, shard in zip(sweep_requests, shard_assignments):
                 runtime_overrides = {
@@ -10744,8 +10862,11 @@ class RenderDaemon:
                 "backend": "daemon",
                 "created_at": _utc_now_iso(),
                 "modalities": modalities,
-                "scheduling_policy": "contiguous_gpu_shards",
+                "scheduling_policy": "interleaved_gpu_shards",
                 "gpu_indices": _render_gpu_indices_from_env(),
+                "skip_existing_observations": skip_existing_observations,
+                "requested_jobs": requested_count,
+                "skipped_existing": skipped_existing,
                 "jobs": jobs,
                 "status": "ready",
                 "counts": {"queued": n, "running": 0, "completed": 0, "failed": 0, "cancelled": 0, "unknown": 0},
@@ -12269,6 +12390,7 @@ class RenderDaemon:
                 return False
             job.status.status = "queued"
             job.status.started_at = None
+            job.status.worker_started_at = None
             job.status.finished_at = None
             job.status.progress_stage = "retry_queued"
             job.status.error = None
@@ -12306,6 +12428,7 @@ class RenderDaemon:
                     continue
                 job.status.status = "running"
                 job.status.started_at = _utc_now_iso()
+                job.status.worker_started_at = job.status.started_at if _RENDER_INPROCESS else None
                 job.status.progress_stage = "starting"
             # Disk I/O outside the lock.
             # For lazy_persist jobs (bulk sweep), the request file and initial "queued"
@@ -12395,6 +12518,133 @@ class RenderDaemon:
             file=sys.stderr, flush=True,
         )
 
+    @staticmethod
+    def _opticalnav_modality_output_names(modality: str) -> tuple[str, ...]:
+        mapping = {
+            "rgb": ("rgb.png", "rgb.exr"),
+            "depth": ("depth.png", "depth.exr", "depth_jet_colorbar.png"),
+            "albedo": ("albedo.png", "albedo.exr"),
+            "active_nir_intensity": ("active_nir_intensity.png", "active_nir_intensity.exr"),
+            "hazard_mask": ("hazard_mask.png",),
+            "polar_rgb_preview": ("polar_rgb_preview.png",),
+            "dop": ("dop_red_black_colorbar.png", "dop.exr"),
+            "aolp": ("aolp_rainbow_colorbar.png", "aolp.exr"),
+            "s1": ("s1_bwr_colorbar.png", "s1.exr"),
+            "s2": ("s2_bwr_colorbar.png", "s2.exr"),
+        }
+        key = str(modality or "").strip()
+        return mapping.get(key, (f"{key}.png", f"{key}.exr"))
+
+    def _opticalnav_copy_observation_files(
+        self,
+        *,
+        project_id: str,
+        scene_id: str,
+        vp_id: str,
+        heading_id: str,
+        job_id: str,
+        frame_id: str,
+        camera_id: str,
+    ) -> bool:
+        """Copy bridge-job camera outputs into the consolidated OpticalNav tree."""
+        try:
+            import shutil
+            src_dir = (
+                self.repo_root / "out" / "bridge_jobs" / job_id / "observations" / frame_id /
+                "cameras" / camera_id
+            )
+            if not src_dir.exists():
+                cameras_root = self.repo_root / "out" / "bridge_jobs" / job_id / "observations" / frame_id / "cameras"
+                first_camera_dir = next((item for item in sorted(cameras_root.iterdir()) if item.is_dir()), None) if cameras_root.exists() else None
+                if first_camera_dir is None:
+                    return False
+                src_dir = first_camera_dir
+                camera_id = first_camera_dir.name
+            dst_dir = self.repo_root / "out" / "opticalnav" / project_id / "scenes" / scene_id / "observations" / vp_id / heading_id
+            sensor_dst_dir = dst_dir / "sensors" / camera_id
+            copy_map = {
+                "rgb.png": "rgb.png",
+                "depth_jet_colorbar.png": "depth.png",
+                "albedo.png": "albedo.png",
+                "active_nir_intensity.png": "active_nir_intensity.png",
+                "hazard_mask.png": "hazard_mask.png",
+                "polar_rgb_preview.png": "polar_rgb_preview.png",
+                "dop_red_black_colorbar.png": "dop_red_black_colorbar.png",
+                "aolp_rainbow_colorbar.png": "aolp_rainbow_colorbar.png",
+                "s1_bwr_colorbar.png": "s1_bwr_colorbar.png",
+                "s2_bwr_colorbar.png": "s2_bwr_colorbar.png",
+            }
+            copied = False
+            for src_name, dst_name in copy_map.items():
+                src = src_dir / src_name
+                if src.exists():
+                    if not copied:
+                        dst_dir.mkdir(parents=True, exist_ok=True)
+                        sensor_dst_dir.mkdir(parents=True, exist_ok=True)
+                        copied = True
+                    shutil.copy2(src, sensor_dst_dir / dst_name)
+                    shutil.copy2(src, dst_dir / dst_name)
+            try:
+                for src in src_dir.iterdir():
+                    if not src.is_file() or src.suffix.lower() != ".exr":
+                        continue
+                    if not copied:
+                        dst_dir.mkdir(parents=True, exist_ok=True)
+                        sensor_dst_dir.mkdir(parents=True, exist_ok=True)
+                        copied = True
+                    shutil.copy2(src, sensor_dst_dir / src.name)
+            except OSError:
+                pass
+            if copied:
+                index_path = dst_dir / "_sensor_index.json"
+                try:
+                    index = _read_json(index_path) if index_path.exists() else {"sensors": {}}
+                except Exception:
+                    index = {"sensors": {}}
+                sensors = dict(index.get("sensors") or {})
+                sensors[camera_id] = {
+                    "camera_id": camera_id,
+                    "updated_at": _utc_now_iso(),
+                    "files": sorted(item.name for item in sensor_dst_dir.iterdir() if item.is_file()),
+                }
+                index_path.write_text(json.dumps({"sensors": sensors}, ensure_ascii=False, indent=2), encoding="utf-8")
+            return copied
+        except Exception:
+            return False
+
+    def _opticalnav_sweep_output_exists(self, project_dir: Path, scene_id: str, sweep_request: Any, modalities: Sequence[str]) -> bool:
+        request = sweep_request.request
+        camera_specs = list(getattr(request, "camera_specs", []) or [])
+        camera_id = str(getattr(camera_specs[0], "camera_id", "") or "opticalnav_front_cam") if camera_specs else "opticalnav_front_cam"
+        vp_id = str(sweep_request.node_id)
+        heading_id = str(sweep_request.heading_id)
+        dst_dir = project_dir / "scenes" / scene_id / "observations" / vp_id / heading_id
+        sensor_dst_dir = dst_dir / "sensors" / camera_id
+
+        def _has_consolidated() -> bool:
+            for modality in modalities:
+                names = self._opticalnav_modality_output_names(str(modality))
+                if not any((sensor_dst_dir / name).exists() or (dst_dir / name).exists() for name in names):
+                    return False
+            return True
+
+        if _has_consolidated():
+            return True
+
+        manifest_path = self.repo_root / "out" / "bridge_jobs" / request.job_id / "observations" / request.frame_id / "manifest.json"
+        if manifest_path.exists():
+            self._opticalnav_copy_observation_files(
+                project_id=project_dir.name,
+                scene_id=scene_id,
+                vp_id=vp_id,
+                heading_id=heading_id,
+                job_id=request.job_id,
+                frame_id=request.frame_id,
+                camera_id=camera_id,
+            )
+            return True
+        return False
+
     def _opticalnav_copy_observation_rgb(self, job: "_QueuedJob") -> None:
         """Copy modality preview PNGs (rgb/depth/etc.) to the consolidated observations dir."""
         try:
@@ -12409,6 +12659,11 @@ class RenderDaemon:
             frame_id = job.render_request.frame_id
             camera_specs = list(getattr(job.render_request, "camera_specs", []) or [])
             camera_id = str(getattr(camera_specs[0], "camera_id", "") or "opticalnav_front_cam") if camera_specs else "opticalnav_front_cam"
+            if self._opticalnav_copy_observation_files(
+                project_id=str(proj_id), scene_id=str(sc_id), vp_id=str(vp_id), heading_id=str(h_id),
+                job_id=job.render_request.job_id, frame_id=frame_id, camera_id=camera_id,
+            ):
+                return
             src_dir = (
                 self.repo_root / "out" / "bridge_jobs" /
                 job.render_request.job_id / "observations" / frame_id /
@@ -12485,13 +12740,13 @@ class RenderDaemon:
         except Exception:
             pass
 
-    def _mark_succeeded(self, job_id: str, *, manifest_path: str) -> None:
+    def _mark_succeeded(self, job_id: str, *, manifest_path: str, event_ts: Any = None) -> None:
         with self._condition:
             job = self._jobs[job_id]
             if job.status.status == "cancelled":
                 return
             job.status.status = "succeeded"
-            job.status.finished_at = _utc_now_iso()
+            job.status.finished_at = _event_ts_iso(event_ts) or _utc_now_iso()
             job.status.progress_stage = "complete"
             job.status.manifest_path = manifest_path
             job.status.error = None
@@ -12505,28 +12760,31 @@ class RenderDaemon:
         with self._condition:
             self._condition.notify_all()
         self._record_render_job_telemetry(job, event_type="complete")
-        self._append_job_log_line(job, event_type="complete", stage="complete", message="Job succeeded")
+        self._append_job_log_line(job, event_type="complete", stage="complete", message="Job succeeded", event_ts=event_ts)
 
-    def _mark_failed(self, job_id: str, error: str) -> None:
+    def _mark_failed(self, job_id: str, error: str, *, event_ts: Any = None) -> None:
         with self._condition:
             job = self._jobs[job_id]
             if job.status.status == "cancelled":
                 return
             job.status.status = "failed"
-            job.status.finished_at = _utc_now_iso()
+            job.status.finished_at = _event_ts_iso(event_ts) or _utc_now_iso()
             job.status.progress_stage = "failed"
             job.status.error = error
             self._condition.notify_all()
         # Disk I/O outside the lock
         self._persist_status_unlocked(job)
         self._record_render_job_telemetry(job, event_type="failed")
-        self._append_job_log_line(job, event_type="failed", stage="failed", message=error or "Job failed")
+        self._append_job_log_line(job, event_type="failed", stage="failed", message=error or "Job failed", event_ts=event_ts)
 
-    def _update_progress(self, job_id: str, stage: str, payload: Mapping[str, Any] | None) -> None:
+    def _update_progress(self, job_id: str, stage: str, payload: Mapping[str, Any] | None, *, event_ts: Any = None) -> None:
         command_id = None
         progress_counts = None
         message = self._isaac_render_stage_message(stage, payload)
         job_for_persist = None
+        should_persist = False
+        now_s = time.monotonic()
+        interval_s = _render_progress_persist_interval_s()
         with self._condition:
             job = self._jobs.get(job_id)
             if job is None or job.status.status != "running":
@@ -12546,14 +12804,19 @@ class RenderDaemon:
                 if stage == "loading_scene" and payload.get("cached"):
                     job.status.extras["scene_cache_hit"] = True
             command_id = _maybe_str(job.status.extras.get("isaac_command_id"))
-            job_for_persist = job
+            should_persist = interval_s == 0.0 or job.last_progress_persist_s == 0.0 or (now_s - job.last_progress_persist_s) >= interval_s
+            if should_persist:
+                job.last_progress_persist_s = now_s
+                job_for_persist = job
             self._condition.notify_all()
-        # Disk I/O outside the lock — prevents blocking HTTP handlers during rendering
+        # Progress events are high-frequency and arrive on the worker stdout
+        # reader thread. Keep most of them in memory only; terminal events still
+        # persist immediately. This prevents status/log/telemetry I/O from
+        # delaying completed events behind stale progress events.
         if job_for_persist is not None:
             self._persist_status_unlocked(job_for_persist)
-            self._record_render_job_telemetry(job_for_persist, event_type="progress")
-            self._append_job_log_line(job_for_persist, event_type="progress", stage=stage, message=message)
-        if command_id:
+            self._append_job_log_line(job_for_persist, event_type="progress", stage=stage, message=message, event_ts=event_ts)
+        if command_id and should_persist:
             try:
                 self._update_isaac_command_progress(
                     command_id,
@@ -12578,11 +12841,11 @@ class RenderDaemon:
     def _job_log_path(self, job_id: str) -> Path:
         return self.repo_root / "out" / "bridge_jobs" / job_id / "render_progress.log"
 
-    def _append_job_log_line(self, job: "_QueuedJob", *, event_type: str, stage: str, message: str) -> None:
+    def _append_job_log_line(self, job: "_QueuedJob", *, event_type: str, stage: str, message: str, event_ts: Any = None) -> None:
         try:
             log_path = self._job_log_path(job.render_request.job_id)
             log_path.parent.mkdir(parents=True, exist_ok=True)
-            ts = _utc_now_iso()
+            ts = _event_ts_iso(event_ts) or _utc_now_iso()
             line = f"[{ts}] [{event_type.upper():<8}] {stage:<25} {message}\n"
             with open(log_path, "a", encoding="utf-8") as fh:
                 fh.write(line)
@@ -14194,6 +14457,8 @@ class RenderDaemon:
             active_stage = running_jobs[0].status.progress_stage if running_jobs else None
             queue_length = len(self._pending)
             variant = self.variant
+            worker_manager = self._render_worker_manager
+        render_workers = worker_manager.health() if worker_manager is not None else None
         session = self._isaac_session
         return {
             "status": "ok",
@@ -14204,6 +14469,7 @@ class RenderDaemon:
             "variant": variant,
             "backend_only": _backend_only_mode(),
             "render_queue_enabled": not _backend_only_mode(),
+            "render_workers": render_workers,
             "isaac_connected": session is not None,
             "isaac_scene_id": session.scene_id if session else None,
             "isaac_opened_at": session.opened_at if session else None,
@@ -14354,23 +14620,31 @@ class RenderDaemon:
         scene_id = request.scene_state.scene_id if request is not None else None
         scene_version = request.scene_state.scene_version if request is not None else None
         age_s: float | None = None
+        elapsed_s: float | None = None
+        queue_wait_s: float | None = None
         is_stuck = False
         ref_ts = status.submitted_at
         if ref_ts:
             try:
                 ref_dt = datetime.fromisoformat(ref_ts).astimezone(_tz.utc)
                 age_s = max(0.0, (_utc_now() - ref_dt).total_seconds())
-                if status.status == "running" and status.started_at:
-                    started_dt = datetime.fromisoformat(status.started_at).astimezone(_tz.utc)
-                    is_stuck = (_utc_now() - started_dt).total_seconds() >= 600.0
             except Exception:
                 pass
+        run_started_at = status.worker_started_at or status.started_at
+        if status.submitted_at and run_started_at:
+            queue_wait_s = self._seconds_between(status.submitted_at, run_started_at)
+        if run_started_at:
+            end_ts = status.finished_at or _utc_now_iso()
+            elapsed_s = self._seconds_between(run_started_at, end_ts)
+            if status.status == "running" and elapsed_s is not None:
+                is_stuck = elapsed_s >= 600.0
         return {
             "job_id": status.job_id,
             "frame_id": status.frame_id,
             "status": status.status,
             "submitted_at": status.submitted_at,
             "started_at": status.started_at,
+            "worker_started_at": status.worker_started_at,
             "finished_at": status.finished_at,
             "progress_stage": status.progress_stage,
             "manifest_path": status.manifest_path,
@@ -14379,6 +14653,8 @@ class RenderDaemon:
             "scene_version": scene_version,
             "queue_position": queue_position,
             "age_s": age_s,
+            "elapsed_s": round(elapsed_s, 2) if elapsed_s is not None else None,
+            "queue_wait_s": round(queue_wait_s, 2) if queue_wait_s is not None else None,
             "is_stuck": is_stuck,
             "extras": dict(status.extras),
         }
@@ -15495,7 +15771,7 @@ class RenderDaemon:
         )
         recent_completed = [
             job for job in jobs
-            if job["status"] == "succeeded" and job.get("started_at") and job.get("finished_at")
+            if job["status"] == "succeeded" and (job.get("worker_started_at") or job.get("started_at")) and job.get("finished_at")
         ][-5:]
         avg_render_time_s: float | None = None
         if recent_completed:
@@ -15506,9 +15782,9 @@ class RenderDaemon:
                 except Exception:
                     return 0.0
             durations = [
-                _parse_ts(j["finished_at"]) - _parse_ts(j["started_at"])
+                _parse_ts(j["finished_at"]) - _parse_ts(j.get("worker_started_at") or j["started_at"])
                 for j in recent_completed
-                if _parse_ts(j["finished_at"]) > _parse_ts(j["started_at"])
+                if _parse_ts(j["finished_at"]) > _parse_ts(j.get("worker_started_at") or j["started_at"])
             ]
             avg_render_time_s = sum(durations) / len(durations) if durations else None
 

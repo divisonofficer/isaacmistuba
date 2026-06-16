@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, fields, replace
 import json
+import time
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
@@ -349,6 +350,7 @@ def render_timestep_bundle(
             artifacts.append(_artifact_manifest_from_result(root, camera_spec, modality, result.results[modality]))
 
     timing_log_path = layout.logs_dir / "render_timing.json"
+    manifest_start = time.perf_counter()
     timing_log_path.write_text(json.dumps(timing_log, indent=2), encoding="utf-8")
 
     bundle_manifest = ObservationBundleManifest(
@@ -376,6 +378,11 @@ def render_timestep_bundle(
             "depth_approx": asdict(render_request.depth_approx) if render_request.depth_approx is not None else None,
         },
     )
+    write_manifest(bundle_manifest, repo_root=root)
+    manifest_s = time.perf_counter() - manifest_start
+    timing_log["manifest_s"] = manifest_s
+    timing_log_path.write_text(json.dumps(timing_log, indent=2), encoding="utf-8")
+    bundle_manifest.extras["manifest_s"] = manifest_s
     write_manifest(bundle_manifest, repo_root=root)
     return bundle_manifest
 
@@ -489,6 +496,7 @@ def render_timestep_bundle_split_lighting(
     timing_log_path = layout.logs_dir / "render_timing.json"
     if progress_callback is not None:
         progress_callback("writing_manifest", {"path": str(timing_log_path)})
+    manifest_start = time.perf_counter()
     timing_log_path.write_text(json.dumps(timing_log, indent=2), encoding="utf-8")
 
     bundle_manifest = ObservationBundleManifest(
@@ -518,6 +526,11 @@ def render_timestep_bundle_split_lighting(
             "branch_modalities": branch_modalities,
         },
     )
+    write_manifest(bundle_manifest, repo_root=root)
+    manifest_s = time.perf_counter() - manifest_start
+    timing_log["manifest_s"] = manifest_s
+    timing_log_path.write_text(json.dumps(timing_log, indent=2), encoding="utf-8")
+    bundle_manifest.extras["manifest_s"] = manifest_s
     write_manifest(bundle_manifest, repo_root=root)
     return bundle_manifest
 

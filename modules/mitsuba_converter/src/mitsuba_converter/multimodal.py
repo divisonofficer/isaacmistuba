@@ -92,6 +92,7 @@ class RenderConfig:
     lidar_max_range_m: float = 80.0
     lidar_wavelength_nm: float = 905.0
     ambient_radiance: float = 1.0
+    write_raw_npz: bool = True
     artifact_stems: dict[str, str] = field(default_factory=dict)
     scene_filenames: dict[str, str] = field(default_factory=dict)
 
@@ -2290,6 +2291,7 @@ def _render_scene(
     # variant is now active; safe to call mi.ScalarTransform4f etc.
 
     sensor = None
+    sensor_build_start = time.perf_counter()
     if viewpoint is not None:
         origin, target, up = camera_to_world_to_lookat(viewpoint.camera_to_world)
         sensor = mi.load_dict({
@@ -2308,6 +2310,7 @@ def _render_scene(
                 "sample_count": 1,
             },
         })
+    sensor_build_s = time.perf_counter() - sensor_build_start
 
     if on_loaded is not None:
         on_loaded()
@@ -2323,6 +2326,7 @@ def _render_scene(
         "variant": variant,
         "load_scene_s": load_s,
         "scene_cache_hit": cache_hit,
+        "sensor_build_s": sensor_build_s,
         "render_s": render_s,
         "total_s": total_s,
     }
@@ -3023,16 +3027,35 @@ def _build_rgb_result(
     timing: dict[str, Any],
     scene_path: Path,
     metadata: Mapping[str, Any] | None = None,
+    write_raw_npz: bool = True,
 ) -> tuple[ModalityResult, dict[str, Any]]:
     exr_path = out_dir / f"{stem}.exr"
     png_path = out_dir / f"{stem}.png"
     raw_path = out_dir / f"{stem}_raw.npz"
 
     save_start = time.perf_counter()
+    exr_start = time.perf_counter()
     _write_bitmap(exr_path, rgb)
+    save_exr_s = time.perf_counter() - exr_start
     preview_percentile = 0.992 if modality == "rgb" else 0.995
+    png_start = time.perf_counter()
     preview = save_rgb_preview(rgb, png_path, percentile=preview_percentile)
-    np.savez_compressed(raw_path, rgb=rgb.astype(np.float32))
+    save_png_s = time.perf_counter() - png_start
+    outputs = {
+        "exr": str(exr_path),
+        "png": str(png_path),
+    }
+    save_npz_s = 0.0
+    raw_npz_removed = False
+    if write_raw_npz:
+        npz_start = time.perf_counter()
+        np.savez_compressed(raw_path, rgb=rgb.astype(np.float32))
+        save_npz_s = time.perf_counter() - npz_start
+        outputs["raw_npz"] = str(raw_path)
+    elif raw_path.exists():
+        raw_path.unlink()
+        raw_npz_removed = True
+    save_s = time.perf_counter() - save_start
     timing_record = {
         "task": "rgb",
         "scene": str(scene_path),
@@ -3040,14 +3063,14 @@ def _build_rgb_result(
         "load_scene_s": timing["load_scene_s"],
         "scene_cache_hit": bool(timing.get("scene_cache_hit", False)),
         "render_s": timing["render_s"],
-        "save_s": time.perf_counter() - save_start,
-        "total_s": timing["total_s"] + (time.perf_counter() - save_start),
+        "save_exr_s": save_exr_s,
+        "save_png_s": save_png_s,
+        "save_npz_s": save_npz_s,
+        "raw_npz_removed": raw_npz_removed,
+        "save_s": save_s,
+        "total_s": timing["total_s"] + save_s,
         "preview": preview,
-        "outputs": {
-            "exr": str(exr_path),
-            "png": str(png_path),
-            "raw_npz": str(raw_path),
-        },
+        "outputs": outputs,
     }
     timing_extras = {
         key: value
@@ -3065,6 +3088,10 @@ def _build_rgb_result(
             "load_scene_s": timing["load_scene_s"],
             "scene_cache_hit": bool(timing.get("scene_cache_hit", False)),
             "render_s": timing["render_s"],
+            "save_exr_s": save_exr_s,
+            "save_png_s": save_png_s,
+            "save_npz_s": save_npz_s,
+            "raw_npz_removed": raw_npz_removed,
             "save_s": timing_record["save_s"],
             "total_s": timing_record["total_s"],
             "scene": str(scene_path),
@@ -3085,6 +3112,7 @@ def _build_grayscale_result(
     timing: dict[str, Any],
     scene_path: Path,
     metadata: Mapping[str, Any] | None = None,
+    write_raw_npz: bool = True,
 ) -> tuple[ModalityResult, dict[str, Any]]:
     exr_path = out_dir / f"{stem}.exr"
     png_path = out_dir / f"{stem}.png"
@@ -3092,10 +3120,27 @@ def _build_grayscale_result(
     rgb = np.repeat(intensity[:, :, None], 3, axis=2).astype(np.float32)
 
     save_start = time.perf_counter()
+    exr_start = time.perf_counter()
     _write_bitmap(exr_path, rgb)
+    save_exr_s = time.perf_counter() - exr_start
     preview_percentile = 0.992 if modality == "active_nir_intensity" else 0.995
+    png_start = time.perf_counter()
     preview = save_rgb_preview(rgb, png_path, percentile=preview_percentile)
-    np.savez_compressed(raw_path, intensity=intensity.astype(np.float32))
+    save_png_s = time.perf_counter() - png_start
+    outputs = {
+        "exr": str(exr_path),
+        "png": str(png_path),
+    }
+    save_npz_s = 0.0
+    raw_npz_removed = False
+    if write_raw_npz:
+        npz_start = time.perf_counter()
+        np.savez_compressed(raw_path, intensity=intensity.astype(np.float32))
+        save_npz_s = time.perf_counter() - npz_start
+        outputs["raw_npz"] = str(raw_path)
+    elif raw_path.exists():
+        raw_path.unlink()
+        raw_npz_removed = True
     save_s = time.perf_counter() - save_start
 
     timing_record = {
@@ -3105,14 +3150,14 @@ def _build_grayscale_result(
         "load_scene_s": timing["load_scene_s"],
         "scene_cache_hit": bool(timing.get("scene_cache_hit", False)),
         "render_s": timing["render_s"],
+        "save_exr_s": save_exr_s,
+        "save_png_s": save_png_s,
+        "save_npz_s": save_npz_s,
+        "raw_npz_removed": raw_npz_removed,
         "save_s": save_s,
         "total_s": timing["total_s"] + save_s,
         "preview": preview,
-        "outputs": {
-            "exr": str(exr_path),
-            "png": str(png_path),
-            "raw_npz": str(raw_path),
-        },
+        "outputs": outputs,
     }
     result = ModalityResult(
         name=modality,
@@ -3124,6 +3169,10 @@ def _build_grayscale_result(
             "load_scene_s": timing["load_scene_s"],
             "scene_cache_hit": bool(timing.get("scene_cache_hit", False)),
             "render_s": timing["render_s"],
+            "save_exr_s": save_exr_s,
+            "save_png_s": save_png_s,
+            "save_npz_s": save_npz_s,
+            "raw_npz_removed": raw_npz_removed,
             "save_s": save_s,
             "total_s": timing_record["total_s"],
             "scene": str(scene_path),
@@ -3266,14 +3315,41 @@ def _compose_derived_result(
     *,
     timing_seed: dict[str, Any],
     dependencies: dict[str, str],
+    write_raw_npz: bool = True,
 ) -> ModalityResult:
     stem = modality
     exr_path = out_dir / f"{stem}.exr"
     png_path = out_dir / f"{stem}.png"
     raw_path = out_dir / f"{stem}_raw.npz"
+    save_start = time.perf_counter()
+    exr_start = time.perf_counter()
     _write_bitmap(exr_path, array)
+    save_exr_s = time.perf_counter() - exr_start
+    png_start = time.perf_counter()
     preview = save_rgb_preview(array, png_path)
-    np.savez_compressed(raw_path, rgb=array.astype(np.float32))
+    save_png_s = time.perf_counter() - png_start
+    artifacts = {
+        "exr": str(exr_path),
+        "png": str(png_path),
+    }
+    save_npz_s = 0.0
+    raw_npz_removed = False
+    if write_raw_npz:
+        npz_start = time.perf_counter()
+        np.savez_compressed(raw_path, rgb=array.astype(np.float32))
+        save_npz_s = time.perf_counter() - npz_start
+        artifacts["raw_npz"] = str(raw_path)
+    elif raw_path.exists():
+        raw_path.unlink()
+        raw_npz_removed = True
+    timing = dict(timing_seed)
+    timing.update({
+        "save_exr_s": save_exr_s,
+        "save_png_s": save_png_s,
+        "save_npz_s": save_npz_s,
+        "raw_npz_removed": raw_npz_removed,
+        "save_s": time.perf_counter() - save_start,
+    })
     return ModalityResult(
         name=modality,
         array=array.astype(np.float32),
@@ -3282,12 +3358,8 @@ def _compose_derived_result(
             "preview": preview,
             "dependencies": dependencies,
         },
-        timing=dict(timing_seed),
-        artifacts={
-            "exr": str(exr_path),
-            "png": str(png_path),
-            "raw_npz": str(raw_path),
-        },
+        timing=timing,
+        artifacts=artifacts,
     )
 
 
@@ -3560,6 +3632,7 @@ def render_modalities(
             plugin_error: str | None = None
             if use_channel_rgb_plugin:
                 try:
+                    stage_start = time.perf_counter()
                     _cb("staging_scene", {
                         "pass": "rgb",
                         "channel_rgb_plugin": True,
@@ -3592,6 +3665,7 @@ def render_modalities(
                             channel_rgb_plugin=True,
                         )
                     staged_scenes["rgb"] = str(scene_rgb)
+                    stage_s = time.perf_counter() - stage_start
                     image, timing = _render_pass(
                         scene_rgb,
                         pass_name="rgb",
@@ -3599,6 +3673,7 @@ def render_modalities(
                         viewpoint=_viewpoint if _use_scene_reuse else None,
                     )
                     timing["spp"] = config.path_spp
+                    timing["stage_s"] = stage_s
                     timing["channel_rgb_plugin"] = True
                     timing["channel_split_rgb"] = True
                     timing["channel_wavelengths_nm"] = {label: nm for label, nm in _RGB_CHANNEL_SPLIT_WAVELENGTHS_NM}
@@ -3621,6 +3696,7 @@ def render_modalities(
                 channel_timings: dict[str, dict[str, Any]] = {}
                 channel_scenes: dict[str, Path] = {}
                 for label, wavelength_nm in _RGB_CHANNEL_SPLIT_WAVELENGTHS_NM:
+                    stage_start = time.perf_counter()
                     _cb("staging_scene", {
                         "pass": "rgb",
                         "channel": label,
@@ -3656,6 +3732,7 @@ def render_modalities(
                         )
                     staged_scenes[f"rgb_{label}"] = str(scene_channel)
                     channel_scenes[label] = scene_channel
+                    stage_s = time.perf_counter() - stage_start
                     image, channel_timing = _render_pass(
                         scene_channel,
                         pass_name=f"rgb_{label}_{wavelength_nm}nm",
@@ -3663,6 +3740,7 @@ def render_modalities(
                         viewpoint=_viewpoint if _use_scene_reuse else None,
                     )
                     channel_timing["spp"] = config.path_spp
+                    channel_timing["stage_s"] = stage_s
                     channel_timing["channel"] = label
                     channel_timing["wavelength_nm"] = wavelength_nm
                     channel_timing["channel_split_rgb"] = True
@@ -3681,6 +3759,7 @@ def render_modalities(
                 if plugin_error is not None:
                     timing["channel_rgb_plugin_error"] = plugin_error
         else:
+            stage_start = time.perf_counter()
             _cb("staging_scene", {"pass": "rgb"})
             if _use_scene_reuse:
                 scene_rgb = _stage_base_path_scene(
@@ -3707,11 +3786,13 @@ def render_modalities(
                     ambient_radiance=config.ambient_radiance,
                 )
             staged_scenes["rgb"] = str(scene_rgb)
+            stage_s = time.perf_counter() - stage_start
             image, timing = _render_pass(
                 scene_rgb, pass_name="rgb", spp=config.path_spp,
                 viewpoint=_viewpoint if _use_scene_reuse else None,
             )
             timing["spp"] = config.path_spp
+            timing["stage_s"] = stage_s
             rgb = image[:, :, :3] if image.ndim == 3 else np.repeat(image[:, :, None], 3, axis=2)
         rgb_result, rgb_record = _build_rgb_result(
             "rgb",
@@ -3731,12 +3812,14 @@ def render_modalities(
                     "channel_wavelengths_nm": {label: nm for label, nm in _RGB_CHANNEL_SPLIT_WAVELENGTHS_NM},
                 } if use_channel_split_rgb else None,
             ),
+            write_raw_npz=config.write_raw_npz,
         )
         pass_records["rgb"] = rgb_record
         if "rgb" in requested_set:
             results["rgb"] = rgb_result
 
     if _needs_direct(requested_set):
+        stage_start = time.perf_counter()
         _cb("staging_scene", {"pass": "direct_light_map"})
         if _use_scene_reuse:
             scene_direct = _stage_base_path_scene(
@@ -3763,11 +3846,13 @@ def render_modalities(
                 ambient_radiance=config.ambient_radiance,
             )
         staged_scenes["direct_light_map"] = str(scene_direct)
+        stage_s = time.perf_counter() - stage_start
         image, timing = _render_pass(
             scene_direct, pass_name="direct_light_map", spp=config.path_spp,
             viewpoint=_viewpoint if _use_scene_reuse else None,
         )
         timing["spp"] = config.path_spp
+        timing["stage_s"] = stage_s
         rgb = image[:, :, :3] if image.ndim == 3 else np.repeat(image[:, :, None], 3, axis=2)
         direct_result, direct_record = _build_rgb_result(
             "direct_light_map",
@@ -3780,12 +3865,14 @@ def render_modalities(
                 illumination_tag="ambient_room",
                 scene_override=scene_override,
             ),
+            write_raw_npz=config.write_raw_npz,
         )
         pass_records["direct_light_map"] = direct_record
         if "direct_light_map" in requested_set:
             results["direct_light_map"] = direct_result
 
     if _needs_diffuse(requested_set):
+        stage_start = time.perf_counter()
         _cb("staging_scene", {"pass": "diffuse_map"})
         if _use_scene_reuse:
             scene_diffuse = _stage_base_diffuse_override_scene(
@@ -3812,11 +3899,13 @@ def render_modalities(
                 ambient_radiance=config.ambient_radiance,
             )
         staged_scenes["diffuse_map"] = str(scene_diffuse)
+        stage_s = time.perf_counter() - stage_start
         image, timing = _render_pass(
             scene_diffuse, pass_name="diffuse_map", spp=config.path_spp,
             viewpoint=_viewpoint if _use_scene_reuse else None,
         )
         timing["spp"] = config.path_spp
+        timing["stage_s"] = stage_s
         rgb = image[:, :, :3] if image.ndim == 3 else np.repeat(image[:, :, None], 3, axis=2)
         diffuse_result, diffuse_record = _build_rgb_result(
             "diffuse_map",
@@ -3829,6 +3918,7 @@ def render_modalities(
                 illumination_tag="ambient_room",
                 scene_override=scene_override,
             ),
+            write_raw_npz=config.write_raw_npz,
         )
         pass_records["diffuse_map"] = diffuse_record
         if "diffuse_map" in requested_set:
@@ -4100,6 +4190,7 @@ def render_modalities(
                     "mask_pixels": int(np.count_nonzero(hazard_mask)),
                 },
             ),
+            write_raw_npz=config.write_raw_npz,
         )
         mask_result.raw_channels["mask"] = hazard_mask.astype(bool)
         pass_records["hazard_mask"] = mask_record
@@ -4158,6 +4249,7 @@ def render_modalities(
                 scene_override=scene_override,
                 assist_light=assist_light,
             ),
+            write_raw_npz=config.write_raw_npz,
         )
         pass_records["active_nir_intensity"] = nir_record
         if "active_nir_intensity" in requested_set:
@@ -4372,11 +4464,12 @@ def render_modalities(
                 artifacts={**shared_artifacts, "png": summary["outputs"]["s2"]},
             )
 
+    total_arr = results["rgb"].array.astype(np.float32) if "rgb" in results else None
+    direct_arr = results["direct_light_map"].array.astype(np.float32) if "direct_light_map" in results else None
+    diffuse_arr = results["diffuse_map"].array.astype(np.float32) if "diffuse_map" in results else None
     if "indirect_light_map" in requested_set:
-        total_rgb = pass_records["rgb"]["outputs"]["raw_npz"]
-        direct_rgb = pass_records["direct_light_map"]["outputs"]["raw_npz"]
-        total_arr = np.load(total_rgb)["rgb"].astype(np.float32)
-        direct_arr = np.load(direct_rgb)["rgb"].astype(np.float32)
+        if total_arr is None or direct_arr is None:
+            raise RuntimeError("indirect_light_map requires rgb and direct_light_map source arrays.")
         indirect = np.clip(total_arr - direct_arr, 0.0, None)
         results["indirect_light_map"] = _compose_derived_result(
             "indirect_light_map",
@@ -4386,15 +4479,14 @@ def render_modalities(
                 "source_results": ["rgb", "direct_light_map"],
             },
             dependencies={
-                "rgb": total_rgb,
-                "direct_light_map": direct_rgb,
+                "rgb": pass_records["rgb"]["outputs"].get("raw_npz", pass_records["rgb"]["outputs"]["exr"]),
+                "direct_light_map": pass_records["direct_light_map"]["outputs"].get("raw_npz", pass_records["direct_light_map"]["outputs"]["exr"]),
             },
+            write_raw_npz=config.write_raw_npz,
         )
     if "specular_map" in requested_set:
-        total_rgb = pass_records["rgb"]["outputs"]["raw_npz"]
-        diffuse_rgb = pass_records["diffuse_map"]["outputs"]["raw_npz"]
-        total_arr = np.load(total_rgb)["rgb"].astype(np.float32)
-        diffuse_arr = np.load(diffuse_rgb)["rgb"].astype(np.float32)
+        if total_arr is None or diffuse_arr is None:
+            raise RuntimeError("specular_map requires rgb and diffuse_map source arrays.")
         specular = np.clip(total_arr - diffuse_arr, 0.0, None)
         results["specular_map"] = _compose_derived_result(
             "specular_map",
@@ -4404,15 +4496,13 @@ def render_modalities(
                 "source_results": ["rgb", "diffuse_map"],
             },
             dependencies={
-                "rgb": total_rgb,
-                "diffuse_map": diffuse_rgb,
+                "rgb": pass_records["rgb"]["outputs"].get("raw_npz", pass_records["rgb"]["outputs"]["exr"]),
+                "diffuse_map": pass_records["diffuse_map"]["outputs"].get("raw_npz", pass_records["diffuse_map"]["outputs"]["exr"]),
             },
+            write_raw_npz=config.write_raw_npz,
         )
 
     if any(modality in requested_set for modality in ("indirect_light_map", "specular_map")):
-        total_arr = np.load(pass_records["rgb"]["outputs"]["raw_npz"])["rgb"].astype(np.float32) if "rgb" in pass_records else None
-        direct_arr = np.load(pass_records["direct_light_map"]["outputs"]["raw_npz"])["rgb"].astype(np.float32) if "direct_light_map" in pass_records else None
-        diffuse_arr = np.load(pass_records["diffuse_map"]["outputs"]["raw_npz"])["rgb"].astype(np.float32) if "diffuse_map" in pass_records else None
         pass_records["derived"] = {
             "assumptions": {
                 "direct_light_map": "Path tracer with max_depth=2.",

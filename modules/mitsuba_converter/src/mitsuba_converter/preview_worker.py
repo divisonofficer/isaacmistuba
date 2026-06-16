@@ -164,6 +164,7 @@ def _release_scene_load_slot(slot: Path | None, *, job_id: str) -> None:
 
 def _emit(event: dict[str, Any]) -> None:
     """Write one JSON line to stdout. Thread-safe; never raises."""
+    event.setdefault("ts", time.time())
     try:
         line = json.dumps(event, ensure_ascii=False)
     except (TypeError, ValueError) as exc:

@@ -426,6 +426,7 @@
 	let seed = $state(0);
 	let backend = $state('daemon');
 	let renderMode = $state('graph_sweep');
+	let renderMissingOnly = $state(true);
 	let renderSplit = $state('train');
 	let maxNodes = $state(300);
 	let minClearance = $state(0.1);
@@ -3069,6 +3070,7 @@
 		if (Object.keys(graphNodeHeights).length) body.node_heights = { ...graphNodeHeights };
 		if (isGraphSweepRenderMode(renderMode)) {
 			if (!sceneId) return;
+			body.skip_existing_observations = renderMissingOnly;
 			if (renderMode === 'episode_nodes') {
 				// Filter to the selected episode's graph nodes; backend's
 				// build_sweep_render_requests already honours node_ids.
@@ -3936,6 +3938,8 @@
 					onRenderEpisodeNodes={() => renderEpisodes('episode_nodes')}
 					{episodeNodesAvailable}
 					{episodePathNodeCount}
+					{renderMissingOnly}
+					onSetRenderMissingOnly={(v) => (renderMissingOnly = v)}
 					headingsPerNode={graphPayload?.node_heading_count ?? 0}
 					onRefreshBatch={refreshBatch}
 					onRemoveCustomSensor={(id) => { customSensorNodes = customSensorNodes.filter(n => n.id !== id); }}
@@ -4343,6 +4347,8 @@
 				onRenderEpisodeNodes={() => renderEpisodes('episode_nodes')}
 				{episodeNodesAvailable}
 				{episodePathNodeCount}
+				{renderMissingOnly}
+				onSetRenderMissingOnly={(v) => (renderMissingOnly = v)}
 				headingsPerNode={graphPayload?.node_heading_count ?? 0}
 				{renderSceneSynced}
 			/>
@@ -4380,6 +4386,8 @@
 				onRenderEpisodeNodes={() => renderEpisodes('episode_nodes')}
 				{episodeNodesAvailable}
 				{episodePathNodeCount}
+				{renderMissingOnly}
+				onSetRenderMissingOnly={(v) => (renderMissingOnly = v)}
 				headingsPerNode={graphPayload?.node_heading_count ?? 0}
 				onRefreshBatch={() => refreshBatch()}
 				onRefreshStats={refreshRenderSceneStats}

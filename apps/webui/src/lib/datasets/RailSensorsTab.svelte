@@ -60,6 +60,8 @@
 		onRenderViewpoint: () => void;
 		onRenderEpisodes: () => void;
 		onRenderEpisodeNodes?: () => void;
+		renderMissingOnly?: boolean;
+		onSetRenderMissingOnly?: (value: boolean) => void;
 		episodeNodesAvailable?: boolean;
 		episodePathNodeCount?: number;
 		headingsPerNode?: number;
@@ -83,6 +85,7 @@
 		onRemoveCustomSensor, onCustomSensorHeadingChange, onLoadRenderConfig,
 		onSetSensorHeight, onSetAmbientRadiance, onClearNodeObservations, onClearAllObservations,
 		onRenderViewpoint, onRenderEpisodes, onRenderEpisodeNodes,
+		renderMissingOnly = true, onSetRenderMissingOnly,
 		episodeNodesAvailable = false, episodePathNodeCount = 0, headingsPerNode = 0,
 		onRefreshBatch, onRefreshStats, onSetShowRoomShell,
 	}: Props = $props();
@@ -244,8 +247,12 @@
 			onclick={onRenderViewpoint}>
 			{renderingViewpoint ? 'Sweeping...' : 'Graph Sweep · this viewpoint'}
 		</button>
+		<label class="sensor-resume-row" title="Skip viewpoints/headings that already have consolidated outputs or a completed bridge-job manifest.">
+			<input type="checkbox" checked={renderMissingOnly} onchange={(e) => onSetRenderMissingOnly?.((e.currentTarget as HTMLInputElement).checked)} />
+			<span>Only missing renders</span>
+		</label>
 		<button class="button button-subtle full" disabled={loading || !selectedProjectId || !renderSceneSynced || !hasGraph} onclick={onRenderEpisodes}>
-			Graph Sweep · all viewpoints
+			{renderMissingOnly ? 'Graph Sweep · missing only' : 'Graph Sweep · all viewpoints'}
 		</button>
 		{#if onRenderEpisodeNodes}
 			<button class="button button-subtle full"

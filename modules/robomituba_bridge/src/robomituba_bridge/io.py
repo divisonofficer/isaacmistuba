@@ -136,7 +136,7 @@ def _render_job_accepted_from_dict(payload: Dict[str, Any]) -> RenderJobAccepted
 
 
 def _render_job_status_from_dict(payload: Dict[str, Any]) -> RenderJobStatus:
-    return RenderJobStatus(**payload)
+    return RenderJobStatus(**_dataclass_kwargs(RenderJobStatus, payload))
 
 
 def scene_snapshot_to_payload(snapshot: SceneSnapshot) -> Dict[str, Any]:

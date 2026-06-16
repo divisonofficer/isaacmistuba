@@ -1,6 +1,6 @@
 <script lang="ts">
 	import JobTimeline from '$lib/datasets/JobTimeline.svelte';
-	import { compactDetail, jobStatusClass, normalizeJobStatus } from '$lib/datasets/batchHelpers';
+	import { compactDetail, formatJobRunDuration, jobStatusClass, normalizeJobStatus } from '$lib/datasets/batchHelpers';
 
 	interface Props {
 		job: any;
@@ -18,7 +18,7 @@
 	const status = $derived(normalizeJobStatus(job));
 	const textureAudit = $derived(job?.status?.extras?.texture_audit);
 	const textureProfile = $derived(job?.status?.extras?.texture_profile ?? textureAudit?.texture_profile);
-	const duration = $derived(job?.status?.started_at && job?.status?.finished_at ? `${Math.max(0, Math.round((Date.parse(job.status.finished_at) - Date.parse(job.status.started_at)) / 1000))}s` : '');
+	const duration = $derived(formatJobRunDuration(job));
 	const errorText = $derived(String(job?.status?.error ?? job?.error ?? ''));
 
 	function retryCurrent() {
