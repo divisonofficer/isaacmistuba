@@ -49,3 +49,7 @@ related_works/
 docs/sensor_docs/
 dev_report/images/
 *.Zone.Identifier
+
+# Infinigen 벤더 체크아웃(번들 Blender 포함, ~320MB) + 생성 출력 — 추적 안 함
+modules/infinigen/
+data/infinigen_generated/
