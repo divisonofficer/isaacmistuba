@@ -177,6 +177,37 @@ def _utc_now_iso() -> str:
     return _utc_now().isoformat(timespec="seconds")
 
 
+def _log_graph_edit(handler: Any, project_dir: "Path", scene_id: str, event: dict[str, Any]) -> None:
+    """Best-effort: append one human graph-edit event to the scene's history jsonl.
+
+    Records the manual viewpoint-graph (path) edit as training/analysis data for
+    improving auto path generation. Never raises — logging must not break the edit.
+    Common context (project/scene/source/session/client) is added here; callers pass
+    the operation-specific delta + algorithm-view fields.
+    """
+    try:
+        from navigation_dataset.graph_edit_log import append_graph_edit
+        scene_dir = Path(project_dir) / "scenes" / str(scene_id)
+        session_id = None
+        client_ip = None
+        try:
+            session_id = handler.headers.get("X-Edit-Session") if getattr(handler, "headers", None) else None
+            client_ip = handler.client_address[0] if getattr(handler, "client_address", None) else None
+        except Exception:  # noqa: BLE001
+            pass
+        enriched = {
+            "project_id": Path(project_dir).name,
+            "scene_id": str(scene_id),
+            "source": "manual_editor",
+            "session_id": session_id,
+            "client_ip": client_ip,
+            **event,
+        }
+        append_graph_edit(scene_dir, enriched, ts=_utc_now_iso())
+    except Exception:  # noqa: BLE001 — logging is strictly best-effort
+        pass
+
+
 def _event_ts_iso(value: Any) -> str | None:
     try:
         return datetime.fromtimestamp(float(value), tz=timezone.utc).isoformat(timespec="seconds")
@@ -1451,28 +1482,52 @@ def _scan_obj_bounds_and_faces(path: Path) -> dict[str, Any]:
 
 def _preview_architecture_kind(shape_id: str, rec: Mapping[str, Any] | None, mesh_info: Mapping[str, Any]) -> str | None:
     extras = rec.get("extras") if isinstance(rec, Mapping) and isinstance(rec.get("extras"), Mapping) else {}
-    tokens = " ".join(
+
+    def _basename(value: Any) -> str:
+        text = str(value or "")
+        if "#" in text:
+            text = text.rsplit("#", 1)[-1]
+        return Path(text).name
+
+    name_tokens = " ".join(
         str(v or "")
         for v in (
             shape_id,
             rec.get("object_id") if isinstance(rec, Mapping) else None,
             rec.get("label") if isinstance(rec, Mapping) else None,
             rec.get("type") if isinstance(rec, Mapping) else None,
-            rec.get("source_ref") if isinstance(rec, Mapping) else None,
-            rec.get("material_id") if isinstance(rec, Mapping) else None,
+            _basename(rec.get("source_ref") if isinstance(rec, Mapping) else None),
             extras.get("mesh_name") if isinstance(extras, Mapping) else None,
-            extras.get("mesh_prim_path") if isinstance(extras, Mapping) else None,
-            extras.get("material_class") if isinstance(extras, Mapping) else None,
-            extras.get("render_material_id") if isinstance(extras, Mapping) else None,
+            _basename(extras.get("mesh_prim_path") if isinstance(extras, Mapping) else None),
         )
     ).lower()
-    if any(tok in tokens for tok in ("ceiling", "roof")):
+    material_id = str(rec.get("material_id") or "").lower() if isinstance(rec, Mapping) else ""
+
+    # Guard common movable/prop factories before architecture checks. Infinigen
+    # imports often use type=landmark and paths like indoor_seed2; substring tests
+    # on the whole path previously matched "door" inside "indoor" and classified
+    # nearly everything as architecture.
+    non_arch_tokens = (
+        "chair", "table", "desk", "shelf", "cabinet", "sofa", "couch", "bed",
+        "comforter", "pillow", "book", "bottle", "bowl", "cup", "plate", "fork",
+        "spoon", "chopstick", "plant", "vase", "lamp", "light", "monitor",
+        "keyboard", "mouse", "printer", "toilet", "sink", "stove", "fridge",
+        "door",
+    )
+    if any(tok in name_tokens for tok in non_arch_tokens):
+        return None
+
+    arch_text = name_tokens
+    if material_id in {"default_floor", "default_wall", "default_ceiling"}:
+        arch_text += f" {material_id}"
+
+    if any(tok in arch_text for tok in ("ceiling", "roof")):
         return "ceiling"
-    if any(tok in tokens for tok in ("floor", "ground", "slab", "tile")):
+    if any(tok in arch_text for tok in ("floor", "ground", "slab", "tile")):
         return "floor"
-    if any(tok in tokens for tok in ("wall", "shell", "partition")):
+    if any(tok in arch_text for tok in ("wall", "shell", "partition")):
         return "wall"
-    if any(tok in tokens for tok in ("glass", "window", "door", "pane")):
+    if any(tok in arch_text for tok in ("glass", "window", "pane")):
         return "glass"
 
     bounds = mesh_info.get("bounds") if isinstance(mesh_info, Mapping) else None
@@ -1481,13 +1536,11 @@ def _preview_architecture_kind(shape_id: str, rec: Mapping[str, Any] | None, mes
         sx, sy, sz = [float(v or 0.0) for v in size[:3]]
         max_xz = max(sx, sz, 1e-6)
         min_xz = max(min(sx, sz), 1e-6)
-        face_count = int(mesh_info.get("face_count") or 0)
-        # Conservative geometry fallback: catch room-scale planes/walls only.
+        # Geometry fallback only catches very large room-scale surfaces. Do not
+        # infer architecture from polygon count alone; furniture can be very dense.
         if max_xz >= 8.0 and sy <= max_xz * 0.06:
             return "floor"
         if sy >= 1.5 and max_xz >= 5.0 and min_xz <= max_xz * 0.08:
-            return "wall"
-        if face_count > 150000 and max(sx, sy, sz) >= 10.0:
             return "wall"
     return None
 
@@ -1540,6 +1593,7 @@ def _build_editor_preview_mesh_manifest(
         "target_faces": target_faces,
         "ready": 0,
         "skipped_small": 0,
+        "skipped_full_mesh": 0,
         "architecture_proxy": 0,
         "failed": 0,
         "unavailable": 0,
@@ -1587,30 +1641,34 @@ def _build_editor_preview_mesh_manifest(
         face_count = int(mesh_info.get("face_count") or 0)
         rec = mat_by_shape.get(shape_id)
         arch_kind = _preview_architecture_kind(shape_id, rec, mesh_info)
-        if arch_kind:
-            by_shape[shape_id] = {
-                "preview_mesh_status": "architecture_proxy",
-                "preview_mesh_reason": f"classified_{arch_kind}",
-                "source_mesh_faces": face_count,
-                "editor_layer": "architecture",
-                "editor_pickable": False,
-                "editor_proxy": {
-                    "kind": arch_kind,
-                    "bounds": mesh_info.get("bounds"),
-                    "material_hint": rec.get("material_id") if isinstance(rec, Mapping) else None,
-                },
-            }
-            stats["architecture_proxy"] += 1
-            continue
+        is_architecture = bool(arch_kind)
+        editor_layer = "architecture" if is_architecture else "object"
+        editor_pickable = not is_architecture
+        editor_proxy = {
+            "kind": arch_kind,
+            "bounds": mesh_info.get("bounds"),
+            "material_hint": rec.get("material_id") if isinstance(rec, Mapping) else None,
+        } if is_architecture else None
         if face_count <= 0:
-            by_shape[shape_id] = {
-                "preview_mesh_status": "failed",
-                "preview_mesh_reason": mesh_info.get("error") or "face_count_unavailable",
-                "source_mesh_faces": face_count,
-                "editor_layer": "object",
-                "editor_pickable": True,
-            }
-            stats["failed"] += 1
+            if is_architecture:
+                by_shape[shape_id] = {
+                    "preview_mesh_status": "architecture_proxy",
+                    "preview_mesh_reason": mesh_info.get("error") or f"classified_{arch_kind}_face_count_unavailable",
+                    "source_mesh_faces": face_count,
+                    "editor_layer": editor_layer,
+                    "editor_pickable": editor_pickable,
+                    "editor_proxy": editor_proxy,
+                }
+                stats["architecture_proxy"] += 1
+            else:
+                by_shape[shape_id] = {
+                    "preview_mesh_status": "failed",
+                    "preview_mesh_reason": mesh_info.get("error") or "face_count_unavailable",
+                    "source_mesh_faces": face_count,
+                    "editor_layer": editor_layer,
+                    "editor_pickable": editor_pickable,
+                }
+                stats["failed"] += 1
             continue
         if face_count <= target_faces:
             ref = _preview_mesh_ref_for_path(src, repo_root)
@@ -1619,8 +1677,9 @@ def _build_editor_preview_mesh_manifest(
                 "preview_mesh_faces": face_count,
                 "source_mesh_faces": face_count,
                 "preview_mesh_status": "skipped_small",
-                "editor_layer": "object",
-                "editor_pickable": True,
+                "editor_layer": editor_layer,
+                "editor_pickable": editor_pickable,
+                **({"editor_proxy": editor_proxy} if editor_proxy else {}),
             }
             stats["skipped_small"] += 1
             continue
@@ -1651,19 +1710,48 @@ def _build_editor_preview_mesh_manifest(
                 "preview_mesh_faces": preview_faces,
                 "source_mesh_faces": face_count,
                 "preview_mesh_status": "ready",
-                "editor_layer": "object",
-                "editor_pickable": True,
+                "editor_layer": editor_layer,
+                "editor_pickable": editor_pickable,
+                **({"editor_proxy": editor_proxy} if editor_proxy else {}),
             }
             stats["ready"] += 1
         else:
-            by_shape[shape_id] = {
-                "preview_mesh_status": "failed",
-                "preview_mesh_reason": reason or "decimation_failed",
-                "source_mesh_faces": face_count,
-                "editor_layer": "object",
-                "editor_pickable": True,
-            }
-            stats["failed"] += 1
+            if is_architecture:
+                try:
+                    src_size = src.stat().st_size
+                except OSError:
+                    src_size = 0
+                if src_size and src_size <= 16 * 1024 * 1024:
+                    by_shape[shape_id] = {
+                        "preview_mesh_path": _preview_mesh_ref_for_path(src, repo_root),
+                        "preview_mesh_faces": face_count,
+                        "source_mesh_faces": face_count,
+                        "preview_mesh_status": "skipped_full_mesh",
+                        "preview_mesh_reason": reason or f"classified_{arch_kind}_decimation_failed_using_full_mesh",
+                        "editor_layer": editor_layer,
+                        "editor_pickable": editor_pickable,
+                        "editor_proxy": editor_proxy,
+                    }
+                    stats["skipped_full_mesh"] += 1
+                else:
+                    by_shape[shape_id] = {
+                        "preview_mesh_status": "architecture_proxy",
+                        "preview_mesh_reason": reason or f"classified_{arch_kind}_decimation_failed",
+                        "source_mesh_faces": face_count,
+                        "editor_layer": editor_layer,
+                        "editor_pickable": editor_pickable,
+                        "editor_proxy": editor_proxy,
+                    }
+                    stats["architecture_proxy"] += 1
+            else:
+                by_shape[shape_id] = {
+                    "preview_mesh_status": "failed",
+                    "preview_mesh_reason": reason or "decimation_failed",
+                    "source_mesh_faces": face_count,
+                    "editor_layer": editor_layer,
+                    "editor_pickable": editor_pickable,
+                }
+                stats["failed"] += 1
     return {"version": _PREVIEW_MESH_CACHE_VERSION, "stats": stats, "shapes": by_shape}
 
 
@@ -10452,6 +10540,17 @@ class RenderDaemon:
                     },
                 )
                 graph_path = write_viewpoint_graph(project_dir / "scenes" / scene_id / "viewpoint_graph.json", graph)
+                _log_graph_edit(handler, project_dir, scene_id, {
+                    "operation": "build_graph",
+                    "graph_id": graph.graph_id,
+                    "before": {"nodes": 0, "edges": 0},
+                    "after": {"nodes": len(nodes), "edges": len(edges)},
+                    "params": dict(graph.metadata),  # full sampler/edge-builder config snapshot
+                    "algo_context": {
+                        "manual_nodes": sum(1 for n in nodes if (n.extras or {}).get("manual")),
+                        "hazard_edges": sum(1 for e in edges if getattr(e, "hazard_crossing", False)),
+                    },
+                })
             except Exception as exc:
                 err_state = {"stage": "error", "progress": 0.0, "status": "error", "error": str(exc)}
                 with self._graph_build_lock:
@@ -10501,6 +10600,7 @@ class RenderDaemon:
                 return True
             try:
                 graph = read_viewpoint_graph(graph_file)
+                _before_edges = len(graph.edges)
                 meta = graph.metadata or {}
                 annotation_path = scene_dir / "scene_annotation.json"
                 grid_path = scene_dir / "traversable_grid.npy"
@@ -10536,6 +10636,19 @@ class RenderDaemon:
                 meta["edges_rebuilt_at"] = _utc_now_iso()
                 graph.metadata = meta
                 write_viewpoint_graph(graph_file, graph)
+                _log_graph_edit(handler, project_dir, scene_id, {
+                    "operation": "rebuild_edges",
+                    "graph_id": graph.graph_id,
+                    "before": {"nodes": len(graph.nodes), "edges": _before_edges},
+                    "after": {"nodes": len(graph.nodes), "edges": len(graph.edges)},
+                    "params": {"resolution": grid_resolution, "robot_radius_m": robot_radius,
+                               "k_neighbors": k_neighbors, "max_edge_length_m": max_edge,
+                               "preserve_manual_edges": bool(payload.get("preserve_manual_edges", True))},
+                    "algo_context": {
+                        "manual_preserved_count": sum(1 for e in graph.edges if (e.extras or {}).get("manual") or str(e.edge_id).startswith("edge_manual")),
+                        "hazard_edges": sum(1 for e in graph.edges if getattr(e, "hazard_crossing", False)),
+                    },
+                })
                 self._send_json(handler, HTTPStatus.OK, {
                     "scene_id": scene_id,
                     "graph_id": graph.graph_id,
@@ -10555,14 +10668,24 @@ class RenderDaemon:
                 self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": "viewpoint_graph.json not found"})
                 return True
             try:
+                from navigation_dataset.graph_edit_log import graph_size as _gsz, nearest_node_distance as _nnd
                 graph = read_viewpoint_graph(graph_path)
+                _before = _gsz(graph)
+                x = float(payload.get("x", 0.0))
+                y = float(payload.get("y", 0.0))
                 node = append_manual_node(
-                    graph,
-                    float(payload.get("x", 0.0)),
-                    float(payload.get("y", 0.0)),
+                    graph, x, y,
                     heading_count=int(payload["heading_count"]) if payload.get("heading_count") is not None else None,
                 )
                 write_viewpoint_graph(graph_path, graph)
+                _log_graph_edit(handler, project_dir, scene_id, {
+                    "operation": "add_node",
+                    "graph_id": getattr(graph, "graph_id", None),
+                    "before": _before, "after": _gsz(graph),
+                    "params": {"x": x, "y": y, "heading_count": payload.get("heading_count")},
+                    "added_node": {"id": node.node_id, "position": [x, y], "headings": len(node.headings)},
+                    "algo_context": {"nearest_existing_node_m": _nnd(graph, x, y, exclude=[node.node_id])},
+                })
                 self._send_json(handler, HTTPStatus.OK, {"node_id": node.node_id, "position": node.position, "headings": len(node.headings)})
             except Exception as exc:
                 self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
@@ -10652,6 +10775,7 @@ class RenderDaemon:
                 return True
             try:
                 graph = read_viewpoint_graph(graph_path)
+                _before_edges_regen = len(graph.edges)
                 grid = load_traversability_grid(grid_path)
                 # Build a region mask that's only true inside the requested bbox.
                 from navigation_dataset.traversability import world_to_cell as _w2c
@@ -10706,6 +10830,21 @@ class RenderDaemon:
                     kept_edges.append(e)
                 graph.edges = kept_edges
                 write_viewpoint_graph(graph_path, graph)
+                _log_graph_edit(handler, project_dir, scene_id, {
+                    "operation": "regenerate_region",
+                    "graph_id": getattr(graph, "graph_id", None),
+                    "before": {"nodes": before, "edges": _before_edges_regen},
+                    "after": {"nodes": len(graph.nodes), "edges": len(graph.edges)},
+                    "params": {"bbox": [bb_min_x, bb_min_y, bb_max_x, bb_max_y],
+                               "max_nodes": int(payload.get("max_nodes") or 60),
+                               "min_node_spacing_m": float(payload.get("min_node_spacing_m") or 0.5),
+                               "min_clearance_m": float(payload.get("min_clearance_m") or 0.0),
+                               "robot_radius_m": float(payload.get("robot_radius_m") or 0.25),
+                               "heading_count": int(payload.get("heading_count") or 8),
+                               "seed": int(payload.get("seed") or 0)},
+                    "algo_context": {"added_nodes": added, "removed_nodes": removed_nodes,
+                                     "removed_edges": removed_edges},
+                })
                 self._send_json(handler, HTTPStatus.OK, {
                     "ok": True,
                     "added_nodes": added,
@@ -10809,7 +10948,9 @@ class RenderDaemon:
                 self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": "source/target node ids required and must differ"})
                 return True
             try:
+                from navigation_dataset.graph_edit_log import graph_size as _gsz, node_record as _nrec
                 graph = read_viewpoint_graph(graph_path)
+                _before = _gsz(graph)
                 edge = append_edge(
                     graph, source, target,
                     distance_m=float(payload["distance_m"]) if payload.get("distance_m") is not None else None,
@@ -10819,6 +10960,44 @@ class RenderDaemon:
                     self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": "Could not append edge (unknown source/target?)"})
                     return True
                 write_viewpoint_graph(graph_path, graph)
+                # Algorithm view: would the auto edge-builder have made this connection?
+                # ("human added an edge the algorithm would have skipped" — key signal.)
+                _algo: dict[str, Any] = {"distance_m": edge.distance_m}
+                try:
+                    from navigation_dataset.traversability import load_traversability_grid, inflate_traversable_grid
+                    from navigation_dataset.edge_builder import line_cells
+                    _gp = project_dir / "scenes" / scene_id / "traversable_grid.npy"
+                    _src = next((n for n in graph.nodes if n.node_id == source), None)
+                    _tgt = next((n for n in graph.nodes if n.node_id == target), None)
+                    if _gp.exists() and _src and _tgt:
+                        _grid = load_traversability_grid(_gp)
+                        _rr = float(payload.get("robot_radius_m", 0.25) or 0.25)
+                        _maxlen = float(payload.get("max_edge_length_m", 1.5) or 1.5)
+                        _infl = inflate_traversable_grid(_grid.traversable.copy(), _rr, _grid.spec.resolution)
+                        _cells = line_cells(_grid, _src.position, _tgt.position)
+                        _w, _h = _grid.spec.width, _grid.spec.height
+                        _blocked = sum(1 for (cx, cy) in _cells if 0 <= cx < _w and 0 <= cy < _h and not _infl[cy, cx])
+                        _hazard = any(bool(_grid.hazard[cy, cx]) for (cx, cy) in _cells if 0 <= cx < _w and 0 <= cy < _h)
+                        _within = edge.distance_m <= _maxlen
+                        _ok = (_blocked == 0 and _within and not _hazard)
+                        _reason = "ok" if _ok else ("too_far" if not _within else ("blocked_by_obstacle" if _blocked else "hazard_crossing"))
+                        _algo.update({"would_auto_connect": _ok, "reason": _reason,
+                                      "blocked_cell_count": _blocked, "hazard_crossing": _hazard,
+                                      "within_max_edge_length": _within})
+                except Exception:  # noqa: BLE001 — verdict is best-effort enrichment
+                    pass
+                _log_graph_edit(handler, project_dir, scene_id, {
+                    "operation": "add_edge",
+                    "graph_id": getattr(graph, "graph_id", None),
+                    "before": _before, "after": _gsz(graph),
+                    "params": {"source": source, "target": target,
+                               "distance_m": payload.get("distance_m"), "weight": payload.get("weight")},
+                    "added_edge": {"id": edge.edge_id, "source": source, "target": target,
+                                   "source_pos": (_nrec(graph, source) or {}).get("position"),
+                                   "target_pos": (_nrec(graph, target) or {}).get("position"),
+                                   "distance_m": edge.distance_m},
+                    "algo_context": _algo,
+                })
                 self._send_json(handler, HTTPStatus.OK, {"edge_id": edge.edge_id, "source": edge.source, "target": edge.target, "distance_m": edge.distance_m})
             except Exception as exc:
                 self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
@@ -11561,10 +11740,27 @@ class RenderDaemon:
                 self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": "viewpoint_graph.json not found"})
                 return True
             try:
+                from navigation_dataset.graph_edit_log import graph_size as _gsz, node_record as _nrec
                 graph = read_viewpoint_graph(graph_path)
+                _before = _gsz(graph)
+                # Resolve node positions/provenance BEFORE removal (lost afterwards).
+                _deleted = [r for r in (_nrec(graph, nid) for nid in node_ids) if r is not None]
                 removed = remove_nodes(graph, node_ids)
                 if removed:
                     write_viewpoint_graph(graph_path, graph)
+                _reason = (payload or {}).get("reason")
+                _log_graph_edit(handler, project_dir, scene_id, {
+                    "operation": "delete_nodes",
+                    "graph_id": getattr(graph, "graph_id", None),
+                    "before": _before, "after": _gsz(graph),
+                    "params": {"requested": node_ids, "reason": _reason},
+                    "deleted_nodes": _deleted,
+                    "algo_context": {
+                        "from_overlap_prune": _reason == "overlap_prune",
+                        "manual_count": sum(1 for r in _deleted if (r.get("extras") or {}).get("manual")),
+                        "regenerated_count": sum(1 for r in _deleted if (r.get("extras") or {}).get("regenerated_region")),
+                    },
+                })
                 self._send_json(handler, HTTPStatus.OK, {
                     "ok": True,
                     "removed": removed,
@@ -11584,12 +11780,29 @@ class RenderDaemon:
                 self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": "viewpoint_graph.json not found"})
                 return True
             try:
+                from navigation_dataset.graph_edit_log import graph_size as _gsz, node_record as _nrec, nearest_node_distance as _nnd
                 graph = read_viewpoint_graph(graph_path)
+                _before = _gsz(graph)
+                _rec = _nrec(graph, node_id)  # resolve BEFORE removal
                 ok = remove_node(graph, node_id)
                 if not ok:
                     self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": f"node_id not found: {node_id}"})
                     return True
                 write_viewpoint_graph(graph_path, graph)
+                _pos = (_rec or {}).get("position") or [None, None]
+                _log_graph_edit(handler, project_dir, scene_id, {
+                    "operation": "delete_node",
+                    "graph_id": getattr(graph, "graph_id", None),
+                    "before": _before, "after": _gsz(graph),
+                    "params": {"node_id": node_id},
+                    "deleted_nodes": [_rec] if _rec else [],
+                    "algo_context": {
+                        "was_manual": bool((( _rec or {}).get("extras") or {}).get("manual")),
+                        "was_regenerated": bool((( _rec or {}).get("extras") or {}).get("regenerated_region")),
+                        "clearance_m": (_rec or {}).get("clearance_m"),
+                        "nearest_remaining_node_m": (_nnd(graph, _pos[0], _pos[1]) if _pos[0] is not None else None),
+                    },
+                })
                 self._send_json(handler, HTTPStatus.OK, {"ok": True, "removed": node_id, "remaining_nodes": len(graph.nodes)})
             except Exception as exc:
                 self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
@@ -11603,12 +11816,27 @@ class RenderDaemon:
                 self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": "viewpoint_graph.json not found"})
                 return True
             try:
+                from navigation_dataset.graph_edit_log import graph_size as _gsz, edge_record as _erec
                 graph = read_viewpoint_graph(graph_path)
+                _before = _gsz(graph)
+                _rec = _erec(graph, edge_id)  # resolve endpoints BEFORE removal
                 ok = remove_edge(graph, edge_id)
                 if not ok:
                     self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": f"edge_id not found: {edge_id}"})
                     return True
                 write_viewpoint_graph(graph_path, graph)
+                _log_graph_edit(handler, project_dir, scene_id, {
+                    "operation": "delete_edge",
+                    "graph_id": getattr(graph, "graph_id", None),
+                    "before": _before, "after": _gsz(graph),
+                    "params": {"edge_id": edge_id},
+                    "deleted_edges": [_rec] if _rec else [],
+                    "algo_context": {
+                        "was_manual": bool(((_rec or {}).get("extras") or {}).get("manual")),
+                        "collision_free": (_rec or {}).get("collision_free"),
+                        "hazard_crossing": (_rec or {}).get("hazard_crossing"),
+                    },
+                })
                 self._send_json(handler, HTTPStatus.OK, {"ok": True, "removed": edge_id, "remaining_edges": len(graph.edges)})
             except Exception as exc:
                 self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
@@ -13738,6 +13966,8 @@ class RenderDaemon:
             "aolp": ("aolp_rainbow_colorbar.png", "aolp.exr"),
             "s1": ("s1_bwr_colorbar.png", "s1.exr"),
             "s2": ("s2_bwr_colorbar.png", "s2.exr"),
+            "s1_over_s0": ("s1_over_s0_bwr_colorbar.png",),
+            "s2_over_s0": ("s2_over_s0_bwr_colorbar.png",),
         }
         key = str(modality or "").strip()
         return mapping.get(key, (f"{key}.png", f"{key}.exr"))
@@ -13780,6 +14010,8 @@ class RenderDaemon:
                 "aolp_rainbow_colorbar.png": "aolp_rainbow_colorbar.png",
                 "s1_bwr_colorbar.png": "s1_bwr_colorbar.png",
                 "s2_bwr_colorbar.png": "s2_bwr_colorbar.png",
+                "s1_over_s0_bwr_colorbar.png": "s1_over_s0_bwr_colorbar.png",
+                "s2_over_s0_bwr_colorbar.png": "s2_over_s0_bwr_colorbar.png",
             }
             copied = False
             for src_name, dst_name in copy_map.items():
@@ -13900,6 +14132,8 @@ class RenderDaemon:
                 "aolp_rainbow_colorbar.png": "aolp_rainbow_colorbar.png",
                 "s1_bwr_colorbar.png": "s1_bwr_colorbar.png",
                 "s2_bwr_colorbar.png": "s2_bwr_colorbar.png",
+                "s1_over_s0_bwr_colorbar.png": "s1_over_s0_bwr_colorbar.png",
+                "s2_over_s0_bwr_colorbar.png": "s2_over_s0_bwr_colorbar.png",
             }
             copied = False
             for src_name, dst_name in copy_map.items():
@@ -14183,8 +14417,18 @@ class RenderDaemon:
             if extra_headers:
                 for key, value in extra_headers.items():
                     handler.send_header(key, value)
+            handler.send_header("Connection", "close")
             handler.end_headers()
-            handler.wfile.write(payload)
+            try:
+                handler.wfile.flush()
+            except OSError:
+                pass
+            handler.connection.sendall(payload)
+            try:
+                import socket as _socket
+                handler.connection.shutdown(_socket.SHUT_WR)
+            except OSError:
+                pass
         except (BrokenPipeError, ConnectionResetError):
             raise _ClientDisconnectedError from None
 
