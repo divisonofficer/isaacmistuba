@@ -21,7 +21,7 @@ type ThreeGroup = any;
 type ThreeObject3D = any;
 type ThreeMesh = any;
 
-const CACHE_VERSION = 'obj-mesh-cache-v2';
+const CACHE_VERSION = 'obj-mesh-cache-v3-head-size';
 // Distinct DB name from primMeshCache's `robomituba-opticalnav`. Both caches
 // opened the same DB at version 1 and each created only its own store in
 // onupgradeneeded — whichever ran first won, and the second cache's store was
@@ -56,7 +56,7 @@ const _loader = new OBJLoader();
 // (browser console saw 1300+ requests / 1.7 GB in a single sync, the daemon's
 // health endpoint timing out). Cap in-flight network fetches; queued waiters
 // run as slots free up.
-const MAX_CONCURRENT_FETCHES = 4;
+const MAX_CONCURRENT_FETCHES = 2;
 let _inflight = 0;
 const _waiters: Array<() => void> = [];
 
@@ -78,7 +78,7 @@ function _releaseSlot() {
 // Size guard: huge meshes (e.g. Main Couch 65 MB) blow up memory and stall
 // rendering with no visual benefit at editor scale. Skip the preview fetch and
 // let the caller draw a placeholder; the render path still uses the full OBJ.
-const MAX_OBJ_BYTES_FOR_PREVIEW = 64 * 1024 * 1024;
+const MAX_OBJ_BYTES_FOR_PREVIEW = 16 * 1024 * 1024;
 
 export function objMeshCacheKey(projectId: string, sceneId: string, filename: string): string {
 	return `${CACHE_VERSION}:${projectId}/${sceneId}#${filename}`;
@@ -124,17 +124,24 @@ export async function loadObjMeshGeometry(
 			setMemory(key, geo);
 			return geo;
 		}
-		// IDB miss → fetch + parse, throttled through the in-flight semaphore.
+		// IDB miss → HEAD size check, then fetch + parse through a small
+		// semaphore. A failed OBJ request used to be retried on every scene rebuild,
+		// producing long bursts of ERR_CONTENT_LENGTH_MISMATCH in Chrome. Cache
+		// misses as null for this page lifetime so placeholders stay cheap.
 		await _acquireSlot();
 		try {
 			const url = opticalNavMeshCacheUrl(projectId, sceneId, filename);
-			const res = await fetch(url, { headers: { Accept: 'text/plain' } });
-			if (!res.ok) {
+			const headLen = await fetchObjContentLength(url);
+			if (Number.isFinite(headLen) && headLen > MAX_OBJ_BYTES_FOR_PREVIEW) {
+				setMemory(key, null);
 				return null;
 			}
-			// Size guard via Content-Length: huge OBJs (e.g. Main Couch 65 MB) blow
-			// up memory and stall rendering with no real visual benefit at editor
-			// scale. Cached as null so the next rebuild doesn't re-fetch.
+
+			const res = await fetch(url, { headers: { Accept: 'text/plain' } });
+			if (!res.ok) {
+				setMemory(key, null);
+				return null;
+			}
 			const cl = res.headers.get('content-length');
 			const len = cl ? Number(cl) : NaN;
 			if (Number.isFinite(len) && len > MAX_OBJ_BYTES_FOR_PREVIEW) {
@@ -145,6 +152,7 @@ export async function loadObjMeshGeometry(
 			const text = await res.text();
 			const geo = parseObjToGeometry(text);
 			if (!geo) {
+				setMemory(key, null);
 				return null;
 			}
 			setMemory(key, geo);
@@ -152,6 +160,7 @@ export async function loadObjMeshGeometry(
 			if (serialized) void writeIdb({ key, serialized, updatedAt: Date.now() });
 			return geo;
 		} catch {
+			setMemory(key, null);
 			return null;
 		} finally {
 			_releaseSlot();
@@ -163,6 +172,18 @@ export async function loadObjMeshGeometry(
 		return await task;
 	} finally {
 		pending.delete(key);
+	}
+}
+
+async function fetchObjContentLength(url: string): Promise<number> {
+	try {
+		const res = await fetch(url, { method: 'HEAD' });
+		if (!res.ok) return NaN;
+		const cl = res.headers.get('content-length');
+		const len = cl ? Number(cl) : NaN;
+		return Number.isFinite(len) ? len : NaN;
+	} catch {
+		return NaN;
 	}
 }
 

@@ -157,10 +157,10 @@
 				</div>
 			{:else if item.geometry?.type === 'rectangle'}
 				<div class="geometry-grid">
-					<label><span>x0</span><input type="number" min="0" max="6" step="0.01" value={item.geometry.bounds?.[0] ?? 0} oninput={(e) => onUpdateRectangleBound(0, (e.currentTarget as HTMLInputElement).value)} /></label>
-					<label><span>y0</span><input type="number" min="0" max="4" step="0.01" value={item.geometry.bounds?.[1] ?? 0} oninput={(e) => onUpdateRectangleBound(1, (e.currentTarget as HTMLInputElement).value)} /></label>
-					<label><span>x1</span><input type="number" min="0" max="6" step="0.01" value={item.geometry.bounds?.[2] ?? 1} oninput={(e) => onUpdateRectangleBound(2, (e.currentTarget as HTMLInputElement).value)} /></label>
-					<label><span>y1</span><input type="number" min="0" max="4" step="0.01" value={item.geometry.bounds?.[3] ?? 1} oninput={(e) => onUpdateRectangleBound(3, (e.currentTarget as HTMLInputElement).value)} /></label>
+					<label><span>x0</span><input type="number" step="0.01" value={item.geometry.bounds?.[0] ?? 0} oninput={(e) => onUpdateRectangleBound(0, (e.currentTarget as HTMLInputElement).value)} /></label>
+					<label><span>y0</span><input type="number" step="0.01" value={item.geometry.bounds?.[1] ?? 0} oninput={(e) => onUpdateRectangleBound(1, (e.currentTarget as HTMLInputElement).value)} /></label>
+					<label><span>x1</span><input type="number" step="0.01" value={item.geometry.bounds?.[2] ?? 1} oninput={(e) => onUpdateRectangleBound(2, (e.currentTarget as HTMLInputElement).value)} /></label>
+					<label><span>y1</span><input type="number" step="0.01" value={item.geometry.bounds?.[3] ?? 1} oninput={(e) => onUpdateRectangleBound(3, (e.currentTarget as HTMLInputElement).value)} /></label>
 				</div>
 			{/if}
 			{#if inspectorError}<p class="inline-error">{inspectorError}</p>{/if}

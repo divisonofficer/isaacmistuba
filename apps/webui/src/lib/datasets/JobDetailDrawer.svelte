@@ -59,7 +59,7 @@
 		<JobTimeline {job} />
 
 		<div class="meta-grid">
-			<div><span>GPU</span><strong>{job?.status?.extras?.target_gpu_index ?? job?.worker_gpu_index ?? '-'}</strong></div>
+			<div><span>GPU</span><strong>{job?.status?.extras?.actual_gpu_index ?? job?.status?.extras?.routed_gpu_index ?? job?.status?.extras?.target_gpu_index ?? job?.worker_gpu_index ?? '-'}</strong></div>
 			<div><span>Cache</span><strong>{job?.status?.extras?.scene_cache_hit ? 'Hit' : 'Miss/unknown'}</strong></div>
 			<div><span>Texture</span><strong>{textureProfile ? `max${textureProfile}` : '-'}</strong></div>
 			<div><span>Duration</span><strong>{duration || '-'}</strong></div>

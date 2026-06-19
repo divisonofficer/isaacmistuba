@@ -25,6 +25,8 @@
 		currentSceneOnly?: boolean;
 		includeThumbnails?: boolean;
 		panoramaObservations?: boolean;
+		pngOnly?: boolean;
+		includeBirdseye?: boolean;
 		currentSceneId?: string;
 		exportableEpisodeCount?: number;
 		exportSummary?: any;
@@ -45,6 +47,8 @@
 		currentSceneOnly = $bindable(true),
 		includeThumbnails = $bindable(false),
 		panoramaObservations = $bindable(true),
+		pngOnly = $bindable(true),
+		includeBirdseye = $bindable(true),
 		currentSceneId = '',
 		exportableEpisodeCount = 0,
 		exportSummary = null,
@@ -146,6 +150,16 @@
 			GT (vp, heading) 만 (slim)
 		{/if}
 	</div>
+	<label class="export-filter-row">
+		<input type="checkbox" bind:checked={pngOnly} />
+		<span>PNG only (exclude EXR)</span>
+	</label>
+	<div class="export-filter-hint">{pngOnly ? 'EXR 제외 — 가볍고 빠름' : 'EXR(HDR) 포함 — 무거움'}</div>
+	<label class="export-filter-row">
+		<input type="checkbox" bind:checked={includeBirdseye} />
+		<span>Bird's-eye summary</span>
+	</label>
+	<div class="export-filter-hint">top-down grid + graph + 경로 요약 PNG</div>
 	<label class="export-filter-row">
 		<input type="checkbox" bind:checked={includeThumbnails} />
 		<span>Include episode thumbnails</span>

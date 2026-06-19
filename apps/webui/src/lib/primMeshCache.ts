@@ -8,7 +8,7 @@ export type PrimMeshPayload = {
 	[key: string]: unknown;
 };
 
-const CACHE_VERSION = 'prim-mesh-cache-v1';
+const CACHE_VERSION = 'prim-mesh-cache-v2-glb';
 const DB_NAME = 'robomituba-opticalnav';
 const STORE_NAME = 'prim_mesh';
 const MAX_MEMORY_ENTRIES = 96;

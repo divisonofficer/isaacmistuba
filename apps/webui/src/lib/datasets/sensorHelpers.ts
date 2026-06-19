@@ -37,6 +37,22 @@ export function sensorRenderModality(sensor: any): string {
 	return 'rgb';
 }
 
+/** Ordered polarization representations shown in the multi-channel hot-camera preview. */
+export const POLAR_PREVIEW_MODALITIES: { id: string; label: string }[] = [
+	{ id: 'polar_rgb_preview', label: 'RGB' },
+	{ id: 's1_over_s0', label: 'S1/S0' },
+	{ id: 's2_over_s0', label: 'S2/S0' },
+	{ id: 'dop', label: 'DoLP' },
+	{ id: 'aolp', label: 'AoLP' },
+];
+
+/** True when a render modality belongs to the polarization family (Stokes products). */
+export function isPolarRenderModality(modality: unknown): boolean {
+	return ['polar_rgb_preview', 's1', 's2', 's1_over_s0', 's2_over_s0', 'dop', 'aolp'].includes(
+		String(modality ?? ''),
+	);
+}
+
 export function sensorRenderChipLabel(option: any): string {
 	const modality = String(option?.modality ?? '').toUpperCase();
 	const renderModality = String(option?.render_modality ?? 'rgb');

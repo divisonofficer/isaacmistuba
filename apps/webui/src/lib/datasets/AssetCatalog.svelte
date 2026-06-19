@@ -33,6 +33,9 @@
 		libraryDisplayLimit, selectedProjectId, assetThumbRefreshTick,
 		onSelectTool, onDelete, onSelectBuiltInPlaceAsset, onSelectUsdAsset, onSearchChange,
 	}: Props = $props();
+
+	const primitiveTool = (asset: BuiltInPlaceAsset) =>
+		asset.kind === 'primitive' ? asset.tool : 'select';
 </script>
 
 {#if pageMode === 'map'}
@@ -74,34 +77,7 @@
 			<button class:active={placementTool === 'select'} onclick={() => onSelectTool('select')}>Select</button>
 			<button class="danger" disabled={!selectedAuthoringId} onclick={onDelete}>Delete</button>
 		</div>
-		<div class="asset-section-title">Built-in Assets</div>
-		{#each builtInPlaceAssetGroups as group}
-			<div class="asset-subsection-title">{group.label}</div>
-			<div class="asset-card-list">
-				{#each group.assets as asset}
-					{@const isRichAsset = asset.kind === 'rich_asset'}
-					{@const richSelected = isRichAsset && selectedUsdAssetId === asset.asset_id && placementTool === 'usd_asset'}
-					{@const primitiveSelected = !isRichAsset && placementTool === asset.tool}
-					<button
-						class:selected={richSelected || primitiveSelected}
-						class="asset-card"
-						title={isRichAsset ? `${asset.label} · ${asset.source_dataset}` : asset.label}
-						onclick={() => onSelectBuiltInPlaceAsset(asset)}
-					>
-						<AssetThumb3D
-							category={asset.category}
-							assetType={builtInThumbType(asset)}
-							bounds={asset.bounds}
-							selected={richSelected || primitiveSelected}
-						/>
-						<span>{asset.label}</span>
-						<small>{isRichAsset ? `${asset.source_dataset} · point placement` : placementHintForTool(asset.tool)}</small>
-					</button>
-				{/each}
-			</div>
-		{/each}
-		<div class="catalog-divider"></div>
-		<div class="asset-section-title">Library Assets</div>
+		<div class="asset-section-title">Verified Library Assets</div>
 		<input class="asset-search" type="search" placeholder="Search {mapAssets.length} assets..." value={usdCatalogSearch} oninput={(e) => onSearchChange((e.currentTarget as HTMLInputElement).value)} />
 		{#if !usdCatalogSearch.trim() && mapAssets.length > libraryDisplayLimit}
 			<small class="catalog-status">Showing {libraryDisplayLimit} of {mapAssets.length} — search to filter all</small>
@@ -126,7 +102,7 @@
 						/>
 					</div>
 					<span>{usdAssetLabel(asset)}</span>
-					<small>{asset.category} · {asset.placement}</small>
+					<small>{asset.render_readiness ?? asset.category} · {asset.placement}</small>
 				</button>
 			{/each}
 			{#if usdAssetCandidates.length === 0}
@@ -136,6 +112,29 @@
 				</div>
 			{/if}
 		</div>
+		{#if builtInPlaceAssetGroups.length}
+			<div class="catalog-divider"></div>
+			<div class="asset-section-title">Debug Proxies</div>
+			{#each builtInPlaceAssetGroups as group}
+				<div class="asset-subsection-title">{group.label}</div>
+				<div class="asset-card-list debug-proxies">
+					{#each group.assets as asset}
+						{@const tool = primitiveTool(asset)}
+						{@const primitiveSelected = asset.kind === 'primitive' && placementTool === tool}
+						<button
+							class:selected={primitiveSelected}
+							class="asset-card debug-card"
+							title={`${asset.label} · debug proxy`}
+							onclick={() => onSelectBuiltInPlaceAsset(asset)}
+						>
+							<AssetThumb3D category={asset.category} assetType={builtInThumbType(asset)} bounds={asset.bounds} selected={primitiveSelected} />
+							<span>{asset.label}</span>
+							<small>{placementHintForTool(tool)}</small>
+						</button>
+					{/each}
+				</div>
+			{/each}
+		{/if}
 	</div>
 {/if}
 
@@ -229,10 +228,20 @@
 		}
 
 	.library-assets {
-			max-height: 310px;
+			max-height: 390px;
 			overflow: auto;
 			padding-right: 2px;
 		}
+
+
+	.debug-proxies {
+		max-height: 180px;
+		overflow: auto;
+	}
+
+	.debug-card {
+		opacity: 0.72;
+	}
 
 	.asset-search {
 			width: 100%;

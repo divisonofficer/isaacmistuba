@@ -15,8 +15,13 @@ export function clampMapNumber(
 ): number {
 	const numeric = Number(value);
 	if (!Number.isFinite(numeric)) return fallback;
-	if (axis === 'x') return Number(Math.max(0, Math.min(mapWidth, numeric)).toFixed(3));
-	if (axis === 'y') return Number(Math.max(0, Math.min(mapHeight, numeric)).toFixed(3));
+	// Allow editing into negative space and a margin beyond the map extent: layouts
+	// often need to be patched/extended past the origin, and the backend already
+	// supports signed coordinates (grid/room-shell/floor derive from region bounds).
+	// We keep a finite pad (one map-side) so objects can't be flung to infinity.
+	const pad = Math.max(mapWidth, mapHeight, 1);
+	if (axis === 'x') return Number(Math.max(-pad, Math.min(mapWidth + pad, numeric)).toFixed(3));
+	if (axis === 'y') return Number(Math.max(-pad, Math.min(mapHeight + pad, numeric)).toFixed(3));
 	if (axis === 'yaw') return Number((((numeric % 360) + 360) % 360).toFixed(1));
 	return Number(Math.max(0.001, numeric).toFixed(3));
 }

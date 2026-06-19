@@ -40,6 +40,8 @@
 		selectedSensorNode: any;
 		onBuildMap: () => void;
 		onRequestBuildGraph: () => void;
+		onRebuildEdges?: () => void;
+		rebuildingEdges?: boolean;
 		onSetPathsMode: (mode: string) => void;
 		onSetPaintRadius: (r: number) => void;
 		onRebuildRegion: () => void;
@@ -72,6 +74,17 @@
 		episodePathNodeCount?: number;
 		headingsPerNode?: number;
 		renderSceneSynced?: boolean;
+		// Multi-select node removal (object-overlap cleanup).
+		removeSelectionCount?: number;
+		removeMarginM?: number;
+		removePassHeightM?: number;
+		findingOverlapping?: boolean;
+		removingNodes?: boolean;
+		onFindOverlapping?: () => void;
+		onRemoveSelectedNodes?: () => void;
+		onClearRemoveSelection?: () => void;
+		onSetRemoveMargin?: (v: number) => void;
+		onSetRemovePassHeight?: (v: number) => void;
 	}
 
 	const COMPONENT_COLORS = ['#6366f1','#ef4444','#fbbf24','#a855f7','#14b8a6','#ec4899','#84cc16'];
@@ -86,7 +99,7 @@
 		filteredEpisodes, episodes, episodeSearch, episodeCount,
 		selectedEpisodeId, splitCounts, robotRadius, minClearance, resolution,
 		maxNodes, headingCount, minNodeSpacing, selectedSensorNode,
-		onBuildMap, onRequestBuildGraph, onSetPathsMode, onSetPaintRadius,
+		onBuildMap, onRequestBuildGraph, onRebuildEdges, rebuildingEdges = false, onSetPathsMode, onSetPaintRadius,
 		onRebuildRegion, onClearRegion, onClearWalkabilityOverlay, onRefreshTraversableMeta,
 		onSetShowFootprint, onSetShowTraversableMask, onAddEdgeAnyway, onDismissEdgeCheck,
 		onDeleteGraphEdge, onDeleteGraphNode, onLoadEpisode, onGenerateEpisodes,
@@ -97,6 +110,8 @@
 		renderMissingOnly = true, onSetRenderMissingOnly,
 		episodeNodesAvailable = false, episodePathNodeCount = 0, headingsPerNode = 0,
 		renderSceneSynced = false,
+		removeSelectionCount = 0, removeMarginM = 0, removePassHeightM = 1.2, findingOverlapping = false, removingNodes = false,
+		onFindOverlapping, onRemoveSelectedNodes, onClearRemoveSelection, onSetRemoveMargin, onSetRemovePassHeight,
 	}: Props = $props();
 </script>
 
@@ -118,6 +133,9 @@
 	<button class="button button-subtle" disabled={!hasMap || buildingGraph} onclick={onRequestBuildGraph}>
 		{buildingGraph ? 'Rebuilding…' : 'Rebuild graph'}
 	</button>
+	<button class="button button-subtle" disabled={!hasGraph || rebuildingEdges} onclick={() => onRebuildEdges?.()} title="Re-run edge building over the current node set (keeps all auto + manual nodes; reconnects manual nodes and drops edges that cross glass/furniture).">
+		{rebuildingEdges ? 'Rebuilding edges…' : 'Rebuild edges (keep nodes)'}
+	</button>
 	{#if selectedSensorNode && !(selectedSensorNode as any).isCustom}
 		<button class="button button-subtle danger" onclick={onDeleteGraphNode}>
 			Delete {selectedSensorNode.node_id}
@@ -137,6 +155,7 @@
 			{ value: 'select_region', label: '▭ Select region', title: 'Drag a rectangle on the floor to select an area, then click "Rebuild this region" to re-sample only that area viewpoints.' },
 			{ value: 'add_edge', label: '⤴ Add edge', title: 'Click two graph nodes in sequence to create a manual edge between them (shown in purple).' },
 			{ value: 'inspect_edge', label: '🔍 Inspect edge', title: 'Click two graph nodes to diagnose why no edge exists between them (distance, blocking cells, hazard).' },
+			{ value: 'remove_node', label: '🗑 Remove nodes', title: 'Box-drag and/or click graph nodes to mark them for removal (e.g. vertices sitting on furniture). Use "Find overlapping" to auto-select, then Remove.' },
 		] as item}
 			<label class="mode-radio" title={item.title}>
 				<input type="radio" name="pathsMode" value={item.value} checked={pathsMode === item.value} onchange={() => onSetPathsMode(item.value)} />
@@ -151,7 +170,28 @@
 			{:else if pathsMode === 'select_region'}Drag a rectangle on the floor…
 			{:else if pathsMode === 'add_edge'}{pendingEdgeSource ? `Source: ${pendingEdgeSource} · click target…` : 'Click first node…'}
 			{:else if pathsMode === 'inspect_edge'}{edgeInspectorSource ? `Source: ${edgeInspectorSource} · click target to diagnose…` : 'Click first node…'}
+			{:else if pathsMode === 'remove_node'}{removeSelectionCount ? `${removeSelectionCount} node(s) marked · box-drag or click to add/remove` : 'Box-drag a rectangle or click nodes to mark for removal…'}
 			{/if}
+		</div>
+	{/if}
+	{#if pathsMode === 'remove_node'}
+		<div class="remove-node-panel">
+			<label class="footprint-toggle">
+				<span>Overlap margin (m)</span>
+				<input type="number" min="0" max="2" step="0.05" value={removeMarginM} oninput={(e) => onSetRemoveMargin?.(Number((e.currentTarget as HTMLInputElement).value))} class="paint-radius" />
+			</label>
+			<label class="footprint-toggle" title="Objects mounted at/above this height (e.g. ceiling lights) are ignored — the robot passes under them.">
+				<span>Pass-under height (m)</span>
+				<input type="number" min="0" max="3" step="0.1" value={removePassHeightM} oninput={(e) => onSetRemovePassHeight?.(Number((e.currentTarget as HTMLInputElement).value))} class="paint-radius" />
+			</label>
+			<button class="button button-subtle" disabled={!hasGraph || findingOverlapping} onclick={() => onFindOverlapping?.()}>
+				{findingOverlapping ? 'Finding…' : '⊙ Find overlapping nodes'}
+			</button>
+			<div class="footprint-info">Marked for removal: <strong>{removeSelectionCount}</strong></div>
+			<button class="button button-subtle danger" disabled={!removeSelectionCount || removingNodes} onclick={() => onRemoveSelectedNodes?.()}>
+				{removingNodes ? 'Removing…' : `Remove ${removeSelectionCount} node(s)`}
+			</button>
+			<button class="button button-subtle" disabled={!removeSelectionCount} onclick={() => onClearRemoveSelection?.()}>Clear selection</button>
 		</div>
 	{/if}
 	{#if pathsMode.startsWith('paint_')}

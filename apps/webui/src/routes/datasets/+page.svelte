@@ -5,7 +5,6 @@
 	import {
 		builtInBuildAssets,
 		builtInPlaceAssetGroups,
-		builtInRichPlaceAssets,
 		type BuiltInPlaceAsset
 	} from '$lib/opticalnavBuiltInAssets';
 	import { assetVM } from '$lib/datasets/vm/AssetVM.svelte';
@@ -24,6 +23,8 @@
 		formatResolution,
 		formatRenderSpp,
 		positiveInt,
+		POLAR_PREVIEW_MODALITIES,
+		isPolarRenderModality,
 	} from '$lib/datasets/sensorHelpers';
 	import { computeWorkflowReadiness } from '$lib/datasets/workflowHelpers';
 	import * as validationService from '$lib/datasets/services/validationService';
@@ -268,7 +269,7 @@
 	let mapEditorRef = $state<any>(null);
 	// ─── Hot Camera Preview (Preview tab) ───────────────────────────────────
 	let probeRendering = $state(false);
-	let probeResult = $state<{ batch_id: string; vp_id: string; heading_id: string; modality: string; sensor_id?: string; submittedAt: number } | null>(null);
+	let probeResult = $state<{ batch_id: string; vp_id: string; heading_id: string; modality: string; modalities?: string[]; is_polar?: boolean; sensor_id?: string; submittedAt: number } | null>(null);
 	let probeError = $state('');
 	type HotCameraPose = {
 		preview_id: string;
@@ -410,6 +411,8 @@
 	let resolution = $state(0.05);
 	let mapWidth = $state(6);
 	let mapHeight = $state(4);
+	let layoutDx = $state(0);
+	let layoutDy = $state(0);
 	// Auto-expand map bounds when USD geometry loads
 	$effect(() => {
 		const b = assetVM.editorGeometryPayload?.bounds;
@@ -432,7 +435,7 @@
 	let minClearance = $state(0.1);
 	let showFootprint = $state(false);
 	// Single source of truth for map-click interaction. Only one mode at a time.
-	type PathsInteractionMode = 'select' | 'place_node' | 'paint_walkable' | 'paint_blocked' | 'paint_erase' | 'select_region' | 'add_edge' | 'inspect_edge';
+	type PathsInteractionMode = 'select' | 'place_node' | 'paint_walkable' | 'paint_blocked' | 'paint_erase' | 'select_region' | 'add_edge' | 'inspect_edge' | 'remove_node';
 	let pathsMode = $state<PathsInteractionMode>('select');
 	// Derived flags consumed by the rest of the code (preserves call sites).
 	const addNodeMode = $derived(pathsMode === 'place_node');
@@ -445,6 +448,14 @@
 	const regionSelectMode = $derived(pathsMode === 'select_region');
 	const addEdgeMode = $derived(pathsMode === 'add_edge');
 	const edgeInspectorMode = $derived(pathsMode === 'inspect_edge');
+	const removeNodeMode = $derived(pathsMode === 'remove_node');
+	// Multi-select node removal (object-overlap cleanup). Declared before the
+	// mode-change effect so it can be cleared there.
+	let removeSelection = $state<Set<string>>(new Set());
+	let removeMarginM = $state(0);
+	let removePassHeightM = $state(1.2);
+	let findingOverlapping = $state(false);
+	let removingNodes = $state(false);
 	// Reset pending selections whenever the mode changes — avoids stale state.
 	$effect(() => {
 		pathsMode;
@@ -452,6 +463,7 @@
 		edgeInspectorSource = '';
 		pendingRegionBbox = null;
 		edgeCheckResult = null;
+		removeSelection = new Set();
 	});
 	let paintRadiusM = $state(0.3);
 	let walkabilityOverlayMeta = $state<any>(null);
@@ -531,6 +543,8 @@
 	// context). OFF restricts to just the (vp, heading) pairs the episode
 	// visits along its GT path (much slimmer bundle).
 	let exportPanoramaObservations = $state(true);
+	let exportPngOnly = $state(true);          // default to the lighter PNG-only bundle (no EXR)
+	let exportIncludeBirdseye = $state(true);  // include a top-down bird's-eye summary PNG
 	// Active scene-bundle export job — populated when user clicks Export.
 	let activeExportJob = $state<import('$lib/datasets/services/exportJobsService').ExportJobStatus | null>(null);
 	let _exportJobUnsub: (() => void) | null = null;
@@ -1627,6 +1641,82 @@
 		setAuthoringMapPayload({ ...authoringMap, objects }, true);
 	}
 
+	// Drag a corner of a rectangle region (e.g. the traversable floor) to resize it
+	// directly in the 3D editor. Mirrors dragLineHandle but writes region bounds.
+	function dragRegionHandle(
+		id: string,
+		handle: 'rect_x0z0' | 'rect_x1z0' | 'rect_x0z1' | 'rect_x1z1',
+		point: { x: number; y: number },
+		_shiftKey = false
+	) {
+		if (!authoringMap) return;
+		if (selectedAuthoringId !== id) selectedAuthoringId = id;
+		const GAP = 0.1;
+		const round = (n: number) => Number(n.toFixed(3));
+		const px = round(point.x);
+		const pz = round(point.y);
+		const regions = (authoringMap.regions ?? []).map((item: any) => {
+			if (item.id !== id || item.geometry?.type !== 'rectangle') return item;
+			let [x0, z0, x1, z1] = [...(item.geometry?.bounds ?? [0, 0, 1, 1])].map(Number);
+			if (handle === 'rect_x0z0') { x0 = Math.min(px, x1 - GAP); z0 = Math.min(pz, z1 - GAP); }
+			else if (handle === 'rect_x1z0') { x1 = Math.max(px, x0 + GAP); z0 = Math.min(pz, z1 - GAP); }
+			else if (handle === 'rect_x0z1') { x0 = Math.min(px, x1 - GAP); z1 = Math.max(pz, z0 + GAP); }
+			else if (handle === 'rect_x1z1') { x1 = Math.max(px, x0 + GAP); z1 = Math.max(pz, z0 + GAP); }
+			return { ...item, geometry: { ...(item.geometry ?? {}), type: 'rectangle', bounds: [x0, z0, x1, z1] } };
+		});
+		setAuthoringMapPayload({ ...authoringMap, regions }, true);
+	}
+
+	// Shift a single geometry block (point/line/rectangle) by (dx, dy) in-plane.
+	function shiftGeometry(g: any, dx: number, dy: number): any {
+		if (!g) return g;
+		const out = { ...g };
+		const sh = (v: any, d: number) => Number((Number(v) + d).toFixed(4));
+		if (Array.isArray(g.center) && g.center.length >= 2)
+			out.center = [sh(g.center[0], dx), sh(g.center[1], dy), ...g.center.slice(2)];
+		if (Array.isArray(g.start) && g.start.length >= 2)
+			out.start = [sh(g.start[0], dx), sh(g.start[1], dy), ...g.start.slice(2)];
+		if (Array.isArray(g.end) && g.end.length >= 2)
+			out.end = [sh(g.end[0], dx), sh(g.end[1], dy), ...g.end.slice(2)];
+		if (Array.isArray(g.bounds) && g.bounds.length >= 4)
+			out.bounds = [sh(g.bounds[0], dx), sh(g.bounds[1], dy), sh(g.bounds[2], dx), sh(g.bounds[3], dy)];
+		return out;
+	}
+
+	// Translate the whole layout (every object + region) by (dx, dy). Lets the user
+	// make room past the origin without re-placing each item. Camera rig mounts are
+	// relative to their sensor pose and environment is global, so both are untouched.
+	function translateLayout(dx: number, dy: number) {
+		if (!authoringMap || (!dx && !dy)) return;
+		const objects = (authoringMap.objects ?? []).map((o: any) => ({ ...o, geometry: shiftGeometry(o.geometry, dx, dy) }));
+		const regions = (authoringMap.regions ?? []).map((o: any) => ({ ...o, geometry: shiftGeometry(o.geometry, dx, dy) }));
+		setAuthoringMapPayload({ ...authoringMap, objects, regions }, true);
+	}
+
+	// Shift the layout so its min corner sits at +margin (no negative coords remain).
+	function normalizeLayoutToPositive(margin = 0.5) {
+		if (!authoringMap) return;
+		let minX = Infinity, minY = Infinity;
+		const consider = (x: any, y: any) => {
+			const nx = Number(x), ny = Number(y);
+			if (Number.isFinite(nx)) minX = Math.min(minX, nx);
+			if (Number.isFinite(ny)) minY = Math.min(minY, ny);
+		};
+		for (const o of [...(authoringMap.objects ?? []), ...(authoringMap.regions ?? [])]) {
+			const g = o?.geometry;
+			if (!g) continue;
+			if (Array.isArray(g.center)) consider(g.center[0], g.center[1]);
+			if (Array.isArray(g.start)) consider(g.start[0], g.start[1]);
+			if (Array.isArray(g.end)) consider(g.end[0], g.end[1]);
+			if (Array.isArray(g.bounds)) { consider(g.bounds[0], g.bounds[1]); consider(g.bounds[2], g.bounds[3]); }
+		}
+		if (!Number.isFinite(minX) || !Number.isFinite(minY)) return;
+		const dx = Number((margin - minX).toFixed(4));
+		const dy = Number((margin - minY).toFixed(4));
+		if (!dx && !dy) return;
+		translateLayout(dx, dy);
+	}
+
 	function updateSelectedRectangleBound(index: number, value: unknown) {
 		const item = selectedAuthoringItem;
 		const existing = [...(item?.geometry?.bounds ?? [0, 0, 1, 1])];
@@ -1861,7 +1951,7 @@
 		const rawSize = selectedUsdAsset.bounds?.size ?? [0.35, 0.5, 0.35];
 		const size = Array.isArray(rawSize) ? rawSize.map((value: any) => Number(value) * scale) : [0.35, 0.5, 0.35];
 		const sourceFormat = selectedUsdAsset.source_format ?? (String(sourceRef).toLowerCase().endsWith('.glb') ? 'glb' : 'usd_prim');
-		const assetSourcePath = sourceFormat === 'glb' ? undefined : selectedUsdAsset.source_path;
+		const assetSourcePath = sourceFormat === 'glb' ? sourceRef : selectedUsdAsset.source_path;
 		const object = {
 			id,
 			type,
@@ -1893,6 +1983,9 @@
 				asset_glb_ref: sourceFormat === 'glb' ? sourceRef : undefined,
 				asset_license_ref: selectedUsdAsset.license_ref,
 				asset_metadata_ref: selectedUsdAsset.metadata_ref,
+				render_readiness: selectedUsdAsset.render_readiness,
+				readiness_reason: selectedUsdAsset.readiness_reason,
+				usable_by_agent: selectedUsdAsset.usable_by_agent,
 				proxy_size: size,
 				normalized_y_min: selectedUsdAsset.bounds?.min?.[1] ?? 0
 			}
@@ -2032,7 +2125,10 @@
 				draftGhost = { type: 'point', x: point.x, y: point.y, valid: inBounds };
 			}
 		} else if (placementTool === 'chair' || placementTool === 'table' || placementTool === 'plant' || placementTool === 'camera' || placementTool === 'usd_asset') {
-			const sp = placementTool === 'usd_asset' ? (assetVM.selectedUsdAsset?.source_path ?? undefined) : undefined;
+			const selectedAsset = assetVM.selectedUsdAsset;
+			const sp = placementTool === 'usd_asset'
+				? (selectedAsset?.source_format === 'glb' ? (selectedAsset?.source_ref ?? undefined) : (selectedAsset?.source_path ?? undefined))
+				: undefined;
 			const ac = placementTool === 'usd_asset' ? (assetVM.selectedUsdAsset?.category ?? undefined) : undefined;
 			const ghostYMin = placementTool === 'usd_asset' ? (assetVM.selectedUsdAsset?.bounds?.min?.[1] ?? 0) : undefined;
 			const rawSize = placementTool === 'usd_asset' ? (assetVM.selectedUsdAsset?.bounds?.size ?? assetVM.selectedUsdAsset?.default_proxy_size ?? undefined) : undefined;
@@ -2831,8 +2927,14 @@
 		const activeCameraSpec = cameraSpecFromRigSensor(activeRigSensorOption?.sensor, camera_spec);
 		const vpId = hotCameraPose.preview_id;
 		const headingId = 'h0';
+		// Polarization sensors render the full set of Stokes representations so the
+		// preview can show them side by side instead of a single grayscale image.
+		const isPolarPreview = isPolarRenderModality(activeRenderModality);
+		const previewModalities = isPolarPreview
+			? POLAR_PREVIEW_MODALITIES.map((m) => m.id)
+			: [activeRenderModality];
 		const body: Record<string, unknown> = {
-			modalities: [activeRenderModality],
+			modalities: previewModalities,
 			backend,
 			camera_height_m: rigMountHeightM,
 			render_settings: renderSettingsFromRigSensor(activeRigSensorOption?.sensor),
@@ -2867,7 +2969,7 @@
 				};
 				hotCameraPoses = hotCameraPoses.map((item) => item.preview_id === vpId ? renderedPose : item);
 				activeHotCameraId = vpId;
-				probeResult = { batch_id: data.batch_id, vp_id: vpId, heading_id: headingId, modality: activeRenderModality, sensor_id: activeRigSensorId, submittedAt: Date.now() };
+				probeResult = { batch_id: data.batch_id, vp_id: vpId, heading_id: headingId, modality: activeRenderModality, modalities: previewModalities, is_polar: isPolarPreview, sensor_id: activeRigSensorId, submittedAt: Date.now() };
 				pushActivity('ok', 'preview:probe', `Hot camera submitted → batch ${data.batch_id}`);
 				startBatchPolling();
 				const job = data.jobs?.find((item: any) => item.preview_id === vpId) ?? data.jobs?.[0];
@@ -2980,6 +3082,60 @@
 			await graphService.deleteEdge(selectedProjectId, sceneId, edgeId);
 			await loadGraph();
 		} catch (err) { pushActivity('error', 'graph:edge-del', errorMessage(err)); }
+	}
+	let rebuildingEdges = $state(false);
+	async function rebuildGraphEdges() {
+		if (!selectedProjectId || !sceneId) return;
+		rebuildingEdges = true;
+		try {
+			const res = await graphService.rebuildGraphEdges(selectedProjectId, sceneId);
+			pushActivity('ok', 'graph:rebuild-edges', `Edges rebuilt (${res?.edge_count ?? '?'} edges, nodes kept)`);
+			await loadGraph();
+		} catch (err) {
+			pushActivity('error', 'graph:rebuild-edges', errorMessage(err));
+		} finally {
+			rebuildingEdges = false;
+		}
+	}
+	// ── Multi-select node removal handlers ──
+	function toggleRemoveNode(nodeId: string) {
+		const next = new Set(removeSelection);
+		if (next.has(nodeId)) next.delete(nodeId); else next.add(nodeId);
+		removeSelection = next;
+	}
+	function addRemoveNodes(nodeIds: string[]) {
+		const next = new Set(removeSelection);
+		for (const id of nodeIds) next.add(id);
+		removeSelection = next;
+	}
+	function clearRemoveSelection() { removeSelection = new Set(); }
+	async function findOverlappingNodes() {
+		if (!selectedProjectId || !sceneId) return;
+		findingOverlapping = true;
+		try {
+			const ids = await graphService.findOverlappingNodes(selectedProjectId, sceneId, { marginM: Number(removeMarginM) || 0, robotHeightM: Number(removePassHeightM) || 1.2 });
+			removeSelection = new Set(ids);
+			pushActivity('ok', 'graph:overlap', `${ids.length} overlapping node(s) selected`);
+		} catch (err) {
+			pushActivity('error', 'graph:overlap', errorMessage(err));
+		} finally {
+			findingOverlapping = false;
+		}
+	}
+	async function removeSelectedGraphNodes() {
+		if (!selectedProjectId || !sceneId || removeSelection.size === 0) return;
+		const ids = Array.from(removeSelection);
+		removingNodes = true;
+		try {
+			const res = await graphService.deleteGraphNodes(selectedProjectId, sceneId, ids);
+			pushActivity('ok', 'graph:remove-nodes', `Removed ${res?.removed_count ?? ids.length} node(s)`);
+			removeSelection = new Set();
+			await loadGraph();
+		} catch (err) {
+			pushActivity('error', 'graph:remove-nodes', errorMessage(err));
+		} finally {
+			removingNodes = false;
+		}
 	}
 	async function renderSensorViewpoint() {
 		if (!selectedSensorNode || !selectedProjectId || !sceneId) return;
@@ -3353,6 +3509,8 @@
 				only_completed: exportOnlyCompleted,
 				include_episode_thumbnails: exportIncludeThumbnails,
 				panorama_observations: exportPanoramaObservations,
+				png_only: exportPngOnly,
+				include_birdseye: exportIncludeBirdseye,
 			});
 			const jobId = (accepted as any)?.job_id;
 			if (!jobId) return;
@@ -3496,6 +3654,7 @@
 		{@const selectedEnvmap = assetVM.envmapFiles.find((f: any) => f.envmap_ref === envmapRef)}
 	{@const shellOn = authoringMap?.settings?.room_shell_enabled ?? true}
 	{@const floorOn = authoringMap?.settings?.auto_floor_enabled ?? true}
+	{@const ceilingOn = authoringMap?.settings?.auto_ceiling_enabled ?? (authoringMap?.settings?.room_shell_enabled ?? true)}
 	<div class="env-section">
 		<div class="env-section-title">Lighting source</div>
 		<div class="env-radio-row">
@@ -3550,15 +3709,19 @@
 			<span><strong>Auto floor</strong><span class="env-toggle-sub">Keep a base floor visible for editing and rendering.</span></span>
 		</label>
 		<label class="inline-check enclosure-toggle">
+			<input type="checkbox" checked={ceilingOn} onchange={(event) => updateSettingsField('auto_ceiling_enabled', (event.currentTarget as HTMLInputElement).checked)} />
+			<span><strong>Auto ceiling</strong><span class="env-toggle-sub">Cap the room with a ceiling (enclosure + light bounce), independent of the walls.</span></span>
+		</label>
+		<label class="inline-check enclosure-toggle">
 			<input type="checkbox" checked={shellOn} onchange={(event) => updateSettingsField('room_shell_enabled', (event.currentTarget as HTMLInputElement).checked)} />
-			<span><strong>Walls & ceiling</strong><span class="env-toggle-sub">Add simple boundary walls and ceiling around the map.</span></span>
+			<span><strong>Perimeter walls</strong><span class="env-toggle-sub">Add simple boundary walls around the map. Turn off to reveal the environment through glass walls / windows.</span></span>
 		</label>
 		{#if mode === 'envmap' && shellOn}
-			<div class="hint-row">💡 Turn off Walls &amp; ceiling so the envmap can light the scene and show as the background.</div>
-		{:else if !shellOn && !floorOn && mode === 'constant'}
-			<div class="hint-row">⚠ Floor + walls/ceiling both off under constant lighting → scene will render almost empty. Switch to envmap.</div>
-		{:else if !shellOn && mode === 'constant'}
-			<div class="hint-row">⚠ Walls/ceiling off + constant lighting → flat. Consider switching to envmap.</div>
+			<div class="hint-row">💡 Turn off Perimeter walls so the envmap shows through glass walls / windows. Keep Auto ceiling for an enclosed room.</div>
+		{:else if !shellOn && !ceilingOn && !floorOn && mode === 'constant'}
+			<div class="hint-row">⚠ Floor + walls + ceiling all off under constant lighting → scene will render almost empty. Switch to envmap.</div>
+		{:else if !shellOn && !ceilingOn && mode === 'constant'}
+			<div class="hint-row">⚠ Walls + ceiling off + constant lighting → flat. Consider switching to envmap.</div>
 		{/if}
 	</div>
 {/snippet}
@@ -3749,7 +3912,7 @@
 				onGroundPointerMove={handleGroundPointerMove}
 				onGroundPointerUp={handleGroundPointerUp}
 				onObjectTransform={handleObjectTransform}
-					preloadSourcePath={placementTool === 'usd_asset' && assetVM.selectedUsdAsset?.source_format !== 'glb' ? (assetVM.selectedUsdAsset?.source_path ?? '') : ''}
+					preloadSourcePath={placementTool === 'usd_asset' ? (assetVM.selectedUsdAsset?.source_format === 'glb' ? (assetVM.selectedUsdAsset?.source_ref ?? assetVM.selectedUsdAsset?.glb_ref ?? '') : (assetVM.selectedUsdAsset?.source_path ?? '')) : ''}
 					preloadUsdRef={placementTool === 'usd_asset' && assetVM.selectedUsdAsset?.source_format !== 'glb' ? (assetVM.selectedUsdAsset?.usd_ref ?? '') : ''}
 				customSensorNodes={customSensorNodes.map(n => ({ id: n.id, x: n.x, z: n.z, headingDeg: n.headingDeg, selected: n.id === selectedSensorNodeId }))}
 			cameraHeight={cameraHeightM}
@@ -3766,6 +3929,7 @@
 				}}
 				onObjectContextMenu={handleContextMenu}
 				onHandleDrag={dragLineHandle}
+				onRegionResize={dragRegionHandle}
 				highlightedPath={selectedEpisodePath}
 				allEpisodePaths={pageMode === 'export' ? allEpisodePaths : []}
 				mapBounds={{ w: mapWidth, h: mapHeight }}
@@ -3801,6 +3965,10 @@
 				addEdgeMode={pageMode === 'paths' && (addEdgeMode || edgeInspectorMode)}
 				onEdgeFirstNode={(nid) => edgeInspectorMode ? handleInspectorFirstNode(nid) : handleEdgeFirstNode(nid)}
 				onEdgeSecondNode={(src, tgt) => edgeInspectorMode ? handleInspectorSecondNode(src, tgt) : handleEdgeSecondNode(src, tgt)}
+				removeNodeMode={pageMode === 'paths' && removeNodeMode}
+				removeSelection={removeSelection}
+				onNodeToggle={toggleRemoveNode}
+				onNodesBoxSelect={addRemoveNodes}
 				addEdgeGhostColor={edgeInspectorMode ? 0xa855f7 : 0x22c55e}
 				addEdgeMaxLengthM={Number(maxEdgeLength)}
 				roomShell={roomShell}
@@ -3958,6 +4126,8 @@
 					bind:currentSceneOnly={exportCurrentSceneOnly}
 					bind:includeThumbnails={exportIncludeThumbnails}
 					bind:panoramaObservations={exportPanoramaObservations}
+				bind:pngOnly={exportPngOnly}
+				bind:includeBirdseye={exportIncludeBirdseye}
 					currentSceneId={sceneId}
 					{exportableEpisodeCount}
 					exportSummary={exportResult}
@@ -4042,6 +4212,20 @@
 						<label><span>map W (m)</span><input type="number" min="1" max="2000" step="1" bind:value={mapWidth} /></label>
 						<label><span>map H (m)</span><input type="number" min="1" max="2000" step="1" bind:value={mapHeight} /></label>
 					</div>
+					{#if hasScene}
+						<div class="translate-layout">
+							<span class="translate-layout-title">Translate layout (m)</span>
+							<div class="geometry-grid">
+								<label><span>Δx (east+)</span><input type="number" step="0.1" bind:value={layoutDx} /></label>
+								<label><span>Δy (north+)</span><input type="number" step="0.1" bind:value={layoutDy} /></label>
+							</div>
+							<div class="action-row">
+								<button class="button button-subtle" disabled={loading || (!layoutDx && !layoutDy)} onclick={() => { translateLayout(Number(layoutDx) || 0, Number(layoutDy) || 0); layoutDx = 0; layoutDy = 0; }}>Apply shift</button>
+								<button class="button button-subtle" disabled={loading} onclick={() => normalizeLayoutToPositive()}>Normalize to ≥0</button>
+							</div>
+							<span class="translate-layout-sub">Shifts every object &amp; region. Use to make room past the origin (negative editing is also allowed). Then bump map W/H and Save Map.</span>
+						</div>
+					{/if}
 					<div class="action-row">
 						<button class="button button-subtle" disabled={!selectedProjectId || loading} onclick={addScene}>Add Scene</button>
 						<button class="button button-primary" disabled={!selectedProjectId || !hasScene || loading} onclick={saveMap}>
@@ -4321,6 +4505,8 @@
 				{maxNodes} {headingCount} {minNodeSpacing} {selectedSensorNode}
 				onBuildMap={buildMap}
 				onRequestBuildGraph={requestBuildGraph}
+				onRebuildEdges={rebuildGraphEdges}
+				rebuildingEdges={rebuildingEdges}
 				onSetPathsMode={(m) => (pathsMode = m as PathsInteractionMode)}
 				onSetPaintRadius={(r) => (paintRadiusM = r)}
 				onRebuildRegion={rebuildRegion}
@@ -4333,6 +4519,16 @@
 				onDismissEdgeCheck={() => (edgeCheckResult = null)}
 				onDeleteGraphEdge={handleDeleteGraphEdge}
 				onDeleteGraphNode={deleteSelectedGraphNode}
+				removeSelectionCount={removeSelection.size}
+				removeMarginM={removeMarginM}
+				removePassHeightM={removePassHeightM}
+				findingOverlapping={findingOverlapping}
+				removingNodes={removingNodes}
+				onFindOverlapping={findOverlappingNodes}
+				onRemoveSelectedNodes={removeSelectedGraphNodes}
+				onClearRemoveSelection={clearRemoveSelection}
+				onSetRemoveMargin={(v) => (removeMarginM = v)}
+				onSetRemovePassHeight={(v) => (removePassHeightM = v)}
 				onLoadEpisode={loadEpisode}
 				onGenerateEpisodes={planGraphEpisodes}
 				onClearEpisodes={clearEpisodes}
@@ -4440,6 +4636,8 @@
 				bind:currentSceneOnly={exportCurrentSceneOnly}
 				bind:includeThumbnails={exportIncludeThumbnails}
 				bind:panoramaObservations={exportPanoramaObservations}
+				bind:pngOnly={exportPngOnly}
+				bind:includeBirdseye={exportIncludeBirdseye}
 				currentSceneId={sceneId}
 				{exportableEpisodeCount}
 				exportSummary={exportResult}
@@ -4462,6 +4660,8 @@
 				onSceneChange={(id) => { sceneId = id; sceneStateText = ''; cameraSpecText = ''; renderConfig = null; syncResult = null; renderReadiness = null; renderConfigError = ''; loadAuthoringMap(); loadRenderConfig(); episodes = []; selectedEpisode = null; selectedEpisodeId = ''; graphPayload = null; observationScan = null; graphBatch = null; graphBatchId = ''; graphBatchIds = []; stopBatchPolling(); _showRoomShellUserTouched = false; if (pageMode === 'sensors') scanObservations(); }}
 				onSetMapWidth={setMapWidthFromInput}
 				onSetMapHeight={setMapHeightFromInput}
+				onTranslateLayout={translateLayout}
+				onNormalizeLayout={() => normalizeLayoutToPositive()}
 				onAddScene={addScene}
 				onSaveMap={saveMap}
 				onEnableAllEmitters={enableAllDetectedEmitters}
@@ -5655,6 +5855,9 @@
 
 
 	.env-toggle-sub { font-size: 11px; color: var(--muted-strong); font-weight: 400; }
+	.translate-layout { display: flex; flex-direction: column; gap: var(--space-1); margin-top: var(--space-2); padding-top: var(--space-2); border-top: 1px solid var(--border-subtle, rgba(148,163,184,0.25)); }
+	.translate-layout-title { font-size: 12px; font-weight: 600; color: var(--muted-strong); }
+	.translate-layout-sub { font-size: 11px; color: var(--muted-strong); font-weight: 400; }
 	.inline-check input[type="checkbox"] { flex: 0 0 auto; }
 	.build-result-row { display: flex; gap: 4px; flex-wrap: wrap; margin-top: 4px; align-items: center; }
 	.spinner-xs {

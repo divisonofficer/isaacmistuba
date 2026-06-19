@@ -68,10 +68,10 @@ export const builtInBuildAssets: BuiltInBuildAsset[] = [
 ];
 
 const primitivePlaceAssets: BuiltInPrimitivePlaceAsset[] = [
-	{ kind: 'primitive', id: 'chair', label: 'Chair', tool: 'chair', category: 'furniture', group: 'Essentials', bounds: { size: [0.45, 0.8, 0.45] } },
-	{ kind: 'primitive', id: 'table', label: 'Table', tool: 'table', category: 'furniture', group: 'Essentials', bounds: { size: [0.9, 0.72, 0.55] } },
-	{ kind: 'primitive', id: 'plant', label: 'Plant', tool: 'plant', category: 'plant', group: 'Essentials', bounds: { size: [0.35, 0.9, 0.35] } },
-	{ kind: 'primitive', id: 'camera', label: 'Camera', tool: 'camera', category: 'electronics', group: 'Essentials', bounds: { size: [0.1, 0.15, 0.1] } }
+	{ kind: 'primitive', id: 'chair', label: 'Chair', tool: 'chair', category: 'furniture', group: 'Debug Proxies', bounds: { size: [0.45, 0.8, 0.45] } },
+	{ kind: 'primitive', id: 'table', label: 'Table', tool: 'table', category: 'furniture', group: 'Debug Proxies', bounds: { size: [0.9, 0.72, 0.55] } },
+	{ kind: 'primitive', id: 'plant', label: 'Plant', tool: 'plant', category: 'plant', group: 'Debug Proxies', bounds: { size: [0.35, 0.9, 0.35] } },
+	{ kind: 'primitive', id: 'camera', label: 'Camera', tool: 'camera', category: 'electronics', group: 'Debug Proxies', bounds: { size: [0.1, 0.15, 0.1] } }
 ];
 
 function moorelaneAsset(
@@ -186,8 +186,8 @@ const dtcPlaceAssets: BuiltInRichPlaceAsset[] = [
 
 export const builtInRichPlaceAssets: BuiltInRichPlaceAsset[] = [...moorelanePlaceAssets, ...dtcPlaceAssets];
 
-const groupOrder = ['Essentials', 'Office Furniture', 'Office Electronics', 'Lighting', 'Safety', 'Reflective Surfaces', 'Furniture', 'Decor', 'Kitchen Props', 'Tools and Office', 'Landmarks'];
-export const builtInPlaceAssets: BuiltInPlaceAsset[] = [...primitivePlaceAssets, ...builtInRichPlaceAssets];
+const groupOrder = ['Debug Proxies'];
+export const builtInPlaceAssets: BuiltInPlaceAsset[] = [...primitivePlaceAssets];
 
 export const builtInPlaceAssetGroups: BuiltInPlaceAssetGroup[] = groupOrder
 	.map((label) => ({

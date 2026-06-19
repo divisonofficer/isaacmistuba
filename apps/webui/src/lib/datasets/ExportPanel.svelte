@@ -21,6 +21,8 @@
 		currentSceneOnly = $bindable(true),
 		includeThumbnails = $bindable(false),
 		panoramaObservations = $bindable(true),
+		pngOnly = $bindable(true),
+		includeBirdseye = $bindable(true),
 		currentSceneId = '',
 		exportableEpisodeCount = 0,
 		exportSummary = null,
@@ -47,6 +49,8 @@
 		currentSceneOnly?: boolean;
 		includeThumbnails?: boolean;
 		panoramaObservations?: boolean;
+		pngOnly?: boolean;
+		includeBirdseye?: boolean;
 		currentSceneId?: string;
 		exportableEpisodeCount?: number;
 		exportSummary?: any;
@@ -167,6 +171,22 @@
 			GT 경로가 지나는 <strong>(vp, heading)</strong> 만 포함 (slimmer bundle).
 		{/if}
 	</div>
+	<label class="export-filter-row">
+		<input type="checkbox" bind:checked={pngOnly} />
+		<span>PNG only (exclude EXR)</span>
+	</label>
+	<div class="export-filter-hint">
+		{#if pngOnly}
+			<strong>EXR/HDR·raw 제외</strong>, PNG 만 패키징 — export가 훨씬 빠르고 가볍습니다.
+		{:else}
+			EXR(HDR) 포함 — 용량 크고 느림.
+		{/if}
+	</div>
+	<label class="export-filter-row">
+		<input type="checkbox" bind:checked={includeBirdseye} />
+		<span>Bird's-eye summary</span>
+	</label>
+	<div class="export-filter-hint">grid + viewpoint graph + episode 경로의 top-down 요약 PNG 를 포함합니다.</div>
 	<label class="export-filter-row">
 		<input type="checkbox" bind:checked={includeThumbnails} />
 		<span>Include episode thumbnails</span>

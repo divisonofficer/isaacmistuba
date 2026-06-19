@@ -22,6 +22,8 @@
 		onSceneChange: (id: string) => void;
 		onSetMapWidth: (value: number) => void;
 		onSetMapHeight: (value: number) => void;
+		onTranslateLayout: (dx: number, dy: number) => void;
+		onNormalizeLayout: () => void;
 		onAddScene: () => void;
 		onSaveMap: () => void;
 		onEnableAllEmitters: () => void;
@@ -42,7 +44,7 @@
 		authoringMap, currentScene, detectedEmitterCount, enabledEmitterCount,
 		effectiveRenderReadiness, mapWidth, mapHeight, loading,
 		envmapFiles, envmapUploading,
-		onSceneChange, onSetMapWidth, onSetMapHeight,
+		onSceneChange, onSetMapWidth, onSetMapHeight, onTranslateLayout, onNormalizeLayout,
 		onAddScene, onSaveMap, onEnableAllEmitters, onDisableAllEmitters,
 		onUpdateEnvironmentField, onUpdateSettingsField, onUploadEnvmap,
 		onMarkAuthoringJsonDirty, onAuthoringMapTextChange, onAnnotationTextChange,
@@ -62,6 +64,10 @@
 	const selectedEnvmap = $derived(envmapFiles.find((f: any) => f.envmap_ref === envmapRef));
 	const shellOn = $derived(authoringMap?.settings?.room_shell_enabled ?? true);
 	const floorOn = $derived(authoringMap?.settings?.auto_floor_enabled ?? true);
+	const ceilingOn = $derived(authoringMap?.settings?.auto_ceiling_enabled ?? shellOn);
+
+	let layoutDx = $state(0);
+	let layoutDy = $state(0);
 </script>
 
 <section class="rail-section rail-tool-panel">
@@ -83,6 +89,20 @@
 				<label><span>map W (m)</span><input type="number" min="1" max="2000" step="1" value={mapWidth} oninput={(e) => onSetMapWidth(Number((e.currentTarget as HTMLInputElement).value))} /></label>
 				<label><span>map H (m)</span><input type="number" min="1" max="2000" step="1" value={mapHeight} oninput={(e) => onSetMapHeight(Number((e.currentTarget as HTMLInputElement).value))} /></label>
 			</div>
+			{#if hasScene}
+				<div class="translate-layout">
+					<span class="translate-layout-title">Translate layout (m)</span>
+					<div class="geometry-grid">
+						<label><span>Δx (east+)</span><input type="number" step="0.1" bind:value={layoutDx} /></label>
+						<label><span>Δy (north+)</span><input type="number" step="0.1" bind:value={layoutDy} /></label>
+					</div>
+					<div class="action-row">
+						<button class="button button-subtle" disabled={loading || (!layoutDx && !layoutDy)} onclick={() => { onTranslateLayout(Number(layoutDx) || 0, Number(layoutDy) || 0); layoutDx = 0; layoutDy = 0; }}>Apply shift</button>
+						<button class="button button-subtle" disabled={loading} onclick={() => onNormalizeLayout()}>Normalize to ≥0</button>
+					</div>
+					<span class="translate-layout-sub">Shifts every object &amp; region together (e.g. bring a negative-coord room back to the origin). Then Save Map.</span>
+				</div>
+			{/if}
 			<div class="action-row">
 				<button class="button button-subtle" disabled={!selectedProjectId || loading} onclick={onAddScene}>Add Scene</button>
 				<button class="button button-primary" disabled={!selectedProjectId || !hasScene || loading} onclick={onSaveMap}>
@@ -170,11 +190,17 @@
 						<input type="checkbox" checked={shellOn} onchange={(e) => onUpdateSettingsField('room_shell_enabled', (e.currentTarget as HTMLInputElement).checked)} />
 						<span><strong>Walls &amp; ceiling</strong><span class="env-toggle-sub">Add simple boundary walls and ceiling around the map.</span></span>
 					</label>
+					{#if !shellOn}
+					<label class="inline-check enclosure-toggle" style="margin-left:18px">
+						<input type="checkbox" checked={ceilingOn} onchange={(e) => onUpdateSettingsField('auto_ceiling_enabled', (e.currentTarget as HTMLInputElement).checked)} />
+						<span><strong>Ceiling only</strong><span class="env-toggle-sub">Keep the ceiling slab while walls are off (envmap lights through sides).</span></span>
+					</label>
+					{/if}
 					{#if envMode === 'envmap' && shellOn}
 						<div class="hint-row">💡 Turn off Walls &amp; ceiling so the envmap can light the scene and show as the background.</div>
-					{:else if !shellOn && !floorOn && envMode === 'constant'}
+					{:else if !shellOn && !floorOn && !ceilingOn && envMode === 'constant'}
 						<div class="hint-row">⚠ Floor + walls/ceiling both off under constant lighting → scene will render almost empty. Switch to envmap.</div>
-					{:else if !shellOn && envMode === 'constant'}
+					{:else if !shellOn && envMode === 'constant' && !ceilingOn}
 						<div class="hint-row">⚠ Walls/ceiling off + constant lighting → flat. Consider switching to envmap.</div>
 					{/if}
 				</div>
@@ -355,4 +381,7 @@
 	.enclosure-toggle strong { font-size: 12px; font-weight: 600; color: #1e293b; }
 
 	.env-toggle-sub { font-size: 11px; color: var(--muted-strong); font-weight: 400; }
+	.translate-layout { display: flex; flex-direction: column; gap: var(--space-1, 4px); margin-top: var(--space-2, 8px); padding-top: var(--space-2, 8px); border-top: 1px solid var(--border-subtle, rgba(148,163,184,0.25)); }
+	.translate-layout-title { font-size: 12px; font-weight: 600; color: var(--muted-strong); }
+	.translate-layout-sub { font-size: 11px; color: var(--muted-strong); font-weight: 400; }
 </style>

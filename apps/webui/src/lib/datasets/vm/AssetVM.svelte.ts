@@ -15,7 +15,6 @@ import type { CameraRig } from '$lib/api';
 import { buildMaterialCards } from '$lib/datasets/materialHelpers';
 import * as assetService from '$lib/datasets/services/assetService';
 import { usdAssetLabel } from '$lib/datasets/authoringHelpers';
-import { builtInRichPlaceAssets } from '$lib/opticalnavBuiltInAssets';
 import { errorMessage } from '$lib/datasets/batchHelpers';
 
 const LIBRARY_DISPLAY_LIMIT = 40;
@@ -58,10 +57,10 @@ class AssetVM {
 	// ── Derived ───────────────────────────────────────────────────
 	materialCards = $derived(buildMaterialCards(this.materialGroups));
 
-	usdAssetSelectionPool = $derived([...builtInRichPlaceAssets, ...this.mapAssets] as any[]);
+	usdAssetSelectionPool = $derived(this.mapAssets as any[]);
 
 	#usdAssetCandidatesAll = $derived.by(() => {
-		const all = this.mapAssets as any[];
+		const all = (this.mapAssets as any[]).filter((item: any) => item.usable_by_agent !== false && ['texture_ready', 'analytic_ok'].includes(String(item.render_readiness ?? '')));
 		if (!this.usdCatalogSearch.trim()) return all;
 		const q = this.usdCatalogSearch.toLowerCase();
 		return all.filter(

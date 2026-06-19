@@ -365,11 +365,12 @@ export const listOpticalNavAssets = (opts: { q?: string; category?: string; sele
 	const query = params.toString();
 	return fetch(`/api/opticalnav/asset-library/assets${query ? `?${query}` : ''}`).then(json);
 };
-export const listOpticalNavAgentAssets = (opts: { q?: string; category?: string; active?: boolean } = {}) => {
+export const listOpticalNavAgentAssets = (opts: { q?: string; category?: string; active?: boolean; include_unready?: boolean } = {}) => {
 	const params = new URLSearchParams();
 	if (opts.q) params.set('q', opts.q);
 	if (opts.category && opts.category !== 'all') params.set('category', opts.category);
 	if (opts.active != null) params.set('active', opts.active ? '1' : '0');
+	if (opts.include_unready) params.set('include_unready', '1');
 	const query = params.toString();
 	return fetch(`/api/opticalnav/agent/assets${query ? `?${query}` : ''}`).then(json);
 };
@@ -390,7 +391,7 @@ export const getOpticalNavProject = (projectId: string) =>
 export const getOpticalNavMapAssets = (projectId: string) =>
 	fetch(`${opticalProject(projectId)}/map-assets`).then(json);
 export const opticalNavAssetThumbnailUrl = (projectId: string, assetId: string) =>
-	`${opticalProject(projectId)}/map-assets/${encodeURIComponent(assetId)}/thumbnail?v=mesh_thumb_v3`;
+	`${opticalProject(projectId)}/map-assets/${encodeURIComponent(assetId)}/thumbnail?v=mesh_thumb_v4`;
 export const addOpticalNavScene = (projectId: string, payload: OpticalNavSceneCreate) =>
 	post(`${opticalProject(projectId)}/scenes`, payload);
 export const attachOpticalNavSceneUsd = (projectId: string, sceneId: string, payload: { usd_ref?: string }) =>
@@ -405,6 +406,8 @@ export const getOpticalNavEditorGeometry = (projectId: string, sceneId: string, 
 	fetch(`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/editor-geometry${refresh ? '?refresh=1' : ''}`).then(json);
 export const getOpticalNavPrimMesh = (projectId: string, sceneId: string, sourcePath: string, usdRef?: string) => {
 	const params = new URLSearchParams({ source_path: sourcePath });
+	const lowerSource = sourcePath.toLowerCase();
+	if (lowerSource.endsWith('.glb') || lowerSource.endsWith('.gltf')) params.set('source_ref', sourcePath);
 	if (usdRef) params.set('usd_ref', usdRef);
 	return fetch(`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/prim-mesh?${params}`).then(json);
 };
@@ -420,6 +423,8 @@ export const buildOpticalNavMap = (projectId: string, sceneId: string, payload: 
 	post(`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/map/build`, payload);
 export const buildOpticalNavViewpointGraph = (projectId: string, sceneId: string, payload: unknown) =>
 	post(`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/graph/build`, payload);
+export const rebuildOpticalNavGraphEdges = (projectId: string, sceneId: string, payload: unknown = {}) =>
+	post(`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/graph/rebuild-edges`, payload);
 export const graphBuildProgressWsUrl = (projectId: string, sceneId: string): string => {
 	const proto = typeof location !== 'undefined' && location.protocol === 'https:' ? 'wss:' : 'ws:';
 	const host = typeof location !== 'undefined' ? location.host : '127.0.0.1:8765';
@@ -487,6 +492,26 @@ export const addOpticalNavGraphNode = (projectId: string, sceneId: string, paylo
 	post(`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/graph/nodes`, payload);
 export const deleteOpticalNavGraphNode = (projectId: string, sceneId: string, nodeId: string) =>
 	fetch(`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/graph/nodes/${encodeURIComponent(nodeId)}`, { method: 'DELETE' }).then(json);
+export const deleteOpticalNavGraphNodes = (projectId: string, sceneId: string, nodeIds: string[]) =>
+	fetch(`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/graph/nodes`, {
+		method: 'DELETE',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify({ node_ids: nodeIds })
+	}).then(json);
+export const fetchOpticalNavOverlappingGraphNodes = (
+	projectId: string,
+	sceneId: string,
+	opts?: { marginM?: number; includeWalls?: boolean; robotHeightM?: number }
+) => {
+	const q = new URLSearchParams();
+	if (opts?.marginM != null) q.set('margin_m', String(opts.marginM));
+	if (opts?.includeWalls) q.set('include_walls', '1');
+	if (opts?.robotHeightM != null) q.set('robot_height_m', String(opts.robotHeightM));
+	const qs = q.toString();
+	return fetch(
+		`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/graph/overlapping-nodes${qs ? `?${qs}` : ''}`
+	).then(json);
+};
 export const getOpticalNavWalkabilityOverlay = (projectId: string, sceneId: string) =>
 	fetch(`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/walkability-overlay`).then(json);
 export const paintOpticalNavWalkabilityOverlay = (
@@ -546,6 +571,8 @@ export const submitOpticalNavExportJob = (
 		episode_ids?: string[] | null;
 		include_episode_thumbnails?: boolean;
 		panorama_observations?: boolean;
+		png_only?: boolean;
+		include_birdseye?: boolean;
 	},
 ) => post(`${opticalProject(projectId)}/export-jobs`, payload);
 

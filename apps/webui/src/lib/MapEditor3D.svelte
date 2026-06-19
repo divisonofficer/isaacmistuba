@@ -27,6 +27,7 @@
 	};
 	type ObjectTransformReason = 'drag_start' | 'drag_move' | 'drag_end' | 'height_move' | 'yaw_move';
 	type ObjectGizmoHandle = 'move_xz' | 'move_y' | 'yaw';
+	type RectHandle = 'rect_x0z0' | 'rect_x1z0' | 'rect_x0z1' | 'rect_x1z1';
 
 	type VisibleLayers = {
 		objects: boolean;
@@ -62,6 +63,14 @@
 		object_id?: string;
 		shape_type: string;
 		mesh_path?: string | null;
+		preview_mesh_path?: string | null;
+		preview_mesh_faces?: number;
+		source_mesh_faces?: number;
+		preview_mesh_status?: 'ready' | 'skipped_small' | 'architecture_proxy' | 'failed' | 'unavailable' | string;
+		preview_mesh_reason?: string | null;
+		editor_layer?: 'object' | 'architecture' | 'floor' | 'shell' | string;
+		editor_pickable?: boolean;
+		editor_proxy?: { kind?: string; bounds?: { min?: number[]; max?: number[]; size?: number[]; center?: number[] } | null; material_hint?: string | null };
 		transform?: { translate?: number[]; scale?: number[]; rotate_y_deg?: number };
 		xml_role?: string;
 		material_id?: string;
@@ -95,6 +104,7 @@
 		onObjectSelect,
 		onObjectContextMenu,
 		onHandleDrag,
+		onRegionResize,
 		onStatus,
 		observationScan = null,
 		onFrustumClick,
@@ -123,6 +133,10 @@
 		addEdgeMode = false,
 		onEdgeFirstNode,
 		onEdgeSecondNode,
+		removeNodeMode = false,
+		removeSelection = new Set<string>() as Set<string>,
+		onNodeToggle,
+		onNodesBoxSelect,
 		roomShell = null as {
 			wall_height_m: number;
 			wall_thickness_m: number;
@@ -131,6 +145,8 @@
 			floor_slabs?: Array<{ role: 'floor'; id?: string; region_id?: string | null; center: [number, number, number]; size: [number, number, number]; material_id?: string }>;
 			auto_floor_enabled?: boolean;
 			default_floor_material_id?: string;
+			walls_enabled?: boolean;
+			ceiling_enabled?: boolean;
 		} | null,
 		showRoomShell = true,
 		// PR2: when enabled, look up each authoring object in xmlSceneIndex.shapes
@@ -191,6 +207,7 @@
 		onObjectSelect?: (id: string) => void;
 		onObjectContextMenu?: (event: MouseEvent, id: string, type: 'object' | 'region') => void;
 		onHandleDrag?: (id: string, handle: 'line_start' | 'line_end', pt: { x: number; y: number }, shiftKey: boolean) => void;
+		onRegionResize?: (id: string, handle: RectHandle, pt: { x: number; y: number }, shiftKey: boolean) => void;
 		onStatus?: (message: string) => void;
 		observationScan?: any;
 		onFrustumClick?: (vpId: string, headingId: string) => void;
@@ -219,6 +236,10 @@
 		addEdgeMode?: boolean;
 		onEdgeFirstNode?: (nodeId: string) => void;
 		onEdgeSecondNode?: (sourceId: string, targetId: string) => void;
+		removeNodeMode?: boolean;
+		removeSelection?: Set<string>;
+		onNodeToggle?: (nodeId: string) => void;
+		onNodesBoxSelect?: (nodeIds: string[]) => void;
 		roomShell?: {
 			wall_height_m: number;
 			wall_thickness_m: number;
@@ -227,6 +248,8 @@
 			floor_slabs?: Array<{ role: 'floor'; id?: string; region_id?: string | null; center: [number, number, number]; size: [number, number, number]; material_id?: string }>;
 			auto_floor_enabled?: boolean;
 			default_floor_material_id?: string;
+			walls_enabled?: boolean;
+			ceiling_enabled?: boolean;
 		} | null;
 		showRoomShell?: boolean;
 		xmlNativePreviewEnabled?: boolean;
@@ -296,7 +319,7 @@
 	const groundPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
 
 	let rightDragStartPos: { x: number; y: number } | null = null;
-	let dragHandle: { id: string; handle: 'line_start' | 'line_end' } | null = null;
+	let dragHandle: { id: string; handle: 'line_start' | 'line_end' | RectHandle } | null = null;
 	let objectDrag: {
 		id: string;
 		handle: ObjectGizmoHandle;
@@ -328,8 +351,13 @@
 		return clampAuthoringPoint(pt.x, pt.z);
 	}
 
-	function getHitObject(event: PointerEvent | MouseEvent): { id: string; type: 'object' | 'region' | 'object_gizmo'; handle?: 'line_start' | 'line_end' | ObjectGizmoHandle } | null {
-		if (!renderer || !camera || !selectableObjects.length) return null;
+	type HitPick = { id: string; type: 'object' | 'region' | 'object_gizmo'; handle?: 'line_start' | 'line_end' | ObjectGizmoHandle | RectHandle };
+
+	// Resolve raycast hits to id-bearing picks, nearest first, deduped by id+handle.
+	// Returning all overlapping picks lets the caller cycle through occluded objects
+	// (e.g. an open door sitting on a wall) instead of being stuck on the topmost one.
+	function getHitCandidates(event: PointerEvent | MouseEvent): HitPick[] {
+		if (!renderer || !camera || !selectableObjects.length) return [];
 		const rect = renderer.domElement.getBoundingClientRect();
 		const ndc = new THREE.Vector2(
 			((event.clientX - rect.left) / rect.width) * 2 - 1,
@@ -337,11 +365,48 @@
 		);
 		raycaster.setFromCamera(ndc, camera);
 		const hits = raycaster.intersectObjects(selectableObjects, true);
-		if (!hits.length) return null;
-		let obj: any = hits[0].object;
-		while (obj.parent && !obj.userData.id) obj = obj.parent;
-		if (obj.userData.id) return { id: obj.userData.id as string, type: (obj.userData.itemType as 'object' | 'region' | 'object_gizmo') ?? 'object', handle: obj.userData.handle };
-		return null;
+		const picks: HitPick[] = [];
+		const seen = new Set<string>();
+		for (const h of hits) {
+			let obj: any = h.object;
+			while (obj.parent && !obj.userData.id) obj = obj.parent;
+			if (!obj.userData?.id) continue;
+			const id = obj.userData.id as string;
+			const handle = obj.userData.handle;
+			const key = `${id}::${handle ?? ''}`;
+			if (seen.has(key)) continue;
+			seen.add(key);
+			picks.push({ id, type: (obj.userData.itemType as 'object' | 'region' | 'object_gizmo') ?? 'object', handle });
+		}
+		return picks;
+	}
+
+	function getHitObject(event: PointerEvent | MouseEvent): HitPick | null {
+		return getHitCandidates(event)[0] ?? null;
+	}
+
+	// Cycle-select state: repeated clicks at ~the same screen point step through the
+	// stack of overlapping objects so occluded items become reachable.
+	let lastPickNdc: { x: number; y: number } | null = null;
+	let pickCycleIndex = 0;
+
+	function getClickPick(event: PointerEvent | MouseEvent): HitPick | null {
+		const candidates = getHitCandidates(event);
+		if (!candidates.length) { lastPickNdc = null; pickCycleIndex = 0; return null; }
+		// A handle under the cursor always wins (drag interaction), no cycling.
+		if (candidates[0].handle) { lastPickNdc = null; pickCycleIndex = 0; return candidates[0]; }
+		const rect = renderer?.domElement?.getBoundingClientRect();
+		const here = rect ? { x: event.clientX - rect.left, y: event.clientY - rect.top } : { x: event.clientX, y: event.clientY };
+		const sameSpot = lastPickNdc && Math.hypot(here.x - lastPickNdc.x, here.y - lastPickNdc.y) <= 6;
+		// Only body picks (no handle) participate in the cycle.
+		const bodies = candidates.filter((c) => !c.handle);
+		if (!bodies.length) { lastPickNdc = here; pickCycleIndex = 0; return candidates[0]; }
+		pickCycleIndex = sameSpot ? (pickCycleIndex + 1) % bodies.length : 0;
+		lastPickNdc = here;
+		if (bodies.length > 1) {
+			onStatus?.(`${bodies.length} overlapping — click again to cycle (${pickCycleIndex + 1}/${bodies.length})`);
+		}
+		return bodies[pickCycleIndex];
 	}
 
 	function pointObjectById(id: string): any | null {
@@ -496,17 +561,59 @@
 		return [Math.max(0.001, mx[0] - mn[0]), Math.max(0.001, mx[1] - mn[1]), Math.max(0.001, mx[2] - mn[2])];
 	}
 
+	// Bounding box of all authored content (object centres ±size, region bounds).
+	// Used so editing/preview placement can reach the real content even when it sits
+	// at negative coords far from the origin (e.g. imported Infinigen rooms at y≈-14).
+	function contentExtent(): { minX: number; minZ: number; maxX: number; maxZ: number } | null {
+		let minX = Infinity, minZ = Infinity, maxX = -Infinity, maxZ = -Infinity;
+		const grow = (x: number, z: number) => {
+			minX = Math.min(minX, x); minZ = Math.min(minZ, z);
+			maxX = Math.max(maxX, x); maxZ = Math.max(maxZ, z);
+		};
+		for (const obj of authoringObjects) {
+			const g = obj?.geometry;
+			const c = g?.center;
+			if (Array.isArray(c) && c.length >= 2) {
+				const s = Array.isArray(g?.size_m) ? g.size_m : [0.5, 0, 0.5];
+				const hx = Math.max(0.25, Number(s[0] ?? 0.5) / 2), hz = Math.max(0.25, Number(s[2] ?? s[1] ?? 0.5) / 2);
+				grow(Number(c[0]) - hx, Number(c[1]) - hz); grow(Number(c[0]) + hx, Number(c[1]) + hz);
+			} else if (Array.isArray(g?.start) && Array.isArray(g?.end)) {
+				grow(Number(g.start[0]), Number(g.start[1])); grow(Number(g.end[0]), Number(g.end[1]));
+			}
+		}
+		for (const reg of authoringRegions) {
+			const b = reg?.geometry?.bounds;
+			if (Array.isArray(b) && b.length >= 4) { grow(Number(b[0]), Number(b[1])); grow(Number(b[2]), Number(b[3])); }
+		}
+		return Number.isFinite(minX) ? { minX, minZ, maxX, maxZ } : null;
+	}
+
 	function clampAuthoringPoint(x: number, z: number): { x: number; y: number } {
 		const bounds = editorGeometry?.bounds;
 		const mn = bounds?.min ?? [0, 0, 0];
 		const mx = bounds?.max ?? [mapBounds?.w ?? 6, 0, mapBounds?.h ?? 4];
+		// Editable range = union of (editor/USD bounds), (mapBounds) and the actual
+		// authored content extent, all padded by one map-side. This lets placement &
+		// "Preview from here" reach content in negative space (backend supports signed
+		// coords) without pinning to the origin or a small default map size.
+		const pad = Math.max(mapBounds?.w ?? 6, mapBounds?.h ?? 4, 1);
+		const ext = contentExtent();
+		const loX = Math.min(Number(mn[0] ?? 0), ext?.minX ?? 0, 0) - pad;
+		const hiX = Math.max(Number(mx[0] ?? 6), ext?.maxX ?? 0, 0) + pad;
+		const loZ = Math.min(Number(mn[2] ?? 0), ext?.minZ ?? 0, 0) - pad;
+		const hiZ = Math.max(Number(mx[2] ?? 4), ext?.maxZ ?? 0, 0) + pad;
 		return {
-			x: Math.max(Number(mn[0] ?? 0), Math.min(Number(mx[0] ?? 6), Number(x.toFixed(3)))),
-			y: Math.max(Number(mn[2] ?? 0), Math.min(Number(mx[2] ?? 4), Number(z.toFixed(3))))
+			x: Math.max(loX, Math.min(hiX, Number(x.toFixed(3)))),
+			y: Math.max(loZ, Math.min(hiZ, Number(z.toFixed(3))))
 		};
 	}
 
+	function isGlbRef(value: unknown): boolean {
+		return typeof value === 'string' && /\.(glb|gltf)$/i.test(value.split('?')[0]);
+	}
+
 	function usdRefFromSourceRef(sourceRef: unknown): string {
+		if (isGlbRef(sourceRef)) return '';
 		return typeof sourceRef === 'string' ? sourceRef.split('#')[0] : '';
 	}
 
@@ -522,9 +629,15 @@
 	}
 
 	function effectiveAssetSourcePath(obj: any): string | undefined {
+		const sourceRef = typeof obj?.source_ref === 'string' ? obj.source_ref : '';
+		const format = String(obj?.metadata?.asset_source_format ?? '').toLowerCase();
+		if (format === 'glb' || isGlbRef(sourceRef) || isGlbRef(obj?.metadata?.asset_glb_ref)) {
+			const glbRef = obj?.metadata?.asset_glb_ref ?? obj?.metadata?.asset_source_ref ?? sourceRef;
+			return typeof glbRef === 'string' && glbRef ? glbRef : undefined;
+		}
 		const stored = obj?.metadata?.asset_source_path;
 		if (typeof stored === 'string' && stored) return stored;
-		const derived = primPathFromSourceRef(obj?.source_ref);
+		const derived = primPathFromSourceRef(sourceRef);
 		return derived || undefined;
 	}
 
@@ -687,6 +800,7 @@
 	// PR2: map of object_id (or shape_id when unmaterialized) → XML shape record.
 	// Built once per rebuildScene() so the authoring object loop can do O(1) lookups.
 	let _xmlShapeIndex = new Map<string, XmlSceneShape>();
+	const _objMeshLoadPending = new Set<string>();
 	function rebuildXmlShapeIndex(): void {
 		_xmlShapeIndex = new Map();
 		const shapes = xmlSceneIndex?.shapes ?? [];
@@ -697,6 +811,53 @@
 			const key = sh.object_id || sh.shape_id;
 			if (key) _xmlShapeIndex.set(key, sh as XmlSceneShape);
 		}
+	}
+
+
+	function buildArchitectureProxyFromXmlShape(sh: XmlSceneShape, colorHint: number): any {
+		const proxy = sh.editor_proxy ?? {};
+		const kind = String(proxy.kind ?? sh.editor_layer ?? 'architecture').toLowerCase();
+		const bounds = proxy.bounds ?? null;
+		const sizeRaw = Array.isArray(bounds?.size) && bounds!.size!.length >= 3 ? bounds!.size! : null;
+		const centerRaw = Array.isArray(bounds?.center) && bounds!.center!.length >= 3 ? bounds!.center! : null;
+		let sx = Math.max(0.02, Number(sizeRaw?.[0] ?? 0.8));
+		let sy = Math.max(0.02, Number(sizeRaw?.[1] ?? 0.08));
+		let sz = Math.max(0.02, Number(sizeRaw?.[2] ?? 0.8));
+		if (kind === 'floor' || kind === 'ground' || kind === 'slab') sy = Math.min(Math.max(sy, 0.015), 0.05);
+		const color = kind.includes('glass') ? 0x67e8f9
+			: kind.includes('floor') || kind.includes('ground') || kind.includes('slab') ? floorMaterialColor(proxy.material_hint ?? sh.material_id)
+			: kind.includes('ceiling') || kind.includes('roof') ? 0xcbd5e1
+			: colorHint || 0x94a3b8;
+		const opacity = kind.includes('floor') || kind.includes('ground') || kind.includes('slab') ? 0.34
+			: kind.includes('glass') ? 0.22
+			: 0.18;
+		const group = new THREE.Group();
+		const geo = new THREE.BoxGeometry(sx, sy, sz);
+		const mat = new THREE.MeshBasicMaterial({ color, transparent: true, opacity, depthWrite: false });
+		const mesh = new THREE.Mesh(geo, mat);
+		const cx = Number(centerRaw?.[0] ?? 0);
+		const cy = Number(centerRaw?.[1] ?? sy / 2);
+		const cz = Number(centerRaw?.[2] ?? 0);
+		mesh.position.set(cx, cy, cz);
+		mesh.userData = {
+			id: sh.object_id ?? sh.shape_id,
+			itemType: 'architecture',
+			editor_pickable: false,
+			xml_shape_id: sh.shape_id,
+			xml_role: sh.xml_role ?? null,
+			architecture_kind: kind,
+		};
+		group.add(mesh);
+		const edges = new THREE.LineSegments(
+			new THREE.EdgesGeometry(geo),
+			new THREE.LineBasicMaterial({ color, transparent: true, opacity: Math.min(0.65, opacity + 0.22) })
+		);
+		edges.position.copy(mesh.position);
+		edges.userData = { ...mesh.userData, itemType: 'architecture_edges' };
+		group.add(edges);
+		if (kind.includes('floor') || kind.includes('ground') || kind.includes('slab')) floorTargets.push(mesh);
+		group.userData = { ...mesh.userData };
+		return group;
 	}
 
 	// PR2: when the toggle is on, build the editor mesh from xml_scene_index.shapes
@@ -724,10 +885,17 @@
 		if (Math.abs(yaw) > 1e-5) group.rotation.y = (yaw * Math.PI) / 180;
 
 		const colorHint = sh.material_id ? floorMaterialColor(sh.material_id) : 0xb8b3a8;
-		const isMesh = sh.shape_type === 'obj' && !!sh.mesh_path;
+		if (sh.editor_layer === 'architecture' || sh.preview_mesh_status === 'architecture_proxy') {
+			const arch = buildArchitectureProxyFromXmlShape(sh, colorHint);
+			arch.position.copy(group.position);
+			arch.rotation.copy(group.rotation);
+			return arch;
+		}
+		const meshPath = sh.preview_mesh_path || sh.mesh_path;
+		const isMesh = sh.shape_type === 'obj' && !!meshPath;
 		let mesh: any;
 		if (isMesh) {
-			const filename = (sh.mesh_path as string).split('/').pop() || sh.mesh_path as string;
+			const filename = (meshPath as string).split('/').pop() || meshPath as string;
 			const key = objMeshCacheKey(opticalNavProjectId, opticalNavSceneId, filename);
 			const cached = getCachedObjMeshGeometry(key);
 			if (cached) {
@@ -760,9 +928,11 @@
 				mesh = new THREE.Mesh(ph, mat);
 				// Schedule an async load; on completion, bump the version state so the
 				// reactive $effect fires rebuildScene() again to swap in the real mesh.
-				if (opticalNavProjectId && opticalNavSceneId) {
+				if (opticalNavProjectId && opticalNavSceneId && cached === undefined && !_objMeshLoadPending.has(key)) {
+					_objMeshLoadPending.add(key);
 					void loadObjMeshGeometry(opticalNavProjectId, opticalNavSceneId, filename)
-						.then((geo) => { if (geo) _xmlNativePreviewVersion++; });
+						.then((geo) => { if (geo) _xmlNativePreviewVersion++; })
+						.finally(() => { _objMeshLoadPending.delete(key); });
 				}
 			}
 		} else {
@@ -776,6 +946,14 @@
 				transparent: true, opacity: sh.fallback ? 0.55 : 0.85,
 			});
 			mesh = new THREE.Mesh(geo, mat);
+		}
+		// Bottom-align the mesh to the group origin (which sits at base_height_m),
+		// matching the renderer (object bottom at base_height_m); otherwise a
+		// centred box is half-buried below the floor.
+		if (mesh?.geometry) {
+			mesh.geometry.computeBoundingBox?.();
+			const _bb = mesh.geometry.boundingBox;
+			if (_bb) mesh.position.y = -_bb.min.y;
 		}
 		mesh.userData = {
 			id: sh.object_id ?? sh.shape_id,
@@ -1009,6 +1187,31 @@
 			const sphere = new THREE.Mesh(geo, mat);
 			sphere.position.set(item.value[0], 0.12, item.value[1]);
 			sphere.userData = { id: obj.id, itemType: 'object', handle: item.handle };
+			rootGroup.add(sphere);
+			selectableObjects.push(sphere);
+		}
+	}
+
+	// Corner drag handles for a selected rectangle region (e.g. traversable floor).
+	// Lets the user resize the green floor directly in 3D — mirrors addLineHandles.
+	function addRectHandles(region: any) {
+		if (!rootGroup || region.geometry?.type !== 'rectangle') return;
+		const b = region.geometry?.bounds;
+		if (!Array.isArray(b) || b.length < 4) return;
+		const [x0, z0, x1, z1] = b.map((v: any) => Number(v));
+		const corners: Array<{ handle: RectHandle; x: number; z: number }> = [
+			{ handle: 'rect_x0z0', x: x0, z: z0 },
+			{ handle: 'rect_x1z0', x: x1, z: z0 },
+			{ handle: 'rect_x0z1', x: x0, z: z1 },
+			{ handle: 'rect_x1z1', x: x1, z: z1 }
+		];
+		for (const c of corners) {
+			if (!Number.isFinite(c.x) || !Number.isFinite(c.z)) continue;
+			const geo = new THREE.SphereGeometry(0.11, 14, 14);
+			const mat = new THREE.MeshBasicMaterial({ color: 0x22c55e });
+			const sphere = new THREE.Mesh(geo, mat);
+			sphere.position.set(c.x, 0.14, c.z);
+			sphere.userData = { id: region.id, itemType: 'region', handle: c.handle };
 			rootGroup.add(sphere);
 			selectableObjects.push(sphere);
 		}
@@ -1271,7 +1474,14 @@
 		if (showRoomShell && roomShell?.shapes?.length) {
 			const wallMat = new THREE.MeshBasicMaterial({ color: 0x94a3b8, transparent: true, opacity: 0.18, depthWrite: false });
 			const slabMat = new THREE.MeshBasicMaterial({ color: 0xcbd5e1, transparent: true, opacity: 0.10, depthWrite: false });
+			// Ceiling and perimeter walls are gated independently (mirrors the renderer
+			// in render_daemon.py). Skip the preview cubes that the scene won't emit so
+			// the editor matches the render. Default true when the flags are absent.
+			const wallsOn = roomShell.walls_enabled ?? true;
+			const ceilingOn = roomShell.ceiling_enabled ?? wallsOn;
 			for (const sh of roomShell.shapes) {
+				if (sh.role === 'ceiling' && !ceilingOn) continue;
+				if (sh.role !== 'ceiling' && sh.role !== 'floor' && !wallsOn) continue;
 				const [cx_w, cy_w, cz_w] = sh.center;
 				const [sx_w, sy_w, sz_w] = sh.size;
 				if (!(sx_w > 0 && sy_w > 0 && sz_w > 0)) continue;
@@ -1363,7 +1573,10 @@
 			if (!mesh) continue;
 			rootGroup.add(mesh);
 			selectableObjects.push(mesh);
-			if (selectedId === region.id) addSelectionEdges(mesh.geometry, mesh.position.clone().setY(0.003), mesh.rotation.clone());
+			if (selectedId === region.id) {
+				addSelectionEdges(mesh.geometry, mesh.position.clone().setY(0.003), mesh.rotation.clone());
+				addRectHandles(region);
+			}
 		}
 
 		// Graph edges
@@ -1406,8 +1619,9 @@
 				}
 				if (!mesh) continue;
 				rootGroup.add(mesh);
-				selectableObjects.push(mesh);
-				if (selectedId === obj.id) {
+				const editorPickable = mesh?.userData?.editor_pickable !== false;
+				if (editorPickable) selectableObjects.push(mesh);
+				if (editorPickable && selectedId === obj.id) {
 					if (mesh.geometry) addSelectionEdges(mesh.geometry, mesh.position.clone(), mesh.rotation.clone());
 					else addSelectionBox(mesh);
 					addLineHandles(obj);
@@ -1427,12 +1641,15 @@
 				const componentColor = (typeof componentIdx === 'number' && componentIdx > 0)
 					? componentPalette[componentIdx % componentPalette.length]
 					: 0x6366f1;
-				const geo = new THREE.SphereGeometry(isSensor ? 0.09 : 0.06, 8, 8);
+				// Nodes flagged for removal render large + red regardless of component.
+				const markedForRemoval = removeSelection?.has?.(node.node_id) ?? false;
+				const baseRadius = isSensor ? 0.09 : 0.06;
+				const geo = new THREE.SphereGeometry(markedForRemoval ? baseRadius * 1.8 : baseRadius, 8, 8);
 				const mat = new THREE.MeshBasicMaterial({
-					color: isSensor ? 0xf59e0b : isHazard ? 0xf97316 : componentColor
+					color: markedForRemoval ? 0xdc2626 : isSensor ? 0xf59e0b : isHazard ? 0xf97316 : componentColor
 				});
 				const sphere = new THREE.Mesh(geo, mat);
-				sphere.position.set(node.position?.[0] ?? 0, 0.06, node.position?.[1] ?? 0);
+				sphere.position.set(node.position?.[0] ?? 0, markedForRemoval ? 0.09 : 0.06, node.position?.[1] ?? 0);
 				sphere.userData = { id: node.node_id, itemType: 'node' };
 				rootGroup.add(sphere);
 				selectableObjects.push(sphere);
@@ -1934,6 +2151,17 @@
 		// Other floor-driven modes also take priority: clicks on the floor (or even
 		// on a node sphere — we ignore the hit and use the world point) should drive
 		// the mode, not change selection.
+		if (removeNodeMode) {
+			// Click a node to toggle it in/out of the removal set; drag empty floor to box-select.
+			const nid = _hitGraphNodeId(event);
+			if (nid) { onNodeToggle?.(nid); return; }
+			const pt = getWorldPoint(event);
+			if (!pt) return;
+			regionStart = { x: pt.x, y: pt.y };
+			regionEnd = { x: pt.x, y: pt.y };
+			if (controls) controls.enabled = false;
+			return;
+		}
 		if (paintMode !== 'none' || regionSelectMode || addNodeMode) {
 			const pt = getWorldPoint(event);
 			if (!pt) return;
@@ -1954,8 +2182,8 @@
 				return;
 			}
 		}
-		// Default: object selection.
-		const hit = getHitObject(event);
+		// Default: object selection (cycle-select through overlapping objects).
+		const hit = getClickPick(event);
 		if (hit?.handle && placementTool === 'select') {
 			onObjectSelect?.(hit.id);
 			if (hit.type === 'object_gizmo' && objectTransformMode && ['move_xz', 'move_y', 'yaw'].includes(String(hit.handle))) {
@@ -1964,6 +2192,9 @@
 			}
 			if (hit.handle === 'line_start' || hit.handle === 'line_end') {
 				dragHandle = { id: hit.id, handle: hit.handle };
+				if (controls) controls.enabled = false;
+			} else if (typeof hit.handle === 'string' && hit.handle.startsWith('rect_')) {
+				dragHandle = { id: hit.id, handle: hit.handle as RectHandle };
 				if (controls) controls.enabled = false;
 			}
 			return;
@@ -2064,7 +2295,11 @@
 
 		const pt = getWorldPoint(event);
 		if (pt && dragHandle) {
-			onHandleDrag?.(dragHandle.id, dragHandle.handle, pt, event.shiftKey);
+			if (dragHandle.handle === 'line_start' || dragHandle.handle === 'line_end') {
+				onHandleDrag?.(dragHandle.id, dragHandle.handle, pt, event.shiftKey);
+			} else {
+				onRegionResize?.(dragHandle.id, dragHandle.handle, pt, event.shiftKey);
+			}
 			return;
 		}
 		// Paint mode: show brush ring at cursor + sample positions while pressed.
@@ -2078,7 +2313,7 @@
 				}
 			}
 		}
-		if (regionSelectMode && regionStart && pt) {
+		if ((regionSelectMode || removeNodeMode) && regionStart && pt) {
 			regionEnd = { x: pt.x, y: pt.y };
 			_updateRegionPreview();
 		}
@@ -2207,7 +2442,7 @@
 			paintStrokeBuffer = [];
 			return;
 		}
-		if (regionSelectMode && regionStart && regionEnd) {
+		if ((regionSelectMode || removeNodeMode) && regionStart && regionEnd) {
 			const a = regionStart, b = regionEnd;
 			regionStart = null;
 			regionEnd = null;
@@ -2221,7 +2456,17 @@
 			const minX = Math.min(a.x, b.x), maxX = Math.max(a.x, b.x);
 			const minZ = Math.min(a.y, b.y), maxZ = Math.max(a.y, b.y);
 			if (Math.abs(maxX - minX) > 0.1 && Math.abs(maxZ - minZ) > 0.1) {
-				onRegionSelected?.([minX, minZ, maxX, maxZ]);
+				if (removeNodeMode) {
+					const ids = graphNodes
+						.filter((node: any) => {
+							const x = node.position?.[0] ?? 0, z = node.position?.[1] ?? 0;
+							return x >= minX && x <= maxX && z >= minZ && z <= maxZ;
+						})
+						.map((node: any) => node.node_id);
+					if (ids.length) onNodesBoxSelect?.(ids);
+				} else {
+					onRegionSelected?.([minX, minZ, maxX, maxZ]);
+				}
 			}
 			return;
 		}
@@ -2387,7 +2632,7 @@
 		primMeshCacheVersion;
 		for (const obj of authoringObjects) {
 			const sourcePath = effectiveAssetSourcePath(obj);
-			const usdRef = typeof obj.source_ref === 'string' ? obj.source_ref.split('#')[0] : '';
+			const usdRef = usdRefFromSourceRef(obj.source_ref);
 			const key = sourcePath ? primMeshKey(sourcePath, usdRef) : '';
 			if (!sourcePath || primMeshCache.has(key) || primMeshPending.has(key)) continue;
 			if (primMeshActiveLoads >= PRIM_MESH_CONCURRENCY) break; // wait for slots to free
@@ -2401,6 +2646,8 @@
 		graphNodes;
 		graphEdges;
 		selectedId;
+		removeSelection; // re-color node spheres when the removal set changes
+		removeNodeMode;
 		visibleLayers;
 		highlightedPath;
 		allEpisodePaths;

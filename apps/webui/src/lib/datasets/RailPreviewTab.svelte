@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { opticalNavObservationModalityUrl } from '$lib/api';
+	import { POLAR_PREVIEW_MODALITIES } from '$lib/datasets/sensorHelpers';
 
 	interface Props {
 		hotCameraPose: any;
@@ -87,10 +88,24 @@
 	{#if probeResult}
 		<div class="probe-result">
 			<div class="probe-result-meta">Batch {probeResult.batch_id.slice(0, 8)}… · {probeResult.vp_id}/{probeResult.heading_id}</div>
-			<img class="probe-result-img"
-				src={opticalNavObservationModalityUrl(selectedProjectId, sceneId, probeResult.vp_id, probeResult.heading_id, probeResult.modality, probeResult.sensor_id ?? activeRigSensorId)}
-				alt={`probe ${probeResult.modality}`} loading="lazy"
-				onerror={(e) => { (e.currentTarget as HTMLImageElement).style.opacity = '0.3'; }} />
+			{#if probeResult.is_polar}
+				<div class="polar-grid">
+					{#each POLAR_PREVIEW_MODALITIES as rep}
+						<figure class="polar-cell">
+							<img
+								src={opticalNavObservationModalityUrl(selectedProjectId, sceneId, probeResult.vp_id, probeResult.heading_id, rep.id, probeResult.sensor_id ?? activeRigSensorId)}
+								alt={`probe ${rep.id}`} loading="lazy"
+								onerror={(e) => { (e.currentTarget as HTMLImageElement).style.opacity = '0.25'; }} />
+							<figcaption>{rep.label}</figcaption>
+						</figure>
+					{/each}
+				</div>
+			{:else}
+				<img class="probe-result-img"
+					src={opticalNavObservationModalityUrl(selectedProjectId, sceneId, probeResult.vp_id, probeResult.heading_id, probeResult.modality, probeResult.sensor_id ?? activeRigSensorId)}
+					alt={`probe ${probeResult.modality}`} loading="lazy"
+					onerror={(e) => { (e.currentTarget as HTMLImageElement).style.opacity = '0.3'; }} />
+			{/if}
 			<button class="button button-subtle" onclick={onRefreshBatch}>Refresh batch status</button>
 		</div>
 	{/if}
@@ -172,6 +187,11 @@
 	.probe-result-meta { font-size: var(--font-size-xs); color: var(--muted-strong); }
 
 	.probe-result-img { width: 100%; max-height: 280px; object-fit: contain; background: #0f172a; border-radius: var(--radius-sm); }
+
+	.polar-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: var(--space-2); }
+	.polar-cell { margin: 0; display: grid; gap: 2px; }
+	.polar-cell img { width: 100%; aspect-ratio: 4 / 3; object-fit: contain; background: #0f172a; border-radius: var(--radius-sm); }
+	.polar-cell figcaption { font-size: var(--font-size-xs); color: var(--muted-strong); text-align: center; }
 
 	.sync-inspector { display: grid; gap: 6px; }
 

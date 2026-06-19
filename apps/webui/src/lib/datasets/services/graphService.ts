@@ -9,7 +9,10 @@ import {
 	getOpticalNavViewpointGraph,
 	graphBuildProgressWsUrl,
 	addOpticalNavGraphNode,
+	rebuildOpticalNavGraphEdges,
 	deleteOpticalNavGraphNode,
+	deleteOpticalNavGraphNodes,
+	fetchOpticalNavOverlappingGraphNodes,
 	checkOpticalNavGraphEdge,
 	addOpticalNavGraphEdge,
 	deleteOpticalNavGraphEdge,
@@ -105,6 +108,26 @@ export async function addGraphNode(
 
 export async function deleteGraphNode(projectId: string, sceneId: string, nodeId: string) {
 	return deleteOpticalNavGraphNode(projectId, sceneId, nodeId);
+}
+
+/** Re-run edge building over the current node set (keeps auto + manual nodes). */
+export async function rebuildGraphEdges(projectId: string, sceneId: string) {
+	return rebuildOpticalNavGraphEdges(projectId, sceneId, {});
+}
+
+/** Batch-remove multiple viewpoint nodes (and their incident edges) in one request. */
+export async function deleteGraphNodes(projectId: string, sceneId: string, nodeIds: string[]) {
+	return deleteOpticalNavGraphNodes(projectId, sceneId, nodeIds);
+}
+
+/** Auto-detect node_ids that overlap scene objects, for review before removal. */
+export async function findOverlappingNodes(
+	projectId: string,
+	sceneId: string,
+	opts?: { marginM?: number; includeWalls?: boolean; robotHeightM?: number }
+): Promise<string[]> {
+	const res = await fetchOpticalNavOverlappingGraphNodes(projectId, sceneId, opts);
+	return (res?.node_ids as string[]) ?? [];
 }
 
 export async function checkEdge(

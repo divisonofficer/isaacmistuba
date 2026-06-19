@@ -47,6 +47,18 @@
 		return 'USD source';
 	}
 
+	function readinessClass(asset: any) {
+		const status = String(asset?.render_readiness ?? 'unknown');
+		if (status === 'texture_ready' || status === 'analytic_ok') return 'ready';
+		if (status === 'partial') return 'partial';
+		return 'blocked';
+	}
+
+	function readinessLabel(asset: any) {
+		const status = String(asset?.render_readiness ?? 'unknown');
+		return status.replace(/_/g, ' ');
+	}
+
 	function formatSize(bytes: number) {
 		if (!Number.isFinite(bytes)) return '-';
 		if (bytes > 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024 / 1024).toFixed(1)} GB`;
@@ -229,6 +241,7 @@
 						</div>
 						<span>{asset.category}</span>
 						<span>{asset.placement}</span>
+						<span class={`readiness ${readinessClass(asset)}`} title={asset.readiness_reason ?? asset.agent_guidance ?? ''}>{readinessLabel(asset)}</span>
 					</div>
 				{/each}
 				{#if assets.length === 0}
@@ -269,6 +282,7 @@
 					<div><span>USD</span><strong>{selectedAsset.usd_ref}</strong></div>
 					<div><span>source path</span><strong>{selectedAsset.source_path}</strong></div>
 					<div><span>material</span><strong>{selectedAsset.material_hint ?? '-'}</strong></div>
+					<div><span>readiness</span><strong>{readinessLabel(selectedAsset)} · {selectedAsset.readiness_reason ?? 'ok'}</strong></div>
 					<div><span>size</span><strong>{(selectedAsset.dimensions_m ?? selectedAsset.bounds?.size)?.map((v: number) => Number(v).toFixed(2)).join(' × ') ?? '-'}</strong></div>
 				</div>
 				<button class="button button-primary full" disabled={loading} onclick={saveDetail}>Save Detail</button>
@@ -421,7 +435,7 @@
 	}
 	.asset-row {
 		display: grid;
-		grid-template-columns: auto minmax(0, 1fr) 110px 120px;
+		grid-template-columns: auto minmax(0, 1fr) 90px 82px 108px;
 		gap: var(--space-3);
 		align-items: center;
 		padding: var(--space-2) var(--space-3);
@@ -435,6 +449,18 @@
 		color: var(--muted-strong);
 		font-size: var(--font-size-sm);
 	}
+
+	.readiness {
+		justify-self: start;
+		border-radius: 999px;
+		padding: 3px 8px;
+		font-size: 11px;
+		font-weight: 800;
+		white-space: nowrap;
+	}
+	.readiness.ready { background: #dcfce7; color: #166534; }
+	.readiness.partial { background: #fef3c7; color: #92400e; }
+	.readiness.blocked { background: #fee2e2; color: #991b1b; }
 	.asset-preview {
 		display: grid;
 		grid-template-columns: 88px minmax(0, 1fr);

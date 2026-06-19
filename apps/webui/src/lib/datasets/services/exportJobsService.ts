@@ -15,6 +15,8 @@ export interface ExportJobSubmitPayload {
 	episode_ids?: string[] | null;
 	include_episode_thumbnails?: boolean;
 	panorama_observations?: boolean;
+	png_only?: boolean;
+	include_birdseye?: boolean;
 }
 
 export interface ExportJobStatus {
