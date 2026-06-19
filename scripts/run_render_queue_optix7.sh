@@ -12,6 +12,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 : "${ROBOMITUBA_MITSUBA_PYTHON:=/root/miniconda3/envs/mitsuba_optix7/bin/python}"
 : "${ROBOMITUBA_MITSUBA_PYTHONPATH:=/jarvis/project/robomituba/build/mitsuba3-optix7/python}"
 : "${ROBOMITUBA_RENDER_GPU_INDICES:=0,1,2,3}"
+: "${ROBOMITUBA_RENDER_WORKER_BACKLOG_PER_GPU:=2}"
 : "${ROBOMITUBA_RENDER_WORKER_COUNT:=4}"
 : "${ROBOMITUBA_FULL_RENDER_DISABLE_CUDA:=0}"
 : "${ROBOMITUBA_DISABLE_CPU_FALLBACK:=1}"
@@ -26,6 +27,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export ROBOMITUBA_MITSUBA_PYTHON
 export ROBOMITUBA_MITSUBA_PYTHONPATH
 export ROBOMITUBA_RENDER_GPU_INDICES
+export ROBOMITUBA_RENDER_WORKER_BACKLOG_PER_GPU
 export ROBOMITUBA_RENDER_WORKER_COUNT
 export ROBOMITUBA_FULL_RENDER_DISABLE_CUDA
 export ROBOMITUBA_DISABLE_CPU_FALLBACK
@@ -39,7 +41,7 @@ export PYTHONUNBUFFERED
 export PYTHONPATH="$REPO_ROOT/modules/mitsuba_converter/src:$REPO_ROOT/modules/robomituba_bridge/src:$REPO_ROOT/modules/navigation_dataset/src:${PYTHONPATH:-}"
 
 echo "[render-queue] url: http://$RENDER_QUEUE_HOST:$RENDER_QUEUE_PORT"
-echo "[render-queue] GPUs: $ROBOMITUBA_RENDER_GPU_INDICES workers=$ROBOMITUBA_RENDER_WORKER_COUNT scene_load_concurrency=$ROBOMITUBA_SCENE_LOAD_CONCURRENCY"
+echo "[render-queue] GPUs: $ROBOMITUBA_RENDER_GPU_INDICES workers=$ROBOMITUBA_RENDER_WORKER_COUNT backlog_per_gpu=$ROBOMITUBA_RENDER_WORKER_BACKLOG_PER_GPU scene_load_concurrency=$ROBOMITUBA_SCENE_LOAD_CONCURRENCY"
 echo "[render-queue] texture max: $ROBOMITUBA_TEXTURE_MAX_RESOLUTION GPU-only cpu_fallback_disabled=$ROBOMITUBA_DISABLE_CPU_FALLBACK"
 
 exec python -u "$REPO_ROOT/apps/run_render_daemon.py" --repo-root "$REPO_ROOT" --host "$RENDER_QUEUE_HOST" --port "$RENDER_QUEUE_PORT" "$@"

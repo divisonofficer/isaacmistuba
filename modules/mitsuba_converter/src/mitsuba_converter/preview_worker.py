@@ -685,7 +685,11 @@ def _dispatch(request: dict[str, Any]) -> None:
         _emit_failed(job_id, "unknown_kind", f"unknown job kind: {kind!r}")
         return
 
-    _emit({"job_id": job_id, "type": "started", "ts": time.time()})
+    try:
+        gpu_index = int(os.environ.get("ROBOMITUBA_RENDER_WORKER_GPU_INDEX", os.environ.get("CUDA_VISIBLE_DEVICES", "-1")))
+    except (TypeError, ValueError):
+        gpu_index = os.environ.get("ROBOMITUBA_RENDER_WORKER_GPU_INDEX") or os.environ.get("CUDA_VISIBLE_DEVICES")
+    _emit({"job_id": job_id, "type": "started", "ts": time.time(), "gpu_index": gpu_index})
     try:
         handler(job_id, spec)
     except SystemExit:

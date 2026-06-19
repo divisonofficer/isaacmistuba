@@ -48,6 +48,7 @@ from typing import Any, Callable, Deque, Optional
 
 HEARTBEAT_TIMEOUT_S = 30.0
 ENV_WORKER_HEARTBEAT_TIMEOUT_S = "ROBOMITUBA_WORKER_HEARTBEAT_TIMEOUT_S"
+ENV_WORKER_BACKLOG_PER_GPU = "ROBOMITUBA_RENDER_WORKER_BACKLOG_PER_GPU"
 RESTART_COOLDOWN_S = 30.0
 DEGRADED_WINDOW_S = 5 * 60.0
 DEGRADED_MAX_EXITS = 3
@@ -115,6 +116,16 @@ def _heartbeat_timeout_s() -> float:
         return HEARTBEAT_TIMEOUT_S
 
 
+def _worker_backlog_per_gpu() -> int:
+    raw = os.environ.get(ENV_WORKER_BACKLOG_PER_GPU)
+    if raw is None:
+        return 2
+    try:
+        return max(1, int(str(raw).strip()))
+    except (TypeError, ValueError):
+        return 2
+
+
 @dataclass
 class WorkerStats:
     pid: Optional[int] = None
@@ -127,6 +138,7 @@ class WorkerStats:
     completed_count: int = 0
     failed_count: int = 0
     unexpected_exits: Deque[float] = field(default_factory=deque)
+    assigned_job_ids: set[str] = field(default_factory=set)
 
 
 class _Worker:
@@ -210,6 +222,7 @@ class _Worker:
             self.stats.last_heartbeat = time.time()
             self.stats.in_flight_job_id = None
             self.stats.in_flight_started_at = None
+            self.stats.assigned_job_ids.clear()
 
             self._writer_thread = threading.Thread(
                 target=self._writer_loop,
@@ -382,6 +395,7 @@ class _Worker:
             if self.stats.in_flight_job_id == job_id:
                 self.stats.in_flight_job_id = None
                 self.stats.in_flight_started_at = None
+            self._manager._release_assignment(self, job_id)
         # Any non-heartbeat event also refreshes liveness — the worker is
         # clearly alive if it just produced output.
         self.stats.last_heartbeat = time.time()
@@ -439,6 +453,7 @@ class _Worker:
         # Synthesize failures for whatever was in flight or queued.
         in_flight_id = self.stats.in_flight_job_id
         if in_flight_id:
+            self._manager._release_assignment(self, in_flight_id)
             self._dispatch_listeners({
                 "job_id": in_flight_id,
                 "type": "failed",
@@ -455,14 +470,31 @@ class _Worker:
             except _queue.Empty:
                 break
             drained += 1
+            pending_job_id = str(pending.get("job_id") or "")
+            self._manager._release_assignment(self, pending_job_id)
             self._dispatch_listeners({
-                "job_id": str(pending.get("job_id") or ""),
+                "job_id": pending_job_id,
                 "type": "failed",
                 "reason": "worker_restarting",
                 "message": "worker restarted before this job ran",
             })
         if drained:
             _stderr(f"worker: drained {drained} pending jobs after worker exit rc={rc}")
+        # A job can already have been written to the worker stdin/OS pipe but not
+        # yet emitted ``started`` when the worker dies. It is no longer in the
+        # outbound queue and not marked in-flight, so fail any remaining assigned
+        # jobs here to keep daemon job state from hanging forever.
+        remaining_assigned = list(self.stats.assigned_job_ids)
+        for pending_job_id in remaining_assigned:
+            self._manager._release_assignment(self, pending_job_id)
+            self._dispatch_listeners({
+                "job_id": pending_job_id,
+                "type": "failed",
+                "reason": "worker_restarting",
+                "message": "worker restarted before this assigned job started",
+            })
+        if remaining_assigned:
+            _stderr(f"worker: failed {len(remaining_assigned)} assigned-but-not-started jobs after worker exit rc={rc}")
         # Track for degraded-mode detection.
         now = time.time()
         self.stats.unexpected_exits.append(now)
@@ -518,6 +550,8 @@ class WorkerManager:
         self._workers: list[_Worker] = []
         self._listeners: list[EventListener] = []
         self._lock = threading.Lock()
+        self._condition = threading.Condition(self._lock)
+        self._backlog_per_gpu = _worker_backlog_per_gpu()
         self._degraded = False
         self._restart_lock = threading.Lock()
         self._rr_cursor = 0
@@ -550,46 +584,67 @@ class WorkerManager:
                 w.start()
 
     def submit(self, job: dict) -> None:
-        """Route a job to the least-busy live worker.
+        """Route a job to a worker with bounded per-GPU backlog.
 
-        Idle workers are preferred. When several workers have equal load,
-        a small round-robin cursor breaks ties so bursts of independent
-        jobs distribute across GPUs 0,1,2,3 instead of piling onto GPU 0.
+        The daemon can enqueue a large sweep very quickly. Without a cap,
+        thousands of jobs are pushed into private per-worker queues and a slow
+        GPU can strand work while faster GPUs go idle. Keep only a small number
+        of assigned jobs per worker so completed GPUs pull the next job.
         """
-        if self._degraded:
-            self._dispatch_synthetic({
-                "job_id": str(job.get("job_id") or ""),
-                "type": "failed",
-                "reason": "manager_degraded",
-                "message": "worker manager is in degraded state — manual reset required",
-            })
-            return
+        job_id = str(job.get("job_id") or "")
         target_gpu_index = self._target_gpu_index(job)
-        worker = self._pick_target_worker(target_gpu_index) if target_gpu_index is not None else None
-        if worker is None:
-            fallback_worker = self._pick_worker()
-            if fallback_worker is None:
-                self._dispatch_synthetic({
-                    "job_id": str(job.get("job_id") or ""),
-                    "type": "failed",
-                    "reason": "no_worker",
-                    "message": "no worker available",
-                })
-                return
-            if target_gpu_index is not None:
-                self._dispatch_synthetic({
-                    "job_id": str(job.get("job_id") or ""),
-                    "type": "routing_fallback",
-                    "reason": "target_worker_unavailable",
-                    "target_gpu_index": target_gpu_index,
-                    "routed_gpu_index": fallback_worker.stats.gpu_index,
-                    "message": (
-                        f"target gpu {target_gpu_index} unavailable; "
-                        f"routed to gpu {fallback_worker.stats.gpu_index}"
-                    ),
-                })
-            worker = fallback_worker
-        worker.submit(job)
+        routing_fallback_event: dict | None = None
+        while True:
+            with self._condition:
+                if self._degraded:
+                    event = {
+                        "job_id": job_id,
+                        "type": "failed",
+                        "reason": "manager_degraded",
+                        "message": "worker manager is in degraded state — manual reset required",
+                    }
+                    break
+                live = self._live_workers()
+                if not live:
+                    event = {
+                        "job_id": job_id,
+                        "type": "failed",
+                        "reason": "no_worker",
+                        "message": "no worker available",
+                    }
+                    break
+                worker: _Worker | None = None
+                if target_gpu_index is not None:
+                    worker = self._pick_target_worker_unlocked(target_gpu_index, live)
+                    if worker is None:
+                        worker = self._pick_worker_unlocked(live)
+                        if worker is not None:
+                            routing_fallback_event = {
+                                "job_id": job_id,
+                                "type": "routing_fallback",
+                                "reason": "target_worker_unavailable",
+                                "target_gpu_index": target_gpu_index,
+                                "routed_gpu_index": worker.stats.gpu_index,
+                                "message": (
+                                    f"target gpu {target_gpu_index} unavailable; "
+                                    f"routed to gpu {worker.stats.gpu_index}"
+                                ),
+                            }
+                else:
+                    worker = self._pick_worker_unlocked(live)
+                if worker is None:
+                    self._condition.wait(timeout=0.5)
+                    continue
+                if self._worker_assigned_count(worker) < self._backlog_per_gpu:
+                    if job_id:
+                        worker.stats.assigned_job_ids.add(job_id)
+                    worker.submit(job)
+                    self._condition.notify_all()
+                    event = routing_fallback_event
+                    break
+                self._condition.wait(timeout=0.5)
+        if event is not None:
+            self._dispatch_synthetic(event)
 
     def cancel(self, job_id: str) -> bool:
         found = False
@@ -619,6 +674,9 @@ class WorkerManager:
                 "pid": w.stats.pid,
                 "in_flight_job_id": w.stats.in_flight_job_id,
                 "queue_depth": self._worker_queue_depth(w),
+                "assigned_count": self._worker_assigned_count(w),
+                "assigned_job_ids": list(w.stats.assigned_job_ids)[:8],
+                "backlog_limit": self._backlog_per_gpu,
                 "load_score": self._worker_load(w),
                 "submitted": w.stats.submitted_count,
                 "completed": w.stats.completed_count,
@@ -632,6 +690,7 @@ class WorkerManager:
         return {
             "degraded": self._degraded,
             "shutting_down": self._shutting_down,
+            "worker_backlog_per_gpu": self._backlog_per_gpu,
             "workers": worker_states,
         }
 
@@ -643,16 +702,19 @@ class WorkerManager:
         except Exception:
             return 0
 
-    def _worker_load(self, worker: _Worker) -> int:
-        """Best-effort load score used for routing.
+    def _worker_assigned_count(self, worker: _Worker) -> int:
+        return len(worker.stats.assigned_job_ids)
 
-        ``in_flight_job_id`` is set after the worker emits ``started``; the
-        outbound queue covers jobs that were just submitted but not accepted
-        yet. This keeps rapid bursts from choosing the same idle worker over
-        and over before its ``started`` event arrives.
-        """
-        in_flight = 1 if worker.stats.in_flight_job_id else 0
-        return in_flight + self._worker_queue_depth(worker)
+    def _worker_load(self, worker: _Worker) -> int:
+        """Best-effort load score used for routing/health."""
+        return self._worker_assigned_count(worker)
+
+    def _release_assignment(self, worker: _Worker, job_id: str | None) -> None:
+        if not job_id:
+            return
+        with self._condition:
+            worker.stats.assigned_job_ids.discard(str(job_id))
+            self._condition.notify_all()
 
     def _target_gpu_index(self, job: dict) -> int | None:
         raw = job.get("worker_gpu_index")
@@ -672,21 +734,29 @@ class WorkerManager:
         ]
 
     def _pick_target_worker(self, gpu_index: int) -> _Worker | None:
-        for worker in self._live_workers():
+        return self._pick_target_worker_unlocked(gpu_index, self._live_workers())
+
+    def _pick_target_worker_unlocked(self, gpu_index: int, live: list[_Worker]) -> _Worker | None:
+        for worker in live:
             if int(worker.stats.gpu_index) == int(gpu_index):
                 return worker
         return None
 
     def _pick_worker(self) -> Optional[_Worker]:
-        """Return the least-busy live worker, rotating ties."""
-        live = self._live_workers()
+        """Return the least-assigned live worker, rotating ties."""
+        return self._pick_worker_unlocked(self._live_workers())
+
+    def _pick_worker_unlocked(self, live: list[_Worker]) -> Optional[_Worker]:
         if not live:
             return self._workers[0] if self._workers else None
 
-        start = self._rr_cursor % len(live)
-        ordered = live[start:] + live[:start]
+        available = [w for w in live if self._worker_assigned_count(w) < self._backlog_per_gpu]
+        if not available:
+            return None
+        start = self._rr_cursor % len(available)
+        ordered = available[start:] + available[:start]
         best = min(ordered, key=lambda w: (self._worker_load(w), ordered.index(w)))
-        self._rr_cursor = (live.index(best) + 1) % len(live)
+        self._rr_cursor = (available.index(best) + 1) % len(available)
         return best
 
     def _dispatch_synthetic(self, event: dict) -> None:
