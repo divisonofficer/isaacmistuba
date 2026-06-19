@@ -12,6 +12,7 @@ dependencies = [
   "Jinja2",
   "numpy",
   "Pillow",
+  "fast-simplification",
   "trimesh",
   "huggingface_hub>=0.23",
   "hf_xet>=0.1",
