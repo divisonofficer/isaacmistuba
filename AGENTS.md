@@ -1,484 +1,191 @@
-# Robomituba - Isaac Sim ↔ Mitsuba 3 Bridge
+# Robomituba — Isaac/Blender ↔ Mitsuba 3 Rendering & OpticalNav Dataset Platform
 
-## 🎯 Project Overview
+> 이 프로젝트는 `/jarvis/project/robomituba` 에 저장되어 있으며, 이 경로 밖의 의존성을 가지지 않는다.
+> (예외: Mitsuba 런타임 빌드는 빌드 디렉토리에 위치 — 아래 "Mitsuba 빌드" 참고.)
 
-**로봇 시뮬레이션 데이터 생성 플랫폼**
+## 🎯 What This Project Is
 
-이 프로젝트는 현재 /jarvis/project/robomituba
-에 저장되어있으며, 이 이외의 경로의 의존성을 가지지 않는다.
+USD 장면(Isaac Sim / Blender / 자체 에디터)으로부터 **Mitsuba 3 (CUDA/OptiX)** 로 고품질 멀티모달 센서 데이터(RGB, Depth, Normal, Polarization, 측정 pBRDF 등)를 생성하는 플랫폼.
 
-Isaac Sim에서 로봇 장면을 작성하고, 고품질 센서 데이터(RGB, Depth, Normal, Polarization 등)를 **Mitsuba 3 렌더러**로 생성하는 통합 시스템입니다.
-
-### Key Vision
-```
-Isaac Sim (물리 시뮬레이션 + 장면 저작)
-    ↓
-Robomituba Bridge (데이터 교환 계약)
-    ↓
-Mitsuba Converter (USD → 렌더링)
-    ↓
-High-Quality Sensor Data (multimodal output)
-    ↓
-ML/Vision Tasks (로봇 학습)
-```
-
-### Core Features
-- 🤖 **Isaac Sim integration**: 실제같은 로봇 시뮬레이션 데이터
-- 🎨 **High-quality rendering**: Mitsuba 3 (GPU 지원)
-- 📸 **Multimodal output**: RGB, Depth, Normal, Polarization, etc.
-- 🌉 **Bridge contract**: 독립적인 Isaac ↔ Mitsuba 통신
-- 🔄 **Modular design**: 각 모듈이 독립적으로 작동
-- ⚡ **Performance**: GPU 병렬화로 빠른 생성
-
----
-
-## 📊 Project Architecture
+초기에는 "Isaac ↔ Mitsuba bridge" 단일 목적이었으나, 현재의 주력 워크로드는 **OpticalNav 데이터셋 생성**이다: 실내 장면의 grid viewpoint × heading 스윕을 렌더링하고, viewpoint graph / traversability grid / navigation episode 와 묶어 학습용 내비게이션 데이터셋으로 export 한다.
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                         ROBOMITUBA SYSTEM                        │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                   │
-│  ┌──────────────────────┐  ┌──────────────────────┐             │
-│  │   Isaac Sim          │  │   Blender            │             │
-│  │  (USD Authoring)     │  │  (USD Authoring)     │             │
-│  └──────────┬───────────┘  └──────────┬───────────┘             │
-│             │                         │                          │
-│             └────────────┬────────────┘                          │
-│                          │                                       │
-│                          ▼                                       │
-│         ┌────────────────────────────────┐                      │
-│         │   robomituba_bridge/           │                      │
-│         │  Job Manifest + Snapshot       │                      │
-│         │  (Pure Python, no deps)        │                      │
-│         └────────────┬───────────────────┘                      │
-│                      │                                           │
-│                      │ (JSON + geometry)                         │
-│                      ▼                                           │
-│         ┌────────────────────────────────┐                      │
-│         │   mitsuba_converter/           │                      │
-│         │  USD→Mitsuba Pipeline          │                      │
-│         │  + Multimodal Rendering        │                      │
-│         └────────────┬───────────────────┘                      │
-│                      │                                           │
-│                      ▼                                           │
-│         ┌────────────────────────────────┐                      │
-│         │   mitsuba3/ (submodule)        │                      │
-│         │  Mitsuba 3 Renderer            │                      │
-│         │  (CUDA/OptiX GPU support)      │                      │
-│         └────────────┬───────────────────┘                      │
-│                      │                                           │
-│                      ▼                                           │
-│    ┌──────────────────────────────────┐                         │
-│    │  High-Quality Sensor Data        │                         │
-│    │  (EXR/HDR outputs)               │                         │
-│    │  ├─ RGB images                   │                         │
-│    │  ├─ Depth maps                   │                         │
-│    │  ├─ Normal maps                  │                         │
-│    │  ├─ Polarization                 │                         │
-│    │  ├─ Decomposition (D/I)          │                         │
-│    │  └─ Robot state                  │                         │
-│    └──────────────────────────────────┘                         │
-│                                                                   │
-└─────────────────────────────────────────────────────────────────┘
+씬 저작 (Isaac Sim / Blender / OpticalNav 에디터 webui)
+   ↓  USD / scene XML
+navigation_dataset (viewpoint graph · grid · episode · planner)
+   ↓  RenderRequest
+robomituba_bridge (job manifest / snapshot 계약)
+   ↓
+mitsuba_converter (USD→Mitsuba, 멀티모달 렌더, render daemon)
+   ↓
+mitsuba3 / mitsuba3-optix7 (GPU 렌더러, 측정 pBRDF BSDF 포함)
+   ↓
+멀티모달 출력 (EXR/PNG/NPZ) + observation manifest
+   ↓
+export_optical_nav_dataset.py → 학습용 번들 (images + index.jsonl + graph/grid/episodes)
 ```
 
 ---
 
-## 📁 Directory Structure
+## 📁 Directory Structure (현재 실제)
 
 ```
 /jarvis/project/robomituba/
-├── modules/                                 # ⭐ 핵심 모듈 (3개)
-│   ├── robomituba_bridge/
-│   │   ├── src/robomituba_bridge/
-│   │   │   ├── types.py                    # Dataclass 정의
-│   │   │   ├── manifest.py                 # Job manifest
-│   │   │   ├── paths.py                    # Path handling
-│   │   │   ├── io.py                       # JSON I/O
-│   │   │   └── material_mapping.py
-│   │   ├── tests/
-│   │   └── AGENTS.md                       # 📖 자세한 가이드
-│   │
-│   ├── mitsuba_converter/
-│   │   ├── src/mitsuba_converter/
-│   │   │   ├── usd_loader.py               # USD → IR
-│   │   │   ├── mitsuba_builder.py          # IR → Mitsuba dict
-│   │   │   ├── multimodal.py               # 멀티모달 렌더링
-│   │   │   ├── observation_bridge.py       # Observation manifest
-│   │   │   ├── render_daemon.py            # HTTP 렌더링 서버
-│   │   │   ├── pipeline.py                 # 통합 파이프라인
-│   │   │   └── cli.py                      # CLI
-│   │   ├── tests/
-│   │   └── AGENTS.md                       # 📖 자세한 가이드
-│   │
-│   ├── mitsuba3/                          # (Git submodule)
-│   │   ├── src/                           # 렌더러 핵심
-│   │   ├── include/
-│   │   ├── docs/
-│   │   └── AGENTS.md                      # 📖 가이드
-│   │
+├── modules/                       # 5개 모듈
+│   ├── robomituba_bridge/         # Job manifest / snapshot 계약 (pure Python)
+│   ├── mitsuba_converter/         # USD→Mitsuba 변환 + 멀티모달 렌더 + render daemon
+│   ├── navigation_dataset/        # ⭐ OpticalNav: episode/grid/graph/planner/exporter/evaluator
+│   ├── mitsuba3/                  # Mitsuba 3 (submodule) — 표준 빌드 트리
+│   ├── mitsuba3-optix7/           # ⭐ Mitsuba 3 OptiX7 변형 — 프로덕션 렌더러 소스
 │   └── README.md
 │
-├── apps/                                   # 렌더링 애플리케이션
-│   ├── render_candidate_cameras.py
-│   ├── render_selected_cameras_multimodal.py
-│   ├── render_curated_multimodal.py
-│   ├── render_reflective_island_frontal_demo.py
-│   ├── render_saved_request_multibranch.py
-│   ├── make_selected_camera_sheets.py
+├── apps/                          # ⭐ 16 일반 도구 (루트) + 4 서브폴더 (특화)
+│   ├── opticalnav.py              # navigation_dataset.cli 엔트리포인트
+│   ├── run_render_daemon.py       # HTTP 렌더 데몬
+│   ├── run_control_plane_dev.sh   # ⭐ 데몬 + webui 통합 개발 런처
+│   ├── run_control_backend_dev.sh
+│   ├── render_saved_request_multibranch.py  # 단일 RenderRequest 렌더 (ambient/active/polar)
+│   ├── export_optical_nav_dataset.py        # ⭐ 학습용 압축 export (EXR/NPZ 제외, JPEG+graph)
+│   ├── export_scene_to_usd.py     # authoring map → USD export
+│   ├── bake_*.py                  # material / asset thumbnail baking
+│   ├── audit_placeable_asset_texture_brdf.py / validate_material_previews.py
+│   ├── auto_link_opticalnav_assets.py / asset_coverage.py / download_dtc_subset.py
+│   ├── import_infinigen_scene.py  # generic Infinigen → OpticalNav importer
 │   ├── visualize_camera_floorplan.py
-│   ├── isaac_capture_current_view_request.py
-│   ├── run_render_daemon.py
-│   └── AGENTS.md                          # 📖 렌더링 앱 가이드
+│   ├── isaac/                     # Isaac Sim 인터랙션 (capture, script editor shim)
+│   ├── scenes/                    # ⭐ scene-specific install / import (cglab / shared_office / moorelane_kitchen)
+│   ├── migrations/                # one-shot fix / migration (Phase 1 metadata, channel-split grid rerender)
+│   ├── legacy/                    # 옛 카메라 sweep 워크플로 (OpticalNav 데몬으로 대체됨)
+│   ├── webui/                     # SvelteKit + Three.js 프론트엔드 (OpticalNav 에디터)
+│   ├── isaac_extension/           # Isaac Sim 확장 (UI 패널)
+│   └── isaac_standalone/          # Isaac 독립 실행 export 스크립트
 │
-├── scenes/                                # USD 씬 파일
-│   ├── mitsuba3/                         # Mitsuba 테스트 씬
-│   └── moorelane/                        # MooreLane 씬
+├── data/                          # 측정 재질 데이터셋
+│   ├── hpbrdf_2025/channels/{material}/{446|542|614|854}.pbrdf   # 단일밴드 채널 슬라이스
+│   └── pbrdf_2020/                # KAIST pBRDF (Baek 2020)
 │
-├── assets/                                # 3D 모델 및 텍스처
-│   ├── moorelane/
-│   └── ...
+├── out/
+│   ├── bridge_jobs/               # 렌더 job (job당 1 frame): opticalnav-<scene>-template-vp_XXX-h_YYY-rgb
+│   └── opticalnav/                # OpticalNav 데이터셋 루트
+│       ├── opticalnav-v0.2/       # scenes/ episodes/ observations/ splits/ evaluation/
+│       │                          # render_batches/ graph_render_batches/ exports/ thumbnails/ docs/
+│       └── asset_library/
 │
-├── out/                                   # 렌더링 결과 (bridge_jobs 포함)
-│   ├── bridge_jobs/
-│   │   ├── job-20260414T120000Z-abc123/
-│   │   │   ├── manifest.json
-│   │   │   ├── snapshot/
-│   │   │   ├── usd/
-│   │   │   ├── renders/
-│   │   │   └── logs/
-│   │   └── ...
-│   └── ...
-│
-├── vendor_datasets/                       # 외부 데이터셋
-├── vendor_docs/                           # 외부 문서
-├── vendor_datasets/measured_materials/    # 측정 재질
-│
-├── tests/                                 # 통합 테스트
-│   ├── contract/
-│   ├── fixtures/
-│   └── ...
-│
-└── AGENTS.md                              # 📖 이 파일
-```
-
-### Key Statistics
-```
-Module Files: 40+ Python files
-- robomituba_bridge: 6 files (387 LOC)
-- mitsuba_converter: 12 files (5,916 LOC)
-- mitsuba3: C++ renderer (external)
-
-Apps: 9 rendering applications
-Tests: Integration test suite
+├── scenes/        assets/        configs/datasets/      # 씬·에셋·데이터셋 설정
+├── tests/         scripts/       tools/    third_party/
+├── dev_report/    docs/   notes/   related_works/       # 보고서·문서
+├── vendor_datasets/   vendor_docs/
+├── build/mitsuba3-optix7/         # ⭐ 프로덕션 Mitsuba 빌드 산출물 (data/, plugins/, python/)
+├── AGENTS.md  CLAUDE.md           # 이 파일 (둘은 동일 미러)
+└── 각 모듈/앱 디렉토리의 CLAUDE.md  # 상세 가이드
 ```
 
 ---
 
-## 🔄 Data Flow Examples
+## 🧩 Modules (5)
 
-### Example 1: Isaac Sim → Mitsuba Rendering
-
-```
-1. Isaac Sim
-   ├─ USD 씬 생성 (geometry, materials, lights)
-   ├─ 카메라 배치
-   └─ 내보내기 (Export to Render)
-
-2. robomituba_bridge
-   ├─ SceneSnapshot 캡처
-   ├─ Geometry export (OBJ)
-   ├─ Texture 복사
-   └─ JobManifest 생성
-   → out/bridge_jobs/job-20260414T120000Z-abc123/
-
-3. mitsuba_converter
-   ├─ load_job_bundle()
-   ├─ SceneSnapshot 읽기
-   ├─ UsdSceneLoader (fallback)
-   ├─ MitsubaSceneBuilder
-   └─ render_modalities()
-
-4. mitsuba3
-   ├─ GPU 초기화
-   ├─ Scene 로드
-   ├─ Path tracing
-   └─ EXR 저장
-
-5. Output
-   out/bridge_jobs/job-.../renders/
-   ├─ camera_0/rgb.exr
-   ├─ camera_0/depth.exr
-   ├─ camera_0/normal.exr
-   ├─ camera_1/rgb.exr
-   └─ observation_bundle.json
-```
-
-### Example 2: Backend Job Queue
-
-```
-Frontend (React/Svelte)
-  ↓ RenderRequest
-Backend (FastAPI)
-  ├─ Create Job
-  └─ QueueProcessor
-  
-      ↓ subprocess
-  
-  /jarvis/project/robomituba/apps/render_*.py
-      ↓
-  mitsuba_converter.pipeline
-      ↓
-  mitsuba3 (GPU)
-      ↓
-  EXR files
-      ↓
-  Database update
-  ↓
-Frontend (polling)
-  ├─ GET /api/jobs/{job_id}
-  └─ UI update
-```
+| 모듈 | 역할 | 핵심 파일 |
+|------|------|-----------|
+| **robomituba_bridge** | Job manifest / SceneSnapshot / RenderRequest 데이터 계약 (의존성 없는 pure Python) | `types.py`, `manifest.py`, `paths.py`, `io.py`, `material_mapping.py` |
+| **mitsuba_converter** | USD→IR→Mitsuba dict, 멀티모달 렌더, observation manifest, HTTP render daemon | `usd_loader.py`, `mitsuba_builder.py`, `multimodal.py`(대형), `observation_bridge.py`, `render_daemon.py`, `pipeline.py`, `cli.py`, `mitsuba_runtime.py` |
+| **navigation_dataset** | OpticalNav 저작: episode schema, scene annotation, traversability grid, A* planner, instruction template, rollout, exporter, evaluator | `episode_schema.py`, `scene_annotations.py`, `planner.py`, `renderer.py`, `authoring_compile.py`, `cli.py` |
+| **mitsuba3** | Mitsuba 3 표준 submodule. 표준 빌드 트리에서 사용 | `src/bsdfs/`, `src/integrators/` 등 |
+| **mitsuba3-optix7** | ⭐ **프로덕션 렌더러 소스** (OptiX7 변형). 측정 pBRDF BSDF 커스터마이즈 포함 | `src/bsdfs/measured_polarized.cpp`, `measured_polarized_rgb.cpp` |
 
 ---
 
-## 🚀 Getting Started
+## 🔭 Mitsuba 빌드 — 두 개가 공존 (주의!)
 
-### Prerequisites
+이 저장소에는 **두 개의 Mitsuba 소스/빌드**가 있고, 어느 것이 런타임에 쓰이는지 반드시 구분해야 한다.
+
+| 소스 | 빌드 위치 | 사용처 |
+|------|-----------|--------|
+| `modules/mitsuba3` | `/home/jinnyeong/robomituba-build/mitsuba3` | 실험·검증용. `setpath.sh` + `LD_LIBRARY_PATH=/usr/lib/wsl/lib` 로 로드 |
+| `modules/mitsuba3-optix7` | `build/mitsuba3-optix7` | ⭐ **프로덕션 데몬/control-plane** (conda env `mitsuba_optix7`, `ROBOMITUBA_MITSUBA_PYTHONPATH=build/mitsuba3-optix7/python`) |
+
+- 플랫폼: WSL2 + RTX GPU. OptiX 드라이버는 `/usr/lib/wsl/lib/libnvoptix.so.1`.
+- 컴파일된 variant(표준 빌드 기준): `scalar_rgb, cuda_rgb, cuda_spectral, cuda_ad_spectral, cuda_ad_spectral_polarized`.
+- **BSDF/플러그인을 고치면 두 트리 중 "프로덕션에서 쓰는 빌드"를 재컴파일했는지 확인할 것.** `modules/mitsuba3` 만 고치면 데몬에는 반영되지 않는다.
+
+---
+
+## 🗺️ OpticalNav 데이터셋 워크플로
+
+1. **저작/컴파일** — `apps/opticalnav.py` (→ `navigation_dataset.cli`) 또는 webui 에디터로 장면 annotation·traversability grid·viewpoint graph·episode 생성. 결과는 `out/opticalnav/opticalnav-v0.2/` 아래.
+2. **렌더** — grid의 각 viewpoint × heading 마다 RenderRequest 생성 → render daemon이 멀티모달 렌더 → `out/bridge_jobs/opticalnav-<scene>-template-vp_XXX-h_YYY-rgb/` 에 job 단위로 저장.
+3. **Export** — `apps/export_optical_nav_dataset.py` 로 학습용 번들 생성: EXR/NPZ 제외, PNG→JPEG, `index.jsonl`(pose/intrinsics 라벨) + viewpoint graph + grid + episodes 동봉.
+
+### bridge_jobs 레이아웃 (job = 1 frame)
+
+```
+out/bridge_jobs/opticalnav-shared_office_floor_001-template-vp_000083-h_090-rgb/
+├── job_status.json
+├── requests/<frame_id>.json                       # 저장된 RenderRequest (재렌더 입력)
+└── observations/<frame_id>/
+    ├── manifest.json                              # camera_to_world, base_pose, intrinsics, timing
+    └── cameras/<camera_id>/
+        ├── rgb.exr   # HDR linear float
+        ├── rgb.png   # 8-bit sRGB tonemapped
+        └── rgb_raw.npz  # float32 raw (EXR와 사실상 중복)
+```
+
+> 현재 scene: `glass_corridor_001/002`, `office_lobby_001`, `cornell_box_001`, `moorelane_kitchen_001`, `shared_office_floor_001`. job 총 2400+개.
+
+---
+
+## 🖥️ Control Plane / Render Daemon
+
+- **`apps/run_control_plane_dev.sh`** — render daemon + webui 를 함께 띄우는 개발 런처. daemon 기본 `127.0.0.1:8765`.
+- **render daemon** (`mitsuba_converter/render_daemon.py`) — RenderRequest 큐, 멀티 GPU 워커(서브프로세스 분리), scene cache.
+- **webui** (`apps/webui`, SvelteKit + Three.js) — OpticalNav 장면/그래프 에디터, 렌더 모니터, XML-native preview.
+- 주요 환경변수(런처에서 주입): `ROBOMITUBA_RENDER_GPU_INDICES`(예 `0,1,2,3`), `ROBOMITUBA_SCENE_LOAD_CONCURRENCY`, `ROBOMITUBA_MITSUBA_PYTHON`/`_PYTHONPATH`(프로덕션 optix7 빌드 지정), `ROBOMITUBA_DISABLE_CUDA`, `ROBOMITUBA_DISABLE_CPU_FALLBACK`.
+
+---
+
+## 🎨 측정 재질 (HPBRDF) & Channel-Split RGB
+
+- `data/hpbrdf_2025/` 는 분광 밴드가 많은 측정 pBRDF. 풀스펙트럼 렌더는 밴드당 ~200MB로 메모리 부담.
+- 최적화: R/G/B에 해당하는 단일밴드 슬라이스(`channels/{mat}/{614,542,446}.pbrdf`)만 골라 렌더 → 한 번에 RGB 합성.
+- BSDF 플러그인 `measured_polarized` (분광/편광) 와 `measured_polarized_rgb` (RGB 합성) 가 이를 담당.
+- **렌더 파이프라인 분기** (`multimodal.py`): `use_channel_rgb_plugin` 이면 단일패스 `measured_polarized_rgb` 렌더, 실패 시 3-pass channel-split fallback(`_compose_channel_split_rgb`).
+
+### ⚠️ 알려진 이슈 / Action item (2026-06-15 기준)
+
+- **3-pass fallback의 compose(`_rgb_channel_intensity`)가 각 파장 패스를 luminance로 붕괴**시켜, 측정 재질이 아닌 일반 재질이 **gray(R=G=B)** 로 죽는다. 결과적으로 OpticalNav grid 데이터셋(shared_office_floor 등)이 사실상 흑백 + 일부 컬러 오브젝트로 렌더됨.
+- 근본 원인: 프로덕션 빌드 `build/mitsuba3-optix7` 에 **`measured_polarized_rgb.so` 가 컴파일되어 있지 않아** 플러그인 로드 실패 → 매 프레임 fallback.
+- 상태:
+  - `modules/mitsuba3-optix7/src/bsdfs/measured_polarized_rgb.cpp` 는 존재·등록되어 있으나 **빌드 안 됨** (RGB-only 설계 → cuda_ad_spectral 패스에서 로드 가능한지 검증 필요).
+  - `modules/mitsuba3` 에 rgb+spectral+polarized 모두 지원하는 별도 구현이 추가되어 `/home/jinnyeong/robomituba-build/mitsuba3` 에서 end-to-end 컬러 복원이 검증됨 — 단, **이건 프로덕션 빌드가 아님**.
+- **할 일**: 프로덕션(optix7) 빌드에 cuda_ad_spectral 에서 로드 가능한 `measured_polarized_rgb` 를 컴파일 → 전체 grid 재렌더(`apps/migrations/rerender_optical_nav_grid.py`, `--only-gray` 는 부분만 잡으니 전체 권장). black 프레임(EXR≈0)은 별도 원인.
+
+---
+
+## 🚀 Quick Start
 
 ```bash
-# System
-- Python 3.10+
-- NVIDIA GPU (optional, for CUDA)
-- cmake (for building mitsuba3)
+# 모듈 (editable install)
+pip install -e modules/robomituba_bridge -e modules/mitsuba_converter -e modules/navigation_dataset
 
-# Python packages
-pip install mitsuba numpy pydantic pyyaml
+# Mitsuba 런타임 (검증용 표준 빌드)
+export LD_LIBRARY_PATH=/usr/lib/wsl/lib:$LD_LIBRARY_PATH
+source /home/jinnyeong/robomituba-build/mitsuba3/setpath.sh
+python -c "import mitsuba as mi; print(mi.variants())"
 
-# Git submodules
-git clone <repo>
-cd robomituba
-git submodule update --init --recursive
-```
+# OpticalNav CLI
+python apps/opticalnav.py --help
 
-### Quick Start
+# 단일 RenderRequest 렌더
+python apps/render_saved_request_multibranch.py \
+  out/bridge_jobs/<job>/requests/<frame>.json --variant cuda_ad_spectral
 
-```bash
-# 1. 모듈 설치
-cd /jarvis/project/robomituba/modules/robomituba_bridge
-pip install -e .
+# control plane (데몬 + webui)
+bash apps/run_control_plane_dev.sh
 
-cd /jarvis/project/robomituba/modules/mitsuba_converter
-pip install -e .
-
-# 2. Mitsuba 설정
-python -c "import mitsuba as mi; mi.set_variant('cuda_rgb'); print('Ready!')"
-
-# 3. 렌더링 테스트
-python -c "
-from mitsuba_converter import convert_usd_to_mitsuba_dict
-import mitsuba as mi
-
-mi.set_variant('cuda_rgb')
-scene_dict = convert_usd_to_mitsuba_dict('scenes/mitsuba3/cornell_box.usd')
-scene = mi.load_dict(scene_dict)
-image = mi.render(scene)
-print('Success!')
-"
-
-# 4. Daemon 시작
-python /jarvis/project/robomituba/apps/run_render_daemon.py
-# → http://localhost:8001/render
-
-# 5. 렌더링 요청
-curl -X POST http://localhost:8001/render \
-  -d '{"manifest_path": "out/bridge_jobs/.../manifest.json"}'
-```
-
----
-
-## 🏗️ Core Concepts
-
-### Job Manifest (robomituba_bridge)
-
-**정의**: 렌더링 작업의 메타데이터 + 씬 스냅샷
-
-```
-Job Manifest = {
-  job_id: "job-20260414T120000Z-abc123"
-  scene_id: "mitsuba3_cornell"
-  frame_id: "frame_0"
-  
-  paths: {
-    job_dir: "out/bridge_jobs/job-..."
-    snapshot_dir: ".../snapshot/"
-    scene_snapshot: ".../scene.json"
-    usd_stage: ".../stage.usda"
-    renders_dir: ".../renders/"
-  }
-}
-```
-
-### Scene Snapshot
-
-**정의**: USD 씬의 스냅샷 (geometry, materials, cameras, lights)
-
-```
-SceneSnapshot = {
-  scene_id: "scene_id"
-  meshes: [MeshRecord, ...]           # OBJ 경로 포함
-  materials: [MaterialRecord, ...]    # BSDF 파라미터
-  cameras: [CameraRecord, ...]
-  lights: [LightRecord, ...]
-}
-```
-
-### Render Request (observation_bridge)
-
-**정의**: 특정 카메라/모달리티 렌더링 요청
-
-```
-RenderRequest = {
-  request_id: "req_001"
-  job_id: "job-..."
-  camera_specs: [CameraSpec, ...]     # 렌더링할 카메라
-  modalities: ["rgb", "depth", ...]   # 원하는 출력
-  render_settings: {spp: 64, ...}
-}
-```
-
----
-
-## 📚 Module Documentation
-
-각 모듈별 상세 가이드:
-
-1. **robomituba_bridge** (`modules/robomituba_bridge/AGENTS.md`)
-   - 데이터 구조 정의
-   - Job manifest 생성/검증
-   - Path 규칙 (repo-relative)
-   - I/O 유틸리티
-
-2. **mitsuba_converter** (`modules/mitsuba_converter/AGENTS.md`)
-   - USD 로더
-   - Mitsuba scene 빌더
-   - 멀티모달 렌더링
-   - Render daemon
-   - CLI 사용법
-
-3. **mitsuba3** (`modules/mitsuba3/AGENTS.md`)
-   - Mitsuba 3 소개
-   - Variant 선택
-   - 성능 팁
-   - GPU 사용법
-
-4. **apps** (`apps/AGENTS.md`)
-   - 9개 렌더링 앱
-   - 독립 실행 및 Daemon 사용법
-   - Job submission 방법
-
----
-
-## 🔌 Integration Points
-
-### Isaac Sim Plugin (Future)
-
-```python
-# Isaac에서 robomituba 사용 (미구현)
-from robomituba_bridge import write_job_bundle, ensure_job_layout
-
-snapshot = export_isaac_scene_as_snapshot()
-layout = ensure_job_layout(repo_root, job_id)
-write_job_bundle(repo_root, layout, snapshot, manifest)
-```
-
-### Blender Add-on (Future)
-
-```python
-# Blender에서 robomituba 사용 (미구현)
-bpy.ops.robomituba.export_job(job_id="job-123")
-```
-
-### Backend API
-
-```bash
-# Render 요청
-curl -X POST http://backend:8000/api/jobs \
-  -d '{
-    "dataset_id": 1,
-    "job_type": "render",
-    "config": {
-      "script": "render_selected_cameras_multimodal.py",
-      "manifest_path": "out/bridge_jobs/job-123/manifest.json"
-    }
-  }'
-
-# 상태 조회
-curl http://backend:8000/api/jobs/1
-```
-
----
-
-## 💾 Key File Formats
-
-### Job Manifest (JSON)
-
-```json
-{
-  "job_id": "job-20260414T120000Z-abc123",
-  "scene_id": "mitsuba3_cornell",
-  "frame_id": "frame_0",
-  "created_at": "2026-04-14T12:00:00Z",
-  "paths": {
-    "job_dir": "out/bridge_jobs/job-...",
-    "manifest": "out/bridge_jobs/job-.../manifest.json",
-    "scene_snapshot": "out/bridge_jobs/job-.../snapshot/scene.json",
-    "usd_stage": "out/bridge_jobs/job-.../usd/stage.usda",
-    "renders_dir": "out/bridge_jobs/job-.../renders/"
-  }
-}
-```
-
-### Scene Snapshot (JSON)
-
-```json
-{
-  "scene_id": "mitsuba3_cornell",
-  "frame": {
-    "frame_id": "frame_0",
-    "time_code": 0.0,
-    "meters_per_unit": 1.0,
-    "up_axis": "Y"
-  },
-  "meshes": [
-    {
-      "mesh_id": "mesh_0",
-      "name": "cube",
-      "geometry_path": "out/bridge_jobs/.../geometry/cube.obj",
-      "material_id": "mat_0",
-      "transform": [...]
-    }
-  ],
-  "materials": [...],
-  "cameras": [...],
-  "lights": [...]
-}
-```
-
-### Render Output (EXR + JSON)
-
-```
-renders/
-├── camera_0/
-│  ├── rgb.exr               # 32-bit float HDR
-│  ├── depth.exr             # normalized [0, 1]
-│  ├── normal.exr            # [-1, 1]
-│  ├── albedo.exr            # base color
-│  └── ...
-├── camera_1/
-│  └── ...
-└── observation_bundle.json  # 메타데이터
+# 학습용 export
+python apps/export_optical_nav_dataset.py \
+  --scene shared_office_floor_001 \
+  --out out/exports/shared_office_floor_001_trainable \
+  --image-format jpeg --jpeg-quality 95 --zip
 ```
 
 ---
@@ -486,15 +193,9 @@ renders/
 ## 🧪 Testing
 
 ```bash
-# Unit tests
-cd modules/robomituba_bridge && pytest tests/
-cd modules/mitsuba_converter && pytest tests/
-
-# Integration test
-python tests/contract/test_bridge_contract.py
-
-# E2E test
-python tests/e2e_rendering.py
+cd modules/robomituba_bridge   && pytest tests/
+cd modules/mitsuba_converter   && pytest tests/
+cd modules/navigation_dataset  && pytest tests/   # viewpoint_graph, authoring_map, episode 등
 ```
 
 ---
@@ -503,145 +204,43 @@ python tests/e2e_rendering.py
 
 | 문제 | 원인 | 해결 |
 |------|------|------|
-| "No module mitsuba" | Mitsuba 미설치 | `pip install mitsuba` |
-| "variant not set" | Mitsuba variant 미설정 | `mi.set_variant('cuda_rgb')` |
-| "GPU out of memory" | spp/resolution 너무 높음 | 값 감소 |
-| "geometry path not found" | repo-relative 경로 잘못됨 | resolve_repo_path() 확인 |
-| "Black rendering" | 조명/재질 없음 | 기본값 확인 |
-
----
-
-## 🎯 Next Steps / Roadmap
-
-### Short-term
-- [ ] Isaac Sim export plugin 구현
-- [ ] Blender add-on 구현
-- [ ] 성능 최적화 (batch rendering)
-- [ ] 추가 modality (polarization, etc.)
-
-### Mid-term
-- [ ] 분산 렌더링 (multi-machine)
-- [ ] Real-time preview
-- [ ] Material library 확장
-- [ ] HDR 환경맵 지원
-
-### Long-term
-- [ ] Inverse rendering (역조명)
-- [ ] Real-time NeRF 학습
-- [ ] Physics-aware rendering
-- [ ] 자동 재질 추정
-
----
-
-## 📖 Documentation Index
-
-```
-/jarvis/project/robomituba/
-├── AGENTS.md                          ← 이 파일 (프로젝트 개요)
-├── modules/
-│   ├── robomituba_bridge/AGENTS.md   ← Bridge contract 상세
-│   ├── mitsuba_converter/AGENTS.md   ← 변환 및 렌더링 상세
-│   └── mitsuba3/AGENTS.md            ← Mitsuba 3 렌더러 가이드
-└── apps/AGENTS.md                    ← 렌더링 앱 가이드
-```
-
----
-
-## 👥 Contributing
-
-```bash
-# 1. Feature branch
-git checkout -b feature/your-feature
-
-# 2. Make changes
-# - Update relevant AGENTS.md
-# - Add tests
-# - Follow code style
-
-# 3. Commit
-git commit -m "[feature] description"
-
-# 4. Push & PR
-git push origin feature/your-feature
-```
+| `No module mitsuba` | 런타임 미로드 | `setpath.sh` + `LD_LIBRARY_PATH=/usr/lib/wsl/lib` |
+| `Could not initialize OptiX` | WSL OptiX 미연결 | `LD_LIBRARY_PATH` 에 `/usr/lib/wsl/lib` 추가 |
+| 렌더가 흑백(gray)으로 나옴 | `measured_polarized_rgb` 미빌드 → channel-split fallback | 위 "알려진 이슈" 참고 (프로덕션 빌드에 플러그인 컴파일 + 재렌더) |
+| 검은색(black) 렌더 | 조명/카메라/씬 staging 문제 | manifest/scene XML, 조명 확인 |
+| 플러그인 수정이 반영 안 됨 | 잘못된 빌드 트리 컴파일 | 프로덕션은 `build/mitsuba3-optix7` 임을 확인 |
+| GPU OOM | spp/resolution 과다 | 값 감소, `ROBOMITUBA_TEXTURE_MAX_RESOLUTION` 조정 |
 
 ---
 
 ## 📝 Key Design Decisions
 
-### 1. Pure Python Bridge (robomituba_bridge)
-- **왜?** 독립성, 이식성, 빠른 개발
-- **결과**: Isaac/Mitsuba 양쪽에서 간단하게 사용 가능
-
-### 2. Repo-relative Paths
-- **왜?** 이동 가능성, 배포 용이
-- **결과**: 어디서나 데이터 사용 가능
-
-### 3. Job Manifest Pattern
-- **왜?** 추적 가능성, 재현성
-- **결과**: 모든 렌더링 작업이 문서화됨
-
-### 4. Multimodal from Start
-- **왜?** ML/vision tasks 지원
-- **결과**: RGB 외 다양한 센서 데이터
-
-### 5. HTTP Daemon for Rendering
-- **왜?** 원격 작업, 확장성
-- **결과**: 분산 렌더링 기반 구축
+1. **Pure Python bridge** (`robomituba_bridge`) — 의존성 없이 Isaac/Mitsuba 양쪽에서 사용.
+2. **Repo-relative paths** — 이동/배포 용이. `resolve_repo_path()` 로 해석.
+3. **Job manifest + observation manifest** — 모든 렌더가 재현 가능하게 문서화 (RenderRequest 저장 → 재렌더 가능).
+4. **Multimodal from start** — RGB 외 depth/normal/polarization/측정 pBRDF.
+5. **Render daemon + 멀티 GPU 워커** — 큐 기반, 서브프로세스 분리, scene cache.
+6. **OpticalNav 데이터셋 레이어 분리** (`navigation_dataset`) — 렌더와 독립적으로 graph/grid/episode 저작.
 
 ---
 
-## 🔗 Related Projects
+## 📖 상세 문서
 
-- **Mitsuba 3**: https://github.com/mitsuba-renderer/mitsuba3
-- **Isaac Sim**: https://developer.nvidia.com/isaac-sim
-- **NVIDIA Research**: https://research.nvidia.com/
+- `modules/robomituba_bridge/CLAUDE.md` — bridge 계약
+- `modules/mitsuba_converter/CLAUDE.md` — 변환/렌더/daemon
+- `modules/mitsuba3/CLAUDE.md` — Mitsuba 렌더러 가이드
+- `apps/CLAUDE.md` — 렌더 앱
+- `modules/navigation_dataset/README.md` — OpticalNav 저작 레이어
+- `dev_report/` — 주차별 개발 보고서
 
 ---
 
 ## 📄 License
 
-Robomituba는 Mitsuba 3 (GPL v3)를 사용하므로 **GPL v3** 라이선스입니다.
+Mitsuba 3 (GPL v3) 사용 → 본 프로젝트도 **GPL v3**.
 
 ---
 
-## 🎓 Learning Path
-
-### 1️⃣ 초급 (Beginner)
-- AGENTS.md (이 파일) 읽기
-- 각 모듈의 Quick Start 따라하기
-- 예시 렌더링 실행
-
-### 2️⃣ 중급 (Intermediate)
-- robomituba_bridge 타입 이해
-- Job manifest 직접 생성
-- mitsuba_converter 파이프라인 커스터마이징
-
-### 3️⃣ 고급 (Advanced)
-- Mitsuba 3 custom BSDF 추가
-- 분산 렌더링 구현
-- Inverse rendering
-
----
-
-## 📞 Support
-
-- 📖 **문서**: 각 AGENTS.md 파일
-- 🔧 **이슈**: GitHub issues
-- 💬 **토론**: GitHub discussions
-- 📧 **문의**: project maintainer
-
----
-
-## 🙏 Acknowledgments
-
-- **Mitsuba 3**: EPFL RGL lab
-- **Isaac Sim**: NVIDIA
-- **Project contributors**: robomituba team
-
----
-
-*Last Updated: 2026-04-14*
-*Project: /jarvis/project/robomituba*
-*Total Module Count: 3 (bridge, converter, mitsuba3)*
-*Documentation: 5 AGENTS.md files*
+*Last Updated: 2026-06-15*
+*Modules: 5 (robomituba_bridge, mitsuba_converter, navigation_dataset, mitsuba3, mitsuba3-optix7)*
+*주력 워크로드: OpticalNav 데이터셋 생성 · 멀티모달 렌더 · 측정 pBRDF*
