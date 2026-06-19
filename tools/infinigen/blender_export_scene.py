@@ -17,6 +17,7 @@ mesh is Y-up (matches Mitsuba / our authoring world). The 2D authoring placement
 (authoring_x, authoring_y) is taken from the Blender world XY of the bbox centre.
 """
 
+import contextlib
 import json
 import math
 import os
@@ -25,6 +26,50 @@ import sys
 
 import bpy  # type: ignore
 from mathutils import Matrix, Vector  # type: ignore
+
+try:
+    from tqdm import tqdm as _tqdm  # progress bar (present in the infinigen env)
+except Exception:  # noqa: BLE001
+    _tqdm = None
+
+
+@contextlib.contextmanager
+def _silence_fds(*fds):
+    """Redirect the given OS file descriptors to /dev/null for the duration.
+
+    Blender floods the console with C-level spam during heavy ops — on BOTH stdout
+    (``Synchronizing object``, ``Updating Images``, deferred ``Info: Baking map
+    saved`` operator reports) and stderr (``Writing to ...``, ``OBJ export ... took``).
+    Redirect fd 1+2 around an op to mute it; the tqdm bar is idle during the op so
+    nothing is lost. Use fd 1 around the whole loop to also catch the deferred
+    operator reports that flush between ops."""
+    saved = []
+    try:
+        sys.stdout.flush(); sys.stderr.flush()
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        for fd in fds:
+            saved.append((fd, os.dup(fd)))
+            os.dup2(devnull, fd)
+        os.close(devnull)
+    except Exception:  # noqa: BLE001
+        saved = []
+    try:
+        yield
+    finally:
+        for fd, old in saved:
+            try:
+                os.dup2(old, fd)
+                os.close(old)
+            except Exception:  # noqa: BLE001
+                pass
+
+
+def _log(msg: str, bar=None) -> None:
+    """Print a line without corrupting an active tqdm bar."""
+    if bar is not None and _tqdm is not None:
+        bar.write(msg)
+    else:
+        print(msg)
 
 
 # ── classification ────────────────────────────────────────────────────────────
@@ -287,7 +332,7 @@ def _ensure_uv(obj):
             bpy.ops.object.mode_set(mode="OBJECT")
         except Exception:
             pass
-        print(f"[bake] uv FAIL {obj.name}: {exc}")
+        print(f"[bake] uv FAIL {obj.name}: {exc}", file=sys.stderr)
         return False
 
 
@@ -338,7 +383,7 @@ def _bake_albedo(obj, out_png, res, samples):
         img.file_format = "PNG"
         img.save()
     except Exception as exc:  # noqa: BLE001
-        print(f"[bake] FAIL {obj.name}: {exc}")
+        print(f"[bake] FAIL {obj.name}: {exc}", file=sys.stderr)
         ok = False
     finally:
         for nt, node in added:
@@ -457,7 +502,22 @@ def main():
         mesh_objs = mesh_objs[:limit]
 
     used_ids = set()
-    for i, obj in enumerate(mesh_objs):
+    baked_count = 0
+    fail_count = 0
+    total = len(mesh_objs)
+    bar = _tqdm(total=total, desc="export", unit="obj", file=sys.stderr,
+                dynamic_ncols=True) if _tqdm else None
+    if bar is None:
+        print(f"[export] exporting {total} units (bake={'on' if do_bake else 'off'})…", flush=True)
+    # When the bar is active, mute stdout for the whole loop so Blender's *deferred*
+    # operator reports ("Info: Baking map saved …", flushed between ops) don't clutter
+    # the console. The bar is on stderr; our own logs use bar.write/stderr. In no-tqdm
+    # mode we leave stdout alone so the fallback progress prints remain visible.
+    _loop_mute = _silence_fds(1) if bar is not None else contextlib.nullcontext()
+    with _loop_mute:
+      for i, obj in enumerate(mesh_objs):
+        if bar is not None:
+            bar.set_postfix_str(f"{obj.name[:22]} bake={baked_count} fail={fail_count}")
         kind, sem, subtype = _classify(obj)
         oid = _sanitize(obj.name)
         if oid in used_ids:
@@ -482,23 +542,29 @@ def main():
         glb_rel = f"meshes/{oid}.glb"
         baked_rel = None
         try:
-            _export_obj(obj, os.path.join(out_dir, obj_rel))
+            with _silence_fds(1, 2):
+                _export_obj(obj, os.path.join(out_dir, obj_rel))
         except Exception as exc:  # noqa: BLE001
-            print(f"[export] OBJ FAIL {obj.name}: {exc}")
+            _log(f"[export] OBJ FAIL {obj.name}: {exc}", bar)
+            fail_count += 1
             obj_rel = None
         # Bake procedural materials -> albedo atlas, wire into the OBJ's MTL so the
         # render path picks up true colours via map_Kd (no Stage 2 change needed).
         if do_bake and obj_rel is not None and len(obj.data.polygons) <= 120000:
             tex_abs = os.path.join(textures_dir, f"{oid}_albedo.png")
-            if _bake_albedo(obj, tex_abs, bake_res, bake_samples):
+            with _silence_fds(1, 2):
+                baked_ok = _bake_albedo(obj, tex_abs, bake_res, bake_samples)
+            if baked_ok:
                 _patch_mtl_map_kd(os.path.join(out_dir, f"meshes/{oid}.mtl"),
                                   f"../textures/{oid}_albedo.png")
                 baked_rel = f"textures/{oid}_albedo.png"
+                baked_count += 1
         if not no_glb:
             try:
-                _export_glb(obj, os.path.join(out_dir, glb_rel))
+                with _silence_fds(1, 2):
+                    _export_glb(obj, os.path.join(out_dir, glb_rel))
             except Exception as exc:  # noqa: BLE001
-                print(f"[export] GLB FAIL {obj.name}: {exc}")
+                _log(f"[export] GLB FAIL {obj.name}: {exc}", bar)
                 glb_rel = None
         else:
             glb_rel = None
@@ -534,8 +600,13 @@ def main():
             "mesh_glb": glb_rel,
             "baked_albedo": baked_rel,
         })
-        if (i + 1) % 20 == 0:
-            print(f"[export] {i + 1}/{len(mesh_objs)} units done")
+        if bar is not None:
+            bar.update(1)
+        elif (i + 1) % 10 == 0 or (i + 1) == total:
+            pct = round(100 * (i + 1) / max(total, 1))
+            print(f"[export] {i + 1}/{total} ({pct}%) units · bake={baked_count} fail={fail_count}", flush=True)
+    if bar is not None:
+        bar.close()
 
     # Lights
     for o in bpy.data.objects:
