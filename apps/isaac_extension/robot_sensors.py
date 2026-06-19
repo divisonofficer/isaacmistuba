@@ -14,7 +14,7 @@ ROBOT_SENSOR_TYPES = {"rgb_camera", "nir_camera", "polar_camera", "lidar_3d"}
 DEFAULT_SENSOR_MODALITIES = {
     "rgb_camera": ["rgb"],
     "nir_camera": ["nir_intensity"],
-    "polar_camera": ["polar_rgb_preview", "dop", "aolp", "s1", "s2"],
+    "polar_camera": ["polar_rgb_preview", "s1_over_s0", "s2_over_s0", "dop", "aolp"],
     "lidar_3d": ["lidar_point_cloud"],
 }
 

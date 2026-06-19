@@ -321,6 +321,8 @@ def iter_export_files(
     kept_episodes: Iterable[EpisodeManifest],
     *,
     panorama_observations: bool = True,
+    include_exr: bool = True,
+    include_polarization_raw: bool = True,
 ) -> Iterable[tuple[Path, str]]:
     """Yield (src_path, dst_relative_posix_path) pairs for the scene bundle.
 
@@ -416,13 +418,24 @@ def iter_export_files(
                 for src in sorted(obs_dir.rglob("*")):
                     if not src.is_file():
                         continue
+                    # PNG-only mode: drop heavy HDR/raw rasters, keep PNG + metadata.
+                    # Exception: keep the polarization Stokes raw (stokes_data.npz) so
+                    # downstream code can recompute any Stokes representation, even when
+                    # other .npz/.exr are dropped. Representation PNGs (s1_over_s0_*.png,
+                    # dop/aolp colorbars) are .png and kept regardless.
+                    if not include_exr and src.suffix.lower() in {".exr", ".hdr", ".npz"}:
+                        if not (include_polarization_raw and src.name == "stokes_data.npz"):
+                            continue
                     rel = src.relative_to(pdir).as_posix()
                     pair = _emit(src, rel)
                     if pair is not None:
                         yield pair
             # 3b. EXR (HDR) pulled from bridge_jobs for every heading at this
             # vp. The daemon's PNG-only consolidation skipped these so we
-            # mirror them under `sensors/<camera>/<modality>.exr`.
+            # mirror them under `sensors/<camera>/<modality>.exr`. This is the
+            # heavy part — skipped entirely in PNG-only mode.
+            if not include_exr:
+                continue
             if repo_root is None:
                 continue
             # bridge_jobs name pattern uses each heading individually, so we
