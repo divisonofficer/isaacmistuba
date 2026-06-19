@@ -7,14 +7,14 @@ instead. Vertices are written in prim-local meters with the bbox bottom shifted
 to ``y=0`` so the renderer can place the object on the floor with a simple
 translate.
 
-Writer version 2 adds UV (``vt``) and normal (``vn``) output when the source
-USD mesh has ``primvars:st`` and ``normals``; this lets the Mitsuba ``obj``
-loader sample basecolor / normal textures bound on the USD material.
+Writer version 4 writes the combined OBJ plus per-child-mesh part OBJs,
+all in the same whole-prim normalized coordinate frame. UV (``vt``) and normal
+(``vn``) streams are preserved so Mitsuba can sample source texture maps.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -22,7 +22,7 @@ import numpy as np
 
 from .usd_export_obj import _triangulate
 
-OBJ_WRITER_VERSION = 3  # v3: also centers x/z on bbox center (v2 only shifted y)
+OBJ_WRITER_VERSION = 4  # v4: also writes per-child-mesh part OBJs for multi-material USD prims
 
 
 @dataclass
@@ -38,6 +38,7 @@ class PrimMeshStats:
     has_uv: bool = False
     has_normal: bool = False
     writer_version: int = OBJ_WRITER_VERSION
+    mesh_parts: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -54,6 +55,7 @@ class PrimMeshStats:
             "has_uv": bool(self.has_uv),
             "has_normal": bool(self.has_normal),
             "writer_version": int(self.writer_version),
+            "mesh_parts": list(self.mesh_parts),
         }
 
 
@@ -143,6 +145,86 @@ def _read_uvs(mesh_schema: Any, raw_idx: list[int]) -> tuple[np.ndarray | None, 
     return None, "none"
 
 
+def _safe_part_slug(value: str, *, fallback: str) -> str:
+    import re
+
+    slug = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value or "").strip()).strip("_.-")
+    return slug or fallback
+
+
+def _write_obj_mesh(
+    out_path: Path,
+    *,
+    usd_path: str | Path,
+    prim_path: str,
+    verts: np.ndarray,
+    tris: np.ndarray,
+    uv_arr: np.ndarray | None,
+    uv_mode: str,
+    corners: np.ndarray,
+    normals: np.ndarray | None,
+) -> dict[str, Any]:
+    write_uv = uv_arr is not None and uv_mode != "none" and len(uv_arr) > 0
+    write_normal = normals is not None and len(normals) == len(verts)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w", encoding="utf-8") as f:
+        f.write(f"# usd_path: {usd_path}\n")
+        f.write(f"# prim_path: {prim_path}\n")
+        f.write(f"# writer_version: {OBJ_WRITER_VERSION}\n")
+        f.write(f"# vertices: {verts.shape[0]}\n")
+        f.write(f"# triangles: {tris.shape[0]}\n")
+        f.write(f"# has_uv: {int(write_uv)}\n")
+        f.write(f"# has_normal: {int(write_normal)}\n")
+        for x, y, z in verts:
+            f.write(f"v {x:.6f} {y:.6f} {z:.6f}\n")
+        if write_uv:
+            for u, vv in uv_arr:
+                f.write(f"vt {u:.6f} {vv:.6f}\n")
+        if write_normal:
+            for nx, ny, nz in normals:
+                f.write(f"vn {nx:.6f} {ny:.6f} {nz:.6f}\n")
+        for i, (a, b, c) in enumerate(tris):
+            va = int(a) + 1
+            vb = int(b) + 1
+            vc = int(c) + 1
+            if write_uv and write_normal:
+                if uv_mode == "vertex":
+                    ta, tb, tc = va, vb, vc
+                elif uv_mode == "corner":
+                    ca, cb, cc = corners[i]
+                    ta, tb, tc = int(ca) + 1, int(cb) + 1, int(cc) + 1
+                else:
+                    ta = tb = tc = 1
+                f.write(f"f {va}/{ta}/{va} {vb}/{tb}/{vb} {vc}/{tc}/{vc}\n")
+            elif write_uv:
+                if uv_mode == "vertex":
+                    ta, tb, tc = va, vb, vc
+                elif uv_mode == "corner":
+                    ca, cb, cc = corners[i]
+                    ta, tb, tc = int(ca) + 1, int(cb) + 1, int(cc) + 1
+                else:
+                    ta = tb = tc = 1
+                f.write(f"f {va}/{ta} {vb}/{tb} {vc}/{tc}\n")
+            elif write_normal:
+                f.write(f"f {va}//{va} {vb}//{vb} {vc}//{vc}\n")
+            else:
+                f.write(f"f {va} {vb} {vc}\n")
+    bbox_min = verts.min(axis=0).tolist() if len(verts) else [0.0, 0.0, 0.0]
+    bbox_max = verts.max(axis=0).tolist() if len(verts) else [0.0, 0.0, 0.0]
+    return {
+        "obj_path": str(out_path),
+        "vertex_count": int(verts.shape[0]),
+        "triangle_count": int(tris.shape[0]),
+        "has_uv": bool(write_uv),
+        "has_normal": bool(write_normal),
+        "bbox": {
+            "min": [float(v) for v in bbox_min],
+            "max": [float(v) for v in bbox_max],
+            "size": [float(bbox_max[i] - bbox_min[i]) for i in range(3)],
+        },
+    }
+
+
 def _read_normals(mesh_schema: Any, transform_dir: Any) -> np.ndarray | None:
     """Per-point normals in world space (prim-local rotation already applied)."""
     try:
@@ -227,6 +309,10 @@ def extract_prim_mesh_to_obj(
         all_tris: list[np.ndarray] = []
         all_uvs: list[np.ndarray] = []           # one row per UV index emitted (vertex- or corner-keyed)
         all_normals: list[np.ndarray] = []        # per-vertex normals (one row per emitted vertex)
+        mesh_uv_arrays: list[np.ndarray | None] = []
+        mesh_names: list[str] = []
+        mesh_paths: list[str] = []
+        mesh_vertex_counts: list[int] = []
         # Per-mesh offsets and modes:
         v_offsets: list[int] = []
         uv_offsets: list[int] = []
@@ -268,6 +354,8 @@ def extract_prim_mesh_to_obj(
             tris_v, tris_c = _triangulate_with_corners(counts_list, idx_list)
             if tris_v.size == 0:
                 continue
+            mesh_paths.append(str(mp.GetPath()))
+            mesh_names.append(str(mp.GetName()))
 
             # UVs
             uv_arr, uv_mode = _read_uvs(mesh_schema, idx_list)
@@ -286,12 +374,14 @@ def extract_prim_mesh_to_obj(
             v_offsets.append(vertex_offset)
             if uv_arr is not None and uv_mode != "none":
                 all_uvs.append(uv_arr)
+                mesh_uv_arrays.append(uv_arr)
                 uv_modes.append(uv_mode)
                 uv_offsets.append(uv_offset)
                 corner_arrays.append(tris_c if uv_mode == "corner" else np.zeros((0, 3), dtype=np.int64))
                 uv_offset += uv_arr.shape[0]
                 any_uv = True
             else:
+                mesh_uv_arrays.append(None)
                 uv_modes.append("none")
                 uv_offsets.append(uv_offset)
                 corner_arrays.append(np.zeros((0, 3), dtype=np.int64))
@@ -304,6 +394,7 @@ def extract_prim_mesh_to_obj(
                 all_normals.append(np.zeros((local_pts.shape[0], 3), dtype=np.float32))
                 normal_present.append(False)
 
+            mesh_vertex_counts.append(int(local_pts.shape[0]))
             vertex_offset += local_pts.shape[0]
             mesh_used += 1
 
@@ -412,6 +503,37 @@ def extract_prim_mesh_to_obj(
                     else:
                         f.write(f"f {va} {vb} {vc}\n")
 
+        mesh_parts: list[dict[str, Any]] = []
+        part_dir = out_path.with_suffix("")
+        part_dir = out_path.parent / f"{part_dir.name}_parts"
+        for mesh_i, tris in enumerate(all_tris):
+            v_off = v_offsets[mesh_i]
+            v_count = mesh_vertex_counts[mesh_i]
+            part_verts = verts[v_off:v_off + v_count]
+            part_tris = tris - v_off
+            part_uv = mesh_uv_arrays[mesh_i]
+            part_normals = all_normals[mesh_i] if normal_present[mesh_i] else None
+            part_corners = corner_arrays[mesh_i]
+            part_slug = _safe_part_slug(mesh_names[mesh_i], fallback=f"part_{mesh_i:03d}")
+            part_path = part_dir / f"{mesh_i:03d}_{part_slug}.obj"
+            part_stats = _write_obj_mesh(
+                part_path,
+                usd_path=usd_path,
+                prim_path=mesh_paths[mesh_i],
+                verts=part_verts,
+                tris=part_tris,
+                uv_arr=part_uv,
+                uv_mode=uv_modes[mesh_i],
+                corners=part_corners,
+                normals=part_normals,
+            )
+            mesh_parts.append({
+                "part_id": f"part_{mesh_i:03d}_{part_slug}",
+                "mesh_prim_path": mesh_paths[mesh_i],
+                "mesh_name": mesh_names[mesh_i],
+                **part_stats,
+            })
+
         return PrimMeshStats(
             vertex_count=int(verts.shape[0]),
             triangle_count=int(total_tris),
@@ -428,6 +550,7 @@ def extract_prim_mesh_to_obj(
             has_uv=bool(write_uv),
             has_normal=bool(write_normal),
             writer_version=OBJ_WRITER_VERSION,
+            mesh_parts=mesh_parts,
         )
     finally:
         if own_stage:
