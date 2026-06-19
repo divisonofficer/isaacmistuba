@@ -1,0 +1,392 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Polarization Camera 렌더 파이프라인 구현 상태 — 2026-06-17</title>
+<style>
+:root{
+  --bg:#f4f6fb; --panel:#fff; --sub:#f8fafc; --text:#1f2937; --muted:#64748b;
+  --line:#dbe3ef; --blue:#2563eb; --green:#16a34a; --amber:#d97706; --red:#dc2626;
+  --purple:#7c3aed; --teal:#0f766e; --mono:"JetBrains Mono",Consolas,Menlo,monospace;
+  --sans:Inter,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html{scroll-behavior:smooth}
+body{font-family:var(--sans);background:var(--bg);color:var(--text);line-height:1.62;font-size:14px}
+.layout{display:flex;min-height:100vh}
+aside{width:270px;flex:0 0 270px;position:sticky;top:0;height:100vh;overflow:auto;padding:22px 14px;border-right:1px solid var(--line);background:#eef2f7}
+main{flex:1;padding:34px 42px;max-width:1180px}
+.logo{font-weight:850;color:var(--blue);letter-spacing:-.02em;font-size:16px}
+.date{margin-top:3px;color:var(--muted);font-family:var(--mono);font-size:11px}
+.small{font-size:12px;color:var(--muted)}
+.nav-title{margin:22px 8px 7px;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.12em;font-weight:850}
+.nav-link{display:block;padding:5px 8px;border-radius:5px;color:#374151;font-size:12px;text-decoration:none;margin-bottom:2px}
+.nav-link:hover{background:#dde3ee}
+a{color:var(--blue);text-decoration:none} a:hover{text-decoration:underline}
+.hero{background:linear-gradient(135deg,#111827,#1e3a8a 55%,#0f766e);color:#fff;border-radius:14px;padding:24px 30px;margin-bottom:24px;box-shadow:0 12px 28px rgba(15,23,42,.20)}
+.hero h1{font-size:25px;font-weight:900;letter-spacing:-.04em;margin-bottom:8px}
+.hero p{color:#dbeafe;font-size:13px;max-width:900px}
+.hero .thesis{margin-top:12px;font-size:15px;color:#fff;font-weight:750;line-height:1.7}
+section{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:23px 25px;margin-bottom:20px}
+h2{font-size:19px;font-weight:850;margin-bottom:14px;letter-spacing:-.03em}
+h3{font-size:14px;font-weight:800;margin:17px 0 8px;letter-spacing:-.01em}
+.note{font-size:13px;color:#475569}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin:14px 0}
+.grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:13px;margin:14px 0}
+.grid4{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:14px 0}
+.card{background:var(--sub);border:1px solid var(--line);border-radius:10px;padding:14px;min-height:70px}
+.card strong{color:#111827}
+.label{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.08em;font-weight:850;margin-bottom:6px}
+.metric{font-size:25px;font-weight:900;letter-spacing:-.05em;color:var(--blue)}
+.tag{display:inline-block;padding:2px 8px;border-radius:999px;font-size:11px;font-weight:800;background:#dbeafe;color:#1e40af;margin:2px 2px 2px 0}
+.tag.green{background:#dcfce7;color:#15803d}
+.tag.amber{background:#fef3c7;color:#b45309}
+.tag.purple{background:#f3e8ff;color:#7e22ce}
+.tag.red{background:#fee2e2;color:#b91c1c}
+.tag.teal{background:#ccfbf1;color:#0f766e}
+table{width:100%;border-collapse:collapse;margin:13px 0;font-size:13px}
+th{background:#eff6ff;padding:9px 10px;text-align:left;font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:.06em;color:#374151;border:1px solid var(--line)}
+td{padding:9px 10px;border:1px solid var(--line);vertical-align:top}
+tr:hover td{background:#fafcff}
+.alert{background:#fff7ed;border-left:4px solid var(--amber);border-radius:7px;padding:12px 14px;margin:13px 0;font-size:13px;color:#7c2d12}
+.alert.blue{background:#eff6ff;border-color:var(--blue);color:#1e3a8a}
+.alert.green{background:#f0fdf4;border-color:var(--green);color:#14532d}
+.alert.red{background:#fef2f2;border-color:var(--red);color:#7f1d1d}
+.alert.purple{background:#f5f3ff;border-color:var(--purple);color:#4c1d95}
+.ascii{font-family:var(--mono);white-space:pre;overflow:auto;background:#0f172a;color:#dbeafe;border-radius:10px;padding:15px 17px;font-size:12px;line-height:1.7;margin:12px 0}
+ul{margin:7px 0 0 18px;color:#475569}
+.li-tight li{margin-bottom:3px}
+code{font-family:var(--mono);background:#eef2ff;color:#1d4ed8;padding:1px 5px;border-radius:4px;font-size:12px}
+.figure{background:var(--sub);border:1px solid var(--line);border-radius:10px;overflow:hidden;margin:14px 0}
+.figure img{display:block;width:100%;height:auto;background:#0f172a}
+.figure figcaption{padding:9px 12px;font-size:12px;color:#475569;border-top:1px solid var(--line)}
+.footer{text-align:center;color:var(--muted);font-size:12px;margin:28px 0 8px}
+@media(max-width:980px){.layout{display:block}aside{position:relative;width:auto;height:auto}main{padding:20px}.grid2,.grid3,.grid4{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<div class="layout">
+
+<aside>
+  <div class="logo">Robomituba</div>
+  <div class="date">2026-06-17</div>
+  <div class="small" style="margin-top:4px">Polarization camera render status</div>
+
+  <div class="nav-title">요약</div>
+  <a class="nav-link" href="#summary">오늘의 결론</a>
+  <a class="nav-link" href="#evidence">chairtest 관찰</a>
+  <a class="nav-link" href="#pipeline">현재 파이프라인</a>
+
+  <div class="nav-title">원인 분석</div>
+  <a class="nav-link" href="#cause1">① preview만 요청됨</a>
+  <a class="nav-link" href="#cause2">② preview의 의미</a>
+  <a class="nav-link" href="#cause3">③ 산출물 노출 부족</a>
+  <a class="nav-link" href="#cause4">④ 색감이 애매한 이유</a>
+
+  <div class="nav-title">개선안</div>
+  <a class="nav-link" href="#proposal">권장 방향</a>
+  <a class="nav-link" href="#tasks">구현 태스크</a>
+  <a class="nav-link" href="#criteria">완료 기준</a>
+
+  <div class="nav-title">이전 보고서</div>
+  <a class="nav-link" href="report_2026-06-17.html">06-17 SV-BRDF 계획</a>
+  <a class="nav-link" href="report_2026-06-15.html">06-15 Infinigen × Mitsuba</a>
+  <a class="nav-link" href="index.html">← 전체 인덱스</a>
+</aside>
+
+<main>
+
+<div class="hero">
+  <h1>Polarization Camera 렌더 파이프라인 구현 상태</h1>
+  <p>chairtest scene에 polarization camera를 선언하고 기존 UI preview 렌더 경로로 돌렸을 때, 결과가 "gray인 듯, 색감이 있는 듯"한 일반 이미지처럼 보이는 원인을 분석한다.</p>
+  <p class="thesis">결론: Stokes 렌더 자체는 수행된다. 문제는 UI 기본 preview가 Stokes 원본에서 뽑은 RGB preview 한 장만 요청·표시해서, 사용자가 DoP/AoLP/S1/S2 같은 편광 정보를 직접 확인할 수 없다는 점이다.</p>
+</div>
+
+<section id="summary">
+  <h2>오늘의 결론</h2>
+  <div class="grid4">
+    <div class="card">
+      <div class="label">실제 렌더</div>
+      <div class="metric">Stokes</div>
+      <div class="note"><code>cuda_ad_spectral_polarized</code> + <code>&lt;integrator type="stokes"&gt;</code>로 15채널 텐서가 생성됐다.</div>
+    </div>
+    <div class="card">
+      <div class="label">UI 요청</div>
+      <div class="metric">1장</div>
+      <div class="note">hot camera preview는 <code>polar_rgb_preview</code> 단일 modality만 요청했다.</div>
+    </div>
+    <div class="card">
+      <div class="label">숨은 데이터</div>
+      <div class="metric">NPZ</div>
+      <div class="note"><code>stokes_data.npz</code>에는 RGB/S0/S1/S2/S3/DoP/AoLP가 들어 있지만 UI에서 읽지 않는다.</div>
+    </div>
+    <div class="card">
+      <div class="label">핵심 문제</div>
+      <div class="metric">UX</div>
+      <div class="note">preview가 polarization map처럼 라벨링되지만 실제로는 Stokes render의 RGB tonemap이다.</div>
+    </div>
+  </div>
+  <div class="alert green">
+    <strong>요약:</strong> "polarization cam이 동작하지 않는다"보다는 "polarization cam의 기본 결과가 해석 가능한 편광 산출물로 노출되지 않는다"가 더 정확하다. 렌더 backend는 Stokes 텐서를 만들고 있지만, UI/manifest/export 계층이 그 의미를 충분히 드러내지 못한다.
+  </div>
+</section>
+
+<section id="evidence">
+  <h2>chairtest 관찰 기록</h2>
+  <p class="note">
+    확인한 job은 <code>opticalnav-shared_office_floor_001_chairtest-template-probe_1781665715059-h0-polar_rgb_preview</code> 이다.
+    manifest 기준 요청 modality는 <code>polar_rgb_preview</code> 하나이며, camera id는 <code>polar_cam</code>이다.
+  </p>
+
+  <figure class="figure">
+    <img src="../out/bridge_jobs/opticalnav-shared_office_floor_001_chairtest-template-probe_1781665715059-h0-polar_rgb_preview/observations/shared_office_floor_001_chairtest_probe_1781665715059_h0/cameras/polar_cam/polar_rgb_preview.png" alt="chairtest polar rgb preview" />
+    <figcaption>실제 저장된 <code>polar_rgb_preview.png</code>. 이 이미지는 편광 scalar map이 아니라 Stokes 렌더의 RGB preview다.</figcaption>
+  </figure>
+
+  <table>
+    <tr><th>항목</th><th>값</th><th>해석</th></tr>
+    <tr>
+      <td>variant</td>
+      <td><code>cuda_ad_spectral_polarized</code></td>
+      <td>편광 variant로 렌더가 수행됐다.</td>
+    </tr>
+    <tr>
+      <td>integrator</td>
+      <td><code>stokes</code> + nested <code>direct</code></td>
+      <td>출력은 Stokes 기반 다채널 텐서다.</td>
+    </tr>
+    <tr>
+      <td>stokes shape</td>
+      <td><code>[360, 480, 15]</code></td>
+      <td>RGB 3채널 + S0/S1/S2/S3 각 3채널 구조로 해석된다.</td>
+    </tr>
+    <tr>
+      <td>saved files</td>
+      <td><code>polar_rgb_preview.png</code>, <code>stokes_data.npz</code></td>
+      <td>S1/S2/DoP/AoLP preview PNG는 요청되지 않아 생성되지 않았다.</td>
+    </tr>
+    <tr>
+      <td>material mode</td>
+      <td><code>original_scene</code></td>
+      <td>fallback scene이 아니라 원본 scene의 polarized-compatible BSDF 조합으로 렌더됐다.</td>
+    </tr>
+    <tr>
+      <td>polar signal</td>
+      <td><code>s1 p99.5≈0.0209</code>, <code>s2 p99.5≈0.00919</code>, masked DoP p99≈0.482</td>
+      <td>편광 신호는 존재한다. 단지 preview 이미지 한 장으로는 잘 보이지 않는다.</td>
+    </tr>
+  </table>
+</section>
+
+<section id="pipeline">
+  <h2>현재 파이프라인</h2>
+  <div class="ascii">UI camera rig
+  polar_camera
+    └─ canonical modalities: polar_rgb_preview, dop, aolp, s1, s2
+
+Preview tab hot camera render
+  active sensor 선택
+    └─ sensorRenderModality(polarization) = polar_rgb_preview
+       └─ request body modalities = [polar_rgb_preview]
+
+render_daemon / multimodal.py
+  _needs_polar() == true
+    ├─ stage scene_polar.xml
+    │    integrator = stokes
+    │    nested integrator = direct 또는 volpath
+    ├─ render with cuda_ad_spectral_polarized
+    ├─ extract_stokes_channels(image)
+    │    rgb = image[:, :, 0:3]
+    │    s0/s1/s2/s3 = later channel groups
+    └─ save_polarization_products()
+         ├─ always: stokes_data.npz
+         └─ requested only: polar_rgb_preview.png</div>
+
+  <div class="alert blue">
+    <strong>핵심:</strong> backend는 polarization branch에 들어간다. 하지만 preview UI는 canonical polar modality 전체가 아니라 <code>polar_rgb_preview</code> 하나만 요청한다. 그래서 사용자가 보는 것은 "편광 카메라의 RGB 미리보기"이지 "편광 물리량 시각화"가 아니다.
+  </div>
+</section>
+
+<section id="cause1">
+  <h2>원인 ① — Hot camera preview가 polar_rgb_preview만 요청한다</h2>
+  <p class="note">
+    dataset UI의 <code>sensorRenderModality()</code>는 authoring map의 <code>modality="polarization"</code>을 <code>polar_rgb_preview</code>로 변환한다.
+    이후 hot camera 렌더 body는 <code>modalities: [activeRenderModality]</code> 형태로 전송된다.
+  </p>
+  <table>
+    <tr><th>단계</th><th>현재 동작</th><th>결과</th></tr>
+    <tr>
+      <td>sensor 선택</td>
+      <td><code>polarization</code> sensor 선택</td>
+      <td>UI 내부 active render modality가 <code>polar_rgb_preview</code>가 된다.</td>
+    </tr>
+    <tr>
+      <td>preview submit</td>
+      <td><code>modalities: ["polar_rgb_preview"]</code></td>
+      <td><code>dop</code>, <code>aolp</code>, <code>s1</code>, <code>s2</code>는 생성 대상에서 빠진다.</td>
+    </tr>
+    <tr>
+      <td>drawer display</td>
+      <td>job의 대표 image URL 한 장 표시</td>
+      <td>colorbar, Stokes 통계, raw channel 목록 없이 일반 이미지처럼 보인다.</td>
+    </tr>
+  </table>
+</section>
+
+<section id="cause2">
+  <h2>원인 ② — polar_rgb_preview는 편광 map이 아니다</h2>
+  <p class="note">
+    <code>save_polarization_products()</code>는 Stokes 렌더 결과에서 <code>rgb = image[:, :, 0:3]</code>를 분리하고,
+    <code>_rgb_preview_array()</code>로 percentile tone mapping을 적용해 <code>polar_rgb_preview.png</code>를 저장한다.
+    즉 이 이미지는 "Stokes render에서 같이 나온 RGB radiance preview"이다.
+  </p>
+  <div class="alert">
+    <strong>혼동 지점:</strong> 파일명이 <code>polar_rgb_preview</code>라서 polar branch의 결과라는 사실은 맞지만, 이미지 내용이 DoP/AoLP/S1/S2를 encoding한 것은 아니다. 그래서 회색 RGB 이미지처럼 보이는 것이 정상에 가깝다.
+  </div>
+  <table>
+    <tr><th>산출물</th><th>의미</th><th>사람이 봤을 때</th></tr>
+    <tr>
+      <td><code>polar_rgb_preview.png</code></td>
+      <td>Stokes 렌더의 RGB 채널 tonemap</td>
+      <td>일반 RGB/gray preview처럼 보임</td>
+    </tr>
+    <tr>
+      <td><code>s1_bwr_colorbar.png</code></td>
+      <td>luminance-weighted S1 signed field</td>
+      <td>blue-white-red signed map</td>
+    </tr>
+    <tr>
+      <td><code>s2_bwr_colorbar.png</code></td>
+      <td>luminance-weighted S2 signed field</td>
+      <td>blue-white-red signed map</td>
+    </tr>
+    <tr>
+      <td><code>dop_red_black_colorbar.png</code></td>
+      <td>Degree of Polarization, 0..1</td>
+      <td>polarization strength map</td>
+    </tr>
+    <tr>
+      <td><code>aolp_rainbow_colorbar.png</code></td>
+      <td>Angle of Linear Polarization, 0..180 deg</td>
+      <td>orientation hue map</td>
+    </tr>
+  </table>
+</section>
+
+<section id="cause3">
+  <h2>원인 ③ — raw polarization 데이터는 저장되지만 UI/복사 계층 노출이 약하다</h2>
+  <ul class="li-tight">
+    <li><code>stokes_data.npz</code>는 항상 저장된다. 여기에는 <code>rgb</code>, <code>s0</code>, <code>s1</code>, <code>s2</code>, <code>s3</code>, <code>dop</code>, <code>aolp</code>, <code>mask</code>가 들어 있다.</li>
+    <li>그러나 job drawer는 대표 PNG 한 장과 raw log만 보여준다. <code>s1_scale_abs_p995</code>, <code>finite_ratio</code>, <code>fallback_used</code>, <code>stokes_shape</code> 같은 진단값은 화면에 드러나지 않는다.</li>
+    <li>데몬의 일부 mapping은 <code>dop.exr</code>, <code>aolp.exr</code>, <code>s1.exr</code>, <code>s2.exr</code>를 기대하지만, 현재 저장 함수는 colorbar PNG와 <code>stokes_data.npz</code> 중심이다. raw scalar artifact 계약이 아직 정리되지 않았다.</li>
+    <li>OpticalNav consolidated observation tree로 복사되는 것도 PNG 중심이다. <code>stokes_data.npz</code>가 sensor output의 first-class artifact로 보이지 않는다.</li>
+  </ul>
+  <div class="alert red">
+    <strong>결과:</strong> backend에는 polarization 정보가 있는데, UI에서는 "어떤 Stokes 값이 나왔는지"가 보이지 않는다. 따라서 사용자는 preview 한 장만 보고 이게 polarization인지 RGB인지 판단해야 하는 상태다.
+  </div>
+</section>
+
+<section id="cause4">
+  <h2>원인 ④ — gray인 듯 색감 있는 듯 보이는 이유</h2>
+  <table>
+    <tr><th>요인</th><th>설명</th></tr>
+    <tr>
+      <td>RGB preview 자체</td>
+      <td><code>polar_rgb_preview</code>는 DoP/AoLP map이 아니라 RGB radiance preview다. 장면 조명과 재질 색이 약하면 회색에 가깝게 보인다.</td>
+    </tr>
+    <tr>
+      <td>단일 wavelength measured pBRDF</td>
+      <td>chairtest의 <code>scene_polar.xml</code>에는 HPBRDF channel 중 <code>542.pbrdf</code>가 여러 measured material에 쓰인다. 단일 녹색 파장 기반이면 RGB 색상 다양성이 제한된다.</td>
+    </tr>
+    <tr>
+      <td>ambient_room 조명</td>
+      <td>이번 job은 assist light 없이 <code>illumination_tag=ambient_room</code>이다. 편광 cue가 강하게 드러나는 active polarized illumination setup이 아니다.</td>
+    </tr>
+    <tr>
+      <td>S1/S2가 preview에 직접 encoding되지 않음</td>
+      <td>편광 차이는 <code>s1/s2/dop/aolp</code>에 존재하지만, 화면에 표시된 PNG에는 그 차이가 색상으로 들어가지 않는다.</td>
+    </tr>
+  </table>
+</section>
+
+<section id="proposal">
+  <h2>권장 방향</h2>
+  <div class="grid3">
+    <div class="card">
+      <div class="label">UI 기본값</div>
+      <strong>polar camera는 full polar set 요청</strong>
+      <p class="note" style="margin-top:6px">preview probe에서도 <code>polar_rgb_preview,dop,aolp,s1,s2</code>를 함께 요청한다. 시간이 부담되면 같은 Stokes pass에서 파생되므로 추가 렌더 비용은 거의 없다.</p>
+    </div>
+    <div class="card">
+      <div class="label">표시 방식</div>
+      <strong>RGB preview와 polarization map 분리</strong>
+      <p class="note" style="margin-top:6px"><code>polar_rgb_preview</code>는 "Stokes RGB preview"로 라벨링하고, 대표 썸네일은 DoP 또는 AoLP로 선택 가능하게 한다.</p>
+    </div>
+    <div class="card">
+      <div class="label">artifact 계약</div>
+      <strong>Stokes raw를 first-class로 승격</strong>
+      <p class="note" style="margin-top:6px"><code>stokes_data.npz</code>를 manifest/export/observation scan에서 명시하고, scalar EXR 저장 여부를 결정한다.</p>
+    </div>
+  </div>
+  <div class="alert green">
+    <strong>실행 우선순위:</strong> 먼저 UI 요청을 full polar set으로 바꾸고, job drawer에서 DoP/AoLP/S1/S2 thumbnail을 보여준다. 물리 모델 자체를 고치기 전에 산출물의 의미를 명확히 보여주는 것이 먼저다.
+  </div>
+</section>
+
+<section id="tasks">
+  <h2>구현 태스크 초안</h2>
+  <table>
+    <tr><th>순서</th><th>태스크</th><th>위치</th><th>완료 조건</th></tr>
+    <tr>
+      <td>1</td>
+      <td>polar sensor preview submit 시 canonical polar modalities 전체 요청</td>
+      <td><code>apps/webui/src/routes/datasets/+page.svelte</code>, <code>sensorHelpers.ts</code></td>
+      <td>hot camera render 후 <code>dop/aolp/s1/s2</code> PNG가 함께 생성</td>
+    </tr>
+    <tr>
+      <td>2</td>
+      <td>job drawer에 polarization artifact grid 추가</td>
+      <td><code>JobDetailDrawer.svelte</code></td>
+      <td>대표 이미지 외에 DoP/AoLP/S1/S2 thumbnail과 colorbar를 확인 가능</td>
+    </tr>
+    <tr>
+      <td>3</td>
+      <td>manifest에 Stokes 진단값 표시 강화</td>
+      <td><code>observation_bridge.py</code>, <code>render_daemon.py</code></td>
+      <td><code>stokes_shape</code>, <code>s1/s2 scale</code>, <code>finite_ratio</code>, <code>fallback_used</code>가 UI에서 보임</td>
+    </tr>
+    <tr>
+      <td>4</td>
+      <td>raw artifact 계약 정리</td>
+      <td><code>save_polarization_products()</code>, export/copy path</td>
+      <td><code>stokes_data.npz</code> 또는 <code>s1/s2/dop/aolp.exr</code> 중 dataset 표준을 확정</td>
+    </tr>
+    <tr>
+      <td>5</td>
+      <td>물리 camera model 구분</td>
+      <td>문서 + modality naming</td>
+      <td><code>stokes</code> 산출물과 analyzer camera intensity(<code>I0/I45/I90/I135</code>)를 명확히 구분</td>
+    </tr>
+  </table>
+</section>
+
+<section id="criteria">
+  <h2>완료 기준</h2>
+  <ul class="li-tight">
+    <li>polar camera hot preview를 한 번 누르면 <code>polar_rgb_preview.png</code>만이 아니라 <code>dop_red_black_colorbar.png</code>, <code>aolp_rainbow_colorbar.png</code>, <code>s1_bwr_colorbar.png</code>, <code>s2_bwr_colorbar.png</code>가 같이 생성된다.</li>
+    <li>UI에서 대표 preview가 "Stokes RGB preview"인지 "DoP"인지 "AoLP"인지 명확하게 표시된다.</li>
+    <li>manifest에서 <code>variant=cuda_ad_spectral_polarized</code>, <code>stokes_shape</code>, <code>material_mode</code>, <code>fallback_used</code>, <code>s1/s2 scale</code>를 확인할 수 있다.</li>
+    <li>export된 dataset에서 polarization raw data의 위치가 명확하다. 최소 기준은 <code>stokes_data.npz</code>를 sensor artifact로 보존하는 것이다.</li>
+    <li>문서에서는 <code>polar_rgb_preview</code>를 편광 물리량 이미지로 부르지 않는다. 편광 물리량은 <code>DoP/AoLP/S1/S2/Stokes</code>로 지칭한다.</li>
+  </ul>
+  <div class="alert purple">
+    <strong>최종 판단:</strong> 현재 구현은 Stokes 렌더 기반을 이미 갖고 있다. 다만 UI preview의 기본 선택과 artifact 계약이 RGB preview 중심이라 편광 데이터셋으로서의 의미가 흐려진다. 다음 개선은 렌더러보다 UI/manifest/export의 polarization product surface를 정리하는 쪽이다.
+  </div>
+</section>
+
+<div class="footer">Robomituba Daily Development Report · 2026-06-17 · Polarization Camera 렌더 파이프라인 구현 상태</div>
+</main>
+</div>
+</body>
+</html>

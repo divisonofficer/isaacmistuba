@@ -1,0 +1,511 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Spatially Varying BRDF 개선 계획 — 2026-06-17</title>
+<style>
+:root{
+  --bg:#f4f6fb; --panel:#fff; --sub:#f8fafc; --text:#1f2937; --muted:#64748b;
+  --line:#dbe3ef; --blue:#2563eb; --green:#16a34a; --amber:#d97706; --red:#dc2626;
+  --purple:#7c3aed; --teal:#0f766e; --mono:"JetBrains Mono",Consolas,Menlo,monospace;
+  --sans:Inter,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html{scroll-behavior:smooth}
+body{font-family:var(--sans);background:var(--bg);color:var(--text);line-height:1.62;font-size:14px}
+.layout{display:flex;min-height:100vh}
+aside{width:260px;flex:0 0 260px;position:sticky;top:0;height:100vh;overflow:auto;padding:22px 14px;border-right:1px solid var(--line);background:#eef2f7}
+main{flex:1;padding:34px 42px;max-width:1180px}
+.logo{font-weight:850;color:var(--blue);letter-spacing:-.02em;font-size:16px}
+.date{margin-top:3px;color:var(--muted);font-family:var(--mono);font-size:11px}
+.small{font-size:12px;color:var(--muted)}
+.nav-title{margin:22px 8px 7px;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.12em;font-weight:850}
+.nav-link{display:block;padding:5px 8px;border-radius:5px;color:#374151;font-size:12px;text-decoration:none;margin-bottom:2px}
+.nav-link:hover{background:#dde3ee}
+a{color:var(--blue);text-decoration:none} a:hover{text-decoration:underline}
+.hero{background:linear-gradient(135deg,#1e3a8a,#0f766e);color:#fff;border-radius:14px;padding:24px 30px;margin-bottom:24px;box-shadow:0 12px 28px rgba(15,118,110,.18)}
+.hero h1{font-size:25px;font-weight:900;letter-spacing:-.04em;margin-bottom:8px}
+.hero p{color:#dbeafe;font-size:13px;max-width:900px}
+.hero .thesis{margin-top:12px;font-size:15px;color:#fff;font-weight:750;line-height:1.7}
+section{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:23px 25px;margin-bottom:20px}
+h2{font-size:19px;font-weight:850;margin-bottom:14px;letter-spacing:-.03em}
+h3{font-size:14px;font-weight:800;margin:17px 0 8px;letter-spacing:-.01em}
+.note{font-size:13px;color:#475569}
+.muted{color:var(--muted)}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin:14px 0}
+.grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:13px;margin:14px 0}
+.grid4{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:14px 0}
+.card{background:var(--sub);border:1px solid var(--line);border-radius:10px;padding:14px;min-height:70px}
+.card strong{color:#111827}
+.label{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.08em;font-weight:850;margin-bottom:6px}
+.metric{font-size:25px;font-weight:900;letter-spacing:-.05em;color:var(--blue)}
+.tag{display:inline-block;padding:2px 8px;border-radius:999px;font-size:11px;font-weight:800;background:#dbeafe;color:#1e40af;margin:2px 2px 2px 0}
+.tag.green{background:#dcfce7;color:#15803d}
+.tag.amber{background:#fef3c7;color:#b45309}
+.tag.purple{background:#f3e8ff;color:#7e22ce}
+.tag.red{background:#fee2e2;color:#b91c1c}
+.tag.teal{background:#ccfbf1;color:#0f766e}
+table{width:100%;border-collapse:collapse;margin:13px 0;font-size:13px}
+th{background:#eff6ff;padding:9px 10px;text-align:left;font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:.06em;color:#374151;border:1px solid var(--line)}
+td{padding:9px 10px;border:1px solid var(--line);vertical-align:top}
+tr:hover td{background:#fafcff}
+.alert{background:#fff7ed;border-left:4px solid var(--amber);border-radius:7px;padding:12px 14px;margin:13px 0;font-size:13px;color:#7c2d12}
+.alert.blue{background:#eff6ff;border-color:var(--blue);color:#1e3a8a}
+.alert.green{background:#f0fdf4;border-color:var(--green);color:#14532d}
+.alert.red{background:#fef2f2;border-color:var(--red);color:#7f1d1d}
+.alert.purple{background:#f5f3ff;border-color:var(--purple);color:#4c1d95}
+.ascii{font-family:var(--mono);white-space:pre;overflow:auto;background:#0f172a;color:#dbeafe;border-radius:10px;padding:15px 17px;font-size:12px;line-height:1.7;margin:12px 0}
+ul{margin:7px 0 0 18px;color:#475569}
+.li-tight li{margin-bottom:3px}
+.chapter{background:linear-gradient(135deg,#1e3a8a,#4c1d95);color:#fff;border-radius:14px;padding:20px 26px;margin:22px 0}
+.chapter h2{color:#fff;margin-bottom:4px}
+.chapter p{color:#c7d2fe;font-size:13px}
+.footer{text-align:center;color:var(--muted);font-size:12px;margin:28px 0 8px}
+.rank{font-weight:900;font-size:18px;color:var(--blue)}
+.score{font-family:var(--mono);font-weight:850}
+code{font-family:var(--mono);background:#eef2ff;color:#1d4ed8;padding:1px 5px;border-radius:4px;font-size:12px}
+@media(max-width:980px){.layout{display:block}aside{position:relative;width:auto;height:auto}main{padding:20px}.grid2,.grid3,.grid4{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<div class="layout">
+
+<aside>
+  <div class="logo">Robomituba</div>
+  <div class="date">2026-06-17</div>
+  <div class="small" style="margin-top:4px">SV-BRDF / RGB texture 활용 계획</div>
+
+  <div class="nav-title">요약</div>
+  <a class="nav-link" href="#summary">오늘의 결론</a>
+  <a class="nav-link" href="#context">문제 재정의</a>
+  <a class="nav-link" href="#current">현재 코드 기반</a>
+
+  <div class="nav-title">대안 검토</div>
+  <a class="nav-link" href="#option1">1안: 단일 pBRDF × texture</a>
+  <a class="nav-link" href="#option2">2안: object part 분리</a>
+  <a class="nav-link" href="#option3">3안: per-pixel pBRDF map</a>
+  <a class="nav-link" href="#compare">비교표</a>
+
+  <div class="nav-title">실행 계획</div>
+  <a class="nav-link" href="#proposal">권장 로드맵</a>
+  <a class="nav-link" href="#tasks">구현 태스크</a>
+  <a class="nav-link" href="#risks">리스크</a>
+
+  <div class="nav-title">이전 보고서</div>
+  <a class="nav-link" href="report_2026-06-15.html">06-15 Infinigen × Mitsuba</a>
+  <a class="nav-link" href="report_2026-06-09.html">06-09 Material assignment</a>
+  <a class="nav-link" href="index.html">← 전체 인덱스</a>
+</aside>
+
+<main>
+
+<div class="hero">
+  <h1>Spatially Varying BRDF 개선 계획</h1>
+  <p>기존 RGB asset이 이미 가진 albedo / normal / metallic / roughness texture를 버리지 않고, 측정 pBRDF 기반 광학 렌더와 어떻게 결합할지에 대한 구현 가능성 검토.</p>
+  <p class="thesis">단기 결론: object-level 측정 pBRDF에 기존 albedo texture를 곱하는 hybrid 방식을 먼저 구현하고, part 분리는 고가치 asset 보정용으로 병행한다. per-pixel pBRDF linking은 연구 트랙으로 분리한다.</p>
+</div>
+
+<section id="summary">
+  <h2>오늘의 결론</h2>
+  <div class="grid4">
+    <div class="card">
+      <div class="label">1순위</div>
+      <div class="metric">1안</div>
+      <div class="note">단일 pBRDF × albedo texture. 지금 코드와 가장 가깝고 OpticalNav 품질 개선 효과가 즉시 크다.</div>
+    </div>
+    <div class="card">
+      <div class="label">보조 전략</div>
+      <div class="metric">2안</div>
+      <div class="note">물체가 실제로 여러 재질이면 part/slot 단위 분리가 맞다. 자동화보다 asset cleanup 성격이 강하다.</div>
+    </div>
+    <div class="card">
+      <div class="label">연구 트랙</div>
+      <div class="metric">3안</div>
+      <div class="note">PBR map을 분석해 texel별 pBRDF id를 그리는 방식. 가능하지만 플러그인, 메모리, 물리 정합성 부담이 크다.</div>
+    </div>
+    <div class="card">
+      <div class="label">선행 조건</div>
+      <div class="metric">RGB</div>
+      <div class="note"><code>measured_polarized_rgb</code>가 프로덕션 OptiX7 빌드에서 로드되는 상태가 먼저 필요하다.</div>
+    </div>
+  </div>
+  <div class="alert green">
+    <strong>권장 방향:</strong> "완전한 SV-BRDF"를 바로 목표로 잡지 않는다. 우선은 <strong>측정 pBRDF가 각도별/편광별 응답을 담당하고, 기존 texture가 공간 색상 변화를 담당</strong>하는 hybrid 근사를 만든다. 논문/데이터셋 설명에서도 이것을 "measured optical response with texture-preserved spatial modulation"으로 명시하는 편이 방어 가능하다.
+  </div>
+</section>
+
+<section id="context">
+  <h2>문제 재정의</h2>
+  <p class="note">
+    6월 15일 보고서에서는 Infinigen/RGB 기반 asset을 Mitsuba + 측정 pBRDF에 연결할 때, 단일 pBRDF를 물체 전체에 적용하면 나무결, 패브릭 직조, 마블 패턴, 페인트 얼룩 같은 공간 변화가 사라진다고 정리했다.
+    오늘의 질문은 "SV-BRDF를 완성하자"보다 구체적이다. 이미 asset에 존재하는 PBR texture 정보를 어느 수준까지 재사용할 것인가다.
+  </p>
+
+  <div class="ascii">기존 asset
+  ├─ geometry / UV
+  ├─ albedo 또는 base_color texture
+  ├─ normal map
+  ├─ roughness map
+  └─ metallic map
+        │
+        ▼
+측정 pBRDF replacement
+  ├─ 각도별 반사 응답
+  ├─ 분광 / 편광 응답
+  └─ RGB channel-split 응답
+        │
+        ▼
+핵심 질문
+  "texture는 공간 패턴으로 보존하고, pBRDF는 광학 응답으로 보존할 수 있는가?"</div>
+
+  <div class="alert blue">
+    <strong>용어 구분:</strong> 여기서 1안은 엄밀한 의미의 SV-BRDF가 아니라 texture-modulated measured BRDF다. 3안처럼 위치마다 pBRDF 자체가 바뀌어야 엄밀한 SV-BRDF에 가깝다.
+  </div>
+</section>
+
+<section id="current">
+  <h2>현재 코드 기반에서 가능한 것</h2>
+  <table>
+    <tr><th>구성 요소</th><th>현재 상태</th><th>의미</th></tr>
+    <tr>
+      <td><code>MaterialRecord.textures</code></td>
+      <td><code>base_color</code>, <code>albedo</code>, <code>diffuse</code>, <code>roughness</code> 같은 texture slot을 담을 수 있다.</td>
+      <td>새로운 scene schema 없이 texture 정보를 계속 전달할 수 있다.</td>
+    </tr>
+    <tr>
+      <td><code>mitsuba_builder._material_to_bsdf</code></td>
+      <td>일반 <code>principled</code> 경로에서는 base color / roughness texture를 Mitsuba bitmap texture로 내보낸다.</td>
+      <td>RGB asset의 texture 보존 경로는 이미 있다.</td>
+    </tr>
+    <tr>
+      <td><code>multimodal.py</code> staging</td>
+      <td>diffuse override / polarized fallback scene을 만들 때 기존 BSDF의 base texture를 찾아 새 BSDF에 복사한다.</td>
+      <td>XML 재작성 단계에서 texture를 보존하는 패턴이 이미 존재한다.</td>
+    </tr>
+    <tr>
+      <td><code>measured_polarized_rgb</code></td>
+      <td>현재 표준 트리 구현은 <code>filename_r/g/b</code>와 <code>alpha_sample</code> 중심이다. albedo/roughness/normal texture 입력은 없다.</td>
+      <td>1안을 제대로 하려면 플러그인 또는 XML 조합 레벨에서 texture multiplier를 추가해야 한다.</td>
+    </tr>
+    <tr>
+      <td>프로덕션 빌드</td>
+      <td><code>build/mitsuba3-optix7</code>에 플러그인이 컴파일되어 로드되는지 확인이 선행되어야 한다.</td>
+      <td>이 문제가 남으면 어떤 texture 결합안도 실제 dataset 렌더에 반영되지 않는다.</td>
+    </tr>
+  </table>
+</section>
+
+<div class="chapter">
+  <h2>세 가지 제안 검토</h2>
+  <p>각 안은 서로 배타적이라기보다 단계가 다르다. 1안은 즉시 품질 개선, 2안은 asset 구조 보정, 3안은 장기 연구 구현이다.</p>
+</div>
+
+<section id="option1">
+  <h2>1안 — 오브젝트 하나에 단일 pBRDF를 샘플링한 뒤 기존 texture를 곱한다</h2>
+  <div class="grid3">
+    <div class="card">
+      <div class="label">구현 난이도</div>
+      <div class="rank">낮음-중간</div>
+      <div class="note">현재 XML/texture 보존 경로를 재사용할 수 있다. 플러그인 입력만 늘리면 된다.</div>
+    </div>
+    <div class="card">
+      <div class="label">물리 정합성</div>
+      <div class="rank">근사</div>
+      <div class="note">색상 texture가 BRDF amplitude를 modulate한다고 보는 모델. 정확한 측정 SV-BRDF는 아니다.</div>
+    </div>
+    <div class="card">
+      <div class="label">데이터셋 효과</div>
+      <div class="rank">큼</div>
+      <div class="note">흑백/단색화 문제를 줄이고, 기존 asset의 시각적 다양성을 바로 살릴 수 있다.</div>
+    </div>
+  </div>
+
+  <h3>구현 방식</h3>
+  <ul class="li-tight">
+    <li><code>measured_polarized_rgb</code>에 optional texture child를 추가한다. 예: <code>&lt;texture name="albedo_scale" type="bitmap"&gt;</code>.</li>
+    <li><code>eval()</code>에서 pBRDF RGB/Spectrum intensity를 계산한 뒤, <code>albedo_scale->eval(si)</code> 값을 곱한다.</li>
+    <li>기존 BSDF에 있던 <code>base_color</code> / <code>diffuse_reflectance</code> texture를 measured replacement 단계에서 <code>albedo_scale</code>으로 옮긴다.</li>
+    <li>normal map은 Mitsuba의 <code>bumpmap</code> wrapper 또는 별도 normal perturbation 경로로 나중에 붙인다. 1차 구현에서는 albedo만 먼저 처리한다.</li>
+    <li>roughness/metallic map은 바로 곱하지 않는다. 측정 pBRDF 안에 이미 lobe shape와 도체/유전체 성격이 들어있기 때문에, 무작정 scalar로 변형하면 해석이 흐려진다.</li>
+  </ul>
+
+  <div class="alert green">
+    <strong>판정:</strong> 구현 가능. 6월 17일 기준 가장 현실적인 MVP다. "텍스처 공간 변화는 보존, pBRDF 각도/편광 응답은 대표 재질에서 제공"이라는 가정도 명확하게 설명할 수 있다.
+  </div>
+
+  <h3>주의점</h3>
+  <table>
+    <tr><th>항목</th><th>주의할 점</th><th>대응</th></tr>
+    <tr>
+      <td>에너지 보존</td>
+      <td>밝은 albedo texture를 그대로 곱하면 measured reflectance가 과도하게 커질 수 있다.</td>
+      <td>texture를 평균 1.0 또는 대표 pBRDF 색상 기준으로 normalize하고 clamp 정책을 둔다.</td>
+    </tr>
+    <tr>
+      <td>색상 의미</td>
+      <td>texture 색상이 pigment인지 조명 bake인지 알 수 없다.</td>
+      <td>asset import 단계에서 baked-lighting 의심 texture를 audit한다. 초기에는 실내 asset의 base_color만 사용한다.</td>
+    </tr>
+    <tr>
+      <td>편광 해석</td>
+      <td>texture는 편광을 바꾸지 않고 intensity만 바꾸는 가정이다.</td>
+      <td>보고서/논문에서는 "polarization-preserving amplitude modulation"으로 제한을 명시한다.</td>
+    </tr>
+  </table>
+</section>
+
+<section id="option2">
+  <h2>2안 — 오브젝트를 여러 파츠로 분리해서 pBRDF를 다르게 적용한다</h2>
+  <div class="grid3">
+    <div class="card">
+      <div class="label">구현 난이도</div>
+      <div class="rank">중간</div>
+      <div class="note">material slot 기준이면 쉽다. texture segmentation으로 자동 분리하면 난이도가 올라간다.</div>
+    </div>
+    <div class="card">
+      <div class="label">물리 정합성</div>
+      <div class="rank">좋음</div>
+      <div class="note">실제로 다른 재질인 영역에 다른 pBRDF를 붙이는 것은 해석이 자연스럽다.</div>
+    </div>
+    <div class="card">
+      <div class="label">데이터셋 효과</div>
+      <div class="rank">선택적</div>
+      <div class="note">chair frame/seat, desk metal leg/wood top처럼 복합 오브젝트에서 효과가 크다.</div>
+    </div>
+  </div>
+
+  <h3>구현 방식</h3>
+  <ul class="li-tight">
+    <li>이미 USD/OBJ가 material slot 또는 mesh part를 분리하고 있으면, 각 slot을 독립 material로 보고 pBRDF를 다르게 매핑한다.</li>
+    <li>분리되어 있지 않은 단일 mesh는 자동 분리보다 authoring/export 단계에서 part를 유지하는 것이 우선이다.</li>
+    <li>texture 기반 자동 분리는 color cluster, metallic/roughness threshold, UV island 단위로 triangle group을 나누는 방식이 가능하다.</li>
+    <li>각 part에는 1안의 <code>pBRDF × albedo texture</code>를 다시 적용할 수 있다.</li>
+  </ul>
+
+  <div class="alert blue">
+    <strong>판정:</strong> 구현 가능하지만 1안의 대체재라기보다 보조 전략이다. "하나의 물체가 여러 실제 재질로 구성된 경우"에만 정당화된다. 모든 texture pattern을 part로 쪼개려 하면 geometry 수, draw/shape 수, BVH 비용, UV seam 문제가 커진다.
+  </div>
+
+  <h3>적용하기 좋은 예</h3>
+  <table>
+    <tr><th>오브젝트</th><th>분리 단위</th><th>매핑 예</th></tr>
+    <tr><td>의자</td><td>metal frame / fabric seat / plastic wheel</td><td>aluminum / rough fabric 근사 / black rough plastic</td></tr>
+    <tr><td>책상</td><td>wood top / metal leg / plastic cable cover</td><td>wood는 analytic+texture 또는 대표 plastic, leg는 aluminum</td></tr>
+    <tr><td>파티션</td><td>glass panel / aluminum frame / rubber gasket</td><td>dielectric glass / aluminum / black rough plastic</td></tr>
+    <tr><td>바닥</td><td>tile / grout / carpet strip</td><td>rough ceramic / diffuse grout / fabric 근사</td></tr>
+  </table>
+</section>
+
+<section id="option3">
+  <h2>3안 — PBR texture map을 분석해서 각 픽셀에 최적 pBRDF를 링킹하는 pBR map을 그린다</h2>
+  <div class="grid3">
+    <div class="card">
+      <div class="label">구현 난이도</div>
+      <div class="rank">높음</div>
+      <div class="note">per-texel pBRDF id map, multi-pBRDF plugin, memory policy, authoring UI가 필요하다.</div>
+    </div>
+    <div class="card">
+      <div class="label">물리 정합성</div>
+      <div class="rank">불확실</div>
+      <div class="note">PBR texture의 roughness/metallic 값이 측정 pBRDF 후보를 유일하게 결정하지 않는다.</div>
+    </div>
+    <div class="card">
+      <div class="label">데이터셋 효과</div>
+      <div class="rank">장기</div>
+      <div class="note">성공하면 가장 강력하지만, 단기 OpticalNav 렌더 품질 문제를 해결하기에는 과하다.</div>
+    </div>
+  </div>
+
+  <h3>필요한 구조</h3>
+  <div class="ascii">PBR maps
+  ├─ albedo: 색상/패턴 힌트
+  ├─ roughness: lobe width 힌트
+  ├─ metallic: conductor/dielectric routing 힌트
+  └─ normal: micro-geometry 힌트
+        │
+        ▼
+Material classifier
+  ├─ per-texel pBRDF_id map
+  ├─ confidence map
+  └─ optional blend weights
+        │
+        ▼
+Mitsuba plugin
+  ├─ 여러 pBRDF table 동시 로드
+  ├─ UV에서 pBRDF_id/weight sample
+  └─ 선택 또는 보간 후 BSDF eval</div>
+
+  <h3>핵심 난점</h3>
+  <ul class="li-tight">
+    <li><strong>pBRDF 선택의 근거 부족:</strong> albedo/roughness/metallic은 렌더러용 파라미터일 뿐, 실제 측정 pBRDF id label이 아니다.</li>
+    <li><strong>보간의 물리성:</strong> 서로 다른 측정 pBRDF 테이블을 선형 보간한다고 실제 중간 재질이 되는 것은 아니다.</li>
+    <li><strong>메모리:</strong> 하나의 object 안에서 여러 pBRDF table을 로드하면 channel-split 최적화 이득이 줄고 GPU memory pressure가 커진다.</li>
+    <li><strong>anti-aliasing:</strong> UV 경계에서 pBRDF id가 바뀌면 texture filtering과 BSDF sampling이 맞물려 noise/seam이 생길 수 있다.</li>
+    <li><strong>검증:</strong> "최적 pBRDF"가 맞다는 ground truth가 없어 정량 평가가 어렵다.</li>
+  </ul>
+
+  <div class="alert">
+    <strong>판정:</strong> 구현은 가능하지만 지금 바로 할 일은 아니다. 3안은 별도 연구 주제로 두고, 단기에는 1안의 albedo modulation과 2안의 material slot 분리를 먼저 안정화하는 것이 맞다.
+  </div>
+
+  <h3>현실적인 축소 버전</h3>
+  <p class="note">
+    3안을 완전히 버리기보다는, 먼저 per-pixel pBRDF가 아니라 <strong>per-material-slot classifier</strong>로 낮춘다.
+    roughness/metallic map은 pBRDF id를 직접 결정하는 label이 아니라 "금속/비금속", "매끈함/거침" 같은 후보 ranking feature로만 사용한다.
+  </p>
+</section>
+
+<section id="compare">
+  <h2>비교표</h2>
+  <table>
+    <tr>
+      <th>안</th>
+      <th>핵심 아이디어</th>
+      <th>구현 가능성</th>
+      <th>품질 개선</th>
+      <th>물리적 방어력</th>
+      <th>권장 위치</th>
+    </tr>
+    <tr>
+      <td><span class="score">1안</span></td>
+      <td>오브젝트/slot 단일 pBRDF에 기존 albedo texture를 amplitude로 곱한다.</td>
+      <td><span class="tag green">높음</span></td>
+      <td><span class="tag green">즉시 큼</span></td>
+      <td><span class="tag amber">근사로 명시 필요</span></td>
+      <td>1차 구현 MVP</td>
+    </tr>
+    <tr>
+      <td><span class="score">2안</span></td>
+      <td>복합 오브젝트를 material part로 나누고 part별 pBRDF를 다르게 준다.</td>
+      <td><span class="tag amber">중간</span></td>
+      <td><span class="tag amber">asset별 편차</span></td>
+      <td><span class="tag green">좋음</span></td>
+      <td>asset cleanup / 고가치 scene 보정</td>
+    </tr>
+    <tr>
+      <td><span class="score">3안</span></td>
+      <td>PBR map을 분석해 texel별 pBRDF id 또는 blend weight map을 만든다.</td>
+      <td><span class="tag red">낮음</span></td>
+      <td><span class="tag purple">잠재력 큼</span></td>
+      <td><span class="tag red">검증 어려움</span></td>
+      <td>장기 연구 트랙</td>
+    </tr>
+  </table>
+</section>
+
+<section id="proposal">
+  <h2>권장 로드맵</h2>
+  <div class="grid3">
+    <div class="card">
+      <div class="label">Phase 0</div>
+      <strong>프로덕션 플러그인 정상화</strong>
+      <p class="note" style="margin-top:6px"><code>modules/mitsuba3-optix7</code> → <code>build/mitsuba3-optix7</code>에 <code>measured_polarized_rgb</code>를 컴파일하고 <code>cuda_ad_spectral_polarized</code>에서 로드 확인.</p>
+    </div>
+    <div class="card">
+      <div class="label">Phase 1</div>
+      <strong>Texture-modulated measured pBRDF</strong>
+      <p class="note" style="margin-top:6px">1안 구현. 기존 base_color texture를 <code>albedo_scale</code>로 보존하고, measured RGB 결과에 곱한다.</p>
+    </div>
+    <div class="card">
+      <div class="label">Phase 2</div>
+      <strong>Material slot 기반 part mapping</strong>
+      <p class="note" style="margin-top:6px">2안의 안전한 범위. 이미 분리된 slot/mesh에만 다른 pBRDF를 붙이고 자동 triangle split은 후순위로 둔다.</p>
+    </div>
+  </div>
+  <div class="grid2">
+    <div class="card">
+      <div class="label">Phase 3</div>
+      <strong>PBR map audit / candidate ranking</strong>
+      <p class="note" style="margin-top:6px">roughness/metallic/normal map을 pBRDF 직접 선택이 아니라 classifier feature로 사용. material override UI에 추천 후보를 표시한다.</p>
+    </div>
+    <div class="card">
+      <div class="label">Phase 4</div>
+      <strong>Per-pixel pBRDF map 연구</strong>
+      <p class="note" style="margin-top:6px">3안. 별도 plugin prototype과 작은 test asset에서만 검증한다. OpticalNav 본 dataset 일정과 분리한다.</p>
+    </div>
+  </div>
+</section>
+
+<section id="tasks">
+  <h2>구현 태스크 초안</h2>
+  <table>
+    <tr><th>순서</th><th>태스크</th><th>구현 위치</th><th>완료 조건</th></tr>
+    <tr>
+      <td>1</td>
+      <td>프로덕션 OptiX7 빌드에 <code>measured_polarized_rgb</code> 포함</td>
+      <td><code>modules/mitsuba3-optix7</code>, <code>build/mitsuba3-optix7</code></td>
+      <td><code>mi.load_dict({"type":"measured_polarized_rgb", ...})</code>가 production pythonpath에서 성공</td>
+    </tr>
+    <tr>
+      <td>2</td>
+      <td>플러그인에 optional <code>albedo_scale</code> texture 추가</td>
+      <td><code>src/bsdfs/measured_polarized_rgb.cpp</code></td>
+      <td>texture 미지정 시 기존 결과와 동일, 지정 시 RGB texture pattern이 보존</td>
+    </tr>
+    <tr>
+      <td>3</td>
+      <td>measured replacement 단계에서 기존 base texture를 <code>albedo_scale</code>로 전달</td>
+      <td><code>multimodal.py</code> XML staging / material override 경로</td>
+      <td>shared office material test에서 단색화 없이 measured pBRDF 렌더</td>
+    </tr>
+    <tr>
+      <td>4</td>
+      <td>texture normalization/clamp 정책 추가</td>
+      <td><code>multimodal.py</code> 또는 plugin parameter</td>
+      <td>과노출/energy blow-up 없는 preview set 확보</td>
+    </tr>
+    <tr>
+      <td>5</td>
+      <td>slot 단위 pBRDF override table 설계</td>
+      <td><code>material_overrides_store.py</code>, webui material library</td>
+      <td>한 object 내부 material slot별 후보 pBRDF 지정 가능</td>
+    </tr>
+    <tr>
+      <td>6</td>
+      <td>검증용 렌더 세트 작성</td>
+      <td><code>tests</code> 또는 <code>apps/render_saved_request_multibranch.py</code> smoke scene</td>
+      <td>analytic texture, measured only, measured×texture 3종 비교 이미지 생성</td>
+    </tr>
+  </table>
+</section>
+
+<section id="risks">
+  <h2>리스크와 판단 기준</h2>
+  <table>
+    <tr><th>리스크</th><th>영향</th><th>판단 기준</th><th>대응</th></tr>
+    <tr>
+      <td>논문에서 "진짜 SV-BRDF가 아니다" 지적</td>
+      <td>방법론 claim 약화</td>
+      <td>위치별 pBRDF 변화가 아니라 texture modulation이면 SV-BRDF라고 부르기 어렵다.</td>
+      <td>용어를 <strong>texture-modulated measured pBRDF</strong>로 제한한다.</td>
+    </tr>
+    <tr>
+      <td>기존 texture가 baked lighting을 포함</td>
+      <td>물리 기반 렌더 결과가 이중 조명처럼 보임</td>
+      <td>shadow/highlight가 albedo texture에 이미 들어있는 asset</td>
+      <td>texture audit, asset whitelist, low-frequency illumination 제거 검토</td>
+    </tr>
+    <tr>
+      <td>roughness/metallic map 미활용</td>
+      <td>일부 재질의 micro-appearance 손실</td>
+      <td>albedo만 살려서는 금속 스크래치/광택 변화가 부족할 수 있음</td>
+      <td>2단계에서 slot 분리, 3단계에서 candidate ranking feature로 사용</td>
+    </tr>
+    <tr>
+      <td>pBRDF table 부족</td>
+      <td>다양한 asset을 소수 measured material로 반복 매핑</td>
+      <td>HPBRDF 약 14종 channel mirror, KAIST pBRDF 25종 수준</td>
+      <td>대분류 중심 매핑을 명시하고 MERL/UTIA/OpenSVBRDF 확장 검토</td>
+    </tr>
+  </table>
+  <div class="alert purple">
+    <strong>최종 판단:</strong> 6월 17일 기준 작업 순서는 <code>measured_polarized_rgb production build</code> → <code>albedo_scale texture multiplier</code> → <code>slot-level pBRDF override</code>가 맞다. 3안은 매력적이지만 본 dataset 생성의 critical path에 넣기에는 불확실성이 크다.
+  </div>
+</section>
+
+<div class="footer">Robomituba Daily Development Report · 2026-06-17 · Spatially Varying BRDF 개선 계획</div>
+</main>
+</div>
+</body>
+</html>
