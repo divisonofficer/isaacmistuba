@@ -53,3 +53,11 @@ dev_report/images/
 # Infinigen 벤더 체크아웃(번들 Blender 포함, ~320MB) + 생성 출력 — 추적 안 함
 modules/infinigen/
 data/infinigen_generated/
+
+# 추가 벤더 체크아웃 / 캐시
+modules/FreeSplatter/
+modules/mitsuba3-optix7/
+scripts/out/
+
+# WSL 잔재 (콜론 형식 — *.Zone.Identifier 패턴이 안 잡음)
+*:Zone.Identifier
