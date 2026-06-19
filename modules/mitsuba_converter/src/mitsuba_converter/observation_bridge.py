@@ -60,6 +60,8 @@ POLAR_MODALITIES = {
     "polar_rgb_preview",
     "s1",
     "s2",
+    "s1_over_s0",
+    "s2_over_s0",
     "dop",
     "aolp",
 }

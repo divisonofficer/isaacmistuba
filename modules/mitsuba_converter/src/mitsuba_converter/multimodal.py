@@ -37,6 +37,8 @@ SUPPORTED_MODALITIES = (
     "aolp",
     "s1",
     "s2",
+    "s1_over_s0",
+    "s2_over_s0",
 )
 
 
@@ -58,6 +60,8 @@ MODALITY_DEFINITIONS = {
     "aolp": "Angle of linear polarization in degrees derived from luminance-weighted Stokes S1/S2.",
     "s1": "Luminance-weighted Stokes S1 signed field.",
     "s2": "Luminance-weighted Stokes S2 signed field.",
+    "s1_over_s0": "Normalized Stokes S1/S0 (luminance-weighted), range [-1, 1], fixed colorbar scale.",
+    "s2_over_s0": "Normalized Stokes S2/S0 (luminance-weighted), range [-1, 1], fixed colorbar scale.",
     "polarization": "Stokes integrator with direct nested integrator, with pplastic fallback when needed.",
 }
 
@@ -2856,6 +2860,12 @@ def save_polarization_products(
     dop = np.clip(dop, 0.0, 1.0)
     aolp = np.mod(0.5 * np.arctan2(s2_l, s1_l), np.pi)
     aolp_deg = np.degrees(aolp)
+    # Normalized Stokes (S1/S0, S2/S0) — physically standard, range [-1, 1], so a
+    # fixed colorbar scale of 1.0 is comparable across frames (unlike the absolute
+    # s1_l/s2_l fields whose scale is per-frame percentile-based).
+    s0_safe = np.maximum(s0_l, 1e-8)
+    s1_n = np.clip(np.where(np.isfinite(s1_l), s1_l, 0.0) / s0_safe, -1.0, 1.0)
+    s2_n = np.clip(np.where(np.isfinite(s2_l), s2_l, 0.0) / s0_safe, -1.0, 1.0)
     context_scale = max(float(np.quantile(finite_s0, 0.995)) if finite_s0.size else 1.0, 1e-6)
     context = np.clip(np.sqrt(np.clip(s0_l, 0.0, None) / context_scale), 0.0, 1.0)
     context_rgb = np.repeat((0.12 + 0.88 * context)[:, :, None], 3, axis=2).astype(np.float32)
@@ -2875,6 +2885,8 @@ def save_polarization_products(
         s1_l=s1_l,
         s2_l=s2_l,
         s3_l=s3_l,
+        s1_over_s0=s1_n,
+        s2_over_s0=s2_n,
         dop=dop,
         aolp=aolp,
         mask=mask,
@@ -2984,6 +2996,18 @@ def save_polarization_products(
         aolp_rgb = _despeckle_dark_preview_pixels(aolp_map(aolp_deg), iterations=3)
         append_colorbar(aolp_rgb, bar, ticks, "AoLP", aolp_path, title_mode="angle")
         outputs["aolp"] = str(aolp_path)
+    if "s1_over_s0" in requested_modalities:
+        bar, ticks = bwr_bar(1.0, s1_n.shape[0])
+        s1n_path = out_dir / "s1_over_s0_bwr_colorbar.png"
+        s1n_rgb = _despeckle_dark_preview_pixels(bwr_map(s1_n, 1.0), iterations=3)
+        append_colorbar(s1n_rgb, bar, ticks, "S1/S0", s1n_path, title_mode="signed")
+        outputs["s1_over_s0"] = str(s1n_path)
+    if "s2_over_s0" in requested_modalities:
+        bar, ticks = bwr_bar(1.0, s2_n.shape[0])
+        s2n_path = out_dir / "s2_over_s0_bwr_colorbar.png"
+        s2n_rgb = _despeckle_dark_preview_pixels(bwr_map(s2_n, 1.0), iterations=3)
+        append_colorbar(s2n_rgb, bar, ticks, "S2/S0", s2n_path, title_mode="signed")
+        outputs["s2_over_s0"] = str(s2n_path)
 
     summary = {
         "s1_scale_abs_p995": s1_scale,
@@ -3006,6 +3030,8 @@ def save_polarization_products(
         "s1_l": s1_l.astype(np.float32),
         "s2_l": s2_l.astype(np.float32),
         "s3_l": s3_l.astype(np.float32),
+        "s1_over_s0": s1_n.astype(np.float32),
+        "s2_over_s0": s2_n.astype(np.float32),
         "dop": dop.astype(np.float32),
         "aolp_deg": aolp_deg.astype(np.float32),
         "mask": mask.astype(bool),
@@ -4308,7 +4334,7 @@ def render_modalities(
         staged_scenes["polar_fallback"] = str(scene_polar_fallback)
         _cb("staging_scene", {"pass": "polar"})
 
-        requested_polar = {modality for modality in requested_set if modality in {"polar_rgb_preview", "dop", "aolp", "s1", "s2"}}
+        requested_polar = {modality for modality in requested_set if modality in {"polar_rgb_preview", "dop", "aolp", "s1", "s2", "s1_over_s0", "s2_over_s0"}}
         polar_scene_used = scene_polar
         fallback_used = False
         try:
@@ -4399,7 +4425,7 @@ def render_modalities(
                 },
                 metadata=dict(shared_metadata),
                 timing=dict(shared_timing),
-                artifacts={**shared_artifacts, "png": summary["outputs"]["rgb_preview"]},
+                artifacts={**shared_artifacts, "png": summary["outputs"]["rgb_preview"], "stokes_npz": summary["outputs"]["stokes_npz"]},
             )
         if "dop" in requested_set:
             results["dop"] = ModalityResult(
@@ -4415,7 +4441,7 @@ def render_modalities(
                     "range": [0.0, 1.0],
                 },
                 timing=dict(shared_timing),
-                artifacts={**shared_artifacts, "png": summary["outputs"]["dop"]},
+                artifacts={**shared_artifacts, "png": summary["outputs"]["dop"], "stokes_npz": summary["outputs"]["stokes_npz"]},
             )
         if "aolp" in requested_set:
             results["aolp"] = ModalityResult(
@@ -4431,7 +4457,7 @@ def render_modalities(
                     "range_degrees": [0.0, 180.0],
                 },
                 timing=dict(shared_timing),
-                artifacts={**shared_artifacts, "png": summary["outputs"]["aolp"]},
+                artifacts={**shared_artifacts, "png": summary["outputs"]["aolp"], "stokes_npz": summary["outputs"]["stokes_npz"]},
             )
         if "s1" in requested_set:
             results["s1"] = ModalityResult(
@@ -4446,7 +4472,7 @@ def render_modalities(
                     "scale_abs_p995": summary["s1_scale_abs_p995"],
                 },
                 timing=dict(shared_timing),
-                artifacts={**shared_artifacts, "png": summary["outputs"]["s1"]},
+                artifacts={**shared_artifacts, "png": summary["outputs"]["s1"], "stokes_npz": summary["outputs"]["stokes_npz"]},
             )
         if "s2" in requested_set:
             results["s2"] = ModalityResult(
@@ -4461,7 +4487,35 @@ def render_modalities(
                     "scale_abs_p995": summary["s2_scale_abs_p995"],
                 },
                 timing=dict(shared_timing),
-                artifacts={**shared_artifacts, "png": summary["outputs"]["s2"]},
+                artifacts={**shared_artifacts, "png": summary["outputs"]["s2"], "stokes_npz": summary["outputs"]["stokes_npz"]},
+            )
+        if "s1_over_s0" in requested_set:
+            results["s1_over_s0"] = ModalityResult(
+                name="s1_over_s0",
+                array=arrays["s1_over_s0"],
+                raw_channels={
+                    "s1_over_s0": arrays["s1_over_s0"],
+                    "s0_l": arrays["s0_l"],
+                    "mask": arrays["mask"],
+                },
+                metadata={**shared_metadata, "range": [-1.0, 1.0]},
+                timing=dict(shared_timing),
+                artifacts={**shared_artifacts, "png": summary["outputs"]["s1_over_s0"],
+                           "stokes_npz": summary["outputs"]["stokes_npz"]},
+            )
+        if "s2_over_s0" in requested_set:
+            results["s2_over_s0"] = ModalityResult(
+                name="s2_over_s0",
+                array=arrays["s2_over_s0"],
+                raw_channels={
+                    "s2_over_s0": arrays["s2_over_s0"],
+                    "s0_l": arrays["s0_l"],
+                    "mask": arrays["mask"],
+                },
+                metadata={**shared_metadata, "range": [-1.0, 1.0]},
+                timing=dict(shared_timing),
+                artifacts={**shared_artifacts, "png": summary["outputs"]["s2_over_s0"],
+                           "stokes_npz": summary["outputs"]["stokes_npz"]},
             )
 
     total_arr = results["rgb"].array.astype(np.float32) if "rgb" in results else None
