@@ -8,10 +8,14 @@ import uuid
 from pathlib import Path
 from typing import Any, Mapping
 
-# Allow importing sibling packages when running inside Isaac Sim
+# Allow importing sibling packages when running inside Isaac Sim. Both
+# `apps/` and `apps/isaac/` are added so the renamed
+# `capture_current_view` module (formerly `isaac_capture_current_view_request`)
+# is reachable regardless of where Isaac Sim mounts the repo.
 _APPS_DIR = Path(__file__).resolve().parent.parent
-if str(_APPS_DIR) not in sys.path:
-    sys.path.insert(0, str(_APPS_DIR))
+for _candidate in (_APPS_DIR, _APPS_DIR / "isaac"):
+    if str(_candidate) not in sys.path:
+        sys.path.insert(0, str(_candidate))
 
 DEFAULT_UNC_REPO_ROOT = r"\\jarvis.postech.ac.kr\workspace\jinnyeong\project\robomituba"
 
@@ -55,7 +59,7 @@ def capture_isaac_state(
 ) -> Any:
     """Capture the current Isaac Sim stage state as an IsaacStateSnapshot."""
     from isaac_standalone._stage_bridge import extract_snapshot as _extract_snapshot
-    from isaac_capture_current_view_request import capture_active_view_camera
+    from capture_current_view import capture_active_view_camera  # renamed 2026-06-10 — apps/isaac/capture_current_view.py
     from robomituba_bridge import CameraSpec, IsaacObjectState, IsaacStateSnapshot
 
     bsdf_map = dict(bsdf_overrides_by_path or {})
@@ -237,7 +241,7 @@ def _stage_material_override(stage: Any, prim_path: str, *, scene_id: str) -> An
 
 
 def capture_current_view_camera() -> Any:
-    from isaac_capture_current_view_request import capture_active_view_camera
+    from capture_current_view import capture_active_view_camera  # renamed 2026-06-10 — apps/isaac/capture_current_view.py
     from robomituba_bridge import CameraSpec
 
     cam_dict = capture_active_view_camera()

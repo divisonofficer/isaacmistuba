@@ -20,13 +20,20 @@ from typing import Any, Callable, Mapping
 from urllib.parse import parse_qs, quote, urlparse
 import webbrowser
 
-# Allow importing from repo apps roots when running inside Isaac Sim runtime copies.
-_PATH_CANDIDATES = [
+# Allow importing from repo apps roots when running inside Isaac Sim runtime
+# copies. We expose both `apps/` and `apps/isaac/` so the renamed
+# `capture_current_view` module (formerly `isaac_capture_current_view_request`)
+# can be imported regardless of how the runtime mounts the repo.
+_APPS_ROOTS = [
     Path(__file__).resolve().parent.parent,
 ]
 _repo_root_env = os.environ.get("ROBOMITUBA_ROOT") or os.environ.get("ROBOMITUBA_WINDOWS_REPO_ROOT")
 if _repo_root_env:
-    _PATH_CANDIDATES.append(Path(_repo_root_env) / "apps")
+    _APPS_ROOTS.append(Path(_repo_root_env) / "apps")
+_PATH_CANDIDATES = []
+for _root in _APPS_ROOTS:
+    _PATH_CANDIDATES.append(_root)
+    _PATH_CANDIDATES.append(_root / "isaac")
 for _candidate in _PATH_CANDIDATES:
     try:
         if _candidate.exists() and str(_candidate) not in sys.path:
@@ -34,7 +41,7 @@ for _candidate in _PATH_CANDIDATES:
     except Exception:
         continue
 
-from isaac_capture_current_view_request import _http_json  # noqa: E402
+from capture_current_view import _http_json  # noqa: E402
 
 DEFAULT_UNC_REPO_ROOT = r"\\jarvis.postech.ac.kr\workspace\jinnyeong\project\robomituba"
 DEFAULT_DAEMON_URL = "http://127.0.0.1:8765"

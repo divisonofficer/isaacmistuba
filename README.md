@@ -122,7 +122,7 @@ http://127.0.0.1:8765/
 
 Isaac current viewport 기준 request를 만들고 daemon queue로 넣는 helper는:
 
-- [isaac_capture_current_view_request.py](/jarvis/project/robomituba/apps/isaac_capture_current_view_request.py)
+- [apps/isaac/capture_current_view.py](/jarvis/project/robomituba/apps/isaac/capture_current_view.py)
 
 ### Isaac XML patch render
 

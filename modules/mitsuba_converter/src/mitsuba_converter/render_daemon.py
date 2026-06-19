@@ -15885,7 +15885,7 @@ class RenderDaemon:
         windows_apps_dir = windows_repo_root + r"\apps"
         windows_moorelane_usd = windows_repo_root + r"\assets\moorelane\Intel_mooreLane_v1_2_0\Intel_mooreLane\USD\MooreLane_ASWF_0623.usda"
         windows_bat_path = windows_repo_root + r"\apps\isaac_extension\isaac-sim-robomituba.example.bat"
-        script_path = str(self.repo_root / "apps" / "isaac_capture_current_view_request.py").replace("\\", "\\\\")
+        script_path = str(self.repo_root / "apps" / "isaac" / "capture_current_view.py").replace("\\", "\\\\")
         return {
             "daemon_url": self.base_url,
             "helper_import_snippet": "\n".join(
