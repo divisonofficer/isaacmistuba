@@ -196,7 +196,8 @@ class AuthoringMap:
         "default_wall_height_m": 2.4,
         "default_wall_thickness_m": 0.08,
         # Phase 1: shell flags are now independent.
-        "room_shell_enabled": True,       # walls + ceiling
+        "room_shell_enabled": True,       # perimeter walls
+        "auto_ceiling_enabled": True,     # ceiling slab (independent of walls)
         "auto_floor_enabled": True,       # floor slab
         "default_floor_material_id": "default_floor",
     })

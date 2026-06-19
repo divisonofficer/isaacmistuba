@@ -1,16 +1,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import heapq
 import math
 import random
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
 
 from .episode_schema import EpisodeManifest, EpisodeTimestep, GENERATION_VERSION, write_episode
 from .rollout import split_for_index
 from .scene_annotations import SceneAnnotation
-from .viewpoint_graph import ViewpointEdge, ViewpointGraph, ViewpointNode
+from .viewpoint_graph import ViewpointEdge, ViewpointGraph, ViewpointHeading, ViewpointNode
 
 
 GRAPH_SCENARIOS = ("goal_only", "hazard_aware", "stop_before_glass", "detour")
@@ -143,6 +144,71 @@ def _actions_for_headings(path_nodes: list[str], path_headings: list[str], graph
     return actions
 
 
+def _heading_yaw(node: ViewpointNode, heading_id: str) -> float:
+    for heading in node.headings:
+        if heading.heading_id == heading_id:
+            return float(heading.yaw_deg)
+    return 0.0
+
+
+def _expand_path_with_rotations(
+    graph: ViewpointGraph,
+    path_nodes: list[str],
+    path_headings: list[str],
+    *,
+    start_heading_id: str | None = None,
+    edge_distances: list[float] | None = None,
+) -> list[tuple[str, str, str, dict[str, Any]]]:
+    """Expand a node path into per-step primitive actions.
+
+    The agent spawns at ``start_heading_id`` (its initial facing) and, for each
+    edge, rotates in place ``step_deg`` (360/heading_count, e.g. 30°) at a time
+    until it faces the next node, then drives ``move_forward`` (variable distance)
+    to it. Returns ``(node_id, heading_id, action, meta)`` tuples where:
+
+      * ``turn_left_30`` / ``turn_right_30`` — rotation step, ``meta={"turn_deg": ±step}``
+      * ``move_forward`` — depart toward the next node, ``meta={"forward_m": dist}``
+      * ``stop`` — final pose, ``meta={}``
+
+    Every emitted heading already has a rendered observation (all headings are
+    swept), so the sequence is fully observed.
+    """
+    nodes = _node_map(graph)
+    step_deg = 360.0 / float(max(1, graph.node_heading_count or 12))
+    n = len(path_nodes)
+    steps: list[tuple[str, str, str, dict[str, Any]]] = []
+    prev_dep_yaw: float | None = None
+    move_index = 0
+    for index, node_id in enumerate(path_nodes):
+        node = nodes[node_id]
+        dep_hid = path_headings[min(index, len(path_headings) - 1)] if path_headings else _nearest_heading_id(node, 0.0)
+        dep_yaw = _heading_yaw(node, dep_hid)
+        if prev_dep_yaw is not None:
+            arr_yaw = prev_dep_yaw                      # faced this way while driving in
+        elif start_heading_id is not None:
+            arr_yaw = _heading_yaw(node, start_heading_id)  # explicit spawn facing
+        else:
+            arr_yaw = dep_yaw
+        delta = ((dep_yaw - arr_yaw + 180.0) % 360.0) - 180.0
+        n_turns = int(round(abs(delta) / step_deg)) if step_deg > 0 else 0
+        direction = 1.0 if delta > 0 else -1.0
+        turn_token = "turn_left_30" if delta > 0 else "turn_right_30"
+        # Pose 0 = arrival heading; poses 1..n_turns rotate toward departure.
+        for j in range(n_turns + 1):
+            yaw = arr_yaw + direction * step_deg * j
+            heading_id = _nearest_heading_id(node, yaw)
+            if j < n_turns:
+                steps.append((node_id, heading_id, turn_token, {"turn_deg": round(direction * step_deg, 3)}))
+            elif index < n - 1:
+                dist = float(edge_distances[move_index]) if edge_distances and move_index < len(edge_distances) else 0.0
+                steps.append((node_id, heading_id, "move_forward", {"forward_m": round(dist, 4)}))
+                move_index += 1
+            else:
+                steps.append((node_id, heading_id, "stop", {}))
+        prev_dep_yaw = dep_yaw
+    return steps
+
+
 def _scenario_instruction(scenario: str, annotation: SceneAnnotation | None, goal_label: str) -> str:
     hazard_label = "transparent partition"
     if annotation is not None and annotation.hazard_regions:
@@ -166,6 +232,37 @@ def _nearest_goal_label(annotation: SceneAnnotation | None, node: ViewpointNode)
     return best.region_id, best.label or best.region_id
 
 
+def _spawn_heading_id(node: ViewpointNode, episode_id: str) -> str:
+    """Deterministic per-episode random spawn heading (reproducible from id)."""
+    if not node.headings:
+        return "h_000"
+    idx = int(hashlib.sha1(episode_id.encode("utf-8")).hexdigest(), 16) % len(node.headings)
+    return node.headings[idx].heading_id
+
+
+def _resolve_observation_ref(
+    heading: "ViewpointHeading | None",
+    *,
+    scene_id: str,
+    node_id: str,
+    heading_id: str,
+    observations_root: Path | None,
+) -> str | None:
+    """Observation ref for a (vp, heading): graph sensor_observations first, then
+    the on-disk consolidated observation dir (so episodes stay trainable even when
+    the graph was rebuilt and lost its swept refs)."""
+    if heading is not None and heading.sensor_observations:
+        ref = heading.sensor_observations.get("bundle") or next(iter(heading.sensor_observations.values()), "")
+        if ref:
+            return ref
+    if observations_root is not None:
+        obs_dir = Path(observations_root) / node_id / heading_id
+        if obs_dir.exists():
+            base = f"scenes/{scene_id}/observations/{node_id}/{heading_id}"
+            return f"{base}/_sensor_index.json" if (obs_dir / "_sensor_index.json").exists() else base
+    return None
+
+
 def make_graph_episode(
     *,
     episode_id: str,
@@ -175,35 +272,53 @@ def make_graph_episode(
     scenario: str,
     modalities: list[str],
     annotation: SceneAnnotation | None = None,
+    observations_root: Path | None = None,
 ) -> EpisodeManifest:
     nodes = _node_map(graph)
     path_headings = _path_headings(graph, path.nodes)
-    actions = _actions_for_headings(path.nodes, path_headings, graph)
+    # Random (deterministic per episode) spawn facing at the start node; the first
+    # actions rotate from it toward the first node.
+    spawn_heading_id = _spawn_heading_id(nodes[path.nodes[0]], episode_id)
+    edge_distances = [float(e.distance_m) for e in path.edges]
+    # Expand to per-step primitive actions (turn_*_30 / move_forward / stop).
+    # path_nodes / path_headings stay as the node-level summary (one per waypoint);
+    # trajectory / timesteps / actions are the executable primitive sequence.
+    expanded = _expand_path_with_rotations(
+        graph, path.nodes, path_headings, start_heading_id=spawn_heading_id, edge_distances=edge_distances,
+    )
     trajectory = []
     timesteps: list[EpisodeTimestep] = []
     observation_refs: list[str] = []
-    for index, node_id in enumerate(path.nodes):
+    actions: list[str] = []
+    move_count = 0
+    for step_index, (node_id, heading_id, action, meta) in enumerate(expanded):
         node = nodes[node_id]
-        heading_id = path_headings[min(index, len(path_headings) - 1)]
         heading = next((item for item in node.headings if item.heading_id == heading_id), None)
         yaw_rad = math.radians(float(heading.yaw_deg if heading is not None else 0.0))
         pose = [float(node.position[0]), float(node.position[1]), yaw_rad]
         trajectory.append(pose)
-        current_ref = None
-        if heading is not None:
-            ref = heading.sensor_observations.get("bundle") or next(iter(heading.sensor_observations.values()), "")
-            if ref:
-                current_ref = ref
-                observation_refs.append(ref)
+        actions.append(action)
+        current_ref = _resolve_observation_ref(
+            heading, scene_id=graph.scene_id, node_id=node_id, heading_id=heading_id, observations_root=observations_root,
+        )
+        if current_ref:
+            observation_refs.append(current_ref)
+        # Map hazard crossing onto the move step that traverses each edge.
+        hazard = False
+        if action == "move_forward":
+            if move_count < len(path.edges):
+                hazard = bool(path.edges[move_count].hazard_crossing)
+            move_count += 1
         timesteps.append(
             EpisodeTimestep(
-                timestep_index=index,
-                timestamp=float(index),
+                timestep_index=step_index,
+                timestamp=float(step_index),
                 agent_pose=pose,
-                action="stop" if index == len(path.nodes) - 1 else "move_to_neighbor",
+                action=action,
                 collision=False,
-                hazard_collision=bool(path.edges[index].hazard_crossing) if index < len(path.edges) else False,
+                hazard_collision=hazard,
                 observation_bundle_ref=current_ref,
+                extras={"node_id": node_id, "heading_id": heading_id, **meta},
             )
         )
     goal_region, goal_label = _nearest_goal_label(annotation, nodes[path.nodes[-1]])
@@ -339,6 +454,7 @@ def plan_graph_episodes(
     modalities: list[str],
     annotation: SceneAnnotation | None = None,
     seed: int = 0,
+    observations_root: Path | None = None,
 ) -> list[EpisodeManifest]:
     if num_pairs <= 0:
         raise ValueError("num_pairs must be positive.")
@@ -384,6 +500,7 @@ def plan_graph_episodes(
                 scenario=scenario,
                 modalities=modalities,
                 annotation=annotation,
+                observations_root=observations_root,
             )
         )
     return episodes

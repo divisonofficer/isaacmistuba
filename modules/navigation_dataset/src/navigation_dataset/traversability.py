@@ -8,6 +8,13 @@ from typing import Any
 
 import numpy as np
 
+from .object_footprint import (
+    ROOM_SHELL_OBJECT_TYPES,
+    footprint_bbox,
+    object_blocks_at_height,
+    object_footprint,
+    point_in_footprint,
+)
 from .scene_annotations import HazardRegion, SceneAnnotation, TraversableRegion
 
 
@@ -180,12 +187,42 @@ def inflate_traversable_grid(traversable: np.ndarray, radius_m: float, resolutio
     return result
 
 
+def _mask_object_footprint(spec: GridSpec, geometry: dict[str, Any], *, margin: float = 0.0) -> np.ndarray:
+    """Rasterize an object's (rotated) footprint into a bool obstacle mask.
+
+    Unlike :func:`_mask_geometry` (which masks the lossy annotation circle/box),
+    this uses the shared :func:`object_footprint` descriptor so point objects are
+    carved as their real ``size_m`` rectangle rotated by ``yaw_deg``. Glass/line
+    and box footprints are handled too. Returns an all-False mask for unsupported
+    geometry.
+    """
+    mask = np.zeros((spec.height, spec.width), dtype=bool)
+    fp = object_footprint(geometry, margin=margin)
+    if fp is None:
+        return mask
+    min_x, min_y, max_x, max_y = footprint_bbox(fp)
+    x0, y0 = world_to_cell(spec, min_x, min_y)
+    x1, y1 = world_to_cell(spec, max_x, max_y)
+    x0 = max(0, min(spec.width - 1, x0))
+    y0 = max(0, min(spec.height - 1, y0))
+    x1 = max(0, min(spec.width - 1, x1))
+    y1 = max(0, min(spec.height - 1, y1))
+    for cy in range(y0, y1 + 1):
+        for cx in range(x0, x1 + 1):
+            wx, wy = cell_to_world(spec, cx, cy)
+            if point_in_footprint(wx, wy, fp):
+                mask[cy, cx] = True
+    return mask
+
+
 def build_traversability_grid(
     annotation: SceneAnnotation,
     *,
     resolution: float = 0.05,
     margin: float = 0.5,
     walkability_overlay: "np.ndarray | None" = None,
+    objects: "list[dict[str, Any]] | None" = None,
+    robot_height_m: float = 1.2,
 ) -> TraversabilityGrid:
     """Build the traversability grid.
 
@@ -228,6 +265,28 @@ def build_traversability_grid(
         blocks = bool(nav_extras.get("blocks_navigation"))
         if blocks or category in _BLOCKING_OBJECT_CATEGORIES:
             traversable &= ~_mask_geometry(spec, obj.geometry)
+    # Footprint-accurate masking from full overlay/authoring object geometry.
+    # The annotation above only carries lossy circles for point furniture (and no
+    # geometry for glass at all), so when the caller supplies the real objects
+    # (``render_scene_overlays.json``) we carve each object's rotated ``size_m``
+    # footprint. Room-shell (floor/ceiling) is skipped; walls/glass DO block;
+    # objects mounted above the robot (ceiling lights) are skipped by height.
+    for obj in objects or []:
+        otype = str(obj.get("type") or "")
+        if otype in ROOM_SHELL_OBJECT_TYPES:
+            continue
+        # Respect an explicit ``blocks_navigation: false``. Imported mesh scenes
+        # (e.g. Infinigen) represent room walls as point objects whose ``size_m`` is
+        # the whole-room AABB — carving that would erase the entire walkable area.
+        # The converter marks such structure non-blocking; the inset traversable
+        # region already excludes the wall perimeter. (Unset/None → carve as before.)
+        nav = obj.get("navigation") or {}
+        if nav.get("blocks_navigation") is False:
+            continue
+        geometry = obj.get("geometry") or {}
+        if not object_blocks_at_height(geometry, robot_height_m=robot_height_m):
+            continue
+        traversable &= ~_mask_object_footprint(spec, geometry)
     # User-painted overlay last: 1 = force walkable, 2 = force blocked.
     if walkability_overlay is not None and walkability_overlay.shape == (height, width):
         forced_walkable = walkability_overlay == 1

@@ -6,7 +6,7 @@ from typing import Callable
 
 import numpy as np
 
-from .traversability import TraversabilityGrid, cell_to_world, inflate_traversable_grid
+from .traversability import TraversabilityGrid, cell_to_world, inflate_traversable_grid, world_to_cell
 from .viewpoint_graph import ViewpointHeading, ViewpointNode
 
 
@@ -43,11 +43,17 @@ def sample_viewpoint_nodes(
     seed: int = 0,
     on_progress: Callable[[float], None] | None = None,
     region_mask: "np.ndarray | None" = None,
+    opening_seeds: "list[tuple[float, float]] | None" = None,
 ) -> list[ViewpointNode]:
     """Sample viewpoint nodes from a traversability grid.
 
     ``region_mask`` (when provided) restricts sampling to cells where the mask is
     True. Useful for local regeneration of a single bbox.
+
+    ``opening_seeds`` are world (x, y) points (e.g. doorway / passage thresholds)
+    where a viewpoint is force-placed if the cell is traversable, ignoring
+    ``min_node_spacing_m``. The Poisson pass then respects spacing from the seeds.
+    Guarantees coverage at transitions the random sampler tends to miss.
     """
     if max_nodes <= 0:
         raise ValueError("max_nodes must be positive.")
@@ -67,6 +73,35 @@ def sample_viewpoint_nodes(
     rng = random.Random(seed)
     rng.shuffle(candidates)
     selected: list[tuple[int, int, float, float, float]] = []
+    # Force-place opening/doorway seeds first. The threshold cell itself may be
+    # masked (a glass door is an obstacle), so snap to the nearest traversable
+    # cell within a small radius — this lands a viewpoint right beside the door.
+    snap_radius_cells = max(1, int(round(0.6 / grid.spec.resolution)))
+    for seed_pt in opening_seeds or []:
+        try:
+            sx, sy = float(seed_pt[0]), float(seed_pt[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        cx, cy = world_to_cell(grid.spec, sx, sy)
+        best: tuple[int, int] | None = None
+        best_d = None
+        for dy in range(-snap_radius_cells, snap_radius_cells + 1):
+            for dx in range(-snap_radius_cells, snap_radius_cells + 1):
+                nx, ny = cx + dx, cy + dy
+                if not (0 <= nx < grid.spec.width and 0 <= ny < grid.spec.height):
+                    continue
+                if not bool(grid.traversable[ny, nx]):
+                    continue
+                dd = dx * dx + dy * dy
+                if best_d is None or dd < best_d:
+                    best_d, best = dd, (nx, ny)
+        if best is None:
+            continue
+        nx, ny = best
+        wx, wy = cell_to_world(grid.spec, nx, ny)
+        if any(math.hypot(wx - s2x, wy - s2y) < grid.spec.resolution for _a, _b, s2x, s2y, _c in selected):
+            continue
+        selected.append((nx, ny, wx, wy, 0.0))
     total = len(candidates)
     report_every = max(1, total // 40)
     # Precompute distance transform only if clearance filtering is needed.

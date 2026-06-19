@@ -3,7 +3,15 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 import json
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, Iterable
+
+from .object_footprint import (
+    ROOM_SHELL_OBJECT_TYPES as _ROOM_SHELL_OBJECT_TYPES,
+    WALL_OBJECT_TYPES as _WALL_OBJECT_TYPES,
+    object_blocks_at_height as _object_blocks_at_height,
+    object_footprint as _object_footprint,
+    point_in_footprint as _point_in_footprint,
+)
 
 
 JsonDict = dict[str, Any]
@@ -202,6 +210,79 @@ def remove_node(graph: ViewpointGraph, node_id: str) -> bool:
         return False
     graph.edges = [e for e in graph.edges if e.source != node_id and e.target != node_id]
     return True
+
+
+def remove_nodes(graph: ViewpointGraph, node_ids: Iterable[str]) -> list[str]:
+    """Remove multiple nodes (and their incident edges) in one pass.
+
+    Returns the list of node_ids that were actually present and removed, in the
+    order they first appear in ``node_ids`` (unknown / duplicate ids are ignored).
+    """
+    present = {n.node_id for n in graph.nodes}
+    removed: list[str] = []
+    seen: set[str] = set()
+    for nid in node_ids:
+        if nid in present and nid not in seen:
+            removed.append(nid)
+            seen.add(nid)
+    if not removed:
+        return []
+    graph.nodes = [n for n in graph.nodes if n.node_id not in seen]
+    graph.edges = [e for e in graph.edges if e.source not in seen and e.target not in seen]
+    return removed
+
+
+def find_object_overlapping_nodes(
+    graph: ViewpointGraph,
+    objects: Iterable[JsonDict],
+    *,
+    margin_m: float = 0.0,
+    include_walls: bool = False,
+    robot_height_m: float = 1.2,
+) -> list[str]:
+    """node_ids whose (x, y) position falls inside any object footprint (+margin).
+
+    ``objects`` are authoring/overlay object dicts (``{type, geometry, ...}``).
+    Room-shell (floor/ceiling) is always skipped; walls/glass are skipped unless
+    ``include_walls`` is True; objects mounted at/above ``robot_height_m`` (e.g.
+    ceiling lights) are skipped because the robot passes under them. Point
+    footprints respect ``yaw_deg`` exactly. Used to auto-flag grid vertices that
+    landed on top of furniture so the user can review and remove them.
+    """
+    margin = float(margin_m)
+    footprints: list[tuple] = []
+    for obj in objects or []:
+        otype = str(obj.get("type") or "")
+        if otype in _ROOM_SHELL_OBJECT_TYPES:
+            continue
+        if not include_walls and otype in _WALL_OBJECT_TYPES:
+            continue
+        # Respect an explicit ``blocks_navigation: false``. Imported mesh scenes
+        # carry floor/ceiling as non-blocking ``landmark`` objects (the authoring
+        # schema has no floor/ceiling type) with whole-room footprints — flagging
+        # every node. Unset/None keeps the legacy behaviour.
+        nav = obj.get("navigation") or {}
+        if nav.get("blocks_navigation") is False:
+            continue
+        geometry = obj.get("geometry") or {}
+        if not _object_blocks_at_height(geometry, robot_height_m=robot_height_m):
+            continue
+        fp = _object_footprint(geometry, margin=margin)
+        if fp is not None:
+            footprints.append(fp)
+    if not footprints:
+        return []
+    overlapping: list[str] = []
+    for node in graph.nodes:
+        pos = node.position or []
+        if len(pos) < 2:
+            continue
+        x, y = float(pos[0]), float(pos[1])
+        for fp in footprints:
+            if _point_in_footprint(x, y, fp):
+                overlapping.append(node.node_id)
+                break
+    return overlapping
 
 
 def _next_manual_edge_id(graph: ViewpointGraph) -> str:
