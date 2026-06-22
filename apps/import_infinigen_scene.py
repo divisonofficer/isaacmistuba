@@ -280,7 +280,8 @@ def _scene_id_from_manifest(manifest_path: Path, override: str | None) -> str:
 
 def build_authoring_map(manifest: dict, scene_id: str, import_rel: str,
                         *, keep_empty_rooms: bool = False, room_override: str | None = None,
-                        normalize_origin: bool = True, origin_margin: float = 0.5) -> dict:
+                        normalize_origin: bool = True, origin_margin: float = 0.5,
+                        fill_missing_lights: bool = True) -> dict:
     all_units = manifest.get("units") or []
     mats_in = manifest.get("materials") or {}
 
@@ -333,13 +334,17 @@ def build_authoring_map(manifest: dict, scene_id: str, import_rel: str,
         mat_names = u.get("materials") or []
         material_id = mat_id_by_name.get(mat_names[0]) if mat_names else DEFAULT_MAT
         source_ref = f"{import_rel}/{u['mesh_obj']}"
-        # Preserve the Blender yaw on each unit so the traversability grid carves
-        # the rotated footprint (point + size + yaw → rrect in object_footprint),
-        # not an axis-aligned AABB around the rotated extent. Without this,
-        # furniture corners over-carve and the auto graph builder leaves edges
-        # marked blocked_by_obstacle along corridors next to rotated tables/sofas
-        # — which the user later has to add back manually.
-        yaw_deg = float(u.get("yaw_deg") or 0.0)
+        # authoring yaw MUST be 0 here. Stage 1 (blender_export_scene.py) exports each
+        # unit's OBJ origin-local but with the world ORIENTATION BAKED INTO THE MESH
+        # vertices, and reports size_m as the rotated WORLD AABB. Both consumers of
+        # geometry.yaw_deg — the webui editor (MapEditor3D, group.rotation.y) and the
+        # render path (usd_exporter._set_xform_translate_rotate) — apply it on top of
+        # that already-rotated mesh, so any nonzero value DOUBLE-rotates the object.
+        # (deb1a8c set yaw_deg=manifest yaw to tighten nav carving; that's wrong for a
+        # baked mesh and is moot anyway because Infinigen furniture sits at right-angle
+        # yaw (±90/±180) where the world AABB is already a tight footprint.) Keep the
+        # real Blender yaw in metadata for reference / future un-baked exports.
+        manifest_yaw = float(u.get("yaw_deg") or 0.0)
         obj = {
             "id": _san(u["id"]),
             "type": sem,
@@ -348,7 +353,7 @@ def build_authoring_map(manifest: dict, scene_id: str, import_rel: str,
             "geometry": {
                 "type": "point",
                 "center": [round(float(center[0]), 4), round(float(center[1]), 4)],
-                "yaw_deg": round(yaw_deg, 3),
+                "yaw_deg": 0.0,
                 "size_m": [round(max(0.02, float(size[0])), 4),
                            round(max(0.02, float(size[1])), 4),
                            round(max(0.02, float(size[2])), 4)],
@@ -362,6 +367,7 @@ def build_authoring_map(manifest: dict, scene_id: str, import_rel: str,
                 "blender_name": u.get("blender_name"),
                 "kind": u.get("kind"),
                 "factory": u.get("factory"),
+                "infinigen_yaw_deg": round(manifest_yaw, 3),
                 "glb_ref": (f"{import_rel}/{u['mesh_glb']}" if u.get("mesh_glb") else None),
                 "world_bbox_min": u.get("world_bbox_min"),
                 "world_bbox_max": u.get("world_bbox_max"),
@@ -404,6 +410,55 @@ def build_authoring_map(manifest: dict, scene_id: str, import_rel: str,
             "emitter_intensity": 1.0,
             "metadata": {"infinigen_light": True, "blender_type": lt.get("type")},
         })
+
+    # Synthesize a ceiling light for any finished room Infinigen left unlit.
+    # Infinigen's constraint solver is best-effort: the "1-4 ceiling lights per
+    # room" rule in home.py is minimized-violation, not guaranteed, so some seeds
+    # light only a couple of rooms (e.g. bedroom/bathroom) and leave living/
+    # kitchen/dining with zero ceiling emitters → those rooms render pitch black.
+    # For every kept room with no existing ceiling-height emitter over its floor,
+    # drop one modest emitter at the room centroid at ceiling height. Runs in the
+    # pre vertical-normalize frame so the dz shift below applies uniformly.
+    if fill_missing_lights and kept_rooms:
+        CEIL_Z_MIN = 2.0  # an emitter above this counts as a room's ceiling light
+        ceil_lights = [o for o in objects
+                       if o.get("is_emitter")
+                       and float(o["geometry"].get("base_height_m", 0.0)) >= CEIL_Z_MIN]
+        if ceil_lights:
+            zs = sorted(float(o["geometry"]["base_height_m"]) for o in ceil_lights)
+            ceil_z = zs[len(zs) // 2]
+            rads = sorted(float(o["emitter_radiance"][0]) for o in ceil_lights)
+            synth_rad = [rads[len(rads) // 2]] * 3
+        else:
+            ceil_z = 2.6
+            synth_rad = [12.0, 12.0, 12.0]  # ~80W white via the watt heuristic above
+        synth = 0
+        for rk in sorted(kept_rooms):
+            a = room_floor.get(rk)
+            if not a:
+                continue
+            if any(_xy_in(a, e["geometry"]["center"][0], e["geometry"]["center"][1])
+                   for e in ceil_lights):
+                continue  # room already has a ceiling light
+            cx, cy = (a[0] + a[2]) / 2.0, (a[1] + a[3]) / 2.0
+            objects.append({
+                "id": _san(f"light_synth_{rk}"),
+                "type": "landmark",
+                "label": f"light:synth:{rk}"[:64],
+                "placement": "point",
+                "geometry": {"type": "point", "center": [round(cx, 4), round(cy, 4)],
+                             "yaw_deg": 0.0, "size_m": [0.3, 0.08, 0.3],
+                             "base_height_m": round(float(ceil_z), 4)},
+                "material": DEFAULT_MAT,
+                "navigation": {"blocks_navigation": False},
+                "is_emitter": True,
+                "emitter_radiance": [round(x, 3) for x in synth_rad],
+                "emitter_intensity": 1.0,
+                "metadata": {"infinigen_light": True, "synthesized": True, "room": rk},
+            })
+            synth += 1
+        if synth:
+            print(f"[import] synthesized {synth} ceiling light(s) for unlit rooms")
 
     # Traversable regions — one per finished room floor, NOT the outer AABB of
     # all floors unioned. Using the outer AABB makes outdoor space (between two
@@ -547,6 +602,8 @@ def main():
                     help="Keep only this room key (e.g. 'dining-room_0/0').")
     ap.add_argument("--no-normalize-origin", action="store_true",
                     help="Keep raw Infinigen world coords instead of shifting the layout to the origin.")
+    ap.add_argument("--no-fill-missing-lights", action="store_true",
+                    help="Do not synthesize ceiling lights for rooms Infinigen left unlit.")
     args = ap.parse_args()
 
     manifest_path = Path(args.manifest).resolve()
@@ -557,7 +614,8 @@ def main():
 
     am = build_authoring_map(manifest, scene_id, import_rel,
                              keep_empty_rooms=args.keep_empty_rooms, room_override=args.room,
-                             normalize_origin=not args.no_normalize_origin)
+                             normalize_origin=not args.no_normalize_origin,
+                             fill_missing_lights=not args.no_fill_missing_lights)
     md = am["metadata"]
     print(f"[import] scene_id={scene_id} objects={len(am['objects'])} materials={len(am['materials'])} "
           f"trav={am['regions'][0]['geometry']['bounds']} (skipped {md.get('skipped_degenerate', 0)} degenerate)")
