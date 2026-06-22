@@ -774,11 +774,15 @@ def _append_extracted_bsdf_xml(
     *,
     fallback_color: str = "0.65 0.62 0.58",
     repo_root: "Path | None" = None,
+    diffuse_bsdf_type: str = "roughplastic",
 ) -> bool:
-    """Emit a roughplastic BSDF from a USD ``UsdPreviewSurface`` descriptor.
+    """Emit a textured BSDF from a USD ``UsdPreviewSurface`` / OBJ-MTL descriptor.
 
-    Returns ``True`` when the BSDF was attached, ``False`` when the descriptor
-    has nothing usable so the caller can fall back.
+    The non-metallic case uses ``diffuse_bsdf_type`` (``roughplastic`` by default,
+    or ``pplastic`` for polarization-aware diffuse surfaces); both accept the same
+    texturable ``diffuse_reflectance`` + scalar ``alpha`` so the baked albedo flows
+    through unchanged. Returns ``True`` when a BSDF was attached, ``False`` when the
+    descriptor has nothing usable so the caller can fall back.
     """
     import xml.etree.ElementTree as ET
 
@@ -832,7 +836,8 @@ def _append_extracted_bsdf_xml(
             alpha = 0.2
         ET.SubElement(bsdf, "float", attrib={"name": "alpha", "value": f"{alpha:.4f}"})
     else:
-        bsdf = ET.SubElement(inner_bsdf_parent, "bsdf", type="roughplastic")
+        bsdf_type = diffuse_bsdf_type if diffuse_bsdf_type in {"roughplastic", "pplastic"} else "roughplastic"
+        bsdf = ET.SubElement(inner_bsdf_parent, "bsdf", type=bsdf_type)
         if base_tex:
             tex = ET.SubElement(bsdf, "texture", attrib={"name": "diffuse_reflectance", "type": "bitmap"})
             ET.SubElement(tex, "string", attrib={"name": "filename", "value": str(base_tex)})
@@ -848,6 +853,10 @@ def _append_extracted_bsdf_xml(
             alpha = max(0.01, min(0.9, float(roughness) if roughness is not None else 0.2))
         except Exception:
             alpha = 0.2
+        # pplastic's dielectric coat looks glossy at low alpha; keep diffuse surfaces
+        # matte by raising the floor (roughplastic keeps the original range).
+        if bsdf_type == "pplastic":
+            alpha = max(0.2, alpha)
         ET.SubElement(bsdf, "float", attrib={"name": "alpha", "value": f"{alpha:.4f}"})
     return True
 
