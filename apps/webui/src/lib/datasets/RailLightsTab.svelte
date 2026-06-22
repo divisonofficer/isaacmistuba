@@ -27,6 +27,40 @@
 	const emitterObjects = $derived(
 		(authoringMap?.objects ?? []).filter((o: any) => detectedEmitterIds.has(o.id) || o.is_emitter)
 	);
+
+	// Ceiling lights = emitters mounted at ceiling height (matches the importer's
+	// synthesis threshold), plus anything labelled "ceiling" or synthesized. These
+	// get bulk on / brightness controls so a whole scene's overhead lighting can be
+	// driven together instead of one fixture at a time.
+	const CEILING_MIN_H = 2.0;
+	const ceilingLights = $derived(
+		emitterObjects.filter((o: any) =>
+			/ceiling/i.test(String(o.label ?? '')) ||
+			o.metadata?.synthesized === true ||
+			Number(o.geometry?.base_height_m ?? 0) >= CEILING_MIN_H
+		)
+	);
+	const ceilingOnCount = $derived(ceilingLights.filter((o: any) => o.is_emitter).length);
+	// Representative brightness for the bulk slider: the first lit ceiling fixture.
+	const ceilingIntensityValue = $derived.by(() => {
+		const lit = ceilingLights.find((o: any) => o.is_emitter);
+		return lit ? Number(lit.emitter_intensity ?? 1.0) : 1.0;
+	});
+	// Live drag value (display only); null when not dragging so the slider tracks
+	// the actual fixture intensity. The bulk apply happens on release (onchange).
+	let ceilingDragValue = $state<number | null>(null);
+	const ceilingSliderValue = $derived(ceilingDragValue ?? ceilingIntensityValue);
+
+	async function enableAllCeiling() {
+		for (const o of ceilingLights) {
+			if (!o.is_emitter) await onToggleEmitter(o.id, true);
+		}
+	}
+	function setAllCeilingIntensity(v: number) {
+		for (const o of ceilingLights) {
+			if (o.is_emitter) onSetEmitterIntensity(o.id, v);
+		}
+	}
 </script>
 
 <section class="rail-section rail-tool-panel lights-panel">
@@ -39,6 +73,22 @@
 				<button class="button button-subtle" onclick={onDisableAll}>Disable all</button>
 			{/if}
 		</div>
+		{#if ceilingLights.length > 0}
+			<div class="emitter-bulk-row ceiling-bulk-row">
+				<span class="ceiling-icon" title="Ceiling lights">☀</span>
+				<span>천장등 {ceilingOnCount}/{ceilingLights.length}</span>
+				<button class="button button-subtle" disabled={ceilingOnCount >= ceilingLights.length} onclick={enableAllCeiling}>Ceiling on</button>
+				<label class="ceiling-dim" title="모든 천장등 밝기 일괄 조절 (놓을 때 적용)">
+					<input type="range" min="0.1" max="20" step="0.1"
+						value={ceilingSliderValue}
+						disabled={ceilingOnCount === 0}
+						oninput={(e) => (ceilingDragValue = Number((e.currentTarget as HTMLInputElement).value))}
+						onchange={(e) => { setAllCeilingIntensity(Number((e.currentTarget as HTMLInputElement).value)); ceilingDragValue = null; }}
+					/>
+					<span class="ceiling-dim-val">{ceilingSliderValue.toFixed(1)}×</span>
+				</label>
+			</div>
+		{/if}
 	{:else}
 		<p class="probe-empty">No light-keyword objects detected in this scene's authoring map.</p>
 	{/if}
@@ -99,6 +149,16 @@
 			gap: var(--space-2);
 			font-size: var(--font-size-sm);
 		}
+
+	.ceiling-bulk-row { flex-wrap: wrap; padding: 4px 6px; border-radius: var(--radius-sm); background: var(--warning-soft); }
+
+	.ceiling-icon { font-size: var(--font-size-sm); }
+
+	.ceiling-dim { display: flex; align-items: center; gap: 6px; flex: 1; min-width: 120px; }
+
+	.ceiling-dim input[type='range'] { flex: 1; }
+
+	.ceiling-dim-val { min-width: 34px; text-align: right; font-variant-numeric: tabular-nums; }
 
 	.lights-panel { display: grid; gap: var(--space-2); }
 
