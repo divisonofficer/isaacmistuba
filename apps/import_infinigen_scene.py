@@ -156,14 +156,36 @@ def _material_binding(mat: dict) -> dict:
     }
 
 
+# Thin / flat furniture the robot can drive over (rugs, carpets, mats, doormats,
+# towels). Detected by factory/semantic name keyword OR by a tiny world-AABB
+# height. Without this exemption the graph builder carves out rug footprints and
+# leaves a node-shaped hole the user fills in manually every time.
+_TRAVERSABLE_OVERLAY_KEYWORDS = ("rug", "carpet", "mat", "doormat", "towel")
+_TRAVERSABLE_OVERLAY_HEIGHT_M = 0.05
+
+
+def _is_traversable_overlay(unit: dict) -> bool:
+    factory = (unit.get("factory") or "").lower()
+    sem = (unit.get("semantic_type") or "").lower()
+    if any(kw in factory or kw in sem for kw in _TRAVERSABLE_OVERLAY_KEYWORDS):
+        return True
+    size = unit.get("place_size_m") or []
+    height_m = float(size[1]) if len(size) >= 2 else 0.0
+    return 0.0 < height_m < _TRAVERSABLE_OVERLAY_HEIGHT_M
+
+
 def _nav_flags(unit: dict) -> dict:
     kind = unit.get("kind")
     sem = unit.get("semantic_type")
     flags = {"blocks_navigation": False, "include_in_hazard_mask": False,
-             "hazard_type": None, "instruction_candidate": False, "goal_candidate": False}
+             "hazard_type": None, "instruction_candidate": False, "goal_candidate": False,
+             "traversable_overlay": False}
     if kind == "furniture":
-        flags["blocks_navigation"] = True
-        flags["instruction_candidate"] = sem in {"table", "shelf", "chair"}
+        if _is_traversable_overlay(unit):
+            flags["traversable_overlay"] = True
+        else:
+            flags["blocks_navigation"] = True
+            flags["instruction_candidate"] = sem in {"table", "shelf", "chair"}
     elif kind == "door":
         flags["blocks_navigation"] = True
         flags["hazard_type"] = "glass_door"
@@ -311,6 +333,13 @@ def build_authoring_map(manifest: dict, scene_id: str, import_rel: str,
         mat_names = u.get("materials") or []
         material_id = mat_id_by_name.get(mat_names[0]) if mat_names else DEFAULT_MAT
         source_ref = f"{import_rel}/{u['mesh_obj']}"
+        # Preserve the Blender yaw on each unit so the traversability grid carves
+        # the rotated footprint (point + size + yaw → rrect in object_footprint),
+        # not an axis-aligned AABB around the rotated extent. Without this,
+        # furniture corners over-carve and the auto graph builder leaves edges
+        # marked blocked_by_obstacle along corridors next to rotated tables/sofas
+        # — which the user later has to add back manually.
+        yaw_deg = float(u.get("yaw_deg") or 0.0)
         obj = {
             "id": _san(u["id"]),
             "type": sem,
@@ -319,7 +348,7 @@ def build_authoring_map(manifest: dict, scene_id: str, import_rel: str,
             "geometry": {
                 "type": "point",
                 "center": [round(float(center[0]), 4), round(float(center[1]), 4)],
-                "yaw_deg": 0.0,
+                "yaw_deg": round(yaw_deg, 3),
                 "size_m": [round(max(0.02, float(size[0])), 4),
                            round(max(0.02, float(size[1])), 4),
                            round(max(0.02, float(size[2])), 4)],
@@ -376,27 +405,57 @@ def build_authoring_map(manifest: dict, scene_id: str, import_rel: str,
             "metadata": {"infinigen_light": True, "blender_type": lt.get("type")},
         })
 
-    # Traversable region from the union of floor footprints (inset for wall clearance).
+    # Traversable regions — one per finished room floor, NOT the outer AABB of
+    # all floors unioned. Using the outer AABB makes outdoor space (between two
+    # L-shaped rooms, or beyond the apartment perimeter) traversable, which the
+    # graph builder then samples and the user has to delete manually. Emitting
+    # each room as its own rectangle makes the region OR-mask the true union of
+    # interior floors only, so outdoor cells are never candidates. Multi-room
+    # apartments stay covered (each room is a separate traversable region).
+    inset = 0.25
     if floor_bounds:
+        regions = []
+        for i, b in enumerate(floor_bounds):
+            mnx, mny, mxx, mxy = float(b[0]), float(b[1]), float(b[2]), float(b[3])
+            # Drop degenerate floors (rare — extruded line, missing extent).
+            if mxx - mnx <= 2 * inset or mxy - mny <= 2 * inset:
+                continue
+            regions.append({
+                "id": f"traversable_room_{i:02d}",
+                "type": "traversable",
+                "label": f"Room {i + 1} floor",
+                "placement": "rectangle",
+                "geometry": {"type": "rectangle", "bounds": [
+                    round(mnx + inset, 3), round(mny + inset, 3),
+                    round(mxx - inset, 3), round(mxy - inset, 3),
+                ]},
+                "floor_material_id": DEFAULT_MAT,
+            })
+        # Outer bounds for the goal rectangle + the origin normalization that
+        # follows. Still computed from the floor union, but only used as a
+        # reference frame — not as a traversable region.
         min_x = min(b[0] for b in floor_bounds); min_y = min(b[1] for b in floor_bounds)
         max_x = max(b[2] for b in floor_bounds); max_y = max(b[3] for b in floor_bounds)
     else:
         cs = [o["geometry"]["center"] for o in objects]
         min_x = min(c[0] for c in cs); max_x = max(c[0] for c in cs)
         min_y = min(c[1] for c in cs); max_y = max(c[1] for c in cs)
-    inset = 0.25
-    trav = [round(min_x + inset, 3), round(min_y + inset, 3),
-            round(max_x - inset, 3), round(max_y - inset, 3)]
-    # Goal: a small rectangle near one corner of the traversable area.
+        trav = [round(min_x + inset, 3), round(min_y + inset, 3),
+                round(max_x - inset, 3), round(max_y - inset, 3)]
+        regions = [{
+            "id": "traversable_main", "type": "traversable", "label": "Apartment floor",
+            "placement": "rectangle", "geometry": {"type": "rectangle", "bounds": trav},
+            "floor_material_id": DEFAULT_MAT,
+        }]
+    # Goal: a small rectangle near one corner of the outer reference frame.
     gx0 = round(max_x - 1.2, 3); gy0 = round(max_y - 1.2, 3)
-    regions = [
-        {"id": "traversable_main", "type": "traversable", "label": "Apartment floor",
-         "placement": "rectangle", "geometry": {"type": "rectangle", "bounds": trav},
-         "floor_material_id": DEFAULT_MAT},
-        {"id": "goal_corner", "type": "goal", "label": "Goal",
-         "placement": "rectangle",
-         "geometry": {"type": "rectangle", "bounds": [gx0, gy0, round(max_x - inset, 3), round(max_y - inset, 3)]}},
-    ]
+    regions.append({
+        "id": "goal_corner", "type": "goal", "label": "Goal",
+        "placement": "rectangle",
+        "geometry": {"type": "rectangle", "bounds": [
+            gx0, gy0, round(max_x - inset, 3), round(max_y - inset, 3),
+        ]},
+    })
 
     # Normalize the layout to the positive origin. Infinigen preserves the source
     # world coords (the real room sits at e.g. y≈-14), which is awkward to edit /
