@@ -11,8 +11,10 @@
 	} from '$lib/primMeshCache';
 	import {
 		getCachedObjMeshGeometry,
+		getObjMeshCacheStats,
 		loadObjMeshGeometry,
 		objMeshCacheKey,
+		type ObjMeshCacheStats,
 	} from '$lib/objMeshCache';
 
 	type GhostGeom =
@@ -57,6 +59,20 @@
 		vpId?: string;
 		headingId?: string;
 		active?: boolean;
+	};
+	type EditorMeshStats = {
+		xml_native_enabled: boolean;
+		authoring_objects: number;
+		xml_matched: number;
+		mesh_loaded: number;
+		placeholder_loading: number;
+		placeholder_cached_null: number;
+		architecture_proxy: number;
+		xml_fallback_shape: number;
+		authoring_proxy_fallback: number;
+		pickable: number;
+		non_pickable: number;
+		cache: ObjMeshCacheStats;
 	};
 	type XmlSceneShape = {
 		shape_id: string;
@@ -106,6 +122,7 @@
 		onHandleDrag,
 		onRegionResize,
 		onStatus,
+		onMeshStats,
 		observationScan = null,
 		onFrustumClick,
 		frustumMode = 'view-aligned' as 'none' | 'view-aligned' | 'selected',
@@ -161,6 +178,13 @@
 				object_id?: string;
 				shape_type: string;
 				mesh_path?: string | null;
+				preview_mesh_path?: string | null;
+				preview_mesh_status?: string;
+				editor_layer?: string;
+				editor_pickable?: boolean;
+				editor_proxy?: XmlSceneShape['editor_proxy'];
+				preview_mesh_faces?: number;
+				source_mesh_faces?: number;
 				transform?: { translate?: number[]; scale?: number[]; rotate_y_deg?: number };
 				xml_role?: string;
 				material_id?: string;
@@ -209,6 +233,7 @@
 		onHandleDrag?: (id: string, handle: 'line_start' | 'line_end', pt: { x: number; y: number }, shiftKey: boolean) => void;
 		onRegionResize?: (id: string, handle: RectHandle, pt: { x: number; y: number }, shiftKey: boolean) => void;
 		onStatus?: (message: string) => void;
+		onMeshStats?: (stats: EditorMeshStats) => void;
 		observationScan?: any;
 		onFrustumClick?: (vpId: string, headingId: string) => void;
 		frustumMode?: 'none' | 'view-aligned' | 'selected';
@@ -262,6 +287,13 @@
 				object_id?: string;
 				shape_type: string;
 				mesh_path?: string | null;
+				preview_mesh_path?: string | null;
+				preview_mesh_status?: string;
+				editor_layer?: string;
+				editor_pickable?: boolean;
+				editor_proxy?: XmlSceneShape['editor_proxy'];
+				preview_mesh_faces?: number;
+				source_mesh_faces?: number;
 				transform?: { translate?: number[]; scale?: number[]; rotate_y_deg?: number };
 				xml_role?: string;
 				material_id?: string;
@@ -856,7 +888,7 @@
 		edges.userData = { ...mesh.userData, itemType: 'architecture_edges' };
 		group.add(edges);
 		if (kind.includes('floor') || kind.includes('ground') || kind.includes('slab')) floorTargets.push(mesh);
-		group.userData = { ...mesh.userData };
+		group.userData = { ...mesh.userData, editor_preview_state: 'architecture_proxy' };
 		return group;
 	}
 
@@ -885,23 +917,34 @@
 		if (Math.abs(yaw) > 1e-5) group.rotation.y = (yaw * Math.PI) / 180;
 
 		const colorHint = sh.material_id ? floorMaterialColor(sh.material_id) : 0xb8b3a8;
-		if (sh.editor_layer === 'architecture' || sh.preview_mesh_status === 'architecture_proxy') {
+		const meshPath = sh.preview_mesh_path || sh.mesh_path;
+		if ((sh.editor_layer === 'architecture' || sh.preview_mesh_status === 'architecture_proxy') && !meshPath) {
 			const arch = buildArchitectureProxyFromXmlShape(sh, colorHint);
 			arch.position.copy(group.position);
 			arch.rotation.copy(group.rotation);
 			return arch;
 		}
-		const meshPath = sh.preview_mesh_path || sh.mesh_path;
 		const isMesh = sh.shape_type === 'obj' && !!meshPath;
 		let mesh: any;
+		let editorPreviewState = 'xml_unknown';
 		if (isMesh) {
 			const filename = (meshPath as string).split('/').pop() || meshPath as string;
 			const key = objMeshCacheKey(opticalNavProjectId, opticalNavSceneId, filename);
 			const cached = getCachedObjMeshGeometry(key);
 			if (cached) {
-				const mat = new THREE.MeshStandardMaterial({ color: colorHint, roughness: 0.85, metalness: 0 });
+				editorPreviewState = 'mesh_cached';
+				const isArchitecture = sh.editor_layer === 'architecture';
+				const mat = new THREE.MeshStandardMaterial({
+					color: colorHint,
+					roughness: 0.85,
+					metalness: 0,
+					transparent: isArchitecture,
+					opacity: isArchitecture ? 0.42 : 1,
+					depthWrite: !isArchitecture,
+				});
 				mesh = new THREE.Mesh(cached, mat);
 			} else {
+				editorPreviewState = cached === null ? 'placeholder_cached_null' : 'placeholder_loading';
 				// Placeholder cube; kick off the async fetch + bump primMeshCacheVersion-style
 				// retrigger by setting _xmlNativePreviewVersion so rebuildScene re-runs.
 				const authoredSize = Array.isArray(obj?.geometry?.size_m) ? obj.geometry.size_m : null;
@@ -931,11 +974,12 @@
 				if (opticalNavProjectId && opticalNavSceneId && cached === undefined && !_objMeshLoadPending.has(key)) {
 					_objMeshLoadPending.add(key);
 					void loadObjMeshGeometry(opticalNavProjectId, opticalNavSceneId, filename)
-						.then((geo) => { if (geo) _xmlNativePreviewVersion++; })
+						.then((geo) => { if (geo) scheduleXmlNativePreviewRefresh(); })
 						.finally(() => { _objMeshLoadPending.delete(key); });
 				}
 			}
 		} else {
+			editorPreviewState = sh.fallback ? 'xml_fallback_shape' : 'xml_primitive_shape';
 			// shape_type cube/sphere/etc. — size from XML scale (BoxGeometry takes full extent).
 			const sx = Math.max(0.01, (Number(sc[0]) || 0.5) * 2);
 			const sy = Math.max(0.01, (Number(sc[1]) || 0.5) * 2);
@@ -955,12 +999,18 @@
 			const _bb = mesh.geometry.boundingBox;
 			if (_bb) mesh.position.y = -_bb.min.y;
 		}
+		const isArchitectureMesh = sh.editor_layer === 'architecture';
 		mesh.userData = {
 			id: sh.object_id ?? sh.shape_id,
-			itemType: 'object',
+			itemType: isArchitectureMesh ? 'architecture' : 'object',
+			editor_pickable: sh.editor_pickable !== false,
 			xml_shape_id: sh.shape_id,
 			xml_role: sh.xml_role ?? null,
+			architecture_kind: sh.editor_proxy?.kind ?? null,
+			editor_preview_state: editorPreviewState,
+			editor_mesh_path: meshPath ?? null,
 		};
+		if (isArchitectureMesh && String(sh.editor_proxy?.kind ?? '').toLowerCase().includes('floor')) floorTargets.push(mesh);
 		group.add(mesh);
 		group.userData = { ...mesh.userData };
 		return group;
@@ -971,6 +1021,14 @@
 	// `let` won't trigger the $effect that watches it, so placeholders would stay
 	// forever and every object would look like a fallback box.
 	let _xmlNativePreviewVersion = $state(0);
+	let _xmlNativePreviewRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+	function scheduleXmlNativePreviewRefresh() {
+		if (_xmlNativePreviewRefreshTimer !== null) return;
+		_xmlNativePreviewRefreshTimer = setTimeout(() => {
+			_xmlNativePreviewRefreshTimer = null;
+			_xmlNativePreviewVersion++;
+		}, 120);
+	}
 
 	function buildPointObject(obj: any): any | null {
 		const center = obj.geometry?.center;
@@ -1051,26 +1109,54 @@
 				addProxyBox(group, [sx, h, sz], [0, worldY + h / 2, 0], color);
 			}
 		}
-		// Emitter halo: small yellow translucent sphere + ring to mark enabled light sources.
-		if (obj.is_emitter) {
-			const haloY = baseHeight + Number(obj.metadata?.normalized_y_min ?? 0) + 0.08;
-			const halo = new THREE.Mesh(
-				new THREE.SphereGeometry(0.18, 16, 12),
-				new THREE.MeshBasicMaterial({ color: 0xfde047, transparent: true, opacity: 0.35, depthWrite: false })
-			);
-			halo.position.set(0, haloY, 0);
-			halo.userData = { itemType: 'emitter_halo' };
-			group.add(halo);
-			const ring = new THREE.Mesh(
-				new THREE.RingGeometry(0.22, 0.28, 24),
-				new THREE.MeshBasicMaterial({ color: 0xf59e0b, transparent: true, opacity: 0.9, side: THREE.DoubleSide })
-			);
-			ring.rotation.x = -Math.PI / 2;
-			ring.position.set(0, haloY - 0.06, 0);
-			ring.userData = { itemType: 'emitter_halo' };
-			group.add(ring);
-		}
 		return group;
+	}
+
+	function addEmitterOverlayForObject(obj: any): void {
+		if (!rootGroup || !obj?.is_emitter || obj.geometry?.type !== 'point') return;
+		const center = obj.geometry?.center;
+		if (!Array.isArray(center) || center.length < 2) return;
+		const baseHeight = objectBaseHeight(obj);
+		const normalizedYMin = Number(obj.metadata?.normalized_y_min ?? 0);
+		const authoredHeight = Number(obj.geometry?.base_height_m ?? baseHeight);
+		const objectHeight = objectProxySize(obj)[1];
+		const haloY = Math.max(baseHeight + normalizedYMin + 0.12, authoredHeight + objectHeight + 0.08);
+		const group = new THREE.Group();
+		group.position.set(Number(center[0]) || 0, haloY, Number(center[1]) || 0);
+		group.userData = { id: obj.id, itemType: 'emitter_halo' };
+
+		const glow = new THREE.Mesh(
+			new THREE.SphereGeometry(0.2, 18, 12),
+			new THREE.MeshBasicMaterial({
+				color: 0xfde047,
+				transparent: true,
+				opacity: 0.42,
+				depthTest: false,
+				depthWrite: false,
+			})
+		);
+		glow.renderOrder = 80;
+		glow.userData = { id: obj.id, itemType: 'emitter_halo' };
+		group.add(glow);
+
+		const ring = new THREE.Mesh(
+			new THREE.RingGeometry(0.24, 0.31, 32),
+			new THREE.MeshBasicMaterial({
+				color: 0xf59e0b,
+				transparent: true,
+				opacity: 0.95,
+				side: THREE.DoubleSide,
+				depthTest: false,
+				depthWrite: false,
+			})
+		);
+		ring.rotation.x = -Math.PI / 2;
+		ring.position.y = -0.04;
+		ring.renderOrder = 81;
+		ring.userData = { id: obj.id, itemType: 'emitter_halo' };
+		group.add(ring);
+
+		rootGroup.add(group);
 	}
 
 	function addSelectionEdges(geo: any, pos: any, rot: any) {
@@ -1563,6 +1649,20 @@
 
 	function rebuildScene() {
 		if (!rootGroup || !scene3D) return;
+		const editorMeshStats: EditorMeshStats = {
+			xml_native_enabled: xmlNativePreviewEnabled,
+			authoring_objects: authoringObjects.length,
+			xml_matched: 0,
+			mesh_loaded: 0,
+			placeholder_loading: 0,
+			placeholder_cached_null: 0,
+			architecture_proxy: 0,
+			xml_fallback_shape: 0,
+			authoring_proxy_fallback: 0,
+			pickable: 0,
+			non_pickable: 0,
+			cache: getObjMeshCacheStats(),
+		};
 		selectableObjects = [];
 		clearGroup(rootGroup);
 
@@ -1608,19 +1708,33 @@
 			rebuildXmlShapeIndex();
 			for (const obj of authoringObjects) {
 				let mesh: any = null;
+				let builtFromXml = false;
+				const matchedXmlShape = xmlNativePreviewEnabled && _xmlShapeIndex.has(obj.id);
+				if (matchedXmlShape) editorMeshStats.xml_matched++;
 				// PR2: when the XML-native preview toggle is on, draw from the actual
 				// render-side mesh first. authoringObjects without a matching XML shape
 				// (placement-only items, edits not yet synced) fall through to the
 				// existing buildWall / buildPointObject path.
-				if (xmlNativePreviewEnabled) mesh = buildObjectFromXmlShape(obj);
+				if (xmlNativePreviewEnabled) {
+					mesh = buildObjectFromXmlShape(obj);
+					builtFromXml = !!mesh;
+				}
 				if (!mesh) {
 					if (obj.geometry?.type === 'line') mesh = buildWall(obj);
 					else if (obj.geometry?.type === 'point') mesh = buildPointObject(obj);
 				}
 				if (!mesh) continue;
+				if (!builtFromXml && xmlNativePreviewEnabled) editorMeshStats.authoring_proxy_fallback++;
+				const previewState = String(mesh?.userData?.editor_preview_state ?? '');
+				if (previewState === 'mesh_cached') editorMeshStats.mesh_loaded++;
+				else if (previewState === 'placeholder_loading') editorMeshStats.placeholder_loading++;
+				else if (previewState === 'placeholder_cached_null') editorMeshStats.placeholder_cached_null++;
+				else if (previewState === 'architecture_proxy') editorMeshStats.architecture_proxy++;
+				else if (previewState === 'xml_fallback_shape') editorMeshStats.xml_fallback_shape++;
 				rootGroup.add(mesh);
 				const editorPickable = mesh?.userData?.editor_pickable !== false;
-				if (editorPickable) selectableObjects.push(mesh);
+				if (editorPickable) { selectableObjects.push(mesh); editorMeshStats.pickable++; }
+				else editorMeshStats.non_pickable++;
 				if (editorPickable && selectedId === obj.id) {
 					if (mesh.geometry) addSelectionEdges(mesh.geometry, mesh.position.clone(), mesh.rotation.clone());
 					else addSelectionBox(mesh);
@@ -1628,7 +1742,11 @@
 					if (objectTransformMode && obj.geometry?.type === 'point') addObjectTransformGizmo(obj);
 				}
 			}
+			for (const obj of authoringObjects) addEmitterOverlayForObject(obj);
 		}
+
+		editorMeshStats.cache = getObjMeshCacheStats();
+		onMeshStats?.(editorMeshStats);
 
 		// Graph nodes
 		if (visibleLayers.graphNodes) {
@@ -2541,6 +2659,10 @@
 		ensureThree();
 			return () => {
 				if (animationFrame) cancelAnimationFrame(animationFrame);
+				if (_xmlNativePreviewRefreshTimer !== null) {
+					clearTimeout(_xmlNativePreviewRefreshTimer);
+					_xmlNativePreviewRefreshTimer = null;
+				}
 				clearMovementKeys();
 				resizeObserver?.disconnect();
 			controls?.dispose();

@@ -29,6 +29,39 @@ export interface SyncProgress {
 	stage: string;
 }
 
+/**
+ * Render-scene sync stage sequence + user-facing labels.
+ *
+ * Backend emits stage strings in this order — see render_daemon.py
+ * `_run_render_scene_sync_inner`. Keep this in sync with backend stages.
+ */
+export const SYNC_STAGES = ['scene_sync', 'mesh_extract', 'readiness'] as const;
+export type SyncStage = (typeof SYNC_STAGES)[number] | string;
+
+const SYNC_STAGE_LABELS_EN: Record<string, string> = {
+	scene_sync: 'Preparing',
+	mesh_extract: 'Extracting meshes',
+	readiness: 'Verifying',
+};
+const SYNC_STAGE_LABELS_KR: Record<string, string> = {
+	scene_sync: '장면 준비',
+	mesh_extract: '메시 추출',
+	readiness: '검증',
+};
+
+export function syncStageLabel(stage: string | undefined, lang: 'kr' | 'en' = 'kr'): string {
+	const key = String(stage ?? '');
+	const map = lang === 'kr' ? SYNC_STAGE_LABELS_KR : SYNC_STAGE_LABELS_EN;
+	return map[key] ?? key ?? '';
+}
+
+/** Index (0-based) of the current stage in SYNC_STAGES, or -1 if unknown. */
+export function syncStageIndex(stage: string | undefined): number {
+	const key = String(stage ?? '');
+	const i = (SYNC_STAGES as readonly string[]).indexOf(key);
+	return i;
+}
+
 /** Load render readiness status for a scene. */
 export async function fetchRenderReadiness(projectId: string, sceneId: string) {
 	return getOpticalNavRenderReadiness(projectId, sceneId);

@@ -288,6 +288,7 @@
 	let activeHotCameraId = $state('');
 	let renderSceneStats = $state<any>(null);
 	let renderSceneStatsLoading = $state(false);
+	let editorMeshStats = $state<any>(null);
 	let roomShell = $state<any>(null);
 	let showRoomShell = $state(true);
 	// Tracks whether the user has explicitly toggled the viewer overlay since the
@@ -474,6 +475,137 @@
 	let showTraversableMask = $state(false);
 	let traversableMeta = $state<any>(null);
 	let traversableVersion = $state(0);
+	type PendingGraphEdit = {
+		client_op_id: string;
+		type: 'add_edge' | 'delete_edge';
+		source?: string;
+		target?: string;
+		edge_id?: string;
+	};
+	let pendingGraphEdits = $state<PendingGraphEdit[]>([]);
+	let graphEditFlushTimer: ReturnType<typeof setTimeout> | null = null;
+	let graphEditIdleRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+	let graphEditBatchSeq = 0;
+	function nextGraphClientOpId(): string {
+		return typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+			? crypto.randomUUID()
+			: `op_${Date.now()}_${Math.floor(Math.random() * 1000000)}`;
+	}
+	function graphNodePosition(nodeId: string): number[] | null {
+		const node = (graphPayload?.nodes ?? []).find((n: any) => n?.node_id === nodeId);
+		return Array.isArray(node?.position) ? node.position : null;
+	}
+	function optimisticAddEdge(op: PendingGraphEdit) {
+		if (!graphPayload || !op.source || !op.target) return;
+		const edges = graphPayload.edges ?? [];
+		if (edges.some((e: any) => (e.source === op.source && e.target === op.target) || (e.source === op.target && e.target === op.source))) return;
+		const src = graphNodePosition(op.source);
+		const tgt = graphNodePosition(op.target);
+		const dx = (src?.[0] ?? 0) - (tgt?.[0] ?? 0);
+		const dy = (src?.[1] ?? 0) - (tgt?.[1] ?? 0);
+		const distance = Math.hypot(dx, dy);
+		graphPayload = {
+			...graphPayload,
+			edges: [
+				...edges,
+				{
+					edge_id: `pending:${op.client_op_id}`,
+					source: op.source,
+					target: op.target,
+					distance_m: distance,
+					weight: distance,
+					collision_free: true,
+					hazard_crossing: false,
+					path_polyline: src && tgt ? [[src[0], src[1]], [tgt[0], tgt[1]]] : [],
+					extras: { manual: true, pending: true, client_op_id: op.client_op_id },
+				},
+			],
+		};
+	}
+	function removePendingEdge(clientOpId: string) {
+		if (!graphPayload) return;
+		graphPayload = {
+			...graphPayload,
+			edges: (graphPayload.edges ?? []).filter((e: any) => e?.edge_id !== `pending:${clientOpId}`),
+		};
+	}
+	function reconcileGraphEditResults(results: any[]) {
+		if (!graphPayload) return;
+		let edges = [...(graphPayload.edges ?? [])];
+		for (const result of results ?? []) {
+			const opId = result?.client_op_id;
+			if (!opId) continue;
+			const pendingId = `pending:${opId}`;
+			if (!result.ok) {
+				edges = edges.filter((e: any) => e.edge_id !== pendingId);
+				pushActivity('error', 'graph:edit', result.error ?? `Graph edit failed: ${opId}`);
+				continue;
+			}
+			if (result.type === 'add_edge') {
+				if (result.duplicate_edge) {
+					edges = edges.filter((e: any) => e.edge_id !== pendingId);
+				} else {
+					edges = edges.map((e: any) => e.edge_id === pendingId ? {
+						...e,
+						edge_id: result.edge_id,
+						source: result.source ?? e.source,
+						target: result.target ?? e.target,
+						distance_m: result.distance_m ?? e.distance_m,
+						weight: result.distance_m ?? e.weight,
+						extras: { ...(e.extras ?? {}), pending: false },
+					} : e);
+				}
+			}
+			if (result.type === 'delete_edge') {
+				edges = edges.filter((e: any) => e.edge_id !== result.edge_id);
+			}
+		}
+		graphPayload = { ...graphPayload, edges };
+	}
+	function scheduleGraphIdleRefresh() {
+		if (graphEditIdleRefreshTimer) clearTimeout(graphEditIdleRefreshTimer);
+		graphEditIdleRefreshTimer = setTimeout(() => {
+			graphEditIdleRefreshTimer = null;
+			void loadGraph();
+		}, 1000);
+	}
+	function scheduleGraphEditFlush() {
+		if (pendingGraphEdits.length >= 10) {
+			if (graphEditFlushTimer) clearTimeout(graphEditFlushTimer);
+			graphEditFlushTimer = null;
+			void flushGraphEdits();
+			return;
+		}
+		if (graphEditFlushTimer) return;
+		graphEditFlushTimer = setTimeout(() => {
+			graphEditFlushTimer = null;
+			void flushGraphEdits();
+		}, 150);
+	}
+	async function flushGraphEdits() {
+		if (!selectedProjectId || !sceneId || pendingGraphEdits.length === 0) return;
+		const ops = pendingGraphEdits;
+		pendingGraphEdits = [];
+		const batchId = `batch_${Date.now()}_${graphEditBatchSeq++}`;
+		try {
+			const res = await graphService.editGraph(selectedProjectId, sceneId, batchId, ops);
+			reconcileGraphEditResults(res?.results ?? []);
+			if (res?.edge_count != null) pushActivity('ok', 'graph:edit', `Graph edits saved (${res.edge_count} edges)`);
+			scheduleGraphIdleRefresh();
+		} catch (err) {
+			for (const op of ops) removePendingEdge(op.client_op_id);
+			pushActivity('error', 'graph:edit', errorMessage(err));
+			scheduleGraphIdleRefresh();
+		}
+	}
+	function enqueueGraphEdit(op: PendingGraphEdit) {
+		pendingGraphEdits = [...pendingGraphEdits, op];
+		if (op.type === 'add_edge') optimisticAddEdge(op);
+		if (op.type === 'delete_edge' && op.edge_id && graphPayload) {
+			graphPayload = { ...graphPayload, edges: (graphPayload.edges ?? []).filter((e: any) => e.edge_id !== op.edge_id) };
+		}
+		scheduleGraphEditFlush();
+	}
 	async function refreshTraversableMeta() {
 		if (!selectedProjectId || !sceneId) { traversableMeta = null; return; }
 		try {
@@ -504,14 +636,11 @@
 	}
 	async function addEdgeAnyway() {
 		if (!edgeCheckResult?.source || !edgeCheckResult?.target) return;
-		try {
-			await graphService.addEdge(selectedProjectId, sceneId, edgeCheckResult.source, edgeCheckResult.target);
-			pushActivity('ok', 'edge:inspect', `Edge created: ${edgeCheckResult.source} ↔ ${edgeCheckResult.target}`);
-			await loadGraph();
-			edgeCheckResult = null;
-		} catch (err) {
-			pushActivity('error', 'edge:inspect', errorMessage(err));
-		}
+		const source = edgeCheckResult.source;
+		const target = edgeCheckResult.target;
+		enqueueGraphEdit({ client_op_id: nextGraphClientOpId(), type: 'add_edge', source, target });
+		pushActivity('info', 'edge:inspect', `Queued edge: ${source} ↔ ${target}`);
+		edgeCheckResult = null;
 	}
 	// Note: mutual exclusion is now implicit because pathsMode is a single-select radio.
 	let headingCount = $state(12);
@@ -3050,18 +3179,11 @@
 		pendingEdgeSource = nodeId;
 		pushActivity('info', 'graph:add-edge', `First node: ${nodeId}. Click target node…`);
 	}
-	async function handleEdgeSecondNode(source: string, target: string) {
-		try {
-			const res = await graphService.addEdge(selectedProjectId, sceneId, source, target);
-			if (res?.edge_id) {
-				pushActivity('ok', 'graph:add-edge', `${source} → ${target} (${res.edge_id})`);
-				await loadGraph();
-			}
-		} catch (err) {
-			pushActivity('error', 'graph:add-edge', errorMessage(err));
-		} finally {
-			pendingEdgeSource = '';
-		}
+	function handleEdgeSecondNode(source: string, target: string) {
+		if (!selectedProjectId || !sceneId) return;
+		enqueueGraphEdit({ client_op_id: nextGraphClientOpId(), type: 'add_edge', source, target });
+		pushActivity('info', 'graph:add-edge', `${source} → ${target} queued`);
+		pendingEdgeSource = '';
 	}
 
 	async function deleteSelectedGraphNode() {
@@ -3077,11 +3199,10 @@
 			pushActivity('error', 'graph:delete-node', errorMessage(err));
 		}
 	}
-	async function handleDeleteGraphEdge(edgeId: string) {
-		try {
-			await graphService.deleteEdge(selectedProjectId, sceneId, edgeId);
-			await loadGraph();
-		} catch (err) { pushActivity('error', 'graph:edge-del', errorMessage(err)); }
+	function handleDeleteGraphEdge(edgeId: string) {
+		if (!selectedProjectId || !sceneId) return;
+		enqueueGraphEdit({ client_op_id: nextGraphClientOpId(), type: 'delete_edge', edge_id: edgeId });
+		pushActivity('info', 'graph:edge-del', `Delete queued: ${edgeId}`);
 	}
 	let rebuildingEdges = $state(false);
 	async function rebuildGraphEdges() {
@@ -3818,6 +3939,43 @@
 			{#if xmlNativePreviewEnabled && xmlIndexStale}
 				<div class="hint-row">⚠ XML index may be stale. Re-sync render scene so the editor reflects the current mesh_cache.</div>
 			{/if}
+			{#if editorMeshStats}
+				{@const ems = editorMeshStats}
+				{@const cache = ems.cache ?? {}}
+				<div class="render-geometry-header" style="margin-top:8px;">
+					<span class="render-geometry-title">Editor preview</span>
+					<span class="render-geometry-chip render-geometry-chip-ok">{ems.mesh_loaded ?? 0} loaded</span>
+					{#if (ems.placeholder_loading ?? 0) > 0}
+						<span class="render-geometry-chip render-geometry-chip-dim">{ems.placeholder_loading} loading placeholders</span>
+					{/if}
+					{#if (ems.placeholder_cached_null ?? 0) > 0}
+						<span class="render-geometry-chip render-geometry-chip-warn">{ems.placeholder_cached_null} failed placeholders</span>
+					{/if}
+					{#if (ems.architecture_proxy ?? 0) > 0}
+						<span class="render-geometry-chip render-geometry-chip-warn">{ems.architecture_proxy} arch proxies</span>
+					{/if}
+					{#if (ems.authoring_proxy_fallback ?? 0) > 0}
+						<span class="render-geometry-chip render-geometry-chip-dim">{ems.authoring_proxy_fallback} authoring proxies</span>
+					{/if}
+				</div>
+				<div class="render-geometry-breakdown">
+					<span class="render-geometry-reason">xml matched: {ems.xml_matched ?? 0}/{ems.authoring_objects ?? 0}</span>
+					<span class="render-geometry-reason">pickable: {ems.pickable ?? 0}</span>
+					<span class="render-geometry-reason">non-pickable: {ems.non_pickable ?? 0}</span>
+					<span class="render-geometry-reason">cache mem: {cache.memory_entries ?? 0} ({cache.memory_null_entries ?? 0} null)</span>
+					<span class="render-geometry-reason">pending: {cache.pending ?? 0} · inflight: {cache.inflight ?? 0} · queued: {cache.queued ?? 0}</span>
+					<span class="render-geometry-reason">net: {cache.network_fetches ?? 0} · idb: {cache.idb_hits ?? 0} · mem hits: {cache.memory_hits ?? 0}</span>
+					{#if (cache.head_too_large ?? 0) > 0}
+						<span class="render-geometry-reason">too large: {cache.head_too_large}</span>
+					{/if}
+					{#if (cache.fetch_errors ?? 0) > 0 || (cache.parse_errors ?? 0) > 0}
+						<span class="render-geometry-reason">fetch/parse errors: {cache.fetch_errors ?? 0}/{cache.parse_errors ?? 0}</span>
+					{/if}
+					{#if cache.last_error}
+						<span class="render-geometry-reason">last: {cache.last_error}</span>
+					{/if}
+				</div>
+			{/if}
 		</div>
 	{/if}
 {/snippet}
@@ -3934,6 +4092,7 @@
 				allEpisodePaths={pageMode === 'export' ? allEpisodePaths : []}
 				mapBounds={{ w: mapWidth, h: mapHeight }}
 				onStatus={(message) => (editor3DStatus = message)}
+				onMeshStats={(stats) => { editorMeshStats = stats; }}
 				observationScan={pageMode === 'sensors' ? observationScan : null}
 				frustumMode={pageMode === 'sensors' ? frustumMode : 'none'}
 				frustumModality={activeRenderModality}
@@ -4007,8 +4166,15 @@
 				<button class="map-float-btn" title="Redo (Ctrl+Y)" disabled={!redoStack.length} onclick={redo}>↪</button>
 				<div class="map-float-sep"></div>
 				{#if syncRunning}
-					<span class="sync-progress-chip" title={syncProgress?.stage ?? ''}>
-						⟳ Syncing {syncProgress?.processed ?? 0}/{syncProgress?.total ?? 0}
+					{@const stageIdx = renderService.syncStageIndex(syncProgress?.stage)}
+					<span class="sync-progress-chip" title={`stage: ${syncProgress?.stage ?? ''}`}>
+						⟳ {renderService.syncStageLabel(syncProgress?.stage, 'kr')}
+						<span class="sync-stage-dots" aria-hidden="true">
+							{#each renderService.SYNC_STAGES as _, i}
+								<span class="sync-stage-dot" class:done={stageIdx > i} class:active={stageIdx === i}></span>
+							{/each}
+						</span>
+						{syncProgress?.processed ?? 0}/{syncProgress?.total ?? 0}
 						{#if syncProgress?.label}· {syncProgress.label}{/if}
 					</span>
 					<div class="map-float-sep"></div>
@@ -4264,16 +4430,29 @@
 							<span class="chip-dim">Texture max{effectiveRenderReadiness?.texture_profile ?? currentScene?.render_readiness?.texture_profile ?? 1024}</span>
 						</div>
 						{#if effectiveRenderReadiness}
+							{@const _errs = effectiveRenderReadiness.errors ?? []}
+							{@const _warns = effectiveRenderReadiness.warnings ?? []}
 							<div class="export-validation" class:validation-ok={effectiveRenderReadiness.ok} class:validation-fail={!effectiveRenderReadiness.ok}>
 								Render readiness: {effectiveRenderReadiness.status ?? (effectiveRenderReadiness.ok ? 'ready' : 'blocked')}
-								{#if effectiveRenderReadiness.error_count != null}<span class="val-errors"> · {effectiveRenderReadiness.error_count} error(s)</span>{/if}
+								{#if _errs.length}<span class="val-errors"> · {_errs.length} error{_errs.length === 1 ? '' : 's'}</span>{/if}
+								{#if _warns.length}<span class="val-warnings"> · {_warns.length} warning{_warns.length === 1 ? '' : 's'}</span>{/if}
 							</div>
-							{#if !effectiveRenderReadiness.ok && effectiveRenderReadiness.errors?.length}
+							{#if _errs.length}
 								<div class="readiness-errors">
-									{#each effectiveRenderReadiness.errors as err}
+									{#each _errs as err}
 										<div class="readiness-error-item">
 											<span class="readiness-error-label">{err.label ?? err.key}:</span>
 											<span class="readiness-error-msg">{err.message}</span>
+										</div>
+									{/each}
+								</div>
+							{/if}
+							{#if _warns.length}
+								<div class="readiness-warnings">
+									{#each _warns as w}
+										<div class="readiness-warning-item">
+											<span class="readiness-warning-label">⚠ {w.label ?? w.key}:</span>
+											<span class="readiness-warning-msg">{w.message}</span>
 										</div>
 									{/each}
 								</div>
@@ -5295,6 +5474,21 @@
 		border-radius: var(--radius-sm);
 		white-space: nowrap;
 	}
+	.sync-stage-dots { display: inline-flex; gap: 3px; align-items: center; }
+	.sync-stage-dot {
+		width: 6px; height: 6px; border-radius: 50%;
+		background: #fde68a;
+	}
+	.sync-stage-dot.done { background: #16a34a; }
+	.sync-stage-dot.active {
+		background: #b45309;
+		box-shadow: 0 0 0 2px rgba(180, 83, 9, 0.18);
+		animation: sync-stage-pulse 1.1s ease-in-out infinite;
+	}
+	@keyframes sync-stage-pulse {
+		0%, 100% { opacity: 1; }
+		50% { opacity: 0.45; }
+	}
 	details {
 		border: 1px solid var(--panel-border);
 		border-radius: var(--radius-sm);
@@ -5648,6 +5842,11 @@
 	.readiness-error-item { font-size: 11px; color: var(--danger); line-height: 1.4; }
 	.readiness-error-label { font-weight: 600; margin-right: 4px; }
 	.readiness-error-msg { color: #7f1d1d; }
+	.readiness-warnings { margin-top: 4px; display: flex; flex-direction: column; gap: 3px; }
+	.readiness-warning-item { font-size: 11px; color: #92400e; line-height: 1.4; }
+	.readiness-warning-label { font-weight: 600; margin-right: 4px; }
+	.readiness-warning-msg { color: #7c2d12; }
+	.val-warnings { color: #92400e; }
 
 
 	.export-validation { font-size: 11px; padding: 4px 8px; border-radius: 4px; margin-top: 6px; }

@@ -21,6 +21,28 @@ type ThreeGroup = any;
 type ThreeObject3D = any;
 type ThreeMesh = any;
 
+export type ObjMeshCacheStats = {
+	memory_hits: number;
+	memory_null_hits: number;
+	pending_hits: number;
+	idb_hits: number;
+	idb_too_large: number;
+	network_fetches: number;
+	head_too_large: number;
+	fetch_errors: number;
+	parse_errors: number;
+	stored: number;
+	null_stored: number;
+	last_error?: string;
+	memory_entries: number;
+	memory_null_entries: number;
+	pending: number;
+	inflight: number;
+	queued: number;
+	max_concurrent_fetches: number;
+	max_obj_bytes_for_preview: number;
+};
+
 const CACHE_VERSION = 'obj-mesh-cache-v3-head-size';
 // Distinct DB name from primMeshCache's `robomituba-opticalnav`. Both caches
 // opened the same DB at version 1 and each created only its own store in
@@ -28,7 +50,7 @@ const CACHE_VERSION = 'obj-mesh-cache-v3-head-size';
 // never created, so transactions failed with "object stores was not found".
 const DB_NAME = 'robomituba-opticalnav-obj';
 const STORE_NAME = 'obj_mesh';
-const MAX_MEMORY_ENTRIES = 96;
+const MAX_MEMORY_ENTRIES = 256;
 const MAX_IDB_AGE_MS = 14 * 24 * 60 * 60 * 1000;
 
 type SerializedGeometry = {
@@ -47,6 +69,20 @@ type CacheRecord = {
 
 const memory = new Map<string, ThreeBufferGeometry | null>();
 const pending = new Map<string, Promise<ThreeBufferGeometry | null>>();
+const _stats = {
+	memory_hits: 0,
+	memory_null_hits: 0,
+	pending_hits: 0,
+	idb_hits: 0,
+	idb_too_large: 0,
+	network_fetches: 0,
+	head_too_large: 0,
+	fetch_errors: 0,
+	parse_errors: 0,
+	stored: 0,
+	null_stored: 0,
+	last_error: '',
+};
 let dbPromise: Promise<IDBDatabase | null> | null = null;
 
 const _loader = new OBJLoader();
@@ -56,7 +92,7 @@ const _loader = new OBJLoader();
 // (browser console saw 1300+ requests / 1.7 GB in a single sync, the daemon's
 // health endpoint timing out). Cap in-flight network fetches; queued waiters
 // run as slots free up.
-const MAX_CONCURRENT_FETCHES = 2;
+const MAX_CONCURRENT_FETCHES = 1;
 let _inflight = 0;
 const _waiters: Array<() => void> = [];
 
@@ -88,6 +124,22 @@ export function getCachedObjMeshGeometry(key: string): ThreeBufferGeometry | nul
 	return memory.get(key);
 }
 
+export function getObjMeshCacheStats(): ObjMeshCacheStats {
+	let memoryNullEntries = 0;
+	for (const value of memory.values()) if (value === null) memoryNullEntries++;
+	return {
+		..._stats,
+		last_error: _stats.last_error || undefined,
+		memory_entries: memory.size,
+		memory_null_entries: memoryNullEntries,
+		pending: pending.size,
+		inflight: _inflight,
+		queued: _waiters.length,
+		max_concurrent_fetches: MAX_CONCURRENT_FETCHES,
+		max_obj_bytes_for_preview: MAX_OBJ_BYTES_FOR_PREVIEW,
+	};
+}
+
 /**
  * Fetch + parse + cache an OBJ file from the daemon's mesh-cache endpoint.
  * Returns a deduplicated BufferGeometry; callers should clone-on-use if they
@@ -102,8 +154,16 @@ export async function loadObjMeshGeometry(
 	filename: string,
 ): Promise<ThreeBufferGeometry | null> {
 	const key = objMeshCacheKey(projectId, sceneId, filename);
-	if (memory.has(key)) return memory.get(key) ?? null;
-	if (pending.has(key)) return pending.get(key) ?? null;
+	if (memory.has(key)) {
+		const value = memory.get(key) ?? null;
+		if (value === null) _stats.memory_null_hits++;
+		else _stats.memory_hits++;
+		return value;
+	}
+	if (pending.has(key)) {
+		_stats.pending_hits++;
+		return pending.get(key) ?? null;
+	}
 
 	const task = (async () => {
 		// Memory miss → check IndexedDB.
@@ -116,10 +176,12 @@ export async function loadObjMeshGeometry(
 			// is denser than the text form).
 			const posBytes = stored.serialized.positions?.byteLength ?? 0;
 			if (posBytes > MAX_OBJ_BYTES_FOR_PREVIEW / 2) {
+				_stats.idb_too_large++;
 				void deleteIdb(key);
 				setMemory(key, null);
 				return null;
 			}
+			_stats.idb_hits++;
 			const geo = deserializeGeometry(stored.serialized);
 			setMemory(key, geo);
 			return geo;
@@ -131,20 +193,25 @@ export async function loadObjMeshGeometry(
 		await _acquireSlot();
 		try {
 			const url = opticalNavMeshCacheUrl(projectId, sceneId, filename);
+			_stats.network_fetches++;
 			const headLen = await fetchObjContentLength(url);
 			if (Number.isFinite(headLen) && headLen > MAX_OBJ_BYTES_FOR_PREVIEW) {
+				_stats.head_too_large++;
 				setMemory(key, null);
 				return null;
 			}
 
 			const res = await fetch(url, { headers: { Accept: 'text/plain' } });
 			if (!res.ok) {
+				_stats.fetch_errors++;
+				_stats.last_error = `http_${res.status}`;
 				setMemory(key, null);
 				return null;
 			}
 			const cl = res.headers.get('content-length');
 			const len = cl ? Number(cl) : NaN;
 			if (Number.isFinite(len) && len > MAX_OBJ_BYTES_FOR_PREVIEW) {
+				_stats.head_too_large++;
 				try { res.body?.cancel(); } catch { /* noop */ }
 				setMemory(key, null);
 				return null;
@@ -152,6 +219,7 @@ export async function loadObjMeshGeometry(
 			const text = await res.text();
 			const geo = parseObjToGeometry(text);
 			if (!geo) {
+				_stats.parse_errors++;
 				setMemory(key, null);
 				return null;
 			}
@@ -159,7 +227,9 @@ export async function loadObjMeshGeometry(
 			const serialized = serializeGeometry(geo);
 			if (serialized) void writeIdb({ key, serialized, updatedAt: Date.now() });
 			return geo;
-		} catch {
+		} catch (err) {
+			_stats.fetch_errors++;
+			_stats.last_error = err instanceof Error ? err.message : String(err);
 			setMemory(key, null);
 			return null;
 		} finally {
@@ -278,6 +348,8 @@ function deserializeGeometry(s: SerializedGeometry): ThreeBufferGeometry {
 }
 
 function setMemory(key: string, geo: ThreeBufferGeometry | null) {
+	if (geo === null) _stats.null_stored++;
+	else _stats.stored++;
 	if (memory.has(key)) memory.delete(key);
 	memory.set(key, geo);
 	while (memory.size > MAX_MEMORY_ENTRIES) {

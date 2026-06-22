@@ -15,6 +15,7 @@ import {
 	fetchOpticalNavOverlappingGraphNodes,
 	checkOpticalNavGraphEdge,
 	addOpticalNavGraphEdge,
+	editOpticalNavGraph,
 	deleteOpticalNavGraphEdge,
 	regenerateOpticalNavGraphRegion,
 } from '$lib/api';
@@ -116,8 +117,8 @@ export async function rebuildGraphEdges(projectId: string, sceneId: string) {
 }
 
 /** Batch-remove multiple viewpoint nodes (and their incident edges) in one request. */
-export async function deleteGraphNodes(projectId: string, sceneId: string, nodeIds: string[]) {
-	return deleteOpticalNavGraphNodes(projectId, sceneId, nodeIds);
+export async function deleteGraphNodes(projectId: string, sceneId: string, nodeIds: string[], reason?: string) {
+	return deleteOpticalNavGraphNodes(projectId, sceneId, nodeIds, reason);
 }
 
 /** Auto-detect node_ids that overlap scene objects, for review before removal. */
@@ -151,6 +152,26 @@ export async function addEdge(
 	target: string
 ) {
 	return addOpticalNavGraphEdge(projectId, sceneId, { source, target });
+}
+
+export interface GraphEditOp {
+	client_op_id?: string;
+	type: 'add_edge' | 'delete_edge';
+	source?: string;
+	target?: string;
+	edge_id?: string;
+}
+
+export async function editGraph(
+	projectId: string,
+	sceneId: string,
+	clientBatchId: string,
+	ops: GraphEditOp[]
+) {
+	return editOpticalNavGraph(projectId, sceneId, {
+		client_batch_id: clientBatchId,
+		ops: ops as unknown as Array<Record<string, unknown>>,
+	});
 }
 
 export async function deleteEdge(projectId: string, sceneId: string, edgeId: string) {

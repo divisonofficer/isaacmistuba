@@ -111,10 +111,19 @@
 			</div>
 			{#if authoringMapDirty}<p class="inline-hint">Unsaved changes.</p>{/if}
 			{#if currentScene?.sync_status}
+				{@const _ss = currentScene.sync_status}
+				{@const _rs = _ss.render_scene_status ?? _ss.render_scene ?? 'pending'}
 				<div class="sync-card">
 					<div class="panel-label">Sync</div>
-					<div class:ready={currentScene.sync_status.render_scene === 'synced'}>Render {currentScene.sync_status.render_scene ?? 'pending'}</div>
-					<div class:ready={currentScene.sync_status.isaac_stage === 'synced'}>Isaac {currentScene.sync_status.isaac_stage ?? 'pending'}</div>
+					<div class:ready={_ss.render_scene === 'synced'}>
+						Render {_ss.render_scene ?? 'pending'}
+						{#if _rs && _rs !== _ss.render_scene}<span class="sync-sub"> · {_rs}</span>{/if}
+					</div>
+					{#if _ss.message}<div class="sync-message">{_ss.message}</div>{/if}
+					<div class:ready={_ss.isaac_stage === 'synced'}>Isaac {_ss.isaac_stage ?? 'pending'}</div>
+					{#if _ss.annotation_stale}<div class="sync-stale">⚠ scene_annotation.json is stale (re-sync recommended)</div>{/if}
+					{#if _ss.traversable_map_stale}<div class="sync-stale">⚠ traversable_map is stale</div>{/if}
+					{#if _ss.viewpoint_graph_stale}<div class="sync-stale">⚠ viewpoint_graph is stale</div>{/if}
 				</div>
 			{/if}
 
@@ -211,16 +220,29 @@
 					<span class="chip-dim">Texture max{effectiveRenderReadiness?.texture_profile ?? currentScene?.render_readiness?.texture_profile ?? 1024}</span>
 				</div>
 				{#if effectiveRenderReadiness}
+					{@const _errs = effectiveRenderReadiness.errors ?? []}
+					{@const _warns = effectiveRenderReadiness.warnings ?? []}
 					<div class="export-validation" class:validation-ok={effectiveRenderReadiness.ok} class:validation-fail={!effectiveRenderReadiness.ok}>
 						Render readiness: {effectiveRenderReadiness.status ?? (effectiveRenderReadiness.ok ? 'ready' : 'blocked')}
-						{#if effectiveRenderReadiness.error_count != null}<span class="val-errors"> · {effectiveRenderReadiness.error_count} error(s)</span>{/if}
+						{#if _errs.length}<span class="val-errors"> · {_errs.length} error{_errs.length === 1 ? '' : 's'}</span>{/if}
+						{#if _warns.length}<span class="val-warnings"> · {_warns.length} warning{_warns.length === 1 ? '' : 's'}</span>{/if}
 					</div>
-					{#if !effectiveRenderReadiness.ok && effectiveRenderReadiness.errors?.length}
+					{#if _errs.length}
 						<div class="readiness-errors">
-							{#each effectiveRenderReadiness.errors as err}
+							{#each _errs as err}
 								<div class="readiness-error-item">
 									<span class="readiness-error-label">{err.label ?? err.key}:</span>
 									<span class="readiness-error-msg">{err.message}</span>
+								</div>
+							{/each}
+						</div>
+					{/if}
+					{#if _warns.length}
+						<div class="readiness-warnings">
+							{#each _warns as w}
+								<div class="readiness-warning-item">
+									<span class="readiness-warning-label">⚠ {w.label ?? w.key}:</span>
+									<span class="readiness-warning-msg">{w.message}</span>
 								</div>
 							{/each}
 						</div>
@@ -271,6 +293,25 @@
 			font-size: var(--font-size-xs);
 		}
 
+	.sync-card div.sync-message {
+			display: block;
+			color: var(--muted-strong);
+			font-size: var(--font-size-xs);
+			line-height: 1.4;
+			padding: 2px 0 0;
+		}
+	.sync-card div.sync-stale {
+			display: block;
+			color: #92400e;
+			font-size: var(--font-size-xs);
+			line-height: 1.4;
+			padding: 1px 0 0;
+		}
+	.sync-card .sync-sub {
+			color: var(--muted-strong);
+			font-weight: 400;
+		}
+
 	.emitter-bulk-card {
 			display: grid;
 			gap: var(--space-2);
@@ -303,6 +344,11 @@
 		}
 
 	.readiness-errors { margin-top: 4px; display: flex; flex-direction: column; gap: 3px; }
+	.readiness-warnings { margin-top: 4px; display: flex; flex-direction: column; gap: 3px; }
+	.readiness-warning-item { font-size: 11px; color: #92400e; line-height: 1.4; }
+	.readiness-warning-label { font-weight: 600; margin-right: 4px; }
+	.readiness-warning-msg { color: #7c2d12; }
+	.val-warnings { color: #92400e; }
 
 	.readiness-error-item { font-size: 11px; color: var(--danger); line-height: 1.4; }
 

@@ -12,6 +12,13 @@ export class ApiError extends Error {
 	}
 }
 
+// One id per page load. Sent on graph-mutating requests so the server-side graph
+// edit history (graph_edit_history.jsonl) can group a session's sequence of edits.
+export const EDIT_SESSION: string =
+	typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+		? crypto.randomUUID()
+		: `sess_${Date.now()}_${Math.floor(Math.random() * 1e6)}`;
+
 const json = async (r: Response) => {
 	if (!r.ok) {
 		let detail = '';
@@ -37,14 +44,18 @@ const json = async (r: Response) => {
 const post = (url: string, body?: unknown) =>
 	fetch(url, {
 		method: 'POST',
-		headers: body ? { 'Content-Type': 'application/json' } : {},
+		headers: body
+			? { 'Content-Type': 'application/json', 'X-Edit-Session': EDIT_SESSION }
+			: { 'X-Edit-Session': EDIT_SESSION },
 		body: body ? JSON.stringify(body) : undefined
 	}).then(json);
 
 const put = (url: string, body?: unknown) =>
 	fetch(url, {
 		method: 'PUT',
-		headers: body ? { 'Content-Type': 'application/json' } : {},
+		headers: body
+			? { 'Content-Type': 'application/json', 'X-Edit-Session': EDIT_SESSION }
+			: { 'X-Edit-Session': EDIT_SESSION },
 		body: body ? JSON.stringify(body) : undefined
 	}).then(json);
 
@@ -491,12 +502,12 @@ export const getOpticalNavRoomShell = (projectId: string, sceneId: string) =>
 export const addOpticalNavGraphNode = (projectId: string, sceneId: string, payload: { x: number; y: number; heading_count?: number }) =>
 	post(`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/graph/nodes`, payload);
 export const deleteOpticalNavGraphNode = (projectId: string, sceneId: string, nodeId: string) =>
-	fetch(`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/graph/nodes/${encodeURIComponent(nodeId)}`, { method: 'DELETE' }).then(json);
-export const deleteOpticalNavGraphNodes = (projectId: string, sceneId: string, nodeIds: string[]) =>
+	fetch(`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/graph/nodes/${encodeURIComponent(nodeId)}`, { method: 'DELETE', headers: { 'X-Edit-Session': EDIT_SESSION } }).then(json);
+export const deleteOpticalNavGraphNodes = (projectId: string, sceneId: string, nodeIds: string[], reason?: string) =>
 	fetch(`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/graph/nodes`, {
 		method: 'DELETE',
-		headers: { 'Content-Type': 'application/json' },
-		body: JSON.stringify({ node_ids: nodeIds })
+		headers: { 'Content-Type': 'application/json', 'X-Edit-Session': EDIT_SESSION },
+		body: JSON.stringify({ node_ids: nodeIds, ...(reason ? { reason } : {}) })
 	}).then(json);
 export const fetchOpticalNavOverlappingGraphNodes = (
 	projectId: string,
@@ -538,8 +549,12 @@ export const addOpticalNavGraphEdge = (
 	projectId: string, sceneId: string,
 	payload: { source: string; target: string; distance_m?: number; weight?: number }
 ) => post(`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/graph/edges`, payload);
+export const editOpticalNavGraph = (
+	projectId: string, sceneId: string,
+	payload: { client_batch_id?: string; ops: Array<Record<string, unknown>> }
+) => post(`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/graph/edits`, payload);
 export const deleteOpticalNavGraphEdge = (projectId: string, sceneId: string, edgeId: string) =>
-	fetch(`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/graph/edges/${encodeURIComponent(edgeId)}`, { method: 'DELETE' }).then(json);
+	fetch(`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/graph/edges/${encodeURIComponent(edgeId)}`, { method: 'DELETE', headers: { 'X-Edit-Session': EDIT_SESSION } }).then(json);
 export const opticalNavObservationRgbUrl = (projectId: string, sceneId: string, vpId: string, headingId: string): string =>
 	`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/observations/${encodeURIComponent(vpId)}/rgb?heading=${encodeURIComponent(headingId)}`;
 export const opticalNavObservationModalityUrl = (projectId: string, sceneId: string, vpId: string, headingId: string, modality: string, sensorId = ''): string =>
