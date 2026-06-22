@@ -35,17 +35,27 @@ export interface SyncProgress {
  * Backend emits stage strings in this order — see render_daemon.py
  * `_run_render_scene_sync_inner`. Keep this in sync with backend stages.
  */
-export const SYNC_STAGES = ['scene_sync', 'mesh_extract', 'readiness'] as const;
+export const SYNC_STAGES = [
+	'scene_sync',
+	'mesh_extract',
+	'stage_obj_cache',
+	'preview_manifest',
+	'readiness',
+] as const;
 export type SyncStage = (typeof SYNC_STAGES)[number] | string;
 
 const SYNC_STAGE_LABELS_EN: Record<string, string> = {
 	scene_sync: 'Preparing',
 	mesh_extract: 'Extracting meshes',
+	stage_obj_cache: 'Staging OBJs',
+	preview_manifest: 'Building preview meshes',
 	readiness: 'Verifying',
 };
 const SYNC_STAGE_LABELS_KR: Record<string, string> = {
 	scene_sync: '장면 준비',
 	mesh_extract: '메시 추출',
+	stage_obj_cache: 'OBJ 캐싱',
+	preview_manifest: '미리보기 메시',
 	readiness: '검증',
 };
 

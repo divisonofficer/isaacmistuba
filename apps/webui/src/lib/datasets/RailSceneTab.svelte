@@ -113,17 +113,28 @@
 			{#if currentScene?.sync_status}
 				{@const _ss = currentScene.sync_status}
 				{@const _rs = _ss.render_scene_status ?? _ss.render_scene ?? 'pending'}
+				{@const _isSyncing = _rs === 'syncing'}
 				<div class="sync-card">
 					<div class="panel-label">Sync</div>
 					<div class:ready={_ss.render_scene === 'synced'}>
 						Render {_ss.render_scene ?? 'pending'}
 						{#if _rs && _rs !== _ss.render_scene}<span class="sync-sub"> · {_rs}</span>{/if}
 					</div>
-					{#if _ss.message}<div class="sync-message">{_ss.message}</div>{/if}
+					<!-- While the daemon is actively syncing, the `message` field carries the
+						 live progress text and supersedes any older "deferred / stale" rationale
+						 the annotation may have been left with. Show stale flags only when sync
+						 is NOT running (otherwise they're trivially expected to clear). -->
+					{#if _isSyncing}
+						<div class="sync-message">Render-scene sync is running…</div>
+					{:else if _ss.message}
+						<div class="sync-message">{_ss.message}</div>
+					{/if}
 					<div class:ready={_ss.isaac_stage === 'synced'}>Isaac {_ss.isaac_stage ?? 'pending'}</div>
-					{#if _ss.annotation_stale}<div class="sync-stale">⚠ scene_annotation.json is stale (re-sync recommended)</div>{/if}
-					{#if _ss.traversable_map_stale}<div class="sync-stale">⚠ traversable_map is stale</div>{/if}
-					{#if _ss.viewpoint_graph_stale}<div class="sync-stale">⚠ viewpoint_graph is stale</div>{/if}
+					{#if !_isSyncing}
+						{#if _ss.annotation_stale}<div class="sync-stale">⚠ scene_annotation.json is stale (re-sync recommended)</div>{/if}
+						{#if _ss.traversable_map_stale}<div class="sync-stale">⚠ traversable_map is stale</div>{/if}
+						{#if _ss.viewpoint_graph_stale}<div class="sync-stale">⚠ viewpoint_graph is stale</div>{/if}
+					{/if}
 				</div>
 			{/if}
 

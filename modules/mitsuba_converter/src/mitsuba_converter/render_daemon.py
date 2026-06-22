@@ -1461,6 +1461,22 @@ def _preview_mesh_target_faces() -> int:
     return _DEFAULT_PREVIEW_TARGET_FACES
 
 
+def _preview_mesh_max_source_faces() -> int:
+    """Source meshes with > this face count are skipped from the preview pipeline.
+
+    Decimating a 500k-face Infinigen mesh via trimesh.simplify_quadric_decimation
+    can stall the sync stage for tens of seconds per mesh. The editor falls back
+    to a proxy box for these — XML render still uses the full mesh.
+    """
+    raw = os.environ.get("ROBOMITUBA_PREVIEW_MESH_MAX_SOURCE_FACES")
+    if raw:
+        try:
+            return max(1000, int(raw))
+        except (TypeError, ValueError):
+            pass
+    return 200_000
+
+
 def _scan_obj_bounds_and_faces(path: Path) -> dict[str, Any]:
     vertices: list[tuple[float, float, float]] = []
     face_count = 0
@@ -1598,6 +1614,8 @@ def _build_editor_preview_mesh_manifest(
     scene_mesh_cache_dir: Path,
     repo_root: Path,
     materialization_records: list[dict[str, Any]] | None = None,
+    progress_cb: "Callable[[int, int, str, str], None] | None" = None,
+    progress_stage: str = "preview_manifest",
 ) -> dict[str, Any]:
     """Create editor-only preview metadata for OBJ shapes in a synced scene.
 
@@ -1634,9 +1652,12 @@ def _build_editor_preview_mesh_manifest(
             mat_by_shape[sid] = rec
 
     scene_mesh_cache_dir.mkdir(parents=True, exist_ok=True)
-    for shape in tree.getroot().findall(".//shape"):
-        if shape.attrib.get("type") != "obj":
-            continue
+    obj_shapes = [s for s in tree.getroot().findall(".//shape") if s.attrib.get("type") == "obj"]
+    total_shapes = len(obj_shapes)
+    publish_every = max(1, total_shapes // 40)
+    if progress_cb is not None and total_shapes:
+        progress_cb(0, total_shapes, "building preview meshes", progress_stage)
+    for processed_idx, shape in enumerate(obj_shapes, start=1):
         shape_id = shape.attrib.get("id") or ""
         if not shape_id:
             continue
@@ -1644,6 +1665,11 @@ def _build_editor_preview_mesh_manifest(
         raw = fn.attrib.get("value") if fn is not None else ""
         if not raw:
             continue
+        # Throttled progress publish — at most ~40 ticks across the whole loop,
+        # plus the final tick. Keeps WS traffic light but UI updates regularly.
+        if progress_cb is not None and (processed_idx % publish_every == 0 or processed_idx == total_shapes):
+            short = raw.rsplit("/", 1)[-1][:48]
+            progress_cb(processed_idx, total_shapes, short, progress_stage)
         try:
             src = resolve_repo_path(repo_root, raw)
         except Exception:
@@ -1702,6 +1728,22 @@ def _build_editor_preview_mesh_manifest(
                 **({"editor_proxy": editor_proxy} if editor_proxy else {}),
             }
             stats["skipped_small"] += 1
+            continue
+        # Skip excessively heavy meshes from the preview pipeline. trimesh's
+        # simplify_quadric_decimation on a 500k-face source can stall this stage
+        # for tens of seconds. The XML render still uses the full mesh; the editor
+        # falls back to a proxy. Override via ROBOMITUBA_PREVIEW_MESH_MAX_SOURCE_FACES.
+        if face_count > _preview_mesh_max_source_faces():
+            by_shape[shape_id] = {
+                "preview_mesh_status": "skipped_heavy_source",
+                "preview_mesh_reason": f"source_faces {face_count} > max {_preview_mesh_max_source_faces()}",
+                "source_mesh_faces": face_count,
+                "editor_layer": editor_layer,
+                "editor_pickable": editor_pickable,
+                **({"editor_proxy": editor_proxy} if editor_proxy else {}),
+            }
+            stats.setdefault("skipped_heavy_source", 0)
+            stats["skipped_heavy_source"] += 1
             continue
         try:
             stat = src.stat()
@@ -1849,6 +1891,8 @@ def _stage_xml_obj_filenames_to_scene_mesh_cache(
     *,
     scene_mesh_cache_dir: Path,
     repo_root: Path,
+    progress_cb: "Callable[[int, int, str, str], None] | None" = None,
+    progress_stage: str = "stage_obj_cache",
 ) -> dict[str, Any]:
     """Copy OBJ files referenced by render_scene.xml into scene-local mesh_cache.
 
@@ -1873,15 +1917,21 @@ def _stage_xml_obj_filenames_to_scene_mesh_cache(
     missing = 0
     rewritten = 0
     root = tree.getroot()
-    for shape in root.findall(".//shape"):
-        if shape.attrib.get("type") != "obj":
-            continue
+    obj_shapes = [s for s in root.findall(".//shape") if s.attrib.get("type") == "obj"]
+    total_shapes = len(obj_shapes)
+    publish_every = max(1, total_shapes // 40)
+    if progress_cb is not None and total_shapes:
+        progress_cb(0, total_shapes, "staging OBJs", progress_stage)
+    for processed_idx, shape in enumerate(obj_shapes, start=1):
         fn = shape.find("./string[@name='filename']")
         if fn is None:
             continue
         raw = fn.attrib.get("value") or ""
         if not raw.lower().endswith(".obj"):
             continue
+        if progress_cb is not None and (processed_idx % publish_every == 0 or processed_idx == total_shapes):
+            short = raw.rsplit("/", 1)[-1][:48]
+            progress_cb(processed_idx, total_shapes, short, progress_stage)
         try:
             src = resolve_repo_path(repo_root, raw)
         except Exception:
@@ -5773,12 +5823,20 @@ class RenderDaemon:
         generation_error: str | None = None
         mesh_extraction_stats: dict[str, int] = {}
 
-        # Total estimate: count overlay objects with USD-backed source_ref.
-        total_estimate = 0
-        for obj in (result.overlay or {}).get("objects") or []:
-            src = obj.get("source_ref") if isinstance(obj, Mapping) else None
-            if isinstance(src, str) and "#" in src:
-                total_estimate += 1
+        # Total estimate: every overlay object is one unit of "stage" work — XML
+        # emit + mesh-cache copy + preview-manifest entry each touch every object.
+        # The old version counted only USD-backed (``#``-fragment) source_refs,
+        # which is 0 for Infinigen-imported scenes (pure OBJ refs), making the
+        # "0/0 preparing" UI sit there for the whole sync. Now the denominator
+        # reflects actual work even when no USD prims are involved.
+        overlay_objects = list((result.overlay or {}).get("objects") or [])
+        total_estimate = len(overlay_objects)
+        usd_backed_count = sum(
+            1 for obj in overlay_objects
+            if isinstance(obj, Mapping)
+            and isinstance(obj.get("source_ref"), str)
+            and "#" in str(obj.get("source_ref"))
+        )
         if progress_cb is not None:
             progress_cb(0, total_estimate, "preparing", "scene_sync")
 
@@ -5788,14 +5846,24 @@ class RenderDaemon:
             _shared_stage_cache: dict[str, Any] = {}
             _processed = {"n": 0}
 
+            # Mesh-extract: kick off the stage explicitly so the UI sees a denominator
+            # even when there's no USD prim to extract (Infinigen / pure-OBJ scenes).
+            if progress_cb is not None:
+                progress_cb(
+                    0,
+                    max(total_estimate, usd_backed_count),
+                    "USD prims" if usd_backed_count else "OBJ shapes",
+                    "mesh_extract",
+                )
+
             def _resolve_prim_obj(usd_ref: str, prim_path: str):
                 res = self._ensure_prim_obj_cached(
                     project_dir, scene_id, usd_ref, prim_path,
                     stage_cache=_shared_stage_cache,
                 )
                 _processed["n"] += 1
-                if progress_cb is not None and (_processed["n"] % 4 == 0 or _processed["n"] == total_estimate):
-                    progress_cb(_processed["n"], max(total_estimate, _processed["n"]), prim_path.rsplit("/", 1)[-1], "mesh_extract")
+                if progress_cb is not None and (_processed["n"] % 4 == 0 or _processed["n"] == usd_backed_count):
+                    progress_cb(_processed["n"], max(total_estimate, usd_backed_count), prim_path.rsplit("/", 1)[-1], "mesh_extract")
                 return res
 
             t_mesh_start = time.perf_counter()
@@ -5813,16 +5881,30 @@ class RenderDaemon:
             mesh_extraction_stats["extraction_time_ms"] = int((time.perf_counter() - t_mesh_start) * 1000)
             render_scene_ref = render_scene_path.relative_to(self.repo_root).as_posix()
             scene_mesh_cache_dir = self._opticalnav_mesh_cache_dir(project_dir, scene_id)
+
+            # Stage: copy every OBJ referenced by render_scene.xml into the scene's
+            # mesh_cache under a hash filename. Cache-aware (skips existing hashes),
+            # so the second sync flies through. The function publishes per-shape
+            # progress under the `stage_obj_cache` stage.
             mesh_extraction_stats["scene_mesh_cache"] = _stage_xml_obj_filenames_to_scene_mesh_cache(
                 render_scene_path,
                 scene_mesh_cache_dir=scene_mesh_cache_dir,
                 repo_root=self.repo_root,
+                progress_cb=progress_cb,
+                progress_stage="stage_obj_cache",
             )
+
+            # Stage: build editor preview meshes (decimate when fast_simplification is
+            # available, copy as-is otherwise). Per-shape work, big on Infinigen.
+            # The function publishes its own per-shape progress under the
+            # `preview_manifest` stage; we just need to pass progress_cb in.
             preview_mesh_manifest = _build_editor_preview_mesh_manifest(
                 render_scene_path,
                 scene_mesh_cache_dir=scene_mesh_cache_dir,
                 repo_root=self.repo_root,
                 materialization_records=materialization_records,
+                progress_cb=progress_cb,
+                progress_stage="preview_manifest",
             )
             mesh_extraction_stats["editor_preview_mesh_cache"] = preview_mesh_manifest.get("stats", {})
             try:
@@ -5864,7 +5946,7 @@ class RenderDaemon:
             generation_error = str(exc)
 
         if progress_cb is not None:
-            progress_cb(total_estimate, total_estimate, "finalizing", "readiness")
+            progress_cb(total_estimate, total_estimate, "checking readiness", "readiness")
 
         readiness = _build_opticalnav_render_readiness(
             authoring_payload,
