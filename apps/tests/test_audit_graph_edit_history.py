@@ -98,6 +98,36 @@ def test_baseline_with_no_corrections_yields_zero(tmp_path):
     assert m["carving_relaxation_rate"] == 0.0
 
 
+def test_position_based_outdoor_survives_reimport(tmp_path):
+    """A re-imported graph (entirely new ids) should still score on the
+    position-based outdoor metric, while the id-based one trivially returns 1.0.
+    """
+    history = [
+        {"operation": "build_graph", "after": {"nodes": 2, "edges": 0}},
+        {"operation": "delete_nodes",
+         "params": {"requested": ["vp_old_0", "vp_old_1"]},
+         "deleted_nodes": [
+             {"id": "vp_old_0", "position": [50.0, 50.0]},  # outdoor — should stay empty
+             {"id": "vp_old_1", "position": [1.0, 1.0]},    # indoor — algorithm still places a node here
+         ],
+         "before": {"nodes": 2}, "after": {"nodes": 0}},
+    ]
+    # Re-imported graph: brand-new ids, only the indoor spot has a nearby node.
+    new_graph = {
+        "scene_id": "s", "graph_id": "g_v2",
+        "nodes": [{"node_id": "vp_new_0", "position": [1.0, 1.0]}],
+        "edges": [],
+    }
+    hist_p = _write(tmp_path, "graph_edit_history.jsonl", history)
+    graph_p = _write(tmp_path, "viewpoint_graph.json", new_graph)
+    rep = A.audit(hist_p, graph_p)
+    m = rep["metrics"]
+    # id-based: both old ids absent (new ids unrelated) → trivially 1.0 (false positive).
+    assert m["outdoor_pruning_recall"] == 1.0
+    # position-based: outdoor spot empty ✓, indoor spot still populated ✗ → 0.5.
+    assert m["outdoor_pruning_recall_pos"] == 0.5
+
+
 def test_partial_improvement(tmp_path):
     """Mixed outcome: 1 of 2 deletes pruned, 1 of 2 fills met, 0 of 1 forced edge resolved."""
     history = [

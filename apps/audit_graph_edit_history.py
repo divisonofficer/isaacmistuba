@@ -62,6 +62,30 @@ def _deleted_node_ids(events: list[dict]) -> set[str]:
     return deleted
 
 
+def _deleted_node_positions(events: list[dict]) -> list[tuple[str, float, float]]:
+    """Human-deleted nodes resolved to (id, x, y) using the event's deleted_nodes snapshot.
+
+    The render_daemon's DELETE handler resolves each requested id to a record
+    (id + position + extras) BEFORE removal and records it under
+    ``event.deleted_nodes``. Events written before that schema (or events that
+    failed to resolve an id) are skipped from the position list — they still
+    contribute to the id-based recall via ``_deleted_node_ids``.
+    """
+    out: list[tuple[str, float, float]] = []
+    seen: set[str] = set()
+    for ev in events:
+        if ev.get("operation") != "delete_nodes":
+            continue
+        for rec in ev.get("deleted_nodes") or []:
+            nid = str(rec.get("id") or "")
+            pos = rec.get("position") or []
+            if len(pos) < 2 or nid in seen:
+                continue
+            seen.add(nid)
+            out.append((nid, float(pos[0]), float(pos[1])))
+    return out
+
+
 def _added_node_positions(events: list[dict]) -> list[tuple[str, float, float]]:
     """Human-added nodes: (added_id, x, y)."""
     out: list[tuple[str, float, float]] = []
@@ -159,10 +183,12 @@ def audit(
     *,
     fill_eps_m: float = 0.25,
     endpoint_eps_m: float = 0.30,
+    prune_eps_m: float = 0.25,
 ) -> dict:
     events = _events(history_path)
     baseline = _baseline_counts(events)
     deleted_ids = _deleted_node_ids(events)
+    deleted_pos = _deleted_node_positions(events)
     added = _added_node_positions(events)
     forced = _forced_edges(events)
 
@@ -171,12 +197,23 @@ def audit(
     edge_pairs = _graph_edge_pairs(graph)
     node_ids = set(node_pos.keys())
 
-    # 1) outdoor_pruning_recall: deleted ids the new graph also doesn't have.
-    #    Only meaningful when the new graph reuses the OLD id scheme — for a
-    #    rebuilt graph with new ids this falls back to "any deletion the new
-    #    graph isn't carrying", which still holds as a recall bound.
+    # 1a) outdoor_pruning_recall (id-based): deleted ids the new graph doesn't carry.
+    #     Honest only when the new graph reuses the OLD id scheme. After a re-import
+    #     the id space changes and this trivially hits 1.0 — use the position-based
+    #     variant below for that case.
     pruned = sum(1 for nid in deleted_ids if nid not in node_ids)
     outdoor_recall = pruned / len(deleted_ids) if deleted_ids else None
+
+    # 1b) outdoor_pruning_recall_pos (position-based): for each deleted position
+    #     (resolved from the event's deleted_nodes snapshot), does the new graph
+    #     have NO node within prune_eps_m? "Yes" = algorithm correctly pruned the
+    #     spot. This survives a re-import (new ids) and is the metric to use when
+    #     comparing OLD vs NEW algorithm.
+    pruned_pos = sum(
+        1 for (_id, x, y) in deleted_pos
+        if _nearest_node_within(node_pos, x, y, prune_eps_m) is None
+    )
+    outdoor_recall_pos = pruned_pos / len(deleted_pos) if deleted_pos else None
 
     # 2) rug_fill_recall: human-added positions that the new graph fills with a
     #    node within fill_eps_m.
@@ -206,16 +243,19 @@ def audit(
         "new_graph_counts": {"nodes": len(node_ids), "edges": len(edge_pairs)},
         "summary": {
             "deleted_nodes": len(deleted_ids),
+            "deleted_nodes_with_positions": len(deleted_pos),
             "added_nodes": len(added),
             "forced_edges_blocked": len(forced),
         },
         "metrics": {
             "outdoor_pruning_recall": _round(outdoor_recall),
+            "outdoor_pruning_recall_pos": _round(outdoor_recall_pos),
             "rug_fill_recall": _round(fill_recall),
             "carving_relaxation_rate": _round(relaxation_rate),
         },
         "details": {
             "outdoor_pruned": pruned,
+            "outdoor_pruned_pos": pruned_pos,
             "rug_filled": filled,
             "carving_relaxed": relaxed,
             "carving_endpoints_matched": matched_endpoints,
@@ -223,6 +263,7 @@ def audit(
         "params": {
             "fill_eps_m": fill_eps_m,
             "endpoint_eps_m": endpoint_eps_m,
+            "prune_eps_m": prune_eps_m,
         },
     }
 
@@ -244,11 +285,12 @@ def _print_table(report: dict) -> None:
     print(f"history events: {report['history_events']}  baseline build: {report['baseline_build']}")
     print(f"new graph: nodes={report['new_graph_counts']['nodes']}  edges={report['new_graph_counts']['edges']}")
     print()
-    print(f"{'metric':<28} {'value':>8}  detail")
-    print(f"{'-' * 28} {'-' * 8}  {'-' * 30}")
-    print(f"{'outdoor_pruning_recall':<28} {str(m['outdoor_pruning_recall']):>8}  {d['outdoor_pruned']}/{s['deleted_nodes']} deleted node-ids absent")
-    print(f"{'rug_fill_recall':<28} {str(m['rug_fill_recall']):>8}  {d['rug_filled']}/{s['added_nodes']} manual additions met by auto node within {report['params']['fill_eps_m']}m")
-    print(f"{'carving_relaxation_rate':<28} {str(m['carving_relaxation_rate']):>8}  {d['carving_relaxed']}/{s['forced_edges_blocked']} blocked-edges now auto-connected ({d['carving_endpoints_matched']} endpoint-pairs matched)")
+    print(f"{'metric':<32} {'value':>8}  detail")
+    print(f"{'-' * 32} {'-' * 8}  {'-' * 40}")
+    print(f"{'outdoor_pruning_recall (id)':<32} {str(m['outdoor_pruning_recall']):>8}  {d['outdoor_pruned']}/{s['deleted_nodes']} deleted ids absent (same-id-scheme only)")
+    print(f"{'outdoor_pruning_recall_pos':<32} {str(m['outdoor_pruning_recall_pos']):>8}  {d['outdoor_pruned_pos']}/{s['deleted_nodes_with_positions']} deleted positions empty within {report['params']['prune_eps_m']}m (re-import safe)")
+    print(f"{'rug_fill_recall':<32} {str(m['rug_fill_recall']):>8}  {d['rug_filled']}/{s['added_nodes']} manual adds met by auto node within {report['params']['fill_eps_m']}m")
+    print(f"{'carving_relaxation_rate':<32} {str(m['carving_relaxation_rate']):>8}  {d['carving_relaxed']}/{s['forced_edges_blocked']} blocked-edges now auto-connected ({d['carving_endpoints_matched']} endpoint-pairs matched)")
 
 
 def main() -> int:
@@ -259,6 +301,8 @@ def main() -> int:
     ap.add_argument("--history", default=None, help="Path to graph_edit_history.jsonl (default: scene's current).")
     ap.add_argument("--fill-eps-m", type=float, default=0.25)
     ap.add_argument("--endpoint-eps-m", type=float, default=0.30)
+    ap.add_argument("--prune-eps-m", type=float, default=0.25,
+                    help="position-based outdoor: a deleted spot counts as pruned when no node within this radius.")
     ap.add_argument("--json", action="store_true", help="Emit JSON to stdout instead of the human table.")
     args = ap.parse_args()
 
@@ -276,6 +320,7 @@ def main() -> int:
     report = audit(
         history_path, graph_path,
         fill_eps_m=args.fill_eps_m, endpoint_eps_m=args.endpoint_eps_m,
+        prune_eps_m=args.prune_eps_m,
     )
     if args.json:
         print(json.dumps(report, ensure_ascii=False, indent=2))
