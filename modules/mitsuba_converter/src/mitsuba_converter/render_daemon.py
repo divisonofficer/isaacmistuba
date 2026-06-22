@@ -3940,6 +3940,21 @@ class RenderDaemon:
         self._job_status_cache_ts: float = 0.0
         self._bundle_manifest_cache: list[Any] | None = None
         self._bundle_manifest_cache_ts: float = 0.0
+        # Per-path (mtime, parsed) index so the bridge_jobs scans don't
+        # re-deserialize unchanged (terminal) jobs every refresh — the full
+        # re-read dominated startup/request latency on the CIFS mount with
+        # thousands of accumulated jobs. TTLs are env-tunable for slow mounts.
+        self._job_status_index: dict[str, tuple[float, Any]] = {}
+        self._bundle_manifest_index: dict[str, tuple[float, Any]] = {}
+
+        def _env_float(name: str, default: float) -> float:
+            try:
+                return max(0.0, float(os.environ.get(name, "").strip() or default))
+            except (TypeError, ValueError):
+                return default
+
+        self._job_status_ttl_s: float = _env_float("ROBOMITUBA_JOB_SCAN_TTL_S", 5.0)
+        self._bundle_manifest_ttl_s: float = _env_float("ROBOMITUBA_BUNDLE_SCAN_TTL_S", 5.0)
         self._session_inventory_cache: list[Any] | None = None
         self._session_inventory_cache_ts: float = 0.0
         self._geometry_bounds_cache: dict[str, dict[str, Any] | None] = {}
@@ -3974,6 +3989,8 @@ class RenderDaemon:
 
         self._graph_build_progress: dict[str, dict[str, Any]] = {}
         self._graph_build_lock = threading.Lock()
+        self._graph_edit_locks: dict[tuple[str, str], threading.RLock] = {}
+        self._graph_edit_locks_lock = threading.Lock()
 
         self._job_status_subscribers: set[_JobStatusSubscriber] = set()
         self._job_status_sub_lock = threading.Lock()
@@ -4002,6 +4019,188 @@ class RenderDaemon:
         asset_root = Path(__file__).resolve().parent
         self._static_dir = asset_root / "static"
         self._spa_dir = asset_root / "static" / "app"
+
+    def _opticalnav_graph_edit_lock(self, project_dir: Path, scene_id: str) -> threading.RLock:
+        key = (str(Path(project_dir).resolve()), str(scene_id))
+        with self._graph_edit_locks_lock:
+            lock = self._graph_edit_locks.get(key)
+            if lock is None:
+                lock = threading.RLock()
+                self._graph_edit_locks[key] = lock
+            return lock
+
+    @staticmethod
+    def _bump_viewpoint_graph_revision(graph: Any, client_op_ids: Sequence[str] = ()) -> tuple[int, int]:
+        meta = dict(getattr(graph, "metadata", None) or {})
+        try:
+            before = int(meta.get("revision", 0) or 0)
+        except (TypeError, ValueError):
+            before = 0
+        after = before + 1
+        meta["revision"] = after
+        if client_op_ids:
+            existing = [str(item) for item in (meta.get("applied_client_op_ids") or []) if item]
+            seen = set(existing)
+            for op_id in client_op_ids:
+                if op_id and op_id not in seen:
+                    existing.append(op_id)
+                    seen.add(op_id)
+            meta["applied_client_op_ids"] = existing[-500:]
+        graph.metadata = meta
+        return before, after
+
+    def _apply_opticalnav_graph_edits(
+        self,
+        handler: BaseHTTPRequestHandler,
+        project_dir: Path,
+        scene_id: str,
+        payload: Mapping[str, Any],
+    ) -> tuple[HTTPStatus, dict[str, Any]]:
+        from navigation_dataset.graph_edit_log import edge_record as _erec, graph_size as _gsz, node_record as _nrec
+        from navigation_dataset.viewpoint_graph import (
+            append_edge,
+            find_edge_by_endpoints,
+            read_viewpoint_graph,
+            remove_edge,
+            write_viewpoint_graph,
+        )
+
+        scene_dir = project_dir / "scenes" / scene_id
+        graph_path = scene_dir / "viewpoint_graph.json"
+        if not graph_path.exists():
+            return HTTPStatus.NOT_FOUND, {"error": "viewpoint_graph.json not found"}
+        raw_ops = payload.get("ops")
+        if not isinstance(raw_ops, list) or not raw_ops:
+            return HTTPStatus.BAD_REQUEST, {"error": "graph edits require a non-empty ops list"}
+        client_batch_id = _maybe_str(payload.get("client_batch_id"))
+
+        with self._opticalnav_graph_edit_lock(project_dir, scene_id):
+            graph = read_viewpoint_graph(graph_path)
+            meta = dict(getattr(graph, "metadata", None) or {})
+            try:
+                revision_before = int(meta.get("revision", 0) or 0)
+            except (TypeError, ValueError):
+                revision_before = 0
+            applied_ids = [str(item) for item in (meta.get("applied_client_op_ids") or []) if item]
+            applied_set = set(applied_ids)
+            new_applied_ids: list[str] = []
+            results: list[dict[str, Any]] = []
+            log_events: list[dict[str, Any]] = []
+            changed = False
+
+            for raw in raw_ops:
+                if not isinstance(raw, Mapping):
+                    results.append({"ok": False, "error": "op must be an object"})
+                    continue
+                op_type = str(raw.get("type") or "")
+                client_op_id = _maybe_str(raw.get("client_op_id"))
+                if client_op_id and client_op_id in applied_set:
+                    results.append({"client_op_id": client_op_id, "ok": True, "duplicate_client_op": True})
+                    continue
+
+                if op_type == "add_edge":
+                    source = str(raw.get("source") or "")
+                    target = str(raw.get("target") or "")
+                    if not source or not target or source == target:
+                        results.append({"client_op_id": client_op_id, "ok": False, "type": op_type, "error": "source/target node ids required and must differ"})
+                        continue
+                    before = _gsz(graph)
+                    existing = find_edge_by_endpoints(graph, source, target)
+                    try:
+                        distance_m = float(raw["distance_m"]) if raw.get("distance_m") is not None else None
+                        weight = float(raw["weight"]) if raw.get("weight") is not None else None
+                    except (TypeError, ValueError):
+                        results.append({"client_op_id": client_op_id, "ok": False, "type": op_type, "source": source, "target": target, "error": "distance_m/weight must be numeric"})
+                        continue
+                    edge = append_edge(graph, source, target, distance_m=distance_m, weight=weight)
+                    if edge is None:
+                        results.append({"client_op_id": client_op_id, "ok": False, "type": op_type, "source": source, "target": target, "error": "Could not append edge (unknown source/target?)"})
+                        continue
+                    is_new = existing is None
+                    changed = changed or is_new
+                    if client_op_id:
+                        new_applied_ids.append(client_op_id)
+                        applied_set.add(client_op_id)
+                    results.append({
+                        "client_op_id": client_op_id,
+                        "ok": True,
+                        "type": op_type,
+                        "edge_id": edge.edge_id,
+                        "source": edge.source,
+                        "target": edge.target,
+                        "distance_m": edge.distance_m,
+                        "duplicate_edge": not is_new,
+                    })
+                    log_events.append({
+                        "operation": "add_edge",
+                        "graph_id": getattr(graph, "graph_id", None),
+                        "client_batch_id": client_batch_id,
+                        "client_op_id": client_op_id,
+                        "revision_before": revision_before,
+                        "before": before,
+                        "after": _gsz(graph),
+                        "params": {"source": source, "target": target, "distance_m": raw.get("distance_m"), "weight": raw.get("weight")},
+                        "added_edge": {
+                            "id": edge.edge_id,
+                            "source": edge.source,
+                            "target": edge.target,
+                            "source_pos": (_nrec(graph, edge.source) or {}).get("position"),
+                            "target_pos": (_nrec(graph, edge.target) or {}).get("position"),
+                            "distance_m": edge.distance_m,
+                            "duplicate_edge": not is_new,
+                        },
+                    })
+                    continue
+
+                if op_type == "delete_edge":
+                    edge_id = str(raw.get("edge_id") or "")
+                    if not edge_id:
+                        results.append({"client_op_id": client_op_id, "ok": False, "type": op_type, "error": "edge_id required"})
+                        continue
+                    before = _gsz(graph)
+                    rec = _erec(graph, edge_id)
+                    ok = remove_edge(graph, edge_id)
+                    if not ok:
+                        results.append({"client_op_id": client_op_id, "ok": False, "type": op_type, "edge_id": edge_id, "error": f"edge_id not found: {edge_id}"})
+                        continue
+                    changed = True
+                    if client_op_id:
+                        new_applied_ids.append(client_op_id)
+                        applied_set.add(client_op_id)
+                    results.append({"client_op_id": client_op_id, "ok": True, "type": op_type, "edge_id": edge_id, "deleted": True})
+                    log_events.append({
+                        "operation": "delete_edge",
+                        "graph_id": getattr(graph, "graph_id", None),
+                        "client_batch_id": client_batch_id,
+                        "client_op_id": client_op_id,
+                        "revision_before": revision_before,
+                        "before": before,
+                        "after": _gsz(graph),
+                        "params": {"edge_id": edge_id},
+                        "deleted_edges": [rec] if rec else [],
+                    })
+                    continue
+
+                results.append({"client_op_id": client_op_id, "ok": False, "type": op_type or None, "error": f"unsupported op type: {op_type or 'missing'}"})
+
+            if changed or new_applied_ids:
+                _rev_before, revision_after = self._bump_viewpoint_graph_revision(graph, new_applied_ids)
+                write_viewpoint_graph(graph_path, graph)
+            else:
+                revision_after = revision_before
+
+            for event in log_events:
+                event["revision_after"] = revision_after
+                _log_graph_edit(handler, project_dir, scene_id, event)
+
+            return HTTPStatus.OK, {
+                "ok": True,
+                "graph_id": getattr(graph, "graph_id", None),
+                "revision": revision_after,
+                "node_count": len(getattr(graph, "nodes", []) or []),
+                "edge_count": len(getattr(graph, "edges", []) or []),
+                "results": results,
+            }
 
     # ── Phase R: render worker subprocess wiring ────────────────────────
 
@@ -5239,7 +5438,13 @@ class RenderDaemon:
         When the daemon restarts, in-flight jobs have no live workers — they
         will never complete on their own.  Rewriting their status to 'failed'
         prevents the UI from showing them as perpetually running/pending.
+
+        Skippable via ``ROBOMITUBA_SKIP_STALE_JOB_SCAN=1`` — on a slow network
+        mount with thousands of jobs this glob delays the daemon's listen.
         """
+        if os.environ.get("ROBOMITUBA_SKIP_STALE_JOB_SCAN", "").strip().lower() in ("1", "true", "yes", "on"):
+            print("[daemon] Skipping startup stale-job scan (ROBOMITUBA_SKIP_STALE_JOB_SCAN).", flush=True)
+            return
         root = self.repo_root / "out" / "bridge_jobs"
         if not root.exists():
             return
@@ -10539,7 +10744,9 @@ class RenderDaemon:
                         "scene_variant_id": payload.get("scene_variant_id"),
                     },
                 )
-                graph_path = write_viewpoint_graph(project_dir / "scenes" / scene_id / "viewpoint_graph.json", graph)
+                with self._opticalnav_graph_edit_lock(project_dir, scene_id):
+                    self._bump_viewpoint_graph_revision(graph)
+                    graph_path = write_viewpoint_graph(project_dir / "scenes" / scene_id / "viewpoint_graph.json", graph)
                 _log_graph_edit(handler, project_dir, scene_id, {
                     "operation": "build_graph",
                     "graph_id": graph.graph_id,
@@ -10598,6 +10805,9 @@ class RenderDaemon:
             if not graph_file.exists():
                 self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": "viewpoint_graph.json not found"})
                 return True
+            _graph_mutation_lock = self._opticalnav_graph_edit_lock(project_dir, scene_id)
+            _graph_mutation_lock.acquire()
+            _graph_mutation_lock_released = False
             try:
                 graph = read_viewpoint_graph(graph_file)
                 _before_edges = len(graph.edges)
@@ -10635,7 +10845,10 @@ class RenderDaemon:
                 graph.edges = new_edges
                 meta["edges_rebuilt_at"] = _utc_now_iso()
                 graph.metadata = meta
+                self._bump_viewpoint_graph_revision(graph)
                 write_viewpoint_graph(graph_file, graph)
+                _graph_mutation_lock.release()
+                _graph_mutation_lock_released = True
                 _log_graph_edit(handler, project_dir, scene_id, {
                     "operation": "rebuild_edges",
                     "graph_id": graph.graph_id,
@@ -10655,7 +10868,13 @@ class RenderDaemon:
                     **graph_summary(graph.nodes, graph.edges, heading_count=graph.node_heading_count),
                 })
             except Exception as exc:
+                if not _graph_mutation_lock_released:
+                    _graph_mutation_lock.release()
                 self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            return True
+        if len(parts) == 5 and parts[1] == "scenes" and parts[3] == "graph" and parts[4] == "edits":
+            status, response = self._apply_opticalnav_graph_edits(handler, project_dir, parts[2], payload)
+            self._send_json(handler, status, response)
             return True
         if len(parts) == 5 and parts[1] == "scenes" and parts[3] == "graph" and parts[4] == "sweep":
             self._handle_opticalnav_graph_sweep(handler, project_dir, parts[2], payload)
@@ -10669,15 +10888,17 @@ class RenderDaemon:
                 return True
             try:
                 from navigation_dataset.graph_edit_log import graph_size as _gsz, nearest_node_distance as _nnd
-                graph = read_viewpoint_graph(graph_path)
-                _before = _gsz(graph)
-                x = float(payload.get("x", 0.0))
-                y = float(payload.get("y", 0.0))
-                node = append_manual_node(
-                    graph, x, y,
-                    heading_count=int(payload["heading_count"]) if payload.get("heading_count") is not None else None,
-                )
-                write_viewpoint_graph(graph_path, graph)
+                with self._opticalnav_graph_edit_lock(project_dir, scene_id):
+                    graph = read_viewpoint_graph(graph_path)
+                    _before = _gsz(graph)
+                    x = float(payload.get("x", 0.0))
+                    y = float(payload.get("y", 0.0))
+                    node = append_manual_node(
+                        graph, x, y,
+                        heading_count=int(payload["heading_count"]) if payload.get("heading_count") is not None else None,
+                    )
+                    self._bump_viewpoint_graph_revision(graph)
+                    write_viewpoint_graph(graph_path, graph)
                 _log_graph_edit(handler, project_dir, scene_id, {
                     "operation": "add_node",
                     "graph_id": getattr(graph, "graph_id", None),
@@ -10773,6 +10994,9 @@ class RenderDaemon:
             except (TypeError, ValueError, IndexError):
                 self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": "bbox must be [min_x, min_y, max_x, max_y]"})
                 return True
+            _graph_mutation_lock = self._opticalnav_graph_edit_lock(project_dir, scene_id)
+            _graph_mutation_lock.acquire()
+            _graph_mutation_lock_released = False
             try:
                 graph = read_viewpoint_graph(graph_path)
                 _before_edges_regen = len(graph.edges)
@@ -10829,7 +11053,10 @@ class RenderDaemon:
                         continue
                     kept_edges.append(e)
                 graph.edges = kept_edges
+                self._bump_viewpoint_graph_revision(graph)
                 write_viewpoint_graph(graph_path, graph)
+                _graph_mutation_lock.release()
+                _graph_mutation_lock_released = True
                 _log_graph_edit(handler, project_dir, scene_id, {
                     "operation": "regenerate_region",
                     "graph_id": getattr(graph, "graph_id", None),
@@ -10853,6 +11080,8 @@ class RenderDaemon:
                     "remaining_nodes": len(graph.nodes),
                 })
             except Exception as exc:
+                if not _graph_mutation_lock_released:
+                    _graph_mutation_lock.release()
                 self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
             return True
         if len(parts) == 5 and parts[1] == "scenes" and parts[3] == "graph" and parts[4] == "edge-check":
@@ -10936,7 +11165,6 @@ class RenderDaemon:
             return True
         if len(parts) == 5 and parts[1] == "scenes" and parts[3] == "graph" and parts[4] == "edges":
             # POST .../graph/edges  body: {source, target, distance_m?, weight?}
-            from navigation_dataset.viewpoint_graph import read_viewpoint_graph, write_viewpoint_graph, append_edge
             scene_id = parts[2]
             graph_path = project_dir / "scenes" / scene_id / "viewpoint_graph.json"
             if not graph_path.exists():
@@ -10947,60 +11175,30 @@ class RenderDaemon:
             if not source or not target or source == target:
                 self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": "source/target node ids required and must differ"})
                 return True
-            try:
-                from navigation_dataset.graph_edit_log import graph_size as _gsz, node_record as _nrec
-                graph = read_viewpoint_graph(graph_path)
-                _before = _gsz(graph)
-                edge = append_edge(
-                    graph, source, target,
-                    distance_m=float(payload["distance_m"]) if payload.get("distance_m") is not None else None,
-                    weight=float(payload["weight"]) if payload.get("weight") is not None else None,
-                )
-                if edge is None:
-                    self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": "Could not append edge (unknown source/target?)"})
-                    return True
-                write_viewpoint_graph(graph_path, graph)
-                # Algorithm view: would the auto edge-builder have made this connection?
-                # ("human added an edge the algorithm would have skipped" — key signal.)
-                _algo: dict[str, Any] = {"distance_m": edge.distance_m}
-                try:
-                    from navigation_dataset.traversability import load_traversability_grid, inflate_traversable_grid
-                    from navigation_dataset.edge_builder import line_cells
-                    _gp = project_dir / "scenes" / scene_id / "traversable_grid.npy"
-                    _src = next((n for n in graph.nodes if n.node_id == source), None)
-                    _tgt = next((n for n in graph.nodes if n.node_id == target), None)
-                    if _gp.exists() and _src and _tgt:
-                        _grid = load_traversability_grid(_gp)
-                        _rr = float(payload.get("robot_radius_m", 0.25) or 0.25)
-                        _maxlen = float(payload.get("max_edge_length_m", 1.5) or 1.5)
-                        _infl = inflate_traversable_grid(_grid.traversable.copy(), _rr, _grid.spec.resolution)
-                        _cells = line_cells(_grid, _src.position, _tgt.position)
-                        _w, _h = _grid.spec.width, _grid.spec.height
-                        _blocked = sum(1 for (cx, cy) in _cells if 0 <= cx < _w and 0 <= cy < _h and not _infl[cy, cx])
-                        _hazard = any(bool(_grid.hazard[cy, cx]) for (cx, cy) in _cells if 0 <= cx < _w and 0 <= cy < _h)
-                        _within = edge.distance_m <= _maxlen
-                        _ok = (_blocked == 0 and _within and not _hazard)
-                        _reason = "ok" if _ok else ("too_far" if not _within else ("blocked_by_obstacle" if _blocked else "hazard_crossing"))
-                        _algo.update({"would_auto_connect": _ok, "reason": _reason,
-                                      "blocked_cell_count": _blocked, "hazard_crossing": _hazard,
-                                      "within_max_edge_length": _within})
-                except Exception:  # noqa: BLE001 — verdict is best-effort enrichment
-                    pass
-                _log_graph_edit(handler, project_dir, scene_id, {
-                    "operation": "add_edge",
-                    "graph_id": getattr(graph, "graph_id", None),
-                    "before": _before, "after": _gsz(graph),
-                    "params": {"source": source, "target": target,
-                               "distance_m": payload.get("distance_m"), "weight": payload.get("weight")},
-                    "added_edge": {"id": edge.edge_id, "source": source, "target": target,
-                                   "source_pos": (_nrec(graph, source) or {}).get("position"),
-                                   "target_pos": (_nrec(graph, target) or {}).get("position"),
-                                   "distance_m": edge.distance_m},
-                    "algo_context": _algo,
-                })
-                self._send_json(handler, HTTPStatus.OK, {"edge_id": edge.edge_id, "source": edge.source, "target": edge.target, "distance_m": edge.distance_m})
-            except Exception as exc:
-                self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            status, response = self._apply_opticalnav_graph_edits(handler, project_dir, scene_id, {
+                "ops": [{
+                    "type": "add_edge",
+                    "source": source,
+                    "target": target,
+                    **({"distance_m": payload.get("distance_m")} if payload.get("distance_m") is not None else {}),
+                    **({"weight": payload.get("weight")} if payload.get("weight") is not None else {}),
+                }]
+            })
+            if status != HTTPStatus.OK:
+                self._send_json(handler, status, response)
+                return True
+            result = next((item for item in response.get("results", []) if item.get("ok")), None)
+            if not result:
+                err = next((item for item in response.get("results", []) if not item.get("ok")), None) or {"error": "Could not append edge"}
+                self._send_json(handler, HTTPStatus.BAD_REQUEST, err)
+                return True
+            self._send_json(handler, HTTPStatus.OK, {
+                "edge_id": result.get("edge_id"),
+                "source": result.get("source"),
+                "target": result.get("target"),
+                "distance_m": result.get("distance_m"),
+                "revision": response.get("revision"),
+            })
             return True
         if len(parts) == 5 and parts[1] == "scenes" and parts[3] == "authoring-map" and parts[4] == "compile":
             from navigation_dataset.authoring_compile import AuthoringMapCompileError, compile_authoring_map
@@ -11741,13 +11939,15 @@ class RenderDaemon:
                 return True
             try:
                 from navigation_dataset.graph_edit_log import graph_size as _gsz, node_record as _nrec
-                graph = read_viewpoint_graph(graph_path)
-                _before = _gsz(graph)
-                # Resolve node positions/provenance BEFORE removal (lost afterwards).
-                _deleted = [r for r in (_nrec(graph, nid) for nid in node_ids) if r is not None]
-                removed = remove_nodes(graph, node_ids)
-                if removed:
-                    write_viewpoint_graph(graph_path, graph)
+                with self._opticalnav_graph_edit_lock(project_dir, scene_id):
+                    graph = read_viewpoint_graph(graph_path)
+                    _before = _gsz(graph)
+                    # Resolve node positions/provenance BEFORE removal (lost afterwards).
+                    _deleted = [r for r in (_nrec(graph, nid) for nid in node_ids) if r is not None]
+                    removed = remove_nodes(graph, node_ids)
+                    if removed:
+                        self._bump_viewpoint_graph_revision(graph)
+                        write_viewpoint_graph(graph_path, graph)
                 _reason = (payload or {}).get("reason")
                 _log_graph_edit(handler, project_dir, scene_id, {
                     "operation": "delete_nodes",
@@ -11781,14 +11981,16 @@ class RenderDaemon:
                 return True
             try:
                 from navigation_dataset.graph_edit_log import graph_size as _gsz, node_record as _nrec, nearest_node_distance as _nnd
-                graph = read_viewpoint_graph(graph_path)
-                _before = _gsz(graph)
-                _rec = _nrec(graph, node_id)  # resolve BEFORE removal
-                ok = remove_node(graph, node_id)
-                if not ok:
-                    self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": f"node_id not found: {node_id}"})
-                    return True
-                write_viewpoint_graph(graph_path, graph)
+                with self._opticalnav_graph_edit_lock(project_dir, scene_id):
+                    graph = read_viewpoint_graph(graph_path)
+                    _before = _gsz(graph)
+                    _rec = _nrec(graph, node_id)  # resolve BEFORE removal
+                    ok = remove_node(graph, node_id)
+                    if not ok:
+                        self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": f"node_id not found: {node_id}"})
+                        return True
+                    self._bump_viewpoint_graph_revision(graph)
+                    write_viewpoint_graph(graph_path, graph)
                 _pos = (_rec or {}).get("position") or [None, None]
                 _log_graph_edit(handler, project_dir, scene_id, {
                     "operation": "delete_node",
@@ -11808,38 +12010,29 @@ class RenderDaemon:
                 self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
             return True
         if len(parts) == 6 and parts[1] == "scenes" and parts[3] == "graph" and parts[4] == "edges":
-            from navigation_dataset.viewpoint_graph import read_viewpoint_graph, write_viewpoint_graph, remove_edge
             scene_id = parts[2]
             edge_id = parts[5]
             graph_path = project_dir / "scenes" / scene_id / "viewpoint_graph.json"
             if not graph_path.exists():
                 self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": "viewpoint_graph.json not found"})
                 return True
-            try:
-                from navigation_dataset.graph_edit_log import graph_size as _gsz, edge_record as _erec
-                graph = read_viewpoint_graph(graph_path)
-                _before = _gsz(graph)
-                _rec = _erec(graph, edge_id)  # resolve endpoints BEFORE removal
-                ok = remove_edge(graph, edge_id)
-                if not ok:
-                    self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": f"edge_id not found: {edge_id}"})
-                    return True
-                write_viewpoint_graph(graph_path, graph)
-                _log_graph_edit(handler, project_dir, scene_id, {
-                    "operation": "delete_edge",
-                    "graph_id": getattr(graph, "graph_id", None),
-                    "before": _before, "after": _gsz(graph),
-                    "params": {"edge_id": edge_id},
-                    "deleted_edges": [_rec] if _rec else [],
-                    "algo_context": {
-                        "was_manual": bool(((_rec or {}).get("extras") or {}).get("manual")),
-                        "collision_free": (_rec or {}).get("collision_free"),
-                        "hazard_crossing": (_rec or {}).get("hazard_crossing"),
-                    },
-                })
-                self._send_json(handler, HTTPStatus.OK, {"ok": True, "removed": edge_id, "remaining_edges": len(graph.edges)})
-            except Exception as exc:
-                self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            status, response = self._apply_opticalnav_graph_edits(handler, project_dir, scene_id, {
+                "ops": [{"type": "delete_edge", "edge_id": edge_id}]
+            })
+            if status != HTTPStatus.OK:
+                self._send_json(handler, status, response)
+                return True
+            result = next((item for item in response.get("results", []) if item.get("ok")), None)
+            if not result:
+                err = next((item for item in response.get("results", []) if not item.get("ok")), None) or {"error": f"edge_id not found: {edge_id}"}
+                self._send_json(handler, HTTPStatus.NOT_FOUND, err)
+                return True
+            self._send_json(handler, HTTPStatus.OK, {
+                "ok": True,
+                "removed": edge_id,
+                "remaining_edges": response.get("edge_count"),
+                "revision": response.get("revision"),
+            })
             return True
         if len(parts) == 4 and parts[1] == "scenes" and parts[3] == "walkability-overlay":
             scene_id = parts[2]
@@ -11905,26 +12098,26 @@ class RenderDaemon:
             node_ids_filter = {str(n) for n in raw_ids}
 
         try:
-            graph = read_viewpoint_graph(graph_path)
+            with self._opticalnav_graph_edit_lock(project_dir, scene_id):
+                graph = read_viewpoint_graph(graph_path)
+                obs_root = project_dir / "scenes" / scene_id / "observations"
+                cleared_nodes: list[str] = []
+                for node in graph.nodes:
+                    if node_ids_filter is not None and node.node_id not in node_ids_filter:
+                        continue
+                    had_obs = any(heading.sensor_observations for heading in node.headings)
+                    for heading in node.headings:
+                        heading.sensor_observations = {}
+                    node_obs_dir = obs_root / node.node_id
+                    if node_obs_dir.exists():
+                        shutil.rmtree(node_obs_dir, ignore_errors=True)
+                    if had_obs:
+                        cleared_nodes.append(node.node_id)
+                self._bump_viewpoint_graph_revision(graph)
+                write_viewpoint_graph(graph_path, graph)
         except Exception as exc:
             self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
             return
-
-        obs_root = project_dir / "scenes" / scene_id / "observations"
-        cleared_nodes: list[str] = []
-        for node in graph.nodes:
-            if node_ids_filter is not None and node.node_id not in node_ids_filter:
-                continue
-            had_obs = any(heading.sensor_observations for heading in node.headings)
-            for heading in node.headings:
-                heading.sensor_observations = {}
-            node_obs_dir = obs_root / node.node_id
-            if node_obs_dir.exists():
-                shutil.rmtree(node_obs_dir, ignore_errors=True)
-            if had_obs:
-                cleared_nodes.append(node.node_id)
-
-        write_viewpoint_graph(graph_path, graph)
         self._send_json(handler, HTTPStatus.OK, {
             "cleared_nodes": len(cleared_nodes),
             "node_ids": cleared_nodes,
@@ -15939,9 +16132,16 @@ class RenderDaemon:
         return pending, jobs, cache_stats
 
     def _status_file_records(self) -> dict[str, RenderJobStatus]:
-        """Read job_status.json files from disk with a 2-second TTL cache."""
+        """Read job_status.json files, TTL-cached and mtime-incremental.
+
+        On a cache miss we re-glob the job dirs but only re-deserialize files
+        whose mtime changed since last seen (terminal jobs never change, so
+        they are parsed once and reused). This keeps the scan cheap even with
+        thousands of jobs on a slow network mount. TTL via
+        ``ROBOMITUBA_JOB_SCAN_TTL_S``.
+        """
         now = time.monotonic()
-        if self._job_status_cache is not None and (now - self._job_status_cache_ts) < 2.0:
+        if self._job_status_cache is not None and (now - self._job_status_cache_ts) < self._job_status_ttl_s:
             return self._job_status_cache  # type: ignore[return-value]
         records: dict[str, RenderJobStatus] = {}
         root = self.repo_root / "out" / "bridge_jobs"
@@ -15949,12 +16149,29 @@ class RenderDaemon:
             self._job_status_cache = records
             self._job_status_cache_ts = now
             return records
+        index = self._job_status_index
+        seen: set[str] = set()
         for status_path in root.glob("*/job_status.json"):
+            key = str(status_path)
+            seen.add(key)
             try:
-                status = read_render_job_status(status_path)
-            except Exception:
+                mtime = status_path.stat().st_mtime
+            except OSError:
                 continue
+            cached = index.get(key)
+            if cached is not None and cached[0] == mtime:
+                status = cached[1]
+            else:
+                try:
+                    status = read_render_job_status(status_path)
+                except Exception:
+                    continue
+                index[key] = (mtime, status)
             records[status.job_id] = status
+        # Forget index entries whose files were archived/removed.
+        if len(index) > len(seen):
+            for key in [k for k in index if k not in seen]:
+                index.pop(key, None)
         self._job_status_cache = records
         self._job_status_cache_ts = now
         return records
@@ -16265,12 +16482,19 @@ class RenderDaemon:
         return checks
 
     def _bundle_manifests(self, *, force_refresh: bool = False) -> list[ObservationBundleManifest]:
-        """Glob + deserialize observation bundle manifests with a 3-second TTL cache."""
+        """Glob observation bundle manifests, TTL-cached and mtime-incremental.
+
+        The nested ``*/observations/*/manifest.json`` glob over thousands of
+        jobs plus deserializing each was the single slowest control-plane scan
+        on the CIFS mount (~2 min cold). The per-path index reuses parsed
+        manifests for files whose mtime is unchanged. TTL via
+        ``ROBOMITUBA_BUNDLE_SCAN_TTL_S``.
+        """
         now = time.monotonic()
         if (
             not force_refresh
             and self._bundle_manifest_cache is not None
-            and (now - self._bundle_manifest_cache_ts) < 3.0
+            and (now - self._bundle_manifest_cache_ts) < self._bundle_manifest_ttl_s
         ):
             return self._bundle_manifest_cache  # type: ignore[return-value]
         root = self.repo_root / "out" / "bridge_jobs"
@@ -16279,12 +16503,30 @@ class RenderDaemon:
             self._bundle_manifest_cache = result
             self._bundle_manifest_cache_ts = now
             return result
+        index = self._bundle_manifest_index
+        seen: set[str] = set()
         bundles: list[ObservationBundleManifest] = []
         for manifest_path in root.glob("*/observations/*/manifest.json"):
+            key = str(manifest_path)
+            seen.add(key)
             try:
-                bundles.append(read_observation_bundle_manifest(manifest_path))
-            except Exception:
+                mtime = manifest_path.stat().st_mtime
+            except OSError:
                 continue
+            cached = index.get(key)
+            if cached is not None and cached[0] == mtime:
+                bundles.append(cached[1])
+            else:
+                try:
+                    bundle = read_observation_bundle_manifest(manifest_path)
+                except Exception:
+                    continue
+                index[key] = (mtime, bundle)
+                bundles.append(bundle)
+        # Forget index entries whose files were archived/removed.
+        if len(index) > len(seen):
+            for key in [k for k in index if k not in seen]:
+                index.pop(key, None)
         bundles.sort(key=lambda item: _safe_sort_ts(item.timestamp), reverse=True)
         self._bundle_manifest_cache = bundles
         self._bundle_manifest_cache_ts = now
