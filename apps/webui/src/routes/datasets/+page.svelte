@@ -91,6 +91,8 @@
 		materialPreviewSource,
 		materialDisplayLabel,
 		materialInfo,
+		findAuthoringMaterial,
+		customMaterialInfo,
 		ensureAuthoringMaterial,
 		buildMaterialCards,
 		filterMaterialCards,
@@ -983,7 +985,17 @@
 				: ''
 	);
 	const selectedMaterialSuggestion = $derived(materialSuggestion(selectedAuthoringItem));
-	const selectedMaterialInfo = $derived(materialInfo(selectedAuthoringItem?.material, assetVM.materialGroups));
+	// Per-scene (Infinigen) material entry — carries inline render_binding/optical_class
+	// that the global catalog has no record of.
+	const selectedMaterialEntry = $derived(
+		findAuthoringMaterial(selectedAuthoringItem?.material, authoringMap?.materials ?? [])
+	);
+	const selectedMaterialInfo = $derived.by(() => {
+		const base = materialInfo(selectedAuthoringItem?.material, assetVM.materialGroups);
+		// Catalog miss (custom) → surface the per-scene render_binding info instead.
+		if (base && base.kind === 'custom') return customMaterialInfo(selectedMaterialEntry) ?? base;
+		return base;
+	});
 	// materialCards, materialCollections, usdAssetSelectionPool, usdAssetCandidates,
 	// selectedUsdAsset → assetVM
 	const materialCollections = $derived(
@@ -4312,7 +4324,7 @@
 					itemKind={selectedAuthoringKind}
 					dirty={authoringMapDirty}
 					{inspectorError} {inspectorTab}
-						materialGroups={assetVM.materialGroups} {selectedMaterialInfo} {selectedMaterialSuggestion}
+						materialGroups={assetVM.materialGroups} {selectedMaterialInfo} {selectedMaterialEntry} {selectedMaterialSuggestion}
 					{materialPickerSearch} {materialPickerCollection} {materialPickerCategory}
 					{filteredMaterialCards} {materialCollections} {materialPreviewEntry}
 						{materialPreviewValue} materialLibraryStatus={assetVM.materialLibraryStatus}
@@ -4641,7 +4653,7 @@
 				itemId={selectedAuthoringId}
 				dirty={authoringMapDirty}
 				{inspectorTab} {inspectorError}
-					materialGroups={assetVM.materialGroups} {selectedMaterialInfo} {selectedMaterialSuggestion}
+					materialGroups={assetVM.materialGroups} {selectedMaterialInfo} {selectedMaterialEntry} {selectedMaterialSuggestion}
 				{materialPickerSearch} {materialPickerCollection} {materialPickerCategory}
 				{filteredMaterialCards} {materialCollections} {materialPreviewEntry}
 					{materialPreviewValue} materialLibraryStatus={assetVM.materialLibraryStatus}

@@ -181,6 +181,68 @@ export function materialInfo(
 	};
 }
 
+// ── Per-scene (authoring-map) materials not in the global catalog ─────────────
+// Infinigen-imported materials carry their full render_binding inline
+// (bsdf_strategy, optical_class, baked albedo) but have no catalog id, so
+// findMaterialOption misses them and the picker shows "custom / none". These
+// helpers surface that inline info + a baked-atlas thumbnail instead.
+
+const OPTICAL_CLASS_LABEL: Record<string, string> = {
+	diffuse: 'Diffuse', mirror: 'Mirror', glass: 'Glass',
+	metal_aluminum: 'Metal', metal_gold: 'Metal · gold', metal_steel: 'Metal · steel',
+};
+const BSDF_STRATEGY_LABEL: Record<string, string> = {
+	pplastic: 'pplastic', roughplastic: 'roughplastic', conductor: 'mirror',
+	dielectric: 'glass', roughdielectric: 'frosted glass',
+	measured_polarized: 'measured pBRDF', measured: 'measured', diffuse: 'diffuse',
+};
+
+/** Find the per-scene authoring material entry (with inline render_binding) by id. */
+export function findAuthoringMaterial(materialId: string | null | undefined, authoringMaterials: any[]) {
+	if (!materialId || !Array.isArray(authoringMaterials)) return null;
+	return authoringMaterials.find((m: any) => m?.material_id === materialId) ?? null;
+}
+
+/** Build display info (label + optical class + BSDF + polarization) from a per-scene material entry. */
+export function customMaterialInfo(entry: any) {
+	if (!entry) return null;
+	const rb = entry.render_binding ?? {};
+	const pbr = entry.params?.pbr ?? {};
+	const oc = String(pbr.optical_class ?? '');
+	const strat = String(rb.bsdf_strategy ?? '');
+	const polarization = !!(rb.capabilities?.polarization);
+	const baseColor = (rb.base_color_factor ?? pbr.base_color ?? null) as number[] | null;
+	const opticalClassLabel = OPTICAL_CLASS_LABEL[oc] ?? (oc || 'custom');
+	const bsdfLabel = BSDF_STRATEGY_LABEL[strat] ?? (strat || 'custom');
+	const detailBits = [opticalClassLabel, bsdfLabel];
+	if (polarization) detailBits.push('polarization');
+	return {
+		kind: 'scene',
+		label: String(entry.material_id ?? '').replace(/^shader_/, '').replace(/\.\d+$/, ''),
+		detail: detailBits.join(' · '),
+		opticalClass: oc, opticalClassLabel,
+		bsdfStrategy: strat, bsdfLabel,
+		polarization, baseColor,
+	};
+}
+
+/** CSS rgb() string from a linear [0,1] color triple, or '' when unavailable. */
+export function rgbCss(c: number[] | null | undefined): string {
+	if (!Array.isArray(c) || c.length < 3) return '';
+	const f = (x: number) => Math.max(0, Math.min(255, Math.round(Number(x) * 255)));
+	return `rgb(${f(c[0])}, ${f(c[1])}, ${f(c[2])})`;
+}
+
+/** Derive the baked-albedo atlas artifact URL from an object's `source_ref`.
+ *  "<import>/meshes/<oid>.obj" -> "/artifacts?path=<import>/textures/<oid>_albedo.png".
+ *  Returns '' when the ref doesn't match (the <img> 404s gracefully to the swatch). */
+export function bakedAtlasArtifactUrl(sourceRef: string | null | undefined): string {
+	if (!sourceRef) return '';
+	const m = String(sourceRef).match(/^(.*)\/meshes\/(.+)\.obj$/);
+	if (!m) return '';
+	return `/artifacts?path=${encodeURIComponent(`${m[1]}/textures/${m[2]}_albedo.png`)}`;
+}
+
 export function ensureAuthoringMaterial(
 	materialId: string,
 	materials: any[],

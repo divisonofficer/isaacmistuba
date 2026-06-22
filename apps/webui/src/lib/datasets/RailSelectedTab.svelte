@@ -1,5 +1,7 @@
 <script lang="ts">
-	import { materialPreviewSource, materialDisplayLabel } from '$lib/datasets/materialHelpers';
+	import {
+		materialPreviewSource, materialDisplayLabel, bakedAtlasArtifactUrl, rgbCss,
+	} from '$lib/datasets/materialHelpers';
 
 	interface Props {
 		item: any;
@@ -10,6 +12,7 @@
 		inspectorError: string;
 		materialGroups: any[];
 		selectedMaterialInfo: any;
+		selectedMaterialEntry?: any;
 		selectedMaterialSuggestion: string;
 		materialPickerSearch: string;
 		materialPickerCollection: string;
@@ -49,7 +52,7 @@
 
 	let {
 		item, itemKind, itemId, dirty, inspectorTab, inspectorError,
-		materialGroups, selectedMaterialInfo, selectedMaterialSuggestion,
+		materialGroups, selectedMaterialInfo, selectedMaterialEntry, selectedMaterialSuggestion,
 		materialPickerSearch, materialPickerCollection, materialPickerCategory,
 		filteredMaterialCards, materialCollections, materialPreviewEntry,
 		materialPreviewValue, materialLibraryStatus,
@@ -91,13 +94,19 @@
 			<div class="material-summary-row">
 				{#if materialPreviewSource(item.material, materialGroups)}
 					<img src={materialPreviewSource(item.material, materialGroups)} alt="" loading="lazy" />
+				{:else if selectedMaterialEntry}
+					{@const sw = rgbCss(selectedMaterialEntry.render_binding?.base_color_factor ?? selectedMaterialEntry.params?.pbr?.base_color)}
+					{@const atlas = bakedAtlasArtifactUrl(item.source_ref)}
+					<span class="material-scene-thumb" style={sw ? `background:${sw}` : ''}>
+						{#if atlas}<img src={atlas} alt="" loading="lazy" onerror={(e) => ((e.currentTarget as HTMLImageElement).style.display = 'none')} />{/if}
+					</span>
 				{:else}
 					<span class="material-empty-thumb">none</span>
 				{/if}
 				<div>
 					<div class="material-mini-label">Material</div>
 					<strong>{materialDisplayLabel(item.material, materialGroups)}</strong>
-					<small>{selectedMaterialInfo?.kind ?? 'preset/custom'}</small>
+					<small>{selectedMaterialInfo?.detail ?? selectedMaterialInfo?.kind ?? 'preset/custom'}</small>
 				</div>
 				<button class="button button-subtle" onclick={() => onSetInspectorTab('material')}>Change</button>
 			</div>
@@ -462,13 +471,26 @@
 		}
 
 	.material-summary-row img,
-		.material-empty-thumb {
+		.material-empty-thumb,
+		.material-scene-thumb {
 			width: 44px;
 			height: 44px;
 			border-radius: var(--radius-sm);
 			object-fit: cover;
 			background: #f1f5f9;
 			border: 1px solid var(--panel-border);
+		}
+
+	.material-scene-thumb {
+			display: inline-block;
+			overflow: hidden;
+			position: relative;
+		}
+	.material-scene-thumb img {
+			width: 100%;
+			height: 100%;
+			object-fit: cover;
+			display: block;
 		}
 
 	.material-empty-thumb {
