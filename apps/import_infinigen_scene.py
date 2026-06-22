@@ -121,10 +121,13 @@ def _material_binding(mat: dict) -> dict:
         if images and images[0].get("filepath"):
             binding["base_color_texture_ref"] = images[0]["filepath"]
     else:  # diffuse
-        binding = {"kind": "preset", "bsdf_strategy": "roughplastic",
-                   # Render-time PBR the XML emitter understands (textured roughplastic).
+        # Polarized plastic (pplastic): texturable diffuse_reflectance keeps the baked
+        # albedo, and it emits a polarization signal in the polarized variant — unlike
+        # roughplastic — without needing measured data or the optix7 Phase-0 build.
+        binding = {"kind": "preset", "bsdf_strategy": "pplastic",
+                   # Render-time PBR the XML emitter understands (textured pplastic).
                    "base_color_factor": base, "roughness": rough, "metallic": metallic,
-                   "capabilities": {"rgb": True}}
+                   "capabilities": {"rgb": True, "polarization": True}}
         if images and images[0].get("filepath"):
             binding["base_color_texture_ref"] = images[0]["filepath"]
 
