@@ -1001,8 +1001,19 @@ def _append_bsdf_xml(
         and extracted_material.get("base_color_texture_ref")
     )
     if extracted_material and ((prefer_source_texture and not measured_channels_dir) or not measured_binding):
-        if _append_extracted_bsdf_xml(shape, extracted_material, fallback_color=fallback_color, repo_root=repo_root):
+        # Diffuse surfaces bound to `pplastic` keep their baked albedo but render
+        # through the polarized-plastic BSDF (polarization signal, no Phase-0 dep).
+        diffuse_bsdf_type = "pplastic" if strategy == "pplastic" else "roughplastic"
+        if _append_extracted_bsdf_xml(
+            shape, extracted_material, fallback_color=fallback_color, repo_root=repo_root,
+            diffuse_bsdf_type=diffuse_bsdf_type,
+        ):
             return
+    if strategy == "pplastic":
+        bsdf = _append_twosided_child_bsdf(shape, "pplastic")
+        ET.SubElement(bsdf, "rgb", attrib={"name": "diffuse_reflectance", "value": fallback_color})
+        ET.SubElement(bsdf, "float", attrib={"name": "alpha", "value": "0.2"})
+        return
     if strategy == "dielectric":
         bsdf = ET.SubElement(shape, "bsdf", type="dielectric")
         ET.SubElement(bsdf, "float", attrib={"name": "int_ior", "value": "1.5"})
