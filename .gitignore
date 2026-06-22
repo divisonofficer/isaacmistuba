@@ -59,5 +59,10 @@ modules/FreeSplatter/
 modules/mitsuba3-optix7/
 scripts/out/
 
+# 데이터 디렉토리 — git 외부에서 관리
+data/freesplatter/
+data/hpbrdf_2025/
+*.deb
+
 # WSL 잔재 (콜론 형식 — *.Zone.Identifier 패턴이 안 잡음)
 *:Zone.Identifier
