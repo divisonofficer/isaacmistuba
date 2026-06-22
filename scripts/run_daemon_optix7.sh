@@ -7,8 +7,18 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-: "${ROBOMITUBA_MITSUBA_PYTHON:=/root/miniconda3/envs/mitsuba_optix7/bin/python}"
-: "${ROBOMITUBA_MITSUBA_PYTHONPATH:=/jarvis/project/robomituba/build/mitsuba3-optix7/python}"
+# Pick the Mitsuba build that matches the host GPU's compute capability.
+#  - sm_120 (RTX 50 / Blackwell) → device B build  (modules/mitsuba3, OptiX 8)
+#  - everything else             → device A build  (modules/mitsuba3-optix7, OptiX 7)
+# Override either default by exporting the env var before running this launcher.
+_compute_cap="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d '[:space:]' || true)"
+if [[ "$_compute_cap" == "12.0" ]]; then
+  : "${ROBOMITUBA_MITSUBA_PYTHON:=/usr/bin/python3}"
+  : "${ROBOMITUBA_MITSUBA_PYTHONPATH:=/home/jinnyeong/robomituba-build/mitsuba3/python}"
+else
+  : "${ROBOMITUBA_MITSUBA_PYTHON:=/root/miniconda3/envs/mitsuba_optix7/bin/python}"
+  : "${ROBOMITUBA_MITSUBA_PYTHONPATH:=/jarvis/project/robomituba/build/mitsuba3-optix7/python}"
+fi
 : "${ROBOMITUBA_RENDER_GPU_INDICES:=0,1,2,3}"
 : "${ROBOMITUBA_RENDER_WORKER_BACKLOG_PER_GPU:=2}"
 : "${ROBOMITUBA_FULL_RENDER_DISABLE_CUDA:=0}"

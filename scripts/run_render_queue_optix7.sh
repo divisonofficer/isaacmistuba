@@ -7,11 +7,23 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+: "${RENDER_QUEUE_AUTO_GPUS:=0}"
+: "${RENDER_QUEUE_AUTO_GPU_MEMORY_USED_PCT_MAX:=10}"
 : "${RENDER_QUEUE_HOST:=127.0.0.1}"
 : "${RENDER_QUEUE_PORT:=8766}"
-: "${ROBOMITUBA_MITSUBA_PYTHON:=/root/miniconda3/envs/mitsuba_optix7/bin/python}"
-: "${ROBOMITUBA_MITSUBA_PYTHONPATH:=/jarvis/project/robomituba/build/mitsuba3-optix7/python}"
-: "${ROBOMITUBA_RENDER_GPU_INDICES:=0,1,2,3}"
+# Pick Mitsuba build by host GPU compute capability.
+#  - sm_120 (RTX 50 / Blackwell) → device B build  (modules/mitsuba3, OptiX 8)
+#  - everything else             → device A build  (modules/mitsuba3-optix7, OptiX 7)
+# Override either default by exporting the env var before running this launcher.
+_compute_cap="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d '[:space:]' || true)"
+if [[ "$_compute_cap" == "12.0" ]]; then
+  : "${ROBOMITUBA_MITSUBA_PYTHON:=/usr/bin/python3}"
+  : "${ROBOMITUBA_MITSUBA_PYTHONPATH:=/home/jinnyeong/robomituba-build/mitsuba3/python}"
+else
+  : "${ROBOMITUBA_MITSUBA_PYTHON:=/root/miniconda3/envs/mitsuba_optix7/bin/python}"
+  : "${ROBOMITUBA_MITSUBA_PYTHONPATH:=/jarvis/project/robomituba/build/mitsuba3-optix7/python}"
+fi
+: "${ROBOMITUBA_RENDER_GPU_INDICES:=1,2,3,4}"
 : "${ROBOMITUBA_RENDER_WORKER_BACKLOG_PER_GPU:=2}"
 : "${ROBOMITUBA_RENDER_WORKER_COUNT:=4}"
 : "${ROBOMITUBA_FULL_RENDER_DISABLE_CUDA:=0}"
@@ -23,6 +35,87 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 : "${ROBOMITUBA_RENDER_INPROCESS:=0}"
 : "${ROBOMITUBA_BACKEND_ONLY:=0}"
 : "${PYTHONUNBUFFERED:=1}"
+
+
+discover_idle_gpus() {
+  local threshold="$1"
+
+  if ! command -v nvidia-smi >/dev/null 2>&1; then
+    echo "[render-queue] ERROR: --auto-gpus requires nvidia-smi in PATH" >&2
+    return 1
+  fi
+
+  nvidia-smi --query-gpu=index,memory.used,memory.total --format=csv,noheader,nounits \
+    | awk -F, -v threshold="$threshold" '
+        function trim(value) {
+          gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+          return value
+        }
+        {
+          gpu_index = trim($1)
+          used = trim($2) + 0
+          total = trim($3) + 0
+          if (total <= 0) {
+            next
+          }
+          memory_used_pct = used * 100 / total
+          if (memory_used_pct < threshold) {
+            if (out != "") {
+              out = out ","
+            }
+            out = out gpu_index
+          }
+        }
+        END {
+          print out
+        }'
+}
+
+DAEMON_ARGS=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --auto-gpus)
+      RENDER_QUEUE_AUTO_GPUS=1
+      shift
+      ;;
+    --gpu-memory-used-pct-max)
+      if [[ $# -lt 2 ]]; then
+        echo "[render-queue] ERROR: --gpu-memory-used-pct-max requires a numeric value" >&2
+        exit 2
+      fi
+      RENDER_QUEUE_AUTO_GPU_MEMORY_USED_PCT_MAX="$2"
+      shift 2
+      ;;
+    --gpu-memory-used-pct-max=*)
+      RENDER_QUEUE_AUTO_GPU_MEMORY_USED_PCT_MAX="${1#*=}"
+      shift
+      ;;
+    --)
+      shift
+      DAEMON_ARGS+=("$@")
+      break
+      ;;
+    *)
+      DAEMON_ARGS+=("$1")
+      shift
+      ;;
+  esac
+done
+set -- "${DAEMON_ARGS[@]}"
+
+if [[ "$RENDER_QUEUE_AUTO_GPUS" == "1" ]]; then
+  if ! [[ "$RENDER_QUEUE_AUTO_GPU_MEMORY_USED_PCT_MAX" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    echo "[render-queue] ERROR: RENDER_QUEUE_AUTO_GPU_MEMORY_USED_PCT_MAX must be numeric" >&2
+    exit 2
+  fi
+
+  ROBOMITUBA_RENDER_GPU_INDICES="$(discover_idle_gpus "$RENDER_QUEUE_AUTO_GPU_MEMORY_USED_PCT_MAX")"
+  if [[ -z "$ROBOMITUBA_RENDER_GPU_INDICES" ]]; then
+    echo "[render-queue] ERROR: no GPUs found below ${RENDER_QUEUE_AUTO_GPU_MEMORY_USED_PCT_MAX}% memory use" >&2
+    exit 1
+  fi
+  ROBOMITUBA_RENDER_WORKER_COUNT="$(awk -F, '{ print NF }' <<<"$ROBOMITUBA_RENDER_GPU_INDICES")"
+fi
 
 export ROBOMITUBA_MITSUBA_PYTHON
 export ROBOMITUBA_MITSUBA_PYTHONPATH
@@ -41,7 +134,10 @@ export PYTHONUNBUFFERED
 export PYTHONPATH="$REPO_ROOT/modules/mitsuba_converter/src:$REPO_ROOT/modules/robomituba_bridge/src:$REPO_ROOT/modules/navigation_dataset/src:${PYTHONPATH:-}"
 
 echo "[render-queue] url: http://$RENDER_QUEUE_HOST:$RENDER_QUEUE_PORT"
+if [[ "$RENDER_QUEUE_AUTO_GPUS" == "1" ]]; then
+  echo "[render-queue] auto GPUs: memory_used_pct<${RENDER_QUEUE_AUTO_GPU_MEMORY_USED_PCT_MAX}%"
+fi
 echo "[render-queue] GPUs: $ROBOMITUBA_RENDER_GPU_INDICES workers=$ROBOMITUBA_RENDER_WORKER_COUNT backlog_per_gpu=$ROBOMITUBA_RENDER_WORKER_BACKLOG_PER_GPU scene_load_concurrency=$ROBOMITUBA_SCENE_LOAD_CONCURRENCY"
 echo "[render-queue] texture max: $ROBOMITUBA_TEXTURE_MAX_RESOLUTION GPU-only cpu_fallback_disabled=$ROBOMITUBA_DISABLE_CPU_FALLBACK"
 
-exec python -u "$REPO_ROOT/apps/run_render_daemon.py" --repo-root "$REPO_ROOT" --host "$RENDER_QUEUE_HOST" --port "$RENDER_QUEUE_PORT" "$@"
+exec python3 -u "$REPO_ROOT/apps/run_render_daemon.py" --repo-root "$REPO_ROOT" --host "$RENDER_QUEUE_HOST" --port "$RENDER_QUEUE_PORT" "$@"
