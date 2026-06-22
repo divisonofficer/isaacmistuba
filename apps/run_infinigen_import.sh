@@ -109,10 +109,17 @@ else
     echo "[error] infinigen python not found: $INFINIGEN_PYTHON (set INFINIGEN_PYTHON=...)" >&2; exit 1; }
   BAKE_FLAG=(); [[ $BAKE == 1 ]] && BAKE_FLAG=(--bake)
   echo "[stage1] exporting meshes/materials with bpy (this can take several minutes)…"
+  # bpy frequently segfaults during interpreter/teardown AFTER the manifest is
+  # already written (conda bpy on WSL). Don't let that non-zero exit abort the
+  # pipeline under `set -e`; the manifest-exists guard below is the real check.
+  stage1_rc=0
   "$INFINIGEN_PYTHON" tools/infinigen/_run_bpy.py "$BLEND" \
     tools/infinigen/blender_export_scene.py -- \
-    --out "$IMPORT_DIR" "${BAKE_FLAG[@]}"
-  [[ -f "$MANIFEST" ]] || { echo "[error] Stage 1 produced no manifest: $MANIFEST" >&2; exit 1; }
+    --out "$IMPORT_DIR" "${BAKE_FLAG[@]}" || stage1_rc=$?
+  if [[ $stage1_rc -ne 0 && -f "$MANIFEST" ]]; then
+    echo "[stage1] bpy exited $stage1_rc (likely a teardown segfault) but the manifest was written — continuing." >&2
+  fi
+  [[ -f "$MANIFEST" ]] || { echo "[error] Stage 1 failed (exit $stage1_rc) and produced no manifest: $MANIFEST" >&2; exit 1; }
 fi
 
 # ── Stage 2: converter ────────────────────────────────────────────────────────

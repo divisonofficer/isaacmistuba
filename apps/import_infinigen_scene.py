@@ -47,30 +47,91 @@ def _san(name: str) -> str:
     return re.sub(r"[^0-9A-Za-z._:-]+", "_", str(name)).strip("_") or "x"
 
 
+# Measured pBRDF material chosen per metal optical class (data/hpbrdf_2025/channels/).
+_METAL_MEASURED_ID = {
+    "metal_gold": "fake_gold",
+    "metal_steel": "suj2",
+    "metal_aluminum": "aluminum",
+}
+
+
+def _fallback_optical_class(name: str, is_glass: bool, metallic: float) -> str:
+    """Re-derive the Stage-1 optical class for manifests that predate it.
+
+    Mirrors tools/infinigen/blender_export_scene.py:_optical_class (name-first,
+    metallic as a weak fallback)."""
+    n = (name or "").lower()
+    if is_glass or "glass" in n:
+        return "glass"
+    if "mirror" in n or "chrome" in n:
+        return "mirror"
+    if any(k in n for k in ("gold", "brass")):
+        return "metal_gold"
+    if any(k in n for k in ("steel", "iron", "suj")):
+        return "metal_steel"
+    if any(k in n for k in ("metal", "alumin", "galvan", "brush", "grain",
+                            "copper", "silver", "nickel")) or float(metallic or 0.0) >= 0.5:
+        return "metal_aluminum"
+    return "diffuse"
+
+
 def _material_binding(mat: dict) -> dict:
-    """Build an AuthoringMaterial dict that renders today AND preserves full PBR."""
+    """Build an AuthoringMaterial dict that renders today AND preserves full PBR.
+
+    The `optical_class` (set by Stage 1, re-derived here for old manifests) drives
+    the render bsdf_strategy:
+      glass  -> dielectric / roughdielectric (clear; analytic, renders today)
+      mirror -> conductor (Al; analytic, renders today)
+      metal_*-> measured_polarized (hpbrdf) modulated by baked albedo (albedo_scale,
+                = dev-report svBRDF Option 1; needs measured_polarized_rgb in the
+                production optix7 build to show colour, else gray fallback)
+      diffuse-> roughplastic with baked albedo (unchanged)
+    """
     name = mat.get("name", "mat")
     base = mat.get("base_color") or [0.6, 0.6, 0.6]
     base = [float(base[0]), float(base[1]), float(base[2])]
     is_glass = bool(mat.get("is_glass"))
     rough = float(mat.get("roughness", 0.6) or 0.6)
     metallic = float(mat.get("metallic", 0.0) or 0.0)
-    strategy = "dielectric" if is_glass else "roughplastic"
-    binding = {
-        "kind": "preset",
-        "bsdf_strategy": strategy,
-        # Render-time PBR the XML emitter understands (textured roughplastic path).
-        "base_color_factor": base,
-        "roughness": rough,
-        "metallic": metallic,
-        "capabilities": {"rgb": True},
-    }
+    oc = mat.get("optical_class") or _fallback_optical_class(name, is_glass, metallic)
     images = mat.get("image_textures") or []
-    if images and images[0].get("filepath"):
-        binding["base_color_texture_ref"] = images[0]["filepath"]
+
+    if oc == "glass":
+        # Infinigen's roughness defaults to a noisy 0.6, so don't infer frosted
+        # from it — default to clear dielectric and only frost when the name says so.
+        nlow = str(name).lower()
+        frosted = any(k in nlow for k in ("frost", "matte"))
+        strategy = "roughdielectric" if frosted else "dielectric"
+        binding = {"kind": "preset", "bsdf_strategy": strategy,
+                   "base_color_factor": base, "roughness": rough, "metallic": metallic,
+                   "capabilities": {"rgb": True}}
+    elif oc == "mirror":
+        binding = {"kind": "preset", "bsdf_strategy": "conductor",
+                   "base_color_factor": base, "roughness": rough, "metallic": metallic,
+                   "capabilities": {"rgb": True}}
+    elif oc in _METAL_MEASURED_ID:
+        mid = _METAL_MEASURED_ID[oc]
+        # Measured pBRDF; the baked albedo (map_Kd) flows in as albedo_scale at
+        # render time (render_daemon._append_measured_albedo_scale_xml).
+        binding = {"kind": "hpbrdf_2025", "dataset_id": "hpbrdf_2025", "material_id": mid,
+                   "bsdf_strategy": "measured_polarized",
+                   "channels_dir": f"data/hpbrdf_2025/channels/{mid}",
+                   "base_color_factor": base, "roughness": rough, "metallic": metallic,
+                   "capabilities": {"rgb": True, "polarization": True}}
+        if images and images[0].get("filepath"):
+            binding["base_color_texture_ref"] = images[0]["filepath"]
+    else:  # diffuse
+        binding = {"kind": "preset", "bsdf_strategy": "roughplastic",
+                   # Render-time PBR the XML emitter understands (textured roughplastic).
+                   "base_color_factor": base, "roughness": rough, "metallic": metallic,
+                   "capabilities": {"rgb": True}}
+        if images and images[0].get("filepath"):
+            binding["base_color_texture_ref"] = images[0]["filepath"]
+
+    transparent = oc == "glass"
     return {
         "material_id": _san(name),
-        "category": "transparent" if is_glass else "opaque",
+        "category": "transparent" if transparent else "opaque",
         "render_binding": binding,
         # Full PBR preserved for future Mitsuba quality upgrades (principled/polarized).
         "params": {
@@ -86,6 +147,7 @@ def _material_binding(mat: dict) -> dict:
                 "procedural": bool(mat.get("procedural", True)),
                 "image_textures": images,
                 "needs_bake": bool(mat.get("procedural", True)) and not images,
+                "optical_class": oc,
             },
         },
     }

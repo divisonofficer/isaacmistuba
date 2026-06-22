@@ -219,6 +219,30 @@ def _name_color(mat_name: str):
     return [0.6, 0.6, 0.6]
 
 
+def _optical_class(name: str, is_glass: bool, metallic: float) -> str:
+    """Classify a material into an optical family for BSDF binding downstream.
+
+    Name keyword is the primary signal (Infinigen's `metallic` param is
+    unreliable — e.g. `shader_brushed_metal` reports metallic=0.0). Returns one
+    of: glass | mirror | metal_gold | metal_steel | metal_aluminum | diffuse.
+    Stage 2 (`import_infinigen_scene._material_binding`) maps these to render
+    bsdf_strategy; Stage 1 uses them to decide whether to bake/strip albedo.
+    """
+    n = (name or "").lower()
+    if is_glass or "glass" in n:
+        return "glass"
+    if "mirror" in n or "chrome" in n:
+        return "mirror"
+    if any(k in n for k in ("gold", "brass")):
+        return "metal_gold"
+    if any(k in n for k in ("steel", "iron", "suj")):
+        return "metal_steel"
+    if any(k in n for k in ("metal", "alumin", "galvan", "brush", "grain",
+                            "copper", "silver", "nickel")) or float(metallic or 0.0) >= 0.5:
+        return "metal_aluminum"
+    return "diffuse"
+
+
 def _extract_material(mat):
     out = {
         "name": mat.name,
@@ -237,6 +261,7 @@ def _extract_material(mat):
     if not (mat.use_nodes and mat.node_tree):
         out["base_color"] = _name_color(mat.name)
         out["procedural"] = False
+        out["optical_class"] = _optical_class(mat.name, out["is_glass"], out["metallic"])
         return out
     nt = mat.node_tree
     images = []
@@ -268,6 +293,7 @@ def _extract_material(mat):
         out["base_color"] = _name_color(mat.name)
     if out["emission_strength"] and out["emission_strength"] > 0 and out["emission_color"] is None:
         out["emission_color"] = [1.0, 1.0, 1.0]
+    out["optical_class"] = _optical_class(mat.name, out["is_glass"], out["metallic"])
     return out
 
 
@@ -418,6 +444,29 @@ def _patch_mtl_map_kd(mtl_path, tex_rel):
         fh.write("\n".join(out_lines) + "\n")
 
 
+def _strip_mtl_diffuse(mtl_path):
+    """Remove diffuse/spec colour + texture lines from an OBJ's .mtl.
+
+    For analytic specular/transparent materials (mirror, glass) we want the
+    render path's _extract_obj_mtl_material to return None so the authoring
+    binding's conductor/dielectric strategy is used instead of being overridden
+    by a textured roughplastic. That helper only returns None when the MTL has
+    neither Kd nor map_Kd, so we drop both (plus Ks/specular + bump maps).
+    """
+    import os as _os
+    if not _os.path.exists(mtl_path):
+        return
+    drop = ("kd ", "map_kd", "ks ", "map_ks", "map_bump", "bump ")
+    out_lines = []
+    for line in open(mtl_path, "r", errors="ignore"):
+        low = line.lstrip().lower()
+        if any(low.startswith(p) for p in drop):
+            continue
+        out_lines.append(line.rstrip("\n"))
+    with open(mtl_path, "w") as fh:
+        fh.write("\n".join(out_lines) + "\n")
+
+
 def _export_obj(obj, path):
     bpy.ops.object.select_all(action="DESELECT")
     obj.select_set(True)
@@ -548,15 +597,36 @@ def main():
             _log(f"[export] OBJ FAIL {obj.name}: {exc}", bar)
             fail_count += 1
             obj_rel = None
-        # Bake procedural materials -> albedo atlas, wire into the OBJ's MTL so the
-        # render path picks up true colours via map_Kd (no Stage 2 change needed).
-        if do_bake and obj_rel is not None and len(obj.data.polygons) <= 120000:
+        # Determine the object's optical class from its FIRST material slot — the
+        # same material Stage 2 (build_authoring_map) binds the object to. This
+        # decides whether baked albedo is kept (diffuse/metal) or stripped
+        # (mirror/glass) so the analytic conductor/dielectric binding survives.
+        slot_mats = [ms.material.name for ms in obj.material_slots if ms.material]
+        unit_oc = (manifest["materials"].get(slot_mats[0], {}).get("optical_class", "diffuse")
+                   if slot_mats else "diffuse")
+        # Object-level safety net: a MirrorFactory mesh is a mirror even if its
+        # material name lacks a keyword. Force both Stage 1 (here) and Stage 2
+        # (via the shared material record) to agree on `mirror`.
+        if "mirror" in (obj.name or "").lower() or "mirror" in (_factory_of(obj.name) or "").lower():
+            unit_oc = "mirror"
+            if slot_mats and manifest["materials"].get(slot_mats[0]) is not None:
+                manifest["materials"][slot_mats[0]]["optical_class"] = "mirror"
+        mtl_abs = os.path.join(out_dir, f"meshes/{oid}.mtl")
+        # Mirror/glass render via analytic conductor/dielectric (no albedo needed);
+        # strip Kd/map_Kd so _extract_obj_mtl_material returns None and the binding
+        # strategy is used instead of a textured roughplastic override. Metal goes
+        # to a measured BSDF that keeps the baked albedo as albedo_scale, so it (and
+        # diffuse) still bakes normally.
+        if obj_rel is not None and unit_oc in ("mirror", "glass"):
+            _strip_mtl_diffuse(mtl_abs)
+        elif do_bake and obj_rel is not None and len(obj.data.polygons) <= 120000:
+            # Bake procedural materials -> albedo atlas, wire into the OBJ's MTL so
+            # the render path picks up true colours via map_Kd.
             tex_abs = os.path.join(textures_dir, f"{oid}_albedo.png")
             with _silence_fds(1, 2):
                 baked_ok = _bake_albedo(obj, tex_abs, bake_res, bake_samples)
             if baked_ok:
-                _patch_mtl_map_kd(os.path.join(out_dir, f"meshes/{oid}.mtl"),
-                                  f"../textures/{oid}_albedo.png")
+                _patch_mtl_map_kd(mtl_abs, f"../textures/{oid}_albedo.png")
                 baked_rel = f"textures/{oid}_albedo.png"
                 baked_count += 1
         if not no_glb:
@@ -596,6 +666,7 @@ def main():
             "place_base_height_m": place_base_height,
             "polys": len(obj.data.polygons),
             "materials": mats,
+            "optical_class": unit_oc,
             "mesh_obj": obj_rel,
             "mesh_glb": glb_rel,
             "baked_albedo": baked_rel,
