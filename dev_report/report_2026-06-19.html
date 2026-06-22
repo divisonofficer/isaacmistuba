@@ -1,0 +1,429 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Infinigen indoor → Mitsuba 렌더 가능 상태로 import — 2026-06-19</title>
+<style>
+:root{
+  --bg:#f4f6fb; --panel:#fff; --sub:#f8fafc; --text:#1f2937; --muted:#64748b;
+  --line:#dbe3ef; --blue:#2563eb; --green:#16a34a; --amber:#d97706; --red:#dc2626;
+  --purple:#7c3aed; --teal:#0f766e; --mono:"JetBrains Mono",Consolas,Menlo,monospace;
+  --sans:Inter,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html{scroll-behavior:smooth}
+body{font-family:var(--sans);background:var(--bg);color:var(--text);line-height:1.62;font-size:14px}
+.layout{display:flex;min-height:100vh}
+aside{width:260px;flex:0 0 260px;position:sticky;top:0;height:100vh;overflow:auto;padding:22px 14px;border-right:1px solid var(--line);background:#eef2f7}
+main{flex:1;padding:34px 42px;max-width:1180px}
+.logo{font-weight:850;color:var(--blue);letter-spacing:-.02em;font-size:16px}
+.date{margin-top:3px;color:var(--muted);font-family:var(--mono);font-size:11px}
+.small{font-size:12px;color:var(--muted)}
+.nav-title{margin:22px 8px 7px;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.12em;font-weight:850}
+.nav-link{display:block;padding:5px 8px;border-radius:5px;color:#374151;font-size:12px;text-decoration:none;margin-bottom:2px}
+.nav-link:hover{background:#dde3ee}
+a{color:var(--blue);text-decoration:none} a:hover{text-decoration:underline}
+.hero{background:linear-gradient(135deg,#1e3a8a,#0f766e);color:#fff;border-radius:14px;padding:24px 30px;margin-bottom:24px;box-shadow:0 12px 28px rgba(15,118,110,.18)}
+.hero h1{font-size:25px;font-weight:900;letter-spacing:-.04em;margin-bottom:8px}
+.hero p{color:#dbeafe;font-size:13px;max-width:900px}
+.hero .thesis{margin-top:12px;font-size:15px;color:#fff;font-weight:750;line-height:1.7}
+section{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:23px 25px;margin-bottom:20px}
+h2{font-size:19px;font-weight:850;margin-bottom:14px;letter-spacing:-.03em}
+h3{font-size:14px;font-weight:800;margin:17px 0 8px;letter-spacing:-.01em}
+.note{font-size:13px;color:#475569}
+.muted{color:var(--muted)}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin:14px 0}
+.grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:13px;margin:14px 0}
+.grid4{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:14px 0}
+.card{background:var(--sub);border:1px solid var(--line);border-radius:10px;padding:14px;min-height:70px}
+.card strong{color:#111827}
+.label{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.08em;font-weight:850;margin-bottom:6px}
+.metric{font-size:25px;font-weight:900;letter-spacing:-.05em;color:var(--blue)}
+.tag{display:inline-block;padding:2px 8px;border-radius:999px;font-size:11px;font-weight:800;background:#dbeafe;color:#1e40af;margin:2px 2px 2px 0}
+.tag.green{background:#dcfce7;color:#15803d}
+.tag.amber{background:#fef3c7;color:#b45309}
+.tag.purple{background:#f3e8ff;color:#7e22ce}
+.tag.red{background:#fee2e2;color:#b91c1c}
+.tag.teal{background:#ccfbf1;color:#0f766e}
+table{width:100%;border-collapse:collapse;margin:13px 0;font-size:13px}
+th{background:#eff6ff;padding:9px 10px;text-align:left;font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:.06em;color:#374151;border:1px solid var(--line)}
+td{padding:9px 10px;border:1px solid var(--line);vertical-align:top}
+tr:hover td{background:#fafcff}
+.alert{background:#fff7ed;border-left:4px solid var(--amber);border-radius:7px;padding:12px 14px;margin:13px 0;font-size:13px;color:#7c2d12}
+.alert.blue{background:#eff6ff;border-color:var(--blue);color:#1e3a8a}
+.alert.green{background:#f0fdf4;border-color:var(--green);color:#14532d}
+.alert.red{background:#fef2f2;border-color:var(--red);color:#7f1d1d}
+.alert.purple{background:#f5f3ff;border-color:var(--purple);color:#4c1d95}
+.ascii{font-family:var(--mono);white-space:pre;overflow:auto;background:#0f172a;color:#dbeafe;border-radius:10px;padding:15px 17px;font-size:12px;line-height:1.7;margin:12px 0}
+ul{margin:7px 0 0 18px;color:#475569}
+.li-tight li{margin-bottom:3px}
+.chapter{background:linear-gradient(135deg,#1e3a8a,#4c1d95);color:#fff;border-radius:14px;padding:20px 26px;margin:22px 0}
+.chapter h2{color:#fff;margin-bottom:4px}
+.chapter p{color:#c7d2fe;font-size:13px}
+.footer{text-align:center;color:var(--muted);font-size:12px;margin:28px 0 8px}
+.rank{font-weight:900;font-size:18px;color:var(--blue)}
+.score{font-family:var(--mono);font-weight:850}
+code{font-family:var(--mono);background:#eef2ff;color:#1d4ed8;padding:1px 5px;border-radius:4px;font-size:12px}
+@media(max-width:980px){.layout{display:block}aside{position:relative;width:auto;height:auto}main{padding:20px}.grid2,.grid3,.grid4{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<div class="layout">
+
+<aside>
+  <div class="logo">Robomituba</div>
+  <div class="date">2026-06-19</div>
+  <div class="small">Infinigen importer · 정리 · 디버깅</div>
+
+  <div class="nav-title">메인 토픽</div>
+  <a class="nav-link" href="#summary">한눈에</a>
+  <a class="nav-link" href="#why">왜 Infinigen 인가</a>
+  <a class="nav-link" href="#assets">Infinigen 에셋이 제공하는 것</a>
+  <a class="nav-link" href="#gap">Infinigen ↔ Mitsuba 격차</a>
+  <a class="nav-link" href="#stage1">Stage 1 · Blender 안에서 export</a>
+  <a class="nav-link" href="#stage2">Stage 2 · OpticalNav 으로 import</a>
+  <a class="nav-link" href="#oneshot">통합 launcher</a>
+  <a class="nav-link" href="#known">알려진 한계</a>
+
+  <div class="nav-title">곁다리 작업</div>
+  <a class="nav-link" href="#side">커밋 정리 · 404 fix · 잔재 정리</a>
+
+  <div class="nav-title">남은 일</div>
+  <a class="nav-link" href="#next">내일 이어서</a>
+
+  <div class="nav-title">이전 보고서</div>
+  <a class="nav-link" href="report_2026-06-17.html">06-17 SVBRDF 개선 계획</a>
+  <a class="nav-link" href="report_2026-06-17_polarization_pipeline.html">06-17 Polarization 파이프라인</a>
+  <a class="nav-link" href="report_2026-06-15.html">06-15 Infinigen × Mitsuba</a>
+  <a class="nav-link" href="index.html">← 전체 인덱스</a>
+</aside>
+
+<main>
+
+<div class="hero">
+  <h1>Infinigen indoor → Mitsuba 렌더 가능 상태로 import</h1>
+  <p>Infinigen 이 만든 절차적(procedural) 실내 <code>.blend</code> 씬을 OpticalNav 의 authoring map 으로 옮겨, Mitsuba 3 (OptiX7) 가 그대로 렌더 가능한 상태로 만드는 2-stage 컨버터의 설계와 구현 정리.</p>
+  <p class="thesis">핵심 격차는 <strong>"Blender 의 절차적 shader graph"</strong> 와 <strong>"Mitsuba 의 평탄(flat) PBR/측정 BSDF"</strong> 사이에 있다. 우리는 (a) Cycles 가 절차 셰이더를 albedo 로 bake 해서 평탄화하고, (b) 이름 키워드 기반 optical class 분류로 mirror / glass / metal 을 분석적/측정 BSDF 로 강제 라우팅하는 두 가지 단순화로 이 격차를 메운다.</p>
+</div>
+
+<section id="summary">
+  <h2>한눈에</h2>
+  <div class="grid4">
+    <div class="card">
+      <div class="label">대상</div>
+      <div class="metric">Indoor</div>
+      <div class="note">Infinigen indoor scene (단일 방 또는 다중 방, 가구·조명·창문·문 포함).</div>
+    </div>
+    <div class="card">
+      <div class="label">파이프라인</div>
+      <div class="metric">2-stage</div>
+      <div class="note">Stage 1 (bpy/Blender env) → Stage 2 (robomituba env). 한 .sh 가 둘을 묶어 일발 실행.</div>
+    </div>
+    <div class="card">
+      <div class="label">출력</div>
+      <div class="metric">OBJ + GLB + manifest</div>
+      <div class="note">Mitsuba 가 먹는 OBJ + 에디터 preview 용 GLB + scene_manifest.json (재질·라이트·카메라 요약).</div>
+    </div>
+    <div class="card">
+      <div class="label">결과물</div>
+      <div class="metric">OpticalNav</div>
+      <div class="note">기존 authoring map / 측정 pBRDF binding / 렌더 데몬 흐름에 그대로 끼워 들어간다.</div>
+    </div>
+  </div>
+
+  <div class="alert green">
+    <strong>결론.</strong> Infinigen 은 "방 모양 + 가구 배치 + 절차적 PBR + 라이팅" 까지 다 차려준다. 우리가 하는 일은 그것을 <strong>Mitsuba 가 직접 이해 가능한 평탄 표현으로 평탄화 (bake)</strong> 하고, 그러면서도 <strong>측정 pBRDF 가 가져갈 mirror/metal/glass 슬롯은 보존</strong>하는 것이다.
+  </div>
+</section>
+
+<section id="why">
+  <h2>왜 Infinigen 인가</h2>
+  <p class="note">
+    OpticalNav 데이터셋은 실내 viewpoint × heading 스윕에서 RGB / depth / polarization 등 멀티모달 관측을 필요로 한다. 즉 <strong>씬 수 × 카메라 × heading × modality</strong> 가 모두 곱해진 큰 데이터셋이 필요. 직접 모델링하기엔 손이 너무 많이 가고, 기존 CC0 데이터셋(Cornell, Office Lobby 등)은 수도 적고 의미도 단조롭다.
+  </p>
+  <p class="note">
+    Infinigen 은 (a) 절차적이라 무한히 다양한 씬을 만들고, (b) 방 / 가구 / 조명 / 문·창문 같이 의미가 있는 단위로 organize 되어 있어 traversability·hazard·instruction grounding 같은 OpticalNav 메타데이터를 추출하기 좋다.
+  </p>
+  <div class="alert blue">
+    한 마디로 — <strong>"수량 × 다양성 × 의미 라벨"</strong> 셋을 한꺼번에 주는 generator 다. 단점은 Blender / 절차 셰이더 / 거대한 polygon 수.
+  </div>
+</section>
+
+<section id="assets">
+  <h2>Infinigen 에셋이 실제로 제공하는 것</h2>
+
+  <h3>1) 지오메트리 (Geometry)</h3>
+  <ul class="li-tight">
+    <li><code>scene.blend</code>(또는 손상 시 <code>scene.blend1</code> 백업) 한 파일 안에 모든 mesh.</li>
+    <li>좌표계는 <strong>Z-up</strong> (Blender 관행). Mitsuba/OpticalNav 의 authoring world 는 <strong>Y-up</strong>.</li>
+    <li>각 object 는 Blender collection 으로 묶임: <code>dining-room_0/0</code> 같은 room key + factory(<code>ChairFactory</code>, <code>TableDiningFactory</code>, <code>WardrobeFactory</code>, ...) 명명.</li>
+    <li>구조물(structure)은 객체명 suffix 로 표시: <code>.wall</code>, <code>.floor</code>, <code>.ceiling</code>, <code>.exterior</code>.</li>
+    <li>Polygon 수는 객체당 수만~수십만 → preview 용 decimation 필요.</li>
+  </ul>
+
+  <h3>2) 재질 (Material) — PBR shader graph</h3>
+  <p class="note">
+    각 object 의 material slot 마다 Blender <em>Principled BSDF</em> 노드(또는 procedural shader 묶음) 가 달려 있다. 우리가 추출 가능한 채널:
+  </p>
+  <table>
+    <thead><tr><th>PBR 채널</th><th>Infinigen 에서 어떻게 주어지나</th><th>우리 처리</th></tr></thead>
+    <tbody>
+      <tr><td><code>base_color</code> (3채널)</td><td>Principled BSDF의 Base Color 소켓 — 단색이거나 노드 트리(Noise·Voronoi·MixRGB 등)에서 도착</td><td>단색이면 그대로, 절차이면 Cycles DIFFUSE bake → PNG atlas</td></tr>
+      <tr><td><code>metallic</code> (0–1)</td><td>Principled BSDF의 Metallic 소켓 (값 또는 노드)</td><td>그대로 읽되 <strong>신뢰성 낮음</strong> — name keyword 가 우선</td></tr>
+      <tr><td><code>roughness</code> (0–1)</td><td>Roughness 소켓</td><td>그대로 읽음. 기본값 0.6 이 많아 frosted 판정엔 안 씀</td></tr>
+      <tr><td><code>ior</code></td><td>IOR 소켓</td><td>diffuse/glass 모두에 보존 (단 현재 binding 은 strategy 고정값 사용)</td></tr>
+      <tr><td><code>alpha</code></td><td>Alpha 소켓</td><td>1.0 미만이면 투명 가능성 표시 (glass 분류 보조)</td></tr>
+      <tr><td><code>emission</code> (strength + color)</td><td>Emission Strength / Color 소켓</td><td>area emitter 의도 신호로 사용</td></tr>
+      <tr><td>이미지 텍스처</td><td>Image Texture 노드의 file path (드물지만 있음)</td><td><code>image_textures[]</code> 로 보존, 재질 binding 에서 <code>base_color_texture_ref</code> 로 사용 가능</td></tr>
+    </tbody>
+  </table>
+
+  <h3>3) 조명 (Lights)</h3>
+  <ul class="li-tight">
+    <li>Blender LIGHT object: type=<code>POINT</code> / <code>AREA</code> / <code>SUN</code> / <code>SPOT</code>, plus color · energy · position.</li>
+    <li>AREA 라이트는 추가로 <code>size</code> / <code>size_y</code> (직사각형 크기).</li>
+    <li>SUN 라이트는 행렬에서 forward 벡터를 뽑아 direction 으로 변환.</li>
+  </ul>
+
+  <h3>4) 의미 정보 (Semantic)</h3>
+  <ul class="li-tight">
+    <li><strong>Factory name</strong> 이 가장 강한 신호. <code>ChairFactory</code> → chair, <code>TableDiningFactory</code> → table, <code>WardrobeFactory</code> → shelf, 등 키워드 기반 매핑.</li>
+    <li>구조물 분류는 객체 이름 suffix(<code>.wall/.floor/.ceiling/.exterior</code>) 가 결정한다.</li>
+    <li>room key (예 <code>dining-room_0/0</code>) 는 다중 방 씬에서 어떤 방에 속하는지를 결정.</li>
+    <li>유리 / 거울 / 금속은 material 이름의 키워드(<code>glass</code>, <code>mirror</code>, <code>brushed_metal</code>, <code>gold</code>, ...) 가 가장 신뢰 가능.</li>
+  </ul>
+</section>
+
+<section id="gap">
+  <h2>Infinigen ↔ Mitsuba 격차</h2>
+
+  <div class="grid2">
+    <div class="card">
+      <strong>1. 좌표계</strong>
+      <div class="note">Blender Z-up ↔ Mitsuba/OpticalNav Y-up. OBJ exporter 의 <code>forward=-Z up=Y</code> 옵션 + authoring 2D 좌표(<code>authoring_y = -blender_y</code>)로 통일.</div>
+    </div>
+    <div class="card">
+      <strong>2. 절차적 shader</strong>
+      <div class="note">Mitsuba 는 Blender 의 noise/voronoi/mixRGB 같은 노드 그래프를 모름 → Cycles DIFFUSE bake 로 단일 albedo PNG 로 평탄화.</div>
+    </div>
+    <div class="card">
+      <strong>3. 광학적 분류</strong>
+      <div class="note">Infinigen 의 metallic=0.0 이 실제로는 brushed metal 이기도 함(쉐이더 이름 vs 값 불일치). name keyword 가 우선, metallic 은 약한 fallback.</div>
+    </div>
+    <div class="card">
+      <strong>4. 측정 pBRDF 슬롯</strong>
+      <div class="note">금속/거울/유리는 baked albedo 대신 <code>measured_polarized</code> / <code>conductor</code> / <code>dielectric</code> 같은 분석/측정 BSDF 로 라우팅해야 분광·편광 응답이 살아 있음.</div>
+    </div>
+    <div class="card">
+      <strong>5. 다중 방</strong>
+      <div class="note">Infinigen 은 한 씬에 여러 방 shell 을 빈 채로 쌓아둠. 가구 있는 방만 "finished" 로 간주해 선택.</div>
+    </div>
+    <div class="card">
+      <strong>6. blend 파일 손상</strong>
+      <div class="note"><code>scene.blend</code> 의 header 가 깨진 경우가 흔함. <code>scene.blend1</code> 백업이 valid → magic bytes <code>BLENDER[-_]</code> 검사로 자동 fallback.</div>
+    </div>
+  </div>
+</section>
+
+<div class="chapter">
+  <h2>Stage 1 — Blender 안에서 export</h2>
+  <p><code>tools/infinigen/blender_export_scene.py</code> · bpy 모듈로 실행 · 출력: <code>scene_manifest.json</code> + <code>meshes/</code> + <code>textures/</code></p>
+</div>
+
+<section id="stage1">
+  <h2>Stage 1 — Blender 안에서 export</h2>
+
+  <p class="note">
+    Infinigen 의 bundled Blender 바이너리는 libs 문제로 종종 깨져 있어, Conda <code>infinigen</code> 환경의 <code>bpy</code> 모듈을 import 해 헤드리스로 실행한다.
+  </p>
+
+  <h3>입력</h3>
+  <p class="note">하나의 <code>.blend</code> 또는 <code>.blend1</code> (header magic 검증 후 자동 선택).</p>
+
+  <h3>핵심 동작</h3>
+  <div class="ascii">for obj in bpy.data.objects (MESH only):
+    semantic_type ← factory_name keyword (chair / table / shelf / plant / ...)
+    kind          ← structure(.wall/.floor/.ceiling/.exterior) / window / door / furniture
+    optical_class ← name keyword (glass / mirror / metal_gold / metal_steel / metal_aluminum / diffuse)
+                                                   ↑ metallic 값은 fallback 일 뿐
+    world_bbox    ← obj.bound_box → world space (Z-up)
+
+    # 좌표/배치 정규화 — render 시 OBJ 를 authoring center 로 옮겨 적용 가능하게
+    offset ← centre xy + bottom z 를 0 으로 이동
+    obj.matrix_world ← Translation(offset) · 원본 matrix_world
+
+    export OBJ (Y-up, forward=-Z)              → meshes/{oid}.obj
+    export GLB (PBR/UV 보존)                    → meshes/{oid}.glb
+    if procedural shader and not skipped:
+        Cycles bake DIFFUSE color → albedo PNG → meshes/{oid}.mtl 에 map_Kd 패치
+
+    # mirror/glass 는 baked albedo 를 버린다 (분석 BSDF 가 알아서 처리)
+    if optical_class in (mirror, glass):
+        meshes/{oid}.mtl 에서 Kd / map_Kd / Ks / bump 모두 제거
+
+    obj.matrix_world ← 원래대로 복원
+
+for light in bpy.data.objects (LIGHT only):
+    type / color / energy / world_pos / authoring_xy=(x, -y) / base_height=z
+    AREA: size, size_y
+    SUN: forward 벡터로부터 direction
+
+# scene_manifest.json 작성
+{
+  "units": [ {id, kind, semantic_type, factory, world_bbox_min/max, dimensions,
+              yaw_deg, place_center, place_size_m, place_base_height_m, polys,
+              materials, optical_class, mesh_obj, mesh_glb, baked_albedo}, ... ],
+  "materials": { "name": { base_color, metallic, roughness, ior, alpha,
+                           emission_strength, emission_color, optical_class,
+                           image_textures, procedural, is_glass, is_emissive } },
+  "lights":  [ {name, type, color, energy, world_pos, ...} ],
+  "cameras": [ ... ]
+}</div>
+
+  <h3>핵심 결정들</h3>
+  <ul class="li-tight">
+    <li><strong>OBJ + MTL 이 Mitsuba 의 입력</strong>: 평탄한 albedo / Kd 만 쓰는 단순 포맷이라 BSDF 라우팅을 우리 쪽이 통제하기 쉽다.</li>
+    <li><strong>GLB 는 에디터 preview</strong>: PBR/UV 가 보존되어 future quality upgrade 용. 지금 렌더 경로는 사용 안 함.</li>
+    <li><strong>Cycles DIFFUSE bake</strong> (<code>use_pass_direct=False</code>, <code>use_pass_indirect=False</code>, <code>use_pass_color=True</code>): 절차 텍스처의 "색"만 빼와서 lighting 의존성 없는 albedo atlas 를 만든다.</li>
+    <li><strong>120k 폴리곤 초과 mesh 는 bake 스킵</strong>: bake 비용이 가파르게 올라가서, decimation 우선순위가 더 높다.</li>
+    <li><strong>Origin-local 좌표</strong>: 렌더 시 authoring center 만큼 translate 하므로, OBJ 는 자체 원점에 centre/bottom 이 와야 한다 (bbox 가로 중심 x=z=0, 바닥 y=0).</li>
+    <li><strong>fd 1/2 silence</strong>: Blender 가 콘솔에 쏟아내는 <code>Synchronizing object…</code> / <code>Writing to…</code> 등 C-level 스팸을 <code>/dev/null</code> 로 보내 tqdm bar 가 깨지지 않게.</li>
+  </ul>
+</section>
+
+<div class="chapter">
+  <h2>Stage 2 — OpticalNav 으로 import</h2>
+  <p><code>apps/import_infinigen_scene.py</code> · robomituba env · 출력: <code>out/opticalnav/&lt;project&gt;/scenes/&lt;scene-id&gt;/</code></p>
+</div>
+
+<section id="stage2">
+  <h2>Stage 2 — OpticalNav 으로 import</h2>
+
+  <p class="note">Stage 1 의 <code>scene_manifest.json</code> 을 읽어 OpticalNav 의 authoring map + traversability grid + 측정 pBRDF binding 까지 생성한다. 결과를 <code>install_shared_office_sample</code> 흐름에 그대로 태우면 webui 가 인식하고 데몬이 바로 렌더 가능.</p>
+
+  <h3>핵심: <code>_material_binding</code></h3>
+  <p class="note">optical_class 가 render binding 의 strategy 를 결정한다:</p>
+  <table>
+    <thead><tr><th>optical_class</th><th>bsdf_strategy</th><th>baked albedo</th><th>capabilities</th></tr></thead>
+    <tbody>
+      <tr><td><code>glass</code> (frosted 키워드 있으면 roughdielectric)</td><td><code>dielectric</code> / <code>roughdielectric</code></td><td>버림</td><td>RGB</td></tr>
+      <tr><td><code>mirror</code></td><td><code>conductor</code> (Al)</td><td>버림</td><td>RGB</td></tr>
+      <tr><td><code>metal_gold</code></td><td><code>measured_polarized</code> (<code>fake_gold</code>)</td><td>albedo_scale 로 변조</td><td>RGB + polarization</td></tr>
+      <tr><td><code>metal_steel</code></td><td><code>measured_polarized</code> (<code>suj2</code>)</td><td>albedo_scale 로 변조</td><td>RGB + polarization</td></tr>
+      <tr><td><code>metal_aluminum</code></td><td><code>measured_polarized</code> (<code>aluminum</code>)</td><td>albedo_scale 로 변조</td><td>RGB + polarization</td></tr>
+      <tr><td><code>diffuse</code> (그 외)</td><td><code>roughplastic</code></td><td>map_Kd 로 그대로</td><td>RGB</td></tr>
+    </tbody>
+  </table>
+
+  <div class="alert purple">
+    <strong>측정 BSDF × baked albedo modulation.</strong> 6-17 보고서의 "svBRDF Option 1" — 측정 pBRDF 가 각도/편광 응답을 담당하고, baked albedo 가 공간 색상 변조를 담당. 측정 RGB plugin (<code>measured_polarized_rgb</code>) 이 프로덕션 빌드에 있어야 컬러가 살아남고, 없으면 grayscale fallback. 이 한계는 두 빌드 (<code>build/mitsuba3-optix7</code> vs 표준) 문제로 6-15 보고서에 정리됨.
+  </div>
+
+  <h3>nav flags · 방 선택 · traversability</h3>
+  <ul class="li-tight">
+    <li><strong>nav flags</strong>: <code>furniture</code> → blocks_navigation=true; <code>door</code> → glass_door hazard; <code>window</code> → transparent_obstacle hazard. instruction/goal candidate 도 semantic_type 으로 자동.</li>
+    <li><strong>방 선택</strong>: 모든 floor footprint 를 모은 뒤 가구 ≥1 개가 footprint 안에 있는 방만 finished 로 채택. 빈 shell 방은 버림.</li>
+    <li><strong>traversability grid</strong>: 채택된 floor footprint 의 union 을 navigable region 으로 삼고, furniture AABB 로 carve. 구조물(<code>.wall/.floor/...</code>)과 window 는 carve 안 함 (벽이 방 전체 footprint 와 겹치므로).</li>
+    <li><strong>face-less OBJ skip</strong>: 잘못 export 된 Bézier curve 같은 face 없는 OBJ 는 Mitsuba 로더가 죽이므로 import 시 사전 skip.</li>
+  </ul>
+</section>
+
+<section id="oneshot">
+  <h2>통합 launcher — 한 스크립트로 일발</h2>
+  <p class="note">
+    Stage 1 은 <code>infinigen</code> conda env (bpy), Stage 2 는 <code>robomituba</code> env (mitsuba_converter / navigation_dataset). 두 env 를 동시에 활성화 못하므로 <code>apps/run_infinigen_import.sh</code> 가 양쪽을 순차 실행한다.
+  </p>
+  <div class="ascii">bash apps/run_infinigen_import.sh data/.../singleroom_furnished
+        ↓ pick_blend()  — scene.blend 손상 시 scene.blend1 로 자동 fallback
+$INFINIGEN_PYTHON tools/infinigen/_run_bpy.py &lt;blend&gt; blender_export_scene.py -- \
+    --out out/infinigen_imports/&lt;name&gt; [--bake]
+        ↓ scene_manifest.json + meshes/ + textures/
+$PYTHON apps/import_infinigen_scene.py \
+    --manifest out/infinigen_imports/&lt;name&gt;/scene_manifest.json \
+    --scene-id infinigen_&lt;name&gt; --force [--room KEY]
+        ↓ out/opticalnav/opticalnav-v0.2/scenes/&lt;scene-id&gt;/
+            ├ authoring_map.json
+            ├ scene_annotation.json
+            ├ traversable_grid.npy
+            ├ render_scene.xml (Mitsuba 입력)
+            └ ...
+  → webui 가 자동 인식, render daemon 이 바로 렌더 가능</div>
+
+  <h3>주요 옵션</h3>
+  <ul class="li-tight">
+    <li><code>--no-bake</code>: bake 스킵. 빠르지만 절차 색은 grayscale 비슷.</li>
+    <li><code>--skip-export</code>: 이미 Stage 1 결과가 있으면 Stage 2 만 다시 실행.</li>
+    <li><code>--room KEY</code>: 특정 방만 (예 <code>dining-room_0/0</code>) 유지.</li>
+    <li><code>--keep-empty-rooms</code>: 가구 없는 방도 포함.</li>
+    <li><code>--no-normalize-origin</code>: Infinigen 의 raw world coord 보존 (원점 정렬 안 함).</li>
+  </ul>
+</section>
+
+<section id="known">
+  <h2>알려진 한계 / 트레이드오프</h2>
+  <table>
+    <thead><tr><th>한계</th><th>왜</th><th>현재 대응</th></tr></thead>
+    <tbody>
+      <tr><td>측정 pBRDF metal 이 grayscale 로 렌더</td><td>프로덕션 OptiX7 빌드에 <code>measured_polarized_rgb</code> 가 빠짐 → 3-pass channel-split fallback 의 luminance 붕괴</td><td>6-15/6-17 보고서의 SVBRDF 트랙 — RGB plugin 컴파일 후 grid 전체 rerender</td></tr>
+      <tr><td>거대 polygon 수의 mesh</td><td>Infinigen 의 procedural fur/foliage 가 수십만 face 만들기도 함</td><td>120k 초과는 bake 스킵; preview mesh decimation (fast-simplification) 으로 web 전송 줄임</td></tr>
+      <tr><td>절차 셰이더 → albedo 만 보존</td><td>normal/roughness 절차 노드는 bake 안 함 (현재는 single channel only)</td><td>SVBRDF Option 2/3 트랙으로 확장 예정</td></tr>
+      <tr><td>Infinigen 의 metallic 값 신뢰성</td><td><code>shader_brushed_metal</code> 이 metallic=0.0 보고하기도</td><td>name keyword 우선, metallic 은 ≥0.5 약한 fallback 으로만 사용</td></tr>
+      <tr><td>scene.blend header 손상</td><td>Infinigen 의 generator 출력에서 종종 발생</td><td>magic bytes 검사 후 <code>.blend1</code> 백업 자동 사용</td></tr>
+      <tr><td>다중 방 처리</td><td>완성 안 된 빈 shell 방이 origin 근처에 stack</td><td>가구 ≥1 개 있는 방만 finished 로 채택; <code>--room</code> 옵션으로 명시 선택 가능</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="side">
+  <h2>곁다리 — 커밋 정리 · 폴라리메트리 404 · 잔재 정리</h2>
+  <p class="note">Infinigen 트랙과 무관하게 오늘 함께 처리한 위생/디버깅 작업 요약:</p>
+
+  <h3>1. working tree 누적 → 14 atomic commit</h3>
+  <p class="note">여러 세션에 걸쳐 working tree 에 쌓여있던 +2883 / -925 변경 (39 files + untracked 다수) 을 의미 단위 라운드 R1–R11 으로 분리. <code>render_daemon.py</code> 1232 line · <code>+page.svelte</code> 거대 hunk 처럼 surgical 분리 비용이 큰 경우는 묶음으로 두되 commit 메시지에 sub-feature bullet 으로 명시.</p>
+
+  <h3>2. Polarization 갤러리 <code>S1/S0</code> · <code>S2/S0</code> 타일 404</h3>
+  <p class="note">
+    Normalized Stokes modality (<code>c61e694</code>) 가 <code>multimodal.py</code> / <code>POLAR_MODALITIES</code> 에는 들어갔으나, <code>render_daemon.py</code> 안 modality↔파일명 매핑 <strong>3 곳 중 2 곳에 누락</strong>. 결과: bridge_jobs → consolidated observations 디렉터리로 PNG 가 복사되지 않아 GET 이 404. 또한 sweep output-exists 체크가 fallback <code>s1_over_s0.png</code> 를 찾고 실패해서 무한 재렌더 위험.
+  </p>
+  <p class="note"><code>893fa5e</code> 에서 세 매핑에 colorbar PNG 파일명 (<code>s1_over_s0_bwr_colorbar.png</code> 등) 정확히 등록. 같이 묶인 변화: <code>_log_graph_edit</code> 헬퍼 (사람의 graph 편집을 jsonl history 로 best-effort append — auto path 개선용 학습 데이터).</p>
+
+  <h3>3. vendor / WSL 잔재 정리</h3>
+  <p class="note">
+    <code>modules/FreeSplatter/</code>, <code>modules/mitsuba3-optix7/</code>, <code>scripts/out/</code> 를 <code>.gitignore</code> 에 등록. WSL 의 <code>:Zone.Identifier</code> 메타데이터는 기존 <code>*.Zone.Identifier</code> 패턴이 콜론 suffix 를 못 잡아 <code>*:Zone.Identifier</code> 패턴 추가. (<code>2730d3d</code>)
+  </p>
+
+  <h3>4. AGENTS.md ↔ CLAUDE.md mirror sync</h3>
+  <p class="note">
+    713 line 어긋난 채 동시 진화하던 두 onboarding 문서를 글자 단위로 mirror (<code>5b4c6df</code>). 자동 sync(symlink / pre-commit hook) 는 다음에 drift 재발 시 도입.
+  </p>
+</section>
+
+<section id="next">
+  <h2>내일 이어서</h2>
+  <div class="grid2">
+    <div class="card">
+      <strong>Stage 2 의 PBR 보존 확장</strong>
+      <div class="note">현재는 albedo 만 bake → 측정 BSDF 의 albedo_scale 로 들어감. roughness / normal 도 bake 해서 SVBRDF Option 2 로 확장.</div>
+    </div>
+    <div class="card">
+      <strong>다중 방 스윕 시나리오</strong>
+      <div class="note">Infinigen 한 씬에서 여러 방이 finished 인 경우 (apartment 수준) viewpoint graph 가 방 사이를 자연스럽게 연결하도록 traversability 의 doorway weight 조정.</div>
+    </div>
+    <div class="card">
+      <strong>Modality filename 매핑 단일화</strong>
+      <div class="note">오늘 발견한 세 매핑 동기화 실패가 잠재 버그. 단일 dataclass 로 묶거나 set-equal assert 도입.</div>
+    </div>
+    <div class="card">
+      <strong>OpticalNav-toy-v0.0 (glass failure testset)</strong>
+      <div class="note">이번 주 최우선 — Infinigen importer 가 안정되면 glass door 가 있는 씬 3개를 자동 generate 해서 testset 채울 수 있는지 검증.</div>
+    </div>
+  </div>
+</section>
+
+<div class="footer">Robomituba · 2026-06-19 · Infinigen importer · 정리 · 디버깅</div>
+
+</main>
+</div>
+</body>
+</html>
