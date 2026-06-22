@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 import json
+import os
 from pathlib import Path, PurePosixPath
+import threading
 from typing import Any, Iterable
 
 from .object_footprint import (
@@ -167,7 +169,20 @@ def write_viewpoint_graph(path: str | Path, graph: ViewpointGraph) -> Path:
     validate_viewpoint_graph(graph)
     output = Path(path)
     output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(json.dumps(viewpoint_graph_to_payload(graph), ensure_ascii=False, indent=2), encoding="utf-8")
+    text = json.dumps(viewpoint_graph_to_payload(graph), ensure_ascii=False, indent=2) + "\n"
+    tmp = output.with_name(f"{output.name}.tmp.{os.getpid()}.{threading.get_ident()}")
+    try:
+        with tmp.open("w", encoding="utf-8") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, output)
+    finally:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
     return output
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
 from types import SimpleNamespace
 import sys
 import tempfile
@@ -29,6 +30,7 @@ from navigation_dataset.viewpoint_graph import (  # noqa: E402
     ViewpointGraph,
     ViewpointHeading,
     ViewpointNode,
+    append_edge,
     find_object_overlapping_nodes,
     read_viewpoint_graph,
     remove_nodes,
@@ -87,6 +89,52 @@ class ViewpointGraphTests(unittest.TestCase):
             path_result = shortest_graph_path(restored, restored.edges[0].source, restored.edges[0].target)
             self.assertEqual(path_result.nodes[0], restored.edges[0].source)
             self.assertEqual(path_result.nodes[-1], restored.edges[0].target)
+
+    def test_write_viewpoint_graph_atomic_roundtrip(self) -> None:
+        _annotation, graph = self.make_graph()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "viewpoint_graph.json"
+            write_viewpoint_graph(path, graph)
+            self.assertEqual(path.read_bytes()[-1:], b"\n")
+            self.assertFalse(list(Path(tmpdir).glob("viewpoint_graph.json.tmp.*")))
+            restored = read_viewpoint_graph(path)
+            self.assertEqual(restored.graph_id, graph.graph_id)
+
+    def test_read_legacy_graph_without_metadata_revision(self) -> None:
+        _annotation, graph = self.make_graph()
+        payload = {
+            "scene_id": graph.scene_id,
+            "graph_id": graph.graph_id,
+            "node_heading_count": 1,
+            "nodes": [
+                {
+                    "node_id": node.node_id,
+                    "position": node.position,
+                    "headings": [{"heading_id": "h_000", "yaw_deg": 0.0}],
+                }
+                for node in graph.nodes
+            ],
+            "edges": [],
+            "schema_version": "0.2",
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "viewpoint_graph.json"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            restored = read_viewpoint_graph(path)
+            self.assertEqual(restored.metadata, {})
+            self.assertEqual(restored.graph_id, graph.graph_id)
+
+    def test_append_edge_duplicate_endpoint_returns_existing_edge(self) -> None:
+        nodes = [
+            ViewpointNode(node_id="vp_a", position=[0.0, 0.0, 0.0]),
+            ViewpointNode(node_id="vp_b", position=[1.0, 0.0, 0.0]),
+        ]
+        graph = ViewpointGraph(scene_id="s", graph_id="g", node_heading_count=4, nodes=nodes)
+        first = append_edge(graph, "vp_a", "vp_b")
+        second = append_edge(graph, "vp_b", "vp_a")
+        self.assertIsNotNone(first)
+        self.assertIs(first, second)
+        self.assertEqual(len(graph.edges), 1)
 
     def test_hazard_crossing_edge_is_flagged_but_retained(self) -> None:
         annotation = self.make_annotation()
