@@ -5493,8 +5493,6 @@ class RenderDaemon:
         if self._server is not None:
             return
 
-        self._cancel_stale_jobs_at_startup()
-
         controller = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -5591,6 +5589,16 @@ class RenderDaemon:
 
         self._server_thread = threading.Thread(target=self._server.serve_forever, name="robomituba-render-daemon", daemon=True)
         self._server_thread.start()
+
+        # Reconcile orphaned running/queued jobs from a previous session in the
+        # BACKGROUND — it only rewrites a few stale statuses (a UI nicety), so it
+        # must never block listening. On a slow CIFS mount with thousands of jobs
+        # the old synchronous startup scan delayed the daemon's listen by minutes.
+        threading.Thread(
+            target=self._cancel_stale_jobs_at_startup,
+            name="robomituba-stale-job-scan",
+            daemon=True,
+        ).start()
 
     def shutdown(self) -> None:
         with self._condition:

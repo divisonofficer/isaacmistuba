@@ -24,6 +24,13 @@ fi
 export PYTHONUNBUFFERED="${PYTHONUNBUFFERED:-1}"
 export PYTHONFAULTHANDLER="${PYTHONFAULTHANDLER:-1}"
 export ROBOMITUBA_RENDER_INPROCESS="${ROBOMITUBA_RENDER_INPROCESS:-0}"
+# CIFS/dev box: out/bridge_jobs accumulates thousands of jobs and lives on a slow
+# network mount, so the startup stale-job scan + per-request job/bundle globs cost
+# minutes. Skip the startup scan and lengthen the scan caches by default (still
+# overridable). Pair with apps/archive_completed_bridge_jobs.py to keep the dir small.
+export ROBOMITUBA_SKIP_STALE_JOB_SCAN="${ROBOMITUBA_SKIP_STALE_JOB_SCAN:-1}"
+export ROBOMITUBA_JOB_SCAN_TTL_S="${ROBOMITUBA_JOB_SCAN_TTL_S:-30}"
+export ROBOMITUBA_BUNDLE_SCAN_TTL_S="${ROBOMITUBA_BUNDLE_SCAN_TTL_S:-30}"
 export ROBOMITUBA_BACKEND_ONLY="${ROBOMITUBA_BACKEND_ONLY:-1}"
 export ROBOMITUBA_RENDER_QUEUE_URL="${ROBOMITUBA_RENDER_QUEUE_URL:-http://127.0.0.1:8766}"
 export ROBOMITUBA_DAEMON_DEBUG_LOG="${ROBOMITUBA_DAEMON_DEBUG_LOG:-1}"
