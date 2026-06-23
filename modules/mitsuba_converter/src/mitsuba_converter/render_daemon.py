@@ -6489,7 +6489,13 @@ class RenderDaemon:
                                     triplets.append((step_idx, vp, h_fwd, dst))
                             continue
                         try:
-                            sample = next(_PILImage.open(p[1]).convert("RGB") for p in panels if p[1])
+                            # Open + immediately convert (which materialises a new image and
+                            # releases the source file handle) for the sample probe. Done in a
+                            # generator so we stop after the first usable panel.
+                            def _open_convert(path):
+                                with _PILImage.open(path) as src:
+                                    return src.convert("RGB")
+                            sample = next(_open_convert(p[1]) for p in panels if p[1])
                             sw, sh = sample.size
                             scale = 240 / max(sw, sh)
                             tw, th = max(1, int(sw * scale)), max(1, int(sh * scale))
@@ -6502,7 +6508,8 @@ class RenderDaemon:
                             x = 0
                             for tag, p, hid in panels:
                                 if p is not None:
-                                    im = _PILImage.open(p).convert("RGB").resize((tw, th), _PILImage.LANCZOS)
+                                    with _PILImage.open(p) as _src:
+                                        im = _src.convert("RGB").resize((tw, th), _PILImage.LANCZOS)
                                     sheet.paste(im, (x, 0))
                                 if draw is not None:
                                     yaw_lbl = (str(_heading_to_yaw(hid) or 0).zfill(3) + "°") if hid else "—"
@@ -6530,7 +6537,8 @@ class RenderDaemon:
                                     hid = _nearest_heading(yaw, goal_available)
                                     rgb_p = (goal_dir / str(hid) / "rgb.png") if hid else None
                                     if rgb_p and rgb_p.is_file():
-                                        im = _PILImage.open(rgb_p).convert("RGB")
+                                        with _PILImage.open(rgb_p) as _src:
+                                            im = _src.convert("RGB")
                                         if sw_g is None:
                                             sw_g, sh_g = im.size
                                             scale = 320 / max(sw_g, sh_g)
@@ -6599,7 +6607,13 @@ class RenderDaemon:
                     # the user can see GT + the goal description in one place.
                     if _PILImage is not None and triplets:
                         try:
-                            row_imgs = [_PILImage.open(p).convert("RGB") for _, _, _, p in triplets]
+                            # Materialise each row image (close the file handle right after) so
+                            # an episode with N steps doesn't keep N file descriptors open
+                            # through the rest of the loop. EMFILE-safe at peak sweep.
+                            def _open_convert_row(path):
+                                with _PILImage.open(path) as src:
+                                    return src.convert("RGB")
+                            row_imgs = [_open_convert_row(p) for _, _, _, p in triplets]
                             if row_imgs:
                                 instruction = (ep.natural_language_instruction or "").strip()
                                 head_h = 0

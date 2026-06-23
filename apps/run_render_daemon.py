@@ -29,6 +29,35 @@ def _bootstrap_project_sys_path() -> None:
 _bootstrap_project_sys_path()
 
 
+def _raise_nofile_to_hard() -> None:
+    """Bump RLIMIT_NOFILE soft → hard so a sweep peak doesn't EMFILE-fail.
+
+    Launchers that come from a parent shell with the legacy 1024 fd soft cap
+    (e.g. some systemd / npm-spawn paths) would otherwise let `_persist_request`
+    crash mid-sweep with `OSError: [Errno 24] Too many open files`. Raising
+    soft → hard is allowed without privileges and is harmless when soft is
+    already at hard. Best-effort: skip on platforms without `resource` (Windows).
+    """
+    try:
+        import resource  # POSIX only
+    except ImportError:
+        return
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if soft < hard:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
+            print(
+                f"[run_render_daemon] RLIMIT_NOFILE raised: {soft} → {hard}",
+                file=sys.stderr, flush=True,
+            )
+    except (OSError, ValueError) as exc:
+        print(f"[run_render_daemon] RLIMIT_NOFILE raise skipped: {exc}",
+              file=sys.stderr, flush=True)
+
+
+_raise_nofile_to_hard()
+
+
 def _is_subprocess_mode() -> bool:
     """Phase R: daemon process does not import mitsuba when the worker
     subprocess does it for us. Decided by the same env flag the daemon
