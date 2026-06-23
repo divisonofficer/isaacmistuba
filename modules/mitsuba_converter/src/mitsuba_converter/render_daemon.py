@@ -4075,6 +4075,18 @@ class RenderDaemon:
         self._scene_cache_stats: dict[str, dict[str, Any]] = {}
         self._path_size_cache: dict[str, dict[str, Any]] = {}
         self._telemetry_cache: dict[str, Any] = {"path": None, "mtime_ns": None, "rows": []}
+        # Per-scene project-summary cache. _opticalnav_project_summary is called on
+        # every project/scene mutation AND once per project on the project list, and
+        # each scene parse fully deserializes scene_annotation.json + viewpoint_graph.json
+        # (the latter builds the whole graph just to count nodes/edges). Keyed by a
+        # cheap stat fingerprint of the scene's files so an unchanged scene is reused
+        # and only a touched scene is recomputed. Thread-safe (ThreadingHTTPServer).
+        self._scene_summary_cache: dict[str, tuple[tuple, dict[str, Any]]] = {}
+        # validate_dataset() re-parses every scene_annotation.json (a SECOND full
+        # annotation pass on top of the per-scene loop). Cache its report by a
+        # project-level fingerprint (dataset.json + all annotation stats).
+        self._validate_report_cache: dict[str, tuple[tuple, dict[str, Any]]] = {}
+        self._scene_summary_lock = threading.Lock()
         # TTL caches for expensive glob+deserialize operations in request handlers
         self._job_status_cache: list[Any] | None = None
         self._job_status_cache_ts: float = 0.0
@@ -7250,119 +7262,68 @@ class RenderDaemon:
             if not path.exists():
                 path.write_text(text, encoding="utf-8")
 
-    def _opticalnav_project_summary(self, project_dir: Path) -> dict[str, Any]:
+    # Scene files whose content or existence feeds a scene's project-summary entry.
+    # Used to build the cache fingerprint; dataset.json is added separately (it backs
+    # the usd_ref fallback).
+    _SCENE_SUMMARY_INPUT_FILES = (
+        "scene_annotation.json", "authoring_map.json", "traversable_grid.npy",
+        "nav_graph.json", "viewpoint_graph.json", "render_readiness.json",
+        "editor_geometry.json", "scene_variant.json", "render_scene_overlays.json",
+        "render_scene.xml",
+    )
+
+    @staticmethod
+    def _stat_sig(path: Path) -> tuple[int, int] | None:
+        """(mtime_ns, size) for a file, or None if absent — a cheap change fingerprint."""
+        try:
+            st = path.stat()
+            return (st.st_mtime_ns, st.st_size)
+        except OSError:
+            return None
+
+    def _scene_summary_fingerprint(self, scene_dir: Path, dataset_path: Path) -> tuple:
+        return tuple(self._stat_sig(scene_dir / name) for name in self._SCENE_SUMMARY_INPUT_FILES) \
+            + (self._stat_sig(dataset_path),)
+
+    def _cached_validation_report(self, project_dir: Path, dataset_path: Path) -> dict[str, Any]:
+        fingerprint = (self._stat_sig(dataset_path),) + tuple(
+            self._stat_sig(p) for p in sorted((project_dir / "scenes").glob("*/scene_annotation.json"))
+        )
+        cache_key = str(project_dir)
+        with self._scene_summary_lock:
+            cached = self._validate_report_cache.get(cache_key)
+        if cached is not None and cached[0] == fingerprint:
+            return cached[1]
         from navigation_dataset.validation import validate_dataset
 
+        report = validate_dataset(project_dir, require_observations=False).to_payload()
+        with self._scene_summary_lock:
+            self._validate_report_cache[cache_key] = (fingerprint, report)
+        return report
+
+    def _opticalnav_project_summary(self, project_dir: Path) -> dict[str, Any]:
         dataset_path = project_dir / "dataset.json"
         dataset = _read_json(dataset_path) if dataset_path.exists() else {}
         scenes = []
         for scene_dir in sorted((project_dir / "scenes").glob("*")):
             if not scene_dir.is_dir():
                 continue
-            annotation_path = scene_dir / "scene_annotation.json"
-            authoring_map_path = scene_dir / "authoring_map.json"
-            traversable_grid_path = scene_dir / "traversable_grid.npy"
-            nav_graph_path = scene_dir / "nav_graph.json"
-            annotation_ok = False
-            annotation_error = None
-            sync_status: dict[str, Any] = {
-                "dataset": "missing",
-                "render_scene": "missing",
-                "isaac_stage": "missing",
-                "annotation_stale": False,
-                "traversable_map_stale": False,
-                "viewpoint_graph_stale": False,
-            }
-            if annotation_path.exists():
-                try:
-                    from navigation_dataset.scene_annotations import read_scene_annotation
-
-                    annotation = read_scene_annotation(annotation_path)
-                    annotation_ok = True
-                    sync_status.update(dict(annotation.metadata.get("sync", {})))
-                except Exception as exc:
-                    annotation_error = str(exc)
-                    # Fallback: read sync metadata directly from raw JSON even if validation fails
-                    # (scenes before compilation may lack goal_regions/traversable_regions).
-                    try:
-                        _raw_ann = json.loads(annotation_path.read_text(encoding="utf-8"))
-                        sync_status.update(dict(_raw_ann.get("metadata", {}).get("sync", {})))
-                    except Exception:
-                        pass
-            if authoring_map_path.exists() and annotation_path.exists():
-                sync_status["annotation_stale"] = authoring_map_path.stat().st_mtime > annotation_path.stat().st_mtime
-            if annotation_path.exists() and traversable_grid_path.exists():
-                sync_status["traversable_map_stale"] = annotation_path.stat().st_mtime > traversable_grid_path.stat().st_mtime
-            graph_path = scene_dir / "viewpoint_graph.json"
-            graph_summary = None
-            if graph_path.exists():
-                try:
-                    from navigation_dataset.viewpoint_graph import read_viewpoint_graph
-
-                    graph = read_viewpoint_graph(graph_path)
-                    graph_summary = {
-                        "graph_id": graph.graph_id,
-                        "node_count": len(graph.nodes),
-                        "edge_count": len(graph.edges),
-                        "heading_count": graph.node_heading_count,
-                        "hazard_edge_count": sum(1 for edge in graph.edges if edge.hazard_crossing),
-                    }
-                except Exception as exc:
-                    graph_summary = {"error": str(exc)}
-            if traversable_grid_path.exists() and graph_path.exists():
-                sync_status["viewpoint_graph_stale"] = traversable_grid_path.stat().st_mtime > graph_path.stat().st_mtime
-            usd_ref = self._opticalnav_scene_usd_ref(project_dir, scene_dir.name)
-            usd_exists = False
-            usd_error = None
-            if usd_ref:
-                try:
-                    usd_exists = resolve_repo_path(self.repo_root, usd_ref).exists()
-                    if not usd_exists:
-                        usd_error = f"USD ref does not exist: {usd_ref}"
-                except Exception as exc:
-                    usd_error = str(exc)
-            readiness_path = scene_dir / "render_readiness.json"
-            readiness_summary = None
-            if readiness_path.exists():
-                try:
-                    readiness_payload = _read_json(readiness_path)
-                    readiness_summary = {
-                        "ok": bool(readiness_payload.get("ok")),
-                        "status": readiness_payload.get("status"),
-                        "texture_profile": readiness_payload.get("texture_profile"),
-                        "error_count": len(readiness_payload.get("errors") or []),
-                        "warning_count": len(readiness_payload.get("warnings") or []),
-                    }
-                except Exception as exc:
-                    readiness_summary = {"ok": False, "status": "unreadable", "error": str(exc)}
-            scenes.append({
-                "scene_id": scene_dir.name,
-                "usd_ref": usd_ref,
-                "usd_exists": usd_exists,
-                "usd_error": usd_error,
-                "annotation_ref": annotation_path.relative_to(project_dir).as_posix() if annotation_path.exists() else None,
-                "authoring_map_ref": authoring_map_path.relative_to(project_dir).as_posix() if authoring_map_path.exists() else None,
-                "authoring_map_exists": authoring_map_path.exists(),
-                "editor_geometry_ref": (scene_dir / "editor_geometry.json").relative_to(project_dir).as_posix() if (scene_dir / "editor_geometry.json").exists() else None,
-                "editor_geometry_exists": (scene_dir / "editor_geometry.json").exists(),
-                "scene_variant_ref": (scene_dir / "scene_variant.json").relative_to(project_dir).as_posix() if (scene_dir / "scene_variant.json").exists() else None,
-                "render_scene_overlay_ref": (scene_dir / "render_scene_overlays.json").relative_to(project_dir).as_posix() if (scene_dir / "render_scene_overlays.json").exists() else None,
-                "render_scene_xml_ref": (scene_dir / "render_scene.xml").relative_to(project_dir).as_posix() if (scene_dir / "render_scene.xml").exists() else None,
-                "render_readiness_ref": readiness_path.relative_to(project_dir).as_posix() if readiness_path.exists() else None,
-                "render_readiness": readiness_summary,
-                "annotation_ok": annotation_ok,
-                "annotation_error": annotation_error,
-                "sync_status": sync_status,
-                "map_exists": traversable_grid_path.exists(),
-                "nav_graph_exists": nav_graph_path.exists(),
-                "viewpoint_graph_exists": graph_path.exists(),
-                "viewpoint_graph": graph_summary,
-            })
+            cache_key = str(scene_dir)
+            fingerprint = self._scene_summary_fingerprint(scene_dir, dataset_path)
+            with self._scene_summary_lock:
+                cached = self._scene_summary_cache.get(cache_key)
+            if cached is not None and cached[0] == fingerprint:
+                scenes.append(cached[1])
+                continue
+            summary = self._compute_scene_summary(scene_dir, project_dir)
+            with self._scene_summary_lock:
+                self._scene_summary_cache[cache_key] = (fingerprint, summary)
+            scenes.append(summary)
         split_counts: dict[str, int] = {}
         for split_dir in sorted((project_dir / "episodes").glob("*")):
             if split_dir.is_dir():
                 split_counts[split_dir.name] = len(list(split_dir.glob("*.json")))
-        report = validate_dataset(project_dir, require_observations=False).to_payload()
+        report = self._cached_validation_report(project_dir, dataset_path)
         return {
             "project_id": project_dir.name,
             "root": project_dir.relative_to(self.repo_root).as_posix(),
@@ -7371,6 +7332,110 @@ class RenderDaemon:
             "split_counts": split_counts,
             "episode_count": sum(split_counts.values()),
             "validation": report,
+        }
+
+    def _compute_scene_summary(self, scene_dir: Path, project_dir: Path) -> dict[str, Any]:
+        """Build one scene's project-summary entry (the expensive part: annotation +
+        viewpoint-graph parse). Cached by _opticalnav_project_summary on a stat
+        fingerprint, so this only runs when a scene's files actually change."""
+        annotation_path = scene_dir / "scene_annotation.json"
+        authoring_map_path = scene_dir / "authoring_map.json"
+        traversable_grid_path = scene_dir / "traversable_grid.npy"
+        nav_graph_path = scene_dir / "nav_graph.json"
+        annotation_ok = False
+        annotation_error = None
+        sync_status: dict[str, Any] = {
+            "dataset": "missing",
+            "render_scene": "missing",
+            "isaac_stage": "missing",
+            "annotation_stale": False,
+            "traversable_map_stale": False,
+            "viewpoint_graph_stale": False,
+        }
+        if annotation_path.exists():
+            try:
+                from navigation_dataset.scene_annotations import read_scene_annotation
+
+                annotation = read_scene_annotation(annotation_path)
+                annotation_ok = True
+                sync_status.update(dict(annotation.metadata.get("sync", {})))
+            except Exception as exc:
+                annotation_error = str(exc)
+                # Fallback: read sync metadata directly from raw JSON even if validation fails
+                # (scenes before compilation may lack goal_regions/traversable_regions).
+                try:
+                    _raw_ann = json.loads(annotation_path.read_text(encoding="utf-8"))
+                    sync_status.update(dict(_raw_ann.get("metadata", {}).get("sync", {})))
+                except Exception:
+                    pass
+        if authoring_map_path.exists() and annotation_path.exists():
+            sync_status["annotation_stale"] = authoring_map_path.stat().st_mtime > annotation_path.stat().st_mtime
+        if annotation_path.exists() and traversable_grid_path.exists():
+            sync_status["traversable_map_stale"] = annotation_path.stat().st_mtime > traversable_grid_path.stat().st_mtime
+        graph_path = scene_dir / "viewpoint_graph.json"
+        graph_summary = None
+        if graph_path.exists():
+            try:
+                from navigation_dataset.viewpoint_graph import read_viewpoint_graph
+
+                graph = read_viewpoint_graph(graph_path)
+                graph_summary = {
+                    "graph_id": graph.graph_id,
+                    "node_count": len(graph.nodes),
+                    "edge_count": len(graph.edges),
+                    "heading_count": graph.node_heading_count,
+                    "hazard_edge_count": sum(1 for edge in graph.edges if edge.hazard_crossing),
+                }
+            except Exception as exc:
+                graph_summary = {"error": str(exc)}
+        if traversable_grid_path.exists() and graph_path.exists():
+            sync_status["viewpoint_graph_stale"] = traversable_grid_path.stat().st_mtime > graph_path.stat().st_mtime
+        usd_ref = self._opticalnav_scene_usd_ref(project_dir, scene_dir.name)
+        usd_exists = False
+        usd_error = None
+        if usd_ref:
+            try:
+                usd_exists = resolve_repo_path(self.repo_root, usd_ref).exists()
+                if not usd_exists:
+                    usd_error = f"USD ref does not exist: {usd_ref}"
+            except Exception as exc:
+                usd_error = str(exc)
+        readiness_path = scene_dir / "render_readiness.json"
+        readiness_summary = None
+        if readiness_path.exists():
+            try:
+                readiness_payload = _read_json(readiness_path)
+                readiness_summary = {
+                    "ok": bool(readiness_payload.get("ok")),
+                    "status": readiness_payload.get("status"),
+                    "texture_profile": readiness_payload.get("texture_profile"),
+                    "error_count": len(readiness_payload.get("errors") or []),
+                    "warning_count": len(readiness_payload.get("warnings") or []),
+                }
+            except Exception as exc:
+                readiness_summary = {"ok": False, "status": "unreadable", "error": str(exc)}
+        return {
+            "scene_id": scene_dir.name,
+            "usd_ref": usd_ref,
+            "usd_exists": usd_exists,
+            "usd_error": usd_error,
+            "annotation_ref": annotation_path.relative_to(project_dir).as_posix() if annotation_path.exists() else None,
+            "authoring_map_ref": authoring_map_path.relative_to(project_dir).as_posix() if authoring_map_path.exists() else None,
+            "authoring_map_exists": authoring_map_path.exists(),
+            "editor_geometry_ref": (scene_dir / "editor_geometry.json").relative_to(project_dir).as_posix() if (scene_dir / "editor_geometry.json").exists() else None,
+            "editor_geometry_exists": (scene_dir / "editor_geometry.json").exists(),
+            "scene_variant_ref": (scene_dir / "scene_variant.json").relative_to(project_dir).as_posix() if (scene_dir / "scene_variant.json").exists() else None,
+            "render_scene_overlay_ref": (scene_dir / "render_scene_overlays.json").relative_to(project_dir).as_posix() if (scene_dir / "render_scene_overlays.json").exists() else None,
+            "render_scene_xml_ref": (scene_dir / "render_scene.xml").relative_to(project_dir).as_posix() if (scene_dir / "render_scene.xml").exists() else None,
+            "render_readiness_ref": readiness_path.relative_to(project_dir).as_posix() if readiness_path.exists() else None,
+            "render_readiness": readiness_summary,
+            "annotation_ok": annotation_ok,
+            "annotation_error": annotation_error,
+            "sync_status": sync_status,
+            "map_exists": traversable_grid_path.exists(),
+            "nav_graph_exists": nav_graph_path.exists(),
+            "viewpoint_graph_exists": graph_path.exists(),
+            "viewpoint_graph": graph_summary,
         }
 
     def _opticalnav_starter_annotation(self, scene_id: str, usd_ref: str | None) -> dict[str, Any]:

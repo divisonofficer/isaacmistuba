@@ -97,6 +97,10 @@ class RenderConfig:
     lidar_wavelength_nm: float = 905.0
     ambient_radiance: float = 1.0
     write_raw_npz: bool = True
+    # Measured-pBRDF band mode: "rgb" (3 bands, default) | "single" (1 band ×
+    # albedo) | "hybrid" (achromatic→1 band, colored metals→3 bands). Empty =
+    # fall back to ROBOMITUBA_PBRDF_BAND_MODE env then "rgb".
+    pbrdf_band_mode: str = "rgb"
     artifact_stems: dict[str, str] = field(default_factory=dict)
     scene_filenames: dict[str, str] = field(default_factory=dict)
 
@@ -302,6 +306,38 @@ _RGB_CHANNEL_SPLIT_WAVELENGTHS_NM: tuple[tuple[str, int], ...] = (
     ("b", 446),
 )
 
+# pBRDF band mode (see dev_report/report_2026-06-23_single_band_pbrdf_albedo.md):
+#   "rgb"    — every measured material loads 3 bands (614/542/446)        [default, current]
+#   "single" — every measured material stays single-band (542 placeholder) × RGB albedo_scale
+#   "hybrid" — achromatic materials → single-band; colored metals → 3 bands
+# Single-band still renders colour because measured_polarized applies albedo_scale.
+_PBRDF_BAND_MODES = {"rgb", "single", "hybrid"}
+
+# Measured materials whose reflectance is ~achromatic across the visible bands, so a
+# single band × RGB albedo reproduces them with negligible error. Conservative:
+# anything NOT here (colored metals like fake_gold/brass/copper, colored silicones
+# /billiards) keeps 3 bands so its coloured specular is preserved.
+_ACHROMATIC_MEASURED_MATERIALS = {
+    "aluminum", "suj2", "steel", "chrome", "nickel", "iron",
+    "white_billiard", "black_billiard", "black_glass", "spectralon",
+    "silver_rough_plastic", "white_rough_plastic", "white_smooth_plastic",
+    "black_rough_plastic", "gray_silicone",
+}
+
+
+def _measured_material_is_colored(material_id: str | None) -> bool:
+    """True when a measured material needs 3 bands to preserve its colour."""
+    return str(material_id or "").strip().lower() not in _ACHROMATIC_MEASURED_MATERIALS
+
+
+def _resolve_pbrdf_band_mode(config: "RenderConfig | None") -> str:
+    """Effective band mode: request (config) → env → 'rgb'; unknown values fall back to 'rgb'."""
+    mode = getattr(config, "pbrdf_band_mode", None) if config is not None else None
+    if not mode:
+        mode = os.environ.get("ROBOMITUBA_PBRDF_BAND_MODE")
+    mode = str(mode or "rgb").strip().lower()
+    return mode if mode in _PBRDF_BAND_MODES else "rgb"
+
 
 def _swap_measured_bsdf_wavelength(root: ET.Element, *, target_nm: int) -> int:
     """Rewrite filenames of channel-split measured BSDFs to a target wavelength.
@@ -335,13 +371,24 @@ def _channel_split_filename_for(value: str, *, target_nm: int) -> str:
     return value[: m.start("wl")] + str(target_nm) + ".pbrdf"
 
 
-def _convert_channel_split_measured_bsdfs_to_rgb_plugin(root: ET.Element) -> int:
+def _convert_channel_split_measured_bsdfs_to_rgb_plugin(
+    root: ET.Element, *, band_mode: str = "rgb"
+) -> int:
     """Convert channel-split measured BSDFs to the RGB single-pass plugin.
 
     Source XML deliberately keeps the stable measured_polarized + 542 nm
     placeholder. RGB staging rewrites that placeholder to a plugin that evaluates
     the three channel-split pBRDF files in one Mitsuba RGB render.
+
+    ``band_mode`` selects which materials get the 3-band plugin:
+      * "rgb"    — all of them (current behaviour),
+      * "single" — none (every measured BSDF stays single-band; colour comes from
+                   its albedo_scale texture),
+      * "hybrid" — only colour-bearing materials (achromatic ones stay single-band).
+    Materials left as single-band still render colour via ``albedo_scale``.
     """
+    if band_mode == "single":
+        return 0
     converted = 0
     for bsdf in list(root.findall(".//bsdf")):
         if str(bsdf.get("type") or "") not in _MEASURED_BSDF_TYPES:
@@ -354,7 +401,11 @@ def _convert_channel_split_measured_bsdfs_to_rgb_plugin(root: ET.Element) -> int
         if filename is None:
             continue
         value = filename.get("value") or ""
-        if not _CHANNEL_SPLIT_FILENAME_RE.search(value):
+        m = _CHANNEL_SPLIT_FILENAME_RE.search(value)
+        if not m:
+            continue
+        if band_mode == "hybrid" and not _measured_material_is_colored(m.group("material")):
+            # Achromatic material: keep single-band (542 placeholder) × albedo_scale.
             continue
 
         bsdf.set("type", _CHANNEL_SPLIT_RGB_PLUGIN_TYPE)
@@ -1519,6 +1570,7 @@ def _stage_path_scene(
     ambient_radiance: float = 1.0,
     measured_wavelength_nm: int | None = None,
     channel_rgb_plugin: bool = False,
+    band_mode: str = "rgb",
 ) -> Path:
     stage_signature = (
         "path",
@@ -1546,7 +1598,7 @@ def _stage_path_scene(
             samples_per_pass=samples_per_pass,
         )
         if channel_rgb_plugin:
-            _convert_channel_split_measured_bsdfs_to_rgb_plugin(root)
+            _convert_channel_split_measured_bsdfs_to_rgb_plugin(root, band_mode=band_mode)
         elif measured_wavelength_nm is not None:
             _swap_measured_bsdf_wavelength(root, target_nm=int(measured_wavelength_nm))
 
@@ -2030,6 +2082,7 @@ def _stage_base_path_scene(
     ambient_radiance: float = 1.0,
     measured_wavelength_nm: int | None = None,
     channel_rgb_plugin: bool = False,
+    band_mode: str = "rgb",
 ) -> Path:
     """Stage a camera-free path-tracer scene shared across viewpoints.
 
@@ -2068,7 +2121,7 @@ def _stage_base_path_scene(
             samples_per_pass=samples_per_pass,
         )
         if channel_rgb_plugin:
-            _convert_channel_split_measured_bsdfs_to_rgb_plugin(root)
+            _convert_channel_split_measured_bsdfs_to_rgb_plugin(root, band_mode=band_mode)
         elif measured_wavelength_nm is not None:
             _swap_measured_bsdf_wavelength(root, target_nm=int(measured_wavelength_nm))
 
@@ -3532,6 +3585,7 @@ def render_modalities(
     if "hazard_mask" in requested_set and not hazard_target_shape_filenames:
         raise ValueError("hazard_mask requires scene_override.target_shape_filenames or depth_approx.target_shape_filenames.")
     use_channel_split_rgb = _needs_path_total(requested_set) and _scene_has_channel_split_measured_bsdfs(source_scene)
+    band_mode = _resolve_pbrdf_band_mode(config)
     use_channel_rgb_plugin = (
         use_channel_split_rgb
         and not os.environ.get("ROBOMITUBA_DISABLE_HPBRDF_RGB_PLUGIN")
@@ -3673,6 +3727,7 @@ def render_modalities(
                             scene_override=scene_override,
                             ambient_radiance=config.ambient_radiance,
                             channel_rgb_plugin=True,
+                            band_mode=band_mode,
                         )
                     else:
                         scene_rgb = _stage_path_scene(
@@ -3689,6 +3744,7 @@ def render_modalities(
                             scene_override=scene_override,
                             ambient_radiance=config.ambient_radiance,
                             channel_rgb_plugin=True,
+                            band_mode=band_mode,
                         )
                     staged_scenes["rgb"] = str(scene_rgb)
                     stage_s = time.perf_counter() - stage_start
