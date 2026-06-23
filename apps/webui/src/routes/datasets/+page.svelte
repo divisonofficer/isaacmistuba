@@ -189,6 +189,17 @@
 	const _urlInit = typeof window !== 'undefined' ? new URLSearchParams(window.location.search) : new URLSearchParams();
 
 	let loading = $state(false);
+	// `loading` is the GLOBAL in-flight flag flipped by every run() call — including
+	// background batch polling and post-save refreshes — so it's the wrong gate for
+	// the Save buttons (they'd block during unrelated activity). `saving` is true
+	// only while an authoring-map persist is actually in flight; a counter keeps it
+	// correct across nested/concurrent saves (e.g. bulk light toggles).
+	let savingCount = $state(0);
+	const saving = $derived(savingCount > 0);
+	// Human-readable description of the current initial-load step, shown in the
+	// header so the user can see WHAT is loading (project list, scene map, details)
+	// rather than staring at an opaque disabled UI.
+	let loadingStage = $state('');
 	let error = $state('');
 	let info = $state('');
 	let projects = $state<any[]>([]);
@@ -2606,28 +2617,46 @@
 
 	async function refreshProject() {
 		if (!selectedProjectId) return;
-		const data = await run(() => projectService.fetchProject(selectedProjectId), undefined, 'project:detail');
-		if (!data) return;
-		project = data;
-		if (!sceneId && data.scenes?.length) sceneId = data.scenes[0].scene_id;
-		const scene = data.scenes?.find((item: any) => item.scene_id === sceneId);
-		if (scene?.usd_ref) usdRef = scene.usd_ref;
-		await loadMapAssets();
-		await loadEnvmaps();
-		await refreshEpisodes();
-		// Auto-load authoring map if one exists on the server and we have nothing in memory yet.
-		// Guard: skip if authoringMap is already populated (e.g. unsaved edits in this session).
-		if (scene?.authoring_map_exists && !authoringMap) {
-			const mapData = await run(
-				() => authoringMapService.fetchAuthoringMap(selectedProjectId, sceneId),
-				undefined,
-				'authoring-map:load'
-			);
-			if (mapData) setAuthoringMapPayload(mapData, false);
+		loadingStage = 'Loading project…';
+		try {
+			const data = await run(() => projectService.fetchProject(selectedProjectId), undefined, 'project:detail');
+			if (!data) return;
+			project = data;
+			// Keep the current sceneId only if THIS project actually contains it; otherwise
+			// fall back to the first scene. Previously this only filled in a missing sceneId,
+			// so a sceneId left over from another project (URL / sessionStorage default)
+			// matched nothing → the auto-load below was skipped and the editor stayed blank
+			// until the user manually re-picked a scene from the dropdown.
+			if (data.scenes?.length && !data.scenes.some((item: any) => item.scene_id === sceneId)) {
+				sceneId = data.scenes[0].scene_id;
+			}
+			const scene = data.scenes?.find((item: any) => item.scene_id === sceneId);
+			if (scene?.usd_ref) usdRef = scene.usd_ref;
+			// Load the authoring map FIRST so the editor is usable immediately — before the
+			// slower/secondary fetches (assets, envmaps, episodes, render config). Guard:
+			// skip if authoringMap is already populated (e.g. unsaved edits this session).
+			if (scene?.authoring_map_exists && !authoringMap) {
+				loadingStage = 'Loading scene map…';
+				const mapData = await run(
+					() => authoringMapService.fetchAuthoringMap(selectedProjectId, sceneId),
+					undefined,
+					'authoring-map:load'
+				);
+				if (mapData) setAuthoringMapPayload(mapData, false);
+			}
+			// Secondary loads — the editor already works at this point. Fetch the rest
+			// sequentially (keeping run()/loading consistent) but with visible progress.
+			loadingStage = 'Loading scene assets…';
+			await loadMapAssets();
+			await loadEnvmaps();
+			loadingStage = 'Loading episodes…';
+			await refreshEpisodes();
+			loadingStage = 'Loading render readiness…';
+			await loadRenderReadiness();
+			if (!sceneStateText.trim()) await loadRenderConfig();
+		} finally {
+			loadingStage = '';
 		}
-		await loadRenderReadiness();
-		// Load render config if not already populated
-		if (!sceneStateText.trim()) await loadRenderConfig();
 	}
 
 	async function createProject() {
@@ -2696,26 +2725,31 @@
 			settings: { ...(payload.settings ?? {}), map_w: mapWidth, map_h: mapHeight },
 			...(options.deferRenderSync ? { defer_render_scene_sync: true } : {}),
 		};
-		const data = await run(
-			() => authoringMapService.saveAuthoringMap(selectedProjectId, sceneId, payload),
-			'Map overlay saved.',
-			'authoring-map:save'
-		);
-		if (!data) return false;
-		if (data?.authoring_map) setAuthoringMapPayload(data.authoring_map, false);
-		// Phase 3: PUT /authoring-map now regenerates render_scene.xml automatically.
-		// Update render readiness from the response so Sync button is no longer needed.
-		if (updateRenderReadiness && data?.render_readiness) {
-			syncResult = null;
-			renderReadiness = data.render_readiness;
-			if (data.render_readiness.ok === false) {
-				pushActivity('warn', 'render-readiness', 'Map saved, but render readiness is blocked.', data.render_readiness);
+		savingCount += 1;
+		try {
+			const data = await run(
+				() => authoringMapService.saveAuthoringMap(selectedProjectId, sceneId, payload),
+				'Map overlay saved.',
+				'authoring-map:save'
+			);
+			if (!data) return false;
+			if (data?.authoring_map) setAuthoringMapPayload(data.authoring_map, false);
+			// Phase 3: PUT /authoring-map now regenerates render_scene.xml automatically.
+			// Update render readiness from the response so Sync button is no longer needed.
+			if (updateRenderReadiness && data?.render_readiness) {
+				syncResult = null;
+				renderReadiness = data.render_readiness;
+				if (data.render_readiness.ok === false) {
+					pushActivity('warn', 'render-readiness', 'Map saved, but render readiness is blocked.', data.render_readiness);
+				}
 			}
+			await refreshProject();
+			// Reload render config (sceneStateText/cameraSpecText) if XML was freshly generated.
+			if (updateRenderReadiness && data?.render_readiness?.ok && !sceneStateText.trim()) await loadRenderConfig();
+			return true;
+		} finally {
+			savingCount -= 1;
 		}
-		await refreshProject();
-		// Reload render config (sceneStateText/cameraSpecText) if XML was freshly generated.
-		if (updateRenderReadiness && data?.render_readiness?.ok && !sceneStateText.trim()) await loadRenderConfig();
-		return true;
 	}
 
 	async function saveMap() {
@@ -4015,6 +4049,7 @@
 		</div>
 	</header>
 
+	{#if loadingStage}<div class="notice loading"><span class="loading-spinner" aria-hidden="true"></span>{loadingStage}</div>{/if}
 	{#if error}<div class="notice error">{error}</div>{/if}
 	{#if info}<div class="notice ok">{info}</div>{/if}
 
@@ -4406,7 +4441,7 @@
 					{/if}
 					<div class="action-row">
 						<button class="button button-subtle" disabled={!selectedProjectId || loading} onclick={addScene}>Add Scene</button>
-						<button class="button button-primary" disabled={!selectedProjectId || !hasScene || loading} onclick={saveMap}>
+						<button class="button button-primary" disabled={!selectedProjectId || !hasScene || saving} onclick={saveMap}>
 							{authoringMapDirty ? '● ' : ''}Save Map
 						</button>
 					</div>
@@ -4785,7 +4820,7 @@
 		{#if railTab === 'lights'}
 			<RailLightsTab
 				{authoringMap} {detectedEmitterIds} {detectedEmitterCount} {enabledEmitterCount}
-				{hasScene} {loading}
+				{hasScene} {saving}
 				onEnableAll={enableAllDetectedEmitters}
 				onDisableAll={disableAllEmitters}
 				onToggleEmitter={handleToggleEmitter}
@@ -5547,6 +5582,9 @@
 	.notice { border-radius: var(--radius-sm); padding: var(--space-2) var(--space-3); }
 	.notice.error { background: var(--danger-soft); color: var(--danger); border: 1px solid #f0b4b4; }
 	.notice.ok { background: var(--tool-traversable-soft); color: var(--tool-traversable); border: 1px solid var(--tool-traversable); }
+	.notice.loading { display: flex; align-items: center; gap: var(--space-2); background: var(--surface-1); color: var(--text-2); border: 1px solid var(--border); }
+	.loading-spinner { width: 13px; height: 13px; border-radius: 50%; border: 2px solid var(--border); border-top-color: var(--text-2); animation: spin 0.7s linear infinite; flex: none; }
+	@keyframes spin { to { transform: rotate(360deg); } }
 	pre {
 		max-height: 360px;
 		overflow: auto;
