@@ -73,6 +73,13 @@ _SCENE_CACHE_LOCK = threading.Lock()
 _RESIDENT_SCENE_CACHE_LIMIT: int = int(os.environ.get("ROBOMITUBA_SCENE_CACHE_LIMIT", "32"))
 _last_source_scene_dir: str = ""
 
+# RGB radiance tonemapping (extended Reinhard). Render-time uses these fixed
+# defaults so every frame in a sweep shares the same exposure (consistent for
+# ML); the export step recomputes a scene-global (exposure, white) from the EXR
+# population and re-tonemaps. Both reuse `_tonemap_reinhard` below.
+_TONE_EXPOSURE_DEFAULT: float = float(os.environ.get("ROBOMITUBA_TONE_EXPOSURE", "1.0"))
+_TONE_WHITE_DEFAULT: float = float(os.environ.get("ROBOMITUBA_TONE_WHITE", "10.0"))
+
 
 @dataclass
 class RenderConfig:
@@ -96,6 +103,10 @@ class RenderConfig:
     lidar_max_range_m: float = 80.0
     lidar_wavelength_nm: float = 905.0
     ambient_radiance: float = 1.0
+    # RGB radiance tonemapping (extended Reinhard) — fixed per-frame exposure so a
+    # sweep stays consistent; export recomputes a scene-global value from EXRs.
+    tone_exposure: float = field(default_factory=lambda: _TONE_EXPOSURE_DEFAULT)
+    tone_white: float = field(default_factory=lambda: _TONE_WHITE_DEFAULT)
     write_raw_npz: bool = True
     # Measured-pBRDF band mode: "rgb" (3 bands, default) | "single" (1 band ×
     # albedo) | "hybrid" (achromatic→1 band, colored metals→3 bands). Empty =
@@ -2425,6 +2436,67 @@ def save_unit_rgb_preview(arr: np.ndarray, path: Path) -> dict[str, Any]:
     return {"encoding": "srgb", "input_range": [0.0, 1.0]}
 
 
+def _tonemap_reinhard(arr: np.ndarray, *, exposure: float, white: float) -> np.ndarray:
+    """Extended Reinhard tonemap (per-channel) → sRGB-encoded [0, 1] float.
+
+    ``y = x (1 + x / white**2) / (1 + x)`` with ``x = arr * exposure`` rolls off
+    highlights toward 1.0 (a light source in view no longer forces the rest of
+    the frame dark) while ``white`` sets the radiance that maps to ~1.0.
+    """
+    safe = np.where(np.isfinite(arr), arr, 0.0)
+    x = np.clip(safe, 0.0, None) * float(exposure)
+    w = max(float(white), 1e-6)
+    y = x * (1.0 + x / (w * w)) / (1.0 + x)
+    return np.clip(srgb_encode(y), 0.0, 1.0).astype(np.float32)
+
+
+def compute_global_tone_params(
+    luminance_samples: Sequence[np.ndarray] | np.ndarray,
+    *,
+    exposure_percentile: float = 0.90,
+    white_percentile: float = 0.999,
+) -> dict[str, float]:
+    """Derive a scene-global (exposure, white) from sampled positive luminance.
+
+    ``exposure`` is set so the ``exposure_percentile`` of the radiance population
+    maps to ~1.0 before roll-off; ``white`` places the ``white_percentile`` (the
+    brightest non-outlier radiance) at the roll-off knee. Reused by the export
+    pipeline and the in-place retonemap migration.
+    """
+    if isinstance(luminance_samples, np.ndarray):
+        pool = luminance_samples.reshape(-1)
+    else:
+        flat = [np.asarray(s, dtype=np.float32).reshape(-1) for s in luminance_samples if s is not None]
+        pool = np.concatenate(flat) if flat else np.zeros(0, dtype=np.float32)
+    pool = pool[np.isfinite(pool)]
+    pool = pool[pool > 0.0]
+    if pool.size == 0:
+        return {"tone_exposure": 1.0, "tone_white": _TONE_WHITE_DEFAULT}
+    key = float(np.quantile(pool, exposure_percentile))
+    key = max(key, 1e-6)
+    exposure = 1.0 / key
+    hi = float(np.quantile(pool, white_percentile)) * exposure
+    white = max(hi, 1.0)
+    return {"tone_exposure": exposure, "tone_white": white}
+
+
+def save_rgb_radiance_preview(
+    arr: np.ndarray,
+    path: Path,
+    *,
+    exposure: float,
+    white: float,
+) -> dict[str, float]:
+    """Tonemap a linear-HDR radiance image (extended Reinhard) and save as PNG."""
+    preview = _tonemap_reinhard(arr, exposure=exposure, white=white)
+    _save_preview_image(preview, path)
+    return {
+        "tone_operator": "reinhard_ext",
+        "tone_exposure": float(exposure),
+        "tone_white": float(white),
+    }
+
+
 def jet_colormap(x: np.ndarray) -> np.ndarray:
     x = np.clip(x, 0.0, 1.0)
     r = np.clip(1.5 - np.abs(4.0 * x - 3.0), 0.0, 1.0)
@@ -3107,6 +3179,8 @@ def _build_rgb_result(
     scene_path: Path,
     metadata: Mapping[str, Any] | None = None,
     write_raw_npz: bool = True,
+    tone_exposure: float | None = None,
+    tone_white: float | None = None,
 ) -> tuple[ModalityResult, dict[str, Any]]:
     exr_path = out_dir / f"{stem}.exr"
     png_path = out_dir / f"{stem}.png"
@@ -3116,9 +3190,13 @@ def _build_rgb_result(
     exr_start = time.perf_counter()
     _write_bitmap(exr_path, rgb)
     save_exr_s = time.perf_counter() - exr_start
-    preview_percentile = 0.992 if modality == "rgb" else 0.995
     png_start = time.perf_counter()
-    preview = save_rgb_preview(rgb, png_path, percentile=preview_percentile)
+    preview = save_rgb_radiance_preview(
+        rgb,
+        png_path,
+        exposure=_TONE_EXPOSURE_DEFAULT if tone_exposure is None else tone_exposure,
+        white=_TONE_WHITE_DEFAULT if tone_white is None else tone_white,
+    )
     save_png_s = time.perf_counter() - png_start
     outputs = {
         "exr": str(exr_path),
@@ -3895,6 +3973,8 @@ def render_modalities(
                 } if use_channel_split_rgb else None,
             ),
             write_raw_npz=config.write_raw_npz,
+            tone_exposure=config.tone_exposure,
+            tone_white=config.tone_white,
         )
         pass_records["rgb"] = rgb_record
         if "rgb" in requested_set:
