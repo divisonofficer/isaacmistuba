@@ -7,7 +7,7 @@
 		detectedEmitterCount: number;
 		enabledEmitterCount: number;
 		hasScene: boolean;
-		loading: boolean;
+		saving: boolean;
 		onEnableAll: () => void;
 		onDisableAll: () => void;
 		onToggleEmitter: (lightId: string, isOn: boolean) => Promise<void>;
@@ -19,7 +19,7 @@
 
 	let {
 		authoringMap, detectedEmitterIds, detectedEmitterCount, enabledEmitterCount,
-		hasScene, loading,
+		hasScene, saving,
 		onEnableAll, onDisableAll, onToggleEmitter,
 		onSetEmitterIntensity, onSetEmitterRadiance, onSetEmitterHeight, onSave,
 	}: Props = $props();
@@ -138,7 +138,7 @@
 		{/each}
 	</div>
 	<div class="sync-actions">
-		<button class="button button-subtle" disabled={!hasScene || loading} onclick={onSave}>Save</button>
+		<button class="button button-subtle" disabled={!hasScene || saving} onclick={onSave}>Save</button>
 	</div>
 </section>
 
