@@ -1616,6 +1616,7 @@ def _build_editor_preview_mesh_manifest(
     materialization_records: list[dict[str, Any]] | None = None,
     progress_cb: "Callable[[int, int, str, str], None] | None" = None,
     progress_stage: str = "preview_manifest",
+    previous_manifest: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Create editor-only preview metadata for OBJ shapes in a synced scene.
 
@@ -1651,12 +1652,37 @@ def _build_editor_preview_mesh_manifest(
         if sid:
             mat_by_shape[sid] = rec
 
+    # Incremental-cache index: shape_id → entry from the previous manifest, used
+    # to skip every per-shape scan/decimate when the source OBJ hasn't changed.
+    # Entries written by older versions (no source_mtime_ns / source_size) fall
+    # through and get fully recomputed; one full sync upgrades the manifest.
+    prev_shapes: dict[str, dict[str, Any]] = {}
+    if isinstance(previous_manifest, Mapping):
+        if previous_manifest.get("version") == _PREVIEW_MESH_CACHE_VERSION:
+            for sid, entry in (previous_manifest.get("shapes") or {}).items():
+                if isinstance(entry, Mapping):
+                    prev_shapes[str(sid)] = dict(entry)
+    stats["reused_from_prev"] = 0
+
     scene_mesh_cache_dir.mkdir(parents=True, exist_ok=True)
     obj_shapes = [s for s in tree.getroot().findall(".//shape") if s.attrib.get("type") == "obj"]
     total_shapes = len(obj_shapes)
     publish_every = max(1, total_shapes // 40)
     if progress_cb is not None and total_shapes:
         progress_cb(0, total_shapes, "building preview meshes", progress_stage)
+
+    def _src_prov(stat_obj: "os.stat_result | None", path: Path) -> dict[str, Any]:
+        if stat_obj is None:
+            return {}
+        return {
+            "source_mtime_ns": int(stat_obj.st_mtime_ns),
+            "source_size": int(stat_obj.st_size),
+            "source_path_repo_rel": _preview_mesh_ref_for_path(path, repo_root),
+        }
+
+    # Keep (stat, src) per shape_id so the post-loop pass can stamp source
+    # provenance onto every fresh entry without threading it through 9 literals.
+    src_prov_by_id: dict[str, dict[str, Any]] = {}
     for processed_idx, shape in enumerate(obj_shapes, start=1):
         shape_id = shape.attrib.get("id") or ""
         if not shape_id:
@@ -1683,6 +1709,40 @@ def _build_editor_preview_mesh_manifest(
             }
             stats["unavailable"] += 1
             continue
+        # Fast cache hit: if the previous manifest has the same shape_id and the
+        # source OBJ's (mtime, size) match, the entry can be reused as-is. This
+        # skips the two expensive _scan_obj_bounds_and_faces calls AND the
+        # decimate path, turning a no-change second sync from ~8s into ~50ms.
+        try:
+            stat_now = src.stat()
+        except OSError:
+            stat_now = None
+        if stat_now is not None:
+            src_prov_by_id[shape_id] = _src_prov(stat_now, src)
+        prev_entry = prev_shapes.get(shape_id)
+        if (
+            prev_entry is not None
+            and stat_now is not None
+            and prev_entry.get("source_mtime_ns") == int(stat_now.st_mtime_ns)
+            and prev_entry.get("source_size") == int(stat_now.st_size)
+        ):
+            # If the cached preview file is referenced, confirm it still exists;
+            # otherwise the entry is stale and we drop through to recompute.
+            cached_preview_ref = prev_entry.get("preview_mesh_path")
+            cached_ok = True
+            if isinstance(cached_preview_ref, str) and cached_preview_ref:
+                try:
+                    cached_ok = resolve_repo_path(repo_root, cached_preview_ref).is_file()
+                except Exception:
+                    cached_ok = False
+            if cached_ok:
+                by_shape[shape_id] = dict(prev_entry)
+                stats["reused_from_prev"] += 1
+                # Roll the per-status counter forward so totals still make sense.
+                _status = str(prev_entry.get("preview_mesh_status") or "")
+                if _status in stats and isinstance(stats[_status], int):
+                    stats[_status] += 1
+                continue
         mesh_info = _scan_obj_bounds_and_faces(src)
         face_count = int(mesh_info.get("face_count") or 0)
         rec = mat_by_shape.get(shape_id)
@@ -1814,6 +1874,16 @@ def _build_editor_preview_mesh_manifest(
                     "editor_pickable": editor_pickable,
                 }
                 stats["failed"] += 1
+
+    # Stamp source provenance (mtime_ns + size + repo-rel path) onto every entry
+    # that doesn't already have it. Entries reused via prev_entry already carry
+    # this; freshly computed ones get it now so the NEXT sync hits the fast path.
+    for sid, entry in by_shape.items():
+        if "source_mtime_ns" in entry:
+            continue
+        prov = src_prov_by_id.get(sid)
+        if prov:
+            entry.update(prov)
     return {"version": _PREVIEW_MESH_CACHE_VERSION, "stats": stats, "shapes": by_shape}
 
 
@@ -5898,6 +5968,15 @@ class RenderDaemon:
             # available, copy as-is otherwise). Per-shape work, big on Infinigen.
             # The function publishes its own per-shape progress under the
             # `preview_manifest` stage; we just need to pass progress_cb in.
+            # Load the previous manifest so unchanged shapes hit the fast path
+            # (skip per-shape scan/decimate entirely on a no-change second sync).
+            preview_manifest_path = scene_dir / "editor_preview_mesh_manifest.json"
+            previous_preview_manifest: dict[str, Any] | None = None
+            if preview_manifest_path.exists():
+                try:
+                    previous_preview_manifest = _read_json(preview_manifest_path)
+                except Exception:
+                    previous_preview_manifest = None
             preview_mesh_manifest = _build_editor_preview_mesh_manifest(
                 render_scene_path,
                 scene_mesh_cache_dir=scene_mesh_cache_dir,
@@ -5905,10 +5984,11 @@ class RenderDaemon:
                 materialization_records=materialization_records,
                 progress_cb=progress_cb,
                 progress_stage="preview_manifest",
+                previous_manifest=previous_preview_manifest,
             )
             mesh_extraction_stats["editor_preview_mesh_cache"] = preview_mesh_manifest.get("stats", {})
             try:
-                (scene_dir / "editor_preview_mesh_manifest.json").write_text(
+                preview_manifest_path.write_text(
                     json.dumps(preview_mesh_manifest, ensure_ascii=False, indent=2), encoding="utf-8",
                 )
             except Exception as exc:
