@@ -9,6 +9,7 @@
 		isaacCommand, listJobs, smokeRender,
 		materialPreviewUrl, measuredMaterialPreviewUrl, applyMeasuredMaterial
 	} from '$lib/api';
+	import { subscribeJobStatus } from '$lib/stores/jobStatusWs';
 
 	const sceneId = $derived(page.params.id ?? '');
 	const L = $derived($lang);
@@ -36,7 +37,7 @@
 	let roUpscale = $state('none');
 	let roModalities = $state<Set<string>>(new Set(['rgb']));
 
-	let refreshTimer: ReturnType<typeof setInterval>;
+	let unsubJobStatus: (() => void) | null = null;
 
 	const floorplanUrl = $derived(`/api/scenes/${sceneId}/floorplan`);
 
@@ -77,17 +78,20 @@
 		loading = false;
 	}
 
-	async function refreshJobs() {
-		try {
-			recentJobs = await listJobs(10).then(r => r.jobs ?? []);
-		} catch {}
-	}
-
 	onMount(async () => {
 		await loadData();
-		refreshTimer = setInterval(refreshJobs, 4000);
+		// Subscribe to backend WS push instead of polling listJobs every 4s. The
+		// WS broadcast is now throttled to ~200ms per cycle, so high-frequency
+		// sweep updates collapse into a stream the UI can keep up with without
+		// hammering connection slots.
+		unsubJobStatus = subscribeJobStatus((msg) => {
+			recentJobs = Array.isArray(msg.jobs) ? msg.jobs.slice(0, 10) : [];
+		});
 	});
-	onDestroy(() => clearInterval(refreshTimer));
+	onDestroy(() => {
+		unsubJobStatus?.();
+		unsubJobStatus = null;
+	});
 
 	async function sendCommand(cmd: string) {
 		if (cmdPending) return;

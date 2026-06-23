@@ -332,6 +332,64 @@
 	// Kept alive across view-aligned camera rotations so textures don't flicker.
 	let frustumHeadingMap = new Map<string, any>();
 	const textureCache = new Map<string, any>(); // url → THREE.Texture
+
+	// Viewport-aware frustum image lazy load: only vps within the camera's
+	// view frustum AND closer than this distance get their preview image
+	// fetched. Out-of-view vps still render a ray stub so the topology is
+	// visible — they just don't consume connection slots. Adjustable via
+	// the FRUSTUM_IMAGE_MAX_DIST env tweak below (kept short to avoid
+	// loading 100s of distant vps when the user zooms out to overview).
+	const FRUSTUM_IMAGE_MAX_DIST = 8.0;
+	// Reusable scratch objects so the per-frame viewport check doesn't allocate.
+	const _viewProjMatrix = new THREE.Matrix4();
+	const _viewFrustum = new THREE.Frustum();
+	const _vpPoint = new THREE.Vector3();
+	function _refreshViewFrustum(): void {
+		if (!camera) return;
+		_viewProjMatrix.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
+		_viewFrustum.setFromProjectionMatrix(_viewProjMatrix);
+	}
+	function _vpShouldLoadImage(nx: number, ny: number, nz: number): boolean {
+		if (!camera) return true;  // fail-open if camera not ready yet
+		_vpPoint.set(nx, ny, nz);
+		const d = camera.position.distanceTo(_vpPoint);
+		if (d > FRUSTUM_IMAGE_MAX_DIST) return false;
+		return _viewFrustum.containsPoint(_vpPoint);
+	}
+
+	// Debounced rebuild on camera change — coalesces drag/zoom bursts.
+	let _viewportRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+	function scheduleViewportFrustumRefresh(): void {
+		if (_viewportRefreshTimer) clearTimeout(_viewportRefreshTimer);
+		_viewportRefreshTimer = setTimeout(() => {
+			_viewportRefreshTimer = null;
+			if (frustumGroup) updateFrustums();
+		}, 200);
+	}
+
+	// Frustum-image texture loads are concurrency-capped so the browser's
+	// 6-conn/origin limit doesn't get drained by a 1000-job sweep — leaves
+	// at least 2 slots for polling (health, log, events, WS upgrade).
+	const FRUSTUM_TEXTURE_CONCURRENCY = 4;
+	let frustumTextureActiveLoads = 0;
+	const frustumTextureQueue: Array<() => void> = [];
+	function acquireFrustumSlot(): Promise<void> {
+		if (frustumTextureActiveLoads < FRUSTUM_TEXTURE_CONCURRENCY) {
+			frustumTextureActiveLoads += 1;
+			return Promise.resolve();
+		}
+		return new Promise<void>((resolve) => {
+			frustumTextureQueue.push(() => {
+				frustumTextureActiveLoads += 1;
+				resolve();
+			});
+		});
+	}
+	function releaseFrustumSlot(): void {
+		frustumTextureActiveLoads -= 1;
+		const next = frustumTextureQueue.shift();
+		if (next) next();
+	}
 	let hoveredObjectId = '';
 	let resizeObserver: ResizeObserver | null = null;
 	let lastFrameMs = 0;
@@ -1986,6 +2044,10 @@
 		controls.update();
 		controls.addEventListener('change', () => {
 			if (frustumMode === 'view-aligned') updateFrustumVisibility();
+			// Viewport-aware image lazy load: camera moved → re-evaluate which vps
+			// are in view and load their preview images. Debounced so a drag burst
+			// triggers exactly one rebuild after the user pauses.
+			scheduleViewportFrustumRefresh();
 		});
 
 		baseGroup = new THREE.Group();
@@ -2195,11 +2257,33 @@
 			new THREE.LineBasicMaterial({ color: args.color ?? 0x38bdf8, transparent: true, opacity: args.opacity ?? 0.9 })
 		));
 		if (args.hasImage && args.imageUrl) {
-			let texture = textureCache.get(args.imageUrl);
+			const url = args.imageUrl;
+			let texture = textureCache.get(url);
 			if (!texture) {
-				texture = new THREE.TextureLoader().load(args.imageUrl);
+				// Insert a placeholder Texture object into the cache immediately so any
+				// concurrent buildCameraFrustumGroup calls for the same URL share it.
+				// The real bitmap is fetched through acquireFrustumSlot — when it
+				// finishes we swap .image and flip needsUpdate so every plane already
+				// bound to this Texture picks the bytes up on the next frame.
+				texture = new THREE.Texture();
 				(texture as any).colorSpace = 'srgb';
-				textureCache.set(args.imageUrl, texture);
+				textureCache.set(url, texture);
+				acquireFrustumSlot().then(() => {
+					new THREE.TextureLoader().load(
+						url,
+						(loaded) => {
+							try {
+								texture.image = loaded.image;
+								(texture as any).colorSpace = 'srgb';
+								texture.needsUpdate = true;
+							} finally {
+								releaseFrustumSlot();
+							}
+						},
+						undefined,
+						() => { releaseFrustumSlot(); },
+					);
+				});
 			}
 			const rotMat = new THREE.Matrix4().makeBasis(right, up, negFwd);
 			const plane = new THREE.Mesh(
@@ -2821,14 +2905,16 @@
 
 	function buildFrustumForHeading(
 		nx: number, nz: number, headingId: string, yawDeg: number, hasModality: boolean,
-		vpId: string, modality: string, sensorId = ''
+		vpId: string, modality: string, sensorId = '', loadImage = true,
 	) {
-		const key = `${vpId}/${headingId}/${modality}/${sensorId || '_'}`;
+		// Cache key includes loadImage so an out-of-view ray-only stub can be
+		// replaced by a full image-bearing frustum when the camera moves close.
+		const key = `${vpId}/${headingId}/${modality}/${sensorId || '_'}/${hasModality && loadImage ? 'img' : 'ray'}`;
 		// Reuse existing group if already built (avoids texture reload on view-aligned updates)
 		if (frustumHeadingMap.has(key)) {
 			const existing = frustumHeadingMap.get(key);
 			frustumGroup.add(existing);
-			if (hasModality) frustumSelectables.push(...existing.children.filter((c: any) => c.isMesh && c.userData.frustum));
+			if (hasModality && loadImage) frustumSelectables.push(...existing.children.filter((c: any) => c.isMesh && c.userData.frustum));
 			return;
 		}
 
@@ -2841,12 +2927,15 @@
 		const group = new THREE.Group();
 		group.userData = { vpId, headingId, yawDeg };
 
-		if (!hasModality) {
-			// Short direction ray only for missing renders
+		if (!hasModality || !loadImage) {
+			// Short direction ray — either no render exists OR the vp is out of
+			// view / too far. The latter case lets the topology stay visible
+			// without consuming a connection slot for the image fetch.
 			const displayDist = 0.5;
 			const tip = origin.clone().addScaledVector(fwd, displayDist * 0.6);
 			const rayGeo = new THREE.BufferGeometry().setFromPoints([origin, tip]);
-			group.add(new THREE.LineSegments(rayGeo, new THREE.LineBasicMaterial({ color: 0x64748b, transparent: true, opacity: 0.5 })));
+			const rayColor = !hasModality ? 0x64748b : 0x3b82f6;
+			group.add(new THREE.LineSegments(rayGeo, new THREE.LineBasicMaterial({ color: rayColor, transparent: true, opacity: 0.5 })));
 		} else {
 			const url = opticalNavObservationModalityUrl(projectId, sceneId, vpId, headingId, modality, sensorId);
 			group.add(buildCameraFrustumGroup({
@@ -2871,6 +2960,7 @@
 		const viewYaw = getCameraYawDeg();
 
 		// Group cached heading groups by vpId, but only consider current modality's entries.
+		// Cache key shape: `${vpId}/${headingId}/${modality}/${sensorId|_}/${img|ray}`
 		const byVp = new Map<string, Array<{ key: string; yawDeg: number; group: any }>>();
 		for (const [key, group] of frustumHeadingMap.entries()) {
 			const parts = key.split('/');
@@ -2959,6 +3049,9 @@
 
 		const viewYaw = frustumMode === 'view-aligned' ? getCameraYawDeg() : 0;
 		const activeSensorId = String(frustumSensorId || '');
+		// Refresh the cached view frustum once per updateFrustums call so each
+		// vp's viewport visibility check is O(1) and consistent within the pass.
+		_refreshViewFrustum();
 
 		function hasHeadingModality(hdata: any, modalityKey: string): boolean {
 			const sensors = hdata?.sensors;
@@ -3012,11 +3105,16 @@
 			const hdEntries = Object.entries(headings);
 			const hdDegs = hdEntries.map(([hid]) => yawMap.get(vpId)?.get(hid) ?? parseInt(hid.replace('h_', '')) ?? 0);
 
+			// One viewport check per vp — every heading at this vp shares it.
+			// 'selected' mode is always loaded (user explicitly pinned it).
+			const loadImage = frustumMode === 'selected'
+				? (vpId === selectedId)
+				: _vpShouldLoadImage(nx, cameraHeight, nz);
 			if (frustumMode === 'selected') {
 				if (vpId !== selectedId) continue;
 				for (let i = 0; i < hdEntries.length; i++) {
 					const [headingId, hdata] = hdEntries[i];
-					buildFrustumForHeading(nx, nz, headingId, hdDegs[i], hasHeadingModality(hdata, modalityKey), vpId, frustumModality, activeSensorId);
+					buildFrustumForHeading(nx, nz, headingId, hdDegs[i], hasHeadingModality(hdata, modalityKey), vpId, frustumModality, activeSensorId, loadImage);
 				}
 			} else {
 				// view-aligned: build ALL headings but only show the nearest one.
@@ -3025,8 +3123,9 @@
 				const nearestDeg = nearestHeadingDeg(viewYaw, hdDegs);
 				for (let i = 0; i < hdEntries.length; i++) {
 					const [headingId, hdata] = hdEntries[i];
-					buildFrustumForHeading(nx, nz, headingId, hdDegs[i], hasHeadingModality(hdata, modalityKey), vpId, frustumModality, activeSensorId);
-					const grp = frustumHeadingMap.get(`${vpId}/${headingId}/${frustumModality}/${activeSensorId || '_'}`);
+					buildFrustumForHeading(nx, nz, headingId, hdDegs[i], hasHeadingModality(hdata, modalityKey), vpId, frustumModality, activeSensorId, loadImage);
+					const keySuffix = hasHeadingModality(hdata, modalityKey) && loadImage ? 'img' : 'ray';
+					const grp = frustumHeadingMap.get(`${vpId}/${headingId}/${frustumModality}/${activeSensorId || '_'}/${keySuffix}`);
 					if (grp) grp.visible = (hdDegs[i] === nearestDeg);
 				}
 			}

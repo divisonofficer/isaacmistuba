@@ -4134,6 +4134,12 @@ class RenderDaemon:
 
         self._job_status_subscribers: set[_JobStatusSubscriber] = set()
         self._job_status_sub_lock = threading.Lock()
+        # Job-status broadcasts are throttled so 1000+ sweep job updates collapse
+        # into ≤5 messages/s; otherwise every state transition fires a daemon
+        # thread spawn + full payload broadcast that saturates the browser's
+        # 6-connection limit and starves polling endpoints (health/log/events).
+        self._job_status_dirty_event = threading.Event()
+        self._job_status_throttle_thread: threading.Thread | None = None
 
         self._graph_build_subscribers: dict[str, set[_GraphBuildSubscriber]] = {}
         self._graph_build_sub_lock = threading.Lock()
@@ -5709,6 +5715,15 @@ class RenderDaemon:
 
         self._server_thread = threading.Thread(target=self._server.serve_forever, name="robomituba-render-daemon", daemon=True)
         self._server_thread.start()
+
+        # Throttled job-status broadcaster — coalesces dirty events into one
+        # publish per ~200ms so a 1000-job sweep doesn't fire 1000 broadcasts.
+        self._job_status_throttle_thread = threading.Thread(
+            target=self._job_status_throttle_loop,
+            name="job-status-throttler",
+            daemon=True,
+        )
+        self._job_status_throttle_thread.start()
 
         # Reconcile orphaned running/queued jobs from a previous session in the
         # BACKGROUND — it only rewrites a few stale statuses (a UI nicety), so it
@@ -16366,11 +16381,34 @@ class RenderDaemon:
         self._job_status_cache_ts = now
         return records
 
+    _JOB_STATUS_THROTTLE_S = 0.2
+
     def _invalidate_job_status_cache(self) -> None:
-        """Call this whenever a new job is submitted or status changes to force cache refresh."""
+        """Mark job-status dirty; the throttler thread coalesces broadcasts."""
         self._job_status_cache = None
         self._job_status_cache_ts = 0.0
-        threading.Thread(target=self._push_job_status_to_subscribers, daemon=True).start()
+        self._job_status_dirty_event.set()
+
+    def _job_status_throttle_loop(self) -> None:
+        """Coalesce job-status broadcasts: wait for dirty, sleep one throttle window
+        to absorb additional invalidations, then publish once. 1000 state changes
+        in a sweep collapse into ≤5 messages/s instead of 1000 thread spawns."""
+        while not self._shutdown:
+            # Block until SOMETHING marked dirty (no busy loop when idle).
+            if not self._job_status_dirty_event.wait(timeout=1.0):
+                continue
+            if self._shutdown:
+                break
+            # Absorb the rest of the throttle window — additional invalidations
+            # during this sleep are still covered by the single broadcast that
+            # follows (we clear the flag AFTER the sleep).
+            time.sleep(self._JOB_STATUS_THROTTLE_S)
+            self._job_status_dirty_event.clear()
+            try:
+                self._push_job_status_to_subscribers()
+            except Exception:
+                # Best-effort broadcast — never let one bad subscriber kill the loop.
+                pass
 
     def _job_status_ws_payload(self) -> dict[str, Any]:
         jobs = self._job_records(limit=250)
