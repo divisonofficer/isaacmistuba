@@ -33,7 +33,9 @@ Stdout protocol (one JSON object per line, ``\\n`` separated):
 ``preview_bench:`` lines from ``sphere_preview._render_to_png`` are
 written to ``stderr`` (inherited from the daemon's stderr fd) so they
 keep showing up in the daemon log unchanged. Stderr is *not* the
-JSON-RPC channel.
+JSON-RPC channel. At runtime the worker duplicates the original stdout
+pipe for JSONL events, then redirects process fd 1 to stderr so native
+C/C++ library logs cannot corrupt the JSONL stream.
 
 Job kinds:
 
@@ -65,10 +67,25 @@ from typing import Any
 
 _HEARTBEAT_INTERVAL_S = 5.0
 _stdout_lock = threading.Lock()
+_json_stdout = sys.stdout
 ENV_FULL_RENDER_DISABLE_CUDA = "ROBOMITUBA_FULL_RENDER_DISABLE_CUDA"
 ENV_SCENE_LOAD_CONCURRENCY = "ROBOMITUBA_SCENE_LOAD_CONCURRENCY"
 ENV_SCENE_LOAD_LOCK_DIR = "ROBOMITUBA_SCENE_LOAD_LOCK_DIR"
 _ALLOWED_RENDER_ENV_OVERRIDES = {"ROBOMITUBA_TEXTURE_MAX_RESOLUTION"}
+
+
+def _isolate_stdout_protocol() -> None:
+    """Keep worker stdout reserved for JSONL events."""
+    global _json_stdout
+    try:
+        stdout_fd = sys.stdout.fileno()
+        stderr_fd = sys.stderr.fileno()
+        json_fd = os.dup(stdout_fd)
+        os.dup2(stderr_fd, stdout_fd)
+        _json_stdout = os.fdopen(json_fd, "w", buffering=1, encoding="utf-8", errors="replace")
+    except Exception as exc:
+        _json_stdout = sys.stdout
+        print(f"[worker] stdout protocol isolation failed: {exc}", file=sys.stderr, flush=True)
 
 
 def _scene_load_concurrency() -> int:
@@ -175,8 +192,8 @@ def _emit(event: dict[str, Any]) -> None:
         })
     with _stdout_lock:
         try:
-            sys.stdout.write(line + "\n")
-            sys.stdout.flush()
+            _json_stdout.write(line + "\n")
+            _json_stdout.flush()
         except Exception:
             pass
 
@@ -730,6 +747,7 @@ def main(argv: list[str] | None = None) -> int:
         f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')}",
         file=sys.stderr, flush=True,
     )
+    _isolate_stdout_protocol()
 
     log_level = _set_render_log_level(
         os.environ.get("ROBOMITUBA_RENDER_LOG_LEVEL", "info"),
