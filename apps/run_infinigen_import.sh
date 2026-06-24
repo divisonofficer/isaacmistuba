@@ -12,6 +12,7 @@
 #   --scene-id ID        OpticalNav scene id        (default: infinigen_<dirname>)
 #   --project-id ID      OpticalNav project         (default: opticalnav-v0.2)
 #   --no-bake            Skip procedural material bake (faster, grayscale-ish)
+#   --no-sync            Skip Stage 3 render-scene sync (don't stage webui meshes)
 #   --skip-export        Reuse an existing Stage-1 manifest (only run Stage 2)
 #   --room KEY           Keep only this room        (e.g. "dining-room_0/0")
 #   --keep-empty-rooms   Keep unfurnished/empty rooms
@@ -37,12 +38,15 @@ SCENE_ID=""
 PROJECT_ID="opticalnav-v0.2"
 BAKE=1
 SKIP_EXPORT=0
+SYNC=1
+DAEMON_URL="${ROBOMITUBA_DAEMON_URL:-http://127.0.0.1:8765}"
 STAGE2_EXTRA=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --scene-id)   SCENE_ID="$2"; shift 2;;
     --project-id) PROJECT_ID="$2"; shift 2;;
     --no-bake)    BAKE=0; shift;;
+    --no-sync)    SYNC=0; shift;;
     --skip-export) SKIP_EXPORT=1; shift;;
     --room)       STAGE2_EXTRA+=(--room "$2"); shift 2;;
     --keep-empty-rooms|--no-normalize-origin) STAGE2_EXTRA+=("$1"); shift;;
@@ -86,8 +90,17 @@ if [[ -z "$BLEND" ]]; then
   exit 1
 fi
 
-# scene name from the blend's parent directory
-DIRNAME="$(basename "$(dirname "$(readlink -f "$BLEND")")")"
+# scene name from the blend's parent directory. The KR generator lays scenes out
+# as <seed>/<stage>/scene.blend (e.g. kr_21606082/full/scene.blend), so the parent
+# dir is a stage keyword, not the scene name — fall back to the grandparent so the
+# scene isn't named "full" (which collides across seeds). Plain layouts like
+# indoor_seed4/scene.blend keep their parent dir name unchanged.
+PARENT_DIR="$(dirname "$(readlink -f "$BLEND")")"
+DIRNAME="$(basename "$PARENT_DIR")"
+case "$DIRNAME" in
+  layout|full|coarse|fine)
+    DIRNAME="$(basename "$(dirname "$PARENT_DIR")")";;
+esac
 NAME="$(echo "$DIRNAME" | tr -cs 'A-Za-z0-9._-' '_' | sed 's/^_*//;s/_*$//')"
 [[ -z "$SCENE_ID" ]] && SCENE_ID="infinigen_${NAME}"
 IMPORT_DIR="out/infinigen_imports/${NAME}"
@@ -129,6 +142,51 @@ echo "[stage2] converting manifest → OpticalNav scene…"
   --scene-id "$SCENE_ID" \
   --project-id "$PROJECT_ID" \
   --force "${STAGE2_EXTRA[@]}"
+
+# ── Stage 3: render-scene sync (stages per-scene mesh_cache for the webui viewer) ─
+# Stage 2 writes authoring_map + render_scene_overlays, but the webui 3D viewer
+# fetches meshes from <scene>/mesh_cache/<digest>.obj, which are only staged when
+# render_scene.xml is generated — and that happens in the daemon's render-scene
+# sync, not in this CLI. Without it the viewer 404s every mesh. Trigger the sync
+# here when the daemon is reachable; otherwise tell the user to do it from webui.
+SCENE_DIR="out/opticalnav/${PROJECT_ID}/scenes/${SCENE_ID}"
+if [[ "$SYNC" == 1 ]]; then
+  if "$PYTHON" - "$DAEMON_URL" "$PROJECT_ID" "$SCENE_ID" <<'PY'
+import json, sys, urllib.request, urllib.error
+base, project, scene = sys.argv[1], sys.argv[2], sys.argv[3]
+def req(method, path, body=None, timeout=10):
+    data = json.dumps(body).encode() if body is not None else None
+    r = urllib.request.Request(base + path, data=data, method=method,
+                               headers={"Content-Type": "application/json"})
+    return urllib.request.urlopen(r, timeout=timeout)
+try:
+    req("GET", "/api/summary", timeout=3).read()
+except Exception:
+    print(f"[stage3] render daemon not reachable at {base} — skipping render-scene sync.")
+    print("          Open the scene in webui and click 'Save Map' to stage meshes")
+    print("          (or set ROBOMITUBA_DAEMON_URL and re-run with --skip-export).")
+    sys.exit(3)
+try:
+    req("POST", f"/api/opticalnav/projects/{project}/scenes/{scene}/sync/render-scene", body={})
+    print(f"[stage3] render-scene sync requested on {base} (async).")
+    sys.exit(0)
+except Exception as exc:  # noqa: BLE001
+    print(f"[stage3] sync request failed: {exc} (continuing).")
+    sys.exit(4)
+PY
+  then
+    # The sync job is async; poll the filesystem until the mesh_cache is staged.
+    echo "[stage3] waiting for render_scene.xml + mesh_cache (up to ~5 min)…"
+    for _ in $(seq 1 150); do
+      if [[ -f "${SCENE_DIR}/render_scene.xml" ]] && compgen -G "${SCENE_DIR}/mesh_cache/*.obj" >/dev/null 2>&1; then
+        echo "[stage3] ✓ render_scene.xml + mesh_cache staged — webui meshes will load."
+        break
+      fi
+      sleep 2
+    done
+    [[ -f "${SCENE_DIR}/render_scene.xml" ]] || echo "[stage3] (timed out waiting; check the daemon log / webui Status tab.)"
+  fi
+fi
 
 echo "═══════════════════════════════════════════════════════════════"
 echo " ✓ done → out/opticalnav/${PROJECT_ID}/scenes/${SCENE_ID}/"

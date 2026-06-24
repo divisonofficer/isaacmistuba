@@ -550,6 +550,15 @@ def main():
     if limit:
         mesh_objs = mesh_objs[:limit]
 
+    # Memory hygiene for big scenes (14M-poly Infinigen blends OOM on low-RAM/WSL
+    # boxes mid-bake). Disabling global undo stops Blender from snapshotting the
+    # whole scene on every operator (bake/select/export ×N objects) — the single
+    # biggest accumulation source in a long headless batch.
+    try:
+        bpy.context.preferences.edit.use_global_undo = False
+    except Exception:  # noqa: BLE001
+        pass
+
     used_ids = set()
     baked_count = 0
     fail_count = 0
@@ -671,6 +680,15 @@ def main():
             "mesh_glb": glb_rel,
             "baked_albedo": baked_rel,
         })
+        # Drop zero-user datablocks left behind by bake/export (temp images, meshes,
+        # node groups) so RAM doesn't creep across hundreds of objects. orphans_purge
+        # only removes data with no users, so shared materials/textures still in use
+        # by later objects are untouched. Every few objects keeps the scan cost low.
+        if (i + 1) % 5 == 0:
+            try:
+                bpy.data.orphans_purge(do_recursive=True)
+            except Exception:  # noqa: BLE001
+                pass
         if bar is not None:
             bar.update(1)
         elif (i + 1) % 10 == 0 or (i + 1) == total:
