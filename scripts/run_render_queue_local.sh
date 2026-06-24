@@ -34,6 +34,8 @@ export LD_LIBRARY_PATH="/usr/lib/wsl/lib:${LD_LIBRARY_PATH:-}"
 # Single-GPU main-PC defaults (override for multi-GPU; or pass --auto-gpus).
 export ROBOMITUBA_RENDER_GPU_INDICES="${ROBOMITUBA_RENDER_GPU_INDICES:-0}"
 export ROBOMITUBA_RENDER_WORKER_COUNT="${ROBOMITUBA_RENDER_WORKER_COUNT:-1}"
+export ROBOMITUBA_OPTIX_DENOISE=1
+
 
 if [[ ! -d "$ROBOMITUBA_MITSUBA_PYTHONPATH" ]]; then
   echo "[render-queue-local] WARNING: Mitsuba build not found at $ROBOMITUBA_MITSUBA_PYTHONPATH" >&2

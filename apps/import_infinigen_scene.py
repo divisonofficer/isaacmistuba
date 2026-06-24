@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -36,6 +37,108 @@ from navigation_dataset.office_sample import install_shared_office_sample  # noq
 # Semantic type -> default OpticalNav material id (a material we synthesise per
 # Blender material; this is only the fallback when a unit has no material slot).
 DEFAULT_MAT = "infinigen_default"
+
+# Ceiling-light emitter geometry. Render variance from an area light scales
+# inversely with the solid angle it subtends, so a few small intense fixtures
+# produce fireflies in the far/dark parts of a room. Ceiling emitters are tagged
+# `emitter_shape="ceiling_panel"` so the renderer builds a wide DOWNWARD-facing
+# flat rectangle (all emission into the room, no 6-face cube waste / ceiling
+# embedding) — large flat area = low-variance, even fill. We also DIVIDE radiance
+# by the area increase so luminous power is conserved (same brightness, less
+# noise). Old geometry [0.3, 0.08, 0.3] is the power-conservation baseline; the
+# y dimension is unused for the flat panel but kept for the authoring record.
+LIGHT_SIZE_M = [0.6, 0.08, 0.6]
+_LIGHT_AREA_BASELINE = 0.3 * 0.3
+_LIGHT_AREA_FACTOR = (LIGHT_SIZE_M[0] * LIGHT_SIZE_M[2]) / _LIGHT_AREA_BASELINE
+
+# Place the panel just below the ceiling so it never embeds in the slab.
+CEILING_HEIGHT_M = 2.6  # matches settings.default_wall_height_m below
+_CEILING_GAP_M = 0.05
+# A light mounted at/above this height counts as a ceiling fixture → downward panel.
+_CEILING_MOUNT_MIN_M = 1.8
+
+# Room-level softbox proxies. Infinigen fixtures are often small/high-energy,
+# which is exactly the high-variance case for glossy measured materials. Keep
+# those fixtures, but add sparse broad ceiling panels as render fill. The panels
+# should behave like a small number of practical ceiling luminaires, not a dense
+# luminous sky grid.
+SOFTBOX_TARGET_COVERAGE = 0.12
+SOFTBOX_MIN_SIZE_M = 0.8
+SOFTBOX_MAX_SIZE_M = 2.2
+SOFTBOX_FILL_RADIANCE = 3.0
+SOFTBOX_PRIMARY_RADIANCE = 4.5
+
+
+def _conserve_power(radiance: list[float]) -> list[float]:
+    """Scale radiance down by the emitter-area increase (constant luminous power)."""
+    return [round(r / _LIGHT_AREA_FACTOR, 3) for r in radiance]
+
+
+def _ceiling_panel_height(base_height_m: float) -> float:
+    """Clamp a ceiling fixture just below the ceiling slab (no embedding)."""
+    return round(min(float(base_height_m), CEILING_HEIGHT_M - _CEILING_GAP_M), 4)
+
+
+def _softbox_count_for_room(width: float, depth: float) -> int:
+    area = max(0.0, float(width) * float(depth))
+    if area < 35.0:
+        return 1
+    if area < 65.0:
+        return 2
+    if area < 105.0:
+        return 3
+    return 4
+
+
+def _softbox_positions(min_x: float, min_y: float, width: float, depth: float, count: int) -> list[tuple[float, float]]:
+    cx = min_x + width * 0.5
+    cy = min_y + depth * 0.5
+    if count <= 1:
+        return [(cx, cy)]
+    if count == 2:
+        if width >= depth:
+            return [(min_x + width / 3.0, cy), (min_x + width * 2.0 / 3.0, cy)]
+        return [(cx, min_y + depth / 3.0), (cx, min_y + depth * 2.0 / 3.0)]
+    if count == 3:
+        if width >= depth * 1.45:
+            return [(min_x + width * f, cy) for f in (0.25, 0.50, 0.75)]
+        if depth >= width * 1.45:
+            return [(cx, min_y + depth * f) for f in (0.25, 0.50, 0.75)]
+        return [
+            (min_x + width * 0.30, min_y + depth * 0.35),
+            (min_x + width * 0.70, min_y + depth * 0.35),
+            (min_x + width * 0.50, min_y + depth * 0.68),
+        ]
+    return [
+        (min_x + width * 0.33, min_y + depth * 0.33),
+        (min_x + width * 0.67, min_y + depth * 0.33),
+        (min_x + width * 0.33, min_y + depth * 0.67),
+        (min_x + width * 0.67, min_y + depth * 0.67),
+    ]
+
+
+def _room_softbox_specs(aabb: list[float], *, strong_fill: bool) -> list[dict]:
+    """Return broad, weak ceiling-panel specs for one room floor AABB."""
+    min_x, min_y, max_x, max_y = [float(v) for v in aabb]
+    width = max(0.1, max_x - min_x)
+    depth = max(0.1, max_y - min_y)
+    count = _softbox_count_for_room(width, depth)
+    target_panel_area = width * depth * SOFTBOX_TARGET_COVERAGE / max(count, 1)
+    target_side = math.sqrt(max(target_panel_area, SOFTBOX_MIN_SIZE_M * SOFTBOX_MIN_SIZE_M))
+    panel_x = min(SOFTBOX_MAX_SIZE_M, max(SOFTBOX_MIN_SIZE_M, target_side))
+    panel_y = min(SOFTBOX_MAX_SIZE_M, max(SOFTBOX_MIN_SIZE_M, target_panel_area / max(panel_x, 1e-6)))
+    panel_x = min(panel_x, max(0.35, width * 0.80))
+    panel_y = min(panel_y, max(0.35, depth * 0.80))
+    radiance = SOFTBOX_PRIMARY_RADIANCE if strong_fill else SOFTBOX_FILL_RADIANCE
+    specs: list[dict] = []
+    for x, y in _softbox_positions(min_x, min_y, width, depth, count):
+        specs.append({
+            "center": [round(x, 4), round(y, 4)],
+            "size_m": [round(panel_x, 4), 0.04, round(panel_y, 4)],
+            "radiance": [round(radiance, 3)] * 3,
+        })
+    return specs
+
 
 # Structure subtypes that must NOT carve the traversability grid (their AABB is
 # the whole room). Furniture carves; walls/floor/ceiling do not.
@@ -391,34 +494,44 @@ def build_authoring_map(manifest: dict, scene_id: str, import_rel: str,
             continue
         col = lt.get("color") or [1.0, 1.0, 1.0]
         energy = float(lt.get("energy", 0.0) or 0.0)
-        # Map Blender watts to a modest area-emitter radiance (heuristic, tunable).
-        rad = [max(0.0, col[0]) * min(40.0, energy / 10.0 + 4.0),
-               max(0.0, col[1]) * min(40.0, energy / 10.0 + 4.0),
-               max(0.0, col[2]) * min(40.0, energy / 10.0 + 4.0)]
-        objects.append({
+        # Map Blender watts to a modest area-emitter radiance (heuristic, tunable),
+        # then conserve power across the wider LIGHT_SIZE_M panel to cut firefly noise.
+        rad = _conserve_power([
+            max(0.0, col[0]) * min(40.0, energy / 10.0 + 4.0),
+            max(0.0, col[1]) * min(40.0, energy / 10.0 + 4.0),
+            max(0.0, col[2]) * min(40.0, energy / 10.0 + 4.0),
+        ])
+        raw_h = float(lt.get("place_base_height_m", 2.4))
+        is_ceiling = raw_h >= _CEILING_MOUNT_MIN_M
+        geometry = {"type": "point", "center": [round(c[0], 4), round(c[1], 4)],
+                    "yaw_deg": 0.0, "size_m": list(LIGHT_SIZE_M),
+                    "base_height_m": _ceiling_panel_height(raw_h) if is_ceiling else round(raw_h, 4)}
+        obj = {
             "id": _san(f"light_{i}_{lt.get('name','')}"),
             "type": "landmark",
             "label": f"light:{lt.get('name','')}"[:64],
             "placement": "point",
-            "geometry": {"type": "point", "center": [round(c[0], 4), round(c[1], 4)],
-                         "yaw_deg": 0.0, "size_m": [0.3, 0.08, 0.3],
-                         "base_height_m": round(float(lt.get("place_base_height_m", 2.4)), 4)},
+            "geometry": geometry,
             "material": DEFAULT_MAT,
             "navigation": {"blocks_navigation": False},
             "is_emitter": True,
-            "emitter_radiance": [round(x, 3) for x in rad],
+            "emitter_radiance": rad,
             "emitter_intensity": 1.0,
             "metadata": {"infinigen_light": True, "blender_type": lt.get("type")},
-        })
+        }
+        if is_ceiling:
+            # Downward-facing flat panel (renderer reads this) — even, low-variance fill.
+            obj["emitter_shape"] = "ceiling_panel"
+        objects.append(obj)
 
-    # Synthesize a ceiling light for any finished room Infinigen left unlit.
+    # Synthesize broad ceiling softboxes for finished rooms.
     # Infinigen's constraint solver is best-effort: the "1-4 ceiling lights per
     # room" rule in home.py is minimized-violation, not guaranteed, so some seeds
     # light only a couple of rooms (e.g. bedroom/bathroom) and leave living/
-    # kitchen/dining with zero ceiling emitters → those rooms render pitch black.
-    # For every kept room with no existing ceiling-height emitter over its floor,
-    # drop one modest emitter at the room centroid at ceiling height. Runs in the
-    # pre vertical-normalize frame so the dz shift below applies uniformly.
+    # kitchen/dining with zero ceiling emitters. Even when fixtures exist, they
+    # are small/high-variance; broad weak proxies give the renderer a stable
+    # sampled light source per room. Runs in the pre vertical-normalize frame so
+    # the dz shift below applies uniformly.
     if fill_missing_lights and kept_rooms:
         CEIL_Z_MIN = 2.0  # an emitter above this counts as a room's ceiling light
         ceil_lights = [o for o in objects
@@ -431,34 +544,43 @@ def build_authoring_map(manifest: dict, scene_id: str, import_rel: str,
             synth_rad = [rads[len(rads) // 2]] * 3
         else:
             ceil_z = 2.6
-            synth_rad = [12.0, 12.0, 12.0]  # ~80W white via the watt heuristic above
+            synth_rad = [SOFTBOX_PRIMARY_RADIANCE] * 3
         synth = 0
         for rk in sorted(kept_rooms):
             a = room_floor.get(rk)
             if not a:
                 continue
-            if any(_xy_in(a, e["geometry"]["center"][0], e["geometry"]["center"][1])
-                   for e in ceil_lights):
-                continue  # room already has a ceiling light
-            cx, cy = (a[0] + a[2]) / 2.0, (a[1] + a[3]) / 2.0
-            objects.append({
-                "id": _san(f"light_synth_{rk}"),
-                "type": "landmark",
-                "label": f"light:synth:{rk}"[:64],
-                "placement": "point",
-                "geometry": {"type": "point", "center": [round(cx, 4), round(cy, 4)],
-                             "yaw_deg": 0.0, "size_m": [0.3, 0.08, 0.3],
-                             "base_height_m": round(float(ceil_z), 4)},
-                "material": DEFAULT_MAT,
-                "navigation": {"blocks_navigation": False},
-                "is_emitter": True,
-                "emitter_radiance": [round(x, 3) for x in synth_rad],
-                "emitter_intensity": 1.0,
-                "metadata": {"infinigen_light": True, "synthesized": True, "room": rk},
-            })
-            synth += 1
+            has_room_ceiling_light = any(
+                _xy_in(a, e["geometry"]["center"][0], e["geometry"]["center"][1])
+                for e in ceil_lights
+            )
+            for si, spec in enumerate(_room_softbox_specs(a, strong_fill=not has_room_ceiling_light)):
+                rad = spec["radiance"] if has_room_ceiling_light else [round(x, 3) for x in synth_rad]
+                objects.append({
+                    "id": _san(f"light_softbox_{rk}_{si:02d}"),
+                    "type": "landmark",
+                    "label": f"light:softbox:{rk}:{si}"[:64],
+                    "placement": "point",
+                    "geometry": {"type": "point", "center": spec["center"],
+                                 "yaw_deg": 0.0, "size_m": spec["size_m"],
+                                 "base_height_m": _ceiling_panel_height(ceil_z)},
+                    "material": DEFAULT_MAT,
+                    "navigation": {"blocks_navigation": False},
+                    "is_emitter": True,
+                    "emitter_shape": "ceiling_panel",
+                    "emitter_radiance": rad,
+                    "emitter_intensity": 1.0,
+                    "metadata": {
+                        "infinigen_light": True,
+                        "synthesized": True,
+                        "softbox_proxy": True,
+                        "room": rk,
+                        "room_had_ceiling_light": has_room_ceiling_light,
+                    },
+                })
+                synth += 1
         if synth:
-            print(f"[import] synthesized {synth} ceiling light(s) for unlit rooms")
+            print(f"[import] synthesized {synth} room softbox light(s)")
 
     # Traversable regions — one per finished room floor, NOT the outer AABB of
     # all floors unioned. Using the outer AABB makes outdoor space (between two
@@ -559,7 +681,13 @@ def build_authoring_map(manifest: dict, scene_id: str, import_rel: str,
         "objects": objects,
         "regions": regions,
         "materials": materials,
-        "environment": {"mode": "constant", "radiance": [0.55, 0.57, 0.6], "intensity": 0.7,
+        # Constant ambient is a zero-variance fill that lifts dark corners (no
+        # firefly cost), and ceiling_fill_gain turns the sealed ceiling into a
+        # large downward area light (cheap to importance-sample) — both cut noise
+        # in light-starved zones at the same spp. See render_daemon's
+        # _ceiling_skylight_radiance / _append_environment_xml.
+        "environment": {"mode": "constant", "radiance": [0.55, 0.57, 0.6], "intensity": 1.0,
+                        "ceiling_skylight": True, "ceiling_fill_gain": 1.6,
                         "background_visible": True},
         "camera_rig": {
             "rig_id": "infinigen_default", "base_frame": "base_link",

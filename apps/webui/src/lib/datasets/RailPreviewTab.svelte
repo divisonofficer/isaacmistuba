@@ -9,6 +9,7 @@
 		activeRigSensorOption: any;
 		activeCameraFrustum: any;
 		activeRenderModality: string;
+		previewBandMode: string;
 		probeRendering: boolean;
 		probeError: string;
 		probeResult: any;
@@ -31,11 +32,13 @@
 		onRefreshStats: () => void;
 		onSetShowRoomShell: (v: boolean) => void;
 		onSelectHotCamera: (id: string) => void;
+		onSetPreviewBandMode: (v: string) => void;
 	}
 
 	let {
 		hotCameraPose, hotCameraPoses, activeHotCameraId,
 		activeRigSensorOption, activeCameraFrustum, activeRenderModality,
+		previewBandMode, onSetPreviewBandMode,
 		probeRendering, probeError, probeResult, activeRigSensorId,
 		selectedProjectId, sceneId,
 		editorObjectsCount, editorEmitterCount, editorMaterialCount,
@@ -61,6 +64,14 @@
 			<p class="probe-empty">No hot camera placed yet.</p>
 		{/if}
 	</div>
+	<label class="band-mode-row" title="측정 pBRDF 밴드 수: single=안정적인 1밴드×albedo · hybrid=무채색 1밴드/유색 3밴드 · rgb=전부 3밴드">
+		<span>pBRDF band</span>
+		<select value={previewBandMode} onchange={(e) => onSetPreviewBandMode((e.currentTarget as HTMLSelectElement).value)}>
+			<option value="rgb">rgb · 3-band (full colour)</option>
+			<option value="hybrid">hybrid · achromatic→1, coloured→3</option>
+			<option value="single">single · 1-band ×albedo</option>
+		</select>
+	</label>
 	<div class="probe-actions">
 		<span class="chip-dim">{activeRigSensorId || 'rig sensor'}</span>
 		<button class="button button-primary" disabled={probeRendering || !hotCameraPose} onclick={onRunProbe}>
@@ -135,6 +146,10 @@
 		<span>Raw .hpbrdf refs (heavy)</span><span>{renderSceneStats?.raw_hpbrdf_refs ?? '—'}</span>
 	</div>
 	<div class="sync-row"><span>Channel-split refs</span><span>{renderSceneStats?.channel_split_refs ?? '—'}</span></div>
+	<div class="sync-row"><span>Measured BSDFs</span><span>{renderSceneStats?.measured_bsdf_count ?? '—'}</span></div>
+	<div class="sync-row"><span>Analytic BSDFs</span><span>{renderSceneStats?.analytic_bsdf_count ?? '—'}</span></div>
+	<div class="sync-row"><span>Diffuse-like analytic</span><span>{renderSceneStats?.diffuse_like_bsdf_count ?? '—'}</span></div>
+	<div class="sync-row"><span>Specular analytic</span><span>{renderSceneStats?.specular_like_bsdf_count ?? '—'}</span></div>
 	<div class="sync-row"><span>Measured polarized BSDFs</span><span>{renderSceneStats?.measured_polarized_count ?? '—'}</span></div>
 	<div class="sync-divider"></div>
 	<div class="sync-row"><span>Active rig</span><span>{authoringMap?.camera_rig?.rig_id ?? '—'}</span></div>
@@ -179,6 +194,9 @@
 	.probe-empty { margin: 4px 0 0 0; color: var(--muted-strong); font-size: var(--font-size-xs); }
 
 	.probe-actions { display: flex; gap: var(--space-2); align-items: center; }
+	.band-mode-row { display: flex; align-items: center; gap: var(--space-2); margin: var(--space-2) 0; }
+	.band-mode-row > span { font-size: 11px; color: var(--text-muted); font-weight: 700; white-space: nowrap; }
+	.band-mode-row > select { flex: 1; min-width: 0; }
 
 	.probe-error { color: var(--danger); background: var(--danger-soft); padding: var(--space-2); border-radius: var(--radius-sm); font-size: var(--font-size-xs); }
 

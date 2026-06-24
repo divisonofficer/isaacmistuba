@@ -830,10 +830,7 @@ def _append_extracted_bsdf_xml(
     if use_conductor:
         bsdf = ET.SubElement(inner_bsdf_parent, "bsdf", type="roughconductor")
         ET.SubElement(bsdf, "string", attrib={"name": "material", "value": "Al"})
-        try:
-            alpha = max(0.01, min(0.9, float(roughness) if roughness is not None else 0.2))
-        except Exception:
-            alpha = 0.2
+        alpha = _clamp_bsdf_alpha(roughness, default=0.2, floor=_MIN_ROUGHCONDUCTOR_ALPHA)
         ET.SubElement(bsdf, "float", attrib={"name": "alpha", "value": f"{alpha:.4f}"})
     else:
         bsdf_type = diffuse_bsdf_type if diffuse_bsdf_type in {"roughplastic", "pplastic"} else "roughplastic"
@@ -849,10 +846,7 @@ def _append_extracted_bsdf_xml(
             ET.SubElement(bsdf, "rgb", attrib={"name": "diffuse_reflectance", "value": rgb})
         else:
             ET.SubElement(bsdf, "rgb", attrib={"name": "diffuse_reflectance", "value": fallback_color})
-        try:
-            alpha = max(0.01, min(0.9, float(roughness) if roughness is not None else 0.2))
-        except Exception:
-            alpha = 0.2
+        alpha = _clamp_bsdf_alpha(roughness, default=0.2, floor=_MIN_ROUGHPLASTIC_ALPHA)
         # pplastic's dielectric coat looks glossy at low alpha; keep diffuse surfaces
         # matte by raising the floor (roughplastic keeps the original range).
         if bsdf_type == "pplastic":
@@ -924,6 +918,18 @@ _BSDF_METAL_TOKENS = ("gold", "silver", "copper", "aluminum", "aluminium", "chro
 _BSDF_CERAMIC_TOKENS = ("ceramic", "alumina", "zro", "zirconia", "porcelain")
 _BSDF_SOFT_TOKENS = ("silicone", "rubber", "wax", "skin", "cloth", "fabric", "velvet")
 
+_MIN_ROUGHPLASTIC_ALPHA = float(os.environ.get("ROBOMITUBA_MIN_ROUGHPLASTIC_ALPHA", "0.08"))
+_MIN_ROUGHCONDUCTOR_ALPHA = float(os.environ.get("ROBOMITUBA_MIN_ROUGHCONDUCTOR_ALPHA", "0.10"))
+_MIN_ROUGHDIELECTRIC_ALPHA = float(os.environ.get("ROBOMITUBA_MIN_ROUGHDIELECTRIC_ALPHA", "0.08"))
+
+
+def _clamp_bsdf_alpha(value: Any, *, default: float, floor: float, ceiling: float = 0.9) -> float:
+    try:
+        alpha = float(value) if value is not None else float(default)
+    except Exception:
+        alpha = float(default)
+    return max(float(floor), min(float(ceiling), alpha))
+
 
 def _measured_alpha_sample_for_material(material_id: str | None) -> float:
     mid = str(material_id or "").lower()
@@ -951,6 +957,13 @@ def _append_twosided_child_bsdf(shape: "ET.Element", bsdf_type: str) -> "ET.Elem
 # below film clipping at common spp/exposure. Authoring `emitter_intensity` scales this.
 _DEFAULT_EMITTER_RADIANCE = (15.0, 14.0, 12.0)
 
+# Hard cap on the final per-channel emitter radiance (= base × intensity). The
+# webui ceiling-light brightness slider writes emitter_intensity up to 20, which
+# turns a small fixture into a radiance≈300 firefly generator on glossy/measured
+# materials. Capping the effective radiance tames those without darkening normal
+# lights (intensity 1 → ~15, well under the cap). Override: ROBOMITUBA_MAX_EMITTER_RADIANCE.
+_MAX_EMITTER_RADIANCE = float(os.environ.get("ROBOMITUBA_MAX_EMITTER_RADIANCE", "80.0"))
+
 
 def _append_area_emitter_xml(shape: "ET.Element", obj: dict[str, Any]) -> None:
     """Wrap ``shape`` with an area emitter using the object's authored radiance."""
@@ -969,7 +982,8 @@ def _append_area_emitter_xml(shape: "ET.Element", obj: dict[str, Any]) -> None:
     except (TypeError, ValueError):
         intensity = 1.0
     intensity = max(0.0, intensity)
-    rgb = " ".join(f"{max(0.0, c * intensity):.6g}" for c in base)
+    cap = _MAX_EMITTER_RADIANCE if _MAX_EMITTER_RADIANCE > 0 else float("inf")
+    rgb = " ".join(f"{min(cap, max(0.0, c * intensity)):.6g}" for c in base)
     emitter = ET.SubElement(shape, "emitter", type="area")
     ET.SubElement(emitter, "rgb", attrib={"name": "radiance", "value": rgb})
 
@@ -1020,7 +1034,7 @@ def _append_bsdf_xml(
         return
     if strategy == "roughdielectric":
         bsdf = ET.SubElement(shape, "bsdf", type="roughdielectric")
-        ET.SubElement(bsdf, "float", attrib={"name": "alpha", "value": "0.08"})
+        ET.SubElement(bsdf, "float", attrib={"name": "alpha", "value": f"{_MIN_ROUGHDIELECTRIC_ALPHA:.4f}"})
         ET.SubElement(bsdf, "float", attrib={"name": "int_ior", "value": "1.5"})
         return
     if strategy == "conductor":
@@ -2545,6 +2559,27 @@ def _proxy_box_xml_element(
                 ),
             },
         )
+        return shape
+
+    # Downward-facing ceiling-light panel: a flat rectangle area emitter whose
+    # normal points into the room (-Y). Unlike the 6-face cube below, ALL emission
+    # goes downward (no top-face waste / ceiling embedding), and a large flat area
+    # is cheap to importance-sample → much lower firefly/grain variance and even
+    # fill. Gated by the authoring `emitter_shape == "ceiling_panel"` flag so wall
+    # lamps and other emitters keep the cube. mitsuba rectangle local normal +Z is
+    # rotated to world -Y via rotate-X 90°; local x/y then span world X/Z.
+    if is_emitter and str(obj.get("emitter_shape") or "").strip() == "ceiling_panel":
+        shape = ET.Element("shape", type="rectangle", id=obj_id)
+        xf = ET.SubElement(shape, "transform", attrib={"name": "to_world"})
+        ET.SubElement(xf, "scale", x=f"{sx / 2:.6f}", y=f"{sz / 2:.6f}")
+        ET.SubElement(xf, "rotate", x="1", angle="90")
+        if abs(yaw_deg) > 1e-5:
+            ET.SubElement(xf, "rotate", y="1", angle=f"{yaw_deg:.4f}")
+        ET.SubElement(xf, "translate", x=f"{cx:.6f}", y=f"{cy_cube:.6f}", z=f"{cz:.6f}")
+        _append_area_emitter_xml(shape, obj)
+        if mesh_stats is not None:
+            mesh_stats["emitter_panel"] = mesh_stats.get("emitter_panel", 0) + 1
+        _record("emitter_panel", "primitive", shape_id=obj_id, reason="ceiling_panel")
         return shape
 
     # Cube fallback (or emitter, which always uses a cube).
@@ -9512,6 +9547,52 @@ class RenderDaemon:
             text = xml_path.read_text(encoding="utf-8", errors="replace")
         except OSError as exc:
             return {"exists": True, "scene_id": scene_id, "error": str(exc)}
+        bsdf_stats: dict[str, Any] = {}
+        try:
+            import xml.etree.ElementTree as ET
+
+            measured_types = {"measured", "measured_polarized", "measured_polarized_rgb"}
+            wrapper_types = {"twosided", "normalmap", "bumpmap", "blendbsdf", "mask"}
+            diffuse_like_types = {"diffuse", "roughplastic", "pplastic", "plastic", "principled"}
+            specular_like_types = {
+                "conductor",
+                "roughconductor",
+                "dielectric",
+                "roughdielectric",
+                "thindielectric",
+                "polarizer",
+                "glossy_black_lacquer",
+                "mirror_black_enamel",
+            }
+            root = ET.fromstring(text)
+            bsdf_type_counts: dict[str, int] = {}
+            for bsdf in root.findall(".//bsdf"):
+                bsdf_type = str(bsdf.attrib.get("type") or "unknown")
+                bsdf_type_counts[bsdf_type] = bsdf_type_counts.get(bsdf_type, 0) + 1
+            measured_count = sum(count for typ, count in bsdf_type_counts.items() if typ in measured_types)
+            wrapper_count = sum(count for typ, count in bsdf_type_counts.items() if typ in wrapper_types)
+            analytic_type_counts = {
+                typ: count
+                for typ, count in sorted(bsdf_type_counts.items())
+                if typ not in measured_types and typ not in wrapper_types
+            }
+            bsdf_stats = {
+                "bsdf_decl_count": int(sum(bsdf_type_counts.values())),
+                "bsdf_wrapper_count": int(wrapper_count),
+                "bsdf_type_counts": dict(sorted(bsdf_type_counts.items())),
+                "measured_bsdf_count": int(measured_count),
+                "analytic_bsdf_count": int(sum(analytic_type_counts.values())),
+                "analytic_bsdf_type_counts": analytic_type_counts,
+                "diffuse_like_bsdf_count": int(sum(bsdf_type_counts.get(t, 0) for t in diffuse_like_types)),
+                "specular_like_bsdf_count": int(sum(bsdf_type_counts.get(t, 0) for t in specular_like_types)),
+                "measured_bsdf_type_counts": {
+                    typ: bsdf_type_counts.get(typ, 0)
+                    for typ in sorted(measured_types)
+                    if bsdf_type_counts.get(typ, 0)
+                },
+            }
+        except Exception as exc:  # noqa: BLE001 - stats endpoint should remain best-effort
+            bsdf_stats = {"bsdf_parse_error": str(exc)}
         return {
             "exists": True,
             "scene_id": scene_id,
@@ -9526,6 +9607,7 @@ class RenderDaemon:
             "constant_emitter_count": text.count('<emitter type="constant"'),
             "shared_bsdf_count": text.count("<bsdf type=") - text.count("shape><bsdf"),
             "measured_polarized_count": text.count('<bsdf type="measured_polarized"'),
+            **bsdf_stats,
             "channel_split_refs": text.count("data/hpbrdf_2025/channels/"),
             "raw_hpbrdf_refs": text.count(".hpbrdf\""),
         }
@@ -10947,87 +11029,49 @@ class RenderDaemon:
 
             _set_progress("nodes", 0.0)
             try:
-                # Always rebuild the traversability grid from the current annotation so that
-                # obstacles added since the last explicit "Build Map" are respected.
-                annotation_path = project_dir / "scenes" / scene_id / "scene_annotation.json"
-                grid_path = project_dir / "scenes" / scene_id / "traversable_grid.npy"
-                _overlay_objects = _load_scene_overlay_objects(annotation_path.parent)
-                if annotation_path.exists():
-                    from navigation_dataset.scene_annotations import read_scene_annotation
-                    _annotation = read_scene_annotation(annotation_path)
-                    grid_resolution = float(payload.get("resolution", 0.05))
-                    grid = build_traversability_grid(_annotation, resolution=grid_resolution, objects=_overlay_objects, robot_height_m=float(payload.get("robot_height_m", 1.2)))
-                    overlay_path = annotation_path.parent / "walkability_overlay.npy"
-                    overlay = _load_walk_overlay(overlay_path, expected_spec=grid.spec) if overlay_path.exists() else None
-                    if overlay is not None:
-                        grid = build_traversability_grid(_annotation, resolution=grid_resolution, walkability_overlay=overlay, objects=_overlay_objects, robot_height_m=float(payload.get("robot_height_m", 1.2)))
-                    save_traversability_grid(grid_path, grid)
-                else:
-                    grid = load_traversability_grid(grid_path)
+                # Mesh-aware shared core: builds an accurate mesh-derived walkable
+                # surface + door portals for Infinigen imports, falling back to the
+                # legacy annotation grid for other scenes. See
+                # navigation_dataset.graph_pipeline.build_viewpoint_graph_core.
+                from navigation_dataset.graph_pipeline import build_viewpoint_graph_core
+                from navigation_dataset.viewpoint_graph import read_viewpoint_graph
+
+                scene_dir = project_dir / "scenes" / scene_id
                 heading_count = int(payload.get("heading_count", 12))
-                # Doorway / passage thresholds get a guaranteed viewpoint. Doors
-                # are usually line geometry → use the segment midpoint.
-                _door_seeds: list[tuple[float, float]] = []
-                for o in (_overlay_objects or []):
-                    if str(o.get("type") or "") not in {"glass_door", "door"}:
-                        continue
-                    g = o.get("geometry") or {}
-                    c = g.get("center")
-                    if isinstance(c, (list, tuple)) and len(c) >= 2:
-                        _door_seeds.append((float(c[0]), float(c[1])))
-                        continue
-                    s, e = g.get("start"), g.get("end")
-                    if isinstance(s, (list, tuple)) and isinstance(e, (list, tuple)):
-                        _door_seeds.append(((float(s[0]) + float(e[0])) / 2.0, (float(s[1]) + float(e[1])) / 2.0))
-                nodes = sample_viewpoint_nodes(
-                    grid,
-                    max_nodes=int(payload.get("max_nodes", 300)),
+                # Preserve manually-added nodes/edges across rebuilds.
+                _existing_graph = None
+                _vg_path = scene_dir / "viewpoint_graph.json"
+                if _vg_path.exists():
+                    try:
+                        _existing_graph = read_viewpoint_graph(_vg_path)
+                    except Exception:
+                        _existing_graph = None
+                _mc = payload.get("min_clearance_m")
+                _build = build_viewpoint_graph_core(
+                    scene_id,
+                    scene_dir,
+                    graph_id=str(payload.get("graph_id") or f"{scene_id}_vg_{_utc_now().strftime('%Y%m%dT%H%M%S%f')}"),
+                    resolution=float(payload.get("resolution", 0.05)),
+                    robot_radius_m=float(payload.get("robot_radius_m", 0.25)),
+                    robot_height_m=float(payload.get("robot_height_m", 1.2)),
                     heading_count=heading_count,
                     min_node_spacing_m=float(payload.get("min_node_spacing_m", 0.5)),
-                    min_clearance_m=float(payload.get("min_clearance_m", 0.0)),
-                    robot_radius_m=float(payload.get("robot_radius_m", 0.25)),
-                    seed=int(payload.get("seed", 0)),
-                    opening_seeds=_door_seeds or None,
-                    on_progress=lambda f: _set_progress("nodes", f * 0.5),
-                )
-                # Safety-net prune: drop any node that still lands inside an object
-                # footprint (should be ~0 now that the grid masks footprints).
-                if bool(payload.get("prune_overlapping", True)) and _overlay_objects:
-                    from navigation_dataset.viewpoint_graph import (
-                        ViewpointGraph as _VG, find_object_overlapping_nodes as _find_ov, remove_nodes as _rm,
-                    )
-                    _tmp = _VG(scene_id=scene_id, graph_id="tmp", node_heading_count=heading_count, nodes=nodes)
-                    _ov = _find_ov(_tmp, _overlay_objects, margin_m=float(payload.get("prune_margin_m", 0.0)))
-                    if _ov:
-                        _rm(_tmp, _ov)
-                        nodes = _tmp.nodes
-                _set_progress("edges", 0.5)
-                edges = build_viewpoint_edges(
-                    grid,
-                    nodes,
-                    robot_radius_m=float(payload.get("robot_radius_m", 0.25)),
+                    min_clearance_m=(float(_mc) if _mc not in (None, 0, 0.0) else None),
+                    camera_margin_m=float(payload.get("camera_margin_m", 0.10)),
+                    max_nodes=int(payload.get("max_nodes", 300)),
                     k_neighbors=int(payload.get("k_neighbors", 8)),
                     max_edge_length_m=float(payload.get("max_edge_length_m", 1.5)),
-                    on_progress=lambda f: _set_progress("edges", 0.5 + f * 0.5),
+                    seed=int(payload.get("seed", 0)),
+                    prune_overlapping=bool(payload.get("prune_overlapping", True)),
+                    prune_margin_m=float(payload.get("prune_margin_m", 0.0)),
+                    existing_graph=_existing_graph,
+                    scene_variant_id=payload.get("scene_variant_id"),
+                    metadata_extra={"built_at": _utc_now_iso()},
+                    on_progress=lambda stage, frac: _set_progress(stage, frac),
                 )
-                graph = ViewpointGraph(
-                    scene_id=scene_id,
-                    graph_id=str(payload.get("graph_id") or f"{scene_id}_vg_{_utc_now().strftime('%Y%m%dT%H%M%S%f')}"),
-                    node_heading_count=heading_count,
-                    nodes=nodes,
-                    edges=edges,
-                    metadata={
-                        "generation_version": "opticalnav-v0.2",
-                        "built_at": _utc_now_iso(),
-                        "robot_radius_m": float(payload.get("robot_radius_m", 0.25)),
-                        "min_node_spacing_m": float(payload.get("min_node_spacing_m", 0.5)),
-                        "max_edge_length_m": float(payload.get("max_edge_length_m", 1.5)),
-                        "k_neighbors": int(payload.get("k_neighbors", 8)),
-                        "seed": int(payload.get("seed", 0)),
-                        "grid_resolution_m": float(payload.get("resolution", 0.05)),
-                        "scene_variant_id": payload.get("scene_variant_id"),
-                    },
-                )
+                graph = _build.graph
+                nodes = graph.nodes
+                edges = graph.edges
                 with self._opticalnav_graph_edit_lock(project_dir, scene_id):
                     self._bump_viewpoint_graph_revision(graph)
                     graph_path = write_viewpoint_graph(project_dir / "scenes" / scene_id / "viewpoint_graph.json", graph)

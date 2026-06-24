@@ -1,0 +1,414 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>2026-06-24 Indoor OpticalNav Render Noise 개선 기록</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f7f8fb;
+      --paper: #ffffff;
+      --ink: #1f2937;
+      --muted: #667085;
+      --line: #d9dee8;
+      --accent: #1d5fd1;
+      --ok: #087443;
+      --warn: #a15c07;
+      --code: #f1f4f9;
+    }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      line-height: 1.58;
+    }
+    .layout {
+      display: flex;
+      min-height: 100vh;
+      align-items: flex-start;
+    }
+    aside {
+      width: 260px;
+      flex: 0 0 260px;
+      position: sticky;
+      top: 0;
+      height: 100vh;
+      overflow-y: auto;
+      padding: 24px 16px;
+      border-right: 1px solid var(--line);
+      background: #eef2f7;
+    }
+    .logo {
+      font-weight: 800;
+      color: var(--accent);
+      letter-spacing: 0;
+      font-size: 16px;
+    }
+    .date {
+      margin-top: 3px;
+      color: var(--muted);
+      font-size: 12px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+    .nav-title {
+      margin: 22px 8px 8px;
+      color: var(--muted);
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: 0.12em;
+      font-weight: 800;
+    }
+    .nav-link {
+      display: block;
+      padding: 6px 8px;
+      border-radius: 5px;
+      color: #344054;
+      font-size: 12px;
+      text-decoration: none;
+      margin-bottom: 2px;
+    }
+    .nav-link:hover {
+      background: #dde3ee;
+      color: var(--accent);
+    }
+    main {
+      flex: 1;
+      min-width: 0;
+      padding: 36px 24px 64px;
+    }
+    article {
+      max-width: 1080px;
+      margin: 0 auto;
+      background: var(--paper);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 34px 40px;
+      box-shadow: 0 8px 24px rgb(16 24 40 / 0.05);
+    }
+    h1, h2, h3 {
+      line-height: 1.25;
+      margin: 0;
+    }
+    h1 {
+      font-size: 28px;
+      letter-spacing: 0;
+    }
+    h2 {
+      margin-top: 34px;
+      padding-top: 22px;
+      border-top: 1px solid var(--line);
+      font-size: 20px;
+    }
+    h3 {
+      margin-top: 22px;
+      font-size: 16px;
+    }
+    p {
+      margin: 10px 0 0;
+    }
+    ul {
+      margin: 10px 0 0 20px;
+      padding: 0;
+    }
+    li {
+      margin: 5px 0;
+    }
+    code {
+      background: var(--code);
+      border: 1px solid #e5e9f2;
+      border-radius: 5px;
+      padding: 1px 5px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 0.92em;
+    }
+    pre {
+      overflow-x: auto;
+      background: #111827;
+      color: #e5e7eb;
+      border-radius: 8px;
+      padding: 14px 16px;
+      font-size: 13px;
+      line-height: 1.5;
+    }
+    pre code {
+      background: transparent;
+      border: 0;
+      padding: 0;
+      color: inherit;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 12px;
+      font-size: 14px;
+    }
+    th, td {
+      border: 1px solid var(--line);
+      padding: 9px 10px;
+      text-align: left;
+      vertical-align: top;
+    }
+    th {
+      background: #f3f6fb;
+      font-weight: 650;
+    }
+    .meta {
+      margin-top: 10px;
+      color: var(--muted);
+      font-size: 14px;
+    }
+    .badge {
+      display: inline-block;
+      margin-right: 6px;
+      border-radius: 999px;
+      padding: 2px 9px;
+      border: 1px solid var(--line);
+      background: #f8fafc;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .ok { color: var(--ok); font-weight: 650; }
+    .warn { color: var(--warn); font-weight: 650; }
+    @media (max-width: 980px) {
+      .layout { display: block; }
+      aside {
+        position: relative;
+        width: auto;
+        height: auto;
+        border-right: 0;
+        border-bottom: 1px solid var(--line);
+      }
+      main { padding: 20px; }
+      article { padding: 24px 20px; }
+    }
+  </style>
+</head>
+<body>
+<div class="layout">
+<aside>
+  <div class="logo">Robomituba</div>
+  <div class="date">2026-06-24</div>
+
+  <div class="nav-title">오늘 보고서</div>
+  <a class="nav-link" href="#summary">요약</a>
+  <a class="nav-link" href="#decisions">핵심 결정</a>
+  <a class="nav-link" href="#changes">구현 변경</a>
+  <a class="nav-link" href="#indoor-seed2">indoor_seed2 적용 결과</a>
+  <a class="nav-link" href="#validation">검증</a>
+  <a class="nav-link" href="#commit-scope">커밋 범위</a>
+
+  <div class="nav-title">이전 보고서</div>
+  <a class="nav-link" href="report_2026-06-23_single_band_pbrdf_albedo.md">2026-06-23 Single-band pBRDF</a>
+  <a class="nav-link" href="report_2026-06-19.html">2026-06-19 Infinigen indoor import</a>
+  <a class="nav-link" href="report_2026-06-17_polarization_pipeline.html">2026-06-17 Polarization pipeline</a>
+  <a class="nav-link" href="index.html">전체 인덱스</a>
+</aside>
+<main>
+  <article>
+    <h1>Indoor OpticalNav Render Noise 개선 기록</h1>
+    <div class="meta">
+      <span class="badge">2026-06-24</span>
+      <span class="badge">scene: indoor_seed2</span>
+      <span class="badge">background single-band</span>
+      <span class="badge">room softbox</span>
+      <span class="badge">RGB channel-split 최소화</span>
+    </div>
+
+    <h2 id="summary">요약</h2>
+    <p>
+      벽면의 쌀알무늬는 벽 재질이 3-band measured BRDF라서 생긴 문제라기보다,
+      작은 cube fixture가 실내 조명을 담당하면서 생긴 low-SNR path sampling noise가 주 원인으로 판단했다.
+      다만 RGB를 R/G/B branch로 따로 렌더한 뒤 합성하면, 벽 BSDF가 single-band여도 채널별 Monte Carlo noise가
+      decorrelate되어 chromatic speckle이 생길 수 있으므로 일반 RGB 경로는 single-band one-pass 쪽으로 정리했다.
+    </p>
+
+    <h2 id="decisions">핵심 결정</h2>
+    <ul>
+      <li>일반 RGB 기본값은 <code>pbrdf_band_mode=single</code>로 둔다.</li>
+      <li>single 경로는 <code>cuda_rgb</code>에서 measured BSDF를 542 nm single-band + <code>albedo_scale</code>로 stage한다.</li>
+      <li>single RGB가 실패해도 channel-split fallback으로 조용히 내려가지 않도록 막는다.</li>
+      <li>hybrid/rgb 3-band 경로는 HQ 비교/논문용 opt-in으로 유지한다.</li>
+      <li>실내 조명은 dense softbox grid가 아니라 방별 sparse representative ceiling panel로 둔다.</li>
+      <li>기존 fixture mesh는 보존하되 실제 illumination source 역할은 rectangle softbox가 담당한다.</li>
+    </ul>
+
+    <h2 id="changes">구현 변경</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>영역</th>
+          <th>변경 내용</th>
+          <th>주요 파일</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>RGB / pBRDF staging</td>
+          <td>
+            <code>RenderConfig.pbrdf_band_mode</code> 기본값을 <code>single</code>로 변경했다.
+            single RGB stage에서 measured BSDF filename을 <code>542.pbrdf</code>로 맞추고
+            <code>&lt;float name="wavelength" value="542"&gt;</code>를 삽입한다.
+            <code>albedo_scale</code>는 보존한다.
+          </td>
+          <td><code>modules/mitsuba_converter/src/mitsuba_converter/multimodal.py</code></td>
+        </tr>
+        <tr>
+          <td>channel-split 방어</td>
+          <td>
+            single RGB render가 실패할 경우 channel-split fallback으로 내려가지 않고 명시적으로 실패시킨다.
+            일반 RGB 품질 평가에서 channel decorrelation speckle이 섞이는 것을 막기 위한 정책이다.
+          </td>
+          <td><code>multimodal.py</code></td>
+        </tr>
+        <tr>
+          <td>render diagnostics</td>
+          <td>
+            render metadata에 <code>pbrdf_band_mode</code>, <code>rgb_render_mode</code>,
+            <code>band_policy_counts</code>, <code>wall_material_policy</code>를 남긴다.
+            Sync Inspector용으로 measured/analytic/diffuse-like/specular-like BSDF count도 추가했다.
+          </td>
+          <td>
+            <code>multimodal.py</code><br>
+            <code>modules/mitsuba_converter/src/mitsuba_converter/render_daemon.py</code>
+          </td>
+        </tr>
+        <tr>
+          <td>AOV 중복 pBRDF load 감소</td>
+          <td>
+            AOV scene에서 nested <code>twosided &gt; measured_polarized</code> BSDF가 치환되지 않던 문제를 수정했다.
+            AOV stage signature를 갱신해 stale scene 재사용도 피했다.
+          </td>
+          <td><code>multimodal.py</code></td>
+        </tr>
+        <tr>
+          <td>softbox migration</td>
+          <td>
+            <code>authoring_map.json</code> source-of-truth 기준으로 room softbox proxy를 생성하고,
+            기존 synthetic light proxy를 제거하며, source-backed fixture emitter는 decorative로 강등하는 migration을 추가했다.
+          </td>
+          <td><code>apps/migrations/patch_scene_ceiling_lights.py</code></td>
+        </tr>
+        <tr>
+          <td>sparse softbox policy</td>
+          <td>
+            처음의 dense grid 정책은 장면을 부자연스럽게 밝히고 방 겹침에서 중복 조명을 만들었다.
+            정책을 coverage <code>0.12</code>, 방당 최대 4개, 가까운 center dedupe 방식으로 낮췄다.
+          </td>
+          <td>
+            <code>patch_scene_ceiling_lights.py</code><br>
+            <code>apps/import_infinigen_scene.py</code>
+          </td>
+        </tr>
+        <tr>
+          <td>noise probe</td>
+          <td>
+            indoor wall grain/chromatic speckle 원인 분리를 위한 probe script를 추가했다.
+            albedo/direct/path SPP sweep/softbox-only/RGB mode 비교를 위한 기반이다.
+          </td>
+          <td><code>apps/migrations/probe_indoor_render_noise.py</code></td>
+        </tr>
+        <tr>
+          <td>Web UI</td>
+          <td>
+            RGB pBRDF 옵션 3종은 유지하되 preview 기본값을 single로 바꿨다.
+            Sync Inspector에 measured/analytic BSDF count를 노출했다.
+            render-only softbox proxy는 에디터에서 fallback box로 그리지 않고 emitter overlay만 남기도록 했다.
+          </td>
+          <td>
+            <code>apps/webui/src/routes/datasets/+page.svelte</code><br>
+            <code>apps/webui/src/lib/datasets/RailPreviewTab.svelte</code><br>
+            <code>apps/webui/src/lib/datasets/RailSensorsTab.svelte</code><br>
+            <code>apps/webui/src/lib/MapEditor3D.svelte</code>
+          </td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h2 id="indoor-seed2">indoor_seed2 적용 결과</h2>
+    <p>
+      기존 compiled scene은 <code>rectangle_emitters=0</code>, <code>softbox_emitters=0</code>,
+      <code>cube_emitters=19</code>였고, 이후 첫 softbox migration에서는 41개의 rectangle softbox가 생성되어
+      에디터와 조명 밀도 양쪽에서 과했다. 최종 sparse 정책으로 다시 패치한 결과는 아래와 같다.
+    </p>
+    <pre><code>authoring softboxes: 7
+render shape_emitters: 7
+rectangle_emitters: 7
+cube_emitters: 0
+softbox_emitters: 7
+removed previous softbox proxies: 41
+softbox target coverage: 0.12
+softbox max per region: 4
+softbox dedupe distance: 1.15 m
+softbox normal: world -Y
+softbox height: ceiling 2.60 m - gap 0.05 m = 2.55 m</code></pre>
+
+    <h2 id="validation">검증</h2>
+    <ul>
+      <li><span class="ok">통과</span> <code>python3 -m py_compile modules/mitsuba_converter/src/mitsuba_converter/multimodal.py</code></li>
+      <li><span class="ok">통과</span> <code>python3 -m py_compile apps/migrations/patch_scene_ceiling_lights.py apps/import_infinigen_scene.py</code></li>
+      <li><span class="ok">통과</span> <code>PYTHONPATH=modules/mitsuba_converter/src:modules/robomituba_bridge/src:modules/navigation_dataset/src python3 -m pytest modules/mitsuba_converter/tests/test_texture_modulated_measured.py</code></li>
+      <li><span class="ok">통과</span> <code>npm --prefix apps/webui run check</code> error 0, 기존 warning 98개</li>
+      <li><span class="warn">제약</span> 현재 shell에서는 Mitsuba runtime path가 로드되지 않아 실제 low-cost render smoke는 별도 daemon/runtime 환경에서 확인해야 한다.</li>
+    </ul>
+
+    <h2 id="commit-scope">커밋 포함 후보</h2>
+    <p>이번 render noise / softbox / RGB band 정책 커밋에 포함할 파일 후보는 다음과 같다.</p>
+    <pre><code>apps/import_infinigen_scene.py
+apps/migrations/patch_scene_ceiling_lights.py
+apps/migrations/probe_indoor_render_noise.py
+apps/webui/src/lib/MapEditor3D.svelte
+apps/webui/src/lib/datasets/RailPreviewTab.svelte
+apps/webui/src/lib/datasets/RailSensorsTab.svelte
+apps/webui/src/routes/datasets/+page.svelte
+modules/mitsuba_converter/src/mitsuba_converter/multimodal.py
+modules/mitsuba_converter/src/mitsuba_converter/render_daemon.py
+modules/mitsuba_converter/tests/test_texture_modulated_measured.py
+dev_docs/6월24일.html</code></pre>
+
+    <h2>커밋에서 보류 검토할 파일</h2>
+    <p>
+      worktree에는 아래처럼 이번 변경과 직접 연결되지 않았거나 별도 기능으로 보이는 dirty/untracked 파일도 있다.
+      같은 커밋에 섞으면 리뷰 단위가 커질 수 있으므로, 별도 커밋으로 분리하는 편이 안전하다.
+    </p>
+    <pre><code>apps/export_optical_nav_dataset.py
+apps/run_infinigen_import.sh
+apps/webui/src/lib/datasets/AssetCatalog.svelte
+apps/webui/src/lib/datasets/vm/AssetVM.svelte.ts
+apps/webui/src/lib/stores/debugEvents.ts
+apps/webui/src/lib/stores/health.ts
+apps/webui/src/lib/stores/jobStatusWs.ts
+modules/mitsuba_converter/src/mitsuba_converter/__init__.py
+modules/mitsuba_converter/src/mitsuba_converter/mitsuba_builder.py
+modules/mitsuba_converter/src/mitsuba_converter/preview_worker.py
+modules/navigation_dataset/src/navigation_dataset/authoring_map.py
+modules/navigation_dataset/src/navigation_dataset/cli.py
+modules/navigation_dataset/src/navigation_dataset/scene_sync.py
+scripts/run_render_queue_local.sh
+tools/infinigen/blender_export_scene.py
+apps/migrations/patch_scene_lights.py
+apps/migrations/retonemap_sweep.py
+modules/mitsuba_converter/tests/test_emitter_shape.py
+modules/mitsuba_converter/tests/test_tonemap.py
+modules/navigation_dataset/src/navigation_dataset/graph_pipeline.py
+modules/navigation_dataset/src/navigation_dataset/qa_walkable.py
+modules/navigation_dataset/src/navigation_dataset/walkable_surface.py
+modules/navigation_dataset/tests/test_walkable_surface.py
+scripts/infinigen_gen.py
+scripts/install_infinigen_deps.sh</code></pre>
+
+    <h2>커밋 메시지 초안</h2>
+    <pre><code>Improve indoor RGB stability and softbox lighting policy
+
+- default RGB pBRDF staging to single-band 542 nm with albedo scaling
+- record pBRDF band/render-mode and BSDF inventory diagnostics
+- avoid channel-split fallback for stable single-band RGB
+- replace dense cube/softbox lighting with sparse room ceiling panels
+- hide render-only softbox fallback meshes in the editor
+- add indoor render noise probe and staging regression coverage</code></pre>
+  </article>
+</main>
+</div>
+</body>
+</html>

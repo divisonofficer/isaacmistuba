@@ -139,7 +139,6 @@
 		sweepOpticalNavViewpointGraph,
 		deleteOpticalNavObservations,
 		validateOpticalNavDataset,
-		opticalNavAssetThumbnailUrl,
 		getOpticalNavRenderConfig,
 		getOpticalNavRenderReadiness,
 		listOpticalNavEnvmaps,
@@ -188,12 +187,14 @@
 	// Read URL params at declaration time — must happen before any $effect fires
 	const _urlInit = typeof window !== 'undefined' ? new URLSearchParams(window.location.search) : new URLSearchParams();
 
-	let loading = $state(false);
-	// `loading` is the GLOBAL in-flight flag flipped by every run() call — including
-	// background batch polling and post-save refreshes — so it's the wrong gate for
-	// the Save buttons (they'd block during unrelated activity). `saving` is true
-	// only while an authoring-map persist is actually in flight; a counter keeps it
-	// correct across nested/concurrent saves (e.g. bulk light toggles).
+	let loadingCount = $state(0);
+	let backgroundLoadingCount = $state(0);
+	const loading = $derived(loadingCount > 0);
+	const backgroundLoading = $derived(backgroundLoadingCount > 0);
+	type RunOptions = { background?: boolean };
+	// `loading` gates only foreground user actions. Background scene refreshes can
+	// take a long time on cold daemon caches, so they use `backgroundLoading`
+	// instead of keeping Save/Refresh controls disabled.
 	let savingCount = $state(0);
 	const saving = $derived(savingCount > 0);
 	// Human-readable description of the current initial-load step, shown in the
@@ -282,6 +283,9 @@
 	let mapEditorRef = $state<any>(null);
 	// ─── Hot Camera Preview (Preview tab) ───────────────────────────────────
 	let probeRendering = $state(false);
+	// Measured-pBRDF band mode for preview renders. Stable/default RGB uses single
+	// band × albedo; rgb/hybrid remain opt-in comparison modes.
+	let previewBandMode = $state('single');
 	let probeResult = $state<{ batch_id: string; vp_id: string; heading_id: string; modality: string; modalities?: string[]; is_polar?: boolean; sensor_id?: string; submittedAt: number } | null>(null);
 	let probeError = $state('');
 	type HotCameraPose = {
@@ -700,8 +704,8 @@
 	let graphPayload = $state<any>(null);
 	let editor3DStatus = $state('');
 	// editorGeometryPayload, editorGeometryCatalogStatus, editorGeometryRefreshToken,
-	// assetThumbRefreshTick, selectedUsdAssetId, mapAssets, mapAssetStatus,
-	// usdCandidates, selectedMoorelaneUsdRef, usdCandidateStatus,
+	// selectedUsdAssetId, mapAssets, mapAssetStatus, usdCandidates,
+	// selectedMoorelaneUsdRef, usdCandidateStatus,
 	// materialGroups, materialLibraryStatus → assetVM
 	let inspectorTab = $state<'object' | 'material'>('object');
 	let materialPickerSearch = $state('');
@@ -813,6 +817,8 @@
 	let robotPos = $state<{ x: number; y: number } | null>(null);
 	let robotAnimTimer: ReturnType<typeof setInterval> | null = null;
 	let batchPollTimer: ReturnType<typeof setInterval> | null = null;
+	let batchRefreshDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+	let observationScanDebounceTimer: ReturnType<typeof setTimeout> | null = null;
 
 	let contextMenu = $state<{ x: number; y: number; targetId: string; targetType: 'object' | 'region' } | null>(null);
 	type ActivityEntry = {
@@ -1116,7 +1122,7 @@
 
 	async function refreshSelectedBatchJobLog(jobId = selectedBatchJobId) {
 		if (!jobId) return;
-		const data = await getJobLog(jobId, 200);
+		const data = await getJobLog(jobId, 80);
 		selectedBatchJobLog = Array.isArray(data?.lines) ? data.lines.map((line: unknown) => String(line)) : [];
 	}
 
@@ -1660,6 +1666,10 @@
 		settings.aov_spp = render.aov_spp;
 		settings.polar_spp = render.polar_spp;
 		if (render.samples_per_pass != null) settings.samples_per_pass = render.samples_per_pass;
+		// pBRDF band mode applies to ALL render paths (preview probe, sensor sweep,
+		// episodes). Only sent when non-default so 'rgb' renders are unchanged and
+		// never trip a stale worker on an unknown render_settings key.
+		if (previewBandMode && previewBandMode !== 'rgb') settings.pbrdf_band_mode = previewBandMode;
 		return settings;
 	}
 
@@ -2584,22 +2594,32 @@
 		if (readiness.kind === 'export') return exportDataset();
 	}
 
-	async function run<T>(fn: () => Promise<T>, success?: string, source = 'api'): Promise<T | undefined> {
-		loading = true;
-		error = '';
-		info = '';
+	async function run<T>(fn: () => Promise<T>, success?: string, source = 'api', options: RunOptions = {}): Promise<T | undefined> {
+		const background = options.background === true;
+		if (background) {
+			backgroundLoadingCount += 1;
+		} else {
+			loadingCount += 1;
+			error = '';
+			info = '';
+		}
 		const silent = success === undefined;
 		if (!silent) pushActivity('info', source, 'Request started.');
 		try {
 			const result = await fn();
-			if (success) { info = success; pushActivity('ok', source, success, result); }
+			if (success) {
+				if (!background) info = success;
+				pushActivity('ok', source, success, result);
+			}
 			return result;
 		} catch (err) {
-			error = errorMessage(err);
-			pushActivity('error', source, error, errorPayload(err));
+			const msg = errorMessage(err);
+			if (!background) error = msg;
+			pushActivity('error', source, msg, errorPayload(err));
 			return undefined;
 		} finally {
-			loading = false;
+			if (background) backgroundLoadingCount = Math.max(0, backgroundLoadingCount - 1);
+			else loadingCount = Math.max(0, loadingCount - 1);
 		}
 	}
 
@@ -2644,15 +2664,18 @@
 				);
 				if (mapData) setAuthoringMapPayload(mapData, false);
 			}
-			// Secondary loads — the editor already works at this point. Fetch the rest
-			// sequentially (keeping run()/loading consistent) but with visible progress.
+			// Secondary loads — the editor already works at this point. These four
+			// fetches are independent (same projectId/sceneId inputs, no result chained
+			// into the next), so run them in parallel to cut the unblock chain from
+			// ~1–4 s of sequential awaits down to whichever single fetch is slowest.
 			loadingStage = 'Loading scene assets…';
-			await loadMapAssets();
-			await loadEnvmaps();
-			loadingStage = 'Loading episodes…';
-			await refreshEpisodes();
-			loadingStage = 'Loading render readiness…';
-			await loadRenderReadiness();
+			await Promise.all([
+				loadMapAssets(),
+				loadEnvmaps(),
+				refreshEpisodes({ background: true }),
+				loadRenderReadiness(),
+			]);
+			loadingStage = 'Loading render config…';
 			if (!sceneStateText.trim()) await loadRenderConfig();
 		} finally {
 			loadingStage = '';
@@ -3046,9 +3069,9 @@
 		await refreshProject();
 	}
 
-	async function refreshEpisodes() {
+	async function refreshEpisodes(options: RunOptions = {}) {
 		if (!selectedProjectId) return;
-		const data = await run(() => episodeService.fetchEpisodes(selectedProjectId), undefined, 'episodes:list');
+		const data = await run(() => episodeService.fetchEpisodes(selectedProjectId), undefined, 'episodes:list', options);
 		if (!data) return;
 		const all: any[] = data.episodes ?? [];
 		episodes = sceneId ? all.filter((ep: any) => !ep.scene_id || ep.scene_id === sceneId) : all;
@@ -3422,7 +3445,7 @@
 		await refreshEpisodes();
 	}
 
-	async function refreshBatch() {
+	async function refreshBatch(options: RunOptions = {}) {
 		if (!selectedProjectId) return;
 		if (isGraphSweepRenderMode(renderMode)) {
 			if (!graphBatchIds.length) return;
@@ -3435,12 +3458,10 @@
 				if (b) merged = merged ? mergeBatch(merged, b) : b;
 			}
 			if (merged) graphBatch = merged;
-			_refreshBatchLogs();
-			if (selectedBatchJobId) void refreshSelectedBatchJobLog().catch(() => {});
 			if ((merged?.progress?.completed ?? 0) !== prevCompleted) scanObservations();
 		} else {
 			if (!renderBatchId) return;
-			const data = await run(() => renderService.fetchRenderBatch(selectedProjectId, renderBatchId), undefined, 'batch:episodes');
+			const data = await run(() => renderService.fetchRenderBatch(selectedProjectId, renderBatchId), undefined, 'batch:episodes', options);
 			if (data) renderBatch = data;
 		}
 	}
@@ -3452,6 +3473,22 @@
 	// stalled the daemon.
 	let _jobStatusUnsub: (() => void) | null = null;
 	let _jobStatusPrevCompleted = 0;
+
+	function scheduleObservationScan(delayMs = 1200) {
+		if (observationScanDebounceTimer !== null) return;
+		observationScanDebounceTimer = setTimeout(() => {
+			observationScanDebounceTimer = null;
+			void scanObservations().catch(() => {});
+		}, delayMs);
+	}
+
+	function scheduleGraphBatchRefresh(delayMs = 1500) {
+		if (batchRefreshDebounceTimer !== null) return;
+		batchRefreshDebounceTimer = setTimeout(() => {
+			batchRefreshDebounceTimer = null;
+			void refreshBatch({ background: true }).catch(() => {});
+		}, delayMs);
+	}
 
 	function _onJobStatusUpdate(msg: JobStatusMessage) {
 		// Batch log feed first — runs even before the batch metadata fetch has
@@ -3518,24 +3555,22 @@
 		const succeededInBatch = (msg.jobs ?? []).filter(
 			(j: any) => batchJobIds.has(String(j?.job_id ?? '')) && String(j?.status ?? '') === 'succeeded'
 		).length;
-		if (succeededInBatch > 0 || completed !== _jobStatusPrevCompleted) {
+		const shouldRefreshDiskState = succeededInBatch > 0 || completed !== _jobStatusPrevCompleted;
+		if (shouldRefreshDiskState) {
 			_jobStatusPrevCompleted = completed;
-			void scanObservations().catch(() => {});
-			// Belt-and-suspenders: also refetch batch via HTTP. The in-listener
-			// `graphBatch = applyJobStatusUpdates(...)` correctly reaches the new
-			// `progress.completed` value (verified via window.__jobStatusDebug),
-			// but multiple downstream components weren't visibly following until
-			// the user hit Refresh — which is exactly what refreshBatch does.
-			// Trigger only when the WS frame carries fresh succeeded entries,
-			// so this is bounded by actual completions, not a fixed cadence.
-			void refreshBatch().catch(() => {});
+			// Coalesce disk-backed observation scans and HTTP batch refreshes.
+			// A fast sweep can complete many headings in a short burst; firing one
+			// observations-scan + graph-batch fetch per WS frame starves health/log
+			// polling in Chromium's per-origin connection pool.
+			scheduleObservationScan();
+			if (succeededInBatch > 0) scheduleGraphBatchRefresh();
 		}
 		if (typeof window !== 'undefined') {
 			(window as any).__jobStatusDebug = {
 				...((window as any).__jobStatusDebug ?? {}),
 				last_listener_completed: completed,
 				prev_completed_seen: prevCompletedBeforeUpdate,
-				scan_fired: succeededInBatch > 0 || completed !== _jobStatusPrevCompleted,
+				scan_fired: shouldRefreshDiskState,
 				succeeded_count_in_frame: succeededInBatch,
 			};
 		}
@@ -3544,16 +3579,25 @@
 		const total = graphBatch?.progress?.total ?? 0;
 		const done = completed + (graphBatch?.progress?.failed ?? 0);
 		if (status === 'error' || (total > 0 && done >= total)) {
-			stopBatchPolling();
+			stopBatchPolling({ clearDebounced: false });
 			const key = _batchStorageKey();
 			if (key) { try { window.sessionStorage.removeItem(key); } catch { /* silent */ } }
 		}
 	}
 
-	function stopBatchPolling() {
+	function stopBatchPolling(options: { clearDebounced?: boolean } = {}) {
+		const clearDebounced = options.clearDebounced !== false;
 		if (batchPollTimer !== null) {
 			clearInterval(batchPollTimer);
 			batchPollTimer = null;
+		}
+		if (clearDebounced && batchRefreshDebounceTimer !== null) {
+			clearTimeout(batchRefreshDebounceTimer);
+			batchRefreshDebounceTimer = null;
+		}
+		if (clearDebounced && observationScanDebounceTimer !== null) {
+			clearTimeout(observationScanDebounceTimer);
+			observationScanDebounceTimer = null;
 		}
 		if (_jobStatusUnsub !== null) {
 			_jobStatusUnsub();
@@ -3589,30 +3633,18 @@
 		// backgrounded page doesn't keep hitting the daemon.
 		batchPollTimer = setInterval(async () => {
 			if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return;
-			await refreshBatch();
+			await refreshBatch({ background: true });
 			const batch = renderBatch;
 			const status = batch?.status;
 			if (status === 'building') return;
 			const total = batch?.progress?.total ?? 0;
 			const done = (batch?.progress?.completed ?? 0) + (batch?.progress?.failed ?? 0);
 			if (status === 'error' || (total > 0 && done >= total)) {
-				stopBatchPolling();
+				stopBatchPolling({ clearDebounced: false });
 				const key = _batchStorageKey();
 				if (key) { try { window.sessionStorage.removeItem(key); } catch { /* silent */ } }
 			}
 		}, 4000);
-	}
-
-	async function _refreshBatchLogs() {
-		// Retained for the one-shot manual refresh on the existing refreshBatch()
-		// path; the WS-driven flow updates batchLogEntries directly without HTTP.
-		if (!selectedProjectId || !isGraphSweepRenderMode(renderMode)) return;
-		const ids = [...new Set([graphBatchId, ...graphBatchIds].filter(Boolean))];
-		if (!ids.length) return;
-		try {
-			const batches = await Promise.all(ids.map((id) => renderService.fetchBatchLogs(selectedProjectId, id, 20).catch(() => null)));
-			batchLogEntries = batches.flatMap((data: any) => Array.isArray(data?.entries) ? data.entries : []);
-		} catch { /* silent */ }
 	}
 
 	async function validateDataset(requireObservations = false) {
@@ -3728,14 +3760,7 @@
 		refreshProjects(selectedProjectId);
 		loadGlobalCameraRig();
 		loadMaterialLibrary();
-		let ticks = 0;
-			const thumbTimer = window.setInterval(() => {
-				ticks += 1;
-				assetVM.bumpAssetThumbTick();
-				if (ticks >= 12) window.clearInterval(thumbTimer);
-			}, 2500);
 		return () => {
-			window.clearInterval(thumbTimer);
 			// Release the job-status WS subscription when the page unmounts so a
 			// route change doesn't leave the connection (and its keepalive churn)
 			// dangling.
@@ -4049,7 +4074,7 @@
 		</div>
 	</header>
 
-	{#if loadingStage}<div class="notice loading"><span class="loading-spinner" aria-hidden="true"></span>{loadingStage}</div>{/if}
+	{#if loadingStage}<div class="notice loading" class:background-loading={backgroundLoading}><span class="loading-spinner" aria-hidden="true"></span>{backgroundLoading ? 'Background: ' : ''}{loadingStage}</div>{/if}
 	{#if error}<div class="notice error">{error}</div>{/if}
 	{#if info}<div class="notice ok">{info}</div>{/if}
 
@@ -4248,13 +4273,11 @@
 				{builtInBuildAssets} {builtInPlaceAssetGroups}
 					selectedUsdAssetId={assetVM.selectedUsdAssetId}
 					usdCatalogSearch={assetVM.usdCatalogSearch}
-					mapAssets={assetVM.mapAssets}
-					mapAssetStatus={assetVM.mapAssetStatus}
-					usdAssetCandidates={assetVM.usdAssetCandidates}
-					libraryDisplayLimit={40}
-					{selectedProjectId}
-					assetThumbRefreshTick={assetVM.assetThumbRefreshTick}
-				onSelectTool={(tool) => { placementTool = tool as PlacementTool; draftPoint = null; linePreview = null; }}
+						mapAssets={assetVM.mapAssets}
+						mapAssetStatus={assetVM.mapAssetStatus}
+						usdAssetCandidates={assetVM.usdAssetCandidates}
+						libraryDisplayLimit={16}
+					onSelectTool={(tool) => { placementTool = tool as PlacementTool; draftPoint = null; linePreview = null; }}
 				onDelete={deleteSelectedAuthoringItem}
 				onSelectBuiltInPlaceAsset={selectBuiltInPlaceAsset}
 					onSelectUsdAsset={(id) => { assetVM.selectedUsdAssetId = id; placementTool = 'usd_asset'; draftPoint = null; }}
@@ -4836,6 +4859,7 @@
 				hotCameraPose={activeHotCameraPose}
 				{hotCameraPoses} {activeHotCameraId}
 				{activeRigSensorOption} {activeCameraFrustum} {activeRenderModality}
+				{previewBandMode} onSetPreviewBandMode={(v) => (previewBandMode = v)}
 				{probeRendering} {probeError} {probeResult} {activeRigSensorId}
 				{selectedProjectId} {sceneId}
 				{editorObjectsCount} {editorEmitterCount} {editorMaterialCount}
@@ -4880,7 +4904,8 @@
 				{sceneId} {projectScenes} {selectedProjectId} {hasScene}
 				{authoringMapDirty} {authoringMapText} {annotationText}
 				{authoringMap} {currentScene} {detectedEmitterCount} {enabledEmitterCount}
-				{effectiveRenderReadiness} {mapWidth} {mapHeight} {loading}
+				{effectiveRenderReadiness} {mapWidth} {mapHeight}
+				loading={loading || saving}
 					envmapFiles={assetVM.envmapFiles}
 					envmapUploading={assetVM.envmapUploading}
 				onSceneChange={(id) => { sceneId = id; sceneStateText = ''; cameraSpecText = ''; renderConfig = null; syncResult = null; renderReadiness = null; renderConfigError = ''; loadAuthoringMap(); loadRenderConfig(); episodes = []; selectedEpisode = null; selectedEpisodeId = ''; graphPayload = null; observationScan = null; graphBatch = null; graphBatchId = ''; graphBatchIds = []; stopBatchPolling(); _showRoomShellUserTouched = false; if (pageMode === 'sensors') scanObservations(); }}

@@ -164,6 +164,9 @@ class AuthoringObject:
     is_emitter: bool = False
     emitter_radiance: list[float] | None = None  # linear [r, g, b]; None → warm-white default
     emitter_intensity: float = 1.0
+    # Emitter geometry: None → 6-face cube (default). "ceiling_panel" → renderer
+    # builds a downward-facing flat rectangle (all light into the room, low variance).
+    emitter_shape: str | None = None
 
 
 @dataclass
@@ -388,6 +391,7 @@ def _normalize_object(payload: Any) -> AuthoringObject:
         is_emitter=bool(data.get("is_emitter", False)),
         emitter_radiance=_normalize_emitter_radiance(data.get("emitter_radiance")),
         emitter_intensity=emitter_intensity,
+        emitter_shape=(str(data["emitter_shape"]) if data.get("emitter_shape") else None),
     )
 
 

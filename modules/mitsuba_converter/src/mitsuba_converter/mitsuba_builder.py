@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict
 import math
+import os
 
 import numpy as np
 
@@ -12,6 +13,9 @@ from robomituba_bridge.paths import resolve_repo_path
 from robomituba_bridge.types import InstancerMappingRecord, MaterialRecord, MeshRecord, SceneSnapshot
 
 from .types import SceneIR
+
+_MIN_ROUGHPLASTIC_ALPHA = float(os.environ.get("ROBOMITUBA_MIN_ROUGHPLASTIC_ALPHA", "0.08"))
+_MIN_ROUGHDIELECTRIC_ALPHA = float(os.environ.get("ROBOMITUBA_MIN_ROUGHDIELECTRIC_ALPHA", "0.08"))
 
 
 @dataclass
@@ -333,7 +337,11 @@ class MitsubaSceneBuilder:
                 "int_ior": material.ior or 1.5,
             }
             if bsdf["type"] == "roughdielectric":
-                bsdf["alpha"] = self._texture_or_scalar(roughness_tex, material.roughness or 0.03, repo_root=repo_root)
+                bsdf["alpha"] = self._texture_or_scalar(
+                    roughness_tex,
+                    max(_MIN_ROUGHDIELECTRIC_ALPHA, material.roughness or 0.03),
+                    repo_root=repo_root,
+                )
         else:
             bsdf = {"type": "principled"}
             if base_color_tex:
@@ -343,7 +351,10 @@ class MitsubaSceneBuilder:
             if roughness_tex:
                 bsdf["roughness"] = self._bitmap_texture(roughness_tex, repo_root=repo_root)
             else:
-                bsdf["roughness"] = material.roughness if material.roughness is not None else 0.5
+                bsdf["roughness"] = max(
+                    _MIN_ROUGHPLASTIC_ALPHA,
+                    material.roughness if material.roughness is not None else 0.5,
+                )
             if kind == "metal":
                 bsdf["metallic"] = material.metallic if material.metallic is not None else 1.0
             if kind in {"plastic", "floor"} and material.metallic is not None:

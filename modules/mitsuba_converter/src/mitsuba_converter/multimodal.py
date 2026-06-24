@@ -80,6 +80,23 @@ _last_source_scene_dir: str = ""
 _TONE_EXPOSURE_DEFAULT: float = float(os.environ.get("ROBOMITUBA_TONE_EXPOSURE", "1.0"))
 _TONE_WHITE_DEFAULT: float = float(os.environ.get("ROBOMITUBA_TONE_WHITE", "10.0"))
 
+# Firefly clamp: cap isolated bright specks at (local 3x3 median × factor) for
+# preview/filtered outputs. Raw EXR/NPZ stay unclamped except NaN/Inf repair.
+# Disable with ROBOMITUBA_FIREFLY_CLAMP=0.
+_FIREFLY_CLAMP_DEFAULT: bool = os.environ.get("ROBOMITUBA_FIREFLY_CLAMP", "1") not in ("", "0", "false", "False")
+_FIREFLY_CLAMP_FACTOR: float = float(os.environ.get("ROBOMITUBA_FIREFLY_CLAMP_FACTOR", "10.0"))
+_MIN_ROUGHPLASTIC_ALPHA: float = float(os.environ.get("ROBOMITUBA_MIN_ROUGHPLASTIC_ALPHA", "0.08"))
+_MIN_ROUGHCONDUCTOR_ALPHA: float = float(os.environ.get("ROBOMITUBA_MIN_ROUGHCONDUCTOR_ALPHA", "0.10"))
+_MIN_ROUGHDIELECTRIC_ALPHA: float = float(os.environ.get("ROBOMITUBA_MIN_ROUGHDIELECTRIC_ALPHA", "0.08"))
+
+
+def _clamp_bsdf_alpha(value: Any, *, default: float, floor: float, ceiling: float = 0.9) -> float:
+    try:
+        alpha = float(value) if value is not None else float(default)
+    except Exception:
+        alpha = float(default)
+    return max(float(floor), min(float(ceiling), alpha))
+
 
 @dataclass
 class RenderConfig:
@@ -107,11 +124,21 @@ class RenderConfig:
     # sweep stays consistent; export recomputes a scene-global value from EXRs.
     tone_exposure: float = field(default_factory=lambda: _TONE_EXPOSURE_DEFAULT)
     tone_white: float = field(default_factory=lambda: _TONE_WHITE_DEFAULT)
+    # OptiX AI denoiser on the linear-HDR rgb pass, guided by albedo + shading
+    # normal AOVs. Removes path-tracing noise without raising spp. CUDA-only
+    # (auto-skips on CPU variants). Default from ROBOMITUBA_OPTIX_DENOISE.
+    use_optix_denoiser: bool = field(
+        default_factory=lambda: os.environ.get("ROBOMITUBA_OPTIX_DENOISE", "") not in ("", "0", "false", "False")
+    )
+    # Firefly clamp on the linear-HDR rgb (local 3x3 median × factor). Applied to
+    # preview/filtered outputs only; raw EXR/NPZ remain unclamped.
+    use_firefly_clamp: bool = field(default_factory=lambda: _FIREFLY_CLAMP_DEFAULT)
+    firefly_clamp_factor: float = field(default_factory=lambda: _FIREFLY_CLAMP_FACTOR)
     write_raw_npz: bool = True
-    # Measured-pBRDF band mode: "rgb" (3 bands, default) | "single" (1 band ×
-    # albedo) | "hybrid" (achromatic→1 band, colored metals→3 bands). Empty =
-    # fall back to ROBOMITUBA_PBRDF_BAND_MODE env then "rgb".
-    pbrdf_band_mode: str = "rgb"
+    # Measured-pBRDF band mode: "single" (stable 1 band × albedo, default) |
+    # "hybrid" (achromatic→1 band, colored materials→3 bands) | "rgb"
+    # (3 bands). Empty = ROBOMITUBA_PBRDF_BAND_MODE env then "single".
+    pbrdf_band_mode: str = "single"
     artifact_stems: dict[str, str] = field(default_factory=dict)
     scene_filenames: dict[str, str] = field(default_factory=dict)
 
@@ -318,9 +345,9 @@ _RGB_CHANNEL_SPLIT_WAVELENGTHS_NM: tuple[tuple[str, int], ...] = (
 )
 
 # pBRDF band mode (see dev_report/report_2026-06-23_single_band_pbrdf_albedo.md):
-#   "rgb"    — every measured material loads 3 bands (614/542/446)        [default, current]
 #   "single" — every measured material stays single-band (542 placeholder) × RGB albedo_scale
 #   "hybrid" — achromatic materials → single-band; colored metals → 3 bands
+#   "rgb"    — every measured material loads 3 bands (614/542/446)
 # Single-band still renders colour because measured_polarized applies albedo_scale.
 _PBRDF_BAND_MODES = {"rgb", "single", "hybrid"}
 
@@ -342,12 +369,12 @@ def _measured_material_is_colored(material_id: str | None) -> bool:
 
 
 def _resolve_pbrdf_band_mode(config: "RenderConfig | None") -> str:
-    """Effective band mode: request (config) → env → 'rgb'; unknown values fall back to 'rgb'."""
+    """Effective band mode: request (config) → env → 'single'; unknown values fall back to 'single'."""
     mode = getattr(config, "pbrdf_band_mode", None) if config is not None else None
     if not mode:
         mode = os.environ.get("ROBOMITUBA_PBRDF_BAND_MODE")
-    mode = str(mode or "rgb").strip().lower()
-    return mode if mode in _PBRDF_BAND_MODES else "rgb"
+    mode = str(mode or "single").strip().lower()
+    return mode if mode in _PBRDF_BAND_MODES else "single"
 
 
 def _swap_measured_bsdf_wavelength(root: ET.Element, *, target_nm: int) -> int:
@@ -373,6 +400,120 @@ def _swap_measured_bsdf_wavelength(root: ET.Element, *, target_nm: int) -> int:
                 s.set("value", new_value)
                 swapped += 1
     return swapped
+
+
+def _ensure_measured_bsdf_wavelength(root: ET.Element, *, target_nm: int = 542) -> int:
+    """Make single-band measured BSDFs load in non-spectral RGB variants.
+
+    ``measured_polarized`` can be used in RGB variants as long as the XML gives a
+    concrete wavelength. The source scene often only carries a channel-split
+    filename placeholder, so stable RGB staging rewrites it to the target band and
+    records ``<float name="wavelength" value="...">`` while preserving
+    ``albedo_scale`` children.
+    """
+    touched = 0
+    for bsdf in list(root.findall(".//bsdf")):
+        if str(bsdf.get("type") or "") not in _MEASURED_BSDF_TYPES:
+            continue
+        changed = False
+        filename_node = None
+        for child in bsdf.findall("./string"):
+            if child.get("name") == "filename":
+                filename_node = child
+                break
+        if filename_node is not None:
+            value = filename_node.get("value") or ""
+            new_value = _channel_split_filename_for(value, target_nm=target_nm)
+            if new_value != value:
+                filename_node.set("value", new_value)
+                changed = True
+
+        first_float_index: int | None = None
+        insert_at = len(list(bsdf))
+        for idx, child in enumerate(list(bsdf)):
+            if child.tag == "float":
+                first_float_index = idx if first_float_index is None else first_float_index
+            if child.tag == "string" and child.get("name") == "filename":
+                insert_at = idx + 1
+        if first_float_index is not None:
+            insert_at = max(insert_at, first_float_index)
+        for child in list(bsdf.findall("./float")):
+            if child.get("name") == "wavelength":
+                bsdf.remove(child)
+                changed = True
+        bsdf.insert(
+            min(insert_at, len(list(bsdf))),
+            ET.Element("float", {"name": "wavelength", "value": str(int(target_nm))}),
+        )
+        touched += 1
+    return touched
+
+
+def _stage_measured_bsdfs_for_rgb(root: ET.Element, *, band_mode: str) -> dict[str, int]:
+    converted = _convert_channel_split_measured_bsdfs_to_rgb_plugin(root, band_mode=band_mode)
+    single = _ensure_measured_bsdf_wavelength(root, target_nm=542)
+    return {"three_band_converted": int(converted), "single_band_wavelength": int(single)}
+
+
+def _pbrdf_band_policy_inventory(scene: Path | ET.Element) -> dict[str, Any]:
+    """Count staged measured-BSDF policy choices for render diagnostics."""
+    try:
+        root = _parse_scene(scene) if isinstance(scene, Path) else scene
+    except Exception:
+        return {
+            "single_band_measured": 0,
+            "three_band_measured": 0,
+            "measured_without_wavelength": 0,
+            "channel_split_candidates": 0,
+            "analytic_or_diffuse_background": 0,
+            "total_bsdfs": 0,
+        }
+    counts = {
+        "single_band_measured": 0,
+        "three_band_measured": 0,
+        "measured_without_wavelength": 0,
+        "channel_split_candidates": 0,
+        "analytic_or_diffuse_background": 0,
+        "total_bsdfs": 0,
+    }
+    for bsdf in root.findall(".//bsdf"):
+        counts["total_bsdfs"] += 1
+        bsdf_type = str(bsdf.get("type") or "")
+        if bsdf_type == _CHANNEL_SPLIT_RGB_PLUGIN_TYPE:
+            counts["three_band_measured"] += 1
+            continue
+        if bsdf_type in _MEASURED_BSDF_TYPES:
+            filename = None
+            for s in bsdf.findall("./string"):
+                if s.get("name") == "filename":
+                    filename = s.get("value") or ""
+                    break
+            if filename and _CHANNEL_SPLIT_FILENAME_RE.search(filename):
+                counts["channel_split_candidates"] += 1
+            if bsdf.find("./float[@name='wavelength']") is not None:
+                counts["single_band_measured"] += 1
+            else:
+                counts["measured_without_wavelength"] += 1
+            continue
+        counts["analytic_or_diffuse_background"] += 1
+    return counts
+
+
+def _rgb_render_mode_from_policy(
+    *,
+    band_mode: str,
+    timing: Mapping[str, Any] | None,
+    band_policy_counts: Mapping[str, Any],
+) -> str:
+    if timing and bool(timing.get("channel_split_rgb")) and not bool(timing.get("channel_rgb_plugin")):
+        return "channel_split"
+    if int(band_policy_counts.get("three_band_measured", 0) or 0) > 0:
+        return "rgb_plugin"
+    if band_mode == "single":
+        return "one_pass_single"
+    if band_mode == "hybrid":
+        return "one_pass_single"
+    return "spectral_polarized" if str((timing or {}).get("variant", "")).endswith("spectral_polarized") else "one_pass_single"
 
 
 def _channel_split_filename_for(value: str, *, target_nm: int) -> str:
@@ -508,13 +649,13 @@ def _merge_channel_split_timing(channel_timings: Mapping[str, Mapping[str, Any]]
 
 
 def _substitute_measured_bsdfs_with_diffuse(root: ET.Element, *, reflectance: str = "0.7 0.7 0.7") -> int:
-    """Replace top-level <bsdf type="measured*"> with diffuse stand-ins, preserving id.
+    """Replace measured BSDFs with diffuse stand-ins, preserving ids.
 
     Used for depth-only / AOV passes where BSDF response is irrelevant but the
     measured BSDF would otherwise force a multi-hundred-MB GPU upload.
     """
     swapped = 0
-    for bsdf in list(root.findall("./bsdf")):
+    for bsdf in list(root.findall(".//bsdf")):
         if str(bsdf.get("type") or "") not in _MEASURED_BSDF_TYPES:
             continue
         bsdf_id = bsdf.get("id")
@@ -1131,7 +1272,11 @@ def _set_principled_bsdf(
             "value": ",".join(f"{float(value):.4f}" for value in base_color),
         },
     )
-    ET.SubElement(principled, "float", {"name": "roughness", "value": f"{float(roughness):.4f}"})
+    ET.SubElement(
+        principled,
+        "float",
+        {"name": "roughness", "value": f"{_clamp_bsdf_alpha(roughness, default=0.5, floor=_MIN_ROUGHPLASTIC_ALPHA):.4f}"},
+    )
     ET.SubElement(principled, "float", {"name": "metallic", "value": f"{float(metallic):.4f}"})
 
 
@@ -1154,7 +1299,11 @@ def _set_roughplastic_bsdf(
             "value": ",".join(f"{float(value):.4f}" for value in diffuse_reflectance),
         },
     )
-    ET.SubElement(roughplastic, "float", {"name": "alpha", "value": f"{float(alpha):.4f}"})
+    ET.SubElement(
+        roughplastic,
+        "float",
+        {"name": "alpha", "value": f"{_clamp_bsdf_alpha(alpha, default=0.2, floor=_MIN_ROUGHPLASTIC_ALPHA):.4f}"},
+    )
     ET.SubElement(roughplastic, "float", {"name": "int_ior", "value": f"{float(int_ior):.4f}"})
     ET.SubElement(roughplastic, "float", {"name": "ext_ior", "value": "1.0000"})
 
@@ -1168,7 +1317,11 @@ def _set_roughconductor_bsdf(
     twosided = ET.SubElement(shape, "bsdf", {"type": "twosided"})
     roughconductor = ET.SubElement(twosided, "bsdf", {"type": "roughconductor"})
     ET.SubElement(roughconductor, "string", {"name": "distribution", "value": "ggx"})
-    ET.SubElement(roughconductor, "float", {"name": "alpha", "value": f"{float(alpha):.4f}"})
+    ET.SubElement(
+        roughconductor,
+        "float",
+        {"name": "alpha", "value": f"{_clamp_bsdf_alpha(alpha, default=0.2, floor=_MIN_ROUGHCONDUCTOR_ALPHA):.4f}"},
+    )
 
 
 def _set_pplastic_bsdf(
@@ -1593,6 +1746,7 @@ def _stage_path_scene(
         round(float(ambient_radiance), 4),
         int(measured_wavelength_nm) if measured_wavelength_nm else 0,
         bool(channel_rgb_plugin),
+        str(band_mode),
     )
     if _should_reuse_staged_scene(out_scene, signature=stage_signature):
         return out_scene
@@ -1609,9 +1763,9 @@ def _stage_path_scene(
             samples_per_pass=samples_per_pass,
         )
         if channel_rgb_plugin:
-            _convert_channel_split_measured_bsdfs_to_rgb_plugin(root, band_mode=band_mode)
+            _stage_measured_bsdfs_for_rgb(root, band_mode=band_mode)
         elif measured_wavelength_nm is not None:
-            _swap_measured_bsdf_wavelength(root, target_nm=int(measured_wavelength_nm))
+            _ensure_measured_bsdf_wavelength(root, target_nm=int(measured_wavelength_nm))
 
     root = _scene_template(
         scene_path,
@@ -1623,6 +1777,7 @@ def _stage_path_scene(
             int(samples_per_pass or 0),
             int(measured_wavelength_nm) if measured_wavelength_nm else 0,
             bool(channel_rgb_plugin),
+            str(band_mode),
         ),
         builder=_build_template,
     )
@@ -1655,16 +1810,23 @@ def _stage_aov_scene(
     height: int,
     scene_override: SceneOverrideSpec | None = None,
     assist_light: AssistLightSpec | None = None,
+    with_normals: bool = False,
 ) -> Path:
     stage_signature = (
         "aov",
+        "measured_nested_substituted_v2",
         _scene_cache_key(scene_path),
         _camera_signature(camera_to_world, fov_deg=fov_deg, spp=spp, width=width, height=height),
         _scene_override_signature(scene_override),
         _assist_light_signature(assist_light),
+        ("normals",) if with_normals else (),
     )
     if _should_reuse_staged_scene(out_scene, signature=stage_signature):
         return out_scene
+
+    # Channel order follows the aov string after the nested "img" integrator:
+    #   [img(3), albedo(3), depth(1)(, sh_normal(3))]
+    aovs = "ab:albedo,dd:depth,nn:sh_normal" if with_normals else "ab:albedo,dd:depth"
 
     def _build_template(root: ET.Element) -> None:
         integrator = root.find("./integrator")
@@ -1673,7 +1835,7 @@ def _stage_aov_scene(
         integrator.attrib["type"] = "aov"
         for child in list(integrator):
             integrator.remove(child)
-        ET.SubElement(integrator, "string", {"name": "aovs", "value": "ab:albedo,dd:depth"})
+        ET.SubElement(integrator, "string", {"name": "aovs", "value": aovs})
         ET.SubElement(integrator, "integrator", {"type": "direct", "name": "img"})
         # AOV branch only needs primary-ray hit geometry/depth; measured BSDFs
         # contribute nothing here yet cost the full hpbrdf/pbrdf table load.
@@ -1683,7 +1845,7 @@ def _stage_aov_scene(
     root = _scene_template(
         scene_path,
         branch_kind="aov",
-        branch_signature=("measured_substituted",),
+        branch_signature=("measured_nested_substituted_v2", "normals" if with_normals else "base"),
         builder=_build_template,
     )
     _update_sensor(
@@ -1810,7 +1972,7 @@ def _stage_diffuse_override_scene(
 
             if "glass" in obj_name:
                 bsdf = ET.SubElement(shape, "bsdf", {"type": "roughdielectric"})
-                ET.SubElement(bsdf, "float", {"name": "alpha", "value": "0.02"})
+                ET.SubElement(bsdf, "float", {"name": "alpha", "value": f"{_MIN_ROUGHDIELECTRIC_ALPHA:.4f}"})
                 ET.SubElement(bsdf, "float", {"name": "int_ior", "value": "1.5"})
                 ET.SubElement(bsdf, "float", {"name": "ext_ior", "value": "1.0"})
                 continue
@@ -1921,7 +2083,7 @@ def _stage_polarized_fallback_scene(
 
             if "glass" in obj_name:
                 bsdf = ET.SubElement(shape, "bsdf", {"type": "roughdielectric"})
-                ET.SubElement(bsdf, "float", {"name": "alpha", "value": "0.02"})
+                ET.SubElement(bsdf, "float", {"name": "alpha", "value": f"{_MIN_ROUGHDIELECTRIC_ALPHA:.4f}"})
                 ET.SubElement(bsdf, "float", {"name": "int_ior", "value": "1.5"})
                 ET.SubElement(bsdf, "float", {"name": "ext_ior", "value": "1.0"})
                 continue
@@ -2110,6 +2272,7 @@ def _stage_base_path_scene(
             int(samples_per_pass or 0),
             int(measured_wavelength_nm) if measured_wavelength_nm else 0,
             bool(channel_rgb_plugin),
+            str(band_mode),
         ),
         _scene_override_signature(scene_override),
         _texture_cache_signature(),
@@ -2132,9 +2295,9 @@ def _stage_base_path_scene(
             samples_per_pass=samples_per_pass,
         )
         if channel_rgb_plugin:
-            _convert_channel_split_measured_bsdfs_to_rgb_plugin(root, band_mode=band_mode)
+            _stage_measured_bsdfs_for_rgb(root, band_mode=band_mode)
         elif measured_wavelength_nm is not None:
-            _swap_measured_bsdf_wavelength(root, target_nm=int(measured_wavelength_nm))
+            _ensure_measured_bsdf_wavelength(root, target_nm=int(measured_wavelength_nm))
 
     root = _scene_template(
         scene_path,
@@ -2146,6 +2309,7 @@ def _stage_base_path_scene(
             int(samples_per_pass or 0),
             int(measured_wavelength_nm) if measured_wavelength_nm else 0,
             bool(channel_rgb_plugin),
+            str(band_mode),
         ),
         builder=_build_template,
     )
@@ -2214,7 +2378,7 @@ def _stage_base_diffuse_override_scene(
 
             if "glass" in obj_name:
                 bsdf = ET.SubElement(shape, "bsdf", {"type": "roughdielectric"})
-                ET.SubElement(bsdf, "float", {"name": "alpha", "value": "0.02"})
+                ET.SubElement(bsdf, "float", {"name": "alpha", "value": f"{_MIN_ROUGHDIELECTRIC_ALPHA:.4f}"})
                 ET.SubElement(bsdf, "float", {"name": "int_ior", "value": "1.5"})
                 ET.SubElement(bsdf, "float", {"name": "ext_ior", "value": "1.0"})
                 continue
@@ -2436,6 +2600,50 @@ def save_unit_rgb_preview(arr: np.ndarray, path: Path) -> dict[str, Any]:
     return {"encoding": "srgb", "input_range": [0.0, 1.0]}
 
 
+def read_exr_rgb(path: str | Path) -> np.ndarray:
+    """Read an HDR EXR into an (H, W, 3) float32 array (linear radiance).
+
+    Tries ``imageio`` (already a dependency for texture handling) and falls back
+    to ``OpenEXR``/``Imath`` (used elsewhere in this package). Raises if neither
+    backend can read the file.
+    """
+    path = Path(path)
+    last_err: Exception | None = None
+    try:
+        import imageio.v3 as iio
+
+        arr = np.asarray(iio.imread(str(path)), dtype=np.float32)
+        if arr.ndim == 2:
+            arr = np.repeat(arr[:, :, None], 3, axis=2)
+        elif arr.shape[2] > 3:
+            arr = arr[:, :, :3]
+        return np.ascontiguousarray(arr, dtype=np.float32)
+    except Exception as exc:  # noqa: BLE001 - fall through to OpenEXR
+        last_err = exc
+    try:
+        import OpenEXR
+        import Imath
+
+        exr = OpenEXR.InputFile(str(path))
+        dw = exr.header()["dataWindow"]
+        w = dw.max.x - dw.min.x + 1
+        h = dw.max.y - dw.min.y + 1
+        pt = Imath.PixelType(Imath.PixelType.FLOAT)
+        chans = exr.channels(["R", "G", "B"], pt)
+        rgb = [np.frombuffer(c, dtype=np.float32).reshape(h, w) for c in chans]
+        return np.ascontiguousarray(np.stack(rgb, axis=-1), dtype=np.float32)
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(f"Failed to read EXR {path}: imageio={last_err}; OpenEXR={exc}") from exc
+
+
+def luminance(arr: np.ndarray) -> np.ndarray:
+    """Rec.709 luminance of an (..., 3) linear-RGB array."""
+    a = np.asarray(arr, dtype=np.float32)
+    if a.ndim >= 1 and a.shape[-1] >= 3:
+        return 0.2126 * a[..., 0] + 0.7152 * a[..., 1] + 0.0722 * a[..., 2]
+    return a.reshape(a.shape[:-1]) if a.shape[-1] == 1 else a
+
+
 def _tonemap_reinhard(arr: np.ndarray, *, exposure: float, white: float) -> np.ndarray:
     """Extended Reinhard tonemap (per-channel) → sRGB-encoded [0, 1] float.
 
@@ -2443,8 +2651,8 @@ def _tonemap_reinhard(arr: np.ndarray, *, exposure: float, white: float) -> np.n
     highlights toward 1.0 (a light source in view no longer forces the rest of
     the frame dark) while ``white`` sets the radiance that maps to ~1.0.
     """
-    safe = np.where(np.isfinite(arr), arr, 0.0)
-    x = np.clip(safe, 0.0, None) * float(exposure)
+    # Inpaint NaN/Inf (low-spp "black square" pixels) instead of zeroing them.
+    x = _sanitize_radiance(arr) * float(exposure)
     w = max(float(white), 1e-6)
     y = x * (1.0 + x / (w * w)) / (1.0 + x)
     return np.clip(srgb_encode(y), 0.0, 1.0).astype(np.float32)
@@ -3169,6 +3377,139 @@ def _write_bitmap(path: Path, array: np.ndarray) -> None:
     mi.util.write_bitmap(str(path), array.astype(np.float32))
 
 
+def _sanitize_radiance(arr: np.ndarray, *, max_value: float = 1e4) -> np.ndarray:
+    """Repair non-finite (NaN/Inf) pixels and clamp to [0, max_value].
+
+    The measured-pBRDF / channel-split path occasionally emits NaN samples; at
+    low spp these survive as opaque black blocks ("black square fireflies") and
+    would also corrupt the OptiX denoiser. Non-finite pixels are inpainted from
+    their finite 4-neighbours over a few iterations (falling back to 0), so the
+    EXR/preview/denoiser all see clean radiance. At high spp (no NaN) this is a
+    cheap no-op beyond the finiteness check.
+    """
+    a = np.asarray(arr, dtype=np.float32)
+    bad = ~np.isfinite(a)
+    if not bad.any():
+        return np.clip(a, 0.0, max_value).astype(np.float32)
+    filled = np.where(bad, 0.0, a).astype(np.float32)
+    valid = (~bad).astype(np.float32)
+    for _ in range(4):
+        if valid.min() >= 0.5:
+            break
+        s = np.zeros_like(filled)
+        w = np.zeros_like(valid)
+        for axis, shift in ((0, 1), (0, -1), (1, 1), (1, -1)):
+            s += np.roll(filled * valid, shift, axis=axis)
+            w += np.roll(valid, shift, axis=axis)
+        fill_here = (valid < 0.5) & (w > 0.0)
+        filled = np.where(fill_here, s / np.maximum(w, 1e-6), filled)
+        valid = np.where(fill_here, 1.0, valid)
+    filled = np.where(valid < 0.5, 0.0, filled)
+    return np.clip(filled, 0.0, max_value).astype(np.float32)
+
+
+def _reject_firefly_outliers(
+    rgb: np.ndarray,
+    *,
+    factor: float = 10.0,
+    floor: float = 1e-3,
+    iterations: int = 2,
+) -> np.ndarray:
+    """Clamp isolated bright specks (fireflies) toward their local neighbourhood.
+
+    A firefly is a pixel whose luminance massively exceeds the *median* of its
+    3×3 neighbourhood — i.e. an isolated high-variance Monte-Carlo spike. We cap
+    such pixels at ``median * factor`` (preserving hue by scaling RGB). A genuine
+    bright source spans many pixels, so its neighbourhood median is also high and
+    it is left untouched; only lone specks are pulled in. ``floor`` avoids
+    touching near-black regions. NaN/Inf are repaired first via _sanitize_radiance.
+    """
+    out = _sanitize_radiance(rgb)
+    if out.ndim != 3 or out.shape[2] != 3:
+        return out
+    weights = np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
+    h, w = out.shape[:2]
+    factor = max(1.0, float(factor))
+    for _ in range(max(1, int(iterations))):
+        lum = out @ weights
+        lum_p = np.pad(lum, 1, mode="edge")
+        neigh = np.stack(
+            [lum_p[dy:dy + h, dx:dx + w] for dy in range(3) for dx in range(3)],
+            axis=-1,
+        )
+        med = np.median(neigh, axis=-1)
+        thresh = med * factor
+        flag = (lum > thresh) & (lum > floor)
+        if not np.any(flag):
+            break
+        target = np.maximum(thresh, floor)
+        scale = np.where(flag, target / np.maximum(lum, 1e-6), 1.0).astype(np.float32)
+        out = (out * scale[:, :, None]).astype(np.float32)
+    return out
+
+
+# OptiX denoiser objects are bound to a fixed input resolution + guide layout and
+# are reusable across frames of that size. Cache one per (variant, w, h, albedo,
+# normals) so a same-resolution sweep allocates the denoiser's state/scratch
+# (~40MB @256x192 … ~300MB @1280x720) ONCE instead of churning it every frame —
+# which would otherwise repeatedly flush Dr.Jit's malloc pool. The resident
+# Mitsuba scene is unaffected: it is held by the loaded mi.Scene object, not by
+# this pool, so denoising never evicts the cached scene.
+_OPTIX_DENOISER_CACHE: dict[tuple, Any] = {}
+
+
+def _get_optix_denoiser(mi, *, width: int, height: int, albedo: bool, normals: bool):
+    key = (str(mi.variant()), int(width), int(height), bool(albedo), bool(normals))
+    den = _OPTIX_DENOISER_CACHE.get(key)
+    if den is None:
+        den = mi.OptixDenoiser(input_size=(width, height), albedo=albedo, normals=normals)
+        _OPTIX_DENOISER_CACHE[key] = den
+    return den
+
+
+def _denoise_rgb(
+    rgb: np.ndarray,
+    albedo: np.ndarray | None,
+    normal: np.ndarray | None,
+    camera_to_world: np.ndarray,
+    *,
+    timing: dict[str, Any] | None = None,
+) -> np.ndarray:
+    """OptiX-denoise a linear-HDR rgb image, guided by albedo + shading normals.
+
+    Returns ``rgb`` unchanged on non-CUDA variants (the OptiX denoiser needs a
+    GPU) or if denoising raises. ``normal`` is world-space ``sh_normal``; the
+    denoiser is told to map it into the sensor frame via ``to_sensor``.
+    """
+    mi = _import_mitsuba()
+    try:
+        variant = mi.variant()
+    except Exception:  # noqa: BLE001
+        variant = None
+    if not variant or not str(variant).startswith("cuda_"):
+        return rgb
+    h, w = rgb.shape[:2]
+    t0 = time.perf_counter()
+    use_albedo = albedo is not None
+    use_normals = normal is not None
+    rgb = _sanitize_radiance(rgb)
+    noisy = mi.TensorXf(np.ascontiguousarray(rgb.astype(np.float32)))
+    denoiser = _get_optix_denoiser(mi, width=w, height=h, albedo=use_albedo, normals=use_normals)
+    kwargs: dict[str, Any] = {}
+    if use_albedo:
+        kwargs["albedo"] = mi.TensorXf(np.ascontiguousarray(albedo.astype(np.float32)))
+    if use_normals:
+        kwargs["normals"] = mi.TensorXf(np.ascontiguousarray(normal.astype(np.float32)))
+        kwargs["to_sensor"] = mi.Transform4f(np.ascontiguousarray(camera_to_world.astype(np.float32))).inverse()
+    out = np.array(denoiser(noisy, **kwargs), dtype=np.float32)
+    if timing is not None:
+        timing["denoise_s"] = time.perf_counter() - t0
+        timing["denoised"] = True
+        timing["denoise_albedo"] = use_albedo
+        timing["denoise_normals"] = use_normals
+    return out
+
+
 def _build_rgb_result(
     modality: str,
     rgb: np.ndarray,
@@ -3181,18 +3522,34 @@ def _build_rgb_result(
     write_raw_npz: bool = True,
     tone_exposure: float | None = None,
     tone_white: float | None = None,
+    firefly_clamp: bool = False,
+    firefly_factor: float = 10.0,
+    filtered_rgb: np.ndarray | None = None,
 ) -> tuple[ModalityResult, dict[str, Any]]:
     exr_path = out_dir / f"{stem}.exr"
     png_path = out_dir / f"{stem}.png"
     raw_path = out_dir / f"{stem}_raw.npz"
+    filtered_exr_path = out_dir / f"{stem}_filtered.exr"
 
+    raw_rgb = _sanitize_radiance(rgb)
+    preview_rgb = _sanitize_radiance(filtered_rgb) if filtered_rgb is not None else raw_rgb
+    filtered_written = filtered_rgb is not None or bool(firefly_clamp)
+    if firefly_clamp:
+        preview_rgb = _reject_firefly_outliers(preview_rgb, factor=firefly_factor)
     save_start = time.perf_counter()
     exr_start = time.perf_counter()
-    _write_bitmap(exr_path, rgb)
+    _write_bitmap(exr_path, raw_rgb)
     save_exr_s = time.perf_counter() - exr_start
+    save_filtered_exr_s = 0.0
+    if filtered_written:
+        filtered_exr_start = time.perf_counter()
+        _write_bitmap(filtered_exr_path, preview_rgb)
+        save_filtered_exr_s = time.perf_counter() - filtered_exr_start
+    elif filtered_exr_path.exists():
+        filtered_exr_path.unlink()
     png_start = time.perf_counter()
     preview = save_rgb_radiance_preview(
-        rgb,
+        preview_rgb,
         png_path,
         exposure=_TONE_EXPOSURE_DEFAULT if tone_exposure is None else tone_exposure,
         white=_TONE_WHITE_DEFAULT if tone_white is None else tone_white,
@@ -3202,11 +3559,13 @@ def _build_rgb_result(
         "exr": str(exr_path),
         "png": str(png_path),
     }
+    if filtered_written:
+        outputs["filtered_exr"] = str(filtered_exr_path)
     save_npz_s = 0.0
     raw_npz_removed = False
     if write_raw_npz:
         npz_start = time.perf_counter()
-        np.savez_compressed(raw_path, rgb=rgb.astype(np.float32))
+        np.savez_compressed(raw_path, rgb=raw_rgb.astype(np.float32))
         save_npz_s = time.perf_counter() - npz_start
         outputs["raw_npz"] = str(raw_path)
     elif raw_path.exists():
@@ -3221,12 +3580,15 @@ def _build_rgb_result(
         "scene_cache_hit": bool(timing.get("scene_cache_hit", False)),
         "render_s": timing["render_s"],
         "save_exr_s": save_exr_s,
+        "save_filtered_exr_s": save_filtered_exr_s,
         "save_png_s": save_png_s,
         "save_npz_s": save_npz_s,
         "raw_npz_removed": raw_npz_removed,
         "save_s": save_s,
         "total_s": timing["total_s"] + save_s,
         "preview": preview,
+        "filtered_output": filtered_written,
+        "firefly_clamped_preview": bool(firefly_clamp),
         "outputs": outputs,
     }
     timing_extras = {
@@ -3237,15 +3599,24 @@ def _build_rgb_result(
     timing_record.update(timing_extras)
     result = ModalityResult(
         name=modality,
-        array=rgb.astype(np.float32),
-        raw_channels={"rgb": rgb.astype(np.float32)},
-        metadata={"preview": preview, **dict(metadata or {})},
+        array=raw_rgb.astype(np.float32),
+        raw_channels={
+            "rgb": raw_rgb.astype(np.float32),
+            **({"filtered_rgb": preview_rgb.astype(np.float32)} if filtered_written else {}),
+        },
+        metadata={
+            "preview": preview,
+            "filtered_output": filtered_written,
+            "firefly_clamped_preview": bool(firefly_clamp),
+            **dict(metadata or {}),
+        },
         timing={
             "variant": timing["variant"],
             "load_scene_s": timing["load_scene_s"],
             "scene_cache_hit": bool(timing.get("scene_cache_hit", False)),
             "render_s": timing["render_s"],
             "save_exr_s": save_exr_s,
+            "save_filtered_exr_s": save_filtered_exr_s,
             "save_png_s": save_png_s,
             "save_npz_s": save_npz_s,
             "raw_npz_removed": raw_npz_removed,
@@ -3253,6 +3624,8 @@ def _build_rgb_result(
             "total_s": timing_record["total_s"],
             "scene": str(scene_path),
             "spp": timing["spp"],
+            "filtered_output": filtered_written,
+            "firefly_clamped_preview": bool(firefly_clamp),
             **timing_extras,
         },
         artifacts=timing_record["outputs"],
@@ -3666,7 +4039,7 @@ def render_modalities(
     band_mode = _resolve_pbrdf_band_mode(config)
     use_channel_rgb_plugin = (
         use_channel_split_rgb
-        and not os.environ.get("ROBOMITUBA_DISABLE_HPBRDF_RGB_PLUGIN")
+        and (band_mode == "single" or not os.environ.get("ROBOMITUBA_DISABLE_HPBRDF_RGB_PLUGIN"))
     )
 
     # ── progress helpers ──────────────────────────────────────────────────
@@ -3782,6 +4155,55 @@ def render_modalities(
     def stage_filename(key: str, default: str) -> Path:
         return workspace / config.scene_filename(key, default)
 
+    # Denoiser needs albedo + shading-normal guides; render the AOV pass once and
+    # reuse it for both the guides and the albedo/depth modality outputs.
+    aov_with_normals = bool(config.use_optix_denoiser)
+    _aov_render: dict[str, Any] = {}
+    path_total_rgb: np.ndarray | None = None
+
+    def _get_aov_render(with_normals: bool) -> dict[str, Any]:
+        if _aov_render and _aov_render.get("with_normals") == with_normals:
+            return _aov_render
+        _cb("staging_scene", {"pass": "aov"})
+        scene_aov = _stage_aov_scene(
+            source_scene,
+            stage_filename("aov", "scene_aov.xml"),
+            camera_to_world=camera_to_world,
+            fov_deg=fov_deg,
+            spp=config.aov_spp,
+            width=config.width,
+            height=config.height,
+            scene_override=scene_override,
+            with_normals=with_normals,
+        )
+        image, timing = _render_pass(scene_aov, pass_name="aov", spp=config.aov_spp)
+        timing["spp"] = config.aov_spp
+        # The img integrator may emit rgb (3) or rgba (4), so index the trailing
+        # AOVs from the end: [..img.., albedo(3), depth(1)(, sh_normal(3))].
+        min_ch = 10 if with_normals else 7
+        if image.ndim != 3 or image.shape[2] < min_ch:
+            raise RuntimeError(f"Unexpected AOV tensor shape: {image.shape} (with_normals={with_normals})")
+        if with_normals:
+            normal = image[:, :, -3:].astype(np.float32)
+            depth = image[:, :, -4].astype(np.float32)
+            albedo = np.clip(image[:, :, -7:-4], 0.0, 1.0).astype(np.float32)
+        else:
+            normal = None
+            depth = image[:, :, -1].astype(np.float32)
+            albedo = np.clip(image[:, :, -4:-1], 0.0, 1.0).astype(np.float32)
+        _aov_render.clear()
+        _aov_render.update(
+            {
+                "with_normals": with_normals,
+                "albedo": albedo,
+                "depth": depth,
+                "normal": normal,
+                "timing": timing,
+                "scene_aov": scene_aov,
+            }
+        )
+        return _aov_render
+
     if _needs_path_total(requested_set):
         if use_channel_split_rgb:
             rgb = None
@@ -3840,6 +4262,10 @@ def render_modalities(
                     rgb = image[:, :, :3] if image.ndim == 3 else np.repeat(image[:, :, None], 3, axis=2)
                 except Exception as exc:
                     plugin_error = str(exc)
+                    if band_mode == "single":
+                        raise RuntimeError(
+                            "single-band RGB staging/render failed; refusing channel-split fallback"
+                        ) from exc
                     _clear_scene_caches()
                     _pass_index[0] = max(0, _pass_index[0] - 1)
                     _total_passes[0] += len(_RGB_CHANNEL_SPLIT_WAVELENGTHS_NM) - 1
@@ -3954,6 +4380,37 @@ def render_modalities(
             timing["spp"] = config.path_spp
             timing["stage_s"] = stage_s
             rgb = image[:, :, :3] if image.ndim == 3 else np.repeat(image[:, :, None], 3, axis=2)
+        filtered_rgb: np.ndarray | None = None
+        if config.use_optix_denoiser:
+            try:
+                guides = _get_aov_render(with_normals=True)
+                denoise_input = (
+                    _reject_firefly_outliers(rgb, factor=config.firefly_clamp_factor)
+                    if config.use_firefly_clamp
+                    else _sanitize_radiance(rgb)
+                )
+                filtered_rgb = _denoise_rgb(
+                    denoise_input,
+                    guides.get("albedo"),
+                    guides.get("normal"),
+                    camera_to_world,
+                    timing=timing,
+                )
+            except Exception as exc:  # noqa: BLE001 - denoise is best-effort
+                _cb("denoise_failed", {"error": str(exc)})
+        if filtered_rgb is None and config.use_firefly_clamp:
+            filtered_rgb = _reject_firefly_outliers(rgb, factor=config.firefly_clamp_factor)
+        band_policy_counts = _pbrdf_band_policy_inventory(scene_rgb)
+        rgb_render_mode = _rgb_render_mode_from_policy(
+            band_mode=band_mode,
+            timing=timing,
+            band_policy_counts=band_policy_counts,
+        )
+        timing["pbrdf_band_mode"] = band_mode
+        timing["rgb_render_mode"] = rgb_render_mode
+        timing["band_policy_counts"] = dict(band_policy_counts)
+        timing["channel_split_rgb"] = rgb_render_mode == "channel_split"
+        timing["channel_rgb_plugin"] = rgb_render_mode == "rgb_plugin"
         rgb_result, rgb_record = _build_rgb_result(
             "rgb",
             rgb,
@@ -3965,18 +4422,30 @@ def render_modalities(
                 illumination_tag="ambient_room",
                 scene_override=scene_override,
                 extra={
-                    "channel_split_rgb": True,
-                    "channel_rgb_plugin": bool(timing.get("channel_rgb_plugin", False)),
+                    "pbrdf_band_mode": band_mode,
+                    "rgb_render_mode": rgb_render_mode,
+                    "band_policy_counts": dict(band_policy_counts),
+                    "wall_material_policy": {
+                        "background_default": "analytic_or_single_band_albedo_scale",
+                        "normal_map": "not_inspected",
+                        "bump_map": "not_inspected",
+                    },
+                    "channel_split_rgb": rgb_render_mode == "channel_split",
+                    "channel_rgb_plugin": rgb_render_mode == "rgb_plugin",
                     "channel_rgb_fallback": bool(timing.get("channel_rgb_fallback", False)),
                     **({"channel_rgb_plugin_error": timing["channel_rgb_plugin_error"]} if timing.get("channel_rgb_plugin_error") else {}),
                     "channel_wavelengths_nm": {label: nm for label, nm in _RGB_CHANNEL_SPLIT_WAVELENGTHS_NM},
-                } if use_channel_split_rgb else None,
+                },
             ),
             write_raw_npz=config.write_raw_npz,
             tone_exposure=config.tone_exposure,
             tone_white=config.tone_white,
+            firefly_clamp=False,
+            firefly_factor=config.firefly_clamp_factor,
+            filtered_rgb=filtered_rgb,
         )
         pass_records["rgb"] = rgb_record
+        path_total_rgb = rgb_result.array.astype(np.float32)
         if "rgb" in requested_set:
             results["rgb"] = rgb_result
 
@@ -4028,6 +4497,10 @@ def render_modalities(
                 scene_override=scene_override,
             ),
             write_raw_npz=config.write_raw_npz,
+            tone_exposure=config.tone_exposure,
+            tone_white=config.tone_white,
+            firefly_clamp=config.use_firefly_clamp,
+            firefly_factor=config.firefly_clamp_factor,
         )
         pass_records["direct_light_map"] = direct_record
         if "direct_light_map" in requested_set:
@@ -4081,30 +4554,23 @@ def render_modalities(
                 scene_override=scene_override,
             ),
             write_raw_npz=config.write_raw_npz,
+            tone_exposure=config.tone_exposure,
+            tone_white=config.tone_white,
+            firefly_clamp=config.use_firefly_clamp,
+            firefly_factor=config.firefly_clamp_factor,
         )
         pass_records["diffuse_map"] = diffuse_record
         if "diffuse_map" in requested_set:
             results["diffuse_map"] = diffuse_result
 
     if _needs_aov(requested_set):
-        _cb("staging_scene", {"pass": "aov"})
-        scene_aov = _stage_aov_scene(
-            source_scene,
-            stage_filename("aov", "scene_aov.xml"),
-            camera_to_world=camera_to_world,
-            fov_deg=fov_deg,
-            spp=config.aov_spp,
-            width=config.width,
-            height=config.height,
-            scene_override=scene_override,
-        )
+        # Reuses the guide pass when the denoiser already rendered it this frame.
+        aov = _get_aov_render(with_normals=aov_with_normals)
+        scene_aov = aov["scene_aov"]
+        timing = aov["timing"]
+        albedo = aov["albedo"]
+        depth = aov["depth"]
         staged_scenes["aov"] = str(scene_aov)
-        image, timing = _render_pass(scene_aov, pass_name="aov", spp=config.aov_spp)
-        timing["spp"] = config.aov_spp
-        if image.ndim != 3 or image.shape[2] < 7:
-            raise RuntimeError(f"Unexpected AOV tensor shape: {image.shape}")
-        albedo = np.clip(image[:, :, -4:-1], 0.0, 1.0).astype(np.float32)
-        depth = image[:, :, -1].astype(np.float32)
         albedo_outputs: dict[str, Any] = {}
         if "albedo" in requested_set:
             albedo_exr = workspace / "albedo.exr"
@@ -4654,7 +5120,7 @@ def render_modalities(
                            "stokes_npz": summary["outputs"]["stokes_npz"]},
             )
 
-    total_arr = results["rgb"].array.astype(np.float32) if "rgb" in results else None
+    total_arr = results["rgb"].array.astype(np.float32) if "rgb" in results else path_total_rgb
     direct_arr = results["direct_light_map"].array.astype(np.float32) if "direct_light_map" in results else None
     diffuse_arr = results["diffuse_map"].array.astype(np.float32) if "diffuse_map" in results else None
     if "indirect_light_map" in requested_set:

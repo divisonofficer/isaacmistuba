@@ -503,6 +503,15 @@
 		return authoringObjects.find((obj: any) => obj?.id === id && obj?.geometry?.type === 'point') ?? null;
 	}
 
+	function isRenderOnlyLightProxy(obj: any): boolean {
+		const id = String(obj?.id ?? '');
+		const kind = String(obj?.metadata?.kind ?? '');
+		const emitterShape = String(obj?.emitter_shape ?? '');
+		return kind === 'room_softbox'
+			|| id.startsWith('light_softbox_')
+			|| (emitterShape === 'ceiling_panel' && !obj?.source_ref);
+	}
+
 	function snapScalar(value: number, step: number): number {
 		if (!Number.isFinite(step) || step <= 0) return value;
 		return Number((Math.round(value / step) * step).toFixed(3));
@@ -553,6 +562,7 @@
 		}];
 		for (const obj of authoringObjects) {
 			if (!obj || obj.id === excludeId || obj.geometry?.type !== 'point') continue;
+			if (isRenderOnlyLightProxy(obj)) continue;
 			const center = obj.geometry?.center;
 			if (!Array.isArray(center) || center.length < 2) continue;
 			const [sx, sy, sz] = objectProxySize(obj);
@@ -661,6 +671,7 @@
 			maxX = Math.max(maxX, x); maxZ = Math.max(maxZ, z);
 		};
 		for (const obj of authoringObjects) {
+			if (isRenderOnlyLightProxy(obj)) continue;
 			const g = obj?.geometry;
 			const c = g?.center;
 			if (Array.isArray(c) && c.length >= 2) {
@@ -958,6 +969,7 @@
 	// the resolved geometry from cache automatically.
 	function buildObjectFromXmlShape(obj: any): any | null {
 		if (!xmlNativePreviewEnabled) return null;
+		if (isRenderOnlyLightProxy(obj)) return null;
 		const sh = _xmlShapeIndex.get(obj.id);
 		if (!sh) return null;
 		const t = sh.transform ?? {};
@@ -1128,6 +1140,7 @@
 		const _usdRef = usdRefFromSourceRef(obj.source_ref);
 		const _cachedGeoPeek = _sourcePath ? primMeshCache.get(primMeshKey(_sourcePath, _usdRef)) : undefined;
 		const _hasUsdMeshOrIsLoadable = !!_cachedGeoPeek || !!_sourcePath;
+		if (isRenderOnlyLightProxy(obj)) return null;
 		if (!Array.isArray(proxy) && ['chair', 'table', 'plant'].includes(obj.type) && !_hasUsdMeshOrIsLoadable) {
 			const shapeGroup = new THREE.Group();
 			shapeGroup.position.y = baseHeight;
@@ -1407,6 +1420,7 @@
 		// Expand floor to cover all placed authoring objects (they may extend beyond mapBounds)
 		let minX = 0, minZ = 0, maxX = w, maxZ = h;
 		for (const obj of authoringObjects) {
+			if (isRenderOnlyLightProxy(obj)) continue;
 			const c = obj?.geometry?.center;
 			if (Array.isArray(c) && c.length >= 2) {
 				const pad = 1.5;
@@ -1767,6 +1781,7 @@
 			for (const obj of authoringObjects) {
 				let mesh: any = null;
 				let builtFromXml = false;
+				if (isRenderOnlyLightProxy(obj)) continue;
 				const matchedXmlShape = xmlNativePreviewEnabled && _xmlShapeIndex.has(obj.id);
 				if (matchedXmlShape) editorMeshStats.xml_matched++;
 				// PR2: when the XML-native preview toggle is on, draw from the actual
@@ -2271,7 +2286,7 @@
 				acquireFrustumSlot().then(() => {
 					new THREE.TextureLoader().load(
 						url,
-						(loaded) => {
+						(loaded: any) => {
 							try {
 								texture.image = loaded.image;
 								(texture as any).colorSpace = 'srgb';

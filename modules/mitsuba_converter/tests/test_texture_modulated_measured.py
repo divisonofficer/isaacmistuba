@@ -3,7 +3,12 @@ from __future__ import annotations
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-from mitsuba_converter.multimodal import _convert_channel_split_measured_bsdfs_to_rgb_plugin
+from mitsuba_converter.multimodal import (
+    _convert_channel_split_measured_bsdfs_to_rgb_plugin,
+    _pbrdf_band_policy_inventory,
+    _substitute_measured_bsdfs_with_diffuse,
+    _stage_measured_bsdfs_for_rgb,
+)
 from mitsuba_converter.render_daemon import (
     _append_bsdf_xml,
     _generate_opticalnav_render_scene_xml,
@@ -98,6 +103,83 @@ def test_rgb_plugin_conversion_preserves_albedo_scale_texture() -> None:
     tex = bsdf.find("./texture[@name='albedo_scale'][@type='bitmap']")
     assert tex is not None
     assert tex.find("./string[@name='filename']").get("value") == "/tmp/oak.png"
+
+
+def test_single_band_rgb_staging_adds_542_wavelength_and_preserves_albedo_scale() -> None:
+    root = ET.fromstring(
+        """
+        <scene version="3.0.0">
+          <bsdf type="measured_polarized" id="wall_mat">
+            <string name="filename" value="data/hpbrdf_2025/channels/white_smooth_plastic/614.pbrdf"/>
+            <texture name="albedo_scale" type="bitmap">
+              <string name="filename" value="/tmp/wall.png"/>
+            </texture>
+          </bsdf>
+        </scene>
+        """
+    )
+
+    counts = _stage_measured_bsdfs_for_rgb(root, band_mode="single")
+
+    assert counts["three_band_converted"] == 0
+    bsdf = root.find(".//bsdf")
+    assert bsdf is not None
+    assert bsdf.get("type") == "measured_polarized"
+    assert bsdf.find("./string[@name='filename']").get("value").endswith("/542.pbrdf")
+    assert bsdf.find("./float[@name='wavelength']").get("value") == "542"
+    assert bsdf.find("./texture[@name='albedo_scale'][@type='bitmap']") is not None
+    inventory = _pbrdf_band_policy_inventory(root)
+    assert inventory["single_band_measured"] == 1
+    assert inventory["three_band_measured"] == 0
+
+
+def test_hybrid_rgb_staging_keeps_achromatic_single_and_converts_coloured() -> None:
+    root = ET.fromstring(
+        """
+        <scene version="3.0.0">
+          <bsdf type="measured_polarized" id="plastic">
+            <string name="filename" value="data/hpbrdf_2025/channels/white_smooth_plastic/542.pbrdf"/>
+            <rgb name="albedo_scale" value="0.8 0.8 0.8"/>
+          </bsdf>
+          <bsdf type="measured_polarized" id="gold">
+            <string name="filename" value="data/hpbrdf_2025/channels/fake_gold/542.pbrdf"/>
+            <rgb name="albedo_scale" value="1 0.7 0.2"/>
+          </bsdf>
+        </scene>
+        """
+    )
+
+    counts = _stage_measured_bsdfs_for_rgb(root, band_mode="hybrid")
+
+    assert counts["three_band_converted"] == 1
+    plastic = root.find(".//bsdf[@id='plastic']")
+    gold = root.find(".//bsdf[@id='gold']")
+    assert plastic is not None and gold is not None
+    assert plastic.get("type") == "measured_polarized"
+    assert plastic.find("./float[@name='wavelength']").get("value") == "542"
+    assert gold.get("type") == "measured_polarized_rgb"
+    assert gold.find("./string[@name='filename_r']") is not None
+    inventory = _pbrdf_band_policy_inventory(root)
+    assert inventory["single_band_measured"] == 1
+    assert inventory["three_band_measured"] == 1
+
+
+def test_aov_measured_substitution_replaces_nested_twosided_measured_bsdfs() -> None:
+    root = ET.fromstring(
+        """
+        <scene version="3.0.0">
+          <bsdf type="twosided" id="shared_mat">
+            <bsdf type="measured_polarized">
+              <string name="filename" value="data/hpbrdf_2025/channels/aluminum/542.pbrdf"/>
+            </bsdf>
+          </bsdf>
+        </scene>
+        """
+    )
+
+    assert _substitute_measured_bsdfs_with_diffuse(root) == 1
+    assert root.find(".//bsdf[@type='measured_polarized']") is None
+    assert root.find(".//bsdf[@type='diffuse']/rgb[@name='reflectance']") is not None
 
 
 def test_pbrdf_fallback_measured_bsdf_emits_albedo_scale_bitmap(tmp_path: Path) -> None:
@@ -220,4 +302,3 @@ def test_usd_prim_mesh_parts_emit_multiple_shapes_with_part_materials(tmp_path: 
     assert by_mesh["Chair_Leather"]["material_class"] == "leather"
     assert by_mesh["Chair_Metal"]["material_class"] == "metal"
     assert by_mesh["Chair_wood"]["material_class"] == "wood"
-
