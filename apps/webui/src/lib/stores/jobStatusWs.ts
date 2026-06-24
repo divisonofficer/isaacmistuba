@@ -17,9 +17,12 @@ export interface JobStatusMessage {
 
 type Listener = (msg: JobStatusMessage) => void;
 
-const RECONNECT_DELAY_MS = 3000;
+const RECONNECT_BASE_MS = 3000;
+const RECONNECT_MAX_MS = 30000;
+const HIDDEN_MULTIPLIER = 4;
 let _ws: WebSocket | null = null;
 let _reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+let _reconnectAttempt = 0;
 let _last: JobStatusMessage | null = null;
 const _listeners = new Set<Listener>();
 
@@ -39,6 +42,9 @@ function _connect() {
 		return;
 	}
 	_ws = ws;
+	ws.onopen = () => {
+		_reconnectAttempt = 0;
+	};
 	ws.onmessage = (ev) => {
 		try {
 			const parsed = JSON.parse(typeof ev.data === 'string' ? ev.data : '');
@@ -61,10 +67,15 @@ function _connect() {
 
 function _scheduleReconnect() {
 	if (_reconnectTimer !== null) return;
+	const hidden = typeof document !== 'undefined' && document.visibilityState !== 'visible';
+	const attempt = Math.min(_reconnectAttempt, 4);
+	const baseDelay = Math.min(RECONNECT_MAX_MS, RECONNECT_BASE_MS * (2 ** attempt));
+	const delay = hidden ? Math.min(RECONNECT_MAX_MS * HIDDEN_MULTIPLIER, baseDelay * HIDDEN_MULTIPLIER) : baseDelay;
+	_reconnectAttempt += 1;
 	_reconnectTimer = setTimeout(() => {
 		_reconnectTimer = null;
 		if (_listeners.size > 0) _connect();
-	}, RECONNECT_DELAY_MS);
+	}, delay);
 }
 
 /**
@@ -83,6 +94,7 @@ export function subscribeJobStatus(listener: Listener): () => void {
 		if (_listeners.size === 0) {
 			if (_reconnectTimer !== null) { clearTimeout(_reconnectTimer); _reconnectTimer = null; }
 			if (_ws) { try { _ws.close(); } catch { /* noop */ } _ws = null; }
+			_reconnectAttempt = 0;
 			_last = null;
 		}
 	};

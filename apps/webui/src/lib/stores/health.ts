@@ -12,9 +12,10 @@ export interface HealthData {
 	[key: string]: unknown;
 }
 
-const POLL_IDLE = 3000;
-const POLL_ACTIVE = 2000;
-const POLL_OFFLINE = 4000;
+const POLL_IDLE = 8000;
+const POLL_ACTIVE = 3000;
+const POLL_OFFLINE = 6000;
+const HIDDEN_MULTIPLIER = 4;
 const TIMEOUT_IDLE = 8000;
 const TIMEOUT_ACTIVE = 12000;
 const OFFLINE_AFTER_FAILURES = 4;
@@ -49,7 +50,9 @@ export const healthStore = readable<HealthData | null>(null, (set) => {
 				backendOfflineReason.set('');
 			}
 			const nextActive = data.worker_state === 'running' || data.active_isaac_command != null;
-			timer = setTimeout(poll, nextActive ? POLL_ACTIVE : POLL_IDLE);
+			const baseMs = nextActive ? POLL_ACTIVE : POLL_IDLE;
+			const hidden = typeof document !== 'undefined' && document.visibilityState !== 'visible';
+			timer = setTimeout(poll, hidden ? baseMs * HIDDEN_MULTIPLIER : baseMs);
 		} catch (e) {
 			consecutiveFailures += 1;
 			const err = e as Error;
@@ -66,7 +69,11 @@ export const healthStore = readable<HealthData | null>(null, (set) => {
 						: err?.message ?? 'connection refused'
 				);
 			}
-			if (!aborted) timer = setTimeout(poll, isTimeout && recentlyHealthy ? POLL_IDLE : POLL_OFFLINE);
+			if (!aborted) {
+				const failBase = isTimeout && recentlyHealthy ? POLL_IDLE : POLL_OFFLINE;
+				const failHidden = typeof document !== 'undefined' && document.visibilityState !== 'visible';
+				timer = setTimeout(poll, failHidden ? failBase * HIDDEN_MULTIPLIER : failBase);
+			}
 		} finally {
 			clearTimeout(tId);
 		}

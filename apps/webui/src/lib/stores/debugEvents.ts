@@ -11,7 +11,10 @@ export interface DebugEvent {
 export const debugEvents = writable<DebugEvent[]>([]);
 export const debugToasts = writable<DebugEvent[]>([]);
 
-const POLL_MS = 2500;
+const POLL_MS = 6000;
+const POLL_MAX_MS = 30000;
+const FETCH_TIMEOUT_MS = 8000;
+const HIDDEN_MULTIPLIER = 4;
 const TTL_MS = 4000;
 const MAX_EVENTS = 80;
 const MAX_TOASTS = 4;
@@ -19,6 +22,7 @@ const MAX_TOASTS = 4;
 let latestId = 0;
 let timer: ReturnType<typeof setTimeout> | null = null;
 let bootstrapped = false;
+let consecutiveFailures = 0;
 
 function kindIcon(kind: string): string {
 	if (kind === 'camera') return '📷';
@@ -27,8 +31,12 @@ function kindIcon(kind: string): string {
 }
 
 async function poll() {
+	let timeoutId: ReturnType<typeof setTimeout> | null = null;
 	try {
-		const data = await fetch(`/api/debug/events?since=${latestId}`).then((r) => r.json());
+		const ctrl = new AbortController();
+		timeoutId = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS);
+		const data = await fetch(`/api/debug/events?since=${latestId}`, { signal: ctrl.signal }).then((r) => r.json());
+		consecutiveFailures = 0;
 		latestId = data?.latest_id ?? latestId;
 		if (data?.events?.length) {
 			debugEvents.update((events) => [...events, ...data.events].slice(-MAX_EVENTS));
@@ -45,9 +53,14 @@ async function poll() {
 		}
 		bootstrapped = true;
 	} catch {
+		consecutiveFailures += 1;
 		// ignore
+	} finally {
+		if (timeoutId !== null) clearTimeout(timeoutId);
 	}
-	timer = setTimeout(poll, POLL_MS);
+	const hidden = typeof document !== 'undefined' && document.visibilityState !== 'visible';
+	const retryMs = Math.min(POLL_MAX_MS, POLL_MS * (2 ** Math.min(consecutiveFailures, 3)));
+	timer = setTimeout(poll, hidden ? retryMs * HIDDEN_MULTIPLIER : retryMs);
 }
 
 export function startDebugPolling() {

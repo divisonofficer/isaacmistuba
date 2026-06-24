@@ -2,7 +2,6 @@
 	import AssetThumb3D from '$lib/AssetThumb3D.svelte';
 	import { builtInThumbType, placementHintForTool, usdAssetLabel } from '$lib/datasets/authoringHelpers';
 	import type { BuiltInPlaceAsset } from '$lib/opticalnavBuiltInAssets';
-	import { opticalNavAssetThumbnailUrl } from '$lib/api';
 
 	interface Props {
 		pageMode: string;
@@ -16,8 +15,6 @@
 		mapAssetStatus: string;
 		usdAssetCandidates: any[];
 		libraryDisplayLimit: number;
-		selectedProjectId: string;
-		assetThumbRefreshTick: number;
 		onSelectTool: (tool: string) => void;
 		onDelete: () => void;
 		onSelectBuiltInPlaceAsset: (asset: BuiltInPlaceAsset) => void;
@@ -30,7 +27,7 @@
 		builtInBuildAssets, builtInPlaceAssetGroups,
 		selectedUsdAssetId, usdCatalogSearch,
 		mapAssets, mapAssetStatus, usdAssetCandidates,
-		libraryDisplayLimit, selectedProjectId, assetThumbRefreshTick,
+		libraryDisplayLimit,
 		onSelectTool, onDelete, onSelectBuiltInPlaceAsset, onSelectUsdAsset, onSearchChange,
 	}: Props = $props();
 
@@ -94,12 +91,7 @@
 					onclick={() => onSelectUsdAsset(assetId)}
 				>
 					<div class="asset-thumb-img" aria-hidden="true">
-						<img
-							src={selectedProjectId ? `${opticalNavAssetThumbnailUrl(selectedProjectId, assetId)}&r=${assetThumbRefreshTick}` : ''}
-							alt=""
-							loading="lazy"
-							draggable="false"
-						/>
+						<AssetThumb3D category={asset.category} assetType={usdAssetLabel(asset)} bounds={asset.bounds} selected={selectedUsdAssetId === assetId && placementTool === 'usd_asset'} />
 					</div>
 					<span>{usdAssetLabel(asset)}</span>
 					<small>{asset.render_readiness ?? asset.category} · {asset.placement}</small>
@@ -315,15 +307,7 @@
 			flex-shrink: 0;
 		}
 
-	.asset-thumb-img img {
-			display: block;
-			width: 100%;
-			height: 100%;
-			border-radius: inherit;
-			object-fit: contain;
-		}
-
-	.asset-card span,
+		.asset-card span,
 		.asset-card small {
 			overflow: hidden;
 		}

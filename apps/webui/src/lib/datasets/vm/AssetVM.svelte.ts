@@ -17,7 +17,7 @@ import * as assetService from '$lib/datasets/services/assetService';
 import { usdAssetLabel } from '$lib/datasets/authoringHelpers';
 import { errorMessage } from '$lib/datasets/batchHelpers';
 
-const LIBRARY_DISPLAY_LIMIT = 40;
+const LIBRARY_DISPLAY_LIMIT = 16;
 
 class AssetVM {
 	// ── Material library ──────────────────────────────────────────
@@ -42,7 +42,6 @@ class AssetVM {
 	editorGeometryPayload = $state<any>(null);
 	editorGeometryCatalogStatus = $state('USD asset catalog not loaded.');
 	editorGeometryRefreshToken = $state(0);
-	assetThumbRefreshTick = $state(0);
 	// Cache key — not reactive, used to skip redundant fetches
 	#editorGeometryCatalogKey = '';
 
@@ -233,10 +232,6 @@ class AssetVM {
 		} finally {
 			this.envmapUploading = false;
 		}
-	}
-
-	bumpAssetThumbTick() {
-		this.assetThumbRefreshTick += 1;
 	}
 
 	reset() {
