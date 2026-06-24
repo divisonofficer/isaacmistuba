@@ -200,42 +200,65 @@ def cmd_episodes_render(args) -> None:
 
 def cmd_graph_build(args) -> None:
     root = _dataset_root(args.dataset)
-    grid_path = Path(args.grid) if args.grid else root / "scenes" / args.scene_id / "traversable_grid.npy"
-    grid = load_traversability_grid(grid_path)
-    nodes = sample_viewpoint_nodes(
-        grid,
-        max_nodes=args.max_nodes,
-        heading_count=args.heading_count,
+    scene_dir = root / "scenes" / args.scene_id
+    graph_path = scene_dir / "viewpoint_graph.json"
+
+    # Explicit --grid path forces the legacy direct flow over a pre-built grid.
+    if args.grid:
+        grid = load_traversability_grid(Path(args.grid))
+        nodes = sample_viewpoint_nodes(
+            grid, max_nodes=args.max_nodes, heading_count=args.heading_count,
+            min_node_spacing_m=args.min_node_spacing, min_clearance_m=args.min_clearance,
+            robot_radius_m=args.robot_radius, seed=args.seed,
+        )
+        edges = build_viewpoint_edges(
+            grid, nodes, robot_radius_m=args.robot_radius,
+            k_neighbors=args.k_neighbors, max_edge_length_m=args.max_edge_length,
+        )
+        graph = ViewpointGraph(
+            scene_id=args.scene_id, graph_id=args.graph_id or f"{args.scene_id}_vg_0001",
+            node_heading_count=args.heading_count, nodes=nodes, edges=edges,
+            metadata={
+                "generation_version": "opticalnav-v0.2", "robot_radius_m": args.robot_radius,
+                "min_node_spacing_m": args.min_node_spacing, "max_edge_length_m": args.max_edge_length,
+                "k_neighbors": args.k_neighbors, "seed": args.seed,
+            },
+        )
+        write_viewpoint_graph(graph_path, graph)
+        print(json.dumps({"graph_ref": graph_path.relative_to(root).as_posix(),
+                          **graph_summary(nodes, edges, heading_count=args.heading_count)}, indent=2))
+        return
+
+    # Default: shared mesh-aware core (mesh-derived walkable surface + portals,
+    # legacy annotation grid for non-Infinigen scenes).
+    from .graph_pipeline import build_viewpoint_graph_core
+    res = build_viewpoint_graph_core(
+        args.scene_id, scene_dir,
+        graph_id=args.graph_id, resolution=getattr(args, "resolution", 0.05),
+        robot_radius_m=args.robot_radius, heading_count=args.heading_count,
         min_node_spacing_m=args.min_node_spacing,
-        min_clearance_m=args.min_clearance,
-        robot_radius_m=args.robot_radius,
-        seed=args.seed,
+        min_clearance_m=(args.min_clearance if args.min_clearance and args.min_clearance > 0 else None),
+        camera_margin_m=getattr(args, "camera_margin", 0.10),
+        max_nodes=args.max_nodes, k_neighbors=args.k_neighbors,
+        max_edge_length_m=args.max_edge_length, seed=args.seed,
     )
-    edges = build_viewpoint_edges(
-        grid,
-        nodes,
-        robot_radius_m=args.robot_radius,
-        k_neighbors=args.k_neighbors,
-        max_edge_length_m=args.max_edge_length,
-    )
-    graph = ViewpointGraph(
-        scene_id=args.scene_id,
-        graph_id=args.graph_id or f"{args.scene_id}_vg_0001",
-        node_heading_count=args.heading_count,
-        nodes=nodes,
-        edges=edges,
-        metadata={
-            "generation_version": "opticalnav-v0.2",
-            "robot_radius_m": args.robot_radius,
-            "min_node_spacing_m": args.min_node_spacing,
-            "max_edge_length_m": args.max_edge_length,
-            "k_neighbors": args.k_neighbors,
-            "seed": args.seed,
-        },
-    )
-    graph_path = root / "scenes" / args.scene_id / "viewpoint_graph.json"
-    write_viewpoint_graph(graph_path, graph)
-    print(json.dumps({"graph_ref": graph_path.relative_to(root).as_posix(), **graph_summary(nodes, edges, heading_count=args.heading_count)}, indent=2))
+    write_viewpoint_graph(graph_path, res.graph)
+    print(json.dumps({"graph_ref": graph_path.relative_to(root).as_posix(), **res.summary}, indent=2))
+
+
+def cmd_graph_qa(args) -> None:
+    root = _dataset_root(args.dataset)
+    scene_dir = root / "scenes" / args.scene_id
+    from .graph_pipeline import build_viewpoint_graph_core
+    from .qa_walkable import graph_qa_report
+    res = build_viewpoint_graph_core(args.scene_id, scene_dir, graph_id="qa", seed=args.seed,
+                                     robot_radius_m=args.robot_radius, persist_grid=False)
+    if res.surface is None:
+        print(json.dumps({"scene_id": args.scene_id, "note": "legacy (non-mesh) scene — QA needs a walkable surface",
+                          **res.summary}, indent=2))
+        return
+    print(json.dumps({"scene_id": args.scene_id,
+                      **graph_qa_report(res.graph, res.surface, robot_radius_m=args.robot_radius)}, indent=2))
 
 
 def cmd_graph_sweep(args) -> None:
@@ -386,7 +409,16 @@ def main() -> None:
     p_graph_build.add_argument("--k-neighbors", type=int, default=8)
     p_graph_build.add_argument("--max-edge-length", type=float, default=1.5)
     p_graph_build.add_argument("--seed", type=int, default=0)
+    p_graph_build.add_argument("--resolution", type=float, default=0.05)
+    p_graph_build.add_argument("--camera-margin", type=float, default=0.10,
+                               help="extra node clearance beyond robot radius so cameras don't hug walls (mesh scenes)")
     p_graph_build.set_defaults(fn=cmd_graph_build)
+    p_graph_qa = graph_sub.add_parser("qa")
+    p_graph_qa.add_argument("--dataset", default=".")
+    p_graph_qa.add_argument("--scene-id", required=True)
+    p_graph_qa.add_argument("--robot-radius", type=float, default=0.25)
+    p_graph_qa.add_argument("--seed", type=int, default=0)
+    p_graph_qa.set_defaults(fn=cmd_graph_qa)
     p_graph_sweep = graph_sub.add_parser("sweep")
     p_graph_sweep.add_argument("--dataset", required=True)
     p_graph_sweep.add_argument("--scene-id", required=True)
