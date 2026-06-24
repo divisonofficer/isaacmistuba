@@ -49,8 +49,13 @@ from pathlib import Path
 
 from PIL import Image
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
+for _module_path in (
+    REPO_ROOT / "modules" / "robomituba_bridge" / "src",
+    REPO_ROOT / "modules" / "mitsuba_converter" / "src",
+):
+    if str(_module_path) not in sys.path:
+        sys.path.insert(0, str(_module_path))
 
 
 @dataclass
@@ -63,6 +68,7 @@ class FrameRecord:
     manifest_slim: dict | None
     modality: str = "rgb"
     stokes_npz_src: Path | None = None
+    src_exr: Path | None = None
 
 
 def _find_jobs(bridge_dir: Path, scene: str | None, include_probe: bool) -> list[Path]:
@@ -123,6 +129,8 @@ def _build_records(job_dir: Path, keep_manifests: bool, exact_scene: str | None 
         src_png = (REPO_ROOT / png_rel).resolve()
         if not src_png.is_file():
             continue
+        exr_rel = (artifact.get("artifact_paths") or {}).get("exr")
+        src_exr = (REPO_ROOT / exr_rel).resolve() if exr_rel else None
         spec = _camera_spec(manifest, camera_id)
         modality = artifact.get("modality", "rgb")
         # Include the modality in the filename for non-rgb modalities so a camera
@@ -161,6 +169,7 @@ def _build_records(job_dir: Path, keep_manifests: bool, exact_scene: str | None 
                 manifest_slim=manifest_slim,
                 modality=modality,
                 stokes_npz_src=stokes_src if (stokes_src and stokes_src.is_file()) else None,
+                src_exr=src_exr if (src_exr and src_exr.is_file()) else None,
             )
         )
     return records
@@ -420,23 +429,73 @@ def _export_nav_graph(
     return info
 
 
-def _encode_image(args: tuple[str, str, str, int]) -> tuple[str, int, str | None]:
-    """Worker: read src png, write target image, return (dst, bytes, error)."""
-    src, dst, fmt, quality = args
+def _save_pil(im: "Image.Image", dst: str, fmt: str, quality: int) -> tuple[str, int, str | None]:
+    if fmt == "jpeg":
+        im.save(dst, "JPEG", quality=quality, optimize=True)
+    elif fmt == "webp":
+        im.save(dst, "WEBP", quality=quality, method=6)
+    elif fmt == "png":
+        im.save(dst, "PNG", optimize=True)
+    else:
+        return dst, 0, f"unknown format {fmt}"
+    return dst, Path(dst).stat().st_size, None
+
+
+def _encode_image(args: tuple) -> tuple[str, int, str | None]:
+    """Worker dispatcher: either re-tonemap an EXR or re-encode an existing PNG.
+
+    Task tuple: ``(mode, src, dst, fmt, quality, exposure, white)``. ``mode``
+    is ``"exr"`` (read HDR, extended-Reinhard tonemap with the scene-global
+    exposure/white) or ``"png"`` (copy the already-tonemapped preview)."""
+    mode, src, dst, fmt, quality, exposure, white = args
     try:
+        if mode == "exr":
+            import numpy as np  # noqa: PLC0415
+            from mitsuba_converter.multimodal import read_exr_rgb, _tonemap_reinhard  # noqa: PLC0415
+
+            rgb = read_exr_rgb(src)
+            preview = _tonemap_reinhard(rgb, exposure=exposure, white=white)
+            u8 = np.clip(np.round(np.clip(preview, 0.0, 1.0) * 255.0), 0, 255).astype("uint8")
+            im = Image.fromarray(u8, mode="RGB")
+            return _save_pil(im, dst, fmt, quality)
         with Image.open(src) as im:
             im = im.convert("RGB")
-            if fmt == "jpeg":
-                im.save(dst, "JPEG", quality=quality, optimize=True)
-            elif fmt == "webp":
-                im.save(dst, "WEBP", quality=quality, method=6)
-            elif fmt == "png":
-                im.save(dst, "PNG", optimize=True)
-            else:
-                return dst, 0, f"unknown format {fmt}"
-        return dst, Path(dst).stat().st_size, None
+            return _save_pil(im, dst, fmt, quality)
     except Exception as exc:  # noqa: BLE001
         return dst, 0, f"{type(exc).__name__}: {exc}"
+
+
+def _scan_global_tone(
+    records: list["FrameRecord"],
+    *,
+    scan_limit: int,
+    pixel_stride: int,
+    exposure_percentile: float,
+    white_percentile: float,
+) -> dict[str, float]:
+    """Pass-1: sample positive luminance from rgb EXRs → scene-global (exposure, white)."""
+    import numpy as np  # noqa: PLC0415
+    from mitsuba_converter.multimodal import read_exr_rgb, luminance, compute_global_tone_params  # noqa: PLC0415
+
+    rgb_exrs = [r.src_exr for r in records if r.modality == "rgb" and r.src_exr is not None]
+    if not rgb_exrs:
+        return {}
+    if scan_limit and len(rgb_exrs) > scan_limit:
+        step = len(rgb_exrs) / scan_limit
+        rgb_exrs = [rgb_exrs[int(i * step)] for i in range(scan_limit)]
+    samples: list = []
+    for p in rgb_exrs:
+        try:
+            rgb = read_exr_rgb(p)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[tone] WARN scan skip {p}: {exc}", file=sys.stderr)
+            continue
+        samples.append(luminance(rgb)[::pixel_stride, ::pixel_stride].reshape(-1).astype(np.float32))
+    if not samples:
+        return {}
+    return compute_global_tone_params(
+        samples, exposure_percentile=exposure_percentile, white_percentile=white_percentile
+    )
 
 
 def main() -> int:
@@ -447,6 +506,13 @@ def main() -> int:
     ap.add_argument("--out", required=True, help="Output dataset directory.")
     ap.add_argument("--image-format", choices=["jpeg", "webp", "png"], default="jpeg")
     ap.add_argument("--jpeg-quality", type=int, default=95, help="Quality for jpeg/webp (1-100).")
+    ap.add_argument("--no-from-exr", action="store_true", help="Copy the existing per-frame rgb.png previews instead of re-tonemapping rgb.exr with a scene-global exposure (the default). Non-rgb modalities always copy their PNG.")
+    ap.add_argument("--tone-exposure", type=float, default=None, help="Override the scene-global exposure (skips the pass-1 EXR scan).")
+    ap.add_argument("--tone-white", type=float, default=None, help="Override the scene-global Reinhard white point (skips the pass-1 EXR scan).")
+    ap.add_argument("--tone-exposure-percentile", type=float, default=0.90, help="Luminance percentile mapped to ~1.0 before roll-off (pass-1).")
+    ap.add_argument("--tone-white-percentile", type=float, default=0.999, help="Luminance percentile placed at the Reinhard knee (pass-1).")
+    ap.add_argument("--tone-scan-limit", type=int, default=600, help="Max rgb frames sampled in pass-1 (evenly spaced; 0 = all).")
+    ap.add_argument("--tone-pixel-stride", type=int, default=4, help="Pass-1 pixel subsample stride.")
     ap.add_argument("--include-probe", action="store_true", help="Also export probe_* jobs (default: grid vp only).")
     ap.add_argument("--keep-manifests", action="store_true", help="Also write slimmed per-frame manifest.json for full provenance.")
     ap.add_argument("--no-polarization-raw", action="store_true", help="Skip copying polarization stokes_data.npz (raw Stokes) into polarization_raw/.")
@@ -495,13 +561,41 @@ def main() -> int:
     images_dir = out_dir / "images"
     images_dir.mkdir(parents=True, exist_ok=True)
 
+    # Scene-global tonemapping: re-tonemap rgb.exr with one (exposure, white) so
+    # every frame shares a consistent exposure (fixes per-frame percentile auto-
+    # exposure: light-facing frames no longer crush to black, dark frames are no
+    # longer over-amplified). Non-rgb modalities keep their existing PNG preview.
+    from_exr = not args.no_from_exr
+    tone: dict[str, float] = {}
+    if from_exr:
+        if args.tone_exposure is not None and args.tone_white is not None:
+            tone = {"tone_exposure": float(args.tone_exposure), "tone_white": float(args.tone_white)}
+            print(f"[tone] override exposure={tone['tone_exposure']:.4g} white={tone['tone_white']:.4g}")
+        else:
+            tone = _scan_global_tone(
+                records,
+                scan_limit=args.tone_scan_limit,
+                pixel_stride=args.tone_pixel_stride,
+                exposure_percentile=args.tone_exposure_percentile,
+                white_percentile=args.tone_white_percentile,
+            )
+            if tone:
+                print(f"[tone] scene-global exposure={tone['tone_exposure']:.4g} white={tone['tone_white']:.4g}")
+            else:
+                print("[tone] no rgb EXRs found — falling back to PNG copy for all frames")
+    use_exr = bool(from_exr and tone)
+
     # Encode images in parallel.
     tasks = []
     for r in records:
         mod_suffix = "" if r.modality == "rgb" else f"__{r.modality}"
         dst = images_dir / f"{r.frame_id}__{r.camera_id}{mod_suffix}.{ext}"
         r.record["image"] = f"images/{dst.name}"
-        tasks.append((str(r.src_png), str(dst), args.image_format, args.jpeg_quality))
+        if use_exr and r.modality == "rgb" and r.src_exr is not None:
+            tasks.append(("exr", str(r.src_exr), str(dst), args.image_format, args.jpeg_quality,
+                          tone["tone_exposure"], tone["tone_white"]))
+        else:
+            tasks.append(("png", str(r.src_png), str(dst), args.image_format, args.jpeg_quality, 0.0, 0.0))
 
     # Polarization raw: copy each camera's stokes_data.npz once (shared across the
     # camera's Stokes-representation modality rows) so downstream code can recompute
@@ -586,6 +680,17 @@ def main() -> int:
         "image_format": args.image_format,
         "jpeg_quality": args.jpeg_quality if args.image_format != "png" else None,
         "dropped_modalities": ["exr", "raw_npz"],
+        "tonemap": (
+            {
+                "source": "rgb.exr",
+                "operator": "reinhard_ext",
+                "exposure": tone.get("tone_exposure"),
+                "white": tone.get("tone_white"),
+                "scope": "scene-global",
+            }
+            if use_exr
+            else {"source": "rgb.png", "operator": "per-frame-percentile (legacy preview)"}
+        ),
         "index_schema": {
             "image": "relative path to encoded image",
             "camera_to_world": "row-major flattened 4x4 (Mitsuba/USD convention, column-translation last)",
