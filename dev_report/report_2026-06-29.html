@@ -1,0 +1,273 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>2026-06-29 Infinigen 생성 → import → nav graph → PBR 렌더</title>
+  <style>
+    :root{color-scheme:light;--bg:#f7f8fb;--paper:#fff;--ink:#1f2937;--muted:#667085;--line:#d9dee8;--accent:#1d5fd1;--ok:#087443;--warn:#a15c07;--code:#f1f4f9;}
+    body{margin:0;background:var(--bg);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;line-height:1.58;}
+    .layout{display:flex;min-height:100vh;align-items:flex-start;}
+    aside{width:260px;flex:0 0 260px;position:sticky;top:0;height:100vh;overflow-y:auto;padding:24px 16px;border-right:1px solid var(--line);background:#eef2f7;}
+    .logo{font-weight:800;color:var(--accent);font-size:16px;}
+    .date{margin-top:3px;color:var(--muted);font-size:12px;font-family:ui-monospace,Menlo,Consolas,monospace;}
+    .nav-title{margin:22px 8px 8px;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.12em;font-weight:800;}
+    .nav-link{display:block;padding:6px 8px;border-radius:5px;color:#344054;font-size:12px;text-decoration:none;margin-bottom:2px;}
+    .nav-link:hover{background:#dde3ee;color:var(--accent);}
+    main{flex:1;min-width:0;padding:36px 24px 64px;}
+    article{max-width:1080px;margin:0 auto;background:var(--paper);border:1px solid var(--line);border-radius:8px;padding:34px 40px;box-shadow:0 8px 24px rgb(16 24 40/.05);}
+    h1,h2,h3{line-height:1.25;margin:0;}
+    h1{font-size:28px;}
+    h2{margin-top:34px;padding-top:22px;border-top:1px solid var(--line);font-size:20px;}
+    h3{margin-top:22px;font-size:16px;}
+    p{margin:10px 0 0;}
+    ul{margin:10px 0 0 20px;padding:0;}
+    li{margin:5px 0;}
+    code{background:var(--code);border:1px solid #e5e9f2;border-radius:5px;padding:1px 5px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:.92em;}
+    pre{overflow-x:auto;background:#111827;color:#e5e7eb;border-radius:8px;padding:14px 16px;font-size:13px;line-height:1.5;}
+    pre code{background:transparent;border:0;padding:0;color:inherit;}
+    table{width:100%;border-collapse:collapse;margin-top:12px;font-size:14px;}
+    th,td{border:1px solid var(--line);padding:9px 10px;text-align:left;vertical-align:top;}
+    th{background:#f3f6fb;font-weight:650;}
+    .meta{margin-top:10px;color:var(--muted);font-size:14px;}
+    .badge{display:inline-block;margin-right:6px;border-radius:999px;padding:2px 9px;border:1px solid var(--line);background:#f8fafc;color:var(--muted);font-size:12px;}
+    .ok{color:var(--ok);font-weight:650;}
+    .warn{color:var(--warn);font-weight:650;}
+    .note{margin-top:12px;padding:10px 14px;border-left:3px solid var(--accent);background:#f3f6fb;border-radius:0 6px 6px 0;font-size:13.5px;}
+    @media(max-width:980px){.layout{display:block;}aside{position:relative;width:auto;height:auto;border-right:0;border-bottom:1px solid var(--line);}main{padding:20px;}article{padding:24px 20px;}}
+  </style>
+</head>
+<body>
+<div class="layout">
+<aside>
+  <div class="logo">Robomituba</div>
+  <div class="date">2026-06-29</div>
+
+  <div class="nav-title">오늘 보고서</div>
+  <a class="nav-link" href="#summary">요약</a>
+  <a class="nav-link" href="#gen">1. Infinigen 생성 — 한국 아파트형 nav 맵</a>
+  <a class="nav-link" href="#import">2. Import (Stage 1 / Stage 2)</a>
+  <a class="nav-link" href="#nav">3. Navigation node graph</a>
+  <a class="nav-link" href="#pbr">4. 렌더 — PBR bake</a>
+  <a class="nav-link" href="#status">현재 상태 · 남은 일</a>
+  <a class="nav-link" href="#measured-black">5. 측정 pBRDF "검정" 규명 · full-analytic 결정</a>
+
+  <div class="nav-title">이전 보고서</div>
+  <a class="nav-link" href="report_2026-06-24.html">2026-06-24 Indoor render noise</a>
+  <a class="nav-link" href="report_2026-06-19.html">2026-06-19 Infinigen indoor import</a>
+  <a class="nav-link" href="report_2026-06-17.html">2026-06-17 Spatially Varying BRDF 계획</a>
+  <a class="nav-link" href="index.html">전체 인덱스</a>
+</aside>
+<main>
+  <article>
+    <h1>Infinigen 생성 → import → nav graph → PBR 렌더</h1>
+    <div class="meta">
+      <span class="badge">2026-06-29</span>
+      <span class="badge">Korean apartment floor-plan</span>
+      <span class="badge">2-stage importer</span>
+      <span class="badge">robot-height nav graph</span>
+      <span class="badge">PBR bake (roughness/normal/metallic)</span>
+    </div>
+
+    <h2 id="summary">요약</h2>
+    <p>
+      Infinigen 실내 생성물을 OpticalNav 데이터셋 파이프라인(에디터 · nav 그래프 · Mitsuba 렌더)에 흘려보내기 위한
+      end-to-end 작업을 정리한다. 네 단계로 나눈다: <b>(1) 한국 아파트형 nav 맵을 만들기 위한 생성 옵션</b>,
+      <b>(2) .blend → OpticalNav scene 임포트(2-stage)</b>, <b>(3) 임포트 결과로 navigation node graph를 깔기 위한 처리</b>,
+      <b>(4) 렌더 품질을 위한 PBR(roughness/metallic/normal) bake</b>.
+    </p>
+    <div class="note">
+      핵심 관점: Infinigen 기본 생성은 "거대한 단독주택 + 자연 terrain"에 가깝다. 로봇 내비게이션용으로는
+      <b>단층 · 복도로 연결된 다실(多室) · 적당한 가구밀도 · 통창 같은 광학적으로 흥미로운 표면</b>이 필요하다.
+      이를 seed 난수에 맡기지 않고 <b>floor-plan prior + gin override</b>로 강제하는 것이 1단계의 골자다.
+    </p>
+
+    <h2 id="gen">1. Infinigen 생성 — 한국 아파트형 nav 맵 옵션</h2>
+    <p>
+      생성 래퍼는 <code>scripts/infinigen_gen.py</code>. Infinigen은 pip 설치돼 있어도 <i>install 폴더에서</i> 실행해야 하므로,
+      이 래퍼가 install dir/conda python으로 <code>python -m infinigen_examples.generate_indoors</code>를 호출한다(검증 대상: Infinigen 1.19.1).
+      기본은 <code>--dry-run-safe</code>(정확한 커맨드만 출력), <code>--run</code> 시 실제 실행(Blender+GPU 필요).
+    </p>
+
+    <h3>"아파트는 seed가 아니라 floor-plan prior"</h3>
+    <p>
+      한국 도시형 아파트 레이아웃은 난수 seed 하나로 나오지 않는다. seed는 한 config 안의 난수만 고정할 뿐이다.
+      그래서 <b>8-digit seed <code>AABBCCDD</code></b>를 의미 있는 프리셋으로 디코딩한다(<code>parse_seed</code>):
+    </p>
+    <table>
+      <thead><tr><th>자리</th><th>의미</th><th>값</th></tr></thead>
+      <tbody>
+        <tr><td><code>AA</code></td><td>유닛 타입</td><td>59㎡ / <b>84㎡</b> / officetel</td></tr>
+        <tr><td><code>BB</code></td><td>레이아웃 변형</td><td>floor-plan 변종 선택</td></tr>
+        <tr><td><code>CC</code></td><td>가구 밀도 → <code>num_floating</code></td><td>model_house 8 · normal_lived_in 18 · family_home 28 · storage_heavy 40</td></tr>
+        <tr><td><code>DD</code></td><td>카메라/조명 프로파일</td><td>daytime_living / evening_warm / entrance_hallway / kitchen_to_living / <b>robot_low_cam</b> (현재 metadata에만 기록)</td></tr>
+      </tbody>
+    </table>
+
+    <h3>floor plan: <code>kr_apt_84</code> (84㎡ 복도형, nav-friendly)</h3>
+    <p>
+      네비게이션에 가장 적합한 레이아웃으로 84㎡ 7실 복도형을 직접 author했다 — <b>거실 · 주방 · 식당 · 복도 · 침실×2 · 욕실</b>.
+      특징:
+    </p>
+    <ul>
+      <li><b>중앙 복도가 모든 방을 연결</b> — 복도 ↔ 각 방 문(door)으로 통행 가능한 그래프 위상(로봇 경로 생성에 유리).</li>
+      <li><b>open LDK</b> — 거실↔식당↔주방은 문이 아니라 <code>opens</code>(벽을 쪼개는 문 없이 열린 연결)로 이어 큰 생활공간을 만든다.</li>
+      <li><b>통창(panoramic window)</b> — 거실 남측 외벽 창에 <code>is_panoramic: 1</code>을 줘 ~3m 바닥-천장 전면창을 강제. 랜덤 <code>WindowFactory</code>가 큰 창을 굴리길 기다리는 것보다 신뢰도가 높고, 유리/편광 렌더 테스트에 유용.</li>
+      <li>방마다 외벽 창(<code>window.00x</code>) — 채광/환경광.</li>
+    </ul>
+    <p>floor-plan 스키마는 <code>rooms / doors / opens / interiors / windows</code> 각각 <code>name → {"shape": &lt;shapely expr&gt;, [is_panoramic]}</code>.
+       Infinigen Solver가 <code>.json</code>을 로드해 <code>shape</code> 문자열을 eval하므로(예: <code>"shapely.box(0,0,5,5)"</code>) 좌표로 평면을 직접 그린다.</p>
+
+    <h3>gin override (생성 옵션)</h3>
+    <p>래퍼가 <code>generate_indoors</code>에 넘기는 검증된 override(<code>build_command</code>):</p>
+    <pre><code>compose_indoors.terrain_enabled=False        # 실내 전용 (자연 terrain 끔)
+Solver.floor_plan='&lt;kr_apt_84.json&gt;'          # 한국 아파트 평면 강제
+compose_indoors.invisible_room_ceilings_enabled=True
+compose_indoors.floating_objs_enabled=True
+compose_indoors.num_floating=&lt;density&gt;         # 가구 밀도 (8~40)
+compose_indoors.enable_collision_floating=True
+compose_indoors.enable_collision_solved=True</code></pre>
+    <p>
+      2-stage 실행: <b>layout</b>(<code>no_objects.gin + overhead.gin</code> — 가구 없이 벽/cutter만 빠르게 검증) →
+      <b>full</b>(object solve, 옵션 <code>fast_solve.gin</code>). 작은 평면 + 단순 위상(축 정렬 box)으로 solve 실패율을 낮춘다.
+    </p>
+    <p class="warn">아직 코드 수정이 필요해 미연결: 랜덤 커튼/셔터 제거(<code>WindowFactory</code>가 @gin.configurable 아님), per-room material bias, 카메라 프로파일 실제 배치(seed의 카메라 자리는 metadata만).</p>
+
+    <h3>사용법 (CLI)</h3>
+    <pre><code># 커맨드만 출력 (dry-run, 기본): seed 디코딩 + floor_plan.json/kr_preset.json 기록 + 실행할 명령 표시
+python scripts/infinigen_gen.py --seed 20003001 --stage full
+# 실제 실행 (Blender+GPU 필요)
+python scripts/infinigen_gen.py --seed 20003001 --stage full --run
+# floor-plan 직접 지정 + gin override 추가
+python scripts/infinigen_gen.py --seed 20003001 --floor-plan kr_apt_84 -p compose_indoors.num_floating=12 --run</code></pre>
+    <p>주요 인자: <code>--seed</code>(AABBCCDD) · <code>--stage layout|full</code> · <code>--fast</code>(빠른 solve) · <code>--floor-plan</code> · <code>-p/--override</code>(raw gin) · <code>--run</code>.
+       산출물은 <code>data/infinigen_generated/outputs/kr_&lt;seed&gt;/&lt;stage&gt;/</code> 아래에 <code>floor_plan.json</code>(방/문/창 geometry) + <code>kr_preset.json</code>(디코딩된 프리셋) + Infinigen 출력(blend 등). 임포트는 이 <code>scene.blend</code>를 받는다.</p>
+
+    <h2 id="import">2. Import — .blend → OpticalNav scene (2-stage)</h2>
+    <p>
+      생성된 <code>scene.blend</code>(헤더 손상 시 <code>scene.blend1</code> 백업)을 OpticalNav scene으로 바꾸는 2단계.
+      원클릭 런처 <code>apps/run_infinigen_import.sh &lt;blend|dir&gt;</code>가 Stage 1+2+sync를 묶는다.
+    </p>
+
+    <h3>Stage 1 — bpy export (<code>tools/infinigen/blender_export_scene.py</code>, conda infinigen)</h3>
+    <p>오브젝트(mesh "unit")별로 다음을 추출:</p>
+    <ul>
+      <li><b>origin-local Y-up OBJ + GLB + 텍스처</b> + <code>scene_manifest.json</code>(분류·world bbox·transform·재질 PBR·조명·카메라·<code>source_blend</code> 경로).</li>
+      <li><b>분류</b> <code>_classify</code>: structure(벽/바닥/천장) · door · window · furniture(Factory 이름 키워드 → semantic type).</li>
+      <li><b>재질 PBR + optical_class</b> 추출. <code>_optical_class</code>가 이름 우선(metallic 파라미터는 절차적이라 불신)으로 glass/mirror/metal(gold/steel/aluminum)/diffuse 분류 — 렌더 BSDF 선택의 근거.</li>
+    </ul>
+    <p>export 함정과 대응(실전에서 막힌 것들):</p>
+    <table>
+      <thead><tr><th>증상</th><th>원인</th><th>대응</th></tr></thead>
+      <tbody>
+        <tr><td>빈 OBJ (구조물 다수)</td><td>Infinigen이 <code>hide_viewport/hide_render</code>로 숨김 → export·bake 거부</td><td><code>_unhide</code>로 일시 가시화</td></tr>
+        <tr><td>Mitsuba 로드 abort</td><td>n-gon이 &gt;1024 char OBJ 라인</td><td><code>export_triangulated_mesh=True</code></td></tr>
+        <tr><td>invalid vertex normal</td><td>degenerate triangle</td><td><code>export_normals=False</code></td></tr>
+        <tr><td>black interior</td><td>단면 BSDF 후면</td><td>two-sided BSDF wrap</td></tr>
+      </tbody>
+    </table>
+    <p><b>절차적 재질 bake</b>: Infinigen 재질은 노드 그래프라 단순 색이 없다. Cycles DIFFUSE 패스를 per-object albedo atlas로 bake → MTL <code>map_Kd</code>로 연결(렌더가 실제 색을 픽업).</p>
+
+    <h3>Stage 2 — converter (<code>apps/import_infinigen_scene.py</code>)</h3>
+    <ul>
+      <li><b>junk/미완성 제거</b>: face 없는 OBJ(곡선·temp) 스킵(<code>_obj_has_faces</code>); <b>가구 ≥1인 "완성된 방"만</b> 유지(<code>_select_rooms</code> — 원점에 쌓인 빈 더미 방 제거).</li>
+      <li><b>좌표 정규화</b>: 방을 양수 원점으로 translate + 바닥을 <code>y=0</code>에 안착(<code>origin_offset = [dx, dy, dz]</code>) — 에디터/렌더 좌표 일관성, nav 노드가 바닥에 깔리게.</li>
+      <li><b>재질 바인딩</b>(<code>_material_binding</code>, optical_class 기반): mirror→<code>conductor</code>, glass→<code>dielectric/roughdielectric</code>, metal→<code>measured_polarized</code>(hpbrdf aluminum/suj2/fake_gold) × baked albedo <code>albedo_scale</code>, diffuse→<b><code>pplastic</code></b>(편광 신호 + 텍스처). reflective(거울/유리)는 MTL의 baked <code>Kd/map_Kd</code>를 strip해 analytic strategy가 roughplastic으로 덮이지 않게.</li>
+      <li><b>조명 power-conservation</b>: 작은 강한 fixture는 far/어두운 곳에 firefly를 만든다 → 패널을 넓히고(<code>LIGHT_SIZE_M</code>) radiance를 면적 증가분만큼 나눠(<code>_conserve_power</code>) 총광량 보존·노이즈 감소.</li>
+      <li><b>밴드 모드 렌더 옵션</b>: 측정 pBRDF를 <code>rgb</code>(3밴드) / <code>single</code>(1밴드×albedo) / <code>hybrid</code>(무채색 금속 1밴드, 유색 3밴드)로 선택 — 메모리·속도 3× 절감(무채색 재질). Preview UI 셀렉터로 노출.</li>
+    </ul>
+
+    <h2 id="nav">3. Navigation node graph 처리</h2>
+    <p>임포트된 scene 위에 traversability grid → viewpoint node → edge를 까는데, Infinigen 기하 특성 때문에 추가 처리가 필요했다.</p>
+    <ul>
+      <li><b>robot-height 통과 판정</b>(<code>object_blocks_at_height</code>, <code>walkable_surface.py</code>): 물체의 바닥이 <code>robot_height_m</code>(기본 1.2m) 이상이면 로봇이 밑으로 지나가므로 <b>막지 않는다</b> — 식탁·선반 아래 통행 가능. grid carve와 node-overlap 양쪽에 <code>robot_height_m</code>를 함께 전달한다.</li>
+      <li><b>방 전체를 막는 오버블록 방지</b>: Infinigen floor/ceiling은 room 크기 AABB를 가진 landmark라, 그대로 두면 방 전체 노드를 prune한다. <code>find_object_overlapping_nodes</code>가 <code>navigation.blocks_navigation == False</code>인 오브젝트를 건너뛰게 해 해결.</li>
+      <li><b>얇은 가구는 walkable overlay</b>: rug/carpet/mat/towel(키워드) 또는 world-AABB 높이 &lt;5cm는 traversable로 두고 carve하지 않는다(<code>_TRAVERSABLE_OVERLAY_*</code>) — 깔개 위에 노드 구멍이 나 매번 수동으로 메우던 문제 제거.</li>
+      <li><b>그래프 편집 히스토리 로깅</b>(<code>graph_edit_log.py</code>): 사람이 자동 생성 그래프를 손볼 때(노드/엣지 추가·삭제, region 재샘플, overlap prune)를 <b>scene별 append-only jsonl</b>로 영속 기록 + "알고리즘 관점" 컨텍스트(삭제 노드의 clearance/manual, add-edge feasibility verdict, add-node의 기존 커버리지) — 추후 자동 path 생성 알고리즘 개선의 학습 신호.</li>
+    </ul>
+
+    <h2 id="pbr">4. 렌더 — PBR(roughness/metallic/normal) bake</h2>
+    <p>
+      문제: 임포트는 <b>albedo만 bake</b>했고 roughness/metallic은 스칼라 한 값뿐 — 절차적 입력은 못 읽어 디폴트(0.6/0.0)로 떨어져
+      <b>공간 변화가 완전 소실</b>됐다. per-texel roughness/normal을 렌더(roughplastic/pplastic의 texturable <code>alpha</code>, <code>normalmap</code>, 향후 <code>principled</code>)에서 쓰려면 맵 bake가 필요.
+    </p>
+    <ul>
+      <li><b>Stage 1 다중 패스 bake</b>(<code>--bake-pbr</code>): <code>_bake_pass</code>로 일반화 — roughness/normal은 Cycles 직접 패스(<code>ROUGHNESS</code>/<code>NORMAL</code>), <b>metallic은 직접 패스가 없어 EMIT 트릭</b>(Principled Metallic→Emission로 임시 배선 후 <code>EMIT</code> bake, 슬롯별 복원). per-object atlas + MTL <code>map_Pr/map_Pm/norm</code> + manifest <code>baked_*</code>.</li>
+      <li><b>렌더 소비</b>: <code>_extract_obj_mtl_material</code>가 새 MTL 키를 읽어 <code>roughness/metallic/normal_texture_ref</code> 반환 → <code>_append_extracted_bsdf_xml</code>가 roughplastic/pplastic의 <code>alpha</code>를 <b>스칼라 대신 텍스처</b>(<code>&lt;texture name="alpha" raw&gt;</code>)로, normal은 기존 normalmap 어댑터로 emit.</li>
+      <li><b><code>--bake-only</code></b>: 기존 scene을 <b>Stage 1만</b> 재bake(Stage 2 재임포트 안 함 → <b>authoring map·수동편집 보존</b>), 끝나면 staged 캐시 무효화로 다음 렌더부터 적용.</li>
+      <li><b>상태 UI</b>: Preview의 Sync Inspector에 "Infinigen PBR maps" 상태(roughness 베이크 N/total, normal/metallic 카운트) + <b>"Bake PBR — copy cmd"</b> 버튼(데몬이 Blender를 돌리지 않고, <code>source_blend</code> 기반 정확한 CLI 명령을 복사). 데몬 <code>render-scene-stats</code>가 import manifest의 <code>baked_*</code>를 읽어 상태를 계산.</li>
+    </ul>
+    <p>
+      비용은 패스 4×(albedo+roughness+normal+metallic)라 <code>--bake-pbr</code> 옵트인. 검증: 정상 베이크 오브젝트(blanket)에서
+      roughness <code>std≈118</code>(강한 공간변화), normal 정상, metallic EMIT 트릭이 비금속에 0/금속에 1을 정확히 산출.
+      측정 금속(measured pBRDF)은 자체 roughness가 있어 이 맵의 주 수혜는 <b>pplastic/roughplastic 확산 표면</b>.
+    </p>
+    <div class="note">
+      참고: 일부 오브젝트(Balloon/Bed 류)는 albedo가 검정으로 bake되는데, 이는 이번 변경과 무관한 기존 내용 한계(셰이더가 DIFFUSE 패스로 안 잡힘)다.
+    </div>
+    <div class="note">
+      <b>metallic은 사실상 per-material 상수</b> — Infinigen은 metallic을 텍스처로 공간변조하지 않는다. 스칼라 분포가
+      <b>scene 전반 87–94%가 0/1</b>(대부분 0=비금속, 소수 1=금속; 나머지 0.375 등 비-binary 값도 per-material 상수)이고,
+      실제 bake한 metallic 맵은 4개 모두 <code>std=0.00</code>(완전 균일)이었다. 따라서 metallic 맵 bake는 균일 아틀라스만 생성해
+      per-material 스칼라 + <code>optical_class</code>(metal/비metal 분류)와 중복 — 사실상 낭비다. 진짜 per-texel 공간변화가 있는 건
+      <b>roughness</b>(std≈118)·normal 뿐. 기본값은 일단 그대로 두되(현재 <code>--bake-pbr</code>가 metallic까지 굽고
+      <code>--no-bake-metallic</code>로 제외), 추후 metallic을 기본 제외해 bake 패스를 4×→3×로 줄이는 것을 권장.
+    </div>
+
+    <h2 id="status">현재 상태 · 남은 일</h2>
+    <ul>
+      <li class="ok">생성(kr_apt_84 floor-plan + seed 프리셋) · import(2-stage, 재질/조명/좌표) · nav graph(robot-height·overlay·edit log) · PBR bake(roughness/normal/metallic + 렌더 소비 + 상태 UI) 동작.</li>
+      <li><b>남은 생성 옵션</b>: WindowFactory 커튼/셔터 제거, per-room material bias, robot_low_cam 카메라 실제 배치(현재 metadata만).</li>
+      <li><b>metallic 맵 렌더 소비</b>는 현재 scalar/binary 유지 — per-texel metallic은 principled/roughconductor-alpha 트랙에서 후속.</li>
+      <li><b>측정 pBRDF 컬러</b>는 production optix7에 <code>measured_polarized_rgb</code> 빌드(Phase 0) 후 완전 복원. analytic(pplastic/conductor/dielectric)은 이미 즉시 동작.</li>
+    </ul>
+  </article>
+
+  <article>
+    <h2 id="measured-black">5. 측정 pBRDF가 "새까맣게" 보이는 현상 규명 — 버그 아님, 그리고 full-analytic 결정</h2>
+    <p>
+      <code>infinigen_kr_20000221</code> vp_000039/h_240의 <b>measured_full</b> RGB 렌더에서 식기세척기(DishwasherFactory)가
+      <b>순수 검정 실루엣</b>으로 나와 "BRDF 매핑 실패냐"는 의심이 제기됨. 최소재현으로 분리한 결론은 <b>버그 아님</b>이다.
+    </p>
+    <ul>
+      <li><b>관측</b>: 식기세척기 영역이 재질·variant 무관하게 ~67% <b>정확히 0</b> (aluminum/white_rough_plastic, cuda_rgb/spectral/polarized 전부 동일, mean≈0.0083). NaN 없음, hpbrdf 채널 로드 정상, BSDF 20개 주입 정상. analytic은 같은 면을 dim하지만 비영(mean 0.02~0.086)으로 렌더.</li>
+      <li><b>메쉬·BSDF는 정상</b>: 노멀/UV가 전혀 없는 식기세척기 OBJ도 <b>강한 직사광 최소재현</b>에서 measured로 mean 0.39·검정 0%로 정상 렌더(sphere도 동일). → 메쉬·플러그인 문제 아님.</li>
+      <li><b>진짜 원인 = analytic 과밝음 × 저조도</b>: 동일 측면창광 통제 실험에서 <b>analytic <code>roughconductor</code>("Al")가 measured aluminum pBRDF보다 ~4× 밝다</b>(0.303 vs 0.076). <code>roughconductor</code>는 넓은 lobe·높은 Fresnel 반사율로 약한 창광도 긁어모으는 반면, 실제 measured는 반사율이 낮아 훨씬 어둡게 반사. 식기세척기는 거의 무조명 구석 → measured 신호가 바닥으로 붕괴하고 specular 반사 경로가 광원을 못 만나 <b>Monte Carlo가 정확히 0</b>을 반환.</li>
+      <li><b>무관 변수 확인</b>: <code>alpha_sample</code> 0.08↔0.5 결과 동일(=sampling lobe 폭 문제 아님), variant 무관, 재질 무관. 순수 <b>반사 크기(밝기) 차이 + 조명 부족</b>.</li>
+    </ul>
+    <table>
+      <thead><tr><th>BSDF (sphere, 측면창광)</th><th>mean</th><th>exact-zero</th></tr></thead>
+      <tbody>
+        <tr><td>measured aluminum (a=0.08 / 0.5)</td><td>0.076</td><td>0%</td></tr>
+        <tr><td>measured white_rough_plastic</td><td>0.052</td><td>0%</td></tr>
+        <tr><td><b>analytic roughconductor (a=0.2)</b></td><td><b>0.303</b></td><td>0%</td></tr>
+        <tr><td>analytic roughconductor (a=0.6)</td><td>0.282</td><td>0%</td></tr>
+      </tbody>
+    </table>
+    <p>
+      함의: measured가 <b>물리적으로 더 정확하게(=더 어둡게)</b> 반사하는데 analytic 근사가 과밝아서 저조도에서 극단적으로 갈렸을 뿐.
+      measured vs analytic 비교는 <b>대상에 충분한 조명을 준 조건</b>에서만 유효하다.
+    </p>
+
+    <h3>결정: full-analytic 모드를 주력으로</h3>
+    <p>
+      위 결과 + 측정 pBRDF의 비용(밴드당 ~183&nbsp;MB, GPU 메모리·로드)·저조도 취약성·Phase 0 빌드 의존성을 감안해,
+      <b>당분간 full-analytic 모드(measured_scope=analytic_only)를 기본 렌더 경로로 삼는다.</b>
+    </p>
+    <ul>
+      <li><b>근거</b>: <code>pplastic</code>(분극성 plastic) · <code>dielectric</code>(유리/투명) · <code>conductor</code>/<code>roughconductor</code>(금속) 세 analytic BSDF만으로
+        <b>polarization + RGB + NIR</b>을 모두 커버할 수 있다 — pplastic/conductor/dielectric은 모두 cuda_ad_spectral_polarized에서 Stokes를 내고, RGB·단일밴드(NIR proxy) 모두 즉시 동작.</li>
+      <li><b>장점</b>: 측정 데이터 로드/메모리 없음, 조명 강건성↑(저조도에서도 0 붕괴 없음), Phase 0(<code>measured_polarized_rgb</code> 빌드) 의존성 제거, 즉시 가용.</li>
+      <li><b>측정 pBRDF는 선택적/연구용으로 보존</b>: measured_scope=measured_full/analytic_priority 경로는 유지하되, 데이터셋 기본 생성은 analytic로 간다. 측정 비교가 필요하면 <b>대상에 충분한 조명</b>을 준 조건에서만.</li>
+      <li><b>후속 검토(별개)</b>: hpbrdf aluminum의 절대 반사 스케일 vs analytic Al reflectance 정량 매칭 — "측정 금속이 너무 어둡다"가 데이터 스케일 이슈인지 확인.</li>
+    </ul>
+    <div class="note">
+      재현 산출물: <code>out/compare_measured_vs_analytic_vp039_h240/</code>(RGB·polar 7모달·diff heatmap·3way·비금속·lit 비교).
+      렌더 환경: <code>scripts/run_render_queue_local.sh</code> 기준(<code>/usr/bin/python3.10</code> + 표준 빌드 <code>robomituba-build/mitsuba3/python</code> + <code>LD_LIBRARY_PATH=/usr/lib/wsl/lib</code>, GPU0).
+      표준 빌드에 <code>measured_polarized_rgb.so</code>가 이미 빌드되어 있어 measured RGB가 동작했다(스크립트 주석의 "plugin 없음"은 stale).
+    </div>
+  </article>
+</main>
+</div>
+</body>
+</html>

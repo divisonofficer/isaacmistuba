@@ -1,15 +1,19 @@
 <script lang="ts">
 	import {
+		POLAR_PREVIEW_MODALITIES,
 		sensorRenderChipLabel,
 		formatRigVec,
 		formatResolution,
 		formatRenderSpp,
 		headingHasSensorModality,
+		isPolarRenderModality,
 	} from '$lib/datasets/sensorHelpers';
 	import { buildBatchJobGrid } from '$lib/datasets/batchHelpers';
 	import { opticalNavObservationModalityUrl } from '$lib/api';
+	import type { Capabilities } from '$lib/datasets/capabilityHelpers';
 
 	interface Props {
+		caps: Capabilities;
 		renderSceneSynced: boolean;
 		globalCameraRig: any;
 		globalCameraRigStatus: string;
@@ -32,6 +36,13 @@
 		ambientRadiance: number;
 		activeModalityTab: string;
 		activeRigSensorOption: any;
+		activeCameraFrustum: any;
+		activeRenderModality: string;
+		hotCameraPose: any;
+		previewBandMode: string;
+		previewMeasuredScope: string;
+		probeRendering: boolean;
+		probeError: string;
 		rigMountHeightM: number;
 		authoringMap: any;
 		selectedProjectId: string;
@@ -58,8 +69,20 @@
 		onClearNodeObservations: (id: string) => void;
 		onClearAllObservations: () => void;
 		onRenderViewpoint: () => void;
+		onRunProbe: () => void;
 		onRenderEpisodes: () => void;
 		onRenderEpisodeNodes?: () => void;
+		renderVariant?: 'base' | 'perturbed' | 'both';
+		perturbationEnabled?: boolean;
+		perturbedRenderReady?: boolean;
+		perturbedRenderStale?: boolean;
+		onSetRenderVariant?: (v: 'base' | 'perturbed' | 'both') => void;
+		onSetPreviewBandMode: (v: string) => void;
+		onSetPreviewMeasuredScope: (v: string) => void;
+		onSetActiveModalityTab?: (v: string) => void;
+		selectedRigSensorIds?: string[];
+		onToggleRigSweepSensor?: (sensorId: string) => void;
+		onSetRigSweepSensors?: (sensorIds: string[]) => void;
 		renderMissingOnly?: boolean;
 		onSetRenderMissingOnly?: (value: boolean) => void;
 		episodeNodesAvailable?: boolean;
@@ -71,20 +94,27 @@
 	}
 
 	let {
+		caps,
 		renderSceneSynced, globalCameraRig, globalCameraRigStatus, globalCameraRigError,
 		rigSensorOptions, activeRigSensorId, selectedSensorNode, selectedSensorNodeId,
 		selectedCustomSensorNode, selectedSensorHeightM,
 		sceneStateText, cameraSpecText, renderConfig,
 		observationScan, graphBatch, sensorRenderResult, renderingViewpoint,
 		placingSensor, frustumMode, ambientRadiance, activeModalityTab,
-		activeRigSensorOption, rigMountHeightM, authoringMap,
+		activeRigSensorOption, activeCameraFrustum, activeRenderModality,
+		hotCameraPose, previewBandMode, previewMeasuredScope,
+		probeRendering, probeError, rigMountHeightM, authoringMap,
 		selectedProjectId, sceneId, loading, hasScene, hasGraph,
 		renderSceneStats, renderSceneStatsLoading, showRoomShell, roomShell,
 		editorObjectsCount, editorEmitterCount, editorMaterialCount,
 		onLoadGlobalCameraRig, onSelectRigSensor, onSetFrustumMode, onTogglePlacingSensor,
 		onRemoveCustomSensor, onCustomSensorHeadingChange, onLoadRenderConfig,
 		onSetSensorHeight, onSetAmbientRadiance, onClearNodeObservations, onClearAllObservations,
-		onRenderViewpoint, onRenderEpisodes, onRenderEpisodeNodes,
+		onRenderViewpoint, onRunProbe, onRenderEpisodes, onRenderEpisodeNodes,
+		renderVariant = 'base', perturbationEnabled = false,
+		perturbedRenderReady = false, perturbedRenderStale = false, onSetRenderVariant,
+		onSetPreviewBandMode, onSetPreviewMeasuredScope, onSetActiveModalityTab,
+		selectedRigSensorIds = [], onToggleRigSweepSensor, onSetRigSweepSensors,
 		renderMissingOnly = true, onSetRenderMissingOnly,
 		episodeNodesAvailable = false, episodePathNodeCount = 0, headingsPerNode = 0,
 		onRefreshBatch, onRefreshStats, onSetShowRoomShell,
@@ -97,6 +127,19 @@
 			: 0)
 	);
 	const vpTotal = $derived(vpScan?.total ?? graphBatch?.progress?.total ?? 0);
+	const isActivePolarSensor = $derived.by(() => {
+		const sensor = activeRigSensorOption?.sensor ?? {};
+		const sensorType = String(sensor?.canonical_sensor_type ?? sensor?.sensor_type ?? '').toLowerCase();
+		const canonical = Array.isArray(sensor?.modalities) ? sensor.modalities : [];
+		return sensorType === 'polar_camera'
+			|| isPolarRenderModality(activeRenderModality)
+			|| canonical.some((item: unknown) => isPolarRenderModality(item));
+	});
+	const visibleObservationModality = $derived(
+		isActivePolarSensor && isPolarRenderModality(activeModalityTab)
+			? activeModalityTab
+			: activeRenderModality
+	);
 </script>
 
 <section class="rail-section rail-tool-panel sensor-panel">
@@ -118,23 +161,42 @@
 			<span>{globalCameraRigStatus}</span>
 			{#if globalCameraRigError}<small>{globalCameraRigError}</small>{/if}
 		</div>
-		{#each rigSensorOptions as option, i}
-			{@const sensor = option.sensor}
-			<details class="rig-sensor-card" open={i === 0 || activeRigSensorId === option.sensor_id}>
-				<summary>{option.label} · {option.modality}</summary>
-				<div class="geometry-grid rig-readonly-grid">
-					<div class="readonly-field"><span>ID</span><strong>{option.sensor_id}</strong></div>
-					<div class="readonly-field"><span>Render</span><strong>{sensorRenderChipLabel(option)}</strong></div>
-					<div class="readonly-field"><span>Type</span><strong>{sensor.canonical_sensor_type ?? sensor.modality ?? 'rgb'}</strong></div>
-					<div class="readonly-field"><span>Parent</span><strong>{sensor.mount?.parent_frame ?? globalCameraRig?.base_frame ?? 'base_link'}</strong></div>
-					<div class="readonly-field"><span>XYZ m</span><strong>{formatRigVec(sensor.mount?.xyz_m)}</strong></div>
-					<div class="readonly-field"><span>RPY deg</span><strong>{formatRigVec(sensor.mount?.rpy_deg, 1)}</strong></div>
-					<div class="readonly-field"><span>FOV</span><strong>{Number(sensor.fov_deg ?? sensor.intrinsics?.fov_h_deg ?? 0).toFixed(0)}°</strong></div>
-					<div class="readonly-field"><span>Resolution</span><strong>{formatResolution(sensor.resolution ?? sensor.intrinsics?.resolution)}</strong></div>
-					<div class="readonly-field wide"><span>SPP</span><strong>{formatRenderSpp(sensor)}</strong></div>
+		<div class="rig-sensor-toolbar">
+			<button class="button button-subtle" onclick={() => onSetRigSweepSensors?.(rigSensorOptions.map((option) => String(option.sensor_id)))}>
+				All active
+			</button>
+			<button class="button button-subtle" onclick={() => onSetRigSweepSensors?.(activeRigSensorId ? [activeRigSensorId] : [])}>
+				Off
+			</button>
+		</div>
+		<div class="rig-sensor-list">
+			{#each rigSensorOptions as option}
+				{@const sensor = option.sensor}
+				<div class="rig-sensor-card">
+					<button
+						class:active-tab={activeRigSensorId === option.sensor_id}
+						class:selected-tab={selectedRigSensorIds.includes(String(option.sensor_id))}
+						onclick={() => onToggleRigSweepSensor ? onToggleRigSweepSensor(String(option.sensor_id)) : onSelectRigSensor(String(option.sensor_id))}
+					>
+						<span>{option.label} · {option.modality}</span>
+						<small>{selectedRigSensorIds.includes(String(option.sensor_id)) ? 'sweep on' : 'sweep off'}</small>
+					</button>
+					<div class="rig-sensor-tooltip" role="tooltip">
+						<div class="geometry-grid rig-readonly-grid">
+							<div class="readonly-field"><span>ID</span><strong>{option.sensor_id}</strong></div>
+							<div class="readonly-field"><span>Render</span><strong>{sensorRenderChipLabel(option)}</strong></div>
+							<div class="readonly-field"><span>Type</span><strong>{sensor.canonical_sensor_type ?? sensor.modality ?? 'rgb'}</strong></div>
+							<div class="readonly-field"><span>Parent</span><strong>{sensor.mount?.parent_frame ?? globalCameraRig?.base_frame ?? 'base_link'}</strong></div>
+							<div class="readonly-field"><span>XYZ m</span><strong>{formatRigVec(sensor.mount?.xyz_m)}</strong></div>
+							<div class="readonly-field"><span>RPY deg</span><strong>{formatRigVec(sensor.mount?.rpy_deg, 1)}</strong></div>
+							<div class="readonly-field"><span>FOV</span><strong>{Number(sensor.fov_deg ?? sensor.intrinsics?.fov_h_deg ?? 0).toFixed(0)}°</strong></div>
+							<div class="readonly-field"><span>Resolution</span><strong>{formatResolution(sensor.resolution ?? sensor.intrinsics?.resolution)}</strong></div>
+							<div class="readonly-field wide"><span>SPP</span><strong>{formatRenderSpp(sensor)}</strong></div>
+						</div>
+					</div>
 				</div>
-			</details>
-		{/each}
+			{/each}
+		</div>
 	</div>
 
 	<div class="sensor-rays-row">
@@ -156,6 +218,65 @@
 		</button>
 	</div>
 
+	<div class="sensor-preview-card">
+		<div class="sensor-preview-head">
+			<div class="rail-title">Hot Camera Preview</div>
+			<span class="chip-dim">{activeRigSensorId || 'rig sensor'}</span>
+		</div>
+		<div class="sensor-preview-meta">
+			<span>{activeRigSensorOption?.label ?? activeRigSensorId ?? 'default'}</span>
+			<span>{visibleObservationModality}</span>
+			<span>{Number(activeCameraFrustum?.fov_deg ?? 70).toFixed(0)}°</span>
+			<span>{rigMountHeightM.toFixed(2)} m</span>
+		</div>
+		{#if isActivePolarSensor}
+			<div class="polar-preview-mode-row" aria-label="Polarization preview modality">
+				{#each POLAR_PREVIEW_MODALITIES as modality}
+					<button
+						type="button"
+						class:active={visibleObservationModality === modality.id}
+						onclick={() => onSetActiveModalityTab?.(modality.id)}
+						title={`Show ${modality.label} polarization preview products`}
+					>
+						{modality.label}
+					</button>
+				{/each}
+			</div>
+		{/if}
+		{#if hotCameraPose}
+			<div class="sensor-preview-pose">
+				x={hotCameraPose.x?.toFixed?.(2) ?? hotCameraPose.x}
+				z={hotCameraPose.z?.toFixed?.(2) ?? hotCameraPose.z}
+				yaw={hotCameraPose.yaw_deg?.toFixed?.(1) ?? hotCameraPose.yaw_deg}°
+			</div>
+		{:else}
+			<div class="sensor-preview-pose muted">No hot camera placed</div>
+		{/if}
+		<label class="band-mode-row" title="측정 pBRDF 밴드 수: single=안정적인 1밴드×albedo · hybrid=무채색 1밴드/유색 3밴드 · rgb=전부 3밴드">
+			<span>pBRDF band</span>
+			<select value={previewBandMode} onchange={(e) => onSetPreviewBandMode((e.currentTarget as HTMLSelectElement).value)}>
+				<option value="rgb">rgb · 3-band (full colour)</option>
+				<option value="hybrid">hybrid · achromatic→1, coloured→3</option>
+				<option value="single">single · 1-band ×albedo</option>
+			</select>
+		</label>
+		<label class="band-mode-row" title="Measured pBRDF 사용 범위: 기본은 analytic-priority로 배경은 polarimetric analytic fallback을 사용하고 target/anchor만 measured를 켭니다.">
+			<span>Measured scope</span>
+			<select value={previewMeasuredScope} onchange={(e) => onSetPreviewMeasuredScope((e.currentTarget as HTMLSelectElement).value)}>
+				<option value="analytic_priority">analytic-priority · anchors only</option>
+				<option value="analytic_only">analytic-only · 0 measured</option>
+				<option value="budgeted_measured">budgeted · up to 3</option>
+				<option value="measured_full">full measured · HQ</option>
+			</select>
+		</label>
+		<button class="button button-primary full" disabled={!caps.runProbe.enabled} title={caps.runProbe.reason} onclick={onRunProbe}>
+			{probeRendering ? 'Rendering…' : 'Render preview'}
+		</button>
+		{#if probeError}
+			<div class="probe-error">{probeError}</div>
+		{/if}
+	</div>
+
 	{#if selectedSensorNode}
 		<div class="rail-title">
 			{(selectedSensorNode as any).isCustom ? 'Custom Camera' : 'Graph Viewpoint'}
@@ -174,14 +295,6 @@
 				Remove
 			</button>
 		{/if}
-		<div class="modality-tabs rig-derived-tabs" title="Derived from Robot Camera Rig sensors">
-			{#each rigSensorOptions as option}
-				<button class:active-tab={activeRigSensorId === option.sensor_id} onclick={() => onSelectRigSensor(option.sensor_id)}>
-					<span>{option.label}</span>
-					<small>{sensorRenderChipLabel(option)}</small>
-				</button>
-			{/each}
-		</div>
 		<div class="sensor-config-row">
 			{#if sceneStateText.trim() && cameraSpecText.trim()}
 				<span class="chip-ok">Config ready ({renderConfig?.source ?? 'custom'})</span>
@@ -219,17 +332,26 @@
 			<div class="obs-heading-gallery">
 				{#each Object.entries(vpScan.headings).sort(([a], [b]) => a.localeCompare(b)) as [hid, hinfo]}
 					{@const hdata = hinfo as any}
-					{@const hasModality = headingHasSensorModality(hdata, activeModalityTab)}
-					{#if hasModality}
+					{@const hasModality = headingHasSensorModality(hdata, visibleObservationModality, activeRigSensorId)}
+					{#if hasModality && perturbationEnabled}
+						<div class="obs-pair" title={`${hid} · base / perturbed (mirrors)`}>
+							<figure><img class="obs-thumb"
+								src={opticalNavObservationModalityUrl(selectedProjectId, sceneId, selectedSensorNodeId, hid, visibleObservationModality, activeRigSensorId, 'base')}
+								alt={`${hid} base`} loading="lazy" /><figcaption>off</figcaption></figure>
+							<figure><img class="obs-thumb"
+								src={opticalNavObservationModalityUrl(selectedProjectId, sceneId, selectedSensorNodeId, hid, visibleObservationModality, activeRigSensorId, 'perturbed')}
+								alt={`${hid} perturbed`} loading="lazy" /><figcaption>mirror</figcaption></figure>
+						</div>
+					{:else if hasModality}
 						<img
 							class="obs-thumb"
-							src={opticalNavObservationModalityUrl(selectedProjectId, sceneId, selectedSensorNodeId, hid, activeModalityTab, activeRigSensorId)}
-							alt={`${hid} ${activeModalityTab}`}
-							title={`${hid} · ${activeRigSensorId || 'legacy'} · ${activeModalityTab}`}
+							src={opticalNavObservationModalityUrl(selectedProjectId, sceneId, selectedSensorNodeId, hid, visibleObservationModality, activeRigSensorId)}
+							alt={`${hid} ${visibleObservationModality}`}
+							title={`${hid} · ${activeRigSensorId || 'legacy'} · ${visibleObservationModality}`}
 							loading="lazy"
 						/>
 					{:else}
-						<div class="obs-thumb obs-thumb-empty" title={`${hid} · ${activeModalityTab} not rendered`}>
+						<div class="obs-thumb obs-thumb-empty" title={`${hid} · ${visibleObservationModality} not rendered`}>
 							<span>{parseInt(hid.replace('h_', '')) || 0}°</span>
 						</div>
 					{/if}
@@ -242,8 +364,28 @@
 				<button class="button button-subtle" onclick={onRefreshBatch}>Refresh</button>
 			</div>
 		{/if}
+		{#if perturbationEnabled}
+			<div class="render-variant-row" title="base = mirrors off · perturbed = mirrors/glass on · both = render each viewpoint twice for the eval split">
+				<span>Mirror render:</span>
+				{#each ['base', 'perturbed', 'both'] as v}
+					{@const needsStaged = v !== 'base' && !perturbedRenderReady}
+					<label class:variant-disabled={needsStaged}
+						title={needsStaged ? 'perturbed render scene이 준비되지 않음 — Sync Render Scene 필요' : ''}>
+						<input type="radio" name="render-variant" checked={renderVariant === v} disabled={needsStaged}
+							onchange={() => onSetRenderVariant?.(v as 'base' | 'perturbed' | 'both')} /> {v}</label>
+				{/each}
+			</div>
+			{#if !perturbedRenderReady}
+				<div class="render-variant-warn">
+					⚠️ perturbed 렌더 미준비 — {perturbedRenderStale
+						? 'perturbation 변경 후 Sync Render Scene을 다시 실행하세요 (perturbed XML stale).'
+						: 'perturbation 활성화 후 Sync Render Scene을 실행하세요.'}
+				</div>
+			{/if}
+		{/if}
 		<button class="button button-primary full"
-			disabled={renderingViewpoint || !selectedProjectId || !renderSceneSynced || (!(selectedSensorNode as any).isCustom && !hasGraph) || (!sceneStateText.trim() || !cameraSpecText.trim())}
+			disabled={!caps.renderSweepNode.enabled}
+			title={caps.renderSweepNode.reason}
 			onclick={onRenderViewpoint}>
 			{renderingViewpoint ? 'Sweeping...' : 'Graph Sweep · this viewpoint'}
 		</button>
@@ -251,13 +393,14 @@
 			<input type="checkbox" checked={renderMissingOnly} onchange={(e) => onSetRenderMissingOnly?.((e.currentTarget as HTMLInputElement).checked)} />
 			<span>Only missing renders</span>
 		</label>
-		<button class="button button-subtle full" disabled={loading || !selectedProjectId || !renderSceneSynced || !hasGraph} onclick={onRenderEpisodes}>
+		<div class="sensor-sweep-summary">Sweep sensors: {selectedRigSensorIds.length || 1} selected</div>
+		<button class="button button-subtle full" disabled={!caps.renderSweepAll.enabled} title={caps.renderSweepAll.reason} onclick={onRenderEpisodes}>
 			{renderMissingOnly ? 'Graph Sweep · missing only' : 'Graph Sweep · all viewpoints'}
 		</button>
 		{#if onRenderEpisodeNodes}
 			<button class="button button-subtle full"
-				disabled={loading || !selectedProjectId || !renderSceneSynced || !hasGraph || !episodeNodesAvailable}
-				title={!episodeNodesAvailable ? 'Select a graph-based episode with path nodes' : ''}
+				disabled={!caps.renderEpisodePath.enabled}
+				title={caps.renderEpisodePath.reason}
 				onclick={onRenderEpisodeNodes}>
 				{#if episodeNodesAvailable && episodePathNodeCount > 0}
 					Graph Sweep · episode path ({episodePathNodeCount}{headingsPerNode > 0 ? ` × ${headingsPerNode}` : ''} jobs)
@@ -308,7 +451,14 @@
 	</div>
 	<div class="sync-row"><span>Channel-split refs</span><span>{renderSceneStats?.channel_split_refs ?? '—'}</span></div>
 	<div class="sync-row"><span>Measured BSDFs</span><span>{renderSceneStats?.measured_bsdf_count ?? '—'}</span></div>
+	<div class="sync-row"><span>Measured candidates</span><span>{renderSceneStats?.measured_candidates ?? '—'}</span></div>
+	<div class="sync-row"><span>Default measured on</span><span>{renderSceneStats?.measured_enabled_default ?? '—'}</span></div>
+	<div class="sync-row"><span>Default suppressed</span><span>{renderSceneStats?.measured_suppressed_default ?? '—'}</span></div>
 	<div class="sync-row"><span>Analytic BSDFs</span><span>{renderSceneStats?.analytic_bsdf_count ?? '—'}</span></div>
+	<div class="sync-row"><span>Analytic polar+RGB</span><span>{renderSceneStats?.analytic_polar_rgb_count ?? '—'}</span></div>
+	<div class="sync-row" class:warn={renderSceneStats?.invalid_analytic_fallback_count > 0}>
+		<span>Invalid analytic fallback</span><span>{renderSceneStats?.invalid_analytic_fallback_count ?? '—'}</span>
+	</div>
 	<div class="sync-row"><span>Diffuse-like analytic</span><span>{renderSceneStats?.diffuse_like_bsdf_count ?? '—'}</span></div>
 	<div class="sync-row"><span>Specular analytic</span><span>{renderSceneStats?.specular_like_bsdf_count ?? '—'}</span></div>
 	<div class="sync-row"><span>Measured polarized BSDFs</span><span>{renderSceneStats?.measured_polarized_count ?? '—'}</span></div>
@@ -328,7 +478,7 @@
 	<div class="sync-row"><span>XML size</span><span>{renderSceneStats?.size_bytes != null ? Math.round(renderSceneStats.size_bytes / 1024) + ' KB' : '—'}</span></div>
 	<div class="sync-row"><span>Last sync</span><span class="mono">{renderSceneStats?.modified_at?.slice(0, 19).replace('T', ' ') ?? '—'}</span></div>
 	<div class="sync-actions">
-		<button class="button button-subtle" disabled={renderSceneStatsLoading} onclick={onRefreshStats}>
+		<button class="button button-subtle" disabled={!caps.refreshStats.enabled} title={caps.refreshStats.reason} onclick={onRefreshStats}>
 			{renderSceneStatsLoading ? 'Loading…' : 'Refresh stats'}
 		</button>
 	</div>
@@ -368,21 +518,87 @@
 			margin-bottom: 10px;
 		}
 
-	.sensor-panel .rig-sensor-card {
-			border: 1px solid var(--panel-border);
-			border-radius: var(--radius-sm);
-			background: var(--surface-1);
-			padding: 6px 8px;
+	.sensor-panel .rig-sensor-toolbar {
+			display: flex;
+			gap: 6px;
+			align-items: center;
 		}
 
-	.sensor-panel .rig-sensor-card summary {
-			cursor: pointer;
-			font-weight: 700;
+	.sensor-panel .rig-sensor-toolbar .button {
+			font-size: 11px;
+			padding: 4px 9px;
+		}
+
+	.sensor-panel .rig-sensor-list {
+			display: grid;
+			gap: 6px;
+			position: relative;
+		}
+
+	.sensor-panel .rig-sensor-card {
+			position: relative;
+		}
+
+	.sensor-panel .rig-sensor-card > button {
+			width: 100%;
+			display: flex;
+			align-items: center;
+			justify-content: space-between;
+			gap: 8px;
+			border: 1px solid var(--panel-border);
+			border-radius: var(--radius-sm);
+			background: #fff;
 			color: var(--text-primary);
+			padding: 7px 9px;
+			font-weight: 700;
+			text-align: left;
+			cursor: pointer;
+		}
+
+	.sensor-panel .rig-sensor-card > button small {
+			font-size: 10px;
+			font-weight: 600;
+			color: var(--text-muted);
+			white-space: nowrap;
+		}
+
+	.sensor-panel .rig-sensor-card > button.selected-tab {
+			background: #eff6ff;
+			color: #1d4ed8;
+			border-color: #60a5fa;
+		}
+
+	.sensor-panel .rig-sensor-card > button.active-tab {
+			background: #2563eb;
+			color: #fff;
+			border-color: #2563eb;
+		}
+
+	.sensor-panel .rig-sensor-card > button.active-tab small {
+			color: rgba(255, 255, 255, 0.86);
+		}
+
+	.sensor-panel .rig-sensor-tooltip {
+			position: absolute;
+			z-index: 30;
+			left: 8px;
+			right: 8px;
+			top: calc(100% + 6px);
+			display: none;
+			padding: 8px;
+			border: 1px solid var(--panel-border);
+			border-radius: var(--radius-md);
+			background: #fff;
+			box-shadow: var(--shadow-lg);
+		}
+
+	.sensor-panel .rig-sensor-card:hover .rig-sensor-tooltip,
+	.sensor-panel .rig-sensor-card:focus-within .rig-sensor-tooltip {
+			display: block;
 		}
 
 	.sensor-panel .rig-readonly-grid {
-			margin-top: 6px;
+			margin-top: 0;
 		}
 
 	.sensor-panel .readonly-field {
@@ -416,20 +632,11 @@
 
 	.sensor-panel .sensor-pos { font-size: 11px; color: var(--text-muted); margin-bottom: 4px; }
 
-	.sensor-panel .modality-tabs { display: flex; gap: 4px; flex-wrap: wrap; }
-
-	.sensor-panel .modality-tabs button {
-			padding: 3px 8px; font-size: 11px; border: 1px solid var(--panel-border); border-radius: var(--radius-sm);
-			background: none; cursor: pointer; color: var(--text-muted);
+	.sensor-sweep-summary {
+			font-size: 11px;
+			color: var(--text-muted);
+			padding: 0 4px 4px;
 		}
-
-	.sensor-panel .rig-derived-tabs button {
-			display: inline-flex; flex-direction: column; align-items: flex-start; gap: 2px; min-width: 112px;
-		}
-
-	.sensor-panel .rig-derived-tabs button small { font-size: 10px; opacity: 0.75; }
-
-	.sensor-panel .modality-tabs button.active-tab { background: var(--accent); color: #fff; border-color: var(--accent); }
 
 	.sensor-panel .sensor-result { display: flex; align-items: center; gap: 6px; }
 
@@ -448,6 +655,13 @@
 	.obs-heading-gallery { display: grid; grid-template-columns: repeat(4, 1fr); gap: 3px; margin: 6px 0; }
 
 	.obs-thumb { width: 100%; aspect-ratio: 4/3; object-fit: cover; border-radius: 3px; border: 1px solid var(--border); cursor: pointer; }
+	.obs-pair { display: grid; grid-template-columns: 1fr 1fr; gap: 2px; }
+	.obs-pair figure { margin: 0; position: relative; }
+	.obs-pair figcaption { position: absolute; top: 1px; left: 2px; font-size: 8px; padding: 0 3px; border-radius: 2px; background: rgba(0,0,0,0.55); color: #fff; }
+	.render-variant-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: var(--font-size-xs); margin: 4px 0; }
+	.render-variant-row label { display: inline-flex; align-items: center; gap: 2px; }
+	.render-variant-row label.variant-disabled { opacity: 0.45; cursor: not-allowed; }
+	.render-variant-warn { font-size: var(--font-size-xs); color: var(--warning, #b45309); background: var(--warning-bg, #fef3c7); border-radius: 3px; padding: 3px 6px; margin: 2px 0 6px; line-height: 1.3; }
 
 	.obs-thumb-empty { display: flex; align-items: center; justify-content: center; background: var(--surface-2, #f1f5f9); border-radius: 3px; border: 1px solid var(--border); }
 
@@ -456,6 +670,100 @@
 	.sensor-panel .full { width: 100%; }
 
 	.sensor-panel .sensor-add-bar { margin-bottom: 8px; }
+
+	.sensor-preview-card {
+			display: grid;
+			gap: 8px;
+			margin: 8px 0 12px;
+			padding: 10px;
+			border: 1px solid var(--panel-border);
+			border-radius: var(--radius-md);
+			background: var(--surface-1);
+		}
+
+	.sensor-preview-head {
+			display: flex;
+			align-items: center;
+			justify-content: space-between;
+			gap: 8px;
+		}
+
+	.sensor-preview-meta {
+			display: flex;
+			flex-wrap: wrap;
+			gap: 5px;
+			font-size: 11px;
+			color: var(--text-muted);
+		}
+
+	.polar-preview-mode-row {
+			display: grid;
+			grid-template-columns: repeat(5, minmax(0, 1fr));
+			gap: 4px;
+		}
+
+	.polar-preview-mode-row button {
+			min-width: 0;
+			border: 1px solid var(--panel-border);
+			border-radius: var(--radius-sm);
+			background: #fff;
+			color: var(--text-secondary);
+			padding: 5px 4px;
+			font-size: 10px;
+			font-weight: 700;
+			cursor: pointer;
+		}
+
+	.polar-preview-mode-row button.active {
+			border-color: #2563eb;
+			background: #2563eb;
+			color: #fff;
+		}
+
+	.sensor-preview-meta span,
+	.sensor-preview-pose {
+			padding: 2px 6px;
+			border-radius: var(--radius-sm);
+			background: #fff;
+			border: 1px solid var(--panel-border);
+		}
+
+	.sensor-preview-pose {
+			font-size: 11px;
+			color: var(--text-primary);
+			overflow-wrap: anywhere;
+		}
+
+	.sensor-preview-pose.muted {
+			color: var(--text-muted);
+		}
+
+	.band-mode-row {
+			display: grid;
+			grid-template-columns: 96px minmax(0, 1fr);
+			align-items: center;
+			gap: 8px;
+		}
+
+	.band-mode-row > span {
+			font-size: 11px;
+			color: var(--text-muted);
+			font-weight: 700;
+			white-space: nowrap;
+		}
+
+	.band-mode-row > select {
+			min-width: 0;
+			font-size: 12px;
+		}
+
+	.probe-error {
+			color: var(--danger);
+			background: var(--danger-soft);
+			padding: var(--space-2);
+			border-radius: var(--radius-sm);
+			font-size: var(--font-size-xs);
+		}
 
 	.sensor-panel .sensor-rays-row { display: flex; align-items: center; justify-content: space-between; gap: 6px; margin-bottom: 8px; }
 

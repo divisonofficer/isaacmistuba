@@ -17,6 +17,8 @@ export interface ExportJobSubmitPayload {
 	panorama_observations?: boolean;
 	png_only?: boolean;
 	include_birdseye?: boolean;
+	include_episode_birdseye?: boolean;
+	eval_perturbation?: boolean;
 }
 
 export interface ExportJobStatus {

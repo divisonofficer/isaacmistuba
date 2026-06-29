@@ -177,12 +177,15 @@ def _env_flag(name: str) -> bool:
 
 def _can_set_variant(variant: str) -> bool:
     variant = str(variant)
-    cached = _WORKING_CACHE.get(variant)
-    if cached is not None:
-        return cached
     try:
         import mitsuba as mi
 
+        cached = _WORKING_CACHE.get(variant)
+        active_variant = getattr(mi, "variant", lambda: None)()
+        if cached is True and active_variant == variant:
+            return True
+        if cached is False:
+            return False
         if getattr(mi, "variant", lambda: None)() != variant:
             mi.set_variant(variant)
     except Exception as exc:

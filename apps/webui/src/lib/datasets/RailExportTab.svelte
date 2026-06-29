@@ -2,8 +2,10 @@
 	import ExportProgressCard from './ExportProgressCard.svelte';
 	import ExportResultCard from './ExportResultCard.svelte';
 	import type { ExportJobStatus } from '$lib/datasets/services/exportJobsService';
+	import type { Capabilities } from '$lib/datasets/capabilityHelpers';
 
 	interface Props {
+		caps: Capabilities;
 		hasScene: boolean;
 		hasMap: boolean;
 		hasGraph: boolean;
@@ -27,6 +29,8 @@
 		panoramaObservations?: boolean;
 		pngOnly?: boolean;
 		includeBirdseye?: boolean;
+		includeEpisodeBirdseye?: boolean;
+		evalPerturbation?: boolean;
 		currentSceneId?: string;
 		exportableEpisodeCount?: number;
 		exportSummary?: any;
@@ -38,6 +42,7 @@
 	}
 
 	let {
+		caps,
 		hasScene, hasMap, hasGraph, hasEpisodes, validationPassed,
 		renderSceneSynced, effectiveRenderReadiness, currentScene,
 		rigSensorOptions, graphPayloadSummary, episodesCount, splitCounts,
@@ -49,6 +54,8 @@
 		panoramaObservations = $bindable(true),
 		pngOnly = $bindable(true),
 		includeBirdseye = $bindable(true),
+		includeEpisodeBirdseye = $bindable(false),
+		evalPerturbation = $bindable(false),
 		currentSceneId = '',
 		exportableEpisodeCount = 0,
 		exportSummary = null,
@@ -118,7 +125,7 @@
 			</div>
 		{/if}
 	{/if}
-	<button class="button button-subtle full mt-2" disabled={!selectedProjectId || loading} onclick={onValidate}>
+	<button class="button button-subtle full mt-2" disabled={!caps.validate.enabled} title={caps.validate.reason} onclick={onValidate}>
 		{loading ? 'Validating...' : 'Validate Dataset'}
 	</button>
 	<label class="export-filter-row">
@@ -161,6 +168,16 @@
 	</label>
 	<div class="export-filter-hint">top-down grid + graph + 경로 요약 PNG</div>
 	<label class="export-filter-row">
+		<input type="checkbox" bind:checked={includeEpisodeBirdseye} />
+		<span>Per-episode path maps</span>
+	</label>
+	<div class="export-filter-hint">episode별 경로 bird's-eye PNG (episodes_birdseye/)</div>
+	<label class="export-filter-row">
+		<input type="checkbox" bind:checked={evalPerturbation} />
+		<span>Eval perturbation pair</span>
+	</label>
+	<div class="export-filter-hint">거울/유리 변형 렌더(observations_perturbed/) 동봉 — base↔perturbed 페어 eval</div>
+	<label class="export-filter-row">
 		<input type="checkbox" bind:checked={includeThumbnails} />
 		<span>Include episode thumbnails</span>
 	</label>
@@ -171,7 +188,8 @@
 	{:else}
 		<button
 			class="button button-primary full"
-			disabled={!selectedProjectId || !hasEpisodes || loading || (onlyCompleted && exportableEpisodeCount === 0) || !currentSceneId}
+			disabled={!caps.export.enabled}
+			title={caps.export.reason}
 			onclick={onExport}
 		>
 			{loading ? 'Submitting…' : 'Export Dataset'}

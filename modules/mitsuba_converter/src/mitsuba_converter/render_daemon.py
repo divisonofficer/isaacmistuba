@@ -4,7 +4,7 @@ import base64
 from collections import deque
 import concurrent.futures
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import hashlib
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -297,6 +297,19 @@ def _safe_sort_ts(value: str | None) -> tuple[int, str]:
 
 def _read_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+# --- optical-perturbation render variants ---------------------------------- #
+# The 'perturbed' (mirrors/glass on) variant renders the SAME viewpoints into a
+# separate output tree so it coexists with 'base'. The variant is encoded in the
+# bridge-job id (-perturbed- vs -template-) and the consolidated obs dir is suffixed,
+# so base/perturbed never collide and the webui can show them split per camera.
+def _obs_subdir(variant: str | None) -> str:
+    return "observations_perturbed" if str(variant or "").lower() == "perturbed" else "observations"
+
+
+def _variant_from_job_id(job_id: str | None) -> str:
+    return "perturbed" if "-perturbed-" in str(job_id or "") else "base"
 
 
 def _load_scene_overlay_objects(scene_dir: Path) -> "list[dict[str, Any]] | None":
@@ -732,6 +745,9 @@ def _extract_obj_mtl_material(obj_path: "Path", *, repo_root: "Path | None" = No
             continue
         kd: list[float] | None = None
         map_kd: Path | None = None
+        map_pr: Path | None = None  # roughness atlas (map_Pr)
+        map_pm: Path | None = None  # metallic atlas (map_Pm)
+        map_norm: Path | None = None  # tangent normal atlas (norm / map_Bump)
         for line in mtl_text.splitlines():
             stripped = line.strip()
             if not stripped or stripped.startswith("#"):
@@ -748,6 +764,21 @@ def _extract_obj_mtl_material(obj_path: "Path", *, repo_root: "Path | None" = No
             elif key_l == "map_kd":
                 tex_value = _mtl_texture_value(raw_value)
                 map_kd = _resolve_material_asset_path(tex_value, base_dir=mtl_path.parent, repo_root=repo_root)
+            elif key_l == "map_pr":
+                map_pr = _resolve_material_asset_path(_mtl_texture_value(raw_value), base_dir=mtl_path.parent, repo_root=repo_root)
+            elif key_l == "map_pm":
+                map_pm = _resolve_material_asset_path(_mtl_texture_value(raw_value), base_dir=mtl_path.parent, repo_root=repo_root)
+            elif key_l in ("norm", "map_bump", "bump"):
+                map_norm = _resolve_material_asset_path(_mtl_texture_value(raw_value), base_dir=mtl_path.parent, repo_root=repo_root)
+        # Per-texel PBR atlases (Stage-1 --bake-pbr). Carried alongside albedo so the
+        # analytic BSDF can use texturable roughness + a normal map per object.
+        _pbr = {}
+        if map_pr is not None:
+            _pbr["roughness_texture_ref"] = str(map_pr)
+        if map_pm is not None:
+            _pbr["metallic_texture_ref"] = str(map_pm)
+        if map_norm is not None:
+            _pbr["normal_texture_ref"] = str(map_norm)
         if map_kd is not None:
             return {
                 "source": "obj_mtl",
@@ -756,6 +787,7 @@ def _extract_obj_mtl_material(obj_path: "Path", *, repo_root: "Path | None" = No
                 "roughness_factor": 0.35,
                 "metallic_factor": 0.0,
                 "mtl_ref": str(mtl_path),
+                **_pbr,
             }
         if kd is not None:
             return {
@@ -788,6 +820,7 @@ def _append_extracted_bsdf_xml(
 
     base_tex = _absolutize_texture_path(extracted_material.get("base_color_texture_ref"), repo_root)
     normal_tex = _absolutize_texture_path(extracted_material.get("normal_texture_ref"), repo_root)
+    roughness_tex = _absolutize_texture_path(extracted_material.get("roughness_texture_ref"), repo_root)
     base_factor = extracted_material.get("base_color_factor")
     roughness = extracted_material.get("roughness_factor")
     metallic = extracted_material.get("metallic_factor")
@@ -797,6 +830,18 @@ def _append_extracted_bsdf_xml(
         base_tex = None
     if normal_tex and not Path(normal_tex).exists():
         normal_tex = None
+    if roughness_tex and not Path(roughness_tex).exists():
+        roughness_tex = None
+
+    def _emit_alpha(bsdf_el: "ET.Element", scalar: float) -> None:
+        # roughplastic/pplastic/roughconductor `alpha` is texturable: prefer the
+        # per-texel baked roughness atlas (read raw — linear), else a scalar.
+        if roughness_tex:
+            tex = ET.SubElement(bsdf_el, "texture", attrib={"name": "alpha", "type": "bitmap"})
+            ET.SubElement(tex, "string", attrib={"name": "filename", "value": str(roughness_tex)})
+            ET.SubElement(tex, "boolean", attrib={"name": "raw", "value": "true"})
+        else:
+            ET.SubElement(bsdf_el, "float", attrib={"name": "alpha", "value": f"{scalar:.4f}"})
 
     has_basecolor = bool(base_tex) or (isinstance(base_factor, (list, tuple)) and len(base_factor) >= 3)
     if not has_basecolor and not normal_tex:
@@ -831,7 +876,7 @@ def _append_extracted_bsdf_xml(
         bsdf = ET.SubElement(inner_bsdf_parent, "bsdf", type="roughconductor")
         ET.SubElement(bsdf, "string", attrib={"name": "material", "value": "Al"})
         alpha = _clamp_bsdf_alpha(roughness, default=0.2, floor=_MIN_ROUGHCONDUCTOR_ALPHA)
-        ET.SubElement(bsdf, "float", attrib={"name": "alpha", "value": f"{alpha:.4f}"})
+        _emit_alpha(bsdf, alpha)
     else:
         bsdf_type = diffuse_bsdf_type if diffuse_bsdf_type in {"roughplastic", "pplastic"} else "roughplastic"
         bsdf = ET.SubElement(inner_bsdf_parent, "bsdf", type=bsdf_type)
@@ -848,26 +893,136 @@ def _append_extracted_bsdf_xml(
             ET.SubElement(bsdf, "rgb", attrib={"name": "diffuse_reflectance", "value": fallback_color})
         alpha = _clamp_bsdf_alpha(roughness, default=0.2, floor=_MIN_ROUGHPLASTIC_ALPHA)
         # pplastic's dielectric coat looks glossy at low alpha; keep diffuse surfaces
-        # matte by raising the floor (roughplastic keeps the original range).
+        # matte by raising the scalar floor (roughplastic keeps the original range).
+        # A per-texel roughness atlas, when present, supersedes the scalar entirely.
         if bsdf_type == "pplastic":
             alpha = max(0.2, alpha)
-        ET.SubElement(bsdf, "float", attrib={"name": "alpha", "value": f"{alpha:.4f}"})
+        _emit_alpha(bsdf, alpha)
     return True
+
+
+_POLAR_RGB_ANALYTIC_BSDFS = {
+    "pplastic",
+    "dielectric",
+    "roughdielectric",
+    "conductor",
+    "roughconductor",
+    "thindielectric",
+}
+
+
+def _analytic_fallback_from_binding(binding: Mapping[str, Any]) -> dict[str, Any]:
+    fallback = binding.get("analytic_fallback") if isinstance(binding.get("analytic_fallback"), Mapping) else None
+    if fallback:
+        resolved = dict(fallback)
+    else:
+        resolved = dict(binding)
+    strategy = str(resolved.get("bsdf_strategy") or "").strip().lower()
+    if strategy in {"roughplastic", "diffuse", "plastic", "principled"}:
+        strategy = "pplastic"
+    if not strategy or strategy in {"measured", "measured_polarized"}:
+        strategy = "pplastic"
+    resolved["bsdf_strategy"] = strategy
+    caps = dict(resolved.get("capabilities") or {})
+    if strategy in _POLAR_RGB_ANALYTIC_BSDFS:
+        caps.setdefault("rgb", True)
+        caps.setdefault("polarization", True)
+    resolved["capabilities"] = caps
+    return resolved
+
+
+def _measured_candidate_from_binding(binding: Mapping[str, Any]) -> dict[str, Any] | None:
+    candidate = binding.get("measured_candidate")
+    if isinstance(candidate, Mapping):
+        return dict(candidate)
+    if _binding_is_measured(dict(binding)):
+        return dict(binding)
+    return None
+
+
+def _material_policy_record(
+    *,
+    shape_id: str | None,
+    material_id: str | None,
+    binding: Mapping[str, Any],
+    extracted_material: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    if not shape_id:
+        return None
+    analytic = _analytic_fallback_from_binding(binding)
+    measured = _measured_candidate_from_binding(binding)
+    strategy = str(analytic.get("bsdf_strategy") or "").strip().lower()
+    caps = dict(analytic.get("capabilities") or {})
+    invalid = not (caps.get("rgb") and caps.get("polarization")) or strategy not in _POLAR_RGB_ANALYTIC_BSDFS
+    return {
+        "shape_id": str(shape_id),
+        "material_id": str(material_id or ""),
+        "analytic_fallback": analytic,
+        "analytic_strategy": strategy,
+        "analytic_capabilities": caps,
+        "analytic_polar_rgb": not invalid,
+        "invalid_analytic_fallback": bool(invalid),
+        "measured_candidate": measured,
+        "measured_role": str(binding.get("measured_role") or (measured or {}).get("measured_role") or "candidate"),
+        "extracted_material": dict(extracted_material or {}),
+    }
+
+
+def _build_render_scene_material_policy(
+    *,
+    scene_id: str,
+    material_policy_records: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    records = [dict(record) for record in material_policy_records if isinstance(record, Mapping)]
+    analytic_type_counts: dict[str, int] = {}
+    measured_candidates = 0
+    default_enabled = 0
+    invalid = 0
+    polar_rgb = 0
+    for record in records:
+        strategy = str(record.get("analytic_strategy") or "unknown")
+        analytic_type_counts[strategy] = analytic_type_counts.get(strategy, 0) + 1
+        if record.get("measured_candidate"):
+            measured_candidates += 1
+            if str(record.get("measured_role") or "").lower() in {"forced", "target", "anchor"} and default_enabled < 3:
+                default_enabled += 1
+        if record.get("invalid_analytic_fallback"):
+            invalid += 1
+        if record.get("analytic_polar_rgb"):
+            polar_rgb += 1
+    return {
+        "version": "robomituba-render-scene-material-policy-v1",
+        "scene_id": str(scene_id or ""),
+        "default_measured_scope": "analytic_priority",
+        "default_max_measured_bsdfs": 3,
+        "summary": {
+            "shape_policy_count": len(records),
+            "measured_candidates": int(measured_candidates),
+            "measured_enabled_default": int(default_enabled),
+            "measured_suppressed_default": max(0, int(measured_candidates) - int(default_enabled)),
+            "analytic_polar_rgb_count": int(polar_rgb),
+            "analytic_rgb_only_count": int(len(records) - polar_rgb),
+            "invalid_analytic_fallback_count": int(invalid),
+            "analytic_bsdf_type_counts": dict(sorted(analytic_type_counts.items())),
+        },
+        "shape_policies": records,
+    }
 
 
 def _resolve_material_binding(material_id: str | None, material_idx: dict[str, dict[str, Any]]) -> dict[str, Any]:
     mid = str(material_id or "").strip()
     preset_strategy = {
-        "painted_wall": "roughplastic",
+        "painted_wall": "pplastic",
         "clear_glass": "dielectric",
         "frosted_glass": "roughdielectric",
         "mirror": "conductor",
-        "wood": "roughplastic",
-        "fabric": "roughplastic",
-        "tile": "roughplastic",
-        "default_floor": "roughplastic",
-        "default_ceiling": "diffuse",
-        "default_wall": "roughplastic",
+        "wood": "pplastic",
+        "fabric": "pplastic",
+        "tile": "pplastic",
+        "plastic": "pplastic",
+        "default_floor": "pplastic",
+        "default_ceiling": "pplastic",
+        "default_wall": "pplastic",
     }
     if mid in material_idx:
         material = material_idx[mid]
@@ -894,10 +1049,10 @@ def _resolve_material_binding(material_id: str | None, material_idx: dict[str, d
         binding.setdefault("kind", "preset" if mid in preset_strategy else "curated")
         if not binding.get("bsdf_strategy"):
             kind = str(binding.get("kind") or "")
-            binding["bsdf_strategy"] = "measured_polarized" if kind in _MEASURED_KINDS else preset_strategy.get(mid, "roughplastic")
+            binding["bsdf_strategy"] = "measured_polarized" if kind in _MEASURED_KINDS else preset_strategy.get(mid, "pplastic")
         return binding
     if mid in preset_strategy or not mid:
-        return {"kind": "preset", "material_id": mid or "default", "bsdf_strategy": preset_strategy.get(mid, "roughplastic"), "capabilities": {"rgb": True}}
+        return {"kind": "preset", "material_id": mid or "default", "bsdf_strategy": preset_strategy.get(mid, "pplastic"), "capabilities": {"rgb": True, "polarization": True}}
     if ":" in mid or "/" in mid:
         sep = ":" if ":" in mid else "/"
         dataset_id, source_mid = mid.split(sep, 1)
@@ -909,7 +1064,7 @@ def _resolve_material_binding(material_id: str | None, material_idx: dict[str, d
             "capabilities": {"rgb": True, "polarization": True},
             "unresolved": True,
         }
-    return {"kind": "preset", "material_id": mid, "bsdf_strategy": "roughplastic", "unresolved": True, "capabilities": {"rgb": True}}
+    return {"kind": "preset", "material_id": mid, "bsdf_strategy": "pplastic", "unresolved": True, "capabilities": {"rgb": True, "polarization": True}}
 
 
 _BSDF_CHANNEL_PLACEHOLDER_NM = 542  # green, used when scene XML is generated outside per-modality dispatch
@@ -996,14 +1151,30 @@ def _append_bsdf_xml(
     fallback_color: str = "0.65 0.62 0.58",
     repo_root: "Path | None" = None,
     extracted_material: dict[str, Any] | None = None,
+    material_policy_records: list[dict[str, Any]] | None = None,
 ) -> None:
     import xml.etree.ElementTree as ET
 
     binding = _resolve_material_binding(material_id, material_idx)
-    strategy = str(binding.get("bsdf_strategy") or "roughplastic")
+    if material_policy_records is not None:
+        record = _material_policy_record(
+            shape_id=_maybe_str(shape.get("id")),
+            material_id=material_id,
+            binding=binding,
+            extracted_material=extracted_material,
+        )
+        if record is not None:
+            material_policy_records.append(record)
+    if isinstance(binding.get("analytic_fallback"), Mapping):
+        binding_for_xml = _analytic_fallback_from_binding(binding)
+    else:
+        binding_for_xml = binding
+    strategy = str(binding_for_xml.get("bsdf_strategy") or "pplastic").strip().lower()
+    if strategy in {"roughplastic", "diffuse", "plastic", "principled"}:
+        strategy = "pplastic"
 
-    measured_binding = _binding_is_measured(binding)
-    measured_channels_dir = _resolve_hpbrdf_channels_dir(binding, repo_root) if measured_binding else None
+    measured_binding = _binding_is_measured(binding_for_xml)
+    measured_channels_dir = _resolve_hpbrdf_channels_dir(binding_for_xml, repo_root) if measured_binding else None
 
     # Per-material branch: HPBRDF channel-split bindings keep the measured BSDF
     # and carry source albedo as ``albedo_scale``. Non-measured materials, and
@@ -1041,6 +1212,12 @@ def _append_bsdf_xml(
         bsdf = _append_twosided_child_bsdf(shape, "conductor")
         ET.SubElement(bsdf, "string", attrib={"name": "material", "value": "Al"})
         return
+    if strategy == "roughconductor":
+        bsdf = _append_twosided_child_bsdf(shape, "roughconductor")
+        ET.SubElement(bsdf, "string", attrib={"name": "material", "value": "Al"})
+        alpha = _clamp_bsdf_alpha(binding_for_xml.get("roughness"), default=0.2, floor=_MIN_ROUGHCONDUCTOR_ALPHA)
+        ET.SubElement(bsdf, "float", attrib={"name": "alpha", "value": f"{alpha:.4f}"})
+        return
     if strategy in {"measured", "measured_polarized"}:
         # Prefer channel-split single-wavelength .pbrdf (~180 MB) over the
         # monolithic raw .hpbrdf (13 GB). At per-shape staging time we don't
@@ -1048,11 +1225,11 @@ def _append_bsdf_xml(
         # wavelength placeholder; Stage 2 swaps this filename per-modality.
         chosen = None
         channels_dir = measured_channels_dir
-        src_mid = _maybe_str(binding.get("material_id"))
+        src_mid = _maybe_str(binding_for_xml.get("material_id"))
         if channels_dir:
             chosen = f"{channels_dir.rstrip('/')}/{_BSDF_CHANNEL_PLACEHOLDER_NM}.pbrdf"
         else:
-            chosen = _maybe_str(binding.get("native_file")) or _catalog_pbrdf_native_file(str(material_id or ""))
+            chosen = _maybe_str(binding_for_xml.get("native_file")) or _catalog_pbrdf_native_file(str(material_id or ""))
         if chosen:
             bsdf_type = "measured_polarized" if strategy == "measured_polarized" else "measured"
             bsdf = _append_twosided_child_bsdf(shape, bsdf_type)
@@ -1063,15 +1240,15 @@ def _append_bsdf_xml(
                     "float",
                     attrib={"name": "alpha_sample", "value": f"{_measured_alpha_sample_for_material(src_mid):.4f}"},
                 )
-            if _binding_is_measured(binding):
+            if _binding_is_measured(binding_for_xml):
                 _append_measured_albedo_scale_xml(bsdf, extracted_material, repo_root=repo_root)
             return
-        # No measured data available — fall through to roughplastic fallback.
+        # No measured data available — fall through to polarimetric analytic fallback.
     if strategy == "diffuse":
         bsdf = _append_twosided_child_bsdf(shape, "diffuse")
         ET.SubElement(bsdf, "rgb", attrib={"name": "reflectance", "value": fallback_color})
         return
-    bsdf = _append_twosided_child_bsdf(shape, "roughplastic")
+    bsdf = _append_twosided_child_bsdf(shape, "pplastic")
     ET.SubElement(bsdf, "rgb", attrib={"name": "diffuse_reflectance", "value": fallback_color})
     ET.SubElement(bsdf, "float", attrib={"name": "alpha", "value": "0.2"})
 
@@ -1763,7 +1940,10 @@ def _build_editor_preview_mesh_manifest(
         arch_kind = _preview_architecture_kind(shape_id, rec, mesh_info)
         is_architecture = bool(arch_kind)
         editor_layer = "architecture" if is_architecture else "object"
-        editor_pickable = not is_architecture
+        # Glass/windows are architecture (rendered see-through) but must stay selectable
+        # so the user can click a window to inspect whether it's actually glass. Walls /
+        # floor / ceiling / shell stay non-pickable (click-through).
+        editor_pickable = (not is_architecture) or (arch_kind == "glass")
         editor_proxy = {
             "kind": arch_kind,
             "bounds": mesh_info.get("bounds"),
@@ -2179,7 +2359,13 @@ def _materialize_glb_obj_for_overlay(
             detail_out.update({"stage": "export", "error": str(exc)})
         return None
 
-def _wall_shape_xml_element(obj: dict[str, Any], material_idx: dict[str, dict[str, Any]], *, repo_root: "Path | None" = None) -> "ET.Element | None":
+def _wall_shape_xml_element(
+    obj: dict[str, Any],
+    material_idx: dict[str, dict[str, Any]],
+    *,
+    repo_root: "Path | None" = None,
+    material_policy_records: "list[dict[str, Any]] | None" = None,
+) -> "ET.Element | None":
     """Return a Mitsuba cube <shape> element for a wall/glass overlay object, or None."""
     import math
     import xml.etree.ElementTree as ET
@@ -2215,7 +2401,14 @@ def _wall_shape_xml_element(obj: dict[str, Any], material_idx: dict[str, dict[st
         material = material or "clear_glass"
     elif obj_type == "mirror_wall" or "mirror" in material:
         material = material or "mirror"
-    _append_bsdf_xml(shape, material or "default_wall", material_idx, fallback_color=fallback, repo_root=repo_root)
+    _append_bsdf_xml(
+        shape,
+        material or "default_wall",
+        material_idx,
+        fallback_color=fallback,
+        repo_root=repo_root,
+        material_policy_records=material_policy_records,
+    )
     return shape
 
 
@@ -2228,9 +2421,10 @@ def _proxy_box_xml_element(
     mesh_resolver: "Callable[[str, str], tuple[Path, dict] | None] | None" = None,
     mesh_stats: "dict[str, int] | None" = None,
     materialization_records: "list[dict[str, Any]] | None" = None,
+    material_policy_records: "list[dict[str, Any]] | None" = None,
     scene_mesh_cache_dir: "Path | None" = None,
     scene_texture_cache_dir: "Path | None" = None,
-) -> "ET.Element | None":
+) -> "ET.Element | list[ET.Element] | None":
     """Return a Mitsuba shape (OBJ when USD mesh is available, cube otherwise).
 
     The element is placed at the authoring center using yaw/pitch/roll + translate.
@@ -2271,7 +2465,12 @@ def _proxy_box_xml_element(
         materialization_records.append(rec)
 
     if geom_type == "line":
-        elem = _wall_shape_xml_element(obj, material_idx, repo_root=repo_root)
+        elem = _wall_shape_xml_element(
+            obj,
+            material_idx,
+            repo_root=repo_root,
+            material_policy_records=material_policy_records,
+        )
         if elem is not None:
             _record("cube", "wall_line", reason=None, shape_id=elem.get("id"))
         else:
@@ -2478,6 +2677,7 @@ def _proxy_box_xml_element(
                 _append_bsdf_xml(
                     shape, selected_material or material, material_idx,
                     fallback_color=fallback, repo_root=repo_root, extracted_material=em,
+                    material_policy_records=material_policy_records,
                 )
                 shapes.append(shape)
                 if mesh_stats is not None:
@@ -2527,6 +2727,7 @@ def _proxy_box_xml_element(
             shape, material, material_idx,
             fallback_color=fallback, repo_root=repo_root,
             extracted_material=obj_extracted_material,
+            material_policy_records=material_policy_records,
         )
         if mesh_stats is not None:
             mesh_stats["mesh_attached"] = mesh_stats.get("mesh_attached", 0) + 1
@@ -2609,7 +2810,14 @@ def _proxy_box_xml_element(
         fallback = "0.7 0.6 0.4"
     elif "chair" in obj_type:
         fallback = "0.5 0.5 0.6"
-    _append_bsdf_xml(shape, material, material_idx, fallback_color=fallback, repo_root=repo_root)
+    _append_bsdf_xml(
+        shape,
+        material,
+        material_idx,
+        fallback_color=fallback,
+        repo_root=repo_root,
+        material_policy_records=material_policy_records,
+    )
     if mesh_stats is not None:
         mesh_stats["cube_fallback"] = mesh_stats.get("cube_fallback", 0) + 1
     _record(
@@ -2876,6 +3084,7 @@ def _generate_opticalnav_render_scene_xml(
     mesh_resolver: "Callable[[str, str], tuple[Path, dict] | None] | None" = None,
     mesh_stats: "dict[str, int] | None" = None,
     materialization_records: "list[dict[str, Any]] | None" = None,
+    material_policy_records: "list[dict[str, Any]] | None" = None,
 ) -> int:
     """Generate a full Mitsuba render scene from authoring_map in authoring coordinates.
 
@@ -2938,7 +3147,14 @@ def _generate_opticalnav_render_scene_xml(
         xf = ET.SubElement(s, "transform", attrib={"name": "to_world"})
         ET.SubElement(xf, "scale", x=f"{sx:.6f}", y=f"{sy:.6f}", z=f"{sz:.6f}")
         ET.SubElement(xf, "translate", x=f"{ex:.6f}", y=f"{ey:.6f}", z=f"{ez:.6f}")
-        _append_bsdf_xml(s, material_id, material_idx, fallback_color=color, repo_root=repo_root)
+        _append_bsdf_xml(
+            s,
+            material_id,
+            material_idx,
+            fallback_color=color,
+            repo_root=repo_root,
+            material_policy_records=material_policy_records,
+        )
         if emitter_radiance:
             em = ET.SubElement(s, "emitter", type="area")
             ET.SubElement(em, "rgb", attrib={"name": "radiance", "value": emitter_radiance})
@@ -3019,6 +3235,7 @@ def _generate_opticalnav_render_scene_xml(
             mesh_resolver=mesh_resolver,
             mesh_stats=mesh_stats,
             materialization_records=materialization_records,
+            material_policy_records=material_policy_records,
             scene_mesh_cache_dir=scene_mesh_cache_dir,
             scene_texture_cache_dir=scene_texture_cache_dir,
         )
@@ -3368,7 +3585,7 @@ def _bake_overlay_into_mitsuba_xml(base_xml_path: Path, overlay: dict[str, Any],
     root = tree.getroot()
     added = 0
     for obj in overlay.get("objects") or []:
-        elem = _wall_shape_xml_element(obj)
+        elem = _wall_shape_xml_element(obj, {})
         if elem is not None:
             root.append(elem)
             added += 1
@@ -4103,6 +4320,9 @@ class RenderDaemon:
         self.port = int(port)
         self.variant = variant
         self.render_fn = render_fn or render_timestep_bundle_split_lighting
+        # In-memory job store for Infinigen scene generation (polled by the webui).
+        self._infinigen_jobs: dict[str, dict[str, Any]] = {}
+        self._infinigen_jobs_lock = threading.Lock()
 
         self._condition = threading.Condition()
         self._pending: deque[str] = deque()
@@ -4118,9 +4338,18 @@ class RenderDaemon:
         # and only a touched scene is recomputed. Thread-safe (ThreadingHTTPServer).
         self._scene_summary_cache: dict[str, tuple[tuple, dict[str, Any]]] = {}
         # validate_dataset() re-parses every scene_annotation.json (a SECOND full
-        # annotation pass on top of the per-scene loop). Cache its report by a
-        # project-level fingerprint (dataset.json + all annotation stats).
+        # annotation pass on top of the per-scene loop) AND stats ~30k episode/
+        # observation paths — ~60s on the CIFS mount. It backs only the advisory
+        # `validation` field embedded in project summaries (the explicit
+        # /validate endpoint computes its own report), so the summary path
+        # NEVER blocks on it: a stale/missing report is refreshed in the
+        # background and the request returns immediately (stale or pending).
+        # Cache its report by a project-level fingerprint (dataset.json + all
+        # annotation stats); `_validate_report_inflight` dedups concurrent
+        # background refreshes (without it, every poll during the ~60s window
+        # spawns its own validate_dataset and they thrash the GIL/mount).
         self._validate_report_cache: dict[str, tuple[tuple, dict[str, Any]]] = {}
+        self._validate_report_inflight: set[str] = set()
         self._scene_summary_lock = threading.Lock()
         # TTL caches for expensive glob+deserialize operations in request handlers
         self._job_status_cache: list[Any] | None = None
@@ -4621,7 +4850,7 @@ class RenderDaemon:
                 {
                     "sensor_id": "opticalnav_right_polar",
                     "sensor_type": "polar_camera",
-                    "modalities": ["polar_rgb_preview", "dop", "aolp", "s1", "s2"],
+                    "modalities": ["polar_rgb_preview", "s1_over_s0", "s2_over_s0", "dop", "aolp", "s1", "s2"],
                     "enabled": True,
                     "mount": {"parent_frame": "base_link", "xyz_m": [0.30, 0.35, 0.72], "rpy_deg": [0.0, 0.0, -90.0]},
                     "intrinsics": dict(base_intrinsics),
@@ -4684,7 +4913,7 @@ class RenderDaemon:
         default_modalities = {
             "rgb_camera": ["rgb"],
             "nir_camera": ["nir_intensity"],
-            "polar_camera": ["polar_rgb_preview", "dop", "aolp", "s1", "s2"],
+            "polar_camera": ["polar_rgb_preview", "s1_over_s0", "s2_over_s0", "dop", "aolp", "s1", "s2"],
             "lidar_3d": ["lidar_point_cloud"],
         }
         normalized_rig_id = str(rig_id or payload.get("rig_id") or "").strip()
@@ -5951,6 +6180,7 @@ class RenderDaemon:
         render_scene_path = scene_dir / "render_scene.xml"
         render_readiness_path = scene_dir / "render_readiness.json"
         render_scene_ref: str | None = None
+        perturbed_scene_ref: str | None = None
         overlay_shape_count = 0
         generation_error: str | None = None
         mesh_extraction_stats: dict[str, int] = {}
@@ -6000,6 +6230,7 @@ class RenderDaemon:
 
             t_mesh_start = time.perf_counter()
             materialization_records: list[dict[str, Any]] = []
+            material_policy_records: list[dict[str, Any]] = []
             overlay_shape_count = _generate_opticalnav_render_scene_xml(
                 authoring_payload,
                 result.overlay,
@@ -6009,6 +6240,7 @@ class RenderDaemon:
                 mesh_resolver=_resolve_prim_obj,
                 mesh_stats=mesh_extraction_stats,
                 materialization_records=materialization_records,
+                material_policy_records=material_policy_records,
             )
             mesh_extraction_stats["extraction_time_ms"] = int((time.perf_counter() - t_mesh_start) * 1000)
             render_scene_ref = render_scene_path.relative_to(self.repo_root).as_posix()
@@ -6024,6 +6256,12 @@ class RenderDaemon:
                 repo_root=self.repo_root,
                 progress_cb=progress_cb,
                 progress_stage="stage_obj_cache",
+            )
+
+            # 'perturbed' variant: base + enabled optical-perturbation objects (eval).
+            perturbed_scene_ref = self._stage_perturbed_render_xml(
+                scene_dir, authoring_payload, result.overlay, eg_data,
+                _resolve_prim_obj, scene_mesh_cache_dir, progress_cb=progress_cb,
             )
 
             # Stage: build editor preview meshes (decimate when fast_simplification is
@@ -6059,6 +6297,16 @@ class RenderDaemon:
             # PR1: per-object materialization audit + XML scene index sidecars.
             # Both consume the records collected during XML emit and the freshly written
             # render_scene.xml, so they sit at the tail of the generation block.
+            try:
+                material_policy = _build_render_scene_material_policy(
+                    scene_id=scene_id,
+                    material_policy_records=material_policy_records,
+                )
+                (scene_dir / "render_scene_material_policy.json").write_text(
+                    json.dumps(material_policy, ensure_ascii=False, indent=2), encoding="utf-8",
+                )
+            except Exception as exc:
+                mesh_extraction_stats["material_policy_error"] = str(exc)
             try:
                 audit_payload = _build_materialization_audit(
                     scene_id=scene_id,
@@ -6107,6 +6355,7 @@ class RenderDaemon:
         sv["render_sync_mode"] = "editor_generated_xml"
         sv["base_scene_xml_ref"] = None
         sv["overlay_scene_xml_ref"] = render_scene_ref
+        sv["perturbed_scene_xml_ref"] = perturbed_scene_ref
         sv["render_readiness_ref"] = readiness_ref
         sv["environment_profile"] = authoring_payload.get("environment") or {}
         sv["camera_rig_id"] = (authoring_payload.get("camera_rig") or {}).get("rig_id")
@@ -6265,6 +6514,7 @@ class RenderDaemon:
         "select_episodes": "내보낼 episode 선택",
         "build_manifest": "index/split 작성",
         "generate_thumbnails": "에피소드 썸네일 생성",
+        "episode_birdseye": "에피소드 경로 맵 생성",
         "collect_files": "파일 수집",
         "zip_files": "파일 압축",
         "finalize": "다운로드 준비",
@@ -6320,6 +6570,8 @@ class RenderDaemon:
         png_only: bool = False,
         include_birdseye: bool = True,
         include_polarization_raw: bool = True,
+        include_episode_birdseye: bool = False,
+        eval_perturbation: bool = False,
     ) -> None:
         """Background worker — runs the 7-/8-stage scene bundle export.
 
@@ -6460,13 +6712,12 @@ class RenderDaemon:
                     thumb_dir.mkdir(parents=True, exist_ok=True)
                     vp_obs_root = project_dir / "scenes" / scene_id / "observations"
                     triplets: list[tuple[int, str, str, Path]] = []  # (step, vp, fwd_h, dst)
-                    # Five panels per step. Render convention: yaw=0 looks
-                    # +y_graph (N) and +yaw rotates CCW from above (N→W→S→E),
-                    # so the agent's LEFT corresponds to forward +90° and the
-                    # agent's RIGHT to forward -90°. Display order on the strip
-                    # is LL · L · F · R · RR (reading left-to-right matches
-                    # the agent panning their head left → right).
-                    panel_offsets = [(60, "LL"), (30, "L"), (0, "F"), (-30, "R"), (-60, "RR")]
+                    # One panel per step: the forward-facing RGB the agent looks at
+                    # while walking this step. The old 5-panel LL·L·F·R·RR montage
+                    # re-encoded five views per step into a composite sheet — slow to
+                    # build and ~5x the bytes. Render convention: yaw=0 looks +y_graph
+                    # (N) and +yaw rotates CCW from above; the forward heading is the
+                    # one snapped to the edge direction (offset 0).
                     # Build a node_id → (x, y) map from viewpoint_graph.json so
                     # we can recompute forward yaw from positions and ignore
                     # episode.path_headings (which were saved with the old,
@@ -6510,49 +6761,26 @@ class RenderDaemon:
                         available = sorted(d.name for d in vp_dir.iterdir() if d.is_dir())
                         # Snap forward to the nearest rendered heading at this vp.
                         h_fwd = _nearest_heading(int(fwd_yaw), available) or h_fwd_saved
-                        panels: list[tuple[str, Path | None, str]] = []
-                        for off, tag in panel_offsets:
-                            hid = h_fwd if off == 0 else _nearest_heading((fwd_yaw + off) % 360, available)
-                            rgb_path = (vp_dir / str(hid) / "rgb.png") if hid else None
-                            panels.append((tag, rgb_path if rgb_path and rgb_path.is_file() else None, hid or "?"))
-                        dst = thumb_dir / f"step_{str(step_idx).zfill(pad)}_yaw{str(fwd_yaw).zfill(3)}deg_{vp}.png"
-                        if _PILImage is None or not any(p[1] is not None for p in panels):
-                            if h_fwd in available:
-                                src = vp_dir / h_fwd / "rgb.png"
-                                if src.is_file():
-                                    shutil.copy2(src, dst)
-                                    triplets.append((step_idx, vp, h_fwd, dst))
+                        src = (vp_dir / str(h_fwd) / "rgb.png") if h_fwd else None
+                        if not src or not src.is_file():
                             continue
+                        dst = thumb_dir / f"step_{str(step_idx).zfill(pad)}_yaw{str(fwd_yaw).zfill(3)}deg_{vp}.png"
+                        # Downscale the forward RGB to a lightweight thumbnail (the
+                        # full-res frame already ships under observations/). Fall back
+                        # to a verbatim copy if PIL is unavailable.
                         try:
-                            # Open + immediately convert (which materialises a new image and
-                            # releases the source file handle) for the sample probe. Done in a
-                            # generator so we stop after the first usable panel.
-                            def _open_convert(path):
-                                with _PILImage.open(path) as src:
-                                    return src.convert("RGB")
-                            sample = next(_open_convert(p[1]) for p in panels if p[1])
-                            sw, sh = sample.size
-                            scale = 240 / max(sw, sh)
-                            tw, th = max(1, int(sw * scale)), max(1, int(sh * scale))
-                            bar_h = 22
-                            gap = 4
-                            sheet_w = tw * len(panels) + gap * (len(panels) - 1)
-                            sheet_h = th + bar_h
-                            sheet = _PILImage.new("RGB", (sheet_w, sheet_h), (15, 23, 42))
-                            draw = _PILDraw.Draw(sheet) if _PILDraw is not None else None
-                            x = 0
-                            for tag, p, hid in panels:
-                                if p is not None:
-                                    with _PILImage.open(p) as _src:
-                                        im = _src.convert("RGB").resize((tw, th), _PILImage.LANCZOS)
-                                    sheet.paste(im, (x, 0))
-                                if draw is not None:
-                                    yaw_lbl = (str(_heading_to_yaw(hid) or 0).zfill(3) + "°") if hid else "—"
-                                    draw.text((x + 4, th + 4), f"{tag} {yaw_lbl}", fill=(219, 234, 254))
-                                x += tw + gap
-                            if draw is not None:
-                                draw.text((4, 4), f"#{step_idx}", fill=(253, 224, 71))
-                            sheet.save(dst, optimize=True)
+                            if _PILImage is not None:
+                                with _PILImage.open(src) as _s:
+                                    im = _s.convert("RGB")
+                                scale = 320 / max(im.size)
+                                if scale < 1.0:
+                                    im = im.resize(
+                                        (max(1, int(im.width * scale)), max(1, int(im.height * scale))),
+                                        _PILImage.LANCZOS,
+                                    )
+                                im.save(dst, optimize=True)
+                            else:
+                                shutil.copy2(src, dst)
                             triplets.append((step_idx, vp, h_fwd, dst))
                         except Exception:
                             pass
@@ -6698,7 +6926,31 @@ class RenderDaemon:
                 panorama_observations=panorama_observations,
                 include_exr=not png_only,
                 include_polarization_raw=include_polarization_raw,
+                include_perturbed=eval_perturbation,
             ))
+            # Eval-perturbation paired split: ship the perturbation sidecar so a
+            # reader can join base↔perturbed observations on identical (vp, h) and
+            # knows which graph edges the glass/mirror overlay sealed.
+            perturbation_summary: dict | None = None
+            if eval_perturbation:
+                try:
+                    from navigation_dataset.optical_perturbation import (
+                        PERTURBATION_FILENAME,
+                        load_perturbation,
+                    )
+                    scene_dir = project_dir / "scenes" / scene_id
+                    pert = load_perturbation(scene_dir)
+                    if pert is not None:
+                        dst = staging / "scenes" / scene_id / PERTURBATION_FILENAME
+                        dst.parent.mkdir(parents=True, exist_ok=True)
+                        dst.write_text(json.dumps(pert, ensure_ascii=False, indent=2), encoding="utf-8")
+                        perturbation_summary = {
+                            "enabled": bool(pert.get("enabled")),
+                            "object_count": len(pert.get("objects") or []),
+                            "disabled_edge_ids": pert.get("disabled_edge_ids") or [],
+                        }
+                except Exception:
+                    pass
             bytes_total = sum(src.stat().st_size for src, _ in files)
             publish(
                 stage="collect_files",
@@ -6745,8 +6997,10 @@ class RenderDaemon:
                     last_pub = now
 
             # ── bird's-eye summary ─────────────────────────────────────────
-            # Top-down PNG of the grid + viewpoint graph + episode paths.
-            if include_birdseye:
+            # Top-down PNG of the grid + viewpoint graph + episode paths. When
+            # `include_episode_birdseye` is set, also write one per-episode map
+            # (just that episode's path) under `episodes_birdseye/<split>/`.
+            if include_birdseye or include_episode_birdseye:
                 try:
                     from navigation_dataset.birdseye import render_birdseye
                     _scene_dir = project_dir / "scenes" / scene_id
@@ -6755,13 +7009,35 @@ class RenderDaemon:
                     _vg = _scene_dir / "viewpoint_graph.json"
                     if _grid_npy.exists() and _vg.exists():
                         grid_spec = (_read_json(_grid_meta).get("grid") if _grid_meta.exists() else {}) or {}
+                        vg_payload = _read_json(_vg)
                         ep_dicts = []
+                        ep_dict_by_id: dict[str, tuple[Any, dict]] = {}
                         for _ep in kept_episodes:
                             ep_path = project_dir / "episodes" / _ep.split / f"{_ep.episode_id}.json"
                             if ep_path.is_file():
-                                ep_dicts.append(_read_json(ep_path))
-                        out_png = staging / "scenes" / scene_id / f"{scene_id}__birdseye.png"
-                        render_birdseye(_grid_npy, grid_spec, _read_json(_vg), ep_dicts, out_png, scale=4)
+                                d = _read_json(ep_path)
+                                ep_dicts.append(d)
+                                ep_dict_by_id[_ep.episode_id] = (_ep, d)
+                        if include_birdseye:
+                            out_png = staging / "scenes" / scene_id / f"{scene_id}__birdseye.png"
+                            render_birdseye(_grid_npy, grid_spec, vg_payload, ep_dicts, out_png, scale=4)
+                        if include_episode_birdseye and ep_dict_by_id:
+                            publish(
+                                stage="episode_birdseye",
+                                current=0,
+                                total=len(ep_dict_by_id),
+                                message="rendering per-episode path maps",
+                            )
+                            for _ei, (_ep, d) in enumerate(ep_dict_by_id.values()):
+                                check_cancel()
+                                ep_png = staging / "episodes_birdseye" / _ep.split / f"{_ep.episode_id}.png"
+                                render_birdseye(_grid_npy, grid_spec, vg_payload, [d], ep_png, scale=4)
+                                publish(
+                                    stage="episode_birdseye",
+                                    current=_ei + 1,
+                                    total=len(ep_dict_by_id),
+                                    message=_ep.episode_id,
+                                )
                 except Exception:
                     pass  # best-effort summary; never fail the export over it
 
@@ -6808,6 +7084,9 @@ class RenderDaemon:
                 "scene_id": scene_id,
                 "only_completed": only_completed,
                 "include_episode_thumbnails": include_episode_thumbnails,
+                "include_episode_birdseye": include_episode_birdseye,
+                "eval_perturbation": eval_perturbation,
+                "perturbation": perturbation_summary,
                 "episodes_total_in_scope": len(scene_paths),
                 "episodes_exported": episodes_kept,
                 "episodes_skipped": episodes_skipped,
@@ -7335,20 +7614,51 @@ class RenderDaemon:
             + (self._stat_sig(dataset_path),)
 
     def _cached_validation_report(self, project_dir: Path, dataset_path: Path) -> dict[str, Any]:
+        """Non-blocking validation report for project summaries.
+
+        validate_dataset() costs ~60s (it stats ~30k episode/observation paths on
+        the CIFS mount), so the summary path must never wait on it. We return the
+        cached report if fresh, otherwise return whatever stale report we have (or
+        a `pending` placeholder) and refresh in the background — deduped so concurrent
+        summary requests don't each launch their own validate_dataset.
+        """
         fingerprint = (self._stat_sig(dataset_path),) + tuple(
             self._stat_sig(p) for p in sorted((project_dir / "scenes").glob("*/scene_annotation.json"))
         )
         cache_key = str(project_dir)
         with self._scene_summary_lock:
             cached = self._validate_report_cache.get(cache_key)
-        if cached is not None and cached[0] == fingerprint:
-            return cached[1]
-        from navigation_dataset.validation import validate_dataset
+            if cached is not None and cached[0] == fingerprint:
+                return cached[1]
+            # Stale or missing → schedule a background refresh (once per project).
+            start_refresh = cache_key not in self._validate_report_inflight
+            if start_refresh:
+                self._validate_report_inflight.add(cache_key)
+        if start_refresh:
+            threading.Thread(
+                target=self._refresh_validation_report,
+                args=(project_dir, cache_key, fingerprint),
+                name=f"validate-{project_dir.name}",
+                daemon=True,
+            ).start()
+        if cached is not None:
+            # Serve the previous (stale) report while the refresh runs.
+            return {**cached[1], "stale": True}
+        return {"ok": None, "status": "pending", "errors": [], "warnings": []}
 
-        report = validate_dataset(project_dir, require_observations=False).to_payload()
-        with self._scene_summary_lock:
-            self._validate_report_cache[cache_key] = (fingerprint, report)
-        return report
+    def _refresh_validation_report(self, project_dir: Path, cache_key: str, fingerprint: tuple) -> None:
+        try:
+            from navigation_dataset.validation import validate_dataset
+
+            report = validate_dataset(project_dir, require_observations=False).to_payload()
+            with self._scene_summary_lock:
+                self._validate_report_cache[cache_key] = (fingerprint, report)
+        except Exception:
+            # Leave any prior cache entry in place; next request reschedules.
+            pass
+        finally:
+            with self._scene_summary_lock:
+                self._validate_report_inflight.discard(cache_key)
 
     def _opticalnav_project_summary(self, project_dir: Path) -> dict[str, Any]:
         dataset_path = project_dir / "dataset.json"
@@ -8980,7 +9290,18 @@ class RenderDaemon:
         if saved_rc.exists():
             return {**_read_json(saved_rc), "source": "saved"}
 
-        # Priority 2: editor-generated scene_variant.json refs. This is the default
+        # Priority 2: direct editor-generated render_scene.xml. Some imported
+        # scenes can have a valid synced XML without a compact scene_variant ref;
+        # rendering should not require a separately saved render_config.json.
+        direct_xml = scene_dir / "render_scene.xml"
+        if direct_xml.exists():
+            try:
+                ref = direct_xml.relative_to(self.repo_root).as_posix()
+            except ValueError:
+                ref = str(direct_xml)
+            return _make_scene_state(ref, "editor_generated_xml")
+
+        # Priority 3: editor-generated scene_variant.json refs. This is the default
         # UI render path and must win over MooreLane/catalog preview fallback.
         sv_path = scene_dir / "scene_variant.json"
         if sv_path.exists():
@@ -8992,7 +9313,7 @@ class RenderDaemon:
                     state["scene_variant"] = sv
                     return state
 
-        # Priority 3: Isaac catalog strict match. This is now legacy/debug fallback;
+        # Priority 4: Isaac catalog strict match. This is now legacy/debug fallback;
         # graph sweep itself refuses catalog fallback unless a generated XML exists.
         catalog_entry = self._strict_catalog_match(project_dir, scene_id)
         if catalog_entry is not None:
@@ -9019,7 +9340,7 @@ class RenderDaemon:
                 "camera_spec": camera_spec,
             }
 
-        # Priority 4: legacy scene_variant refs (older non-catalog scenes only).
+        # Priority 5: legacy scene_variant refs (older non-catalog scenes only).
         sv_path = scene_dir / "scene_variant.json"
         if sv_path.exists():
             sv = _read_json(sv_path)
@@ -9028,7 +9349,7 @@ class RenderDaemon:
                 if ref and resolve_repo_path(self.repo_root, ref).exists():
                     return _make_scene_state(ref, "scene_variant")
 
-        # Priority 5: hand-crafted base_scene.xml (non-catalog scenes like cornell_box)
+        # Priority 6: hand-crafted base_scene.xml (non-catalog scenes like cornell_box)
         candidate = scene_dir / "base_scene.xml"
         if candidate.exists():
             try:
@@ -9327,6 +9648,41 @@ class RenderDaemon:
     def _opticalnav_mesh_cache_dir(self, project_dir: Path, scene_id: str) -> Path:
         return project_dir / "scenes" / scene_id / "mesh_cache"
 
+    def _stage_perturbed_render_xml(self, scene_dir: Path, authoring_payload: dict[str, Any],
+                                    base_overlay: dict[str, Any] | None, eg_data: Any,
+                                    mesh_resolver: Any, scene_mesh_cache_dir: Path,
+                                    progress_cb: Any = None) -> str | None:
+        """Stage a SECOND render-scene XML = base overlay + the enabled optical
+        perturbation objects (mirrors/glass), so the same scene can be rendered with
+        them ('perturbed' variant) vs without ('base'). Returns the perturbed render
+        ref, or None when there is no enabled perturbation overlay."""
+        try:
+            from navigation_dataset.optical_perturbation import load_perturbation
+        except Exception:
+            return None
+        pert = load_perturbation(scene_dir)
+        if not (isinstance(pert, dict) and pert.get("enabled") and pert.get("objects")):
+            return None
+        merged = dict(base_overlay or {})
+        merged["objects"] = list((base_overlay or {}).get("objects") or []) + list(pert.get("objects") or [])
+        perturbed_path = scene_dir / "render_scene_perturbed.xml"
+        try:
+            _generate_opticalnav_render_scene_xml(
+                authoring_payload, merged, perturbed_path,
+                editor_geometry=eg_data, repo_root=self.repo_root,
+                mesh_resolver=mesh_resolver, mesh_stats={},
+                materialization_records=[], material_policy_records=[],
+            )
+            _stage_xml_obj_filenames_to_scene_mesh_cache(
+                perturbed_path, scene_mesh_cache_dir=scene_mesh_cache_dir,
+                repo_root=self.repo_root, progress_cb=progress_cb,
+                progress_stage="stage_obj_cache_perturbed",
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._push_debug_event("warn", f"perturbed render XML generation failed: {exc}")
+            return None
+        return perturbed_path.relative_to(self.repo_root).as_posix()
+
     def _opticalnav_texture_cache_dir(self, project_dir: Path, scene_id: str) -> Path:
         return project_dir / "scenes" / scene_id / "texture_cache"
 
@@ -9539,7 +9895,8 @@ class RenderDaemon:
 
     def _opticalnav_render_scene_stats(self, project_dir: Path, scene_id: str) -> dict[str, Any]:
         """Quick counts from render_scene.xml so the Sync Inspector can diff against the editor state."""
-        xml_path = project_dir / "scenes" / scene_id / "render_scene.xml"
+        scene_dir = project_dir / "scenes" / scene_id
+        xml_path = scene_dir / "render_scene.xml"
         if not xml_path.exists():
             return {"exists": False, "scene_id": scene_id}
         try:
@@ -9593,6 +9950,56 @@ class RenderDaemon:
             }
         except Exception as exc:  # noqa: BLE001 - stats endpoint should remain best-effort
             bsdf_stats = {"bsdf_parse_error": str(exc)}
+        material_policy_stats: dict[str, Any] = {}
+        policy_path = scene_dir / "render_scene_material_policy.json"
+        if policy_path.exists():
+            try:
+                policy = _read_json(policy_path)
+                summary = dict(policy.get("summary") or {})
+                material_policy_stats = {
+                    "material_policy_ref": policy_path.relative_to(self.repo_root).as_posix(),
+                    "measured_scope_default": str(policy.get("default_measured_scope") or "analytic_priority"),
+                    "max_measured_bsdfs_default": int(policy.get("default_max_measured_bsdfs") or 3),
+                    "measured_candidates": int(summary.get("measured_candidates", 0) or 0),
+                    "measured_enabled_default": int(summary.get("measured_enabled_default", 0) or 0),
+                    "measured_suppressed_default": int(summary.get("measured_suppressed_default", 0) or 0),
+                    "analytic_polar_rgb_count": int(summary.get("analytic_polar_rgb_count", 0) or 0),
+                    "analytic_rgb_only_count": int(summary.get("analytic_rgb_only_count", 0) or 0),
+                    "invalid_analytic_fallback_count": int(summary.get("invalid_analytic_fallback_count", 0) or 0),
+                    "material_policy_analytic_bsdf_type_counts": dict(summary.get("analytic_bsdf_type_counts") or {}),
+                }
+            except Exception as exc:  # noqa: BLE001
+                material_policy_stats = {"material_policy_error": str(exc)}
+        # Infinigen PBR-bake status: read the import's scene_manifest.json (linked via
+        # authoring_map metadata.import_root) and count units with baked roughness/
+        # normal/metallic atlases, so the editor can show whether --bake-pbr ran and
+        # offer the re-bake command (source_blend).
+        pbr_bake_stats: dict[str, Any] = {}
+        try:
+            auth_map = _read_json(scene_dir / "authoring_map.json")
+            meta = dict((auth_map or {}).get("metadata") or {})
+            import_root = _maybe_str(meta.get("import_root"))
+            if import_root:
+                manifest = _read_json(self.repo_root / import_root / "scene_manifest.json")
+                units = list((manifest or {}).get("units") or [])
+                meshes = [u for u in units if u.get("mesh_obj")]
+                n = len(meshes)
+                rc = sum(1 for u in meshes if u.get("baked_roughness"))
+                nc = sum(1 for u in meshes if u.get("baked_normal"))
+                mc = sum(1 for u in meshes if u.get("baked_metallic"))
+                ac = sum(1 for u in meshes if u.get("baked_albedo"))
+                pbr_bake_stats = {
+                    "infinigen_import_root": import_root,
+                    "infinigen_source_blend": _maybe_str((manifest or {}).get("source_blend")),
+                    "infinigen_unit_count": int(n),
+                    "pbr_baked_albedo_count": int(ac),
+                    "pbr_baked_roughness_count": int(rc),
+                    "pbr_baked_normal_count": int(nc),
+                    "pbr_baked_metallic_count": int(mc),
+                    "pbr_baked": bool(rc > 0 or nc > 0 or mc > 0),
+                }
+        except Exception:  # noqa: BLE001 - best-effort status only
+            pbr_bake_stats = {}
         return {
             "exists": True,
             "scene_id": scene_id,
@@ -9608,6 +10015,8 @@ class RenderDaemon:
             "shared_bsdf_count": text.count("<bsdf type=") - text.count("shape><bsdf"),
             "measured_polarized_count": text.count('<bsdf type="measured_polarized"'),
             **bsdf_stats,
+            **material_policy_stats,
+            **pbr_bake_stats,
             "channel_split_refs": text.count("data/hpbrdf_2025/channels/"),
             "raw_hpbrdf_refs": text.count(".hpbrdf\""),
         }
@@ -9621,11 +10030,12 @@ class RenderDaemon:
         modality: str,
         *,
         sensor_id: str | None = None,
+        variant: str = "base",
     ) -> bytes | None:
         filename = self._OPTICALNAV_OBS_PNG_FILENAMES.get(modality)
         if not filename:
             return None
-        heading_dir = project_dir / "scenes" / scene_id / "observations" / vp_id / heading_id
+        heading_dir = project_dir / "scenes" / scene_id / _obs_subdir(variant) / vp_id / heading_id
         if sensor_id:
             path = heading_dir / "sensors" / sensor_id / filename
             if path.exists():
@@ -9643,20 +10053,60 @@ class RenderDaemon:
             return path.read_bytes()
         return None
 
-    def _opticalnav_render_batch_payload(self, project_dir: Path, batch_id: str) -> dict[str, Any]:
-        batch_path = project_dir / "render_batches" / f"{batch_id}.json"
-        if not batch_path.exists():
-            raise KeyError(batch_id)
-        batch = _read_json(batch_path)
+    @staticmethod
+    def _normalize_batch_job_state(value: Any) -> str:
+        state = str(value or "unknown").lower()
+        if state in {"succeeded", "completed", "complete", "done", "success"}:
+            return "completed"
+        if state in {"running", "rendering"}:
+            return "running"
+        if state in {"queued", "pending", "dispatched", "retry_queued"}:
+            return "queued"
+        if state in {"failed", "error"}:
+            return "failed"
+        if state in {"cancelled", "canceled"}:
+            return "cancelled"
+        return "unknown"
+
+    def _status_is_stale_for_batch(self, batch: Mapping[str, Any], status: Mapping[str, Any]) -> bool:
+        state = self._normalize_batch_job_state(status.get("status"))
+        if state not in {"completed", "failed", "cancelled"}:
+            return False
+        batch_dt = self._parse_iso_timestamp(_maybe_str(batch.get("created_at")))
+        if batch_dt is None:
+            return False
+        status_dt = None
+        for key in ("finished_at", "completed_at", "worker_started_at", "started_at", "submitted_at"):
+            status_dt = self._parse_iso_timestamp(_maybe_str(status.get(key)))
+            if status_dt is not None:
+                break
+        if status_dt is None:
+            return False
+        return status_dt < (batch_dt - timedelta(seconds=30))
+
+    def _batch_status_for_job(self, batch: Mapping[str, Any], job_id: str) -> dict[str, Any]:
+        try:
+            status = render_job_status_to_payload(self.get_status(job_id))
+        except Exception:
+            return {"job_id": job_id, "status": "unknown"}
+        if self._status_is_stale_for_batch(batch, status):
+            return {
+                "job_id": job_id,
+                "status": "queued",
+                "progress_stage": "queued",
+                "stale_previous_status": status.get("status"),
+                "stale_previous_finished_at": status.get("finished_at"),
+                "stale_batch_created_at": batch.get("created_at"),
+            }
+        return status
+
+    def _batch_payload_with_statuses(self, batch: Mapping[str, Any]) -> dict[str, Any]:
         jobs = []
         counts = {"queued": 0, "running": 0, "completed": 0, "failed": 0, "cancelled": 0, "unknown": 0}
         for item in batch.get("jobs", []):
             job_id = str(item.get("job_id") or "")
-            try:
-                status = render_job_status_to_payload(self.get_status(job_id))
-            except Exception:
-                status = {"job_id": job_id, "status": "unknown"}
-            state = str(status.get("status") or "unknown")
+            status = self._batch_status_for_job(batch, job_id)
+            state = self._normalize_batch_job_state(status.get("status"))
             counts[state] = counts.get(state, 0) + 1
             jobs.append({**item, "status": status})
         total = max(1, len(jobs))
@@ -9672,34 +10122,17 @@ class RenderDaemon:
             },
         }
 
+    def _opticalnav_render_batch_payload(self, project_dir: Path, batch_id: str) -> dict[str, Any]:
+        batch_path = project_dir / "render_batches" / f"{batch_id}.json"
+        if not batch_path.exists():
+            raise KeyError(batch_id)
+        return self._batch_payload_with_statuses(_read_json(batch_path))
+
     def _opticalnav_graph_batch_payload(self, project_dir: Path, batch_id: str) -> dict[str, Any]:
         batch_path = project_dir / "graph_render_batches" / f"{batch_id}.json"
         if not batch_path.exists():
             raise KeyError(batch_id)
-        batch = _read_json(batch_path)
-        jobs = []
-        counts = {"queued": 0, "running": 0, "completed": 0, "failed": 0, "cancelled": 0, "unknown": 0}
-        for item in batch.get("jobs", []):
-            job_id = str(item.get("job_id") or "")
-            try:
-                status = render_job_status_to_payload(self.get_status(job_id))
-            except Exception:
-                status = {"job_id": job_id, "status": "unknown"}
-            state = str(status.get("status") or "unknown")
-            counts[state] = counts.get(state, 0) + 1
-            jobs.append({**item, "status": status})
-        total = max(1, len(jobs))
-        return {
-            **batch,
-            "jobs": jobs,
-            "counts": counts,
-            "progress": {
-                "completed": counts.get("completed", 0),
-                "failed": counts.get("failed", 0),
-                "total": len(jobs),
-                "fraction": (counts.get("completed", 0) + counts.get("failed", 0)) / total,
-            },
-        }
+        return self._batch_payload_with_statuses(_read_json(batch_path))
 
     # --- OpticalNav Agent API helpers ---
 
@@ -9902,6 +10335,20 @@ class RenderDaemon:
         if len(parts) == 1:
             self._send_json(handler, HTTPStatus.OK, self._opticalnav_project_summary(project_dir))
             return True
+        if len(parts) == 2 and parts[1] == "infinigen-generate":
+            with self._infinigen_jobs_lock:
+                jobs = [dict(v) for v in self._infinigen_jobs.values() if v.get("project_id") == parts[0]]
+            jobs.sort(key=lambda j: str(j.get("created_at") or ""), reverse=True)
+            self._send_json(handler, HTTPStatus.OK, {"project_id": parts[0], "jobs": jobs[:20]})
+            return True
+        if len(parts) == 3 and parts[1] == "infinigen-generate":
+            with self._infinigen_jobs_lock:
+                state = dict(self._infinigen_jobs.get(parts[2]) or {})
+            if not state:
+                self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": f"Unknown infinigen job: {parts[2]}"})
+                return True
+            self._send_json(handler, HTTPStatus.OK, state)
+            return True
         if len(parts) == 2 and parts[1] == "map-assets":
             readiness_index = self._load_asset_readiness_index()
             assets = [
@@ -9940,6 +10387,35 @@ class RenderDaemon:
                 self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": "scene_annotation.json not found"})
                 return True
             self._send_json(handler, HTTPStatus.OK, _read_json(annotation_path))
+            return True
+        if len(parts) == 4 and parts[1] == "scenes" and parts[3] == "optical-perturbation":
+            from navigation_dataset.optical_perturbation import load_perturbation, perturbation_path
+            scene_dir = project_dir / "scenes" / parts[2]
+            pert = load_perturbation(scene_dir)
+            payload = dict(pert) if pert is not None else {"exists": False, "objects": []}
+            # Perturbed-render readiness: a 'perturbed' sweep needs the perturbed XML
+            # staged (scene_variant.perturbed_scene_xml_ref). Report whether it is
+            # present and whether the perturbation was edited *after* the last sync
+            # (stale → re-sync required) so the UI can gate the variant selector
+            # instead of silently rendering the base scene.
+            perturbed_ready = False
+            perturbed_stale = False
+            try:
+                sv_path = scene_dir / "scene_variant.json"
+                if sv_path.exists():
+                    sv = _read_json(sv_path)
+                    ref = _maybe_str(sv.get("perturbed_scene_xml_ref"))
+                    xml = resolve_repo_path(self.repo_root, ref) if ref else None
+                    if xml is not None and xml.exists():
+                        perturbed_ready = True
+                        pert_file = perturbation_path(scene_dir)
+                        if pert_file.is_file() and pert_file.stat().st_mtime > xml.stat().st_mtime:
+                            perturbed_stale = True
+            except Exception:
+                pass
+            payload["perturbed_render_ready"] = bool(perturbed_ready and not perturbed_stale)
+            payload["perturbed_render_stale"] = bool(perturbed_stale)
+            self._send_json(handler, HTTPStatus.OK, payload)
             return True
         if len(parts) == 4 and parts[1] == "scenes" and parts[3] == "authoring-map":
             from navigation_dataset.authoring_map import authoring_map_to_payload, load_authoring_map, starter_authoring_map
@@ -10474,10 +10950,11 @@ class RenderDaemon:
             modality = parts[5]
             heading_id = _maybe_str((query.get("heading") or [None])[0]) or ""
             sensor_id = _maybe_str((query.get("sensor_id") or [None])[0])
+            variant = _maybe_str((query.get("variant") or [None])[0]) or "base"
             if not heading_id:
                 self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": "heading query param required"})
                 return True
-            png_bytes = self._opticalnav_observation_modality_png(project_dir, scene_id, vp_id, heading_id, modality, sensor_id=sensor_id)
+            png_bytes = self._opticalnav_observation_modality_png(project_dir, scene_id, vp_id, heading_id, modality, sensor_id=sensor_id, variant=variant)
             if png_bytes is None:
                 suffix = f" for sensor_id={sensor_id}" if sensor_id else ""
                 self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": f"{modality} preview not found{suffix}"})
@@ -10697,6 +11174,74 @@ class RenderDaemon:
             return True
         return False
 
+    _INFINIGEN_ARCHETYPES = ("apartment", "office")
+    _INFINIGEN_DENSITIES = ("model_house", "normal_lived_in", "family_home", "storage_heavy")
+    _INFINIGEN_STAGES = ("full", "layout")
+
+    def _infinigen_set_job(self, job_id: str, **updates: Any) -> dict[str, Any]:
+        with self._infinigen_jobs_lock:
+            state = dict(self._infinigen_jobs.get(job_id) or {})
+            state.update(updates)
+            state["updated_at"] = _utc_now_iso()
+            self._infinigen_jobs[job_id] = state
+        return state
+
+    def _infinigen_append_log(self, job_id: str, line: str, cap: int = 400) -> None:
+        with self._infinigen_jobs_lock:
+            state = dict(self._infinigen_jobs.get(job_id) or {})
+            log = list(state.get("log") or [])
+            log.append(line)
+            if len(log) > cap:
+                log = log[-cap:]
+            state["log"] = log
+            state["message"] = line
+            state["updated_at"] = _utc_now_iso()
+            self._infinigen_jobs[job_id] = state
+
+    def _run_infinigen_generate_job(self, job_id: str, params: Mapping[str, Any]) -> None:
+        """Background worker: run scripts/infinigen_wizard.py (generate [+ import])
+        non-interactively, streaming its stdout into the polled job log."""
+        import subprocess
+
+        repo = self.repo_root
+        wizard = repo / "scripts" / "infinigen_wizard.py"
+        cmd = [
+            sys.executable, str(wizard),
+            "--archetype", str(params["archetype"]),
+            "--density", str(params["density"]),
+            "--stage", str(params["stage"]),
+            "--seed", str(params["seed"]),
+            "--scene-id", str(params["scene_id"]),
+            "--import" if params.get("do_import", True) else "--no-import",
+            "--yes",
+        ]
+        if params.get("bake_pbr"):
+            cmd.append("--bake-pbr")
+        self._infinigen_set_job(job_id, status="running", stage="generating",
+                                command=" ".join(cmd))
+        try:
+            proc = subprocess.Popen(
+                cmd, cwd=str(repo), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1, env=dict(os.environ),
+            )
+            assert proc.stdout is not None
+            for raw in proc.stdout:
+                line = raw.rstrip("\n")
+                if not line.strip():
+                    continue
+                if "run_infinigen_import.sh" in line or "[Stage 1" in line or "Stage 2" in line:
+                    self._infinigen_set_job(job_id, stage="importing")
+                self._infinigen_append_log(job_id, line)
+            rc = proc.wait()
+        except Exception as exc:  # noqa: BLE001
+            self._infinigen_set_job(job_id, status="failed", stage="error", error=str(exc))
+            return
+        if rc == 0:
+            self._infinigen_set_job(job_id, status="succeeded", stage="done", returncode=0)
+        else:
+            self._infinigen_set_job(job_id, status="failed", stage="error",
+                                    returncode=rc, error=f"exit code {rc}")
+
     def _handle_opticalnav_post(self, handler: BaseHTTPRequestHandler, path: str, payload: Mapping[str, Any]) -> bool:
         if path == "/api/opticalnav/asset-library/import":
             usd_ref = _maybe_str(payload.get("usd_ref") or payload.get("source_ref") or payload.get("glb_ref"))
@@ -10770,6 +11315,48 @@ class RenderDaemon:
         if not project_dir.exists():
             self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": f"Unknown OpticalNav project_id: {parts[0]}"})
             return True
+        if len(parts) == 2 and parts[1] == "infinigen-generate":
+            import random
+
+            archetype = str(payload.get("archetype") or "apartment")
+            density = str(payload.get("density") or "normal_lived_in")
+            stage = str(payload.get("stage") or "full")
+            seed_in = (str(payload.get("seed") or "today").strip() or "today")
+            do_import = self._coerce_bool(payload.get("import_scene", payload.get("do_import", True)), True)
+            bake_pbr = self._coerce_bool(payload.get("bake_pbr"), False)
+            if archetype not in self._INFINIGEN_ARCHETYPES:
+                self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": f"archetype must be one of {list(self._INFINIGEN_ARCHETYPES)}"})
+                return True
+            if density not in self._INFINIGEN_DENSITIES:
+                self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": f"density must be one of {list(self._INFINIGEN_DENSITIES)}"})
+                return True
+            if stage not in self._INFINIGEN_STAGES:
+                self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": f"stage must be one of {list(self._INFINIGEN_STAGES)}"})
+                return True
+            if seed_in not in ("today", "random") and not (seed_in.isdigit() and len(seed_in) == 8):
+                self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": "seed must be 8 digits, 'today', or 'random'"})
+                return True
+            if seed_in == "today":
+                seed = _utc_now().strftime("%Y%m%d")
+            elif seed_in == "random":
+                seed = f"{random.randint(0, 99999999):08d}"
+            else:
+                seed = seed_in
+            scene_id = _maybe_str(payload.get("scene_id")) or f"infinigen_{archetype}_{seed}"
+            job_id = f"infinigen-{_utc_now().strftime('%Y%m%dT%H%M%S%f')}-{hashlib.sha1(scene_id.encode()).hexdigest()[:6]}"
+            params = {"archetype": archetype, "density": density, "stage": stage,
+                      "seed": seed, "scene_id": scene_id, "do_import": do_import, "bake_pbr": bake_pbr}
+            self._infinigen_set_job(
+                job_id, job_id=job_id, project_id=parts[0], status="queued", stage="queued",
+                params=params, scene_id=scene_id, seed=seed, created_at=_utc_now_iso(), log=[],
+            )
+            threading.Thread(target=self._run_infinigen_generate_job, args=(job_id, params),
+                             name=f"infinigen-{job_id}", daemon=True).start()
+            self._send_json(handler, HTTPStatus.ACCEPTED, {
+                "ok": True, "job_id": job_id, "scene_id": scene_id, "seed": seed,
+                "poll_url": f"/api/opticalnav/projects/{parts[0]}/infinigen-generate/{job_id}",
+            })
+            return True
         if len(parts) == 2 and parts[1] == "scenes":
             from navigation_dataset.episode_schema import read_project, write_project
 
@@ -10840,6 +11427,36 @@ class RenderDaemon:
                 "size_bytes": len(blob),
                 "content_type": payload.get("content_type") or mimetypes.guess_type(out_path.name)[0] or "application/octet-stream",
             })
+            return True
+        if len(parts) == 4 and parts[1] == "scenes" and parts[3] == "optical-perturbation":
+            from navigation_dataset.optical_perturbation import (
+                build_optical_perturbation, load_perturbation, perturbation_path)
+            scene_id = parts[2]
+            scene_dir = project_dir / "scenes" / scene_id
+            if not (scene_dir / "authoring_map.json").exists():
+                self._send_json(handler, HTTPStatus.BAD_REQUEST,
+                                {"error": "authoring_map.json is required before placing perturbations."})
+                return True
+            body = payload if isinstance(payload, dict) else {}
+            action = str(body.get("action") or "generate")
+            if action == "set_enabled":
+                pert = load_perturbation(scene_dir)
+                if pert is None:
+                    self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": "no perturbation overlay to toggle"})
+                    return True
+                pert["enabled"] = bool(body.get("enabled", True))
+                perturbation_path(scene_dir).write_text(
+                    json.dumps(pert, ensure_ascii=False, indent=2), encoding="utf-8")
+                self._send_json(handler, HTTPStatus.OK, pert)
+                return True
+            pert = build_optical_perturbation(
+                scene_dir,
+                seed=int(body.get("seed", 0) or 0),
+                enabled=bool(body.get("enabled", True)),
+                mirror_density=float(body.get("mirror_density", 1.0) or 1.0),
+                max_glass_walls=int(body.get("max_glass_walls", 2) or 2),
+            )
+            self._send_json(handler, HTTPStatus.OK, pert)
             return True
         if len(parts) == 5 and parts[1] == "scenes" and parts[3] == "sync" and parts[4] == "render-scene":
             scene_id = parts[2]
@@ -11058,6 +11675,7 @@ class RenderDaemon:
                     min_node_spacing_m=float(payload.get("min_node_spacing_m", 0.5)),
                     min_clearance_m=(float(_mc) if _mc not in (None, 0, 0.0) else None),
                     camera_margin_m=float(payload.get("camera_margin_m", 0.10)),
+                    doorway_gap_m=float(payload.get("doorway_gap_m", 0.45)),
                     max_nodes=int(payload.get("max_nodes", 300)),
                     k_neighbors=int(payload.get("k_neighbors", 8)),
                     max_edge_length_m=float(payload.get("max_edge_length_m", 1.5)),
@@ -11119,13 +11737,13 @@ class RenderDaemon:
             return True
         if len(parts) == 5 and parts[1] == "scenes" and parts[3] == "graph" and parts[4] == "rebuild-edges":
             # Re-run edge building over the CURRENT node set (auto + manual nodes
-            # preserved, NOT resampled) on a footprint-masked grid. This connects
-            # manually-added nodes and drops edges that now cross glass/furniture,
-            # without discarding the user's hand-placed nodes.
-            from navigation_dataset.edge_builder import build_viewpoint_edges, graph_summary
-            from navigation_dataset.traversability import build_traversability_grid, load_traversability_grid
+            # preserved, NOT resampled). Delegates to graph_pipeline.rebuild_viewpoint_edges
+            # so this shares the SAME mesh-aware clearance grid + portal bridges +
+            # connectivity repair as the build_graph handler. Previously this re-derived
+            # a smaller annotation grid and eroded it a second time, collapsing dense
+            # graphs (~339 edges) down to a few dozen and fragmenting the map.
+            from navigation_dataset.graph_pipeline import rebuild_viewpoint_edges
             from navigation_dataset.viewpoint_graph import read_viewpoint_graph, write_viewpoint_graph
-            from navigation_dataset.walkability_overlay import load_overlay as _load_walk_overlay
 
             scene_id = parts[2]
             scene_dir = project_dir / "scenes" / scene_id
@@ -11139,38 +11757,26 @@ class RenderDaemon:
             try:
                 graph = read_viewpoint_graph(graph_file)
                 _before_edges = len(graph.edges)
+                _before_nodes = len(graph.nodes)
                 meta = graph.metadata or {}
-                annotation_path = scene_dir / "scene_annotation.json"
-                grid_path = scene_dir / "traversable_grid.npy"
-                overlay_objects = _load_scene_overlay_objects(scene_dir)
                 grid_resolution = float(payload.get("resolution", meta.get("grid_resolution_m", 0.05)))
-                if annotation_path.exists():
-                    from navigation_dataset.scene_annotations import read_scene_annotation
-                    _annotation = read_scene_annotation(annotation_path)
-                    grid = build_traversability_grid(_annotation, resolution=grid_resolution, objects=overlay_objects, robot_height_m=float(payload.get("robot_height_m", 1.2)))
-                    overlay_path = scene_dir / "walkability_overlay.npy"
-                    _walk = _load_walk_overlay(overlay_path, expected_spec=grid.spec) if overlay_path.exists() else None
-                    if _walk is not None:
-                        grid = build_traversability_grid(_annotation, resolution=grid_resolution, walkability_overlay=_walk, objects=overlay_objects, robot_height_m=float(payload.get("robot_height_m", 1.2)))
-                else:
-                    grid = load_traversability_grid(grid_path)
                 robot_radius = float(payload.get("robot_radius_m", meta.get("robot_radius_m", 0.25)))
                 k_neighbors = int(payload.get("k_neighbors", meta.get("k_neighbors", 8)))
                 max_edge = float(payload.get("max_edge_length_m", meta.get("max_edge_length_m", 1.5)))
-                new_edges = build_viewpoint_edges(
-                    grid, graph.nodes, robot_radius_m=robot_radius, k_neighbors=k_neighbors, max_edge_length_m=max_edge,
+                preserve_manual = bool(payload.get("preserve_manual_edges", True))
+                result = rebuild_viewpoint_edges(
+                    scene_id,
+                    scene_dir,
+                    graph,
+                    resolution=grid_resolution,
+                    robot_radius_m=robot_radius,
+                    robot_height_m=float(payload.get("robot_height_m", 1.2)),
+                    heading_count=int(graph.node_heading_count or 12),
+                    k_neighbors=k_neighbors,
+                    max_edge_length_m=max_edge,
+                    preserve_manual_edges=preserve_manual,
                 )
-                # Keep manual edges that the auto pass didn't reproduce.
-                if bool(payload.get("preserve_manual_edges", True)):
-                    have = {(e.source, e.target) for e in new_edges}
-                    have |= {(e.target, e.source) for e in new_edges}
-                    for e in graph.edges:
-                        is_manual = bool((e.extras or {}).get("manual")) or str(e.edge_id).startswith("edge_manual")
-                        if is_manual and (e.source, e.target) not in have:
-                            new_edges.append(e)
-                            have.add((e.source, e.target))
-                            have.add((e.target, e.source))
-                graph.edges = new_edges
+                graph = result.graph
                 meta["edges_rebuilt_at"] = _utc_now_iso()
                 graph.metadata = meta
                 self._bump_viewpoint_graph_revision(graph)
@@ -11180,20 +11786,24 @@ class RenderDaemon:
                 _log_graph_edit(handler, project_dir, scene_id, {
                     "operation": "rebuild_edges",
                     "graph_id": graph.graph_id,
-                    "before": {"nodes": len(graph.nodes), "edges": _before_edges},
+                    "before": {"nodes": _before_nodes, "edges": _before_edges},
                     "after": {"nodes": len(graph.nodes), "edges": len(graph.edges)},
                     "params": {"resolution": grid_resolution, "robot_radius_m": robot_radius,
                                "k_neighbors": k_neighbors, "max_edge_length_m": max_edge,
-                               "preserve_manual_edges": bool(payload.get("preserve_manual_edges", True))},
+                               "preserve_manual_edges": preserve_manual},
                     "algo_context": {
                         "manual_preserved_count": sum(1 for e in graph.edges if (e.extras or {}).get("manual") or str(e.edge_id).startswith("edge_manual")),
                         "hazard_edges": sum(1 for e in graph.edges if getattr(e, "hazard_crossing", False)),
+                        "bridge_edges": result.summary.get("bridge_edges", 0),
+                        "bridge_nodes": result.summary.get("bridge_nodes", 0),
+                        "portal_edges": result.summary.get("portal_edges", 0),
+                        "connected_components": result.summary.get("connected_components"),
                     },
                 })
                 self._send_json(handler, HTTPStatus.OK, {
                     "scene_id": scene_id,
                     "graph_id": graph.graph_id,
-                    **graph_summary(graph.nodes, graph.edges, heading_count=graph.node_heading_count),
+                    **result.summary,
                 })
             except Exception as exc:
                 if not _graph_mutation_lock_released:
@@ -11591,18 +12201,50 @@ class RenderDaemon:
                     raise ValueError("splits must be an object or 'train:60,val_seen:10' string.")
                 modalities = [str(item) for item in payload.get("modalities", ["rgb", "depth", "active_nir_intensity", "hazard_mask"])]
                 instruction_types = [str(item) for item in payload.get("instruction_types", ["goal_only", "hazard_aware", "ambiguous"])]
+                _ep_target = int(payload.get("num_pairs", sum(split_counts.values())))
+                _ep_t0 = time.monotonic()
+                _ep_log_state = {"t": 0.0}
+
+                def _ep_progress(planned: int, target: int, processed: int) -> None:
+                    now = time.monotonic()
+                    if processed >= target or now - _ep_log_state["t"] >= 2.0:
+                        _ep_log_state["t"] = now
+                        pct = 100.0 * processed / max(1, target)
+                        print(
+                            f"[episodes] {scene_id} plan {processed}/{target} ({pct:.0f}%) "
+                            f"accepted={planned} {time.monotonic() - _ep_t0:.0f}s",
+                            file=sys.stderr, flush=True,
+                        )
+
+                print(f"[episodes] {scene_id} plan start: target={_ep_target}", file=sys.stderr, flush=True)
                 episodes = plan_episodes(
                     annotation=annotation,
                     grid=grid,
-                    num_pairs=int(payload.get("num_pairs", sum(split_counts.values()))),
+                    num_pairs=_ep_target,
                     split_counts=split_counts,
                     instruction_types=instruction_types,
                     modalities=modalities,
                     seed=int(payload.get("seed", 0)),
+                    on_progress=_ep_progress,
                 )
+                print(f"[episodes] {scene_id} plan done: {len(episodes)} planned in "
+                      f"{time.monotonic() - _ep_t0:.1f}s, writing files...", file=sys.stderr, flush=True)
                 written = write_episodes(project_dir, episodes)
-                write_dataset_index(project_dir)
+                print(f"[episodes] {scene_id} wrote {len(written)} files, rebuilding dataset index...",
+                      file=sys.stderr, flush=True)
+                _idx_state = {"t": 0.0}
+
+                def _idx_progress(done: int, total: int) -> None:
+                    now = time.monotonic()
+                    if done >= total or now - _idx_state["t"] >= 2.0:
+                        _idx_state["t"] = now
+                        print(f"[episodes] {scene_id} index {done}/{total} episodes scanned",
+                              file=sys.stderr, flush=True)
+
+                write_dataset_index(project_dir, on_progress=_idx_progress)
                 write_split_files(project_dir)
+                print(f"[episodes] {scene_id} DONE: {len(written)} new episodes, total "
+                      f"{time.monotonic() - _ep_t0:.1f}s", file=sys.stderr, flush=True)
             except Exception as exc:
                 self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                 return True
@@ -11625,8 +12267,13 @@ class RenderDaemon:
                 self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": "scene_id is required."})
                 return True
             try:
-                graph = read_viewpoint_graph(project_dir / "scenes" / scene_id / "viewpoint_graph.json")
-                annotation_path = project_dir / "scenes" / scene_id / "scene_annotation.json"
+                from navigation_dataset.optical_perturbation import disabled_edges_for_scene
+                scene_dir = project_dir / "scenes" / scene_id
+                graph = read_viewpoint_graph(scene_dir / "viewpoint_graph.json")
+                # Edges cut by an enabled glass/mirror overlay must not be routed
+                # through by episode paths.
+                excluded_edges = disabled_edges_for_scene(scene_dir, graph)
+                annotation_path = scene_dir / "scene_annotation.json"
                 annotation = read_scene_annotation(annotation_path) if annotation_path.exists() else None
                 split_spec = payload.get("splits", {"train": int(payload.get("num_pairs", 10))})
                 if isinstance(split_spec, str):
@@ -11637,19 +12284,54 @@ class RenderDaemon:
                     raise ValueError("splits must be an object or 'train:60,val_seen:10' string.")
                 scenarios = [str(item) for item in payload.get("scenarios", list(GRAPH_SCENARIOS))]
                 modalities = [str(item) for item in payload.get("modalities", ["rgb", "depth", "active_nir_intensity", "hazard_mask"])]
+                _ep_target = int(payload.get("num_pairs", sum(split_counts.values())))
+                _ep_t0 = time.monotonic()
+                _ep_log_state = {"t": 0.0}
+
+                def _ep_progress(planned: int, target: int, attempts: int) -> None:
+                    now = time.monotonic()
+                    if planned >= target or now - _ep_log_state["t"] >= 2.0:
+                        _ep_log_state["t"] = now
+                        rate = planned / max(1e-6, now - _ep_t0)
+                        eta = (target - planned) / rate if rate > 0 else 0.0
+                        pct = 100.0 * planned / max(1, target)
+                        print(
+                            f"[episodes] {scene_id} graph-plan {planned}/{target} ({pct:.0f}%) "
+                            f"attempts={attempts} {rate:.1f} eps/s eta~{eta:.0f}s",
+                            file=sys.stderr, flush=True,
+                        )
+
+                print(f"[episodes] {scene_id} graph-plan start: target={_ep_target}", file=sys.stderr, flush=True)
                 episodes = plan_graph_episodes(
                     graph=graph,
-                    num_pairs=int(payload.get("num_pairs", sum(split_counts.values()))),
+                    num_pairs=_ep_target,
                     split_counts=split_counts,
                     scenarios=scenarios,
                     modalities=modalities,
                     annotation=annotation,
                     seed=int(payload.get("seed", 0)),
-                    observations_root=project_dir / "scenes" / scene_id / "observations",
+                    observations_root=scene_dir / "observations",
+                    excluded_edge_ids=excluded_edges,
+                    on_progress=_ep_progress,
                 )
+                print(f"[episodes] {scene_id} graph-plan done: {len(episodes)} planned in "
+                      f"{time.monotonic() - _ep_t0:.1f}s, writing files...", file=sys.stderr, flush=True)
                 written = write_graph_episodes(project_dir, episodes)
-                write_dataset_index(project_dir)
+                print(f"[episodes] {scene_id} wrote {len(written)} files, rebuilding dataset index...",
+                      file=sys.stderr, flush=True)
+                _idx_state = {"t": 0.0}
+
+                def _idx_progress(done: int, total: int) -> None:
+                    now = time.monotonic()
+                    if done >= total or now - _idx_state["t"] >= 2.0:
+                        _idx_state["t"] = now
+                        print(f"[episodes] {scene_id} index {done}/{total} episodes scanned",
+                              file=sys.stderr, flush=True)
+
+                write_dataset_index(project_dir, on_progress=_idx_progress)
                 write_split_files(project_dir)
+                print(f"[episodes] {scene_id} DONE: {len(written)} new episodes, total "
+                      f"{time.monotonic() - _ep_t0:.1f}s", file=sys.stderr, flush=True)
             except Exception as exc:
                 self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                 return True
@@ -11659,6 +12341,94 @@ class RenderDaemon:
                 "mode": "viewpoint_graph",
                 "episodes": [path.relative_to(project_dir).as_posix() for path in written],
                 "project": self._opticalnav_project_summary(project_dir),
+            })
+            return True
+        if len(parts) == 3 and parts[1] == "episodes" and parts[2] == "validate-graph-refs":
+            # On-demand audit (not per-edit): find graph episodes whose baked path
+            # now references a deleted node/edge or an edge disabled by the glass/
+            # mirror overlay, and optionally prune them. scene_id optional (defaults
+            # to all scenes); pass {"delete": true} to remove the stale episode files.
+            from navigation_dataset.graph_episode_sampler import graph_episode_stale_refs
+            from navigation_dataset.optical_perturbation import disabled_edges_for_scene
+            from navigation_dataset.viewpoint_graph import read_viewpoint_graph
+
+            scene_id = _maybe_str(payload.get("scene_id"))
+            do_delete = self._coerce_bool(payload.get("delete"), False)
+            # Cache per-scene graph lookups (node ids, edge node-pairs, disabled pairs).
+            scene_cache: dict[str, dict[str, Any] | None] = {}
+
+            def _scene_refs(sid: str) -> dict[str, Any] | None:
+                if sid in scene_cache:
+                    return scene_cache[sid]
+                graph_path = project_dir / "scenes" / sid / "viewpoint_graph.json"
+                if not graph_path.exists():
+                    scene_cache[sid] = None
+                    return None
+                graph = read_viewpoint_graph(graph_path)
+                node_ids = {n.node_id for n in graph.nodes}
+                pair = lambda a, b: (a, b) if a <= b else (b, a)  # noqa: E731
+                edge_pairs = {pair(e.source, e.target) for e in graph.edges}
+                disabled_ids = disabled_edges_for_scene(project_dir / "scenes" / sid, graph)
+                by_id = {e.edge_id: e for e in graph.edges}
+                disabled_pairs = {pair(by_id[eid].source, by_id[eid].target)
+                                  for eid in disabled_ids if eid in by_id}
+                refs = {"node_ids": node_ids, "edge_pairs": edge_pairs, "disabled_pairs": disabled_pairs}
+                scene_cache[sid] = refs
+                return refs
+
+            checked = 0
+            stale: list[dict[str, Any]] = []
+            missing_graph_scenes: set[str] = set()
+            for ep_path in self._opticalnav_episode_files(project_dir):
+                try:
+                    episode = _read_json(ep_path)
+                except Exception:
+                    continue
+                ep_scene = str(episode.get("scene_id") or "")
+                if scene_id and ep_scene != scene_id:
+                    continue
+                if str(episode.get("navigation_mode") or "") != "viewpoint_graph":
+                    continue
+                refs = _scene_refs(ep_scene)
+                if refs is None:
+                    missing_graph_scenes.add(ep_scene)
+                    continue
+                checked += 1
+                report = graph_episode_stale_refs(
+                    episode,
+                    node_ids=refs["node_ids"],
+                    edge_pairs=refs["edge_pairs"],
+                    disabled_pairs=refs["disabled_pairs"],
+                )
+                if report["stale"]:
+                    stale.append({
+                        "episode_id": episode.get("episode_id") or ep_path.stem,
+                        "scene_id": ep_scene,
+                        "split": episode.get("split"),
+                        "ref": ep_path.relative_to(project_dir).as_posix(),
+                        **{k: report[k] for k in ("reasons", "missing_nodes", "missing_edges", "disabled_edges")},
+                    })
+            deleted: list[str] = []
+            if do_delete and stale:
+                for item in stale:
+                    ep_path = project_dir / item["ref"]
+                    try:
+                        ep_path.unlink()
+                        deleted.append(item["episode_id"])
+                    except FileNotFoundError:
+                        pass
+                from navigation_dataset.exporters.custom_json import write_dataset_index, write_split_files
+                write_dataset_index(project_dir)
+                write_split_files(project_dir)
+            self._send_json(handler, HTTPStatus.OK, {
+                "scene_id": scene_id,
+                "checked": checked,
+                "stale_count": len(stale),
+                "stale": stale,
+                "deleted": deleted,
+                "deleted_count": len(deleted),
+                "scenes_without_graph": sorted(missing_graph_scenes),
+                "project": self._opticalnav_project_summary(project_dir) if deleted else None,
             })
             return True
         if len(parts) == 3 and parts[1] == "episodes" and parts[2] == "render":
@@ -11758,6 +12528,8 @@ class RenderDaemon:
             png_only = bool(payload.get("png_only", False))
             include_birdseye = bool(payload.get("include_birdseye", True))
             include_polarization_raw = bool(payload.get("include_polarization_raw", True))
+            include_episode_birdseye = bool(payload.get("include_episode_birdseye", False))
+            eval_perturbation = bool(payload.get("eval_perturbation", False))
             job_id = f"export-{scene_id}-{_utc_now().strftime('%Y%m%dT%H%M%S%f')}"
             with self._export_jobs_lock:
                 self._export_jobs[job_id] = {
@@ -11782,7 +12554,7 @@ class RenderDaemon:
                 }
             threading.Thread(
                 target=self._run_export_job,
-                args=(job_id, parts[0], project_dir, scene_id, only_completed, episode_ids, include_episode_thumbnails, panorama_observations, png_only, include_birdseye, include_polarization_raw),
+                args=(job_id, parts[0], project_dir, scene_id, only_completed, episode_ids, include_episode_thumbnails, panorama_observations, png_only, include_birdseye, include_polarization_raw, include_episode_birdseye, eval_perturbation),
                 name=f"export-job-{job_id}",
                 daemon=True,
             ).start()
@@ -12026,6 +12798,7 @@ class RenderDaemon:
                 mesh_resolver = self._make_mesh_resolver(project_dir, scene_id)
                 mesh_stats: dict[str, int] = {}
                 materialization_records: list[dict[str, Any]] = []
+                material_policy_records: list[dict[str, Any]] = []
                 xml_shape_count = _generate_opticalnav_render_scene_xml(
                     saved,
                     saved,  # overlay == authoring map itself (objects live here)
@@ -12035,13 +12808,26 @@ class RenderDaemon:
                     mesh_resolver=mesh_resolver,
                     mesh_stats=mesh_stats,
                     materialization_records=materialization_records,
+                    material_policy_records=material_policy_records,
                 )
+                try:
+                    material_policy = _build_render_scene_material_policy(
+                        scene_id=scene_id,
+                        material_policy_records=material_policy_records,
+                    )
+                    (scene_dir / "render_scene_material_policy.json").write_text(
+                        json.dumps(material_policy, ensure_ascii=False, indent=2), encoding="utf-8",
+                    )
+                except Exception as exc:
+                    mesh_stats["material_policy_error"] = str(exc)
                 scene_mesh_cache_dir = self._opticalnav_mesh_cache_dir(project_dir, scene_id)
                 mesh_stats["scene_mesh_cache"] = _stage_xml_obj_filenames_to_scene_mesh_cache(
                     render_scene_path,
                     scene_mesh_cache_dir=scene_mesh_cache_dir,
                     repo_root=self.repo_root,
                 )
+                perturbed_scene_ref = self._stage_perturbed_render_xml(
+                    scene_dir, saved, saved, editor_geometry, mesh_resolver, scene_mesh_cache_dir)
                 preview_mesh_manifest = _build_editor_preview_mesh_manifest(
                     render_scene_path,
                     scene_mesh_cache_dir=scene_mesh_cache_dir,
@@ -12099,6 +12885,7 @@ class RenderDaemon:
                 sv["render_sync_mode"] = "editor_generated_xml"
                 sv["overlay_scene_xml_ref"] = render_scene_ref
                 sv["base_scene_xml_ref"] = None
+                sv["perturbed_scene_xml_ref"] = perturbed_scene_ref
                 sv_path.write_text(json.dumps(sv, ensure_ascii=False, indent=2), encoding="utf-8")
 
                 # Write render_readiness.json so loadRenderReadiness() reads OK on page reload.
@@ -12460,6 +13247,13 @@ class RenderDaemon:
         backend = str(payload.get("backend") or "daemon")
         scene_state_payload = payload.get("scene_state")
         camera_spec_payload = payload.get("camera_spec")
+        camera_specs_payload = payload.get("camera_specs")
+        if not isinstance(camera_specs_payload, list):
+            camera_specs_payload = None
+        sensor_scope = str(payload.get("sensor_scope") or "active").strip().lower()
+        if sensor_scope not in {"active", "all_rig", "selected"}:
+            sensor_scope = "active"
+        sensor_ids = [str(item) for item in payload.get("sensor_ids", [])] if isinstance(payload.get("sensor_ids"), list) else None
         camera_height_m = float(payload.get("camera_height_m") or 1.0)
         node_heights_raw = payload.get("node_heights")
         node_heights = dict(node_heights_raw) if isinstance(node_heights_raw, Mapping) else None
@@ -12470,6 +13264,9 @@ class RenderDaemon:
             or payload.get("only_missing")
             or payload.get("resume_missing_only")
         )
+        sweep_execution_policy = str(payload.get("sweep_execution_policy") or "auto").strip().lower()
+        if sweep_execution_policy not in {"auto", "per_view", "modality_phases"}:
+            sweep_execution_policy = "auto"
 
         precondition = self._opticalnav_render_precondition_payload(project_dir, [scene_id], payload, mode="graph_sweep")
         if precondition is not None:
@@ -12481,13 +13278,40 @@ class RenderDaemon:
         # If no XML is found, return an error requiring the user to run Sync Render Scene first.
         _sv_path = project_dir / "scenes" / scene_id / "scene_variant.json"
         resolved_scene_ref: str | None = None
+        # 'perturbed' variant (eval, mirrors/glass on) selects the perturbed XML when
+        # present; default 'base' keeps the unperturbed scene. The perturbed XML is a
+        # different file → a distinct mitsuba_scene_ref → distinct scene cache key.
+        _variant_key = str(payload.get("scene_variant_key")
+                           or (payload.get("extras") or {}).get("scene_variant_key")
+                           or "base").lower()
         if _sv_path.exists():
             _sv = _read_json(_sv_path)
-            for _key in ("overlay_scene_xml_ref", "base_scene_xml_ref"):
-                _ref = _maybe_str(_sv.get(_key))
+            if _variant_key == "perturbed":
+                # The perturbed variant MUST render the perturbed XML — never fall back
+                # to the base/overlay scene. A silent fallback produces a "perturbed"
+                # render that is byte-identical to base (no mirrors/glass), which is
+                # indistinguishable from a real eval pair and silently corrupts the
+                # dataset. Require the perturbed XML to be staged first.
+                _ref = _maybe_str(_sv.get("perturbed_scene_xml_ref"))
                 if _ref and resolve_repo_path(self.repo_root, _ref).exists():
                     resolved_scene_ref = _ref
-                    break
+                else:
+                    self._send_json(handler, HTTPStatus.BAD_REQUEST, {
+                        "error": "Perturbed render scene is not prepared for this scene.",
+                        "scene_id": scene_id,
+                        "hint": (
+                            "Enable the optical perturbation (mirrors/glass) and run "
+                            "'Sync Render Scene' before rendering the perturbed variant — "
+                            "the perturbed XML (perturbed_scene_xml_ref) is missing or stale."
+                        ),
+                    })
+                    return
+            else:
+                for _key in ("overlay_scene_xml_ref", "base_scene_xml_ref"):
+                    _ref = _maybe_str(_sv.get(_key))
+                    if _ref and resolve_repo_path(self.repo_root, _ref).exists():
+                        resolved_scene_ref = _ref
+                        break
         if not resolved_scene_ref:
             self._send_json(handler, HTTPStatus.BAD_REQUEST, {
                 "error": "No render scene XML found for this scene. Run 'Sync Render Scene' first.",
@@ -12496,8 +13320,11 @@ class RenderDaemon:
             })
             return
         # Always rebuild canonical scene_state — never inherit stale job_id from caller.
+        # 'perturbed' renders carry a distinct job id so their bridge-job + consolidated
+        # outputs never overwrite the base render.
+        _job_variant = "perturbed" if _variant_key == "perturbed" else "template"
         scene_state_payload = {
-            "job_id": f"opticalnav-{scene_id}-template",
+            "job_id": f"opticalnav-{scene_id}-{_job_variant}",
             "scene_id": scene_id,
             "frame_id": f"{scene_id}_frame_template",
             "timestamp": _utc_now_iso(),
@@ -12520,7 +13347,10 @@ class RenderDaemon:
                 sweep_requests = build_custom_position_render_requests(
                     custom_positions,
                     scene_state_payload=dict(scene_state_payload),
-                    camera_spec_payload=dict(camera_spec_payload),
+                    camera_spec_payload=dict(camera_spec_payload or {}),
+                    camera_specs_payload=camera_specs_payload,
+                    sensor_scope=sensor_scope,
+                    sensor_ids=sensor_ids,
                     modalities=modalities,
                     scene_id=scene_id,
                     camera_height_m=camera_height_m,
@@ -12563,6 +13393,9 @@ class RenderDaemon:
                         "render_mode": sweep_request.request.extras.get("render_mode"),
                         "preview_id": sweep_request.request.extras.get("preview_id"),
                         "sensor_id": sweep_request.request.camera_specs[0].camera_id if sweep_request.request.camera_specs else None,
+                        "sensor_ids": list(sweep_request.sensor_ids or []),
+                        "sensor_count": len(sweep_request.sensor_ids or []),
+                        "modalities_by_sensor": dict(sweep_request.modalities_by_sensor or {}),
                         "modality": modalities[0] if len(modalities) == 1 else None,
                         "status_url": accepted.status_url,
                         **runtime_overrides,
@@ -12578,6 +13411,9 @@ class RenderDaemon:
                 "backend": "daemon",
                 "created_at": _utc_now_iso(),
                 "modalities": modalities,
+                "sensor_scope": sensor_scope,
+                "sensor_ids": sensor_ids or [],
+                "execution_policy": sweep_execution_policy,
                 "scheduling_policy": "interleaved_gpu_shards" if _static_gpu_shards_enabled() else _dynamic_gpu_scheduling_policy(),
                 "gpu_indices": _render_gpu_indices_from_env(),
                 "static_gpu_shards": _static_gpu_shards_enabled(),
@@ -12614,7 +13450,10 @@ class RenderDaemon:
                     dataset_root=project_dir,
                     graph_path=graph_path,
                     scene_state_payload=dict(scene_state_payload),
-                    camera_spec_payload=dict(camera_spec_payload),
+                    camera_spec_payload=dict(camera_spec_payload or {}),
+                    camera_specs_payload=camera_specs_payload,
+                    sensor_scope=sensor_scope,
+                    sensor_ids=sensor_ids,
                     modalities=modalities,
                     render_fn=self.render_fn,
                     variant=str(payload.get("variant") or self.variant),
@@ -12643,6 +13482,11 @@ class RenderDaemon:
             "backend": "daemon",
             "created_at": _utc_now_iso(),
             "modalities": modalities,
+            "sensor_scope": sensor_scope,
+            "sensor_ids": sensor_ids or [],
+            "execution_policy": sweep_execution_policy,
+            "phase_order": [],
+            "phase_count": 0,
             "status": "building",
             "skip_existing_observations": skip_existing_observations,
             "jobs": [],
@@ -12659,19 +13503,56 @@ class RenderDaemon:
                 scene_id=scene_id,
                 graph_path=graph_path,
                 scene_state_payload=dict(scene_state_payload),
-                camera_spec_payload=dict(camera_spec_payload),
+                camera_spec_payload=dict(camera_spec_payload or {}),
+                camera_specs_payload=camera_specs_payload,
+                sensor_scope=sensor_scope,
+                sensor_ids=sensor_ids,
                 modalities=modalities,
                 node_ids_filter=node_ids_filter,
                 camera_height_m=camera_height_m,
                 render_settings=render_settings,
                 node_heights=node_heights,
                 variant=str(payload.get("variant") or self.variant),
+                sweep_execution_policy=sweep_execution_policy,
                 skip_existing_observations=skip_existing_observations,
             ),
             daemon=True,
             name=f"sweep-{batch_id}",
         ).start()
         self._send_json(handler, HTTPStatus.ACCEPTED, stub)
+
+    def _wait_for_render_jobs_terminal(self, job_ids: Sequence[str], *, timeout_s: float | None = None) -> dict[str, int]:
+        terminal = {"succeeded", "failed", "cancelled"}
+        deadline = time.time() + float(timeout_s) if timeout_s is not None else None
+        job_id_set = {str(item) for item in job_ids if str(item)}
+        if not job_id_set:
+            return {}
+        while True:
+            with self._condition:
+                counts: dict[str, int] = {}
+                pending = False
+                for job_id in job_id_set:
+                    job = self._jobs.get(job_id)
+                    status = str(job.status.status if job is not None else "unknown")
+                    counts[status] = counts.get(status, 0) + 1
+                    if status not in terminal:
+                        pending = True
+                if not pending:
+                    return counts
+                if deadline is not None:
+                    remaining = deadline - time.time()
+                    if remaining <= 0:
+                        return counts
+                    self._condition.wait(timeout=min(1.0, remaining))
+                else:
+                    self._condition.wait(timeout=1.0)
+
+    def _recycle_render_workers_if_available(self, *, reason: str) -> dict[str, Any]:
+        with self._render_worker_manager_lock:
+            manager = self._render_worker_manager
+        if manager is None:
+            return {"recycled": 0, "skipped_busy": 0, "reason": reason, "manager": "not_started"}
+        return manager.recycle_idle_workers(reason=reason)
 
     def _run_graph_sweep_submission(
         self,
@@ -12683,23 +13564,34 @@ class RenderDaemon:
         graph_path: "Path",
         scene_state_payload: dict,
         camera_spec_payload: dict,
+        camera_specs_payload: "list[dict] | None",
+        sensor_scope: str,
+        sensor_ids: "list[str] | None",
         modalities: list,
         node_ids_filter: "list[str] | None",
         camera_height_m: float,
         render_settings: dict,
         node_heights: "dict | None",
         variant: str,
+        sweep_execution_policy: str = "auto",
         skip_existing_observations: bool = False,
     ) -> None:
         """Background thread: read graph, build RenderRequests, submit all jobs."""
-        from navigation_dataset.sensor_sweep import build_sweep_render_requests
+        from navigation_dataset.sensor_sweep import build_sweep_render_requests, split_sweep_requests_by_modality_phase
         from navigation_dataset.viewpoint_graph import read_viewpoint_graph
         try:
+            try:
+                batch_created_at = _maybe_str(_read_json(batch_path).get("created_at")) or _utc_now_iso()
+            except Exception:
+                batch_created_at = _utc_now_iso()
             graph = read_viewpoint_graph(graph_path)
             sweep_requests = build_sweep_render_requests(
                 graph,
                 scene_state_payload=scene_state_payload,
                 camera_spec_payload=camera_spec_payload,
+                camera_specs_payload=camera_specs_payload,
+                sensor_scope=sensor_scope,
+                sensor_ids=sensor_ids,
                 modalities=modalities,
                 job_id_mode="per_heading",
                 node_ids=node_ids_filter,
@@ -12707,69 +13599,122 @@ class RenderDaemon:
                 render_settings=render_settings,
                 node_heights=node_heights,
             )
-            requested_count = len(sweep_requests)
+            phases = split_sweep_requests_by_modality_phase(
+                sweep_requests,
+                sweep_execution_policy=sweep_execution_policy,
+            )
+            resolved_execution_policy = (
+                "modality_phases"
+                if len(phases) > 1 or (phases and phases[0].phase != "per_view")
+                else "per_view"
+            )
+            requested_count = sum(len(phase.requests) for phase in phases)
             skipped_existing = 0
-            if skip_existing_observations:
-                kept_requests = []
-                for sweep_request in sweep_requests:
-                    if self._opticalnav_sweep_output_exists(project_dir, scene_id, sweep_request, modalities):
-                        skipped_existing += 1
-                    else:
-                        kept_requests.append(sweep_request)
-                sweep_requests = kept_requests
             gpu_indices = _render_gpu_indices_from_env()
-            shard_assignments = _interleaved_gpu_shard_assignments(len(sweep_requests), gpu_indices)
             jobs = []
-            for sweep_request, shard in zip(sweep_requests, shard_assignments):
-                runtime_overrides = {
-                    "shard_index": shard["shard_index"],
-                    "shard_count": shard["shard_count"],
-                    "shard_item_index": shard["shard_item_index"],
-                    "shard_size": shard["shard_size"],
-                }
-                if _static_gpu_shards_enabled():
-                    runtime_overrides["worker_gpu_index"] = shard["target_gpu_index"]
-                sweep_request.request.extras["opticalnav_project_id"] = project_dir.name
-                sweep_request.request.extras["opticalnav_scene_id"] = scene_id
-                sweep_request.request.extras["opticalnav_vp_id"] = sweep_request.node_id
-                sweep_request.request.extras["opticalnav_heading_id"] = sweep_request.heading_id
-                accepted = self.submit(
-                    sweep_request.request,
-                    variant=variant,
-                    runtime_overrides=runtime_overrides,
-                    lazy_persist=True,
-                )
-                jobs.append({
-                    "job_id": accepted.job_id,
+            submitted_phase_job_ids: list[str] = []
+            phase_order = [phase.phase for phase in phases]
+            phase_recycle_events: list[dict[str, Any]] = []
+
+            def _write_batch(status: str, *, active_phase: str | None = None) -> None:
+                n = len(jobs)
+                batch = {
+                    "batch_id": batch_id,
+                    "project_id": project_dir.name,
                     "scene_id": scene_id,
                     "graph_id": graph.graph_id,
-                    "node_id": sweep_request.node_id,
-                    "heading_id": sweep_request.heading_id,
-                    "status_url": accepted.status_url,
-                    **runtime_overrides,
+                    "backend": "daemon",
+                    "created_at": batch_created_at,
+                    "modalities": modalities,
+                    "sensor_scope": sensor_scope,
+                    "sensor_ids": sensor_ids or [],
+                    "execution_policy": resolved_execution_policy,
+                    "phase_order": phase_order,
+                    "phase_count": len(phases),
+                    "active_phase": active_phase,
+                    "phase_recycle_events": phase_recycle_events,
+                    "scheduling_policy": "interleaved_gpu_shards" if _static_gpu_shards_enabled() else _dynamic_gpu_scheduling_policy(),
+                    "gpu_indices": _render_gpu_indices_from_env(),
+                    "static_gpu_shards": _static_gpu_shards_enabled(),
+                    "skip_existing_observations": skip_existing_observations,
+                    "requested_jobs": requested_count,
+                    "skipped_existing": skipped_existing,
+                    "jobs": jobs,
+                    "status": status,
+                    "counts": {"queued": n, "running": 0, "completed": 0, "failed": 0, "cancelled": 0, "unknown": 0},
+                    "progress": {"completed": 0, "failed": 0, "total": n, "fraction": 0.0},
+                }
+                batch_path.write_text(json.dumps(batch, ensure_ascii=False, indent=2), encoding="utf-8")
+
+            for phase_pos, phase in enumerate(phases):
+                if resolved_execution_policy == "modality_phases" and phase_pos > 0:
+                    _write_batch("waiting_phase_boundary", active_phase=phase.phase)
+                    phase_wait_counts = self._wait_for_render_jobs_terminal(submitted_phase_job_ids)
+                    recycle_result = self._recycle_render_workers_if_available(reason="modality_phase_boundary")
+                    phase_recycle_events.append({
+                        "after_phase": phases[phase_pos - 1].phase,
+                        "before_phase": phase.phase,
+                        "job_status_counts": phase_wait_counts,
+                        "worker_recycle": recycle_result,
+                        "at": _utc_now_iso(),
+                    })
+                    _write_batch("recycled_phase_boundary", active_phase=phase.phase)
+
+                phase_requests = list(phase.requests)
+                if skip_existing_observations:
+                    kept_requests = []
+                    for sweep_request in phase_requests:
+                        if self._opticalnav_sweep_output_exists(project_dir, scene_id, sweep_request, sweep_request.request.modalities):
+                            skipped_existing += 1
+                        else:
+                            kept_requests.append(sweep_request)
+                    phase_requests = kept_requests
+
+                shard_assignments = _interleaved_gpu_shard_assignments(len(phase_requests), gpu_indices)
+                submitted_phase_job_ids = []
+                for sweep_request, shard in zip(phase_requests, shard_assignments):
+                    runtime_overrides = {
+                        "shard_index": shard["shard_index"],
+                        "shard_count": shard["shard_count"],
+                        "shard_item_index": shard["shard_item_index"],
+                        "shard_size": shard["shard_size"],
+                    }
+                    if _static_gpu_shards_enabled():
+                        runtime_overrides["worker_gpu_index"] = shard["target_gpu_index"]
+                    sweep_request.request.extras["opticalnav_project_id"] = project_dir.name
+                    sweep_request.request.extras["opticalnav_scene_id"] = scene_id
+                    sweep_request.request.extras["opticalnav_vp_id"] = sweep_request.node_id
+                    sweep_request.request.extras["opticalnav_heading_id"] = sweep_request.heading_id
+                    sweep_request.request.extras["sweep_execution_policy"] = resolved_execution_policy
+                    sweep_request.request.extras["phase"] = phase.phase
+                    sweep_request.request.extras["phase_index"] = phase.phase_index
+                    accepted = self.submit(
+                        sweep_request.request,
+                        variant=variant,
+                        runtime_overrides=runtime_overrides,
+                        lazy_persist=True,
+                    )
+                    submitted_phase_job_ids.append(accepted.job_id)
+                    jobs.append({
+                        "job_id": accepted.job_id,
+                        "scene_id": scene_id,
+                        "graph_id": graph.graph_id,
+                        "node_id": sweep_request.node_id,
+                        "heading_id": sweep_request.heading_id,
+                        "sensor_id": sweep_request.request.camera_specs[0].camera_id if sweep_request.request.camera_specs else None,
+                        "sensor_ids": list(sweep_request.sensor_ids or []),
+                        "sensor_count": len(sweep_request.sensor_ids or []),
+                        "phase": phase.phase,
+                        "phase_index": phase.phase_index,
+                        "phase_sensor_ids": list(sweep_request.sensor_ids or []),
+                        "modalities_by_sensor": dict(sweep_request.modalities_by_sensor or {}),
+                        "status_url": accepted.status_url,
+                        **runtime_overrides,
                         **({"target_gpu_index": shard["target_gpu_index"]} if _static_gpu_shards_enabled() else {}),
-                })
-            n = len(jobs)
-            batch = {
-                "batch_id": batch_id,
-                "project_id": project_dir.name,
-                "scene_id": scene_id,
-                "graph_id": graph.graph_id,
-                "backend": "daemon",
-                "created_at": _utc_now_iso(),
-                "modalities": modalities,
-                "scheduling_policy": "interleaved_gpu_shards" if _static_gpu_shards_enabled() else _dynamic_gpu_scheduling_policy(),
-                "gpu_indices": _render_gpu_indices_from_env(),
-                "static_gpu_shards": _static_gpu_shards_enabled(),
-                "skip_existing_observations": skip_existing_observations,
-                "requested_jobs": requested_count,
-                "skipped_existing": skipped_existing,
-                "jobs": jobs,
-                "status": "ready",
-                "counts": {"queued": n, "running": 0, "completed": 0, "failed": 0, "cancelled": 0, "unknown": 0},
-                "progress": {"completed": 0, "failed": 0, "total": n, "fraction": 0.0},
-            }
-            batch_path.write_text(json.dumps(batch, ensure_ascii=False, indent=2), encoding="utf-8")
+                    })
+                _write_batch("ready", active_phase=phase.phase)
+
+            _write_batch("ready", active_phase=None)
         except Exception as exc:
             import traceback
             print(f"[daemon] sweep-submission-thread error batch_id={batch_id}: {exc}", file=sys.stderr, flush=True)
@@ -12825,7 +13770,7 @@ class RenderDaemon:
                     episode,
                     dataset_root=project_dir,
                     scene_state_payload=dict(scene_state_payload),
-                    camera_spec_payload=dict(camera_spec_payload),
+                    camera_spec_payload=dict(camera_spec_payload or {}),
                     modalities=modalities,
                     render_fn=self.render_fn,
                     variant=str(payload.get("variant") or self.variant),
@@ -12845,7 +13790,7 @@ class RenderDaemon:
                 requests = build_episode_render_requests(
                     episode,
                     scene_state_payload=dict(scene_state_payload),
-                    camera_spec_payload=dict(camera_spec_payload),
+                    camera_spec_payload=dict(camera_spec_payload or {}),
                     modalities=modalities,
                     job_id_mode="per_timestep",
                 )
@@ -12961,7 +13906,11 @@ class RenderDaemon:
                 if not artifact_path:
                     self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": "Missing path query parameter."})
                     return
-                self._serve_repo_artifact(handler, artifact_path)
+                # Browsers name the download after the URL's last segment ("artifacts")
+                # unless a Content-Disposition filename is set. Use the artifact's real
+                # basename (e.g. "<scene>_<ts>.zip") so export downloads land named.
+                download_name = _maybe_str(query.get("download", [None])[0]) or Path(artifact_path).name
+                self._serve_repo_artifact(handler, artifact_path, download_name=download_name)
                 return
             if path == "/api/summary":
                 self._send_json(handler, HTTPStatus.OK, self._summary_payload())
@@ -14518,7 +15467,7 @@ class RenderDaemon:
                     return False
                 src_dir = first_camera_dir
                 camera_id = first_camera_dir.name
-            dst_dir = self.repo_root / "out" / "opticalnav" / project_id / "scenes" / scene_id / "observations" / vp_id / heading_id
+            dst_dir = self.repo_root / "out" / "opticalnav" / project_id / "scenes" / scene_id / _obs_subdir(_variant_from_job_id(job_id)) / vp_id / heading_id
             sensor_dst_dir = dst_dir / "sensors" / camera_id
             copy_map = {
                 "rgb.png": "rgb.png",
@@ -14575,17 +15524,26 @@ class RenderDaemon:
     def _opticalnav_sweep_output_exists(self, project_dir: Path, scene_id: str, sweep_request: Any, modalities: Sequence[str]) -> bool:
         request = sweep_request.request
         camera_specs = list(getattr(request, "camera_specs", []) or [])
-        camera_id = str(getattr(camera_specs[0], "camera_id", "") or "opticalnav_front_cam") if camera_specs else "opticalnav_front_cam"
         vp_id = str(sweep_request.node_id)
         heading_id = str(sweep_request.heading_id)
-        dst_dir = project_dir / "scenes" / scene_id / "observations" / vp_id / heading_id
-        sensor_dst_dir = dst_dir / "sensors" / camera_id
+        dst_dir = project_dir / "scenes" / scene_id / _obs_subdir(_variant_from_job_id(request.job_id)) / vp_id / heading_id
+        modalities_by_sensor = dict(getattr(sweep_request, "modalities_by_sensor", None) or getattr(request, "extras", {}).get("modalities_by_sensor") or {})
+        if not camera_specs:
+            camera_specs = [type("_Camera", (), {"camera_id": "opticalnav_front_cam"})()]
 
         def _has_consolidated() -> bool:
-            for modality in modalities:
-                names = self._opticalnav_modality_output_names(str(modality))
-                if not any((sensor_dst_dir / name).exists() or (dst_dir / name).exists() for name in names):
-                    return False
+            for camera_spec in camera_specs:
+                camera_id = str(getattr(camera_spec, "camera_id", "") or "opticalnav_front_cam")
+                sensor_dst_dir = dst_dir / "sensors" / camera_id
+                camera_modalities = [str(item) for item in modalities_by_sensor.get(camera_id, modalities)]
+                for modality in camera_modalities:
+                    names = self._opticalnav_modality_output_names(str(modality))
+                    if len(camera_specs) == 1:
+                        exists = any((sensor_dst_dir / name).exists() or (dst_dir / name).exists() for name in names)
+                    else:
+                        exists = any((sensor_dst_dir / name).exists() for name in names)
+                    if not exists:
+                        return False
             return True
 
         if _has_consolidated():
@@ -14593,16 +15551,17 @@ class RenderDaemon:
 
         manifest_path = self.repo_root / "out" / "bridge_jobs" / request.job_id / "observations" / request.frame_id / "manifest.json"
         if manifest_path.exists():
-            self._opticalnav_copy_observation_files(
-                project_id=project_dir.name,
-                scene_id=scene_id,
-                vp_id=vp_id,
-                heading_id=heading_id,
-                job_id=request.job_id,
-                frame_id=request.frame_id,
-                camera_id=camera_id,
-            )
-            return True
+            for camera_spec in camera_specs:
+                self._opticalnav_copy_observation_files(
+                    project_id=project_dir.name,
+                    scene_id=scene_id,
+                    vp_id=vp_id,
+                    heading_id=heading_id,
+                    job_id=request.job_id,
+                    frame_id=request.frame_id,
+                    camera_id=str(getattr(camera_spec, "camera_id", "") or "opticalnav_front_cam"),
+                )
+            return _has_consolidated()
         return False
 
     def _opticalnav_copy_observation_rgb(self, job: "_QueuedJob") -> None:
@@ -14619,10 +15578,14 @@ class RenderDaemon:
             frame_id = job.render_request.frame_id
             camera_specs = list(getattr(job.render_request, "camera_specs", []) or [])
             camera_id = str(getattr(camera_specs[0], "camera_id", "") or "opticalnav_front_cam") if camera_specs else "opticalnav_front_cam"
-            if self._opticalnav_copy_observation_files(
-                project_id=str(proj_id), scene_id=str(sc_id), vp_id=str(vp_id), heading_id=str(h_id),
-                job_id=job.render_request.job_id, frame_id=frame_id, camera_id=camera_id,
-            ):
+            copied_any = False
+            for camera_spec in (camera_specs or [type("_Camera", (), {"camera_id": camera_id})()]):
+                copied_any = self._opticalnav_copy_observation_files(
+                    project_id=str(proj_id), scene_id=str(sc_id), vp_id=str(vp_id), heading_id=str(h_id),
+                    job_id=job.render_request.job_id, frame_id=frame_id,
+                    camera_id=str(getattr(camera_spec, "camera_id", "") or camera_id),
+                ) or copied_any
+            if copied_any:
                 return
             src_dir = (
                 self.repo_root / "out" / "bridge_jobs" /
@@ -14638,7 +15601,7 @@ class RenderDaemon:
                 camera_id = first_camera_dir.name
             dst_dir = (
                 self.repo_root / "out" / "opticalnav" / proj_id /
-                "scenes" / sc_id / "observations" / vp_id / h_id
+                "scenes" / sc_id / _obs_subdir(_variant_from_job_id(job.render_request.job_id)) / vp_id / h_id
             )
             sensor_dst_dir = dst_dir / "sensors" / camera_id
             # bridge-job filename → consolidated UI-facing filename
@@ -15993,7 +16956,9 @@ class RenderDaemon:
             return
         self._serve_file(handler, path)
 
-    def _serve_repo_artifact(self, handler: BaseHTTPRequestHandler, repo_relative_path: str) -> None:
+    def _serve_repo_artifact(
+        self, handler: BaseHTTPRequestHandler, repo_relative_path: str, *, download_name: str | None = None
+    ) -> None:
         candidate = resolve_repo_path(self.repo_root, repo_relative_path).resolve()
         try:
             candidate.relative_to(self.repo_root)
@@ -16003,7 +16968,7 @@ class RenderDaemon:
         if not candidate.exists() or not candidate.is_file():
             self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": f"Artifact not found: {repo_relative_path}"})
             return
-        self._serve_file(handler, candidate)
+        self._serve_file(handler, candidate, download_name=download_name)
 
     def _serve_scene_geometry(self, handler: BaseHTTPRequestHandler, scene_id: str, mesh_id: str) -> None:
         detail = self._scene_detail(scene_id).get("scene")
@@ -16035,11 +17000,23 @@ class RenderDaemon:
 
         self._serve_repo_artifact(handler, match.geometry_path)
 
-    def _serve_file(self, handler: BaseHTTPRequestHandler, path: Path, *, default_type: str | None = None) -> None:
+    def _serve_file(
+        self,
+        handler: BaseHTTPRequestHandler,
+        path: Path,
+        *,
+        default_type: str | None = None,
+        download_name: str | None = None,
+    ) -> None:
         payload = path.read_bytes()
         mime_type, _ = mimetypes.guess_type(str(path))
         content_type = default_type or mime_type or "application/octet-stream"
-        self._send_bytes(handler, HTTPStatus.OK, payload, content_type=content_type)
+        extra_headers: dict[str, str] | None = None
+        if download_name:
+            # Quote per RFC 6266; keep it simple (basename only, no path separators).
+            safe = download_name.replace("\\", "_").replace("/", "_").replace('"', "")
+            extra_headers = {"Content-Disposition": f'attachment; filename="{safe}"'}
+        self._send_bytes(handler, HTTPStatus.OK, payload, content_type=content_type, extra_headers=extra_headers)
 
     def _last_command_of_type(self, *types: str) -> "_IsaacRemoteCommand | None":
         with self._condition:
@@ -17820,7 +18797,7 @@ class RenderDaemon:
         avg_render_time_s: float | None = None
         if recent_completed:
             def _parse_ts(s: str) -> float:
-                from datetime import datetime, timezone
+                from datetime import datetime, timezone, timedelta
                 try:
                     return datetime.fromisoformat(s).astimezone(timezone.utc).timestamp()
                 except Exception:

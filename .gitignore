@@ -66,3 +66,5 @@ data/hpbrdf_2025/
 
 # WSL 잔재 (콜론 형식 — *.Zone.Identifier 패턴이 안 잡음)
 *:Zone.Identifier
+# machine-local infinigen env path (scripts/infinigen_env.py)
+.infinigen_env

@@ -360,6 +360,23 @@ const opticalProject = (projectId: string) =>
 
 export const listOpticalNavProjects = () =>
 	fetch('/api/opticalnav/projects').then(json);
+
+// --- Infinigen procedural scene generation (background job, polled) ---------
+export type InfinigenGenerateRequest = {
+	archetype: 'apartment' | 'office';
+	density: 'model_house' | 'normal_lived_in' | 'family_home' | 'storage_heavy';
+	stage: 'full' | 'layout';
+	seed: string; // 8 digits, 'today', or 'random'
+	import_scene?: boolean;
+	bake_pbr?: boolean;
+	scene_id?: string;
+};
+export const startInfinigenGenerate = (projectId: string, body: InfinigenGenerateRequest) =>
+	post(`${opticalProject(projectId)}/infinigen-generate`, body);
+export const getInfinigenJob = (projectId: string, jobId: string) =>
+	fetch(`${opticalProject(projectId)}/infinigen-generate/${encodeURIComponent(jobId)}`).then(json);
+export const listInfinigenJobs = (projectId: string) =>
+	fetch(`${opticalProject(projectId)}/infinigen-generate`).then(json);
 export const listOpticalNavUsdCandidates = () =>
 	fetch('/api/opticalnav/usd-candidates').then(json);
 export const listOpticalNavAssetSources = () =>
@@ -430,6 +447,10 @@ export const syncOpticalNavRenderScene = (projectId: string, sceneId: string, pa
 	post(`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/sync/render-scene`, payload);
 export const syncOpticalNavIsaacStage = (projectId: string, sceneId: string, payload: unknown = {}) =>
 	post(`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/sync/isaac-stage`, payload);
+export const getOpticalPerturbation = (projectId: string, sceneId: string) =>
+	fetch(`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/optical-perturbation`).then(json);
+export const buildOpticalPerturbation = (projectId: string, sceneId: string, payload: unknown = {}) =>
+	post(`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/optical-perturbation`, payload);
 export const buildOpticalNavMap = (projectId: string, sceneId: string, payload: { resolution: number }) =>
 	post(`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/map/build`, payload);
 export const buildOpticalNavViewpointGraph = (projectId: string, sceneId: string, payload: unknown) =>
@@ -474,6 +495,10 @@ export const planOpticalNavEpisodes = (projectId: string, payload: unknown) =>
 	post(`${opticalProject(projectId)}/episodes/plan`, payload);
 export const planOpticalNavGraphEpisodes = (projectId: string, payload: unknown) =>
 	post(`${opticalProject(projectId)}/graph/episodes/plan`, payload);
+export const validateOpticalNavGraphEpisodes = (
+	projectId: string,
+	payload: { scene_id?: string; delete?: boolean },
+) => post(`${opticalProject(projectId)}/episodes/validate-graph-refs`, payload);
 export const listOpticalNavEpisodes = (projectId: string, split?: string) =>
 	fetch(`${opticalProject(projectId)}/episodes${split ? `?split=${encodeURIComponent(split)}` : ''}`).then(json);
 export const getOpticalNavEpisode = (projectId: string, episodeId: string) =>
@@ -557,8 +582,8 @@ export const deleteOpticalNavGraphEdge = (projectId: string, sceneId: string, ed
 	fetch(`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/graph/edges/${encodeURIComponent(edgeId)}`, { method: 'DELETE', headers: { 'X-Edit-Session': EDIT_SESSION } }).then(json);
 export const opticalNavObservationRgbUrl = (projectId: string, sceneId: string, vpId: string, headingId: string): string =>
 	`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/observations/${encodeURIComponent(vpId)}/rgb?heading=${encodeURIComponent(headingId)}`;
-export const opticalNavObservationModalityUrl = (projectId: string, sceneId: string, vpId: string, headingId: string, modality: string, sensorId = ''): string =>
-	`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/observations/${encodeURIComponent(vpId)}/${encodeURIComponent(modality)}?heading=${encodeURIComponent(headingId)}${sensorId ? `&sensor_id=${encodeURIComponent(sensorId)}` : ''}`;
+export const opticalNavObservationModalityUrl = (projectId: string, sceneId: string, vpId: string, headingId: string, modality: string, sensorId = '', variant = 'base'): string =>
+	`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/observations/${encodeURIComponent(vpId)}/${encodeURIComponent(modality)}?heading=${encodeURIComponent(headingId)}${sensorId ? `&sensor_id=${encodeURIComponent(sensorId)}` : ''}${variant && variant !== 'base' ? `&variant=${encodeURIComponent(variant)}` : ''}`;
 export const validateOpticalNavDataset = (
 	projectId: string,
 	payload: { require_observations?: boolean; scene_ids?: string[] | null },
@@ -588,6 +613,9 @@ export const submitOpticalNavExportJob = (
 		panorama_observations?: boolean;
 		png_only?: boolean;
 		include_birdseye?: boolean;
+		include_episode_birdseye?: boolean;
+		include_polarization_raw?: boolean;
+		eval_perturbation?: boolean;
 	},
 ) => post(`${opticalProject(projectId)}/export-jobs`, payload);
 

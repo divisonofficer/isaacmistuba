@@ -191,6 +191,43 @@ def render_config_from_payload(payload: Mapping[str, Any] | None) -> RenderConfi
     return RenderConfig(**dict(payload))
 
 
+def _camera_render_settings_payload(base_payload: Mapping[str, Any] | None, camera_spec: CameraSpec) -> dict[str, Any]:
+    payload = dict(base_payload or {})
+    extras = camera_spec.extras if isinstance(camera_spec.extras, Mapping) else {}
+    overrides = extras.get("render") if isinstance(extras.get("render"), Mapping) else extras.get("render_settings")
+    if isinstance(overrides, Mapping):
+        allowed = {item.name for item in fields(RenderConfig)}
+        for key, value in overrides.items():
+            if key in allowed and value is not None:
+                payload[str(key)] = value
+    return payload
+
+
+def _camera_modalities(render_request: RenderRequest, camera_spec: CameraSpec) -> list[str]:
+    extras = camera_spec.extras if isinstance(camera_spec.extras, Mapping) else {}
+    values = extras.get("render_modalities")
+    if isinstance(values, list):
+        modalities = [str(item) for item in values if str(item)]
+        if modalities:
+            return modalities
+    value = extras.get("render_modality")
+    if value:
+        return [str(value)]
+    return list(render_request.modalities)
+
+
+def _camera_assist_light(render_request: RenderRequest, camera_spec: CameraSpec, camera_modalities: list[str]) -> AssistLightSpec | None:
+    extras = camera_spec.extras if isinstance(camera_spec.extras, Mapping) else {}
+    # Multi-sensor rig sweeps stamp render_modalities per camera. In that mode,
+    # keep camera-aligned active illumination scoped to the cameras that need it
+    # instead of lighting unrelated RGB/polar cameras in the same bundle.
+    if "render_modalities" in extras:
+        if any(item in {"active_nir_intensity", "nir_intensity"} for item in camera_modalities) or extras.get("active_emitter"):
+            return render_request.assist_light
+        return None
+    return render_request.assist_light
+
+
 def render_config_to_payload(config: RenderConfig) -> dict[str, Any]:
     return asdict(config)
 
@@ -279,8 +316,6 @@ def render_scene_state(
 
     root = Path(repo_root).resolve()
     scene_path = resolve_repo_path(root, scene_state.mitsuba_scene_ref)
-    base_config = render_config_from_payload(render_request.render_settings)
-
     if out_dir is None:
         layout = ensure_observation_layout(root, scene_state.job_id, scene_state.frame_id)
         camera_root = layout.cameras_dir
@@ -293,16 +328,19 @@ def render_scene_state(
         camera_dir = camera_root / camera_spec.camera_id
         camera_dir.mkdir(parents=True, exist_ok=True)
         camera_to_world = np.asarray(camera_spec.camera_to_world, dtype=np.float32).reshape(4, 4)
+        base_config = render_config_from_payload(_camera_render_settings_payload(render_request.render_settings, camera_spec))
         config = _camera_config(base_config, camera_spec)
+        camera_modalities = _camera_modalities(render_request, camera_spec)
+        camera_assist_light = _camera_assist_light(render_request, camera_spec, camera_modalities)
         rendered[camera_spec.camera_id] = render_modalities(
             scene_path,
             camera_to_world,
             camera_spec.fov_deg,
-            render_request.modalities,
+            camera_modalities,
             out_dir=camera_dir,
             config=config,
             scene_override=render_request.scene_override,
-            assist_light=render_request.assist_light,
+            assist_light=camera_assist_light,
             depth_approx=render_request.depth_approx,
             variant=variant,
         )
@@ -346,7 +384,7 @@ def render_timestep_bundle(
     for camera_spec in render_request.camera_specs:
         result = camera_results[camera_spec.camera_id]
         timing_log["cameras"][camera_spec.camera_id] = result.pass_records
-        for modality in render_request.modalities:
+        for modality in _camera_modalities(render_request, camera_spec):
             if modality not in result.results:
                 continue
             artifacts.append(_artifact_manifest_from_result(root, camera_spec, modality, result.results[modality]))
@@ -412,9 +450,7 @@ def render_timestep_bundle_split_lighting(
     validate_render_request(render_request)
     root = Path(repo_root).resolve()
     layout = ensure_observation_layout(root, render_request.job_id, render_request.frame_id)
-    base_config = render_config_from_payload(render_request.render_settings)
     scene_path = resolve_repo_path(root, render_request.scene_state.mitsuba_scene_ref)
-    branch_modalities = _split_lighting_modalities(list(render_request.modalities))
 
     artifacts: list[RenderArtifactManifest] = []
     timing_log = {
@@ -430,7 +466,11 @@ def render_timestep_bundle_split_lighting(
         camera_dir = layout.cameras_dir / camera_spec.camera_id
         camera_dir.mkdir(parents=True, exist_ok=True)
         camera_to_world = np.asarray(camera_spec.camera_to_world, dtype=np.float32).reshape(4, 4)
+        base_config = render_config_from_payload(_camera_render_settings_payload(render_request.render_settings, camera_spec))
         camera_config = _camera_config(base_config, camera_spec)
+        camera_modalities = _camera_modalities(render_request, camera_spec)
+        camera_assist_light = _camera_assist_light(render_request, camera_spec, camera_modalities)
+        branch_modalities = _split_lighting_modalities(camera_modalities)
         branch_results: dict[str, MultimodalRenderResult] = {}
 
         if branch_modalities["ambient"]:
@@ -461,7 +501,7 @@ def render_timestep_bundle_split_lighting(
                 out_dir=camera_dir,
                 config=camera_config,
                 scene_override=render_request.scene_override,
-                assist_light=render_request.assist_light,
+                assist_light=camera_assist_light,
                 depth_approx=render_request.depth_approx,
                 variant=variant,
                 progress_callback=progress_callback,
@@ -479,7 +519,7 @@ def render_timestep_bundle_split_lighting(
                 out_dir=camera_dir,
                 config=polar_config,
                 scene_override=render_request.scene_override,
-                assist_light=render_request.assist_light,
+                assist_light=camera_assist_light,
                 depth_approx=None,
                 variant=variant,
                 progress_callback=progress_callback,
@@ -490,7 +530,7 @@ def render_timestep_bundle_split_lighting(
             for branch_name, result in branch_results.items()
         }
         for result in branch_results.values():
-            for modality in render_request.modalities:
+            for modality in camera_modalities:
                 if modality not in result.results:
                     continue
                 artifacts.append(_artifact_manifest_from_result(root, camera_spec, modality, result.results[modality]))
@@ -576,6 +616,8 @@ def make_reflective_island_demo_request(
             "sensor_depth_approx",
             "active_nir_intensity",
             "polar_rgb_preview",
+            "s1_over_s0",
+            "s2_over_s0",
             "s1",
             "s2",
             "dop",

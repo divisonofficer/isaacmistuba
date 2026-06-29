@@ -99,6 +99,8 @@
 		geometryKey = '',
 		authoringObjects = [],
 		authoringRegions = [],
+		perturbationObjects = [],
+		perturbationEnabled = false,
 		graphNodes = [],
 		graphEdges = [],
 		selectedId = '',
@@ -210,6 +212,8 @@
 		geometryKey?: string;
 		authoringObjects: any[];
 		authoringRegions: any[];
+		perturbationObjects?: any[];
+		perturbationEnabled?: boolean;
 		graphNodes: any[];
 		graphEdges: any[];
 		selectedId: string;
@@ -1805,7 +1809,12 @@
 				else if (previewState === 'architecture_proxy') editorMeshStats.architecture_proxy++;
 				else if (previewState === 'xml_fallback_shape') editorMeshStats.xml_fallback_shape++;
 				rootGroup.add(mesh);
-				const editorPickable = mesh?.userData?.editor_pickable !== false;
+				// Glass/windows render as see-through architecture but stay clickable so the
+				// user can select a window to inspect its material. This fallback keeps them
+				// pickable even with editor_geometry generated before the daemon-side fix.
+				const _archKind = String(mesh?.userData?.architecture_kind ?? '').toLowerCase();
+				const editorPickable = mesh?.userData?.editor_pickable !== false
+					|| _archKind.includes('glass') || _archKind.includes('window');
 				if (editorPickable) { selectableObjects.push(mesh); editorMeshStats.pickable++; }
 				else editorMeshStats.non_pickable++;
 				if (editorPickable && selectedId === obj.id) {
@@ -1816,6 +1825,25 @@
 				}
 			}
 			for (const obj of authoringObjects) addEmitterOverlayForObject(obj);
+		}
+
+		// Optical perturbation overlay (separate, toggleable layer): render the
+		// auto-placed mirror_wall / glass_wall line objects so the user can see and
+		// judge placement in the editor. buildWall already styles glass (blue) and
+		// mirror (metallic); we tag them + a faint emissive so the overlay reads as
+		// distinct from base walls. Display-only (not pushed to selectableObjects).
+		if (perturbationEnabled) {
+			for (const obj of perturbationObjects) {
+				if (obj?.geometry?.type !== 'line') continue;
+				const mesh = buildWall(obj);
+				if (!mesh) continue;
+				mesh.userData = { ...(mesh.userData || {}), perturbation: true };
+				try {
+					if (mesh.material && mesh.material.emissive)
+						mesh.material.emissive = new THREE.Color(obj.type === 'mirror_wall' ? 0x335577 : 0x224466);
+				} catch { /* material has no emissive — fine */ }
+				rootGroup.add(mesh);
+			}
 		}
 
 		editorMeshStats.cache = getObjMeshCacheStats();
@@ -2565,8 +2593,11 @@
 			}
 		}
 		const dist = Math.hypot(ex - sx, ez - sz);
+		// Use the mode's ghost color for a valid endpoint (green=add, purple=inspect,
+		// red=remove); over-length always reds out as an "auto-build won't link this"
+		// affordance (only meaningful for add mode — remove ignores length).
 		const color = endIsNode
-			? (dist <= addEdgeMaxLengthM ? 0x22c55e : 0xef4444)
+			? (dist <= addEdgeMaxLengthM ? addEdgeGhostColor : 0xef4444)
 			: addEdgeGhostColor;
 		const pts = [new THREE.Vector3(sx, 0.05, sz), new THREE.Vector3(ex, 0.05, ez)];
 		const line = new THREE.Line(
@@ -2864,6 +2895,8 @@
 	$effect(() => {
 		authoringObjects;
 		authoringRegions;
+		perturbationObjects;
+		perturbationEnabled;
 		graphNodes;
 		graphEdges;
 		selectedId;

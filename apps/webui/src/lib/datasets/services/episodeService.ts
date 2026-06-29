@@ -8,6 +8,7 @@ import {
 	getOpticalNavEpisode,
 	planOpticalNavEpisodes,
 	planOpticalNavGraphEpisodes,
+	validateOpticalNavGraphEpisodes,
 	scanOpticalNavObservations,
 	deleteOpticalNavObservations,
 } from '$lib/api';
@@ -70,4 +71,12 @@ export async function clearNodeObservations(projectId: string, sceneId: string, 
 
 export async function clearAllObservations(projectId: string, sceneId: string) {
 	return deleteOpticalNavObservations(projectId, sceneId, null);
+}
+
+/**
+ * Audit graph episodes for stale references (deleted nodes/edges or edges disabled by
+ * the glass/mirror overlay). Pass `del=true` to prune the stale episode files.
+ */
+export async function validateGraphEpisodes(projectId: string, sceneId: string, del = false) {
+	return validateOpticalNavGraphEpisodes(projectId, { scene_id: sceneId, delete: del });
 }

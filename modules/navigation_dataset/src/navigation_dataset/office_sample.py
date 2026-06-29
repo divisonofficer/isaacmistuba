@@ -152,6 +152,7 @@ def _try_materialize_render_scene(
         from mitsuba_converter.render_daemon import (  # type: ignore
             _build_materialization_audit,
             _build_opticalnav_render_readiness,
+            _build_render_scene_material_policy,
             _build_xml_scene_index,
             _generate_opticalnav_render_scene_xml,
             _stage_xml_obj_filenames_to_scene_mesh_cache,
@@ -170,6 +171,7 @@ def _try_materialize_render_scene(
     render_scene_path = scene_dir / "render_scene.xml"
     mesh_stats: dict[str, int] = {}
     materialization_records: list[dict[str, Any]] = []
+    material_policy_records: list[dict[str, Any]] = []
     try:
         shape_count = _generate_opticalnav_render_scene_xml(
             authoring_map,
@@ -180,6 +182,15 @@ def _try_materialize_render_scene(
             mesh_resolver=None,
             mesh_stats=mesh_stats,
             materialization_records=materialization_records,
+            material_policy_records=material_policy_records,
+        )
+        material_policy = _build_render_scene_material_policy(
+            scene_id=scene_id,
+            material_policy_records=material_policy_records,
+        )
+        (scene_dir / "render_scene_material_policy.json").write_text(
+            json.dumps(material_policy, ensure_ascii=False, indent=2),
+            encoding="utf-8",
         )
         render_scene_ref = render_scene_path.relative_to(repo_root).as_posix()
         mesh_stats["scene_mesh_cache"] = _stage_xml_obj_filenames_to_scene_mesh_cache(

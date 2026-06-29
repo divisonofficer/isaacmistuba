@@ -42,6 +42,79 @@ export function normalizedCounts(jobs: any[]): Record<NormalizedJobStatus, numbe
 	return counts;
 }
 
+function parseTsMs(value: unknown): number | null {
+	if (typeof value !== 'string' || value.length === 0) return null;
+	const parsed = Date.parse(value);
+	return Number.isFinite(parsed) ? parsed : null;
+}
+
+function batchCreatedAtMs(batch: any, job?: any): number | null {
+	return parseTsMs(job?.batch_created_at ?? job?.status?.batch_created_at ?? batch?.created_at);
+}
+
+function statusEventMs(status: any): number | null {
+	for (const key of ['finished_at', 'completed_at', 'worker_started_at', 'started_at', 'submitted_at']) {
+		const parsed = parseTsMs(status?.[key]);
+		if (parsed !== null) return parsed;
+	}
+	return null;
+}
+
+function isTerminalNormalized(status: NormalizedJobStatus): boolean {
+	return status === 'done' || status === 'failed' || status === 'cancelled';
+}
+
+function staleStatusForBatch(batch: any, job: any, status: any): boolean {
+	const normalized = normalizeJobStatus({ status });
+	if (!isTerminalNormalized(normalized)) return false;
+	const batchMs = batchCreatedAtMs(batch, job);
+	const eventMs = statusEventMs(status);
+	if (batchMs === null || eventMs === null) return false;
+	return eventMs < batchMs - 30_000;
+}
+
+function maskStaleStatus(batch: any, job: any): any {
+	const status = (job?.status && typeof job.status === 'object') ? job.status : { status: job?.status ?? 'unknown' };
+	const batchCreated = job?.batch_created_at ?? batch?.created_at;
+	if (!staleStatusForBatch(batch, job, status)) {
+		return { ...job, batch_created_at: batchCreated };
+	}
+	return {
+		...job,
+		batch_created_at: batchCreated,
+		status: {
+			job_id: status.job_id ?? job?.job_id,
+			status: 'queued',
+			progress_stage: 'queued',
+			batch_created_at: batchCreated,
+			stale_previous_status: status.status,
+			stale_previous_finished_at: status.finished_at,
+		},
+	};
+}
+
+function withRecomputedProgress(batch: any, jobs: any[]): any {
+	const normalized = normalizedCounts(jobs);
+	const counts: Record<string, number> = { ...normalized, completed: normalized.done };
+	const total = Math.max(1, jobs.length);
+	return {
+		...(batch ?? {}),
+		jobs,
+		counts,
+		progress: {
+			completed: normalized.done,
+			failed: counts.failed,
+			total: jobs.length,
+			fraction: (normalized.done + normalized.failed) / total,
+		},
+	};
+}
+
+export function normalizeBatchForDisplay(batch: any): any {
+	if (!batch || !Array.isArray(batch.jobs)) return batch;
+	return withRecomputedProgress(batch, batch.jobs.map((job: any) => maskStaleStatus(batch, job)));
+}
+
 /**
  * Apply a flat job-status update (the shape pushed by `/api/ws/job-status`) to
  * an existing batch by job_id, preserving the rich batch-side metadata
@@ -63,7 +136,7 @@ export function applyJobStatusUpdates(batch: any, wsJobs: any[]): any {
 	}
 	const nextJobs = batch.jobs.map((job: any) => {
 		const ws = wsById.get(String(job?.job_id ?? ''));
-		if (!ws) return job;
+		if (!ws) return maskStaleStatus(batch, job);
 		// Merge ws extras into existing status.extras so batch-side fields
 		// (texture_profile, scene_cache_hit, etc.) survive the update.
 		const prevExtras = (job?.status?.extras && typeof job.status.extras === 'object')
@@ -84,24 +157,11 @@ export function applyJobStatusUpdates(batch: any, wsJobs: any[]): any {
 			error: ws.error ?? job?.status?.error,
 			extras: { ...prevExtras, ...(ws.extras ?? {}) },
 		};
-		return { ...job, status: nestedStatus };
+		return maskStaleStatus(batch, { ...job, status: nestedStatus });
 	});
-	const normalized = normalizedCounts(nextJobs);
-	const counts: Record<string, number> = { ...normalized, completed: normalized.done };
-	const total = Math.max(1, nextJobs.length);
 	// Always return a fresh object so downstream $derived chains re-fire even
 	// when the merge produced no semantic change.
-	return {
-		...batch,
-		jobs: nextJobs,
-		counts,
-		progress: {
-			completed: normalized.done,
-			failed: counts.failed,
-			total: nextJobs.length,
-			fraction: (normalized.done + normalized.failed) / total,
-		},
-	};
+	return withRecomputedProgress(batch, nextJobs);
 }
 
 /**
@@ -123,23 +183,10 @@ export function logTailsToBatchEntries(
 
 export function mergeBatch(existing: any, incoming: any): any {
 	const jobMap = new Map<string, any>();
-	for (const j of existing?.jobs ?? []) jobMap.set(j.job_id, j);
-	for (const j of incoming?.jobs ?? []) jobMap.set(j.job_id, j);
+	for (const j of existing?.jobs ?? []) jobMap.set(j.job_id, maskStaleStatus(existing, j));
+	for (const j of incoming?.jobs ?? []) jobMap.set(j.job_id, maskStaleStatus(incoming, j));
 	const jobs = [...jobMap.values()];
-	const normalized = normalizedCounts(jobs);
-	const counts: Record<string, number> = { ...normalized, completed: normalized.done };
-	const total = Math.max(1, jobs.length);
-	return {
-		...(incoming ?? existing ?? {}),
-		jobs,
-		counts,
-		progress: {
-			completed: normalized.done,
-			failed: counts.failed,
-			total: jobs.length,
-			fraction: (normalized.done + normalized.failed) / total,
-		},
-	};
+	return withRecomputedProgress((incoming ?? existing ?? {}), jobs);
 }
 
 export function buildBatchJobGrid(batch: any): {
@@ -198,12 +245,6 @@ export function jobStatusClass(job: any): string {
 
 export function jobStageLabel(job: any): string {
 	return String(job?.status?.progress_stage ?? job?.status?.status ?? '');
-}
-
-function parseTsMs(value: unknown): number | null {
-	if (typeof value !== 'string' || value.length === 0) return null;
-	const parsed = Date.parse(value);
-	return Number.isFinite(parsed) ? parsed : null;
 }
 
 export function jobRunStartedAt(job: any): string {

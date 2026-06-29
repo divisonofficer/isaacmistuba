@@ -239,6 +239,7 @@ def cmd_graph_build(args) -> None:
         min_node_spacing_m=args.min_node_spacing,
         min_clearance_m=(args.min_clearance if args.min_clearance and args.min_clearance > 0 else None),
         camera_margin_m=getattr(args, "camera_margin", 0.10),
+        doorway_gap_m=getattr(args, "doorway_gap", 0.45),
         max_nodes=args.max_nodes, k_neighbors=args.k_neighbors,
         max_edge_length_m=args.max_edge_length, seed=args.seed,
     )
@@ -297,17 +298,23 @@ def cmd_graph_sweep(args) -> None:
 
 def cmd_graph_episodes_plan(args) -> None:
     root = _dataset_root(args.dataset)
+    from .optical_perturbation import disabled_edges_for_scene
+
     graph_path = Path(args.graph) if args.graph else root / "scenes" / args.scene_id / "viewpoint_graph.json"
     annotation_path = root / "scenes" / args.scene_id / "scene_annotation.json"
     annotation = read_scene_annotation(annotation_path) if annotation_path.exists() else None
+    graph = read_viewpoint_graph(graph_path)
+    # Exclude edges cut by an enabled glass/mirror perturbation overlay from planning.
+    excluded_edges = disabled_edges_for_scene(root / "scenes" / args.scene_id, graph)
     episodes = plan_graph_episodes(
-        graph=read_viewpoint_graph(graph_path),
+        graph=graph,
         num_pairs=args.num_pairs,
         split_counts=split_counts_from_spec(args.splits),
         scenarios=[item.strip() for item in args.scenarios.split(",") if item.strip()],
         modalities=_modalities(args.modalities),
         annotation=annotation,
         seed=args.seed,
+        excluded_edge_ids=excluded_edges,
     )
     written = write_graph_episodes(root, episodes)
     write_dataset_index(root)
@@ -327,6 +334,19 @@ def cmd_evaluate(args) -> None:
     output = root / "evaluation" / f"{args.policy}.json"
     write_evaluation(output, root, success_radius=args.success_radius)
     print(json.dumps(evaluate_dataset(root, success_radius=args.success_radius)["metrics"], indent=2))
+
+
+def cmd_perturbation_build(args) -> None:
+    from .optical_perturbation import build_optical_perturbation
+
+    root = _dataset_root(args.dataset)
+    scene_dir = root / "scenes" / args.scene_id
+    payload = build_optical_perturbation(
+        scene_dir, seed=args.seed, enabled=not args.disabled,
+        mirror_density=args.mirror_density, max_glass_walls=args.max_glass_walls,
+    )
+    print(json.dumps({"scene_id": args.scene_id, **payload["metadata"],
+                      "enabled": payload["enabled"]}, indent=2))
 
 
 def cmd_export(args) -> None:
@@ -412,6 +432,8 @@ def main() -> None:
     p_graph_build.add_argument("--resolution", type=float, default=0.05)
     p_graph_build.add_argument("--camera-margin", type=float, default=0.10,
                                help="extra node clearance beyond robot radius so cameras don't hug walls (mesh scenes)")
+    p_graph_build.add_argument("--doorway-gap", type=float, default=0.45,
+                               help="max wall/threshold gap (m) bridged to connect rooms whose doorway isn't in the grid")
     p_graph_build.set_defaults(fn=cmd_graph_build)
     p_graph_qa = graph_sub.add_parser("qa")
     p_graph_qa.add_argument("--dataset", default=".")
@@ -456,6 +478,18 @@ def main() -> None:
     p_eval.add_argument("--policy", default="shortest_oracle")
     p_eval.add_argument("--success-radius", type=float, default=0.5)
     p_eval.set_defaults(fn=cmd_evaluate)
+
+    p_perturb = sub.add_parser("perturbation")
+    perturb_sub = p_perturb.add_subparsers(dest="perturbation_cmd", required=True)
+    p_perturb_build = perturb_sub.add_parser("build", help="auto-place mirrors+glass as a toggleable overlay")
+    p_perturb_build.add_argument("--dataset", default=".")
+    p_perturb_build.add_argument("--scene-id", required=True)
+    p_perturb_build.add_argument("--seed", type=int, default=0)
+    p_perturb_build.add_argument("--mirror-density", type=float, default=1.0)
+    p_perturb_build.add_argument("--max-glass-walls", type=int, default=2)
+    p_perturb_build.add_argument("--disabled", action="store_true",
+                                 help="write the overlay with enabled=false (placed but off).")
+    p_perturb_build.set_defaults(fn=cmd_perturbation_build)
 
     p_export = sub.add_parser("export")
     p_export.add_argument("--dataset", required=True)

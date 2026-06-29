@@ -2,8 +2,10 @@
 	import ExportProgressCard from './ExportProgressCard.svelte';
 	import ExportResultCard from './ExportResultCard.svelte';
 	import type { ExportJobStatus } from '$lib/datasets/services/exportJobsService';
+	import type { Capabilities } from '$lib/datasets/capabilityHelpers';
 
 	let {
+		caps,
 		hasScene,
 		hasMap,
 		hasGraph,
@@ -23,6 +25,8 @@
 		panoramaObservations = $bindable(true),
 		pngOnly = $bindable(true),
 		includeBirdseye = $bindable(true),
+		includeEpisodeBirdseye = $bindable(false),
+		evalPerturbation = $bindable(false),
 		currentSceneId = '',
 		exportableEpisodeCount = 0,
 		exportSummary = null,
@@ -32,6 +36,7 @@
 		onCancelExport,
 		onResetExport,
 	}: {
+		caps: Capabilities;
 		hasScene: boolean;
 		hasMap: boolean;
 		hasGraph: boolean;
@@ -51,6 +56,8 @@
 		panoramaObservations?: boolean;
 		pngOnly?: boolean;
 		includeBirdseye?: boolean;
+		includeEpisodeBirdseye?: boolean;
+		evalPerturbation?: boolean;
 		currentSceneId?: string;
 		exportableEpisodeCount?: number;
 		exportSummary?: any;
@@ -139,7 +146,7 @@
 			</div>
 		{/if}
 	{/if}
-	<button class="button button-subtle full mt-2" disabled={loading} onclick={onValidate}>
+	<button class="button button-subtle full mt-2" disabled={!caps.validate.enabled} title={caps.validate.reason} onclick={onValidate}>
 		{loading ? 'Validating...' : 'Validate Dataset'}
 	</button>
 	<label class="export-filter-row">
@@ -188,6 +195,16 @@
 	</label>
 	<div class="export-filter-hint">grid + viewpoint graph + episode 경로의 top-down 요약 PNG 를 포함합니다.</div>
 	<label class="export-filter-row">
+		<input type="checkbox" bind:checked={includeEpisodeBirdseye} />
+		<span>Per-episode path maps</span>
+	</label>
+	<div class="export-filter-hint">episode별 경로 bird's-eye PNG (episodes_birdseye/) 를 추가로 생성합니다.</div>
+	<label class="export-filter-row">
+		<input type="checkbox" bind:checked={evalPerturbation} />
+		<span>Eval perturbation pair</span>
+	</label>
+	<div class="export-filter-hint">거울/유리 변형 렌더(observations_perturbed/)를 동봉해 base↔perturbed 페어 eval 번들을 만듭니다.</div>
+	<label class="export-filter-row">
 		<input type="checkbox" bind:checked={includeThumbnails} />
 		<span>Include episode thumbnails</span>
 	</label>
@@ -206,7 +223,8 @@
 	{:else}
 		<button
 			class="button button-primary full"
-			disabled={!hasEpisodes || loading || (onlyCompleted && exportableEpisodeCount === 0) || !currentSceneId}
+			disabled={!caps.export.enabled}
+			title={caps.export.reason}
 			onclick={onExport}
 		>
 			{loading ? 'Submitting…' : 'Export Dataset'}

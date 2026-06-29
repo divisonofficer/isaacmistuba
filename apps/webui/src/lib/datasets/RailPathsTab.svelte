@@ -1,5 +1,7 @@
 <script lang="ts">
+	import type { Capabilities } from '$lib/datasets/capabilityHelpers';
 	interface Props {
+		caps: Capabilities;
 		hasMap: boolean;
 		hasGraph: boolean;
 		hasScene: boolean;
@@ -57,6 +59,10 @@
 		onLoadEpisode: (id: string) => void;
 		onGenerateEpisodes: () => void;
 		onClearEpisodes: () => void;
+		onValidateEpisodes?: () => void;
+		onPruneStaleEpisodes?: () => void;
+		staleEpisodeReport?: any;
+		validatingEpisodes?: boolean;
 		onSetEpisodeSearch: (v: string) => void;
 		onSetEpisodeCount: (n: number) => void;
 		onSetRobotRadius: (v: number) => void;
@@ -70,6 +76,7 @@
 		onRenderEpisodeNodes?: () => void;
 		renderMissingOnly?: boolean;
 		onSetRenderMissingOnly?: (value: boolean) => void;
+		selectedRigSensorCount?: number;
 		episodeNodesAvailable?: boolean;
 		episodePathNodeCount?: number;
 		headingsPerNode?: number;
@@ -90,6 +97,7 @@
 	const COMPONENT_COLORS = ['#6366f1','#ef4444','#fbbf24','#a855f7','#14b8a6','#ec4899','#84cc16'];
 
 	let {
+		caps,
 		hasMap, hasGraph, hasScene, selectedProjectId, sceneId, loading,
 		buildingMap, buildingGraph, graphBuildProgress, graphResult, mapResult,
 		graphPayloadSummary, graphPayload, graphNodes, graphEdges,
@@ -103,11 +111,14 @@
 		onRebuildRegion, onClearRegion, onClearWalkabilityOverlay, onRefreshTraversableMeta,
 		onSetShowFootprint, onSetShowTraversableMask, onAddEdgeAnyway, onDismissEdgeCheck,
 		onDeleteGraphEdge, onDeleteGraphNode, onLoadEpisode, onGenerateEpisodes,
-		onClearEpisodes, onSetEpisodeSearch, onSetEpisodeCount,
+		onClearEpisodes, onValidateEpisodes, onPruneStaleEpisodes,
+		staleEpisodeReport = null, validatingEpisodes = false,
+		onSetEpisodeSearch, onSetEpisodeCount,
 		onSetRobotRadius, onSetMinClearance, onSetResolution,
 		onSetMaxNodes, onSetHeadingCount, onSetMinNodeSpacing,
 		onRenderEpisodeNodes,
 		renderMissingOnly = true, onSetRenderMissingOnly,
+		selectedRigSensorCount = 1,
 		episodeNodesAvailable = false, episodePathNodeCount = 0, headingsPerNode = 0,
 		renderSceneSynced = false,
 		removeSelectionCount = 0, removeMarginM = 0, removePassHeightM = 1.2, findingOverlapping = false, removingNodes = false,
@@ -126,14 +137,14 @@
 	<label class="footprint-toggle"><input type="checkbox" checked={showFootprint} onchange={(e) => onSetShowFootprint((e.currentTarget as HTMLInputElement).checked)} /> Show inflation overlay (3D view)</label>
 	<div class="rail-title mt-2">Traversable grid</div>
 	<label><span>Resolution (m)</span><input type="number" step="0.01" min="0.01" value={resolution} oninput={(e) => onSetResolution(Number((e.currentTarget as HTMLInputElement).value))} /></label>
-	<button class="button button-subtle" disabled={!selectedProjectId || !hasScene || buildingMap} onclick={onBuildMap}>
+	<button class="button button-subtle" disabled={!caps.buildMap.enabled} title={caps.buildMap.reason} onclick={onBuildMap}>
 		{#if buildingMap}<span class="spinner-xs"></span> Building...{:else}{hasMap ? 'Rebuild grid' : 'Build grid'}{/if}
 	</button>
 	<div class="rail-title mt-2">Viewpoint graph</div>
-	<button class="button button-subtle" disabled={!hasMap || buildingGraph} onclick={onRequestBuildGraph}>
+	<button class="button button-subtle" disabled={!caps.buildGraph.enabled} title={caps.buildGraph.reason} onclick={onRequestBuildGraph}>
 		{buildingGraph ? 'Rebuilding…' : 'Rebuild graph'}
 	</button>
-	<button class="button button-subtle" disabled={!hasGraph || rebuildingEdges} onclick={() => onRebuildEdges?.()} title="Re-run edge building over the current node set (keeps all auto + manual nodes; reconnects manual nodes and drops edges that cross glass/furniture).">
+	<button class="button button-subtle" disabled={!caps.rebuildEdges.enabled} onclick={() => onRebuildEdges?.()} title={caps.rebuildEdges.reason || "Re-run edge building over the current node set (keeps all auto + manual nodes; reconnects manual nodes and drops edges that cross glass/furniture)."}>
 		{rebuildingEdges ? 'Rebuilding edges…' : 'Rebuild edges (keep nodes)'}
 	</button>
 	{#if selectedSensorNode && !(selectedSensorNode as any).isCustom}
@@ -154,6 +165,7 @@
 			{ value: 'paint_erase', label: '🧽 Erase paint', title: 'Drag to clear walkability paint marks in that area (restore the auto-computed mask).' },
 			{ value: 'select_region', label: '▭ Select region', title: 'Drag a rectangle on the floor to select an area, then click "Rebuild this region" to re-sample only that area viewpoints.' },
 			{ value: 'add_edge', label: '⤴ Add edge', title: 'Click two graph nodes in sequence to create a manual edge between them (shown in purple).' },
+			{ value: 'remove_edge', label: '✂ Remove edge', title: 'Click the two endpoints of an existing edge to delete it (works for auto + manual edges). Ghost line shows red.' },
 			{ value: 'inspect_edge', label: '🔍 Inspect edge', title: 'Click two graph nodes to diagnose why no edge exists between them (distance, blocking cells, hazard).' },
 			{ value: 'remove_node', label: '🗑 Remove nodes', title: 'Box-drag and/or click graph nodes to mark them for removal (e.g. vertices sitting on furniture). Use "Find overlapping" to auto-select, then Remove.' },
 		] as item}
@@ -169,6 +181,7 @@
 			{:else if pathsMode.startsWith('paint_')}Drag on the floor (brush radius {paintRadiusM} m)…
 			{:else if pathsMode === 'select_region'}Drag a rectangle on the floor…
 			{:else if pathsMode === 'add_edge'}{pendingEdgeSource ? `Source: ${pendingEdgeSource} · click target…` : 'Click first node…'}
+			{:else if pathsMode === 'remove_edge'}{pendingEdgeSource ? `Endpoint: ${pendingEdgeSource} · click the other endpoint to delete…` : 'Click first endpoint of the edge to remove…'}
 			{:else if pathsMode === 'inspect_edge'}{edgeInspectorSource ? `Source: ${edgeInspectorSource} · click target to diagnose…` : 'Click first node…'}
 			{:else if pathsMode === 'remove_node'}{removeSelectionCount ? `${removeSelectionCount} node(s) marked · box-drag or click to add/remove` : 'Box-drag a rectangle or click nodes to mark for removal…'}
 			{/if}
@@ -184,11 +197,11 @@
 				<span>Pass-under height (m)</span>
 				<input type="number" min="0" max="3" step="0.1" value={removePassHeightM} oninput={(e) => onSetRemovePassHeight?.(Number((e.currentTarget as HTMLInputElement).value))} class="paint-radius" />
 			</label>
-			<button class="button button-subtle" disabled={!hasGraph || findingOverlapping} onclick={() => onFindOverlapping?.()}>
+			<button class="button button-subtle" disabled={!caps.findOverlapping.enabled} title={caps.findOverlapping.reason} onclick={() => onFindOverlapping?.()}>
 				{findingOverlapping ? 'Finding…' : '⊙ Find overlapping nodes'}
 			</button>
 			<div class="footprint-info">Marked for removal: <strong>{removeSelectionCount}</strong></div>
-			<button class="button button-subtle danger" disabled={!removeSelectionCount || removingNodes} onclick={() => onRemoveSelectedNodes?.()}>
+			<button class="button button-subtle danger" disabled={!caps.removeNodes.enabled} title={caps.removeNodes.reason} onclick={() => onRemoveSelectedNodes?.()}>
 				{removingNodes ? 'Removing…' : `Remove ${removeSelectionCount} node(s)`}
 			</button>
 			<button class="button button-subtle" disabled={!removeSelectionCount} onclick={() => onClearRemoveSelection?.()}>Clear selection</button>
@@ -306,19 +319,40 @@
 	</div>
 	<div class="episode-generate-bar">
 		<input type="number" min="1" value={episodeCount} oninput={(e) => onSetEpisodeCount(Number((e.currentTarget as HTMLInputElement).value))} title="Count" />
-		<button class="button button-primary" disabled={!selectedProjectId || !hasGraph || loading} onclick={onGenerateEpisodes}>+ Generate</button>
+		<button class="button button-primary" disabled={!caps.generateEpisodes.enabled} title={caps.generateEpisodes.reason} onclick={onGenerateEpisodes}>+ Generate</button>
 		{#if episodes.length > 0}
 			<button class="button button-subtle" onclick={onClearEpisodes} title="Clear all episodes">✕</button>
 		{/if}
 	</div>
+	{#if onValidateEpisodes && episodes.length > 0}
+		<div class="episode-validate-bar">
+			<button class="button button-subtle" disabled={!caps.validateEpisodes.enabled} onclick={() => onValidateEpisodes?.()}
+				title={caps.validateEpisodes.reason || "Check whether any episode path uses a node/edge you removed, or an edge disabled by the glass/mirror overlay."}>
+				{validatingEpisodes ? 'Checking…' : '✓ Validate episodes'}
+			</button>
+			{#if staleEpisodeReport}
+				{#if (staleEpisodeReport.stale_count ?? 0) > 0}
+					<div class="episode-stale-warn">
+						⚠ {staleEpisodeReport.stale_count} stale of {staleEpisodeReport.checked} — path uses removed/disabled edges
+						<button class="button button-subtle danger" disabled={validatingEpisodes} title={validatingEpisodes ? 'Checking…' : ''} onclick={() => onPruneStaleEpisodes?.()}>
+							Remove {staleEpisodeReport.stale_count} stale
+						</button>
+					</div>
+				{:else}
+					<div class="episode-stale-ok">✓ All {staleEpisodeReport.checked} graph episodes valid</div>
+				{/if}
+			{/if}
+		</div>
+	{/if}
 	{#if onRenderEpisodeNodes && selectedEpisodeId}
 		<label class="sensor-resume-row" title="Skip episode path viewpoints/headings that already have outputs.">
 			<input type="checkbox" checked={renderMissingOnly} onchange={(e) => onSetRenderMissingOnly?.((e.currentTarget as HTMLInputElement).checked)} />
 			<span>Only missing renders</span>
 		</label>
+		<div class="sensor-sweep-summary">Sweep sensors: {Math.max(1, selectedRigSensorCount)} selected</div>
 		<button class="button button-primary full episode-render-btn"
-			disabled={loading || !selectedProjectId || !renderSceneSynced || !hasGraph || !episodeNodesAvailable}
-			title={!episodeNodesAvailable ? 'Selected episode has no graph path_nodes' : ''}
+			disabled={!caps.renderEpisodePath.enabled}
+			title={caps.renderEpisodePath.reason}
 			onclick={onRenderEpisodeNodes}>
 			{#if episodeNodesAvailable && episodePathNodeCount > 0}
 				▶ Render episode path ({episodePathNodeCount}{headingsPerNode > 0 ? ` × ${headingsPerNode}` : ''} jobs)
@@ -341,7 +375,7 @@
 			</div>
 			<div class="rail-title">Traversable Grid</div>
 			<label><span>resolution m</span><input type="number" step="0.01" min="0.01" value={resolution} oninput={(e) => onSetResolution(Number((e.currentTarget as HTMLInputElement).value))} /></label>
-			<button class="button button-subtle" disabled={!selectedProjectId || !hasScene || buildingMap} onclick={onBuildMap}>
+			<button class="button button-subtle" disabled={!caps.buildMap.enabled} title={caps.buildMap.reason} onclick={onBuildMap}>
 				{#if buildingMap}<span class="spinner-xs"></span> Building...{:else}{hasMap ? 'Rebuild Grid' : 'Build Grid'}{/if}
 			</button>
 			{#if mapResult}
@@ -358,7 +392,7 @@
 				<label><span>spacing m</span><input type="number" step="0.05" min="0" value={minNodeSpacing} oninput={(e) => onSetMinNodeSpacing(Number((e.currentTarget as HTMLInputElement).value))} /></label>
 				<label><span>robot r</span><input type="number" step="0.05" min="0" value={robotRadius} oninput={(e) => onSetRobotRadius(Number((e.currentTarget as HTMLInputElement).value))} /></label>
 			</div>
-			<button class="button button-subtle" disabled={!selectedProjectId || !hasMap || buildingGraph} onclick={onRequestBuildGraph}>
+			<button class="button button-subtle" disabled={!caps.buildGraph.enabled} title={caps.buildGraph.reason} onclick={onRequestBuildGraph}>
 				{#if buildingGraph}<span class="spinner-xs"></span>{#if graphBuildProgress} {graphBuildProgress.stage === 'edges' ? 'Edges' : 'Nodes'} {Math.round(graphBuildProgress.progress * 100)}%{:else} Building...{/if}{:else}{hasGraph ? 'Rebuild Graph' : 'Build Graph'}{/if}
 			</button>
 			{#if graphResult || graphPayloadSummary}
@@ -373,7 +407,7 @@
 			{/if}
 			<div class="rail-title mt-2">Episodes</div>
 			<label><span>num pairs</span><input type="number" min="1" value={episodeCount} oninput={(e) => onSetEpisodeCount(Number((e.currentTarget as HTMLInputElement).value))} /></label>
-			<button class="button button-primary" disabled={!selectedProjectId || !hasGraph || loading} onclick={onGenerateEpisodes}>
+			<button class="button button-primary" disabled={!caps.generateEpisodes.enabled} title={caps.generateEpisodes.reason} onclick={onGenerateEpisodes}>
 				Generate Episodes
 			</button>
 			{#if splitCounts.train != null}
@@ -506,6 +540,26 @@
 	.paths-panel .episode-generate-bar input { width: 60px; padding: 3px 6px; font-size: var(--font-size-xs); border: 1px solid var(--panel-border); border-radius: var(--radius-sm); }
 
 	.paths-panel .episode-generate-bar button { flex: 1; }
+
+	.sensor-sweep-summary {
+			font-size: 11px;
+			color: var(--text-muted);
+			padding: 0 4px 4px;
+		}
+
+	.episode-validate-bar { display: grid; gap: 6px; margin-top: 6px; }
+
+	.episode-stale-warn {
+			display: grid;
+			gap: 6px;
+			font-size: var(--font-size-xs);
+			color: var(--danger);
+			background: var(--danger-soft);
+			padding: 6px 8px;
+			border-radius: var(--radius-sm);
+		}
+
+	.episode-stale-ok { font-size: var(--font-size-xs); color: #166534; }
 
 	/* Path status chips */
 	.path-status-chips {

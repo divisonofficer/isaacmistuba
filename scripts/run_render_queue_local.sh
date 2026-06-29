@@ -34,7 +34,11 @@ export LD_LIBRARY_PATH="/usr/lib/wsl/lib:${LD_LIBRARY_PATH:-}"
 # Single-GPU main-PC defaults (override for multi-GPU; or pass --auto-gpus).
 export ROBOMITUBA_RENDER_GPU_INDICES="${ROBOMITUBA_RENDER_GPU_INDICES:-0}"
 export ROBOMITUBA_RENDER_WORKER_COUNT="${ROBOMITUBA_RENDER_WORKER_COUNT:-1}"
-export ROBOMITUBA_OPTIX_DENOISE=1
+export ROBOMITUBA_OPTIX_DENOISE=0
+# Keep the reusable RGB base scene resident, but evict per-heading polarization
+# staged scenes quickly. The default renderer limit (32) can retain many heavy
+# polar XML variants during mixed RGB+polar rig sweeps on a single GPU.
+export ROBOMITUBA_SCENE_CACHE_LIMIT="${ROBOMITUBA_SCENE_CACHE_LIMIT:-2}"
 
 
 if [[ ! -d "$ROBOMITUBA_MITSUBA_PYTHONPATH" ]]; then

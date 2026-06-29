@@ -6,10 +6,10 @@ import heapq
 import math
 import random
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable, Mapping
 
 from .episode_schema import EpisodeManifest, EpisodeTimestep, GENERATION_VERSION, write_episode
-from .rollout import split_for_index
+from .rollout import scale_split_counts, split_for_index
 from .scene_annotations import SceneAnnotation
 from .viewpoint_graph import ViewpointEdge, ViewpointGraph, ViewpointHeading, ViewpointNode
 
@@ -455,9 +455,19 @@ def plan_graph_episodes(
     annotation: SceneAnnotation | None = None,
     seed: int = 0,
     observations_root: Path | None = None,
+    excluded_edge_ids: set[str] | None = None,
+    on_progress: "Callable[[int, int, int], None] | None" = None,
 ) -> list[EpisodeManifest]:
     if num_pairs <= 0:
         raise ValueError("num_pairs must be positive.")
+    # Drop edges cut by the optical-perturbation overlay (glass/mirror walls) so the
+    # planner never routes an episode path through a sealed passage. Done before the
+    # empty-edge check so a fully-blocked graph fails loudly instead of silently
+    # planning through glass.
+    if excluded_edge_ids:
+        from dataclasses import replace
+        kept = [edge for edge in graph.edges if edge.edge_id not in excluded_edge_ids]
+        graph = replace(graph, edges=kept)
     if not graph.edges:
         raise ValueError("Viewpoint graph has no edges.")
     scenario_cycle = [item for item in scenarios if item] or ["goal_only"]
@@ -465,6 +475,7 @@ def plan_graph_episodes(
     if unknown:
         raise ValueError(f"Unsupported graph scenarios: {unknown}")
     rng = random.Random(seed)
+    split_counts = scale_split_counts(split_counts, num_pairs)
     node_ids = sorted(node.node_id for node in graph.nodes)
     # Track how many times each node appears in accepted episodes (for coverage scoring)
     node_visit_counts: dict[str, int] = {}
@@ -472,6 +483,8 @@ def plan_graph_episodes(
     attempts = 0
     while len(episodes) < num_pairs and attempts < num_pairs * 20:
         attempts += 1
+        if on_progress is not None:
+            on_progress(len(episodes), num_pairs, attempts)
         start, goal = rng.sample(node_ids, 2)
         # Generate a small pool of alternative paths and pick by coverage score (RxR §3)
         candidates = _k_shortest_paths(graph, start, goal, k=3)
@@ -513,3 +526,61 @@ def write_graph_episodes(root: str | Path, episodes: Iterable[EpisodeManifest]) 
         path = dataset_root / "episodes" / episode.split / f"{episode.episode_id}.json"
         written.append(write_episode(path, episode))
     return written
+
+
+def _pair(a: str, b: str) -> tuple[str, str]:
+    return (a, b) if a <= b else (b, a)
+
+
+def graph_episode_stale_refs(
+    episode: Mapping[str, Any],
+    *,
+    node_ids: set[str],
+    edge_pairs: set[tuple[str, str]],
+    disabled_pairs: set[tuple[str, str]] | None = None,
+) -> dict[str, Any]:
+    """Report graph references in ``episode`` that the current graph no longer satisfies.
+
+    A viewpoint-graph episode bakes in a node path (``path_nodes``); after the user
+    deletes nodes/edges (or a glass/mirror overlay disables an edge) that path may
+    traverse something that no longer exists. Rather than re-scan on every edit, this
+    is run on demand (the editor's "validate episodes" step) over each episode.
+
+    Returns ``{"stale", "reasons", "missing_nodes", "missing_edges", "disabled_edges"}``.
+    Non-graph episodes (``navigation_mode != 'viewpoint_graph'``) are never stale.
+    """
+    disabled_pairs = disabled_pairs or set()
+    result: dict[str, Any] = {
+        "stale": False, "reasons": [],
+        "missing_nodes": [], "missing_edges": [], "disabled_edges": [],
+    }
+    if str(episode.get("navigation_mode") or "") != "viewpoint_graph":
+        return result
+    path_nodes = [str(n) for n in (episode.get("path_nodes") or [])]
+    # endpoints referenced directly (start/goal) are covered by path_nodes too, but
+    # check them explicitly so a malformed/empty path is still caught.
+    for extra in (episode.get("start_node"), episode.get("goal_node")):
+        if extra and str(extra) not in path_nodes:
+            path_nodes.append(str(extra))
+
+    missing_nodes = [n for n in path_nodes if n not in node_ids]
+    if missing_nodes:
+        result["missing_nodes"] = sorted(set(missing_nodes))
+        result["reasons"].append("missing_nodes")
+
+    seq = [str(n) for n in (episode.get("path_nodes") or [])]
+    for a, b in zip(seq, seq[1:]):
+        if a not in node_ids or b not in node_ids:
+            continue  # already reported as a missing node
+        pair = _pair(a, b)
+        if pair not in edge_pairs:
+            result["missing_edges"].append([a, b])
+        elif pair in disabled_pairs:
+            result["disabled_edges"].append([a, b])
+    if result["missing_edges"]:
+        result["reasons"].append("missing_edges")
+    if result["disabled_edges"]:
+        result["reasons"].append("disabled_edges")
+
+    result["stale"] = bool(result["reasons"])
+    return result

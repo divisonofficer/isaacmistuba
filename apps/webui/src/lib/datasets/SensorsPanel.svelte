@@ -1,10 +1,12 @@
 <script lang="ts">
 	import {
+		POLAR_PREVIEW_MODALITIES,
 		sensorRenderChipLabel,
 		formatRigVec,
 		formatResolution,
 		formatRenderSpp,
 		headingHasSensorModality,
+		isPolarRenderModality,
 	} from '$lib/datasets/sensorHelpers';
 	import { opticalNavObservationModalityUrl } from '$lib/api';
 
@@ -70,6 +72,22 @@
 		onRefreshBatch,
 		onRemoveCustomSensor, onCustomSensorHeadingChange,
 	}: Props = $props();
+
+	const activeRigSensorOption = $derived(rigSensorOptions.find((item: any) => item.sensor_id === activeRigSensorId) ?? rigSensorOptions[0] ?? null);
+	const isActivePolarSensor = $derived.by(() => {
+		const sensor = activeRigSensorOption?.sensor ?? {};
+		const sensorType = String(sensor?.canonical_sensor_type ?? sensor?.sensor_type ?? '').toLowerCase();
+		const defaultModality = String(activeRigSensorOption?.render_modality ?? 'rgb');
+		const canonical = Array.isArray(sensor?.modalities) ? sensor.modalities : [];
+		return sensorType === 'polar_camera'
+			|| isPolarRenderModality(defaultModality)
+			|| canonical.some((item: unknown) => isPolarRenderModality(item));
+	});
+	const visibleObservationModality = $derived(
+		isActivePolarSensor && isPolarRenderModality(activeModalityTab)
+			? activeModalityTab
+			: String(activeRigSensorOption?.render_modality ?? activeModalityTab ?? 'rgb')
+	);
 </script>
 
 <div class="map-float-inspector sensor-panel">
@@ -157,6 +175,20 @@
 				</button>
 			{/each}
 		</div>
+		{#if isActivePolarSensor}
+			<div class="polar-preview-mode-row" aria-label="Polarization preview modality">
+				{#each POLAR_PREVIEW_MODALITIES as modality}
+					<button
+						type="button"
+						class:active={visibleObservationModality === modality.id}
+						onclick={() => activeModalityTab = modality.id}
+						title={`Show ${modality.label} polarization preview products`}
+					>
+						{modality.label}
+					</button>
+				{/each}
+			</div>
+		{/if}
 		<div class="sensor-config-row">
 			{#if sceneStateText.trim() && cameraSpecText.trim()}
 				<span class="chip-ok">Config ready ({renderConfig?.source ?? 'custom'})</span>
@@ -183,11 +215,11 @@
 			<div class="obs-heading-gallery">
 				{#each Object.entries(vpScan2.headings).sort(([a], [b]) => a.localeCompare(b)) as [hid, hinfo]}
 					{@const hdata = hinfo as any}
-					{@const hasModality = headingHasSensorModality(hdata, activeModalityTab, activeRigSensorId)}
+					{@const hasModality = headingHasSensorModality(hdata, visibleObservationModality, activeRigSensorId)}
 					{#if hasModality}
-						<img class="obs-thumb" src={opticalNavObservationModalityUrl(selectedProjectId, sceneId, selectedSensorNodeId, hid, activeModalityTab, activeRigSensorId)} alt={`${hid} ${activeModalityTab}`} title={`${hid} · ${activeRigSensorId || 'legacy'} · ${activeModalityTab}`} loading="lazy" />
+						<img class="obs-thumb" src={opticalNavObservationModalityUrl(selectedProjectId, sceneId, selectedSensorNodeId, hid, visibleObservationModality, activeRigSensorId)} alt={`${hid} ${visibleObservationModality}`} title={`${hid} · ${activeRigSensorId || 'legacy'} · ${visibleObservationModality}`} loading="lazy" />
 					{:else}
-						<div class="obs-thumb obs-thumb-empty" title={`${hid} · ${activeModalityTab} not rendered`}><span>{parseInt(hid.replace('h_',''))||0}°</span></div>
+						<div class="obs-thumb obs-thumb-empty" title={`${hid} · ${visibleObservationModality} not rendered`}><span>{parseInt(hid.replace('h_',''))||0}°</span></div>
 					{/if}
 				{/each}
 			</div>
@@ -325,6 +357,31 @@
 	.sensor-panel .rig-derived-tabs button small { font-size: 10px; opacity: 0.75; }
 
 	.sensor-panel .modality-tabs button.active-tab { background: var(--accent); color: #fff; border-color: var(--accent); }
+
+	.polar-preview-mode-row {
+			display: grid;
+			grid-template-columns: repeat(5, minmax(0, 1fr));
+			gap: 4px;
+			margin-top: 6px;
+		}
+
+	.polar-preview-mode-row button {
+			min-width: 0;
+			border: 1px solid var(--panel-border);
+			border-radius: var(--radius-sm);
+			background: #fff;
+			color: var(--text-secondary);
+			padding: 5px 4px;
+			font-size: 10px;
+			font-weight: 700;
+			cursor: pointer;
+		}
+
+	.polar-preview-mode-row button.active {
+			border-color: #2563eb;
+			background: #2563eb;
+			color: #fff;
+		}
 
 	.sensor-panel .sensor-result { display: flex; align-items: center; gap: 6px; }
 

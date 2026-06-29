@@ -12,6 +12,10 @@
 #   --scene-id ID        OpticalNav scene id        (default: infinigen_<dirname>)
 #   --project-id ID      OpticalNav project         (default: opticalnav-v0.2)
 #   --no-bake            Skip procedural material bake (faster, grayscale-ish)
+#   --bake-pbr           Also bake per-texel roughness/normal/metallic atlases (~4x bake time)
+#   --no-bake-metallic   With --bake-pbr, skip the (fiddly) metallic EMIT bake
+#   --bake-only          Re-bake PBR into an EXISTING scene's import (Stage 1 only, no
+#                        re-import) — preserves the authoring map; busts the staged cache
 #   --no-sync            Skip Stage 3 render-scene sync (don't stage webui meshes)
 #   --skip-export        Reuse an existing Stage-1 manifest (only run Stage 2)
 #   --room KEY           Keep only this room        (e.g. "dining-room_0/0")
@@ -29,14 +33,25 @@ set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO"
-INFINIGEN_PYTHON="${INFINIGEN_PYTHON:-/home/jinnyeong/miniconda3/envs/infinigen/bin/python}"
 PYTHON="${PYTHON:-python3}"
+
+# Resolve the Infinigen env path machine-independently (see scripts/infinigen_env.py):
+# source the persisted config, and if still unset, auto-detect + persist it.
+[[ -f "$REPO/.infinigen_env" ]] && source "$REPO/.infinigen_env"
+if [[ -z "${INFINIGEN_PYTHON:-}" ]]; then
+  "$PYTHON" "$REPO/scripts/infinigen_env.py" --write >/dev/null 2>&1 || true
+  [[ -f "$REPO/.infinigen_env" ]] && source "$REPO/.infinigen_env"
+fi
+INFINIGEN_PYTHON="${INFINIGEN_PYTHON:-$HOME/miniconda3/envs/infinigen/bin/python}"
 
 # ── parse args ────────────────────────────────────────────────────────────────
 INPUT=""
 SCENE_ID=""
 PROJECT_ID="opticalnav-v0.2"
 BAKE=1
+BAKE_PBR=0
+BAKE_METALLIC=1
+BAKE_ONLY=0
 SKIP_EXPORT=0
 SYNC=1
 DAEMON_URL="${ROBOMITUBA_DAEMON_URL:-http://127.0.0.1:8765}"
@@ -46,6 +61,9 @@ while [[ $# -gt 0 ]]; do
     --scene-id)   SCENE_ID="$2"; shift 2;;
     --project-id) PROJECT_ID="$2"; shift 2;;
     --no-bake)    BAKE=0; shift;;
+    --bake-pbr)   BAKE_PBR=1; shift;;
+    --no-bake-metallic) BAKE_METALLIC=0; shift;;
+    --bake-only)  BAKE_ONLY=1; BAKE=1; BAKE_PBR=1; SKIP_EXPORT=0; shift;;
     --no-sync)    SYNC=0; shift;;
     --skip-export) SKIP_EXPORT=1; shift;;
     --room)       STAGE2_EXTRA+=(--room "$2"); shift 2;;
@@ -121,6 +139,8 @@ else
   [[ -x "$INFINIGEN_PYTHON" || -f "$INFINIGEN_PYTHON" ]] || {
     echo "[error] infinigen python not found: $INFINIGEN_PYTHON (set INFINIGEN_PYTHON=...)" >&2; exit 1; }
   BAKE_FLAG=(); [[ $BAKE == 1 ]] && BAKE_FLAG=(--bake)
+  [[ $BAKE == 1 && $BAKE_PBR == 1 ]] && BAKE_FLAG+=(--bake-pbr)
+  [[ $BAKE_PBR == 1 && $BAKE_METALLIC == 0 ]] && BAKE_FLAG+=(--no-bake-metallic)
   echo "[stage1] exporting meshes/materials with bpy (this can take several minutes)…"
   # bpy frequently segfaults during interpreter/teardown AFTER the manifest is
   # already written (conda bpy on WSL). Don't let that non-zero exit abort the
@@ -133,6 +153,22 @@ else
     echo "[stage1] bpy exited $stage1_rc (likely a teardown segfault) but the manifest was written — continuing." >&2
   fi
   [[ -f "$MANIFEST" ]] || { echo "[error] Stage 1 failed (exit $stage1_rc) and produced no manifest: $MANIFEST" >&2; exit 1; }
+fi
+
+# ── --bake-only: re-baked PBR atlases + MTL keys in place; do NOT re-run Stage 2
+# (which would rebuild authoring_map and lose manual edits). The authoring map and
+# render_scene.xml still reference the same meshes by path, so just bust the staged
+# scene cache so the next render re-stages with the new map_Pr/map_Pm/norm.
+if [[ "$BAKE_ONLY" == 1 ]]; then
+  SCENE_DIR="out/opticalnav/${PROJECT_ID}/scenes/${SCENE_ID}"
+  rm -rf "$SCENE_DIR/.staged_mitsuba" 2>/dev/null || true
+  [[ -f "$SCENE_DIR/render_scene.xml" ]] && touch "$SCENE_DIR/render_scene.xml"
+  echo "═══════════════════════════════════════════════════════════════"
+  echo " ✓ bake-only done → re-baked PBR into $IMPORT_DIR"
+  echo "   authoring map preserved; staged cache busted for $SCENE_DIR"
+  echo "   다음 렌더부터 roughness/normal 맵이 적용됩니다."
+  echo "═══════════════════════════════════════════════════════════════"
+  exit 0
 fi
 
 # ── Stage 2: converter ────────────────────────────────────────────────────────

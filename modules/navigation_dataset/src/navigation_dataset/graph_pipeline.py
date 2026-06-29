@@ -37,7 +37,7 @@ from .viewpoint_graph import (
     find_object_overlapping_nodes,
     remove_nodes,
 )
-from .walkable_surface import WalkableSurface, _largest_island, build_walkable_surface
+from .walkable_surface import WalkableSurface, build_walkable_surface
 
 
 @dataclass
@@ -46,6 +46,28 @@ class GraphBuildResult:
     graph: ViewpointGraph
     surface: WalkableSurface | None
     summary: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class _GraphGrids:
+    """Prepared traversability grids for node sampling + edge building.
+
+    Shared by :func:`build_viewpoint_graph_core` and :func:`rebuild_viewpoint_edges`
+    so both paths derive edges from the SAME surface/clearance logic. ``*_radius``
+    is the dilation passed to :func:`build_viewpoint_edges`: ``0.0`` on the mesh
+    path because the masks are already clearance-pre-eroded (avoids double erosion),
+    ``robot_radius_m`` on the legacy annotation path.
+    """
+
+    grid: TraversabilityGrid
+    node_grid: TraversabilityGrid
+    edge_grid: TraversabilityGrid
+    node_radius: float
+    edge_radius: float
+    sampler_min_clearance: float
+    surface: WalkableSurface | None
+    portals: list[Any]
+    opening_seeds: list[Any]
 
 
 def _read_json(path: Path) -> Any:
@@ -102,6 +124,52 @@ def _line_clear(full_grid: TraversabilityGrid, a, b) -> bool:
     return True
 
 
+def _max_gap_run_cells(full_grid: TraversabilityGrid, a, b) -> int:
+    """Longest contiguous run of non-walkable cells along the a->b line.
+
+    A real doorway/threshold between two rooms is a short run (the wall/threshold the
+    floor mesh didn't bridge); a thick solid wall or an exterior void is a long run.
+    Lets the connectivity repair bridge rooms whose doorway isn't in the grid (no
+    door object, per-room floor meshes that stop at the threshold) without punching
+    through thick walls.
+    """
+    from .edge_builder import line_cells
+
+    spec, trav = full_grid.spec, full_grid.traversable
+    run = mx = 0
+    for x, y in line_cells(full_grid, a, b):
+        if 0 <= x < spec.width and 0 <= y < spec.height and bool(trav[y, x]):
+            run = 0
+        else:
+            run += 1
+            mx = max(mx, run)
+    return mx
+
+
+def _max_wall_run_cells(wall_mask, spec, a, b) -> int:
+    """Longest contiguous run of robot-body-height WALL cells along the a->b line.
+
+    Uses the mesh-derived wall-band mask (sills/lintels excluded) so a real doorway —
+    open at body height — reads as zero, while a straight line punched through a wall
+    reads as the wall's thickness in cells. Repair rejects bridges with a non-trivial
+    run so rooms connect through doorways, not through walls.
+    """
+    from .edge_builder import line_cells
+
+    if wall_mask is None:
+        return 0
+    h, w = wall_mask.shape
+    run = mx = 0
+    for x, y in line_cells(TraversabilityGrid(spec=spec, traversable=wall_mask,
+                                              hazard=wall_mask), a, b):
+        if 0 <= x < w and 0 <= y < h and bool(wall_mask[y, x]):
+            run += 1
+            mx = max(mx, run)
+        else:
+            run = 0
+    return mx
+
+
 def _bfs_path_cells(full_grid: TraversabilityGrid, start_cell, goal_cell, max_steps: int):
     """4-connected BFS between two cells over the full walkable grid (bounded)."""
     from collections import deque
@@ -139,7 +207,10 @@ def _repair_connectivity(
     full_grid: TraversabilityGrid,
     *,
     max_bridge_m: float = 3.0,
+    doorway_gap_m: float = 0.45,
     heading_count: int = 12,
+    wall_mask=None,
+    max_wall_cross_m: float = 0.0,
 ) -> tuple[int, int]:
     """Greedily reconnect disconnected components through real walkable space.
 
@@ -151,6 +222,14 @@ def _repair_connectivity(
        at the path's doorway midpoint, and connect both ends. Mirrors the manual node
        + bridge edges users add at thresholds.
 
+    ``wall_mask`` (mesh-derived, robot-body-height; see
+    :func:`walkable_surface._wall_body_band_mask`) gates BOTH passes: a bridge whose
+    straight line crosses more than ``max_wall_cross_m`` of wall is rejected, so rooms
+    connect through doorway openings instead of punching through walls. Without it the
+    repair picked the smallest *grid* gap, which a thin interior wall satisfies just as
+    well as a real doorway — the exact "connects rooms through a wall, ignoring the
+    door" failure this guards against.
+
     Returns (straight_bridges, stepping_stone_nodes).
     """
     from .node_sampler import heading_sweep
@@ -161,6 +240,13 @@ def _repair_connectivity(
     stones = 0
     stone_seq = 0
     max_steps = int((max_bridge_m * 6.0) / spec.resolution)
+    gap_tol = max(1, int(round(doorway_gap_m / spec.resolution)))
+    # Tolerate at most this many body-height wall cells on a bridge line. 0 → reject
+    # any wall contact (doorway openings read exactly 0; a wall reads its thickness).
+    wall_tol = int(round(max_wall_cross_m / spec.resolution))
+
+    def _crosses_wall(pa, pb) -> bool:
+        return _max_wall_run_cells(wall_mask, spec, pa, pb) > wall_tol
     while True:
         comps = compute_connected_components(graph).get("components", [])
         if len(comps) <= 1:
@@ -187,20 +273,34 @@ def _repair_connectivity(
                 pairs.append((best_other[0], nid, best_other[1]))
         pairs.sort(key=lambda t: t[0])
 
-        # --- pass 1: nearest cross-component pair with a clear straight line ---
+        # --- pass 1: bridge the cleanest cross-component doorway ---
+        # Accept a short non-walkable run (a doorway/threshold the floor mesh didn't
+        # bridge); prefer the smallest gap, then the shortest edge. Minimal-spanning
+        # (one bridge per iteration) so rooms aren't over-connected through walls.
         made = False
+        best_bridge: tuple[int, float, str, str] | None = None
         for d, a, b in pairs:
             if d > max_bridge_m:
                 break
-            if _line_clear(full_grid, idmap[a].position, idmap[b].position):
-                edge = append_edge(graph, a, b)
-                if edge is not None:
-                    edge.extras = {**(edge.extras or {}), "bridge": True}
-                    straight += 1
-                    made = True
-                    break
-        if made:
-            continue
+            if _crosses_wall(idmap[a].position, idmap[b].position):
+                continue  # straight line punches through a wall — not a doorway
+            gap = _max_gap_run_cells(full_grid, idmap[a].position, idmap[b].position)
+            if gap > gap_tol:
+                continue
+            if best_bridge is None or (gap, d) < (best_bridge[0], best_bridge[1]):
+                best_bridge = (gap, d, a, b)
+            if gap == 0:
+                break  # closest fully-clear bridge — can't do better
+        if best_bridge is not None:
+            gap, _d, a, b = best_bridge
+            edge = append_edge(graph, a, b)
+            if edge is not None:
+                edge.extras = {**(edge.extras or {}), "bridge": True}
+                if gap > 0:
+                    edge.extras["doorway_gap_cells"] = int(gap)
+                straight += 1
+                made = True
+                continue
 
         # --- pass 2: stepping-stone via BFS through the doorway ---
         for _d, a, b in pairs:
@@ -214,6 +314,8 @@ def _repair_connectivity(
             wx, wy = cell_to_world(spec, mid_cell[0], mid_cell[1])
             if not (_line_clear(full_grid, n.position, [wx, wy]) and _line_clear(full_grid, m.position, [wx, wy])):
                 continue
+            if _crosses_wall(n.position, [wx, wy]) or _crosses_wall(m.position, [wx, wy]):
+                continue  # stepping stone reachable only by crossing a wall
             stone_seq += 1
             stone = ViewpointNode(
                 node_id=f"vp_bridge_{stone_seq:04d}",
@@ -249,40 +351,69 @@ def _nearest_node(nodes: list[ViewpointNode], x: float, y: float) -> ViewpointNo
     return best
 
 
-def build_viewpoint_graph_core(
-    scene_id: str,
-    scene_dir: str | Path,
+def _connect_portals_and_repair(
+    graph: ViewpointGraph,
+    grid: TraversabilityGrid,
+    portals: list[Any],
+    surface: WalkableSurface | None,
     *,
-    graph_id: str | None = None,
-    resolution: float = 0.05,
-    robot_radius_m: float = 0.25,
-    robot_height_m: float = 1.2,
-    heading_count: int = 12,
-    min_node_spacing_m: float = 0.5,
-    min_clearance_m: float | None = None,
-    camera_margin_m: float = 0.10,
-    max_nodes: int = 300,
-    k_neighbors: int = 8,
-    max_edge_length_m: float = 1.5,
-    low_profile_max_height_m: float = 0.03,
-    wall_inflate_m: float = 0.0,
-    seed: int = 0,
-    prune_overlapping: bool = True,
-    prune_margin_m: float = 0.0,
-    persist_grid: bool = True,
-    walkability_overlay: "np.ndarray | None" = None,
-    existing_graph: ViewpointGraph | None = None,
-    scene_variant_id: Any = None,
-    on_progress: Callable[[str, float], None] | None = None,
-    metadata_extra: dict | None = None,
-) -> GraphBuildResult:
-    scene_dir = Path(scene_dir)
+    max_edge_length_m: float,
+    heading_count: int,
+    doorway_gap_m: float = 0.45,
+) -> tuple[int, int, int]:
+    """Force door-portal edges, then bridge any remaining disconnected rooms.
 
-    def _progress(stage: str, frac: float) -> None:
-        if on_progress is not None:
-            on_progress(stage, frac)
+    Returns ``(portal_edges, bridge_edges, bridge_nodes)``. Connectivity repair is
+    mesh-path only (``surface is not None``) so non-Infinigen scenes keep their
+    original unbridged behaviour. Shared by ``build_viewpoint_graph_core`` and
+    ``rebuild_viewpoint_edges``.
+    """
+    portal_edges = 0
+    for p in portals:
+        if not getattr(p, "resolved", False):
+            continue
+        na = _nearest_node(graph.nodes, p.side_a[0], p.side_a[1])
+        nb = _nearest_node(graph.nodes, p.side_b[0], p.side_b[1])
+        if na is None or nb is None or na.node_id == nb.node_id:
+            continue
+        edge = append_edge(graph, na.node_id, nb.node_id)
+        if edge is not None:
+            edge.extras = {**(edge.extras or {}), "portal": p.door_id, "portal_type": p.door_type}
+            portal_edges += 1
+    if surface is not None:
+        bridge_edges, bridge_nodes = _repair_connectivity(
+            graph, grid, max_bridge_m=max(3.0, max_edge_length_m * 2.0),
+            doorway_gap_m=doorway_gap_m, heading_count=heading_count,
+            wall_mask=getattr(surface, "wall_band_mask", None),
+        )
+    else:
+        bridge_edges, bridge_nodes = 0, 0
+    return portal_edges, bridge_edges, bridge_nodes
 
-    overlay_objects = _load_overlay_objects(scene_dir)
+
+def _prepare_graph_grids(
+    scene_id: str,
+    scene_dir: Path,
+    *,
+    overlay_objects: list[dict],
+    resolution: float,
+    robot_radius_m: float,
+    robot_height_m: float,
+    min_clearance_m: float | None,
+    camera_margin_m: float,
+    low_profile_max_height_m: float,
+    wall_inflate_m: float,
+    walkability_overlay: "np.ndarray | None",
+) -> _GraphGrids:
+    """Derive node/edge traversability grids + portals for a scene.
+
+    Mesh-aware (Infinigen) scenes use the EDT clearance map with ``*_radius=0`` so
+    edges are NOT eroded a second time; non-Infinigen scenes use the legacy
+    annotation grid with crude ``robot_radius`` erosion. This is the single source
+    of truth so ``build_graph`` and ``rebuild_edges`` stay consistent — previously
+    the daemon's rebuild handler re-derived a much smaller annotation grid here and
+    collapsed dense graphs to a few edges.
+    """
     inf = _infinigen_inputs(scene_dir)
 
     surface: WalkableSurface | None = None
@@ -324,9 +455,41 @@ def build_viewpoint_graph_core(
             node_clr = max(edge_clr, float(min_clearance_m))
         else:
             node_clr = edge_clr + max(0.0, float(camera_margin_m))
-        node_mask = _largest_island(surface.clearance_m >= node_clr)
-        if not node_mask.any():              # very narrow scene — relax to physical fit
-            node_mask = _largest_island(surface.clearance_m >= edge_clr)
+        # Node candidates need extra clearance (camera_margin) so viewpoints aren't
+        # buried in geometry. But a tight room (1.2m hallway, furniture-packed kitchen/
+        # bath) can have ZERO node-clearance cells and would get no nodes at all. So
+        # instead of keeping only the largest island, take every node-clearance cell,
+        # then per walkable ROOM component recover any room left with none: first relax
+        # to physical-fit clearance (drop the camera margin), then fall back to that
+        # room's single best-clearance cell. grid.traversable is the kept multi-room
+        # surface (sub-robot pockets already dropped upstream).
+        from scipy import ndimage
+        # The clearance EDT is computed from the walkable ISLAND only, so it cannot see
+        # thin interior walls — a node can land in the sliver between two walls and read
+        # as "clear". Exclude a robot-radius halo around the body-height wall mask so
+        # node centres keep the robot body off walls (the "node wedged between walls"
+        # failure). Edges are gated separately (build_viewpoint_edges wall_mask).
+        wall_band = getattr(surface, "wall_band_mask", None)
+        if wall_band is not None and wall_band.shape == grid.traversable.shape:
+            halo_it = max(1, int(round(float(robot_radius_m) / float(resolution))))
+            wall_halo = ndimage.binary_dilation(wall_band, iterations=halo_it)
+        else:
+            wall_halo = np.zeros_like(grid.traversable)
+        node_mask = (surface.clearance_m >= node_clr) & ~wall_halo
+        edge_ok = (surface.clearance_m >= edge_clr) & ~wall_halo
+        comp_labels, n_comp = ndimage.label(grid.traversable)
+        for ci in range(1, int(n_comp) + 1):
+            comp = comp_labels == ci
+            if (node_mask & comp).any():
+                continue                      # room already has node candidates
+            relaxed = edge_ok & comp
+            if relaxed.any():
+                node_mask = node_mask | relaxed
+            else:                             # nothing fits clear of walls — best cell off the wall
+                clr = np.where(comp & ~wall_halo, surface.clearance_m, -1.0)
+                iy, ix = np.unravel_index(int(np.argmax(clr)), clr.shape)
+                if comp[iy, ix] and clr[iy, ix] >= 0.0:
+                    node_mask[iy, ix] = True
         if not node_mask.any():
             node_mask = grid.traversable
         edge_mask = surface.clearance_m >= edge_clr
@@ -334,49 +497,111 @@ def build_viewpoint_graph_core(
             edge_mask = grid.traversable
         node_grid = TraversabilityGrid(spec=grid.spec, traversable=node_mask, hazard=grid.hazard)
         edge_grid = TraversabilityGrid(spec=grid.spec, traversable=edge_mask, hazard=grid.hazard)
-        node_radius = 0.0
-        edge_radius = 0.0
-        sampler_min_clearance = 0.0
-    else:
-        # ---- legacy path (non-Infinigen scenes): annotation grid, unchanged ----
-        from .scene_annotations import read_scene_annotation
-        from .walkability_overlay import load_overlay as _load_walk_overlay
+        return _GraphGrids(
+            grid=grid, node_grid=node_grid, edge_grid=edge_grid,
+            node_radius=0.0, edge_radius=0.0, sampler_min_clearance=0.0,
+            surface=surface, portals=portals, opening_seeds=opening_seeds,
+        )
 
-        annotation_path = scene_dir / "scene_annotation.json"
-        if annotation_path.is_file():
-            annotation = read_scene_annotation(annotation_path)
+    # ---- legacy path (non-Infinigen scenes): annotation grid, unchanged ----
+    from .scene_annotations import read_scene_annotation
+    from .walkability_overlay import load_overlay as _load_walk_overlay
+
+    annotation_path = scene_dir / "scene_annotation.json"
+    if annotation_path.is_file():
+        annotation = read_scene_annotation(annotation_path)
+        grid = build_traversability_grid(
+            annotation, resolution=resolution, objects=overlay_objects, robot_height_m=robot_height_m,
+        )
+        if walkability_overlay is None:
+            ov_path = scene_dir / "walkability_overlay.npy"
+            if ov_path.is_file():
+                walkability_overlay = _load_walk_overlay(ov_path, expected_spec=grid.spec)
+        if walkability_overlay is not None:
             grid = build_traversability_grid(
-                annotation, resolution=resolution, objects=overlay_objects, robot_height_m=robot_height_m,
+                annotation, resolution=resolution, walkability_overlay=walkability_overlay,
+                objects=overlay_objects, robot_height_m=robot_height_m,
             )
-            if walkability_overlay is None:
-                ov_path = scene_dir / "walkability_overlay.npy"
-                if ov_path.is_file():
-                    walkability_overlay = _load_walk_overlay(ov_path, expected_spec=grid.spec)
-            if walkability_overlay is not None:
-                grid = build_traversability_grid(
-                    annotation, resolution=resolution, walkability_overlay=walkability_overlay,
-                    objects=overlay_objects, robot_height_m=robot_height_m,
-                )
-        else:
-            from .traversability import load_traversability_grid
-            grid = load_traversability_grid(scene_dir / "traversable_grid.npy")
-        portals = []
-        _door_seeds: list[tuple[float, float]] = []
-        for o in overlay_objects:
-            if str(o.get("type") or "") not in {"glass_door", "door"}:
-                continue
-            g = o.get("geometry") or {}
-            c = g.get("center")
-            if isinstance(c, (list, tuple)) and len(c) >= 2:
-                _door_seeds.append((float(c[0]), float(c[1])))
-                continue
-            s, e = g.get("start"), g.get("end")
-            if isinstance(s, (list, tuple)) and isinstance(e, (list, tuple)):
-                _door_seeds.append(((float(s[0]) + float(e[0])) / 2.0, (float(s[1]) + float(e[1])) / 2.0))
-        opening_seeds = _door_seeds
-        node_grid = edge_grid = grid
-        node_radius = edge_radius = float(robot_radius_m)
-        sampler_min_clearance = float(min_clearance_m) if min_clearance_m is not None else 0.0
+    else:
+        from .traversability import load_traversability_grid
+        grid = load_traversability_grid(scene_dir / "traversable_grid.npy")
+    _door_seeds: list[tuple[float, float]] = []
+    for o in overlay_objects:
+        if str(o.get("type") or "") not in {"glass_door", "door"}:
+            continue
+        g = o.get("geometry") or {}
+        c = g.get("center")
+        if isinstance(c, (list, tuple)) and len(c) >= 2:
+            _door_seeds.append((float(c[0]), float(c[1])))
+            continue
+        s, e = g.get("start"), g.get("end")
+        if isinstance(s, (list, tuple)) and isinstance(e, (list, tuple)):
+            _door_seeds.append(((float(s[0]) + float(e[0])) / 2.0, (float(s[1]) + float(e[1])) / 2.0))
+    return _GraphGrids(
+        grid=grid, node_grid=grid, edge_grid=grid,
+        node_radius=float(robot_radius_m), edge_radius=float(robot_radius_m),
+        sampler_min_clearance=(float(min_clearance_m) if min_clearance_m is not None else 0.0),
+        surface=None, portals=[], opening_seeds=_door_seeds,
+    )
+
+
+def build_viewpoint_graph_core(
+    scene_id: str,
+    scene_dir: str | Path,
+    *,
+    graph_id: str | None = None,
+    resolution: float = 0.05,
+    robot_radius_m: float = 0.25,
+    robot_height_m: float = 1.2,
+    heading_count: int = 12,
+    min_node_spacing_m: float = 0.5,
+    min_clearance_m: float | None = None,
+    camera_margin_m: float = 0.10,
+    doorway_gap_m: float = 0.45,
+    max_nodes: int = 300,
+    k_neighbors: int = 8,
+    max_edge_length_m: float = 1.5,
+    low_profile_max_height_m: float = 0.03,
+    wall_inflate_m: float = 0.0,
+    seed: int = 0,
+    prune_overlapping: bool = True,
+    prune_margin_m: float = 0.0,
+    persist_grid: bool = True,
+    walkability_overlay: "np.ndarray | None" = None,
+    existing_graph: ViewpointGraph | None = None,
+    scene_variant_id: Any = None,
+    on_progress: Callable[[str, float], None] | None = None,
+    metadata_extra: dict | None = None,
+) -> GraphBuildResult:
+    scene_dir = Path(scene_dir)
+
+    def _progress(stage: str, frac: float) -> None:
+        if on_progress is not None:
+            on_progress(stage, frac)
+
+    overlay_objects = _load_overlay_objects(scene_dir)
+    grids = _prepare_graph_grids(
+        scene_id,
+        scene_dir,
+        overlay_objects=overlay_objects,
+        resolution=resolution,
+        robot_radius_m=robot_radius_m,
+        robot_height_m=robot_height_m,
+        min_clearance_m=min_clearance_m,
+        camera_margin_m=camera_margin_m,
+        low_profile_max_height_m=low_profile_max_height_m,
+        wall_inflate_m=wall_inflate_m,
+        walkability_overlay=walkability_overlay,
+    )
+    surface = grids.surface
+    grid = grids.grid
+    portals = grids.portals
+    opening_seeds = grids.opening_seeds
+    node_grid = grids.node_grid
+    edge_grid = grids.edge_grid
+    node_radius = grids.node_radius
+    edge_radius = grids.edge_radius
+    sampler_min_clearance = grids.sampler_min_clearance
 
     # Persist the (full, un-eroded) traversability grid for the editor / nav_graph.
     if persist_grid:
@@ -440,6 +665,7 @@ def build_viewpoint_graph_core(
         robot_radius_m=edge_radius,
         k_neighbors=k_neighbors,
         max_edge_length_m=max_edge_length_m,
+        wall_mask=(surface.wall_band_mask if surface is not None else None),
         on_progress=lambda f: _progress("edges", 0.5 + f * 0.5),
     )
 
@@ -463,29 +689,12 @@ def build_viewpoint_graph_core(
         },
     )
 
-    # ---- forced portal bridge edges --------------------------------------- #
-    portal_edges = 0
-    for p in portals:
-        if not getattr(p, "resolved", False):
-            continue
-        na = _nearest_node(graph.nodes, p.side_a[0], p.side_a[1])
-        nb = _nearest_node(graph.nodes, p.side_b[0], p.side_b[1])
-        if na is None or nb is None or na.node_id == nb.node_id:
-            continue
-        edge = append_edge(graph, na.node_id, nb.node_id)
-        if edge is not None:
-            edge.extras = {**(edge.extras or {}), "portal": p.door_id, "portal_type": p.door_type}
-            portal_edges += 1
-
-    # ---- connectivity repair: bridge rooms through doorways (full grid) ---- #
-    # Mesh path only — the legacy annotation grid keeps its original (unbridged)
-    # behaviour so non-Infinigen scenes don't regress.
-    if surface is not None:
-        bridge_edges, bridge_nodes = _repair_connectivity(
-            graph, grid, max_bridge_m=max(3.0, max_edge_length_m * 2.0), heading_count=heading_count,
-        )
-    else:
-        bridge_edges, bridge_nodes = 0, 0
+    # ---- forced portal bridge edges + connectivity repair ----------------- #
+    portal_edges, bridge_edges, bridge_nodes = _connect_portals_and_repair(
+        graph, grid, portals, surface,
+        max_edge_length_m=max_edge_length_m, heading_count=heading_count,
+        doorway_gap_m=doorway_gap_m,
+    )
 
     summary = graph_summary(graph.nodes, graph.edges, heading_count=heading_count)
     summary["bridge_edges"] = bridge_edges
@@ -518,3 +727,113 @@ def build_viewpoint_graph_core(
         summary["walkable_surface"] = surface.stats
     _progress("edges", 1.0)
     return GraphBuildResult(grid=grid, graph=graph, surface=surface, summary=summary)
+
+
+def rebuild_viewpoint_edges(
+    scene_id: str,
+    scene_dir: str | Path,
+    graph: ViewpointGraph,
+    *,
+    resolution: float = 0.05,
+    robot_radius_m: float = 0.25,
+    robot_height_m: float = 1.2,
+    heading_count: int = 12,
+    k_neighbors: int = 8,
+    max_edge_length_m: float = 1.5,
+    min_clearance_m: float | None = None,
+    camera_margin_m: float = 0.10,
+    doorway_gap_m: float = 0.45,
+    low_profile_max_height_m: float = 0.03,
+    wall_inflate_m: float = 0.0,
+    walkability_overlay: "np.ndarray | None" = None,
+    preserve_manual_edges: bool = True,
+    on_progress: Callable[[str, float], None] | None = None,
+) -> GraphBuildResult:
+    """Re-run edge building over the graph's CURRENT node set (not resampled).
+
+    Uses the same grid/portal/connectivity logic as :func:`build_viewpoint_graph_core`
+    (mesh-aware clearance grid with no double erosion + portal bridges + room repair)
+    so a rebuild connects manually-added nodes densely instead of collapsing the
+    graph. The previous daemon handler re-derived a much smaller annotation grid and
+    eroded it a second time, which dropped ~80% of valid edges.
+
+    Manually-added nodes are preserved (they are part of ``graph.nodes`` already);
+    manual edges the auto pass doesn't reproduce are re-appended when
+    ``preserve_manual_edges`` is true. Connectivity repair may add a few
+    stepping-stone bridge nodes at doorways, exactly like ``build_graph``.
+    """
+    scene_dir = Path(scene_dir)
+
+    def _progress(stage: str, frac: float) -> None:
+        if on_progress is not None:
+            on_progress(stage, frac)
+
+    overlay_objects = _load_overlay_objects(scene_dir)
+    grids = _prepare_graph_grids(
+        scene_id,
+        scene_dir,
+        overlay_objects=overlay_objects,
+        resolution=resolution,
+        robot_radius_m=robot_radius_m,
+        robot_height_m=robot_height_m,
+        min_clearance_m=min_clearance_m,
+        camera_margin_m=camera_margin_m,
+        low_profile_max_height_m=low_profile_max_height_m,
+        wall_inflate_m=wall_inflate_m,
+        walkability_overlay=walkability_overlay,
+    )
+
+    _progress("edges", 0.0)
+    old_edges = list(graph.edges)
+    new_edges = build_viewpoint_edges(
+        grids.edge_grid,
+        graph.nodes,
+        robot_radius_m=grids.edge_radius,
+        k_neighbors=k_neighbors,
+        max_edge_length_m=max_edge_length_m,
+        wall_mask=(grids.surface.wall_band_mask if grids.surface is not None else None),
+        on_progress=lambda f: _progress("edges", f * 0.9),
+    )
+    graph.edges = new_edges
+
+    # Re-append manual edges the auto pass didn't reproduce.
+    if preserve_manual_edges:
+        have = {(e.source, e.target) for e in graph.edges}
+        have |= {(e.target, e.source) for e in graph.edges}
+        for e in old_edges:
+            is_manual = bool((e.extras or {}).get("manual")) or str(e.edge_id).startswith("edge_manual")
+            if is_manual and (e.source, e.target) not in have:
+                graph.edges.append(e)
+                have.add((e.source, e.target))
+                have.add((e.target, e.source))
+
+    portal_edges, bridge_edges, bridge_nodes = _connect_portals_and_repair(
+        graph, grids.grid, grids.portals, grids.surface,
+        max_edge_length_m=max_edge_length_m, heading_count=heading_count,
+    )
+
+    summary = graph_summary(graph.nodes, graph.edges, heading_count=heading_count)
+    summary["bridge_edges"] = bridge_edges
+    summary["bridge_nodes"] = bridge_nodes
+    summary["portal_count"] = len(grids.portals)
+    summary["portal_edges"] = portal_edges
+    summary["portals_unresolved"] = sum(1 for p in grids.portals if not getattr(p, "resolved", True))
+    comps = compute_connected_components(graph).get("components", [])
+    summary["connected_components"] = len(comps)
+    if len(comps) > 1:
+        idpos = {n.node_id: n.position for n in graph.nodes}
+        isolated = []
+        for comp in comps[1:]:
+            pts = [idpos[nid] for nid in comp.get("node_ids", []) if nid in idpos]
+            if pts:
+                cx = sum(float(p[0]) for p in pts) / len(pts)
+                cy = sum(float(p[1]) for p in pts) / len(pts)
+            else:
+                cx = cy = 0.0
+            isolated.append({"size": int(comp.get("size", len(pts))),
+                             "centroid": [round(cx, 3), round(cy, 3)]})
+        summary["disconnected"] = {"component_count": len(comps), "isolated": isolated}
+    if grids.surface is not None:
+        summary["walkable_surface"] = grids.surface.stats
+    _progress("edges", 1.0)
+    return GraphBuildResult(grid=grids.grid, graph=graph, surface=grids.surface, summary=summary)

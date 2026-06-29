@@ -63,6 +63,10 @@ WALKABLE_SURFACE_VERSION = 1
 # scene_manifest unit classification
 _FLOOR_SUBTYPES = {"floor"}
 _WALL_SUBTYPES = {"wall", "exterior"}
+# Lower bound of the robot "body" height band used to rasterize walls for connectivity
+# repair. Geometry below this (floor sills, thresholds, baseboards) is ignored so a
+# doorway — open above its sill — reads as a gap rather than a solid wall.
+WALL_BAND_Z_LO_M = 0.30
 # Overlay object types that name a real door opening (portals).
 _DOOR_OVERLAY_TYPES = {"door", "glass_door"}
 # Floor coverings the robot drives over — never carve them (cat 4). Matched on the
@@ -99,6 +103,11 @@ class WalkableSurface:
     floor_mask: np.ndarray            # (H,W) bool — union of floor footprints (for QA)
     portals: list[PortalSpec] = field(default_factory=list)
     stats: dict[str, Any] = field(default_factory=dict)
+    # (H,W) bool — wall geometry occupying the robot's BODY height band (sills/floor
+    # trim below and door lintels above are excluded), so real door openings read as
+    # gaps. Used by connectivity repair to reject bridges that punch through a wall
+    # instead of routing through a doorway. None when no wall meshes were available.
+    wall_band_mask: "np.ndarray | None" = None
 
 
 # --------------------------------------------------------------------------- #
@@ -162,6 +171,32 @@ def _largest_island(mask: np.ndarray) -> np.ndarray:
     return labels == keep
 
 
+def _keep_components(mask: np.ndarray, min_cells: int) -> tuple[np.ndarray, int, int]:
+    """Keep every 4-connected component with >= ``min_cells`` cells; drop the rest.
+
+    Unlike ``_largest_island`` this preserves real rooms that are separate components
+    (a doorway whose portal didn't resolve, or a floor fragmented by furniture). Tiny
+    sub-robot pockets are still dropped. Returns (kept_mask, n_kept, n_dropped).
+    Connectivity *between* kept rooms is restored downstream (portal edges +
+    _repair_connectivity)."""
+    from scipy import ndimage
+
+    if not mask.any():
+        return mask.copy(), 0, 0
+    labels, n = ndimage.label(mask)
+    if n <= 1:
+        return mask.copy(), int(n), 0
+    counts = np.bincount(labels.ravel())
+    counts[0] = 0  # background
+    keep_labels = {int(i) for i in np.nonzero(counts >= int(min_cells))[0]}
+    if not keep_labels:
+        keep_labels = {int(counts.argmax())}  # nothing meets the bar — keep the largest
+    kept = np.isin(labels, list(keep_labels))
+    n_kept = len(keep_labels)
+    n_dropped = int(n) - n_kept
+    return kept, n_kept, n_dropped
+
+
 # --------------------------------------------------------------------------- #
 # Mesh loading / classification
 # --------------------------------------------------------------------------- #
@@ -187,6 +222,85 @@ def _load_unit_faces(import_root: Path, unit: dict, origin_offset) -> tuple[np.n
         verts, unit.get("world_bbox_min"), unit.get("world_bbox_max"), origin_offset
     )
     return xy, faces
+
+
+def _wall_body_band_mask(
+    import_root: Path,
+    walls: list[dict],
+    origin_offset,
+    spec: GridSpec,
+    *,
+    z_lo: float,
+    z_hi: float,
+) -> np.ndarray:
+    """Rasterize wall geometry that occupies the robot BODY height band [z_lo, z_hi].
+
+    Walls are thin vertical surfaces; their XY *triangle-fill* footprint is near-empty
+    (degenerate when projected top-down), so :func:`_rasterize_faces` misses them.
+    Instead we draw every wall mesh EDGE as a line — but only for triangles that span
+    the body band, so floor sills/thresholds (below ``z_lo``) and door lintels (above
+    ``z_hi``) are dropped. A real doorway then reads as a GAP in the wall lines, which
+    is exactly what connectivity repair needs to avoid bridging through a wall.
+
+    Height is taken from Blender-Y (the up axis used by :func:`_project_to_authoring_xy`),
+    measured above each unit's lowest vertex.
+    """
+    from skimage.draw import line as sk_line
+
+    import trimesh
+
+    mask = np.zeros((spec.height, spec.width), dtype=bool)
+
+    def _to_cell(px: float, py: float) -> tuple[int, int]:
+        return (int(round((px - spec.origin[0]) / spec.resolution)),
+                int(round((py - spec.origin[1]) / spec.resolution)))
+
+    for unit in walls:
+        rel = unit.get("mesh_obj")
+        if not rel:
+            continue
+        path = import_root / rel
+        if not path.is_file():
+            continue
+        try:
+            mesh = trimesh.load(str(path), process=False, force="mesh")
+        except Exception:
+            continue
+        verts = np.asarray(getattr(mesh, "vertices", np.zeros((0, 3))), dtype=np.float64)
+        faces = np.asarray(getattr(mesh, "faces", np.zeros((0, 3))), dtype=np.int64)
+        if len(verts) == 0 or len(faces) == 0:
+            continue
+        xy = _project_to_authoring_xy(
+            verts, unit.get("world_bbox_min"), unit.get("world_bbox_max"), origin_offset
+        )
+        height = verts[:, 1] - float(verts[:, 1].min())  # Blender-Y up, above unit base
+        seen: set[tuple[int, int]] = set()
+        for tri in faces:
+            a, b, c = int(tri[0]), int(tri[1]), int(tri[2])
+            hmin = min(height[a], height[b], height[c])
+            hmax = max(height[a], height[b], height[c])
+            if hmax < z_lo or hmin > z_hi:
+                continue  # entirely a sill (below) or a lintel/ceiling (above)
+            for i, j in ((a, b), (b, c), (c, a)):
+                key = (i, j) if i < j else (j, i)
+                if key in seen:
+                    continue
+                seen.add(key)
+                p, q = xy[i], xy[j]
+                if math.hypot(q[0] - p[0], q[1] - p[1]) <= spec.resolution * 0.5:
+                    continue  # vertical edge — projects to a point
+                c0x, c0y = _to_cell(p[0], p[1])
+                c1x, c1y = _to_cell(q[0], q[1])
+                if not (0 <= c0x < spec.width and 0 <= c0y < spec.height
+                        and 0 <= c1x < spec.width and 0 <= c1y < spec.height):
+                    # clamp endpoints into bounds before drawing
+                    c0x = min(max(c0x, 0), spec.width - 1)
+                    c0y = min(max(c0y, 0), spec.height - 1)
+                    c1x = min(max(c1x, 0), spec.width - 1)
+                    c1y = min(max(c1y, 0), spec.height - 1)
+                rr, cc = sk_line(c0y, c0x, c1y, c1x)
+                mask[rr, cc] = True
+    return mask
 
 
 def _structure_units(manifest: dict) -> tuple[list[dict], list[dict]]:
@@ -323,6 +437,8 @@ def build_walkable_surface(
     low_profile_max_height_m: float = 0.03,
     wall_inflate_m: float = 0.0,
     portal_stamp_radius_m: float = 0.18,
+    min_room_area_m2: float = 1.0,
+    opening_bridge_m: float = 0.15,
 ) -> WalkableSurface:
     """Build an accurate 2D walkable + clearance grid from per-room meshes."""
     from scipy import ndimage
@@ -408,8 +524,37 @@ def build_walkable_surface(
         if p.resolved:
             _stamp_disc(walkable, spec, p.center[0], p.center[1], portal_stamp_radius_m)
 
-    # --- largest island ---------------------------------------------------- #
-    island = _largest_island(walkable)
+    # --- bridge thin opening gaps regardless of door objects --------------- #
+    # Doorways and open passages where the two room floors stop at the wall faces
+    # leave a thin (~wall-thickness) gap in `walkable` with no floor. The door portals
+    # above only bridge openings that HAVE a door object; open LDK passages (and
+    # doorways whose door leaf was dropped/removed) don't. Morphologically close small
+    # gaps in walkable, then keep only the filled cells that are NOT wall — so genuine
+    # openings (wall cut, no wall in the gap) connect, while solid walls keep rooms
+    # apart. This makes connectivity independent of door objects.
+    n_bridged = 0
+    if opening_bridge_m > 0 and wall_mask.any():
+        r = max(1, int(round(float(opening_bridge_m) / resolution)))
+        struct = ndimage.generate_binary_structure(2, 1)
+        closed = ndimage.binary_closing(walkable, structure=struct, iterations=r)
+        # Constrain bridges to the building interior (floor+walls, holes filled) so a
+        # closed gap at an EXTERIOR opening (window/door cut in the perimeter wall)
+        # can't leak walkable cells outside the building.
+        interior = ndimage.binary_fill_holes(floor_mask | wall_mask)
+        bridge = closed & ~walkable & ~wall_mask & interior
+        n_bridged = int(bridge.sum())
+        if n_bridged:
+            walkable = walkable | bridge
+
+    # --- keep all real-room components (not just the largest) -------------- #
+    # _largest_island would drop every room that isn't part of the single biggest
+    # component — e.g. a room reachable only through a doorway whose portal didn't
+    # resolve, or a small room fragmented by furniture. Keeping all components above a
+    # minimum room area preserves those rooms (so they get nodes); connectivity between
+    # them is restored downstream by portal edges + _repair_connectivity. Sub-robot
+    # pockets stay dropped.
+    min_room_cells = max(1, int(round(float(min_room_area_m2) / (resolution * resolution))))
+    island, n_rooms_kept, n_pockets_dropped = _keep_components(walkable, min_room_cells)
 
     # --- clearance (EDT) --------------------------------------------------- #
     clearance_m = ndimage.distance_transform_edt(island).astype(np.float32) * float(resolution)
@@ -419,6 +564,15 @@ def build_walkable_surface(
         traversable=island,
         hazard=np.zeros((height, width), dtype=bool),
     )
+
+    # --- wall occupancy at robot body height (for connectivity repair) ------ #
+    # Drop floor sills (below WALL_BAND_Z_LO) and door lintels (above robot height)
+    # so door openings read as gaps; repair uses this to avoid bridging through walls.
+    wall_band_mask = _wall_body_band_mask(
+        import_root, walls, origin_offset, spec,
+        z_lo=WALL_BAND_Z_LO_M, z_hi=max(WALL_BAND_Z_LO_M + 0.1, float(robot_height_m)),
+    )
+
     stats = {
         "walkable_surface_version": WALKABLE_SURFACE_VERSION,
         "floor_units": len(floor_faces),
@@ -428,10 +582,14 @@ def build_walkable_surface(
         "floor_cells": int(floor_mask.sum()),
         "walkable_cells": int(walkable.sum()),
         "island_cells": int(island.sum()),
+        "rooms_kept": int(n_rooms_kept),
+        "pockets_dropped": int(n_pockets_dropped),
+        "opening_bridge_cells": int(n_bridged),
         "portals": len(portals),
         "portals_unresolved": sum(1 for p in portals if not p.resolved),
+        "wall_band_cells": int(wall_band_mask.sum()),
         "grid": {"width": width, "height": height, "resolution": resolution,
                  "origin": [float(minx), float(miny)]},
     }
     return WalkableSurface(grid=grid, clearance_m=clearance_m, floor_mask=floor_mask,
-                           portals=portals, stats=stats)
+                           portals=portals, stats=stats, wall_band_mask=wall_band_mask)

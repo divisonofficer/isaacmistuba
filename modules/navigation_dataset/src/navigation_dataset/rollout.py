@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 
 from .episode_schema import EpisodeManifest, EpisodeTimestep, GENERATION_VERSION, write_episode
 from .instruction_templates import make_instruction
@@ -19,6 +19,29 @@ def split_counts_from_spec(spec: str) -> dict[str, int]:
         name, value = part.split(":", 1)
         result[name.strip()] = int(value)
     return result
+
+
+def scale_split_counts(split_counts: dict[str, int], total: int) -> dict[str, int]:
+    """Rescale a split spec (interpreted as weights/ratios) to ``total`` items.
+
+    The CLI spec (e.g. ``train:60,val_seen:10,val_unseen:10``) describes *proportions*,
+    not absolute counts. When ``num_pairs`` exceeds ``sum(split_counts)`` the raw counts
+    would dump every overflow episode into the last split. Rescaling preserves the ratio
+    regardless of how many episodes are generated, using largest-remainder rounding so
+    the result sums to exactly ``total``.
+    """
+    weights = {name: max(0, int(count)) for name, count in split_counts.items()}
+    weight_sum = sum(weights.values())
+    if total <= 0 or weight_sum <= 0:
+        return dict(split_counts)
+    exact = {name: total * w / weight_sum for name, w in weights.items()}
+    scaled = {name: int(value) for name, value in exact.items()}
+    remainder = total - sum(scaled.values())
+    # Hand out the leftover (from flooring) to the largest fractional parts first.
+    order = sorted(exact, key=lambda name: exact[name] - scaled[name], reverse=True)
+    for name in order[:remainder]:
+        scaled[name] += 1
+    return scaled
 
 
 def split_for_index(split_counts: dict[str, int], index: int) -> str:
@@ -92,10 +115,15 @@ def plan_episodes(
     instruction_types: list[str],
     modalities: list[str],
     seed: int = 0,
+    on_progress: "Callable[[int, int, int], None] | None" = None,
 ) -> list[EpisodeManifest]:
     pairs = sample_start_goal_pairs(grid, annotation.goal_regions, count=num_pairs, seed=seed)
+    split_counts = scale_split_counts(split_counts, len(pairs))
     episodes: list[EpisodeManifest] = []
+    total = len(pairs)
     for index, (start_pose, goal_region) in enumerate(pairs):
+        if on_progress is not None:
+            on_progress(len(episodes), total, index + 1)
         split = split_for_index(split_counts, index)
         instruction_type = instruction_types[index % len(instruction_types)]
         episode_id = f"{annotation.scene_id}_{split}_{index + 1:06d}"

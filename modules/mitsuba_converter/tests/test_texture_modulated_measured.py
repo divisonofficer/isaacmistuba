@@ -1,16 +1,20 @@
 from __future__ import annotations
 
+import json
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
 from mitsuba_converter.multimodal import (
+    _apply_measured_scope_policy,
     _convert_channel_split_measured_bsdfs_to_rgb_plugin,
     _pbrdf_band_policy_inventory,
     _substitute_measured_bsdfs_with_diffuse,
     _stage_measured_bsdfs_for_rgb,
 )
 from mitsuba_converter.render_daemon import (
+    RenderDaemon,
     _append_bsdf_xml,
+    _build_render_scene_material_policy,
     _generate_opticalnav_render_scene_xml,
     _select_part_render_material,
 )
@@ -131,6 +135,189 @@ def test_single_band_rgb_staging_adds_542_wavelength_and_preserves_albedo_scale(
     inventory = _pbrdf_band_policy_inventory(root)
     assert inventory["single_band_measured"] == 1
     assert inventory["three_band_measured"] == 0
+
+
+def test_measured_scope_policy_injects_budgeted_candidates_after_analytic_source(tmp_path: Path) -> None:
+    scene_path = tmp_path / "render_scene.xml"
+    scene_path.write_text(
+        """
+        <scene version="3.0.0">
+          <integrator type="path"/>
+          <shape type="obj" id="metal_shape">
+            <string name="filename" value="metal.obj"/>
+            <bsdf type="twosided"><bsdf type="roughconductor"/></bsdf>
+          </shape>
+          <shape type="obj" id="wall_shape">
+            <string name="filename" value="wall.obj"/>
+            <bsdf type="twosided"><bsdf type="pplastic"/></bsdf>
+          </shape>
+        </scene>
+        """,
+        encoding="utf-8",
+    )
+    policy = _build_render_scene_material_policy(
+        scene_id="unit",
+        material_policy_records=[
+            {
+                "shape_id": "metal_shape",
+                "material_id": "metal",
+                "analytic_strategy": "roughconductor",
+                "analytic_capabilities": {"rgb": True, "polarization": True},
+                "analytic_polar_rgb": True,
+                "invalid_analytic_fallback": False,
+                "measured_role": "anchor",
+                "measured_candidate": {
+                    "kind": "hpbrdf_2025",
+                    "material_id": "aluminum",
+                    "bsdf_strategy": "measured_polarized",
+                    "channels_dir": "data/hpbrdf_2025/channels/aluminum",
+                    "base_color_factor": [0.8, 0.7, 0.6],
+                },
+            },
+            {
+                "shape_id": "wall_shape",
+                "material_id": "wall",
+                "analytic_strategy": "pplastic",
+                "analytic_capabilities": {"rgb": True, "polarization": True},
+                "analytic_polar_rgb": True,
+                "invalid_analytic_fallback": False,
+                "measured_role": "candidate",
+                "measured_candidate": {
+                    "kind": "hpbrdf_2025",
+                    "material_id": "white_smooth_plastic",
+                    "bsdf_strategy": "measured_polarized",
+                    "channels_dir": "data/hpbrdf_2025/channels/white_smooth_plastic",
+                },
+            },
+        ],
+    )
+    (tmp_path / "render_scene_material_policy.json").write_text(
+        json.dumps(policy),
+        encoding="utf-8",
+    )
+
+    root = ET.parse(scene_path).getroot()
+    counts = _apply_measured_scope_policy(
+        root,
+        source_scene=scene_path,
+        measured_scope="analytic_priority",
+        max_measured_bsdfs=1,
+    )
+    assert counts["measured_candidates"] == 2
+    assert counts["measured_enabled"] == 1
+    assert counts["measured_suppressed"] == 1
+    _stage_measured_bsdfs_for_rgb(root, band_mode="single")
+    assert root.find(".//shape[@id='metal_shape']//bsdf[@type='measured_polarized']") is not None
+    assert root.find(".//shape[@id='wall_shape']//bsdf[@type='measured_polarized']") is None
+    measured = root.find(".//shape[@id='metal_shape']//bsdf[@type='measured_polarized']")
+    assert measured.find("./string[@name='filename']").get("value").endswith("/542.pbrdf")
+    assert measured.find("./float[@name='wavelength']").get("value") == "542"
+    assert measured.find("./rgb[@name='albedo_scale']").get("value") == "0.8 0.7 0.6"
+    assert measured.find("./string[@name='material_id']") is None
+
+
+def test_measured_scope_analytic_only_keeps_policy_scene_fully_analytic(tmp_path: Path) -> None:
+    scene_path = tmp_path / "render_scene.xml"
+    scene_path.write_text(
+        """
+        <scene version="3.0.0">
+          <shape type="obj" id="metal_shape">
+            <string name="filename" value="metal.obj"/>
+            <bsdf type="twosided"><bsdf type="roughconductor"/></bsdf>
+          </shape>
+        </scene>
+        """,
+        encoding="utf-8",
+    )
+    policy = _build_render_scene_material_policy(
+        scene_id="unit",
+        material_policy_records=[
+            {
+                "shape_id": "metal_shape",
+                "material_id": "metal",
+                "analytic_strategy": "roughconductor",
+                "analytic_capabilities": {"rgb": True, "polarization": True},
+                "analytic_polar_rgb": True,
+                "invalid_analytic_fallback": False,
+                "measured_role": "anchor",
+                "measured_candidate": {
+                    "kind": "hpbrdf_2025",
+                    "material_id": "aluminum",
+                    "bsdf_strategy": "measured_polarized",
+                    "channels_dir": "data/hpbrdf_2025/channels/aluminum",
+                },
+            }
+        ],
+    )
+    (tmp_path / "render_scene_material_policy.json").write_text(
+        json.dumps(policy),
+        encoding="utf-8",
+    )
+
+    root = ET.parse(scene_path).getroot()
+    counts = _apply_measured_scope_policy(
+        root,
+        source_scene=scene_path,
+        measured_scope="analytic_only",
+        max_measured_bsdfs=3,
+    )
+
+    assert counts["measured_candidates"] == 1
+    assert counts["measured_enabled"] == 0
+    assert counts["measured_suppressed"] == 1
+    assert root.find(".//bsdf[@type='measured_polarized']") is None
+    assert root.find(".//bsdf[@type='roughconductor']") is not None
+
+
+def test_render_scene_stats_reads_material_policy_sidecar(tmp_path: Path) -> None:
+    project_dir = tmp_path / "project"
+    scene_dir = project_dir / "scenes" / "unit"
+    scene_dir.mkdir(parents=True)
+    (scene_dir / "render_scene.xml").write_text(
+        """
+        <scene version="3.0.0">
+          <shape type="obj" id="metal_shape">
+            <string name="filename" value="metal.obj"/>
+            <bsdf type="twosided"><bsdf type="roughconductor"/></bsdf>
+          </shape>
+        </scene>
+        """,
+        encoding="utf-8",
+    )
+    policy = _build_render_scene_material_policy(
+        scene_id="unit",
+        material_policy_records=[
+            {
+                "shape_id": "metal_shape",
+                "material_id": "metal",
+                "analytic_strategy": "roughconductor",
+                "analytic_capabilities": {"rgb": True, "polarization": True},
+                "analytic_polar_rgb": True,
+                "invalid_analytic_fallback": False,
+                "measured_role": "anchor",
+                "measured_candidate": {
+                    "kind": "hpbrdf_2025",
+                    "material_id": "aluminum",
+                    "bsdf_strategy": "measured_polarized",
+                    "channels_dir": "data/hpbrdf_2025/channels/aluminum",
+                },
+            }
+        ],
+    )
+    (scene_dir / "render_scene_material_policy.json").write_text(
+        json.dumps(policy),
+        encoding="utf-8",
+    )
+    daemon = object.__new__(RenderDaemon)
+    daemon.repo_root = tmp_path
+
+    stats = RenderDaemon._opticalnav_render_scene_stats(daemon, project_dir, "unit")
+
+    assert stats["exists"] is True
+    assert stats["shape_count"] == 1
+    assert stats["measured_candidates"] == 1
+    assert stats["measured_enabled_default"] == 1
+    assert stats["material_policy_ref"] == "project/scenes/unit/render_scene_material_policy.json"
 
 
 def test_hybrid_rgb_staging_keeps_achromatic_single_and_converts_coloured() -> None:

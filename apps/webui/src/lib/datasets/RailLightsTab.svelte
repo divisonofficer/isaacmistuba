@@ -1,7 +1,9 @@
 <script lang="ts">
 	import { kelvinToRgb, rgbToKelvinApprox } from '$lib/datasets/materialHelpers';
+	import type { Capabilities } from '$lib/datasets/capabilityHelpers';
 
 	interface Props {
+		caps: Capabilities;
 		authoringMap: any;
 		detectedEmitterIds: Set<string>;
 		detectedEmitterCount: number;
@@ -18,6 +20,7 @@
 	}
 
 	let {
+		caps,
 		authoringMap, detectedEmitterIds, detectedEmitterCount, enabledEmitterCount,
 		hasScene, saving,
 		onEnableAll, onDisableAll, onToggleEmitter,
@@ -68,7 +71,7 @@
 	{#if detectedEmitterCount > 0}
 		<div class="emitter-bulk-row">
 			<span>{enabledEmitterCount}/{detectedEmitterCount} fixtures enabled</span>
-			<button class="button button-subtle" disabled={enabledEmitterCount >= detectedEmitterCount} onclick={onEnableAll}>Enable all</button>
+			<button class="button button-subtle" disabled={!caps.enableEmitters.enabled} title={caps.enableEmitters.reason} onclick={onEnableAll}>Enable all</button>
 			{#if enabledEmitterCount > 0}
 				<button class="button button-subtle" onclick={onDisableAll}>Disable all</button>
 			{/if}
@@ -138,7 +141,7 @@
 		{/each}
 	</div>
 	<div class="sync-actions">
-		<button class="button button-subtle" disabled={!hasScene || saving} onclick={onSave}>Save</button>
+		<button class="button button-subtle" disabled={!caps.saveLights.enabled} title={caps.saveLights.reason} onclick={onSave}>Save</button>
 	</div>
 </section>
 

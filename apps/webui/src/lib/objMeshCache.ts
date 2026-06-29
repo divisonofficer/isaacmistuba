@@ -50,7 +50,13 @@ const CACHE_VERSION = 'obj-mesh-cache-v3-head-size';
 // never created, so transactions failed with "object stores was not found".
 const DB_NAME = 'robomituba-opticalnav-obj';
 const STORE_NAME = 'obj_mesh';
-const MAX_MEMORY_ENTRIES = 256;
+// Must comfortably exceed a single scene's distinct mesh count, otherwise loaded
+// geometries get LRU-evicted mid-scene → MapEditor3D's next rebuild reads an
+// evicted key as undefined, draws a placeholder box, and re-fetches → the editor
+// flickers box↔mesh forever. Infinigen indoor scenes reach ~440 distinct OBJs;
+// 4096 holds the working set with headroom. Per-entry size is bounded by
+// MAX_OBJ_BYTES_FOR_PREVIEW, so the worst-case footprint stays in check.
+const MAX_MEMORY_ENTRIES = 4096;
 const MAX_IDB_AGE_MS = 14 * 24 * 60 * 60 * 1000;
 
 type SerializedGeometry = {
@@ -68,6 +74,13 @@ type CacheRecord = {
 };
 
 const memory = new Map<string, ThreeBufferGeometry | null>();
+// Negative cache (404 / too-large / parse-failed). Kept SEPARATE from `memory`
+// so a missing OBJ is requested at most once per page: when nulls shared the
+// geometry LRU, a scene with >MAX_MEMORY_ENTRIES distinct meshes evicted the
+// null markers, getCachedObjMeshGeometry returned undefined again, and the
+// editor's rebuild re-fired the fetch — an endless 404 storm. Keys are tiny, so
+// this stays unbounded for the page lifetime.
+const negative = new Set<string>();
 const pending = new Map<string, Promise<ThreeBufferGeometry | null>>();
 const _stats = {
 	memory_hits: 0,
@@ -121,17 +134,16 @@ export function objMeshCacheKey(projectId: string, sceneId: string, filename: st
 }
 
 export function getCachedObjMeshGeometry(key: string): ThreeBufferGeometry | null | undefined {
+	if (negative.has(key)) return null;
 	return memory.get(key);
 }
 
 export function getObjMeshCacheStats(): ObjMeshCacheStats {
-	let memoryNullEntries = 0;
-	for (const value of memory.values()) if (value === null) memoryNullEntries++;
 	return {
 		..._stats,
 		last_error: _stats.last_error || undefined,
 		memory_entries: memory.size,
-		memory_null_entries: memoryNullEntries,
+		memory_null_entries: negative.size,
 		pending: pending.size,
 		inflight: _inflight,
 		queued: _waiters.length,
@@ -154,6 +166,10 @@ export async function loadObjMeshGeometry(
 	filename: string,
 ): Promise<ThreeBufferGeometry | null> {
 	const key = objMeshCacheKey(projectId, sceneId, filename);
+	if (negative.has(key)) {
+		_stats.memory_null_hits++;
+		return null;
+	}
 	if (memory.has(key)) {
 		const value = memory.get(key) ?? null;
 		if (value === null) _stats.memory_null_hits++;
@@ -178,7 +194,7 @@ export async function loadObjMeshGeometry(
 			if (posBytes > MAX_OBJ_BYTES_FOR_PREVIEW / 2) {
 				_stats.idb_too_large++;
 				void deleteIdb(key);
-				setMemory(key, null);
+				markNegative(key);
 				return null;
 			}
 			_stats.idb_hits++;
@@ -197,7 +213,7 @@ export async function loadObjMeshGeometry(
 			const headLen = await fetchObjContentLength(url);
 			if (Number.isFinite(headLen) && headLen > MAX_OBJ_BYTES_FOR_PREVIEW) {
 				_stats.head_too_large++;
-				setMemory(key, null);
+				markNegative(key);
 				return null;
 			}
 
@@ -205,7 +221,7 @@ export async function loadObjMeshGeometry(
 			if (!res.ok) {
 				_stats.fetch_errors++;
 				_stats.last_error = `http_${res.status}`;
-				setMemory(key, null);
+				markNegative(key);
 				return null;
 			}
 			const cl = res.headers.get('content-length');
@@ -213,14 +229,14 @@ export async function loadObjMeshGeometry(
 			if (Number.isFinite(len) && len > MAX_OBJ_BYTES_FOR_PREVIEW) {
 				_stats.head_too_large++;
 				try { res.body?.cancel(); } catch { /* noop */ }
-				setMemory(key, null);
+				markNegative(key);
 				return null;
 			}
 			const text = await res.text();
 			const geo = parseObjToGeometry(text);
 			if (!geo) {
 				_stats.parse_errors++;
-				setMemory(key, null);
+				markNegative(key);
 				return null;
 			}
 			setMemory(key, geo);
@@ -230,7 +246,7 @@ export async function loadObjMeshGeometry(
 		} catch (err) {
 			_stats.fetch_errors++;
 			_stats.last_error = err instanceof Error ? err.message : String(err);
-			setMemory(key, null);
+			markNegative(key);
 			return null;
 		} finally {
 			_releaseSlot();
@@ -347,9 +363,17 @@ function deserializeGeometry(s: SerializedGeometry): ThreeBufferGeometry {
 	return g;
 }
 
-function setMemory(key: string, geo: ThreeBufferGeometry | null) {
-	if (geo === null) _stats.null_stored++;
-	else _stats.stored++;
+// Negative cache a key: a 404 / too-large / unparseable OBJ. Lives in `negative`
+// (never evicted) instead of the geometry LRU so it is never re-requested.
+function markNegative(key: string) {
+	_stats.null_stored++;
+	memory.delete(key);
+	negative.add(key);
+}
+
+function setMemory(key: string, geo: ThreeBufferGeometry) {
+	_stats.stored++;
+	negative.delete(key);
 	if (memory.has(key)) memory.delete(key);
 	memory.set(key, geo);
 	while (memory.size > MAX_MEMORY_ENTRIES) {

@@ -185,10 +185,9 @@ def _material_binding(mat: dict) -> dict:
     the render bsdf_strategy:
       glass  -> dielectric / roughdielectric (clear; analytic, renders today)
       mirror -> conductor (Al; analytic, renders today)
-      metal_*-> measured_polarized (hpbrdf) modulated by baked albedo (albedo_scale,
-                = dev-report svBRDF Option 1; needs measured_polarized_rgb in the
-                production optix7 build to show colour, else gray fallback)
-      diffuse-> roughplastic with baked albedo (unchanged)
+      metal_*-> roughconductor analytic fallback plus a measured_polarized candidate
+                recorded for render-time opt-in scopes
+      diffuse-> pplastic with baked albedo (polarization-aware analytic fallback)
     """
     name = mat.get("name", "mat")
     base = mat.get("base_color") or [0.6, 0.6, 0.6]
@@ -207,22 +206,35 @@ def _material_binding(mat: dict) -> dict:
         strategy = "roughdielectric" if frosted else "dielectric"
         binding = {"kind": "preset", "bsdf_strategy": strategy,
                    "base_color_factor": base, "roughness": rough, "metallic": metallic,
-                   "capabilities": {"rgb": True}}
+                   "capabilities": {"rgb": True, "polarization": True}}
     elif oc == "mirror":
         binding = {"kind": "preset", "bsdf_strategy": "conductor",
                    "base_color_factor": base, "roughness": rough, "metallic": metallic,
-                   "capabilities": {"rgb": True}}
+                   "capabilities": {"rgb": True, "polarization": True}}
     elif oc in _METAL_MEASURED_ID:
         mid = _METAL_MEASURED_ID[oc]
-        # Measured pBRDF; the baked albedo (map_Kd) flows in as albedo_scale at
-        # render time (render_daemon._append_measured_albedo_scale_xml).
-        binding = {"kind": "hpbrdf_2025", "dataset_id": "hpbrdf_2025", "material_id": mid,
-                   "bsdf_strategy": "measured_polarized",
-                   "channels_dir": f"data/hpbrdf_2025/channels/{mid}",
+        # Source XML stays analytic/polarimetric by default. The measured pBRDF
+        # remains available as an opt-in render-time candidate via the policy sidecar.
+        binding = {"kind": "preset", "bsdf_strategy": "roughconductor",
                    "base_color_factor": base, "roughness": rough, "metallic": metallic,
-                   "capabilities": {"rgb": True, "polarization": True}}
+                   "capabilities": {"rgb": True, "polarization": True},
+                   "analytic_fallback": {
+                       "kind": "preset", "bsdf_strategy": "roughconductor",
+                       "base_color_factor": base, "roughness": rough, "metallic": metallic,
+                       "capabilities": {"rgb": True, "polarization": True},
+                   },
+                   "measured_candidate": {
+                       "kind": "hpbrdf_2025", "dataset_id": "hpbrdf_2025", "material_id": mid,
+                       "bsdf_strategy": "measured_polarized",
+                       "channels_dir": f"data/hpbrdf_2025/channels/{mid}",
+                       "base_color_factor": base, "roughness": rough, "metallic": metallic,
+                       "capabilities": {"rgb": True, "polarization": True},
+                   },
+                   "measured_role": "anchor"}
         if images and images[0].get("filepath"):
             binding["base_color_texture_ref"] = images[0]["filepath"]
+            binding["analytic_fallback"]["base_color_texture_ref"] = images[0]["filepath"]
+            binding["measured_candidate"]["base_color_texture_ref"] = images[0]["filepath"]
     else:  # diffuse
         # Polarized plastic (pplastic): texturable diffuse_reflectance keeps the baked
         # albedo, and it emits a polarization signal in the polarized variant — unlike
@@ -265,6 +277,89 @@ def _material_binding(mat: dict) -> dict:
 # leaves a node-shaped hole the user fills in manually every time.
 _TRAVERSABLE_OVERLAY_KEYWORDS = ("rug", "carpet", "mat", "doormat", "towel")
 _TRAVERSABLE_OVERLAY_HEIGHT_M = 0.05
+
+# Oversized-door drop. Infinigen door-leaf factories sometimes emit a leaf far larger
+# than its frame/opening that sits across a passage (a real leaf footprint is thin,
+# ~0.05-0.2m, by ~0.8-1.0m wide → ~0.15m²). Such a leaf is dropped at import so it
+# neither renders as a wall-sized door nor breaks doorway portal detection. Detection
+# is frame-RELATIVE: a leaf is oversized when its horizontal footprint is far larger
+# than its nearest door frame (door_base_elements), which marks the true opening and
+# is robust across door scales. Absolute thresholds are only a fallback when no frame
+# is nearby. Frames are NEVER dropped — only door *leaf* factories.
+_DOOR_LEAF_FACTORY_HINT = "doorfactory"
+_DOOR_FRAME_COLLECTION_HINT = "door_base_elements"
+_DOOR_FRAME_MATCH_RADIUS_M = 1.5     # leaf↔frame pairing distance
+_DOOR_LEAF_THICKNESS_FACTOR = 3.0    # leaf min-horiz > frame min-horiz × this → oversized
+_DOOR_LEAF_THICKNESS_MARGIN_M = 0.2
+_DOOR_LEAF_AREA_FACTOR = 2.5         # leaf area > frame area × this → oversized
+_DOOR_LEAF_MAX_THICKNESS_M = 0.4     # absolute fallback (no frame nearby)
+_DOOR_LEAF_MAX_AREA_M2 = 0.9
+
+
+def _door_footprint(unit: dict) -> tuple[float, float, float] | None:
+    """(min_horiz, area, _) of a door unit's horizontal footprint, or None."""
+    size = unit.get("place_size_m") or []
+    if len(size) < 3:
+        return None
+    sx, sz = float(size[0]), float(size[2])  # size[1] is height
+    return min(sx, sz), sx * sz, 0.0
+
+
+def _is_door_leaf(unit: dict) -> bool:
+    if unit.get("kind") != "door":
+        return False
+    name = str(unit.get("blender_name") or unit.get("factory") or "").lower()
+    return _DOOR_LEAF_FACTORY_HINT in name
+
+
+def _is_door_frame(unit: dict) -> bool:
+    return unit.get("kind") == "door" and any(
+        _DOOR_FRAME_COLLECTION_HINT in str(c) for c in (unit.get("collections") or []))
+
+
+def _drop_oversized_doors(units: list[dict]) -> tuple[list[dict], int]:
+    """Drop door leaves whose footprint dwarfs their nearest frame. Returns (kept, n)."""
+    import math
+    frames = []
+    for u in units:
+        if not _is_door_frame(u):
+            continue
+        c = u.get("place_center")
+        fp = _door_footprint(u)
+        if c and fp:
+            frames.append((float(c[0]), float(c[1]), fp[0], fp[1]))  # x, y, min_horiz, area
+
+    def _nearest_frame(cx, cy):
+        best = None
+        for fx, fy, fmin, farea in frames:
+            d = math.hypot(fx - cx, fy - cy)
+            if d <= _DOOR_FRAME_MATCH_RADIUS_M and (best is None or d < best[0]):
+                best = (d, fmin, farea)
+        return best
+
+    kept, dropped = [], 0
+    for u in units:
+        if not _is_door_leaf(u):
+            kept.append(u)
+            continue
+        fp = _door_footprint(u)
+        c = u.get("place_center")
+        if not fp:
+            kept.append(u)
+            continue
+        leaf_min, leaf_area, _ = fp
+        frame = _nearest_frame(float(c[0]), float(c[1])) if c else None
+        if frame is not None:
+            _, fmin, farea = frame
+            oversized = (leaf_min > fmin * _DOOR_LEAF_THICKNESS_FACTOR + _DOOR_LEAF_THICKNESS_MARGIN_M
+                         or (farea > 0 and leaf_area > farea * _DOOR_LEAF_AREA_FACTOR))
+        else:  # no frame to compare against — fall back to absolute thresholds
+            oversized = leaf_min > _DOOR_LEAF_MAX_THICKNESS_M or leaf_area > _DOOR_LEAF_MAX_AREA_M2
+        if oversized:
+            dropped += 1
+        else:
+            kept.append(u)
+    return kept, dropped
 
 
 def _is_traversable_overlay(unit: dict) -> bool:
@@ -395,6 +490,13 @@ def build_authoring_map(manifest: dict, scene_id: str, import_rel: str,
              if u.get("mesh_obj") and _obj_has_faces(REPO_ROOT / import_rel / u["mesh_obj"])]
     skipped = len(all_units) - len(units)
 
+    # Drop oversized door leaves (much larger than their nearest frame) that block a
+    # passage. Removing them keeps the scene nav-clean (no wall-sized door mesh) and
+    # lets doorway portal detection resolve so the rooms stay connected.
+    units, _n_dropped_doors = _drop_oversized_doors(units)
+    if _n_dropped_doors:
+        print(f"[import] dropped {_n_dropped_doors} oversized door(s)")
+
     # Drop "unfinished" rooms — empty/unsolved shells Infinigen leaves stacked at
     # the origin. Keep only finished rooms (>=1 furniture) + the units inside them.
     kept_rooms, room_floor = _select_rooms(units, keep_empty=keep_empty_rooms, room_override=room_override)
@@ -415,8 +517,9 @@ def build_authoring_map(manifest: dict, scene_id: str, import_rel: str,
     used_mat_names = {m for u in units for m in (u.get("materials") or [])}
     materials = [{
         "material_id": DEFAULT_MAT, "category": "opaque",
-        "render_binding": {"kind": "preset", "bsdf_strategy": "roughplastic",
-                           "base_color_factor": [0.6, 0.6, 0.6], "capabilities": {"rgb": True}},
+        "render_binding": {"kind": "preset", "bsdf_strategy": "pplastic",
+                           "base_color_factor": [0.6, 0.6, 0.6],
+                           "capabilities": {"rgb": True, "polarization": True}},
         "params": {"source": "infinigen", "fallback": True},
     }]
     mat_id_by_name = {}
@@ -730,6 +833,11 @@ def main():
                     help="Keep only this room key (e.g. 'dining-room_0/0').")
     ap.add_argument("--no-normalize-origin", action="store_true",
                     help="Keep raw Infinigen world coords instead of shifting the layout to the origin.")
+    ap.add_argument("--optical-perturbation", nargs="?", const=0, type=int, default=None,
+                    metavar="SEED",
+                    help="After import, auto-place mirrors+glass as a toggleable optical "
+                         "perturbation overlay (optional SEED). Glass walls need the viewpoint "
+                         "graph; rerun `opticalnav perturbation build` after graph build for those.")
     ap.add_argument("--no-fill-missing-lights", action="store_true",
                     help="Do not synthesize ceiling lights for rooms Infinigen left unlit.")
     args = ap.parse_args()
@@ -762,6 +870,13 @@ def main():
     )
     scene_dir = REPO_ROOT / "out" / "opticalnav" / args.project_id / "scenes" / scene_id
     print(f"[import] installed -> {scene_dir.relative_to(REPO_ROOT)}")
+    if args.optical_perturbation is not None:
+        from navigation_dataset.optical_perturbation import build_optical_perturbation
+        pp = build_optical_perturbation(scene_dir, seed=int(args.optical_perturbation))
+        m = pp["metadata"]
+        print(f"[import] optical perturbation: mirrors={m['mirror_count']} "
+              f"glass={m['glass_wall_count']} disabled_edges={m['disabled_edge_count']} "
+              f"-> {(scene_dir / 'optical_perturbation.json').relative_to(REPO_ROOT)}")
     rx = scene_dir / "render_scene.xml"
     print(f"[import] render_scene.xml exists={rx.exists()} size={rx.stat().st_size if rx.exists() else 0}")
     print(f"[import] DONE result_keys={list(result.__dict__.keys()) if hasattr(result,'__dict__') else type(result)}")

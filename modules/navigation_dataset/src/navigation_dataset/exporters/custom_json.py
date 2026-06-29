@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import asdict
 import json
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 import zipfile
 
 from ..episode_schema import DatasetProject, EpisodeManifest, read_episode, read_project, write_project
@@ -16,6 +16,19 @@ def _rel(root: Path, path: Path) -> str:
 def find_episode_files(dataset_root: str | Path) -> list[Path]:
     root = Path(dataset_root)
     return sorted((root / "episodes").glob("*/*.json"))
+
+
+def _scene_id_from_path(path: Path, split: str) -> str:
+    """Derive scene_id from the episode path without opening the file.
+
+    Episode ids are constructed as ``f"{scene_id}_{split}_…"`` (see ``rollout`` and
+    ``graph_episode_sampler``) and stored under ``episodes/<split>/``. The scene_id
+    is therefore the filename stem up to the ``_<split>_`` marker. Returns "" if the
+    marker isn't found (caller falls back to a real read).
+    """
+    stem = path.stem
+    idx = stem.find(f"_{split}_")
+    return stem[:idx] if idx > 0 else ""
 
 
 _OBS_FILE_SUFFIXES = (".png", ".exr", ".jpg", ".jpeg", ".npy")
@@ -101,16 +114,27 @@ def _filter_episode_files(
     allow_scene = set(str(sid) for sid in scene_ids) if scene_ids is not None else None
     kept: list[Path] = []
     for path in paths:
-        try:
-            episode = read_episode(path)
-        except Exception:
+        # episode_id == filename stem, split == parent dir, scene_id derivable from
+        # both — so the episode_id / scene_id filters never need to open the file
+        # (~26 ms each on this filesystem). Only ``only_completed`` requires a read.
+        if allow_episode is not None and path.stem not in allow_episode:
             continue
-        if allow_episode is not None and episode.episode_id not in allow_episode:
-            continue
-        if allow_scene is not None and episode.scene_id not in allow_scene:
-            continue
-        if only_completed and not is_episode_complete(episode, dataset_root):
-            continue
+        if allow_scene is not None:
+            scene_id = _scene_id_from_path(path, path.parent.name)
+            if not scene_id:
+                try:
+                    scene_id = read_episode(path).scene_id
+                except Exception:
+                    continue
+            if scene_id not in allow_scene:
+                continue
+        if only_completed:
+            try:
+                episode = read_episode(path)
+            except Exception:
+                continue
+            if not is_episode_complete(episode, dataset_root):
+                continue
         kept.append(path)
     return kept
 
@@ -121,6 +145,7 @@ def build_dataset_index(
     episode_ids: Iterable[str] | None = None,
     only_completed: bool = False,
     scene_ids: Iterable[str] | None = None,
+    on_progress: "Callable[[int, int], None] | None" = None,
 ) -> dict:
     root = Path(dataset_root).resolve()
     project_path = root / "dataset.json"
@@ -132,26 +157,37 @@ def build_dataset_index(
     kept_paths = _filter_episode_files(
         root, episode_ids=episode_ids, only_completed=only_completed, scene_ids=scene_ids,
     )
-    kept_set = {p.resolve() for p in kept_paths}
     # When a scene scope is active, "total on disk" should reflect that scope so
     # the UI can show "X of Y rendered for this scene".
     scoped_total = 0
     skipped_count = 0
-    for path in all_episode_paths:
+    _index_total = len(all_episode_paths)
+    # Fast path: the index only needs each episode's split + scene_id + rel path.
+    # Both are encoded in the layout (``episodes/<split>/<scene_id>_<split>_…json``),
+    # so we derive them from the path instead of opening the file. On this filesystem
+    # a single read_episode is ~26 ms, so reading every episode (thousands) on each
+    # rebuild cost 90 s+; deriving from the path makes the no-filter rebuild near-instant.
+    no_filter = episode_ids is None and not only_completed and scene_ids is None
+    kept_set = set() if no_filter else {p.resolve() for p in kept_paths}
+    for _i, path in enumerate(all_episode_paths):
+        if on_progress is not None:
+            on_progress(_i + 1, _index_total)
+        split = path.parent.name
         if scene_filter is not None:
-            try:
-                ep_scene = read_episode(path).scene_id
-            except Exception:
-                ep_scene = ""
+            ep_scene = _scene_id_from_path(path, split)
+            if not ep_scene:                       # unexpected naming → fall back to a real read
+                try:
+                    ep_scene = read_episode(path).scene_id
+                except Exception:
+                    ep_scene = ""
             if ep_scene not in scene_filter:
                 continue
+            discovered_scene_ids.add(ep_scene)
         scoped_total += 1
-        if path.resolve() not in kept_set:
+        if not no_filter and path.resolve() not in kept_set:
             skipped_count += 1
             continue
-        episode = read_episode(path)
-        episodes_by_split.setdefault(episode.split, []).append(_rel(root, path))
-        discovered_scene_ids.add(episode.scene_id)
+        episodes_by_split.setdefault(split, []).append(_rel(root, path))
     scene_artifacts: list[dict] = []
     for scene_dir in sorted((root / "scenes").glob("*")):
         if not scene_dir.is_dir():
@@ -197,10 +233,12 @@ def write_dataset_index(
     episode_ids: Iterable[str] | None = None,
     only_completed: bool = False,
     scene_ids: Iterable[str] | None = None,
+    on_progress: "Callable[[int, int], None] | None" = None,
 ) -> Path:
     root = Path(dataset_root)
     index = build_dataset_index(
         root, episode_ids=episode_ids, only_completed=only_completed, scene_ids=scene_ids,
+        on_progress=on_progress,
     )
     path = root / "dataset.json"
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -323,6 +361,7 @@ def iter_export_files(
     panorama_observations: bool = True,
     include_exr: bool = True,
     include_polarization_raw: bool = True,
+    include_perturbed: bool = False,
 ) -> Iterable[tuple[Path, str]]:
     """Yield (src_path, dst_relative_posix_path) pairs for the scene bundle.
 
@@ -353,6 +392,42 @@ def iter_export_files(
             return None
         yielded_dst.add(dst_rel)
         return (src, dst_rel)
+
+    def _emit_observation_dir(obs_dir: Path) -> Iterable[tuple[Path, str]]:
+        """Yield de-duplicated (src, dst) pairs for one consolidated <vp>/<h>/ dir.
+
+        The daemon mirrors a "primary" view's rasters at the heading root
+        (e.g. <vp>/<h>/rgb.png) *and* under `sensors/<camera>/`. The root copies
+        are byte-identical to a sensors/ file, so the bundle would carry every
+        primary modality twice and present an asymmetric tree (root = one camera
+        only, sub-folders = all cameras). Ship per-camera modalities under
+        `sensors/<camera>/` only; drop the root-level duplicates.
+        """
+        if not obs_dir.is_dir():
+            return
+        sensors_root = obs_dir / "sensors"
+        sensor_file_names: set[str] = set()
+        if sensors_root.is_dir():
+            sensor_file_names = {p.name for p in sensors_root.rglob("*") if p.is_file()}
+        for src in sorted(obs_dir.rglob("*")):
+            if not src.is_file():
+                continue
+            # Skip a root-level observation file (directly under <vp>/<h>/)
+            # when the same modality is already carried under sensors/.
+            if src.parent == obs_dir and src.name in sensor_file_names:
+                continue
+            # PNG-only mode: drop heavy HDR/raw rasters, keep PNG + metadata.
+            # Exception: keep the polarization Stokes raw (stokes_data.npz) so
+            # downstream code can recompute any Stokes representation, even when
+            # other .npz/.exr are dropped. Representation PNGs (s1_over_s0_*.png,
+            # dop/aolp colorbars) are .png and kept regardless.
+            if not include_exr and src.suffix.lower() in {".exr", ".hdr", ".npz"}:
+                if not (include_polarization_raw and src.name == "stokes_data.npz"):
+                    continue
+            rel = src.relative_to(pdir).as_posix()
+            pair = _emit(src, rel)
+            if pair is not None:
+                yield pair
 
     # 1. Scene artifact files from index_payload.scene_artifacts.
     for artifact in index_payload.get("scene_artifacts") or []:
@@ -414,22 +489,18 @@ def iter_export_files(
                             heading_ids = [gt_h]
             # 3a. Consolidated observation files for every heading at this vp.
             for h_id in heading_ids:
-                obs_dir = vp_dir / h_id
-                for src in sorted(obs_dir.rglob("*")):
-                    if not src.is_file():
-                        continue
-                    # PNG-only mode: drop heavy HDR/raw rasters, keep PNG + metadata.
-                    # Exception: keep the polarization Stokes raw (stokes_data.npz) so
-                    # downstream code can recompute any Stokes representation, even when
-                    # other .npz/.exr are dropped. Representation PNGs (s1_over_s0_*.png,
-                    # dop/aolp colorbars) are .png and kept regardless.
-                    if not include_exr and src.suffix.lower() in {".exr", ".hdr", ".npz"}:
-                        if not (include_polarization_raw and src.name == "stokes_data.npz"):
-                            continue
-                    rel = src.relative_to(pdir).as_posix()
-                    pair = _emit(src, rel)
-                    if pair is not None:
-                        yield pair
+                yield from _emit_observation_dir(vp_dir / h_id)
+            # 3c. Paired perturbation variant (eval split): the same viewpoints
+            # rendered with the optical-perturbation overlay (mirrors/glass) live
+            # under `observations_perturbed/`. Ship them alongside the base tree
+            # so downstream can join base↔perturbed on identical (vp, heading).
+            if include_perturbed:
+                pvp_dir = pdir / "scenes" / str(ep.scene_id) / "observations_perturbed" / str(vp_id)
+                if pvp_dir.is_dir():
+                    p_disk = sorted(p.name for p in pvp_dir.iterdir() if p.is_dir())
+                    p_headings = p_disk if panorama_observations else [h for h in heading_ids if h in p_disk]
+                    for h_id in p_headings:
+                        yield from _emit_observation_dir(pvp_dir / h_id)
             # 3b. EXR (HDR) pulled from bridge_jobs for every heading at this
             # vp. The daemon's PNG-only consolidation skipped these so we
             # mirror them under `sensors/<camera>/<modality>.exr`. This is the

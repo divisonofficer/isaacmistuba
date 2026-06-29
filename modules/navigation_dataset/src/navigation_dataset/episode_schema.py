@@ -75,6 +75,11 @@ class EpisodeManifest:
     path_nodes: list[str] = field(default_factory=list)
     path_headings: list[str] = field(default_factory=list)
     observation_refs: list[str] = field(default_factory=list)
+    # Optional set of alternative natural-language instructions at different
+    # knowledge levels (turn_by_turn / landmark / perception / …). Each entry:
+    # {type, level, text, lang, source, grounding}. The primary instruction stays
+    # in `natural_language_instruction` (back-compat); this list augments it.
+    instructions: list[JsonDict] = field(default_factory=list)
 
 
 @dataclass
@@ -139,6 +144,7 @@ def episode_from_payload(payload: JsonDict) -> EpisodeManifest:
         path_nodes=[str(item) for item in payload.get("path_nodes", [])],
         path_headings=[str(item) for item in payload.get("path_headings", [])],
         observation_refs=[str(item) for item in payload.get("observation_refs", [])],
+        instructions=[dict(item) for item in payload.get("instructions", []) if isinstance(item, dict)],
     )
     validate_episode(episode)
     return episode
@@ -189,7 +195,11 @@ def validate_episode(episode: EpisodeManifest) -> None:
             raise ValueError(f"Unsupported timestep action: {timestep.action}")
         if timestep.observation_bundle_ref:
             _validate_repo_relative(timestep.observation_bundle_ref, field_name="observation_bundle_ref")
+    for idx, instruction in enumerate(episode.instructions):
+        if not isinstance(instruction, dict) or not str(instruction.get("text", "")).strip():
+            raise ValueError(f"instructions[{idx}] must be a dict with non-empty 'text'.")
     json.dumps(episode.metadata)
+    json.dumps(episode.instructions)
 
 
 def read_episode(path: str | Path) -> EpisodeManifest:

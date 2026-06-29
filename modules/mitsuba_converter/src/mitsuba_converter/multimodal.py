@@ -139,6 +139,11 @@ class RenderConfig:
     # "hybrid" (achromatic→1 band, colored materials→3 bands) | "rgb"
     # (3 bands). Empty = ROBOMITUBA_PBRDF_BAND_MODE env then "single".
     pbrdf_band_mode: str = "single"
+    # Measured-pBRDF scope: "analytic_only" (0 measured) |
+    # "analytic_priority" (forced/target/anchor up to max, default) |
+    # "budgeted_measured" (top candidates up to max) | "measured_full".
+    measured_scope: str = "analytic_priority"
+    max_measured_bsdfs: int = 3
     artifact_stems: dict[str, str] = field(default_factory=dict)
     scene_filenames: dict[str, str] = field(default_factory=dict)
 
@@ -466,6 +471,9 @@ def _pbrdf_band_policy_inventory(scene: Path | ET.Element) -> dict[str, Any]:
             "measured_without_wavelength": 0,
             "channel_split_candidates": 0,
             "analytic_or_diffuse_background": 0,
+            "analytic_polar_rgb_count": 0,
+            "analytic_rgb_only_count": 0,
+            "analytic_bsdf_type_counts": {},
             "total_bsdfs": 0,
         }
     counts = {
@@ -474,8 +482,13 @@ def _pbrdf_band_policy_inventory(scene: Path | ET.Element) -> dict[str, Any]:
         "measured_without_wavelength": 0,
         "channel_split_candidates": 0,
         "analytic_or_diffuse_background": 0,
+        "analytic_polar_rgb_count": 0,
+        "analytic_rgb_only_count": 0,
+        "analytic_bsdf_type_counts": {},
         "total_bsdfs": 0,
     }
+    wrapper_types = {"twosided", "normalmap", "bumpmap", "blendbsdf", "mask"}
+    polar_rgb_types = {"pplastic", "dielectric", "roughdielectric", "conductor", "roughconductor", "thindielectric"}
     for bsdf in root.findall(".//bsdf"):
         counts["total_bsdfs"] += 1
         bsdf_type = str(bsdf.get("type") or "")
@@ -495,7 +508,15 @@ def _pbrdf_band_policy_inventory(scene: Path | ET.Element) -> dict[str, Any]:
             else:
                 counts["measured_without_wavelength"] += 1
             continue
-        counts["analytic_or_diffuse_background"] += 1
+        if bsdf_type not in wrapper_types:
+            counts["analytic_or_diffuse_background"] += 1
+            type_counts = dict(counts["analytic_bsdf_type_counts"])
+            type_counts[bsdf_type] = type_counts.get(bsdf_type, 0) + 1
+            counts["analytic_bsdf_type_counts"] = type_counts
+            if bsdf_type in polar_rgb_types:
+                counts["analytic_polar_rgb_count"] += 1
+            else:
+                counts["analytic_rgb_only_count"] += 1
     return counts
 
 
@@ -670,6 +691,297 @@ def _substitute_measured_bsdfs_with_diffuse(root: ET.Element, *, reflectance: st
             bsdf.set("id", bsdf_id)
         swapped += 1
     return swapped
+
+
+_MEASURED_SCOPES = {"analytic_only", "analytic_priority", "budgeted_measured", "measured_full"}
+_PRIORITY_MEASURED_ROLES = {"forced", "target", "anchor"}
+_MEASURED_SCOPE_STAGE_VERSION = "measured-scope-v3"
+
+
+def _resolve_measured_scope(config: "RenderConfig | None") -> str:
+    mode = getattr(config, "measured_scope", None) if config is not None else None
+    if not mode:
+        mode = os.environ.get("ROBOMITUBA_MEASURED_SCOPE")
+    mode = str(mode or "analytic_priority").strip().lower()
+    return mode if mode in _MEASURED_SCOPES else "analytic_priority"
+
+
+def _resolve_max_measured_bsdfs(config: "RenderConfig | None") -> int:
+    raw = getattr(config, "max_measured_bsdfs", None) if config is not None else None
+    if raw is None:
+        raw = os.environ.get("ROBOMITUBA_MAX_MEASURED_BSDFS", "3")
+    try:
+        return max(0, int(raw))
+    except Exception:
+        return 3
+
+
+def _material_policy_path_for_scene(scene_path: Path) -> Path:
+    return scene_path.parent / "render_scene_material_policy.json"
+
+
+def _material_policy_signature(scene_path: Path) -> tuple[int, int]:
+    path = _material_policy_path_for_scene(scene_path)
+    try:
+        stat = path.stat()
+        return (int(stat.st_mtime_ns), int(stat.st_size))
+    except OSError:
+        return (0, 0)
+
+
+def _load_material_policy_for_scene(scene_path: Path) -> dict[str, Any] | None:
+    path = _material_policy_path_for_scene(scene_path)
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _select_measured_policy_records(
+    policy: Mapping[str, Any] | None,
+    *,
+    measured_scope: str,
+    max_measured_bsdfs: int,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    records = [
+        dict(item)
+        for item in ((policy or {}).get("shape_policies") or [])
+        if isinstance(item, Mapping) and item.get("measured_candidate")
+    ]
+    enabled: list[dict[str, Any]] = []
+    if measured_scope == "measured_full":
+        enabled = records
+    elif measured_scope == "budgeted_measured":
+        enabled = records[:max_measured_bsdfs]
+    elif measured_scope == "analytic_priority":
+        priority = [record for record in records if str(record.get("measured_role") or "").lower() in _PRIORITY_MEASURED_ROLES]
+        enabled = priority[:max_measured_bsdfs]
+    else:
+        enabled = []
+    enabled_ids = {str(record.get("shape_id") or "") for record in enabled}
+    summary = dict((policy or {}).get("summary") or {})
+    return enabled, {
+        "measured_scope": measured_scope,
+        "max_measured_bsdfs": int(max_measured_bsdfs),
+        "measured_candidates": len(records),
+        "measured_enabled": len(enabled),
+        "measured_suppressed": max(0, len(records) - len(enabled)),
+        "enabled_shape_ids": sorted(sid for sid in enabled_ids if sid),
+        "analytic_polar_rgb_count": int(summary.get("analytic_polar_rgb_count", 0) or 0),
+        "analytic_rgb_only_count": int(summary.get("analytic_rgb_only_count", 0) or 0),
+        "invalid_analytic_fallback_count": int(summary.get("invalid_analytic_fallback_count", 0) or 0),
+        "analytic_bsdf_type_counts": dict(summary.get("analytic_bsdf_type_counts") or {}),
+    }
+
+
+def _append_measured_candidate_bsdf(
+    shape: ET.Element,
+    candidate: Mapping[str, Any],
+    extracted_material: Mapping[str, Any] | None,
+) -> bool:
+    channels_dir = str(candidate.get("channels_dir") or "").strip()
+    native_file = str(candidate.get("native_file") or "").strip()
+    if channels_dir:
+        filename = channels_dir.rstrip("/") + "/542.pbrdf"
+    elif native_file:
+        filename = native_file
+    else:
+        return False
+
+    for child in list(shape):
+        if child.tag in {"bsdf", "ref"}:
+            shape.remove(child)
+
+    twosided = ET.SubElement(shape, "bsdf", {"type": "twosided"})
+    bsdf_type = "measured_polarized" if str(candidate.get("bsdf_strategy") or "measured_polarized") == "measured_polarized" else "measured"
+    bsdf = ET.SubElement(twosided, "bsdf", {"type": bsdf_type})
+    ET.SubElement(bsdf, "string", {"name": "filename", "value": filename})
+    if bsdf_type == "measured_polarized":
+        ET.SubElement(bsdf, "float", {"name": "alpha_sample", "value": "0.0800"})
+
+    base_tex = str((extracted_material or {}).get("base_color_texture_ref") or candidate.get("base_color_texture_ref") or "").strip()
+    if base_tex and Path(base_tex).exists():
+        tex = ET.SubElement(bsdf, "texture", {"name": "albedo_scale", "type": "bitmap"})
+        ET.SubElement(tex, "string", {"name": "filename", "value": base_tex})
+    else:
+        base_factor = (extracted_material or {}).get("base_color_factor") or candidate.get("base_color_factor")
+        if isinstance(base_factor, (list, tuple)) and len(base_factor) >= 3:
+            try:
+                rgb = " ".join(f"{max(0.0, min(1.0, float(c))):.6g}" for c in base_factor[:3])
+                ET.SubElement(bsdf, "rgb", {"name": "albedo_scale", "value": rgb})
+            except Exception:
+                pass
+    return True
+
+
+def _base_color_from_policy(
+    analytic: Mapping[str, Any],
+    extracted_material: Mapping[str, Any] | None,
+) -> tuple[str | None, str]:
+    base_tex = str((extracted_material or {}).get("base_color_texture_ref") or analytic.get("base_color_texture_ref") or "").strip()
+    if base_tex and Path(base_tex).exists():
+        return base_tex, "0.65 0.62 0.58"
+    base_factor = (extracted_material or {}).get("base_color_factor") or analytic.get("base_color_factor")
+    if isinstance(base_factor, (list, tuple)) and len(base_factor) >= 3:
+        try:
+            rgb = " ".join(f"{max(0.0, min(1.0, float(c))):.6g}" for c in base_factor[:3])
+            return None, rgb
+        except Exception:
+            pass
+    return None, "0.65 0.62 0.58"
+
+
+def _append_policy_analytic_bsdf(
+    shape: ET.Element,
+    analytic: Mapping[str, Any],
+    extracted_material: Mapping[str, Any] | None,
+) -> bool:
+    strategy = str(analytic.get("bsdf_strategy") or analytic.get("analytic_strategy") or "pplastic").strip().lower()
+    if strategy in {"roughplastic", "diffuse", "plastic", "principled", "measured", "measured_polarized"}:
+        strategy = "pplastic"
+
+    for child in list(shape):
+        if child.tag in {"bsdf", "ref"}:
+            shape.remove(child)
+
+    if strategy == "dielectric":
+        bsdf = ET.SubElement(shape, "bsdf", {"type": "dielectric"})
+        ET.SubElement(bsdf, "float", {"name": "int_ior", "value": "1.5"})
+        return True
+    if strategy == "roughdielectric":
+        bsdf = ET.SubElement(shape, "bsdf", {"type": "roughdielectric"})
+        alpha = _clamp_bsdf_alpha(analytic.get("roughness"), default=0.2, floor=_MIN_ROUGHDIELECTRIC_ALPHA)
+        ET.SubElement(bsdf, "float", {"name": "alpha", "value": f"{alpha:.4f}"})
+        ET.SubElement(bsdf, "float", {"name": "int_ior", "value": "1.5"})
+        return True
+    if strategy == "conductor":
+        twosided = ET.SubElement(shape, "bsdf", {"type": "twosided"})
+        bsdf = ET.SubElement(twosided, "bsdf", {"type": "conductor"})
+        ET.SubElement(bsdf, "string", {"name": "material", "value": "Al"})
+        return True
+    if strategy == "roughconductor":
+        twosided = ET.SubElement(shape, "bsdf", {"type": "twosided"})
+        bsdf = ET.SubElement(twosided, "bsdf", {"type": "roughconductor"})
+        ET.SubElement(bsdf, "string", {"name": "material", "value": "Al"})
+        alpha = _clamp_bsdf_alpha(analytic.get("roughness"), default=0.2, floor=_MIN_ROUGHCONDUCTOR_ALPHA)
+        ET.SubElement(bsdf, "float", {"name": "alpha", "value": f"{alpha:.4f}"})
+        return True
+
+    twosided = ET.SubElement(shape, "bsdf", {"type": "twosided"})
+    bsdf = ET.SubElement(twosided, "bsdf", {"type": "pplastic"})
+    base_tex, rgb = _base_color_from_policy(analytic, extracted_material)
+    if base_tex:
+        tex = ET.SubElement(bsdf, "texture", {"name": "diffuse_reflectance", "type": "bitmap"})
+        ET.SubElement(tex, "string", {"name": "filename", "value": base_tex})
+    else:
+        ET.SubElement(bsdf, "rgb", {"name": "diffuse_reflectance", "value": rgb})
+    alpha = _clamp_bsdf_alpha(analytic.get("roughness"), default=0.2, floor=_MIN_ROUGHPLASTIC_ALPHA)
+    ET.SubElement(bsdf, "float", {"name": "alpha", "value": f"{max(0.2, alpha):.4f}"})
+    return True
+
+
+def _bsdf_tree_contains_measured(bsdf: ET.Element) -> bool:
+    bsdf_type = str(bsdf.get("type") or "")
+    if bsdf_type in _MEASURED_BSDF_TYPES or bsdf_type == _CHANNEL_SPLIT_RGB_PLUGIN_TYPE:
+        return True
+    return any(child.tag == "bsdf" and _bsdf_tree_contains_measured(child) for child in bsdf)
+
+
+def _remove_unreferenced_measured_bsdf_declarations(root: ET.Element) -> int:
+    referenced_ids = {str(ref.get("id")) for ref in root.findall(".//ref") if ref.get("id")}
+    removed = 0
+    for child in list(root):
+        if child.tag != "bsdf":
+            continue
+        bsdf_id = child.get("id")
+        if bsdf_id and bsdf_id in referenced_ids:
+            continue
+        if _bsdf_tree_contains_measured(child):
+            root.remove(child)
+            removed += 1
+    return removed
+
+
+def _apply_measured_scope_policy(
+    root: ET.Element,
+    *,
+    source_scene: Path,
+    measured_scope: str,
+    max_measured_bsdfs: int,
+) -> dict[str, Any]:
+    policy = _load_material_policy_for_scene(source_scene)
+    enabled, summary = _select_measured_policy_records(
+        policy,
+        measured_scope=measured_scope,
+        max_measured_bsdfs=max_measured_bsdfs,
+    )
+    injected = 0
+    if policy is None:
+        if measured_scope == "analytic_only":
+            summary["legacy_measured_substituted"] = _substitute_measured_bsdfs_with_diffuse(root)
+        return summary
+
+    shapes = {str(shape.get("id") or ""): shape for shape in root.findall(".//shape") if shape.get("id")}
+    analytic_rewritten = 0
+    for record in (policy.get("shape_policies") or []):
+        if not isinstance(record, Mapping):
+            continue
+        shape = shapes.get(str(record.get("shape_id") or ""))
+        if shape is None:
+            continue
+        if _append_policy_analytic_bsdf(
+            shape,
+            record.get("analytic_fallback") if isinstance(record.get("analytic_fallback"), Mapping) else record,
+            record.get("extracted_material") if isinstance(record.get("extracted_material"), Mapping) else None,
+        ):
+            analytic_rewritten += 1
+    for record in enabled:
+        shape_id = str(record.get("shape_id") or "")
+        shape = shapes.get(shape_id)
+        if shape is None:
+            continue
+        if _append_measured_candidate_bsdf(
+            shape,
+            dict(record.get("measured_candidate") or {}),
+            record.get("extracted_material") if isinstance(record.get("extracted_material"), Mapping) else None,
+        ):
+            injected += 1
+    summary["analytic_rewritten"] = analytic_rewritten
+    summary["measured_injected"] = injected
+    summary["unreferenced_measured_declarations_removed"] = _remove_unreferenced_measured_bsdf_declarations(root)
+    return summary
+
+
+def _measured_scope_policy_inventory(
+    scene_path: Path,
+    *,
+    measured_scope: str,
+    max_measured_bsdfs: int,
+) -> dict[str, Any]:
+    policy = _load_material_policy_for_scene(scene_path)
+    _enabled, summary = _select_measured_policy_records(
+        policy,
+        measured_scope=measured_scope,
+        max_measured_bsdfs=max_measured_bsdfs,
+    )
+    return summary
+
+
+def _scene_has_enabled_measured_policy(
+    scene_path: Path,
+    *,
+    measured_scope: str,
+    max_measured_bsdfs: int,
+) -> bool:
+    policy = _load_material_policy_for_scene(scene_path)
+    enabled, _summary = _select_measured_policy_records(
+        policy,
+        measured_scope=measured_scope,
+        max_measured_bsdfs=max_measured_bsdfs,
+    )
+    return bool(enabled)
 
 
 def _scene_template(
@@ -1735,6 +2047,8 @@ def _stage_path_scene(
     measured_wavelength_nm: int | None = None,
     channel_rgb_plugin: bool = False,
     band_mode: str = "rgb",
+    measured_scope: str = "analytic_priority",
+    max_measured_bsdfs: int = 3,
 ) -> Path:
     stage_signature = (
         "path",
@@ -1747,6 +2061,10 @@ def _stage_path_scene(
         int(measured_wavelength_nm) if measured_wavelength_nm else 0,
         bool(channel_rgb_plugin),
         str(band_mode),
+        str(measured_scope),
+        int(max_measured_bsdfs),
+        _MEASURED_SCOPE_STAGE_VERSION,
+        _material_policy_signature(scene_path),
     )
     if _should_reuse_staged_scene(out_scene, signature=stage_signature):
         return out_scene
@@ -1763,9 +2081,28 @@ def _stage_path_scene(
             samples_per_pass=samples_per_pass,
         )
         if channel_rgb_plugin:
+            _apply_measured_scope_policy(
+                root,
+                source_scene=scene_path,
+                measured_scope=measured_scope,
+                max_measured_bsdfs=max_measured_bsdfs,
+            )
             _stage_measured_bsdfs_for_rgb(root, band_mode=band_mode)
         elif measured_wavelength_nm is not None:
+            _apply_measured_scope_policy(
+                root,
+                source_scene=scene_path,
+                measured_scope=measured_scope,
+                max_measured_bsdfs=max_measured_bsdfs,
+            )
             _ensure_measured_bsdf_wavelength(root, target_nm=int(measured_wavelength_nm))
+        else:
+            _apply_measured_scope_policy(
+                root,
+                source_scene=scene_path,
+                measured_scope=measured_scope,
+                max_measured_bsdfs=max_measured_bsdfs,
+            )
 
     root = _scene_template(
         scene_path,
@@ -1778,6 +2115,10 @@ def _stage_path_scene(
             int(measured_wavelength_nm) if measured_wavelength_nm else 0,
             bool(channel_rgb_plugin),
             str(band_mode),
+            str(measured_scope),
+            int(max_measured_bsdfs),
+            _MEASURED_SCOPE_STAGE_VERSION,
+            _material_policy_signature(scene_path),
         ),
         builder=_build_template,
     )
@@ -1877,12 +2218,21 @@ def _stage_stokes_scene(
     scene_override: SceneOverrideSpec | None = None,
     assist_light: AssistLightSpec | None = None,
     nested_integrator_type: str = "direct",
+    measured_scope: str = "analytic_priority",
+    max_measured_bsdfs: int = 3,
 ) -> Path:
     stage_signature = (
         "stokes",
         _scene_cache_key(scene_path),
         _camera_signature(camera_to_world, fov_deg=fov_deg, spp=spp, width=width, height=height),
-        (nested_integrator_type, int(samples_per_pass or 0)),
+        (
+            nested_integrator_type,
+            int(samples_per_pass or 0),
+            str(measured_scope),
+            int(max_measured_bsdfs),
+            _MEASURED_SCOPE_STAGE_VERSION,
+            _material_policy_signature(scene_path),
+        ),
         _scene_override_signature(scene_override),
         _assist_light_signature(assist_light),
     )
@@ -1899,11 +2249,24 @@ def _stage_stokes_scene(
         if samples_per_pass is not None and samples_per_pass > 0:
             ET.SubElement(integrator, "integer", {"name": "samples_per_pass", "value": str(samples_per_pass)})
         ET.SubElement(integrator, "integrator", {"type": nested_integrator_type})
+        _apply_measured_scope_policy(
+            root,
+            source_scene=scene_path,
+            measured_scope=measured_scope,
+            max_measured_bsdfs=max_measured_bsdfs,
+        )
 
     root = _scene_template(
         scene_path,
         branch_kind="stokes",
-        branch_signature=(nested_integrator_type, int(samples_per_pass or 0)),
+        branch_signature=(
+            nested_integrator_type,
+            int(samples_per_pass or 0),
+            str(measured_scope),
+            int(max_measured_bsdfs),
+            _MEASURED_SCOPE_STAGE_VERSION,
+            _material_policy_signature(scene_path),
+        ),
         builder=_build_template,
     )
     _update_sensor(
@@ -1920,6 +2283,82 @@ def _stage_stokes_scene(
     result = _write_scene(root, out_scene)
     _record_staged_scene_signature(result, signature=stage_signature)
     return result
+
+
+def _stage_base_stokes_scene(
+    scene_path: Path,
+    *,
+    samples_per_pass: int | None,
+    scene_override: SceneOverrideSpec | None = None,
+    nested_integrator_type: str = "direct",
+    measured_scope: str = "analytic_priority",
+    max_measured_bsdfs: int = 3,
+) -> Path:
+    """Stage a camera-free Stokes scene shared across polar viewpoints."""
+    sig = (
+        "base_stokes",
+        _scene_cache_key(scene_path),
+        (
+            nested_integrator_type,
+            int(samples_per_pass or 0),
+            str(measured_scope),
+            int(max_measured_bsdfs),
+            _MEASURED_SCOPE_STAGE_VERSION,
+            _material_policy_signature(scene_path),
+        ),
+        _scene_override_signature(scene_override),
+        _texture_cache_signature(),
+    )
+    out_scene = _shared_base_scene_path(scene_path, sig)
+    if out_scene.exists():
+        _ensure_texture_audit(out_scene, fail_on_gt_profile=True)
+        return out_scene
+
+    def _build_template(root: ET.Element) -> None:
+        integrator = root.find("./integrator")
+        if integrator is None:
+            raise RuntimeError("Scene has no integrator node")
+        integrator.attrib["type"] = "stokes"
+        for child in list(integrator):
+            integrator.remove(child)
+        if samples_per_pass is not None and samples_per_pass > 0:
+            ET.SubElement(integrator, "integer", {"name": "samples_per_pass", "value": str(samples_per_pass)})
+        ET.SubElement(integrator, "integrator", {"type": nested_integrator_type})
+        _apply_measured_scope_policy(
+            root,
+            source_scene=scene_path,
+            measured_scope=measured_scope,
+            max_measured_bsdfs=max_measured_bsdfs,
+        )
+
+    root = _scene_template(
+        scene_path,
+        branch_kind="stokes",
+        branch_signature=(
+            nested_integrator_type,
+            int(samples_per_pass or 0),
+            str(measured_scope),
+            int(max_measured_bsdfs),
+            _MEASURED_SCOPE_STAGE_VERSION,
+            _material_policy_signature(scene_path),
+        ),
+        builder=_build_template,
+    )
+    _apply_scene_override(root, scene_override, mode="polar")
+    out_scene.parent.mkdir(parents=True, exist_ok=True)
+    tmp = out_scene.with_name(f"{out_scene.stem}.tmp.{os.getpid()}.{threading.get_ident()}.xml")
+    _write_scene(root, tmp)
+    try:
+        os.replace(tmp, out_scene)
+    except FileNotFoundError:
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+        if not out_scene.exists():
+            raise
+    _write_texture_audit(root, out_scene=out_scene, fail_on_gt_profile=True)
+    return out_scene
 
 
 def _stage_diffuse_override_scene(
@@ -2165,6 +2604,129 @@ def _stage_polarized_fallback_scene(
     return result
 
 
+def _stage_base_polarized_fallback_scene(
+    scene_path: Path,
+    *,
+    samples_per_pass: int | None,
+    scene_override: SceneOverrideSpec | None = None,
+    nested_integrator_type: str = "direct",
+) -> Path:
+    """Stage a camera-free analytic polarized fallback scene shared across viewpoints."""
+    sig = (
+        "base_polarized_fallback",
+        _scene_cache_key(scene_path),
+        (nested_integrator_type, int(samples_per_pass or 0)),
+        _scene_override_signature(scene_override),
+        _texture_cache_signature(),
+    )
+    out_scene = _shared_base_scene_path(scene_path, sig)
+    if out_scene.exists():
+        _ensure_texture_audit(out_scene, fail_on_gt_profile=True)
+        return out_scene
+
+    def _build_template(root: ET.Element) -> None:
+        integrator = root.find("./integrator")
+        if integrator is None:
+            raise RuntimeError("Scene has no integrator node")
+        integrator.attrib["type"] = "stokes"
+        for child in list(integrator):
+            integrator.remove(child)
+        if samples_per_pass is not None and samples_per_pass > 0:
+            ET.SubElement(integrator, "integer", {"name": "samples_per_pass", "value": str(samples_per_pass)})
+        ET.SubElement(integrator, "integrator", {"type": nested_integrator_type})
+
+        for shape in root.findall("./shape"):
+            filename = shape.find("string[@name='filename']")
+            if filename is None:
+                continue
+            obj_name = Path(filename.attrib["value"]).name.lower()
+            old_bsdf = shape.find("./bsdf")
+            _remove_shape_bsdf_children(shape)
+
+            if "glass" in obj_name:
+                bsdf = ET.SubElement(shape, "bsdf", {"type": "roughdielectric"})
+                ET.SubElement(bsdf, "float", {"name": "alpha", "value": f"{_MIN_ROUGHDIELECTRIC_ALPHA:.4f}"})
+                ET.SubElement(bsdf, "float", {"name": "int_ior", "value": "1.5"})
+                ET.SubElement(bsdf, "float", {"name": "ext_ior", "value": "1.0"})
+                continue
+
+            twosided = ET.SubElement(shape, "bsdf", {"type": "twosided"})
+            pplastic = ET.SubElement(twosided, "bsdf", {"type": "pplastic"})
+
+            base_tex = None
+            base_rgb = None
+            roughness = None
+            if old_bsdf is not None:
+                base_tex = extract_first_by_name(old_bsdf, "texture", ("base_color", "diffuse_reflectance"))
+                base_rgb = extract_first_by_name(old_bsdf, "rgb", ("base_color", "reflectance", "diffuse_reflectance"))
+                roughness = extract_first_by_name(old_bsdf, "float", ("roughness", "alpha"))
+
+            if base_tex is not None:
+                tex = ET.SubElement(
+                    pplastic,
+                    "texture",
+                    {
+                        "type": base_tex.attrib.get("type", "bitmap"),
+                        "name": "diffuse_reflectance",
+                    },
+                )
+                for child in list(base_tex):
+                    tex.append(child)
+                for key, value in base_tex.attrib.items():
+                    if key not in ("type", "name"):
+                        tex.attrib[key] = value
+            elif base_rgb is not None:
+                ET.SubElement(
+                    pplastic,
+                    "rgb",
+                    {
+                        "name": "diffuse_reflectance",
+                        "value": base_rgb.attrib.get("value", "0.75,0.75,0.75"),
+                    },
+                )
+            else:
+                ET.SubElement(
+                    pplastic,
+                    "rgb",
+                    {
+                        "name": "diffuse_reflectance",
+                        "value": "0.75,0.75,0.75",
+                    },
+                )
+
+            alpha = "0.12"
+            if roughness is not None:
+                try:
+                    alpha = f"{max(0.03, min(0.35, float(roughness.attrib.get('value', '0.12')))):.4f}"
+                except ValueError:
+                    alpha = "0.12"
+            ET.SubElement(pplastic, "float", {"name": "alpha", "value": alpha})
+            ET.SubElement(pplastic, "float", {"name": "int_ior", "value": "1.49"})
+            ET.SubElement(pplastic, "float", {"name": "ext_ior", "value": "1.0"})
+
+    root = _scene_template(
+        scene_path,
+        branch_kind="polarized_fallback",
+        branch_signature=(nested_integrator_type, int(samples_per_pass or 0)),
+        builder=_build_template,
+    )
+    _apply_scene_override(root, scene_override, mode="polar")
+    out_scene.parent.mkdir(parents=True, exist_ok=True)
+    tmp = out_scene.with_name(f"{out_scene.stem}.tmp.{os.getpid()}.{threading.get_ident()}.xml")
+    _write_scene(root, tmp)
+    try:
+        os.replace(tmp, out_scene)
+    except FileNotFoundError:
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+        if not out_scene.exists():
+            raise
+    _write_texture_audit(root, out_scene=out_scene, fail_on_gt_profile=True)
+    return out_scene
+
+
 def _stage_target_mask_scene(
     scene_path: Path,
     out_scene: Path,
@@ -2256,6 +2818,8 @@ def _stage_base_path_scene(
     measured_wavelength_nm: int | None = None,
     channel_rgb_plugin: bool = False,
     band_mode: str = "rgb",
+    measured_scope: str = "analytic_priority",
+    max_measured_bsdfs: int = 3,
 ) -> Path:
     """Stage a camera-free path-tracer scene shared across viewpoints.
 
@@ -2273,6 +2837,10 @@ def _stage_base_path_scene(
             int(measured_wavelength_nm) if measured_wavelength_nm else 0,
             bool(channel_rgb_plugin),
             str(band_mode),
+            str(measured_scope),
+            int(max_measured_bsdfs),
+            _MEASURED_SCOPE_STAGE_VERSION,
+            _material_policy_signature(scene_path),
         ),
         _scene_override_signature(scene_override),
         _texture_cache_signature(),
@@ -2295,9 +2863,28 @@ def _stage_base_path_scene(
             samples_per_pass=samples_per_pass,
         )
         if channel_rgb_plugin:
+            _apply_measured_scope_policy(
+                root,
+                source_scene=scene_path,
+                measured_scope=measured_scope,
+                max_measured_bsdfs=max_measured_bsdfs,
+            )
             _stage_measured_bsdfs_for_rgb(root, band_mode=band_mode)
         elif measured_wavelength_nm is not None:
+            _apply_measured_scope_policy(
+                root,
+                source_scene=scene_path,
+                measured_scope=measured_scope,
+                max_measured_bsdfs=max_measured_bsdfs,
+            )
             _ensure_measured_bsdf_wavelength(root, target_nm=int(measured_wavelength_nm))
+        else:
+            _apply_measured_scope_policy(
+                root,
+                source_scene=scene_path,
+                measured_scope=measured_scope,
+                max_measured_bsdfs=max_measured_bsdfs,
+            )
 
     root = _scene_template(
         scene_path,
@@ -2310,6 +2897,10 @@ def _stage_base_path_scene(
             int(measured_wavelength_nm) if measured_wavelength_nm else 0,
             bool(channel_rgb_plugin),
             str(band_mode),
+            str(measured_scope),
+            int(max_measured_bsdfs),
+            _MEASURED_SCOPE_STAGE_VERSION,
+            _material_policy_signature(scene_path),
         ),
         builder=_build_template,
     )
@@ -3945,7 +4536,7 @@ def _needs_aov(modalities: set[str]) -> bool:
 
 
 def _needs_polar(modalities: set[str]) -> bool:
-    return any(modality in modalities for modality in ("polar_rgb_preview", "dop", "aolp", "s1", "s2"))
+    return any(modality in modalities for modality in ("polar_rgb_preview", "dop", "aolp", "s1", "s2", "s1_over_s0", "s2_over_s0"))
 
 
 def _needs_active_nir(modalities: set[str]) -> bool:
@@ -3999,7 +4590,8 @@ def render_modalities(
         workspace.mkdir(parents=True, exist_ok=True)
         temporary_workspace = False
 
-    _use_scene_reuse = not os.environ.get("ROBOMITUBA_DISABLE_SCENE_REUSE")
+    _disable_scene_reuse = str(os.environ.get("ROBOMITUBA_DISABLE_SCENE_REUSE", "")).strip().lower()
+    _use_scene_reuse = _disable_scene_reuse not in {"1", "true", "yes", "on"}
     _viewpoint = _ViewpointSensorSpec(
         camera_to_world=camera_to_world,
         fov_deg=fov_deg,
@@ -4035,8 +4627,17 @@ def render_modalities(
         hazard_target_shape_filenames = list(depth_approx.target_shape_filenames)
     if "hazard_mask" in requested_set and not hazard_target_shape_filenames:
         raise ValueError("hazard_mask requires scene_override.target_shape_filenames or depth_approx.target_shape_filenames.")
-    use_channel_split_rgb = _needs_path_total(requested_set) and _scene_has_channel_split_measured_bsdfs(source_scene)
     band_mode = _resolve_pbrdf_band_mode(config)
+    measured_scope = _resolve_measured_scope(config)
+    max_measured_bsdfs = _resolve_max_measured_bsdfs(config)
+    use_channel_split_rgb = _needs_path_total(requested_set) and (
+        _scene_has_channel_split_measured_bsdfs(source_scene)
+        or _scene_has_enabled_measured_policy(
+            source_scene,
+            measured_scope=measured_scope,
+            max_measured_bsdfs=max_measured_bsdfs,
+        )
+    )
     use_channel_rgb_plugin = (
         use_channel_split_rgb
         and (band_mode == "single" or not os.environ.get("ROBOMITUBA_DISABLE_HPBRDF_RGB_PLUGIN"))
@@ -4228,6 +4829,8 @@ def render_modalities(
                             ambient_radiance=config.ambient_radiance,
                             channel_rgb_plugin=True,
                             band_mode=band_mode,
+                            measured_scope=measured_scope,
+                            max_measured_bsdfs=max_measured_bsdfs,
                         )
                     else:
                         scene_rgb = _stage_path_scene(
@@ -4245,6 +4848,8 @@ def render_modalities(
                             ambient_radiance=config.ambient_radiance,
                             channel_rgb_plugin=True,
                             band_mode=band_mode,
+                            measured_scope=measured_scope,
+                            max_measured_bsdfs=max_measured_bsdfs,
                         )
                     staged_scenes["rgb"] = str(scene_rgb)
                     stage_s = time.perf_counter() - stage_start
@@ -4299,6 +4904,8 @@ def render_modalities(
                             scene_override=scene_override,
                             ambient_radiance=config.ambient_radiance,
                             measured_wavelength_nm=wavelength_nm,
+                            measured_scope=measured_scope,
+                            max_measured_bsdfs=max_measured_bsdfs,
                         )
                     else:
                         scene_channel = _stage_path_scene(
@@ -4315,6 +4922,8 @@ def render_modalities(
                             scene_override=scene_override,
                             ambient_radiance=config.ambient_radiance,
                             measured_wavelength_nm=wavelength_nm,
+                            measured_scope=measured_scope,
+                            max_measured_bsdfs=max_measured_bsdfs,
                         )
                     staged_scenes[f"rgb_{label}"] = str(scene_channel)
                     channel_scenes[label] = scene_channel
@@ -4355,6 +4964,8 @@ def render_modalities(
                     samples_per_pass=config.samples_per_pass,
                     scene_override=scene_override,
                     ambient_radiance=config.ambient_radiance,
+                    measured_scope=measured_scope,
+                    max_measured_bsdfs=max_measured_bsdfs,
                 )
             else:
                 scene_rgb = _stage_path_scene(
@@ -4370,6 +4981,8 @@ def render_modalities(
                     samples_per_pass=config.samples_per_pass,
                     scene_override=scene_override,
                     ambient_radiance=config.ambient_radiance,
+                    measured_scope=measured_scope,
+                    max_measured_bsdfs=max_measured_bsdfs,
                 )
             staged_scenes["rgb"] = str(scene_rgb)
             stage_s = time.perf_counter() - stage_start
@@ -4401,14 +5014,22 @@ def render_modalities(
         if filtered_rgb is None and config.use_firefly_clamp:
             filtered_rgb = _reject_firefly_outliers(rgb, factor=config.firefly_clamp_factor)
         band_policy_counts = _pbrdf_band_policy_inventory(scene_rgb)
+        measured_policy_counts = _measured_scope_policy_inventory(
+            source_scene,
+            measured_scope=measured_scope,
+            max_measured_bsdfs=max_measured_bsdfs,
+        )
         rgb_render_mode = _rgb_render_mode_from_policy(
             band_mode=band_mode,
             timing=timing,
             band_policy_counts=band_policy_counts,
         )
         timing["pbrdf_band_mode"] = band_mode
+        timing["measured_scope"] = measured_scope
+        timing["max_measured_bsdfs"] = max_measured_bsdfs
         timing["rgb_render_mode"] = rgb_render_mode
         timing["band_policy_counts"] = dict(band_policy_counts)
+        timing["measured_policy_counts"] = dict(measured_policy_counts)
         timing["channel_split_rgb"] = rgb_render_mode == "channel_split"
         timing["channel_rgb_plugin"] = rgb_render_mode == "rgb_plugin"
         rgb_result, rgb_record = _build_rgb_result(
@@ -4423,8 +5044,11 @@ def render_modalities(
                 scene_override=scene_override,
                 extra={
                     "pbrdf_band_mode": band_mode,
+                    "measured_scope": measured_scope,
+                    "max_measured_bsdfs": max_measured_bsdfs,
                     "rgb_render_mode": rgb_render_mode,
                     "band_policy_counts": dict(band_policy_counts),
+                    "measured_policy_counts": dict(measured_policy_counts),
                     "wall_material_policy": {
                         "background_default": "analytic_or_single_band_albedo_scale",
                         "normal_map": "not_inspected",
@@ -4460,6 +5084,8 @@ def render_modalities(
                 samples_per_pass=config.samples_per_pass,
                 scene_override=scene_override,
                 ambient_radiance=config.ambient_radiance,
+                measured_scope=measured_scope,
+                max_measured_bsdfs=max_measured_bsdfs,
             )
         else:
             scene_direct = _stage_path_scene(
@@ -4475,6 +5101,8 @@ def render_modalities(
                 samples_per_pass=config.samples_per_pass,
                 scene_override=scene_override,
                 ambient_radiance=config.ambient_radiance,
+                measured_scope=measured_scope,
+                max_measured_bsdfs=max_measured_bsdfs,
             )
         staged_scenes["direct_light_map"] = str(scene_direct)
         stage_s = time.perf_counter() - stage_start
@@ -4858,6 +5486,8 @@ def render_modalities(
             scene_override=scene_override,
             assist_light=assist_light,
             measured_wavelength_nm=854,
+            measured_scope=measured_scope,
+            max_measured_bsdfs=max_measured_bsdfs,
         )
         staged_scenes["active_nir_intensity"] = str(scene_active)
         _cb("staging_scene", {"pass": "active_nir_intensity"})
@@ -4906,32 +5536,55 @@ def render_modalities(
     if _needs_polar(requested_set):
         polar_nested = "volpath" if assist_light is not None and assist_light.polarized else "direct"
         polar_illumination_tag = "camera_aligned_nir_active_polarized" if assist_light is not None else "ambient_room"
-        scene_polar = _stage_stokes_scene(
-            source_scene,
-            stage_filename("polar", "scene_polar.xml"),
-            camera_to_world=camera_to_world,
-            fov_deg=fov_deg,
-            spp=config.polar_spp,
-            width=config.width,
-            height=config.height,
-            samples_per_pass=config.samples_per_pass,
-            scene_override=scene_override,
-            assist_light=assist_light,
-            nested_integrator_type=polar_nested,
-        )
-        scene_polar_fallback = _stage_polarized_fallback_scene(
-            source_scene,
-            stage_filename("polar_fallback", "scene_polar_fallback.xml"),
-            camera_to_world=camera_to_world,
-            fov_deg=fov_deg,
-            spp=config.polar_spp,
-            width=config.width,
-            height=config.height,
-            samples_per_pass=config.samples_per_pass,
-            scene_override=scene_override,
-            assist_light=assist_light,
-            nested_integrator_type=polar_nested,
-        )
+        # Camera-aligned assist lights are part of the scene geometry, so they
+        # must stay camera-baked. Plain ambient-room polarization can share one
+        # resident Stokes scene across all headings and only swap the sensor.
+        use_base_polar_scene = _use_scene_reuse and assist_light is None
+        polar_viewpoint = _viewpoint if use_base_polar_scene else None
+        if use_base_polar_scene:
+            scene_polar = _stage_base_stokes_scene(
+                source_scene,
+                samples_per_pass=config.samples_per_pass,
+                scene_override=scene_override,
+                nested_integrator_type=polar_nested,
+                measured_scope=measured_scope,
+                max_measured_bsdfs=max_measured_bsdfs,
+            )
+            scene_polar_fallback = _stage_base_polarized_fallback_scene(
+                source_scene,
+                samples_per_pass=config.samples_per_pass,
+                scene_override=scene_override,
+                nested_integrator_type=polar_nested,
+            )
+        else:
+            scene_polar = _stage_stokes_scene(
+                source_scene,
+                stage_filename("polar", "scene_polar.xml"),
+                camera_to_world=camera_to_world,
+                fov_deg=fov_deg,
+                spp=config.polar_spp,
+                width=config.width,
+                height=config.height,
+                samples_per_pass=config.samples_per_pass,
+                scene_override=scene_override,
+                assist_light=assist_light,
+                nested_integrator_type=polar_nested,
+                measured_scope=measured_scope,
+                max_measured_bsdfs=max_measured_bsdfs,
+            )
+            scene_polar_fallback = _stage_polarized_fallback_scene(
+                source_scene,
+                stage_filename("polar_fallback", "scene_polar_fallback.xml"),
+                camera_to_world=camera_to_world,
+                fov_deg=fov_deg,
+                spp=config.polar_spp,
+                width=config.width,
+                height=config.height,
+                samples_per_pass=config.samples_per_pass,
+                scene_override=scene_override,
+                assist_light=assist_light,
+                nested_integrator_type=polar_nested,
+            )
         staged_scenes["polar"] = str(scene_polar)
         staged_scenes["polar_fallback"] = str(scene_polar_fallback)
         _cb("staging_scene", {"pass": "polar"})
@@ -4940,8 +5593,15 @@ def render_modalities(
         polar_scene_used = scene_polar
         fallback_used = False
         try:
-            image, timing = _render_pass(scene_polar, pass_name="polar", spp=config.polar_spp, variant_override=_polar_variant(variant))
+            image, timing = _render_pass(
+                scene_polar,
+                pass_name="polar",
+                spp=config.polar_spp,
+                variant_override=_polar_variant(variant),
+                viewpoint=polar_viewpoint,
+            )
             timing["spp"] = config.polar_spp
+            timing["dynamic_sensor"] = bool(use_base_polar_scene)
             summary, arrays = save_polarization_products(image, workspace, requested_polar)
             polarization_material_mode = "original_scene"
             weak_scales = max(float(summary["s1_scale_abs_p995"]), float(summary["s2_scale_abs_p995"])) < config.polar_scale_threshold
@@ -4951,8 +5611,15 @@ def render_modalities(
             if weak_scales or invalid_polar:
                 fallback_workspace = workspace / "_polar_fallback_candidate"
                 fallback_workspace.mkdir(parents=True, exist_ok=True)
-                fallback_image, fallback_timing = _render_pass(scene_polar_fallback, pass_name="polar_fallback", spp=config.polar_spp, variant_override=_polar_variant(variant))
+                fallback_image, fallback_timing = _render_pass(
+                    scene_polar_fallback,
+                    pass_name="polar_fallback",
+                    spp=config.polar_spp,
+                    variant_override=_polar_variant(variant),
+                    viewpoint=polar_viewpoint,
+                )
                 fallback_timing["spp"] = config.polar_spp
+                fallback_timing["dynamic_sensor"] = bool(use_base_polar_scene)
                 fallback_summary, fallback_arrays = save_polarization_products(fallback_image, fallback_workspace, requested_polar)
                 prefer_fallback = weak_scales
                 if not prefer_fallback:
@@ -4970,8 +5637,15 @@ def render_modalities(
                     polar_scene_used = scene_polar_fallback
                     fallback_used = True
         except Exception:
-            image, timing = _render_pass(scene_polar_fallback, pass_name="polar_fallback", spp=config.polar_spp, variant_override=_polar_variant(variant))
+            image, timing = _render_pass(
+                scene_polar_fallback,
+                pass_name="polar_fallback",
+                spp=config.polar_spp,
+                variant_override=_polar_variant(variant),
+                viewpoint=polar_viewpoint,
+            )
             timing["spp"] = config.polar_spp
+            timing["dynamic_sensor"] = bool(use_base_polar_scene)
             summary, arrays = save_polarization_products(image, workspace, requested_polar)
             polarization_material_mode = "pplastic_fallback"
             polar_scene_used = scene_polar_fallback
@@ -4988,9 +5662,12 @@ def render_modalities(
             "material_mode": polarization_material_mode,
             "selected_polar_scene": "polar_fallback" if fallback_used else "polar",
             "fallback_used": fallback_used,
+            "dynamic_sensor": bool(use_base_polar_scene),
             "illumination_tag": polar_illumination_tag,
             "stokes_shape": list(image.shape),
             "polarization": summary,
+            "measured_scope": measured_scope,
+            "max_measured_bsdfs": max_measured_bsdfs,
         }
         shared_timing = {
             "variant": timing["variant"],
@@ -5001,6 +5678,9 @@ def render_modalities(
             "spp": config.polar_spp,
             "total_s": timing["total_s"],
             "material_mode": polarization_material_mode,
+            "dynamic_sensor": bool(use_base_polar_scene),
+            "measured_scope": measured_scope,
+            "max_measured_bsdfs": max_measured_bsdfs,
         }
         shared_artifacts = {
             "stokes_npz": summary["outputs"]["stokes_npz"],
@@ -5013,6 +5693,8 @@ def render_modalities(
                 "material_mode": polarization_material_mode,
                 "fallback_used": fallback_used,
                 "selected_polar_scene": "polar_fallback" if fallback_used else "polar",
+                "measured_scope": measured_scope,
+                "max_measured_bsdfs": max_measured_bsdfs,
                 "invalid_pixel_count": int(summary.get("invalid_pixel_count", 0)),
                 "finite_ratio": float(summary.get("finite_ratio", 1.0)),
             },
@@ -5215,7 +5897,7 @@ def render_depth(*args, **kwargs) -> MultimodalRenderResult:
 
 
 def render_polarization(*args, **kwargs) -> MultimodalRenderResult:
-    return render_modalities(*args, modalities=["polar_rgb_preview", "dop", "aolp", "s1", "s2"], **kwargs)
+    return render_modalities(*args, modalities=["polar_rgb_preview", "s1_over_s0", "s2_over_s0", "dop", "aolp", "s1", "s2"], **kwargs)
 
 
 def render_decomposition(*args, **kwargs) -> MultimodalRenderResult:

@@ -47,6 +47,10 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from floorplan_gen import build_floor_plan  # noqa: E402  (sibling module)
+import infinigen_env  # noqa: E402  (sibling: env path detection + persistence)
+
 # --- env -------------------------------------------------------------------
 
 DEFAULT_INFINIGEN_DIR = Path.home() / "module" / "infinigen"
@@ -54,11 +58,18 @@ DEFAULT_INFINIGEN_PYTHON = Path.home() / "miniconda3" / "envs" / "infinigen" / "
 
 
 def infinigen_dir() -> Path:
-    return Path(os.environ.get("INFINIGEN_DIR", str(DEFAULT_INFINIGEN_DIR))).expanduser()
+    if os.environ.get("INFINIGEN_DIR"):
+        return Path(os.environ["INFINIGEN_DIR"]).expanduser()
+    return infinigen_env.resolve_dir() or DEFAULT_INFINIGEN_DIR
 
 
 def infinigen_python() -> Path:
-    return Path(os.environ.get("INFINIGEN_PYTHON", str(DEFAULT_INFINIGEN_PYTHON))).expanduser()
+    if os.environ.get("INFINIGEN_PYTHON"):
+        return Path(os.environ["INFINIGEN_PYTHON"]).expanduser()
+    try:
+        return infinigen_env.resolve_python(persist=True)
+    except FileNotFoundError:
+        return DEFAULT_INFINIGEN_PYTHON
 
 
 # --- floor plans -----------------------------------------------------------
@@ -157,10 +168,22 @@ def _kr_apt_84(seed: int) -> dict:
     }
 
 
+# Seed-driven procedural generators (see floorplan_gen.py). Unlike the anchors,
+# these honor the seed: every seed yields a different VALID wall layout.
+def _gen_apartment(seed: int) -> dict:
+    return build_floor_plan(int(seed), "apartment")
+
+
+def _gen_office(seed: int) -> dict:
+    return build_floor_plan(int(seed), "office")
+
+
 # key -> builder
 FLOOR_PLANS = {
     "kr_apt_84": _kr_apt_84,
     "kr_glasswall_demo": _kr_glasswall_demo,
+    "gen_apartment": _gen_apartment,
+    "gen_office": _gen_office,
 }
 
 
@@ -175,6 +198,7 @@ class AptPreset:
     density: str
     num_floating: int
     camera_profile: str
+    archetype: str | None = None
     overrides: list[str] = field(default_factory=list)
 
 
@@ -193,9 +217,18 @@ def parse_seed(seed: int) -> AptPreset:
     else:
         unit_type = "84m2"
 
-    # 84㎡ → multi-room corridor layout (nav-friendly); others fall back to the
-    # simple open-LDK demonstrator until more layouts are authored.
-    floor_plan_key = "kr_apt_84" if unit_type == "84m2" else "kr_glasswall_demo"
+    # BB (layout variant) now selects between hand-authored anchors and the
+    # seed-driven procedural generators (floorplan_gen.py):
+    #   BB == 0        -> anchor by unit_type (back-compat; canonical fixed layout)
+    #   1  <= BB <= 49 -> generated apartment (living-centered, corridor, LDK)
+    #   50 <= BB <= 99 -> generated office (corridor network, dozens of rooms)
+    archetype: str | None = None
+    if bb == 0:
+        floor_plan_key = "kr_apt_84" if unit_type == "84m2" else "kr_glasswall_demo"
+    elif bb < 50:
+        floor_plan_key, archetype = "gen_apartment", "apartment"
+    else:
+        floor_plan_key, archetype = "gen_office", "office"
 
     if cc < 25:
         density, num_floating = "model_house", 8
@@ -216,6 +249,7 @@ def parse_seed(seed: int) -> AptPreset:
     return AptPreset(
         seed=int(seed), unit_type=unit_type, floor_plan_key=floor_plan_key,
         density=density, num_floating=num_floating, camera_profile=camera_profile,
+        archetype=archetype,
     )
 
 
@@ -274,6 +308,8 @@ def main() -> int:
         if args.floor_plan not in FLOOR_PLANS:
             ap.error(f"unknown floor plan {args.floor_plan!r}; have {list(FLOOR_PLANS)}")
         preset.floor_plan_key = args.floor_plan
+        preset.archetype = {"gen_apartment": "apartment",
+                            "gen_office": "office"}.get(args.floor_plan)
 
     repo_root = Path(__file__).resolve().parent.parent
     out = args.out or (repo_root / "data" / "infinigen_generated" / "outputs"
@@ -288,7 +324,8 @@ def main() -> int:
     # Record the decoded preset (camera profile etc. are metadata-only for now).
     (out / "kr_preset.json").write_text(json.dumps({
         "seed": preset.seed, "unit_type": preset.unit_type,
-        "floor_plan_key": preset.floor_plan_key, "density": preset.density,
+        "floor_plan_key": preset.floor_plan_key, "archetype": preset.archetype,
+        "density": preset.density,
         "num_floating": preset.num_floating, "camera_profile": preset.camera_profile,
     }, indent=2), encoding="utf-8")
 

@@ -1,7 +1,10 @@
 <script lang="ts">
 	import { opticalNavEnvmapPreviewUrl } from '$lib/api';
+	import type { Capabilities } from '$lib/datasets/capabilityHelpers';
+	import InfinigenGeneratePanel from '$lib/datasets/InfinigenGeneratePanel.svelte';
 
 	interface Props {
+		caps: Capabilities;
 		sceneId: string;
 		projectScenes: any[];
 		selectedProjectId: string;
@@ -28,6 +31,11 @@
 		onSaveMap: () => void;
 		onEnableAllEmitters: () => void;
 		onDisableAllEmitters: () => void;
+		perturbation: any;
+		perturbationSeed: number;
+		onGeneratePerturbation: () => void;
+		onSetPerturbationEnabled: (enabled: boolean) => void;
+		onSetPerturbationSeed: (seed: number) => void;
 		onUpdateEnvironmentField: (key: string, value: unknown) => void;
 		onUpdateSettingsField: (key: string, value: unknown) => void;
 		onUploadEnvmap: (input: HTMLInputElement) => void;
@@ -39,6 +47,7 @@
 	}
 
 	let {
+		caps,
 		sceneId, projectScenes, selectedProjectId, hasScene,
 		authoringMapDirty, authoringMapText, annotationText,
 		authoringMap, currentScene, detectedEmitterCount, enabledEmitterCount,
@@ -46,6 +55,8 @@
 		envmapFiles, envmapUploading,
 		onSceneChange, onSetMapWidth, onSetMapHeight, onTranslateLayout, onNormalizeLayout,
 		onAddScene, onSaveMap, onEnableAllEmitters, onDisableAllEmitters,
+		perturbation, perturbationSeed,
+		onGeneratePerturbation, onSetPerturbationEnabled, onSetPerturbationSeed,
 		onUpdateEnvironmentField, onUpdateSettingsField, onUploadEnvmap,
 		onMarkAuthoringJsonDirty, onAuthoringMapTextChange, onAnnotationTextChange,
 		onLoadAnnotation, onSaveAnnotation,
@@ -97,19 +108,23 @@
 						<label><span>Δy (north+)</span><input type="number" step="0.1" bind:value={layoutDy} /></label>
 					</div>
 					<div class="action-row">
-						<button class="button button-subtle" disabled={loading || (!layoutDx && !layoutDy)} onclick={() => { onTranslateLayout(Number(layoutDx) || 0, Number(layoutDy) || 0); layoutDx = 0; layoutDy = 0; }}>Apply shift</button>
-						<button class="button button-subtle" disabled={loading} onclick={() => onNormalizeLayout()}>Normalize to ≥0</button>
+						<button class="button button-subtle" disabled={!caps.saveMap.enabled || (!layoutDx && !layoutDy)} title={caps.saveMap.reason} onclick={() => { onTranslateLayout(Number(layoutDx) || 0, Number(layoutDy) || 0); layoutDx = 0; layoutDy = 0; }}>Apply shift</button>
+						<button class="button button-subtle" disabled={!caps.saveMap.enabled} title={caps.saveMap.reason} onclick={() => onNormalizeLayout()}>Normalize to ≥0</button>
 					</div>
 					<span class="translate-layout-sub">Shifts every object &amp; region together (e.g. bring a negative-coord room back to the origin). Then Save Map.</span>
 				</div>
 			{/if}
 			<div class="action-row">
-				<button class="button button-subtle" disabled={!selectedProjectId || loading} onclick={onAddScene}>Add Scene</button>
-				<button class="button button-primary" disabled={!selectedProjectId || !hasScene || loading} onclick={onSaveMap}>
+				<button class="button button-subtle" disabled={!caps.addScene.enabled} title={caps.addScene.reason} onclick={onAddScene}>Add Scene</button>
+				<button class="button button-primary" disabled={!caps.saveMap.enabled} title={caps.saveMap.reason} onclick={onSaveMap}>
 					{authoringMapDirty ? '● ' : ''}Save Map
 				</button>
 			</div>
 			{#if authoringMapDirty}<p class="inline-hint">Unsaved changes.</p>{/if}
+			<details class="infinigen-details">
+				<summary>＋ Infinigen 씬 생성 (절차적)</summary>
+				<InfinigenGeneratePanel projectId={selectedProjectId} />
+			</details>
 			{#if currentScene?.sync_status}
 				{@const _ss = currentScene.sync_status}
 				{@const _rs = _ss.render_scene_status ?? _ss.render_scene ?? 'pending'}
@@ -143,11 +158,32 @@
 					<div class="panel-label">🔆 Light fixtures</div>
 					<div class="emitter-bulk-row">
 						<span>{enabledEmitterCount}/{detectedEmitterCount} enabled</span>
-						<button class="button button-subtle" disabled={enabledEmitterCount >= detectedEmitterCount} onclick={onEnableAllEmitters}>Enable all</button>
+						<button class="button button-subtle" disabled={!caps.enableEmitters.enabled} title={caps.enableEmitters.reason} onclick={onEnableAllEmitters}>Enable all</button>
 						{#if enabledEmitterCount > 0}
 							<button class="button button-subtle" onclick={onDisableAllEmitters}>Disable all</button>
 						{/if}
 					</div>
+				</div>
+			{/if}
+
+			{#if hasScene}
+				<div class="emitter-bulk-card">
+					<div class="panel-label">🪞 Optical perturbation (eval)</div>
+					{#if perturbation}
+						<div class="emitter-bulk-row">
+							<span>{perturbation.metadata?.mirror_count ?? 0} mirrors · {perturbation.metadata?.glass_wall_count ?? 0} glass · {perturbation.metadata?.disabled_edge_count ?? 0} edges off</span>
+						</div>
+						<div class="emitter-bulk-row">
+							<label><input type="checkbox" checked={Boolean(perturbation.enabled)} onchange={(e) => onSetPerturbationEnabled((e.currentTarget as HTMLInputElement).checked)} /> Show / enabled</label>
+							<button class="button button-subtle" disabled={!caps.perturbation.enabled} title={caps.perturbation.reason} onclick={onGeneratePerturbation}>Regenerate</button>
+						</div>
+					{:else}
+						<div class="emitter-bulk-row">
+							<span>none placed</span>
+							<label>seed <input type="number" style="width:4rem" value={perturbationSeed} onchange={(e) => onSetPerturbationSeed(Number((e.currentTarget as HTMLInputElement).value))} /></label>
+							<button class="button button-subtle" disabled={!caps.perturbation.enabled} title={caps.perturbation.reason} onclick={onGeneratePerturbation}>Auto-place</button>
+						</div>
+					{/if}
 				</div>
 			{/if}
 
@@ -267,8 +303,8 @@
 			<details>
 				<summary>scene_annotation.json</summary>
 				<div class="action-row mt-2">
-					<button class="button button-subtle" disabled={!selectedProjectId || !hasScene || loading} onclick={onLoadAnnotation}>Load</button>
-					<button class="button button-subtle" disabled={!selectedProjectId || !hasScene || loading} onclick={onSaveAnnotation}>Validate</button>
+					<button class="button button-subtle" disabled={!caps.editAnnotation.enabled} title={caps.editAnnotation.reason} onclick={onLoadAnnotation}>Load</button>
+					<button class="button button-subtle" disabled={!caps.editAnnotation.enabled} title={caps.editAnnotation.reason} onclick={onSaveAnnotation}>Validate</button>
 				</div>
 				<textarea class="code-editor small" value={annotationText} oninput={(e) => onAnnotationTextChange((e.currentTarget as HTMLTextAreaElement).value)} placeholder="scene_annotation.json"></textarea>
 			</details>

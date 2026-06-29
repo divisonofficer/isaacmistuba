@@ -40,6 +40,17 @@ def _edge_yaw_deg(source: ViewpointNode, target: ViewpointNode) -> float:
     return (math.degrees(math.atan2(dy, dx)) + 360.0) % 360.0
 
 
+def _max_run(values) -> int:
+    run = mx = 0
+    for v in values:
+        if v:
+            run += 1
+            mx = max(mx, run)
+        else:
+            run = 0
+    return mx
+
+
 def build_viewpoint_edges(
     grid: TraversabilityGrid,
     nodes: list[ViewpointNode],
@@ -47,13 +58,26 @@ def build_viewpoint_edges(
     robot_radius_m: float = 0.25,
     k_neighbors: int = 8,
     max_edge_length_m: float = 1.5,
+    wall_mask=None,
+    max_wall_cross_m: float = 0.0,
     on_progress: Callable[[float], None] | None = None,
 ) -> list[ViewpointEdge]:
+    """Connect viewpoint nodes to their nearest neighbours with collision-free edges.
+
+    When ``wall_mask`` (a mesh-derived robot-body-height wall occupancy grid; see
+    :func:`walkable_surface._wall_body_band_mask`) is supplied, an edge whose straight
+    line crosses more than ``max_wall_cross_m`` of wall is rejected. The robot-radius
+    erosion of the *floor* grid does NOT represent thin interior walls (their top-down
+    footprint is degenerate), so without this an edge happily threads a wall instead of
+    a doorway — the "connects rooms through a wall, ignoring the door" failure.
+    """
     if k_neighbors <= 0:
         raise ValueError("k_neighbors must be positive.")
     if max_edge_length_m <= 0:
         raise ValueError("max_edge_length_m must be positive.")
     traversable = _dilated_traversable(grid, robot_radius_m)
+    wall_tol = int(round(max_wall_cross_m / grid.spec.resolution)) if wall_mask is not None else 0
+    wall_h, wall_w = (wall_mask.shape if wall_mask is not None else (0, 0))
     edges: list[ViewpointEdge] = []
     seen_pairs: set[tuple[str, str]] = set()
     total_nodes = len(nodes)
@@ -75,6 +99,10 @@ def build_viewpoint_edges(
             cells = _line_cells(grid, source.position, target.position)
             if any(not (0 <= x < grid.spec.width and 0 <= y < grid.spec.height and bool(traversable[y, x])) for x, y in cells):
                 continue
+            if wall_mask is not None and _max_run(
+                0 <= x < wall_w and 0 <= y < wall_h and bool(wall_mask[y, x]) for x, y in cells
+            ) > wall_tol:
+                continue  # straight line punches through a wall — route via a doorway
             seen_pairs.add(pair)
             hazard_crossing = any(bool(grid.hazard[y, x]) for x, y in cells if 0 <= x < grid.spec.width and 0 <= y < grid.spec.height)
             edge_id = f"edge_{source.node_id}_{target.node_id}"

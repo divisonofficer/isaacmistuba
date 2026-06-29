@@ -163,6 +163,7 @@ class _Worker:
         self._watchdog_thread: threading.Thread | None = None
         self._stop_event = threading.Event()
         self._lock = threading.Lock()
+        self._generation = 0
         self.stats = WorkerStats(gpu_index=gpu_index)
 
     # ── lifecycle ─────────────────────────────────────────────────────
@@ -170,6 +171,9 @@ class _Worker:
     def start(self) -> None:
         with self._lock:
             self._stop_event = threading.Event()
+            self._generation += 1
+            generation = self._generation
+            stop_event = self._stop_event
             env = dict(os.environ)
             # Pin this worker to a single GPU. CUDA_VISIBLE_DEVICES is the
             # ONLY supported isolation mechanism (anti-improvement #6).
@@ -226,6 +230,7 @@ class _Worker:
 
             self._writer_thread = threading.Thread(
                 target=self._writer_loop,
+                args=(self._process, stop_event, generation),
                 name=f"render-worker-writer-{self._gpu_index}",
                 daemon=True,
             )
@@ -233,6 +238,7 @@ class _Worker:
 
             self._reader_thread = threading.Thread(
                 target=self._reader_loop,
+                args=(self._process, stop_event, generation),
                 name=f"render-worker-reader-{self._gpu_index}",
                 daemon=True,
             )
@@ -240,6 +246,7 @@ class _Worker:
 
             self._watchdog_thread = threading.Thread(
                 target=self._watchdog_loop,
+                args=(self._process, stop_event, generation),
                 name=f"render-worker-watchdog-{self._gpu_index}",
                 daemon=True,
             )
@@ -312,12 +319,16 @@ class _Worker:
             self._outbound.put(item)
         return found
 
-    def _writer_loop(self) -> None:
-        proc = self._process
+    def _writer_loop(
+        self,
+        proc: subprocess.Popen[bytes] | None,
+        stop_event: threading.Event,
+        generation: int,
+    ) -> None:
         if proc is None or proc.stdin is None:
             return
         stdin = proc.stdin
-        while not self._stop_event.is_set():
+        while not stop_event.is_set():
             try:
                 job = self._outbound.get(timeout=0.5)
             except _queue.Empty:
@@ -341,22 +352,27 @@ class _Worker:
                 except (BrokenPipeError, ValueError):
                     # Pipe closed — worker is dead. Re-queue the job so
                     # the manager can fail it once we know the exit reason.
-                    self._inject_event({
-                        "job_id": str(job.get("job_id") or ""),
-                        "type": "failed",
-                        "reason": "worker_pipe_broken",
-                        "message": "stdin pipe closed before write",
-                    })
+                    if self._is_current_generation(proc, generation):
+                        self._inject_event({
+                            "job_id": str(job.get("job_id") or ""),
+                            "type": "failed",
+                            "reason": "worker_pipe_broken",
+                            "message": "stdin pipe closed before write",
+                        })
                     return
 
-    def _reader_loop(self) -> None:
-        proc = self._process
+    def _reader_loop(
+        self,
+        proc: subprocess.Popen[bytes] | None,
+        stop_event: threading.Event,
+        generation: int,
+    ) -> None:
         if proc is None or proc.stdout is None:
             return
         stdout = proc.stdout
         try:
             for raw in iter(stdout.readline, b""):
-                if self._stop_event.is_set():
+                if stop_event.is_set():
                     break
                 line = raw.decode("utf-8", errors="replace").strip()
                 if not line:
@@ -370,7 +386,7 @@ class _Worker:
                     continue
                 self._handle_event(event)
         finally:
-            self._on_worker_exited()
+            self._on_worker_exited(proc=proc, stop_event=stop_event, generation=generation)
 
     def _handle_event(self, event: dict) -> None:
         kind = str(event.get("type") or "")
@@ -413,9 +429,16 @@ class _Worker:
         emit it, e.g. broken pipe before write)."""
         self._handle_event(event)
 
-    def _watchdog_loop(self) -> None:
+    def _watchdog_loop(
+        self,
+        proc: subprocess.Popen[bytes] | None,
+        stop_event: threading.Event,
+        generation: int,
+    ) -> None:
         timeout_s = _heartbeat_timeout_s()
-        while not self._stop_event.wait(1.0):
+        while not stop_event.wait(1.0):
+            if not self._is_current_generation(proc, generation):
+                return
             if time.time() - self.stats.last_heartbeat > timeout_s:
                 _stderr(
                     f"worker: heartbeat stalled "
@@ -425,14 +448,29 @@ class _Worker:
                 self._manager._request_restart(self, reason="heartbeat_timeout")
                 return
 
-    def _on_worker_exited(self) -> None:
-        proc = self._process
+    def _is_current_generation(self, proc: subprocess.Popen[bytes] | None, generation: int) -> bool:
+        with self._lock:
+            return generation == self._generation and proc is self._process
+
+    def _on_worker_exited(
+        self,
+        *,
+        proc: subprocess.Popen[bytes] | None = None,
+        stop_event: threading.Event | None = None,
+        generation: int | None = None,
+    ) -> None:
+        if proc is None:
+            proc = self._process
         if proc is None:
             return
-        rc = proc.poll()
-        if self._stop_event.is_set():
-            # Manager-initiated stop; nothing to recover.
+        if stop_event is not None and stop_event.is_set():
+            # Manager-initiated recycle/shutdown. The worker may already have
+            # been respawned on the same _Worker object; never let an old reader
+            # clean up or kill the new process.
             return
+        if generation is not None and not self._is_current_generation(proc, generation):
+            return
+        rc = proc.poll()
         # drjit's "Critical Dr.Jit compiler failure" path (CUDA OOM, OptiX
         # init failure, etc) closes stdout from inside the worker but does
         # NOT terminate the process — abort() runs after some atexit
@@ -655,6 +693,54 @@ class WorkerManager:
                 pass
         return found
 
+    def recycle_idle_workers(self, *, reason: str = "manual", timeout_s: float = 15.0) -> dict[str, Any]:
+        """Restart idle workers without marking any render job as failed.
+
+        Used at modality phase boundaries to release Mitsuba/Dr.Jit resident
+        scene memory before submitting a different scene/variant family.
+        """
+        deadline = time.time() + max(0.0, float(timeout_s))
+        while True:
+            with self._condition:
+                workers = list(self._workers)
+                busy = [
+                    w for w in workers
+                    if w.stats.in_flight_job_id
+                    or self._worker_assigned_count(w) > 0
+                    or self._worker_queue_depth(w) > 0
+                ]
+                if not busy:
+                    break
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    return {
+                        "recycled": 0,
+                        "skipped_busy": len(busy),
+                        "reason": reason,
+                    }
+                self._condition.wait(timeout=min(0.5, remaining))
+
+        recycled = 0
+        for worker in workers:
+            proc = getattr(worker, "_process", None)
+            if proc is None or proc.poll() is not None:
+                continue
+            _stderr(
+                f"worker: recycling idle worker pid={worker.stats.pid} "
+                f"gpu_index={worker.stats.gpu_index} reason={reason}"
+            )
+            try:
+                worker.stop(kill=False, timeout_s=3.0)
+                worker.start()
+                recycled += 1
+            except Exception as exc:
+                _stderr(f"worker: recycle failed: {type(exc).__name__}: {exc}")
+        return {
+            "recycled": recycled,
+            "skipped_busy": 0,
+            "reason": reason,
+        }
+
     def shutdown(self) -> None:
         with self._lock:
             self._shutting_down = True
@@ -767,11 +853,16 @@ class WorkerManager:
                 pass
 
     def _request_restart(self, worker: _Worker, *, reason: str) -> None:
-        # Stop the stalled worker; ``_on_worker_exited`` will drive recovery.
+        # Kill the stalled worker without marking it as a manager-initiated
+        # recycle/shutdown. The reader thread will observe stdout EOF and drive
+        # failure synthesis + cooldown respawn through ``_on_worker_exited``.
         try:
-            worker.stop(kill=True, timeout_s=2.0)
+            with worker._lock:
+                proc = worker._process
+            if proc is not None:
+                proc.kill()
         except Exception as exc:
-            _stderr(f"worker: stop on restart raised: {type(exc).__name__}: {exc}")
+            _stderr(f"worker: kill on restart raised: {type(exc).__name__}: {exc}")
 
     def _on_worker_exited(self, worker: _Worker, rc: int | None) -> None:
         if self._shutting_down:

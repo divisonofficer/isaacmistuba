@@ -362,12 +362,16 @@ def _ensure_uv(obj):
         return False
 
 
-def _bake_albedo(obj, out_png, res, samples):
-    """Bake the object's (procedural) materials to a single albedo atlas PNG.
+def _bake_pass(obj, out_png, res, samples, *, bake_type="DIFFUSE",
+               color_pass=False, non_color=False):
+    """Bake one Cycles pass for all of an object's material slots into one atlas PNG.
 
-    All material slots share one baked image laid out over the object's UV, so a
-    single map_Kd in the MTL reproduces the full per-face colour at render time.
-    Returns True on success. Best-effort: any failure leaves the object untextured.
+    A ShaderNodeTexImage targeting a shared image is added to every slot so Cycles
+    lays all slots over the object's UV in one bake. ``bake_type`` is a Cycles bake
+    type ("DIFFUSE"/"ROUGHNESS"/"NORMAL"/"EMIT"); ``color_pass`` restricts DIFFUSE to
+    the albedo colour (no direct/indirect light); ``non_color`` stores the PNG as
+    linear data (roughness/normal/metallic — read raw at render time).
+    Returns True on success. Best-effort.
     """
     if not obj.material_slots:
         return False
@@ -380,10 +384,16 @@ def _bake_albedo(obj, out_png, res, samples):
     bake = scene.render.bake
     bake.use_pass_direct = False
     bake.use_pass_indirect = False
-    bake.use_pass_color = True
+    if color_pass:
+        bake.use_pass_color = True
     bake.margin = 4
 
     img = bpy.data.images.new(f"bake_{obj.name}", width=res, height=res, alpha=False)
+    if non_color:
+        try:
+            img.colorspace_settings.name = "Non-Color"
+        except Exception:  # noqa: BLE001
+            pass
     added = []
     for slot in obj.material_slots:
         mat = slot.material
@@ -404,12 +414,12 @@ def _bake_albedo(obj, out_png, res, samples):
         bpy.ops.object.select_all(action="DESELECT")
         obj.select_set(True)
         bpy.context.view_layer.objects.active = obj
-        bpy.ops.object.bake(type="DIFFUSE")
+        bpy.ops.object.bake(type=bake_type)
         img.filepath_raw = out_png
         img.file_format = "PNG"
         img.save()
     except Exception as exc:  # noqa: BLE001
-        print(f"[bake] FAIL {obj.name}: {exc}", file=sys.stderr)
+        print(f"[bake] FAIL {obj.name} ({bake_type}): {exc}", file=sys.stderr)
         ok = False
     finally:
         for nt, node in added:
@@ -424,24 +434,97 @@ def _bake_albedo(obj, out_png, res, samples):
     return ok
 
 
-def _patch_mtl_map_kd(mtl_path, tex_rel):
-    """Point every material in an OBJ's .mtl at the baked albedo (map_Kd).
+def _bake_albedo(obj, out_png, res, samples):
+    """Bake the object's materials to a single albedo atlas PNG (map_Kd)."""
+    return _bake_pass(obj, out_png, res, samples, bake_type="DIFFUSE", color_pass=True)
 
-    The render pipeline's _extract_obj_mtl_material reads map_Kd from the first MTL
-    sidecar, so this is enough to make the baked colour show up at render time.
+
+def _bake_roughness(obj, out_png, res, samples):
+    return _bake_pass(obj, out_png, res, samples, bake_type="ROUGHNESS", non_color=True)
+
+
+def _bake_normal(obj, out_png, res, samples):
+    return _bake_pass(obj, out_png, res, samples, bake_type="NORMAL", non_color=True)
+
+
+def _bake_metallic(obj, out_png, res, samples):
+    """Bake per-texel metallic via the EMIT trick — Cycles has no metallic pass.
+
+    Per Principled material: route its Metallic input into an Emission shader
+    connected to the material output (grayscale = metallic), bake EMIT, then
+    restore the original surface link. Best-effort.
+    """
+    if not obj.material_slots:
+        return False
+    ok = False
+    rewired = []  # (node_tree, emission_node, output_node, original_surface_from_socket)
+    try:
+        for slot in obj.material_slots:
+            mat = slot.material
+            if not mat or not mat.use_nodes or not mat.node_tree:
+                continue
+            nt = mat.node_tree
+            p = next((n for n in nt.nodes if n.type == "BSDF_PRINCIPLED"), None)
+            out = next((n for n in nt.nodes if n.type == "OUTPUT_MATERIAL" and n.is_active_output), None) \
+                or next((n for n in nt.nodes if n.type == "OUTPUT_MATERIAL"), None)
+            if p is None or out is None:
+                continue
+            metal = p.inputs.get("Metallic")
+            surf = out.inputs.get("Surface")
+            if metal is None or surf is None:
+                continue
+            emit = nt.nodes.new("ShaderNodeEmission")
+            if metal.is_linked:
+                nt.links.new(emit.inputs["Color"], metal.links[0].from_socket)
+            else:
+                v = float(metal.default_value)
+                emit.inputs["Color"].default_value = (v, v, v, 1.0)
+            orig_surf_from = surf.links[0].from_socket if surf.is_linked else None
+            nt.links.new(surf, emit.outputs["Emission"])
+            rewired.append((nt, emit, out, orig_surf_from))
+        if not rewired:
+            return False
+        ok = _bake_pass(obj, out_png, res, samples, bake_type="EMIT", non_color=True)
+    finally:
+        for nt, emit, out, orig_surf_from in rewired:
+            try:
+                surf = out.inputs.get("Surface")
+                if orig_surf_from is not None and surf is not None:
+                    nt.links.new(surf, orig_surf_from)
+                nt.nodes.remove(emit)
+            except Exception:  # noqa: BLE001
+                pass
+    return ok
+
+
+def _patch_mtl_map(mtl_path, tex_rel, key):
+    """Add a texture map line (`<key> <tex_rel>`) to every material in an OBJ's .mtl.
+
+    The render pipeline's _extract_obj_mtl_material reads these per-object atlas refs
+    (map_Kd=albedo, map_Pr=roughness, map_Pm=metallic, norm=normal). Drops any
+    existing line for the same key before re-adding it under each newmtl.
     """
     import os as _os
     if not _os.path.exists(mtl_path):
         return
+    kl = key.lower()
     out_lines = []
     for line in open(mtl_path, "r", errors="ignore"):
-        if line.lstrip().lower().startswith("map_kd"):
-            continue  # drop any existing
+        if line.lstrip().lower().startswith(kl + " ") or line.lstrip().lower().startswith(kl):
+            # drop any existing line for this exact key (avoid map_Pr matching map_Pm: compare token)
+            tok = line.lstrip().split(None, 1)[0].lower() if line.strip() else ""
+            if tok == kl:
+                continue
         out_lines.append(line.rstrip("\n"))
         if line.lstrip().lower().startswith("newmtl"):
-            out_lines.append(f"map_Kd {tex_rel}")
+            out_lines.append(f"{key} {tex_rel}")
     with open(mtl_path, "w") as fh:
         fh.write("\n".join(out_lines) + "\n")
+
+
+def _patch_mtl_map_kd(mtl_path, tex_rel):
+    """Albedo convenience wrapper (kept for the existing call site)."""
+    _patch_mtl_map(mtl_path, tex_rel, "map_Kd")
 
 
 def _strip_mtl_diffuse(mtl_path):
@@ -512,6 +595,11 @@ def main():
     do_bake = "--bake" in args
     bake_res = int(args[args.index("--bake-res") + 1]) if "--bake-res" in args else 512
     bake_samples = int(args[args.index("--bake-samples") + 1]) if "--bake-samples" in args else 12
+    # Per-texel PBR maps (roughness/normal/metallic) in addition to albedo. Opt-in
+    # because each is a full extra Cycles bake (~4x bake time). Metallic uses the
+    # EMIT trick; skip it with --no-bake-metallic if only roughness/normal wanted.
+    bake_pbr = "--bake-pbr" in args
+    bake_metallic = bake_pbr and "--no-bake-metallic" not in args
 
     meshes_dir = os.path.join(out_dir, "meshes")
     os.makedirs(meshes_dir, exist_ok=True)
@@ -599,6 +687,7 @@ def main():
         obj_rel = f"meshes/{oid}.obj"
         glb_rel = f"meshes/{oid}.glb"
         baked_rel = None
+        baked_roughness = baked_normal = baked_metallic = None
         try:
             with _silence_fds(1, 2):
                 _export_obj(obj, os.path.join(out_dir, obj_rel))
@@ -638,6 +727,29 @@ def main():
                 _patch_mtl_map_kd(mtl_abs, f"../textures/{oid}_albedo.png")
                 baked_rel = f"textures/{oid}_albedo.png"
                 baked_count += 1
+                # Per-texel PBR atlases (opt-in via --bake-pbr). Each is wired into
+                # the same per-object MTL so the render path picks it up alongside
+                # map_Kd (map_Pr=roughness, norm=normal, map_Pm=metallic).
+                if bake_pbr:
+                    pbr_passes = [
+                        ("roughness", "map_Pr", _bake_roughness),
+                        ("normal", "norm", _bake_normal),
+                    ]
+                    if bake_metallic:
+                        pbr_passes.append(("metallic", "map_Pm", _bake_metallic))
+                    for suffix, mtl_key, bake_fn in pbr_passes:
+                        ptex_abs = os.path.join(textures_dir, f"{oid}_{suffix}.png")
+                        with _silence_fds(1, 2):
+                            ok_pbr = bake_fn(obj, ptex_abs, bake_res, bake_samples)
+                        if ok_pbr:
+                            _patch_mtl_map(mtl_abs, f"../textures/{oid}_{suffix}.png", mtl_key)
+                            rel = f"textures/{oid}_{suffix}.png"
+                            if suffix == "roughness":
+                                baked_roughness = rel
+                            elif suffix == "normal":
+                                baked_normal = rel
+                            else:
+                                baked_metallic = rel
         if not no_glb:
             try:
                 with _silence_fds(1, 2):
@@ -679,6 +791,9 @@ def main():
             "mesh_obj": obj_rel,
             "mesh_glb": glb_rel,
             "baked_albedo": baked_rel,
+            "baked_roughness": baked_roughness,
+            "baked_normal": baked_normal,
+            "baked_metallic": baked_metallic,
         })
         # Drop zero-user datablocks left behind by bake/export (temp images, meshes,
         # node groups) so RAM doesn't creep across hundreds of objects. orphans_purge

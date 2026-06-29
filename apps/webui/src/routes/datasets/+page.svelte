@@ -27,6 +27,7 @@
 		isPolarRenderModality,
 	} from '$lib/datasets/sensorHelpers';
 	import { computeWorkflowReadiness } from '$lib/datasets/workflowHelpers';
+	import { computeCapabilities } from '$lib/datasets/capabilityHelpers';
 	import * as validationService from '$lib/datasets/services/validationService';
 	import * as episodeService from '$lib/datasets/services/episodeService';
 	import * as exportJobsService from '$lib/datasets/services/exportJobsService';
@@ -39,6 +40,7 @@
 	import * as projectService from '$lib/datasets/services/projectService';
 	import {
 		mergeBatch,
+		normalizeBatchForDisplay,
 		applyJobStatusUpdates,
 		logTailsToBatchEntries,
 		isGraphSweepRenderMode,
@@ -135,6 +137,8 @@
 		saveSceneAnnotation,
 		syncOpticalNavIsaacStage,
 		syncOpticalNavRenderScene,
+		getOpticalPerturbation,
+		buildOpticalPerturbation,
 		opticalNavSyncProgressWsUrl,
 		sweepOpticalNavViewpointGraph,
 		deleteOpticalNavObservations,
@@ -189,9 +193,16 @@
 
 	let loadingCount = $state(0);
 	let backgroundLoadingCount = $state(0);
+	// `actionCount` counts only user-triggered MUTATIONS in flight (build/save/export/…),
+	// not initial/secondary data loads. Button gating keys on `actionInFlight` so loads
+	// no longer disable the whole UI — the core fix for the "buttons block during load"
+	// problem. A run() call is classified as a load when it carries a `resource` (or
+	// explicit kind:'load'); everything else defaults to an action.
+	let actionCount = $state(0);
 	const loading = $derived(loadingCount > 0);
 	const backgroundLoading = $derived(backgroundLoadingCount > 0);
-	type RunOptions = { background?: boolean };
+	const actionInFlight = $derived(actionCount > 0);
+	type RunOptions = { background?: boolean; resource?: ResourceKey; kind?: 'load' | 'action' };
 	// `loading` gates only foreground user actions. Background scene refreshes can
 	// take a long time on cold daemon caches, so they use `backgroundLoading`
 	// instead of keeping Save/Refresh controls disabled.
@@ -201,6 +212,57 @@
 	// header so the user can see WHAT is loading (project list, scene map, details)
 	// rather than staring at an opaque disabled UI.
 	let loadingStage = $state('');
+
+	// Per-resource load registry. Each loader reports its own status through
+	// `track()` so the UI can show exactly WHAT is loading (vs the opaque global
+	// `loading` flag) and so button gating can key on a specific resource's
+	// readiness instead of the catch-all counter. Plain $state object (deep-proxied
+	// → per-key writes are reactive); the key set is fixed/closed.
+	type ResourceKey =
+		| 'projects' | 'project' | 'authoringMap' | 'mapAssets' | 'envmaps'
+		| 'episodes' | 'renderReadiness' | 'renderConfig' | 'perturbation'
+		| 'roomShell' | 'xmlSceneIndex' | 'materializationAudit'
+		| 'graph' | 'renderSceneStats';
+	type ResourceState = 'idle' | 'loading' | 'ready' | 'error';
+	const _RESOURCE_KEYS: ResourceKey[] = [
+		'projects', 'project', 'authoringMap', 'mapAssets', 'envmaps',
+		'episodes', 'renderReadiness', 'renderConfig', 'perturbation',
+		'roomShell', 'xmlSceneIndex', 'materializationAudit', 'graph', 'renderSceneStats',
+	];
+	let resourceStatus = $state<Record<ResourceKey, ResourceState>>(
+		Object.fromEntries(_RESOURCE_KEYS.map((k) => [k, 'idle'])) as Record<ResourceKey, ResourceState>
+	);
+	let resourceError = $state<Partial<Record<ResourceKey, string>>>({});
+
+	// Wrap a loader so its resource status tracks idle→loading→ready/error.
+	// Orthogonal to run(): run() drives the foreground spinner + activity log,
+	// track() drives per-resource status. A loader can use both.
+	async function track<T>(key: ResourceKey, fn: () => Promise<T>): Promise<T | undefined> {
+		resourceStatus[key] = 'loading';
+		try {
+			const r = await fn();
+			resourceStatus[key] = 'ready';
+			delete resourceError[key];
+			return r;
+		} catch (err) {
+			resourceStatus[key] = 'error';
+			resourceError[key] = errorMessage(err);
+			return undefined;
+		}
+	}
+
+	// Core resources whose loading blocks a usable editor. Used for the "initial
+	// load pending" signal (distinct from a user action being in flight).
+	const _CORE_RESOURCE_KEYS: ResourceKey[] = ['project', 'authoringMap', 'renderReadiness', 'renderConfig', 'episodes'];
+	const loadingResources = $derived(_RESOURCE_KEYS.filter((k) => resourceStatus[k] === 'loading'));
+	const erroredResources = $derived(_RESOURCE_KEYS.filter((k) => resourceStatus[k] === 'error'));
+	const initialLoadPending = $derived(_CORE_RESOURCE_KEYS.some((k) => resourceStatus[k] === 'loading'));
+	// Optical-nav perturbation overlay (auto-placed mirrors/glass; separate toggleable layer).
+	let perturbation = $state<any>(null);
+	let perturbationSeed = $state(0);
+	// Render variant: 'base' (mirrors off), 'perturbed' (mirrors/glass on), or 'both'
+	// (render each viewpoint twice into separate trees for the eval split).
+	let renderVariant = $state<'base' | 'perturbed' | 'both'>('base');
 	let error = $state('');
 	let info = $state('');
 	let projects = $state<any[]>([]);
@@ -217,6 +279,7 @@
 	let selectedSensorNodeId = $state('');
 	let activeModalityTab = $state('rgb');
 	let activeRigSensorId = $state('');
+	let selectedRigSensorIds = $state<string[]>([]);
 	// assetVM.globalCameraRig, assetVM.globalCameraRigStatus, assetVM.globalCameraRigError → assetVM
 	let sensorRenderResult = $state<any>(null);
 	let frustumMode = $state<'none' | 'view-aligned' | 'selected'>('view-aligned');
@@ -286,6 +349,7 @@
 	// Measured-pBRDF band mode for preview renders. Stable/default RGB uses single
 	// band × albedo; rgb/hybrid remain opt-in comparison modes.
 	let previewBandMode = $state('single');
+	let previewMeasuredScope = $state('analytic_priority');
 	let probeResult = $state<{ batch_id: string; vp_id: string; heading_id: string; modality: string; modalities?: string[]; is_polar?: boolean; sensor_id?: string; submittedAt: number } | null>(null);
 	let probeError = $state('');
 	type HotCameraPose = {
@@ -317,13 +381,12 @@
 	let syncRunning = $state(false);
 	async function refreshRoomShell() {
 		if (!selectedProjectId || !sceneId) { roomShell = null; return; }
-		try {
-			const res = await renderService.fetchRoomShell(selectedProjectId, sceneId);
-			roomShell = res?.room_shell ?? null;
-			if (!_showRoomShellUserTouched && roomShell && typeof roomShell.enabled === 'boolean') {
-				showRoomShell = roomShell.enabled;
-			}
-		} catch (err) { roomShell = null; }
+		const res = await track('roomShell', () => renderService.fetchRoomShell(selectedProjectId, sceneId));
+		if (res === undefined) { roomShell = null; return; }
+		roomShell = res?.room_shell ?? null;
+		if (!_showRoomShellUserTouched && roomShell && typeof roomShell.enabled === 'boolean') {
+			showRoomShell = roomShell.enabled;
+		}
 	}
 	$effect(() => {
 		if (selectedProjectId && sceneId) refreshRoomShell();
@@ -331,13 +394,9 @@
 	async function refreshRenderSceneStats() {
 		if (!selectedProjectId || !sceneId) return;
 		renderSceneStatsLoading = true;
-		try {
-			renderSceneStats = await renderService.fetchRenderSceneStats(selectedProjectId, sceneId);
-		} catch (err) {
-			renderSceneStats = { exists: false, error: errorMessage(err) };
-		} finally {
-			renderSceneStatsLoading = false;
-		}
+		const res = await track('renderSceneStats', () => renderService.fetchRenderSceneStats(selectedProjectId, sceneId));
+		renderSceneStats = res ?? { exists: false, error: resourceError.renderSceneStats ?? 'load failed' };
+		renderSceneStatsLoading = false;
 	}
 
 	// PR1: per-object materialization audit + XML scene index. Surfaced in the Sync
@@ -347,15 +406,13 @@
 	let xmlSceneIndex = $state<any>(null);
 	async function refreshMaterializationAudit() {
 		if (!selectedProjectId || !sceneId) { materializationAudit = null; return; }
-		try {
-			materializationAudit = await renderService.fetchMaterializationAudit(selectedProjectId, sceneId);
-		} catch { materializationAudit = null; }
+		const res = await track('materializationAudit', () => renderService.fetchMaterializationAudit(selectedProjectId, sceneId));
+		materializationAudit = res ?? null;
 	}
 	async function refreshXmlSceneIndex() {
 		if (!selectedProjectId || !sceneId) { xmlSceneIndex = null; return; }
-		try {
-			xmlSceneIndex = await renderService.fetchXmlSceneIndex(selectedProjectId, sceneId);
-		} catch { xmlSceneIndex = null; }
+		const res = await track('xmlSceneIndex', () => renderService.fetchXmlSceneIndex(selectedProjectId, sceneId));
+		xmlSceneIndex = res ?? null;
 	}
 	$effect(() => {
 		if (selectedProjectId && sceneId) {
@@ -385,7 +442,20 @@
 		return Math.abs(idxMs - xmlMs) > 5000;
 	});
 	let _xmlStaleWarnedAt = 0;
+	// One-shot auto-refetch: if the index looks stale (e.g. a sync ran in
+	// another tab or via CLI, so _finalizeSyncResult never fired here), pull a
+	// fresh index once per index version. Keyed on the current index mtime so
+	// it can't loop — if the server's file is genuinely still older, the
+	// refetch returns the same mtime and we stop (just warn).
+	let _xmlStaleRefetchedFor = 0;
 	$effect(() => {
+		if (xmlIndexStale) {
+			const idxNs = Number(xmlSceneIndex?.xml_mtime_ns) || 0;
+			if (idxNs && idxNs !== _xmlStaleRefetchedFor) {
+				_xmlStaleRefetchedFor = idxNs;
+				void refreshXmlSceneIndex();
+			}
+		}
 		if (xmlIndexStale && Date.now() - _xmlStaleWarnedAt > 30_000) {
 			_xmlStaleWarnedAt = Date.now();
 			console.warn('[XML-native preview] xml_scene_index.json is older than render_scene.xml — meshes shown in the editor may not reflect the current sync. Run Sync Render Scene to refresh.');
@@ -453,7 +523,7 @@
 	let minClearance = $state(0.1);
 	let showFootprint = $state(false);
 	// Single source of truth for map-click interaction. Only one mode at a time.
-	type PathsInteractionMode = 'select' | 'place_node' | 'paint_walkable' | 'paint_blocked' | 'paint_erase' | 'select_region' | 'add_edge' | 'inspect_edge' | 'remove_node';
+	type PathsInteractionMode = 'select' | 'place_node' | 'paint_walkable' | 'paint_blocked' | 'paint_erase' | 'select_region' | 'add_edge' | 'inspect_edge' | 'remove_edge' | 'remove_node';
 	let pathsMode = $state<PathsInteractionMode>('select');
 	// Derived flags consumed by the rest of the code (preserves call sites).
 	const addNodeMode = $derived(pathsMode === 'place_node');
@@ -466,6 +536,7 @@
 	const regionSelectMode = $derived(pathsMode === 'select_region');
 	const addEdgeMode = $derived(pathsMode === 'add_edge');
 	const edgeInspectorMode = $derived(pathsMode === 'inspect_edge');
+	const removeEdgeMode = $derived(pathsMode === 'remove_edge');
 	const removeNodeMode = $derived(pathsMode === 'remove_node');
 	// Multi-select node removal (object-overlap cleanup). Declared before the
 	// mode-change effect so it can be cleared there.
@@ -691,6 +762,8 @@
 	let exportPanoramaObservations = $state(true);
 	let exportPngOnly = $state(true);          // default to the lighter PNG-only bundle (no EXR)
 	let exportIncludeBirdseye = $state(true);  // include a top-down bird's-eye summary PNG
+	let exportIncludeEpisodeBirdseye = $state(false);  // per-episode path map PNGs (episodes_birdseye/)
+	let exportEvalPerturbation = $state(false);  // also ship observations_perturbed/ (mirror/glass eval split)
 	// Active scene-bundle export job — populated when user clicks Export.
 	let activeExportJob = $state<import('$lib/datasets/services/exportJobsService').ExportJobStatus | null>(null);
 	let _exportJobUnsub: (() => void) | null = null;
@@ -889,7 +962,7 @@
 		});
 	});
 	const activeRigSensorOption = $derived(rigSensorOptions.find((item: any) => item.sensor_id === activeRigSensorId) ?? rigSensorOptions[0] ?? null);
-	const activeRenderModality = $derived(String(activeRigSensorOption?.render_modality ?? activeModalityTab ?? 'rgb'));
+	const activeRenderModality = $derived(String(activeModalityTab || activeRigSensorOption?.render_modality || 'rgb'));
 	const activeCameraFrustum = $derived.by(() => {
 		const sensor: any = activeRigSensorOption?.sensor ?? {};
 		const rawResolution = Array.isArray(sensor.resolution) ? sensor.resolution : sensor.intrinsics?.resolution;
@@ -939,7 +1012,24 @@
 		const selected = rigSensorOptions.find((item: any) => item.sensor_id === activeRigSensorId) ?? rigSensorOptions[0];
 		if (!selected) return;
 		if (activeRigSensorId !== selected.sensor_id) activeRigSensorId = selected.sensor_id;
-		if (activeModalityTab !== selected.render_modality) activeModalityTab = selected.render_modality;
+		const selectedDefaultModality = String(selected.render_modality ?? 'rgb');
+		const selectedSensor = selected.sensor ?? {};
+		const selectedSensorType = String(selectedSensor?.canonical_sensor_type ?? selectedSensor?.sensor_type ?? '').toLowerCase();
+		const selectedCanonical = Array.isArray(selectedSensor?.modalities) ? selectedSensor.modalities : [];
+		const selectedIsPolar = selectedSensorType === 'polar_camera'
+			|| isPolarRenderModality(selectedDefaultModality)
+			|| selectedCanonical.some((item: unknown) => isPolarRenderModality(item));
+		if (selectedIsPolar) {
+			if (!isPolarRenderModality(activeModalityTab)) activeModalityTab = selectedDefaultModality;
+		} else if (activeModalityTab !== selectedDefaultModality) {
+			activeModalityTab = selectedDefaultModality;
+		}
+		const validIds = new Set(rigSensorOptions.map((item: any) => String(item.sensor_id)));
+		const kept = selectedRigSensorIds.filter((id) => validIds.has(id));
+		if (!kept.length) kept.push(String(selected.sensor_id));
+		if (kept.length !== selectedRigSensorIds.length || kept.some((id, index) => id !== selectedRigSensorIds[index])) {
+			selectedRigSensorIds = kept;
+		}
 	});
 	/** Active rig sensor mount height. Used as default before per-viewpoint overrides. */
 	const rigMountHeightM = $derived<number>(
@@ -1083,6 +1173,7 @@
 		hasMap, hasGraph, hasEpisodes, renderSceneSynced, renderConfigReady,
 		validationReport, validationPassed,
 	}));
+
 
 	// _mergeIntoBatch, buildBatchJobGrid, jobStatusClass, jobStageLabel, stageIndex,
 	// progressPercent, compactDetail, errorMessage, errorPayload → $lib/datasets/batchHelpers
@@ -1530,7 +1621,7 @@
 	// envmapSizeLabel, fileToDataBase64 → materialHelpers.ts (imported above)
 
 	async function loadEnvmaps() {
-		await assetVM.loadEnvmaps(selectedProjectId, sceneId);
+		await track('envmaps', () => assetVM.loadEnvmaps(selectedProjectId, sceneId));
 	}
 
 	async function uploadEnvmapFromInput(input: HTMLInputElement) {
@@ -1618,7 +1709,20 @@
 		sensorRenderResult = null;
 	}
 
-	function cameraSpecFromRigSensor(sensor: any, baseSpec: any) {
+	function toggleRigSweepSensor(sensorId: string) {
+		const id = String(sensorId || '');
+		if (!id) return;
+		selectRigRenderSensor(id);
+		const current = selectedRigSensorIds.includes(id) ? selectedRigSensorIds : [...selectedRigSensorIds, id];
+		if (selectedRigSensorIds.includes(id)) {
+			if (selectedRigSensorIds.length <= 1) return;
+			selectedRigSensorIds = selectedRigSensorIds.filter((item) => item !== id);
+		} else {
+			selectedRigSensorIds = current;
+		}
+	}
+
+	function cameraSpecFromRigSensor(sensor: any, baseSpec: any, renderModalities?: string[]) {
 		if (!sensor) return baseSpec;
 		const sensorId = String(sensor.sensor_id || 'opticalnav_front_cam');
 		const rawResolution = Array.isArray(sensor.resolution) ? sensor.resolution : sensor.intrinsics?.resolution;
@@ -1645,6 +1749,7 @@
 		if (sensor.polarization) extras.polarization = sensor.polarization;
 		if (sensor.lidar) extras.lidar = sensor.lidar;
 		if (sensor.render) extras.render = sensor.render;
+		if (renderModalities?.length) extras.render_modalities = renderModalities;
 		return {
 			...base,
 			camera_id: sensorId,
@@ -1659,6 +1764,60 @@
 		};
 	}
 
+	function renderModalitiesForRigOption(option: any): string[] {
+		const modality = String(option?.render_modality ?? sensorRenderModality(option?.sensor) ?? 'rgb');
+		const sensorType = String(option?.sensor?.canonical_sensor_type ?? option?.sensor?.sensor_type ?? '').toLowerCase();
+		const canonical = Array.isArray(option?.sensor?.modalities)
+			? option.sensor.modalities.map((item: unknown) => String(item)).filter(Boolean)
+			: [];
+		if (sensorType === 'polar_camera' || isPolarRenderModality(modality) || canonical.some((item: string) => isPolarRenderModality(item))) {
+			const expanded = [
+				...POLAR_PREVIEW_MODALITIES.map((item) => item.id),
+				...canonical.filter((item: string) => isPolarRenderModality(item)),
+			];
+			return [...new Set(expanded)];
+		}
+		return modality ? [modality] : ['rgb'];
+	}
+
+	function cameraSpecsForSweep(baseSpec: any): any[] {
+		const selected = selectedRigSensorIds.length ? selectedRigSensorIds : (activeRigSensorId ? [activeRigSensorId] : []);
+		const selectedSet = new Set(selected.map((id) => String(id)));
+		const options = rigSensorOptions.filter((option: any) => selectedSet.has(String(option.sensor_id)));
+		const resolvedOptions = options.length ? options : (activeRigSensorOption ? [activeRigSensorOption] : []);
+		return resolvedOptions
+			.map((option: any) => cameraSpecFromRigSensor(option?.sensor, baseSpec, renderModalitiesForRigOption(option)))
+			.filter(Boolean);
+	}
+
+	function modalitiesFromCameraSpecs(specs: any[], fallback: string[]): string[] {
+		const out: string[] = [];
+		for (const spec of specs) {
+			const modalities = Array.isArray(spec?.extras?.render_modalities) ? spec.extras.render_modalities : fallback;
+			for (const modality of modalities) {
+				const item = String(modality || '');
+				if (item && !out.includes(item)) out.push(item);
+			}
+		}
+		return out.length ? out : fallback;
+	}
+
+	function applySweepSensorScope(body: Record<string, unknown>, baseSpec: any, fallbackModalities: string[]) {
+		const specs = cameraSpecsForSweep(baseSpec);
+		const sensorIds = specs.map((spec: any) => String(spec?.camera_id || '')).filter(Boolean);
+		const useSelected = sensorIds.length > 1 || (sensorIds[0] && sensorIds[0] !== activeRigSensorId);
+		body.sensor_scope = useSelected ? 'selected' : 'active';
+		if (useSelected) {
+			body.camera_specs = specs;
+			body.sensor_ids = sensorIds;
+			body.modalities = modalitiesFromCameraSpecs(specs, fallbackModalities);
+		} else {
+			const activeSpec = specs[0] ?? cameraSpecFromRigSensor(activeRigSensorOption?.sensor, baseSpec, fallbackModalities);
+			if (activeSpec) body.camera_spec = activeSpec;
+			body.modalities = fallbackModalities;
+		}
+	}
+
 	function renderSettingsFromRigSensor(sensor: any): Record<string, unknown> {
 		const settings: Record<string, unknown> = { ambient_radiance: ambientRadiance };
 		const render = normalizeRigRenderSettings(sensor?.render, String(sensor?.canonical_sensor_type ?? sensor?.sensor_type ?? 'rgb_camera'));
@@ -1670,6 +1829,8 @@
 		// episodes). Only sent when non-default so 'rgb' renders are unchanged and
 		// never trip a stale worker on an unknown render_settings key.
 		if (previewBandMode && previewBandMode !== 'rgb') settings.pbrdf_band_mode = previewBandMode;
+		if (previewMeasuredScope && previewMeasuredScope !== 'analytic_priority') settings.measured_scope = previewMeasuredScope;
+		if (previewMeasuredScope === 'analytic_priority' || previewMeasuredScope === 'budgeted_measured') settings.max_measured_bsdfs = 3;
 		return settings;
 	}
 
@@ -1964,7 +2125,7 @@
 	}
 
 	async function loadMapAssets() {
-		await assetVM.loadMapAssets(selectedProjectId);
+		await track('mapAssets', () => assetVM.loadMapAssets(selectedProjectId));
 	}
 
 	function friendlyUsdCatalogMessage(payload: any) {
@@ -2596,6 +2757,10 @@
 
 	async function run<T>(fn: () => Promise<T>, success?: string, source = 'api', options: RunOptions = {}): Promise<T | undefined> {
 		const background = options.background === true;
+		const resource = options.resource;
+		const isAction = options.kind ? options.kind === 'action' : !resource;
+		if (resource) resourceStatus[resource] = 'loading';
+		if (isAction) actionCount += 1;
 		if (background) {
 			backgroundLoadingCount += 1;
 		} else {
@@ -2607,6 +2772,7 @@
 		if (!silent) pushActivity('info', source, 'Request started.');
 		try {
 			const result = await fn();
+			if (resource) { resourceStatus[resource] = 'ready'; delete resourceError[resource]; }
 			if (success) {
 				if (!background) info = success;
 				pushActivity('ok', source, success, result);
@@ -2614,17 +2780,19 @@
 			return result;
 		} catch (err) {
 			const msg = errorMessage(err);
+			if (resource) { resourceStatus[resource] = 'error'; resourceError[resource] = msg; }
 			if (!background) error = msg;
 			pushActivity('error', source, msg, errorPayload(err));
 			return undefined;
 		} finally {
+			if (isAction) actionCount = Math.max(0, actionCount - 1);
 			if (background) backgroundLoadingCount = Math.max(0, backgroundLoadingCount - 1);
 			else loadingCount = Math.max(0, loadingCount - 1);
 		}
 	}
 
 	async function refreshProjects(selectId = selectedProjectId) {
-		const data = await run(() => projectService.fetchProjects(), undefined, 'projects:list');
+		const data = await run(() => projectService.fetchProjects(), undefined, 'projects:list', { resource: 'projects' });
 		if (!data) return;
 		projects = data.projects ?? [];
 		if (selectId && projects.some((item) => item.project_id === selectId)) {
@@ -2639,7 +2807,7 @@
 		if (!selectedProjectId) return;
 		loadingStage = 'Loading project…';
 		try {
-			const data = await run(() => projectService.fetchProject(selectedProjectId), undefined, 'project:detail');
+			const data = await run(() => projectService.fetchProject(selectedProjectId), undefined, 'project:detail', { resource: 'project' });
 			if (!data) return;
 			project = data;
 			// Keep the current sceneId only if THIS project actually contains it; otherwise
@@ -2660,7 +2828,8 @@
 				const mapData = await run(
 					() => authoringMapService.fetchAuthoringMap(selectedProjectId, sceneId),
 					undefined,
-					'authoring-map:load'
+					'authoring-map:load',
+					{ resource: 'authoringMap' }
 				);
 				if (mapData) setAuthoringMapPayload(mapData, false);
 			}
@@ -2674,12 +2843,43 @@
 				loadEnvmaps(),
 				refreshEpisodes({ background: true }),
 				loadRenderReadiness(),
+				loadPerturbation(),
 			]);
 			loadingStage = 'Loading render config…';
 			if (!sceneStateText.trim()) await loadRenderConfig();
 		} finally {
 			loadingStage = '';
 		}
+	}
+
+	// Reset all scene-scoped transient state. Shared by selectScene/selectProject so
+	// switching either re-loads through the SAME full path (refreshProject) instead of
+	// the old narrow inline handlers that skipped assets/episodes/renderReadiness.
+	function _resetSceneScopedState() {
+		sceneStateText = ''; cameraSpecText = ''; renderConfig = null; syncResult = null;
+		renderReadiness = null; renderConfigError = '';
+		episodes = []; selectedEpisode = null; selectedEpisodeId = '';
+		graphPayload = null; observationScan = null;
+		graphBatch = null; graphBatchId = ''; graphBatchIds = [];
+		stopBatchPolling(); _showRoomShellUserTouched = false;
+		// Force refreshProject to reload the authoring map (it skips reload when truthy).
+		authoringMap = null;
+	}
+
+	async function selectScene(id: string) {
+		if (!id || id === sceneId) return;
+		sceneId = id;
+		_resetSceneScopedState();
+		await refreshProject();
+		if (pageMode === 'sensors') scanObservations();
+	}
+
+	async function selectProject(id: string) {
+		if (!id || id === selectedProjectId) return;
+		selectedProjectId = id;
+		_resetSceneScopedState();
+		await refreshProject();
+		if (pageMode === 'sensors') scanObservations();
 	}
 
 	async function createProject() {
@@ -2725,10 +2925,66 @@
 		const data = await run(
 			() => authoringMapService.fetchAuthoringMap(selectedProjectId, sceneId),
 			undefined,
-			'authoring-map:load'
+			'authoring-map:load',
+			{ resource: 'authoringMap' }
 		);
 		if (data) setAuthoringMapPayload(data, false);
 		await loadEnvmaps();
+	}
+
+	async function loadPerturbation(): Promise<void> {
+		if (!selectedProjectId || !sceneId) { perturbation = null; return; }
+		const data = await track('perturbation', () => getOpticalPerturbation(selectedProjectId, sceneId));
+		perturbation = data && data.exists !== false ? data : null;
+	}
+
+	async function generatePerturbation(): Promise<void> {
+		if (!requireReady(hasScene, 'Add the scene before placing optical perturbations.')) return;
+		// Regenerate → new layout: pick a fresh random seed when a perturbation already
+		// exists so the placer yields a different arrangement each click. (First
+		// "Auto-place" uses the seed the user typed.)
+		if (perturbation) perturbationSeed = Math.floor(Math.random() * 100000);
+		const data = await run(
+			() => buildOpticalPerturbation(selectedProjectId, sceneId, { seed: perturbationSeed, enabled: true }),
+			'Optical perturbation placed.',
+			'optical-perturbation',
+		);
+		if (data) perturbation = data;
+	}
+
+	async function setPerturbationEnabled(enabled: boolean): Promise<void> {
+		if (!perturbation) return;
+		const data = await run(
+			() => buildOpticalPerturbation(selectedProjectId, sceneId, { action: 'set_enabled', enabled }),
+			undefined,
+			'optical-perturbation',
+		);
+		if (data) perturbation = data;
+	}
+
+	// Sweep the render for the selected render variant(s). 'both' renders each
+	// viewpoint twice (base + perturbed) into separate output trees so the same
+	// cameras get a mirror-off and mirror-on image. Returns the last sweep result.
+	async function sweepVariants(body: Record<string, unknown>): Promise<any> {
+		const variants = renderVariant === 'both' ? ['base', 'perturbed'] : [renderVariant];
+		// Guard: a 'perturbed' sweep needs the perturbed render scene staged. Without
+		// it the daemon would (used to) silently render the base scene — a "perturbed"
+		// output identical to base. Block it here with an actionable message instead.
+		if (variants.includes('perturbed') && !perturbation?.perturbed_render_ready) {
+			const why = perturbation?.perturbed_render_stale
+				? 'perturbation을 변경한 뒤 Sync Render Scene을 다시 실행해야 합니다 (perturbed XML stale).'
+				: !perturbation?.enabled
+					? 'optical perturbation이 비활성화되어 있습니다. 활성화 후 Sync Render Scene을 실행하세요.'
+					: 'perturbed render scene이 준비되지 않았습니다. Sync Render Scene을 실행하세요.';
+			error = `Perturbed 렌더를 실행할 수 없습니다 — ${why}`;
+			pushActivity('error', 'render:variant', error);
+			throw new Error(error);
+		}
+		let last: any;
+		for (const v of variants) {
+			last = await renderService.sweepViewpointGraph(selectedProjectId, sceneId, { ...body, scene_variant_key: v });
+		}
+		return last;
 	}
 
 	async function saveAuthoringMap(options: { updateRenderReadiness?: boolean; deferRenderSync?: boolean } = {}): Promise<boolean> {
@@ -2875,6 +3131,11 @@
 			}
 			await refreshRenderSceneStats();
 			await refreshRoomShell();
+			// A sync rewrites render_scene.xml + regenerates the mesh_cache OBJs
+			// (content-hash names change), so the editor's cached xml_scene_index
+			// now points at stale digests → every preview OBJ 404s. Refetch the
+			// index here so MapEditor3D requests the freshly-staged filenames.
+			await refreshXmlSceneIndex();
 		}
 		await refreshProject();
 		if (data?.ok) await loadRenderConfig();
@@ -2882,27 +3143,22 @@
 
 	async function loadRenderReadiness() {
 		if (!selectedProjectId || !sceneId) return;
-		try {
-			renderReadiness = await renderService.fetchRenderReadiness(selectedProjectId, sceneId);
-		} catch {
-			renderReadiness = null;
-		}
+		const res = await track('renderReadiness', () => renderService.fetchRenderReadiness(selectedProjectId, sceneId));
+		renderReadiness = res ?? null;
 	}
 
 	async function loadRenderConfig() {
 		if (!selectedProjectId || !sceneId) return;
-		try {
-			const data = await renderService.fetchRenderConfig(selectedProjectId, sceneId);
-			if (data?.ok && data.scene_state && data.camera_spec) {
-				renderConfig = data;
-				renderConfigError = '';
-				sceneStateText = JSON.stringify(data.scene_state, null, 2);
-				cameraSpecText = JSON.stringify(data.camera_spec, null, 2);
-			} else if (data && !data.ok) {
-				renderConfigError = data.error ?? 'No render config available';
-			}
-		} catch (err: any) {
-			renderConfigError = err?.message ?? 'Failed to load render config';
+		const data = await track('renderConfig', () => renderService.fetchRenderConfig(selectedProjectId, sceneId));
+		if (data?.ok && data.scene_state && data.camera_spec) {
+			renderConfig = data;
+			renderConfigError = '';
+			sceneStateText = JSON.stringify(data.scene_state, null, 2);
+			cameraSpecText = JSON.stringify(data.camera_spec, null, 2);
+		} else if (data && !data.ok) {
+			renderConfigError = data.error ?? 'No render config available';
+		} else if (data === undefined && resourceStatus.renderConfig === 'error') {
+			renderConfigError = resourceError.renderConfig ?? 'Failed to load render config';
 		}
 	}
 
@@ -2976,7 +3232,7 @@
 	async function loadGraph() {
 		if (!requireReady(Boolean(selectedProjectId), 'Create or select a project first.')) return;
 		if (!requireReady(hasGraph, 'Build the viewpoint graph before loading graph JSON.')) return;
-		const data = await run(() => graphService.fetchGraph(selectedProjectId, sceneId), undefined, 'graph:load');
+		const data = await run(() => graphService.fetchGraph(selectedProjectId, sceneId), undefined, 'graph:load', { resource: 'graph' });
 		if (data) graphPayload = data;
 	}
 
@@ -3047,6 +3303,42 @@
 		pushActivity('info', 'episodes', 'Episodes cleared. Regenerate when ready.');
 	}
 
+	// On-demand episode audit: flags graph episodes whose baked path references a
+	// deleted node/edge or an edge disabled by the glass/mirror overlay. Cheaper than
+	// re-scanning on every edge delete — the user runs it after editing the graph.
+	let staleEpisodeReport = $state<any>(null);
+	let validatingEpisodes = $state(false);
+	async function validateGraphEpisodes() {
+		if (!selectedProjectId || !sceneId) return;
+		validatingEpisodes = true;
+		try {
+			const res = await episodeService.validateGraphEpisodes(selectedProjectId, sceneId, false);
+			staleEpisodeReport = res;
+			const n = res?.stale_count ?? 0;
+			pushActivity(n > 0 ? 'warn' : 'ok', 'episodes:validate',
+				n > 0 ? `${n} stale episode(s) reference removed/disabled graph edges` : `All ${res?.checked ?? 0} graph episodes are valid`);
+		} catch (err) {
+			pushActivity('error', 'episodes:validate', errorMessage(err));
+		} finally {
+			validatingEpisodes = false;
+		}
+	}
+	async function pruneStaleEpisodes() {
+		if (!selectedProjectId || !sceneId) return;
+		validatingEpisodes = true;
+		try {
+			const res = await episodeService.validateGraphEpisodes(selectedProjectId, sceneId, true);
+			pushActivity('ok', 'episodes:validate', `Removed ${res?.deleted_count ?? 0} stale episode(s)`);
+			staleEpisodeReport = null;
+			await refreshEpisodes();
+			await refreshProject();
+		} catch (err) {
+			pushActivity('error', 'episodes:validate', errorMessage(err));
+		} finally {
+			validatingEpisodes = false;
+		}
+	}
+
 	async function planGraphEpisodes() {
 		if (!requireReady(Boolean(selectedProjectId), 'Create or select a project first.')) return;
 		if (!requireReady(hasGraph, 'Build the viewpoint graph before planning graph episodes.')) return;
@@ -3071,7 +3363,7 @@
 
 	async function refreshEpisodes(options: RunOptions = {}) {
 		if (!selectedProjectId) return;
-		const data = await run(() => episodeService.fetchEpisodes(selectedProjectId), undefined, 'episodes:list', options);
+		const data = await run(() => episodeService.fetchEpisodes(selectedProjectId), undefined, 'episodes:list', { ...options, resource: 'episodes' });
 		if (!data) return;
 		const all: any[] = data.episodes ?? [];
 		episodes = sceneId ? all.filter((ep: any) => !ep.scene_id || ep.scene_id === sceneId) : all;
@@ -3151,7 +3443,7 @@
 		if (activeCameraSpec) body.camera_spec = activeCameraSpec;
 		probeRendering = true;
 		try {
-			const data = await renderService.sweepViewpointGraph(selectedProjectId, sceneId, body);
+			const data = await sweepVariants(body);
 			if (data?.batch_id) {
 				graphBatchId = data.batch_id;
 				graphBatchIds = [...new Set([...graphBatchIds, data.batch_id])];
@@ -3254,6 +3546,28 @@
 		pushActivity('info', 'graph:add-edge', `${source} → ${target} queued`);
 		pendingEdgeSource = '';
 	}
+	// Edge-erase mode: click the two endpoints of an existing edge to delete it
+	// (works for auto + manual edges, unlike the manual-edges list which only lists
+	// hand-added ones). Reuses the add-edge two-node click flow in MapEditor3D.
+	function handleRemoveEdgeFirstNode(nodeId: string) {
+		pendingEdgeSource = nodeId;
+		pushActivity('info', 'graph:remove-edge', `First node: ${nodeId}. Click the other endpoint…`);
+	}
+	function handleRemoveEdgeSecondNode(source: string, target: string) {
+		pendingEdgeSource = '';
+		if (!selectedProjectId || !sceneId) return;
+		const matches = (graphPayload?.edges ?? []).filter((e: any) =>
+			(e.source === source && e.target === target) || (e.source === target && e.target === source));
+		const deletable = matches.filter((e: any) => e?.edge_id && !String(e.edge_id).startsWith('pending:'));
+		if (deletable.length === 0) {
+			pushActivity('warn', 'graph:remove-edge', `No edge between ${source} and ${target}`);
+			return;
+		}
+		for (const e of deletable) {
+			enqueueGraphEdit({ client_op_id: nextGraphClientOpId(), type: 'delete_edge', edge_id: e.edge_id });
+		}
+		pushActivity('info', 'graph:remove-edge', `Delete queued: ${source} ↔ ${target}`);
+	}
 
 	async function deleteSelectedGraphNode() {
 		if (!selectedSensorNode || (selectedSensorNode as any).isCustom) return;
@@ -3344,15 +3658,13 @@
 			renderingViewpoint = false;
 			return;
 		}
-		const activeCameraSpec = cameraSpecFromRigSensor(activeRigSensorOption?.sensor, camera_spec);
 		const body: Record<string, unknown> = {
-			modalities: [activeRenderModality],
 			backend,
 			camera_height_m: rigMountHeightM,
 			render_settings: renderSettingsFromRigSensor(activeRigSensorOption?.sensor)
 		};
 		if (scene_state) body.scene_state = scene_state;
-		if (activeCameraSpec) body.camera_spec = activeCameraSpec;
+		applySweepSensorScope(body, camera_spec, [activeRenderModality]);
 		if (isCustom && customNode) {
 			body.custom_positions = [{ x: customNode.x, y: customNode.z, yaw_deg: customNode.headingDeg, height_m: customNode.height_m ?? rigMountHeightM }];
 		} else {
@@ -3361,7 +3673,7 @@
 			if (typeof h === 'number') body.node_heights = { [selectedSensorNode.node_id]: h };
 		}
 		try {
-			const data = await renderService.sweepViewpointGraph(selectedProjectId, sceneId, body);
+			const data = await sweepVariants(body);
 			if (data?.batch_id) {
 				graphBatchId = data.batch_id;
 				graphBatchIds = [...new Set([...graphBatchIds, data.batch_id])];
@@ -3404,15 +3716,13 @@
 			error = `Invalid render config JSON: ${errorMessage(err)}`;
 			return;
 		}
-		const activeCameraSpec = cameraSpecFromRigSensor(activeRigSensorOption?.sensor, camera_spec);
 		const body: Record<string, unknown> = {
-			modalities: [activeRenderModality],
 			backend,
 			camera_height_m: rigMountHeightM,
 			render_settings: renderSettingsFromRigSensor(activeRigSensorOption?.sensor)
 		};
 		if (scene_state) body.scene_state = scene_state;
-		if (activeCameraSpec) body.camera_spec = activeCameraSpec;
+		applySweepSensorScope(body, camera_spec, [activeRenderModality]);
 		if (Object.keys(graphNodeHeights).length) body.node_heights = { ...graphNodeHeights };
 		if (isGraphSweepRenderMode(renderMode)) {
 			if (!sceneId) return;
@@ -3426,7 +3736,7 @@
 			const successMsg = renderMode === 'episode_nodes'
 				? 'Episode path sweep submitted.'
 				: 'Graph sensor sweep submitted.';
-			const data = await run(() => renderService.sweepViewpointGraph(selectedProjectId, sceneId, body), successMsg, 'graph:sweep');
+			const data = await run(() => sweepVariants(body), successMsg, 'graph:sweep');
 			if (data?.batch_id) {
 				graphBatchId = data.batch_id;
 				graphBatchIds = [...new Set([...graphBatchIds, data.batch_id])];
@@ -3455,14 +3765,14 @@
 			);
 			let merged: any = null;
 			for (const b of batches) {
-				if (b) merged = merged ? mergeBatch(merged, b) : b;
+				if (b) merged = merged ? mergeBatch(merged, b) : normalizeBatchForDisplay(b);
 			}
 			if (merged) graphBatch = merged;
 			if ((merged?.progress?.completed ?? 0) !== prevCompleted) scanObservations();
 		} else {
 			if (!renderBatchId) return;
 			const data = await run(() => renderService.fetchRenderBatch(selectedProjectId, renderBatchId), undefined, 'batch:episodes', options);
-			if (data) renderBatch = data;
+			if (data) renderBatch = normalizeBatchForDisplay(data);
 		}
 	}
 
@@ -3698,6 +4008,30 @@
 			: episodes.length
 	);
 
+	// Single source of truth for every button's enabled state + a "why disabled"
+	// reason. Threaded into the tab components as one `caps` prop so the gating
+	// conditions can't drift apart. Gates on `actionInFlight` (not the catch-all
+	// `loading`), so data loads no longer disable the whole UI. Declared here (after
+	// all its $derived inputs) to stay clear of block-scoped use-before-declaration.
+	const caps = $derived(computeCapabilities({
+		selectedProjectId, hasScene, hasMap, hasGraph, hasEpisodes,
+		renderSceneSynced, renderConfigReady, validationPassed,
+		actionInFlight,
+		buildingMap, buildingGraph, rebuildingEdges, renderingViewpoint,
+		validatingEpisodes, findingOverlapping, removingNodes, probeRendering,
+		renderSceneStatsLoading,
+		removeSelectionCount: removeSelection.size,
+		emitterEnabledCount: enabledEmitterCount,
+		emitterDetectedCount: detectedEmitterCount,
+		currentSceneId: sceneId,
+		onlyCompleted: exportOnlyCompleted,
+		exportableEpisodeCount,
+		selectedNodeIsCustom: Boolean((selectedSensorNode as any)?.isCustom),
+		episodeNodesAvailable,
+		hotCameraPose: activeHotCameraPose,
+		failedJobCount: 0,
+	}));
+
 	async function exportDataset() {
 		if (!selectedProjectId || !sceneId) return;
 		// Scene-bundle export: always tied to the current scene. The submit
@@ -3710,6 +4044,8 @@
 				panorama_observations: exportPanoramaObservations,
 				png_only: exportPngOnly,
 				include_birdseye: exportIncludeBirdseye,
+				include_episode_birdseye: exportIncludeEpisodeBirdseye,
+				eval_perturbation: exportEvalPerturbation,
 			});
 			const jobId = (accepted as any)?.job_id;
 			if (!jobId) return;
@@ -4074,14 +4410,30 @@
 		</div>
 	</header>
 
-	{#if loadingStage}<div class="notice loading" class:background-loading={backgroundLoading}><span class="loading-spinner" aria-hidden="true"></span>{backgroundLoading ? 'Background: ' : ''}{loadingStage}</div>{/if}
 	{#if error}<div class="notice error">{error}</div>{/if}
 	{#if info}<div class="notice ok">{info}</div>{/if}
+
+	<!-- Floating load-status pill (fixed; never reflows the editor). Shows what is
+	     loading and surfaces resource errors; auto-hides when idle. -->
+	{#if loadingStage || loadingResources.length || erroredResources.length}
+		<div class="load-pill" class:has-error={erroredResources.length > 0}>
+			{#if erroredResources.length}
+				<span class="load-pill-dot error" aria-hidden="true"></span>
+				<span class="load-pill-text">Failed: {erroredResources.map((k) => resourceError[k] ? `${k} (${resourceError[k]})` : k).join(', ')}</span>
+			{:else}
+				<span class="loading-spinner" aria-hidden="true"></span>
+				<span class="load-pill-text">
+					{#if loadingResources.length}Loading {loadingResources.join(', ')}…
+					{:else}{backgroundLoading ? 'Background: ' : ''}{loadingStage}{/if}
+				</span>
+			{/if}
+		</div>
+	{/if}
 
 	<section class="panel project-strip">
 		<label>
 			<span>Project selector</span>
-			<select bind:value={selectedProjectId} onchange={refreshProject}>
+			<select value={selectedProjectId} onchange={(e) => selectProject((e.currentTarget as HTMLSelectElement).value)}>
 				<option value="">No project</option>
 				{#each projects as item}
 					<option value={item.project_id}>{item.project_id}</option>
@@ -4124,6 +4476,8 @@
 					geometryKey={`${currentUsdRef}:${assetVM.editorGeometryRefreshToken}`}
 				{authoringObjects}
 				{authoringRegions}
+				perturbationObjects={perturbation?.objects ?? []}
+				perturbationEnabled={Boolean(perturbation?.enabled)}
 				{graphNodes}
 				{graphEdges}
 				selectedId={selectedAuthoringId}
@@ -4193,14 +4547,14 @@
 				] as [number, number, number, number] : null}
 				regionSelectMode={pageMode === 'paths' && regionSelectMode}
 				onRegionSelected={(bbox) => { pendingRegionBbox = bbox; pathsMode = 'select'; }}
-				addEdgeMode={pageMode === 'paths' && (addEdgeMode || edgeInspectorMode)}
-				onEdgeFirstNode={(nid) => edgeInspectorMode ? handleInspectorFirstNode(nid) : handleEdgeFirstNode(nid)}
-				onEdgeSecondNode={(src, tgt) => edgeInspectorMode ? handleInspectorSecondNode(src, tgt) : handleEdgeSecondNode(src, tgt)}
+				addEdgeMode={pageMode === 'paths' && (addEdgeMode || edgeInspectorMode || removeEdgeMode)}
+				onEdgeFirstNode={(nid) => edgeInspectorMode ? handleInspectorFirstNode(nid) : removeEdgeMode ? handleRemoveEdgeFirstNode(nid) : handleEdgeFirstNode(nid)}
+				onEdgeSecondNode={(src, tgt) => edgeInspectorMode ? handleInspectorSecondNode(src, tgt) : removeEdgeMode ? handleRemoveEdgeSecondNode(src, tgt) : handleEdgeSecondNode(src, tgt)}
 				removeNodeMode={pageMode === 'paths' && removeNodeMode}
 				removeSelection={removeSelection}
 				onNodeToggle={toggleRemoveNode}
 				onNodesBoxSelect={addRemoveNodes}
-				addEdgeGhostColor={edgeInspectorMode ? 0xa855f7 : 0x22c55e}
+				addEdgeGhostColor={edgeInspectorMode ? 0xa855f7 : removeEdgeMode ? 0xef4444 : 0x22c55e}
 				addEdgeMaxLengthM={Number(maxEdgeLength)}
 				roomShell={roomShell}
 				showRoomShell={showRoomShell}
@@ -4212,8 +4566,9 @@
 				traversableOverlayUrl={pageMode === 'paths' && showTraversableMask && traversableMeta?.png_url ? `${traversableMeta.png_url}&v=${traversableVersion}` : null}
 				traversableOverlayBbox={pageMode === 'paths' && showTraversableMask && traversableMeta?.bbox ? traversableMeta.bbox : null}
 				onFrustumClick={(vpId, headingId) => {
-					lightboxUrl = opticalNavObservationModalityUrl(selectedProjectId, sceneId, vpId, headingId, activeRenderModality, activeRigSensorId);
-					lightboxLabel = `${vpId} · ${headingId} · ${activeRigSensorId || 'legacy'} · ${activeRenderModality}`;
+					const modality = activeRenderModality;
+					lightboxUrl = opticalNavObservationModalityUrl(selectedProjectId, sceneId, vpId, headingId, modality, activeRigSensorId);
+					lightboxLabel = `${vpId} · ${headingId} · ${activeRigSensorId || 'legacy'} · ${modality}`;
 				}}
 			/>
 
@@ -4354,6 +4709,7 @@
 			<!-- Export mode panel -->
 			{#if pageMode === 'export'}
 				<ExportPanel
+					{caps}
 					{hasScene} {hasMap} {hasGraph} {hasEpisodes} {validationPassed}
 					{effectiveRenderReadiness} {validationReport} {graphPayloadSummary}
 					{splitCounts} {allEpisodePaths} {exportPath} {loading}
@@ -4364,6 +4720,8 @@
 					bind:panoramaObservations={exportPanoramaObservations}
 				bind:pngOnly={exportPngOnly}
 				bind:includeBirdseye={exportIncludeBirdseye}
+				bind:includeEpisodeBirdseye={exportIncludeEpisodeBirdseye}
+				bind:evalPerturbation={exportEvalPerturbation}
 					currentSceneId={sceneId}
 					{exportableEpisodeCount}
 					exportSummary={exportResult}
@@ -4436,7 +4794,7 @@
 					{#if projectScenes.length > 0}
 						<label>
 							<span>scene</span>
-							<select class="scene-select" value={sceneId} onchange={(e) => { sceneId = e.currentTarget.value; sceneStateText = ''; cameraSpecText = ''; renderConfig = null; syncResult = null; renderReadiness = null; renderConfigError = ''; loadAuthoringMap(); loadRenderConfig(); episodes = []; selectedEpisode = null; selectedEpisodeId = ''; graphPayload = null; observationScan = null; graphBatch = null; graphBatchId = ''; graphBatchIds = []; stopBatchPolling(); _showRoomShellUserTouched = false; if (pageMode === 'sensors') scanObservations(); }}>
+							<select class="scene-select" value={sceneId} onchange={(e) => selectScene(e.currentTarget.value)}>
 								{#each projectScenes as item}
 									<option value={item.scene_id}>{item.scene_id}</option>
 								{/each}
@@ -4742,6 +5100,7 @@
 
 		{#if railTab === 'paths'}
 			<RailPathsTab
+				{caps}
 				{hasMap} {hasGraph} {hasScene} {selectedProjectId} {sceneId} {loading}
 				{buildingMap} {buildingGraph} {graphBuildProgress} {graphResult} {mapResult}
 				{graphPayloadSummary} {graphPayload} graphNodes={graphNodes} graphEdges={graphEdges}
@@ -4781,6 +5140,10 @@
 				onLoadEpisode={loadEpisode}
 				onGenerateEpisodes={planGraphEpisodes}
 				onClearEpisodes={clearEpisodes}
+				onValidateEpisodes={validateGraphEpisodes}
+				onPruneStaleEpisodes={pruneStaleEpisodes}
+				staleEpisodeReport={staleEpisodeReport}
+				validatingEpisodes={validatingEpisodes}
 				onSetEpisodeSearch={(v) => (episodeSearch = v)}
 				onSetEpisodeCount={(n) => (episodeCount = n)}
 				onSetRobotRadius={(v) => (robotRadius = v)}
@@ -4792,6 +5155,7 @@
 				onRenderEpisodeNodes={() => renderEpisodes('episode_nodes')}
 				{episodeNodesAvailable}
 				{episodePathNodeCount}
+				selectedRigSensorCount={selectedRigSensorIds.length || 1}
 				{renderMissingOnly}
 				onSetRenderMissingOnly={(v) => (renderMissingOnly = v)}
 				headingsPerNode={graphPayload?.node_heading_count ?? 0}
@@ -4801,6 +5165,7 @@
 
 			{#if railTab === 'sensors'}
 				<RailSensorsTab
+					{caps}
 					{renderSceneSynced}
 					globalCameraRig={assetVM.globalCameraRig}
 					globalCameraRigStatus={assetVM.globalCameraRigStatus}
@@ -4810,13 +5175,24 @@
 				{sceneStateText} {cameraSpecText} {renderConfig}
 				{observationScan} {graphBatch} {sensorRenderResult} {renderingViewpoint}
 				{placingSensor} {frustumMode} {ambientRadiance} {activeModalityTab}
-				{activeRigSensorOption} {rigMountHeightM} {authoringMap}
+				{activeRigSensorOption} {activeCameraFrustum} {activeRenderModality}
+				hotCameraPose={activeHotCameraPose}
+				{previewBandMode} {previewMeasuredScope}
+				{probeRendering} {probeError}
+				{rigMountHeightM} {authoringMap}
 				{selectedProjectId} {sceneId} {loading} {hasScene} {hasGraph}
 				{renderSceneStats} {renderSceneStatsLoading}
 				{showRoomShell} {roomShell}
 				{editorObjectsCount} {editorEmitterCount} {editorMaterialCount}
 				onLoadGlobalCameraRig={loadGlobalCameraRig}
 				onSelectRigSensor={selectRigRenderSensor}
+				{selectedRigSensorIds}
+				onToggleRigSweepSensor={toggleRigSweepSensor}
+				onSetRigSweepSensors={(ids) => {
+					const validIds = new Set(rigSensorOptions.map((option: any) => String(option.sensor_id)));
+					const next = ids.map((id) => String(id)).filter((id) => validIds.has(id));
+					selectedRigSensorIds = next.length ? next : (activeRigSensorId ? [activeRigSensorId] : []);
+				}}
 				onSetFrustumMode={(m) => (frustumMode = m as 'none' | 'view-aligned' | 'selected')}
 				onTogglePlacingSensor={() => { placingSensor = !placingSensor; selectedSensorNodeId = ''; }}
 				onRemoveCustomSensor={(id) => { customSensorNodes = customSensorNodes.filter(n => n.id !== id); selectedSensorNodeId = ''; }}
@@ -4827,8 +5203,17 @@
 				onClearNodeObservations={clearNodeObservations}
 				onClearAllObservations={clearAllObservations}
 				onRenderViewpoint={renderSensorViewpoint}
+				onRunProbe={renderHotCameraPreview}
 				onRenderEpisodes={() => renderEpisodes('graph_sweep')}
 				onRenderEpisodeNodes={() => renderEpisodes('episode_nodes')}
+				{renderVariant}
+				perturbationEnabled={Boolean(perturbation?.enabled)}
+				perturbedRenderReady={Boolean(perturbation?.perturbed_render_ready)}
+				perturbedRenderStale={Boolean(perturbation?.perturbed_render_stale)}
+				onSetRenderVariant={(v) => (renderVariant = v)}
+				onSetPreviewBandMode={(v) => (previewBandMode = v)}
+				onSetPreviewMeasuredScope={(v) => (previewMeasuredScope = v)}
+				onSetActiveModalityTab={(v) => (activeModalityTab = v)}
 				{episodeNodesAvailable}
 				{episodePathNodeCount}
 				{renderMissingOnly}
@@ -4842,6 +5227,7 @@
 
 		{#if railTab === 'lights'}
 			<RailLightsTab
+				{caps}
 				{authoringMap} {detectedEmitterIds} {detectedEmitterCount} {enabledEmitterCount}
 				{hasScene} {saving}
 				onEnableAll={enableAllDetectedEmitters}
@@ -4856,17 +5242,15 @@
 
 		{#if railTab === 'preview'}
 			<RailPreviewTab
+				{caps}
 				hotCameraPose={activeHotCameraPose}
 				{hotCameraPoses} {activeHotCameraId}
 				{activeRigSensorOption} {activeCameraFrustum} {activeRenderModality}
-				{previewBandMode} onSetPreviewBandMode={(v) => (previewBandMode = v)}
-				{probeRendering} {probeError} {probeResult} {activeRigSensorId}
+				{probeResult} {activeRigSensorId}
 				{selectedProjectId} {sceneId}
 				{editorObjectsCount} {editorEmitterCount} {editorMaterialCount}
 				{renderSceneStats} {renderSceneStatsLoading}
 				{showRoomShell} {roomShell} {rigMountHeightM} {authoringMap}
-				{hasScene} {loading}
-				onRunProbe={renderHotCameraPreview}
 				onRefreshBatch={() => refreshBatch()}
 				onRefreshStats={refreshRenderSceneStats}
 				onSetShowRoomShell={(v) => { showRoomShell = v; _showRoomShellUserTouched = true; }}
@@ -4876,6 +5260,7 @@
 
 		{#if railTab === 'export'}
 			<RailExportTab
+				{caps}
 				{hasScene} {hasMap} {hasGraph} {hasEpisodes} {validationPassed}
 				{renderSceneSynced} {effectiveRenderReadiness} {currentScene}
 				{rigSensorOptions} {graphPayloadSummary}
@@ -4888,6 +5273,8 @@
 				bind:panoramaObservations={exportPanoramaObservations}
 				bind:pngOnly={exportPngOnly}
 				bind:includeBirdseye={exportIncludeBirdseye}
+				bind:includeEpisodeBirdseye={exportIncludeEpisodeBirdseye}
+				bind:evalPerturbation={exportEvalPerturbation}
 				currentSceneId={sceneId}
 				{exportableEpisodeCount}
 				exportSummary={exportResult}
@@ -4901,6 +5288,7 @@
 
 		{#if railTab === 'scene'}
 			<RailSceneTab
+				{caps}
 				{sceneId} {projectScenes} {selectedProjectId} {hasScene}
 				{authoringMapDirty} {authoringMapText} {annotationText}
 				{authoringMap} {currentScene} {detectedEmitterCount} {enabledEmitterCount}
@@ -4908,7 +5296,7 @@
 				loading={loading || saving}
 					envmapFiles={assetVM.envmapFiles}
 					envmapUploading={assetVM.envmapUploading}
-				onSceneChange={(id) => { sceneId = id; sceneStateText = ''; cameraSpecText = ''; renderConfig = null; syncResult = null; renderReadiness = null; renderConfigError = ''; loadAuthoringMap(); loadRenderConfig(); episodes = []; selectedEpisode = null; selectedEpisodeId = ''; graphPayload = null; observationScan = null; graphBatch = null; graphBatchId = ''; graphBatchIds = []; stopBatchPolling(); _showRoomShellUserTouched = false; if (pageMode === 'sensors') scanObservations(); }}
+				onSceneChange={(id) => selectScene(id)}
 				onSetMapWidth={setMapWidthFromInput}
 				onSetMapHeight={setMapHeightFromInput}
 				onTranslateLayout={translateLayout}
@@ -4917,6 +5305,11 @@
 				onSaveMap={saveMap}
 				onEnableAllEmitters={enableAllDetectedEmitters}
 				onDisableAllEmitters={disableAllEmitters}
+				{perturbation}
+				{perturbationSeed}
+				onGeneratePerturbation={generatePerturbation}
+				onSetPerturbationEnabled={setPerturbationEnabled}
+				onSetPerturbationSeed={(s) => (perturbationSeed = s)}
 				onUpdateEnvironmentField={updateEnvironmentField}
 				onUpdateSettingsField={updateSettingsField}
 				onUploadEnvmap={uploadEnvmapFromInput}
@@ -4934,6 +5327,7 @@
 {#snippet datasetBottomContent()}
 	<BottomPanel
 		bottomPanelCollapsed={$bottomPanelCollapsed}
+		{actionInFlight}
 		{activeBatch} {renderMode}
 		{selectedBatchJobId} {selectedBatchJob} {selectedBatchJobLog} {selectedBatchJobLoading}
 		{selectedBatchJobImageUrl}
@@ -4951,6 +5345,46 @@
 
 <style>
 	:global {
+
+	/* --- Floating load-status pill --- */
+	.load-pill {
+		position: fixed;
+		right: 16px;
+		bottom: 64px; /* clear the bottom Render Monitor bar */
+		z-index: 60;
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		max-width: 360px;
+		padding: 7px 12px;
+		border-radius: 999px;
+		background: var(--surface, #fff);
+		border: 1px solid var(--border, #e2e2e2);
+		box-shadow: 0 4px 16px rgba(0, 0, 0, 0.12);
+		font-size: 12px;
+		color: var(--text-2, #555);
+		pointer-events: none; /* purely informational; don't block the canvas */
+		animation: load-pill-in 0.18s ease-out;
+	}
+	.load-pill.has-error {
+		background: #fee2e2;
+		border-color: #fca5a5;
+		color: #991b1b;
+		pointer-events: auto;
+	}
+	.load-pill-text {
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+	.load-pill-dot {
+		width: 8px; height: 8px; border-radius: 50%; flex: none;
+	}
+	.load-pill-dot.error { background: #dc2626; }
+	@keyframes load-pill-in {
+		from { opacity: 0; transform: translateY(6px); }
+		to { opacity: 1; transform: translateY(0); }
+	}
 
 	/* --- Mode bar --- */
 	.mode-bar {

@@ -22,7 +22,7 @@ from navigation_dataset.edge_builder import build_viewpoint_edges  # noqa: E402
 from navigation_dataset.graph_episode_sampler import plan_graph_episodes, shortest_graph_path, write_graph_episodes  # noqa: E402
 from navigation_dataset.node_sampler import heading_sweep, sample_viewpoint_nodes  # noqa: E402
 from navigation_dataset.scene_annotations import GoalRegion, HazardRegion, SceneAnnotation, TraversableRegion, write_scene_annotation  # noqa: E402
-from navigation_dataset.sensor_sweep import build_custom_position_render_requests, build_sweep_render_requests, render_viewpoint_sweep_direct  # noqa: E402
+from navigation_dataset.sensor_sweep import build_custom_position_render_requests, build_sweep_render_requests, render_viewpoint_sweep_direct, split_sweep_requests_by_modality_phase  # noqa: E402
 from navigation_dataset.traversability import build_traversability_grid, save_traversability_grid  # noqa: E402
 from navigation_dataset.validation import validate_dataset  # noqa: E402
 from navigation_dataset.viewpoint_graph import (  # noqa: E402
@@ -216,6 +216,153 @@ class ViewpointGraphTests(unittest.TestCase):
             self.assertTrue(restored.path_nodes)
             report = validate_dataset(root, require_observations=True)
             self.assertTrue(report.ok, report.errors)
+
+    def test_multi_sensor_sweep_request_groups_rig_cameras_per_heading(self) -> None:
+        graph = ViewpointGraph(
+            scene_id="rig_room",
+            graph_id="rig_graph",
+            node_heading_count=1,
+            nodes=[ViewpointNode(node_id="vp_000", position=[1.0, 2.0, 0.0], headings=[ViewpointHeading(heading_id="h_000", yaw_deg=0.0)])],
+        )
+        scene_state = {
+            "job_id": "job-rig",
+            "scene_id": "rig_room",
+            "frame_id": "frame_0",
+            "timestamp": "2026-05-27T00:00:00+00:00",
+            "scene_snapshot_ref": "snapshot/scene.json",
+            "mitsuba_scene_ref": "scene.xml",
+        }
+        base_camera = {
+            "camera_id": "front",
+            "name": "front",
+            "camera_to_world": [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1],
+            "fov_deg": 70.0,
+        }
+        camera_specs = [
+            {
+                **base_camera,
+                "camera_id": "rgb_left",
+                "resolution": [320, 256],
+                "extras": {"robot_mount": {"xyz_m": [-0.2, 1.5, 0.0]}, "render_modalities": ["rgb"], "render": {"path_spp": 2048}},
+            },
+            {
+                **base_camera,
+                "camera_id": "polar_center",
+                "resolution": [640, 512],
+                "extras": {
+                    "robot_mount": {"xyz_m": [0.0, 1.5, 0.0]},
+                    "render_modalities": ["polar_rgb_preview"],
+                    "render": {"path_spp": 4096, "polar_spp": 256},
+                },
+            },
+        ]
+
+        requests = build_sweep_render_requests(
+            graph,
+            scene_state_payload=scene_state,
+            camera_spec_payload=base_camera,
+            camera_specs_payload=camera_specs,
+            sensor_scope="all_rig",
+            modalities=["rgb"],
+        )
+
+        self.assertEqual(len(requests), 1)
+        request = requests[0].request
+        self.assertEqual([cam.camera_id for cam in request.camera_specs], ["rgb_left", "polar_center"])
+        self.assertEqual(request.modalities, ["rgb", "polar_rgb_preview", "s1_over_s0", "s2_over_s0", "dop", "aolp", "s1", "s2"])
+        self.assertEqual(request.extras["sensor_count"], 2)
+        self.assertEqual(request.extras["modalities_by_sensor"]["rgb_left"], ["rgb"])
+        self.assertEqual(request.extras["modalities_by_sensor"]["polar_center"], ["polar_rgb_preview", "s1_over_s0", "s2_over_s0", "dop", "aolp", "s1", "s2"])
+        self.assertIn("vp_000-h_000", request.job_id)
+        self.assertNotIn("rgb_left", request.job_id)
+
+    def test_mixed_rgb_polar_sweep_can_split_into_modality_phases(self) -> None:
+        graph = ViewpointGraph(
+            scene_id="rig_room",
+            graph_id="rig_graph",
+            node_heading_count=1,
+            nodes=[ViewpointNode(node_id="vp_000", position=[1.0, 2.0, 0.0], headings=[ViewpointHeading(heading_id="h_000", yaw_deg=0.0)])],
+        )
+        scene_state = {
+            "job_id": "job-rig",
+            "scene_id": "rig_room",
+            "frame_id": "frame_0",
+            "timestamp": "2026-05-27T00:00:00+00:00",
+            "scene_snapshot_ref": "snapshot/scene.json",
+            "mitsuba_scene_ref": "scene.xml",
+        }
+        base_camera = {
+            "camera_id": "front",
+            "name": "front",
+            "camera_to_world": [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1],
+            "fov_deg": 70.0,
+        }
+        camera_specs = [
+            {**base_camera, "camera_id": "rgb_left", "extras": {"render_modalities": ["rgb"]}},
+            {**base_camera, "camera_id": "rgb_right", "extras": {"render_modalities": ["rgb"]}},
+            {**base_camera, "camera_id": "polar_center", "sensor_modality": "polarization", "extras": {"render_modalities": ["polar_rgb_preview"]}},
+        ]
+
+        requests = build_sweep_render_requests(
+            graph,
+            scene_state_payload=scene_state,
+            camera_spec_payload=base_camera,
+            camera_specs_payload=camera_specs,
+            sensor_scope="all_rig",
+            modalities=["rgb"],
+        )
+        phases = split_sweep_requests_by_modality_phase(requests, sweep_execution_policy="modality_phases")
+
+        self.assertEqual([phase.phase for phase in phases], ["rgb", "polar"])
+        rgb_request = phases[0].requests[0].request
+        polar_request = phases[1].requests[0].request
+        self.assertEqual([cam.camera_id for cam in rgb_request.camera_specs], ["rgb_left", "rgb_right"])
+        self.assertEqual([cam.camera_id for cam in polar_request.camera_specs], ["polar_center"])
+        self.assertEqual(rgb_request.frame_id, polar_request.frame_id)
+        self.assertTrue(rgb_request.job_id.endswith("-rgb"))
+        self.assertTrue(polar_request.job_id.endswith("-polar"))
+        self.assertNotEqual(rgb_request.job_id, polar_request.job_id)
+        self.assertEqual(rgb_request.modalities, ["rgb"])
+        self.assertIn("s1_over_s0", polar_request.modalities)
+        self.assertEqual(polar_request.extras["phase_sensor_ids"], ["polar_center"])
+
+    def test_auto_sweep_policy_keeps_rgb_only_rig_per_view(self) -> None:
+        graph = ViewpointGraph(
+            scene_id="rig_room",
+            graph_id="rig_graph",
+            node_heading_count=1,
+            nodes=[ViewpointNode(node_id="vp_000", position=[1.0, 2.0, 0.0], headings=[ViewpointHeading(heading_id="h_000", yaw_deg=0.0)])],
+        )
+        scene_state = {
+            "job_id": "job-rig",
+            "scene_id": "rig_room",
+            "frame_id": "frame_0",
+            "timestamp": "2026-05-27T00:00:00+00:00",
+            "scene_snapshot_ref": "snapshot/scene.json",
+            "mitsuba_scene_ref": "scene.xml",
+        }
+        base_camera = {
+            "camera_id": "front",
+            "name": "front",
+            "camera_to_world": [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1],
+            "fov_deg": 70.0,
+        }
+        requests = build_sweep_render_requests(
+            graph,
+            scene_state_payload=scene_state,
+            camera_spec_payload=base_camera,
+            camera_specs_payload=[
+                {**base_camera, "camera_id": "rgb_left", "extras": {"render_modalities": ["rgb"]}},
+                {**base_camera, "camera_id": "rgb_right", "extras": {"render_modalities": ["rgb"]}},
+            ],
+            sensor_scope="all_rig",
+            modalities=["rgb"],
+        )
+        phases = split_sweep_requests_by_modality_phase(requests, sweep_execution_policy="auto")
+
+        self.assertEqual(len(phases), 1)
+        self.assertEqual(phases[0].phase, "per_view")
+        self.assertEqual([cam.camera_id for cam in phases[0].requests[0].request.camera_specs], ["rgb_left", "rgb_right"])
 
     def test_custom_position_preview_metadata_is_preserved(self) -> None:
         scene_state = {
@@ -442,6 +589,144 @@ class RotationPathExpansionTests(unittest.TestCase):
                                     scenario="goal_only", modalities=["rgb"], observations_root=obs_root)
             refs = [t.observation_bundle_ref for t in ep.timesteps if t.extras.get("heading_id") == "h_000"]
             self.assertTrue(refs and all(r and "scenes/scn/observations/" in r for r in refs))
+
+
+class TestEdgeBuilderWallGate(unittest.TestCase):
+    def test_regular_edges_skip_walls_but_keep_doorways(self):
+        import numpy as np
+        from navigation_dataset.traversability import GridSpec, TraversabilityGrid
+
+        spec = GridSpec(width=40, height=20, resolution=0.1, origin=(0.0, 0.0), scene_id="t")
+        grid = TraversabilityGrid(spec=spec, traversable=np.ones((20, 40), bool),
+                                  hazard=np.zeros((20, 40), bool))
+        wall = np.zeros((20, 40), dtype=bool)
+        wall[:, 15] = True            # wall at x≈1.5 ...
+        wall[13:18, 15] = False       # ... with a doorway gap at y∈[1.3,1.7]
+        nodes = [
+            ViewpointNode(node_id="L1", position=[1.0, 0.5, 0.0], headings=heading_sweep(1)),
+            ViewpointNode(node_id="R1", position=[2.0, 0.5, 0.0], headings=heading_sweep(1)),  # across wall
+            ViewpointNode(node_id="L2", position=[1.0, 1.5, 0.0], headings=heading_sweep(1)),
+            ViewpointNode(node_id="R2", position=[2.0, 1.5, 0.0], headings=heading_sweep(1)),  # across doorway
+        ]
+        edges = build_viewpoint_edges(grid, nodes, max_edge_length_m=1.5, wall_mask=wall)
+        pairs = {tuple(sorted((e.source, e.target))) for e in edges}
+        self.assertIn(("L2", "R2"), pairs, "doorway edge should be kept")
+        self.assertNotIn(("L1", "R1"), pairs, "through-wall edge must be dropped")
+        # Same nodes WITHOUT a wall mask: the through-wall edge is created (legacy).
+        legacy = {tuple(sorted((e.source, e.target)))
+                  for e in build_viewpoint_edges(grid, nodes, max_edge_length_m=1.5)}
+        self.assertIn(("L1", "R1"), legacy)
+
+
+class TestConnectivityRepairWallGate(unittest.TestCase):
+    def test_repair_bridges_through_doorway_not_wall(self):
+        """A wall between two rooms with a doorway gap: repair must connect the pair
+        whose straight line threads the doorway, never the pair that crosses the wall."""
+        import numpy as np
+        from navigation_dataset.traversability import GridSpec, TraversabilityGrid
+        from navigation_dataset.graph_pipeline import _repair_connectivity, _max_wall_run_cells
+
+        spec = GridSpec(width=40, height=20, resolution=0.1, origin=(0.0, 0.0), scene_id="t")
+        traversable = np.ones((20, 40), dtype=bool)          # open floor (no grid gap)
+        grid = TraversabilityGrid(spec=spec, traversable=traversable,
+                                  hazard=np.zeros((20, 40), bool))
+        # Vertical wall at x≈1.5 (col 15) with a doorway gap at y∈[1.3,1.7] (rows 13-17).
+        wall = np.zeros((20, 40), dtype=bool)
+        wall[:, 15] = True
+        wall[13:18, 15] = False
+
+        def node(nid, x, y):
+            return ViewpointNode(node_id=nid, position=[x, y, 0.0],
+                                 headings=heading_sweep(1))
+        # Left room {L1,L2} and right room {R1,R2}; L1↔R1 cross the solid wall (y=0.5),
+        # L2↔R2 cross the doorway (y=1.5). Both cross-pairs are 1.0 m apart.
+        graph = ViewpointGraph(
+            scene_id="t", graph_id="g", node_heading_count=1,
+            nodes=[node("L1", 1.0, 0.5), node("L2", 1.0, 1.5),
+                   node("R1", 2.0, 0.5), node("R2", 2.0, 1.5)],
+            edges=[ViewpointEdge(edge_id="L", source="L1", target="L2", distance_m=1.0, weight=1.0),
+                   ViewpointEdge(edge_id="R", source="R1", target="R2", distance_m=1.0, weight=1.0)],
+        )
+        # Sanity: the discriminator sees the wall on L1-R1 and a clear doorway on L2-R2.
+        self.assertGreater(_max_wall_run_cells(wall, spec, [1.0, 0.5], [2.0, 0.5]), 0)
+        self.assertEqual(_max_wall_run_cells(wall, spec, [1.0, 1.5], [2.0, 1.5]), 0)
+
+        _repair_connectivity(graph, grid, wall_mask=wall, heading_count=1)
+        pairs = {tuple(sorted((e.source, e.target))) for e in graph.edges}
+        self.assertIn(("L2", "R2"), pairs, "should bridge through the doorway")
+        self.assertNotIn(("L1", "R1"), pairs, "must not bridge through the wall")
+        # Whatever bridges were added, none may cross body-height wall.
+        pos = {n.node_id: n.position for n in graph.nodes}
+        for e in graph.edges:
+            self.assertEqual(
+                _max_wall_run_cells(wall, spec, list(pos[e.source][:2]), list(pos[e.target][:2])), 0,
+                f"edge {e.edge_id} crosses a wall")
+
+    def test_no_wall_mask_keeps_legacy_behaviour(self):
+        """Without a wall mask (e.g. non-Infinigen scenes) repair still bridges."""
+        import numpy as np
+        from navigation_dataset.traversability import GridSpec, TraversabilityGrid
+        from navigation_dataset.graph_pipeline import _repair_connectivity
+
+        spec = GridSpec(width=40, height=20, resolution=0.1, origin=(0.0, 0.0), scene_id="t")
+        grid = TraversabilityGrid(spec=spec, traversable=np.ones((20, 40), bool),
+                                  hazard=np.zeros((20, 40), bool))
+        graph = ViewpointGraph(
+            scene_id="t", graph_id="g", node_heading_count=1,
+            nodes=[ViewpointNode(node_id="A", position=[1.0, 1.0, 0.0], headings=heading_sweep(1)),
+                   ViewpointNode(node_id="B", position=[2.0, 1.0, 0.0], headings=heading_sweep(1))],
+            edges=[],
+        )
+        s, _ = _repair_connectivity(graph, grid, wall_mask=None, heading_count=1)
+        self.assertTrue(graph.edges, "repair should still connect the two nodes")
+
+
+class TestGraphEpisodeStaleRefs(unittest.TestCase):
+    def _graph(self):
+        def mk(nid, x, y):
+            hs = [ViewpointHeading(heading_id=f"h_{int(round(i * 30)):03d}", yaw_deg=float(i * 30)) for i in range(12)]
+            return ViewpointNode(node_id=nid, position=[x, y, 0.0], headings=hs)
+        # A-B-C chain.
+        return ViewpointGraph(
+            scene_id="scn", graph_id="g", node_heading_count=12,
+            nodes=[mk("A", 0.0, 0.0), mk("B", 0.0, 1.0), mk("C", 0.0, 2.0)],
+            edges=[ViewpointEdge(edge_id="ab", source="A", target="B", distance_m=1.0, weight=1.0),
+                   ViewpointEdge(edge_id="bc", source="B", target="C", distance_m=1.0, weight=1.0)],
+        )
+
+    def test_plan_excludes_disabled_edges(self):
+        # Disabling B-C leaves the planner unable to reach C — no episode may traverse it.
+        graph = self._graph()
+        eps = plan_graph_episodes(
+            graph=graph, num_pairs=3, split_counts={"train": 3}, scenarios=["goal_only"],
+            modalities=["rgb"], seed=1, excluded_edge_ids={"bc"},
+        )
+        for ep in eps:
+            self.assertNotIn("C", ep.path_nodes, "episode routed through the disabled B-C edge")
+
+    def test_stale_refs_detects_missing_and_disabled(self):
+        from navigation_dataset.graph_episode_sampler import graph_episode_stale_refs
+        node_ids = {"A", "B", "C"}
+        edge_pairs = {("A", "B"), ("B", "C")}
+        r = graph_episode_stale_refs(
+            {"navigation_mode": "viewpoint_graph", "path_nodes": ["A", "Z"]},
+            node_ids=node_ids, edge_pairs=edge_pairs)
+        self.assertTrue(r["stale"])
+        self.assertEqual(r["missing_nodes"], ["Z"])
+        r = graph_episode_stale_refs(
+            {"navigation_mode": "viewpoint_graph", "path_nodes": ["A", "C"]},
+            node_ids=node_ids, edge_pairs=edge_pairs)
+        self.assertEqual(r["missing_edges"], [["A", "C"]])
+        r = graph_episode_stale_refs(
+            {"navigation_mode": "viewpoint_graph", "path_nodes": ["B", "C"]},
+            node_ids=node_ids, edge_pairs=edge_pairs, disabled_pairs={("B", "C")})
+        self.assertEqual(r["disabled_edges"], [["B", "C"]])
+        self.assertFalse(graph_episode_stale_refs(
+            {"navigation_mode": "viewpoint_graph", "path_nodes": ["A", "B", "C"]},
+            node_ids=node_ids, edge_pairs=edge_pairs)["stale"])
+        self.assertFalse(graph_episode_stale_refs(
+            {"navigation_mode": "grid", "path_nodes": ["Z"]},
+            node_ids=node_ids, edge_pairs=edge_pairs)["stale"])
 
 
 if __name__ == "__main__":

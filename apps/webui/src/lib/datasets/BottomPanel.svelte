@@ -21,6 +21,9 @@
 		batchLogEntries: any[];
 		activityLog: any[];
 		loading: boolean;
+		/** A user mutation is running. Gates Refresh/Retry instead of the broad
+		 * `loading` (which is true during initial data loads too). */
+		actionInFlight?: boolean;
 		onTogglePanel: () => void;
 		onRefreshBatch: () => void;
 		onSelectBatchJob: (job: any) => void;
@@ -35,7 +38,7 @@
 		bottomPanelCollapsed, activeBatch, renderMode,
 		selectedBatchJobId, selectedBatchJob,
 		selectedBatchJobLog, selectedBatchJobLoading, selectedBatchJobImageUrl,
-		batchLogEntries, activityLog, loading,
+		batchLogEntries, activityLog, loading, actionInFlight = false,
 		onTogglePanel, onRefreshBatch, onSelectBatchJob,
 		onCancelStaleBatchJobs, onCloseJobDetail,
 		onRetryJob, onCancelJob, onRefreshSelectedJobLog,
@@ -94,9 +97,9 @@
 				<button class:active={activeTab === 'logs'} onclick={() => activeTab = 'logs'}>Logs</button>
 			</nav>
 			<div class="monitor-actions">
-				<button class="button button-subtle" disabled={loading} onclick={onRefreshBatch}>Refresh</button>
+				<button class="button button-subtle" disabled={actionInFlight} onclick={onRefreshBatch}>Refresh</button>
 				<button class="button button-subtle" disabled={!hasActiveJobs} onclick={onCancelStaleBatchJobs}>Cancel queued</button>
-				<button class="button button-primary" disabled={failedJobs.length === 0 || loading} onclick={retryFailedJobs}>Retry failed ({failedJobs.length})</button>
+				<button class="button button-primary" disabled={failedJobs.length === 0 || actionInFlight} onclick={retryFailedJobs}>Retry failed ({failedJobs.length})</button>
 				<div class="size-controls" aria-label="Panel size">
 					<button class:active={$bottomPanelMode === 'expanded'} onclick={() => setMode('expanded')}>M</button>
 					<button class:active={$bottomPanelMode === 'maximized'} onclick={() => setMode('maximized')}>L</button>
