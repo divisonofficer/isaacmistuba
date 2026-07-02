@@ -59,8 +59,12 @@
 	import BottomPanel from '$lib/datasets/BottomPanel.svelte';
 	import RailSceneTab from '$lib/datasets/RailSceneTab.svelte';
 	import RailSensorsTab from '$lib/datasets/RailSensorsTab.svelte';
+	import RailSyncInspectorTab from '$lib/datasets/RailSyncInspectorTab.svelte';
 	import RailPathsTab from '$lib/datasets/RailPathsTab.svelte';
+	import InitStatusDashboard from '$lib/datasets/InitStatusDashboard.svelte';
 	import RailSelectedTab from '$lib/datasets/RailSelectedTab.svelte';
+	import RailMaterialsTab from '$lib/datasets/RailMaterialsTab.svelte';
+	import MaterialInspector from '$lib/datasets/MaterialInspector.svelte';
 	import {
 		makeStarterAuthoringMap,
 		makeVisibleStarterAuthoringMap,
@@ -138,6 +142,7 @@
 		syncOpticalNavIsaacStage,
 		syncOpticalNavRenderScene,
 		getOpticalPerturbation,
+		getEpisodePlanProgress,
 		buildOpticalPerturbation,
 		opticalNavSyncProgressWsUrl,
 		sweepOpticalNavViewpointGraph,
@@ -239,16 +244,54 @@
 	// track() drives per-resource status. A loader can use both.
 	async function track<T>(key: ResourceKey, fn: () => Promise<T>): Promise<T | undefined> {
 		resourceStatus[key] = 'loading';
-		try {
-			const r = await fn();
-			resourceStatus[key] = 'ready';
-			delete resourceError[key];
-			return r;
-		} catch (err) {
-			resourceStatus[key] = 'error';
-			resourceError[key] = errorMessage(err);
-			return undefined;
+		for (let attempt = 0; ; attempt++) {
+			try {
+				const r = await fn();
+				resourceStatus[key] = 'ready';
+				delete resourceError[key];
+				return r;
+			} catch (err) {
+				const msg = errorMessage(err);
+				// A hard refresh fires many requests before the daemon/connection is
+				// ready → transient "Failed to fetch" / network errors. Auto-retry those
+				// a couple times with backoff so a momentary blip on e.g. xmlSceneIndex
+				// doesn't permanently break mesh loading.
+				const transient = /failed to fetch|networkerror|load failed|connection|fetch failed|err_|50[234]/i.test(msg);
+				if (transient && attempt < 2) {
+					await new Promise((res) => setTimeout(res, 350 * (attempt + 1)));
+					resourceStatus[key] = 'loading';
+					continue;
+				}
+				resourceStatus[key] = 'error';
+				resourceError[key] = msg;
+				return undefined;
+			}
 		}
+	}
+
+	// Re-run a single resource's loader (dashboard "Retry"). Keyed to the same
+	// loaders the initial load uses.
+	function retryResource(key: string) {
+		const loaders: Partial<Record<ResourceKey, () => unknown>> = {
+			projects: () => refreshProjects(),
+			project: () => refreshProject(),
+			authoringMap: () => refreshProject(),
+			graph: () => loadGraph(),
+			episodes: () => refreshEpisodes({ background: true }),
+			renderReadiness: () => loadRenderReadiness(),
+			renderConfig: () => loadRenderConfig(),
+			mapAssets: () => loadMapAssets(),
+			envmaps: () => loadEnvmaps(),
+			perturbation: () => loadPerturbation(),
+			renderSceneStats: () => refreshRenderSceneStats(),
+			xmlSceneIndex: () => refreshXmlSceneIndex(),
+			materializationAudit: () => refreshMaterializationAudit(),
+			roomShell: () => refreshRoomShell(),
+		};
+		loaders[key as ResourceKey]?.();
+	}
+	function retryAllFailed() {
+		for (const k of erroredResources) retryResource(k);
 	}
 
 	// Core resources whose loading blocks a usable editor. Used for the "initial
@@ -263,6 +306,8 @@
 	// Render variant: 'base' (mirrors off), 'perturbed' (mirrors/glass on), or 'both'
 	// (render each viewpoint twice into separate trees for the eval split).
 	let renderVariant = $state<'base' | 'perturbed' | 'both'>('base');
+	// Live episode-plan progress (polled while the synchronous plan request runs).
+	let episodePlanProgress = $state<{ status?: string; planned?: number; target?: number; eta_s?: number | null } | null>(null);
 	let error = $state('');
 	let info = $state('');
 	let projects = $state<any[]>([]);
@@ -349,7 +394,7 @@
 	// Measured-pBRDF band mode for preview renders. Stable/default RGB uses single
 	// band × albedo; rgb/hybrid remain opt-in comparison modes.
 	let previewBandMode = $state('single');
-	let previewMeasuredScope = $state('analytic_priority');
+	let previewMeasuredScope = $state('analytic_only');
 	let probeResult = $state<{ batch_id: string; vp_id: string; heading_id: string; modality: string; modalities?: string[]; is_polar?: boolean; sensor_id?: string; submittedAt: number } | null>(null);
 	let probeError = $state('');
 	type HotCameraPose = {
@@ -469,7 +514,7 @@
 	});
 
 	$effect(() => {
-		if (railTab === 'preview' && selectedProjectId && sceneId) {
+		if ((railTab === 'sync' || railTab === 'preview') && selectedProjectId && sceneId) {
 			refreshRenderSceneStats();
 		}
 	});
@@ -834,7 +879,7 @@
 
 	type PageMode = 'map' | 'objects' | 'paths' | 'sensors' | 'lights' | 'preview' | 'export';
 	let pageMode = $state<PageMode>('map');
-	type RailTab = 'selected' | 'scene' | 'paths' | 'sensors' | 'lights' | 'preview' | 'export' | 'status';
+	type RailTab = 'selected' | 'scene' | 'paths' | 'sensors' | 'lights' | 'preview' | 'export' | 'status' | 'sync' | 'materials';
 	let railTab = $state<RailTab>('scene');
 	let lastRailSyncedPageMode: PageMode = 'map';
 	let lastRailSelectedId = '';
@@ -1829,7 +1874,7 @@
 		// episodes). Only sent when non-default so 'rgb' renders are unchanged and
 		// never trip a stale worker on an unknown render_settings key.
 		if (previewBandMode && previewBandMode !== 'rgb') settings.pbrdf_band_mode = previewBandMode;
-		if (previewMeasuredScope && previewMeasuredScope !== 'analytic_priority') settings.measured_scope = previewMeasuredScope;
+		if (previewMeasuredScope && previewMeasuredScope !== 'analytic_only') settings.measured_scope = previewMeasuredScope;
 		if (previewMeasuredScope === 'analytic_priority' || previewMeasuredScope === 'budgeted_measured') settings.max_measured_bsdfs = 3;
 		return settings;
 	}
@@ -3348,15 +3393,29 @@
 				return [name.trim(), Number(value)];
 			})
 		);
-		const data = await run(
-			() => episodeService.planGraphEpisodes(selectedProjectId, {
-				sceneId, numPairs: Number(episodeCount), splits: splitObject,
-				scenarios: graphScenarios.split(',').map((s) => s.trim()).filter(Boolean),
-				modalities: selectedModalities, seed: Number(seed),
-			}),
-			'Graph episodes planned.',
-			'episodes:plan-graph'
-		);
+		// The plan request is synchronous; poll the side-channel for "N/M" progress.
+		episodePlanProgress = { status: 'running', planned: 0, target: Number(episodeCount) };
+		const poll = setInterval(async () => {
+			try {
+				const p = await getEpisodePlanProgress(selectedProjectId, sceneId);
+				if (p && p.status && p.status !== 'idle') episodePlanProgress = p;
+			} catch { /* transient — keep last */ }
+		}, 600);
+		let data: any;
+		try {
+			data = await run(
+				() => episodeService.planGraphEpisodes(selectedProjectId, {
+					sceneId, numPairs: Number(episodeCount), splits: splitObject,
+					scenarios: graphScenarios.split(',').map((s) => s.trim()).filter(Boolean),
+					modalities: selectedModalities, seed: Number(seed),
+				}),
+				'Graph episodes planned.',
+				'episodes:plan-graph'
+			);
+		} finally {
+			clearInterval(poll);
+			episodePlanProgress = null;
+		}
 		if (data) planResult = data;
 		await refreshProject();
 	}
@@ -4415,20 +4474,15 @@
 
 	<!-- Floating load-status pill (fixed; never reflows the editor). Shows what is
 	     loading and surfaces resource errors; auto-hides when idle. -->
-	{#if loadingStage || loadingResources.length || erroredResources.length}
-		<div class="load-pill" class:has-error={erroredResources.length > 0}>
-			{#if erroredResources.length}
-				<span class="load-pill-dot error" aria-hidden="true"></span>
-				<span class="load-pill-text">Failed: {erroredResources.map((k) => resourceError[k] ? `${k} (${resourceError[k]})` : k).join(', ')}</span>
-			{:else}
-				<span class="loading-spinner" aria-hidden="true"></span>
-				<span class="load-pill-text">
-					{#if loadingResources.length}Loading {loadingResources.join(', ')}…
-					{:else}{backgroundLoading ? 'Background: ' : ''}{loadingStage}{/if}
-				</span>
-			{/if}
-		</div>
-	{/if}
+	<div class="status-dash-anchor">
+		<InitStatusDashboard
+			{resourceStatus}
+			{resourceError}
+			syncStatus={currentScene?.sync_status}
+			onRetry={retryResource}
+			onRetryAll={retryAllFailed}
+		/>
+	</div>
 
 	<section class="panel project-strip">
 		<label>
@@ -4665,7 +4719,11 @@
 					</div>
 					<div class="episode-generate-bar">
 						<input type="number" min="1" bind:value={episodeCount} title="Count" />
-						<button class="button button-primary" disabled={!selectedProjectId || !hasGraph || loading} onclick={planGraphEpisodes}>+ Generate</button>
+						<button class="button button-primary" disabled={!selectedProjectId || !hasGraph || loading} onclick={planGraphEpisodes}>
+							{#if episodePlanProgress}
+								{episodePlanProgress.status === 'indexing' ? 'Indexing…' : `Generating ${episodePlanProgress.planned ?? 0}/${episodePlanProgress.target ?? episodeCount}`}
+							{:else}+ Generate{/if}
+						</button>
 						{#if episodes.length > 0}
 							<button class="button button-subtle" onclick={clearEpisodes} title="Clear all episodes">✕</button>
 						{/if}
@@ -4768,6 +4826,20 @@
 					onSetTransformGridSizeM={(v) => (transformGridSizeM = v)}
 					onSetTransformAngleSnapDeg={(v) => (transformAngleSnapDeg = v)}
 				/>
+				{#if selectedAuthoringKind === 'object'}
+					<MaterialInspector
+						projectId={selectedProjectId}
+						{sceneId}
+						materialId={selectedAuthoringItem.material}
+						objectId={selectedAuthoringItem.id}
+						sourceRef={selectedAuthoringItem.source_ref}
+						entry={selectedMaterialEntry}
+					/>
+				{/if}
+			{/if}
+
+			{#if railTab === 'materials'}
+				<RailMaterialsTab projectId={selectedProjectId} {sceneId} />
 			{/if}
 
 			<!-- Floating bottom status bar -->
@@ -4951,7 +5023,9 @@
 					<div class="panel-label mt-2">Episodes</div>
 					<label><span>num pairs</span><input type="number" min="1" bind:value={episodeCount} /></label>
 					<button class="button button-primary" disabled={!selectedProjectId || !hasGraph || loading} onclick={planGraphEpisodes}>
-						Generate Episodes
+						{#if episodePlanProgress}
+							{episodePlanProgress.status === 'indexing' ? 'Indexing…' : `Generating ${episodePlanProgress.planned ?? 0}/${episodePlanProgress.target ?? episodeCount}`}
+						{:else}Generate Episodes{/if}
 					</button>
 					{#if splitCounts.train != null}
 						<div class="path-status-chips mt-1">
@@ -5056,9 +5130,11 @@
 				<button class:active={railTab === 'paths'} onclick={() => activateRailTab('paths')}>Paths</button>
 			{/if}
 			<button class:active={railTab === 'sensors'} onclick={() => activateRailTab('sensors')}>Sensors</button>
+			<button class:active={railTab === 'materials'} onclick={() => activateRailTab('materials')}>Materials</button>
 			<button class:active={railTab === 'lights'} onclick={() => activateRailTab('lights')}>Lights</button>
 			<button class:active={railTab === 'preview'} onclick={() => activateRailTab('preview')}>Preview</button>
 			<button class:active={railTab === 'export'} onclick={() => activateRailTab('export')}>Export</button>
+			<button class:active={railTab === 'sync'} onclick={() => activateRailTab('sync')}>Sync</button>
 			<button class:active={railTab === 'status'} onclick={() => activateRailTab('status')}>Status</button>
 		</div>
 
@@ -5139,6 +5215,7 @@
 				onSetRemovePassHeight={(v) => (removePassHeightM = v)}
 				onLoadEpisode={loadEpisode}
 				onGenerateEpisodes={planGraphEpisodes}
+				{episodePlanProgress}
 				onClearEpisodes={clearEpisodes}
 				onValidateEpisodes={validateGraphEpisodes}
 				onPruneStaleEpisodes={pruneStaleEpisodes}
@@ -5181,9 +5258,6 @@
 				{probeRendering} {probeError}
 				{rigMountHeightM} {authoringMap}
 				{selectedProjectId} {sceneId} {loading} {hasScene} {hasGraph}
-				{renderSceneStats} {renderSceneStatsLoading}
-				{showRoomShell} {roomShell}
-				{editorObjectsCount} {editorEmitterCount} {editorMaterialCount}
 				onLoadGlobalCameraRig={loadGlobalCameraRig}
 				onSelectRigSensor={selectRigRenderSensor}
 				{selectedRigSensorIds}
@@ -5220,8 +5294,6 @@
 				onSetRenderMissingOnly={(v) => (renderMissingOnly = v)}
 				headingsPerNode={graphPayload?.node_heading_count ?? 0}
 				onRefreshBatch={() => refreshBatch()}
-				onRefreshStats={refreshRenderSceneStats}
-				onSetShowRoomShell={(v) => { showRoomShell = v; _showRoomShellUserTouched = true; }}
 			/>
 		{/if}
 
@@ -5242,18 +5314,13 @@
 
 		{#if railTab === 'preview'}
 			<RailPreviewTab
-				{caps}
 				hotCameraPose={activeHotCameraPose}
 				{hotCameraPoses} {activeHotCameraId}
 				{activeRigSensorOption} {activeCameraFrustum} {activeRenderModality}
 				{probeResult} {activeRigSensorId}
 				{selectedProjectId} {sceneId}
-				{editorObjectsCount} {editorEmitterCount} {editorMaterialCount}
-				{renderSceneStats} {renderSceneStatsLoading}
-				{showRoomShell} {roomShell} {rigMountHeightM} {authoringMap}
+				{rigMountHeightM}
 				onRefreshBatch={() => refreshBatch()}
-				onRefreshStats={refreshRenderSceneStats}
-				onSetShowRoomShell={(v) => { showRoomShell = v; _showRoomShellUserTouched = true; }}
 				onSelectHotCamera={(id) => { activeHotCameraId = id; }}
 			/>
 		{/if}
@@ -5283,6 +5350,25 @@
 				onExport={exportDataset}
 				onCancelExport={cancelActiveExportJob}
 				onResetExport={resetExportJob}
+			/>
+		{/if}
+
+		{#if railTab === 'sync'}
+			<RailSyncInspectorTab
+				{renderSceneStats}
+				{renderSceneStatsLoading}
+				{sceneId}
+				{editorObjectsCount}
+				{editorEmitterCount}
+				{editorMaterialCount}
+				{authoringMap}
+				{rigMountHeightM}
+				{showRoomShell}
+				{roomShell}
+				refreshEnabled={caps.refreshStats.enabled}
+				refreshReason={caps.refreshStats.reason}
+				onRefreshStats={refreshRenderSceneStats}
+				onSetShowRoomShell={(v) => { showRoomShell = v; _showRoomShellUserTouched = true; }}
 			/>
 		{/if}
 
@@ -5346,7 +5432,15 @@
 <style>
 	:global {
 
-	/* --- Floating load-status pill --- */
+	/* --- Floating load-status dashboard anchor --- */
+	.status-dash-anchor {
+		position: fixed;
+		right: 16px;
+		bottom: 64px; /* clear the bottom Render Monitor bar */
+		z-index: 60;
+	}
+
+	/* --- Floating load-status pill (legacy) --- */
 	.load-pill {
 		position: fixed;
 		right: 16px;

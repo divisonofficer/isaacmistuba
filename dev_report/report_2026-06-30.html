@@ -1,0 +1,378 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>2026-06-30 Infinigen PBR: metallic/IOR 단일값 규명</title>
+  <style>
+    :root{color-scheme:light;--bg:#f7f8fb;--paper:#fff;--ink:#1f2937;--muted:#667085;--line:#d9dee8;--accent:#1d5fd1;--ok:#087443;--warn:#a15c07;--code:#f1f4f9;}
+    body{margin:0;background:var(--bg);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;line-height:1.58;}
+    .layout{display:flex;min-height:100vh;align-items:flex-start;}
+    aside{width:260px;flex:0 0 260px;position:sticky;top:0;height:100vh;overflow-y:auto;padding:24px 16px;border-right:1px solid var(--line);background:#eef2f7;}
+    .logo{font-weight:800;color:var(--accent);font-size:16px;}
+    .date{margin-top:3px;color:var(--muted);font-size:12px;font-family:ui-monospace,Menlo,Consolas,monospace;}
+    .nav-title{margin:22px 8px 8px;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.12em;font-weight:800;}
+    .nav-link{display:block;padding:6px 8px;border-radius:5px;color:#344054;font-size:12px;text-decoration:none;margin-bottom:2px;}
+    .nav-link:hover{background:#dde3ee;color:var(--accent);}
+    main{flex:1;min-width:0;padding:36px 24px 64px;}
+    article{max-width:1080px;margin:0 auto;background:var(--paper);border:1px solid var(--line);border-radius:8px;padding:34px 40px;box-shadow:0 8px 24px rgb(16 24 40/.05);}
+    h1,h2,h3{line-height:1.25;margin:0;}
+    h1{font-size:28px;}
+    h2{margin-top:34px;padding-top:22px;border-top:1px solid var(--line);font-size:20px;}
+    h3{margin-top:22px;font-size:16px;}
+    p{margin:10px 0 0;}
+    ul{margin:10px 0 0 20px;padding:0;}
+    li{margin:5px 0;}
+    code{background:var(--code);border:1px solid #e5e9f2;border-radius:5px;padding:1px 5px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:.92em;}
+    pre{overflow-x:auto;background:#111827;color:#e5e7eb;border-radius:8px;padding:14px 16px;font-size:13px;line-height:1.5;}
+    pre code{background:transparent;border:0;padding:0;color:inherit;}
+    table{width:100%;border-collapse:collapse;margin-top:12px;font-size:14px;}
+    th,td{border:1px solid var(--line);padding:9px 10px;text-align:left;vertical-align:top;}
+    th{background:#f3f6fb;font-weight:650;}
+    .meta{margin-top:10px;color:var(--muted);font-size:14px;}
+    .badge{display:inline-block;margin-right:6px;border-radius:999px;padding:2px 9px;border:1px solid var(--line);background:#f8fafc;color:var(--muted);font-size:12px;}
+    .ok{color:var(--ok);font-weight:650;}
+    .warn{color:var(--warn);font-weight:650;}
+    .note{margin-top:12px;padding:10px 14px;border-left:3px solid var(--accent);background:#f3f6fb;border-radius:0 6px 6px 0;font-size:13.5px;}
+    @media(max-width:980px){.layout{display:block;}aside{position:relative;width:auto;height:auto;border-right:0;border-bottom:1px solid var(--line);}main{padding:20px;}article{padding:24px 20px;}}
+  </style>
+</head>
+<body>
+<div class="layout">
+<aside>
+  <div class="logo">Robomituba</div>
+  <div class="date">2026-06-30</div>
+
+  <div class="nav-title">오늘 보고서</div>
+  <a class="nav-link" href="#summary">요약 · 결론</a>
+  <a class="nav-link" href="#obs">1. 관찰 · 질문</a>
+  <a class="nav-link" href="#method">2. 조사 방법</a>
+  <a class="nav-link" href="#infinigen">3. Infinigen generator 근거</a>
+  <a class="nav-link" href="#bake">4. 우리 bake는 정상</a>
+  <a class="nav-link" href="#render">5. 별개: 렌더 소비부 한계</a>
+  <a class="nav-link" href="#followup">6. 결론 · 후속 과제</a>
+  <a class="nav-link" href="#polar">7. 편광 BSDF의 PBR 소비</a>
+  <a class="nav-link" href="#ior">8. IOR 정확도 · 연구 사례</a>
+  <a class="nav-link" href="#direction">9. measured 최소화 → IOR authoring 갭</a>
+  <a class="nav-link" href="#coverage">10. 클래스 주입 커버리지 분석</a>
+
+  <div class="nav-title">이전 보고서</div>
+  <a class="nav-link" href="report_2026-06-29.html">2026-06-29 Infinigen→import→nav→PBR</a>
+  <a class="nav-link" href="report_2026-06-24.html">2026-06-24 Indoor render noise</a>
+  <a class="nav-link" href="index.html">전체 인덱스</a>
+</aside>
+<main>
+  <article>
+    <h1>Infinigen PBR: metallic / IOR 가 에셋당 단일값인 이유 규명</h1>
+    <div class="meta">
+      <span class="badge">2026-06-30</span>
+      <span class="badge">Infinigen material</span>
+      <span class="badge">PBR bake</span>
+      <span class="badge">metallic / IOR</span>
+      <span class="badge">render BSDF 소비</span>
+    </div>
+
+    <h2 id="summary">요약 · 결론</h2>
+    <p>
+      질문: Infinigen import 씬을 bake 해보니 <b>albedo·roughness는 공간변화(spatially varying)</b>하는데
+      <b>metallic·IOR(index of refraction)은 에셋당 단일값</b>으로 나온다. 이것이 <b>(1)</b> 우리 import/bake/generate
+      파이프라인의 버그인가, <b>(2)</b> Infinigen material generator의 설계인가?
+    </p>
+    <div class="note">
+      <b>결론: (2) Infinigen material generator의 설계다. 우리 bake 버그가 아니다.</b>
+      Infinigen은 <b>metallic·IOR을 "머티리얼 정체성"(재질당 상수)</b>로, <b>roughness·base color·normal을 "표면 디테일"(절차적 텍스처)</b>로
+      분리해서 만든다. 이는 물리적으로도 자연스러운 PBR 저작 방식이다(금속이냐/유리냐는 재질 속성, 거칠기·색은 표면 디테일).
+      우리 EMIT-트릭 metallic bake는 <b>변화가 존재하면 그대로 캡처</b>하므로 정상이다.
+    </p>
+    <p>
+      단, 질문과는 별개로 확인된 <b>렌더 소비부의 실제 손실 지점</b>이 있다(§5): 렌더러가 baked metallic 텍스처를 무시하고 이진 처리하며,
+      roughness 텍스처도 대부분의 표면(roughplastic/pplastic)에서 스칼라로 붕괴시킨다. per-texel 사실감을 <i>렌더까지</i> 살리려면
+      bake가 아니라 이 소비부를 손봐야 한다.
+    </p>
+
+    <h2 id="obs">1. 관찰 · 질문</h2>
+    <p>
+      Infinigen indoor 생성물을 2-stage import(<code>--bake-pbr</code>)로 per-object 텍스처 아틀라스(albedo/roughness/normal/metallic)로
+      구운 뒤, 각 채널의 공간변화를 눈으로 보면:
+    </p>
+    <ul>
+      <li><b>albedo</b> — 색이 위치마다 변함(나뭇결, 책 표지, 얼룩 등). 공간변화 O.</li>
+      <li><b>roughness</b> — 광택/거칠기가 위치마다 변함. 공간변화 O.</li>
+      <li><b>metallic</b> — 단일 머티리얼 오브젝트에서 한 값으로 평탄해 보임.</li>
+      <li><b>IOR</b> — 아틀라스 자체가 없고, MTL엔 스칼라 <code>Ni</code> 하나뿐.</li>
+    </ul>
+
+    <h2 id="method">2. 조사 방법</h2>
+    <p>세 방향에서 교차 확인했다.</p>
+    <ul>
+      <li><b>실측</b> — 실제 baked 아틀라스(<code>out/infinigen_imports/kr_20260627</code>)의 채널별 픽셀 표준편차 측정.</li>
+      <li><b>Infinigen 소스</b> — <code>~/module/infinigen/infinigen/assets/materials/</code>의 머티리얼 generator 18+개를 읽어
+        Principled BSDF의 <code>Metallic</code>/<code>IOR</code>/<code>Roughness</code>/<code>Base Color</code> 입력이 상수인지 텍스처/노이즈 구동인지 확인.</li>
+      <li><b>렌더 소비부</b> — <code>render_daemon.py</code>가 baked 채널을 Mitsuba BSDF로 어떻게 emit 하는지 확인.</li>
+    </ul>
+
+    <h2 id="infinigen">3. Infinigen generator 근거 (핵심)</h2>
+    <p>머티리얼 소스를 직접 읽은 결과, metallic·IOR은 사실상 상수이고 roughness·color는 절차적 텍스처였다.</p>
+    <table>
+      <thead><tr><th>채널</th><th>Infinigen 저작 방식</th><th>공간변화</th></tr></thead>
+      <tbody>
+        <tr><td><b>Metallic</b></td><td>금속 머티리얼 11개 중 <b>10개가 상수</b>(<code>1.0</code>/비금속 <code>0.0</code>). 텍스처 구동은 <code>metal/aluminum.py</code>(ColorRamp) <b>단 1개</b>뿐.</td><td class="warn">거의 없음</td></tr>
+        <tr><td><b>IOR</b></td><td>glass/plastic/dielectric 전반에서 <b>공간변화 사례 0건</b>. 항상 스칼라(<code>glass.py</code>=1.5, <code>plastic_translucent.py</code>는 <code>sample_range(1.2,1.6)</code>로 인스턴스마다 랜덤이나 <i>위치 기반 아님</i>).</td><td class="warn">전혀 없음</td></tr>
+        <tr><td><b>Roughness</b></td><td>~70%가 <code>NoiseTexture</code>/<code>Musgrave</code>/<code>Voronoi</code>/<code>ColorRamp</code> 구동(예: wood, leather, ceramic, brick).</td><td class="ok">있음</td></tr>
+        <tr><td><b>Base color</b></td><td>~80%가 절차적 텍스처/ColorRamp 구동.</td><td class="ok">있음</td></tr>
+      </tbody>
+    </table>
+    <p><code>metal/aluminum.py</code> — Metallic을 텍스처로 구동하는 유일한 예외:</p>
+    <pre><code>colorramp = nw.new_node(Nodes.ColorRamp, input_kwargs={"Fac": colorramp_4})
+principled_bsdf = nw.new_node(Nodes.PrincipledBSDF, input_kwargs={
+    "Metallic": colorramp.outputs["Color"],   # &lt;- 공간변화 (예외적)
+    ...})</code></pre>
+    <div class="note">
+      즉 Infinigen은 <b>"머티리얼 정체성(metallic·IOR = 상수) vs 표면 디테일(roughness·color·normal = 텍스처)"</b>로
+      의도적으로 나눠 저작한다. 금속의 "금속다움"은 metallic을 위치별로 흔드는 게 아니라 <b>roughness·normal 변화</b>로 표현한다.
+    </div>
+
+    <h2 id="bake">4. 우리 bake는 정상 (변화가 있으면 잡아냄)</h2>
+    <p>
+      baked 아틀라스(<code>kr_20260627</code>, 8-bit L 기준 픽셀 std)를 측정하니 metallic 아틀라스도 <b>평균적으로는 변화가 있다</b>.
+      다만 <b>단일 머티리얼 오브젝트는 평탄, 다중 머티리얼 오브젝트는 변화</b>하는 패턴 — 즉 metallic의 "변화"는 한 머티리얼 내부의
+      spatial 변화가 아니라, 한 오브젝트 UV에 <b>여러 머티리얼이 패킹되어 생기는 cross-material 차이</b>다.
+    </p>
+    <table>
+      <thead><tr><th>채널</th><th>맵 수</th><th>std 평균 / 중앙값</th><th>평탄(std&lt;1)</th></tr></thead>
+      <tbody>
+        <tr><td>roughness</td><td>58</td><td>45.3 / 55.7</td><td>2/58</td></tr>
+        <tr><td>metallic</td><td>57</td><td>57.2 / 57.8</td><td>3/57</td></tr>
+      </tbody>
+    </table>
+    <table>
+      <thead><tr><th>오브젝트(예)</th><th>머티리얼 성격</th><th>metallic std</th><th>해석</th></tr></thead>
+      <tbody>
+        <tr><td>BedFactory</td><td>단일 머티리얼</td><td>0.0 (평탄)</td><td>머티리얼당 상수 그대로 캡처</td></tr>
+        <tr><td>BookColumn</td><td>다중(책 여러 권)</td><td>~124 (큼)</td><td>책마다 다른 metallic → cross-material</td></tr>
+      </tbody>
+    </table>
+    <p>
+      만약 Infinigen이 한 머티리얼 안에서 metallic을 노이즈로 흔들었다면 EMIT-트릭 bake가 그 값을 그대로 구웠을 것이다
+      (다중 머티리얼 아틀라스가 실제로 변화하는 것이 그 증거). 따라서 <b>평탄한 metallic은 bake 실패가 아니라 Infinigen이 상수라서</b>다.
+      IOR은 애초에 bake 패스가 없다(<code>tools/infinigen/blender_export_scene.py</code>는 albedo/roughness/normal/metallic만 굽고,
+      IOR은 스칼라 <code>("IOR","ior")</code>로만 추출) — 그래도 Infinigen이 IOR을 공간변화시키지 않으므로 손실은 없다.
+    </p>
+
+    <h2 id="render">5. 별개: 렌더 소비부의 실제 손실 지점</h2>
+    <p>
+      질문(bake vs Infinigen)과는 무관하지만, 조사 중 확인된 <b>렌더 파이프라인의 per-texel 손실</b>이 있다
+      (<code>render_daemon.py :: _append_extracted_bsdf_xml</code>):
+    </p>
+    <table>
+      <thead><tr><th>채널</th><th>baked?</th><th>렌더가 per-texel로 쓰나?</th></tr></thead>
+      <tbody>
+        <tr><td>albedo</td><td>O</td><td class="ok">O — <code>diffuse_reflectance</code> bitmap</td></tr>
+        <tr><td>normal</td><td>O</td><td class="ok">O — <code>normalmap</code> BSDF</td></tr>
+        <tr><td>roughness</td><td>O</td><td class="warn">금속(roughconductor)만 텍스처 alpha. roughplastic/pplastic은 <b>스칼라</b>로 붕괴(플러그인이 텍스처 alpha 미지원)</td></tr>
+        <tr><td>metallic</td><td>O</td><td class="warn">아니오 — <code>metallic_factor&gt;0.5</code> <b>이진 결정</b>(roughconductor vs roughplastic), baked map_Pm 무시</td></tr>
+        <tr><td>IOR</td><td>X</td><td class="warn">glass에만 상수 <code>int_ior=1.5</code></td></tr>
+      </tbody>
+    </table>
+    <pre><code># _append_extracted_bsdf_xml (요지)
+if metallic is not None and float(metallic) &gt; 0.5:      # 이진: 텍스처 무시
+    bsdf = roughconductor(material="Al")
+    _emit_alpha(bsdf, alpha, alpha_texturable=True)      # 금속만 roughness 텍스처
+else:
+    bsdf = roughplastic | pplastic
+    _emit_alpha(bsdf, alpha, alpha_texturable=False)     # 스칼라 alpha로 붕괴</code></pre>
+    <div class="note">
+      결과적으로 <b>공간변화로 잘 구운 roughness조차 대부분의 확산 표면에서 렌더 시 단일값</b>이 된다. baked metallic 텍스처는 전혀 쓰이지 않는다.
+    </div>
+
+    <h2 id="followup">6. 결론 · 후속 과제</h2>
+    <ul>
+      <li><b>질문 답</b>: metallic·IOR 단일값은 <b>Infinigen의 설계(2번)</b>이며 import/bake/generate 버그가 아니다. bake는 변화가 있으면 캡처한다.</li>
+      <li><b>기대치 정리</b>: Infinigen 재질을 구우면 metallic은 (다중 머티리얼 아틀라스 외엔) 평탄, IOR은 텍스처 없음, roughness·color·normal은 디테일 있음 — 정상.</li>
+      <li><b>후속(선택)</b>: per-texel roughness/metallic을 <i>렌더까지</i> 살리고 싶다면 bake가 아니라 렌더 BSDF 소비부를 손봐야 한다 —
+        (a) roughplastic/pplastic 대신 텍스처 alpha를 지원하는 경로(예: <code>principled</code> BSDF) 도입, (b) baked metallic 텍스처를 실제로 소비,
+        (c) IOR — Infinigen이 상수라 per-texel은 불필요하나, <b>real-world 편광 충실도엔 값 자체의 정확도가 중요</b>하다(§8).</li>
+    </ul>
+
+    <h2 id="polar">7. 편광 BSDF에서 albedo / metallic / roughness / IOR 소비</h2>
+    <p>
+      대전제 — 편광(Mueller 행렬)은 오직 <b>정반사 Fresnel 항</b>에서 나온다. 프로덕션 빌드(<code>mitsuba3-optix7</code>) 소스에서 확인:
+      <code>pplastic</code>/<code>roughconductor</code>는 <code>mueller::specular_reflection(…, eta)</code>로 편광 Fresnel을 계산하고,
+      확산 로브는 <code>depolarizer(diffuse_reflectance)</code>로 비편광이다. <b>즉 IOR이 편광의 원천</b>이고, 나머지 채널은 그 신호를 변조·희석한다.
+    </p>
+    <table>
+      <thead><tr><th>채널</th><th>편광 BRDF에서의 역할</th><th>들어가는 파라미터</th></tr></thead>
+      <tbody>
+        <tr><td><b>IOR</b></td><td><b>편광의 원천</b>. Fresnel의 s/p 반사율 차 = 편광. 유전체(실수 eta)와 금속(복소 eta+ik)이 서로 다른 편광 서명</td><td>pplastic <code>int_ior</code>→<code>m_eta</code>(스칼라) · roughconductor <code>eta/k</code></td></tr>
+        <tr><td><b>roughness(alpha)</b></td><td>마이크로패싯 분포 폭 → 편광 정반사 로브를 퍼뜨림. <b>매끈=Brewster 부근 DoLP↑, 거칠=퍼지며 DoLP↓</b></td><td>roughconductor <code>alpha</code>(<b>텍스처 O</b>) · pplastic <code>alpha</code>(<b>스칼라만</b>)</td></tr>
+        <tr><td><b>albedo</b></td><td><b>비편광</b> 확산 로브. radiance를 더해 DoLP를 <b>희석</b></td><td>pplastic <code>diffuse_reflectance</code>(텍스처 O). 금속은 확산 없음</td></tr>
+        <tr><td><b>metallic</b></td><td>모델 선택자: 유전체(pplastic, 실수 IOR) ↔ 도체(roughconductor, 복소 IOR). 색의 출처도 albedo↔eta/k로 바뀜</td><td>이 둘엔 연속 파라미터 없음 → 이진 스위치/blend</td></tr>
+      </tbody>
+    </table>
+    <p>플러그인별 능력(소스 확인):</p>
+    <table>
+      <thead><tr><th>plugin</th><th>편광?</th><th>albedo</th><th>roughness</th><th>metallic</th><th>IOR</th></tr></thead>
+      <tbody>
+        <tr><td>pplastic</td><td class="ok">✓ 유전체 Mueller</td><td>texture ✓</td><td class="warn">스칼라만</td><td>—</td><td>int_ior 스칼라</td></tr>
+        <tr><td>roughconductor</td><td class="ok">✓ 도체 Mueller</td><td>(없음)</td><td class="ok">texture ✓</td><td>=1 암묵</td><td>eta/k</td></tr>
+        <tr><td>measured_polarized(_rgb)</td><td class="ok">✓ 측정 Mueller</td><td colspan="4">4채널 모두 측정에 내장(개별 소비 없음)</td></tr>
+        <tr><td>principled</td><td class="warn">✗ <code>depolarizer()</code></td><td>texture ✓</td><td>texture ✓</td><td>texture ✓</td><td>texture</td></tr>
+        <tr><td>roughdielectric</td><td class="warn">✗ (이 빌드 depolarize)</td><td>—</td><td>texture ✓</td><td>—</td><td>int_ior</td></tr>
+      </tbody>
+    </table>
+    <div class="note">
+      <b>근본 트레이드오프</b>: 단일 stock 플러그인으로 "per-texel metallic + 편광"을 동시에 얻을 수 없다.
+      pplastic/roughconductor는 편광되지만 pplastic의 roughness는 스칼라·metallic은 모델스위치, <code>principled</code>는 per-texel 다 되지만
+      <code>return depolarizer(value)</code>로 <b>편광이 0</b>이다.
+    </div>
+    <h3>per-texel PBR을 편광 경로에 넣는 방법</h3>
+    <ul>
+      <li><b>albedo</b> — 이미 됨(<code>pplastic.diffuse_reflectance</code> 비트맵).</li>
+      <li><b>roughness</b> — 금속은 <code>roughconductor.alpha</code> 텍스처로 오늘도 됨. plastic이 문제(pplastic alpha 스칼라) → <b>pplastic.cpp가 alpha를 Texture로 저장·<code>eval_1(si)</code>로 per-si 평가하도록 소폭 개조</b>(roughconductor가 이미 하는 방식)가 §5 붕괴의 해소책.</li>
+      <li><b>metallic (per-texel)</b> — 빌드에 <code>blendbsdf</code>(텍스처 <code>weight</code>)가 있어 편광을 양쪽에 유지한 채 혼합 가능(아래).</li>
+      <li><b>IOR (per-texel)</b> — pplastic eta 스칼라 → 개조 필요하나 Infinigen 상수라 불필요.</li>
+      <li><b>measured_polarized</b> — 예외: albedo/roughness/IOR을 <b>소비하지 않는다</b>. 측정 Mueller가 통째로 대체하므로 입력은 "측정 재질 선택".</li>
+    </ul>
+    <pre><code>&lt;bsdf type="blendbsdf"&gt;
+  &lt;texture name="weight" type="bitmap"&gt;&lt;string name="filename" value="…_metallic.png"/&gt;
+    &lt;boolean name="raw" value="true"/&gt;&lt;/texture&gt;
+  &lt;bsdf type="pplastic"&gt; … 유전체(비금속) … &lt;/bsdf&gt;
+  &lt;bsdf type="roughconductor"&gt; … 금속 … &lt;/bsdf&gt;
+&lt;/bsdf&gt;</code></pre>
+
+    <h2 id="ior">8. real-world 편광엔 IOR 정확도가 관건 — 연구 사례</h2>
+    <p>
+      직관대로, <b>해석적(analytic) 편광 렌더의 사실성은 IOR 정확도에 병목</b>된다. 편광 지표(DoLP/AoLP)가 IOR에 민감하기 때문이다:
+    </p>
+    <ul>
+      <li><b>유전체</b> — Brewster각 θ<sub>B</sub>=arctan(n)에서 DoLP가 극대. 일반 유전체 n은 1.4–1.6로 좁아 상수 1.5는 "그럴듯한" 근사지만 정량 오차가 남는다.</li>
+      <li><b>금속</b> — 반사·편광이 <b>복소 IOR (n+ik)</b>로 결정되고 강한 파장의존. 모든 금속을 generic <code>"Al"</code>로 쓰면 오차가 크다 — brass/gold/chrome은 eta/k가 크게 달라 색·DoLP·AoLP가 다르다(KAIST가 Chrome/Brass/Gold/SUJ2를 <i>따로</i> 측정한 이유).</li>
+    </ul>
+    <p>연구 흐름은 크게 두 갈래다:</p>
+    <table>
+      <thead><tr><th>접근</th><th>대표 연구</th><th>IOR 처리</th></tr></thead>
+      <tbody>
+        <tr><td><b>측정 (Mueller 직접)</b></td><td>Baek et al. 2020 (KAIST pBRDF, 5 파장) · Hyperspectral pBRDF 2025(hpBRDF) · Hwang et al. 2022 (Sparse Ellipsometry — 3D Mueller+IOR+shape 동시)</td><td>Mueller 측정에 Fresnel/IOR이 <b>내장</b> → 명시적 IOR 불필요. <b>본 프로젝트가 편광 ground-truth로 지정한 route</b>(<code>data/pbrdf_2020</code>, <code>hpbrdf_2025</code>).</td></tr>
+        <tr><td><b>해석적 + IOR 추정</b></td><td>Baek et al. 2018 (pBRDF+normal 동시 역렌더) · Deschaintre et al. 2021 (Deep Polarization Imaging) · Riviere et al. 2017</td><td>편광 데이터에서 굴절률·roughness·specular를 per-material 추정. 단 Baek 2018은 "<b>n의 scale은 채널비만으론 robust하게 못 얻는다</b>"고 명시 — IOR 정확 추정 자체가 난제.</td></tr>
+      </tbody>
+    </table>
+    <div class="note">
+      <b>함의(우리 파이프라인)</b>: Infinigen IOR은 측정값이 아니라 Principled 기본값(≈1.45–1.5)·재질당 상수·금속 generic이다. real-world 충실 편광을 원하면 —
+      <b>(a)</b> 편광 결정적 표면(유리·금속·거울)은 <code>measured_polarized</code>(KAIST/hpBRDF) 우선,
+      <b>(b)</b> 해석적 유전체엔 재질별 정확 IOR(유리 1.5·물 1.33·플라스틱 1.46–1.55),
+      <b>(c)</b> 금속엔 generic "Al" 대신 금속별 복소 eta/k 스펙트럼을 매핑.
+      → §6의 "IOR 우선순위 낮음"은 <i>per-texel 관점</i>에서만 참이고, <i>정량 편광 충실도 관점</i>에선 IOR 정확도가 오히려 최우선이다.
+    </div>
+
+    <h3>보강 — Infinigen이 IOR을 "정확히 못 내는" 게 아니라 "계산하지 않는" 이유 (4겹)</h3>
+    <p>
+      실제 metal generator를 보면 원인이 분명하다: <code>metal_basic.py</code> = <code>Metallic:1.0</code> · <code>Specular IOR Level:uniform(0.5,1.0)</code> · <code>Base Color:metal_hsv()</code>;
+      <code>brushed_metal.py</code> = <code>Metallic:1.0</code> · <code>Specular IOR Level:0.0</code>.
+    </p>
+    <table>
+      <thead><tr><th>#</th><th>한계</th><th>내용</th></tr></thead>
+      <tbody>
+        <tr><td>1</td><td><b>모델에 복소 IOR 부재</b></td><td>모든 재질이 Blender <b>Principled BSDF</b> 기반. metallic 워크플로는 금속 반사를 <b>F0 = Base Color</b>로 근사 — <code>n+ik</code>·소광계수 <code>k</code>가 아예 없다. 금속색은 <code>metal_hsv()</code> 난수(= F0를 예술적으로 지정).</td></tr>
+        <tr><td>2</td><td><b>Metallic=1 → IOR 무력화</b></td><td><code>Metallic=1</code>이면 유전체 <code>IOR</code>/<code>Specular IOR Level</code>은 반사색에 거의 무관 → <code>0.0</code>/랜덤으로 둬도 무방(장식용). bake가 읽는 Principled <code>IOR</code> 스칼라는 금속에선 의미 없음.</td></tr>
+        <tr><td>3</td><td><b>목표 렌더러가 비편광</b></td><td>겨냥 렌더러 Cycles는 편광 미시뮬. 비편광 RGB에선 IOR이 하이라이트/Fresnel edge에만 약영향 → "그럴듯하면 OK", 정확도 압력 없음. 오차가 편광(DoLP/AoLP)에선 1차 항으로 노출.</td></tr>
+        <tr><td>4</td><td><b>스칼라·비측정·비스펙트럼</b></td><td>유전체 IOR도 하드코딩/샘플(유리 1.5·물 1.33·plastic <code>sample_range(1.2,1.6)</code>) — 측정 아닌 눈대중. Principled IOR은 스칼라 1개(파장 무관) → 금속 <code>eta/k(λ)</code> 표현 불가.</td></tr>
+      </tbody>
+    </table>
+    <div class="note">
+      즉 "정확히 계산 못 한" 게 아니라 <b>애초에 계산하지 않는 설계</b>다: (1) 표현수단 없음 · (2) 입력 무력 · (3) 정확도 압력 없음 · (4) 스칼라/비스펙트럼.
+      측정 pBRDF(KAIST/hpBRDF)는 Mueller를 직접 재므로 이 넷을 모두 우회한다.
+    </div>
+
+    <p class="meta">
+      참고문헌: Baek et al. 2018 (ToG, <i>Simultaneous Acquisition of Polarimetric SVBRDF and Normals</i>) ·
+      Baek et al. 2020 (SIGGRAPH, KAIST pBRDF dataset) ·
+      Deschaintre et al. 2021 (CVPR, <i>Deep Polarization Imaging for 3D Shape and SVBRDF Acquisition</i>) ·
+      Hwang et al. 2022 (<i>Sparse Ellipsometry</i>) · Hyperspectral pBRDF 2025 (arXiv:2509.13779).
+    </p>
+    <h2 id="direction">9. 방향성: measured 최소화 시 남는 IOR authoring 갭</h2>
+    <p>
+      <b>현재 목표</b> — Infinigen을 scene generator로 써서 정확한 편광 렌더를 만든다.
+      <b>방향성</b> — measured pBRDF 사용을 최대한 줄이고 <b>해석적(analytic) 편광 BSDF</b>(pplastic/roughconductor)를 주력으로 한다.
+      이 조합에서 §8 보강의 <b>IOR 갭이 정면으로 문제</b>가 된다: Infinigen의 IOR/금속정보는 신뢰 불가인데, 해석적 편광의 사실성은 바로 그 IOR/eta·k에 달려 있다.
+      따라서 <b>IOR을 Infinigen에서 "받는" 게 아니라 우리가 "주입(author)"</b>해야 한다.
+    </p>
+
+    <h3>갭을 채우는 방법 — optical-constants injection layer</h3>
+    <p>
+      Infinigen 재질은 named generator(= 재질 정체성)를 갖고, 우리 import는 이미 <code>optical_class</code>(conductor/dielectric/…)로 분류한다.
+      이를 키로 <b>물리 광학상수 테이블</b>을 씌워 Infinigen의 무의미한 IOR을 덮어쓴다:
+    </p>
+    <table>
+      <thead><tr><th>클래스</th><th>주입값</th><th>비고</th></tr></thead>
+      <tbody>
+        <tr><td>유전체(비금속)</td><td>재질별 <b>실수 IOR</b> — 유리 1.5 · 물 1.33 · 플라스틱 1.46–1.55 · 세라믹 ~1.5 · 나무 ~1.5</td><td>범위가 좁아 <b>클래스별 상수로 충분</b>(Brewster 민감도 낮음). <code>pplastic int_ior</code>로 주입.</td></tr>
+        <tr><td>금속(도체)</td><td>실제 금속의 <b>복소 eta/k 스펙트럼</b> — Al · Cu · Au · steel · brass · chrome (Mitsuba conductor preset/spectra)</td><td>generic <code>"Al"</code> 대체. <code>roughconductor material=</code>(또는 eta·k)로 주입.</td></tr>
+      </tbody>
+    </table>
+    <p>
+      <b>적용 위치</b>: 이미 <code>optical_class</code>→BSDF 전략이 있는 <b>import material binding</b> 또는 <code>render_daemon</code>의 BSDF emit
+      (pplastic <code>int_ior</code>, roughconductor <code>material</code>). 현재 코드가 <b>모든 금속에 <code>material="Al"</code>을 박는 지점</b>을 이 lookup으로 교체하는 것이 최소 변경.
+    </p>
+
+    <h3>잔여 난제</h3>
+    <ul>
+      <li><b>금속 종 식별</b> — Infinigen 금속은 "어떤 금속인지" 정보가 없다(<code>metal_hsv()</code> 난수 색). →
+        (a) 색 hue 추정(금빛→Au, 따뜻한 톤→Cu/brass, 중성→Al/steel), (b) 물체 semantic 활용(수전→chrome/steel, 손잡이→brass),
+        (c) 최소한 "실제 eta/k를 쓰는 임의 금속"이 generic Al 일괄보다 낫다.</li>
+      <li><b>유전체 코트/2층</b> — 도장면·바니시는 pplastic(유전체 코트+확산)로 충분하나 코트 IOR을 재질별로.</li>
+      <li><b>measured와의 하이브리드</b> — "measured 최소화"와 양립: 편광 결정적 소수 표면(핵심 유리/거울/특정 금속)만 measured로 두고, 나머지는 위 주입 테이블로 해석적 처리.</li>
+    </ul>
+    <div class="note">
+      <b>정리</b>: measured 최소화 방향에서 IOR은 "Infinigen에서 받는 값"이 아니라 "<b><code>optical_class</code> 기반으로 우리가 주입하는 값</b>"이 되어야 한다.
+      유전체는 클래스별 상수 테이블로 저비용 해결, <b>금속은 실제 eta/k 매핑(+금속종 식별 휴리스틱)이 핵심 과제</b>로 남는다.
+    </div>
+
+    <h2 id="coverage">10. 현재 환경에서 class 기반 IOR 주입 — 신호·커버리지 분석</h2>
+    <p>
+      class 기반 주입의 실현 가능성은 "import 환경에 <b>재질 정체성 신호가 얼마나 남아있나</b>"에 달렸다. 실측 결과 신호는 풍부·결정적이다.
+    </p>
+    <h3>재질 정체성 신호 (실측)</h3>
+    <ul>
+      <li><b><code>material_id</code> = Infinigen shader 이름 그대로</b> — authoring_map·MTL에 <code>shader_glass_volume</code>, <code>shader_vase_ceramic</code>, <code>shader_marble</code>, <code>shader_galvanized_metal</code>, <code>shader_leather</code>… 보존. 씬당 ~63 distinct.</li>
+      <li><b>Infinigen 재질 라이브러리는 유한(123 모듈)</b>이고 <b>폴더 taxonomy로 물리 분류</b>됨: <code>ceramic/ fabric/ metal/ plastic/ wood/ tiles/ plant/ terrain/ fluid/ …</code>. → <b>shader 이름 → 폴더 → 물리 클래스</b>가 정적·결정적. Infinigen이 이미 해둔 물리 분류가 곧 우리 IOR 클래스.</li>
+      <li>이미 render_binding에 strategy 분포: pplastic 436 · roughconductor 61 · dielectric 19 · conductor 4 (한 씬 기준) + <code>capabilities.polarization</code>.</li>
+    </ul>
+    <h3>커버리지 (23 씬 · 6,312 재질 · 137 distinct stem)</h3>
+    <p>shader 이름 → (dielectric 클래스 IOR | 원소 금속 eta/k | finish-only 금속 fallback | 미분류) 분류기를 실제 재질에 적용:</p>
+    <table>
+      <thead><tr><th>계층</th><th>처리 방식</th><th>비중</th></tr></thead>
+      <tbody>
+        <tr><td><b>L1 — 유전체</b></td><td>클래스별 실수 IOR 정적 테이블(유리1.5·물1.33·세라믹1.5·나무1.5·플라스틱1.49·직물1.5…)</td><td class="ok">86.6%</td></tr>
+        <tr><td><b>L1 — 금속(원소 이름)</b></td><td>gold/steel/copper/chrome… → 실제 eta/k</td><td>2.0%</td></tr>
+        <tr><td><b>L2 — 금속(finish-only)</b></td><td>brushed/galvanized/white_metal… → <b>base_color→F0 매칭</b>으로 실제 금속 선택</td><td class="warn">9.3%</td></tr>
+        <tr><td><b>L3 — 미분류</b></td><td>테이블 확장 대상 or 이미 measured</td><td>2.0%</td></tr>
+      </tbody>
+    </table>
+    <p><b>L1 결정적 88.7% · L1+L2 물리적 처리 98.0% · L3 2.0%.</b></p>
+    <div class="note">
+      게다가 L3 미분류의 상당수는 (a) 테이블만 넓히면 흡수될 유전체(<code>painted_wall</code>, plant류, <code>rug</code>, <code>wax</code>, <code>ear</code> …) → dielectric L1을 ~96%로 끌어올림, (b) <b>이미 measured 재질</b>(<code>pbrdf_2020:*_billiard</code>, <code>hpbrdf_2025/green_silicone</code>) → IOR 주입 자체가 불필요. 실질 미분류는 사실상 0에 수렴.
+    </div>
+
+    <h3>가장 물리적으로 정합한 접근 — 계층형 결정적 파이프라인</h3>
+    <table>
+      <thead><tr><th>계층</th><th>내용</th><th>성격</th></tr></thead>
+      <tbody>
+        <tr><td><b>L1 정적 taxonomy 테이블</b>(backbone)</td><td><code>shader→폴더 클래스→광학상수</code>. 유전체 실수 IOR, 원소 금속 eta/k. 유한(123)이라 한 번 만들면 끝.</td><td>결정적·auditable·재현성</td></tr>
+        <tr><td><b>L2 base_color→F0 매칭</b>(금속 미결정)</td><td>Infinigen metal 워크플로에서 <b>base_color ≈ F0</b> → 색조를 실제 금속 F0와 매칭(금빛→Au, 붉은→Cu, 중성회→Al/Fe). 이름 추측 아닌 <b>authored 반사율 기반</b>.</td><td>물리적 fallback</td></tr>
+        <tr><td><b>L3 오프라인 LLM</b>(선택)</td><td>재질 유한 → per-frame 불필요. LLM은 <b>신규/롱테일 shader를 테이블에 편입</b>할 때 분류 제안(사람 승인)만.</td><td>유지보수 도구</td></tr>
+      </tbody>
+    </table>
+    <p>
+      <b>왜 template ≫ per-frame LLM</b>: 재질 집합이 유한 + 이미 폴더로 물리 분류 + 유전체 IOR 범위가 좁음 → 결정적 테이블이 커버리지·정합성·재현성 모두 우위. LLM은 그 테이블을 <i>만드는</i> 보조.
+    </p>
+    <p><b>적용 지점</b>: <code>import_infinigen_scene._material_binding</code>이 shader 이름/<code>optical_class</code> 기반으로 render_binding에 <code>int_ior</code>(유전체)·<code>conductor_material</code>/eta·k(금속)를 채우고, <code>render_daemon</code>이 현재 <b>모든 금속에 <code>material="Al"</code> 박는 지점</b>을 그 값으로 교체.</p>
+    <div class="note">
+      <b>정직한 천장</b>: Infinigen 금속 base_color는 측정값이 아니라 <code>metal_hsv()</code> 난수 → L2도 "그 물체의 진짜 금속 복원"이 아니라 "<b>authored 외형과 정합하는 실제 금속으로 스냅</b>"이다. 합성 편광 데이터셋 목적엔 이게 정확히 원하는 것(물리적으로 valid한 편광 서명 + 실제 금속 다양성 + RGB 외형 일관). ground-truth 금속은 애초에 없다.
+    </div>
+
+    <p class="meta">근거 데이터: <code>out/infinigen_imports/kr_20260627</code> · <code>out/opticalnav/opticalnav-v0.2/scenes/*/authoring_map.json</code>(23 씬·6,312 재질) · Infinigen 1.19.1 <code>assets/materials/{ceramic,fabric,metal,plastic,wood,…}/*</code>(123 모듈) · <code>render_daemon.py</code>, <code>tools/infinigen/blender_export_scene.py</code>(<code>_optical_class</code>) · <code>mitsuba3-optix7/src/bsdfs/{pplastic,roughconductor,principled,roughdielectric,blendbsdf}.cpp</code> · <code>docs/BRDF_IMPLEMENTATION_GUIDE.md</code> · IOR 테이블: pixelandpoly.com/ior.html, refractiveindex.info.</p>
+  </article>
+</main>
+</div>
+</body>
+</html>

@@ -139,10 +139,14 @@ class RenderConfig:
     # "hybrid" (achromatic→1 band, colored materials→3 bands) | "rgb"
     # (3 bands). Empty = ROBOMITUBA_PBRDF_BAND_MODE env then "single".
     pbrdf_band_mode: str = "single"
-    # Measured-pBRDF scope: "analytic_only" (0 measured) |
-    # "analytic_priority" (forced/target/anchor up to max, default) |
+    # Measured-pBRDF scope: "analytic_only" (0 measured, DEFAULT) |
+    # "analytic_priority" (forced/target/anchor up to max) |
     # "budgeted_measured" (top candidates up to max) | "measured_full".
-    measured_scope: str = "analytic_priority"
+    # Default flipped to analytic_only (2026-06-29): analytic BSDFs
+    # (pplastic/dielectric/conductor) cover RGB+NIR+polarization, avoid measured
+    # pBRDF cost + low-light collapse + measured_polarized_rgb build dependency.
+    # Measured stays opt-in via explicit measured_scope.
+    measured_scope: str = "analytic_only"
     max_measured_bsdfs: int = 3
     artifact_stems: dict[str, str] = field(default_factory=dict)
     scene_filenames: dict[str, str] = field(default_factory=dict)
@@ -702,8 +706,8 @@ def _resolve_measured_scope(config: "RenderConfig | None") -> str:
     mode = getattr(config, "measured_scope", None) if config is not None else None
     if not mode:
         mode = os.environ.get("ROBOMITUBA_MEASURED_SCOPE")
-    mode = str(mode or "analytic_priority").strip().lower()
-    return mode if mode in _MEASURED_SCOPES else "analytic_priority"
+    mode = str(mode or "analytic_only").strip().lower()
+    return mode if mode in _MEASURED_SCOPES else "analytic_only"
 
 
 def _resolve_max_measured_bsdfs(config: "RenderConfig | None") -> int:
@@ -2047,7 +2051,7 @@ def _stage_path_scene(
     measured_wavelength_nm: int | None = None,
     channel_rgb_plugin: bool = False,
     band_mode: str = "rgb",
-    measured_scope: str = "analytic_priority",
+    measured_scope: str = "analytic_only",
     max_measured_bsdfs: int = 3,
 ) -> Path:
     stage_signature = (
@@ -2218,7 +2222,7 @@ def _stage_stokes_scene(
     scene_override: SceneOverrideSpec | None = None,
     assist_light: AssistLightSpec | None = None,
     nested_integrator_type: str = "direct",
-    measured_scope: str = "analytic_priority",
+    measured_scope: str = "analytic_only",
     max_measured_bsdfs: int = 3,
 ) -> Path:
     stage_signature = (
@@ -2291,7 +2295,7 @@ def _stage_base_stokes_scene(
     samples_per_pass: int | None,
     scene_override: SceneOverrideSpec | None = None,
     nested_integrator_type: str = "direct",
-    measured_scope: str = "analytic_priority",
+    measured_scope: str = "analytic_only",
     max_measured_bsdfs: int = 3,
 ) -> Path:
     """Stage a camera-free Stokes scene shared across polar viewpoints."""
@@ -2818,7 +2822,7 @@ def _stage_base_path_scene(
     measured_wavelength_nm: int | None = None,
     channel_rgb_plugin: bool = False,
     band_mode: str = "rgb",
-    measured_scope: str = "analytic_priority",
+    measured_scope: str = "analytic_only",
     max_measured_bsdfs: int = 3,
 ) -> Path:
     """Stage a camera-free path-tracer scene shared across viewpoints.

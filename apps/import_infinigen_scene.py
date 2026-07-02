@@ -246,6 +246,11 @@ def _material_binding(mat: dict) -> dict:
         if images and images[0].get("filepath"):
             binding["base_color_texture_ref"] = images[0]["filepath"]
 
+    # Carry optical_class into the render binding so the daemon can inject
+    # per-material IOR / metal eta-k (ROBOMITUBA_BSDF_MODE=injected) without
+    # re-deriving from the material name. (Older scenes lack this; the daemon
+    # falls back to deriving from the material_id/shader name.)
+    binding["optical_class"] = oc
     transparent = oc == "glass"
     return {
         "material_id": _san(name),

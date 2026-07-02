@@ -1,0 +1,337 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>2026-07-01 BSDF IOR/금속 주입 — OLD vs NEW 편광 비교</title>
+  <style>
+    :root{color-scheme:light;--bg:#f7f8fb;--paper:#fff;--ink:#1f2937;--muted:#667085;--line:#d9dee8;--accent:#1d5fd1;--ok:#087443;--warn:#a15c07;--code:#f1f4f9;}
+    body{margin:0;background:var(--bg);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;line-height:1.58;}
+    .layout{display:flex;min-height:100vh;align-items:flex-start;}
+    aside{width:260px;flex:0 0 260px;position:sticky;top:0;height:100vh;overflow-y:auto;padding:24px 16px;border-right:1px solid var(--line);background:#eef2f7;}
+    .logo{font-weight:800;color:var(--accent);font-size:16px;}
+    .date{margin-top:3px;color:var(--muted);font-size:12px;font-family:ui-monospace,Menlo,Consolas,monospace;}
+    .nav-title{margin:22px 8px 8px;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.12em;font-weight:800;}
+    .nav-link{display:block;padding:6px 8px;border-radius:5px;color:#344054;font-size:12px;text-decoration:none;margin-bottom:2px;}
+    .nav-link:hover{background:#dde3ee;color:var(--accent);}
+    main{flex:1;min-width:0;padding:36px 24px 64px;}
+    article{max-width:1080px;margin:0 auto;background:var(--paper);border:1px solid var(--line);border-radius:8px;padding:34px 40px;box-shadow:0 8px 24px rgb(16 24 40/.05);}
+    h1,h2,h3{line-height:1.25;margin:0;}
+    h1{font-size:28px;}
+    h2{margin-top:34px;padding-top:22px;border-top:1px solid var(--line);font-size:20px;}
+    h3{margin-top:22px;font-size:16px;}
+    p{margin:10px 0 0;}
+    ul{margin:10px 0 0 20px;padding:0;}
+    li{margin:5px 0;}
+    code{background:var(--code);border:1px solid #e5e9f2;border-radius:5px;padding:1px 5px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:.92em;}
+    pre{overflow-x:auto;background:#111827;color:#e5e7eb;border-radius:8px;padding:14px 16px;font-size:13px;line-height:1.5;}
+    pre code{background:transparent;border:0;padding:0;color:inherit;}
+    table{width:100%;border-collapse:collapse;margin-top:12px;font-size:14px;}
+    th,td{border:1px solid var(--line);padding:9px 10px;text-align:left;vertical-align:top;}
+    th{background:#f3f6fb;font-weight:650;}
+    figure{margin:16px 0 0;}
+    figure img{width:100%;border:1px solid var(--line);border-radius:8px;display:block;}
+    figcaption{margin-top:6px;color:var(--muted);font-size:12.5px;}
+    .meta{margin-top:10px;color:var(--muted);font-size:14px;}
+    .badge{display:inline-block;margin-right:6px;border-radius:999px;padding:2px 9px;border:1px solid var(--line);background:#f8fafc;color:var(--muted);font-size:12px;}
+    .ok{color:var(--ok);font-weight:650;}
+    .warn{color:var(--warn);font-weight:650;}
+    .note{margin-top:12px;padding:10px 14px;border-left:3px solid var(--accent);background:#f3f6fb;border-radius:0 6px 6px 0;font-size:13.5px;}
+    @media(max-width:980px){.layout{display:block;}aside{position:relative;width:auto;height:auto;border-right:0;border-bottom:1px solid var(--line);}main{padding:20px;}article{padding:24px 20px;}}
+  </style>
+</head>
+<body>
+<div class="layout">
+<aside>
+  <div class="logo">Robomituba</div>
+  <div class="date">2026-07-01</div>
+  <div class="nav-title">오늘 보고서</div>
+  <a class="nav-link" href="#summary">요약</a>
+  <a class="nav-link" href="#impl">1. 구현 (NEW = injected)</a>
+  <a class="nav-link" href="#result">2. OLD vs NEW 비교 결과</a>
+  <a class="nav-link" href="#build">3. Phase 3 — pplastic 재빌드</a>
+  <a class="nav-link" href="#diverse">4. 더 다양한 비교</a>
+  <a class="nav-link" href="#validate">5. Correctness 검증 (절대)</a>
+  <a class="nav-link" href="#gallery">6. 다중 씬 갤러리 (top-10)</a>
+  <a class="nav-link" href="#limits">7. 한계 · 남은 일</a>
+  <a class="nav-link" href="#repro">재현 방법</a>
+  <div class="nav-title">이전 보고서</div>
+  <a class="nav-link" href="report_2026-06-30.html">2026-06-30 metallic/IOR 규명 · 편광 소비</a>
+  <a class="nav-link" href="report_2026-06-29.html">2026-06-29 Infinigen→import→nav→PBR</a>
+  <a class="nav-link" href="index.html">전체 인덱스</a>
+</aside>
+<main>
+  <article>
+    <h1>BSDF IOR/금속 주입 — OLD(legacy) vs NEW(injected) 편광 비교</h1>
+    <div class="meta">
+      <span class="badge">2026-07-01</span>
+      <span class="badge">ROBOMITUBA_BSDF_MODE</span>
+      <span class="badge">per-material IOR / 실제 eta-k</span>
+      <span class="badge">pplastic texture-alpha 빌드</span>
+      <span class="badge">scene: infinigen_kr_20000221</span>
+    </div>
+
+    <h2 id="summary">요약</h2>
+    <p>
+      6/30 리포트(§7–10)에서 진단한 문제 — 렌더가 모든 표면에 <code>int_ior=1.5</code>·<code>material="Al"</code>를 하드코딩해
+      편광(DoLP/AoLP) 신호가 물리적으로 무의미 — 를 실제로 고치고, OLD(기존)와 NEW(주입)를 렌더로 비교했다.
+    </p>
+    <div class="note">
+      <b>결과</b>: NEW는 (a) 금속을 <b>실제 금속 eta-k</b>(Au·Cr·Ni·Ag·Al)로, (b) 유전체를 <b>재질별 IOR</b>로 렌더하며,
+      (c) Infinigen이 금속을 <code>metallic≈0</code>으로 구워 <b>diffuse plastic으로 잘못 렌더되던 버그</b>를 교정(금속을 conductor로 강제)했다.
+      한 뷰포인트에서 <b>RGB 픽셀의 19%, DoLP 픽셀의 6.5%가 유의하게 변화</b>(금속/유리 표면; 로컬 DoLP |Δ| 최대 0.98). 옵트인
+      플래그라 <code>legacy</code>(기본)면 기존과 완전 동일(회귀 0). 추가로 <b>pplastic 플러그인을 재빌드해 per-texel roughness(texture alpha)를 지원</b>하게 했다.
+      <b>§6</b>에 <b>3개 실내 씬 · 34개 뷰포인트</b>를 자동 배치 렌더해 개선이 가장 큰 <b>top-10 before/after 갤러리</b>를 추가했다(순수 유리 씬은 injection이 정확히 no-op임도 확인).
+    </p>
+
+    <h2 id="impl">1. 구현 (NEW = <code>ROBOMITUBA_BSDF_MODE=injected</code>)</h2>
+    <p>토글 <code>ROBOMITUBA_BSDF_MODE</code> ∈ {<code>legacy</code>(기본), <code>injected</code>, <code>measured</code>}. 두 BSDF emitter가 이 값으로 분기.</p>
+    <table>
+      <thead><tr><th>채널</th><th>legacy (OLD)</th><th>injected (NEW)</th></tr></thead>
+      <tbody>
+        <tr><td>금속 재질</td><td>전부 <code>material="Al"</code></td><td>optical_class(gold/steel/mirror) + <b>base_color→F0 색조 매칭(L2)</b>으로 실제 금속 preset: Au/Cr/Ni_palik/Ag/Al</td></tr>
+        <tr><td>금속 판정</td><td>OBJ-MTL <code>metallic_factor&gt;0.5</code> → Infinigen은 ≈0이라 <b>금속이 diffuse plastic으로 렌더됨(버그)</b></td><td>optical_class가 metal/mirror면 <b>conductor 강제</b> → 진짜 금속으로 렌더 + 편광</td></tr>
+        <tr><td>유전체 IOR</td><td><code>int_ior=1.5</code> 하드코딩</td><td>클래스별 실수 IOR(유리 1.5·물 1.33·나무/세라믹 1.5·plant 1.42…)</td></tr>
+        <tr><td>roughness(plastic)</td><td>스칼라 alpha</td><td>pplastic texture-alpha 빌드 후 <b>per-texel</b>(baked roughness 있을 때)</td></tr>
+      </tbody>
+    </table>
+    <p>매핑 로직은 <code>modules/mitsuba_converter/src/mitsuba_converter/optical_constants.py</code>, emit는 <code>render_daemon.py</code>의 두 경로(<code>_append_extracted_bsdf_xml</code>, <code>_append_bsdf_xml</code>). 실제 씬의 금속 분포:</p>
+    <pre><code>legacy   금속 material= : {'Al': 67}
+injected 금속 material= : {'Al': 28, 'Cr': 24, 'Ni_palik': 9, 'Au': 3, 'Ag': 3}
+injected 유전체 int_ior : {1.5: 85, 1.49: 14, 1.40: 8, 1.45: 2, 1.42: 1}</code></pre>
+
+    <h2 id="result">2. OLD vs NEW 비교 결과</h2>
+    <p>
+      씬 <code>infinigen_kr_20000221</code>의 한 뷰포인트를 편광 variant(<code>cuda_ad_spectral_polarized</code>)로 legacy·injected 각각 렌더.
+      행=모드, 열=[RGB · DoLP · AoLP].
+    </p>
+    <figure>
+      <img src="assets/bsdf_compare_2026-07-01.png" alt="legacy vs injected montage (RGB/DoLP/AoLP/S1)">
+      <figcaption>행: legacy · injected · <b>diff(injected−legacy)</b>. 열: RGB / DoLP(red→black) / AoLP(rainbow 0–180°) / S1/S0(bwr). diff 행의 <b>AoLP 차분</b>을 보면 금속 캐비닛·문틀 등 <b>금속/유리 표면에서 편광각이 바뀐 위치</b>가 뚜렷하다(확산 벽은 거의 백색=무변화).</figcaption>
+    </figure>
+    <p>프레임 평균이 아니라 <b>injected − legacy 차분</b>으로 보면 변화가 드러난다:</p>
+    <table>
+      <thead><tr><th>지표</th><th>legacy → injected (평균)</th><th>국소 변화</th></tr></thead>
+      <tbody>
+        <tr><td><b>DoLP</b></td><td>0.1298 → 0.1318</td><td class="ok"><b>6.5%</b> 픽셀이 &gt;0.05 변화, 최대 |Δ|=<b>0.985</b>; 변화 픽셀에서 0.400→0.414</td></tr>
+        <tr><td><b>AoLP</b></td><td>—</td><td><b>DoLP-mask 후 1.73°</b>(DoLP-weighted 1.12°). ※ 마스크 전 "max π"는 저편광 픽셀 노이즈 — §5.3 참조</td></tr>
+        <tr><td><b>RGB</b></td><td>—</td><td class="ok"><b>19.2%</b> 픽셀이 &gt;0.02 변화(최대 0.50) — 금속이 metallic하게 보임</td></tr>
+      </tbody>
+    </table>
+    <div class="note">
+      즉 주입은 <b>금속·유리 표면(프레임의 6–19%)의 편광 서명을 강하게 바꾸고</b>, 확산 벽(int_ior 1.49→1.5)은 거의 그대로다.
+      프레임 평균 DoLP가 작게 움직인 건 이 씬에서 금속이 소수 픽셀이라서지, 주입 효과가 작아서가 아니다.
+    </div>
+
+    <h3>추가 뷰포인트 — 금속/거울/유리에서의 개선</h3>
+    <p>금속·프레임이 크게 잡히는 뷰포인트에서 개선이 더 뚜렷하다(같은 씬, 다른 뷰포인트).</p>
+    <figure>
+      <img src="assets/bsdf_view_metal_cabinet.png" alt="metal cabinet viewpoint legacy vs injected">
+      <figcaption><b>금속 서랍장</b> 뷰포인트. RGB: legacy는 서랍장이 <b>무광 plastic처럼 어둡게</b> 렌더(metallic≈0 버그) → injected는 <b>금속답게 밝고 하이라이트</b>가 생김. AoLP diff(하단): 서랍장·벽 전체에 <b>편광각이 균일하게 shift</b>(금속=conductor화 + 벽 IOR 보정).</figcaption>
+    </figure>
+    <figure>
+      <img src="assets/bsdf_view_framed_panel.png" alt="framed panel viewpoint legacy vs injected">
+      <figcaption><b>금속 프레임 패널</b>(거울/창틀류) 뷰포인트. DoLP: 프레임 모서리에서 강한 편광. AoLP·diff: 패널 내부와 좌측 금속 소품에서 편광각 변화. DoLP |Δ| 최대 <b>0.74</b>(5.0% 픽셀).</figcaption>
+    </figure>
+    <p class="meta">뷰포인트별 DoLP |Δ| 최대: probe_517562=0.98(3.5%) · probe_630781=0.74(5.0%) · vp1_h090=0.59(2.4%). (벽만 보이는 뷰포인트는 변화 미미.)</p>
+
+    <h2 id="build">3. Phase 3 — pplastic 재빌드 (per-texel roughness)</h2>
+    <p>
+      표준 검증 빌드(<code>/home/jinnyeong/robomituba-build/mitsuba3</code>, Mitsuba v3.7.1, jinnyeong 소유)의 <code>pplastic.cpp</code>를 수정해
+      <code>alpha</code>(roughness)를 스칼라가 아닌 <b>Texture</b>로 받게 했다(같은 트리의 <code>roughconductor.cpp</code> 패턴 미러 —
+      upstream PR #1843과 동일 취지). 핵심: 멤버 <code>Float→ref&lt;Texture&gt;</code>, ctor에서 <code>get_unbounded_texture</code>,
+      sample/eval/pdf에서 <code>m_alpha_u-&gt;eval_1(si,active)</code>, <code>make_opaque</code>에서 alpha 제거, anisotropy는 텍스처 포인터 비교로.
+    </p>
+    <pre><code>ninja -C /home/jinnyeong/robomituba-build/mitsuba3   # plugins/pplastic.so 재링크 (증분, 수초)
+# 검증:
+pplastic(alpha=0.1)                          -> OK  (스칼라, 하위호환)
+pplastic(alpha=checkerboard 0.02/0.4)        -> OK  (per-texel roughness 수용)</code></pre>
+    <p class="ok">빌드·로드 검증 완료. 컴파일 에러 0, 스칼라/텍스처 alpha 둘 다 로드. pplastic만 별도 <code>.so</code>라 <code>libmitsuba.so</code> 무영향(백업도 보관).</p>
+    <p>단, 렌더에서 per-texel roughness가 <i>보이려면</i> 씬이 <code>--bake-pbr</code>로 roughness 아틀라스를 가져야 한다(테스트 씬 <code>kr_20000221</code>은 albedo만 구워져 alpha_tex=0). baked 씬(예 <code>kr_20260627</code>, roughness 58장)에서 효과 확인 예정.</p>
+
+    <h2 id="diverse">4. 더 다양한 비교 (완료)</h2>
+    <p>OLD vs NEW 프레임 비교(§2)에 더해, 주입의 물리적 타당성을 4가지 각도에서 렌더로 확인했다.</p>
+
+    <h3>4.1 금속 팔레트 — 금속마다 다른 편광 서명</h3>
+    <figure>
+      <img src="assets/bsdf_metal_palette.png" alt="metal palette spheres RGB/DoLP/AoLP">
+      <figcaption>동일 구에 plastic·Al·Au·Cr·Ag·Cu(<code>apps/demo_metal_polarization.py --preset metal</code>). RGB: 각 금속 고유색(Au 금·Cu 구리·Cr 청회·Ag/Al 은). DoLP: <b>Cr(steel)이 최강</b>, 금속마다 다름. AoLP: 방사형 편광각 필드. → legacy처럼 "전부 Al"이면 이 <b>색·편광 다양성이 통째로 사라진다</b>.</figcaption>
+    </figure>
+
+    <h3>4.2 추가 실내 뷰포인트 — 금속 가구</h3>
+    <figure>
+      <img src="assets/bsdf_view_locker_wall.png" alt="metal locker wall legacy vs injected">
+      <figcaption>금속 서랍/락커 벽(vp1_h120). <b>legacy는 거의 검은 무광(plastic)</b> → <b>injected는 밝은 금속 + 하이라이트</b>(metallic≈0 버그 교정). AoLP diff: 벽 전체 편광각이 균일 shift. (§2의 서랍장 뷰포인트도 동일 패턴.)</figcaption>
+    </figure>
+
+    <h3>4.3 per-texel roughness (patched pplastic, §3)</h3>
+    <figure>
+      <img src="assets/bsdf_texture_roughness.png" alt="pplastic scalar vs texture alpha roughness">
+      <figcaption>pplastic α: 스칼라 0.04(매끈·날카로운 하이라이트)·0.35(거침·무광)·<b>texture(체커)</b>. 3번째 구는 <b>하이라이트/DoLP/AoLP가 체커 패턴으로 공간변화</b> — §3 pplastic 재빌드가 렌더 파이프라인에서 실제 동작함을 확인(스칼라 구는 불가).</figcaption>
+    </figure>
+
+    <h3>4.4 injected(analytic) vs measured(aluminum pBRDF) 레퍼런스</h3>
+    <figure>
+      <img src="assets/bsdf_injected_vs_measured.png" alt="injected analytic vs measured aluminum pBRDF">
+      <figcaption>같은 금속 가구를 <b>analytic-injected</b> vs <b>measured_polarized(aluminum, KAIST hpBRDF)</b>로 렌더(<code>--modes injected measured</code>). RGB·DoLP는 근접하나 <b>AoLP가 다소 다름</b>(diff 균일한 옅은 차) → analytic이 measured에 <b>가까워졌지만 완전 일치는 아님</b>(§5 analytic 상한). "변했다"를 넘어 "measured 쪽으로 근접"을 보이는 앵커.</figcaption>
+    </figure>
+
+    <h3>4.5 dataset viewer — 개선 렌더 준비 상태 UI</h3>
+    <p>
+      webui <b>Sensors 탭 → Sync Inspector</b>에 "🔬 BSDF injection (improved render)" 그룹 추가:
+      <b>BSDF mode</b>(env) · <b>IOR/metal linking</b>(✓ injected / legacy) · <b>Injected metals(real eta-k)</b> · <b>Per-material IOR variants</b> · <b>pplastic texture-α</b>.
+      daemon <code>_opticalnav_render_scene_stats</code>가 staged <code>render_scene.xml</code>에서 자동 감지(금속 material≠Al, int_ior 다양성, texture alpha) → 현재 씬이 <b>개선 렌더 경로를 타는지 한눈에</b> 확인.
+    </p>
+    <div class="note">하네스(<code>apps/compare_bsdf_modes.py</code>)는 파이프라인 컬러맵 PNG(DoLP red→black, AoLP rainbow, S1/S2 bwr)를 타일 + diff 행 자동 생성. <code>--ambient</code>로 밝기, <code>--modes legacy injected measured</code>로 3-way. 데모: <code>apps/demo_metal_polarization.py --preset metal|roughness</code>.</div>
+
+    <h2 id="validate">5. Correctness 검증 — analytic ground truth 대비 (절대 검증)</h2>
+    <p>§2–4는 "legacy 대비 변했다 / measured에 근접"이라는 <i>상대</i> 검증이다. <b>correctness</b>는 정답을 계산할 수 있는 최소 씬에서 closed-form Fresnel과 직접 대는 <b>절대 검증</b>이 필요하다. 가장 근본적인 것부터(0→3) — 모듈 <code>apps/polar_validation.py</code>.</p>
+
+    <h3>5.0 Realizability · Stokes 물리성</h3>
+    <p>모든 픽셀에서 <b>DoLP ≤ 1</b>, <b>√(S1²+S2²+S3²) ≤ S0</b> 가 성립해야 Mueller 전파가 정상이다. 결과: <b>3모드 전부 위반 0%</b> (전 픽셀 max DoLP ≈ 0.999).</p>
+    <table>
+      <thead><tr><th>mode</th><th>max DoLP (lit)</th><th>‖S‖/S0 max (lit)</th><th>&gt;1.001 위반</th><th>verdict</th></tr></thead>
+      <tbody>
+        <tr><td>legacy</td><td>0.369</td><td>0.369</td><td>0.000%</td><td class="ok">OK</td></tr>
+        <tr><td>injected</td><td>0.392</td><td>0.392</td><td>0.000%</td><td class="ok">OK</td></tr>
+        <tr><td>measured</td><td>0.459</td><td>0.459</td><td>0.000%</td><td class="ok">OK</td></tr>
+      </tbody>
+    </table>
+
+    <h3>5.1 유전체 Fresnel / Brewster — DoLP(θ)</h3>
+    <figure>
+      <img src="assets/validate_brewster_dielectric.png" alt="dielectric DoLP(theta) vs Fresnel">
+      <figcaption>평활 pplastic 구(n=1.5) + constant unpolarized env. 렌더 DoLP(θ)(빨강) vs closed-form Fresnel(검정). <b>상승부 0–50°가 정확히 일치</b>(RMSE <b>0.003</b>@θ&lt;45°, 0.005@θ&lt;50°) → θ 매핑·유전체 IOR·specular 편광 경로가 물리적으로 옳다. 피크는 ~0.94/52°로 이상적 1.0/56.3°보다 낮은데, 이는 <b>pplastic의 coated 모델</b>(coat→substrate 투과분 depolarize; bare 계면이면 1.0)이지 버그 아님. &gt;65° 급락은 구 실루엣 아티팩트.</figcaption>
+    </figure>
+    <figure>
+      <img src="assets/validate_sphere_dop_dielectric.png" alt="dielectric sphere DoLP Brewster ring">
+      <figcaption>같은 렌더의 DoLP 필드(red→black). 교과서적 <b>Brewster 링</b>: 중심(법선입사 θ=0)은 <b>DoLP≈0(검정)</b>, ~52° 지점에 <b>밝은 링(DoLP≈0.9)</b>, 실루엣으로 갈수록 감소. 위 θ-곡선을 이미지로 직관 확인.</figcaption>
+    </figure>
+
+    <h3>5.2 도체 DoLP(θ) — 복소 eta-k</h3>
+    <figure>
+      <img src="assets/validate_conductor_au.png" alt="Au conductor DoLP(theta) vs complex Fresnel">
+      <figcaption>Au 평활 구 vs 복소 Fresnel(n=0.35, k=2.72 @550nm). <b>RMSE 0.028</b>. 금속은 DoLP가 ~0.13로 유전체(1.0)보다 훨씬 약하고 pseudo-Brewster(~60°)에서 피크 — 물리대로. 도체 eta-k 주입 경로 검증.</figcaption>
+    </figure>
+    <figure>
+      <img src="assets/validate_conductor_cr.png" alt="Cr conductor DoLP(theta) vs complex Fresnel">
+      <figcaption>Cr(steel stand-in): <b>RMSE 0.13</b> — Au보다 큼. 하드코딩 550nm n,k와 렌더의 <b>spectral 평균</b>(+steel→Cr 대체) 차이 = <b>금속 preset stand-in 근사 오차의 정량화</b>(§6 한계). analytic 곡선 형태는 따르나 크기에 편차.</figcaption>
+    </figure>
+
+    <h3>5.3 AoLP는 반드시 DoLP-mask (§2 재해석)</h3>
+    <p>DoLP→0 픽셀에서 AoLP는 정의 자체가 노이즈다. §2의 "AoLP ~10°, 최대 π"는 저편광 확산 픽셀에 오염된 값이었다. <b>DoLP&gt;0.05 마스킹 + circular error(mod π)</b>로 재계산:</p>
+    <table>
+      <thead><tr><th>비교</th><th>naive-all</th><th>masked</th><th>DoLP-weighted</th><th>DoLP RMSE (masked)</th></tr></thead>
+      <tbody>
+        <tr><td>legacy → injected</td><td>6.21°</td><td><b>1.73°</b></td><td>1.12°</td><td>0.050</td></tr>
+        <tr><td>injected vs measured</td><td>15.18°</td><td><b>2.13°</b></td><td>1.91°</td><td><b>0.022</b></td></tr>
+      </tbody>
+    </table>
+    <div class="note">
+      → (1) legacy→injected의 <b>실제</b> AoLP 변화는 ~1–2°(금속/유리 표면); "max π"는 노이즈였다. (2) <b>injected(analytic) ↔ measured(aluminum pBRDF)는 마스킹 시 AoLP 1.9°·DoLP RMSE 0.022로 매우 근접</b> — "변했다"를 넘어 measured에 <b>정량적으로 근접</b>함을 확정. AoLP는 circular(mod π) + DoLP 가중으로 재는 게 맞다.
+    </div>
+    <p class="meta">모듈 <code>apps/polar_validation.py</code>: <code>realize</code>(§5.0) · <code>sphere --ior|--metal</code>(§5.1–2) · <code>aolp</code>(§5.3–4). 남은 단계: 출력 Stokes frame의 0° 정의를 실제 편광 카메라(IMX250MZR 등)와 명시 대조 → 실제 카메라 end-to-end.</p>
+
+    <h2 id="gallery">6. 다중 씬 · 다중 뷰포인트 갤러리 — legacy vs injected top-10 (자동 랭킹)</h2>
+    <p>
+      §2·§4의 단일 뷰포인트 비교를 넘어, <code>apps/batch_bsdf_examples.py</code>로 <b>여러 씬 × 여러 뷰포인트</b>를
+      legacy/injected 두 모드로 자동 렌더하고, <b>편광 변화 + 색 복원</b>으로 점수화해 개선이 가장 잘 보이는
+      상위 10장을 뽑았다. 각 그림은 4열(RGB·DoLP·AoLP·S1/S0) × 3행(legacy·injected·diff).
+    </p>
+    <div class="note">
+      점수 지표 — <b>frac_dolp</b>: DoLP <code>|injected−legacy|&gt;0.05</code> 인 픽셀 비율(주 개선 지표) ·
+      <b>AoLP(masked)</b>: DoLP 가중 circular AoLP 변화(rad, §5 마스킹과 동일) · <b>chroma Δ</b>: 채도(색) 복원.
+      핵심 서명은 두 가지다 — (a) <b>금속 가구가 legacy에선 무광 plastic(metallic≈0 버그)로, injected에선 반사 conductor</b>로 렌더(#2 선반),
+      (b) <b>legacy의 int_ior=1.5-전면적용이 무광 벽을 과편광</b>시키던 것을 injected가 <b>물리적으로 교정</b>(#1·#3 벽 DoLP 붕괴, 금속만 편광 유지).
+    </div>
+    <div class="gallery">
+      <figure>
+        <img src="assets/bsdf_gallery_01_kr20260625_000094_h_000.png" alt="kr20260625 000094_h_000 legacy vs injected" loading="lazy">
+        <figcaption><b>#1 · kr20260625 · 000094_h_000</b> — corridor: legacy 과편광(벽 전체 red DoLP) → injected 물리적 재구성<br>
+          <span class="meta">score 73.2 · DoLP |Δ|&gt;0.05 <b>47.8%</b> · DoLP mean |Δ| 0.2089 · AoLP(masked) 0.5029 rad · chroma Δ -0.006</span></figcaption>
+      </figure>
+      <figure>
+        <img src="assets/bsdf_gallery_02_kr20000221_000117_h_300.png" alt="kr20000221 000117_h_300 legacy vs injected" loading="lazy">
+        <figcaption><b>#2 · kr20000221 · 000117_h_300</b> — 거실 금속 선반: legacy 검은 무광(plastic) → injected 반사 금속 프레임<br>
+          <span class="meta">score 12.9 · DoLP |Δ|&gt;0.05 <b>10.8%</b> · DoLP mean |Δ| 0.0199 · AoLP(masked) 0.0392 rad · chroma Δ +0.001</span></figcaption>
+      </figure>
+      <figure>
+        <img src="assets/bsdf_gallery_03_kr20260625_000001_h_000.png" alt="kr20260625 000001_h_000 legacy vs injected" loading="lazy">
+        <figcaption><b>#3 · kr20260625 · 000001_h_000</b> — 무광 벽 DoLP→0 교정 + 금속 환기구는 편광 유지 (교과서적)<br>
+          <span class="meta">score 23.9 · DoLP |Δ|&gt;0.05 <b>14.0%</b> · DoLP mean |Δ| 0.0334 · AoLP(masked) 0.1959 rad · chroma Δ +0.002</span></figcaption>
+      </figure>
+      <figure>
+        <img src="assets/bsdf_gallery_04_kr20260625_000108_h_000.png" alt="kr20260625 000108_h_000 legacy vs injected" loading="lazy">
+        <figcaption><b>#4 · kr20260625 · 000108_h_000</b> — 침실 문틀: 우측 벽 과편광 교정 + AoLP 필드 shift<br>
+          <span class="meta">score 28.3 · DoLP |Δ|&gt;0.05 <b>16.3%</b> · DoLP mean |Δ| 0.0339 · AoLP(masked) 0.2308 rad · chroma Δ -0.004</span></figcaption>
+      </figure>
+      <figure>
+        <img src="assets/bsdf_gallery_05_kr20260625_000076_h_000.png" alt="kr20260625 000076_h_000 legacy vs injected" loading="lazy">
+        <figcaption><b>#5 · kr20260625 · 000076_h_000</b> — 벽·가구 DoLP 재분포 (frac 0.14)<br>
+          <span class="meta">score 19.8 · DoLP |Δ|&gt;0.05 <b>14.1%</b> · DoLP mean |Δ| 0.0249 · AoLP(masked) 0.1101 rad · chroma Δ +0.000</span></figcaption>
+      </figure>
+      <figure>
+        <img src="assets/bsdf_gallery_06_kr20260625_000030_h_000.png" alt="kr20260625 000030_h_000 legacy vs injected" loading="lazy">
+        <figcaption><b>#6 · kr20260625 · 000030_h_000</b> — AoLP 필드 변화 위주 (masked 0.16)<br>
+          <span class="meta">score 12.2 · DoLP |Δ|&gt;0.05 <b>3.9%</b> · DoLP mean |Δ| 0.0111 · AoLP(masked) 0.1569 rad · chroma Δ +0.007</span></figcaption>
+      </figure>
+      <figure>
+        <img src="assets/bsdf_gallery_07_kr20000221_000132_h_330.png" alt="kr20000221 000132_h_330 legacy vs injected" loading="lazy">
+        <figcaption><b>#7 · kr20000221 · 000132_h_330</b> — 거실 다른 각도 — 선반/벽 편광 변화<br>
+          <span class="meta">score 7.2 · DoLP |Δ|&gt;0.05 <b>4.9%</b> · DoLP mean |Δ| 0.0155 · AoLP(masked) 0.0439 rad · chroma Δ +0.001</span></figcaption>
+      </figure>
+      <figure>
+        <img src="assets/bsdf_gallery_08_kr20000221_000015_h_030.png" alt="kr20000221 000015_h_030 legacy vs injected" loading="lazy">
+        <figcaption><b>#8 · kr20000221 · 000015_h_030</b> — 금속 가구 DoLP 증가 (frac 0.05)<br>
+          <span class="meta">score 6.2 · DoLP |Δ|&gt;0.05 <b>5.0%</b> · DoLP mean |Δ| 0.0151 · AoLP(masked) 0.0217 rad · chroma Δ +0.000</span></figcaption>
+      </figure>
+      <figure>
+        <img src="assets/bsdf_gallery_09_kr20000221_000001_h_000.png" alt="kr20000221 000001_h_000 legacy vs injected" loading="lazy">
+        <figcaption><b>#9 · kr20000221 · 000001_h_000</b> — 코너 뷰 — AoLP masked 0.06<br>
+          <span class="meta">score 5.9 · DoLP |Δ|&gt;0.05 <b>2.8%</b> · DoLP mean |Δ| 0.0148 · AoLP(masked) 0.0615 rad · chroma Δ +0.000</span></figcaption>
+      </figure>
+      <figure>
+        <img src="assets/bsdf_gallery_10_kitchen_vp_000001_h090.png" alt="kitchen vp_000001_h090 legacy vs injected" loading="lazy">
+        <figcaption><b>#10 · kitchen · vp_000001_h090</b> — 주방(수동 설치 씬): mirror→Ag 주입, 바닥 반사·금속 프레임 미세 변화<br>
+          <span class="meta">score 2.8 · DoLP |Δ|&gt;0.05 <b>1.5%</b> · DoLP mean |Δ| 0.0039 · AoLP(masked) 0.0225 rad · chroma Δ -0.000</span></figcaption>
+      </figure>
+    </div>
+    <p>
+      <b>씬 다양성 / 한계</b>: 상위권은 Infinigen 실내 2종(<code>kr20260625</code> 침실·복도, <code>kr20000221</code> 거실)이 차지했고,
+      수동 설치 <b>주방</b> 씬(<code>moorelane_kitchen</code>, mirror→Ag 주입)도 미세 개선(#10)을 확인했다.
+      <b>유리 전용 씬</b>(<code>glass_corridor</code>, 16뷰)은 <b>개선 점수 ≈ 0</b> — 이는 <b>버그가 아니라 기대된 결과</b>다:
+      순수 유리의 유전체 IOR은 legacy도 이미 1.5로 맞아, injection이 정확히 <b>변화를 주지 않는다</b>(주입의 실효는 <b>금속 eta·k</b>와 <b>클래스별 유전체 IOR</b>).
+      456-shape 씬(<code>kr20260627</code>)은 편광 spectral variant에서 GPU 메모리를 초과해 이 배치에서 제외(§7).
+    </p>
+
+    <h2 id="limits">7. 한계 · 남은 일</h2>
+    <ul>
+      <li><b>analytic diffuse 편광 상한</b>: analytic Fresnel은 금속·매끈 유전체 specular 편광엔 정확하나 diffuse 편광(벽·직물·나무=Infinigen 대다수)은 1차 근사(Kondo 2020). 장기적으로 measured/Kondo diffuse 항이 로드맵.</li>
+      <li><b>대형 씬 GPU 메모리</b>: 456-shape 씬(<code>kr20260627</code>)은 <code>cuda_ad_spectral_polarized</code> + 텍스처로 표준 빌드 GPU 메모리를 초과(res·텍스처 캡을 낮춰도 OOM) → §6 배치에서 제외. 대형 씬은 프로덕션 optix7 빌드/멀티-GPU 워커 경로 필요.</li>
+      <li><b>금속 preset stand-in</b>: Fe/steel/Ti/Zn preset이 빌드에 없어 steel→Cr, galvanized→Ni_palik, brass→Au로 근사. n,k 스펙트럼상 오차원(벤치마크엔 허용).</li>
+      <li><b>measured 근접도 잔차</b>: injected(analytic)가 measured aluminum pBRDF에 근접하나 AoLP에 잔차 존재(§4.4) — analytic의 태생적 한계. 정량 지표(per-region 오차)는 후속.</li>
+      <li><b>유리 전용 씬의 개선 없음(정상)</b>: §6에서 <code>glass_corridor</code>(16뷰)를 렌더한 결과 개선 점수 ≈ 0 — 순수 유리 유전체 IOR은 legacy(1.5)도 이미 맞아 injection이 no-op. 유리에서의 편광 개선은 <b>IOR 자체가 아니라</b> 코팅/다층·측정 pBRDF 영역이라 별도 로드맵.</li>
+      <li><b>per-texel roughness 실내 적용</b>: 합성 구로 검증(§4.3)했으나 실내 씬 적용은 <code>--bake-pbr</code>로 roughness 아틀라스를 가진 씬 필요(kr_20000221은 albedo만).</li>
+      <li><b>Phase 2 (per-texel metallic blendbsdf)</b>: 미착수(Infinigen metallic이 대개 flat이라 우선순위 낮음). 채택 전 blendbsdf의 편광 Mueller 전파 스모크 필요.</li>
+    </ul>
+
+    <h2 id="repro">재현 방법</h2>
+    <pre><code># 표준 빌드 env (현재 PC)
+cd /jarvis/project/robomituba
+export PYTHONPATH=modules/robomituba_bridge/src:modules/mitsuba_converter/src:modules/navigation_dataset/src:/home/jinnyeong/robomituba-build/mitsuba3/python
+export LD_LIBRARY_PATH=/usr/lib/wsl/lib:$LD_LIBRARY_PATH
+PY=/usr/bin/python3.10
+
+# (A) 빠른 검증: legacy vs injected XML BSDF diff (렌더 X)
+$PY apps/compare_bsdf_modes.py --scene infinigen_kr_20000221 --xml-only
+
+# (B) 실제 A/B 렌더 + montage
+$PY apps/compare_bsdf_modes.py --scene infinigen_kr_20000221 \
+  --request out/bridge_jobs/opticalnav-infinigen_kr_20000221-template-probe_1782359458321-h0-rgb/requests/infinigen_kr_20000221_probe_1782359458321_h0.json \
+  --modes legacy injected --spp 64 --res 512</code></pre>
+    <p class="meta">파일: <code>optical_constants.py</code>(신규) · <code>render_daemon.py</code>(emitter 2경로) · <code>import_infinigen_scene.py</code>(_material_binding optical_class) · <code>modules/mitsuba3/src/bsdfs/pplastic.cpp</code>(texture alpha) · <code>apps/compare_bsdf_modes.py</code>(비교 하네스). 산출: <code>out/bsdf_compare/infinigen_kr_20000221/</code>.</p>
+  </article>
+</main>
+</div>
+</body>
+</html>

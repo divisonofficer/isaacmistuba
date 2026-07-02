@@ -10,6 +10,7 @@
 	} from '$lib/datasets/sensorHelpers';
 	import { buildBatchJobGrid } from '$lib/datasets/batchHelpers';
 	import { opticalNavObservationModalityUrl } from '$lib/api';
+	import RenderLightbox from '$lib/datasets/RenderLightbox.svelte';
 	import type { Capabilities } from '$lib/datasets/capabilityHelpers';
 
 	interface Props {
@@ -50,13 +51,6 @@
 		loading: boolean;
 		hasScene: boolean;
 		hasGraph: boolean;
-		renderSceneStats: any;
-		renderSceneStatsLoading: boolean;
-		showRoomShell: boolean;
-		roomShell: any;
-		editorObjectsCount: number;
-		editorEmitterCount: number;
-		editorMaterialCount: number;
 		onLoadGlobalCameraRig: () => void;
 		onSelectRigSensor: (sensorId: string) => void;
 		onSetFrustumMode: (mode: string) => void;
@@ -89,8 +83,6 @@
 		episodePathNodeCount?: number;
 		headingsPerNode?: number;
 		onRefreshBatch: () => void;
-		onRefreshStats: () => void;
-		onSetShowRoomShell: (v: boolean) => void;
 	}
 
 	let {
@@ -105,8 +97,6 @@
 		hotCameraPose, previewBandMode, previewMeasuredScope,
 		probeRendering, probeError, rigMountHeightM, authoringMap,
 		selectedProjectId, sceneId, loading, hasScene, hasGraph,
-		renderSceneStats, renderSceneStatsLoading, showRoomShell, roomShell,
-		editorObjectsCount, editorEmitterCount, editorMaterialCount,
 		onLoadGlobalCameraRig, onSelectRigSensor, onSetFrustumMode, onTogglePlacingSensor,
 		onRemoveCustomSensor, onCustomSensorHeadingChange, onLoadRenderConfig,
 		onSetSensorHeight, onSetAmbientRadiance, onClearNodeObservations, onClearAllObservations,
@@ -117,10 +107,22 @@
 		selectedRigSensorIds = [], onToggleRigSweepSensor, onSetRigSweepSensors,
 		renderMissingOnly = true, onSetRenderMissingOnly,
 		episodeNodesAvailable = false, episodePathNodeCount = 0, headingsPerNode = 0,
-		onRefreshBatch, onRefreshStats, onSetShowRoomShell,
+		onRefreshBatch,
 	}: Props = $props();
 
 	const vpScan = $derived(observationScan?.viewpoints?.[selectedSensorNodeId]);
+
+	// Render lightbox — click any gallery thumb to open a large viewer with
+	// in-modal camera / modality / mirror-variant switching and heading nav.
+	let lightboxOpen = $state(false);
+	let lightboxHeading = $state('');
+	let lightboxVariant = $state<'base' | 'perturbed'>('base');
+	const lightboxHeadings = $derived(vpScan?.headings ? Object.keys(vpScan.headings) : []);
+	function openLightbox(hid: string, variant: 'base' | 'perturbed' = 'base') {
+		lightboxHeading = hid;
+		lightboxVariant = variant;
+		lightboxOpen = true;
+	}
 	const vpCompleted = $derived(
 		vpScan?.completed ?? (graphBatch
 			? (buildBatchJobGrid(graphBatch).rows.find((r: any) => r.nid === selectedSensorNodeId)?.cells?.filter((c: any) => c?.status?.status === 'completed')?.length ?? 0)
@@ -260,11 +262,11 @@
 				<option value="single">single · 1-band ×albedo</option>
 			</select>
 		</label>
-		<label class="band-mode-row" title="Measured pBRDF 사용 범위: 기본은 analytic-priority로 배경은 polarimetric analytic fallback을 사용하고 target/anchor만 measured를 켭니다.">
+		<label class="band-mode-row" title="Measured pBRDF 사용 범위: 기본은 analytic-only로 모든 표면을 polarimetric analytic BSDF(pplastic/dielectric/conductor)로 렌더합니다 — RGB+NIR+편광 커버. measured는 연구용 opt-in.">
 			<span>Measured scope</span>
 			<select value={previewMeasuredScope} onchange={(e) => onSetPreviewMeasuredScope((e.currentTarget as HTMLSelectElement).value)}>
+				<option value="analytic_only">analytic-only · 0 measured (default)</option>
 				<option value="analytic_priority">analytic-priority · anchors only</option>
-				<option value="analytic_only">analytic-only · 0 measured</option>
 				<option value="budgeted_measured">budgeted · up to 3</option>
 				<option value="measured_full">full measured · HQ</option>
 			</select>
@@ -335,21 +337,24 @@
 					{@const hasModality = headingHasSensorModality(hdata, visibleObservationModality, activeRigSensorId)}
 					{#if hasModality && perturbationEnabled}
 						<div class="obs-pair" title={`${hid} · base / perturbed (mirrors)`}>
-							<figure><img class="obs-thumb"
+							<figure><button type="button" class="obs-thumb-btn" onclick={() => openLightbox(hid, 'base')}><img class="obs-thumb"
 								src={opticalNavObservationModalityUrl(selectedProjectId, sceneId, selectedSensorNodeId, hid, visibleObservationModality, activeRigSensorId, 'base')}
-								alt={`${hid} base`} loading="lazy" /><figcaption>off</figcaption></figure>
-							<figure><img class="obs-thumb"
+								alt={`${hid} base`} loading="lazy" /></button><figcaption>off</figcaption></figure>
+							<figure><button type="button" class="obs-thumb-btn" onclick={() => openLightbox(hid, 'perturbed')}><img class="obs-thumb"
 								src={opticalNavObservationModalityUrl(selectedProjectId, sceneId, selectedSensorNodeId, hid, visibleObservationModality, activeRigSensorId, 'perturbed')}
-								alt={`${hid} perturbed`} loading="lazy" /><figcaption>mirror</figcaption></figure>
+								alt={`${hid} perturbed`} loading="lazy" /></button><figcaption>mirror</figcaption></figure>
 						</div>
 					{:else if hasModality}
-						<img
-							class="obs-thumb"
-							src={opticalNavObservationModalityUrl(selectedProjectId, sceneId, selectedSensorNodeId, hid, visibleObservationModality, activeRigSensorId)}
-							alt={`${hid} ${visibleObservationModality}`}
-							title={`${hid} · ${activeRigSensorId || 'legacy'} · ${visibleObservationModality}`}
-							loading="lazy"
-						/>
+						<button type="button" class="obs-thumb-btn"
+							onclick={() => openLightbox(hid, 'base')}
+							title={`${hid} · ${activeRigSensorId || 'legacy'} · ${visibleObservationModality} — click to enlarge`}>
+							<img
+								class="obs-thumb"
+								src={opticalNavObservationModalityUrl(selectedProjectId, sceneId, selectedSensorNodeId, hid, visibleObservationModality, activeRigSensorId)}
+								alt={`${hid} ${visibleObservationModality}`}
+								loading="lazy"
+							/>
+						</button>
 					{:else}
 						<div class="obs-thumb obs-thumb-empty" title={`${hid} · ${visibleObservationModality} not rendered`}>
 							<span>{parseInt(hid.replace('h_', '')) || 0}°</span>
@@ -389,26 +394,6 @@
 			onclick={onRenderViewpoint}>
 			{renderingViewpoint ? 'Sweeping...' : 'Graph Sweep · this viewpoint'}
 		</button>
-		<label class="sensor-resume-row" title="Skip viewpoints/headings that already have consolidated outputs or a completed bridge-job manifest.">
-			<input type="checkbox" checked={renderMissingOnly} onchange={(e) => onSetRenderMissingOnly?.((e.currentTarget as HTMLInputElement).checked)} />
-			<span>Only missing renders</span>
-		</label>
-		<div class="sensor-sweep-summary">Sweep sensors: {selectedRigSensorIds.length || 1} selected</div>
-		<button class="button button-subtle full" disabled={!caps.renderSweepAll.enabled} title={caps.renderSweepAll.reason} onclick={onRenderEpisodes}>
-			{renderMissingOnly ? 'Graph Sweep · missing only' : 'Graph Sweep · all viewpoints'}
-		</button>
-		{#if onRenderEpisodeNodes}
-			<button class="button button-subtle full"
-				disabled={!caps.renderEpisodePath.enabled}
-				title={caps.renderEpisodePath.reason}
-				onclick={onRenderEpisodeNodes}>
-				{#if episodeNodesAvailable && episodePathNodeCount > 0}
-					Graph Sweep · episode path ({episodePathNodeCount}{headingsPerNode > 0 ? ` × ${headingsPerNode}` : ''} jobs)
-				{:else}
-					Graph Sweep · episode path
-				{/if}
-			</button>
-		{/if}
 	{:else}
 		<div class="sensor-hint">Click a viewpoint (blue dot) to select it</div>
 		{#if observationScan?.viewpoints}
@@ -424,65 +409,45 @@
 			{/if}
 		{/if}
 	{/if}
+
+	<!-- Scene-level sweeps: independent of viewpoint selection -->
+	<label class="sensor-resume-row" title="Skip viewpoints/headings that already have consolidated outputs or a completed bridge-job manifest.">
+		<input type="checkbox" checked={renderMissingOnly} onchange={(e) => onSetRenderMissingOnly?.((e.currentTarget as HTMLInputElement).checked)} />
+		<span>Only missing renders</span>
+	</label>
+	<div class="sensor-sweep-summary">Sweep sensors: {selectedRigSensorIds.length || 1} selected</div>
+	<button class="button button-subtle full" disabled={!caps.renderSweepAll.enabled} title={caps.renderSweepAll.reason} onclick={onRenderEpisodes}>
+		{renderMissingOnly ? 'Graph Sweep · missing only' : 'Graph Sweep · all viewpoints'}
+	</button>
+	{#if onRenderEpisodeNodes}
+		<button class="button button-subtle full"
+			disabled={!caps.renderEpisodePath.enabled}
+			title={caps.renderEpisodePath.reason}
+			onclick={onRenderEpisodeNodes}>
+			{#if episodeNodesAvailable && episodePathNodeCount > 0}
+				Graph Sweep · episode path ({episodePathNodeCount}{headingsPerNode > 0 ? ` × ${headingsPerNode}` : ''} jobs)
+			{:else}
+				Graph Sweep · episode path
+			{/if}
+		</button>
+	{/if}
 </section>
 
-<section class="rail-section rail-tool-panel sync-inspector">
-	<div class="rail-title">Sync Inspector</div>
-	<div class="sync-row"><span>Authoring objects</span><span>{editorObjectsCount}</span></div>
-	<div class="sync-row"><span>Render shapes (XML)</span><span>{renderSceneStats?.shape_count ?? '—'}</span></div>
-	<div class="sync-row" class:warn={renderSceneStats?.exists && renderSceneStats.obj_shape_count === 0 && editorObjectsCount > 0}>
-		<span>Real USD meshes (OBJ)</span><span>{renderSceneStats?.obj_shape_count ?? '—'}</span>
-	</div>
-	<div class="sync-row"><span>Cube fallbacks</span><span>{renderSceneStats?.cube_shape_count ?? '—'}</span></div>
-	<div class="sync-row" class:warn={renderSceneStats?.exists && editorObjectsCount > 0 && renderSceneStats.shape_count < editorObjectsCount}>
-		<span>Δ object mismatch</span>
-		<span>{renderSceneStats?.shape_count != null ? renderSceneStats.shape_count - editorObjectsCount : '—'}</span>
-	</div>
-	<div class="sync-divider"></div>
-	<div class="sync-row"><span>is_emitter=true objects</span><span>{editorEmitterCount}</span></div>
-	<div class="sync-row" class:warn={renderSceneStats?.exists && renderSceneStats.area_emitter_count !== editorEmitterCount}>
-		<span>Area emitters (XML)</span><span>{renderSceneStats?.area_emitter_count ?? '—'}</span>
-	</div>
-	<div class="sync-row"><span>Environment (envmap)</span><span>{renderSceneStats?.envmap_count ?? '—'}</span></div>
-	<div class="sync-divider"></div>
-	<div class="sync-row"><span>Authoring materials</span><span>{editorMaterialCount}</span></div>
-	<div class="sync-row" class:warn={renderSceneStats?.raw_hpbrdf_refs > 0}>
-		<span>Raw .hpbrdf refs (heavy)</span><span>{renderSceneStats?.raw_hpbrdf_refs ?? '—'}</span>
-	</div>
-	<div class="sync-row"><span>Channel-split refs</span><span>{renderSceneStats?.channel_split_refs ?? '—'}</span></div>
-	<div class="sync-row"><span>Measured BSDFs</span><span>{renderSceneStats?.measured_bsdf_count ?? '—'}</span></div>
-	<div class="sync-row"><span>Measured candidates</span><span>{renderSceneStats?.measured_candidates ?? '—'}</span></div>
-	<div class="sync-row"><span>Default measured on</span><span>{renderSceneStats?.measured_enabled_default ?? '—'}</span></div>
-	<div class="sync-row"><span>Default suppressed</span><span>{renderSceneStats?.measured_suppressed_default ?? '—'}</span></div>
-	<div class="sync-row"><span>Analytic BSDFs</span><span>{renderSceneStats?.analytic_bsdf_count ?? '—'}</span></div>
-	<div class="sync-row"><span>Analytic polar+RGB</span><span>{renderSceneStats?.analytic_polar_rgb_count ?? '—'}</span></div>
-	<div class="sync-row" class:warn={renderSceneStats?.invalid_analytic_fallback_count > 0}>
-		<span>Invalid analytic fallback</span><span>{renderSceneStats?.invalid_analytic_fallback_count ?? '—'}</span>
-	</div>
-	<div class="sync-row"><span>Diffuse-like analytic</span><span>{renderSceneStats?.diffuse_like_bsdf_count ?? '—'}</span></div>
-	<div class="sync-row"><span>Specular analytic</span><span>{renderSceneStats?.specular_like_bsdf_count ?? '—'}</span></div>
-	<div class="sync-row"><span>Measured polarized BSDFs</span><span>{renderSceneStats?.measured_polarized_count ?? '—'}</span></div>
-	<div class="sync-divider"></div>
-	<div class="sync-row"><span>Active rig</span><span>{authoringMap?.camera_rig?.rig_id ?? '—'}</span></div>
-	<div class="sync-row"><span>Rig mount height</span><span>{rigMountHeightM.toFixed(2)} m</span></div>
-	<div class="sync-row"><span>Ceiling height</span><span>{Number(authoringMap?.settings?.default_wall_height_m ?? 2.4).toFixed(2)} m</span></div>
-	<div class="sync-row">
-		<label class="footprint-toggle">
-			<input type="checkbox" checked={showRoomShell} onchange={(e) => onSetShowRoomShell((e.currentTarget as HTMLInputElement).checked)} />
-			Show auto room shell
-		</label>
-		<span>{roomShell?.shapes?.length ?? 0} shapes</span>
-	</div>
-	<div class="sync-divider"></div>
-	<div class="sync-row"><span>XML file</span><span class="mono">{renderSceneStats?.path ? renderSceneStats.path.split('/').slice(-2).join('/') : 'not generated'}</span></div>
-	<div class="sync-row"><span>XML size</span><span>{renderSceneStats?.size_bytes != null ? Math.round(renderSceneStats.size_bytes / 1024) + ' KB' : '—'}</span></div>
-	<div class="sync-row"><span>Last sync</span><span class="mono">{renderSceneStats?.modified_at?.slice(0, 19).replace('T', ' ') ?? '—'}</span></div>
-	<div class="sync-actions">
-		<button class="button button-subtle" disabled={!caps.refreshStats.enabled} title={caps.refreshStats.reason} onclick={onRefreshStats}>
-			{renderSceneStatsLoading ? 'Loading…' : 'Refresh stats'}
-		</button>
-	</div>
-</section>
+<RenderLightbox
+	open={lightboxOpen}
+	projectId={selectedProjectId}
+	{sceneId}
+	vpId={selectedSensorNodeId}
+	heading={lightboxHeading}
+	headings={lightboxHeadings}
+	sensorOptions={rigSensorOptions}
+	sensorId={activeRigSensorId}
+	modality={visibleObservationModality}
+	variant={lightboxVariant}
+	{perturbationEnabled}
+	hasRender={(hid, sid, mod) => headingHasSensorModality(vpScan?.headings?.[hid], mod, sid)}
+	onClose={() => (lightboxOpen = false)}
+/>
 
 <style>
 	/* Sensor panel */
@@ -654,7 +619,10 @@
 
 	.obs-heading-gallery { display: grid; grid-template-columns: repeat(4, 1fr); gap: 3px; margin: 6px 0; }
 
-	.obs-thumb { width: 100%; aspect-ratio: 4/3; object-fit: cover; border-radius: 3px; border: 1px solid var(--border); cursor: pointer; }
+	.obs-thumb-btn { display: block; width: 100%; padding: 0; border: none; background: none; cursor: pointer; }
+	.obs-thumb-btn:hover .obs-thumb { border-color: var(--accent, #38bdf8); }
+	.obs-thumb-btn:focus-visible { outline: 2px solid var(--accent, #38bdf8); outline-offset: 1px; border-radius: 3px; }
+	.obs-thumb { width: 100%; aspect-ratio: 4/3; object-fit: cover; border-radius: 3px; border: 1px solid var(--border); cursor: pointer; display: block; }
 	.obs-pair { display: grid; grid-template-columns: 1fr 1fr; gap: 2px; }
 	.obs-pair figure { margin: 0; position: relative; }
 	.obs-pair figcaption { position: absolute; top: 1px; left: 2px; font-size: 8px; padding: 0 3px; border-radius: 2px; background: rgba(0,0,0,0.55); color: #fff; }
@@ -779,15 +747,4 @@
 
 	.sensor-panel .sensor-config-row { display: flex; align-items: center; justify-content: space-between; gap: 6px; margin: 6px 0; }
 
-	/* Sync Inspector — mirrored from RailPreviewTab so the same component used in
-	   this tab actually renders with spacing/dividers. Svelte CSS is component-scoped
-	   so styles from the other file don't apply here. */
-	.sync-inspector { display: grid; gap: 6px; }
-	.sync-row { display: flex; justify-content: space-between; gap: 10px; font-size: var(--font-size-xs, 11px); padding: 2px 0; }
-	.sync-row.warn { color: var(--danger, #dc2626); font-weight: 600; }
-	.sync-row .mono { font-family: monospace; max-width: 60%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-	.sync-divider { height: 1px; background: var(--border, #e5e7eb); margin: 4px 0; }
-	.sync-actions { display: flex; gap: var(--space-2, 6px); margin-top: var(--space-2, 6px); }
-	.footprint-toggle { display: flex; align-items: center; gap: 6px; font-size: var(--font-size-xs, 11px); cursor: pointer; }
-	.footprint-toggle input { margin: 0; }
 </style>

@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
 from .episode_schema import EpisodeManifest, EpisodeTimestep, GENERATION_VERSION, write_episode
+from .instruction_generators import EpisodeCore, InstructionContext, build_instruction_context, generate_instructions
 from .rollout import scale_split_counts, split_for_index
 from .scene_annotations import SceneAnnotation
 from .viewpoint_graph import ViewpointEdge, ViewpointGraph, ViewpointHeading, ViewpointNode
@@ -273,6 +274,8 @@ def make_graph_episode(
     modalities: list[str],
     annotation: SceneAnnotation | None = None,
     observations_root: Path | None = None,
+    instruction_ctx: InstructionContext | None = None,
+    use_instruction_llm: bool = False,
 ) -> EpisodeManifest:
     nodes = _node_map(graph)
     path_headings = _path_headings(graph, path.nodes)
@@ -322,6 +325,23 @@ def make_graph_episode(
             )
         )
     goal_region, goal_label = _nearest_goal_label(annotation, nodes[path.nodes[-1]])
+    # Multi-level instruction set (turn-by-turn / landmark / perception / …). The
+    # scenario string stays the primary `natural_language_instruction` for
+    # back-compat; `instructions` augments it. Built only when a context is given.
+    instructions: list[dict] = []
+    if instruction_ctx is not None:
+        label = goal_label if goal_label not in ("", goal_region) else instruction_ctx.goal_label
+        if str(label).strip().lower() in ("goal", "the goal"):
+            label = "the goal"
+        core = EpisodeCore(
+            episode_id=episode_id,
+            scenario=scenario,
+            path_nodes=list(path.nodes),
+            node_xy={n: (float(nodes[n].position[0]), float(nodes[n].position[1])) for n in path.nodes},
+            expanded_steps=expanded,
+            goal_label=label,
+        )
+        instructions = generate_instructions(core, instruction_ctx, use_llm=use_instruction_llm)
     return EpisodeManifest(
         episode_id=episode_id,
         scene_id=graph.scene_id,
@@ -333,6 +353,7 @@ def make_graph_episode(
         trajectory=trajectory,
         actions=actions,
         timesteps=timesteps,
+        instructions=instructions,
         metadata={
             "modalities": list(modalities),
             "generation_version": GENERATION_VERSION,
@@ -340,6 +361,7 @@ def make_graph_episode(
             "graph_distance_m": path.distance_m,
             "hazard_crossing": path.hazard_crossing,
             "scene_variant_id": graph.metadata.get("scene_variant_id"),
+            "instruction_types": sorted({str(i.get("type")) for i in instructions}),
         },
         navigation_mode="viewpoint_graph",
         graph_id=graph.graph_id,
@@ -457,6 +479,9 @@ def plan_graph_episodes(
     observations_root: Path | None = None,
     excluded_edge_ids: set[str] | None = None,
     on_progress: "Callable[[int, int, int], None] | None" = None,
+    authoring_map: dict | None = None,
+    perturbation: dict | None = None,
+    use_instruction_llm: bool = False,
 ) -> list[EpisodeManifest]:
     if num_pairs <= 0:
         raise ValueError("num_pairs must be positive.")
@@ -476,6 +501,10 @@ def plan_graph_episodes(
         raise ValueError(f"Unsupported graph scenarios: {unknown}")
     rng = random.Random(seed)
     split_counts = scale_split_counts(split_counts, num_pairs)
+    # Build the per-scene instruction context once (rooms/objects/mirrors); reused
+    # for every episode. Cheap and side-effect free; degrades gracefully when
+    # authoring_map / perturbation are absent.
+    instruction_ctx = build_instruction_context(graph, annotation, authoring_map, perturbation)
     node_ids = sorted(node.node_id for node in graph.nodes)
     # Track how many times each node appears in accepted episodes (for coverage scoring)
     node_visit_counts: dict[str, int] = {}
@@ -514,6 +543,8 @@ def plan_graph_episodes(
                 modalities=modalities,
                 annotation=annotation,
                 observations_root=observations_root,
+                instruction_ctx=instruction_ctx,
+                use_instruction_llm=use_instruction_llm,
             )
         )
     return episodes

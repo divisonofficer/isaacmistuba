@@ -71,6 +71,7 @@ from robomituba_bridge import (
 )
 from robomituba_bridge.io import scene_snapshot_from_payload
 
+from . import optical_constants
 from .local_snapshot import enumerate_xml_targets, prepare_basic_scene_from_disk
 from .material_overrides_store import (
     StoredOverride,
@@ -807,6 +808,7 @@ def _append_extracted_bsdf_xml(
     fallback_color: str = "0.65 0.62 0.58",
     repo_root: "Path | None" = None,
     diffuse_bsdf_type: str = "roughplastic",
+    inject: "dict[str, Any] | None" = None,
 ) -> bool:
     """Emit a textured BSDF from a USD ``UsdPreviewSurface`` / OBJ-MTL descriptor.
 
@@ -833,10 +835,15 @@ def _append_extracted_bsdf_xml(
     if roughness_tex and not Path(roughness_tex).exists():
         roughness_tex = None
 
-    def _emit_alpha(bsdf_el: "ET.Element", scalar: float) -> None:
-        # roughplastic/pplastic/roughconductor `alpha` is texturable: prefer the
-        # per-texel baked roughness atlas (read raw — linear), else a scalar.
-        if roughness_tex:
+    def _emit_alpha(bsdf_el: "ET.Element", scalar: float, *, alpha_texturable: bool) -> None:
+        # Only roughconductor/roughdielectric accept a TEXTURE for `alpha` in
+        # Mitsuba 3. roughplastic/pplastic precompute a scalar-alpha distribution
+        # (rough-transmittance LUT / scalar alpha_u,v), so a <texture name="alpha">
+        # makes the plugin fail to instantiate:
+        #   "The property alpha has the wrong type (expected <float>, is <Object>)".
+        # For those, fall back to the scalar even when a baked roughness atlas exists
+        # (per-texel plastic roughness is unsupported by the plugin).
+        if roughness_tex and alpha_texturable:
             tex = ET.SubElement(bsdf_el, "texture", attrib={"name": "alpha", "type": "bitmap"})
             ET.SubElement(tex, "string", attrib={"name": "filename", "value": str(roughness_tex)})
             ET.SubElement(tex, "boolean", attrib={"name": "raw", "value": "true"})
@@ -865,21 +872,28 @@ def _append_extracted_bsdf_xml(
         inner_bsdf_parent = twosided
 
     # Treat fully metallic materials as roughconductor; otherwise roughplastic.
-    use_conductor = False
-    try:
-        if metallic is not None and float(metallic) > 0.5:
-            use_conductor = True
-    except Exception:
-        pass
+    # In injected mode a metal-classified material forces the conductor path even
+    # when the baked metallic_factor is ~0 (Infinigen encodes metals via base_color
+    # F0, not the metallic slot), so real eta-k / polarization applies.
+    use_conductor = bool(inject and inject.get("is_metal"))
+    if not use_conductor:
+        try:
+            if metallic is not None and float(metallic) > 0.5:
+                use_conductor = True
+        except Exception:
+            pass
 
     if use_conductor:
         bsdf = ET.SubElement(inner_bsdf_parent, "bsdf", type="roughconductor")
-        ET.SubElement(bsdf, "string", attrib={"name": "material", "value": "Al"})
+        metal = (inject or {}).get("conductor_material") or "Al"
+        ET.SubElement(bsdf, "string", attrib={"name": "material", "value": metal})
         alpha = _clamp_bsdf_alpha(roughness, default=0.2, floor=_MIN_ROUGHCONDUCTOR_ALPHA)
-        _emit_alpha(bsdf, alpha)
+        _emit_alpha(bsdf, alpha, alpha_texturable=True)
     else:
         bsdf_type = diffuse_bsdf_type if diffuse_bsdf_type in {"roughplastic", "pplastic"} else "roughplastic"
         bsdf = ET.SubElement(inner_bsdf_parent, "bsdf", type=bsdf_type)
+        if inject and inject.get("ior") and bsdf_type in {"pplastic", "roughplastic"}:
+            ET.SubElement(bsdf, "float", attrib={"name": "int_ior", "value": f"{float(inject['ior']):.4f}"})
         if base_tex:
             tex = ET.SubElement(bsdf, "texture", attrib={"name": "diffuse_reflectance", "type": "bitmap"})
             ET.SubElement(tex, "string", attrib={"name": "filename", "value": str(base_tex)})
@@ -897,7 +911,10 @@ def _append_extracted_bsdf_xml(
         # A per-texel roughness atlas, when present, supersedes the scalar entirely.
         if bsdf_type == "pplastic":
             alpha = max(0.2, alpha)
-        _emit_alpha(bsdf, alpha)
+        # pplastic accepts a TEXTURE alpha as of the patched build (per-texel
+        # roughness); enable it in injected mode. roughplastic still takes scalar
+        # alpha only (not rebuilt), so keep it scalar.
+        _emit_alpha(bsdf, alpha, alpha_texturable=(bsdf_type == "pplastic" and inject is not None))
     return True
 
 
@@ -938,6 +955,32 @@ def _measured_candidate_from_binding(binding: Mapping[str, Any]) -> dict[str, An
     if _binding_is_measured(dict(binding)):
         return dict(binding)
     return None
+
+
+def _baked_atlas_urls(source_ref: str | None, repo_root: "Path | None" = None) -> dict[str, Any]:
+    """Derive baked albedo/roughness/normal atlas artifact URLs from an object's
+    ``source_ref`` ("<import>/meshes/<oid>.obj" -> "<import>/textures/<oid>_<kind>.png"),
+    mirroring the webui ``bakedAtlasArtifactUrl`` derivation. ``exists`` is checked
+    against ``repo_root`` when given (None when it can't be determined; the <img>
+    404s gracefully to the base-color swatch either way)."""
+    out: dict[str, Any] = {"source_ref": source_ref}
+    ref = str(source_ref or "")
+    base, sep, tail = ref.rpartition("/meshes/")
+    ok = bool(sep) and tail.endswith(".obj")
+    oid = tail[:-4] if ok else None
+    for kind in ("albedo", "roughness", "normal"):
+        if not ok:
+            out[kind] = {"url": None, "exists": None}
+            continue
+        rel = f"{base}/textures/{oid}_{kind}.png"
+        exists: "bool | None" = None
+        if repo_root is not None:
+            try:
+                exists = (repo_root / rel).exists()
+            except Exception:
+                exists = None
+        out[kind] = {"url": f"/artifacts?path={quote(rel)}", "exists": exists}
+    return out
 
 
 def _material_policy_record(
@@ -993,7 +1036,7 @@ def _build_render_scene_material_policy(
     return {
         "version": "robomituba-render-scene-material-policy-v1",
         "scene_id": str(scene_id or ""),
-        "default_measured_scope": "analytic_priority",
+        "default_measured_scope": "analytic_only",
         "default_max_measured_bsdfs": 3,
         "summary": {
             "shape_policy_count": len(records),
@@ -1165,13 +1208,43 @@ def _append_bsdf_xml(
         )
         if record is not None:
             material_policy_records.append(record)
-    if isinstance(binding.get("analytic_fallback"), Mapping):
+    # measured mode (reference): prefer the measured_polarized candidate on
+    # surfaces that carry one (metals) so injected(analytic) can be compared to a
+    # measured-pBRDF anchor; other surfaces stay analytic.
+    _measured_ref = (_measured_candidate_from_binding(binding)
+                     if optical_constants.bsdf_mode() == "measured" else None)
+    if _measured_ref is not None:
+        binding_for_xml = _measured_ref
+    elif isinstance(binding.get("analytic_fallback"), Mapping):
         binding_for_xml = _analytic_fallback_from_binding(binding)
     else:
         binding_for_xml = binding
     strategy = str(binding_for_xml.get("bsdf_strategy") or "pplastic").strip().lower()
     if strategy in {"roughplastic", "diffuse", "plastic", "principled"}:
         strategy = "pplastic"
+
+    # NEW (ROBOMITUBA_BSDF_MODE=injected/measured): replace the legacy hardcoded
+    # int_ior=1.5 / material="Al" with per-material physically-plausible optical
+    # constants (dielectric IOR / real metal eta-k preset), derived from the
+    # binding's explicit fields when present else from optical_class/shader name.
+    # legacy mode leaves inject=None -> identical to the old output (no regression).
+    inject: "dict[str, Any] | None" = None
+    if optical_constants.injection_enabled():
+        oc = _maybe_str(binding_for_xml.get("optical_class"))
+        base_color = binding_for_xml.get("base_color_factor")
+        # A material classified as metal/mirror should render as a CONDUCTOR even
+        # though Infinigen's baked metallic_factor is ~0 (its Principled metal uses
+        # base_color as F0, not the metallic slot) -- legacy renders these as diffuse
+        # plastic, which is physically wrong for a metal. In injected mode force the
+        # conductor path so the real eta-k / polarization applies.
+        is_metal = strategy in {"conductor", "roughconductor"} or oc in {
+            "metal_gold", "metal_steel", "metal_aluminum", "mirror"}
+        inject = {
+            "ior": binding_for_xml.get("ior") or optical_constants.dielectric_ior_for(oc, material_id),
+            "conductor_material": (binding_for_xml.get("conductor_material")
+                                   or optical_constants.conductor_material_for(oc, material_id, base_color)),
+            "is_metal": is_metal,
+        }
 
     measured_binding = _binding_is_measured(binding_for_xml)
     measured_channels_dir = _resolve_hpbrdf_channels_dir(binding_for_xml, repo_root) if measured_binding else None
@@ -1191,30 +1264,34 @@ def _append_bsdf_xml(
         diffuse_bsdf_type = "pplastic" if strategy == "pplastic" else "roughplastic"
         if _append_extracted_bsdf_xml(
             shape, extracted_material, fallback_color=fallback_color, repo_root=repo_root,
-            diffuse_bsdf_type=diffuse_bsdf_type,
+            diffuse_bsdf_type=diffuse_bsdf_type, inject=inject,
         ):
             return
+    _ior = f"{float(inject['ior']):.4f}" if inject and inject.get("ior") else "1.5"
+    _metal = (inject.get("conductor_material") if inject else None) or "Al"
     if strategy == "pplastic":
         bsdf = _append_twosided_child_bsdf(shape, "pplastic")
         ET.SubElement(bsdf, "rgb", attrib={"name": "diffuse_reflectance", "value": fallback_color})
         ET.SubElement(bsdf, "float", attrib={"name": "alpha", "value": "0.2"})
+        if inject and inject.get("ior"):
+            ET.SubElement(bsdf, "float", attrib={"name": "int_ior", "value": _ior})
         return
     if strategy == "dielectric":
         bsdf = ET.SubElement(shape, "bsdf", type="dielectric")
-        ET.SubElement(bsdf, "float", attrib={"name": "int_ior", "value": "1.5"})
+        ET.SubElement(bsdf, "float", attrib={"name": "int_ior", "value": _ior})
         return
     if strategy == "roughdielectric":
         bsdf = ET.SubElement(shape, "bsdf", type="roughdielectric")
         ET.SubElement(bsdf, "float", attrib={"name": "alpha", "value": f"{_MIN_ROUGHDIELECTRIC_ALPHA:.4f}"})
-        ET.SubElement(bsdf, "float", attrib={"name": "int_ior", "value": "1.5"})
+        ET.SubElement(bsdf, "float", attrib={"name": "int_ior", "value": _ior})
         return
     if strategy == "conductor":
         bsdf = _append_twosided_child_bsdf(shape, "conductor")
-        ET.SubElement(bsdf, "string", attrib={"name": "material", "value": "Al"})
+        ET.SubElement(bsdf, "string", attrib={"name": "material", "value": _metal})
         return
     if strategy == "roughconductor":
         bsdf = _append_twosided_child_bsdf(shape, "roughconductor")
-        ET.SubElement(bsdf, "string", attrib={"name": "material", "value": "Al"})
+        ET.SubElement(bsdf, "string", attrib={"name": "material", "value": _metal})
         alpha = _clamp_bsdf_alpha(binding_for_xml.get("roughness"), default=0.2, floor=_MIN_ROUGHCONDUCTOR_ALPHA)
         ET.SubElement(bsdf, "float", attrib={"name": "alpha", "value": f"{alpha:.4f}"})
         return
@@ -4437,6 +4514,10 @@ class RenderDaemon:
         self._export_jobs_lock = threading.Lock()
         self._export_job_subscribers: dict[str, set[_GraphBuildSubscriber]] = {}
         self._export_job_sub_lock = threading.Lock()
+        # Live progress for the synchronous episode-plan endpoint (scene_id -> state),
+        # polled by the webui to show "planned/target" while the request is in flight.
+        self._episode_plan_progress: dict[str, dict[str, Any]] = {}
+        self._episode_plan_lock = threading.Lock()
 
         asset_root = Path(__file__).resolve().parent
         self._static_dir = asset_root / "static"
@@ -7773,8 +7854,32 @@ class RenderDaemon:
                 }
             except Exception as exc:
                 readiness_summary = {"ok": False, "status": "unreadable", "error": str(exc)}
+        # Lightweight metadata for the scene gallery (sort by size / area / date).
+        object_count: int | None = None
+        area_m2: float | None = None
+        updated_mtime: float | None = None
+        updated_at: str | None = None
+        if authoring_map_path.exists():
+            try:
+                _am = json.loads(authoring_map_path.read_text(encoding="utf-8"))
+                object_count = len(_am.get("objects") or [])
+                _st = _am.get("settings") or {}
+                _w, _h = _st.get("map_w"), _st.get("map_h")
+                if isinstance(_w, (int, float)) and isinstance(_h, (int, float)):
+                    area_m2 = round(float(_w) * float(_h), 2)
+            except Exception:
+                pass
+            try:
+                updated_mtime = authoring_map_path.stat().st_mtime
+                updated_at = datetime.fromtimestamp(updated_mtime, tz=timezone.utc).isoformat(timespec="seconds")
+            except Exception:
+                pass
         return {
             "scene_id": scene_dir.name,
+            "object_count": object_count,
+            "area_m2": area_m2,
+            "updated_mtime": updated_mtime,
+            "updated_at": updated_at,
             "usd_ref": usd_ref,
             "usd_exists": usd_exists,
             "usd_error": usd_error,
@@ -9958,7 +10063,7 @@ class RenderDaemon:
                 summary = dict(policy.get("summary") or {})
                 material_policy_stats = {
                     "material_policy_ref": policy_path.relative_to(self.repo_root).as_posix(),
-                    "measured_scope_default": str(policy.get("default_measured_scope") or "analytic_priority"),
+                    "measured_scope_default": str(policy.get("default_measured_scope") or "analytic_only"),
                     "max_measured_bsdfs_default": int(policy.get("default_max_measured_bsdfs") or 3),
                     "measured_candidates": int(summary.get("measured_candidates", 0) or 0),
                     "measured_enabled_default": int(summary.get("measured_enabled_default", 0) or 0),
@@ -10000,11 +10105,28 @@ class RenderDaemon:
                 }
         except Exception:  # noqa: BLE001 - best-effort status only
             pbr_bake_stats = {}
+        # BSDF injection status (ROBOMITUBA_BSDF_MODE): detect from the staged XML
+        # whether metals carry real eta-k presets (not blanket "Al"), per-material
+        # IOR was injected, and pplastic per-texel roughness (texture alpha) is used.
+        import re as _re
+        _mats = _re.findall(r'name="material"\s+value="([^"]+)"', text)
+        _iors = sorted(set(_re.findall(r'name="int_ior"\s+value="([^"]+)"', text)))
+        _injected_metals = sum(1 for _m in _mats if _m != "Al")
+        _tex_alpha = text.count('<texture name="alpha"')
+        injection_stats = {
+            "bsdf_mode": optical_constants.bsdf_mode(),
+            "bsdf_injection_active": bool(_injected_metals or len(_iors) > 1 or _tex_alpha),
+            "injected_metal_count": int(_injected_metals),
+            "conductor_material_counts": {_m: _mats.count(_m) for _m in sorted(set(_mats))},
+            "per_material_ior_variants": len(_iors),
+            "pplastic_texture_alpha_count": int(_tex_alpha),
+        }
         return {
             "exists": True,
             "scene_id": scene_id,
             "path": xml_path.relative_to(self.repo_root).as_posix(),
             "size_bytes": int(stat.st_size),
+            **injection_stats,
             "modified_at": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
             "shape_count": text.count("<shape "),
             "obj_shape_count": text.count('<shape type="obj"'),
@@ -10249,6 +10371,158 @@ class RenderDaemon:
         )
         return AuthoringRegion(id=obj_id, type=region_type, label=label, placement=placement, geometry=geometry, navigation=nav)
 
+    def _resolve_material_optics(
+        self,
+        entry: Mapping[str, Any],
+        source_ref: str | None,
+        *,
+        object_id: str | None,
+    ) -> dict[str, Any]:
+        """Resolve one authoring material into the viewer payload, mirroring the
+        render-time BSDF injection in ``_append_bsdf_xml`` so the UI reports the SAME
+        IOR / metal preset the renderer computes. IOR/eta-k are never stored on disk;
+        they are derived from ``optical_class`` via ``optical_constants`` at render time."""
+        material_id = _maybe_str(entry.get("material_id"))
+        binding = dict(entry.get("render_binding") or {}) if isinstance(entry.get("render_binding"), Mapping) else {}
+        pbr: dict[str, Any] = {}
+        params = entry.get("params")
+        if isinstance(params, Mapping) and isinstance(params.get("pbr"), Mapping):
+            pbr = dict(params["pbr"])
+        # effective binding = analytic_fallback if present, else the binding itself,
+        # with strategy normalized exactly like the renderer (_append_bsdf_xml:1196-1198).
+        if isinstance(binding.get("analytic_fallback"), Mapping):
+            binding_for_xml = _analytic_fallback_from_binding(binding)
+        else:
+            binding_for_xml = binding
+        strategy = str(binding_for_xml.get("bsdf_strategy") or "pplastic").strip().lower()
+        if strategy in {"roughplastic", "diffuse", "plastic", "principled"}:
+            strategy = "pplastic"
+        oc = _maybe_str(binding_for_xml.get("optical_class")) or _maybe_str(pbr.get("optical_class"))
+        base_color = binding_for_xml.get("base_color_factor") or pbr.get("base_color")
+        is_metal = strategy in {"conductor", "roughconductor"} or oc in {
+            "metal_gold", "metal_steel", "metal_aluminum", "mirror"}
+        # Resolve optical constants the SAME way as render_daemon injection
+        # (_append_bsdf_xml:1216-1220) -- call the optical_constants public API, never
+        # duplicate the IOR / metal tables.
+        resolved_ior = (binding_for_xml.get("ior") or pbr.get("ior")
+                        or optical_constants.dielectric_ior_for(oc, material_id))
+        conductor_preset = (binding_for_xml.get("conductor_material")
+                            or optical_constants.conductor_material_for(oc, material_id, base_color))
+        measured_candidate = _measured_candidate_from_binding(binding) if binding else None
+        measured_out = None
+        if isinstance(measured_candidate, Mapping):
+            measured_out = {
+                "kind": _maybe_str(measured_candidate.get("kind")),
+                "dataset_id": _maybe_str(measured_candidate.get("dataset_id")),
+                "material_id": _maybe_str(measured_candidate.get("material_id")),
+                "bsdf_strategy": _maybe_str(measured_candidate.get("bsdf_strategy")),
+                "channels_dir": _maybe_str(measured_candidate.get("channels_dir")),
+            }
+        # Polarimetric BRDF function the material connects to + how polarization arises.
+        if measured_out is not None:
+            brdf_fn, polar_source = "measured_polarized", "measured"
+        elif is_metal:
+            brdf_fn, polar_source = "roughconductor", "Fresnel(eta-k)"
+        elif strategy in {"dielectric", "roughdielectric"}:
+            brdf_fn, polar_source = strategy, "Fresnel(IOR)"
+        else:
+            brdf_fn, polar_source = "pplastic", "analytic"
+        caps = binding_for_xml.get("capabilities") or binding.get("capabilities") or {}
+        polarization = bool(caps.get("polarization")) or is_metal or brdf_fn in {
+            "measured_polarized", "dielectric", "roughdielectric", "pplastic"}
+
+        def _num(value: Any) -> "float | None":
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+
+        roughness = binding_for_xml.get("roughness")
+        if roughness is None:
+            roughness = pbr.get("roughness")
+        metallic = binding_for_xml.get("metallic")
+        if metallic is None:
+            metallic = pbr.get("metallic")
+        return {
+            "material_id": material_id,
+            "object_id": object_id,
+            "material": {
+                "category": _maybe_str(entry.get("category")),
+                "optical_class": oc,
+                "bsdf_strategy": strategy,
+                "polarimetric_brdf": brdf_fn,
+                "polarization_capable": polarization,
+                "polarization_source": polar_source,
+                "base_color": list(base_color) if isinstance(base_color, (list, tuple)) else None,
+                "roughness": _num(roughness),
+                "metallic": _num(metallic),
+                "is_metal": is_metal,
+            },
+            "optical_resolution": {
+                "dielectric_ior": _num(resolved_ior),
+                "conductor_preset": conductor_preset,
+                "applies_as": "conductor" if is_metal else "dielectric",
+            },
+            "measured_candidate": measured_out,
+            "atlases": _baked_atlas_urls(source_ref, self.repo_root),
+        }
+
+    def _opticalnav_object_material_view(
+        self,
+        project_dir: Path,
+        scene_id: str,
+        material_id: str | None,
+        object_id: str | None,
+    ) -> dict[str, Any] | None:
+        """Per-object / per-material optical metadata for the scene-editor material
+        viewer. With neither id -> list mode (resolve every material in the scene)."""
+        authoring_path = project_dir / "scenes" / scene_id / "authoring_map.json"
+        if not authoring_path.exists():
+            return None
+        try:
+            authoring = _read_json(authoring_path)
+        except Exception:
+            return None
+        materials = authoring.get("materials") or []
+        objects = authoring.get("objects") or []
+        mode_meta = {
+            "bsdf_mode": optical_constants.bsdf_mode(),
+            "injection_enabled": optical_constants.injection_enabled(),
+            "note": (
+                "optical_resolution values are the constants injected when "
+                f"ROBOMITUBA_BSDF_MODE=injected (current mode: {optical_constants.bsdf_mode()})."
+            ),
+        }
+
+        if material_id is None and object_id is None:
+            # list mode: pick a representative object source_ref per material for atlases.
+            source_by_material: dict[str, str] = {}
+            for obj in objects:
+                mid = _maybe_str(obj.get("material"))
+                src = _maybe_str(obj.get("source_ref"))
+                if mid and src and mid not in source_by_material:
+                    source_by_material[mid] = src
+            resolved = [
+                self._resolve_material_optics(entry, source_by_material.get(_maybe_str(entry.get("material_id")) or ""), object_id=None)
+                for entry in materials
+                if _maybe_str(entry.get("material_id"))
+            ]
+            return {"ok": True, "scene_id": scene_id, **mode_meta, "count": len(resolved), "materials": resolved}
+
+        source_ref = None
+        if object_id is not None:
+            obj_match = next((o for o in objects if _maybe_str(o.get("id")) == object_id), None)
+            if obj_match is not None:
+                source_ref = _maybe_str(obj_match.get("source_ref"))
+                if material_id is None:
+                    material_id = _maybe_str(obj_match.get("material"))
+        if material_id is None:
+            return None
+        entry = next((m for m in materials if _maybe_str(m.get("material_id")) == material_id), None)
+        if entry is None:
+            return None
+        return {"ok": True, "scene_id": scene_id, **mode_meta, **self._resolve_material_optics(entry, source_ref, object_id=object_id)}
+
     def _handle_opticalnav_get(self, handler: BaseHTTPRequestHandler, path: str, query: Mapping[str, list[str]]) -> bool:
         if path == "/api/opticalnav/projects":
             projects = []
@@ -10387,6 +10661,11 @@ class RenderDaemon:
                 self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": "scene_annotation.json not found"})
                 return True
             self._send_json(handler, HTTPStatus.OK, _read_json(annotation_path))
+            return True
+        if len(parts) == 4 and parts[1] == "scenes" and parts[3] == "episode-plan-progress":
+            with self._episode_plan_lock:
+                state = self._episode_plan_progress.get(parts[2])
+            self._send_json(handler, HTTPStatus.OK, state if state is not None else {"status": "idle"})
             return True
         if len(parts) == 4 and parts[1] == "scenes" and parts[3] == "optical-perturbation":
             from navigation_dataset.optical_perturbation import load_perturbation, perturbation_path
@@ -10944,6 +11223,23 @@ class RenderDaemon:
                 "extracted_material": meta.get("extracted_material"),
             })
             return True
+        if len(parts) == 4 and parts[1] == "scenes" and parts[3] == "object-material":
+            scene_id = parts[2]
+            material_id = _maybe_str((query.get("material_id") or [None])[0])
+            object_id = _maybe_str((query.get("object_id") or [None])[0])
+            try:
+                payload = self._opticalnav_object_material_view(project_dir, scene_id, material_id, object_id)
+            except Exception as exc:
+                self._send_json(handler, HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
+                return True
+            if payload is None:
+                self._send_json(handler, HTTPStatus.NOT_FOUND, {
+                    "error": "material not found in authoring_map",
+                    "scene_id": scene_id, "material_id": material_id, "object_id": object_id,
+                })
+                return True
+            self._send_json(handler, HTTPStatus.OK, payload)
+            return True
         if len(parts) == 6 and parts[1] == "scenes" and parts[3] == "observations" and parts[5] in self._OPTICALNAV_OBS_PNG_FILENAMES:
             scene_id = parts[2]
             vp_id = parts[4]
@@ -11182,6 +11478,7 @@ class RenderDaemon:
         with self._infinigen_jobs_lock:
             state = dict(self._infinigen_jobs.get(job_id) or {})
             state.update(updates)
+            state["job_id"] = job_id
             state["updated_at"] = _utc_now_iso()
             self._infinigen_jobs[job_id] = state
         return state
@@ -11347,7 +11644,7 @@ class RenderDaemon:
             params = {"archetype": archetype, "density": density, "stage": stage,
                       "seed": seed, "scene_id": scene_id, "do_import": do_import, "bake_pbr": bake_pbr}
             self._infinigen_set_job(
-                job_id, job_id=job_id, project_id=parts[0], status="queued", stage="queued",
+                job_id, project_id=parts[0], status="queued", stage="queued",
                 params=params, scene_id=scene_id, seed=seed, created_at=_utc_now_iso(), log=[],
             )
             threading.Thread(target=self._run_infinigen_generate_job, args=(job_id, params),
@@ -12288,12 +12585,19 @@ class RenderDaemon:
                 _ep_t0 = time.monotonic()
                 _ep_log_state = {"t": 0.0}
 
+                def _set_plan_progress(**kw: Any) -> None:
+                    with self._episode_plan_lock:
+                        self._episode_plan_progress[scene_id] = kw
+
                 def _ep_progress(planned: int, target: int, attempts: int) -> None:
                     now = time.monotonic()
+                    rate = planned / max(1e-6, now - _ep_t0)
+                    eta = (target - planned) / rate if rate > 0 else 0.0
+                    # Side channel for the UI poll (cheap; every call).
+                    _set_plan_progress(status="running", stage="plan", planned=planned, target=target,
+                                       attempts=attempts, eta_s=round(eta, 1), updated_at=_utc_now_iso())
                     if planned >= target or now - _ep_log_state["t"] >= 2.0:
                         _ep_log_state["t"] = now
-                        rate = planned / max(1e-6, now - _ep_t0)
-                        eta = (target - planned) / rate if rate > 0 else 0.0
                         pct = 100.0 * planned / max(1, target)
                         print(
                             f"[episodes] {scene_id} graph-plan {planned}/{target} ({pct:.0f}%) "
@@ -12301,7 +12605,17 @@ class RenderDaemon:
                             file=sys.stderr, flush=True,
                         )
 
+                # Multi-level instruction context inputs (rooms/objects/mirror-glass).
+                _authoring_payload = None
+                _map_path = scene_dir / "authoring_map.json"
+                if _map_path.exists():
+                    from navigation_dataset.authoring_map import authoring_map_to_payload, load_authoring_map
+                    _authoring_payload = authoring_map_to_payload(load_authoring_map(_map_path))
+                from navigation_dataset.optical_perturbation import load_perturbation as _load_perturbation
+                _perturbation = _load_perturbation(scene_dir)
                 print(f"[episodes] {scene_id} graph-plan start: target={_ep_target}", file=sys.stderr, flush=True)
+                _set_plan_progress(status="running", stage="plan", planned=0, target=_ep_target,
+                                   attempts=0, eta_s=None, updated_at=_utc_now_iso())
                 episodes = plan_graph_episodes(
                     graph=graph,
                     num_pairs=_ep_target,
@@ -12313,6 +12627,9 @@ class RenderDaemon:
                     observations_root=scene_dir / "observations",
                     excluded_edge_ids=excluded_edges,
                     on_progress=_ep_progress,
+                    authoring_map=_authoring_payload,
+                    perturbation=_perturbation,
+                    use_instruction_llm=bool(payload.get("instruction_llm", False)),
                 )
                 print(f"[episodes] {scene_id} graph-plan done: {len(episodes)} planned in "
                       f"{time.monotonic() - _ep_t0:.1f}s, writing files...", file=sys.stderr, flush=True)
@@ -12328,11 +12645,18 @@ class RenderDaemon:
                         print(f"[episodes] {scene_id} index {done}/{total} episodes scanned",
                               file=sys.stderr, flush=True)
 
+                _set_plan_progress(status="indexing", stage="index", planned=len(written),
+                                   target=_ep_target, updated_at=_utc_now_iso())
                 write_dataset_index(project_dir, on_progress=_idx_progress)
                 write_split_files(project_dir)
                 print(f"[episodes] {scene_id} DONE: {len(written)} new episodes, total "
                       f"{time.monotonic() - _ep_t0:.1f}s", file=sys.stderr, flush=True)
+                _set_plan_progress(status="done", stage="done", planned=len(written),
+                                   target=_ep_target, updated_at=_utc_now_iso())
             except Exception as exc:
+                with self._episode_plan_lock:
+                    self._episode_plan_progress[scene_id] = {"status": "failed", "error": str(exc),
+                                                             "updated_at": _utc_now_iso()}
                 self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                 return True
             self._send_json(handler, HTTPStatus.OK, {
