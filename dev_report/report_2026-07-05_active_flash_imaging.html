@@ -149,6 +149,43 @@
       <figcaption>정적 filmstrip(위=light 좌, 아래=light 우). GIF 미재생 환경용.</figcaption>
     </figure>
 
+    <h3>Relighting sweep — 고프레임·spp2048 (mirror/glass 정면 씬)</h3>
+    <p>
+      위 8프레임 sweep을 <b>16프레임 · spp2048</b>로 확장하고, 관측자를 정면으로 향한
+      <b>거울(roughconductor Al α0.15) + 유리(roughdielectric α0.12)</b> 패널 씬에서
+      편광 flash를 <b>x −1.05→+1.05m 로 이동</b>했다(flash fixture는 프레임 밖으로 올림).
+      RGB(S0) specular 하이라이트가 좌(거울)→우(유리)로 이동하며 DoLP·s1·s2 편광 응답도 함께 이동한다
+      (specular DoLP ≈ 0.76).
+    </p>
+    <figure>
+      <img src="images/0705_relight_sweep_2k.gif" alt="relight sweep spp2048 16 frames">
+      <figcaption>16프레임 · spp2048 · ping-pong GIF. 5패널 = RGB(S0) · DoLP · AoLP · s1 · s2. 절차적 재질(외부 텍스처 無)이라 CIFS 핸들 부담 없이 고품질 렌더.</figcaption>
+    </figure>
+    <figure>
+      <img src="images/0705_relight_filmstrip_2k.png" alt="relight sweep spp2048 filmstrip" style="max-width:520px">
+      <figcaption>정적 filmstrip(위=flash 좌, 아래=flash 우).</figcaption>
+    </figure>
+
+    <h3>Polarizer 각도 회전 — 유리/거울 정면 반사의 편광 응답</h3>
+    <p>
+      편광 조명을 <b>거울/유리 표면에 직접 조사</b>하면 광원의 specular 반사가 카메라에 강하게 잡히고,
+      그 반사광의 편광 상태는 <b>조명측 linear polarizer 각도</b>에 지배된다. area-emitter flash(unpolarized) 앞에
+      <code>polarizer</code> BSDF 판을 두고 <b>각도 θ를 0→180° 회전</b>시켰다.
+      (delta spot/point는 편광판이 NEE shadow ray를 가려 기여가 0이 되므로, 광이 편광판을 투과하려면 area emitter가 필요하다.)
+    </p>
+    <p>
+      결과: 거울 specular 영역에서 <b>DoLP ≈ 0.66</b>이 유지되고 <b>AoLP가 조명 polarizer 각도를 1:1로 추종</b>한다
+      (θ=45°→45°, 90°→90°, 135°→135°). filmstrip의 AoLP hue가 red→yellow→green→cyan→blue→magenta로 한 바퀴 도는 것이 곧 편광각 0→180° 회전이다.
+    </p>
+    <figure>
+      <img src="images/0705_polarizer_sweep.gif" alt="illumination polarizer rotation sweep (animated)">
+      <figcaption>12프레임 · spp1024 · ping-pong GIF. 좌측=거울(강한 편광 반사), 우측=유리. AoLP hue = 편광각.</figcaption>
+    </figure>
+    <figure>
+      <img src="images/0705_polarizer_filmstrip.png" alt="polarizer rotation filmstrip" style="max-width:520px">
+      <figcaption>θ=0·30·60·90·120·150°. AoLP hue 회전 = 조명 편광각 회전. specular-only 마스크(S0&gt;0.12 &amp; DoLP&gt;0.06).</figcaption>
+    </figure>
+
     <h2 id="remain">5. 남은 일 · 설계 주의</h2>
     <ul>
       <li class="ok"><b>완료</b>: Bridge · Staging · Rig/Sweep · UI + on/off 검증. active flash + 편광 조명이 end-to-end 동작.</li>
