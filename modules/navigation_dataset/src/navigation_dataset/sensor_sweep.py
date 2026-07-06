@@ -280,11 +280,20 @@ def build_sweep_render_requests(
     camera_specs_payload: Sequence[Mapping[str, Any]] | None = None,
     sensor_scope: str = "active",
     sensor_ids: Sequence[str] | None = None,
+    active_lights: Sequence[Mapping[str, Any]] | None = None,
 ) -> list[SweepRenderRequest]:
-    from robomituba_bridge import AssistLightSpec, RenderRequest, RobotState
-    from robomituba_bridge import scene_state_from_payload
+    from robomituba_bridge import ActiveLightSpec, AssistLightSpec, RenderRequest, RobotState
+    from robomituba_bridge import active_light_spec_from_payload, scene_state_from_payload
 
     scene_state = scene_state_from_payload(scene_state_payload)
+    # Rig-mounted active lights (RGB/NIR flash + polarizer). Positioned at
+    # base_pose @ mount by the renderer; passed on every request (the renderer
+    # filters each light by its `modalities` per render pass).
+    rig_active_lights = [
+        active_light_spec_from_payload(dict(item))
+        for item in (active_lights or [])
+        if isinstance(item, Mapping) and item.get("enabled", True)
+    ]
     camera_templates = _camera_templates_from_payloads(
         camera_spec_payload=camera_spec_payload,
         camera_specs_payload=camera_specs_payload,
@@ -335,7 +344,8 @@ def build_sweep_render_requests(
                 modalities=request_modalities,
                 robot_state=RobotState(base_pose=base_pose),
                 render_settings=dict(render_settings or {}),
-                assist_light=AssistLightSpec() if _needs_default_assist_light(request_modalities) else None,
+                assist_light=AssistLightSpec() if (_needs_default_assist_light(request_modalities) and not rig_active_lights) else None,
+                active_lights=list(rig_active_lights),
                 extras={
                     "graph_id": graph.graph_id,
                     "scene_id": graph.scene_id,
@@ -373,12 +383,18 @@ def build_custom_position_render_requests(
     camera_specs_payload: Sequence[Mapping[str, Any]] | None = None,
     sensor_scope: str = "active",
     sensor_ids: Sequence[str] | None = None,
+    active_lights: Sequence[Mapping[str, Any]] | None = None,
 ) -> list[SweepRenderRequest]:
     """Build render requests for arbitrary (x, y, yaw_deg) positions not in the graph."""
     from robomituba_bridge import AssistLightSpec, RenderRequest, RobotState
-    from robomituba_bridge import scene_state_from_payload
+    from robomituba_bridge import active_light_spec_from_payload, scene_state_from_payload
 
     scene_state = scene_state_from_payload(scene_state_payload)
+    rig_active_lights = [
+        active_light_spec_from_payload(dict(item))
+        for item in (active_lights or [])
+        if isinstance(item, Mapping) and item.get("enabled", True)
+    ]
     camera_templates = _camera_templates_from_payloads(
         camera_spec_payload=camera_spec_payload,
         camera_specs_payload=camera_specs_payload,
@@ -424,7 +440,8 @@ def build_custom_position_render_requests(
             modalities=request_modalities,
             robot_state=RobotState(base_pose=base_pose),
             render_settings=dict(render_settings or {}),
-            assist_light=AssistLightSpec() if _needs_default_assist_light(request_modalities) else None,
+            assist_light=AssistLightSpec() if (_needs_default_assist_light(request_modalities) and not rig_active_lights) else None,
+            active_lights=list(rig_active_lights),
             extras={
                 "scene_id": scene_id,
                 "node_id": node_id,
@@ -478,6 +495,7 @@ def render_viewpoint_sweep_direct(
     camera_specs_payload: Sequence[Mapping[str, Any]] | None = None,
     sensor_scope: str = "active",
     sensor_ids: Sequence[str] | None = None,
+    active_lights: Sequence[Mapping[str, Any]] | None = None,
 ) -> ViewpointGraph:
     if render_fn is None:
         from mitsuba_converter import render_timestep_bundle_split_lighting
@@ -491,6 +509,7 @@ def render_viewpoint_sweep_direct(
         camera_specs_payload=camera_specs_payload,
         sensor_scope=sensor_scope,
         sensor_ids=sensor_ids,
+        active_lights=active_lights,
         modalities=modalities,
         job_id_mode="per_heading",
     )

@@ -10,6 +10,12 @@
 		resourceStatus = {} as Record<string, ResourceState>,
 		resourceError = {} as Record<string, string>,
 		syncStatus = null as any,
+		// Live render-scene sync progress (mesh cache / IOR injection etc.) — the same
+		// stream the in-canvas chip shows. Feeding it here keeps the bottom dashboard
+		// live during Save Map instead of frozen at the persisted sync_status.
+		syncProgress = null as { processed: number; total: number; label: string; stage: string } | null,
+		syncRunning = false as boolean,
+		syncStageLabel = '' as string,
 		onRetry = undefined as ((key: string) => void) | undefined,
 		onRetryAll = undefined as (() => void) | undefined,
 	} = $props();
@@ -52,10 +58,33 @@
 		return { loading, ready, error, total };
 	});
 
-	// Render-scene sync (object/mesh cache). `message` is the live progress text.
+	// Render-scene sync (object/mesh cache). The live `syncRunning`/`syncProgress`
+	// stream is authoritative while a Save Map / sync is in flight; the persisted
+	// `sync_status` is the fallback at rest.
 	const syncState = $derived(String(syncStatus?.render_scene_status ?? syncStatus?.render_scene ?? ''));
-	const syncing = $derived(syncState === 'syncing');
+	// A finished sync writes render_scene:"synced" but older daemons left the
+	// render_scene_status flag stuck at "syncing" — treat an at-rest completed sync
+	// as done so the progress banner clears without re-syncing (live syncRunning still
+	// wins while a Save Map is actually in flight).
+	const syncDone = $derived(
+		syncStatus?.render_scene === 'synced' || syncStatus?.render_scene_status === 'synced',
+	);
+	const syncing = $derived(Boolean(syncRunning) || (syncState === 'syncing' && !syncDone));
 	const syncMessage = $derived(String(syncStatus?.message ?? ''));
+	// Live "<stage> · <processed>/<total> · <label>" line built from syncProgress.
+	const syncLive = $derived.by(() => {
+		if (!syncRunning || !syncProgress) return '';
+		const p = syncProgress;
+		const base = syncStageLabel || p.stage || 'syncing';
+		const frac = p.total ? ` · ${p.processed}/${p.total}` : '';
+		const lbl = p.label ? ` · ${p.label}` : '';
+		return `${base}${frac}${lbl}`;
+	});
+	const syncPct = $derived(
+		syncRunning && syncProgress && syncProgress.total > 0
+			? Math.min(100, Math.round((syncProgress.processed / syncProgress.total) * 100))
+			: null
+	);
 
 	const active = $derived(counts.loading > 0 || syncing);
 	const hasError = $derived(counts.error > 0);
@@ -82,7 +111,7 @@
 	const summary = $derived.by(() => {
 		if (hasError) return `${counts.error} failed · ${counts.ready}/${counts.total} ready`;
 		if (counts.loading) return `Loading… ${counts.ready}/${counts.total} ready${syncing ? ' · sync' : ''}`;
-		if (syncing) return 'Render sync running…';
+		if (syncing) return syncLive ? `Sync · ${syncLive}` : 'Render sync running…';
 		if (doneLinger) return 'All ready';
 		return `${counts.ready}/${counts.total} ready`;
 	});
@@ -132,16 +161,19 @@
 					{/each}
 				{/each}
 
-				{#if syncStatus}
-					<div class="sd-group">Render-scene sync (object cache)</div>
-					<div class="sd-row" class:sd-loading={syncing} class:sd-ready={syncState === 'synced'}>
+				{#if syncStatus || syncRunning}
+					<div class="sd-group">Render-scene sync (object cache · IOR)</div>
+					<div class="sd-row" class:sd-loading={syncing} class:sd-ready={!syncRunning && syncDone}>
 						<span class="sd-icon">
-							{#if syncing}<span class="loading-spinner sm" aria-hidden="true"></span>{:else}{syncState === 'synced' ? '✓' : '·'}{/if}
+							{#if syncing}<span class="loading-spinner sm" aria-hidden="true"></span>{:else}{syncDone ? '✓' : '·'}{/if}
 						</span>
 						<span class="sd-label">Render scene</span>
-						<span class="sd-msg">{syncing ? (syncMessage || 'syncing…') : (syncStatus.render_scene ?? 'pending')}</span>
+						<span class="sd-msg">{syncRunning ? (syncLive || 'syncing…') : (syncDone ? 'synced' : (syncState === 'syncing' ? (syncMessage || 'syncing…') : (syncStatus?.render_scene ?? 'pending')))}</span>
 					</div>
-					{#if syncStatus.isaac_stage}
+					{#if syncPct !== null}
+						<div class="sd-progress"><div class="sd-progress-fill" style={`width:${syncPct}%`}></div></div>
+					{/if}
+					{#if syncStatus?.isaac_stage}
 						<div class="sd-row" class:sd-ready={syncStatus.isaac_stage === 'synced'}>
 							<span class="sd-icon">{syncStatus.isaac_stage === 'synced' ? '✓' : '·'}</span>
 							<span class="sd-label">Isaac stage</span>
@@ -193,6 +225,8 @@
 	.sd-msg { flex: 1; color: var(--text-dim, #64748b); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 	.sd-row.sd-error .sd-msg { color: #dc2626; }
 	.sd-msg.dim { opacity: 0.5; }
+	.sd-progress { height: 4px; margin: 1px 10px 4px; background: var(--surface-2, #e5e7eb); border-radius: 3px; overflow: hidden; }
+	.sd-progress-fill { height: 100%; background: var(--brand, #2f7bf6); border-radius: 3px; transition: width 0.15s linear; }
 	.loading-spinner.sm { width: 11px; height: 11px; border-width: 2px; }
 	.sd-retry, .sd-retry-all {
 		flex: none; border: 1px solid var(--border, #d9dde3); background: var(--surface-1, #fff);

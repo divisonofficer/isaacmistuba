@@ -329,6 +329,33 @@ class AssistLightSpec:
 
 
 @dataclass
+class ActiveLightSpec:
+    """Rig-mounted active light (flash) for an active flashing imaging system.
+
+    Composed from existing Mitsuba plugins at render time: a ``spot``/``point``
+    emitter + (optional) a ``polarizer`` BSDF surface for polarized illumination.
+    Pose is derived at render time as ``base_pose @ mount`` (base_link-mounted),
+    so a sweep can reuse a topology-stable scene across headings.
+    """
+    light_id: str
+    enabled: bool = True
+    emitter_type: str = "spot"                # "spot" | "point"
+    # Local mount relative to base_frame: {parent_frame, xyz_m[3], rpy_deg[3]}.
+    mount: JsonDict = field(default_factory=lambda: {"parent_frame": "base_link", "xyz_m": [0.0, 0.0, 0.0], "rpy_deg": [0.0, 0.0, 0.0]})
+    # Which render passes this light participates in: subset of {"rgb","nir","polar"}.
+    modalities: List[str] = field(default_factory=lambda: ["nir", "polar"])
+    spectrum_kind: str = "rgb"                # "rgb" | "nir"
+    rgb: Vec3 = field(default_factory=lambda: [1.0, 1.0, 1.0])
+    wavelength_nm: float = 850.0              # used when spectrum_kind == "nir"
+    radiance: float = 40.0                    # intensity scale
+    cutoff_angle_deg: float = 45.0            # spot only
+    beam_width_deg: float = 30.0             # spot only
+    polarized: bool = False
+    polarizer_angle_deg: float = 0.0
+    extras: JsonDict = field(default_factory=dict)
+
+
+@dataclass
 class DepthApproxSpec:
     mode: str = "planar_reflective_proxy"
     target_shape_filenames: List[str] = field(default_factory=list)
@@ -360,6 +387,9 @@ class RenderRequest:
     render_settings: JsonDict = field(default_factory=dict)
     scene_override: Optional[SceneOverrideSpec] = None
     assist_light: Optional[AssistLightSpec] = None
+    # Rig-mounted active lights (flash). When non-empty, take precedence over the
+    # legacy single camera-aligned `assist_light`; empty keeps legacy behaviour.
+    active_lights: List["ActiveLightSpec"] = field(default_factory=list)
     depth_approx: Optional[DepthApproxSpec] = None
     action_ref: Optional[str] = None
     prev_observation_ref: Optional[str] = None

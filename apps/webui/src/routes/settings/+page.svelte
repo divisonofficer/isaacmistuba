@@ -24,7 +24,35 @@
 	let saving = $state(false);
 	let saveMsg = $state<string>('');
 
+	// Render / BSDF preferences (daemon-side). bsdf_mode + texture cap take effect
+	// on the next sync/render; pBRDF band + measured scope are picked up by the
+	// dataset editor's render requests.
+	let bsdfMode = $state<string>('');        // '' = follow launcher env default
+	let textureRes = $state<number | ''>('');  // '' = daemon default
+	let pbrdfBand = $state<string>('single');
+	let measuredScope = $state<string>('analytic_only');
+	let savingRender = $state(false);
+	let renderMsg = $state<string>('');
+
 	const SPP_PRESETS = [256, 1024, 2048, 4096, 8192, 16384];
+	const TEX_PRESETS = [256, 512, 1024, 2048, 4096];
+	const BSDF_MODES = [
+		{ id: '', label: 'default (launcher env)' },
+		{ id: 'legacy', label: 'legacy — hardcoded int_ior=1.5 / Al' },
+		{ id: 'injected', label: 'injected — per-material IOR + real metal eta-k' },
+		{ id: 'measured', label: 'measured — measured pBRDF reference' }
+	];
+	const PBRDF_BANDS = [
+		{ id: 'rgb', label: 'rgb · 3-band (full colour)' },
+		{ id: 'hybrid', label: 'hybrid · achromatic→1, coloured→3' },
+		{ id: 'single', label: 'single · 1-band ×albedo' }
+	];
+	const MEASURED_SCOPES = [
+		{ id: 'analytic_only', label: 'analytic-only · 0 measured (default)' },
+		{ id: 'analytic_priority', label: 'analytic-priority · anchors only' },
+		{ id: 'budgeted_measured', label: 'budgeted · up to 3' },
+		{ id: 'measured_full', label: 'full measured · HQ' }
+	];
 
 	onMount(async () => {
 		try {
@@ -32,6 +60,11 @@
 			overrides = (r?.settings?.dataset_storage_overrides as StorageOverrides) ?? {};
 			const spp = r?.settings?.material_preview_spp;
 			previewSpp = typeof spp === 'number' ? spp : '';
+			bsdfMode = typeof r?.settings?.bsdf_mode === 'string' ? r.settings.bsdf_mode : '';
+			const tr = r?.settings?.texture_max_resolution;
+			textureRes = typeof tr === 'number' ? tr : '';
+			pbrdfBand = typeof r?.settings?.pbrdf_band_mode === 'string' ? r.settings.pbrdf_band_mode : 'single';
+			measuredScope = typeof r?.settings?.measured_scope === 'string' ? r.settings.measured_scope : 'analytic_only';
 			settingsPath = String(r?.settings_path ?? '');
 		} catch {
 			// ignore — leave defaults
@@ -39,6 +72,25 @@
 			loading = false;
 		}
 	});
+
+	async function saveRender() {
+		savingRender = true;
+		renderMsg = '';
+		try {
+			await setUserSettings({
+				bsdf_mode: bsdfMode || null,
+				texture_max_resolution: typeof textureRes === 'number' && textureRes > 0 ? textureRes : null,
+				pbrdf_band_mode: pbrdfBand,
+				measured_scope: measuredScope
+			});
+			renderMsg = $lang === 'kr' ? '저장됨 · 다음 sync/render부터 적용' : 'Saved — applies to the next sync/render';
+		} catch (e: unknown) {
+			renderMsg = (e as Error).message ?? 'error';
+		} finally {
+			savingRender = false;
+			setTimeout(() => { renderMsg = ''; }, 3000);
+		}
+	}
 
 	async function save() {
 		saving = true;
@@ -117,6 +169,57 @@
 				<div><span>{$lang === 'kr' ? '워커 상태' : 'Worker'}</span><span>{h.worker_state}</span></div>
 				<div><span>{$lang === 'kr' ? '큐' : 'Queue'}</span><span>{h.queue_length} jobs</span></div>
 			</div>
+		</div>
+	{/if}
+</div>
+
+<div class="panel mt-4">
+	<div class="panel-label">{$lang === 'kr' ? '렌더 / BSDF' : 'Render / BSDF'}</div>
+	<p class="muted text-xs mt-2">
+		{$lang === 'kr'
+			? 'render_scene.xml 생성(sync) 및 렌더에 적용되는 daemon 설정. BSDF mode / 텍스처 캡은 저장 즉시 os.environ에 반영되어 다음 sync/render부터 적용됩니다(재시작 불필요). pBRDF band / measured scope는 dataset editor의 렌더 요청에 사용됩니다.'
+			: 'Daemon-side settings applied at render_scene.xml sync + render time. BSDF mode / texture cap are mirrored into the daemon env on save (next sync/render, no restart). pBRDF band / measured scope feed the dataset editor render requests.'}
+	</p>
+	{#if !loading}
+		<div class="settings-render-grid mt-3">
+			<label class="settings-render-row">
+				<span class="settings-storage-name">BSDF mode</span>
+				<select class="settings-storage-input" bind:value={bsdfMode}>
+					{#each BSDF_MODES as m}<option value={m.id}>{m.label}</option>{/each}
+				</select>
+			</label>
+
+			<label class="settings-render-row">
+				<span class="settings-storage-name">{$lang === 'kr' ? '텍스처 최대 해상도' : 'Texture max resolution'}</span>
+				<div style="display:flex;gap:0.4rem;flex-wrap:wrap;align-items:center">
+					<input class="settings-storage-input mono" type="number" min="128" max="8192" step="128"
+						placeholder={$lang === 'kr' ? '기본값' : 'default'} bind:value={textureRes} style="width:8rem" />
+					{#each TEX_PRESETS as v}
+						<button class="button {textureRes === v ? 'button-primary' : 'button-subtle'} text-xs" onclick={() => (textureRes = v)}>{v}</button>
+					{/each}
+					<button class="button {textureRes === '' ? 'button-primary' : 'button-subtle'} text-xs" onclick={() => (textureRes = '')}>{$lang === 'kr' ? '기본값' : 'default'}</button>
+				</div>
+			</label>
+
+			<label class="settings-render-row">
+				<span class="settings-storage-name">pBRDF band</span>
+				<select class="settings-storage-input" bind:value={pbrdfBand}>
+					{#each PBRDF_BANDS as b}<option value={b.id}>{b.label}</option>{/each}
+				</select>
+			</label>
+
+			<label class="settings-render-row">
+				<span class="settings-storage-name">Measured scope</span>
+				<select class="settings-storage-input" bind:value={measuredScope}>
+					{#each MEASURED_SCOPES as s}<option value={s.id}>{s.label}</option>{/each}
+				</select>
+			</label>
+		</div>
+		<div class="settings-row mt-3" style="align-items:center;gap:0.6rem">
+			<button class="button button-primary text-sm" onclick={saveRender} disabled={savingRender}>
+				{savingRender ? '…' : ($lang === 'kr' ? '저장' : 'Save')}
+			</button>
+			{#if renderMsg}<span class="muted text-xs">{renderMsg}</span>{/if}
 		</div>
 	{/if}
 </div>
@@ -240,6 +343,20 @@
 		outline: none;
 		border-color: var(--brand);
 		box-shadow: 0 0 0 2px rgba(47, 123, 246, 0.15);
+	}
+	.settings-render-grid {
+		display: grid;
+		grid-template-columns: 1fr 1fr;
+		gap: 0.9rem 1.2rem;
+	}
+	.settings-render-row {
+		display: flex;
+		flex-direction: column;
+		gap: 0.35rem;
+		min-width: 0;
+	}
+	@media (max-width: 720px) {
+		.settings-render-grid { grid-template-columns: 1fr; }
 	}
 	@media (max-width: 640px) {
 		.settings-storage-row {

@@ -40,8 +40,6 @@
 		activeCameraFrustum: any;
 		activeRenderModality: string;
 		hotCameraPose: any;
-		previewBandMode: string;
-		previewMeasuredScope: string;
 		probeRendering: boolean;
 		probeError: string;
 		rigMountHeightM: number;
@@ -71,8 +69,6 @@
 		perturbedRenderReady?: boolean;
 		perturbedRenderStale?: boolean;
 		onSetRenderVariant?: (v: 'base' | 'perturbed' | 'both') => void;
-		onSetPreviewBandMode: (v: string) => void;
-		onSetPreviewMeasuredScope: (v: string) => void;
 		onSetActiveModalityTab?: (v: string) => void;
 		selectedRigSensorIds?: string[];
 		onToggleRigSweepSensor?: (sensorId: string) => void;
@@ -82,6 +78,10 @@
 		episodeNodesAvailable?: boolean;
 		episodePathNodeCount?: number;
 		headingsPerNode?: number;
+		sensorFindQuery?: string;
+		sensorFindError?: string;
+		graphNodeCount?: number;
+		onFindSensor?: () => void;
 		onRefreshBatch: () => void;
 	}
 
@@ -94,7 +94,7 @@
 		observationScan, graphBatch, sensorRenderResult, renderingViewpoint,
 		placingSensor, frustumMode, ambientRadiance, activeModalityTab,
 		activeRigSensorOption, activeCameraFrustum, activeRenderModality,
-		hotCameraPose, previewBandMode, previewMeasuredScope,
+		hotCameraPose,
 		probeRendering, probeError, rigMountHeightM, authoringMap,
 		selectedProjectId, sceneId, loading, hasScene, hasGraph,
 		onLoadGlobalCameraRig, onSelectRigSensor, onSetFrustumMode, onTogglePlacingSensor,
@@ -103,10 +103,11 @@
 		onRenderViewpoint, onRunProbe, onRenderEpisodes, onRenderEpisodeNodes,
 		renderVariant = 'base', perturbationEnabled = false,
 		perturbedRenderReady = false, perturbedRenderStale = false, onSetRenderVariant,
-		onSetPreviewBandMode, onSetPreviewMeasuredScope, onSetActiveModalityTab,
+		onSetActiveModalityTab,
 		selectedRigSensorIds = [], onToggleRigSweepSensor, onSetRigSweepSensors,
 		renderMissingOnly = true, onSetRenderMissingOnly,
 		episodeNodesAvailable = false, episodePathNodeCount = 0, headingsPerNode = 0,
+		sensorFindQuery = $bindable(''), sensorFindError = '', graphNodeCount = 0, onFindSensor,
 		onRefreshBatch,
 	}: Props = $props();
 
@@ -146,6 +147,20 @@
 
 <section class="rail-section rail-tool-panel sensor-panel">
 	<div class="rail-title">Sensor Render</div>
+
+	<!-- Find a viewpoint/sensor node by number and fly the editor camera to it. -->
+	<div class="sensor-find">
+		<input
+			type="text"
+			placeholder="Find sensor # (e.g. 92 or vp_000092)"
+			bind:value={sensorFindQuery}
+			onkeydown={(e) => { if (e.key === 'Enter') onFindSensor?.(); }}
+			title={graphNodeCount ? `${graphNodeCount} viewpoints` : 'Build the viewpoint graph first'}
+		/>
+		<button class="button button-subtle" disabled={!hasGraph} onclick={() => onFindSensor?.()}>Find</button>
+	</div>
+	{#if sensorFindError}<div class="sensor-find-error">{sensorFindError}</div>{/if}
+
 	{#if !renderSceneSynced}
 		<div class="sensor-sync-warning">
 			<span>Render scene not synced</span>
@@ -254,23 +269,9 @@
 		{:else}
 			<div class="sensor-preview-pose muted">No hot camera placed</div>
 		{/if}
-		<label class="band-mode-row" title="측정 pBRDF 밴드 수: single=안정적인 1밴드×albedo · hybrid=무채색 1밴드/유색 3밴드 · rgb=전부 3밴드">
-			<span>pBRDF band</span>
-			<select value={previewBandMode} onchange={(e) => onSetPreviewBandMode((e.currentTarget as HTMLSelectElement).value)}>
-				<option value="rgb">rgb · 3-band (full colour)</option>
-				<option value="hybrid">hybrid · achromatic→1, coloured→3</option>
-				<option value="single">single · 1-band ×albedo</option>
-			</select>
-		</label>
-		<label class="band-mode-row" title="Measured pBRDF 사용 범위: 기본은 analytic-only로 모든 표면을 polarimetric analytic BSDF(pplastic/dielectric/conductor)로 렌더합니다 — RGB+NIR+편광 커버. measured는 연구용 opt-in.">
-			<span>Measured scope</span>
-			<select value={previewMeasuredScope} onchange={(e) => onSetPreviewMeasuredScope((e.currentTarget as HTMLSelectElement).value)}>
-				<option value="analytic_only">analytic-only · 0 measured (default)</option>
-				<option value="analytic_priority">analytic-priority · anchors only</option>
-				<option value="budgeted_measured">budgeted · up to 3</option>
-				<option value="measured_full">full measured · HQ</option>
-			</select>
-		</label>
+		<div class="band-mode-note muted" title="pBRDF band / Measured scope는 Settings → Render / BSDF 로 이동했습니다.">
+			pBRDF band · Measured scope → <a href="/settings">Settings</a>
+		</div>
 		<button class="button button-primary full" disabled={!caps.runProbe.enabled} title={caps.runProbe.reason} onclick={onRunProbe}>
 			{probeRendering ? 'Rendering…' : 'Render preview'}
 		</button>
@@ -593,6 +594,10 @@
 			overflow-wrap: anywhere;
 		}
 
+	.sensor-find { display: flex; gap: 6px; margin: 4px 0; }
+	.sensor-find input { flex: 1; min-width: 0; padding: 4px 8px; font-size: var(--font-size-xs); border: 1px solid var(--border); border-radius: 6px; }
+	.sensor-find-error { font-size: 11px; color: #dc2626; margin: -2px 0 4px; }
+
 	.sensor-panel .sensor-node-id { font-family: monospace; font-size: var(--font-size-xs); color: var(--text-muted); word-break: break-all; }
 
 	.sensor-panel .sensor-pos { font-size: 11px; color: var(--text-muted); margin-bottom: 4px; }
@@ -706,24 +711,15 @@
 			color: var(--text-muted);
 		}
 
-	.band-mode-row {
-			display: grid;
-			grid-template-columns: 96px minmax(0, 1fr);
-			align-items: center;
-			gap: 8px;
-		}
-
-	.band-mode-row > span {
+	.band-mode-note {
 			font-size: 11px;
-			color: var(--text-muted);
-			font-weight: 700;
-			white-space: nowrap;
+			padding: 2px 0;
 		}
-
-	.band-mode-row > select {
-			min-width: 0;
-			font-size: 12px;
+	.band-mode-note a {
+			color: var(--brand, #2f7bf6);
+			text-decoration: none;
 		}
+	.band-mode-note a:hover { text-decoration: underline; }
 
 	.probe-error {
 			color: var(--danger);

@@ -8,6 +8,7 @@
 		listCameraRigs,
 		saveCameraRig,
 		type CameraRig,
+		type CameraRigActiveLight,
 		type CameraRigMeshPayload,
 		type CameraRigRenderSettings,
 		type CameraRigSensor,
@@ -183,6 +184,61 @@
 		next.sensors = next.sensors.filter((sensor) => sensor.sensor_id !== selectedSensor.sensor_id);
 		rig = next;
 		selectedSensorId = next.sensors[0]?.sensor_id ?? '';
+	}
+
+	// ── Active lights (RGB/NIR flash + linear polarizer) ────────────────────────
+	function makeActiveLight(kind: 'rgb' | 'nir'): CameraRigActiveLight {
+		const existing = new Set((rig?.active_lights ?? []).map((l) => l.light_id));
+		let base = `${kind}_flash`;
+		let id = base;
+		let n = 1;
+		while (existing.has(id)) id = `${base}_${n++}`;
+		return {
+			light_id: id,
+			enabled: true,
+			emitter_type: 'spot',
+			mount: { parent_frame: rig?.base_frame ?? 'base_link', xyz_m: [0, 0.1, 0.7], rpy_deg: [0, 0, 0] },
+			modalities: kind === 'nir' ? ['nir', 'polar'] : ['rgb', 'polar'],
+			spectrum_kind: kind,
+			rgb: [1, 1, 1],
+			wavelength_nm: kind === 'nir' ? 850 : 550,
+			radiance: 40,
+			cutoff_angle_deg: 45,
+			beam_width_deg: 30,
+			polarized: false,
+			polarizer_angle_deg: 0
+		};
+	}
+
+	function addActiveLight(kind: 'rgb' | 'nir') {
+		if (!rig) return;
+		const next = cloneRig(rig);
+		next.active_lights = [...(next.active_lights ?? []), makeActiveLight(kind)];
+		rig = next;
+	}
+
+	function removeActiveLight(lightId: string) {
+		if (!rig) return;
+		const next = cloneRig(rig);
+		next.active_lights = (next.active_lights ?? []).filter((l) => l.light_id !== lightId);
+		rig = next;
+	}
+
+	function updateActiveLight(lightId: string, patch: Partial<CameraRigActiveLight>) {
+		if (!rig) return;
+		const next = cloneRig(rig);
+		next.active_lights = (next.active_lights ?? []).map((l) =>
+			l.light_id === lightId ? { ...l, ...patch } : l
+		);
+		rig = next;
+	}
+
+	function toggleLightModality(light: CameraRigActiveLight, modality: string) {
+		const has = light.modalities.includes(modality);
+		const modalities = has
+			? light.modalities.filter((m) => m !== modality)
+			: [...light.modalities, modality];
+		updateActiveLight(light.light_id, { modalities });
 	}
 
 	function changeSensorType(type: CameraRigSensorType) {
@@ -373,6 +429,59 @@
 					</tbody>
 				</table>
 			</div>
+
+				<div class="sensor-list active-lights">
+					<div class="table-title">
+						<h2>Active Lights ({rig?.active_lights?.length ?? 0})</h2>
+						<div>
+							<button on:click={() => addActiveLight('rgb')}>Add RGB Flash</button>
+							<button on:click={() => addActiveLight('nir')}>Add NIR Flash</button>
+						</div>
+					</div>
+					<p class="hint">Base-mounted flash (spot/point) + optional linear polarizer. Positioned at base_pose · mount at render time.</p>
+					{#each rig?.active_lights ?? [] as light (light.light_id)}
+						<div class="light-card" class:disabled={!light.enabled}>
+							<div class="light-head">
+								<label class="light-toggle"><input type="checkbox" checked={light.enabled} on:change={(e) => updateActiveLight(light.light_id, { enabled: e.currentTarget.checked })} /> {light.light_id}</label>
+								<select value={light.emitter_type} on:change={(e) => updateActiveLight(light.light_id, { emitter_type: e.currentTarget.value as 'spot' | 'point' })}><option value="spot">spot</option><option value="point">point</option></select>
+								<select value={light.spectrum_kind} on:change={(e) => updateActiveLight(light.light_id, { spectrum_kind: e.currentTarget.value as 'rgb' | 'nir' })}><option value="rgb">RGB</option><option value="nir">NIR</option></select>
+								<button class="light-remove" on:click={() => removeActiveLight(light.light_id)}>✕</button>
+							</div>
+							<div class="light-grid">
+								{#if light.spectrum_kind === 'nir'}
+									<label>λ nm<input type="number" min="700" max="1100" step="10" value={light.wavelength_nm} on:input={(e) => updateActiveLight(light.light_id, { wavelength_nm: +e.currentTarget.value })} /></label>
+								{:else}
+									<label>R<input type="number" min="0" max="1" step="0.05" value={light.rgb[0]} on:input={(e) => updateActiveLight(light.light_id, { rgb: [+e.currentTarget.value, light.rgb[1], light.rgb[2]] })} /></label>
+									<label>G<input type="number" min="0" max="1" step="0.05" value={light.rgb[1]} on:input={(e) => updateActiveLight(light.light_id, { rgb: [light.rgb[0], +e.currentTarget.value, light.rgb[2]] })} /></label>
+									<label>B<input type="number" min="0" max="1" step="0.05" value={light.rgb[2]} on:input={(e) => updateActiveLight(light.light_id, { rgb: [light.rgb[0], light.rgb[1], +e.currentTarget.value] })} /></label>
+								{/if}
+								<label>Radiance<input type="number" min="0" step="5" value={light.radiance} on:input={(e) => updateActiveLight(light.light_id, { radiance: +e.currentTarget.value })} /></label>
+								{#if light.emitter_type === 'spot'}
+									<label>Cutoff°<input type="number" min="1" max="90" step="1" value={light.cutoff_angle_deg} on:input={(e) => updateActiveLight(light.light_id, { cutoff_angle_deg: +e.currentTarget.value })} /></label>
+									<label>Beam°<input type="number" min="0" max="90" step="1" value={light.beam_width_deg} on:input={(e) => updateActiveLight(light.light_id, { beam_width_deg: +e.currentTarget.value })} /></label>
+								{/if}
+							</div>
+							<div class="light-grid">
+								<label>x<input type="number" step="0.05" value={light.mount.xyz_m[0]} on:input={(e) => updateActiveLight(light.light_id, { mount: { ...light.mount, xyz_m: [+e.currentTarget.value, light.mount.xyz_m[1], light.mount.xyz_m[2]] } })} /></label>
+								<label>y<input type="number" step="0.05" value={light.mount.xyz_m[1]} on:input={(e) => updateActiveLight(light.light_id, { mount: { ...light.mount, xyz_m: [light.mount.xyz_m[0], +e.currentTarget.value, light.mount.xyz_m[2]] } })} /></label>
+								<label>z<input type="number" step="0.05" value={light.mount.xyz_m[2]} on:input={(e) => updateActiveLight(light.light_id, { mount: { ...light.mount, xyz_m: [light.mount.xyz_m[0], light.mount.xyz_m[1], +e.currentTarget.value] } })} /></label>
+								<label>yaw°<input type="number" step="1" value={light.mount.rpy_deg[2]} on:input={(e) => updateActiveLight(light.light_id, { mount: { ...light.mount, rpy_deg: [light.mount.rpy_deg[0], light.mount.rpy_deg[1], +e.currentTarget.value] } })} /></label>
+								<label>pitch°<input type="number" step="1" value={light.mount.rpy_deg[1]} on:input={(e) => updateActiveLight(light.light_id, { mount: { ...light.mount, rpy_deg: [light.mount.rpy_deg[0], +e.currentTarget.value, light.mount.rpy_deg[2]] } })} /></label>
+							</div>
+							<div class="light-foot">
+								<div class="light-modalities">
+									{#each ['rgb', 'nir', 'polar'] as m}
+										<button class="chip" class:on={light.modalities.includes(m)} on:click={() => toggleLightModality(light, m)}>{m}</button>
+									{/each}
+								</div>
+								<label class="light-pol"><input type="checkbox" checked={light.polarized} on:change={(e) => updateActiveLight(light.light_id, { polarized: e.currentTarget.checked })} /> polarizer</label>
+								{#if light.polarized}
+									<label>angle°<input type="number" step="5" value={light.polarizer_angle_deg} on:input={(e) => updateActiveLight(light.light_id, { polarizer_angle_deg: +e.currentTarget.value })} /></label>
+								{/if}
+							</div>
+						</div>
+					{/each}
+				</div>
 		</div>
 
 		<aside class="right-pane">
@@ -517,6 +626,22 @@
 		background: #ffffff;
 		border-radius: 8px;
 	}
+
+	.active-lights { margin-top: 12px; padding-bottom: 8px; }
+	.active-lights .hint { padding: 0 12px 6px; color: #64748b; font-size: 12px; }
+	.light-card { margin: 8px 12px; padding: 8px 10px; border: 1px solid #e2e8f0; border-radius: 6px; background: #f8fafc; display: grid; gap: 6px; }
+	.light-card.disabled { opacity: 0.55; }
+	.light-head { display: flex; align-items: center; gap: 8px; }
+	.light-toggle { display: flex; align-items: center; gap: 6px; font-weight: 600; font-size: 13px; flex: 1; }
+	.light-remove { margin-left: auto; border: none; background: #fee2e2; color: #991b1b; border-radius: 4px; cursor: pointer; padding: 2px 8px; }
+	.light-grid { display: flex; flex-wrap: wrap; gap: 8px; }
+	.light-grid label { display: grid; gap: 2px; font-size: 11px; color: #475569; }
+	.light-grid input { width: 68px; padding: 3px 5px; border: 1px solid #cbd5e1; border-radius: 4px; }
+	.light-foot { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+	.light-modalities { display: flex; gap: 4px; }
+	.light-modalities .chip { border: 1px solid #cbd5e1; background: #fff; color: #64748b; border-radius: 999px; padding: 2px 10px; font-size: 11px; cursor: pointer; }
+	.light-modalities .chip.on { background: #1d5fd1; border-color: #1d5fd1; color: #fff; }
+	.light-pol { display: flex; align-items: center; gap: 5px; font-size: 12px; }
 
 	.toolbar {
 		display: flex;

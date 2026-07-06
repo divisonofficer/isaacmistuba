@@ -1,0 +1,219 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>2026-07-02 NIR spectral albedo — 상황 분석 · 자료조사 · 계획</title>
+  <style>
+    :root{color-scheme:light;--bg:#f7f8fb;--paper:#fff;--ink:#1f2937;--muted:#667085;--line:#d9dee8;--accent:#1d5fd1;--ok:#087443;--warn:#a15c07;--code:#f1f4f9;}
+    body{margin:0;background:var(--bg);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;line-height:1.58;}
+    .layout{display:flex;min-height:100vh;align-items:flex-start;}
+    aside{width:260px;flex:0 0 260px;position:sticky;top:0;height:100vh;overflow-y:auto;padding:24px 16px;border-right:1px solid var(--line);background:#eef2f7;}
+    .logo{font-weight:800;color:var(--accent);font-size:16px;}
+    .date{margin-top:3px;color:var(--muted);font-size:12px;font-family:ui-monospace,Menlo,Consolas,monospace;}
+    .nav-title{margin:22px 8px 8px;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.12em;font-weight:800;}
+    .nav-link{display:block;padding:6px 8px;border-radius:5px;color:#344054;font-size:12px;text-decoration:none;margin-bottom:2px;}
+    .nav-link:hover{background:#dde3ee;color:var(--accent);}
+    main{flex:1;min-width:0;padding:36px 24px 64px;}
+    article{max-width:1080px;margin:0 auto;background:var(--paper);border:1px solid var(--line);border-radius:8px;padding:34px 40px;box-shadow:0 8px 24px rgb(16 24 40/.05);}
+    h1,h2,h3{line-height:1.25;margin:0;}
+    h1{font-size:28px;}
+    h2{margin-top:34px;padding-top:22px;border-top:1px solid var(--line);font-size:20px;}
+    h3{margin-top:22px;font-size:16px;}
+    p{margin:10px 0 0;}
+    ul,ol{margin:10px 0 0 20px;padding:0;}
+    li{margin:5px 0;}
+    code{background:var(--code);border:1px solid #e5e9f2;border-radius:5px;padding:1px 5px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:.92em;}
+    pre{overflow-x:auto;background:#111827;color:#e5e7eb;border-radius:8px;padding:14px 16px;font-size:13px;line-height:1.5;}
+    pre code{background:transparent;border:0;padding:0;color:inherit;}
+    table{width:100%;border-collapse:collapse;margin-top:12px;font-size:14px;}
+    th,td{border:1px solid var(--line);padding:9px 10px;text-align:left;vertical-align:top;}
+    th{background:#f3f6fb;font-weight:650;}
+    .meta{margin-top:10px;color:var(--muted);font-size:14px;}
+    .badge{display:inline-block;margin-right:6px;border-radius:999px;padding:2px 9px;border:1px solid var(--line);background:#f8fafc;color:var(--muted);font-size:12px;}
+    .ok{color:var(--ok);font-weight:650;}
+    .warn{color:var(--warn);font-weight:650;}
+    .note{margin-top:12px;padding:10px 14px;border-left:3px solid var(--accent);background:#f3f6fb;border-radius:0 6px 6px 0;font-size:13.5px;}
+    a{color:var(--accent);}
+    @media(max-width:980px){.layout{display:block;}aside{position:relative;width:auto;height:auto;border-right:0;border-bottom:1px solid var(--line);}main{padding:20px;}article{padding:24px 20px;}}
+  </style>
+</head>
+<body>
+<div class="layout">
+<aside>
+  <div class="logo">Robomituba</div>
+  <div class="date">2026-07-02</div>
+  <div class="nav-title">오늘 보고서</div>
+  <a class="nav-link" href="#summary">요약</a>
+  <a class="nav-link" href="#situation">1. 상황 분석 (코드/데이터 실측)</a>
+  <a class="nav-link" href="#research">2. 자료조사 (외부 데이터·방법론)</a>
+  <a class="nav-link" href="#proposal">3. 제안 — 2-tier 룩업</a>
+  <a class="nav-link" href="#plan">4. 실행 계획·우선순위</a>
+  <a class="nav-link" href="#artifacts">5. 신규 아티팩트</a>
+  <div class="nav-title">이전 보고서</div>
+  <a class="nav-link" href="report_2026-07-01.html">2026-07-01 BSDF IOR/금속 주입 — OLD vs NEW</a>
+  <a class="nav-link" href="report_2026-06-30.html">2026-06-30 metallic/IOR 단일값 규명</a>
+  <a class="nav-link" href="report_2026-06-29.html">2026-06-29 Infinigen→import→nav→PBR</a>
+  <a class="nav-link" href="index.html">전체 인덱스</a>
+</aside>
+<main>
+  <article>
+    <h1>NIR spectral albedo 준비 &amp; IOR 할당 — 상황 분석 · 자료조사 · 계획</h1>
+    <div class="meta">
+      <span class="badge">2026-07-02</span>
+      <span class="badge">tri-modal (RGB · NIR · polar)</span>
+      <span class="badge">spectral albedo</span>
+      <span class="badge">measured-anchored lookup</span>
+      <span class="badge">분석/계획 (구현 전)</span>
+    </div>
+
+    <h2 id="summary">요약</h2>
+    <p>
+      RGB만이면 <code>int_ior=1.5</code> 몰빵이 방어되지만, <b>NIR + 편광이 붙으면 판이 바뀐다.</b> 그리고 방향이 반직관적이다 —
+      진짜 깨지는 건 유전체 IOR이 아니라 <b>spectral albedo</b> 쪽이고, IOR이 문제되는 지점은 유전체가 아니라 <b>금속</b>으로 넘어간다.
+    </p>
+    <div class="note">
+      <b>결론 미리:</b> (1) 유전체 n은 visible→NIR가 거의 평평(Δn≈−0.005~−0.01) → <b>고정 1.5는 NIR 편광 기하까지 그대로 전이</b>. 파장별 IOR 테이블 불필요.
+      (2) <code>base_color</code>가 RGB 3-point라 <b>NIR diffuse 반사율은 복원 불가능한 4번째 독립 채널</b>(식생 red-edge / dye·잉크 NIR 투명 / 피부 / 직물). 현재 analytic NIR 렌더는
+      <b>RGB를 luminance로 collapse</b>하는 proxy라 이 독립성을 통째로 지운다. (3) 금속은 <code>conductor_preset</code>이 NIR complex n,k·편광 반사를 좌우 → <b>dead field에서 load-bearing으로 뒤집힌다.</b>
+      제안: <b>클래스별 NIR 반사율을 discrete 4번째 밴드로 주입</b>하되 — hpBRDF measured(854, raw로 940) 앵커(Tier A) + 외부 스펙트럴 라이브러리(Tier B) — 그리고 편광과 커플링시킨다.
+    </div>
+
+    <h2 id="situation">1. 상황 분석 (코드/데이터 실측)</h2>
+    <table>
+      <thead><tr><th>축</th><th>현재 상태 (실측 확인)</th><th>함의</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><b>NIR 렌더</b></td>
+          <td>analytic 재질은 white assist light 아래 <b>RGB 렌더 → luminance collapse</b>(<code>multimodal.py</code> NIR 경로, <code>0.2126R+0.7152G+0.0722B</code>). <code>wavelength_band_nm:[830,870]</code>은 메타데이터일 뿐.</td>
+          <td class="warn">analytic NIR = grayscale(RGB base_color) — advisor가 경고한 "NIR=f(RGB)"의 최악 형태.</td>
+        </tr>
+        <tr>
+          <td><b>albedo 표현</b></td>
+          <td>staged <code>render_scene.xml</code> 본문 <code>&lt;rgb name="diffuse_reflectance"&gt;</code> 27개, <code>&lt;spectrum&gt;</code> <b>0개</b>.</td>
+          <td class="warn">base_color 파장 불변. spectral variant여도 Jakob-Hanika uplift라 NIR은 임의(가시광 metameric).</td>
+        </tr>
+        <tr>
+          <td><b>measured 커버리지</b></td>
+          <td>hpBRDF_2025 = 14종 × {446,542,614,<b>854</b>}nm 채널-슬라이스. raw는 <b>414–950nm / 68밴드</b>(<code>configs/datasets/datasets.yaml</code>).</td>
+          <td class="ok">measured 재질만 진짜 854nm pBRDF. <b>940은 raw에서 슬라이스하면 확보 가능.</b></td>
+        </tr>
+        <tr>
+          <td><b>pBRDF_2020</b></td>
+          <td>25종, <b>450–650nm(가시광 only)</b>.</td>
+          <td>NIR 앵커 불가. 가시광 analytic 매칭 보조용.</td>
+        </tr>
+        <tr>
+          <td><b>optical_class</b></td>
+          <td>diffuse 4780 / metal_aluminum 605 / glass 243 / mirror 23 / None 661 (<b>coarse</b>).</td>
+          <td>wood/plant/skin/ink 등 세분 클래스는 optical_class가 아니라 <b>shader-name family</b>(37-rule <code>_SHADER_DIELECTRIC</code>)에서 옴.</td>
+        </tr>
+        <tr>
+          <td><b>Mitsuba 범위</b></td>
+          <td><code>MI_CIE_MIN/MAX = 360/830nm</code> 하드코딩(<code>spectrum.h</code>).</td>
+          <td>854/940 연속 spectral 불가. 단 <b>discrete 4-band 채널 스킴이 measured 경로에 이미 존재</b>.</td>
+        </tr>
+        <tr>
+          <td><b>NIR albedo 테이블</b></td>
+          <td><b>존재하지 않음</b>(greenfield). NIR은 measured tensor에만 갇혀 있고 analytic 클래스로 매핑 안 됨.</td>
+          <td>클래스→NIR 반사율 룩업을 새로 만들어야 함.</td>
+        </tr>
+      </tbody>
+    </table>
+    <div class="note">
+      <b>문제 재정의:</b> "연속 spectral NIR 렌더"가 아니라 <b>analytic 재질에 클래스별 NIR 반사율을 discrete 4번째 밴드로 주입</b>하고 편광과 커플링시키는 것.
+      Mitsuba 830nm 한계와 싸울 필요 없이, measured가 854에서 쓰는 채널-스플릿 스킴을 analytic으로 확장하면 된다.
+    </div>
+
+    <h3>왜 spectral albedo가 핵심인가 (파장별 물리)</h3>
+    <table>
+      <thead><tr><th>재질</th><th>NIR 거동</th><th>RGB→NIR 파생 시 오류</th></tr></thead>
+      <tbody>
+        <tr><td>식생 (greenery/monocot/cactus/coral)</td><td>엽록소 red-edge, NIR 40–60% vs red ~5–10%</td><td>밝아야 하는데 어둡게 나옴</td></tr>
+        <tr><td>염색 직물 (sofa/fabric, 어두운 base)</td><td>dye transparency — 검은 셔츠가 NIR에서 밝아짐</td><td>어두운 색의 NIR 상승을 못 잡음</td></tr>
+        <tr><td>인쇄물 (text/art/paint, 로고·포스터)</td><td>process 잉크 NIR 투명, 카본블랙만 남음</td><td class="warn">NIR에서 글자·로고가 사라져야 하는데 그대로 유지 (문서 forensics 효과)</td></tr>
+        <tr><td>피부 (nose/tongue/ear)</td><td>800–1100nm 고반사(멜라닌 무관) + NIR SSS 급증, 970nm 물흡수 딥</td><td>어둡고 표면적으로 나옴</td></tr>
+      </tbody>
+    </table>
+    <p>
+      <b>편광 커플링이 벤치마크상 핵심:</b> diffuse는 대체로 unpolarized, specular가 편광을 싣는다. 유전체 n이 평평하니 specular(≈4%)는 NIR에서도 고정인데,
+      <b>diffuse albedo가 NIR에서 뛰면 <code>DoLP≈specular/(specular+diffuse)</code>가 떨어진다.</b> 식생·어두운 직물은 NIR에서 DoLP 급감.
+      base_color를 파장 불변으로 두면 <b>RGB DoLP는 맞는데 NIR DoLP가 틀리는</b> 형태라 눈으로도 안 걸러진다. subsurface(피부/대리석/잎/왁스)도 NIR 투과↑ → depolarization↑로 같은 방향.
+    </p>
+
+    <h2 id="research">2. 자료조사 (외부 데이터 · 방법론)</h2>
+    <h3>스펙트럴 라이브러리 — measured DB가 못 덮는 클래스용</h3>
+    <ul>
+      <li><b>ECOSTRESS</b> 3400+ 스펙트라, 0.35–15.4µm(850·940 포함), 식생/토양/암석/인공물 — <a href="https://speclib.jpl.nasa.gov/">speclib.jpl.nasa.gov</a> (<a href="https://www.sciencedirect.com/science/article/abs/pii/S0034425719302081">RSE 2019</a>)</li>
+      <li><b>LOPEX'93 / ANGERS</b> 잎 반사·투과 400–2500nm, red-edge + NIR plateau(700–1100nm) — <a href="https://ecosis.org/package/leaf-optical-properties-experiment-database--lopex93-">ecosis.org LOPEX93</a></li>
+      <li><b>PROSPECT</b> 잎 반사율 생성 모델(생화학 파라미터 → 400–2500nm) — 잎 클래스 절차적 대안</li>
+      <li><b>피부 NIR</b>: 800–1100nm 고반사(멜라닌 무관), 970nm 물흡수 딥(940밴드 영향) — <a href="https://www.nist.gov/programs-projects/reflectance-measurements-human-skin">NIST skin reflectance</a>, <a href="https://pmc.ncbi.nlm.nih.gov/articles/PMC8078188/">PMC8078188</a></li>
+    </ul>
+    <h3>measured → analytic 피팅 방법론 ("룩업"의 근거)</h3>
+    <p>
+      Fresnel Microfacet BRDF 계열이 <b>(IOR, albedo, roughness, eta·k)를 measured pBRDF에 least-squares로 추정</b>하는 표준 접근을 제공한다 —
+      <a href="https://arxiv.org/pdf/2212.04483">arXiv 2212.04483</a>, <a href="https://www.sciencedirect.com/science/article/abs/pii/S1077314211001615">multiple-lobe analytical BRDF fitting</a>.
+      즉 "measured 샘플에 analytic 파라미터를 맞춘다"는 방향은 검증된 방법이다.
+    </p>
+    <div class="note">
+      <b>주의 (forward 합성 무결성):</b> Gated2Gated류/cross-spectral RGB→NIR translation은 <b>ground-truth 생성기로 쓰면 안 된다.</b>
+      NIR을 f(RGB)로 합성하면 라벨에 "NIR=f(RGB)" 가정을 구워 넣어, tri-modal이 착취해야 할 out-of-band 시그니처를 예측기가 정확히 지운다(순환 벤치마크).
+      RGB→NIR은 <b>baseline 방법</b>이나 실측 데이터 augmentation에만. GT 생성은 클래스별 실측 스펙트럼 할당으로.
+    </div>
+
+    <h2 id="proposal">3. 제안 — 2-tier 클래스별 스펙트럴 albedo 룩업</h2>
+    <p>"measured 샘플과 비교해 lookup으로 analytic+PBR 매칭"을 <b>2계층</b>으로 구체화. 두 계층 모두 단일 산출물로 수렴:
+      <code>class → {ρ446, ρ542, ρ614, ρ854, ρ940, roughness, (eta,k)}</code>.</p>
+
+    <h3>Tier A — measured-anchored (hpBRDF가 덮는 클래스)</h3>
+    <ol>
+      <li>오프라인 캘리브레이션이 14종 <code>.pbrdf</code> tensor를 밴드별 로드(Mitsuba <code>tensor_file</code>, <code>wvls</code> 배열 포함 → <b>렌더 없이</b> 텐서에서 반사율 직접 추출).</li>
+      <li>밴드별 추출: 유효 diffuse albedo ρ(λ)(near-normal Mueller m00), roughness(마이크로패싯 로브 폭), 금속은 DoLP(θ) 서명 → eta,k.</li>
+      <li>앵커→클래스 매핑: <code>aluminum→metal_aluminum, fake_gold→metal_gold, suj2→metal_steel, white_smooth_plastic→plastic/ceramic, *_rough_plastic→plastic, *_silicone→rubber, black_glass→glass</code>.</li>
+      <li>전이 가능한 시그니처 = <b>NIR/visible 비율</b>(ρ854/ρ614 등)을 클래스에 저장.</li>
+    </ol>
+    <p class="meta">hpBRDF 14종: aluminum · fake_gold · suj2 · black_glass · white/yellow/red/plum/silver/black_rough_plastic · white_smooth_plastic · white_billiard · gray/green_silicone. (커버: 금속·플라스틱·실리콘·유리·빌리어드. 미커버: 식생·피부·직물·잉크·나무·토양 → Tier B.)</p>
+
+    <h3>Tier B — library-anchored (hpBRDF가 못 덮는 클래스)</h3>
+    <p>식생·피부·직물·인쇄물·나무·토양 → ECOSTRESS/LOPEX/ANGERS/skin 곡선을 4(+1)밴드에서 샘플해 같은 <code>ρ(λ)</code>·NIR/vis 비율로 저장. <b>RGB에서 유도하지 않음.</b></p>
+
+    <h3>렌더 적용 (per-instance, 색 다양성 보존)</h3>
+    <ul>
+      <li>Infinigen 인스턴스의 <b>가시광 RGB(base_color/atlas)는 그대로 유지.</b></li>
+      <li>NIR 밴드 diffuse_reflectance = <code>class_NIR/vis_ratio × (instance visible brightness)</code> → 인스턴스별 색 변화 보존 + NIR 물리는 클래스에서 주입.</li>
+      <li>NIR 렌더 패스가 이 값을 diffuse_reflectance로 emit(현재의 luminance-proxy 대체). measured가 854에서 채널-스왑하는 것과 동일 메커니즘 → <b>Mitsuba 830nm 한계 회피.</b></li>
+    </ul>
+    <p><b>편광 커플링은 자동:</b> specular 고정 + NIR diffuse 상승 → DoLP가 식생·어두운 직물에서 자동 하락. 올바른 NIR albedo만으로 cross-modal 서명이 물리적으로 성립. (skin/marble/leaf는 NIR SSS/depolarization 추가로 diffuse DoLP 추가 하락 — 선택.)</p>
+
+    <h2 id="plan">4. 실행 계획 · 우선순위</h2>
+    <table>
+      <thead><tr><th>#</th><th>작업</th><th>규모</th><th>비고</th></tr></thead>
+      <tbody>
+        <tr><td><b>0</b></td><td>램프갓 <code>ior:4→1.5</code> 버그 픽스</td><td>XS</td><td>유전체 IOR에서 유일하게 급함</td></tr>
+        <tr><td><b>1</b></td><td><b>Tier A 캘리브레이션</b> <code>tools/calibrate_nir_albedo.py</code> — 14 <code>.pbrdf</code> → 클래스별 {ρλ, roughness, eta/k} (+ raw에서 <b>940 슬라이스</b>)</td><td>M</td><td>measured→analytic 룩업의 핵심</td></tr>
+        <tr><td><b>2</b></td><td><b>Tier B 라이브러리 스펙트럼</b> 수집·정규화 → 식생/피부/직물/인쇄물/나무/토양 밴드 반사율</td><td>M</td><td>ECOSTRESS/LOPEX/skin</td></tr>
+        <tr><td><b>3</b></td><td><code>spectral_albedo.py</code>(신규, <code>optical_constants</code> 옆): <code>class_nir_reflectance(oc, shader_name)→ρ(λ)</code> 룩업 + <code>data/spectral/class_nir_reflectance.json</code></td><td>S</td><td>IOR 테이블과 동일 패턴</td></tr>
+        <tr><td><b>4</b></td><td><b>렌더 와이어링</b>: NIR 패스가 luminance-proxy 대신 클래스 NIR 반사율을 diffuse_reflectance로 emit</td><td>M</td><td><code>multimodal.py</code> NIR 경로 + <code>_append_bsdf_xml</code></td></tr>
+        <tr><td><b>5</b></td><td><b>금속 n,k NIR</b>: <code>data/ior/*.eta/*.k</code>가 830 넘는지 확인 + measured 금속 854/940 추출, 없으면 <b>"NIR 금속 편광 = analytic complex Fresnel fallback" 정책 명시</b></td><td>S–M</td><td>벤치마크 무결성</td></tr>
+        <tr><td><b>6</b></td><td>subsurface/DoLP NIR 강화 (skin/marble/leaf)</td><td>S</td><td>선택</td></tr>
+        <tr><td><b>7</b></td><td><b>검증</b>: green_silicone 등 measured 재질을 analytic+NIR테이블 vs <code>measured_polarized@854</code>로 렌더 → albedo·DoLP 비교; 식생 sanity(NIR 밝음+DoLP 하락)</td><td>M</td><td>앵커 대비 절대 검증</td></tr>
+        <tr><td>—</td><td><s>유전체 파장별 IOR</s></td><td>—</td><td class="ok"><b>안 함</b> (visible→NIR 평평)</td></tr>
+      </tbody>
+    </table>
+
+    <h2 id="artifacts">5. 신규 아티팩트</h2>
+    <ul>
+      <li><code>tools/calibrate_nir_albedo.py</code> — Tier A 오프라인 피팅(측정 텐서 → 클래스 테이블).</li>
+      <li><code>data/spectral/class_nir_reflectance.json</code> — 클래스별 5밴드 반사율 + BSDF 파라미터.</li>
+      <li><code>modules/mitsuba_converter/src/mitsuba_converter/spectral_albedo.py</code> — 렌더타임 룩업(<code>optical_constants</code> 미러 패턴).</li>
+      <li>렌더 와이어링(NIR 패스) + 검증 스크립트.</li>
+    </ul>
+    <div class="note">
+      <b>한 줄 정리:</b> IOR 튜닝은 사실상 끝났고(램프갓만), 진짜 작업은 <b>discrete NIR 밴드 albedo를 클래스별로 — measured 앵커(Tier A) + 외부 라이브러리(Tier B)에서 — 할당하고 편광과 커플링</b>시키는 것. "measured 룩업 매칭"은 Tier A 캘리브레이션으로 실현되고, measured가 못 덮는 판별력 있는 클래스는 Tier B가 채운다.
+    </div>
+    <p class="meta">관련 코드: <code>multimodal.py</code>(NIR 경로·채널스플릿) · <code>render_daemon.py</code>(<code>_append_bsdf_xml</code>) · <code>optical_constants.py</code>(IOR/eta-k, <code>_SHADER_DIELECTRIC</code> 37-rule) · <code>material_library.py</code>(<code>HPBRDF_2025_RGBNIR_WAVELENGTHS_NM=(446,542,614,854)</code>) · <code>data/hpbrdf_2025/</code>(414–950nm) · <code>configs/datasets/datasets.yaml</code>. 상태: 분석/계획 단계 — 구현 미착수.</p>
+  </article>
+</main>
+</div>
+</body>
+</html>

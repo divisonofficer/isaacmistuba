@@ -176,6 +176,26 @@ export type CameraRigSensor = {
 		wavelength_nm: number;
 	};
 };
+export type CameraRigActiveLight = {
+	light_id: string;
+	enabled: boolean;
+	emitter_type: 'spot' | 'point';
+	mount: {
+		parent_frame: string;
+		xyz_m: [number, number, number];
+		rpy_deg: [number, number, number];
+	};
+	// Which render passes this light participates in: subset of rgb/nir/polar.
+	modalities: string[];
+	spectrum_kind: 'rgb' | 'nir';
+	rgb: [number, number, number];
+	wavelength_nm: number;
+	radiance: number;
+	cutoff_angle_deg: number;
+	beam_width_deg: number;
+	polarized: boolean;
+	polarizer_angle_deg: number;
+};
 export type CameraRig = {
 	rig_id: string;
 	label: string;
@@ -183,6 +203,7 @@ export type CameraRig = {
 	base_frame: string;
 	updated_at: string;
 	sensors: CameraRigSensor[];
+	active_lights?: CameraRigActiveLight[];
 };
 export type CameraRigMeshPayload = {
 	robot_model: string;
@@ -298,6 +319,10 @@ export const getUserSettings = () =>
 export const setUserSettings = (payload: {
 	dataset_storage_overrides?: Record<string, string>;
 	material_preview_spp?: number | null;
+	bsdf_mode?: string | null;
+	texture_max_resolution?: number | null;
+	pbrdf_band_mode?: string | null;
+	measured_scope?: string | null;
 }) => post('/api/user-settings', payload);
 
 export const invalidateCuratedPreview = (materialId: string) =>

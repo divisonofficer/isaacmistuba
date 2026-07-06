@@ -16,6 +16,7 @@ from .manifest import (
 )
 from .paths import JobLayout, repo_root_from, resolve_repo_path
 from .types import (
+    ActiveLightSpec,
     AssistLightSpec,
     BsdfOverride,
     CameraRecord,
@@ -117,6 +118,12 @@ def _scene_override_from_dict(payload: Dict[str, Any]) -> SceneOverrideSpec:
 
 def _assist_light_from_dict(payload: Dict[str, Any]) -> AssistLightSpec:
     return AssistLightSpec(**payload)
+
+
+def _active_light_from_dict(payload: Dict[str, Any]) -> ActiveLightSpec:
+    # Defensive: ignore unknown keys so newer/older payloads round-trip safely.
+    allowed = {f.name for f in fields(ActiveLightSpec)}
+    return ActiveLightSpec(**{k: v for k, v in payload.items() if k in allowed})
 
 
 def _depth_approx_from_dict(payload: Dict[str, Any]) -> DepthApproxSpec:
@@ -242,6 +249,14 @@ def assist_light_spec_from_payload(payload: Dict[str, Any]) -> AssistLightSpec:
     return _assist_light_from_dict(payload)
 
 
+def active_light_spec_to_payload(active_light: ActiveLightSpec) -> Dict[str, Any]:
+    return asdict(active_light)
+
+
+def active_light_spec_from_payload(payload: Dict[str, Any]) -> ActiveLightSpec:
+    return _active_light_from_dict(payload)
+
+
 def depth_approx_spec_to_payload(depth_approx: DepthApproxSpec) -> Dict[str, Any]:
     return asdict(depth_approx)
 
@@ -272,6 +287,7 @@ def render_request_to_payload(render_request: RenderRequest) -> Dict[str, Any]:
         "render_settings": render_request.render_settings,
         "scene_override": scene_override_spec_to_payload(render_request.scene_override) if render_request.scene_override else None,
         "assist_light": assist_light_spec_to_payload(render_request.assist_light) if render_request.assist_light else None,
+        "active_lights": [active_light_spec_to_payload(item) for item in render_request.active_lights],
         "depth_approx": depth_approx_spec_to_payload(render_request.depth_approx) if render_request.depth_approx else None,
         "action_ref": render_request.action_ref,
         "prev_observation_ref": render_request.prev_observation_ref,
@@ -293,6 +309,7 @@ def render_request_from_payload(payload: Dict[str, Any]) -> RenderRequest:
         render_settings=payload.get("render_settings", {}),
         scene_override=scene_override_spec_from_payload(payload["scene_override"]) if payload.get("scene_override") else None,
         assist_light=assist_light_spec_from_payload(payload["assist_light"]) if payload.get("assist_light") else None,
+        active_lights=[active_light_spec_from_payload(item) for item in payload.get("active_lights", [])],
         depth_approx=depth_approx_spec_from_payload(payload["depth_approx"]) if payload.get("depth_approx") else None,
         action_ref=payload.get("action_ref"),
         prev_observation_ref=payload.get("prev_observation_ref"),

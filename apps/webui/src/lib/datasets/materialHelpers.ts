@@ -239,7 +239,7 @@ export function rgbCss(c: number[] | null | undefined): string {
  *  Returns '' when the ref doesn't match (the <img> 404s gracefully to the swatch). */
 export function bakedAtlasUrlFor(
 	sourceRef: string | null | undefined,
-	kind: 'albedo' | 'roughness' | 'normal',
+	kind: 'albedo' | 'roughness' | 'metallic' | 'normal',
 ): string {
 	if (!sourceRef) return '';
 	const m = String(sourceRef).match(/^(.*)\/meshes\/(.+)\.obj$/);

@@ -16,7 +16,7 @@ import xml.etree.ElementTree as ET
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
-from robomituba_bridge import AssistLightSpec, BsdfOverride, DepthApproxSpec, SceneOverrideSpec
+from robomituba_bridge import ActiveLightSpec, AssistLightSpec, BsdfOverride, DepthApproxSpec, SceneOverrideSpec
 
 
 SUPPORTED_MODALITIES = (
@@ -1059,6 +1059,26 @@ def _assist_light_signature(assist_light: AssistLightSpec | None) -> Any:
     return _normalize_signature_value(asdict(assist_light))
 
 
+def _active_lights_signature(
+    active_lights: Sequence["ActiveLightSpec"],
+    base_pose: Any,
+    pass_kind: str,
+) -> Any:
+    """Signature for pose-baked active lights (Stage B): pose IS included, so a
+    different base_pose yields a different staged scene (correct, no reuse). Stage C
+    will use a topology-only variant that excludes pose to enable reuse."""
+    if not active_lights or not pass_kind:
+        return None
+    relevant = [asdict(l) for l in active_lights if getattr(l, "enabled", True) and pass_kind in (l.modalities or [])]
+    if not relevant:
+        return None
+    try:
+        pose = np.round(np.asarray(base_pose, dtype=np.float32).reshape(-1), 5).tolist() if base_pose is not None else None
+    except Exception:
+        pose = None
+    return _normalize_signature_value({"pass": pass_kind, "lights": relevant, "base_pose": pose})
+
+
 def _should_reuse_staged_scene(out_scene: Path, *, signature: tuple[Any, ...]) -> bool:
     cache_key = str(out_scene.resolve())
     signature = _effective_stage_signature(signature)
@@ -1912,6 +1932,101 @@ def _camera_aligned_rectangle_matrix(
     return matrix
 
 
+def _active_light_mount_matrix(mount: Mapping[str, Any] | None) -> np.ndarray:
+    """Canonical (row-major, translation in col 3) local mount transform from a
+    rig mount dict {xyz_m[3], rpy_deg[3]}. Y-up world; rotation = Ry(yaw) Rx(pitch)
+    Rz(roll) with rpy=[roll_x, pitch_x?, yaw_y] following the codebase Y-up
+    convention (yaw about +Y). The emitter's local +Z is the beam axis, so at
+    identity the flash points along +Z; rpy aims it."""
+    mount = mount or {}
+    xyz = mount.get("xyz_m") or [0.0, 0.0, 0.0]
+    rpy = mount.get("rpy_deg") or [0.0, 0.0, 0.0]
+    try:
+        tx, ty, tz = float(xyz[0]), float(xyz[1]), float(xyz[2])
+    except Exception:
+        tx, ty, tz = 0.0, 0.0, 0.0
+    try:
+        roll = np.deg2rad(float(rpy[0])); pitch = np.deg2rad(float(rpy[1])); yaw = np.deg2rad(float(rpy[2]))
+    except Exception:
+        roll = pitch = yaw = 0.0
+    cy, sy = np.cos(yaw), np.sin(yaw)
+    cx, sx = np.cos(pitch), np.sin(pitch)
+    cz, sz = np.cos(roll), np.sin(roll)
+    ry = np.array([[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]], dtype=np.float64)   # about +Y
+    rx = np.array([[1, 0, 0], [0, cx, -sx], [0, sx, cx]], dtype=np.float64)   # about +X
+    rz = np.array([[cz, -sz, 0], [sz, cz, 0], [0, 0, 1]], dtype=np.float64)   # about +Z
+    rot = ry @ rx @ rz
+    m = np.eye(4, dtype=np.float32)
+    m[:3, :3] = rot
+    m[:3, 3] = [tx, ty, tz]
+    return m
+
+
+def _active_light_intensity_xml(emitter: ET.Element, light: ActiveLightSpec, *, spectral: bool) -> None:
+    """Emit the emitter <intensity>. NIR uses a single-band spectrum when a
+    spectral variant is active; otherwise a grayscale-proxy rgb (Stage 5 upgrades
+    the spectral path)."""
+    scale = max(0.0, float(light.radiance))
+    if light.spectrum_kind == "nir":
+        if spectral:
+            ET.SubElement(emitter, "spectrum", {"name": "intensity", "value": f"{float(light.wavelength_nm):.1f}:{scale:.6g}"})
+        else:
+            ET.SubElement(emitter, "rgb", {"name": "intensity", "value": f"{scale:.6g},{scale:.6g},{scale:.6g}"})
+    else:
+        rgb = light.rgb if isinstance(light.rgb, (list, tuple)) and len(light.rgb) >= 3 else [1.0, 1.0, 1.0]
+        vals = ",".join(f"{max(0.0, float(c)) * scale:.6g}" for c in rgb[:3])
+        ET.SubElement(emitter, "rgb", {"name": "intensity", "value": vals})
+
+
+def _append_base_active_lights(
+    root: ET.Element,
+    active_lights: Sequence["ActiveLightSpec"],
+    base_pose: np.ndarray | Sequence[float] | None,
+    *,
+    pass_kind: str,
+    spectral: bool,
+) -> int:
+    """Bake rig-mounted active lights into the scene as spot/point emitters (+ an
+    optional linear `polarizer` surface for polarized illumination), positioned at
+    light_to_world = base_pose @ mount. `pass_kind` in {"rgb","nir","polar"} filters
+    which lights participate. Returns the count injected. Pose-baked (Stage B):
+    correctness-first, no scene reuse."""
+    if not active_lights or base_pose is None:
+        return 0
+    base = normalize_mat4_storage(base_pose)
+    injected = 0
+    for light in active_lights:
+        if not getattr(light, "enabled", True):
+            continue
+        if pass_kind not in (light.modalities or []):
+            continue
+        world = (base @ _active_light_mount_matrix(light.mount)).astype(np.float32)
+        emitter_type = light.emitter_type if light.emitter_type in ("spot", "point") else "spot"
+        emitter = ET.SubElement(root, "emitter", {"type": emitter_type, "id": f"active_light_{light.light_id}"})
+        etf = ET.SubElement(emitter, "transform", {"name": "to_world"})
+        ET.SubElement(etf, "matrix", {"value": _matrix_to_string(world)})
+        _active_light_intensity_xml(emitter, light, spectral=spectral)
+        if emitter_type == "spot":
+            ET.SubElement(emitter, "float", {"name": "cutoff_angle", "value": f"{float(light.cutoff_angle_deg):.4f}"})
+            ET.SubElement(emitter, "float", {"name": "beam_width", "value": f"{float(light.beam_width_deg):.4f}"})
+        injected += 1
+        # Polarized illumination: emitters emit UNPOLARIZED, so place a linear
+        # `polarizer` BSDF surface just in front of the emitter along its +Z beam.
+        if light.polarized:
+            offset = np.eye(4, dtype=np.float64)
+            offset[:3, 3] = [0.0, 0.0, 0.02]  # 2cm along local +Z (beam)
+            # small rectangle facing the beam; rectangle's local normal is +Z.
+            pol_world = (world.astype(np.float64) @ offset).astype(np.float32)
+            pol_shape = ET.SubElement(root, "shape", {"type": "rectangle", "id": f"active_polarizer_{light.light_id}"})
+            ptf = ET.SubElement(pol_shape, "transform", {"name": "to_world"})
+            # scale the rectangle small so it only sits in front of the emitter
+            scale = np.eye(4, dtype=np.float32); scale[0, 0] = scale[1, 1] = 0.05
+            ET.SubElement(ptf, "matrix", {"value": _matrix_to_string((pol_world @ scale).astype(np.float32))})
+            pol_bsdf = ET.SubElement(pol_shape, "bsdf", {"type": "polarizer"})
+            ET.SubElement(pol_bsdf, "float", {"name": "theta", "value": f"{float(light.polarizer_angle_deg):.4f}"})
+    return injected
+
+
 def _append_camera_assist_light(
     root: ET.Element,
     camera_to_world: np.ndarray,
@@ -2053,6 +2168,10 @@ def _stage_path_scene(
     band_mode: str = "rgb",
     measured_scope: str = "analytic_only",
     max_measured_bsdfs: int = 3,
+    active_lights: Sequence["ActiveLightSpec"] = (),
+    base_pose: Any = None,
+    active_pass_kind: str = "",
+    active_spectral: bool = False,
 ) -> Path:
     stage_signature = (
         "path",
@@ -2061,6 +2180,7 @@ def _stage_path_scene(
         (integrator_type, int(max_depth), int(rr_depth), int(samples_per_pass or 0)),
         _scene_override_signature(scene_override),
         _assist_light_signature(assist_light),
+        _active_lights_signature(active_lights, base_pose, active_pass_kind),
         round(float(ambient_radiance), 4),
         int(measured_wavelength_nm) if measured_wavelength_nm else 0,
         bool(channel_rgb_plugin),
@@ -2139,6 +2259,8 @@ def _stage_path_scene(
         _inject_constant_emitter(root, ambient_radiance)
     if assist_light is not None:
         _append_camera_assist_light(root, camera_to_world, assist_light, polarized=False)
+    if active_lights and active_pass_kind:
+        _append_base_active_lights(root, active_lights, base_pose, pass_kind=active_pass_kind, spectral=active_spectral)
     result = _write_scene(root, out_scene)
     _record_staged_scene_signature(result, signature=stage_signature)
     return result
@@ -2224,6 +2346,8 @@ def _stage_stokes_scene(
     nested_integrator_type: str = "direct",
     measured_scope: str = "analytic_only",
     max_measured_bsdfs: int = 3,
+    active_lights: Sequence["ActiveLightSpec"] = (),
+    base_pose: Any = None,
 ) -> Path:
     stage_signature = (
         "stokes",
@@ -2239,6 +2363,7 @@ def _stage_stokes_scene(
         ),
         _scene_override_signature(scene_override),
         _assist_light_signature(assist_light),
+        _active_lights_signature(active_lights, base_pose, "polar"),
     )
     if _should_reuse_staged_scene(out_scene, signature=stage_signature):
         return out_scene
@@ -2284,6 +2409,9 @@ def _stage_stokes_scene(
     _apply_scene_override(root, scene_override, mode="polar")
     if assist_light is not None:
         _append_camera_assist_light(root, camera_to_world, assist_light, polarized=assist_light.polarized)
+    if active_lights:
+        # Polar branch is spectral-polarized → single-band NIR spectrum allowed.
+        _append_base_active_lights(root, active_lights, base_pose, pass_kind="polar", spectral=True)
     result = _write_scene(root, out_scene)
     _record_staged_scene_signature(result, signature=stage_signature)
     return result
@@ -4577,6 +4705,8 @@ def render_modalities(
     config: RenderConfig | None = None,
     scene_override: SceneOverrideSpec | None = None,
     assist_light: AssistLightSpec | None = None,
+    active_lights: Sequence["ActiveLightSpec"] = (),
+    base_pose: Any = None,
     depth_approx: DepthApproxSpec | None = None,
     variant: str = "auto",
     progress_callback: Callable[[str, Mapping[str, Any] | None], None] | None = None,
@@ -4619,11 +4749,13 @@ def render_modalities(
         or scene_override.transform_overrides
     )) else None
     assist_light = assist_light if assist_light and assist_light.mode == "camera_aligned_rect" else None
+    active_lights = [l for l in (active_lights or []) if getattr(l, "enabled", True)]
+    _nir_active_lights = [l for l in active_lights if "nir" in (l.modalities or [])]
     depth_approx = depth_approx if depth_approx and depth_approx.target_shape_filenames else None
     if "sensor_depth_approx" in requested_set and depth_approx is None:
         raise ValueError("sensor_depth_approx requires a depth_approx specification.")
-    if _needs_active_nir(requested_set) and assist_light is None:
-        raise ValueError("active NIR modalities require an assist_light specification.")
+    if _needs_active_nir(requested_set) and assist_light is None and not _nir_active_lights:
+        raise ValueError("active NIR modalities require an assist_light or an nir active_light.")
     hazard_target_shape_filenames: list[str] = []
     if scene_override is not None and scene_override.target_shape_filenames:
         hazard_target_shape_filenames = list(scene_override.target_shape_filenames)
@@ -5475,7 +5607,7 @@ def render_modalities(
         pass_records["lidar_point_cloud"] = lidar_record
         results["lidar_point_cloud"] = lidar_result
 
-    if _needs_active_nir(requested_set) and assist_light is not None:
+    if _needs_active_nir(requested_set) and (assist_light is not None or _nir_active_lights):
         scene_active = _stage_path_scene(
             source_scene,
             stage_filename("active_nir_intensity", "scene_active_nir.xml"),
@@ -5492,6 +5624,10 @@ def render_modalities(
             measured_wavelength_nm=854,
             measured_scope=measured_scope,
             max_measured_bsdfs=max_measured_bsdfs,
+            active_lights=_nir_active_lights,
+            base_pose=base_pose,
+            active_pass_kind="nir",
+            active_spectral=False,
         )
         staged_scenes["active_nir_intensity"] = str(scene_active)
         _cb("staging_scene", {"pass": "active_nir_intensity"})
@@ -5538,12 +5674,19 @@ def render_modalities(
 
     polarization_material_mode = "not_requested"
     if _needs_polar(requested_set):
-        polar_nested = "volpath" if assist_light is not None and assist_light.polarized else "direct"
-        polar_illumination_tag = "camera_aligned_nir_active_polarized" if assist_light is not None else "ambient_room"
-        # Camera-aligned assist lights are part of the scene geometry, so they
-        # must stay camera-baked. Plain ambient-room polarization can share one
-        # resident Stokes scene across all headings and only swap the sensor.
-        use_base_polar_scene = _use_scene_reuse and assist_light is None
+        _polar_active_lights = [l for l in active_lights if "polar" in (l.modalities or [])]
+        _has_polarized_active = any(l.polarized for l in _polar_active_lights)
+        polar_nested = "volpath" if (assist_light is not None and assist_light.polarized) or _has_polarized_active else "direct"
+        polar_illumination_tag = (
+            "camera_aligned_nir_active_polarized" if assist_light is not None
+            else "rig_active_light" if _polar_active_lights
+            else "ambient_room"
+        )
+        # Camera-aligned assist lights AND pose-baked rig active lights (Stage B)
+        # are part of the scene geometry, so they must stay camera/base-baked.
+        # Plain ambient-room polarization can share one resident Stokes scene
+        # across all headings and only swap the sensor.
+        use_base_polar_scene = _use_scene_reuse and assist_light is None and not _polar_active_lights
         polar_viewpoint = _viewpoint if use_base_polar_scene else None
         if use_base_polar_scene:
             scene_polar = _stage_base_stokes_scene(
@@ -5575,6 +5718,8 @@ def render_modalities(
                 nested_integrator_type=polar_nested,
                 measured_scope=measured_scope,
                 max_measured_bsdfs=max_measured_bsdfs,
+                active_lights=_polar_active_lights,
+                base_pose=base_pose,
             )
             scene_polar_fallback = _stage_polarized_fallback_scene(
                 source_scene,

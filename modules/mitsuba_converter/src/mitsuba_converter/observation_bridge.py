@@ -470,6 +470,11 @@ def render_timestep_bundle_split_lighting(
         camera_config = _camera_config(base_config, camera_spec)
         camera_modalities = _camera_modalities(render_request, camera_spec)
         camera_assist_light = _camera_assist_light(render_request, camera_spec, camera_modalities)
+        # Rig-mounted active lights (RGB/NIR flash + polarizer). Positioned at
+        # base_pose @ mount inside the renderer. Robot base pose comes from the
+        # request; the helper normalises matrix storage.
+        active_lights = list(render_request.active_lights or [])
+        base_pose = render_request.robot_state.base_pose if render_request.robot_state else None
         branch_modalities = _split_lighting_modalities(camera_modalities)
         branch_results: dict[str, MultimodalRenderResult] = {}
 
@@ -502,6 +507,8 @@ def render_timestep_bundle_split_lighting(
                 config=camera_config,
                 scene_override=render_request.scene_override,
                 assist_light=camera_assist_light,
+                active_lights=active_lights,
+                base_pose=base_pose,
                 depth_approx=render_request.depth_approx,
                 variant=variant,
                 progress_callback=progress_callback,
@@ -520,6 +527,8 @@ def render_timestep_bundle_split_lighting(
                 config=polar_config,
                 scene_override=render_request.scene_override,
                 assist_light=camera_assist_light,
+                active_lights=active_lights,
+                base_pose=base_pose,
                 depth_approx=None,
                 variant=variant,
                 progress_callback=progress_callback,

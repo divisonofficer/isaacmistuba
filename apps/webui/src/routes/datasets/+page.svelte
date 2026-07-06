@@ -178,6 +178,7 @@
 		retryJob as retryRenderJob,
 		cancelJob,
 		getCameraRig,
+		getUserSettings,
 		type CameraRig,
 		type CameraRigRenderSettings,
 		type CameraRigSensor
@@ -322,6 +323,9 @@
 	let selectedEpisode = $state<any>(null);
 	let episodeSearch = $state('');
 	let selectedSensorNodeId = $state('');
+	// "Find sensor #" — jump the editor camera to a viewpoint/custom-sensor node by number.
+	let sensorFindQuery = $state('');
+	let sensorFindError = $state('');
 	let activeModalityTab = $state('rgb');
 	let activeRigSensorId = $state('');
 	let selectedRigSensorIds = $state<string[]>([]);
@@ -2429,6 +2433,37 @@
 		handleGroundPointerUp(end);
 	}
 
+	// Resolve a free-form sensor query to a node id: exact id (vp_000092 / custom_…),
+	// bare digits ("92" → vp_000092), or a numeric suffix match against any node.
+	function resolveSensorNodeId(q: string): string | null {
+		const s = (q ?? '').trim();
+		if (!s) return null;
+		if (graphNodes.some((n: any) => n.node_id === s) || customSensorNodes.some((n) => n.id === s)) return s;
+		const digits = s.replace(/[^0-9]/g, '');
+		if (!digits) return null;
+		const padded = `vp_${digits.padStart(6, '0')}`;
+		if (graphNodes.some((n: any) => n.node_id === padded)) return padded;
+		const asNum = parseInt(digits, 10);
+		const byNum = graphNodes.find((n: any) => {
+			const m = String(n.node_id).match(/(\d+)\s*$/);
+			return m && parseInt(m[1], 10) === asNum;
+		});
+		return byNum ? byNum.node_id : null;
+	}
+
+	// Select + fly the editor camera to the matched sensor node (with a pulse ring).
+	function focusSensorNode() {
+		const id = resolveSensorNodeId(sensorFindQuery);
+		if (!id) { sensorFindError = `No sensor node matching "${sensorFindQuery.trim()}"`; return; }
+		sensorFindError = '';
+		selectedSensorNodeId = id;
+		sensorRenderResult = null;
+		placingSensor = false;
+		if (pageMode !== 'sensors') setPageMode('sensors');
+		const ok = mapEditorRef?.focusOnNode?.(id);
+		if (!ok) sensorFindError = 'Viewer not ready yet — try again in a moment.';
+	}
+
 	// World-coordinate handlers (used by MapEditor3D callbacks)
 	function handleGroundPointerDown(point: { x: number; y: number }, shiftKey = false, placement: { base_height_m?: number; snap_label?: string } = {}) {
 		contextMenu = null;
@@ -4155,6 +4190,13 @@
 		refreshProjects(selectedProjectId);
 		loadGlobalCameraRig();
 		loadMaterialLibrary();
+		// pBRDF band / measured scope now live in Settings (user_settings). Seed the
+		// render-request state from there so this editor honours the saved choice.
+		getUserSettings().then((r) => {
+			const s = r?.settings ?? {};
+			if (typeof s.pbrdf_band_mode === 'string') previewBandMode = s.pbrdf_band_mode;
+			if (typeof s.measured_scope === 'string') previewMeasuredScope = s.measured_scope;
+		}).catch(() => {});
 		return () => {
 			// Release the job-status WS subscription when the page unmounts so a
 			// route change doesn't leave the connection (and its keepalive churn)
@@ -4479,6 +4521,9 @@
 			{resourceStatus}
 			{resourceError}
 			syncStatus={currentScene?.sync_status}
+			{syncProgress}
+			{syncRunning}
+			syncStageLabel={renderService.syncStageLabel(syncProgress?.stage, 'kr')}
 			onRetry={retryResource}
 			onRetryAll={retryAllFailed}
 		/>
@@ -4826,20 +4871,6 @@
 					onSetTransformGridSizeM={(v) => (transformGridSizeM = v)}
 					onSetTransformAngleSnapDeg={(v) => (transformAngleSnapDeg = v)}
 				/>
-				{#if selectedAuthoringKind === 'object'}
-					<MaterialInspector
-						projectId={selectedProjectId}
-						{sceneId}
-						materialId={selectedAuthoringItem.material}
-						objectId={selectedAuthoringItem.id}
-						sourceRef={selectedAuthoringItem.source_ref}
-						entry={selectedMaterialEntry}
-					/>
-				{/if}
-			{/if}
-
-			{#if railTab === 'materials'}
-				<RailMaterialsTab projectId={selectedProjectId} {sceneId} />
 			{/if}
 
 			<!-- Floating bottom status bar -->
@@ -5172,6 +5203,20 @@
 				onSetTransformGridSizeM={(v) => (transformGridSizeM = v)}
 				onSetTransformAngleSnapDeg={(v) => (transformAngleSnapDeg = v)}
 			/>
+			{#if selectedAuthoringKind === 'object'}
+				<MaterialInspector
+					projectId={selectedProjectId}
+					{sceneId}
+					materialId={selectedAuthoringItem.material}
+					objectId={selectedAuthoringItem.id}
+					sourceRef={selectedAuthoringItem.source_ref}
+					entry={selectedMaterialEntry}
+				/>
+			{/if}
+		{/if}
+
+		{#if railTab === 'materials'}
+			<RailMaterialsTab projectId={selectedProjectId} {sceneId} />
 		{/if}
 
 		{#if railTab === 'paths'}
@@ -5254,7 +5299,6 @@
 				{placingSensor} {frustumMode} {ambientRadiance} {activeModalityTab}
 				{activeRigSensorOption} {activeCameraFrustum} {activeRenderModality}
 				hotCameraPose={activeHotCameraPose}
-				{previewBandMode} {previewMeasuredScope}
 				{probeRendering} {probeError}
 				{rigMountHeightM} {authoringMap}
 				{selectedProjectId} {sceneId} {loading} {hasScene} {hasGraph}
@@ -5285,14 +5329,16 @@
 				perturbedRenderReady={Boolean(perturbation?.perturbed_render_ready)}
 				perturbedRenderStale={Boolean(perturbation?.perturbed_render_stale)}
 				onSetRenderVariant={(v) => (renderVariant = v)}
-				onSetPreviewBandMode={(v) => (previewBandMode = v)}
-				onSetPreviewMeasuredScope={(v) => (previewMeasuredScope = v)}
 				onSetActiveModalityTab={(v) => (activeModalityTab = v)}
 				{episodeNodesAvailable}
 				{episodePathNodeCount}
 				{renderMissingOnly}
 				onSetRenderMissingOnly={(v) => (renderMissingOnly = v)}
 				headingsPerNode={graphPayload?.node_heading_count ?? 0}
+				bind:sensorFindQuery
+				{sensorFindError}
+				graphNodeCount={graphNodes.length}
+				onFindSensor={focusSensorNode}
 				onRefreshBatch={() => refreshBatch()}
 			/>
 		{/if}

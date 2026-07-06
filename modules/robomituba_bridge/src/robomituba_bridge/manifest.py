@@ -8,6 +8,7 @@ import secrets
 
 from .paths import JobLayout, to_repo_relative_posix
 from .types import (
+    ActiveLightSpec,
     AssistLightSpec,
     CameraSpec,
     DepthApproxSpec,
@@ -172,6 +173,24 @@ def validate_assist_light_spec(assist_light: AssistLightSpec) -> None:
         raise ValueError("assist_light.spectrum_mode must not be empty.")
 
 
+def validate_active_light_spec(active_light: "ActiveLightSpec") -> None:
+    if not active_light.light_id:
+        raise ValueError("active_light.light_id must not be empty.")
+    if active_light.emitter_type not in ("spot", "point"):
+        raise ValueError(f"Unsupported active_light.emitter_type: {active_light.emitter_type}")
+    if active_light.spectrum_kind not in ("rgb", "nir"):
+        raise ValueError(f"Unsupported active_light.spectrum_kind: {active_light.spectrum_kind}")
+    mount = active_light.mount or {}
+    xyz = mount.get("xyz_m", [])
+    rpy = mount.get("rpy_deg", [])
+    if len(xyz) != 3 or len(rpy) != 3:
+        raise ValueError("active_light.mount must have xyz_m[3] and rpy_deg[3].")
+    if active_light.radiance < 0:
+        raise ValueError("active_light.radiance must be non-negative.")
+    if active_light.spectrum_kind == "nir" and active_light.wavelength_nm <= 0:
+        raise ValueError("active_light.wavelength_nm must be positive for nir.")
+
+
 def validate_depth_approx_spec(depth_approx: DepthApproxSpec) -> None:
     if depth_approx.mode != "planar_reflective_proxy":
         raise ValueError(f"Unsupported depth_approx.mode: {depth_approx.mode}")
@@ -223,12 +242,24 @@ def validate_render_request(render_request: RenderRequest) -> None:
         validate_scene_override_spec(render_request.scene_override)
     if render_request.assist_light is not None:
         validate_assist_light_spec(render_request.assist_light)
+    active_light_ids: set[str] = set()
+    for active_light in render_request.active_lights:
+        validate_active_light_spec(active_light)
+        if active_light.light_id in active_light_ids:
+            raise ValueError(f"Duplicate active_light.light_id: {active_light.light_id}")
+        active_light_ids.add(active_light.light_id)
     if render_request.depth_approx is not None:
         validate_depth_approx_spec(render_request.depth_approx)
     if "sensor_depth_approx" in render_request.modalities and render_request.depth_approx is None:
         raise ValueError("sensor_depth_approx requires render_request.depth_approx.")
-    if any(item in render_request.modalities for item in ("active_nir_intensity", "nir_intensity")) and render_request.assist_light is None:
-        raise ValueError("active NIR modalities require render_request.assist_light.")
+    # Active NIR needs an illumination source: either the legacy camera-aligned
+    # assist_light or at least one rig-mounted active light that covers the nir pass.
+    _has_nir_active_light = any(
+        light.enabled and "nir" in (light.modalities or []) for light in render_request.active_lights
+    )
+    if any(item in render_request.modalities for item in ("active_nir_intensity", "nir_intensity")) \
+            and render_request.assist_light is None and not _has_nir_active_light:
+        raise ValueError("active NIR modalities require render_request.assist_light or an nir active_light.")
     try:
         json.dumps(render_request.render_settings)
     except TypeError as exc:

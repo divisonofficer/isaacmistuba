@@ -958,8 +958,8 @@ def _measured_candidate_from_binding(binding: Mapping[str, Any]) -> dict[str, An
 
 
 def _baked_atlas_urls(source_ref: str | None, repo_root: "Path | None" = None) -> dict[str, Any]:
-    """Derive baked albedo/roughness/normal atlas artifact URLs from an object's
-    ``source_ref`` ("<import>/meshes/<oid>.obj" -> "<import>/textures/<oid>_<kind>.png"),
+    """Derive baked albedo/roughness/metallic/normal atlas artifact URLs from an
+    object's ``source_ref`` ("<import>/meshes/<oid>.obj" -> "<import>/textures/<oid>_<kind>.png"),
     mirroring the webui ``bakedAtlasArtifactUrl`` derivation. ``exists`` is checked
     against ``repo_root`` when given (None when it can't be determined; the <img>
     404s gracefully to the base-color swatch either way)."""
@@ -968,7 +968,7 @@ def _baked_atlas_urls(source_ref: str | None, repo_root: "Path | None" = None) -
     base, sep, tail = ref.rpartition("/meshes/")
     ok = bool(sep) and tail.endswith(".obj")
     oid = tail[:-4] if ok else None
-    for kind in ("albedo", "roughness", "normal"):
+    for kind in ("albedo", "roughness", "metallic", "normal"):
         if not ok:
             out[kind] = {"url": None, "exists": None}
             continue
@@ -981,6 +981,53 @@ def _baked_atlas_urls(source_ref: str | None, repo_root: "Path | None" = None) -
                 exists = None
         out[kind] = {"url": f"/artifacts?path={quote(rel)}", "exists": exists}
     return out
+
+
+def _split_obj_shapes_cached(abs_obj: "Path", repo_root: "Path") -> list[dict[str, Any]]:
+    """Split a multi-``usemtl`` OBJ into per-material-group sub-OBJs (cached next to
+    the source under ``_split/``) so the render staging can emit one shape+BSDF per
+    face group -- restoring the per-face-group materials that Infinigen bakes but the
+    single-material authoring object flattens away (orphan-material fix).
+
+    Returns ``[{material_id, material_name, obj_ref, triangle_count}]`` (obj_ref is
+    repo-relative for the XML ``filename``), or ``[]`` for single-material meshes.
+    """
+    from mitsuba_converter import obj_split
+
+    try:
+        src_mtime = abs_obj.stat().st_mtime
+    except OSError:
+        return []
+    groups = obj_split.iter_material_groups(abs_obj)
+    if len(groups) <= 1:
+        return []
+    out_dir = abs_obj.parent / "_split"
+    stem = abs_obj.stem
+    need = any(
+        not (out_dir / f"{stem}__{g['material_id']}.obj").exists()
+        or (out_dir / f"{stem}__{g['material_id']}.obj").stat().st_mtime < src_mtime
+        for g in groups
+    )
+    if need:
+        parts = obj_split.split_obj_by_material(abs_obj, out_dir=out_dir)
+    else:
+        parts = [{
+            "material_name": g["material_name"], "material_id": g["material_id"],
+            "path": out_dir / f"{stem}__{g['material_id']}.obj",
+            "triangle_count": g["triangle_count"],
+        } for g in groups]
+    result: list[dict[str, Any]] = []
+    for p in parts:
+        path = Path(p["path"])
+        try:
+            ref = path.relative_to(repo_root).as_posix()
+        except ValueError:
+            ref = str(path)
+        result.append({
+            "material_id": p["material_id"], "material_name": p["material_name"],
+            "obj_ref": ref, "triangle_count": p.get("triangle_count"),
+        })
+    return result
 
 
 def _material_policy_record(
@@ -2799,6 +2846,48 @@ def _proxy_box_xml_element(
                 )
             return shapes if len(shapes) > 1 else shapes[0]
 
+        # Infinigen meshes carry several per-face-group materials (usemtl groups) but
+        # the authoring object records only one; split into one shape+BSDF per group
+        # so each group renders with its real material (base_color atlas is shared per
+        # mesh, so all groups reuse obj_extracted_material; only the BSDF differs).
+        split_groups: list[dict[str, Any]] = []
+        if materialize_source_type == "obj_file" and repo_root is not None:
+            try:
+                split_groups = _split_obj_shapes_cached(resolve_repo_path(repo_root, obj_mesh_filename), repo_root)
+            except Exception:
+                split_groups = []
+        if len(split_groups) > 1:
+            shapes = []
+            for gi, grp in enumerate(split_groups):
+                grp_mid = grp["material_id"]
+                grp_material = grp_mid if grp_mid in material_idx else material
+                shape_id = obj_id if gi == 0 else f"{obj_id}__{grp_mid}"
+                grp_shape = _obj_shape(grp["obj_ref"], shape_id)
+                _append_bsdf_xml(
+                    grp_shape, grp_material, material_idx,
+                    fallback_color=fallback, repo_root=repo_root,
+                    extracted_material=obj_extracted_material,
+                    material_policy_records=material_policy_records,
+                )
+                shapes.append(grp_shape)
+                if mesh_stats is not None:
+                    mesh_stats["mesh_attached"] = mesh_stats.get("mesh_attached", 0) + 1
+                    if obj_extracted_material:
+                        mesh_stats["usd_material_attached"] = mesh_stats.get("usd_material_attached", 0) + 1
+                _record(
+                    "obj", "obj_file_material_group",
+                    shape_id=shape_id, cache_obj=grp["obj_ref"],
+                    extras={
+                        "parent_shape_id": obj_id,
+                        "material_group": grp["material_name"],
+                        "render_material_id": grp_material,
+                        "triangle_count": grp.get("triangle_count"),
+                        "object_material": material,
+                        "asset_id": (obj_meta.get("asset_id") if isinstance(obj_meta, dict) else None),
+                    },
+                )
+            return shapes
+
         shape = _obj_shape(obj_mesh_filename, obj_id)
         _append_bsdf_xml(
             shape, material, material_idx,
@@ -3162,6 +3251,7 @@ def _generate_opticalnav_render_scene_xml(
     mesh_stats: "dict[str, int] | None" = None,
     materialization_records: "list[dict[str, Any]] | None" = None,
     material_policy_records: "list[dict[str, Any]] | None" = None,
+    shape_progress_cb: "Callable[[int, int], None] | None" = None,
 ) -> int:
     """Generate a full Mitsuba render scene from authoring_map in authoring coordinates.
 
@@ -3305,7 +3395,9 @@ def _generate_opticalnav_render_scene_xml(
     # in one scene all share the basename "mesh.obj" and 404 in the editor).
     scene_mesh_cache_dir = out_path.parent / "mesh_cache"
     scene_texture_cache_dir = out_path.parent / "texture_cache"
-    for obj in overlay.get("objects") or []:
+    _overlay_objects = overlay.get("objects") or []
+    _obj_total = len(_overlay_objects)
+    for _obj_i, obj in enumerate(_overlay_objects):
         elem = _proxy_box_xml_element(
             obj, eg_by_label, material_idx,
             repo_root=repo_root,
@@ -3316,6 +3408,13 @@ def _generate_opticalnav_render_scene_xml(
             scene_mesh_cache_dir=scene_mesh_cache_dir,
             scene_texture_cache_dir=scene_texture_cache_dir,
         )
+        # Per-object progress so pure-OBJ / GLB-materialized scenes (no USD prims,
+        # so mesh_resolver never fires) still show a moving bar instead of 0/N.
+        if shape_progress_cb is not None:
+            try:
+                shape_progress_cb(_obj_i + 1, _obj_total)
+            except Exception:
+                pass
         if elem is not None:
             root.append(ET.Comment(_opticalnav_obj_comment_data(obj)))
             elems = elem if isinstance(elem, list) else [elem]
@@ -5081,14 +5180,56 @@ class RenderDaemon:
                     "wavelength_nm": self._as_finite_float(lidar_raw.get("wavelength_nm", 905.0), name=f"{sensor_id}.lidar.wavelength_nm"),
                 }
             sensors.append(sensor)
+        base_frame = str(payload.get("base_frame") or "base_link")
+        active_lights = self._normalize_camera_rig_active_lights(payload.get("active_lights"), base_frame=base_frame)
         return {
             "rig_id": normalized_rig_id,
             "label": str(payload.get("label") or normalized_rig_id),
             "robot_model": "ranger_mini_v3",
-            "base_frame": str(payload.get("base_frame") or "base_link"),
+            "base_frame": base_frame,
             "updated_at": _utc_now_iso(),
             "sensors": sensors,
+            "active_lights": active_lights,
         }
+
+    def _normalize_camera_rig_active_lights(self, value: Any, *, base_frame: str) -> list[dict[str, Any]]:
+        """Normalize rig-level active lights (RGB/NIR flash + linear polarizer).
+        Mirrors ActiveLightSpec fields; tolerant of partial/legacy payloads."""
+        if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+            return []
+        out: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for idx, raw in enumerate(value):
+            if not isinstance(raw, Mapping):
+                continue
+            light_id = str(raw.get("light_id") or f"active_light_{idx}").strip() or f"active_light_{idx}"
+            if light_id in seen:
+                raise ValueError(f"duplicate active light light_id: {light_id}")
+            seen.add(light_id)
+            mount_raw = raw.get("mount") if isinstance(raw.get("mount"), Mapping) else {}
+            modalities = [str(m) for m in (raw.get("modalities") or ["nir", "polar"]) if str(m).strip()]
+            emitter_type = "point" if str(raw.get("emitter_type")) == "point" else "spot"
+            spectrum_kind = "nir" if str(raw.get("spectrum_kind")) == "nir" else "rgb"
+            out.append({
+                "light_id": light_id,
+                "enabled": bool(raw.get("enabled", True)),
+                "emitter_type": emitter_type,
+                "mount": {
+                    "parent_frame": str(mount_raw.get("parent_frame") or base_frame),
+                    "xyz_m": self._as_float_vec(mount_raw.get("xyz_m", [0.0, 0.0, 0.0]), name=f"{light_id}.mount.xyz_m", length=3),
+                    "rpy_deg": self._as_float_vec(mount_raw.get("rpy_deg", [0.0, 0.0, 0.0]), name=f"{light_id}.mount.rpy_deg", length=3),
+                },
+                "modalities": modalities or ["nir", "polar"],
+                "spectrum_kind": spectrum_kind,
+                "rgb": self._as_float_vec(raw.get("rgb", [1.0, 1.0, 1.0]), name=f"{light_id}.rgb", length=3),
+                "wavelength_nm": self._as_finite_float(raw.get("wavelength_nm", 850.0), name=f"{light_id}.wavelength_nm"),
+                "radiance": self._as_finite_float(raw.get("radiance", 40.0), name=f"{light_id}.radiance"),
+                "cutoff_angle_deg": self._as_finite_float(raw.get("cutoff_angle_deg", 45.0), name=f"{light_id}.cutoff_angle_deg"),
+                "beam_width_deg": self._as_finite_float(raw.get("beam_width_deg", 30.0), name=f"{light_id}.beam_width_deg"),
+                "polarized": bool(raw.get("polarized", False)),
+                "polarizer_angle_deg": self._as_finite_float(raw.get("polarizer_angle_deg", 0.0), name=f"{light_id}.polarizer_angle_deg"),
+            })
+        return out
 
     def _load_camera_rig(self, rig_id: str) -> dict[str, Any]:
         path = self._camera_rig_path(rig_id)
@@ -5976,6 +6117,14 @@ class RenderDaemon:
         if self._server is not None:
             return
 
+        # Persisted user render prefs (bsdf_mode / texture cap) win over the
+        # launcher env, so apply them before any scene sync / worker spawn.
+        try:
+            from .user_settings import apply_render_env_from_settings
+            apply_render_env_from_settings()
+        except Exception:
+            pass
+
         controller = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -6299,6 +6448,8 @@ class RenderDaemon:
                     "mesh_extract",
                 )
 
+            _denom = max(total_estimate, usd_backed_count, 1)
+
             def _resolve_prim_obj(usd_ref: str, prim_path: str):
                 res = self._ensure_prim_obj_cached(
                     project_dir, scene_id, usd_ref, prim_path,
@@ -6306,8 +6457,17 @@ class RenderDaemon:
                 )
                 _processed["n"] += 1
                 if progress_cb is not None and (_processed["n"] % 4 == 0 or _processed["n"] == usd_backed_count):
-                    progress_cb(_processed["n"], max(total_estimate, usd_backed_count), prim_path.rsplit("/", 1)[-1], "mesh_extract")
+                    progress_cb(_processed["n"], _denom, prim_path.rsplit("/", 1)[-1], "mesh_extract")
                 return res
+
+            def _on_shape(done: int, total: int) -> None:
+                # OBJ / GLB-materialized scenes have no USD prims, so this loop-based
+                # counter is what actually advances the "OBJ shapes" bar.
+                if progress_cb is None:
+                    return
+                if done % 4 == 0 or done == total:
+                    seen = max(done, _processed["n"])
+                    progress_cb(seen, max(_denom, total), "OBJ shapes", "mesh_extract")
 
             t_mesh_start = time.perf_counter()
             materialization_records: list[dict[str, Any]] = []
@@ -6322,6 +6482,7 @@ class RenderDaemon:
                 mesh_stats=mesh_extraction_stats,
                 materialization_records=materialization_records,
                 material_policy_records=material_policy_records,
+                shape_progress_cb=_on_shape,
             )
             mesh_extraction_stats["extraction_time_ms"] = int((time.perf_counter() - t_mesh_start) * 1000)
             render_scene_ref = render_scene_path.relative_to(self.repo_root).as_posix()
@@ -6454,6 +6615,10 @@ class RenderDaemon:
             **dict(_raw.get("metadata", {}).get("sync", {})),
             **result.sync,
             "render_scene": "synced" if readiness.get("ok") else "blocked",
+            # Clear the "syncing" flag set at job start — the editor's InitStatusDashboard
+            # reads render_scene_status preferentially, so leaving it "syncing" keeps the
+            # progress banner (OBJ 캐싱 …) spinning forever after the sync has finished.
+            "render_scene_status": "synced" if readiness.get("ok") else "blocked",
             "render_scene_mode": "editor_generated_xml",
             "scene_variant_ref": result.scene_variant_ref,
             "render_scene_overlay_ref": result.overlay_ref,
@@ -10494,20 +10659,81 @@ class RenderDaemon:
             ),
         }
 
-        if material_id is None and object_id is None:
-            # list mode: pick a representative object source_ref per material for atlases.
-            source_by_material: dict[str, str] = {}
+        # Representative original-mesh source_ref per material (for atlas thumbnails),
+        # taken from authoring objects (the un-split ".../meshes/<oid>.obj").
+        source_by_material: dict[str, str] = {}
+        for obj in objects:
+            mid = _maybe_str(obj.get("material"))
+            src = _maybe_str(obj.get("source_ref"))
+            if mid and src and mid not in source_by_material:
+                source_by_material[mid] = src
+
+        # "used by" reverse index. A material is USED if it is emitted as a render
+        # shape -- which since the per-usemtl split includes the face-group materials
+        # a single authoring object carries, NOT just objects[].material. Count from
+        # render_scene_materialization.json (extras.render_material_id per shape), so
+        # split-group materials show as used. Fall back to authoring object refs when
+        # the scene hasn't been synced yet.
+        used_by: dict[str, list[dict[str, Any]]] = {}
+        seen_pairs: set[tuple[str, str]] = set()
+        matz_path = project_dir / "scenes" / scene_id / "render_scene_materialization.json"
+        if matz_path.exists():
+            try:
+                matz = _read_json(matz_path)
+            except Exception:
+                matz = {}
+            for shp in (matz.get("shapes") or matz.get("objects") or []):
+                if not isinstance(shp, Mapping):
+                    continue
+                ex = shp.get("extras") if isinstance(shp.get("extras"), Mapping) else {}
+                mat = _maybe_str(ex.get("render_material_id")) or _maybe_str(shp.get("material_id"))
+                if not mat:
+                    continue
+                oid = (_maybe_str(ex.get("parent_shape_id")) or _maybe_str(shp.get("object_id"))
+                       or _maybe_str(shp.get("shape_id")) or "")
+                if "__" in oid:
+                    oid = oid.split("__", 1)[0]
+                if (mat, oid) in seen_pairs:
+                    continue
+                seen_pairs.add((mat, oid))
+                src = _maybe_str(shp.get("source_ref"))
+                used_by.setdefault(mat, []).append({
+                    "object_id": oid or None, "label": _maybe_str(shp.get("label")), "source_ref": src,
+                })
+        if not used_by:
             for obj in objects:
                 mid = _maybe_str(obj.get("material"))
-                src = _maybe_str(obj.get("source_ref"))
-                if mid and src and mid not in source_by_material:
-                    source_by_material[mid] = src
-            resolved = [
-                self._resolve_material_optics(entry, source_by_material.get(_maybe_str(entry.get("material_id")) or ""), object_id=None)
-                for entry in materials
-                if _maybe_str(entry.get("material_id"))
-            ]
-            return {"ok": True, "scene_id": scene_id, **mode_meta, "count": len(resolved), "materials": resolved}
+                if not mid:
+                    continue
+                used_by.setdefault(mid, []).append({
+                    "object_id": _maybe_str(obj.get("id")),
+                    "label": _maybe_str(obj.get("label")),
+                    "source_ref": _maybe_str(obj.get("source_ref")),
+                })
+
+        if material_id is None and object_id is None:
+            resolved = []
+            for entry in materials:
+                mid = _maybe_str(entry.get("material_id"))
+                if not mid:
+                    continue
+                rec = self._resolve_material_optics(entry, source_by_material.get(mid), object_id=None)
+                uses = used_by.get(mid, [])
+                rec["used_by"] = uses
+                rec["used_by_count"] = len(uses)
+                resolved.append(rec)
+            referenced = sum(1 for r in resolved if r["used_by_count"] > 0)
+            return {
+                "ok": True, "scene_id": scene_id, **mode_meta,
+                "count": len(resolved),
+                "summary": {
+                    "objects": len(objects),
+                    "materials": len(resolved),
+                    "referenced": referenced,
+                    "orphan": len(resolved) - referenced,
+                },
+                "materials": resolved,
+            }
 
         source_ref = None
         if object_id is not None:
@@ -10521,7 +10747,42 @@ class RenderDaemon:
         entry = next((m for m in materials if _maybe_str(m.get("material_id")) == material_id), None)
         if entry is None:
             return None
-        return {"ok": True, "scene_id": scene_id, **mode_meta, **self._resolve_material_optics(entry, source_ref, object_id=object_id)}
+        if source_ref is None:
+            source_ref = source_by_material.get(material_id)
+        payload = self._resolve_material_optics(entry, source_ref, object_id=object_id)
+        uses = used_by.get(material_id, [])
+        payload["used_by"] = uses
+        payload["used_by_count"] = len(uses)
+        result = {"ok": True, "scene_id": scene_id, **mode_meta, **payload}
+
+        # object -> materials (1:N): an Infinigen mesh carries several usemtl face
+        # groups. The authoring object records only the first; enumerate the real
+        # groups from the mesh so the viewer can show every material the object uses
+        # (this is the same relationship the render splitter emits as sub-shapes).
+        if source_ref and str(source_ref).lower().endswith(".obj"):
+            try:
+                from mitsuba_converter import obj_split
+                abs_obj = resolve_repo_path(self.repo_root, source_ref)
+                groups = obj_split.iter_material_groups(abs_obj) if abs_obj.exists() else []
+            except Exception:
+                groups = []
+            if len(groups) > 1:
+                by_id = {_maybe_str(m.get("material_id")): m for m in materials}
+                obj_mats = []
+                for g in groups:
+                    entry_g = by_id.get(g["material_id"])
+                    if entry_g is None:
+                        continue
+                    rec = self._resolve_material_optics(entry_g, source_ref, object_id=object_id)
+                    rec["triangle_count"] = g.get("triangle_count")
+                    guses = used_by.get(g["material_id"], [])
+                    rec["used_by"] = guses
+                    rec["used_by_count"] = len(guses)
+                    obj_mats.append(rec)
+                if obj_mats:
+                    result["object_materials"] = obj_mats
+                    result["object_material_count"] = len(obj_mats)
+        return result
 
     def _handle_opticalnav_get(self, handler: BaseHTTPRequestHandler, path: str, query: Mapping[str, list[str]]) -> bool:
         if path == "/api/opticalnav/projects":
@@ -13574,6 +13835,13 @@ class RenderDaemon:
         camera_specs_payload = payload.get("camera_specs")
         if not isinstance(camera_specs_payload, list):
             camera_specs_payload = None
+        # Rig-mounted active lights (RGB/NIR flash + linear polarizer). The webui
+        # sweep request carries the loaded rig's active_lights; normalize defensively.
+        try:
+            active_lights_payload = self._normalize_camera_rig_active_lights(
+                payload.get("active_lights"), base_frame=str(payload.get("base_frame") or "base_link"))
+        except Exception:
+            active_lights_payload = []
         sensor_scope = str(payload.get("sensor_scope") or "active").strip().lower()
         if sensor_scope not in {"active", "all_rig", "selected"}:
             sensor_scope = "active"
@@ -13673,6 +13941,7 @@ class RenderDaemon:
                     scene_state_payload=dict(scene_state_payload),
                     camera_spec_payload=dict(camera_spec_payload or {}),
                     camera_specs_payload=camera_specs_payload,
+                    active_lights=active_lights_payload,
                     sensor_scope=sensor_scope,
                     sensor_ids=sensor_ids,
                     modalities=modalities,
@@ -13776,6 +14045,7 @@ class RenderDaemon:
                     scene_state_payload=dict(scene_state_payload),
                     camera_spec_payload=dict(camera_spec_payload or {}),
                     camera_specs_payload=camera_specs_payload,
+                    active_lights=active_lights_payload,
                     sensor_scope=sensor_scope,
                     sensor_ids=sensor_ids,
                     modalities=modalities,
@@ -13839,6 +14109,7 @@ class RenderDaemon:
                 variant=str(payload.get("variant") or self.variant),
                 sweep_execution_policy=sweep_execution_policy,
                 skip_existing_observations=skip_existing_observations,
+                active_lights=active_lights_payload,
             ),
             daemon=True,
             name=f"sweep-{batch_id}",
@@ -13899,6 +14170,7 @@ class RenderDaemon:
         variant: str,
         sweep_execution_policy: str = "auto",
         skip_existing_observations: bool = False,
+        active_lights: "list[dict] | None" = None,
     ) -> None:
         """Background thread: read graph, build RenderRequests, submit all jobs."""
         from navigation_dataset.sensor_sweep import build_sweep_render_requests, split_sweep_requests_by_modality_phase
@@ -13922,6 +14194,7 @@ class RenderDaemon:
                 camera_height_m=camera_height_m,
                 render_settings=render_settings,
                 node_heights=node_heights,
+                active_lights=active_lights,
             )
             phases = split_sweep_requests_by_modality_phase(
                 sweep_requests,
@@ -16878,7 +17151,11 @@ class RenderDaemon:
         })
 
     def _handle_user_settings_post(self, handler: BaseHTTPRequestHandler, payload: dict) -> None:
-        from .user_settings import load_user_settings, save_user_settings, MIN_PREVIEW_SPP, MAX_PREVIEW_SPP
+        from .user_settings import (
+            load_user_settings, save_user_settings, apply_render_env_from_settings,
+            MIN_PREVIEW_SPP, MAX_PREVIEW_SPP, MIN_TEXTURE_RES, MAX_TEXTURE_RES,
+            VALID_BSDF_MODES, VALID_PBRDF_BANDS, VALID_MEASURED_SCOPES,
+        )
         if not isinstance(payload, dict):
             self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": "payload must be an object"})
             return
@@ -16916,7 +17193,57 @@ class RenderDaemon:
                     )
                     return
                 current["material_preview_spp"] = n
+        # Render / BSDF preferences. Empty string / null clears the override.
+        if "bsdf_mode" in payload:
+            mode = payload.get("bsdf_mode")
+            if mode in (None, ""):
+                current.pop("bsdf_mode", None)
+            elif isinstance(mode, str) and mode in VALID_BSDF_MODES:
+                current["bsdf_mode"] = mode
+            else:
+                self._send_json(handler, HTTPStatus.BAD_REQUEST,
+                                {"error": f"bsdf_mode must be one of {VALID_BSDF_MODES}"})
+                return
+        if "texture_max_resolution" in payload:
+            tv = payload.get("texture_max_resolution")
+            if tv in (None, "", 0, "0"):
+                current.pop("texture_max_resolution", None)
+            else:
+                try:
+                    n = int(tv)
+                except (TypeError, ValueError):
+                    self._send_json(handler, HTTPStatus.BAD_REQUEST,
+                                    {"error": "texture_max_resolution must be an integer"})
+                    return
+                if not (MIN_TEXTURE_RES <= n <= MAX_TEXTURE_RES):
+                    self._send_json(handler, HTTPStatus.BAD_REQUEST,
+                                    {"error": f"texture_max_resolution must be in [{MIN_TEXTURE_RES}, {MAX_TEXTURE_RES}]"})
+                    return
+                current["texture_max_resolution"] = n
+        if "pbrdf_band_mode" in payload:
+            bv = payload.get("pbrdf_band_mode")
+            if bv in (None, ""):
+                current.pop("pbrdf_band_mode", None)
+            elif isinstance(bv, str) and bv in VALID_PBRDF_BANDS:
+                current["pbrdf_band_mode"] = bv
+            else:
+                self._send_json(handler, HTTPStatus.BAD_REQUEST,
+                                {"error": f"pbrdf_band_mode must be one of {VALID_PBRDF_BANDS}"})
+                return
+        if "measured_scope" in payload:
+            sv = payload.get("measured_scope")
+            if sv in (None, ""):
+                current.pop("measured_scope", None)
+            elif isinstance(sv, str) and sv in VALID_MEASURED_SCOPES:
+                current["measured_scope"] = sv
+            else:
+                self._send_json(handler, HTTPStatus.BAD_REQUEST,
+                                {"error": f"measured_scope must be one of {VALID_MEASURED_SCOPES}"})
+                return
         save_user_settings(current)
+        # bsdf_mode / texture cap are env-backed: mirror them into this daemon's
+        # os.environ now so the next sync/render honours them without a restart.
+        apply_render_env_from_settings()
         self._send_json(handler, HTTPStatus.OK, {"settings": current})
 
     def _handle_material_preview_get(

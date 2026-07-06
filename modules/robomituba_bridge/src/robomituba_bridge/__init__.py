@@ -1,4 +1,6 @@
 from .io import (
+    active_light_spec_from_payload,
+    active_light_spec_to_payload,
     assist_light_spec_from_payload,
     assist_light_spec_to_payload,
     bsdf_override_from_payload,
@@ -72,6 +74,7 @@ from .manifest import (
 from .paths import BRIDGE_JOBS_ROOT, ensure_job_layout, ensure_observation_layout, repo_root_from, resolve_repo_path, to_repo_relative_posix
 from .shape_mapping import build_shape_mapping, read_shape_mapping, write_shape_mapping
 from .types import (
+    ActiveLightSpec,
     AssistLightSpec,
     BsdfOverride,
     CameraRecord,
@@ -106,6 +109,7 @@ from .types import (
 )
 
 __all__ = [
+    "ActiveLightSpec",
     "AssistLightSpec",
     "BRIDGE_JOBS_ROOT",
     "BsdfOverride",
@@ -138,6 +142,8 @@ __all__ = [
     "SceneSnapshot",
     "SceneState",
     "SCENE_SNAPSHOT_SCHEMA_VERSION",
+    "active_light_spec_from_payload",
+    "active_light_spec_to_payload",
     "assist_light_spec_from_payload",
     "assist_light_spec_to_payload",
     "bsdf_override_from_payload",
