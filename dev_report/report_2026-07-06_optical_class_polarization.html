@@ -15,6 +15,7 @@
  th{background:#eef2f7}
  .k{color:#12386b;font-weight:600}
  .warn{background:#fffbeb;border-left:4px solid #f0b400;padding:8px 12px;margin:12px 0}
+ .ok{background:#ecfdf3;border-left:4px solid #12b76a;padding:8px 12px;margin:12px 0}
 </style></head><body>
 
 <h1>Optical-class 대표 오브젝트 — PBR 맵 시각화 + 편광 광원 스윕</h1>
@@ -22,62 +23,75 @@
 
 <h2>대상 오브젝트 (5)</h2>
 <table>
-<tr><th>#</th><th>class</th><th>오브젝트</th><th>재질 (manifest)</th><th>편광 요약 (본 렌더)</th></tr>
-<tr><td>1</td><td class="k">metal</td><td>수도꼭지 (Tap)</td><td><code>shader_metal.213</code> · metallic=1.0 · rough=0.6 · optical_class=metal_aluminum · baked ARMN</td><td>DoLP 0.89→0.93 (전면 강한 편광)</td></tr>
-<tr><td>2</td><td class="k">glass</td><td>유리병 (Jar)</td><td><code>shader_glass_volume.247</code> · is_glass · IOR=1.5 · <b>baked PBR 없음</b></td><td>DoLP 0.63→0.66 (specular만, 입사각 의존)</td></tr>
-<tr><td>3</td><td class="k">diffuse (textured)</td><td>식품상자 (FoodBox)</td><td><code>shader_text.502</code> · 인쇄 라벨 albedo · metallic=0.39(무시됨)</td><td>DoLP ≈ 0 (depolarizing)</td></tr>
-<tr><td>4</td><td class="k">diffuse (flat)</td><td>직물 램프갓 (DeskLamp)</td><td><code>shader_fine_knit_fabric.044</code> · 절차적 직물</td><td>DoLP ≈ 0 (depolarizing)</td></tr>
-<tr><td>5</td><td class="k">brushed-metal</td><td>TV장 (TVStand)</td><td><code>shader_brushed_metal.249</code> · <b>metallic=0.0</b> but optical_class=metal_aluminum</td><td>DoLP 0.86→0.95 (금속처럼 강한 편광)</td></tr>
+<tr><th>#</th><th>class</th><th>오브젝트</th><th>주입 BSDF</th><th>편광 요약 (본 렌더)</th></tr>
+<tr><td>1</td><td class="k">metal</td><td>수도꼭지 (Tap)</td><td><code>roughconductor</code> Al</td><td>DoLP ~0.9 (전면 강한 편광)</td></tr>
+<tr><td>2</td><td class="k">glass</td><td>유리병 (Jar)</td><td><code>dielectric</code> (IOR 1.5)</td><td>DoLP 0.63→0.66 (specular만, 입사각 의존)</td></tr>
+<tr><td>3</td><td class="k">diffuse (textured)</td><td>식품상자 (FoodBox)</td><td><code>pplastic</code> + 인쇄 라벨 albedo</td><td>DoLP ~0.2 (약한 코팅 편광)</td></tr>
+<tr><td>4</td><td class="k">diffuse (flat)</td><td>직물 램프갓 (DeskLamp)</td><td><code>pplastic</code> + 직물 albedo</td><td>DoLP ~0.06→0.09 (grazing서 상승)</td></tr>
+<tr><td>5</td><td class="k">brushed-metal</td><td>TV장 (TVStand)</td><td><code>roughconductor</code> Al (<b>metallic=0</b>이지만 optical_class=metal)</td><td>DoLP ~0.9 (금속처럼 편광)</td></tr>
 </table>
 
-<h2>1. PBR 채널맵 시각화 (mesh / albedo / metallic / roughness / normal + IOR)</h2>
+<div class="ok"><b>편광 플러그인 트리오</b>: 재질을 <b><code>conductor</code>/<code>roughconductor</code>(금속·거울) + <code>dielectric</code>(유리) + <code>pplastic</code>(diffuse·plastic)</b> 로 주입한다. 아래 §요약 밑의 표 참고 — 이 셋만이 이 빌드의 폴라라이즈드 variant에서 편광 Fresnel을 낸다.</div>
+
+<h2>1. PBR 채널맵 시각화 (albedo / metallic / roughness / normal + IOR)</h2>
 <figure>
   <img src="images/0706_optclass_pbr_maps.png" alt="PBR channel maps per object">
-  <figcaption>오브젝트별 베이크된 PBR 맵과 스칼라 파라미터. 관찰: <b>metal(tap)</b>의 albedo=검정(금속은 diffuse albedo 없음)·metallic=흰색. <b>glass(jar)</b>는 맵이 전혀 없음 → "유리=IOR-only" 그림 그 자체. <b>foodbox</b> albedo에 진짜 인쇄 라벨(바코드·문자). <b>tvstand(brushed-metal)</b>는 albedo=나무톤에 <b>metallic 맵=검정(0.0)</b>인데도 optical_class는 metal → 값과 분류의 불일치가 보인다.</figcaption>
+  <figcaption>오브젝트별 베이크된 PBR 맵과 스칼라 파라미터. 관찰: <b>metal(tap)</b> albedo=검정(금속은 diffuse albedo 없음)·metallic=흰색. <b>glass(jar)</b>는 맵이 전혀 없음 → "유리=IOR-only". <b>foodbox</b> albedo=진짜 인쇄 라벨. <b>tvstand(brushed-metal)</b>는 metallic 맵=검정(0.0)인데도 optical_class는 metal. (이 맵들은 <code>.glb</code>의 UV로 베이크됨 — <code>.obj</code> export가 UV를 잃어서 렌더에는 glb의 UV를 복원해 사용.)</figcaption>
 </figure>
 
 <h2>2. 광학 클래스 요약 — RGB(S0) vs DoLP</h2>
 <figure>
   <img src="images/0706_optclass_summary.png" alt="RGB vs DoLP per optical class" style="max-width:560px;margin:0 auto">
-  <figcaption>대표 프레임 1장씩. RGB에서는 다섯 오브젝트 모두 보이지만, <b>DoLP에서는 금속(tap·tvstand)과 유리(jar)만 빨갛게 켜지고 diffuse(foodbox·lampshade)는 완전히 검다</b>. 편광이 optical class를 분리한다. tvstand는 metallic=0인데도 금속처럼 편광 → conductor로 렌더됨을 직접 확인.</figcaption>
+  <figcaption>대표 프레임 1장씩. RGB(S0)는 각 재질의 실제 색을 담는다(foodbox 인쇄 라벨, lampshade 분홍 직물 — glb UV로 베이크 텍스처 매핑). DoLP: <b>금속(tap·tvstand)≈0.9 강함, 유리(jar) specular만, diffuse는 pplastic 코팅으로 약하게(foodbox~0.2, lampshade~0.06)</b>. 편광 세기가 optical class를 정렬한다. tvstand는 metallic=0인데도 금속처럼 강편광 → conductor로 렌더됨.</figcaption>
 </figure>
 
-<div class="warn"><b>렌더 파이프라인 발견</b>: 이 검증 빌드의 <code>roughdielectric</code> BSDF는 편광 Fresnel을 생성하지 못한다(DoLP≡0). 최소 테스트에서 smooth <code>dielectric</code>=DoLP 0.999, <code>roughdielectric</code>=0.000, <code>conductor</code>=0.95. → 유리 편광은 반드시 smooth <code>dielectric</code>으로 렌더해야 하며(유리병 rough=0이라 물리적으로도 맞음), <code>render_material_closeups.py</code> 등 dielectric 주입 경로 점검 필요.</div>
+<h3>편광 지원 플러그인 (검증 빌드, <code>cuda_ad_spectral_polarized</code>)</h3>
+<table>
+<tr><th>플러그인</th><th>DoLP(Brewster 테스트)</th><th>편광</th><th>용도</th></tr>
+<tr><td><code>dielectric</code> (smooth)</td><td>0.999</td><td>✅</td><td>유리(매끈)</td></tr>
+<tr><td><code>conductor</code> / <code>roughconductor</code></td><td>0.95</td><td>✅</td><td>금속·거울</td></tr>
+<tr><td><code>pplastic</code></td><td>0.87</td><td>✅</td><td>diffuse·도장·직물·코팅</td></tr>
+<tr><td><code>roughdielectric</code></td><td>0.000</td><td>❌</td><td>(편광 미지원 — 사용 금지)</td></tr>
+<tr><td><code>thindielectric</code></td><td>0.000</td><td>❌</td><td>미지원</td></tr>
+<tr><td><code>plastic</code> / <code>roughplastic</code></td><td>0.000</td><td>❌</td><td>미지원 → pplastic로 대체</td></tr>
+</table>
+<div class="warn"><b>주의</b>: 투과형 microfacet <code>roughdielectric</code>과 <code>plastic</code>/<code>roughplastic</code>은 이 빌드에서 편광 Fresnel을 만들지 못한다(DoLP≡0). 유리는 <code>dielectric</code>(smooth), 도장/plastic/diffuse는 <code>pplastic</code>으로 주입해야 편광이 나온다. <code>render_material_closeups.py</code> 등 dielectric/plastic 주입 경로 점검 필요.</div>
 
 <h2>3. 움직이는 편광 광원 스윕 (오브젝트당 2종)</h2>
-<p>능동 편광 조명 = <b>area emitter + 그 앞의 linear polarizer</b>(delta spot/point는 편광판 투과 불가라 area 필수). 두 가지 모션:</p>
+<p>능동 편광 조명 = <b>area emitter + 그 앞의 linear polarizer</b>(delta spot/point는 편광판 투과 불가라 area 필수, polarizer는 emitter보다 크게). 두 모션:</p>
 <ul>
-<li><b>입사각 궤도(orbit)</b>: flash를 오브젝트 주위로 이동(azimuth 20°→85°) → 국소 입사각이 grazing으로 감. 유리는 Brewster 부근에서 DoLP 상승.</li>
-<li><b>polarizer 회전(polrot)</b>: flash 고정, 조명 polarizer θ 0→180° 회전 → specular 반사의 AoLP가 각도를 추종.</li>
+<li><b>입사각 궤도(orbit)</b>: flash를 오브젝트 주위로 이동(azimuth 20°→85°) → 국소 입사각이 grazing으로. 유리·plastic은 Brewster 부근서 DoLP 상승.</li>
+<li><b>polarizer 회전(polrot)</b>: flash 고정, 조명 polarizer θ 0→180° 회전 → specular 반사의 AoLP가 각도 추종.</li>
 </ul>
-<p>5패널 = RGB(S0) · DoLP · AoLP · s1/s0 · s2/s0. specular 마스크(S0&gt;0.04 &amp; DoLP&gt;0.05)로 편광 영역만 표시. spp2048.</p>
+<p>5패널 = RGB(S0) · DoLP · AoLP · s1/s0 · s2/s0. specular 마스크(S0&gt;0.04 &amp; DoLP&gt;0.05). spp6000.</p>
 
 <h3>#1 metal — 수도꼭지</h3>
 <figure><img src="images/0706_optclass_tap_orbit.gif" alt="tap orbit"><figcaption>입사각 궤도. 금속 전면이 조명 편광을 보존해 DoLP≈0.9로 강하게 켜진다.</figcaption></figure>
 <figure><img src="images/0706_optclass_tap_polrot.gif" alt="tap polrot"><figcaption>polarizer 회전. AoLP/s1/s2가 조명 각도를 따라 회전.</figcaption></figure>
 
-<h3>#2 glass — 유리병</h3>
-<figure><img src="images/0706_optclass_jar_orbit.gif" alt="jar orbit"><figcaption>입사각 궤도. 투명 유리는 <b>specular 하이라이트(세로 두 줄 등)에서만</b> 편광이 뜨고, grazing으로 갈수록 DoLP가 커진다(Brewster). 확산 몸통은 편광 없음.</figcaption></figure>
-<figure><img src="images/0706_optclass_jar_polrot.gif" alt="jar polrot"><figcaption>polarizer 회전. smooth <code>dielectric</code>으로 렌더(roughdielectric은 DoLP=0).</figcaption></figure>
+<h3>#2 glass — 유리병 (<code>dielectric</code>)</h3>
+<figure><img src="images/0706_optclass_jar_orbit.gif" alt="jar orbit"><figcaption>입사각 궤도. 투명 유리는 <b>specular 하이라이트에서만</b> 편광이 뜨고 grazing으로 갈수록 DoLP↑(Brewster). smooth <code>dielectric</code>으로 렌더(roughdielectric은 DoLP=0).</figcaption></figure>
+<figure><img src="images/0706_optclass_jar_polrot.gif" alt="jar polrot"><figcaption>polarizer 회전.</figcaption></figure>
 
-<h3>#3 diffuse-textured — 식품상자</h3>
-<figure><img src="images/0706_optclass_foodbox_orbit.gif" alt="foodbox orbit"><figcaption>입사각 궤도. RGB에는 인쇄 라벨이 뚜렷하지만 <b>DoLP/AoLP는 계속 검정</b> — Lambertian diffuse가 편광을 지운다. "텍스처는 RGB에만, 편광엔 없음"의 예.</figcaption></figure>
-<figure><img src="images/0706_optclass_foodbox_polrot.gif" alt="foodbox polrot"><figcaption>polarizer를 돌려도 편광 응답 없음(depolarizing surface).</figcaption></figure>
+<h3>#3 diffuse-textured — 식품상자 (<code>pplastic</code> + 라벨 텍스처)</h3>
+<figure><img src="images/0706_optclass_foodbox_orbit.gif" alt="foodbox orbit"><figcaption>RGB(S0)에 진짜 인쇄 라벨(바코드·문자·물방울). pplastic 코팅이라 DoLP≈0.2의 약한 편광이 뜬다(순수 Lambertian이면 0). 텍스처는 glb UV로 매핑.</figcaption></figure>
+<figure><img src="images/0706_optclass_foodbox_polrot.gif" alt="foodbox polrot"><figcaption>polarizer 회전에 코팅 반사의 AoLP가 반응.</figcaption></figure>
 
-<h3>#4 diffuse-flat — 직물 램프갓</h3>
-<figure><img src="images/0706_optclass_lampshade_orbit.gif" alt="lampshade orbit"><figcaption>#3과 동일하게 DoLP≈0. flat 절차적 직물도 편광 신호 없음.</figcaption></figure>
-<figure><img src="images/0706_optclass_lampshade_polrot.gif" alt="lampshade polrot"><figcaption>polarizer 회전에도 무응답.</figcaption></figure>
+<h3>#4 diffuse-flat — 직물 램프갓 (<code>pplastic</code> + 직물 텍스처)</h3>
+<figure><img src="images/0706_optclass_lampshade_orbit.gif" alt="lampshade orbit"><figcaption>분홍 직물 색이 RGB에 나온다. DoLP는 매우 약하지만(≈0.06) grazing 입사로 갈수록 커진다 — matte 표면의 Fresnel 편광.</figcaption></figure>
+<figure><img src="images/0706_optclass_lampshade_polrot.gif" alt="lampshade polrot"><figcaption>polarizer 회전.</figcaption></figure>
 
 <h3>#5 brushed-metal — TV장 (Q3)</h3>
-<figure><img src="images/0706_optclass_tvstand_orbit.gif" alt="tvstand orbit"><figcaption>입사각 궤도. <b>metallic=0.0</b>인데 optical_class=metal이라 conductor로 렌더 → 금속처럼 DoLP≈0.9로 강하게 편광된다. 값(metallic=0)과 렌더(conductor)의 불일치가 편광으로 드러남.</figcaption></figure>
-<figure><img src="images/0706_optclass_tvstand_polrot.gif" alt="tvstand polrot"><figcaption>polarizer 회전에 금속 편광이 각도 추종.</figcaption></figure>
+<figure><img src="images/0706_optclass_tvstand_orbit.gif" alt="tvstand orbit"><figcaption><b>metallic=0.0</b>인데 optical_class=metal이라 conductor로 렌더 → 금속처럼 DoLP≈0.9로 강편광. 값(metallic=0)과 렌더(conductor)의 불일치가 편광으로 드러난다. (단일 BSDF 주입이라 나무 부분도 금속으로 렌더 — multi-material 분리는 후속.)</figcaption></figure>
+<figure><img src="images/0706_optclass_tvstand_polrot.gif" alt="tvstand polrot"><figcaption>polarizer 회전.</figcaption></figure>
 
 <h2>4. 결론</h2>
 <ul>
-<li><b>편광은 optical class를 분리한다</b>: 금속/유리는 specular 편광(DoLP↑), diffuse는 depolarizing(DoLP≈0). RGB만으로는 안 보이는 재질 구분이 편광 채널에서 드러난다.</li>
-<li><b>유리 = IOR-only</b>: baked PBR 맵이 없고 IOR만 있으며, 편광은 <b>Brewster 부근 grazing 입사</b>에서만 강하게 나타난다(정면 반사율 ~4%).</li>
-<li><b>brushed-metal(#5)</b>: metallic=0 스칼라와 무관하게 optical_class로 conductor 렌더 → 편광이 금속임을 폭로.</li>
-<li><b>파이프라인 주의</b>: <code>roughdielectric</code> 편광 미지원(DoLP=0) → 유리는 smooth <code>dielectric</code> 필수. 편광 area flash의 polarizer는 emitter보다 크게.</li>
+<li><b>편광은 optical class를 분리한다</b>: 금속(DoLP~0.9) &gt; 유리(specular만) &gt; diffuse(pplastic 약한 코팅 편광). RGB만으로는 안 보이는 구분이 편광 채널에서 드러난다.</li>
+<li><b>플러그인 트리오</b>: <code>conductor</code>(금속) + <code>dielectric</code>(유리) + <code>pplastic</code>(diffuse/plastic). <code>roughdielectric</code>·<code>roughplastic</code>은 편광 미지원(DoLP=0)이라 금지.</li>
+<li><b>텍스처/색</b>: <code>.glb</code>의 UV를 복원해 베이크 albedo를 매핑 → S0가 실제 재질 색(라벨·직물색)을 담는다. <code>.obj</code> export는 UV를 잃으므로 glb를 써야 한다.</li>
+<li><b>유리 = IOR-only</b> · <b>brushed-metal(#5)</b>는 metallic=0 무관하게 conductor로 편광.</li>
+<li><b>후속</b>: multi-material 오브젝트(tvstand 금속+나무, jar 유리+나무) per-material BSDF 분리 렌더.</li>
 </ul>
 
 </body></html>
