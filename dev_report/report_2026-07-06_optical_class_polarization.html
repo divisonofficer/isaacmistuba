@@ -63,7 +63,9 @@
 <li><b>입사각 궤도(orbit)</b>: flash를 오브젝트 주위로 이동(azimuth 20°→85°) → 국소 입사각이 grazing으로. 유리·plastic은 Brewster 부근서 DoLP 상승.</li>
 <li><b>polarizer 회전(polrot)</b>: flash 고정, 조명 polarizer θ 0→180° 회전 → specular 반사의 AoLP가 각도 추종.</li>
 </ul>
-<p>6패널 = RGB(S0) · DoLP · AoLP · s1/s0 · s2/s0 · s3/s0. <b>DoLP·AoLP</b>는 편광 마스크(S0&gt;0.04 &amp; DoLP&gt;0.05)로 편광 영역만; <b>s1/s2/s3</b>는 마스크 없이 <b>전영역 BwR</b>(unpolarized=흰색, 부호장 그대로). s3는 원편광이라 선형광학만 있는 이 씬에선 ≈0(흰색). <b>soft Reinhard 톤매핑</b>으로 하이라이트가 안 날아가고 <b>EXR(S0)</b>도 동시 출력. 각 편광 패널 우하단 <b>컬러바</b>. 배경 벽은 glossy(<code>pplastic</code>)라 편광 반사가 보인다(analyzer/벽 witness 강화). 광원 <code>polarized_area</code>, spp8000(유리 12000).</p>
+<p>6패널 = RGB(S0) · DoLP · AoLP · s1/s0 · s2/s0 · s3/s0. <b>DoLP·AoLP</b>는 편광 마스크(S0&gt;0.04 &amp; DoLP&gt;0.05)로 편광 영역만; <b>s1/s2/s3</b>는 마스크 없이 <b>전영역 BwR</b>(unpolarized=흰색, 부호장 그대로). s3는 원편광이라 선형광학만 있는 이 씬에선 ≈0(흰색). <b>soft Reinhard 톤매핑</b>으로 하이라이트가 안 날아가고 <b>EXR(S0)</b>도 동시 출력. 컬러바는 애니메이션 프레임에 넣지 않고 <b>아래 별도 legend</b>로 제공한다(GIF 팔레트 양자화로 프레임마다 색이 흔들리는 것을 방지). 배경 벽은 glossy(<code>pplastic</code>)라 편광 반사가 보인다(analyzer/벽 witness 강화). 광원 <code>polarized_area</code>, spp8000(유리 12000).</p>
+
+<figure style="max-width:480px"><img src="images/0706_optclass_colorbar_legend.png" alt="colorbar legend"><figcaption>컬러바 범례 (모든 편광 패널 공통). DoLP: black0→red1. AoLP: hue=각도(0→180°). s1/s2/s3: BwR(파랑 −1 → 흰 0 → 빨강 +1).</figcaption></figure>
 
 <h3>#1 metal — 수도꼭지</h3>
 <figure><img src="images/0706_optclass_tap_orbit.gif" alt="tap orbit"><figcaption>입사각 궤도. 금속 전면이 조명 편광을 보존해 DoLP≈0.9로 강하게 켜진다.</figcaption></figure>
