@@ -70,7 +70,7 @@
 <figure><img src="images/0706_optclass_tap_polrot.gif" alt="tap polrot"><figcaption>polarizer 회전. AoLP/s1/s2가 조명 각도를 따라 회전.</figcaption></figure>
 
 <h3>#2 glass — 유리병 (<code>dielectric</code>)</h3>
-<figure><img src="images/0706_optclass_jar_orbit.gif" alt="jar orbit"><figcaption>입사각 궤도. 투명 유리는 <b>specular 하이라이트에서만</b> 편광이 뜨고 grazing으로 갈수록 DoLP↑(Brewster). smooth <code>dielectric</code>으로 렌더(roughdielectric은 DoLP=0).</figcaption></figure>
+<figure><img src="images/0706_optclass_jar_orbit.gif" alt="jar orbit"><figcaption>입사각 궤도. 유리 몸통(<code>dielectric</code>)과 나무 뚜껑(<code>pplastic</code>)을 multi-material로 분리. 투명 유리는 <b>specular 하이라이트에서만</b> 편광, grazing으로 갈수록 DoLP↑(Brewster). 투과 특성상 남는 grain은 spp16000 + <code>max_depth</code> 제한 + firefly 클램프로 완화.</figcaption></figure>
 <figure><img src="images/0706_optclass_jar_polrot.gif" alt="jar polrot"><figcaption>polarizer 회전.</figcaption></figure>
 
 <h3>#3 diffuse-textured — 식품상자 (<code>pplastic</code> + 라벨 텍스처)</h3>
@@ -82,16 +82,27 @@
 <figure><img src="images/0706_optclass_lampshade_polrot.gif" alt="lampshade polrot"><figcaption>polarizer 회전.</figcaption></figure>
 
 <h3>#5 brushed-metal — TV장 (Q3)</h3>
-<figure><img src="images/0706_optclass_tvstand_orbit.gif" alt="tvstand orbit"><figcaption><b>metallic=0.0</b>인데 optical_class=metal이라 conductor로 렌더 → 금속처럼 DoLP≈0.9로 강편광. 값(metallic=0)과 렌더(conductor)의 불일치가 편광으로 드러난다. (단일 BSDF 주입이라 나무 부분도 금속으로 렌더 — multi-material 분리는 후속.)</figcaption></figure>
+<figure><img src="images/0706_optclass_tvstand_orbit.gif" alt="tvstand orbit"><figcaption><b>multi-material 분리</b>: 금속 프레임(<code>roughconductor</code>)과 나무 상판(<code>pplastic</code>+텍스처)을 각 geometry로 나눠 주입. 이 각도에선 나무 상판이 보여 DoLP가 약하지만, 금속 프레임은 <b>metallic=0.0인데도 conductor로 렌더</b>돼 강편광한다(값과 렌더의 불일치 = Q3).</figcaption></figure>
 <figure><img src="images/0706_optclass_tvstand_polrot.gif" alt="tvstand polrot"><figcaption>polarizer 회전.</figcaption></figure>
 
-<h2>4. 결론</h2>
+<h2>5. 파이프라인 정리 — Infinigen은 <code>.obj</code> 대신 <code>.glb</code>를 소비해야</h2>
+<p>이번 작업에서 드러난 구조적 이슈: <b>OpticalNav 렌더 경로는 <code>.obj</code> 메시를 소비</b>하는데(<code>import_infinigen_scene.py:547</code> <code>source_ref=&lt;import&gt;/meshes/&lt;id&gt;.obj</code>), Infinigen import의 <code>.obj</code>는 <b>UV(vt)를 잃어버린다</b>(대부분 vt=0). 그래서 베이크된 albedo/텍스처를 렌더에서 매핑할 수 없고 per-material 분리도 안 된다.</p>
+<p>반면 같은 오브젝트의 <code>.glb</code>에는 <b>UV와 material별 geometry가 온전히 살아있다</b>(본 작업은 trimesh로 glb를 로드해 per-material UV 메시로 복원 → 베이크 텍스처 매핑 + per-material BSDF 성공).</p>
+<p>중요한 건 <b>이미 그 machinery가 코드베이스에 있다</b>는 점이다 — <code>glb_texture_adapter.py</code>는 GLB를 <b>per-material OBJ 파트(<code>has_uv</code> 추적) + 추출 텍스처</b>로 브리지한다. 다만 이건 현재 <b>DTC 카탈로그 전용</b>(<code>vendor_datasets/dtc_objects/*/3d-asset.glb</code>)이고, Infinigen import는 이 경로를 타지 않는다.</p>
+<table>
+<tr><th>자산</th><th>source_ref</th><th>UV</th><th>텍스처</th><th>per-material</th></tr>
+<tr><td>DTC 카탈로그</td><td><code>.glb</code> → glb_texture_adapter</td><td>✅</td><td>✅ 추출</td><td>✅ 분리</td></tr>
+<tr><td>Infinigen import</td><td><code>.obj</code> (UV 없음)</td><td>❌</td><td>❌ 매핑 불가</td><td>❌</td></tr>
+</table>
+<p><b>권장</b>: Infinigen import도 <code>.glb</code>를 source로 참조하고 <code>glb_texture_adapter</code>(또는 그 확장)를 태워서 UV·베이크 텍스처·per-material 분리를 렌더 경로에서 사용하도록 개선. blender export 단계에서 UV 보존 <code>.obj</code>를 쓰는 방법도 있으나, glb 경로 재사용이 기존 계약(OBJ + extracted_material)과 호환되어 더 간단하다.</p>
+
+<h2>6. 결론</h2>
 <ul>
 <li><b>편광은 optical class를 분리한다</b>: 금속(DoLP~0.9) &gt; 유리(specular만) &gt; diffuse(pplastic 약한 코팅 편광). RGB만으로는 안 보이는 구분이 편광 채널에서 드러난다.</li>
 <li><b>플러그인 트리오</b>: <code>conductor</code>(금속) + <code>dielectric</code>(유리) + <code>pplastic</code>(diffuse/plastic). <code>roughdielectric</code>·<code>roughplastic</code>은 편광 미지원(DoLP=0)이라 금지.</li>
 <li><b>텍스처/색</b>: <code>.glb</code>의 UV를 복원해 베이크 albedo를 매핑 → S0가 실제 재질 색(라벨·직물색)을 담는다. <code>.obj</code> export는 UV를 잃으므로 glb를 써야 한다.</li>
 <li><b>유리 = IOR-only</b> · <b>brushed-metal(#5)</b>는 metallic=0 무관하게 conductor로 편광.</li>
-<li><b>후속</b>: multi-material 오브젝트(tvstand 금속+나무, jar 유리+나무) per-material BSDF 분리 렌더.</li>
+<li><b>multi-material</b>: glb는 material별 geometry로 분리돼 있어(<code>visual.material.name</code>=manifest 재질명) per-geometry BSDF 주입 가능 → jar(유리+나무), tvstand(금속+나무)를 정확히 렌더.</li>
 </ul>
 
 </body></html>
