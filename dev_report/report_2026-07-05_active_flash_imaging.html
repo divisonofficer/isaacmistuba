@@ -149,20 +149,20 @@
       <figcaption>정적 filmstrip(위=light 좌, 아래=light 우). GIF 미재생 환경용.</figcaption>
     </figure>
 
-    <h3>Relighting sweep — 고프레임·spp2048 (mirror/glass 정면 씬)</h3>
+    <h3>Relighting sweep — 고프레임·spp4096 (mirror/glass 정면 씬)</h3>
     <p>
-      위 8프레임 sweep을 <b>16프레임 · spp2048</b>로 확장하고, 관측자를 정면으로 향한
+      위 8프레임 sweep을 <b>16프레임 · spp4096</b>로 확장하고, 관측자를 정면으로 향한
       <b>거울(roughconductor Al α0.15) + 유리(roughdielectric α0.12)</b> 패널 씬에서
       편광 flash를 <b>x −1.05→+1.05m 로 이동</b>했다(flash fixture는 프레임 밖으로 올림).
       RGB(S0) specular 하이라이트가 좌(거울)→우(유리)로 이동하며 DoLP·s1·s2 편광 응답도 함께 이동한다
       (specular DoLP ≈ 0.76).
     </p>
     <figure>
-      <img src="images/0705_relight_sweep_2k.gif" alt="relight sweep spp2048 16 frames">
-      <figcaption>16프레임 · spp2048 · ping-pong GIF. 5패널 = RGB(S0) · DoLP · AoLP · s1 · s2. 절차적 재질(외부 텍스처 無)이라 CIFS 핸들 부담 없이 고품질 렌더.</figcaption>
+      <img src="images/0705_relight_sweep_2k.gif" alt="relight sweep spp4096 16 frames">
+      <figcaption>16프레임 · spp4096 · ping-pong GIF. 5패널 = RGB(S0) · DoLP · AoLP · s1 · s2. 편광 패널은 아래 polarizer 스윕과 <b>동일한 specular 마스크</b>(S0&gt;0.12 &amp; DoLP&gt;0.06)를 써서 직접 비교 가능 — 배경(diffuse, 편광≈0)은 제거되고 거울 specular 하이라이트만 표시. flash가 좌→우로 이동하며 하이라이트도 이동.</figcaption>
     </figure>
     <figure>
-      <img src="images/0705_relight_filmstrip_2k.png" alt="relight sweep spp2048 filmstrip" style="max-width:520px">
+      <img src="images/0705_relight_filmstrip_2k.png" alt="relight sweep spp4096 filmstrip" style="max-width:520px">
       <figcaption>정적 filmstrip(위=flash 좌, 아래=flash 우).</figcaption>
     </figure>
 
@@ -179,7 +179,7 @@
     </p>
     <figure>
       <img src="images/0705_polarizer_sweep.gif" alt="illumination polarizer rotation sweep (animated)">
-      <figcaption>12프레임 · spp1024 · ping-pong GIF. 좌측=거울(강한 편광 반사), 우측=유리. AoLP hue = 편광각.</figcaption>
+      <figcaption>12프레임 · spp4096 · ping-pong GIF. 좌측=거울(강한 편광 반사), 우측=유리. AoLP hue = 편광각. relight 스윕과 동일 마스크·colormap.</figcaption>
     </figure>
     <figure>
       <img src="images/0705_polarizer_filmstrip.png" alt="polarizer rotation filmstrip" style="max-width:520px">
