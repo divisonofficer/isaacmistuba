@@ -87,6 +87,16 @@
 <figure><img src="images/0706_optclass_tvstand_orbit.gif" alt="tvstand orbit"><figcaption><b>multi-material 분리</b>: 금속 프레임(<code>roughconductor</code>)과 나무 상판(<code>pplastic</code>+텍스처)을 각 geometry로 나눠 주입. 이 각도에선 나무 상판이 보여 DoLP가 약하지만, 금속 프레임은 <b>metallic=0.0인데도 conductor로 렌더</b>돼 강편광한다(값과 렌더의 불일치 = Q3).</figcaption></figure>
 <figure><img src="images/0706_optclass_tvstand_polrot.gif" alt="tvstand polrot"><figcaption>polarizer 회전.</figcaption></figure>
 
+<h3>#5 심층 — brushed-metal 과편광의 원인(Q3) + 수정 데모</h3>
+<p>tvstand가 "나무 텍스처인데 금속처럼 강하게 빛나는" 어색함은 두 원인이 겹친 것이다(이 물체는 실제로 금속 프레임+나무 상판의 multi-material):</p>
+<ul>
+<li><b>Cause A (구조)</b>: 프로덕션 렌더가 소비하는 Infinigen <code>.obj</code>는 UV(vt)를 잃어(§4) — (a) 나무 albedo가 barycentric fallback으로 전 표면에 가짜 매핑 + (b) per-material 분리 불가 → 오브젝트 전체가 하나의 optical_class(metal)로 붕괴(=나무 텍스처 전역 + 전체 conductor). 본 리포트 클로즈업은 <code>.glb</code>로 UV/geometry를 복원해 우회했다.</li>
+<li><b>Cause B (분류·과편광)</b>: <code>optical_class</code>는 재질 <b>이름 키워드</b>로 결정되고(brush/grain/metal→metal_aluminum), Infinigen metallic은 신뢰불가라 <b>의도적으로 무시</b>(설계결정). 이후 metal_*→<code>roughconductor</code>(Al) 주입 → 편광 빌드에서 conductor DoLP≈0.9~0.97. 그래서 metallic=0인 brushed_metal도 알루미늄처럼 과편광한다. 코드: <code>apps/import_infinigen_scene.py</code> <code>_material_binding</code>(metal_*→roughconductor 무조건).</li>
+</ul>
+<figure><img src="images/0706_tvstand_q3_swatch.png" alt="conductor vs pplastic DoLP" style="max-width:420px">
+<figcaption>같은 brushed_metal을 구(sphere)로 렌더한 데모. <b>위=현재(roughconductor Al): DoLP 0.97 — 전면 과편광</b>. <b>아래=수정(pplastic 코팅): DoLP 0.07</b> — 몸통 depolarize + 하이라이트만 약편광, 코팅/마감의 물리적으로 옳은 모습. "유약 바른 나무" 가설과 달리 옳은 표현은 pplastic이며, 지금의 DoLP 0.9는 "통 알루미늄" 취급에서 오는 오차다.</figcaption></figure>
+<p><b>수정 방향</b>(여기선 파이프라인 미변경, 데모만): metallic 무시 결정을 지키면서 <b>이름 키워드로 세분화</b> — <code>brush/coat/paint/finish/laminate</code> 계열 "표면 마감"은 conductor가 아니라 <code>pplastic</code>(코팅 유전체)로 라우팅하면 과편광이 사라진다. Cause A는 병행 작업의 OBJ-UV fix(<code>_ensure_uv</code> 선호출 / glb 라우팅)로 해소 예정.</p>
+
 <h2>4. 파이프라인 정리 — Infinigen은 <code>.obj</code> 대신 <code>.glb</code>를 소비해야</h2>
 <p>이번 작업에서 드러난 구조적 이슈: <b>OpticalNav 렌더 경로는 <code>.obj</code> 메시를 소비</b>하는데(<code>import_infinigen_scene.py:547</code> <code>source_ref=&lt;import&gt;/meshes/&lt;id&gt;.obj</code>), Infinigen import의 <code>.obj</code>는 <b>UV(vt)를 잃어버린다</b>(대부분 vt=0). 그래서 베이크된 albedo/텍스처를 렌더에서 매핑할 수 없고 per-material 분리도 안 된다.</p>
 <p>반면 같은 오브젝트의 <code>.glb</code>에는 <b>UV와 material별 geometry가 온전히 살아있다</b>(본 작업은 trimesh로 glb를 로드해 per-material UV 메시로 복원 → 베이크 텍스처 매핑 + per-material BSDF 성공).</p>
@@ -104,13 +114,64 @@
 <p><b>효과</b>: 편광은 동일(DoLP 0.95, area+polarizer와 일치)하면서, 곡면 유리+diffuse 배경 씬에서 <b>firefly/grain이 급감</b>. (flat 평판 테스트에선 차이가 작지만 — 그 경우 노이즈가 BSDF 분산 지배 — 실제 오브젝트 씬에서 큰 개선.) 빌드: <code>ninja polarized_area</code> → <code>plugins/polarized_area.so</code>.</p>
 <p>남은 유리 grain(투명 dielectric의 굴절 caustic)은 NEE로도 근본 제거되지 않아 spp로 완화. 필요 시 OptiX denoiser가 다음 후보.</p>
 
-<h2>6. 결론</h2>
+<h2>6. TVStand(#5) 심층 진단 — "나무 텍스처가 금속처럼 편광한다" (Q3)</h2>
+<p>관찰: brushed-metal로 표시된 TVStand 렌더에서 <b>표면 전체에 나무 텍스처</b>가 보이고, 그 나무 표면이 <b>금속처럼 강하게 편광(DoLP~0.9)</b>한다. 세 가지 가설을 파이프라인 근거로 판정한다.</p>
+<table>
+<tr><th>가설</th><th>내용</th><th>판정</th></tr>
+<tr><td>①</td><td>원래 fully 나무인데 metal 머터리얼이 잘못 붙었다</td><td><b>✗ (전제 틀림)</b> — 물체는 manifest상 실제 <b>금속 프레임 + 나무 상판</b>. "fully 나무"가 아님. 다만 금속부가 과편광하는 건 별개 문제(원인 B).</td></tr>
+<tr><td>②</td><td>나무 위에 유약/니스를 발라 빛나는 게 맞다</td><td><b>✗</b> — 유약/니스칠 나무의 물리적 표현은 <code>pplastic</code>(diffuse 위 dielectric 코트)로 <b>DoLP~0.2의 약한 편광</b>. 지금 DoLP~0.9는 코트가 아니라 <b>"통 알루미늄(conductor Al)"으로 취급</b>해서 나오는 값. 물리적으로 유약이 아님.</td></tr>
+<tr><td>③</td><td>나무+금속인데 렌더 문제로 나무 텍스처가 전역 입혀졌다</td><td><b>◐ (기본 OBJ 경로의 실제 메커니즘)</b> — 물체는 실제 나무+금속이 맞고, 기본 렌더 경로가 per-material을 못 나눠 나무 albedo가 전역 + 전체가 단일 metal BSDF로 붕괴. 사용자가 본 그림과 일치.</td></tr>
+</table>
+
+<h3>어색함의 두 원인 (겹침)</h3>
+<p><b>원인 A — 렌더 경로가 per-material을 못 나눔 (=가설 ③).</b> 프로덕션 렌더는 <code>.obj</code>를 소비하는데 Infinigen <code>.obj</code>는 <b>UV(vt)를 잃는다</b>(§4). UV가 없으면 (1) 베이크된 나무 albedo가 barycentric fallback으로 <b>전 표면에 가짜 매핑</b>되고, (2) material별 geometry <b>분리 불가</b> → 오브젝트 전체가 <b>하나의 optical_class(=metal)</b>로 붕괴 → 나무 텍스처가 온 표면에 깔리면서 전체가 금속처럼 편광. 리포트의 클로즈업 렌더(#5)는 <code>.glb</code>를 trimesh로 로드해 이를 우회(프레임=conductor / 상판=pplastic 분리)한다 — 사용자가 <b>나무 전역</b>을 봤다면 분리 전 <b>OBJ 경로 렌더</b>를 본 것.</p>
+<p><b>원인 B — 금속부의 과편광 (=Q3, 값과 렌더의 불일치).</b> <code>optical_class</code>는 <b>재질 이름 키워드</b>로 정해진다(<code>blender_export_scene.py</code> <code>_optical_class</code>): 이름에 <code>brush</code>/<code>grain</code>/<code>metal</code>/<code>alumin</code>… 있으면 <code>metal_aluminum</code>, <b>metallic 값은 무시</b>(Infinigen metallic이 신뢰 불가라 의도적). <code>shader_brushed_metal</code> → metal. 이후 주입 레이어가 metal → <b><code>roughconductor</code>(Al eta/k)</b>로 박고, 편광 빌드에서 conductor는 DoLP~0.9~0.95(§2 표). 그래서 <b>metallic=0인데도 알루미늄처럼 강편광</b>.</p>
+<div class="warn"><b>주의 — <code>grain</code> 키워드 오분류.</b> <code>_optical_class</code>의 metal 키워드에 <code>"grain"</code>이 포함돼 있어, 이름에 grain이 든 <b>나무(wood-grain) 재질도 metal_aluminum으로 오분류</b>될 수 있다. brushed 금속뿐 아니라 나무결 재질까지 conductor로 갈 위험 — classification 보정 시 우선 점검 대상.</div>
+
+<h3>한 줄 정리 + 수정 방향</h3>
+<div class="ok"><b>결론</b>: 물체는 진짜 <b>금속+나무</b>다(②·"fully 나무" 아님). 어색함 = <b>③ 렌더 경로(OBJ, UV 손실)의 per-material 붕괴</b> + <b>이름 키워드 분류로 금속부가 metallic=0인데 conductor 과편광(Q3)</b>. 유약(②) 아님.<br>
+<b>수정</b>: (1) §4 권장대로 Infinigen import도 <code>.glb</code> source + <code>glb_texture_adapter</code>로 per-material 분리를 렌더 경로에 태움 → 상판=<code>pplastic</code>(약편광)/프레임=<code>conductor</code>(강편광)로 정확히 갈림. (2) brushed/coated·저 metallic·저 roughness 금속은 <code>conductor</code> 대신 <code>pplastic</code>으로 보내는 classification 보정 + <code>grain</code> 키워드 오분류 제거 → Q3 과편광까지 완화.</div>
+
+<h2>7. 파이프라인 엔드투엔드 — Infinigen import → Mitsuba render</h2>
+<p>이 리포트 재질들이 어떻게 만들어지는지 3단계 전체 흐름. 파일·함수 근거 포함. (사용자 이해와 다른 지점은 아래 <span class="k">정정</span> 콜아웃.)</p>
+<p><code>[Blender/bpy] blender_export_scene.py</code> → <code>scene_manifest.json</code> + <code>.obj</code>/<code>.glb</code> &nbsp;→&nbsp; <code>import_infinigen_scene.py</code> → authoring_map + render_binding &nbsp;→&nbsp; <code>render_daemon._generate_opticalnav_render_scene_xml</code> → <code>render_scene.xml</code>(BSDF) &nbsp;→&nbsp; <code>multimodal.render_modalities</code> → RGB·depth·normal·<b>Stokes 편광</b> 출력</p>
+
+<h3>Stage 1 — Blender export (<code>tools/infinigen/blender_export_scene.py</code>)</h3>
+<ul>
+<li><b>지오메트리</b>: 오브젝트당 <b><code>.obj</code>(렌더용) + <code>.glb</code>(PBR/UV 프리뷰) 둘 다</b> 출력. 삼각화 강제(Mitsuba OBJ 로더가 &gt;1024자 face 줄 거부), <b>normal export 안 함</b>(Infinigen 퇴화 삼각형의 NaN normal이 로더를 죽여서 — Mitsuba가 재계산). 오브젝트를 원점-로컬로 임시 이동해 export.</li>
+<li><b>UV 이슈(핵심)</b>: <code>wm.obj_export</code>가 UV 없는 메시를 <code>vt=0</code>으로 써서 렌더에서 텍스처가 barycentric 가짜 매핑됨. <b>fix</b>: OBJ export <b>직전</b>에 <code>_ensure_uv()</code>가 <code>smart_project</code>로 UV 생성(bake 아틀라스와 같은 UV 공유하도록 순서 보장).</li>
+<li><b>재질 파라미터</b>(Principled BSDF에서): base_color·metallic·roughness·ior·emission을 <b>단일 상수</b>로 읽음(소켓 unlinked일 때). 절차적 재질이라 <code>--bake</code> 시 Cycles로 <b>per-object 텍스처 아틀라스</b> 베이크(albedo=DIFFUSE, roughness=ROUGHNESS, normal=NORMAL, metallic=EMIT 트릭). ior/transmission/emission은 상수만.</li>
+<li><b>semantic/kind</b>: <code>FACTORY_SEMANTIC</code> 맵 + 컬렉션 접미사(<code>.wall/.floor/.ceiling</code>)로 chair/table/bed/shelf/plant/door/window/light/structure 분류.</li>
+<li><b>optical_class</b>(우리 자체 분석, <b>재질 이름 키워드 기반</b>): glass/mirror/metal_gold(gold·brass)/metal_steel(steel·iron·suj)/metal_aluminum(metal·alumin·<b>brush·grain</b>·copper·silver…)/diffuse. <b>metallic 값 무시</b>. mirror/glass는 MTL에서 diffuse strip(analytic conductor/dielectric 바인딩 쓰도록).</li>
+</ul>
+
+<h3>Stage 2 — 재질 → Mitsuba BSDF + IOR 주입 (<code>render_daemon.py</code> + <code>optical_constants.py</code>)</h3>
+<div class="warn"><span class="k">정정 (사용자 이해 vs 실제)</span>: "재질 semantic으로 IOR를 table에서 찾아 적용하고 roughconductor/pplastic/dielectric 중 하나 할당" → <b>순서가 반대</b>. <b>BSDF 타입을 먼저</b> 고르고(<code>_resolve_material_binding</code>의 preset→strategy 표), <b>그 다음 별도 "injection" 단계</b>가 IOR/eta·k를 채운다. 그리고 3종이 아니라 <code>pplastic·dielectric·roughdielectric·conductor·roughconductor·measured·measured_polarized·diffuse</code> 전체.</div>
+<ul>
+<li><b>BSDF 타입 선택(먼저)</b>: <code>_resolve_material_binding</code>의 preset→strategy 표 — <code>clear_glass→dielectric</code>, <code>frosted_glass→roughdielectric</code>, <code>mirror→conductor</code>, <code>painted_wall/wood/fabric/tile/plastic→pplastic</code>, measured kind→<code>measured_polarized</code>, 기본 fallback <b><code>pplastic</code></b>. metal은 텍스처 경로에서 <code>metallic&gt;0.5 or is_metal → roughconductor</code>. <b>metallic은 blend 가중치가 아니라 conductor↔plastic <u>선택자</u></b>(재질당 단일 BSDF).</li>
+<li><b>IOR/eta·k 주입 레이어(그 다음, <code>optical_constants.py</code>)</b>: env <code>ROBOMITUBA_BSDF_MODE</code>=<code>injected</code>/<code>measured</code>일 때만 on(기본 <code>legacy</code>는 <code>int_ior=1.5</code>/<code>Al</code> 하드코딩). <b>렌더-XML 시점</b>에 <code>optical_class</code>로 유전체 IOR 표(glass 1.50, ceramic 1.50, fabric 1.50, plant 1.42…)와 금속 preset(gold→Au, steel→Cr, aluminum→Al, mirror→Ag = Mitsuba 내장 측정 eta·k 스펙트럼)을 조회해 <code>int_ior</code>/<code>material</code>을 채움. 명시적 값이 있으면 그게 우선, 없으면 optical_class→이름키워드→base_color 순.</li>
+<li><b>텍스처 배선</b>: albedo→<code>diffuse_reflectance</code>(bitmap/rgb), normal→<code>normalmap</code> 래핑, roughness→<code>alpha</code>(단, texture alpha는 roughconductor/roughdielectric만; pplastic은 스칼라로 클램프, floor 0.08~0.10).</li>
+</ul>
+
+<h3>Stage 3 — 렌더 실행 + 편광 (<code>multimodal.py</code>)</h3>
+<div class="warn"><span class="k">정정</span>: "채널스플릿/measured pBRDF로 편광 렌더" → 기본 경로는 <b>analytic</b>. <code>RenderConfig.measured_scope="analytic_only"</code>가 기본이라 measured pBRDF(<code>measured_polarized</code>/<code>_rgb</code> 플러그인)와 채널스플릿 RGB는 <b>opt-in</b>이고 이 리포트/기본 씬에선 안 탄다. RGB 본 이미지는 <b><code>cuda_rgb</code></b>(스펙트럴 아님), <b>편광 패스만</b> <code>cuda_spectral_polarized</code>.</div>
+<ul>
+<li><b>멀티패스·per-pass variant</b>: 각 modality가 자기 XML을 스테이징해 따로 렌더. RGB/AOV/depth=<code>cuda_rgb</code>, polar=<code>cuda_spectral_polarized</code>(<code>resolve_variant(kind=...)</code>).</li>
+<li><b>편광(진짜 Stokes)</b>: <code>stokes</code> integrator + nested <code>direct</code>. 15/16채널 film에서 s0~s3 추출 → 휘도가중 <code>dop=√(s1²+s2²)/s0</code>, <code>aolp=½atan2(s2,s1)</code>, <code>s1/s0·s2/s0</code>, <code>polar_rgb_preview</code>, <code>stokes_data.npz</code> + 컬러바 PNG. 신호 약하면 <code>pplastic_fallback</code> 씬 재렌더.</li>
+<li><b>채널스플릿 RGB(opt-in)</b>: measured BSDF가 씬에 있을 때만. 단일패스 <code>measured_polarized_rgb</code> 플러그인(614/542/446nm 단밴드 슬라이스 직접 반환) 우선, 실패 시 3-pass fallback <code>_compose_channel_split_rgb</code>. <b>3-pass는 각 밴드를 luminance 스칼라로 붕괴</b>해 R=G=B 회색 위험 있음(그래서 단밴드 모드는 fallback 거부).</li>
+<li><b>출력</b>: rgb.exr/png, depth, normal, albedo, active_nir_intensity, hazard_mask, 그리고 편광(dop/aolp/s1/s2/s1_over_s0/s2_over_s0 + polar_rgb_preview + stokes_data.npz).</li>
+</ul>
+<div class="ok"><b>요약(사용자 이해 검증)</b>: mesh/uv/albedo/roughness/metallic 추출 ✅ · optical_class(=semantic)로 IOR·금속 preset 조회 ✅(단 <b>BSDF 타입 선택 후 별도 주입</b>) · roughconductor/pplastic/dielectric <b>+α</b> 할당 ✅ · <b>polarized 렌더 ✅(analytic BSDF의 Fresnel Stokes, measured pBRDF는 opt-in)</b>.</div>
+
+<h2>8. 결론</h2>
 <ul>
 <li><b>편광은 optical class를 분리한다</b>: 금속(DoLP~0.9) &gt; 유리(specular만) &gt; diffuse(pplastic 약한 코팅 편광). RGB만으로는 안 보이는 구분이 편광 채널에서 드러난다.</li>
 <li><b>플러그인 트리오</b>: <code>conductor</code>(금속) + <code>dielectric</code>(유리) + <code>pplastic</code>(diffuse/plastic). <code>roughdielectric</code>·<code>roughplastic</code>은 편광 미지원(DoLP=0)이라 금지.</li>
 <li><b>텍스처/색</b>: <code>.glb</code>의 UV를 복원해 베이크 albedo를 매핑 → S0가 실제 재질 색(라벨·직물색)을 담는다. <code>.obj</code> export는 UV를 잃으므로 glb를 써야 한다.</li>
 <li><b>유리 = IOR-only</b> · <b>brushed-metal(#5)</b>는 metallic=0 무관하게 conductor로 편광.</li>
 <li><b>multi-material</b>: glb는 material별 geometry로 분리돼 있어(<code>visual.material.name</code>=manifest 재질명) per-geometry BSDF 주입 가능 → jar(유리+나무), tvstand(금속+나무)를 정확히 렌더.</li>
+<li><b>TVStand(#5) 진단(§6)</b>: 물체는 실제 금속+나무 → 어색함은 유약(②)이 아니라 <b>OBJ 경로 per-material 붕괴(③)</b> + <b>이름키워드 분류로 금속부 과편광(Q3)</b>. <code>grain</code> 키워드가 나무를 metal로 오분류할 위험도 확인.</li>
+<li><b>파이프라인(§7)</b>: BSDF 타입을 <b>먼저</b> 고르고 IOR/eta·k는 <b>별도 주입 단계</b>(순서 정정). 기본은 <b>analytic</b> — measured pBRDF·채널스플릿은 opt-in. RGB=<code>cuda_rgb</code>, 편광 패스만 <code>cuda_spectral_polarized</code>의 진짜 Stokes.</li>
 </ul>
 
 </body></html>
