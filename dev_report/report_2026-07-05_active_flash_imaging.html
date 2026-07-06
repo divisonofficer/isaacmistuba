@@ -134,6 +134,21 @@
       <figcaption>spp 1024. 행: active OFF(ambient) / ON(polarized flash). 열: Intensity(S0) · DoLP(편광도) · AoLP(편광각). ON에서 씬이 밝아지고(3.19×) DoLP가 상승(2.17×)하며 AoLP가 편광 조명 기준으로 재편된다.</figcaption>
     </figure>
 
+    <h3>Relighting sweep — active light L→R (RGB · DoLP · AoLP · s1 · s2)</h3>
+    <p>
+      고정 시점에서 편광 flash를 <b>좌→우로 8프레임 점진 이동</b>(mount x −0.6→+0.6m)하며 relighting을 캡처했다.
+      RGB(S0) 조명이 좌측 구조물→우측 기둥으로 이동하고, <b>편광 채널(DoLP·AoLP·s1·s2)이 조명–표면–카메라 기하 변화에 물리적으로 반응</b>한다
+      (능동 편광 조명이 표면 편광 응답을 바꾸는 실제 active polarimetric imaging 동작).
+    </p>
+    <figure>
+      <img src="images/0705_relight_sweep.gif" alt="active light relighting sweep (animated)">
+      <figcaption>애니메이션(GIF). 5패널 = RGB(S0) · DoLP · AoLP · s1 · s2. flash가 좌→우로 이동. mp4: <code>out/compare_measured_vs_analytic_vp039_h240/relight/relight_sweep.mp4</code></figcaption>
+    </figure>
+    <figure>
+      <img src="images/0705_relight_filmstrip.png" alt="relighting sweep filmstrip" style="max-width:520px">
+      <figcaption>정적 filmstrip(위=light 좌, 아래=light 우). GIF 미재생 환경용.</figcaption>
+    </figure>
+
     <h2 id="remain">5. 남은 일 · 설계 주의</h2>
     <ul>
       <li class="ok"><b>완료</b>: Bridge · Staging · Rig/Sweep · UI + on/off 검증. active flash + 편광 조명이 end-to-end 동작.</li>
