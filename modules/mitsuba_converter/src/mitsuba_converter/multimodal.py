@@ -1962,20 +1962,21 @@ def _active_light_mount_matrix(mount: Mapping[str, Any] | None) -> np.ndarray:
     return m
 
 
-def _active_light_intensity_xml(emitter: ET.Element, light: ActiveLightSpec, *, spectral: bool) -> None:
-    """Emit the emitter <intensity>. NIR uses a single-band spectrum when a
+def _active_light_intensity_xml(emitter: ET.Element, light: ActiveLightSpec, *, spectral: bool, name: str = "intensity") -> None:
+    """Emit the emitter radiance field (``name`` = "intensity" for spot/point,
+    "radiance" for an area emitter). NIR uses a single-band spectrum when a
     spectral variant is active; otherwise a grayscale-proxy rgb (Stage 5 upgrades
     the spectral path)."""
     scale = max(0.0, float(light.radiance))
     if light.spectrum_kind == "nir":
         if spectral:
-            ET.SubElement(emitter, "spectrum", {"name": "intensity", "value": f"{float(light.wavelength_nm):.1f}:{scale:.6g}"})
+            ET.SubElement(emitter, "spectrum", {"name": name, "value": f"{float(light.wavelength_nm):.1f}:{scale:.6g}"})
         else:
-            ET.SubElement(emitter, "rgb", {"name": "intensity", "value": f"{scale:.6g},{scale:.6g},{scale:.6g}"})
+            ET.SubElement(emitter, "rgb", {"name": name, "value": f"{scale:.6g},{scale:.6g},{scale:.6g}"})
     else:
         rgb = light.rgb if isinstance(light.rgb, (list, tuple)) and len(light.rgb) >= 3 else [1.0, 1.0, 1.0]
         vals = ",".join(f"{max(0.0, float(c)) * scale:.6g}" for c in rgb[:3])
-        ET.SubElement(emitter, "rgb", {"name": "intensity", "value": vals})
+        ET.SubElement(emitter, "rgb", {"name": name, "value": vals})
 
 
 def _append_base_active_lights(
@@ -2001,26 +2002,40 @@ def _append_base_active_lights(
         if pass_kind not in (light.modalities or []):
             continue
         world = (base @ _active_light_mount_matrix(light.mount)).astype(np.float32)
-        emitter_type = light.emitter_type if light.emitter_type in ("spot", "point") else "spot"
-        emitter = ET.SubElement(root, "emitter", {"type": emitter_type, "id": f"active_light_{light.light_id}"})
-        etf = ET.SubElement(emitter, "transform", {"name": "to_world"})
-        ET.SubElement(etf, "matrix", {"value": _matrix_to_string(world)})
-        _active_light_intensity_xml(emitter, light, spectral=spectral)
-        if emitter_type == "spot":
-            ET.SubElement(emitter, "float", {"name": "cutoff_angle", "value": f"{float(light.cutoff_angle_deg):.4f}"})
-            ET.SubElement(emitter, "float", {"name": "beam_width", "value": f"{float(light.beam_width_deg):.4f}"})
+        emitter_type = light.emitter_type if light.emitter_type in ("spot", "point", "area") else "spot"
+        area_half = max(1e-3, float(getattr(light, "area_size_m", 0.1)))
+        if emitter_type == "area":
+            # Emissive rectangle (local normal +Z = beam). Required for polarized
+            # illumination: unlike a delta spot/point, an area emitter's radiance
+            # physically transmits through the polarizer surface in front of it.
+            shape = ET.SubElement(root, "shape", {"type": "rectangle", "id": f"active_light_{light.light_id}"})
+            stf = ET.SubElement(shape, "transform", {"name": "to_world"})
+            eshalf = np.eye(4, dtype=np.float64); eshalf[0, 0] = eshalf[1, 1] = area_half
+            ET.SubElement(stf, "matrix", {"value": _matrix_to_string((world.astype(np.float64) @ eshalf).astype(np.float32))})
+            area_emitter = ET.SubElement(shape, "emitter", {"type": "area"})
+            _active_light_intensity_xml(area_emitter, light, spectral=spectral, name="radiance")
+        else:
+            emitter = ET.SubElement(root, "emitter", {"type": emitter_type, "id": f"active_light_{light.light_id}"})
+            etf = ET.SubElement(emitter, "transform", {"name": "to_world"})
+            ET.SubElement(etf, "matrix", {"value": _matrix_to_string(world)})
+            _active_light_intensity_xml(emitter, light, spectral=spectral)
+            if emitter_type == "spot":
+                ET.SubElement(emitter, "float", {"name": "cutoff_angle", "value": f"{float(light.cutoff_angle_deg):.4f}"})
+                ET.SubElement(emitter, "float", {"name": "beam_width", "value": f"{float(light.beam_width_deg):.4f}"})
         injected += 1
         # Polarized illumination: emitters emit UNPOLARIZED, so place a linear
         # `polarizer` BSDF surface just in front of the emitter along its +Z beam.
+        # (Genuinely polarizes only for an area emitter — see area note above.)
         if light.polarized:
             offset = np.eye(4, dtype=np.float64)
-            offset[:3, 3] = [0.0, 0.0, 0.02]  # 2cm along local +Z (beam)
-            # small rectangle facing the beam; rectangle's local normal is +Z.
+            offset[:3, 3] = [0.0, 0.0, 0.03 if emitter_type == "area" else 0.02]  # along local +Z (beam)
+            # rectangle facing the beam; local normal is +Z. For an area emitter,
+            # size the polarizer to cover the emissive panel so all rays transmit.
+            pol_half = max(0.05, area_half * 1.1) if emitter_type == "area" else 0.05
             pol_world = (world.astype(np.float64) @ offset).astype(np.float32)
             pol_shape = ET.SubElement(root, "shape", {"type": "rectangle", "id": f"active_polarizer_{light.light_id}"})
             ptf = ET.SubElement(pol_shape, "transform", {"name": "to_world"})
-            # scale the rectangle small so it only sits in front of the emitter
-            scale = np.eye(4, dtype=np.float32); scale[0, 0] = scale[1, 1] = 0.05
+            scale = np.eye(4, dtype=np.float32); scale[0, 0] = scale[1, 1] = pol_half
             ET.SubElement(ptf, "matrix", {"value": _matrix_to_string((pol_world @ scale).astype(np.float32))})
             pol_bsdf = ET.SubElement(pol_shape, "bsdf", {"type": "polarizer"})
             ET.SubElement(pol_bsdf, "float", {"name": "theta", "value": f"{float(light.polarizer_angle_deg):.4f}"})

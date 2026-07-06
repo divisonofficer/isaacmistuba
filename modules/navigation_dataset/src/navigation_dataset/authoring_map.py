@@ -363,7 +363,7 @@ def _normalize_active_light(payload: Any, index: int = 0) -> JsonDict:
     return {
         "light_id": str(data.get("light_id") or f"active_light_{index}"),
         "enabled": bool(data.get("enabled", True)),
-        "emitter_type": "point" if str(data.get("emitter_type")) == "point" else "spot",
+        "emitter_type": str(data.get("emitter_type")) if str(data.get("emitter_type")) in ("spot", "point", "area") else "spot",
         "mount": {"parent_frame": str(mount.get("parent_frame") or "base_link"),
                   "xyz_m": [float(v) for v in xyz], "rpy_deg": [float(v) for v in rpy]},
         "modalities": modalities,
@@ -373,6 +373,7 @@ def _normalize_active_light(payload: Any, index: int = 0) -> JsonDict:
         "radiance": float(data.get("radiance") if data.get("radiance") is not None else 40.0),
         "cutoff_angle_deg": float(data.get("cutoff_angle_deg") or 45.0),
         "beam_width_deg": float(data.get("beam_width_deg") or 30.0),
+        "area_size_m": float(data.get("area_size_m") or 0.1),
         "polarized": bool(data.get("polarized", False)),
         "polarizer_angle_deg": float(data.get("polarizer_angle_deg") or 0.0),
     }

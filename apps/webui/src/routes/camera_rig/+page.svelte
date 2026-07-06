@@ -205,6 +205,7 @@
 			radiance: 40,
 			cutoff_angle_deg: 45,
 			beam_width_deg: 30,
+			area_size_m: 0.1,
 			polarized: false,
 			polarizer_angle_deg: 0
 		};
@@ -438,12 +439,12 @@
 							<button on:click={() => addActiveLight('nir')}>Add NIR Flash</button>
 						</div>
 					</div>
-					<p class="hint">Base-mounted flash (spot/point) + optional linear polarizer. Positioned at base_pose · mount at render time.</p>
+					<p class="hint">Base-mounted flash (spot/point/area) + optional linear polarizer. Positioned at base_pose · mount at render time. Polarized illumination requires an <b>area</b> emitter (a delta spot/point can't transmit through the polarizer).</p>
 					{#each rig?.active_lights ?? [] as light (light.light_id)}
 						<div class="light-card" class:disabled={!light.enabled}>
 							<div class="light-head">
 								<label class="light-toggle"><input type="checkbox" checked={light.enabled} on:change={(e) => updateActiveLight(light.light_id, { enabled: e.currentTarget.checked })} /> {light.light_id}</label>
-								<select value={light.emitter_type} on:change={(e) => updateActiveLight(light.light_id, { emitter_type: e.currentTarget.value as 'spot' | 'point' })}><option value="spot">spot</option><option value="point">point</option></select>
+								<select value={light.emitter_type} on:change={(e) => updateActiveLight(light.light_id, { emitter_type: e.currentTarget.value as 'spot' | 'point' | 'area' })}><option value="spot">spot</option><option value="point">point</option><option value="area">area</option></select>
 								<select value={light.spectrum_kind} on:change={(e) => updateActiveLight(light.light_id, { spectrum_kind: e.currentTarget.value as 'rgb' | 'nir' })}><option value="rgb">RGB</option><option value="nir">NIR</option></select>
 								<button class="light-remove" on:click={() => removeActiveLight(light.light_id)}>✕</button>
 							</div>
@@ -459,6 +460,8 @@
 								{#if light.emitter_type === 'spot'}
 									<label>Cutoff°<input type="number" min="1" max="90" step="1" value={light.cutoff_angle_deg} on:input={(e) => updateActiveLight(light.light_id, { cutoff_angle_deg: +e.currentTarget.value })} /></label>
 									<label>Beam°<input type="number" min="0" max="90" step="1" value={light.beam_width_deg} on:input={(e) => updateActiveLight(light.light_id, { beam_width_deg: +e.currentTarget.value })} /></label>
+								{:else if light.emitter_type === 'area'}
+									<label>Size m<input type="number" min="0.01" step="0.02" value={light.area_size_m} on:input={(e) => updateActiveLight(light.light_id, { area_size_m: +e.currentTarget.value })} /></label>
 								{/if}
 							</div>
 							<div class="light-grid">
@@ -477,6 +480,9 @@
 								<label class="light-pol"><input type="checkbox" checked={light.polarized} on:change={(e) => updateActiveLight(light.light_id, { polarized: e.currentTarget.checked })} /> polarizer</label>
 								{#if light.polarized}
 									<label>angle°<input type="number" step="5" value={light.polarizer_angle_deg} on:input={(e) => updateActiveLight(light.light_id, { polarizer_angle_deg: +e.currentTarget.value })} /></label>
+									{#if light.emitter_type !== 'area'}
+										<span class="light-warn" title="A delta spot/point cannot transmit through the polarizer (its shadow ray is blocked and it can't be BSDF-sampled), so polarization is negligible. Use an area emitter.">⚠ polarized needs area emitter</span>
+									{/if}
 								{/if}
 							</div>
 						</div>
@@ -638,6 +644,7 @@
 	.light-grid label { display: grid; gap: 2px; font-size: 11px; color: #475569; }
 	.light-grid input { width: 68px; padding: 3px 5px; border: 1px solid #cbd5e1; border-radius: 4px; }
 	.light-foot { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+	.light-warn { font-size: 11px; color: #b45309; background: #fffbeb; border: 1px solid #fde68a; border-radius: 4px; padding: 2px 6px; cursor: help; }
 	.light-modalities { display: flex; gap: 4px; }
 	.light-modalities .chip { border: 1px solid #cbd5e1; background: #fff; color: #64748b; border-radius: 999px; padding: 2px 10px; font-size: 11px; cursor: pointer; }
 	.light-modalities .chip.on { background: #1d5fd1; border-color: #1d5fd1; color: #fff; }

@@ -179,7 +179,7 @@ export type CameraRigSensor = {
 export type CameraRigActiveLight = {
 	light_id: string;
 	enabled: boolean;
-	emitter_type: 'spot' | 'point';
+	emitter_type: 'spot' | 'point' | 'area';
 	mount: {
 		parent_frame: string;
 		xyz_m: [number, number, number];
@@ -193,6 +193,8 @@ export type CameraRigActiveLight = {
 	radiance: number;
 	cutoff_angle_deg: number;
 	beam_width_deg: number;
+	// area emitter half-extent (m). Required for genuine polarized illumination.
+	area_size_m: number;
 	polarized: boolean;
 	polarizer_angle_deg: number;
 };

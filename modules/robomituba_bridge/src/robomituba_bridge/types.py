@@ -339,7 +339,7 @@ class ActiveLightSpec:
     """
     light_id: str
     enabled: bool = True
-    emitter_type: str = "spot"                # "spot" | "point"
+    emitter_type: str = "spot"                # "spot" | "point" | "area"
     # Local mount relative to base_frame: {parent_frame, xyz_m[3], rpy_deg[3]}.
     mount: JsonDict = field(default_factory=lambda: {"parent_frame": "base_link", "xyz_m": [0.0, 0.0, 0.0], "rpy_deg": [0.0, 0.0, 0.0]})
     # Which render passes this light participates in: subset of {"rgb","nir","polar"}.
@@ -347,9 +347,14 @@ class ActiveLightSpec:
     spectrum_kind: str = "rgb"                # "rgb" | "nir"
     rgb: Vec3 = field(default_factory=lambda: [1.0, 1.0, 1.0])
     wavelength_nm: float = 850.0              # used when spectrum_kind == "nir"
-    radiance: float = 40.0                    # intensity scale
+    radiance: float = 40.0                    # intensity/radiance scale
     cutoff_angle_deg: float = 45.0            # spot only
     beam_width_deg: float = 30.0             # spot only
+    # area emitter half-extent (m). NOTE: polarized illumination REQUIRES an area
+    # emitter — a delta spot/point cannot transmit through a `polarizer` surface
+    # (its NEE shadow ray is blocked by the polarizer and a delta light cannot be
+    # BSDF-sampled), so a polarized spot/point yields ~no genuine polarization.
+    area_size_m: float = 0.1                  # area only (rectangle half-extent)
     polarized: bool = False
     polarizer_angle_deg: float = 0.0
     extras: JsonDict = field(default_factory=dict)

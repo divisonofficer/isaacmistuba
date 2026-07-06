@@ -5208,7 +5208,7 @@ class RenderDaemon:
             seen.add(light_id)
             mount_raw = raw.get("mount") if isinstance(raw.get("mount"), Mapping) else {}
             modalities = [str(m) for m in (raw.get("modalities") or ["nir", "polar"]) if str(m).strip()]
-            emitter_type = "point" if str(raw.get("emitter_type")) == "point" else "spot"
+            emitter_type = str(raw.get("emitter_type")) if str(raw.get("emitter_type")) in ("spot", "point", "area") else "spot"
             spectrum_kind = "nir" if str(raw.get("spectrum_kind")) == "nir" else "rgb"
             out.append({
                 "light_id": light_id,
@@ -5226,6 +5226,7 @@ class RenderDaemon:
                 "radiance": self._as_finite_float(raw.get("radiance", 40.0), name=f"{light_id}.radiance"),
                 "cutoff_angle_deg": self._as_finite_float(raw.get("cutoff_angle_deg", 45.0), name=f"{light_id}.cutoff_angle_deg"),
                 "beam_width_deg": self._as_finite_float(raw.get("beam_width_deg", 30.0), name=f"{light_id}.beam_width_deg"),
+                "area_size_m": self._as_finite_float(raw.get("area_size_m", 0.1), name=f"{light_id}.area_size_m"),
                 "polarized": bool(raw.get("polarized", False)),
                 "polarizer_angle_deg": self._as_finite_float(raw.get("polarizer_angle_deg", 0.0), name=f"{light_id}.polarizer_angle_deg"),
             })

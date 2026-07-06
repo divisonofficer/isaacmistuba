@@ -176,10 +176,12 @@ def validate_assist_light_spec(assist_light: AssistLightSpec) -> None:
 def validate_active_light_spec(active_light: "ActiveLightSpec") -> None:
     if not active_light.light_id:
         raise ValueError("active_light.light_id must not be empty.")
-    if active_light.emitter_type not in ("spot", "point"):
+    if active_light.emitter_type not in ("spot", "point", "area"):
         raise ValueError(f"Unsupported active_light.emitter_type: {active_light.emitter_type}")
     if active_light.spectrum_kind not in ("rgb", "nir"):
         raise ValueError(f"Unsupported active_light.spectrum_kind: {active_light.spectrum_kind}")
+    if active_light.emitter_type == "area" and active_light.area_size_m <= 0:
+        raise ValueError("active_light.area_size_m must be positive for area emitter.")
     mount = active_light.mount or {}
     xyz = mount.get("xyz_m", [])
     rpy = mount.get("rpy_deg", [])
