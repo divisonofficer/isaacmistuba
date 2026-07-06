@@ -116,6 +116,24 @@
       <figcaption>polar_rgb_preview. 좌: active light OFF(ambient) · 우: active light ON(base-mounted flash). 우측 벽·문틀·구조물이 크게 밝아짐.</figcaption>
     </figure>
 
+    <h3>고품질(spp 1024) RGB + 편광 비교 — polarized flash</h3>
+    <p>
+      같은 시점을 <b>path/polar spp 1024</b> 로, <b>편광 spot flash</b>(polarized=true) on/off로 렌더해 intensity(S0)·DoLP·AoLP를 비교했다.
+      편광 능동 조명은 <b>조명(intensity)뿐 아니라 편광 상태 자체를 부여</b>한다 — DoLP가 전반적으로 상승하고 AoLP 구조가 크게 재편된다.
+    </p>
+    <table>
+      <thead><tr><th>지표</th><th>OFF (ambient)</th><th>ON (polarized flash)</th><th>비</th></tr></thead>
+      <tbody>
+        <tr><td>Intensity S0 (mean)</td><td>31.8</td><td>101.3</td><td><b>3.19×</b></td></tr>
+        <tr><td>DoLP (dop R-channel mean)</td><td>57.7</td><td>125.1</td><td><b>2.17×</b></td></tr>
+        <tr><td>AoLP</td><td colspan="2">ambient 자연 편광각 → 편광 조명이 지배하는 구조로 재편(육안 확연)</td><td>—</td></tr>
+      </tbody>
+    </table>
+    <figure>
+      <img src="images/0705_activelight_onoff_hq_grid.png" alt="active light on/off HQ RGB+polarization grid">
+      <figcaption>spp 1024. 행: active OFF(ambient) / ON(polarized flash). 열: Intensity(S0) · DoLP(편광도) · AoLP(편광각). ON에서 씬이 밝아지고(3.19×) DoLP가 상승(2.17×)하며 AoLP가 편광 조명 기준으로 재편된다.</figcaption>
+    </figure>
+
     <h2 id="remain">5. 남은 일 · 설계 주의</h2>
     <ul>
       <li class="ok"><b>완료</b>: Bridge · Staging · Rig/Sweep · UI + on/off 검증. active flash + 편광 조명이 end-to-end 동작.</li>
