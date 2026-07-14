@@ -124,7 +124,6 @@ def orchestrate(args: argparse.Namespace) -> None:
                 "rgb": "scene_rgb.xml",
                 "aov": "scene_depth.xml",
                 "polar": "scene_polar.xml",
-                "polar_fallback": "scene_polar_fallback.xml",
             },
         ),
     )

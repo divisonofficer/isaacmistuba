@@ -1,0 +1,36 @@
+{
+  "schema": "robomituba.spatial_pbr_ab.v2",
+  "experiment_id": "spatial-pbr-f0-only-rgb-polar-ab-2026-07-13",
+  "variant": "cuda_ad_spectral_polarized",
+  "rgb_variant": "cuda_ad_spectral",
+  "output": "out/spatial_pbr_ab/2026-07-13",
+  "fov_deg": 45.0,
+  "frame_fill": 0.72,
+  "views": {
+    "front": 0.0,
+    "grazing65": 65.0
+  },
+  "lights": {
+    "left50": -50.0,
+    "right50": 50.0
+  },
+  "light_elevation_deg": 45.0,
+  "light_distance_radii": 3.25,
+  "light_half_size_radii": 0.55,
+  "light_radiance": 18.0,
+  "smoke": {"resolution": 256, "spp": 64},
+  "final": {"resolution": 640, "spp": 512},
+  "uv_spp": 1,
+  "seed": 0,
+  "bootstrap_samples": 2000,
+  "assets": [
+    {"group": "positive", "scene": "kr_20000221", "id": "BeverageFridgeFactory_4647172_.spawn_asset_4618900"},
+    {"group": "positive", "scene": "kr_20000221", "id": "BookColumnFactory_8291484_.spawn_asset_7622244"},
+    {"group": "positive", "scene": "kr_20000221", "id": "BottleFactory_3548288_.spawn_asset_291184"},
+    {"group": "positive", "scene": "kr_20000221", "id": "BookStackFactory_3836551_.spawn_asset_7763197"},
+    {"group": "negative", "scene": "kr_20260625", "id": "BedFactory_7812946_.spawn_asset_5878389"},
+    {"group": "negative", "scene": "kr_20260625", "id": "NatureShelfTrinketsFactory_7695705_.spawn_asset_742423"},
+    {"group": "negative", "scene": "kr_20260625", "id": "LargePlantContainerFactory_2686399_.spawn_asset_5396567"},
+    {"group": "negative", "scene": "kr_20260625", "id": "PlantContainerFactory_8288363_.spawn_asset_1688329"}
+  ]
+}

@@ -11,8 +11,11 @@
 # Options:
 #   --scene-id ID        OpticalNav scene id        (default: infinigen_<dirname>)
 #   --project-id ID      OpticalNav project         (default: opticalnav-v0.2)
-#   --no-bake            Skip procedural material bake (faster, grayscale-ish)
-#   --bake-pbr           Also bake per-texel roughness/normal/metallic atlases (~4x bake time)
+#   --no-bake            Skip procedural material bake (explicit degraded preview mode)
+#   --bake-pbr           Deprecated compatibility no-op (PBR bake is now the default)
+#   --no-bake-pbr        Disable roughness/normal/metallic bake (degraded preview mode)
+#   --no-glb             Disable GLB export (requires --allow-obj-fallback)
+#   --allow-obj-fallback Permit legacy/incomplete manifests and OBJ render fallback
 #   --no-bake-metallic   With --bake-pbr, skip the (fiddly) metallic EMIT bake
 #   --bake-only          Re-bake PBR into an EXISTING scene's import (Stage 1 only, no
 #                        re-import) — preserves the authoring map; busts the staged cache
@@ -49,8 +52,10 @@ INPUT=""
 SCENE_ID=""
 PROJECT_ID="opticalnav-v0.2"
 BAKE=1
-BAKE_PBR=0
+BAKE_PBR=1
 BAKE_METALLIC=1
+GLB=1
+ALLOW_OBJ_FALLBACK=0
 BAKE_ONLY=0
 SKIP_EXPORT=0
 SYNC=1
@@ -62,6 +67,9 @@ while [[ $# -gt 0 ]]; do
     --project-id) PROJECT_ID="$2"; shift 2;;
     --no-bake)    BAKE=0; shift;;
     --bake-pbr)   BAKE_PBR=1; shift;;
+    --no-bake-pbr) BAKE_PBR=0; shift;;
+    --no-glb)     GLB=0; shift;;
+    --allow-obj-fallback) ALLOW_OBJ_FALLBACK=1; shift;;
     --no-bake-metallic) BAKE_METALLIC=0; shift;;
     --bake-only)  BAKE_ONLY=1; BAKE=1; BAKE_PBR=1; SKIP_EXPORT=0; shift;;
     --no-sync)    SYNC=0; shift;;
@@ -76,6 +84,14 @@ done
 if [[ -z "$INPUT" ]]; then
   echo "[error] missing <scene.blend | scene-dir>. See --help." >&2; exit 2
 fi
+if [[ "$GLB" == 0 && "$ALLOW_OBJ_FALLBACK" == 0 ]]; then
+  echo "[error] --no-glb requires --allow-obj-fallback (default import is strict GLB)." >&2
+  exit 2
+fi
+if [[ "$BAKE" == 0 || "$BAKE_PBR" == 0 ]]; then
+  ALLOW_OBJ_FALLBACK=1
+fi
+[[ $ALLOW_OBJ_FALLBACK == 1 ]] && STAGE2_EXTRA+=(--allow-obj-fallback)
 
 # ── resolve a readable .blend ─────────────────────────────────────────────────
 # Infinigen's main scene.blend is often header-corrupt; the scene.blend1 backup
@@ -141,18 +157,55 @@ else
   BAKE_FLAG=(); [[ $BAKE == 1 ]] && BAKE_FLAG=(--bake)
   [[ $BAKE == 1 && $BAKE_PBR == 1 ]] && BAKE_FLAG+=(--bake-pbr)
   [[ $BAKE_PBR == 1 && $BAKE_METALLIC == 0 ]] && BAKE_FLAG+=(--no-bake-metallic)
-  echo "[stage1] exporting meshes/materials with bpy (this can take several minutes)…"
-  # bpy frequently segfaults during interpreter/teardown AFTER the manifest is
-  # already written (conda bpy on WSL). Don't let that non-zero exit abort the
-  # pipeline under `set -e`; the manifest-exists guard below is the real check.
-  stage1_rc=0
-  "$INFINIGEN_PYTHON" tools/infinigen/_run_bpy.py "$BLEND" \
-    tools/infinigen/blender_export_scene.py -- \
-    --out "$IMPORT_DIR" "${BAKE_FLAG[@]}" || stage1_rc=$?
-  if [[ $stage1_rc -ne 0 && -f "$MANIFEST" ]]; then
-    echo "[stage1] bpy exited $stage1_rc (likely a teardown segfault) but the manifest was written — continuing." >&2
+  [[ $GLB == 0 ]] && BAKE_FLAG+=(--no-glb)
+  [[ $ALLOW_OBJ_FALLBACK == 1 ]] && BAKE_FLAG+=(--allow-incomplete-pbr)
+  DEFAULT_STAGING_DIR="${IMPORT_DIR}.staging.$(date +%Y%m%dT%H%M%S)-$$"
+  STAGING_DIR="${INFINIGEN_EXPORT_RESUME_DIR:-$DEFAULT_STAGING_DIR}"
+  STAGING_MANIFEST="${STAGING_DIR}/scene_manifest.json"
+  echo "[stage1] exporting meshes/materials with bpy -> $STAGING_DIR"
+  # Long-lived bpy processes are unstable on multi-GB scenes. Export bounded
+  # chunks into one staging directory and merge the manifest after each chunk.
+  CHUNK_SIZE="${INFINIGEN_EXPORT_CHUNK_SIZE:-40}"
+  [[ "$CHUNK_SIZE" =~ ^[1-9][0-9]*$ ]] || { echo "[error] invalid INFINIGEN_EXPORT_CHUNK_SIZE=$CHUNK_SIZE" >&2; exit 2; }
+  chunk_skip=0
+  unit_count=0
+  total_count=-1
+  if [[ -n "${INFINIGEN_EXPORT_RESUME_DIR:-}" && -f "$STAGING_MANIFEST" ]]; then
+    counts="$("$PYTHON" -c "import json,sys; d=json.load(open(sys.argv[1])); print(len(d.get(\"units\", [])), d.get(\"renderable_unit_count\", -1))" "$STAGING_MANIFEST")"
+    read -r unit_count total_count <<< "$counts"
+    chunk_skip=$unit_count
+    echo "[stage1] resuming committed staging at $unit_count/$total_count units"
   fi
-  [[ -f "$MANIFEST" ]] || { echo "[error] Stage 1 failed (exit $stage1_rc) and produced no manifest: $MANIFEST" >&2; exit 1; }
+  while (( total_count < 0 || unit_count < total_count )); do
+    before_count=$unit_count
+    MERGE_FLAG=(); [[ -f "$STAGING_MANIFEST" ]] && MERGE_FLAG=(--merge)
+    stage1_rc=0
+    "$INFINIGEN_PYTHON" tools/infinigen/_run_bpy.py "$BLEND" \
+      tools/infinigen/blender_export_scene.py -- \
+      --out "$STAGING_DIR" --scene-id "$NAME" --skip "$chunk_skip" --limit "$CHUNK_SIZE" \
+      "${MERGE_FLAG[@]}" "${BAKE_FLAG[@]}" || stage1_rc=$?
+    [[ -f "$STAGING_MANIFEST" ]] || { echo "[error] Stage 1 chunk failed (exit $stage1_rc) before manifest update" >&2; exit 1; }
+    counts="$("$PYTHON" -c "import json,sys; d=json.load(open(sys.argv[1])); print(len(d.get(\"units\", [])), d.get(\"renderable_unit_count\", -1))" "$STAGING_MANIFEST")"
+    read -r unit_count total_count <<< "$counts"
+    if (( unit_count <= before_count && unit_count < total_count )); then
+      echo "[error] Stage 1 chunk at skip=$chunk_skip failed (exit $stage1_rc); manifest did not advance" >&2
+      exit 1
+    fi
+    if [[ $stage1_rc -ne 0 ]]; then
+      echo "[stage1] bpy exited $stage1_rc after committing chunk; continuing with a fresh process." >&2
+    fi
+    echo "[stage1] committed $unit_count/$total_count units"
+    chunk_skip=$((chunk_skip + CHUNK_SIZE))
+  done
+  VALIDATE_FLAG=(); [[ $ALLOW_OBJ_FALLBACK == 1 ]] && VALIDATE_FLAG+=(--allow-obj-fallback)
+  "$PYTHON" apps/import_infinigen_scene.py --manifest "$STAGING_MANIFEST" --validate-only "${VALIDATE_FLAG[@]}"
+  if [[ -d "$IMPORT_DIR" ]]; then
+    BACKUP_DIR="${IMPORT_DIR}.backup.$(date +%Y%m%dT%H%M%S)"
+    mv "$IMPORT_DIR" "$BACKUP_DIR"
+    echo "[stage1] previous import preserved at $BACKUP_DIR"
+  fi
+  mv "$STAGING_DIR" "$IMPORT_DIR"
+  echo "[stage1] atomically promoted $IMPORT_DIR"
 fi
 
 # ── --bake-only: re-baked PBR atlases + MTL keys in place; do NOT re-run Stage 2

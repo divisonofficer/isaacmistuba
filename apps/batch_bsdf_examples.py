@@ -165,6 +165,8 @@ def main() -> int:
     ap.add_argument("--graph-headings", nargs="+", type=float, default=[0.0, 90.0, 180.0, 270.0],
                     help="yaw angles (deg) sampled per graph node in --from-graph mode")
     ap.add_argument("--eye-height", type=float, default=1.5)
+    ap.add_argument("--regen-injected", action="store_true",
+                    help="rebuild injected XML instead of copying the scene's production render_scene.xml (~7 min/scene)")
     a = ap.parse_args()
 
     import apps.compare_bsdf_modes as C
@@ -222,12 +224,19 @@ def main() -> int:
         sout.mkdir(parents=True, exist_ok=True)
         xmls: dict[str, Path] = {}
         try:
+            import shutil
+            prod_xml = REPO / "out" / "opticalnav" / PROJECT / "scenes" / scene / "render_scene.xml"
             for mode in ("legacy", "injected"):
                 xp = sout / f"render_scene_{mode}.xml"
-                n = C.regenerate_xml(PROJECT, scene, mode, xp)
+                # The production render_scene.xml is already the injected build, so copy
+                # it (paths are absolute) and skip the ~7 min rebuild; legacy regenerates.
+                if mode == "injected" and not a.regen_injected and prod_xml.exists():
+                    shutil.copyfile(prod_xml, xp)
+                else:
+                    C.regenerate_xml(PROJECT, scene, mode, xp)
                 xmls[mode] = xp
                 hist = C._bsdf_material_histogram(xp)
-                print(f"  [{scene}/{mode}] shapes={n} metals={hist['materials']}", flush=True)
+                print(f"  [{scene}/{mode}] metals={hist['materials']} int_ior={hist['int_ior']}", flush=True)
         except Exception:
             print(f"[error] XML regen failed for {scene}:\n{traceback.format_exc()}", flush=True)
             continue

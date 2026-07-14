@@ -11,6 +11,7 @@ import {
 
 export interface ExportJobSubmitPayload {
 	scene_id: string;
+	camera_ids?: string[] | null;
 	only_completed?: boolean;
 	episode_ids?: string[] | null;
 	include_episode_thumbnails?: boolean;
@@ -19,6 +20,14 @@ export interface ExportJobSubmitPayload {
 	include_birdseye?: boolean;
 	include_episode_birdseye?: boolean;
 	eval_perturbation?: boolean;
+}
+
+export interface ExportCameraInventoryItem {
+	sensor_id: string;
+	modalities: string[];
+	observation_count: number;
+	base_count: number;
+	perturbed_count: number;
 }
 
 export interface ExportJobStatus {

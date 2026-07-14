@@ -28,7 +28,9 @@ Crash policy (matches plan anti-improvements):
   * Queued jobs marked failed (``reason:'worker_restarting'``)
   * Cooldown 30 s before respawn
   * 3 unexpected exits within 5 min → manager enters ``degraded`` state;
-    ``health()`` reports it; no further auto-respawn until manual reset
+    ``health()`` reports it; ordinary submissions remain blocked until manual
+    reset, while an explicit terminal scene/modality phase boundary may reset
+    and respawn idle/dead workers.
 """
 from __future__ import annotations
 
@@ -693,11 +695,20 @@ class WorkerManager:
                 pass
         return found
 
-    def recycle_idle_workers(self, *, reason: str = "manual", timeout_s: float = 15.0) -> dict[str, Any]:
-        """Restart idle workers without marking any render job as failed.
+    def recycle_idle_workers(
+        self,
+        *,
+        reason: str = "manual",
+        timeout_s: float = 15.0,
+        recover_degraded: bool = False,
+    ) -> dict[str, Any]:
+        """Restart idle workers without marking render jobs as failed.
 
-        Used at modality phase boundaries to release Mitsuba/Dr.Jit resident
-        scene memory before submitting a different scene/variant family.
+        ``recover_degraded`` is intentionally opt-in. A modality/scene phase
+        boundary has already waited for every submitted job to become terminal,
+        so it is a safe point to clear the circuit breaker and respawn dead
+        workers before submitting the next scene variant. Ordinary/manual calls
+        retain the fail-closed degraded behavior.
         """
         deadline = time.time() + max(0.0, float(timeout_s))
         while True:
@@ -710,35 +721,88 @@ class WorkerManager:
                     or self._worker_queue_depth(w) > 0
                 ]
                 if not busy:
+                    if self._degraded and not recover_degraded:
+                        return {
+                            "recycled": 0,
+                            "started": 0,
+                            "skipped_busy": 0,
+                            "degraded_reset": False,
+                            "degraded": True,
+                            "reason": reason,
+                        }
                     break
                 remaining = deadline - time.time()
                 if remaining <= 0:
                     return {
                         "recycled": 0,
+                        "started": 0,
                         "skipped_busy": len(busy),
+                        "degraded_reset": False,
+                        "degraded": self._degraded,
                         "reason": reason,
                     }
                 self._condition.wait(timeout=min(0.5, remaining))
 
+        if self._shutting_down:
+            return {
+                "recycled": 0,
+                "started": 0,
+                "skipped_busy": 0,
+                "degraded_reset": False,
+                "degraded": self._degraded,
+                "reason": reason,
+            }
+
+        degraded_reset = False
+        if recover_degraded:
+            with self._condition:
+                degraded_reset = bool(self._degraded)
+                if degraded_reset:
+                    # The previous crash window must not immediately trip the
+                    # breaker again when this explicit boundary recovery starts.
+                    self._degraded = False
+                    for worker in workers:
+                        worker.stats.unexpected_exits.clear()
+
         recycled = 0
+        started = 0
+        failures: list[str] = []
         for worker in workers:
             proc = getattr(worker, "_process", None)
-            if proc is None or proc.poll() is not None:
-                continue
-            _stderr(
-                f"worker: recycling idle worker pid={worker.stats.pid} "
-                f"gpu_index={worker.stats.gpu_index} reason={reason}"
-            )
-            try:
-                worker.stop(kill=False, timeout_s=3.0)
-                worker.start()
-                recycled += 1
-            except Exception as exc:
-                _stderr(f"worker: recycle failed: {type(exc).__name__}: {exc}")
+            live = proc is not None and proc.poll() is None
+            if live:
+                _stderr(
+                    f"worker: recycling idle worker pid={worker.stats.pid} "
+                    f"gpu_index={worker.stats.gpu_index} reason={reason}"
+                )
+                try:
+                    worker.stop(kill=False, timeout_s=3.0)
+                    worker.start()
+                    recycled += 1
+                except Exception as exc:
+                    failures.append(f"gpu_index={worker.stats.gpu_index}: {exc}")
+            elif recover_degraded:
+                # A worker that already exited has no process for the ordinary
+                # recycle path; explicit recovery must spawn it again.
+                try:
+                    worker.start()
+                    started += 1
+                except Exception as exc:
+                    failures.append(f"gpu_index={worker.stats.gpu_index}: {exc}")
+
+        if failures:
+            with self._condition:
+                self._degraded = True
+            _stderr(f"worker: recovery failed ({'; '.join(failures)})")
+
         return {
             "recycled": recycled,
+            "started": started,
             "skipped_busy": 0,
+            "degraded_reset": degraded_reset and not failures,
+            "degraded": self._degraded,
             "reason": reason,
+            **({"errors": failures} if failures else {}),
         }
 
     def shutdown(self) -> None:

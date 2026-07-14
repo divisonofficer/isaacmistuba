@@ -48,6 +48,10 @@
 		episodeNodesAvailable?: boolean;
 		episodePathNodeCount?: number;
 		headingsPerNode?: number;
+		sensorFindQuery?: string;
+		sensorFindError?: string;
+		graphNodeCount?: number;
+		onFindSensor?: () => void;
 		onRefreshBatch: () => void;
 		onRemoveCustomSensor: (id: string) => void;
 		onCustomSensorHeadingChange: (id: string, deg: number) => void;
@@ -69,6 +73,7 @@
 		onRenderSensorViewpoint, onRenderEpisodes, onRenderEpisodeNodes,
 		renderMissingOnly = true, onSetRenderMissingOnly,
 		episodeNodesAvailable = false, episodePathNodeCount = 0, headingsPerNode = 0,
+		sensorFindQuery = $bindable(''), sensorFindError = '', graphNodeCount = 0, onFindSensor,
 		onRefreshBatch,
 		onRemoveCustomSensor, onCustomSensorHeadingChange,
 	}: Props = $props();
@@ -91,6 +96,19 @@
 </script>
 
 <div class="map-float-inspector sensor-panel">
+	<!-- Find a viewpoint/sensor node by number and fly the editor camera to it. -->
+	<div class="sensor-find">
+		<input
+			type="text"
+			placeholder="Find sensor # (e.g. 92 or vp_000092)"
+			bind:value={sensorFindQuery}
+			onkeydown={(e) => { if (e.key === 'Enter') onFindSensor?.(); }}
+			title={graphNodeCount ? `${graphNodeCount} viewpoints` : 'Build the viewpoint graph first'}
+		/>
+		<button class="button button-subtle" disabled={!hasGraph} onclick={() => onFindSensor?.()}>Find</button>
+	</div>
+	{#if sensorFindError}<div class="sensor-find-error">{sensorFindError}</div>{/if}
+
 	{#if !renderSceneSynced}
 		<div class="sensor-sync-warning">
 			<span>Render scene not synced</span>
@@ -338,6 +356,10 @@
 			font-weight: 700;
 			overflow-wrap: anywhere;
 		}
+
+	.sensor-find { display: flex; gap: 6px; margin: 0 0 6px; }
+	.sensor-find input { flex: 1; min-width: 0; padding: 4px 8px; font-size: var(--font-size-xs); border: 1px solid var(--border); border-radius: 6px; }
+	.sensor-find-error { font-size: 11px; color: #dc2626; margin: -2px 0 6px; }
 
 	.sensor-panel .sensor-node-id { font-family: monospace; font-size: var(--font-size-xs); color: var(--text-muted); word-break: break-all; }
 

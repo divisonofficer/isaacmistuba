@@ -264,8 +264,11 @@ def cmd_graph_qa(args) -> None:
 
 def cmd_graph_sweep(args) -> None:
     root = _dataset_root(args.dataset)
-    if not args.scene_state or not args.camera_spec:
-        raise SystemExit("--scene-state and --camera-spec JSON payloads are required for graph sensor sweep.")
+    if not args.scene_state or (not args.camera_spec and not args.sensor_specs):
+        raise SystemExit("--scene-state and at least one of --camera-spec/--sensor-specs JSON payloads are required for graph sensor sweep.")
+    scene_state_payload = _read_json(args.scene_state)
+    camera_spec_payload = _read_json(args.camera_spec) if args.camera_spec else None
+    sensor_specs_payload = _read_json(args.sensor_specs) if args.sensor_specs else None
     if args.backend == "daemon":
         project_id = args.project_id or root.name
         url = f"{args.daemon_url.rstrip('/')}/api/opticalnav/projects/{project_id}/scenes/{args.scene_id}/graph/sweep"
@@ -274,8 +277,9 @@ def cmd_graph_sweep(args) -> None:
             {
                 "backend": "daemon",
                 "modalities": _modalities(args.modalities),
-                "scene_state": _read_json(args.scene_state),
-                "camera_spec": _read_json(args.camera_spec),
+                "scene_state": scene_state_payload,
+                "camera_spec": camera_spec_payload,
+                "sensor_specs": sensor_specs_payload or [],
                 "variant": args.variant,
             },
         )
@@ -287,8 +291,9 @@ def cmd_graph_sweep(args) -> None:
         graph,
         dataset_root=root,
         graph_path=graph_path,
-        scene_state_payload=_read_json(args.scene_state),
-        camera_spec_payload=_read_json(args.camera_spec),
+        scene_state_payload=scene_state_payload,
+        camera_spec_payload=camera_spec_payload,
+        sensor_specs_payload=sensor_specs_payload,
         modalities=_modalities(args.modalities),
         variant=args.variant,
     )
@@ -522,6 +527,8 @@ def main() -> None:
     p_graph_sweep.add_argument("--project-id", default=None)
     p_graph_sweep.add_argument("--scene-state", default=None)
     p_graph_sweep.add_argument("--camera-spec", default=None)
+    p_graph_sweep.add_argument("--sensor-specs", default=None,
+                               help="JSON array of IsaacSensorSpec payloads (for example an Ouster OS1-128 sensor)")
     p_graph_sweep.add_argument("--variant", default="auto")
     p_graph_sweep.set_defaults(fn=cmd_graph_sweep)
     p_graph_episodes = graph_sub.add_parser("episodes")

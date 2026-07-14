@@ -12,6 +12,7 @@ from .types import (
     AssistLightSpec,
     CameraSpec,
     DepthApproxSpec,
+    IsaacSensorSpec,
     JobManifest,
     JobPaths,
     ObservationBundleManifest,
@@ -145,6 +146,29 @@ def validate_camera_spec(camera_spec: CameraSpec) -> None:
         validate_repo_relative_path(camera_spec.calibration_ref)
 
 
+def validate_sensor_spec(sensor_spec: IsaacSensorSpec) -> None:
+    if not sensor_spec.sensor_id:
+        raise ValueError("sensor_spec.sensor_id must not be empty.")
+    if not sensor_spec.name:
+        raise ValueError("sensor_spec.name must not be empty.")
+    allowed_types = {"rgb_camera", "polar_camera", "depth_sensor", "ouster_lidar"}
+    if sensor_spec.sensor_type not in allowed_types:
+        raise ValueError(f"Unsupported sensor_spec.sensor_type: {sensor_spec.sensor_type}")
+    if not sensor_spec.modalities:
+        raise ValueError("sensor_spec.modalities must not be empty.")
+    if sensor_spec.camera_to_world is not None and len(sensor_spec.camera_to_world) != 16:
+        raise ValueError("sensor_spec.camera_to_world must contain 16 values when provided.")
+    if sensor_spec.resolution is not None:
+        if len(sensor_spec.resolution) != 2 or any(int(value) <= 0 for value in sensor_spec.resolution):
+            raise ValueError("sensor_spec.resolution must contain two positive values.")
+    if not sensor_spec.sensor_sync_group:
+        raise ValueError("sensor_spec.sensor_sync_group must not be empty.")
+    for field_name in ("calibration_ref", "metadata_ref"):
+        value = getattr(sensor_spec, field_name)
+        if value:
+            validate_repo_relative_path(value)
+
+
 def validate_scene_override_spec(scene_override: SceneOverrideSpec) -> None:
     if (
         not scene_override.target_shape_filenames
@@ -224,8 +248,8 @@ def validate_render_request(render_request: RenderRequest) -> None:
         raise ValueError("render_request.timestamp must not be empty.")
     if not render_request.modalities:
         raise ValueError("render_request.modalities must not be empty.")
-    if not render_request.camera_specs:
-        raise ValueError("render_request.camera_specs must not be empty.")
+    if not render_request.camera_specs and not render_request.sensor_specs:
+        raise ValueError("render_request must contain camera_specs or sensor_specs.")
     validate_scene_state(render_request.scene_state)
     validate_robot_state(render_request.robot_state)
     if render_request.job_id != render_request.scene_state.job_id:
@@ -240,6 +264,11 @@ def validate_render_request(render_request: RenderRequest) -> None:
         if camera_spec.camera_id in seen:
             raise ValueError(f"Duplicate camera_id in render_request.camera_specs: {camera_spec.camera_id}")
         seen.add(camera_spec.camera_id)
+    for sensor_spec in render_request.sensor_specs:
+        validate_sensor_spec(sensor_spec)
+        if sensor_spec.sensor_id in seen:
+            raise ValueError(f"Duplicate sensor_id in render_request: {sensor_spec.sensor_id}")
+        seen.add(sensor_spec.sensor_id)
     if render_request.scene_override is not None:
         validate_scene_override_spec(render_request.scene_override)
     if render_request.assist_light is not None:
@@ -338,5 +367,7 @@ def validate_observation_bundle_manifest(bundle: ObservationBundleManifest) -> N
         raise ValueError("bundle.timestamp must match scene_state.timestamp.")
     for camera_spec in bundle.camera_specs:
         validate_camera_spec(camera_spec)
+    for sensor_spec in bundle.sensor_specs:
+        validate_sensor_spec(sensor_spec)
     for artifact in bundle.artifacts:
         validate_render_artifact_manifest(artifact)

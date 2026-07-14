@@ -8,7 +8,7 @@
 		headingHasSensorModality,
 		isPolarRenderModality,
 	} from '$lib/datasets/sensorHelpers';
-	import { buildBatchJobGrid } from '$lib/datasets/batchHelpers';
+	import { buildBatchJobGrid, normalizeJobStatus } from '$lib/datasets/batchHelpers';
 	import { opticalNavObservationModalityUrl } from '$lib/api';
 	import RenderLightbox from '$lib/datasets/RenderLightbox.svelte';
 	import type { Capabilities } from '$lib/datasets/capabilityHelpers';
@@ -126,7 +126,9 @@
 	}
 	const vpCompleted = $derived(
 		vpScan?.completed ?? (graphBatch
-			? (buildBatchJobGrid(graphBatch).rows.find((r: any) => r.nid === selectedSensorNodeId)?.cells?.filter((c: any) => c?.status?.status === 'completed')?.length ?? 0)
+			? (buildBatchJobGrid(graphBatch).rows.find((r: any) => r.nid === selectedSensorNodeId)?.cells?.filter(
+				(cell: any) => cell.jobs?.some((job: any) => normalizeJobStatus(job) === 'done'),
+			)?.length ?? 0)
 			: 0)
 	);
 	const vpTotal = $derived(vpScan?.total ?? graphBatch?.progress?.total ?? 0);

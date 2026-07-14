@@ -813,6 +813,42 @@
 	let exportIncludeBirdseye = $state(true);  // include a top-down bird's-eye summary PNG
 	let exportIncludeEpisodeBirdseye = $state(false);  // per-episode path map PNGs (episodes_birdseye/)
 	let exportEvalPerturbation = $state(false);  // also ship observations_perturbed/ (mirror/glass eval split)
+	let exportSelectedCameraIds = $state<string[]>([]);
+	let exportCameraSelectionSceneKey = $state('');
+	let exportCameraSelectionTouched = $state(false);
+	const exportCameraInventory = $derived.by(() => {
+		const raw = Array.isArray(observationScan?.sensor_inventory)
+			? observationScan.sensor_inventory
+			: [];
+		return raw
+			.map((item: any): exportJobsService.ExportCameraInventoryItem => ({
+				sensor_id: String(item?.sensor_id ?? ''),
+				modalities: Array.isArray(item?.modalities) ? item.modalities.map(String) : [],
+				observation_count: Number(item?.observation_count ?? 0),
+				base_count: Number(item?.base_count ?? 0),
+				perturbed_count: Number(item?.perturbed_count ?? 0),
+			}))
+			.filter((item: exportJobsService.ExportCameraInventoryItem) => Boolean(item.sensor_id));
+	});
+	$effect(() => {
+		const sceneKey = `${selectedProjectId}/${sceneId}`;
+		const availableIds = exportCameraInventory.map(
+			(item: exportJobsService.ExportCameraInventoryItem) => item.sensor_id
+		);
+		if (exportCameraSelectionSceneKey !== sceneKey) {
+			exportCameraSelectionSceneKey = sceneKey;
+			exportCameraSelectionTouched = false;
+			exportSelectedCameraIds = availableIds;
+			return;
+		}
+		if (!exportCameraSelectionTouched) {
+			exportSelectedCameraIds = availableIds;
+			return;
+		}
+		const available = new Set(availableIds);
+		const next = exportSelectedCameraIds.filter((cameraId) => available.has(cameraId));
+		if (next.length !== exportSelectedCameraIds.length) exportSelectedCameraIds = next;
+	});
 	// Active scene-bundle export job — populated when user clicks Export.
 	let activeExportJob = $state<import('$lib/datasets/services/exportJobsService').ExportJobStatus | null>(null);
 	let _exportJobUnsub: (() => void) | null = null;
@@ -1868,8 +1904,9 @@
 	}
 
 	function renderSettingsFromRigSensor(sensor: any): Record<string, unknown> {
+		const sensorType = String(sensor?.canonical_sensor_type ?? sensor?.sensor_type ?? 'rgb_camera').toLowerCase();
 		const settings: Record<string, unknown> = { ambient_radiance: ambientRadiance };
-		const render = normalizeRigRenderSettings(sensor?.render, String(sensor?.canonical_sensor_type ?? sensor?.sensor_type ?? 'rgb_camera'));
+		const render = normalizeRigRenderSettings(sensor?.render, sensorType);
 		settings.path_spp = render.path_spp;
 		settings.aov_spp = render.aov_spp;
 		settings.polar_spp = render.polar_spp;
@@ -3042,14 +3079,11 @@
 		if (data) perturbation = data;
 	}
 
-	// Sweep the render for the selected render variant(s). 'both' renders each
-	// viewpoint twice (base + perturbed) into separate output trees so the same
-	// cameras get a mirror-off and mirror-on image. Returns the last sweep result.
+	// Sweep the selected render variants as one UI submission. The daemon still
+	// creates one batch per variant, but every response is retained so base jobs do
+	// not disappear when the perturbed request returns.
 	async function sweepVariants(body: Record<string, unknown>): Promise<any> {
 		const variants = renderVariant === 'both' ? ['base', 'perturbed'] : [renderVariant];
-		// Guard: a 'perturbed' sweep needs the perturbed render scene staged. Without
-		// it the daemon would (used to) silently render the base scene — a "perturbed"
-		// output identical to base. Block it here with an actionable message instead.
 		if (variants.includes('perturbed') && !perturbation?.perturbed_render_ready) {
 			const why = perturbation?.perturbed_render_stale
 				? 'perturbation을 변경한 뒤 Sync Render Scene을 다시 실행해야 합니다 (perturbed XML stale).'
@@ -3060,11 +3094,39 @@
 			pushActivity('error', 'render:variant', error);
 			throw new Error(error);
 		}
-		let last: any;
-		for (const v of variants) {
-			last = await renderService.sweepViewpointGraph(selectedProjectId, sceneId, { ...body, scene_variant_key: v });
+
+		const submissionGroupId = `sweep-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+		const batches: any[] = [];
+		for (const variant of variants) {
+			const response = await renderService.sweepViewpointGraph(selectedProjectId, sceneId, {
+				...body,
+				scene_variant_key: variant,
+				submission_group_id: submissionGroupId,
+			});
+			batches.push({
+				...response,
+				scene_variant_key: variant,
+				submission_group_id: submissionGroupId,
+			});
 		}
-		return last;
+		const last = batches[batches.length - 1] ?? null;
+		return last ? {
+			...last,
+			batches,
+			batch_ids: batches.map((batch) => batch.batch_id).filter(Boolean),
+			submission_group_id: submissionGroupId,
+		} : null;
+	}
+
+	function registerGraphSweepResult(result: any): any {
+		const batches = Array.isArray(result?.batches) ? result.batches : result ? [result] : [];
+		if (!batches.length) return null;
+		const batchIds = batches.map((batch: any) => String(batch?.batch_id ?? '')).filter(Boolean);
+		graphBatchIds = [...new Set([...graphBatchIds, ...batchIds])];
+		for (const batch of batches) graphBatch = mergeBatch(graphBatch, batch);
+		const current = batches[batches.length - 1];
+		graphBatchId = String(current?.batch_id ?? '');
+		return current;
 	}
 
 	async function saveAuthoringMap(options: { updateRenderReadiness?: boolean; deferRenderSync?: boolean } = {}): Promise<boolean> {
@@ -3537,11 +3599,8 @@
 		if (activeCameraSpec) body.camera_spec = activeCameraSpec;
 		probeRendering = true;
 		try {
-			const data = await sweepVariants(body);
+			const data = registerGraphSweepResult(await sweepVariants(body));
 			if (data?.batch_id) {
-				graphBatchId = data.batch_id;
-				graphBatchIds = [...new Set([...graphBatchIds, data.batch_id])];
-				graphBatch = mergeBatch(graphBatch, data);
 				const renderedPose: HotCameraPose = {
 					...hotCameraPose,
 					batch_id: data.batch_id,
@@ -3767,11 +3826,8 @@
 			if (typeof h === 'number') body.node_heights = { [selectedSensorNode.node_id]: h };
 		}
 		try {
-			const data = await sweepVariants(body);
+			const data = registerGraphSweepResult(await sweepVariants(body));
 			if (data?.batch_id) {
-				graphBatchId = data.batch_id;
-				graphBatchIds = [...new Set([...graphBatchIds, data.batch_id])];
-				graphBatch = mergeBatch(graphBatch, data);
 				sensorRenderResult = { batch_id: data.batch_id, status: 'submitted' };
 				pushActivity('ok', 'sensor:render', `Render submitted: batch ${data.batch_id}`);
 				startBatchPolling();
@@ -3830,11 +3886,8 @@
 			const successMsg = renderMode === 'episode_nodes'
 				? 'Episode path sweep submitted.'
 				: 'Graph sensor sweep submitted.';
-			const data = await run(() => sweepVariants(body), successMsg, 'graph:sweep');
+			const data = registerGraphSweepResult(await run(() => sweepVariants(body), successMsg, 'graph:sweep'));
 			if (data?.batch_id) {
-				graphBatchId = data.batch_id;
-				graphBatchIds = [...new Set([...graphBatchIds, data.batch_id])];
-				graphBatch = mergeBatch(graphBatch, data);
 				startBatchPolling();
 			}
 		} else {
@@ -4128,11 +4181,16 @@
 
 	async function exportDataset() {
 		if (!selectedProjectId || !sceneId) return;
+		if (exportCameraInventory.length > 0 && exportSelectedCameraIds.length === 0) {
+			error = 'Select at least one camera before exporting.';
+			return;
+		}
 		// Scene-bundle export: always tied to the current scene. The submit
 		// returns immediately with a job_id; progress arrives over WS.
 		try {
 			const accepted = await exportJobsService.submitExportJob(selectedProjectId, {
 				scene_id: sceneId,
+				camera_ids: exportCameraInventory.length > 0 ? exportSelectedCameraIds : null,
 				only_completed: exportOnlyCompleted,
 				include_episode_thumbnails: exportIncludeThumbnails,
 				panorama_observations: exportPanoramaObservations,
@@ -4149,6 +4207,14 @@
 		} catch (err) {
 			error = `Export submit failed: ${errorMessage(err)}`;
 		}
+	}
+
+	function updateExportCameraSelection(cameraIds: string[]) {
+		const selected = new Set(cameraIds);
+		exportSelectedCameraIds = exportCameraInventory
+			.map((item: exportJobsService.ExportCameraInventoryItem) => item.sensor_id)
+			.filter((cameraId: string) => selected.has(cameraId));
+		exportCameraSelectionTouched = true;
 	}
 
 	async function cancelActiveExportJob() {
@@ -4803,6 +4869,10 @@
 					{renderMissingOnly}
 					onSetRenderMissingOnly={(v) => (renderMissingOnly = v)}
 					headingsPerNode={graphPayload?.node_heading_count ?? 0}
+					bind:sensorFindQuery
+					{sensorFindError}
+					graphNodeCount={graphNodes.length}
+					onFindSensor={focusSensorNode}
 					onRefreshBatch={refreshBatch}
 					onRemoveCustomSensor={(id) => { customSensorNodes = customSensorNodes.filter(n => n.id !== id); }}
 					onCustomSensorHeadingChange={(id, deg) => { customSensorNodes = customSensorNodes.map(n => n.id === id ? {...n, headingDeg: deg} : n); sensorRenderResult = null; }}
@@ -4824,7 +4894,9 @@
 				bind:pngOnly={exportPngOnly}
 				bind:includeBirdseye={exportIncludeBirdseye}
 				bind:includeEpisodeBirdseye={exportIncludeEpisodeBirdseye}
-				bind:evalPerturbation={exportEvalPerturbation}
+					bind:evalPerturbation={exportEvalPerturbation}
+					cameraInventory={exportCameraInventory}
+					selectedCameraIds={exportSelectedCameraIds}
 					currentSceneId={sceneId}
 					{exportableEpisodeCount}
 					exportSummary={exportResult}
@@ -4833,6 +4905,7 @@
 					onExport={exportDataset}
 					onCancelExport={cancelActiveExportJob}
 					onResetExport={resetExportJob}
+					onCameraSelectionChange={updateExportCameraSelection}
 				/>
 			{/if}
 

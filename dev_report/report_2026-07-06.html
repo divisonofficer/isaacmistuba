@@ -1,0 +1,579 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>2026-07-06 Infinigen 재질 import·injection 점검 · 편광 viz 개편</title>
+  <style>
+    :root{color-scheme:light;--bg:#f7f8fb;--paper:#fff;--ink:#1f2937;--muted:#667085;--line:#d9dee8;--accent:#1d5fd1;--ok:#087443;--warn:#a15c07;--code:#f1f4f9;}
+    body{margin:0;background:var(--bg);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;line-height:1.58;}
+    .layout{display:flex;min-height:100vh;align-items:flex-start;}
+    aside{width:260px;flex:0 0 260px;position:sticky;top:0;height:100vh;overflow-y:auto;padding:24px 16px;border-right:1px solid var(--line);background:#eef2f7;}
+    .logo{font-weight:800;color:var(--accent);font-size:16px;}
+    .date{margin-top:3px;color:var(--muted);font-size:12px;font-family:ui-monospace,Menlo,Consolas,monospace;}
+    .nav-title{margin:22px 8px 8px;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.12em;font-weight:800;}
+    .nav-link{display:block;padding:6px 8px;border-radius:5px;color:#344054;font-size:12px;text-decoration:none;margin-bottom:2px;}
+    .nav-link:hover{background:#dde3ee;color:var(--accent);}
+    main{flex:1;min-width:0;padding:36px 24px 64px;}
+    article{max-width:1080px;margin:0 auto;background:var(--paper);border:1px solid var(--line);border-radius:8px;padding:34px 40px;box-shadow:0 8px 24px rgb(16 24 40/.05);}
+    h1,h2,h3{line-height:1.25;margin:0;}
+    h1{font-size:28px;}
+    h2{margin-top:34px;padding-top:22px;border-top:1px solid var(--line);font-size:20px;}
+    h3{margin-top:22px;font-size:16px;}
+    p{margin:10px 0 0;}
+    ul{margin:10px 0 0 20px;padding:0;}
+    li{margin:5px 0;}
+    code{background:var(--code);border:1px solid #e5e9f2;border-radius:5px;padding:1px 5px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:.92em;}
+    pre{overflow-x:auto;background:#111827;color:#e5e7eb;border-radius:8px;padding:14px 16px;font-size:13px;line-height:1.5;}
+    pre code{background:transparent;border:0;padding:0;color:inherit;}
+    table{width:100%;border-collapse:collapse;margin-top:12px;font-size:14px;}
+    th,td{border:1px solid var(--line);padding:9px 10px;text-align:left;vertical-align:top;}
+    th{background:#f3f6fb;font-weight:650;}
+    figure{margin:16px 0 0;}
+    figure img{width:100%;border:1px solid var(--line);border-radius:8px;display:block;}
+    figcaption{margin-top:6px;color:var(--muted);font-size:12.5px;}
+    .meta{margin-top:10px;color:var(--muted);font-size:14px;}
+    .badge{display:inline-block;margin-right:6px;border-radius:999px;padding:2px 9px;border:1px solid var(--line);background:#f8fafc;color:var(--muted);font-size:12px;}
+    .ok{color:var(--ok);font-weight:650;}
+    .warn{color:var(--warn);font-weight:650;}
+    .note{margin-top:12px;padding:10px 14px;border-left:3px solid var(--accent);background:#f3f6fb;border-radius:0 6px 6px 0;font-size:13.5px;}
+    .gallery{display:grid;grid-template-columns:1fr;gap:20px;margin-top:16px;}
+    @media(max-width:980px){.layout{display:block;}aside{position:relative;width:auto;height:auto;border-right:0;border-bottom:1px solid var(--line);}main{padding:20px;}article{padding:24px 20px;}}
+  </style>
+</head>
+<body>
+<div class="layout">
+<aside>
+  <div class="logo">Robomituba</div>
+  <div class="date">2026-07-06</div>
+  <div class="nav-title">오늘 보고서</div>
+  <a class="nav-link" href="#summary">요약</a>
+  <div class="nav-title">A. 재질 import·injection 점검</div>
+  <a class="nav-link" href="#dist">A1. 원본 .blend 재질 분포</a>
+  <a class="nav-link" href="#flow">A2. import→injection→render 흐름</a>
+  <a class="nav-link" href="#qa">A3. 관찰 현상 5문 해설</a>
+  <a class="nav-link" href="#metallic">A4. metallic이 미사용인 이유</a>
+  <a class="nav-link" href="#rules">A5. 분류 규칙 · η,k/IOR 맵</a>
+  <a class="nav-link" href="#robust">A6. Robustness · 액션</a>
+  <div class="nav-title">B. 편광 viz · 렌더</div>
+  <a class="nav-link" href="#viz">B1. 편광 시각화 개편 (전역)</a>
+  <a class="nav-link" href="#palette">B2. 재질 팔레트 재현 (spp 1024)</a>
+  <a class="nav-link" href="#closeup">B3. 재질별 RGB↔편광 closeup</a>
+  <a class="nav-link" href="#gallery">B4. kr20260625 갤러리 재렌더</a>
+  <a class="nav-link" href="#physics">B5. 편광 물리 검증 (vp_000030)</a>
+  <a class="nav-link" href="#mataudit">B6. 재질 할당 점검</a>
+  <a class="nav-link" href="#objsig">B7. 재질 signature · 텍스처 소비</a>
+  <a class="nav-link" href="#glbfix">B8. UV 손실 수정 (GLB 라우팅)</a>
+  <a class="nav-link" href="#repro">재현 방법 · 남은 일</a>
+  <div class="nav-title">이전 보고서</div>
+  <a class="nav-link" href="report_2026-07-05_active_flash_imaging.html">2026-07-05 Active flash imaging</a>
+  <a class="nav-link" href="report_2026-07-02.html">2026-07-02</a>
+  <a class="nav-link" href="report_2026-07-01.html">2026-07-01 BSDF 주입 OLD vs NEW</a>
+  <a class="nav-link" href="report_2026-06-30.html">2026-06-30 metallic/IOR</a>
+  <a class="nav-link" href="index.html">← 전체 목록</a>
+</aside>
+<main>
+<article>
+  <h1>Infinigen 재질 import·injection robustness 점검 &amp; 편광 viz 개편</h1>
+  <p class="meta">
+    <span class="badge">injection audit</span><span class="badge">549 src materials</span><span class="badge">viz overhaul</span><span class="badge">measured pol.</span>
+    <span class="badge">spp 1024</span><span class="badge">injected BSDF</span>
+    <span class="badge">infinigen_kr_20260625</span>
+  </p>
+
+  <h2 id="summary">요약</h2>
+  <p>
+    두 갈래. <b>A</b>) webui 재질 인스펙터에서 제기된 의문(metallic이 0, IOR 안 보임, albedo 텍스처 없음)을 계기로
+    <b>Infinigen 재질 생성 ↔ 우리 import/injection 로직의 robustness 를 원본 <code>scene.blend</code>·import 코드·렌더 XML 세 층에서 점검</b>했다.
+    <b>B</b>) 2026-07-01 이후 <b>카메라(FOV 60→75)</b>·<b>재질 주입</b> 갱신으로 stale 해진 예시를 위해 <b>편광 viz 를 전역 개편</b>하고 갱신 씬으로 예시를 새로 뽑았다.
+  </p>
+  <div class="note">
+    <b>A의 한 줄 결론</b> — <code>metallic</code> 채널은 이 파이프라인에서 <b>사실상 미사용(vestigial)이며 그것이 의도된 설계</b>다.
+    Infinigen 절차적 셰이더가 Principled <code>Metallic</code>/<code>IOR</code> 를 신뢰성 있게 안 채우므로, <b>셰이더 이름 기반 <code>optical_class</code></b> 로
+    conductor/dielectric/diffuse 를 정하고 금속 η,k·유전체 IOR 을 주입한다. 팀도 이미 인지 —
+    <code>blender_export_scene.py:_optical_class</code>: <i>"Infinigen's metallic param is unreliable … Name keyword is the primary signal."</i>
+  </div>
+  <ul>
+    <li><b>편광 시각화 개편(전역)</b> — S1/S2·S1/S0·S2/S0 를 <b>순수 red-white-blue</b>로(배경 S0 intensity 제거),
+        AoLP 를 <b>완전 DoLP-gating</b>(무편광 영역 hue 누출 제거). <code>save_polarization_products()</code> 한 곳에서 전 파이프라인 PNG에 반영.</li>
+    <li><b>재질 팔레트 재현(spp 1024)</b> — plastic/Al/Au/Cr/Ag/Cu 구(球) 한 줄을 새 viz로 재현, 재질별 고유 DoLP/AoLP 서명 확인.</li>
+    <li><b>재질별 closeup 추출(신규 도구)</b> — <code>apps/render_material_closeups.py</code>: 광학적으로 흥미로운(거울/유리/금속) 오브젝트를
+        <b>하나씩 가까이</b> 프레이밍해 "RGB에선 이렇게 · 편광에선 이렇게"를 한 장에 보인다.</li>
+    <li><b>kr20260625 갤러리 재렌더</b> — 갱신된 카메라(FOV 75) + injection 으로 top 예시 재추출.</li>
+  </ul>
+
+  <h2 id="dist">A1. 원본 <code>.blend</code> 재질 분포 — 어떤 채널이 실제로 제공되는가</h2>
+  <p>
+    source: <code>data/infinigen_generated/outputs/kr_20260625/full/scene.blend</code> (2.8&nbsp;GB) →
+    Blender 익스포터 매니페스트 <code>out/infinigen_imports/kr_20260625/scene_manifest.json</code> 의 <b>549개 머티리얼</b> 집계.
+  </p>
+  <table>
+    <thead><tr><th>채널</th><th>분포</th><th>해석</th></tr></thead>
+    <tbody>
+      <tr><td>procedural</td><td><b>502 / 549 (91%)</b></td><td>대부분 노드그래프 셰이더</td></tr>
+      <tr><td>image_textures 보유</td><td><b>47 / 549 (8%)</b></td><td>← "albedo가 flat" 의 근본 원인</td></tr>
+      <tr><td><code>metallic</code></td><td><b>0 = 464 (85%)</b>, nonzero 85</td><td>진짜 metal 셰이더만 세팅: <code>shader_metal.*</code>=1.0(26), brushed/hammered/grained=0.375(11)</td></tr>
+      <tr><td><code>ior</code></td><td><b>1.5 = 539 (98%)</b></td><td>실질 미제공. 예외 10: lampshade 4.0(4), ceramic 1.47(3), plant 1.01~1.3</td></tr>
+      <tr><td><code>roughness</code></td><td>547 / 549 제공 (0.6=237, 0.9=73)</td><td class="warn">⚠ 4개가 &gt;1 버그: snake_plant=14.28, succulent/spider=2.0</td></tr>
+      <tr><td><code>optical_class</code></td><td>diffuse 442 · metal_aluminum 72 · glass 31 · mirror 4</td><td>분광-활성 재질 107 / 549 (19%)</td></tr>
+    </tbody>
+  </table>
+  <div class="note">
+    핵심: <b>albedo·roughness는 (스칼라로) 제공되지만 metallic은 대부분 상수 0, IOR은 사실상 미제공(98%가 1.5)</b> —
+    관측한 가설과 정확히 일치. 그래서 <b>IOR injection 은 필수</b>(원본 IOR 무의미)이고 <b>metallic 무시는 정당</b>하다.
+  </div>
+
+  <h2 id="flow">A2. import → injection → render 흐름 — 어디서 무엇이 실제로 쓰이나</h2>
+  <p>원본 스칼라가 렌더까지 살아남는지를 실제 <code>render_scene.xml</code> 의 텍스처 참조·BSDF 타입으로 확인했다.</p>
+  <table>
+    <thead><tr><th>텍스처 채널</th><th>render_scene.xml 참조</th><th>매핑되는 Mitsuba 파라미터</th></tr></thead>
+    <tbody>
+      <tr><td>albedo</td><td>174</td><td><code>diffuse_reflectance</code></td></tr>
+      <tr><td>roughness</td><td>212</td><td><code>alpha</code> — <b class="ok">per-texel roughness 실제로 wired</b></td></tr>
+      <tr><td>normal</td><td>221</td><td><code>normalmap</code></td></tr>
+      <tr><td class="warn">metallic</td><td class="warn"><b>0</b></td><td class="warn">143개 baked PNG 가 디스크에 있으나 <b>렌더가 전혀 참조하지 않음</b></td></tr>
+    </tbody>
+  </table>
+  <p class="meta">BSDF 타입(render_scene.xml): pplastic 173 · roughconductor 51 · roughplastic 9 · conductor 1 · dielectric 1 (+ normalmap/twosided 래퍼).</p>
+  <div class="note" style="border-left-color:var(--warn);background:#fbf6ee;">
+    <b>낭비 발견</b> — <code>--bake-pbr</code> 가 metallic 아틀라스(143장)를 EMIT-trick 으로 굽지만(<code>blender_export_scene.py:_bake_metallic</code>),
+    값이 ~0이고 렌더가 metallic 을 아예 읽지 않으므로 <b>순수 낭비</b>. <code>--no-bake-metallic</code> 로 bake 시간 절약 권장.
+  </div>
+
+  <h2 id="qa">A3. webui 인스펙터 관찰 현상 5문 해설</h2>
+  <table>
+    <thead><tr><th>#</th><th>관찰</th><th>해설 (근거)</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td><code>sofa_fabric</code> 등 albedo/roughness/metallic 텍스처 안 묻어남</td>
+        <td><b>Infinigen 의도 + import 특성</b>. 91% procedural / 텍스처 8%. procedural 은 <code>_trace_color</code> 가 <b>단일 대표색</b>만 추출 → albedo flat. fabric 은 baked atlas 도 없어 완전 flat.</td></tr>
+      <tr><td>2</td><td>LargeShelf 등 머티리얼 2+개인데 전환해도 차이 없음</td>
+        <td><b>사실상 정보 공유가 맞다</b>. <code>shelves_black_wood.NNN</code> 변종이 base=[0.01,0.01,0.01]·metallic=0·rough=0.9·텍스처0 으로 <b>전부 동일</b>. 슬롯만 다름. (% 는 <code>usemtl</code> 삼각형 비율.)</td></tr>
+      <tr><td>3</td><td><code>brushed_metal</code> metal 분류인데 metallic=0 — 안 쓰나?</td>
+        <td><b>metallic 은 렌더 결정에 안 읽힘</b>(<code>render_daemon.py:1287</code>). reflectance 는 <b>Al η,k 프리셋</b>, metallic=0 무시 → <b>정상</b>.</td></tr>
+      <tr><td>4</td><td><code>plaster</code> 벽 텍스처가 mesh 형상 안 띔 — 벽 편광 되나?</td>
+        <td>base_color 는 flat 이나 <b>roughness 는 per-texel alpha 로 wired</b>. 벽 편광은 pplastic <b>analytic diffuse Fresnel(IOR 1.5)</b> → <b>기하-기반 DoLP gradient 정상</b>. micro-texture 변화는 roughness atlas 있는 면 한정, diffuse 편광은 1차 근사(Kondo 2020).</td></tr>
+      <tr><td>5</td><td>wood+metal 혼합, roughness 차이는 보이나 metallic 둘 다 0</td>
+        <td>roughness 차이는 <code>alpha</code> 로 반영. metal/wood 구분은 metallic 아닌 <b><code>optical_class</code>+<code>bsdf_strategy</code></b>(roughconductor vs pplastic). → <b>제대로 구분됨</b>.</td></tr>
+    </tbody>
+  </table>
+  <div class="note">
+    <b>보너스 — webui "albedo 0.00"</b>: 표시 아티팩트. albedo 스칼라가 <code>null</code> 인데 <code>fmt(null)</code> 이 <code>Number(null)=0 → "0.00"</code> 을 뱉음
+    (<code>MaterialInspector.svelte:109</code>). 실제 albedo 는 옆의 <b>색 swatch</b>(base_color). roughness/metallic 숫자는 진짜 값. (마이너 UI 버그)
+  </div>
+
+  <h2 id="metallic">A4. 왜 <code>metallic</code> 을 안 쓰는가 — 설계 근거</h2>
+  <p>metal-vs-dielectric 판정은 <b>오직 <code>optical_class</code>/<code>bsdf_strategy</code></b> 로 이뤄지며, <code>metallic</code> 스칼라는 렌더 제어에 한 번도 읽히지 않는다(UI 리포트·override 전달용으로만 READ).</p>
+  <ul>
+    <li><b>원본이 신뢰 불가</b>: 진짜 금속조차 Principled Metallic 을 0으로 두는 경우가 태반(brushed_metal=0.0). 절차적 그래프가 Anisotropic/Glossy 로 금속 룩을 만들기 때문.</li>
+    <li><b>이름 기반이 더 견고</b>: <code>shader_brushed_metal</code>, <code>shader_metal.*</code> 이름 키워드가 metallic 스칼라보다 안정적. metallic≥0.5 는 <b>보조 fallback</b>.</li>
+    <li><b>결과</b>: metallic 이 0이어도 metal 은 conductor(Al η,k)로 정확히 렌더. metallic 채널만 보면 고장난 듯하지만 파이프라인상 무해.</li>
+  </ul>
+
+  <h2 id="rules">A5. <code>optical_class</code> 분류 규칙 + η,k / IOR injection 맵</h2>
+  <h3>이름 → optical_class (<code>blender_export_scene.py:_optical_class</code>, 이름 우선)</h3>
+  <pre><code>"glass"                                     -> glass
+"mirror"/"chrome"                            -> mirror
+"gold"/"brass"                               -> metal_gold
+"steel"/"iron"/"suj"                         -> metal_steel
+"metal"/"alumin"/"galvan"/"brush"/"grain"
+   /"copper"/"silver"/"nickel"  OR metallic>=0.5 -> metal_aluminum
+else                                         -> diffuse</code></pre>
+  <table>
+    <thead><tr><th>optical_class</th><th>bsdf_strategy</th><th>주입 (injected 모드)</th></tr></thead>
+    <tbody>
+      <tr><td>metal_gold</td><td>roughconductor</td><td>η,k = <b>Au</b></td></tr>
+      <tr><td>metal_steel</td><td>roughconductor</td><td>η,k = <b>Cr</b> (Fe 프리셋 부재 → stand-in)</td></tr>
+      <tr><td>metal_aluminum</td><td>roughconductor</td><td>η,k = <b>Al</b> (base_color 로 Au/Cu/Cr 재판별 가능)</td></tr>
+      <tr><td>mirror</td><td>conductor</td><td>η,k = <b>Ag</b></td></tr>
+      <tr><td>glass</td><td>dielectric / roughdielectric</td><td>int_ior = <b>1.50</b></td></tr>
+      <tr><td>diffuse</td><td>pplastic</td><td>int_ior = 클래스별 표(대개 1.5), diffuse_reflectance 텍스처</td></tr>
+    </tbody>
+  </table>
+  <p class="meta">legacy 모드는 전부 int_ior=1.5 / material=Al 하드코딩; injected 모드가 위 표대로 per-class 주입. 이 두 모드가 webui 토글·§B4 갤러리 비교 대상.</p>
+
+  <h2 id="robust">A6. Robustness 평가 · 액션 아이템</h2>
+  <p><b class="ok">견고한 점</b> — metallic 무시 + 이름기반 optical_class 는 옳은 선택(원본 신뢰불가를 팀이 이미 인지), IOR injection 필수성 확인, roughness per-texel 실제 적용됨.</p>
+  <table>
+    <thead><tr><th>#</th><th>리스크 / 개선</th><th>조치</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td><b>metallic bake 낭비</b> — 143 PNG 굽지만 렌더 0회 참조</td><td><code>--no-bake-metallic</code>, 또는 metallic bake 제거</td></tr>
+      <tr><td>2</td><td class="warn"><b>roughness&gt;1 버그</b> — plant 4종(snake_plant=14.28)</td><td>alpha 주입 전 <code>min(rough,1.0)</code> clamp 위치 확인</td></tr>
+      <tr><td>3</td><td><b>optical_class 이름 의존</b> — metal_aluminum 이 gold/steel 아닌 모든 metal 을 Al 로 뭉갬; 0.375 semi-metallic 도 full conductor; 애매한 이름은 diffuse. <b>구체 사례</b>: <code>PanFactory</code> 가 <code>shader_rough_plastic</code> 셰이더명을 받아 <b>금속 팬이 dielectric 으로</b> 분류(§B6).</td><td>base_color 재판별 확대 / <b>object factory 이름 override</b>(Pan·Skillet·Pot·Kettle→metal) / semi-metal blendbsdf 로드맵</td></tr>
+      <tr><td>4</td><td><b>albedo 미-bake 88%</b> — 대부분 단일색</td><td>spatial albedo 필요 씬은 <code>--bake-pbr</code> 전체 적용</td></tr>
+      <tr><td>5</td><td>webui albedo "0.00" 표기 버그</td><td><code>fmt</code> 가 albedo(null) 엔 라벨 미표시하도록 수정</td></tr>
+    </tbody>
+  </table>
+  <div class="note">
+    <b>남은 마지막 한 겹</b> — <code>scene_manifest</code> 는 <b>Principled 소켓만</b> 읽는다(<code>_trace_color</code> 는 RGB/ColorRamp/TEX_IMAGE 정도 trace).
+    brushed_metal 이 실제로 Anisotropic/Glossy BSDF 를 쓰면 Principled metallic 이 0으로 잡히는 것뿐일 수 있다.
+    "어떤 셰이더가 Principled 를 안 쓰는지" 노드-타입 분포는 <b>bpy 로 <code>scene.blend</code> 직접 열어야</b> 확정 가능 — 후속 작업.
+  </div>
+
+  <h2 id="viz">B1. 편광 시각화 개편 (전역)</h2>
+  <p>
+    편광 산출물 PNG는 모두 <code>modules/mitsuba_converter/src/mitsuba_converter/multimodal.py</code>의
+    <code>save_polarization_products()</code>에서 생성된다. 두 가지를 고쳤고, 프로덕션 렌더 전체에 반영된다.
+  </p>
+  <h3>(a) Stokes S1/S2 → 순수 red-white-blue (배경 제거)</h3>
+  <p>
+    기존 <code>bwr_map()</code>은 발산형 red/blue 뒤에 <b>S0 intensity(grayscale) 배경</b>을 15% 하한으로 블렌딩했다.
+    이 때문에 부호(+/−)·크기가 밝기와 섞여 읽혔다. 이제 <b>배경을 깔지 않고</b> 0에서 흰색, +scale에서 순수 빨강,
+    −scale에서 순수 파랑으로만 매핑한다(무효 픽셀은 흰색 fallback). S1/S0·S2/S0 도 동일.
+  </p>
+  <h3>(b) AoLP → 완전 DoLP-gating (hue 누출 제거)</h3>
+  <p>
+    <code>aolp_map()</code>의 hue 불투명도는 √DoLP 로 변조되지만 <b>0.20 하한</b>이 있어, DoLP≈0(무편광) 영역에서도
+    노이즈성 각도(hue)의 20%가 새어 나왔다. 하한을 제거해 <code>rgb = context·(1−√DoLP) + hue·√DoLP</code> 로 바꿔,
+    무편광 영역은 <b>grayscale(S0)로 완전히 회귀</b>하고 편광이 실재하는 곳에만 색이 남는다.
+  </p>
+  <div class="note">
+    <b>검증</b>: 합성 Stokes 텐서로 확인 — +S1→(1.0,0.4,0.4) 빨강, −S1→(0.4,0.4,1.0) 파랑, DoLP≈0→(1,1,1) 순백(S1/S0);
+    AoLP 는 고DoLP 블록에서 채도 hue, DoLP≈0 블록에서 (1.0,0.97,0.97) 회백 = <b>hue 완전 억제</b>. 실 렌더(§2)에서도 재확인.
+  </div>
+
+  <h2 id="palette">B2. 재질 팔레트 재현 — spp 1024, 새 viz</h2>
+  <p>
+    통제된 "금속 팔레트"(plastic + 실금속 Al/Au/Cr/Ag/Cu 구)를 프로덕션과 동일한 <code>render_modalities</code>
+    경로로 <b>spp 1024</b>에서 재현. 각 재질이 <b>서로 다른 DoLP/AoLP 서명</b>을 갖는다는 것이 per-material
+    IOR/eta·k 주입이 필요한 물리적 근거다. 새 viz 로 AoLP 의 specular highlight 중심이 <b>회색으로 gating</b>되고
+    DoLP 는 순백 배경 위에 읽힌다.
+  </p>
+  <figure>
+    <img src="assets/0706_metal_palette_montage.png" alt="metal palette RGB/DoLP/AoLP spp1024" loading="lazy">
+    <figcaption>좌→우: plastic · Al · Au · Cr · Ag · Cu. 상단 RGB, 중단 DoLP(red-black), 하단 AoLP(rainbow, DoLP-gated).
+      <code>apps/demo_metal_polarization.py --spp 1024 --res 1200</code></figcaption>
+  </figure>
+
+  <h2 id="closeup">B3. 재질별 RGB↔편광 closeup — "이 재질은 RGB에선 이렇게, 편광에선 이렇게"</h2>
+  <p>
+    실내 전체 뷰포인트는 한 재질의 편광 서명이 주변 지오메트리에 묻힌다. 그래서 신규 도구
+    <code>apps/render_material_closeups.py</code>는 <b>광학적으로 흥미로운 오브젝트를 하나씩 가까이</b> 프레이밍한다:
+    baked mesh 의 world bbox 를 읽어 오브젝트가 화면의 <b>~55%</b>를 채우도록 카메라 거리를 잡고, 카메라 높이를
+    <b>편안한 시야 band [0.9, 1.6] m</b> 로 두어(floor/ceiling skimming 방지) 오브젝트를 내려다/올려다본다.
+    씬 자체 조명이 어둡고 불균일하므로 <b>카메라 옆 fill point light(headlight, intensity ∝ dist²)</b> 를 주입해 일관되게 밝힌다.
+    injected(물리) 모드를 편광 variant 로 <b>spp 1024</b> 렌더하고 <code>[RGB | DoLP | AoLP | S1/S0]</code> montage 를 낸다.
+    injected XML 은 프로덕션 <code>render_scene.xml</code>(갱신본) 재사용으로 ~7분 재생성 생략.
+  </p>
+  <div class="note">
+    선택 기준: injected BSDF 가 metal(roughconductor)·glass(dielectric)·mirror(conductor)인 오브젝트(kr20260625 에 40개)를
+    <b>고립도(최근접 이웃 거리) 우선</b>·크기로 랭크. 단 <b>납작한 오브젝트(벽거울·패널, min/max extent&lt;0.3)는 제외</b> —
+    정면 법선 프레이밍이 없으면 비스듬히 보여 얇은 sliver 로만 잡힌다(초기 시도에서 확인). 결과적으로 잘 고립된 금속 가전·화분·유리 병이 선택됨.
+  </div>
+  <div class="note" style="border-left-color:var(--warn);background:#fbf6ee;">
+    <b>디버그 히스토리 — 초기 렌더의 검은 영역은 physics 가 아니라 setup 버그</b>였다. (1) <b>카메라 높이 버그</b>: 예전
+    <code>eye_y = center_y + 0.35·r</code> 은 바닥 오브젝트에서 카메라를 <b>~0.2 m</b>(바닥 skimming)에, 선반 위 병에선 천장 근처에 뒀다 →
+    프레임 하단/상단이 통째로 어두운 바닥·천장. (2) <b>ambient no-op</b>: <code>_inject_constant_emitter</code> 는 <code>not _has_emitter</code> 일 때만
+    작동하는데 이 씬엔 이미 emitter(area 15 + constant 0.57)가 있어 <code>--ambient</code> 가 <b>완전히 무시</b>됐다 → 유리/거울이 어두운 방을 비춰 검게 나옴.
+    <b>해결</b>: 높이 band clamp + 카메라 headlight. <code>max_depth=6</code> 은 유리/거울 1-bounce 에 충분하므로 검정의 원인이 아니었다.
+  </div>
+  <div class="note" style="border-left-color:var(--ok);">
+    <b>A6 clamp 선행조건 — 이미 충족</b>: roughness→alpha 는 <code>_clamp_bsdf_alpha(ceiling=0.9)</code>(<code>render_daemon.py:1171</code>)로 이미 clamp 되어
+    프로덕션 <code>render_scene.xml</code> 의 scalar alpha 는 max 0.6·<b>&gt;1 값 0개</b>. <code>snake_plant=14.28</code> 은 잎(diffuse)이라 이 closeup 대상(금속·유리 용기/가전)에 없음. → 그대로 배치 렌더.
+  </div>
+  <div class="note">
+    <b>RGB tonemap</b> — montage RGB 는 원본 rgb.png(specular percentile 자동노출) 대신 <b>linear HDR(<code>stokes_data.npz['rgb']</code>)</b> 에서
+    p90 을 일정 중간톤으로 맞추는 <b>노출 + Reinhard + sRGB gamma</b> 로 재-tonemap(도구 기본값). headlight 로 이미 잘 밝혀진 위에 적용되어
+    <b>어두운 그림자까지 균형있게</b> 보인다. DoLP/AoLP/S1·S0 패널은 물리량이라 그대로.
+  </div>
+  <div class="note" style="border-left-color:var(--ok);">
+    <b>UV 수정 반영</b>: 아래 closeup 은 <b>§B8 exporter UV 수정 후의 메시</b>로 재렌더했다 — 무-UV barycentric 아티팩트(가짜 텍스처)가 제거되어 텍스처가 올바르게 매핑된다(예: #2 나무결).
+  </div>
+  <div class="gallery" id="closeup-gallery">
+      <figure>
+        <img src="assets/0706_closeup_c01_metal.png" alt="plant in metal bowl closeup" loading="lazy">
+        <figcaption><b>#1 · 브러시드 금속 화분 (roughconductor)</b> — <code>LargePlantContainerFactory(5261571)</code>, 고립도 nn=1.04m. headlight 로 화분·잎이 또렷.
+          <b>금속 볼 표면 DoLP 强(red) · AoLP 완만 gradient</b>; diffuse 잎은 약편광. 예전 "새까만" 버전은 카메라 높이 0.2m + ambient no-op 버그였다(위 debug note).</figcaption>
+      </figure>
+      <figure>
+        <img src="assets/0706_closeup_c02_metal.png" alt="wood TV stand closeup (UV-fixed)" loading="lazy">
+        <figcaption><b>#2 · 나무 TV 스탠드 (roughconductor+wood)</b> — <code>TVStandFactory(4576596)</code>, 고립도 nn=1.02m. <b>UV 수정(§B8) 후 재렌더</b>: 이전엔 barycentric 아티팩트로 <b>가짜 houndstooth 직조</b>였으나 이제 <b>올바른 나무결</b>. 나무 표면이 각진 면마다 DoLP/AoLP 서명(오른쪽 벽 pplastic diffuse Fresnel gradient 도 뚜렷).</figcaption>
+      </figure>
+      <figure>
+        <img src="assets/0706_closeup_c03_metal.png" alt="plant in metal bowl closeup 2" loading="lazy">
+        <figcaption><b>#3 · 브러시드 금속 화분 (roughconductor)</b> — <code>LargePlantContainerFactory(9348784)</code>, 고립도 nn=1.00m. 다른 위치의 금속 볼 — <b>금속=강DoLP·균일 AoLP</b> 서명 일관성 재확인.</figcaption>
+      </figure>
+      <figure>
+        <img src="assets/0706_closeup_c04_glass.png" alt="glass jar backlit closeup" loading="lazy">
+        <figcaption><b>#4 · 유리 병 (dielectric)</b> — <code>JarFactory(9410176)</code>. 카메라 headlight + <b>오브젝트 뒤 backlight</b> 로 벽을 밝혀 병을 <b>실루엣</b>으로 세웠다.
+          <b>유전체 rim(가장자리)이 DoLP 强</b> — 유전체는 grazing 에서 강편광(§B5: 유리 @45° DoLP 0.83 vs Al 0.03). frosted/두꺼운 병이라 body 는 투과가 약해 어둡다(이 씬엔 clear glassware 부재).</figcaption>
+      </figure>
+  </div>
+
+  <h2 id="gallery">B4. kr20260625 갤러리 재렌더 — 갱신 카메라(FOV 75) + injection</h2>
+  <p>
+    2026-07-01 갤러리(03:25 렌더)는 이후 갱신된 <b>템플릿 카메라(FOV 60→75, 07-02 19:13)</b>와 재질 주입을 반영하지 못한다.
+    동일 뷰포인트를 <b>legacy vs injected</b> 두 모드로 <b>spp 1024</b> 재렌더하고 새 viz 로 montage 를 재생성했다.
+  </p>
+  <p>
+    각 그림은 3행(legacy · injected · diff) × 4열(RGB · DoLP · AoLP · S1/S0). <code>batch_bsdf_examples.py</code> 가
+    <b>injected XML 은 갱신된 프로덕션 <code>render_scene.xml</code> 재사용</b>, legacy 만 재생성해 뷰포인트를 spread 로 4개 골랐다.
+  </p>
+  <div class="gallery" id="rerender-gallery">
+      <figure>
+        <img src="assets/0706_gallery_01_infinigen_kr_20260625_vp_000094_h_000.png" alt="vp_000094 legacy vs injected" loading="lazy">
+        <figcaption><b>#1 · vp_000094_h_000</b> (score 69.5) — <b>교과서적 corridor</b>: legacy 는 벽 전체가 <b>DoLP≈1(red) 과편광</b>(int_ior=1.5 전면적용),
+          injected 는 무광 벽 DoLP 를 <b>물리적으로 붕괴</b>시켜 실제 편광 표면만 남긴다. diff 행이 벽 전역에서 <b>파랑(DoLP 감소)</b>. DoLP |Δ|&gt;0.05 <b>46.3%</b> · AoLP(masked) 0.453 rad.</figcaption>
+      </figure>
+      <figure>
+        <img src="assets/0706_gallery_02_infinigen_kr_20260625_vp_000059_h_000.png" alt="vp_000059 legacy vs injected" loading="lazy">
+        <figcaption><b>#2 · vp_000059_h_000</b> (score 20.6) — 벽·가구 편광 재분포. DoLP |Δ|&gt;0.05 <b>8.7%</b> · AoLP(masked) 0.236 rad · chroma Δ +0.004.</figcaption>
+      </figure>
+      <figure>
+        <img src="assets/0706_gallery_03_infinigen_kr_20260625_vp_000001_h_000.png" alt="vp_000001 legacy vs injected" loading="lazy">
+        <figcaption><b>#3 · vp_000001_h_000</b> (score 17.3) — 무광 벽 DoLP→0 교정 + 금속만 편광 유지. DoLP |Δ|&gt;0.05 <b>5.8%</b> · AoLP(masked) 0.228 rad.</figcaption>
+      </figure>
+      <figure>
+        <img src="assets/0706_gallery_04_infinigen_kr_20260625_vp_000030_h_000.png" alt="vp_000030 legacy vs injected" loading="lazy">
+        <figcaption><b>#4 · vp_000030_h_000</b> (score 6.4) — 완만한 편광 변화(AoLP 위주). DoLP |Δ|&gt;0.05 <b>2.5%</b> · AoLP(masked) 0.076 rad.</figcaption>
+      </figure>
+  </div>
+
+  <h2 id="physics">B5. 편광 물리 검증 — vp_000030 침실 사례 (금속 vs 유전체)</h2>
+  <p>
+    §B4 #4(vp_000030) 를 자세히 뜯어보면 4가지 관찰이 나오는데, <b>전부 물리적으로 옳은 렌더</b>임을 analytic Fresnel 로 정량 확인했다.
+    장면: 침대(천 침구) + <b>나무 등받이</b> + 등받이 위 <b>은색 풍선</b>(<code>BalloonFactory</code>). 재질 확인 —
+    풍선 <code>shader_brushed_metal</code>→<b>roughconductor(Al)</b>, 등받이 <code>shader_wood</code>·침구 <code>sofa_fabric</code>→<b>pplastic(diffuse)</b>.
+  </p>
+  <h3>단일 specular 반사의 DoLP — 유전체 vs Al 금속 (analytic Fresnel)</h3>
+  <table>
+    <thead><tr><th>표면</th><th>peak DoLP</th><th>@45°</th><th>@60°</th><th>의미</th></tr></thead>
+    <tbody>
+      <tr><td>유전체 n=1.5 (유리/코팅)</td><td><b>1.00</b> (Brewster 56°)</td><td>0.83</td><td>0.98</td><td>강편광</td></tr>
+      <tr><td class="warn"><b>Al 금속 (풍선)</b></td><td class="warn"><b>0.14</b> (82°)</td><td class="warn"><b>0.03</b></td><td class="warn"><b>0.06</b></td><td>약편광 (~15× 낮음)</td></tr>
+    </tbody>
+  </table>
+  <p class="meta">Al: n≈0.96, k≈6.69 → Rs≈Rp → |Rs−Rp| 미소 → DoLP 낮음. 유전체는 Brewster 에서 Rp→0 → DoLP→1.</p>
+  <table>
+    <thead><tr><th>#</th><th>관찰</th><th>검증 (verdict)</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td>풍선 색 정보가 injection 후 변함</td>
+        <td><b class="ok">의도됨</b>. legacy(코팅형 처리)→injected(실 Al η,k) 로 풍선이 <b>제대로 반사(chrome-like)</b>. "색"은 고정 albedo 가 아니라 <b>반사된 방</b>이다. η,k 주입의 정상 효과.</td></tr>
+      <tr><td>2</td><td>나무 등받이 편광이 injection 후 ≈0</td>
+        <td><b class="ok">의도된 교정</b>. legacy 는 int_ior=1.5 를 <b>전 표면에 발라</b> 무광 나무까지 과편광(벽 corridor 와 동일). injected 는 rough diffuse 유전체로 두어 specular 편광 lobe 가 약·넓음→저DoLP.
+        <b>단</b> analytic diffuse 편광은 1차 근사(Kondo 2020) — 실제 무광 나무는 약하지만 <b>nonzero</b>; "정확히 0" 은 모델 바닥이라 measured 는 잔차 존재.</td></tr>
+      <tr><td>3</td><td>침구가 약한 편광 방출</td>
+        <td><b class="ok">타당(1차 근사)</b>. rough pplastic → 약한 DoLP + <b>주름 법선을 따라가는 AoLP</b>(기하학적으로 옳음). 단 실제 직물은 subsurface·섬유 구조로 measured pBRDF 가 크기·분포에서 달라짐 — analytic 은 <b>경향</b>만.</td></tr>
+      <tr><td>4</td><td>풍선이 RGB 는 glossy 인데 S1 편광이 안 보임</td>
+        <td><b class="ok">물리적으로 옳음</b>. <b>gloss(고반사) ≠ 고편광</b>. Al 은 약편광(위 표: @45° DoLP 0.03) — 유리(0.83)의 1/28. 곡면 풍선의 다양한 각도에서도 DoLP 는 최대 0.14. <b>금속 vs 유전체 편광 구분</b>의 교과서적 예.</td></tr>
+    </tbody>
+  </table>
+  <div class="note">
+    <b>한 줄</b>: legacy→injected 의 "풍선 반사 강화 · 나무/침구 과편광 붕괴 · 금속 저DoLP" 는 모두
+    <b>metal(약편광) vs dielectric(강편광, 무광이면 저편광) 의 올바른 물리</b>다. 남는 정량 오차는 analytic diffuse 의 태생적 한계(measured pBRDF 영역)로, §7-01 로드맵과 동일.
+  </div>
+
+  <h2 id="mataudit">B6. 재질 할당 점검 — vp_000030 / vp_000059 객체별</h2>
+  <p>
+    두 뷰포인트의 객체별 <code>render_binding</code>(bsdf_strategy · optical_class)을 원본과 대조했다. <b>대부분 정상이고,
+    유일한 실질 이슈는 프라이팬</b>이다. "이상해 보이는" 나머지는 이미 규명된 세 가지 — 절차적 단일색 텍스처(§A), conductor 의 eta-k 표현(§A4), 금속의 약편광(§B5) — 로 설명된다.
+  </p>
+  <table>
+    <thead><tr><th>객체 (material)</th><th>할당</th><th>검증</th></tr></thead>
+    <tbody>
+      <tr><td>풍선 <code>brushed_metal</code></td><td>roughconductor / <b>Al</b></td>
+        <td><b class="ok">정상 — 금속(유리 아님)</b>. webui 에 albedo/metallic 이 없는 건 <b>conductor 는 η,k 프리셋을 쓰고 diffuse albedo·metallic 스칼라를 안 쓰기</b> 때문(§A4); roughness 는 <code>alpha</code> 로 존재. 약편광 = Al 물리(§B5).</td></tr>
+      <tr><td class="warn">프라이팬 <code>rough_plastic</code></td><td class="warn">pplastic / <b>diffuse</b></td>
+        <td><b class="warn">⚠ 유일한 실질 이슈</b>. Infinigen 이 팬 셰이더를 문자 그대로 <code>rough_plastic</code> 로 지어, 이름기반 분류(§A5)가 metal 키워드 없음 → diffuse. 팬을 금속으로 기대하면 <b>오분류</b>(§A6 #3 구체 사례). <b>factory-name override</b>(<code>PanFactory→metal</code>) 필요.</td></tr>
+      <tr><td>선반 (metal 36% + shelves_white 64%)</td><td>roughconductor + pplastic</td>
+        <td><b class="ok">정상 — multi-usemtl</b>. 금속 프레임 = conductor, 흰 패널 = diffuse 로 올바르게 분리.</td></tr>
+      <tr><td>PlantContainer(9673922) <code>grained_metal</code></td><td>roughconductor / <b>Al</b></td>
+        <td><b class="ok">정상 — 금속</b>("grain"→metal_aluminum). "하얀 무편광" 은 Al 이 밝은 softbox 를 <b>반사(→밝음)</b> + Al <b>약편광</b>(§B5) → <b>올바른 물리</b>, 미할당/버그 아님. 안의 snake_plant 는 pplastic(diffuse).</td></tr>
+      <tr><td>침대보 <code>sofa_fabric</code> · 프레임 <code>wood</code> · rug</td><td>pplastic / diffuse (flat)</td>
+        <td><b class="ok">분류 정상</b>(직물·나무·러그 = diffuse). 단일 albedo/roughness 는 <b>Infinigen 절차적 → 대표색 1개</b>(§A, 88% spatial bake 안 됨) — 미할당이 아니라 텍스처-bake 갭. rug 의 약한 spatial roughness 는 baked atlas 있는 면 한정(§A: roughness per-texel wired).</td></tr>
+    </tbody>
+  </table>
+  <div class="note">
+    <b>액션</b>: 이름기반 optical_class 를 <b>object factory 이름</b>으로 보강(예 <code>Pan/Skillet/Pot/Kettle→metal</code>) 하면 셰이더명이 애매한 금속기물을 잡는다.
+    현재는 <b>셰이더명에 충실</b>한 분류라 Infinigen 이 <code>rough_plastic</code> 로 지은 팬을 그대로 dielectric 으로 렌더 — <b>파이프라인 버그가 아니라 입력(셰이더명) 한계</b>. §A6 #3 에 팬 사례 추가.
+  </div>
+
+  <h2 id="objsig">B7. Infinigen 오브젝트 종류 × 재질 signature → 편광 준비도 · 텍스처 소비 현실</h2>
+  <p>
+    Infinigen indoor 가 실제로 어떤 종류의 오브젝트를 만들고, 각 오브젝트가 <b>어떤 재질 채널을 들고 오는지</b>(UV / albedo / roughness / metallic / IOR, 그리고 각 맵이 <b>공간변화(spatially-varying)</b>인지 스칼라인지)를 전수 스캔했다.
+    관찰의 출발점: <b>bookshelf·bottle</b> 류는 UV·albedo·roughness 가 다 있고 metallic 도 <b>공간변화</b>로 있는데, <b>glass bottle</b> 은 albedo·roughness·metallic·UV 가 아예 없고(순수 IOR), <b>fabric</b> 은 UV 없이 flat albedo 만 있다 — 이 <b>채널 유무 패턴이 곧 광학 클래스이자 편광 렌더 준비도</b>라는 가설을 데이터로 확인한다.
+  </p>
+  <div class="note">
+    <b>스캔 방법.</b> import 2개(<code>kr_20260627</code> 598 + <code>kr_88074926_apartment</code> 605 = <b>1,203 objects</b>)에 대해
+    ① mesh <code>.obj</code> 의 <code>vt</code> 유무로 <b>UV</b>, ② baked <code>{oid}_{albedo|metallic|roughness|normal}.png</code> 존재+<b>std&gt;0.04</b> 로 맵·공간변화, ③ <code>scene_manifest.json</code> 의 <code>optical_class / ior / is_glass / metallic·roughness scalar</code> 를 결합.
+    스크립트: <code>apps/analyze_infinigen_material_signatures.py</code>.
+  </div>
+
+  <figure>
+    <img src="assets/0706_object_signature_heatmap.png" alt="object type × material channel signature heatmap">
+    <figcaption>
+      <b>[per-baked-file signature]</b> 오브젝트 종류(행, 대표 40종·n≥4) × <b>자기 인스턴스가 baked 한</b> 재질 채널(열)의 보유율(%).
+      <b>Wineglass·Mirror</b> = 전 채널 0 (순수 dielectric/mirror, IOR·reflectance 만).
+      <b>Bottle·Can·WallArt</b>(금속) = 전 채널 100 + <b>metallic 공간변화 88–90%</b>.
+      <b>BookStack·FoodBox·BookColumn</b> = 전 채널 100 + albedo/metallic 공간변화(인쇄 라벨·책등).
+      <b>hoof·Fruit·Cube</b> = 재질 데이터 없음(nature/primitive).
+      ⚠ <b>이 표는 "인스턴스별 baked 파일" 기준</b>이라 flat 을 과다계상한다 — 렌더러는 재질 정체성으로 <b>BSDF 를 공유</b>하고(§아래 render-time 보정), 텍스처의 실제 소비 여부는 <b>메시 UV 유무</b>가 결정한다.
+    </figcaption>
+  </figure>
+
+  <h3>렌더타임 현실 — shared BSDF + 텍스처 소비 3분류 (per-file 스캔의 보정)</h3>
+  <p>
+    위 per-file signature 는 두 가지를 놓친다: (1) 렌더 파이프라인은 <b>같은 재질을 쓰는 인스턴스끼리 BSDF·텍스처를 공유</b>(kr_20260627 기준 distinct textured shared_bsdf <b>521개가 1,087 shape 을 커버</b>)하므로, 자기 baked 파일이 없는 인스턴스도 대표 인스턴스의 텍스처로 렌더된다 → <b>flat 과다계상</b>.
+    (2) 텍스처가 BSDF 에 바인딩돼도 <b>메시에 UV(<code>vt</code>)가 없으면 소비 불가</b>.
+    그래서 <code>render_scene.xml</code> 의 <b>실제 placed shape 1,978개</b>(3 씬)를 다시 파싱해 각 shape 의 <b>주입된 BSDF 광학타입 × 텍스처 바인딩 × mesh_cache UV</b> 를 뽑았다. (<code>apps/analyze_infinigen_rendertime_materials.py</code>)
+  </p>
+
+  <div class="gallery" style="grid-template-columns:1.55fr 1fr;align-items:center;">
+    <figure><img src="assets/0706_rendertime_matrix.png" alt="render-time optical x texture consumption"></figure>
+    <figure><img src="assets/0706_texture_consumption_donut.png" alt="texture consumption donut"></figure>
+  </div>
+
+  <table>
+    <thead><tr><th>텍스처 소비 상태 (n, %)</th><th>뜻</th><th>주요 종류</th><th>조치</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><span class="badge" style="background:#087443;color:#fff">TEXTURE_OK</span><br>1,363 · 69%</td>
+        <td>UV + 텍스처 → <b>정상 소비</b> (baked albedo/rough/normal 이 UV 레이아웃대로 적용)</td>
+        <td>BookStack·FoodBox·Bottle·Can 등 대부분의 가구·소품</td>
+        <td class="ok">문제 없음</td>
+      </tr>
+      <tr>
+        <td><span class="badge" style="background:#c2410c;color:#fff">TEXTURE_BROKEN</span><br>292 · 15%</td>
+        <td>텍스처는 BSDF 에 바인딩됐으나 <b>메시 UV 없음</b> → Mitsuba 가 <code>si.uv = (b1,b2)</code> <b>삼각형 barycentric</b> 으로 샘플([mesh.cpp:1477](#)) → <b>삼각형마다 뒤죽박죽 오적용</b></td>
+        <td>SingleCabinet 61, Bowl 45, Window 32, SimpleBookcase 26, LargeShelf 24, FloorLamp 16, DeskLamp 12, CeilingLight 11, CellShelf 10, Oven 8…</td>
+        <td class="warn">OBJ export 가 UV 를 떨굼(GLB 엔 UV 존재). 원본 OBJ UV 복구 or GLB 소비로 전환</td>
+      </tr>
+      <tr>
+        <td><span class="badge" style="background:#9aa4b2;color:#fff">FLAT_RGB</span><br>323 · 16%</td>
+        <td>텍스처 없음 — <b>단일 base_color</b> or IOR-only</td>
+        <td>NatureShelfTrinkets 166·PlantContainer 49(진짜 flat) · <b>Mirror 12·유리 32(=정상 IOR/reflectance-only)</b></td>
+        <td>진짜 flat 만 대상; 유리·거울은 <b>정상</b>(맵 불필요)</td>
+      </tr>
+    </tbody>
+  </table>
+  <p class="meta">* 광학축(주입 BSDF): plastic/diffuse 1,772(90%) · <b>metal 174(9%) + dielectric 32(2%) = 편광 Fresnel-정의 11%</b>. metal 은 셋 다 존재(OK 98·BROKEN 48·FLAT 28), <b>dielectric 32 는 전부 FLAT_RGB = IOR-only 로 물리적으로 정상</b>.</p>
+
+  <div class="note">
+    <b>두 질문에 대한 답.</b>
+    <ul>
+      <li><b>Q. DIFFUSE_MAP_NOUV 는 UV 없이 텍스처를 어떻게 소비하나?</b> → <b>못 한다(TEXTURE_BROKEN, 292개·15%)</b>. 원본 <code>meshes/*.obj</code> 가 <code>vt</code>=0 이고 mesh_cache 는 그 OBJ 에서 추출되므로 UV 가 없다. BSDF 는 albedo/rough/normal 을 바인딩하지만 Mitsuba 는 texcoord 가 없으면 삼각형 barycentric 을 UV 로 써서 <b>오적용</b>한다. GLB 에는 UV(예: CeilingLight 15,826개)가 있으니 <b>OBJ export 단계의 UV 손실 버그</b>다.</li>
+      <li><b>Q. DIFFUSE_SCALAR 는 그냥 단일 색인가?</b> → <b>일부만</b>. 진짜 단일색은 <b>16%(323)</b> 뿐이고, 그중 유리·거울 44개는 <b>정상 IOR/reflectance-only</b>. 나머지는 <b>shared BSDF</b> 로 같은 재질 대표 인스턴스의 텍스처를 빌려 렌더된다 — per-file 스캔이 flat 을 41%로 과다계상했던 이유.</li>
+    </ul>
+  </div>
+
+  <h3>대표 5종 PBR 맵 몽타주 — baked "채널 유무"가 광학 클래스로 직결됨</h3>
+  <figure>
+    <img src="assets/0706_pbr_maps_montage.png" alt="per-object PBR channel maps for 5 representative objects">
+    <figcaption>
+      각 광학 클래스의 baked 채널. <b>#1 Tap(metal)</b>: albedo=검정(금속 확산 없음)·metallic=흰색(1.0).
+      <b>#2 Jar(glass)</b>: 전 채널 "no map" — 순수 IOR-only 확인.
+      <b>#3 FoodBox(diffuse-textured)</b>: albedo 에 실제 인쇄 라벨(바코드·문자).
+      <b>#4 Lampshade(fabric)</b>: 직물 패턴이 albedo 에.
+      <b>#5 TVStand(brushed-metal)</b>: albedo=나무톤 + metallic 맵=검정(0.0) 인데 <code>optical_class=metal</code> — 셰이더명 vs 스칼라 불일치 사례(§A3).
+    </figcaption>
+  </figure>
+
+  <div class="note">
+    <b>결론 — 두 개의 독립 축으로 봐야 한다: (편광) 광학 클래스 · (외형) 텍스처 소비.</b>
+    <ul>
+      <li><b>편광 축 (주입 BSDF 광학 클래스)</b>: 렌더타임 기준 <b>metal 9% + dielectric 2% = 11%</b> 만 Fresnel 로 편광이 잘 정의된다. glass 는 맵 없이 <b>IOR-only 로 정상</b>(FLAT_RGB 32 = 전부 유리), metal 은 <code>optical_class</code> 기반 <b>η,k injection</b> 으로 준비(§A5). 나머지 <b>90% plastic/diffuse</b> 는 약한 specular 로브 근사.</li>
+      <li><b>외형 축 (텍스처 소비)</b>: <b>TEXTURE_OK 69%</b> 는 정상, <b>TEXTURE_BROKEN 15%(292개)</b> 는 텍스처가 바인딩됐으나 <b>UV 없어 오적용</b>(SingleCabinet·Bowl·Window·SimpleBookcase·LargeShelf…), <b>FLAT_RGB 16%</b> 는 단일색(+유리·거울 정상분).</li>
+      <li><b>per-file 스캔의 함정</b>: 렌더러가 재질별로 BSDF·텍스처를 <b>공유</b>하므로 "인스턴스별 baked 파일" 기준은 flat 을 과다계상(41%)한다. 실제 flat 은 16%. <b>진짜 판별자는 "메시에 UV 가 있어 바인딩된 텍스처를 실제로 소비하는가"</b>.</li>
+      <li><b>액션</b>: (1) DIELECTRIC 경로 smooth <code>dielectric</code> 고정(roughdielectric=DoLP0 금지, §B1), (2) metal η,k injection 을 174 metal shape 에 우선 적용, (3) <b>TEXTURE_BROKEN 292개의 OBJ UV 손실 버그 수정</b> — GLB 엔 UV 가 있으므로 export/mesh_cache 경로를 GLB 소비 or UV 보존 OBJ 로 교체.</li>
+    </ul>
+  </div>
+
+  <h2 id="glbfix">B8. UV 손실 버그 수정 — Infinigen 렌더를 GLB 지오메트리로 (구현)</h2>
+  <p>
+    §B7 액션 #3(<b>OBJ UV 손실 → baked 텍스처 소비 불가</b>)을 실제 코드로 고쳤다. 진단·구현·검증 요약:
+  </p>
+  <h3>문제</h3>
+  <ul>
+    <li>렌더 경로는 오브젝트의 <code>source_ref</code>(<b>.obj</b>)를 소비하는데, Infinigen <b>.obj 는 UV 손실</b>(263개 중 <b>146개 vt=0</b>).</li>
+    <li>그 중 <b>72개는 baked PBR atlas(albedo·roughness·normal·metallic)를 .mtl 로 참조</b>하지만 UV 가 없어 <b>텍스처가 죽어있다</b>(degenerate UV 로 매핑 → flat/garbage).</li>
+    <li>DTC 자산용 <code>glb_texture_adapter</code>(glb→per-material OBJ, <b>UV 보존</b>)는 이미 있으나 Infinigen 은 이 경로를 안 탔다.</li>
+  </ul>
+  <h3>수정 (flag 기본 OFF, opt-in)</h3>
+  <ul>
+    <li><code>ROBOMITUBA_INFINIGEN_USE_GLB=1</code> 이면 Infinigen 오브젝트를 <b>.glb(UV 보존) 로 라우팅</b>. 신규 <code>_split_glb_shapes_cached</code>(<code>render_daemon.py</code>)가 glb 를 per-material OBJ 로 머티리얼라이즈하고, <b>각 파트의 glTF material name → authoring <code>material_id</code> 로 이름 매핑</b>(<code>obj_split</code> 과 동일 규칙) → <b>§A/§B optical_class injection 그대로 보존</b>.</li>
+    <li><b>버그 발견·수정</b>: 첫 시도의 flag-on 렌더가 깨짐(<b>depth 70% 불일치·12% 구멍</b>). 원인 — 어댑터 <code>_scene_geometries</code> 가 glTF <b>node transform 을 무시하고 local frame 으로 export</b>(Infinigen GLB 는 회전을 노드에 보유). vertex 에 node transform 을 bake 하도록 수정(<b>adapter v5</b>; DTC 는 identity 라 no-op·안전).</li>
+  </ul>
+  <h3>검증 (vp_000059, flag-off vs on, 그 외 조건 동일)</h3>
+  <table>
+    <thead><tr><th>항목</th><th>결과</th></tr></thead>
+    <tbody>
+      <tr><td>지오메트리 (depth)</td><td><b class="ok">일치</b> — v5 수정 후 mean |Δdepth| <b>0.0012 m</b>, &gt;0.1m 픽셀 0.2%, 구멍 0% (수정 전 0.94m·70.8%·12%)</td></tr>
+      <tr><td>injection 보존</td><td><b class="ok">동일</b> — conductor {Al:30,Cr:12,Ni:4,Au:4,Cu:1,Ag:1}, int_ior 분포 동일. 540 shape 이 GLB 파트(UV 보유) 참조</td></tr>
+      <tr><td>텍스처 소비</td><td>72개 오브젝트의 죽은 atlas 가 <b>실제 매핑됨</b>(GLB 파트 vt=UV 완비). 로드 텍스처 ↑ → <b>GPU 메모리 무거움</b>(res 512 OOM, <code>ROBOMITUBA_TEXTURE_MAX_RESOLUTION</code> cap 필요)</td></tr>
+      <tr><td class="warn">가시 효과</td><td class="warn"><b>이 절차적 씬에선 modest</b> — RGB mean 44.7→45.5, closeup pixel |Δ| <b>8.7/255</b>. Infinigen 절차적 재질은 대표색 1개라 baked albedo 가 near-uniform(§A) → flat fallback 과 큰 차이 없음</td></tr>
+    </tbody>
+  </table>
+  <figure>
+    <img src="assets/0706_glb_ab_rgb.png" alt="GLB off vs on RGB" loading="lazy">
+    <figcaption>vp_000059 RGB — <b>OFF</b> obj_split(UV 없음) vs <b>ON v5</b> GLB(UV·atlas 소비). 지오메트리 완전 일치, 밝기·구도 동일 — <b>수정이 정확</b>하고 이 씬에선 차이가 미미함을 함께 보인다.</figcaption>
+  </figure>
+  <figure>
+    <img src="assets/0706_glb_ab_albedo.png" alt="GLB off vs on albedo AOV" loading="lazy">
+    <figcaption>Albedo AOV — 벽·가구가 near-uniform albedo 라 OFF(flat fallback)와 ON(spatial atlas)이 거의 동일. atlas 는 <b>정상 매핑</b>되나 표면이 균일해 시각 이득이 작다.</figcaption>
+  </figure>
+  <div class="note">
+    <b>중간 결론</b>: GLB 라우팅은 <b>정확한 인프라 수정</b>(UV·per-material·injection 보존)이나 render-time GLB 머티리얼라이즈 + 텍스처 메모리 오버헤드가 있다. 이후 <b>근본 원인을 찾아 exporter 를 고쳤다</b>(아래).
+  </div>
+
+  <h3>근본 원인 &amp; 수정 — export/bake 순서 버그 (upstream, 채택)</h3>
+  <p>
+    UV 손실의 진짜 원인은 <b><code>tools/infinigen/blender_export_scene.py</code> 의 export/bake 순서</b>였다. Blender 씬에서 무-UV 오브젝트(TVStand·Cabinet·Shelf: <code>uv_layers=0</code>)는 —
+  </p>
+  <ol style="margin:8px 0 0 20px;">
+    <li>메인 루프가 <b>OBJ 를 먼저 export</b>(<code>_export_obj</code>) → 이 시점엔 UV 없음 → <code>vt=0</code>.</li>
+    <li>그 뒤 bake 단계의 <code>_ensure_uv</code> 가 <b>Smart-UV-project 로 UV 를 생성</b> → 그 UV 로 atlas 를 굽는다.</li>
+    <li>GLB 는 bake <b>후</b> export → GLB 만 그 UV 를 담고, OBJ 는 못 담는다.</li>
+  </ol>
+  <p>
+    결과: atlas 는 OBJ 에 없는 UV 로 구워져, 렌더 시 mitsuba 가 <b>barycentric per-triangle fallback</b> 으로 atlas 를 적용 → <b>가짜 반복 텍스처</b>(TVStand 가 나무결이 아니라 가짜 houndstooth "직조"로 보였던 이유). 즉 §B4/§B3 에서 무-UV 금속에 보이던 "디테일" 은 <b>아티팩트</b>였다.
+  </p>
+  <p>
+    <b>수정</b>(1줄): <code>_ensure_uv(obj)</code> 를 <code>_export_obj</code> <b>앞에</b> 호출 → OBJ 와 bake 가 <b>같은 Smart-Project UV</b> 를 공유. flag 불필요, 표준 OBJ 경로가 바로 옳게 동작. <b>검증</b>: TVStand 재-export → OBJ <code>vt=0→1090</code>, 2D UV <code>[0.01,0.97]×[0.01,0.99]</code>, 렌더가 <b>올바른 나무결</b>(아래).
+  </p>
+  <figure>
+    <img src="assets/0706_uvfix_3way.png" alt="TVStand BEFORE (barycentric) / GLB / AFTER (correct wood grain)" loading="lazy">
+    <figcaption>씬 렌더 3-way — <b>BEFORE</b>(obj vt=0): 가짜 houndstooth 직조(barycentric 아티팩트); <b>GLB 라우팅</b>: strip UV 로 flat-ish; <b>AFTER</b>(exporter 수정): <b>올바른 나무결</b>. exporter 수정이 최상(2D UV). walls/floor 등 다른 fixed 오브젝트도 함께 올바르게 매핑됨.</figcaption>
+  </figure>
+  <h3>속도: re-bake 불필요 (Smart-UV 결정성) → ~5분 적용</h3>
+  <p>
+    Smart-UV-Project 가 <b>결정적</b>(같은 mesh+params → 같은 UV)임을 확인: no-bake 재-export UV == with-bake UV(동일), 그리고 <b>no-bake OBJ + 원본 production atlas 렌더가 올바름</b>. 즉 기존 atlas 는
+    이미 이 결정적 UV 로 구워졌고, OBJ 만 그 UV 를 못 담았던 것. → <b>re-bake 불필요</b>. 신규 <code>--reuse-atlas</code> 모드로 OBJ 만 재-export + MTL 을 기존 atlas 에 재연결.
+  </p>
+  <div class="note" style="border-left-color:var(--ok);">
+    <b>적용 완료</b>(kr20260625, in place): <code>--reuse-atlas --no-bake</code> 로 263 obj <b>~5분</b> 재-export(bake 없음). <b>atlas 있는 no-UV 오브젝트 72→0</b>(전부 교정), TVStand vt=0→1090. 남은 no-UV 55개는 <b>atlas 없음</b>(mirror/glass/미-bake) → UV 무의미. 표준 OBJ 경로가 flag 없이 올바르게 동작(GLB 라우팅 대안은 유지, flag OFF).
+    <br>변경: <code>tools/infinigen/blender_export_scene.py</code>(<code>_ensure_uv</code> before export + <code>--reuse-atlas</code>/<code>--only</code>), <code>render_daemon.py</code>·<code>glb_texture_adapter.py</code>(GLB 경로 대안).
+  </div>
+
+  <h2 id="repro">재현 방법 · 남은 일</h2>
+  <pre><code># 표준 빌드 env
+export PYTHONPATH=modules/robomituba_bridge/src:modules/mitsuba_converter/src:\
+modules/navigation_dataset/src:/home/jinnyeong/robomituba-build/mitsuba3/python
+export LD_LIBRARY_PATH=/usr/lib/wsl/lib
+
+# (2) 재질 팔레트
+python3 apps/demo_metal_polarization.py --preset metal --spp 1024 --res 1200 \
+  --out out/bsdf_compare/metal_palette_v2
+
+# (3) 재질별 closeup (injected XML 재사용; 카메라 headlight 로 조명;
+#     montage RGB 는 linear HDR 에서 tonemap 기본 적용)
+python3 apps/render_material_closeups.py --scene infinigen_kr_20260625 \
+  --k 6 --spp 1024 --res 640 --headlight 6.0
+
+# (4) 갱신 카메라+injection 갤러리 재렌더 (injected XML 재사용, legacy 만 regen)
+python3 apps/batch_bsdf_examples.py --scenes infinigen_kr_20260625 \
+  --per-scene 4 --spp 1024 --res 512
+
+# (B8) Infinigen 을 GLB(UV 보존) 로 라우팅 — flag opt-in, 텍스처 메모리 cap 필요
+ROBOMITUBA_INFINIGEN_USE_GLB=1 ROBOMITUBA_TEXTURE_MAX_RESOLUTION=512 \
+  python3 apps/compare_bsdf_modes.py --scene infinigen_kr_20260625 \
+  --request <req.json> --modes injected --spp 256 --res 512
+#  → render_scene XML 이 .obj 대신 glb_*_parts/*.obj(UV) 참조. injection 은 이름 매핑으로 동일 유지.</code></pre>
+  <ul>
+    <li><b>0° 정의(편광 카메라 대조)</b> — 출력 Stokes frame 의 0° 를 실제 편광 카메라(IMX250MZR 등)와 명시 대조 필요(§07-01 §5 잔여).</li>
+    <li><b>diffuse 편광 상한</b> — analytic Fresnel 은 금속·매끈 유전체엔 정확하나 diffuse(벽·직물·나무) 편광은 1차 근사(Kondo 2020).</li>
+    <li><b>legacy XML regen 비용</b> — injected 는 프로덕션 <code>render_scene.xml</code> 재사용으로 즉시, legacy A/B 는 XML 재생성(~7분)이 필요.</li>
+  </ul>
+</article>
+</main>
+</div>
+</body>
+</html>

@@ -54,7 +54,7 @@ class SweepRenderPhase:
 
 
 _SWEEP_EXECUTION_POLICIES = {"auto", "per_view", "modality_phases"}
-_PHASE_ORDER = ("rgb", "polar")
+_PHASE_ORDER = ("rgb", "polar", "lidar")
 
 
 def _mat4_from_xy_yaw(x: float, y: float, yaw_rad: float, height_m: float = 1.0) -> list[float]:
@@ -106,6 +106,8 @@ def _camera_templates_from_payloads(
     *,
     camera_spec_payload: dict | None,
     camera_specs_payload: Sequence[Mapping[str, Any]] | None = None,
+    sensor_specs_payload: Sequence[Mapping[str, Any]] | None = None,
+    allow_empty: bool = False,
     sensor_scope: str = "active",
     sensor_ids: Sequence[str] | None = None,
 ) -> list[object]:
@@ -122,9 +124,28 @@ def _camera_templates_from_payloads(
         raw_specs = [dict(camera_spec_payload)]
     else:
         raw_specs = []
+    if not raw_specs and allow_empty:
+        return []
     if not raw_specs:
         raise ValueError("No camera_spec payload was provided for sweep rendering.")
     return [camera_spec_from_payload(dict(item)) for item in raw_specs]
+
+
+def _sensor_templates_from_payloads(sensor_specs_payload: Sequence[Mapping[str, Any]] | None) -> list[object]:
+    from robomituba_bridge import isaac_sensor_spec_from_payload
+
+    return [
+        isaac_sensor_spec_from_payload(dict(item))
+        for item in (sensor_specs_payload or [])
+        if isinstance(item, Mapping)
+    ]
+
+
+def _sensor_render_modalities(sensor_template: object, fallback_modalities: Sequence[str]) -> list[str]:
+    values = getattr(sensor_template, "modalities", None)
+    if isinstance(values, Sequence) and not isinstance(values, (str, bytes)) and values:
+        return [str(item) for item in values if str(item)]
+    return [str(item) for item in fallback_modalities]
 
 
 def _camera_render_modalities(camera_template: object, fallback_modalities: Sequence[str]) -> list[str]:
@@ -170,6 +191,9 @@ def _needs_default_assist_light(modalities: Sequence[str]) -> bool:
 
 
 def _modality_phase(modalities: Sequence[str]) -> str:
+    lidar_modalities = {"lidar_point_cloud", "lidar_range", "lidar_signal", "lidar_reflectivity", "lidar_near_ir", "lidar_valid", "lidar_xyz"}
+    if any(str(item) in lidar_modalities for item in modalities):
+        return "lidar"
     return "polar" if any(str(item) in POLAR_SWEEP_MODALITIES for item in modalities) else "rgb"
 
 
@@ -209,8 +233,10 @@ def split_sweep_requests_by_modality_phase(
         for sweep_request in sweep_requests:
             request = sweep_request.request
             camera_specs = list(getattr(request, "camera_specs", []) or [])
+            sensor_specs = list(getattr(request, "sensor_specs", []) or [])
             modalities_by_sensor = dict(sweep_request.modalities_by_sensor or getattr(request, "extras", {}).get("modalities_by_sensor") or {})
             phase_camera_specs = []
+            phase_sensor_specs = []
             phase_modalities_by_sensor: dict[str, list[str]] = {}
             for camera_spec in camera_specs:
                 camera_id = str(getattr(camera_spec, "camera_id", "") or "")
@@ -221,11 +247,18 @@ def split_sweep_requests_by_modality_phase(
                     continue
                 phase_camera_specs.append(camera_spec)
                 phase_modalities_by_sensor[camera_id] = camera_modalities
-            if not phase_camera_specs:
+            for sensor_spec in sensor_specs:
+                sensor_id = str(getattr(sensor_spec, "sensor_id", "") or "")
+                sensor_modalities = [str(item) for item in modalities_by_sensor.get(sensor_id, _sensor_render_modalities(sensor_spec, [])) if str(item)]
+                if not sensor_modalities or _modality_phase(sensor_modalities) != phase_name:
+                    continue
+                phase_sensor_specs.append(sensor_spec)
+                phase_modalities_by_sensor[sensor_id] = sensor_modalities
+            if not phase_camera_specs and not phase_sensor_specs:
                 continue
 
             phase_modalities = _union_modalities(phase_modalities_by_sensor, [])
-            phase_sensor_ids = [str(getattr(item, "camera_id", "") or "") for item in phase_camera_specs]
+            phase_sensor_ids = [str(getattr(item, "camera_id", "") or "") for item in phase_camera_specs] + [str(getattr(item, "sensor_id", "") or "") for item in phase_sensor_specs]
             phase_job_id = f"{request.job_id}-{phase_name}"
             phase_scene_state = replace(request.scene_state, job_id=phase_job_id)
             phase_extras = {
@@ -244,6 +277,7 @@ def split_sweep_requests_by_modality_phase(
                 job_id=phase_job_id,
                 scene_state=phase_scene_state,
                 camera_specs=phase_camera_specs,
+                sensor_specs=phase_sensor_specs,
                 modalities=phase_modalities,
                 assist_light=request.assist_light if _needs_default_assist_light(phase_modalities) else None,
                 extras=phase_extras,
@@ -278,6 +312,7 @@ def build_sweep_render_requests(
     render_settings: dict | None = None,
     node_heights: dict | None = None,
     camera_specs_payload: Sequence[Mapping[str, Any]] | None = None,
+    sensor_specs_payload: Sequence[Mapping[str, Any]] | None = None,
     sensor_scope: str = "active",
     sensor_ids: Sequence[str] | None = None,
     active_lights: Sequence[Mapping[str, Any]] | None = None,
@@ -294,9 +329,11 @@ def build_sweep_render_requests(
         for item in (active_lights or [])
         if isinstance(item, Mapping) and item.get("enabled", True)
     ]
+    sensor_templates = _sensor_templates_from_payloads(sensor_specs_payload)
     camera_templates = _camera_templates_from_payloads(
         camera_spec_payload=camera_spec_payload,
         camera_specs_payload=camera_specs_payload,
+        allow_empty=bool(sensor_templates),
         sensor_scope=sensor_scope,
         sensor_ids=sensor_ids,
     )
@@ -318,6 +355,7 @@ def build_sweep_render_requests(
                     pass
             base_pose = _mat4_from_xy_yaw(float(node.position[0]), float(node.position[1]), yaw_rad, height_m=node_height)
             camera_specs = []
+            sensor_specs = []
             modalities_by_sensor: dict[str, list[str]] = {}
             for camera_template in camera_templates:
                 pose = _sensor_pose_from_xy_yaw(float(node.position[0]), float(node.position[1]), yaw_rad, camera_template, fallback_height_m=node_height)
@@ -325,8 +363,14 @@ def build_sweep_render_requests(
                 camera_modalities = _camera_render_modalities(camera_template, modalities)
                 modalities_by_sensor[camera_id] = camera_modalities
                 camera_specs.append(replace(camera_template, camera_to_world=pose))
+            for sensor_template in sensor_templates:
+                pose = _sensor_pose_from_xy_yaw(float(node.position[0]), float(node.position[1]), yaw_rad, sensor_template, fallback_height_m=node_height)
+                sensor_id = str(getattr(sensor_template, "sensor_id", "") or f"sensor_{len(sensor_specs) + 1}")
+                sensor_modalities = _sensor_render_modalities(sensor_template, modalities)
+                modalities_by_sensor[sensor_id] = sensor_modalities
+                sensor_specs.append(replace(sensor_template, camera_to_world=pose))
             request_modalities = _union_modalities(modalities_by_sensor, modalities)
-            sensor_ids_list = [str(getattr(item, "camera_id", "") or "") for item in camera_specs]
+            sensor_ids_list = [str(getattr(item, "camera_id", "") or "") for item in camera_specs] + [str(getattr(item, "sensor_id", "") or "") for item in sensor_specs]
             mod_suffix = _modality_suffix(list(request_modalities))
             job_id = scene_state.job_id
             if job_id_mode == "per_heading":
@@ -341,6 +385,7 @@ def build_sweep_render_requests(
                 timestamp=timestamp,
                 scene_state=timestep_scene_state,
                 camera_specs=camera_specs,
+                sensor_specs=sensor_specs,
                 modalities=request_modalities,
                 robot_state=RobotState(base_pose=base_pose),
                 render_settings=dict(render_settings or {}),
@@ -381,6 +426,7 @@ def build_custom_position_render_requests(
     camera_height_m: float = 1.0,
     render_settings: dict | None = None,
     camera_specs_payload: Sequence[Mapping[str, Any]] | None = None,
+    sensor_specs_payload: Sequence[Mapping[str, Any]] | None = None,
     sensor_scope: str = "active",
     sensor_ids: Sequence[str] | None = None,
     active_lights: Sequence[Mapping[str, Any]] | None = None,
@@ -395,9 +441,11 @@ def build_custom_position_render_requests(
         for item in (active_lights or [])
         if isinstance(item, Mapping) and item.get("enabled", True)
     ]
+    sensor_templates = _sensor_templates_from_payloads(sensor_specs_payload)
     camera_templates = _camera_templates_from_payloads(
         camera_spec_payload=camera_spec_payload,
         camera_specs_payload=camera_specs_payload,
+        allow_empty=bool(sensor_templates),
         sensor_scope=sensor_scope,
         sensor_ids=sensor_ids,
     )
@@ -417,6 +465,7 @@ def build_custom_position_render_requests(
                 pass
         base_pose = _mat4_from_xy_yaw(x, y, yaw_rad, height_m=per_pos_height)
         camera_specs = []
+        sensor_specs = []
         modalities_by_sensor: dict[str, list[str]] = {}
         for camera_template in camera_templates:
             pose = _sensor_pose_from_xy_yaw(x, y, yaw_rad, camera_template, fallback_height_m=per_pos_height)
@@ -424,8 +473,14 @@ def build_custom_position_render_requests(
             camera_modalities = _camera_render_modalities(camera_template, modalities)
             modalities_by_sensor[camera_id] = camera_modalities
             camera_specs.append(replace(camera_template, camera_to_world=pose))
+        for sensor_template in sensor_templates:
+            pose = _sensor_pose_from_xy_yaw(x, y, yaw_rad, sensor_template, fallback_height_m=per_pos_height)
+            sensor_id = str(getattr(sensor_template, "sensor_id", "") or f"sensor_{len(sensor_specs) + 1}")
+            sensor_modalities = _sensor_render_modalities(sensor_template, modalities)
+            modalities_by_sensor[sensor_id] = sensor_modalities
+            sensor_specs.append(replace(sensor_template, camera_to_world=pose))
         request_modalities = _union_modalities(modalities_by_sensor, modalities)
-        sensor_ids_list = [str(getattr(item, "camera_id", "") or "") for item in camera_specs]
+        sensor_ids_list = [str(getattr(item, "camera_id", "") or "") for item in camera_specs] + [str(getattr(item, "sensor_id", "") or "") for item in sensor_specs]
         frame_id = f"{scene_id}_{node_id}_{heading_id}"
         timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
         job_id = f"{scene_state.job_id}-{node_id}-{heading_id}{_modality_suffix(list(request_modalities))}"
@@ -437,6 +492,7 @@ def build_custom_position_render_requests(
             timestamp=timestamp,
             scene_state=timestep_scene_state,
             camera_specs=camera_specs,
+            sensor_specs=sensor_specs,
             modalities=request_modalities,
             robot_state=RobotState(base_pose=base_pose),
             render_settings=dict(render_settings or {}),
@@ -493,6 +549,7 @@ def render_viewpoint_sweep_direct(
     render_fn: Callable | None = None,
     variant: str = "auto",
     camera_specs_payload: Sequence[Mapping[str, Any]] | None = None,
+    sensor_specs_payload: Sequence[Mapping[str, Any]] | None = None,
     sensor_scope: str = "active",
     sensor_ids: Sequence[str] | None = None,
     active_lights: Sequence[Mapping[str, Any]] | None = None,
@@ -507,6 +564,7 @@ def render_viewpoint_sweep_direct(
         scene_state_payload=scene_state_payload,
         camera_spec_payload=camera_spec_payload,
         camera_specs_payload=camera_specs_payload,
+        sensor_specs_payload=sensor_specs_payload,
         sensor_scope=sensor_scope,
         sensor_ids=sensor_ids,
         active_lights=active_lights,

@@ -71,6 +71,7 @@ _json_stdout = sys.stdout
 ENV_FULL_RENDER_DISABLE_CUDA = "ROBOMITUBA_FULL_RENDER_DISABLE_CUDA"
 ENV_SCENE_LOAD_CONCURRENCY = "ROBOMITUBA_SCENE_LOAD_CONCURRENCY"
 ENV_SCENE_LOAD_LOCK_DIR = "ROBOMITUBA_SCENE_LOAD_LOCK_DIR"
+ENV_SCENE_LOAD_TIMEOUT_S = "ROBOMITUBA_SCENE_LOAD_TIMEOUT_S"
 _ALLOWED_RENDER_ENV_OVERRIDES = {"ROBOMITUBA_TEXTURE_MAX_RESOLUTION"}
 
 
@@ -100,6 +101,19 @@ def _scene_load_lock_root() -> Path:
     return Path(os.environ.get(ENV_SCENE_LOAD_LOCK_DIR, "/tmp/robomituba_scene_load_slots"))
 
 
+def _scene_load_timeout_s() -> float:
+    raw = str(os.environ.get(ENV_SCENE_LOAD_TIMEOUT_S, "900")).strip()
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return 900.0
+
+
+def _scene_load_stale_after_s() -> float:
+    timeout = _scene_load_timeout_s()
+    return max(timeout + 60.0, 120.0)
+
+
 def _pid_is_alive(pid: int | None) -> bool:
     if not pid or pid <= 0:
         return False
@@ -107,18 +121,79 @@ def _pid_is_alive(pid: int | None) -> bool:
     return proc.exists()
 
 
-def _clear_stale_scene_load_slot(slot: Path) -> bool:
+def _slot_holder_is_stale(data: dict[str, Any], *, now: float | None = None, stale_after_s: float | None = None) -> bool:
+    now_f = time.time() if now is None else float(now)
+    stale_after = _scene_load_stale_after_s() if stale_after_s is None else float(stale_after_s)
+    pid = data.get("pid")
+    try:
+        pid_i = int(pid) if pid is not None else None
+    except (TypeError, ValueError):
+        pid_i = None
+    if not _pid_is_alive(pid_i):
+        return True
+    heartbeat = data.get("heartbeat_at", data.get("updated_at", data.get("acquired_at")))
+    try:
+        heartbeat_f = float(heartbeat)
+    except (TypeError, ValueError):
+        return False
+    return (now_f - heartbeat_f) > stale_after
+
+
+def _write_scene_load_holder(
+    slot: Path,
+    *,
+    job_id: str,
+    gpu_index: str | None,
+    acquired_at: float,
+    stage: str,
+    sub_step: str | None = None,
+) -> None:
+    now = time.time()
+    payload: dict[str, Any] = {
+        "pid": os.getpid(),
+        "job_id": job_id,
+        "gpu_index": gpu_index,
+        "acquired_at": acquired_at,
+        "heartbeat_at": now,
+        "updated_at": now,
+        "stage": stage,
+    }
+    if sub_step:
+        payload["sub_step"] = sub_step
+    try:
+        (slot / "holder.json").write_text(json.dumps(payload), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _update_scene_load_slot(
+    slot: Path | None,
+    *,
+    job_id: str,
+    gpu_index: str | None,
+    acquired_at: float,
+    stage: str = "loading_scene",
+    sub_step: str | None = None,
+) -> None:
+    if slot is None:
+        return
+    _write_scene_load_holder(
+        slot,
+        job_id=job_id,
+        gpu_index=gpu_index,
+        acquired_at=acquired_at,
+        stage=stage,
+        sub_step=sub_step,
+    )
+
+
+def _clear_stale_scene_load_slot(slot: Path, *, now: float | None = None, stale_after_s: float | None = None) -> bool:
     holder = slot / "holder.json"
     try:
         data = json.loads(holder.read_text()) if holder.exists() else {}
     except Exception:
         data = {}
-    pid = data.get("pid") if isinstance(data, dict) else None
-    try:
-        pid_i = int(pid) if pid is not None else None
-    except (TypeError, ValueError):
-        pid_i = None
-    if _pid_is_alive(pid_i):
+    if isinstance(data, dict) and not _slot_holder_is_stale(data, now=now, stale_after_s=stale_after_s):
         return False
     try:
         if holder.exists():
@@ -129,7 +204,7 @@ def _clear_stale_scene_load_slot(slot: Path) -> bool:
         return False
 
 
-def _acquire_scene_load_slot(job_id: str, *, gpu_index: str | None = None) -> Path | None:
+def _acquire_scene_load_slot(job_id: str, *, gpu_index: str | None = None) -> tuple[Path, float] | None:
     limit = _scene_load_concurrency()
     if limit <= 0:
         return None
@@ -145,20 +220,19 @@ def _acquire_scene_load_slot(job_id: str, *, gpu_index: str | None = None) -> Pa
                 continue
             except OSError:
                 continue
-            try:
-                (slot / "holder.json").write_text(json.dumps({
-                    "pid": os.getpid(),
-                    "job_id": job_id,
-                    "gpu_index": gpu_index,
-                    "acquired_at": time.time(),
-                }), encoding="utf-8")
-            except OSError:
-                pass
+            acquired_at = time.time()
+            _write_scene_load_holder(
+                slot,
+                job_id=job_id,
+                gpu_index=gpu_index,
+                acquired_at=acquired_at,
+                stage="loading_scene",
+            )
             print(
                 f"[worker] scene_load_slot acquired job_id={job_id} slot={idx}/{limit}",
                 file=sys.stderr, flush=True,
             )
-            return slot
+            return slot, acquired_at
         time.sleep(0.5)
 
 
@@ -578,6 +652,9 @@ def _dispatch_render_job(job_id: str, spec: dict[str, Any]) -> None:
 
     t_start = time.perf_counter()
     scene_load_slot: Path | None = None
+    scene_load_slot_acquired_at = 0.0
+    scene_load_watchdog_stop: threading.Event | None = None
+    scene_load_watchdog_thread: threading.Thread | None = None
     with _DispatchHeartbeat(job_id) as hb:
         hb.update(
             "running",
@@ -586,13 +663,60 @@ def _dispatch_render_job(job_id: str, spec: dict[str, Any]) -> None:
         )
 
         def _release_scene_load_gate() -> None:
-            nonlocal scene_load_slot
+            nonlocal scene_load_slot, scene_load_watchdog_stop, scene_load_watchdog_thread
+            if scene_load_watchdog_stop is not None:
+                scene_load_watchdog_stop.set()
+                scene_load_watchdog_stop = None
+                scene_load_watchdog_thread = None
             if scene_load_slot is not None:
                 _release_scene_load_slot(scene_load_slot, job_id=job_id)
                 scene_load_slot = None
 
+        def _start_scene_load_watchdog(sub_step: str | None = None) -> None:
+            nonlocal scene_load_watchdog_stop, scene_load_watchdog_thread
+            if scene_load_slot is None or scene_load_watchdog_stop is not None:
+                return
+            timeout_s = _scene_load_timeout_s()
+            if timeout_s <= 0:
+                return
+            stop_event = threading.Event()
+            scene_load_watchdog_stop = stop_event
+            slot = scene_load_slot
+            acquired_at = scene_load_slot_acquired_at
+            gpu_index = os.environ.get("CUDA_VISIBLE_DEVICES")
+
+            def _watchdog() -> None:
+                while not stop_event.wait(_HEARTBEAT_INTERVAL_S):
+                    elapsed_s = time.time() - acquired_at
+                    _update_scene_load_slot(
+                        slot,
+                        job_id=job_id,
+                        gpu_index=gpu_index,
+                        acquired_at=acquired_at,
+                        stage="loading_scene",
+                        sub_step=sub_step,
+                    )
+                    if elapsed_s < timeout_s:
+                        continue
+                    elapsed_ms = int((time.perf_counter() - t_start) * 1000.0)
+                    _emit_failed(
+                        job_id,
+                        "gpu_scene_load_timeout",
+                        f"loading_scene exceeded {timeout_s:.0f}s; restarting worker",
+                        elapsed_ms=elapsed_ms,
+                    )
+                    _release_scene_load_slot(slot, job_id=job_id)
+                    os._exit(124)
+
+            scene_load_watchdog_thread = threading.Thread(
+                target=_watchdog,
+                name=f"scene-load-watchdog-{job_id}",
+                daemon=True,
+            )
+            scene_load_watchdog_thread.start()
+
         def _progress(stage: str, payload: Any = None) -> None:
-            nonlocal scene_load_slot
+            nonlocal scene_load_slot, scene_load_slot_acquired_at
             event: dict[str, Any] = {
                 "job_id": job_id, "type": "progress",
                 "stage": str(stage),
@@ -620,11 +744,24 @@ def _dispatch_render_job(job_id: str, spec: dict[str, Any]) -> None:
                 if bits:
                     label = f"{stage} · " + " · ".join(bits)
 
-            if str(stage) == "loading_scene" and not cached_scene and scene_load_slot is None:
-                hb.update("waiting_scene_load_slot", "Waiting for scene load slot")
-                scene_load_slot = _acquire_scene_load_slot(
-                    job_id,
+            if str(stage) == "loading_scene" and not cached_scene:
+                sub_step = str(payload.get("sub_step") or "") if isinstance(payload, dict) else ""
+                if scene_load_slot is None:
+                    hb.update("waiting_scene_load_slot", "Waiting for scene load slot")
+                    acquired = _acquire_scene_load_slot(
+                        job_id,
+                        gpu_index=os.environ.get("CUDA_VISIBLE_DEVICES"),
+                    )
+                    if acquired is not None:
+                        scene_load_slot, scene_load_slot_acquired_at = acquired
+                        _start_scene_load_watchdog(sub_step or None)
+                _update_scene_load_slot(
+                    scene_load_slot,
+                    job_id=job_id,
                     gpu_index=os.environ.get("CUDA_VISIBLE_DEVICES"),
+                    acquired_at=scene_load_slot_acquired_at,
+                    stage="loading_scene",
+                    sub_step=sub_step or None,
                 )
             elif str(stage) != "loading_scene":
                 _release_scene_load_gate()

@@ -57,6 +57,22 @@
 </table>
 <div class="warn"><b>주의</b>: 투과형 microfacet <code>roughdielectric</code>과 <code>plastic</code>/<code>roughplastic</code>은 이 빌드에서 편광 Fresnel을 만들지 못한다(DoLP≡0). 유리는 <code>dielectric</code>(smooth), 도장/plastic/diffuse는 <code>pplastic</code>으로 주입해야 편광이 나온다. <code>render_material_closeups.py</code> 등 dielectric/plastic 주입 경로 점검 필요.</div>
 
+<h3>2.1 왜 <code>conductor</code>·<code>roughdielectric</code>가 섞여 들어가나 — 원인분석</h3>
+<p>의도한 편광 트리오는 <b><code>roughconductor</code>·<code>pplastic</code>·<code>dielectric</code></b>인데, 실제 렌더에는 <code>conductor</code>와 <code>roughdielectric</code>도 나타난다. 판정:</p>
+<ul>
+<li><b><code>conductor</code> (smooth) — 문제 아님(의도).</b> <code>mirror</code> optical_class → strategy <code>conductor</code>(거울=매끈, import <code>_material_binding:211</code> · render <code>preset_strategy:1169</code>). §2 표대로 conductor는 <b>DoLP 0.95 ✅ 편광 정상</b> — conductor-family라 허용 범주. 배제 대상 아님.</li>
+<li><b><code>roughdielectric</code> — 진짜 위반(DoLP=0).</b> 아래 4곳에서 샌다.</li>
+</ul>
+<table>
+<tr><th>#</th><th>누수 지점</th><th>파일:라인</th><th>설명</th></tr>
+<tr><td>①</td><td><b>편광-가능 화이트리스트 오류 (근본)</b></td><td><code>render_daemon._POLAR_RGB_ANALYTIC_BSDFS:920</code> · <code>multimodal.polar_rgb_types:495</code></td><td>"이 BSDF는 편광 OK" 판정 세트가 <b>DoLP=0인 <code>roughdielectric</code>·<code>thindielectric</code>까지 포함</b> → 파이프라인이 편광 가능으로 착각 → 치환·경고 안 함. 정책이 데이터로 강제되는 유일 지점인데 여기가 틀림.</td></tr>
+<tr><td>②</td><td>frosted/matte glass 매핑</td><td><code>import _material_binding:205-206</code> · <code>render preset_strategy:1168</code></td><td>이름에 <code>frost</code>/<code>matte</code> → <code>roughdielectric</code>. RGB 외형엔 맞지만 편광 빌드선 0.</td></tr>
+<tr><td>③</td><td>scene stager가 glass를 하드코딩</td><td><code>multimodal:2671</code>(편광 fallback) · 857·2560·2794·3118 · <code>render_daemon:1392</code></td><td><b>편광 약할 때 재렌더하는 <code>_stage_polarized_fallback_scene</code>이 glass를 <code>roughdielectric</code>로 박음</b> → 오히려 편광 0으로 만드는 자기모순.</td></tr>
+<tr><td>④</td><td>치환 guard 부재</td><td>—</td><td>polar 패스 직전 <code>roughdielectric→dielectric</code> / <code>roughplastic·plastic→pplastic</code> / <code>thindielectric→dielectric</code>로 바꿔주는 필터가 없음.</td></tr>
+</table>
+<div class="warn"><b>근본 원인</b>: "편광 트리오만"은 <b>의도(정책)</b>였지만, BSDF 선택 코드(<code>preset_strategy</code>·<code>_material_binding</code>)는 원래 <b>RGB/analytic 렌더 기준</b>으로 작성돼 편광 제약을 반영하지 않았고, 편광 가능 여부 판정 <b>화이트리스트 자체가 <code>roughdielectric</code>·<code>thindielectric</code>를 포함(오류)</b> → "편광 안 되는 플러그인 배제" 가드가 코드에 강제된 적이 없다.</div>
+<div class="ok"><b>수정 방향</b>: (1) <code>_POLAR_RGB_ANALYTIC_BSDFS</code>(920)·<code>polar_rgb_types</code>(495)에서 <code>roughdielectric</code>·<code>thindielectric</code> <b>제거</b>(근본). (2) polar 패스 직전 <b>치환 가드</b> 추가(roughdielectric/thindielectric→<code>dielectric</code>, roughplastic/plastic→<code>pplastic</code>). (3) 편광 fallback scene(2671) 등의 glass를 <code>dielectric</code>로. (4) 선택: frosted_glass는 RGB 패스만 roughdielectric, polar 패스는 <code>dielectric</code>로 분기(frost 외형 vs 편광 trade-off). <code>conductor</code>는 유지(편광 정상).</div>
+
 <h2>3. 움직이는 편광 광원 스윕 (오브젝트당 2종)</h2>
 <p>능동 편광 조명 = <b>커스텀 <code>polarized_area</code> emitter</b>(아래 §6). 배경에는 편광광이 실제로 뿌려지고 변하는지 보이는 <b>witness</b> 2개 — 좌: bare mirror(flash 편광을 반사 → DoLP/AoLP에 나타남), 우: mirror+고정 polarizer analyzer(<b>소광 witness</b>: 조명 편광각이 돌면 밝기가 밝→어둠→밝). 두 모션:</p>
 <ul>

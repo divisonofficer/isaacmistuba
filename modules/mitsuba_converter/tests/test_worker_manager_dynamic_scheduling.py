@@ -154,3 +154,21 @@ def test_stale_reader_exit_generation_mismatch_does_not_kill_new_worker():
     assert old_proc.killed == 0
     assert new_proc.killed == 0
     assert not mgr.health()["degraded"]
+
+
+def test_phase_boundary_recovery_clears_degraded_and_respawns_dead_workers(monkeypatch):
+    mgr, workers = _manager(monkeypatch, backlog=2)
+    workers[0]._process = _ExitedProc()
+    mgr._degraded = True
+
+    result = mgr.recycle_idle_workers(
+        reason="scene_variant_boundary", timeout_s=0.1, recover_degraded=True,
+    )
+
+    assert result["degraded_reset"] is True
+    assert result["degraded"] is False
+    assert result["started"] == 1
+    assert result["recycled"] == 1
+    assert workers[0].started == 1
+    assert workers[1].started == 1
+    assert not mgr.health()["degraded"]

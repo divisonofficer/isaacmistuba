@@ -362,6 +362,7 @@ def iter_export_files(
     include_exr: bool = True,
     include_polarization_raw: bool = True,
     include_perturbed: bool = False,
+    camera_ids: Iterable[str] | None = None,
 ) -> Iterable[tuple[Path, str]]:
     """Yield (src_path, dst_relative_posix_path) pairs for the scene bundle.
 
@@ -386,6 +387,11 @@ def iter_export_files(
     pdir = Path(project_dir).resolve()
     repo_root = pdir.parents[2] if len(pdir.parents) >= 3 else None
     yielded_dst: set[str] = set()
+    allowed_camera_ids = (
+        {str(camera_id) for camera_id in camera_ids}
+        if camera_ids is not None
+        else None
+    )
 
     def _emit(src: Path, dst_rel: str):
         if dst_rel in yielded_dst:
@@ -408,10 +414,29 @@ def iter_export_files(
         sensors_root = obs_dir / "sensors"
         sensor_file_names: set[str] = set()
         if sensors_root.is_dir():
-            sensor_file_names = {p.name for p in sensors_root.rglob("*") if p.is_file()}
+            sensor_file_names = {
+                p.name
+                for p in sensors_root.rglob("*")
+                if p.is_file()
+                and (
+                    allowed_camera_ids is None
+                    or p.relative_to(sensors_root).parts[0] in allowed_camera_ids
+                )
+            }
         for src in sorted(obs_dir.rglob("*")):
             if not src.is_file():
                 continue
+            if sensors_root in src.parents:
+                sensor_rel = src.relative_to(sensors_root)
+                if allowed_camera_ids is not None and sensor_rel.parts[0] not in allowed_camera_ids:
+                    continue
+            if allowed_camera_ids is not None and src.parent == obs_dir:
+                # A filtered bundle is camera-explicit. Never let a primary
+                # camera's legacy root copy bypass the sensors/<camera> filter.
+                if src.name == "_sensor_index.json":
+                    continue
+                if src.suffix.lower() in {".png", ".exr", ".hdr", ".jpg", ".jpeg", ".npy", ".npz"}:
+                    continue
             # Skip a root-level observation file (directly under <vp>/<h>/)
             # when the same modality is already carried under sensors/.
             if src.parent == obs_dir and src.name in sensor_file_names:
@@ -539,6 +564,8 @@ def iter_export_files(
                             camera_id = parts[cam_idx + 1]
                         except (ValueError, IndexError):
                             continue
+                        if allowed_camera_ids is not None and camera_id not in allowed_camera_ids:
+                            continue
                         dst_rel = (
                             f"scenes/{ep.scene_id}/observations/{vp_id}/{h_id}/"
                             f"sensors/{camera_id}/{src.name}"
@@ -546,3 +573,47 @@ def iter_export_files(
                         pair = _emit(src, dst_rel)
                         if pair is not None:
                             yield pair
+
+
+def write_filtered_sensor_indexes(export_root: str | Path) -> list[Path]:
+    """Rebuild per-heading sensor indexes from a filtered staging tree.
+
+    The source index cannot be copied verbatim when camera filtering is active,
+    because it would still advertise excluded cameras and files. Building it
+    from staging makes the sidecar describe exactly what the ZIP contains.
+    """
+    root = Path(export_root)
+    written: list[Path] = []
+    for scene_dir in sorted((root / "scenes").glob("*")):
+        if not scene_dir.is_dir():
+            continue
+        for observation_name in ("observations", "observations_perturbed"):
+            observation_root = scene_dir / observation_name
+            if not observation_root.is_dir():
+                continue
+            for sensors_dir in sorted(observation_root.glob("*/*/sensors")):
+                if not sensors_dir.is_dir():
+                    continue
+                sensors: dict[str, dict] = {}
+                for sensor_dir in sorted(sensors_dir.iterdir()):
+                    if not sensor_dir.is_dir():
+                        continue
+                    files = sorted(
+                        path.relative_to(sensor_dir).as_posix()
+                        for path in sensor_dir.rglob("*")
+                        if path.is_file()
+                    )
+                    if files:
+                        sensors[sensor_dir.name] = {
+                            "camera_id": sensor_dir.name,
+                            "files": files,
+                        }
+                if not sensors:
+                    continue
+                index_path = sensors_dir.parent / "_sensor_index.json"
+                index_path.write_text(
+                    json.dumps({"sensors": sensors}, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                written.append(index_path)
+    return written

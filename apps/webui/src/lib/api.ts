@@ -653,6 +653,7 @@ export const submitOpticalNavExportJob = (
 	projectId: string,
 	payload: {
 		scene_id: string;
+		camera_ids?: string[] | null;
 		only_completed?: boolean;
 		episode_ids?: string[] | null;
 		include_episode_thumbnails?: boolean;

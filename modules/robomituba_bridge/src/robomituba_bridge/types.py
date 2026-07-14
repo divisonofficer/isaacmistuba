@@ -291,6 +291,11 @@ class IsaacSensorSpec:
     resolution: Optional[List[int]] = None
     sensor_sync_group: str = "default"
     pose_source: Optional[str] = None
+    # First-class non-camera sensor contract.  Existing payloads omit these
+    # fields and remain rgb-camera sensors by default.
+    sensor_type: str = "rgb_camera"
+    profile: Optional[str] = None
+    metadata_ref: Optional[str] = None
     extras: JsonDict = field(default_factory=dict)
 
 
@@ -387,6 +392,7 @@ class RenderRequest:
     timestamp: str
     scene_state: SceneState
     camera_specs: List[CameraSpec] = field(default_factory=list)
+    sensor_specs: List[IsaacSensorSpec] = field(default_factory=list)
     modalities: List[str] = field(default_factory=list)
     robot_state: RobotState = field(default_factory=RobotState)
     render_settings: JsonDict = field(default_factory=dict)
@@ -441,6 +447,7 @@ class RenderArtifactManifest:
     material_mode: Optional[str] = None
     array_shape: List[int] = field(default_factory=list)
     dtype: Optional[str] = None
+    sensor_id: Optional[str] = None
     extras: JsonDict = field(default_factory=dict)
 
 
@@ -454,6 +461,7 @@ class ObservationBundleManifest:
     robot_state: RobotState
     requested_modalities: List[str] = field(default_factory=list)
     camera_specs: List[CameraSpec] = field(default_factory=list)
+    sensor_specs: List[IsaacSensorSpec] = field(default_factory=list)
     artifacts: List[RenderArtifactManifest] = field(default_factory=list)
     bundle_root: str = ""
     status: str = "complete"

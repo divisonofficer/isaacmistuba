@@ -28,6 +28,7 @@ class ObservationLayout:
     frame_dir: Path
     manifest: Path
     cameras_dir: Path
+    sensors_dir: Path
     logs_dir: Path
 
 
@@ -72,9 +73,10 @@ def ensure_observation_layout(repo_root: str | Path, job_id: str, frame_id: str)
     observations_dir = job_dir / "observations"
     frame_dir = observations_dir / frame_id
     cameras_dir = frame_dir / "cameras"
+    sensors_dir = frame_dir / "sensors"
     logs_dir = frame_dir / "logs"
 
-    for path in [observations_dir, frame_dir, cameras_dir, logs_dir]:
+    for path in [observations_dir, frame_dir, cameras_dir, sensors_dir, logs_dir]:
         path.mkdir(parents=True, exist_ok=True)
 
     return ObservationLayout(
@@ -83,6 +85,7 @@ def ensure_observation_layout(repo_root: str | Path, job_id: str, frame_id: str)
         frame_dir=frame_dir,
         manifest=frame_dir / "manifest.json",
         cameras_dir=cameras_dir,
+        sensors_dir=sensors_dir,
         logs_dir=logs_dir,
     )
 

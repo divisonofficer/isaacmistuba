@@ -1,0 +1,229 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>2026-07-08 Infinigen degenerate-UV 근본원인 규명 · PBR bake 파이프라인 수정</title>
+  <style>
+    :root{color-scheme:light;--bg:#f7f8fb;--paper:#fff;--ink:#1f2937;--muted:#667085;--line:#d9dee8;--accent:#1d5fd1;--ok:#087443;--warn:#a15c07;--bad:#b42318;--code:#f1f4f9;}
+    body{margin:0;background:var(--bg);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;line-height:1.58;}
+    .layout{display:flex;min-height:100vh;align-items:flex-start;}
+    aside{width:260px;flex:0 0 260px;position:sticky;top:0;height:100vh;overflow-y:auto;padding:24px 16px;border-right:1px solid var(--line);background:#eef2f7;}
+    .logo{font-weight:800;color:var(--accent);font-size:16px;}
+    .date{margin-top:3px;color:var(--muted);font-size:12px;font-family:ui-monospace,Menlo,Consolas,monospace;}
+    .nav-title{margin:22px 8px 8px;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.12em;font-weight:800;}
+    .nav-link{display:block;padding:6px 8px;border-radius:5px;color:#344054;font-size:12px;text-decoration:none;margin-bottom:2px;}
+    .nav-link:hover{background:#dde3ee;color:var(--accent);}
+    main{flex:1;min-width:0;padding:36px 24px 64px;}
+    article{max-width:1080px;margin:0 auto;background:var(--paper);border:1px solid var(--line);border-radius:8px;padding:34px 40px;box-shadow:0 8px 24px rgb(16 24 40/.05);}
+    h1,h2,h3{line-height:1.25;margin:0;}
+    h1{font-size:28px;}
+    h2{margin-top:34px;padding-top:22px;border-top:1px solid var(--line);font-size:20px;}
+    h3{margin-top:22px;font-size:16px;}
+    p{margin:10px 0 0;}
+    ul{margin:10px 0 0 20px;padding:0;}
+    li{margin:5px 0;}
+    code{background:var(--code);border:1px solid #e5e9f2;border-radius:5px;padding:1px 5px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:.92em;}
+    pre{overflow-x:auto;background:#111827;color:#e5e7eb;border-radius:8px;padding:14px 16px;font-size:13px;line-height:1.5;}
+    pre code{background:transparent;border:0;padding:0;color:inherit;}
+    table{width:100%;border-collapse:collapse;margin-top:12px;font-size:14px;}
+    th,td{border:1px solid var(--line);padding:9px 10px;text-align:left;vertical-align:top;}
+    th{background:#f3f6fb;font-weight:650;}
+    figure{margin:16px 0 0;}
+    figure img{width:100%;border:1px solid var(--line);border-radius:8px;display:block;}
+    figcaption{margin-top:6px;color:var(--muted);font-size:12.5px;}
+    .meta{margin-top:10px;color:var(--muted);font-size:14px;}
+    .badge{display:inline-block;margin-right:6px;border-radius:999px;padding:2px 9px;border:1px solid var(--line);background:#f8fafc;color:var(--muted);font-size:12px;}
+    .ok{color:var(--ok);font-weight:650;}
+    .warn{color:var(--warn);font-weight:650;}
+    .bad{color:var(--bad);font-weight:650;}
+    .note{margin-top:12px;padding:10px 14px;border-left:3px solid var(--accent);background:#f3f6fb;border-radius:0 6px 6px 0;font-size:13.5px;}
+    .note.warnbox{border-left-color:var(--warn);background:#fdf6ec;}
+    .note.okbox{border-left-color:var(--ok);background:#eefaf933;background:#f0f9f4;}
+  </style>
+</head>
+<body>
+<div class="layout">
+<aside>
+  <div class="logo">Robomituba</div>
+  <div class="date">2026-07-08</div>
+  <div class="nav-title">오늘 보고서</div>
+  <a class="nav-link" href="#summary">요약</a>
+  <div class="nav-title">근본원인</div>
+  <a class="nav-link" href="#symptom">1. 증상</a>
+  <a class="nav-link" href="#rootcause">2. 근본원인 = degenerate UV</a>
+  <a class="nav-link" href="#misdiag">3. 어제 진단이 틀렸던 이유</a>
+  <div class="nav-title">수정</div>
+  <a class="nav-link" href="#fixes">4. 코드 수정 3종</a>
+  <a class="nav-link" href="#scan">5. 씬 전체 스캔</a>
+  <a class="nav-link" href="#result">6. 결과</a>
+  <div class="nav-title">아키텍처</div>
+  <a class="nav-link" href="#glb">7. GLB 소비 고찰</a>
+  <a class="nav-link" href="#next">8. 남은 일</a>
+</aside>
+<main>
+<article>
+
+  <h1>Infinigen <span style="color:var(--bad)">degenerate-UV</span> 근본원인 규명 &amp; PBR bake 파이프라인 수정</h1>
+  <div class="meta">
+    <span class="badge">scene: infinigen_kr_20260625</span>
+    <span class="badge">tools/infinigen/blender_export_scene.py</span>
+    <span class="badge">2026-07-08</span>
+  </div>
+
+  <h2 id="summary">요약</h2>
+  <p>
+    Infinigen import 오브젝트가 <strong>albedo/roughness/metallic 을 잃고 렌더</strong>되던 문제(대표 사례: 침대 프레임의 편광·roughness 소실)의
+    진짜 근본원인을 찾았다. <strong>Geometry-Nodes로 생성된 <code>spawn_asset</code> 오브젝트의 UVMap이 전부 (0,0) 한 점에 뭉친
+    degenerate(zero-area) UV</strong>였고, 이 위에 bake하면 아틀라스 전체가 1 texel로 붕괴되어 <strong>새까만 텍스처</strong>가 나온다.
+  </p>
+  <div class="note warnbox">
+    <strong>어제(07-07)의 "procedural roughness가 bake 시 collapse한다"는 진단은 오판이었다.</strong> 모든 실험이 이 degenerate UV 위에서
+    수행되어 교란(confounded)됐던 것 — UV만 정상화하면 Cycles ROUGHNESS pass가 실제 per-texel 값을 정확히 구워낸다.
+  </div>
+  <p>
+    수정 3종(① degenerate UV 감지·재투영 ② bake 중 OOM 방지 isolation ③ 고폴리 게이트 flag)을 적용하고, 영향받은
+    <strong>28개 render-relevant 오브젝트를 재-bake</strong>했다. 침대 albedo <span class="bad">0.000</span>→<span class="ok">0.159</span>,
+    선반소품·화분 등 <strong>0.5–1.5M 폴리 장식물 20종이 모두 실제 아틀라스를 갖게 됐다</strong>.
+  </p>
+
+  <h2 id="symptom">1. 증상</h2>
+  <p>
+    <code>vp_000030</code> 뷰포인트에서 침대 나무 프레임의 편광 신호가 거의 0, 재질 뷰어에는 roughness≈0.6으로 뜨는데 렌더된 텍스처는 나오지 않았다.
+    동료들은 "편광을 지원하지 않는 material plugin이 붙은 것 아니냐"고 물었으나, BSDF plugin 문제가 아니라
+    <strong>애초에 이 오브젝트에 텍스처가 실려있지 않았다</strong>(아틀라스가 새까맸다).
+  </p>
+
+  <h2 id="rootcause">2. 근본원인 = degenerate UV</h2>
+  <p>
+    침대 오브젝트를 뜯어보니 <code>UVMap</code> 레이어는 존재하는데 <strong>73,932개 loop의 UV가 전부 정확히 (0,0)</strong>이었다.
+    UV 면적이 0이므로 어떤 bake(albedo/roughness/metallic)든 아틀라스의 단 1 texel에만 래스터화되어 나머지는 검게 남는다.
+    Infinigen 절차 재질은 object-space(Generated/Object) 좌표로 shading하므로 UV가 필요 없어, GN 파이프라인이 placeholder UVMap을 만들되
+    좌표를 채우지 않은 채 남긴 것 — Infinigen 자체 렌더에는 무해하지만, <strong>우리처럼 텍스처 아틀라스로 bake·OBJ export하는 소비 경로에서만 터지는 버그</strong>다.
+  </p>
+  <figure>
+    <img src="images/0708_uv_degenerate_mechanism.png" alt="degenerate UV mechanism: UV before/after and atlas before/after">
+    <figcaption>
+      ① .blend의 UVMap은 전 loop이 (0,0)에 붕괴 → ② <code>_ensure_uv</code> Smart-Project 후 [0,1]²에 정상 전개 →
+      ③ 수정 전 albedo 아틀라스는 mean=max=0.000 (완전 흑색) → ④ 수정 후 실제 나무결·헤드보드 슬랫이 복원됨(mean 0.159).
+    </figcaption>
+  </figure>
+
+  <h2 id="misdiag">3. 어제 진단이 틀렸던 이유</h2>
+  <p>
+    07-07에는 "procedural roughness(Noise→FloatCurve)가 GN 메쉬에서 bake 시 0으로 collapse하며, 좌표(Generated/Object/UV/Position)를 주입해도
+    복원 안 된다"고 결론냈다. 그러나 그 실험들은 <strong>전부 degenerate UV 위에서 bake</strong>한 것이라, 좌표를 무엇으로 바꾸든 UV 면적이 0이니
+    당연히 아틀라스가 검게 나왔던 것이다(교란된 실험). UV를 정상화하자:
+  </p>
+  <table>
+    <thead><tr><th>pass</th><th>degenerate UV</th><th>정상 UV (Smart-Project)</th></tr></thead>
+    <tbody>
+      <tr><td>albedo</td><td class="bad">mean 0.000</td><td class="ok">mean 0.159 · max 0.490 (실제 나무색)</td></tr>
+      <tr><td>roughness</td><td class="bad">mean 0.000</td><td class="ok">mean 0.144 (spatial pass 정상 작동, 상수 fallback 미사용)</td></tr>
+      <tr><td>metallic</td><td>0.000</td><td>0.000 (나무 → metallic=0, 정상)</td></tr>
+    </tbody>
+  </table>
+  <p>즉 <strong>procedural은 붕괴하지 않았다.</strong> 결함은 오로지 UV였다.</p>
+
+  <h2 id="fixes">4. 코드 수정 3종 <span class="badge">blender_export_scene.py</span></h2>
+  <table>
+    <thead><tr><th>#</th><th>수정</th><th>내용</th></tr></thead>
+    <tbody>
+      <tr>
+        <td>①</td><td><code>_uv_is_degenerate</code> + <code>_ensure_uv</code></td>
+        <td>기존 <code>_ensure_uv</code>는 UV가 <em>없을 때만</em> Smart-Project 했다. 이제 active UV의 bbox span이 &lt;1e-4인 <strong>degenerate UV도 감지</strong>해서 placeholder를 버리고 새로 투영한다. OBJ export·bake가 동일한 정상 UV를 공유.</td>
+      </tr>
+      <tr>
+        <td>②</td><td><code>_render_isolate(obj)</code></td>
+        <td>2.8GB blend의 <strong>~14M 폴리 전 씬을 Cycles가 bake마다 sync → 11GB WSL 박스에서 OOM kill</strong>(RSS 9.9GB). bake는 direct/indirect 조명 OFF라 다른 지오메트리가 기여하지 않으므로, bake 동안 대상 외 오브젝트를 <code>hide_render</code> 처리 → 메모리를 대상 하나로 제한(무손실).</td>
+      </tr>
+      <tr>
+        <td>③</td><td><code>--max-poly N</code> (기본 120000)</td>
+        <td>고폴리 diffuse 장식물(0.5–1.5M 폴리)이 하드코딩 폴리 게이트에 <strong>조용히 skip</strong>되고 있었다. isolation으로 메모리가 잡히니 2,000,000으로 올려 이들도 bake(검증: 528k 선반소품 정상, 메모리 baseline 유지).</td>
+      </tr>
+    </tbody>
+  </table>
+  <p>부수적으로 손상된 manifest를 건드리지 않고 타깃 재-bake하는 <code>--only-degenerate</code>(zero-area UV 오브젝트 자동 선택) + <code>--merge</code>(blender_name 기준 splice, 기존 id 재사용해 파일 제자리 덮어쓰기) 플래그를 추가했다.</p>
+  <div class="note">
+    실행: <code>$INFINIGEN_PYTHON tools/infinigen/_run_bpy.py &lt;scene.blend&gt; tools/infinigen/blender_export_scene.py -- --out out/infinigen_imports/kr_20260625 --only-degenerate --merge --bake --bake-pbr --max-poly 2000000 --bake-res 512</code>
+  </div>
+
+  <h2 id="scan">5. 씬 전체 스캔</h2>
+  <p>침대만의 문제가 아니었다. 433개 mesh 오브젝트 스캔:</p>
+  <table>
+    <thead><tr><th>UV 상태</th><th>개수</th><th>비고</th></tr></thead>
+    <tbody>
+      <tr><td class="ok">정상 UV</td><td>223 (52%)</td><td>bake/export OK</td></tr>
+      <tr><td class="bad">degenerate (전부 0,0)</td><td>37</td><td>침대·화분·선반소품·방 셸 — 이번 수정으로 구제</td></tr>
+      <tr><td class="warn">missing/empty</td><td>173</td><td>다수가 bbox_placeholder(렌더 안 됨)·BézierCurve; 기존 코드가 이미 처리</td></tr>
+    </tbody>
+  </table>
+  <p>
+    degenerate 37개 중 <strong>렌더에 실제 소비되는 OBJ 보유 오브젝트 28개</strong>가 재-bake 대상이다(나머지 9개는 OBJ 없는 방 내부 = authoring
+    region으로 <code>floor_material_id</code> 렌더, 무관). <code>_ensure_uv</code>가 export 전에 돌아 <strong>OBJ와 GLB 둘 다 정상 UV</strong>를 갖게 됐다.
+  </p>
+
+  <h2 id="result">6. 결과</h2>
+  <p>재-bake 후 <code>bake=2</code>→<code>bake=20</code>. 28개 중:</p>
+  <table>
+    <thead><tr><th>그룹</th><th>결과</th></tr></thead>
+    <tbody>
+      <tr><td>Bed · kitchen floor (diffuse)</td><td class="ok">아틀라스 정상 복원</td></tr>
+      <tr><td>NatureShelfTrinkets ×10 (528k 폴리)</td><td class="ok">고폴리 bake 성공</td></tr>
+      <tr><td>LargePlantContainer ×4 · PlantContainer ×4 (0.8–1.5M 폴리)</td><td class="ok">고폴리 bake 성공</td></tr>
+      <tr><td>PlantContainer(glass) ×1</td><td>아틀라스 없음 — analytic dielectric 렌더가 정상</td></tr>
+      <tr><td>방 <code>.exterior</code> 벽 ×7</td><td>바깥 셸, 카메라 비가시 — 무관</td></tr>
+    </tbody>
+  </table>
+  <figure>
+    <img src="images/0708_scene_fix_montage.png" alt="scene-wide recovery montage: albedo and roughness atlases for bed, trinket, plant containers">
+    <figcaption>
+      씬 전반 복원 — diffuse 오브젝트 20종(0.5–1.5M 폴리 장식물 포함)이 실제 per-texel albedo(상)·roughness(하) 아틀라스를 갖게 됨.
+      과거엔 모두 검은 아틀라스였다. isolation 덕에 고폴리 28종 전체 재-bake가 OOM 없이 ~2분에 완료.
+    </figcaption>
+  </figure>
+
+  <h2 id="glb">7. GLB 소비로 전환해야 하나? — 고찰</h2>
+  <p>
+    "앞으로 렌더가 GLB를 소비해야 UV를 제대로 읽는다"는 방향에 대해 검증했다. 재-export된 bed GLB를 직접 디코딩한 결과:
+  </p>
+  <table>
+    <thead><tr><th>GLB가 담는 것</th><th>GLB가 <strong>못</strong> 담는 것</th></tr></thead>
+    <tbody>
+      <tr><td class="ok">mesh (POSITION/NORMAL)</td><td class="bad">텍스처: images=0, textures=0</td></tr>
+      <tr><td class="ok">TEXCOORD_0 UV [0.009–0.991] (수정 반영됨)</td><td class="bad">baseColorFactor=None (재질은 이름만)</td></tr>
+      <tr><td class="ok">node transform</td><td class="bad">Infinigen procedural node 그래프</td></tr>
+    </tbody>
+  </table>
+  <div class="note okbox">
+    <strong>핵심:</strong> Infinigen procedural 재질(Noise→FloatCurve→Principled)은 <strong>glTF export 시 빈 PBR로 flatten</strong>된다 — GLB에는
+    albedo/roughness 텍스처가 하나도 안 들어간다. 따라서 GLB만으로는 재질이 flat하게 렌더되고, 정확한 per-texel 재질은 <strong>여전히 bake된 아틀라스</strong>에서 와야 한다.
+  </div>
+  <p>
+    또한 이번 37개는 <strong>.blend의 UV 자체가 degenerate</strong>였으므로 GLB로 뽑아도 동일하게 (0,0)이 나왔을 것이다 — GLB가 UV를 "제대로 읽는" 게 아니라,
+    <code>_ensure_uv</code> 수정이 degenerate를 고쳐 OBJ·GLB 둘 다 정상화한 것이다. 결론:
+  </p>
+  <ul>
+    <li><strong>올바른 아키텍처 = GLB(지오메트리+UV+transform 견고성) + bake 아틀라스(재질)</strong>. daemon에 배선 존재(<code>_split_glb_shapes_cached</code> → authoring <code>material_id</code> → 아틀라스), <code>ROBOMITUBA_INFINIGEN_USE_GLB=1</code>로 활성화.</li>
+    <li>GLB 전환은 OBJ의 <code>vt=0</code> barycentric 취약성을 없애는 <strong>견고성</strong> 이득이며, bake 파이프라인을 <strong>대체하지 않고 함께</strong> 간다.</li>
+    <li>어느 경로든 <strong>degenerate-UV 수정이 선행</strong>돼야 한다.</li>
+  </ul>
+
+  <h2 id="next">8. 남은 일</h2>
+  <ul>
+    <li>침대 <code>vp_000030</code> 뷰포인트 재렌더 → 편광·재질 복원을 시각적으로 확인(before/after).</li>
+    <li>손상된 <code>scene_manifest.json</code>(이전 <code>--only</code> 실행으로 1-unit balloon만 남음) 정합화 — 렌더는 <code>authoring_map.json</code>을 소비해 영향 없으나 위생상 정리.</li>
+    <li><code>ROBOMITUBA_INFINIGEN_USE_GLB=1</code> 경로를 실제 렌더로 검증(GLB 지오메트리 + 아틀라스 재질).</li>
+  </ul>
+
+  <div class="note" style="margin-top:26px;">
+    <strong>변경 파일:</strong> <code>tools/infinigen/blender_export_scene.py</code>
+    (<code>_uv_is_degenerate</code>, <code>_ensure_uv</code>, <code>_render_isolate</code>, <code>--max-poly</code>, <code>--only-degenerate</code>, <code>--merge</code>).
+    재-bake 적용: <code>out/infinigen_imports/kr_20260625</code> (28 objects).
+  </div>
+
+</article>
+</main>
+</div>
+</body>
+</html>
