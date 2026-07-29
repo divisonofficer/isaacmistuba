@@ -1244,7 +1244,7 @@ def _pbr_input_contract(obj):
         return {
             "base_color": {"source": "not_applicable", "constants": []},
             "roughness": {"source": "not_applicable", "constants": []},
-            "metallic": {"source": "constant", "constants": [0.0]},
+            "metallic": {"source": "unresolved", "constants": [0.0]},
             "normal": {"source": "not_applicable", "constants": []},
         }
     specs = {
@@ -1289,10 +1289,12 @@ def _pbr_input_contract(obj):
                 "constants": constants,
             }
         else:
-            # Unknown nested shaders remain bake-required for color/roughness;
-            # metallic defaults to a dielectric factor only when no Principled exists.
+            # Unknown nested shaders remain bake-required for color/roughness.
+            # Metallic gets a dielectric 0.0 so the channel stays renderable, but
+            # it is an assumption, not a traced socket: mark it `unresolved` so it
+            # is never confused with a genuinely unlinked metallic=0 factor.
             out[key] = {
-                "source": "linked" if key in {"base_color", "roughness"} else "constant",
+                "source": "linked" if key in {"base_color", "roughness"} else "unresolved",
                 "constants": [0.0] if key == "metallic" else [],
             }
     return out
@@ -1433,6 +1435,26 @@ def main():
     max_bake_poly = int(args[args.index("--max-poly") + 1]) if "--max-poly" in args else 0
     allow_incomplete_pbr = "--allow-incomplete-pbr" in args
 
+    # ── mesh decimation (policy-gated; DEFAULT off = zero behaviour change) ──
+    # The decimation POLICY (how much to cut per object) is isolated in
+    # mesh_decimation.py so the still-undecided compression rules evolve there while
+    # this call-site stays fixed. Runs on the live bpy mesh in the per-object loop
+    # (before _ensure_uv/_export_obj) so OBJ + baked atlas + GLB all reflect it.
+    decimate_policy_name = args[args.index("--decimate-policy") + 1] if "--decimate-policy" in args else "none"
+    decimate_min_polys = int(args[args.index("--decimate-min-polys") + 1]) if "--decimate-min-polys" in args else 50000
+    decimate_ratio = float(args[args.index("--decimate-ratio") + 1]) if "--decimate-ratio" in args else 0.30
+    decimation_policy = None
+    _DecCtx = _decimate_object = None
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from mesh_decimation import (resolve_policy as _resolve_dec_policy,
+                                      DecimationContext as _DecCtx, decimate_object as _decimate_object)
+        decimation_policy = _resolve_dec_policy(decimate_policy_name, min_faces=decimate_min_polys, ratio=decimate_ratio)
+        if decimate_policy_name not in ("none", "off", ""):
+            print(f"[decimate] policy={decimation_policy.name} min_polys={decimate_min_polys} ratio={decimate_ratio}")
+    except Exception as _dec_exc:  # noqa: BLE001
+        print(f"[decimate] disabled ({_dec_exc})")
+
     meshes_dir = os.path.join(out_dir, "meshes")
     os.makedirs(meshes_dir, exist_ok=True)
     textures_dir = os.path.join(out_dir, "textures")
@@ -1550,6 +1572,25 @@ def main():
         orig_mw = obj.matrix_world.copy()
         obj.matrix_world = Matrix.Translation(offset) @ orig_mw
         hide_state = _unhide(obj)
+
+        # mesh decimation (policy-gated) — on the live bpy mesh, before UV/OBJ/bake so
+        # the reduced mesh flows into the exported OBJ, the baked atlas, and the GLB.
+        decimation_record = None
+        if decimation_policy is not None and _decimate_object is not None:
+            _dslots = [{"name": ms.material.name,
+                        "optical_class": manifest["materials"].get(ms.material.name, {}).get("optical_class", "diffuse")}
+                       for ms in obj.material_slots if ms.material]
+            _dctx = _DecCtx(object_id=oid, n_faces=len(obj.data.polygons), kind=kind,
+                            semantic_type=sem, subtype=subtype, factory=_factory_of(obj.name) or "",
+                            optical_class=(_dslots[0]["optical_class"] if _dslots else "diffuse"),
+                            material_slots=_dslots, bbox_min=tuple(bmin), bbox_max=tuple(bmax),
+                            has_baked_normal=False)
+            decimation_record = _decimate_object(obj, decimation_policy, _dctx)
+            if decimation_record.get("decimated"):
+                _log(f"[decimate] {obj.name}: {decimation_record['faces_before']}"
+                     f"→{decimation_record['faces_after']} ({decimation_record['policy']})", bar)
+            elif decimation_record.get("error"):
+                _log(f"[decimate] {obj.name} FAIL: {decimation_record['error']}", bar)
 
         obj_rel = f"meshes/{oid}.obj"
         glb_rel = f"meshes/{oid}.glb"
@@ -1766,11 +1807,16 @@ def main():
         }
         pbr_channels = {}
         pbr_issues = []
+        pbr_assumptions = []
         for key in ("base_color", "roughness", "metallic", "normal"):
             source = pbr_inputs[key]["source"]
             texture_ref = channel_textures[key]
             if source == "linked" and not texture_ref:
                 pbr_issues.append(f"{key}: linked input was not baked")
+            if source == "unresolved":
+                # No traced Principled socket: the emitted factor is an assumed
+                # default, not evidence that the source value is really this.
+                pbr_assumptions.append(f"{key}: assumed default factor (no traced socket)")
             constants = pbr_inputs[key].get("constants") or []
             default_constant = {
                 "base_color": [[0.6, 0.6, 0.6]],
@@ -1803,6 +1849,7 @@ def main():
             "self_contained_glb": bool(glb_rel and not pbr_issues),
             "channels": pbr_channels,
             "issues": pbr_issues,
+            "assumptions": pbr_assumptions,
         }
         glb_digest = _sha256_file(os.path.join(out_dir, glb_rel)) if glb_rel else None
 
@@ -1835,6 +1882,7 @@ def main():
             "place_size_m": place_size,          # [x, height, z] world AABB
             "place_base_height_m": place_base_height,
             "polys": len(obj.data.polygons),
+            "decimation": decimation_record,
             "materials": mats,
             "optical_class": unit_oc,
             "mesh_obj": obj_rel,

@@ -1,0 +1,38 @@
+digraph import_flow {
+  rankdir=TB; bgcolor="transparent"; nodesep=0.3; ranksep=0.45; compound=true;
+  node [shape=box style="rounded,filled" fontname="Helvetica" fontsize=11
+        fillcolor="#161b22" color="#2c3a4f" fontcolor="#e6e9ef" margin="0.16,0.09"];
+  edge [color="#6aa9ff" arrowsize=0.8 penwidth=1.2];
+
+  blend [label="Infinigen .blend" shape=note fillcolor="#20200f" color="#ffcc66" fontcolor="#ffcc66"];
+
+  subgraph cluster_s1 {
+    label="STAGE 1 — Blender 프로세스 (bpy)   tools/infinigen/blender_export_scene.py";
+    fontname="Helvetica"; fontsize=11; fontcolor="#9aa4b2"; color="#31404f"; style="rounded"; bgcolor="#12161c";
+    s1_load  [label=<<b>bpy 씬 로드 · 재질 추출</b><br/><font point-size="9" color="#9aa4b2">_extract_material · _optical_class</font>> color="#c58bff"];
+    s1_decim [label=<<b>◆ mesh decimation ✓ 구현</b><br/><font point-size="9" color="#ffcc66">decimate_object(obj, policy) · mesh_decimation.py</font>> color="#ffcc66" fontcolor="#ffcc66" style="rounded,filled,dashed" fillcolor="#20200f"];
+    s1_obj   [label=<<b>OBJ + MTL export</b><br/><font point-size="9" color="#9aa4b2">_export_obj · usemtl slot</font>> color="#39d98a"];
+    s1_bake  [label=<<b>texture / PBR bake</b><br/><font point-size="9" color="#9aa4b2">_bake_albedo/roughness/metallic/normal (per-object atlas)</font>> color="#ffcc66" fillcolor="#20200f"];
+    s1_glb   [label=<<b>GLB export</b><br/><font point-size="9" color="#9aa4b2">_export_glb · baked PBR 임베드</font>> color="#39d98a"];
+    s1_unit  [label=<<b>units[] append</b><br/><font point-size="9" color="#9aa4b2">polys·material_slots·optical_class·baked_normal</font>> color="#39d98a"];
+    s1_load -> s1_decim -> s1_obj -> s1_bake -> s1_glb -> s1_unit;
+  }
+
+  manifest [label=<<b>scene_manifest.json</b><br/><font point-size="9" color="#ffcc66">파일 핸드오프 (별도 Python env)</font>> shape=cylinder fillcolor="#20200f" color="#ffcc66" fontcolor="#ffcc66"];
+
+  subgraph cluster_s2 {
+    label="STAGE 2 — robomituba 프로세스   apps/import_infinigen_scene.py";
+    fontname="Helvetica"; fontsize=11; fontcolor="#9aa4b2"; color="#31404f"; style="rounded"; bgcolor="#12161c";
+    s2_val  [label=<<b>manifest 검증</b><br/><font point-size="9" color="#9aa4b2">validate_infinigen_manifest</font>> color="#6aa9ff"];
+    s2_auth [label=<<b>build_authoring_map</b><br/><font point-size="9" color="#9aa4b2">optical_class → bsdf_strategy (_material_binding)</font>> color="#6aa9ff"];
+    s2_inst [label=<<b>install / materialize</b><br/><font point-size="9" color="#9aa4b2">navigation_dataset.office_sample</font>> color="#c58bff"];
+    s2_xml  [label=<<b>render_scene.xml (~540 shape)</b><br/><font point-size="9" color="#9aa4b2">render_daemon._generate_opticalnav_render_scene_xml · GLB→OBJ glb_texture_adapter</font>> color="#39d98a"];
+    s2_pol  [label=<<b>material_policy.json</b><br/><font point-size="9" color="#9aa4b2">_build_render_scene_material_policy</font>> color="#39d98a"];
+    s2_cache[label=<<b>mesh_cache dedup</b><br/><font point-size="9" color="#9aa4b2">_stage_xml_obj_filenames_to_scene_mesh_cache</font>> color="#39d98a"];
+    s2_val -> s2_auth -> s2_inst -> s2_xml -> s2_pol -> s2_cache;
+  }
+
+  blend -> s1_load [lhead=cluster_s1];
+  s1_unit -> manifest;
+  manifest -> s2_val [lhead=cluster_s2];
+}
