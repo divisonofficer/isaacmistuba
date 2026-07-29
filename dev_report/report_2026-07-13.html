@@ -1,0 +1,499 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>2026-07-13 Infinigen spatial PBR → spectral/polarized BSDF 적용성 검증</title>
+  <style>
+    :root{color-scheme:light;--bg:#f6f8fb;--paper:#fff;--ink:#1d2939;--muted:#667085;--line:#d8dee9;--accent:#315fd5;--ok:#087443;--warn:#a15c07;--bad:#b42318;--code:#f1f4f9;--nav:#eef2f7}
+    *{box-sizing:border-box} html{scroll-behavior:smooth} body{margin:0;background:var(--bg);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;line-height:1.58}
+    .layout{display:flex;min-height:100vh;align-items:flex-start} aside{width:270px;flex:0 0 270px;position:sticky;top:0;height:100vh;overflow-y:auto;padding:24px 16px;border-right:1px solid var(--line);background:var(--nav)}
+    .logo{font-weight:800;color:var(--accent);font-size:16px}.date{margin-top:3px;color:var(--muted);font-size:12px;font-family:ui-monospace,Menlo,Consolas,monospace}.nav-title{margin:22px 8px 8px;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.12em;font-weight:800}.nav-link{display:block;padding:6px 8px;border-radius:5px;color:#344054;font-size:12px;text-decoration:none;margin-bottom:2px}.nav-link:hover{background:#dde3ee;color:var(--accent)}
+    main{flex:1;min-width:0;padding:36px 24px 64px} article{max-width:1120px;margin:0 auto;background:var(--paper);border:1px solid var(--line);border-radius:9px;padding:34px 40px;box-shadow:0 8px 24px rgb(16 24 40/.05)}
+    h1,h2,h3{line-height:1.25;margin:0}h1{font-size:28px}h2{margin-top:36px;padding-top:22px;border-top:1px solid var(--line);font-size:20px}h3{margin-top:24px;font-size:16px}p{margin:10px 0 0}ul,ol{margin:10px 0 0 22px;padding:0}li{margin:5px 0}code{background:var(--code);border:1px solid #e5e9f2;border-radius:5px;padding:1px 5px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:.92em}pre{overflow-x:auto;background:#111827;color:#e5e7eb;border-radius:8px;padding:14px 16px;font-size:13px;line-height:1.5}pre code{background:transparent;border:0;padding:0;color:inherit}
+    table{width:100%;border-collapse:collapse;margin-top:12px;font-size:13.5px}th,td{border:1px solid var(--line);padding:9px 10px;text-align:left;vertical-align:top}th{background:#f3f6fb;font-weight:650}figure{margin:18px 0 0}figure img{width:100%;border:1px solid var(--line);border-radius:8px;display:block;background:#111827}figcaption{margin-top:7px;color:var(--muted);font-size:12.5px}.meta{margin-top:10px;color:var(--muted);font-size:14px}.badge{display:inline-block;margin-right:6px;border-radius:999px;padding:2px 9px;border:1px solid var(--line);background:#f8fafc;color:var(--muted);font-size:12px}.ok{color:var(--ok);font-weight:650}.warn{color:var(--warn);font-weight:650}.bad{color:var(--bad);font-weight:650}
+    .cards{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-top:16px}.card{border:1px solid var(--line);border-radius:8px;padding:14px;background:#fbfcfe}.card .v{font-size:24px;font-weight:800;color:var(--accent)}.card .k{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em}.card .d{font-size:12px;color:var(--muted);margin-top:3px}.note{margin-top:14px;padding:11px 14px;border-left:3px solid var(--accent);background:#f3f6fb;border-radius:0 6px 6px 0;font-size:13.5px}.note.okbox{border-left-color:var(--ok);background:#f0f9f4}.note.warnbox{border-left-color:var(--warn);background:#fdf6ec}.note.badbox{border-left-color:var(--bad);background:#fff3f1}.flow{margin-top:14px;background:#111827;color:#e5e7eb;border-radius:8px;padding:14px 16px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:13px;white-space:pre-wrap}.small{font-size:12px;color:var(--muted)}
+    @media(max-width:900px){aside{display:none}.cards{grid-template-columns:repeat(2,minmax(0,1fr))}main{padding:16px}article{padding:24px 20px}}
+  </style>
+</head>
+<body>
+<div class="layout">
+<aside>
+  <div class="logo">Robomituba</div><div class="date">2026-07-13</div>
+  <div class="nav-title">검증</div>
+  <a class="nav-link" href="#summary">요약</a><a class="nav-link" href="#targets">1. 대상 4그룹</a><a class="nav-link" href="#contract">2. GLB/PBR 계약</a><a class="nav-link" href="#raw-result">3. sv-polartexture 실행</a>
+  <div class="nav-title">핵심 발견</div>
+  <a class="nav-link" href="#factor">4. metallicFactor 함정</a><a class="nav-link" href="#semantics">5. optical_class 우선순위</a><a class="nav-link" href="#mitsuba">6. Mitsuba GPU 검증</a>
+  <div class="nav-title">결론</div>
+  <a class="nav-link" href="#decision">7. 편입 판단</a><a class="nav-link" href="#implementation">8. 변환 모듈</a><a class="nav-link" href="#spatial-metallic">9. metallic bake 검증</a><a class="nav-link" href="#next">10. 다음 구현</a>
+  <div class="nav-title">242-unit 전수 감사</div>
+  <a class="nav-link" href="#full-audit">11. 채널 분포 해석</a><a class="nav-link" href="#collapse-audit">12. linked bake 붕괴</a><a class="nav-link" href="#collapse-root">13. 근본 원인</a><a class="nav-link" href="#strict-gate">14. strict gate 수정</a><a class="nav-link" href="#audit-evidence">15. 증거·판정</a>
+  <div class="nav-title">A/B integration</div>
+  <a class="nav-link" href="#spatial-ab">16. F0-only close-up A/B</a>
+  <div class="nav-title">원본 blend 의미 감사</div>
+  <a class="nav-link" href="#source-semantics">17. source channel 의미</a><a class="nav-link" href="#glb-uv-correction">18. GLB·UV 계약 정정</a><a class="nav-link" href="#provenance-audit">19. ARMN provenance</a><a class="nav-link" href="#fidelity-grades">20. fidelity 등급</a><a class="nav-link" href="#implemented-fixes">21. 수정·재실행 gate</a><a class="nav-link" href="#rebake-audit-final">22. full rebake 정정</a><a class="nav-link" href="#armn-source-semantics">23. ARMN source semantics</a><a class="nav-link" href="#snapshot-reconciliation">24. snapshot reconciliation</a>
+</aside>
+<main><article>
+  <h1>Infinigen spatial PBR → spectral·polarized analytic BSDF 적용성 검증</h1>
+  <div class="meta"><span class="badge">scene: kr_20260625</span><span class="badge">21 assets</span><span class="badge">cuda_ad_spectral_polarized</span><span class="badge">2026-07-13</span></div>
+
+  <h2 id="summary">요약</h2>
+  <p>07-08에 degenerate UV를 복구했던 네 그룹을 실제 Robomituba GLB로 다시 읽어, 첨부된 <code>sv-polartexture</code>의 PBR 추출·metal mask·F0→conductor n/k 생성을 실행했다. <strong>geometry/UV/PBR 추출과 Mitsuba BSDF 로드는 가능</strong>하지만, 원본 알고리즘은 glTF의 <code>metallicFactor</code>를 무시해 이번 대상의 diffuse·glass를 전부 conductor로 오판했다.</p>
+  <div class="cards">
+    <div class="card"><div class="k">Concrete assets</div><div class="v">21</div><div class="d">보고서 4개 행을 실제 ID로 전개</div></div>
+    <div class="card"><div class="k">UV / GLB contract</div><div class="v">21/21</div><div class="d">UV valid · self-contained GLB</div></div>
+    <div class="card"><div class="k">Basecolor extract</div><div class="v">21/21</div><div class="d">GLB embedded atlas round-trip</div></div>
+    <div class="card"><div class="k">False conductor</div><div class="v">10/10</div><div class="d">MR texture 보유 대상이 100% metal로 오판</div></div>
+  </div>
+  <div class="note badbox"><strong>결론:</strong> <code>sv-polartexture.py</code> 전체를 그대로 편입하면 안 된다. mesh normalization/OBJ rewrite는 제외하고, <code>effective_metallic = texture.B × metallicFactor</code>와 Robomituba <code>optical_class</code> 우선순위를 포함한 atlas adapter만 재구현해야 한다.</div>
+  <div class="note okbox"><strong>후속 구현 완료:</strong> 위 조건을 반영한 texture-only converter를 추가했다. 실제 spatial metallic 4종은 연속값과 UV 분포가 보존됐고, 기존 4개 조사 그룹은 모두 effective metallic 0으로 올바르게 판정됐다.</div>
+
+  <div class="note badbox"><strong>후속 242-unit 전수 감사:</strong> 위 21개 표본의 GLB round-trip 성공과 별개로, 전체 scene의 linked atlas를 픽셀 검사하자 39개 unit에서 albedo/roughness/metallic bake가 all-black 또는 full-constant로 붕괴한 사실이 확인됐다. 현재 <code>pbr.status=ok 242/242</code>는 PNG 존재만 확인한 과대 판정이므로 Stage 2·sync·render는 보류한다.</div>
+  <div class="note badbox"><strong>최종 정정 — section 17–21이 앞선 242-unit 수치를 대체한다:</strong> binary GLB와 UV triangle area까지 검사한 결과 현재 설치본은 strict-valid <strong>169/242</strong>뿐이다. 34개 GLB는 mesh primitive가 전혀 없고, 39개는 적어도 한 material primitive의 UV area가 0이다. 또한 원본 material Normal 입력은 0개이므로 생성된 normal 88개를 “원본 normal map 복원”으로 부르면 안 된다.</div>
+
+  <h2 id="targets">1. 07-08 재-bake 대상 4그룹</h2>
+  <table><thead><tr><th>보고서 그룹</th><th>실제 대상</th><th>폴리곤</th><th>현재 계약</th></tr></thead><tbody>
+    <tr><td>Bed · kitchen floor</td><td>Bed 1 + kitchen floor 1</td><td>18,425</td><td>diffuse · albedo 정상, bed roughness texture</td></tr>
+    <tr><td>NatureShelfTrinkets ×10</td><td>528,384/528,576 poly인 10개</td><td>5,284,224</td><td>diffuse · basecolor texture, roughness/metallic constant</td></tr>
+    <tr><td>LargePlantContainer ×4 + PlantContainer ×4</td><td>Large 4 + 0.84–1.31M Plant 4</td><td>7,350,824</td><td>diffuse/metal material part 혼합 · basecolor/roughness texture</td></tr>
+    <tr><td>PlantContainer(glass) ×1</td><td><code>PlantContainerFactory_8288363…</code></td><td>1,531,320</td><td>glass + sand/speckle/plant material part 혼합</td></tr>
+  </tbody></table>
+  <figure><img src="images/0713_target_asset_montage.png" alt="21 target assets GLB-extracted basecolor montage"><figcaption>21개 GLB에서 다시 추출한 basecolor atlas. 검은 영역은 UV atlas padding이며 유효 texel의 색·패턴은 보존됐다.</figcaption></figure>
+
+  <h2 id="contract">2. GLB/PBR 계약 점검</h2>
+  <ul>
+    <li><strong>21/21</strong>: 모든 geometry에 UV가 존재하고 span이 non-zero.</li>
+    <li><strong>21/21</strong>: manifest <code>pbr.status=ok</code>, <code>self_contained_glb=true</code>.</li>
+    <li><strong>21/21</strong>: <code>trimesh</code>를 통한 embedded baseColorTexture 재추출 성공.</li>
+    <li>Bed/plant/glass 10개는 packed metallic-roughness texture 보유, floor/trinkets 11개는 roughness·metallic이 constant라 MR texture가 없음.</li>
+  </ul>
+  <figure><img src="images/0713_group_atlas_detail.png" alt="Representative basecolor and roughness atlas detail"><figcaption>네 그룹 대표 atlas. constant channel에 불필요한 texture를 만들지 않는 현재 GLB 계약은 정상이다.</figcaption></figure>
+  <div class="note okbox">07-08의 “GLB에는 texture가 없다”는 당시 산출물에 대한 진단이었다. 현재 exporter 변경이 적용된 재-export 결과는 GLB 안에 PBR texture가 들어가며, 별도 atlas reference와 manifest channel 계약도 함께 유지된다.</div>
+
+  <h2 id="raw-result">3. 원본 sv-polartexture 실행 결과</h2>
+  <p>첨부 스크립트의 <code>save_textures()</code>와 <code>make_nk_maps()</code>를 mesh normalize/OBJ rewrite 없이 21개 GLB에 적용했다.</p>
+  <table><thead><tr><th>그룹</th><th>basecolor</th><th>n/k 생성</th><th>원본 알고리즘 판정</th></tr></thead><tbody>
+    <tr><td>Bed + floor</td><td>2/2 성공</td><td>Bed 1개</td><td>Bed conductor 100% — <span class="bad">오판</span></td></tr>
+    <tr><td>Trinkets ×10</td><td>10/10 성공</td><td>0</td><td>MR texture 없음 → diffuse short-circuit, 정상</td></tr>
+    <tr><td>Plant containers ×8</td><td>8/8 성공</td><td>8/8</td><td>전부 conductor 100% — <span class="bad">오판</span></td></tr>
+    <tr><td>Glass container ×1</td><td>1/1 성공</td><td>1/1</td><td>conductor 100% — <span class="bad">glass 파괴</span></td></tr>
+  </tbody></table>
+  <p>오판된 texel의 conductor preset은 <code>ThF4</code> 2,543,837 px가 압도적이었고, 뒤이어 <code>MgO</code> 34,251 px, <code>Cu</code> 29,945 px였다. 이는 렌더러 호환성 문제가 아니라 metallic 입력 해석 오류의 결과다.</p>
+
+  <h2 id="factor">4. 근본원인 — glTF metallicFactor를 무시</h2>
+  <p>glTF metallic-roughness는 texture 하나로 끝나지 않는다. 최종 metallic은 다음 곱이다.</p>
+  <div class="flow">effective_metallic(u,v) = metallicRoughnessTexture.B(u,v) × metallicFactor</div>
+  <p>이번 GLB는 roughness texture를 pack하기 위해 B 채널을 1.0으로 채우고, material의 <code>metallicFactor=0</code>으로 diffuse를 표현한다. 원본 스크립트는 B만 저장하므로 1.0×0을 1.0으로 잘못 해석한다.</p>
+  <figure><img src="images/0713_metallic_factor_trap.png" alt="Raw metallic texture versus factor-aware effective metallic"><figcaption>세 대표 에셋 모두 raw B는 white, factor 적용 후 실제 metallic은 black이다. 원본 mask는 factor를 무시해 white가 된다.</figcaption></figure>
+  <div class="note badbox"><strong>즉시 수정 조건:</strong> baseColor/roughness/metallic texture를 추출할 때 glTF factor를 반드시 곱해야 한다. 특히 <code>roughnessFactor</code>와 <code>baseColorFactor</code>도 같은 원칙으로 처리해야 한다.</div>
+
+  <h2 id="semantics">5. factor만 고쳐도 부족 — optical_class가 우선</h2>
+  <p>Infinigen은 이름이 <code>shader_hammered_metal</code>이어도 Principled metallic 값이 0인 사례가 있다. 따라서 factor를 올바르게 적용하면 false metal은 사라지지만, 실제 metal material part까지 plastic으로 놓칠 수 있다.</p>
+  <table><thead><tr><th>우선순위</th><th>판정</th><th>렌더 BSDF</th></tr></thead><tbody>
+    <tr><td>1</td><td>material slot <code>optical_class=glass</code></td><td><code>dielectric/roughdielectric</code>; metallic atlas 무시</td></tr>
+    <tr><td>2</td><td><code>optical_class=metal_*</code> 또는 강한 metal name</td><td>part 전체 <code>roughconductor</code> + 실제 eta/k preset</td></tr>
+    <tr><td>3</td><td>신뢰 가능한 effective metallic texture</td><td><code>blendbsdf(pplastic, roughconductor)</code></td></tr>
+    <tr><td>4</td><td>나머지 diffuse</td><td>textured <code>pplastic</code></td></tr>
+  </tbody></table>
+  <div class="note warnbox"><strong>Glass 예외 해석:</strong> 현재 mixed PlantContainer GLB에는 sand/plant part용 atlas가 존재한다. “오브젝트에 atlas가 있다”가 glass가 textured plastic이 되어야 한다는 뜻은 아니다. GLB material part를 분리하고 glass slot에 analytic dielectric를 유지하는 것이 정답이다.</div>
+
+  <h2 id="mitsuba">6. production spectral·polarized BSDF 로드 검증</h2>
+  <p>GPU 접근이 가능한 환경에서 <code>cuda_ad_spectral_polarized</code> variant로 세 대표 branch를 직접 instantiate했다.</p>
+  <table><thead><tr><th>대표</th><th>BSDF</th><th>결과</th></tr></thead><tbody>
+    <tr><td>Bed diffuse</td><td>bitmap albedo + bitmap alpha <code>pplastic</code></td><td class="ok">BSDF load 성공</td></tr>
+    <tr><td>Metal-mixed planter</td><td>bitmap eta/k + bitmap alpha <code>roughconductor</code></td><td class="ok">BSDF load 성공</td></tr>
+    <tr><td>Glass PlantContainer</td><td>bitmap alpha <code>roughdielectric</code></td><td class="ok">BSDF load 성공</td></tr>
+  </tbody></table>
+  <p>따라서 적용을 막는 기술적 장애는 없다. 문제는 <strong>어떤 texel/part에 어느 BSDF와 optical constants를 배정하느냐</strong>다.</p>
+
+  <h2 id="decision">7. 정식 편입 판단</h2>
+  <table><thead><tr><th>구성요소</th><th>판정</th><th>이유</th></tr></thead><tbody>
+    <tr><td>GLB→OBJ normalize/rewrite</td><td class="bad">제외</td><td>OpticalNav world scale/transform 파괴, 기존 GLB materializer와 중복</td></tr>
+    <tr><td>PBR texture extraction</td><td class="ok">재사용</td><td>단, glTF factor와 multi-material 처리 필수</td></tr>
+    <tr><td>Gaussian σ=30 mask</td><td class="bad">제외</td><td>해상도 의존 경계 bleed; metallic texture를 continuous weight로 사용</td></tr>
+    <tr><td>RGB F0 nearest preset</td><td class="warn">실험용</td><td>material identity가 불명확한 metal texel의 보조 추정치로만 사용</td></tr>
+    <tr><td>RGB n/k EXR</td><td class="warn">Phase 1</td><td>polarized spectral variant에서 로드되지만 3-band 재구성이라 full SPD는 아님</td></tr>
+    <tr><td>conductor index map</td><td class="ok">Phase 2 기반</td><td>custom indexed conductor가 full eta(λ), k(λ)를 선택하는 입력으로 적합</td></tr>
+  </tbody></table>
+  <p><strong>최종 결정:</strong> standalone script의 정식 편입은 보류하고, Robomituba-native <code>spatial_pbr_adapter</code>로 핵심만 재구현한다.</p>
+
+  <h2 id="implementation">8. Robomituba texture-only converter 구현</h2>
+  <p><code>mitsuba_converter.spatial_pbr</code>와 manifest CLI <code>apps/convert_spatial_pbr_textures.py</code>를 추가했다. geometry, UV, transform은 건드리지 않고 이미 bake된 atlas만 Mitsuba용 공간 가변 BSDF 입력으로 바꾼다.</p>
+  <div class="flow">baked basecolor ───────────────────────────────→ basecolor.png
+baked roughness × roughnessFactor ── square(r) ─→ alpha.png
+baked metallic × metallicFactor ────────────────→ metallic.png / bsdf_weight.png
+linear basecolor + metallic texel ── F0 match ──→ conductor_index.png / eta·k maps
+manifest + factors + preset provenance ─────────→ spatial_pbr.json</div>
+  <ul>
+    <li>새 <code>pbr.channels</code>와 기존 <code>baked_*</code> manifest 계약을 모두 읽는다.</li>
+    <li>glTF channel/factor를 적용하고, roughness는 <code>alpha=r²</code>로 변환한다.</li>
+    <li>metallic을 blur하거나 이진화하지 않고 continuous <code>blendbsdf</code> weight로 보존한다. threshold는 conductor preset 선택에만 사용한다.</li>
+    <li>preset 후보는 실제 conductor 7종(Ag, Al, Au, Cr, Cu, Ni, W)으로 제한하고 모든 선택 근거를 sidecar에 기록한다.</li>
+  </ul>
+  <table><thead><tr><th>검증</th><th>결과</th><th>의미</th></tr></thead><tbody>
+    <tr><td>factor/channel/alpha 단위 테스트</td><td class="ok">2/2 pass</td><td>metallicFactor, roughnessFactor, r² 및 연속 metallic 보존</td></tr>
+    <tr><td>production-compatible GPU load</td><td class="ok">성공</td><td><code>cuda_ad_spectral_polarized</code>에서 bitmap weight/alpha/eta/k <code>blendbsdf</code> 생성</td></tr>
+    <tr><td>renderer 자동 연결</td><td class="warn">미적용</td><td>현재는 변환·검증 CLI 단계이며 기존 material builder 동작은 바꾸지 않음</td></tr>
+  </tbody></table>
+
+  <h2 id="spatial-metallic">9. spatially varying metallic bake 실측 검증</h2>
+  <p>07-13 대상 21개는 실제 metallic이 전부 0이라 spatial bake의 양성 검증에는 부적합했다. 같은 Infinigen import 파이프라인의 기존 manifest에서 metallic atlas가 실제로 변하는 4개를 추가 선정해 converter를 실행했다.</p>
+  <table><thead><tr><th>양성 검증 에셋</th><th>effective metallic 범위</th><th>conductor texel</th><th>고유값 수</th></tr></thead><tbody>
+    <tr><td>BeverageFridgeFactory</td><td>0.000–1.000</td><td>20.9%</td><td>48</td></tr>
+    <tr><td>BookColumnFactory</td><td>0.000–1.000</td><td>68.6%</td><td>3</td></tr>
+    <tr><td>BottleFactory</td><td>0.000–1.000</td><td>94.3%</td><td>77</td></tr>
+    <tr><td>BookStackFactory</td><td>0.000–0.812</td><td>3.8%</td><td>10</td></tr>
+  </tbody></table>
+  <figure><img src="images/0713_spatial_metallic_positive.png" alt="Positive spatial metallic bake validation for four assets"><figcaption>왼쪽부터 basecolor, roughness, Mitsuba alpha=r², effective metallic, BSDF blend weight, conductor index. metallic의 연속값과 UV 공간 분포가 출력까지 붕괴 없이 유지된다.</figcaption></figure>
+  <div class="note okbox"><strong>Bake transport 판정: 성공.</strong> 네 에셋 모두 source metallic atlas의 값 범위·경계·부분 점유가 converter 출력에 보존됐다. 다만 BookColumn처럼 시각적으로 diffuse인 영역의 높은 metallic은 bake 전달 문제가 아니라 source material 의미론 문제일 수 있어 별도 audit이 필요하다.</div>
+
+  <h3>07-13 조사 대상 4그룹 — 음성 대조군</h3>
+  <p>Bed, NatureShelfTrinkets, LargePlantContainer, glass PlantContainer 대표를 같은 converter에 통과시켰다. 네 결과 모두 effective metallic 범위 0–0, conductor texel 0%였다.</p>
+  <figure><img src="images/0713_spatial_metallic_controls.png" alt="Negative spatial metallic controls from the four investigated groups"><figcaption>raw MR의 흰 B 채널에 속지 않고 metallicFactor를 적용해 모두 black으로 복원됐다. glass/metal material slot의 최종 BSDF는 atlas가 아니라 <code>optical_class</code> 우선순위가 결정한다.</figcaption></figure>
+
+  <h3>F0→conductor identity는 아직 실험 단계</h3>
+  <p>양성 4종의 평균 nearest-F0 오차는 각각 0.8555, 0.6338, 0.8407, 0.6478로 높았고 대부분 W로 몰렸다. 즉 <strong>spatial metallic bake와 blend weight는 신뢰할 수 있지만, basecolor만으로 실제 금속 종류와 spectral n/k를 확정할 수는 없다.</strong> material <code>optical_class</code>/이름 기반 preset을 우선하고 F0 match는 confidence gate를 통과한 경우에만 보조값으로 써야 한다.</p>
+
+  <h2 id="next">10. 다음 구현 순서</h2>
+  <ol>
+    <li>material builder에 converter sidecar를 연결하되 <code>glass → explicit metal → texture blend → diffuse</code> 우선순위를 보존한다.</li>
+    <li>nearest-F0 오차 threshold와 semantic fallback을 추가해 confidence가 낮은 n/k 자동 배정을 차단한다.</li>
+    <li><strong>구현·smoke 실행 완료:</strong> 양성 4종·음성 4종을 GLB UV/normal parts로 staging하고, <code>cuda_ad_spectral</code> RGB A/B와 <code>cuda_ad_spectral_polarized</code> A/B를 독립 생성하는 harness/config를 추가했다. 256²/64 spp에서 32/32 pair·128/128 render를 완료했고 pair별 RGB/polar montage와 mode별 metrics를 저장했다.</li>
+    <li>Phase 2 <code>indexed_roughconductor</code>에서 conductor index로 full eta(λ), k(λ)를 선택한다.</li>
+    <li>양성 4종·음성 4종과 synthetic Au/Cu/Al/plastic atlas를 regression fixture로 고정한다.</li>
+  </ol>
+  <div class="note"><strong>산출물:</strong> 원본 feasibility 결과는 <code>out/sv_polartexture_feasibility/kr_20260625_july13/</code>, 새 converter 양성 결과는 <code>out/spatial_pbr/2026-07-13-positive/</code>, 4그룹 음성 대조 결과는 <code>out/spatial_pbr/2026-07-13-controls/</code>에 저장했다. 기존 renderer/exporter의 미커밋 변경은 수정하지 않았다.</div>
+  <h2 id="full-audit">11. 242-unit PBR 채널 전수 감사</h2>
+  <p><code>kr_20260625</code>를 self-contained GLB v2 계약으로 full rebake한 뒤, manifest 분류와 실제 PNG 픽셀을 분리해 감사했다. 먼저 <strong>모든 물체에 네 장의 texture가 있어야 한다는 전제는 틀리다.</strong> 원래 Principled socket이 unlinked라면 glTF factor/manifest constant가 정답이고, normal bake가 flat이면 <code>not_applicable</code>이 정답이다.</p>
+  <div class="cards">
+    <div class="card"><div class="k">GLB / UV valid</div><div class="v">242/242</div><div class="d">self-contained geometry와 usable UV</div></div>
+    <div class="card"><div class="k">Spatial normal</div><div class="v">88</div><div class="d">1–99 percentile 변화량 0.02 이상</div></div>
+    <div class="card"><div class="k">Linked collapse</div><div class="v bad">39</div><div class="d">black 또는 full-constant channel ≥1</div></div>
+    <div class="card"><div class="k">Stage 2 gate</div><div class="v bad">BLOCK</div><div class="d">strict non-normal 검증 수정 전 보류</div></div>
+  </div>
+  <table><thead><tr><th>채널</th><th>Texture</th><th>Constant</th><th>Not applicable</th><th>texture가 242개가 아닌 이유</th></tr></thead><tbody>
+    <tr><td>Albedo</td><td>203</td><td>39</td><td>0</td><td>material-bearing unlinked factor 29 + no-material default 10</td></tr>
+    <tr><td>Roughness</td><td>161</td><td>81</td><td>0</td><td>material-bearing unlinked factor 71 + no-material default 10</td></tr>
+    <tr><td>Metallic</td><td>81</td><td>161</td><td>0</td><td>material-bearing unlinked factor 151 + no-material default 10</td></tr>
+    <tr><td>Normal</td><td>88</td><td>0</td><td>154</td><td>flat bake 폐기 144 + no-material 10</td></tr>
+  </tbody></table>
+  <div class="note okbox"><strong>Normal 복구 판정:</strong> material-bearing unit 232개를 모두 bake했고, 88개만 spatial texture로 유지했다. flat 144개는 PNG를 삭제했으며 normal constant는 0개다. 더 강한 변화량 0.1 기준으로도 59개가 남아 이전의 “유의미한 normal 약 56개” 수준을 복원했다.</div>
+
+  <h3>실제 texture 조합</h3>
+  <table><thead><tr><th>존재하는 texture 채널</th><th>Unit</th></tr></thead><tbody>
+    <tr><td>albedo + roughness</td><td>47</td></tr>
+    <tr><td>albedo + roughness + metallic</td><td>43</td></tr>
+    <tr><td>albedo + roughness + metallic + normal</td><td>38</td></tr>
+    <tr><td>texture 없음 — 모두 factor/N/A</td><td>31</td></tr>
+    <tr><td>albedo only</td><td>26</td></tr>
+    <tr><td>albedo + roughness + normal</td><td>25</td></tr>
+    <tr><td>albedo + normal</td><td>24</td></tr>
+    <tr><td>roughness only</td><td>7</td></tr>
+    <tr><td>roughness + normal</td><td>1</td></tr>
+  </tbody></table>
+
+  <h2 id="collapse-audit">12. linked bake pixel audit — 39 unit 붕괴</h2>
+  <p>manifest의 <code>mode=texture</code>는 PNG 생성 여부만 뜻한다. 실제 512×512 PNG의 RGB min/max를 전수 검사해 all-black 및 full-image constant를 별도로 집계했다.</p>
+  <table><thead><tr><th>채널</th><th>Manifest texture</th><th>whole-atlas variation 있음</th><th>All black</th><th>Full constant</th><th>판정</th></tr></thead><tbody>
+    <tr><td>Albedo</td><td>203</td><td>167</td><td class="bad">31</td><td class="bad">5</td><td>linked collapse 36</td></tr>
+    <tr><td>Roughness</td><td>161</td><td>147</td><td class="bad">3</td><td class="bad">11</td><td>linked collapse 14</td></tr>
+    <tr><td>Metallic</td><td>81</td><td>78</td><td class="bad">2</td><td class="bad">1</td><td>linked collapse 3</td></tr>
+    <tr><td>Normal</td><td>88</td><td>88</td><td>0</td><td>0</td><td class="ok">robust spatial 검증 통과</td></tr>
+  </tbody></table>
+  <p>채널 간 중복을 제거하면 affected unit은 39개다: <strong>metal 19, diffuse 11, glass 8, mirror 1</strong>. 조합은 albedo:black only 22, albedo:black+roughness:constant 6, albedo:constant+roughness:constant 5, albedo:black+roughness:black 3, metallic:black 2, metallic:constant 1이다.</p>
+  <div class="note warnbox"><strong>측정 한계:</strong> whole-image variation은 UV padding의 검은 배경까지 포함하므로 “variation 있음” 167/147/78을 곧바로 spatially valid로 확정할 수 없다. 반대로 all-black/full-constant는 명백한 붕괴다. 최종 strict 판정에는 별도 UV coverage mask가 필요하다.</div>
+
+  <details style="margin-top:14px"><summary><strong>39개 affected unit 전체 목록</strong></summary>
+  <ul class="small">
+    <li><code>BalloonFactory(7351594).spawn_asset(9790325)</code> — metal — albedo:black, roughness:black</li>
+    <li><code>Cube.002</code>, <code>Cube.003</code>, <code>Cube.004</code>, <code>Cube.005</code>, <code>Cube.006</code> — metal — albedo:black</li>
+    <li><code>GlassPanelDoorFactory(5853611).spawn_asset(0/1/3/4/5)</code> — metal — albedo:black</li>
+    <li><code>HardwareFactory(8245182).spawn_asset(4422616)</code> — metal — metallic:constant</li>
+    <li><code>JarFactory(3231562).spawn_asset(527553)</code> — glass — albedo:black</li>
+    <li><code>MirrorFactory(884242).spawn_asset(6121807)</code> — mirror — albedo:black, roughness:black</li>
+    <li><code>NatureShelfTrinketsFactory(2353833/4221758/4844736/5471316/6736818)</code> — diffuse — albedo:constant, roughness:constant</li>
+    <li><code>NatureShelfTrinketsFactory(6251345).spawn_asset(4288383)</code> — diffuse — albedo:black, roughness:black</li>
+    <li><code>OvenFactory(2648629).spawn_asset(4187647)</code> — metal — albedo:black</li>
+    <li><code>PanelDoorFactory(4622038).spawn_asset(2)</code> — diffuse — metallic:black</li>
+    <li><code>Plane.001/.003/.005/.007/.009</code> — metal — albedo:black</li>
+    <li><code>Plane.002/.004/.006/.008/.010/.012</code> — glass — albedo:black, roughness:constant</li>
+    <li><code>PlateFactory(9597174).spawn_asset(1375567/4706358/5794906)</code> — diffuse — albedo:black</li>
+    <li><code>SinkFactory(7637489).spawn_asset(0)</code> — metal — albedo:black</li>
+    <li><code>StandingSinkFactory(335794).spawn_asset(4727617)</code> — diffuse — metallic:black</li>
+    <li><code>VaseFactory(2983453).spawn_asset(0)</code> — glass — albedo:black</li>
+  </ul></details>
+
+  <h2 id="collapse-root">13. 근본 원인 — 비대칭 bake/validation 계약</h2>
+  <div class="flow">Normal     → Cycles bake → covered pixel percentile 검증 → spatial만 유지
+Albedo     → Cycles DIFFUSE bake ───────────────────────────→ 파일 존재만 확인
+Roughness  → Cycles ROUGHNESS bake ─────────────────────────→ 파일 존재만 확인
+Metallic   → nested Principled→Emission bake ───────────────→ 파일 존재만 확인</div>
+  <p>Infinigen의 nested group, glass/refraction route, mixed material graph는 Cycles DIFFUSE/ROUGHNESS pass가 socket 값을 항상 노출한다는 보장이 없다. 이 경우 Blender는 오류 없이 PNG를 저장하지만 결과는 black일 수 있다. 또한 linked graph나 multi-material 강제 bake가 full-constant로 붕괴해도 현재 strict check는 texture path가 있다는 이유로 통과시킨다.</p>
+  <table><thead><tr><th>코드 위치</th><th>현재 역할</th><th>결함</th></tr></thead><tbody>
+    <tr><td><code>blender_export_scene.py:475</code></td><td>albedo DIFFUSE bake</td><td>nested socket 값 자체를 직접 bake하지 않음</td></tr>
+    <tr><td><code>:540</code></td><td>normal pixel validation</td><td class="ok">현재 유일한 post-bake spatial gate</td></tr>
+    <tr><td><code>:696</code></td><td>roughness pass</td><td>black/constant 결과 검증 없음</td></tr>
+    <tr><td><code>:703</code></td><td>metallic emission substitution</td><td>결과 PNG의 covered range 검증 없음</td></tr>
+    <tr><td><code>:839</code></td><td>nested Principled contract</td><td>linked/constant 분류는 수행</td></tr>
+    <tr><td><code>:1276</code></td><td>strict linked check</td><td>texture path 유무만 검사</td></tr>
+  </tbody></table>
+
+  <h2 id="strict-gate">14. Stage 2 전 필수 수정</h2>
+  <ol>
+    <li>nested Principled-to-Emission helper를 Base Color, Roughness, Metallic 공통 경로로 일반화한다.</li>
+    <li>unit별 UV coverage mask를 별도로 bake하거나 생성해 padding을 제외한 texel만 검사한다.</li>
+    <li>네 채널 모두에 <code>bake_validation</code>을 기록한다: covered sample 수, robust percentile range, black/constant/spatial 결과, threshold.</li>
+    <li>strict mode에서 linked channel의 covered sample 0, all-black, robust constant를 실패시킨다.</li>
+    <li>constant는 원래 socket이 unlinked였을 때만 허용한다. normal N/A는 verified-flat 또는 no-material일 때만 허용한다.</li>
+    <li>Stage 1만 다시 실행하고 linked-collapse 0을 확인한 뒤 Stage 2를 연다.</li>
+  </ol>
+  <div class="note badbox"><strong>현재 promotion 판정 정정:</strong> GLB/UV/normal recovery는 성공했지만 non-normal spatial PBR acceptance는 실패다. 현재 설치된 v2 manifest를 Stage 2에 사용하거나 sync/RGB/polarization render를 시작하면 안 된다.</div>
+
+  <h2 id="audit-evidence">15. 증거·보존 상태</h2>
+  <ul>
+    <li>GLB 242/242, fallback OBJ 242/242, UV valid 242/242.</li>
+    <li>referenced texture file missing 0, manifest linked→missing texture 0.</li>
+    <li>normal spatial 88, flat discard 144, constant 0.</li>
+    <li>GLB/PBR materialization/XML 자동 테스트 6/6 pass.</li>
+    <li>full rebake는 resumable 20–40 unit fresh-bpy chunk와 atomic manifest merge로 완료했다.</li>
+    <li>기존 import는 <code>out/infinigen_imports/kr_20260625.backup.20260713T080738</code>에 보존됐다.</li>
+    <li>Stage 2, sync, observation rerender는 수행하지 않았다.</li>
+  </ul>
+  <div class="note badbox"><strong>정정:</strong> 위 목록은 file/manifest flag 감사의 중간 결과다. 실제 binary mesh primitive + per-primitive TEXCOORD triangle area 기준은 GLB strict-valid 169/242, empty 34, degenerate UV 39다. 자동 테스트도 아래 후속 수정 후 8/8로 갱신됐다.</div>
+  <h3>Material slot이 없는 10개 unit</h3>
+  <p>아래 unit은 albedo 0.6, roughness 0.6, metallic 0의 명시적 factor와 normal N/A가 올바른 결과다.</p>
+  <p class="small"><code>Cube.001</code> · <code>NatureShelfTrinketsFactory(120620).spawn_asset(7953580)</code> · <code>NatureShelfTrinketsFactory(3198458).spawn_asset(2814515)</code> · <code>bathroom_0/0.exterior</code> · <code>bedroom_0/0.exterior</code> · <code>bedroom_0/1.exterior</code> · <code>dining-room_0/0.exterior</code> · <code>hallway_0/0.exterior</code> · <code>kitchen_0/0.exterior</code> · <code>living-room_0/0.exterior</code></p>
+  <div class="note"><strong>상세 감사 원본:</strong> <code>dev_report/infinigen_kr_20260625_pbr_channel_audit_2026-07-13.md</code>. 본 HTML 섹션은 그 결과를 07-13 개발 보고서에 통합한 버전이다.</div>
+
+  <h2 id="spatial-ab">16. Spatial PBR F0-only close-up A/B integration</h2>
+  <p>정확도 benchmark가 아니라 adapter transport 검증을 위해 독립 harness <code>apps/render_spatial_pbr_ab.py</code>를 추가했다. 제품 <code>RenderRequest</code>, daemon, scene cache 계약은 변경하지 않는다. 고정 config는 8개 자산 × 정면/수평 65° × 좌/우 50° area light × A/B이며, 각 pair를 독립 RGB pass와 polarized pass로 실행해 <strong>32 pair·128 render</strong>를 정의한다.</p>
+  <div class="note">이 절의 실행은 242-unit Stage 2 promotion과 분리된 고정 GLB subset integration experiment다. 따라서 아래 smoke 완료는 전체 import manifest의 strict gate를 해제하거나 OpticalNav 데이터셋을 재렌더했다는 뜻이 아니다.</div>
+  <div class="flow">A: manifest material-level analytic routing + raw roughness-as-alpha
+B: blendbsdf(pplastic, roughconductor) + alpha=r² + continuous metallic
+   + basecolor F0 nearest preset에서 생성한 spatial η/k
+공통: GLB에서 materialize한 UV/normal 보존 mesh parts · basecolor · camera · area light · sampler seed</div>
+  <div class="note warnbox"><strong>입력 메시 정정:</strong> 최초 OBJ fallback은 <code>vt=0</code>, <code>vn=0</code>인 파일이라 삼각형 단위 텍스처/노멀 경계가 관측됐다. 이 결과와 그 경로의 이미지는 폐기했다. 현재 실험은 sibling GLB를 authoritative source로 사용하고, GLB scene-node transform을 bake한 material primitive별 OBJ를 모두 별도 shape으로 렌더한다. Fridge는 4 parts, Bed는 2 parts이며 각 part의 UV와 vertex normal이 보존된다.</div>
+
+  <h3>고정 자산</h3>
+  <table><thead><tr><th>Group</th><th>Scene</th><th>Object ID</th><th>atlas conductor fraction</th><th>F0 preset 집중</th></tr></thead><tbody>
+    <tr><td rowspan="4">positive</td><td rowspan="4"><code>kr_20000221</code></td><td><code>BeverageFridgeFactory_4647172_.spawn_asset_4618900</code></td><td>20.9%</td><td>W 100%</td></tr>
+    <tr><td><code>BookColumnFactory_8291484_.spawn_asset_7622244</code></td><td>68.6%</td><td>W 96.5%, Ni 3.5%</td></tr>
+    <tr><td><code>BottleFactory_3548288_.spawn_asset_291184</code></td><td>94.3%</td><td>W 100%</td></tr>
+    <tr><td><code>BookStackFactory_3836551_.spawn_asset_7763197</code></td><td>3.8%</td><td>W 100%</td></tr>
+    <tr><td rowspan="4">negative</td><td rowspan="4"><code>kr_20260625</code></td><td><code>BedFactory_7812946_.spawn_asset_5878389</code></td><td>0%</td><td>dielectric only</td></tr>
+    <tr><td><code>NatureShelfTrinketsFactory_7695705_.spawn_asset_742423</code></td><td>0%</td><td>dielectric only</td></tr>
+    <tr><td><code>LargePlantContainerFactory_2686399_.spawn_asset_5396567</code></td><td>0%</td><td>dielectric only</td></tr>
+    <tr><td><code>PlantContainerFactory_8288363_.spawn_asset_1688329</code></td><td>0%</td><td>glass analytic class</td></tr>
+  </tbody></table>
+
+  <h3>정렬·산출물 계약</h3>
+  <ul>
+    <li>bbox 기반 72% frame fill과 geometry scale 보존, FOV 45°, neutral floor와 단일 직사각형 area emitter만 사용한다.</li>
+    <li>material-independent UV/depth AOV를 pair당 한 번 렌더하고 atlas를 nearest resample한다. object, metal(<code>metallic≥0.5</code>), dielectric ROI 밖 값은 0으로 강제한다.</li>
+    <li>RGB는 <code>cuda_ad_spectral</code> non-polarized pass, polarization은 <code>cuda_ad_spectral_polarized</code> pass로 A/B를 각각 독립 실행한다. RGB EXR/PNG/NPZ와 polarized RGB·Stokes S0–S3, DoLP/AoLP, S1/S0·S2/S0 colorbar를 모두 저장한다.</li>
+    <li>ROI별 linear RGB relative MAE, |ΔDoLP| mean/p95/&gt;0.05, DoLP-weighted π-period AoLP distance, S1/S0·S2/S0 MAE를 기록하고 group별 paired bootstrap 95% CI를 계산한다.</li>
+    <li><code>resume_manifest.json</code>은 실패 pair만 재시도하며, config·GLB·materialized OBJ parts·manifest·atlas SHA-256과 camera/light matrix, seed, build, BSDF 요약을 보존한다.</li>
+  </ul>
+
+  <h3>GPU preflight 결과</h3>
+  <table><thead><tr><th>대상</th><th>조건</th><th>결과</th><th>검증 범위</th></tr></thead><tbody>
+    <tr><td>8개 GLB 전체</td><td>256×256, 64 spp, 32 conditions</td><td class="ok">32/32 pair · 128/128 render 완료</td><td>독립 RGB A/B + polarized A/B, GLB parts, ROI/metrics</td></tr>
+    <tr><td>유리 화분 예외</td><td>roughdielectric + normalmap</td><td class="ok">twosided 제거 후 4/4 pair 재개 완료</td><td>투과 BSDF 로드 제약을 기록하고 수정</td></tr>
+    <tr><td>8px preflight</td><td>8×8, 1 spp</td><td class="ok">완료</td><td>GLB parts wiring smoke; 보고서 대표 이미지에는 사용하지 않음</td></tr>
+    <tr><td>전체</td><td>640×640, 512 spp, 128 renders</td><td class="warn">미실행</td><td>완료 판정 128/128은 아직 주장하지 않음</td></tr>
+  </tbody></table>
+  <table><thead><tr><th>New 8-asset smoke / ROI</th><th>RGB linear rel. MAE</th><th>polar mean |ΔDoLP|</th><th>polar weighted ΔAoLP (rad)</th></tr></thead><tbody>
+    <tr><td>positive / object</td><td>0.77244</td><td>0.08693</td><td>0.10000</td></tr>
+    <tr><td>positive / metal</td><td>0.62100</td><td>0.08807</td><td>0.10017</td></tr>
+    <tr><td>negative / object (= dielectric)</td><td>0.32232</td><td>0.02069</td><td>0.01304</td></tr>
+  </tbody></table>
+  <table><thead><tr><th>New independent RGB pass</th><th>status</th><th>output</th></tr></thead><tbody>
+    <tr><td>8 assets × 4 conditions × A/B</td><td class="ok">완료 · 64 RGB + 64 polarized</td><td><code>rgb_metrics</code>, <code>rgb_comparison.png</code>, <code>polar_comparison.png</code>, RGB/ Stokes EXR·NPZ</td></tr>
+  </tbody></table>
+  <p class="small">위 값은 새 8-asset 256×256/64 spp smoke의 16 positive·16 negative pair에 대한 paired bootstrap 평균이다. 최종 640×640/512 spp는 별도 고비용 실행으로 남겨 두었다. Bed·negative군도 변화가 0이라고 가정하지 않으며, raw roughness와 r² alpha 차이를 포함한다.</p>
+  <figure><img src="../out/spatial_pbr_ab/2026-07-13-rgb-polar-256-glb/BeverageFridgeFactory_4647172_.spawn_asset_4618900/rgb_contact_sheet.png" alt="Fridge GLB RGB A/B 256px smoke contact sheet"><figcaption>Fridge authoritative GLB material parts(4개)의 RGB A/B. 각 패널은 analytic A, spatial-F0 B, 3× absolute difference이며, OBJ fallback은 사용하지 않는다.</figcaption></figure>
+  <figure><img src="../out/spatial_pbr_ab/2026-07-13-rgb-polar-256-glb/BeverageFridgeFactory_4647172_.spawn_asset_4618900/polar_contact_sheet.png" alt="Fridge GLB polarized A/B 256px smoke contact sheet"><figcaption>Fridge 동일 조건의 polarized RGB A/B contact sheet. 각 pair에는 Stokes S0–S3, DoLP/AoLP와 normalized Stokes raw arrays가 함께 보존된다.</figcaption></figure>
+  <figure><img src="../out/spatial_pbr_ab/2026-07-13-rgb-polar-256-glb/BeverageFridgeFactory_4647172_.spawn_asset_4618900/front__left50/polar_diagnostics.png" alt="Fridge DoLP AoLP S1 S2 polarization diagnostics with colorbars"><figcaption>Fridge 대표 정면·좌측 조명: DoLP(=DoP), AoLP, raw S1/S2, S1/S0·S2/S0를 A analytic/B spatial-F0로 나란히 표시하고 각 필드의 고정 colorbar를 붙였다. raw S1/S2는 frame별 signed scale, normalized Stokes는 [-1,+1] scale이다.</figcaption></figure>
+  <figure><img src="../out/spatial_pbr_ab/2026-07-13-rgb-polar-256-glb/BedFactory_7812946_.spawn_asset_5878389/rgb_contact_sheet.png" alt="Bed GLB RGB A/B 256px smoke contact sheet"><figcaption>Bed negative-control RGB A/B. metallic=0인 대조군도 raw roughness와 r² alpha 차이로 관측 변화가 생길 수 있음을 보여준다.</figcaption></figure>
+  <figure><img src="../out/spatial_pbr_ab/2026-07-13-rgb-polar-256-glb/BedFactory_7812946_.spawn_asset_5878389/polar_contact_sheet.png" alt="Bed GLB polarized A/B 256px smoke contact sheet"><figcaption>Bed negative-control polarized A/B contact sheet. RGB와 편광은 동일 geometry/UV/camera/light/seed 쌍으로 비교했다.</figcaption></figure>
+  <figure><img src="../out/spatial_pbr_ab/2026-07-13-rgb-polar-256-glb/BedFactory_7812946_.spawn_asset_5878389/front__left50/polar_diagnostics.png" alt="Bed DoLP AoLP S1 S2 polarization diagnostics with colorbars"><figcaption>Bed 대표 정면·좌측 조명: 음성 대조군의 DoLP/AoLP/S1/S2를 colorbar와 함께 확인할 수 있다. 이 diagnostics는 RGB montage와 별도로 Stokes 채널 자체를 읽기 위한 그림이다.</figcaption></figure>
+  <p class="small">전체 산출물: <code>out/spatial_pbr_ab/2026-07-13-rgb-polar-256-glb/</code>. 각 조건 디렉터리에 <code>rgb_comparison.png</code>, <code>polar_comparison.png</code>, <code>polar_diagnostics.png</code>(DoLP/AoLP/S1/S2 colorbar 포함), <code>A/rgb/</code>, <code>B/rgb/</code>, Stokes EXR/NPZ, ROI/AOV NPZ가 저장된다.</p>
+
+  <div class="note okbox"><strong>Transport 결론:</strong> production <code>cuda_ad_spectral_polarized</code>에서 B의 continuous metallic blend, r² alpha, η/k texture가 실제 Stokes render까지 도달한다. 즉 “spatial PBR adapter가 관측을 변경할 수 있는가”에 대한 integration wiring은 확인됐다.</div>
+  <div class="note badbox"><strong>Retrieval 결론:</strong> F0 match가 W에 과도하게 집중되고 평균 match error도 높다. 또한 η/k EXR의 물리 값은 1을 넘어 Mitsuba RGB-spectrum bitmap 범위 경고를 낸다. 로드는 성공하지만 이 3-band upsampling을 실제 금속 η(λ), k(λ) 정확도 향상으로 해석할 수 없다. indexed conductor/full-SPD 또는 semantic preset 경로가 후속 과제다.</div>
+  <div class="note warnbox"><strong>정량 해석 한계:</strong> 이번 완료 수치는 256²/64 spp smoke다. RGB·polar 관측 변화의 integration wiring은 확인됐지만, F0 nearest-preset의 η/k 물리 정확도나 640²/512 spp 최종 품질을 의미하지 않는다. Mitsuba의 eta/k 범위 경고는 의도된 F0-only retrieval 한계로 기록했다.</div>
+
+  <h2 id="source-semantics">17. 원본 <code>scene.blend</code> source channel 의미 감사</h2>
+  <p>2.7 GB 원본 <code>data/infinigen_generated/outputs/kr_20260625/full/scene.blend</code>를 audit-only로 열어 Material Output Surface에서 역추적 가능한 closure와 nested Group Input을 분석했다. 전체 mesh object는 433개이며, exporter 대상 242개와 placeholder duplicate 191개로 분리된다. 242개는 manifest와 이름 기준 242/242 매칭됐다.</p>
+  <div class="cards">
+    <div class="card"><div class="k">Source-varying A</div><div class="v">169</div><div class="d">Base Color가 surface/slot에 따라 변화</div></div>
+    <div class="card"><div class="k">Source-varying R</div><div class="v">138</div><div class="d">Roughness가 surface/slot에 따라 변화</div></div>
+    <div class="card"><div class="k">Source-varying M</div><div class="v">81</div><div class="d">metallic mask 또는 slot 상이</div></div>
+    <div class="card"><div class="k">Source material N</div><div class="v bad">0</div><div class="d">Principled Normal 연결 0</div></div>
+  </div>
+  <table><thead><tr><th>실제 source-varying 조합</th><th>Unit</th><th>해석</th></tr></thead><tbody>
+    <tr><td><code>----</code></td><td>53</td><td>ARMN 모두 상수·부재 또는 nonstandard unresolved</td></tr>
+    <tr><td><code>-R--</code></td><td>14</td><td>roughness만 의미 있게 변화</td></tr>
+    <tr><td><code>-RM-</code></td><td>6</td><td>roughness + metallic 변화</td></tr>
+    <tr><td><code>A---</code></td><td>51</td><td>albedo만 변화</td></tr>
+    <tr><td><code>AR--</code></td><td>43</td><td>albedo + roughness 변화</td></tr>
+    <tr><td><code>ARM-</code></td><td>75</td><td>albedo + roughness + metallic 변화</td></tr>
+  </tbody></table>
+  <h3>metallic=0 constant의 원인 분해</h3>
+  <p>최신 <code>kr_20260625_covered_uv_pbr_audit_new.json</code>에서 metallic source state, manifest channel, covered-UV verdict, optical class를 결합하면 “실제 effective zero”와 “소켓 부재”를 분리할 수 있다. 단, <code>DEFAULT_CONSTANT=0</code>은 Blender 기본값을 그대로 둔 경우와 사용자가 0을 명시한 경우를 evaluated <code>.blend</code>만으로는 더 세분화할 수 없다.</p>
+  <table><thead><tr><th>판정</th><th>Unit</th><th>현재 의미</th></tr></thead><tbody>
+    <tr><td class="ok"><code>DEFAULT_CONSTANT=0</code> · diffuse</td><td>106</td><td>Principled Metallic 소켓이 존재하고 링크되지 않은 유효 constant 0. 실시간 PBR 의미상 dielectric/effective metal 없음.</td></tr>
+    <tr><td class="warn">glass/mirror analytic override</td><td>13</td><td>metallic atlas로 판정하지 않음. glass/mirror optical class가 최종 BSDF를 결정하며, 0 또는 unresolved여도 “금속성 0” 증거가 아니다.</td></tr>
+    <tr><td class="warn">metallic socket <code>ABSENT</code></td><td>10</td><td>Principled Metallic 입력 자체가 없거나 material이 없어 exporter가 fallback 0을 기록. “실제 0”이 아니라 parameter absent.</td></tr>
+    <tr><td class="bad">non-analytic unresolved</td><td>13</td><td>source graph를 해석하지 못해 0 constant를 의미론적으로 확정할 수 없음.</td></tr>
+    <tr><td>explicit/nonzero constant</td><td>19</td><td>constant 값이 0이 아닌 source factor; 금속 1 또는 중간값 등.</td></tr>
+    <tr><td>source-varying texture</td><td>4</td><td>source metallic variation이 texture로 보존됨.</td></tr>
+    <tr><td class="bad">source-varying bake collapse</td><td>33</td><td>source는 varying인데 bake가 collapse됨. 0/constant 출력으로 보이면 “금속성 없음”으로 분류하면 안 됨.</td></tr>
+    <tr><td>source-varying approximation</td><td>44</td><td>varying source는 확인되지만 layered/transmission 등 근사 transport라 별도 fidelity 주의.</td></tr>
+  </tbody></table>
+  <div class="note okbox"><strong>07-13 대상에 적용:</strong> Bed, NatureShelfTrinkets, LargePlantContainer는 <code>DEFAULT_CONSTANT=0</code>인 diffuse라 effective metallic 없음으로 분류할 수 있다. glass PlantContainer는 <code>optical_class=glass</code> + unresolved source이므로 “metallic 0”이 아니라 analytic glass override/미해결로 기록해야 한다.</div>
+  <div class="note warnbox"><strong>Normal 의미:</strong> node tree 전체에는 <code>Normal Map</code> 노드가 9개 있었지만 모두 실제 Principled Normal/Output Surface 경로에 연결되지 않았다. 즉 source material normal variation은 0개다. Normal bake는 material map 추출이 아니라 evaluated surface normal의 재샘플링이다.</div>
+
+  <h2 id="glb-uv-correction">18. GLB·UV 계약의 구조적 정정</h2>
+  <p>기존 <code>GLB 242/242, UV valid 242/242</code>는 “파일 존재 + manifest bool”만 센 값이었다. GLB v2 JSON/BIN의 mesh primitive, POSITION, TEXCOORD_0 accessor, index count와 UV triangle area를 읽은 결과는 다음과 같다.</p>
+  <table><thead><tr><th>상태</th><th>Unit</th><th>실패 형태</th></tr></thead><tbody>
+    <tr><td class="ok">strict-valid GLB + per-part UV</td><td>169</td><td>mesh primitive 존재, 모든 primitive에 non-empty POSITION/TEXCOORD_0와 non-zero UV triangle area</td></tr>
+    <tr><td class="bad">empty GLB</td><td>34</td><td>132-byte container, <code>meshes/primitives</code> 없음</td></tr>
+    <tr><td class="bad">degenerate UV GLB</td><td>39</td><td>적어도 한 material primitive가 line/point UV; per-primitive issue 72건</td></tr>
+  </tbody></table>
+  <p>원본의 실제 UV triangle-area invalid는 139개다. 현재 산출물에서 109개만 usable GLB UV로 복구됐고 30개는 여전히 invalid다. 반대로 원본 UV가 usable이었던 객체 중 43개도 hidden-collection GLB gather 실패 또는 일부 material part 누락으로 현재 GLB가 invalid가 됐다.</p>
+  <div class="flow">오판: U range > 0 OR V range > 0  → valid
+실제 Balloon: U=0.0035…0.995, V=0…0 → 모든 UV triangle area=0
+수정: material slot별 loop-triangle area > 1e-10 확인
+      + hidden collection object를 visible scene-root proxy로 GLB export</div>
+
+  <h2 id="provenance-audit">19. ARMN file completeness가 아닌 provenance</h2>
+  <p>현재 설치본 PNG를 GLB UV triangle coverage 안에서만 검사하고 source graph와 결합했다. 아래 수치는 “파일을 만들었는가”가 아니라 그 파일이 무엇을 의미하는가를 보여준다.</p>
+  <table><thead><tr><th>채널</th><th>SOURCE_PROJECTED</th><th>BAKE_APPROXIMATION</th><th>CONSTANT / factor</th><th>BAKE_COLLAPSE</th><th>UNRESOLVED / invalid GLB</th></tr></thead><tbody>
+    <tr><td>Albedo</td><td>32</td><td>103</td><td>12 rasterized + 37 factor</td><td class="bad">29</td><td>7 unresolved + 22 unverifiable</td></tr>
+    <tr><td>Roughness</td><td>14</td><td>79</td><td>12 rasterized + 76 factor</td><td class="bad">27</td><td>9 unresolved + 25 unverifiable</td></tr>
+    <tr><td>Metallic</td><td>4</td><td>44</td><td>136 factor</td><td class="bad">33</td><td>25 unresolved</td></tr>
+    <tr><td>Normal</td><td>0</td><td>80 geometry-derived</td><td>154 source absent</td><td>3 flat/artifact</td><td>5 unverifiable</td></tr>
+  </tbody></table>
+  <p>생성 normal atlas는 88개지만, covered-UV 기준 80개가 <code>BAKE_DERIVED_GEOMETRY_NORMAL</code>, 3개가 flat/artifact, 5개가 invalid GLB 때문에 검증 불가다. 따라서 88개 모두 source material normal map이 아니다.</p>
+  <div class="note warnbox"><strong>앞선 39-unit 수치와의 관계:</strong> 39는 whole-image all-black/full-constant만 찾은 1차 하한이다. UV padding을 제외하고 source-varying semantics를 적용하면 strict-valid 169개 중 28개가 여전히 linked bake collapse다(albedo 17, roughness 13, metallic 21; 중복 포함). invalid GLB까지 포함한 current-export channel collapse 관측은 56개지만, 73개 geometry/UV invalid는 별도 unsupported 사유로 우선 처리한다.</div>
+
+  <h2 id="fidelity-grades">20. 객체별 exportability와 fidelity 판정</h2>
+  <table><thead><tr><th>원본 graph 그룹</th><th>Unit</th><th>4-map 의미</th></tr></thead><tbody>
+    <tr><td>G1 standard PBR + constants</td><td>17</td><td>factor/absent가 정답; full ARMN은 형식적 constant rasterization</td></tr>
+    <tr><td>G2 bakeable procedural PBR</td><td>53</td><td>render 비교 통과 시 bake-equivalent</td></tr>
+    <tr><td>G3 displacement-dependent</td><td>79</td><td>ARMN만으로 height/silhouette 손실</td></tr>
+    <tr><td>G4 transmission/glass</td><td>6</td><td>transmission/IOR/volume를 ARMN으로 표현 불가</td></tr>
+    <tr><td>G5 nonstandard/layered</td><td>87</td><td>Mix Shader, coat, subsurface 등 closure 축약</td></tr>
+    <tr><td>G6/G7</td><td>0</td><td>원본 graph 자체의 evaluated failure는 없었음; 현재 export failure는 별도 집계</td></tr>
+  </tbody></table>
+  <table><thead><tr><th>현재 설치본 4-map fidelity</th><th>Unit</th><th>판정 조건</th></tr></thead><tbody>
+    <tr><td>exact candidate</td><td>9</td><td>simple constant/standard path + 현재 GLB/UV valid</td></tr>
+    <tr><td>bake-equivalent candidate</td><td>31</td><td>G2 + current channel/GLB gate 통과; multi-view render 검증 전 candidate</td></tr>
+    <tr><td>severely lossy</td><td>101</td><td>displacement/transmission/layered closure가 ARMN 밖에 존재</td></tr>
+    <tr><td>unsupported — channel collapse</td><td>28</td><td>strict-valid GLB지만 source-varying bake가 covered UV에서 black/constant</td></tr>
+    <tr><td>unsupported — degenerate GLB UV</td><td>39</td><td>한 개 이상의 material primitive UV area=0</td></tr>
+    <tr><td>unsupported — empty GLB</td><td>34</td><td>mesh primitive 없음</td></tr>
+  </tbody></table>
+  <p><strong>세 질문은 분리해야 한다.</strong> raster bake feasibility는 exact 9, bake-equivalent candidate 73, opaque-term-only 6, surface-color-only 53이며 나머지는 current export/GLB 실패다. 4-map fidelity는 위 표와 같고, real-time metallic-roughness 근사는 G2 73개에서 acceptable candidate이지만 G3 53개와 glass 6개는 심한 손실이다. <code>candidate</code>는 원본-vs-baked multi-view/grazing-light render 비교 전에는 확정 등급으로 승격하지 않는다.</p>
+
+  <h2 id="implemented-fixes">21. 구현 수정과 재실행 gate</h2>
+  <ul>
+    <li>원본 audit 도구 <code>tools/infinigen/blender_audit_original_pbr.py</code>: reachable Surface closure, nested Group Input, material-slot channel state, evaluated mesh, modifier/GN, per-slot UV area 기록.</li>
+    <li>coverage 결합 도구 <code>tools/infinigen/summarize_original_pbr_audit.py</code>: GLB part UV mask, padding 제외 percentile, source/projected/constant/derived/approximation/collapse provenance와 객체별 fidelity 기록.</li>
+    <li>exporter: hidden collection용 temporary scene-root proxy GLB export, empty GLB 즉시 실패, material-slot별 UV triangle-area Smart UV, A/R/M 공통 Principled-to-Emission 경로.</li>
+    <li>Stage 2: GLB JSON/BIN을 읽어 primitive/POSITION/TEXCOORD/index/triangle UV area를 strict 검사한다.</li>
+    <li>회귀 테스트: valid UV GLB 수용, empty GLB 거부, collinear UV 거부를 포함해 <strong>8/8 pass</strong>.</li>
+  </ul>
+  <table><thead><tr><th>Targeted positive test</th><th>수정 전</th><th>수정 후</th></tr></thead><tbody>
+    <tr><td>BalloonFactory(7351594)</td><td>V=0 line UV, albedo/roughness black</td><td>2D Smart UV, spatial albedo/roughness, non-empty 1-part GLB strict pass</td></tr>
+    <tr><td>GlassPanelDoorFactory(5853611).0</td><td>3개 중 2개 material primitive UV degenerate</td><td>3/3 primitive UV valid, spatial albedo/roughness/metallic, strict pass</td></tr>
+    <tr><td>Cube.001</td><td>132-byte empty GLB</td><td>1.9 KB mesh+UV GLB, strict pass</td></tr>
+  </tbody></table>
+  <div class="note badbox"><strong>현재 gate:</strong> 수정 코드는 targeted positive와 8개 자동 테스트를 통과했지만, 현재 설치된 6 GB import는 수정 전 산출물이다. full Stage 1 rebake, 새 provenance audit, linked collapse 0, GLB/UV 242/242, original-vs-baked representative multi-view render를 통과하기 전에는 Stage 2·sync·RGB/polarization rerender를 실행하지 않는다.</div>
+  <div class="note"><strong>감사 산출물:</strong> <code>out/infinigen_audits/kr_20260625_original_pbr_audit.json</code>와 <code>out/infinigen_audits/kr_20260625_covered_uv_pbr_audit.json</code>. 모든 242개 객체의 source state, generated map, provenance, collapse reason, GLB/UV 상태와 provisional fidelity를 포함한다.</div>
+
+  <h2 id="rebake-audit-final">22. 2026-07-13 full rebake 후 전수 provenance 감사와 strict gate 정정</h2>
+  <p>위 21절의 pre-rebake 수치에 대해 strict fresh-bpy chunk export를 재시도했다. GLB/UV 및 normal 복구는 targeted probe에서 확인했지만, full staging은 40/242 unit을 커밋한 뒤 <code>CellShelfFactory(6182579).spawn_asset(4231825)</code>의 linked roughness가 실제 bake에서 constant로 붕괴해 중단됐다. 따라서 아래의 242-unit 표는 마지막으로 완료된 covered audit의 provenance이고, 현재 staging은 Stage 2 승인/atomic promote 대상이 아니다.</p>
+  <div class="cards">
+    <div class="card"><div class="k">Covered-audit GLB structure</div><div class="v ok">242/242</div><div class="d">prior completed audit · empty 0 · degenerate UV 0</div></div>
+    <div class="card"><div class="k">Covered-audit Export UV</div><div class="v ok">242/242</div><div class="d">prior completed audit · source-invalid 139개 모두 planar/Smart UV로 복구</div></div>
+    <div class="card"><div class="k">Spatial normal</div><div class="v">92</div><div class="d">geometry-derived; flat/artifact 1, source normal 0</div></div>
+    <div class="card"><div class="k">Linked collapse units</div><div class="v bad">63/242</div><div class="d">albedo 26 · roughness 35 · metallic 33 (중복)</div></div>
+  </div>
+  <table><thead><tr><th>채널</th><th>SOURCE_PROJECTED</th><th>BAKE_APPROXIMATION</th><th>CONSTANT_RASTERIZED</th><th>SOURCE_CONSTANT_FACTOR</th><th>BAKE_COLLAPSE</th><th>UNRESOLVED</th></tr></thead><tbody>
+    <tr><td>Albedo</td><td>35</td><td>112</td><td>20</td><td>37</td><td class="bad">26</td><td>12</td></tr>
+    <tr><td>Roughness</td><td>19</td><td>85</td><td>12</td><td>76</td><td class="bad">35</td><td>15</td></tr>
+    <tr><td>Metallic</td><td>4</td><td>44</td><td>0</td><td>136</td><td class="bad">33</td><td>25</td></tr>
+    <tr><td>Normal</td><td>0</td><td>92 geometry-derived</td><td>—</td><td>149 source absent</td><td>1 flat/artifact</td><td>—</td></tr>
+  </tbody></table>
+  <table><thead><tr><th>판정</th><th>Unit</th><th>해석</th></tr></thead><tbody>
+    <tr><td>exact candidate</td><td>17</td><td>standard PBR/factor path; render comparison 전 candidate</td></tr>
+    <tr><td>bake-equivalent candidate</td><td>38</td><td>GLB/UV와 opaque PBR transport는 가능하나 multi-view 검증 전</td></tr>
+    <tr><td>severely lossy</td><td>124</td><td>displacement, transmission, layered/nonstandard closure를 ARMN으로 축약</td></tr>
+    <tr><td class="bad">unsupported — linked collapse</td><td>63</td><td>covered UV에서 linked albedo/roughness/metallic이 black 또는 constant</td></tr>
+  </tbody></table>
+  <p>정상적으로 네 파일을 생성할 수 있는지와 원본이 네 개의 varying material channel을 가졌는지는 별개다. 위 표의 covered-audit 당시 normal PNG 93개(유효 spatial 92 + flat/artifact 1)도 모두 source normal map은 아니며, 대부분 evaluated geometry normal의 bake-derived 결과였다. metallic 136개는 varying texture가 아니라 source constant factor가 정답이다. 최신 export 집계는 아래 23절에서 88개 유효 normal로 별도 기록한다.</p>
+  <h3>linked collapse의 구조적 원인 분해</h3>
+  <p>collapse는 단순히 PNG 파일을 못 만든 것이 아니라, source graph가 Principled socket을 linked로 선언했지만 현재 임시 Emission 경로가 그 closure를 유효한 값으로 평가하지 못한 경우다. 같은 unit이 여러 채널에서 중복될 수 있다.</p>
+  <table><thead><tr><th>source/exportability group</th><th>collapse unit</th><th>albedo</th><th>roughness</th><th>metallic</th><th>주된 의미 손실</th></tr></thead><tbody>
+    <tr><td>G2 bakeable procedural PBR</td><td>15</td><td>5</td><td>11</td><td>5</td><td>nested procedural/Group Input 평가 경로가 black/constant; 수정 우선순위 1</td></tr>
+    <tr><td>G3 displacement-dependent</td><td>25</td><td>15</td><td>15</td><td>12</td><td>표면 shader 외에 height/displacement와 bake context 의존</td></tr>
+    <tr><td>G4 transmission/glass</td><td>3</td><td>0</td><td>3</td><td>2</td><td>analytic transmission/IOR를 ARMN으로 투영하면 안 됨</td></tr>
+    <tr><td>G5 nonstandard/layered</td><td>20</td><td>6</td><td>6</td><td>14</td><td>Mix/layer/coat/비표준 closure를 한 socket으로 축약</td></tr>
+  </tbody></table>
+  <p>따라서 “242개에 ARMN 네 파일을 모두 붙인다”는 것은 가능하더라도, source-varying ARMN은 아니다. 새 audit의 source variation은 A 169, R 138, M 81, N 0이며, 각 object에 factor/analytic/not_applicable/geometry-derived provenance를 함께 기록해야 한다. 특히 G4/G5는 무조건 texture를 만들기보다 <code>optical_class → analytic BSDF</code>를 우선하고, G2/G3만 closure별 bake adapter를 보강하는 것이 손실을 줄이는 경로다.</p>
+  <h3>strict gate 구현과 현재 설치 상태</h3>
+  <ul>
+    <li>exporter에 albedo/roughness/metallic <code>bake_validation</code>(sample 수, robust range, black/constant/spatial)을 추가하고, linked source가 spatial이 아니면 strict export failure가 되도록 수정했다.</li>
+    <li>importer는 linked texture에 <code>bake_validation.result == spatial</code>을 요구한다. 기존 promote는 이 필드가 없으므로 새 strict validator에서 의도적으로 차단된다.</li>
+    <li>회귀 테스트는 GLB/PBR 관련 <strong>9 passed</strong>이며, black linked texture 거부 테스트를 포함한다. Mitsuba conda 프로세스는 종료 시 exit 139를 냈지만 pytest 자체는 9개 모두 통과했고 별도 py_compile/diff check도 통과했다.</li>
+    <li>strict positive probe: Balloon 1개는 64²에서 albedo robust range 0.336, roughness 0.514, normal spatial로 export/manifest validation 통과했다. strict negative probe: Blanket은 albedo/roughness가 black으로 판정되어 export가 중단됐다.</li>
+  </ul>
+  <div class="note badbox"><strong>최종 gate:</strong> GLB/UV 구조와 normal 복구는 targeted probe에서 통과했지만, full staging은 linked roughness constant collapse에서 중단됐다. 현재 설치본과 40-unit staging 모두 Stage 2, sync, RGB/polarization render에 사용하지 않는다. 다음 작업은 collapse object의 source closure별 bake 수정 또는 strict <code>unsupported</code>/<code>analytic</code> provenance를 명시한 뒤 full manifest를 재생성하는 것이다.</div>
+  <div class="note"><strong>최신 감사 원본:</strong> <code>out/infinigen_audits/kr_20260625_covered_uv_pbr_audit_new.json</code>. 이전 수치와 혼동하지 않도록 후속 분석과 promotion 판단은 이 파일을 authoritative 입력으로 사용한다.</div>
+
+  <p class="small" style="margin-top:28px">검증 입력: <code>out/infinigen_imports/kr_20260625/scene_manifest.json</code> · IOR source: <code>modules/mitsuba3-optix7/resources/data/ior</code> · renderer: production-compatible Mitsuba polarized spectral build.</p>
+
+  <h2 id="armn-source-semantics">23. ARMN file completeness와 source semantics의 분리</h2>
+  <p>visible mesh마다 albedo/roughness/metallic/normal 네 파일을 생성할 수 있다는 것과, 원본 재질이 네 개의 독립적인 spatially varying PBR channel을 보유했다는 것은 다른 주장이다. UV를 만들고 강제 bake하면 상수값도 PNG가 되며, Blender의 <code>NORMAL</code> bake는 source normal texture가 없어도 evaluated surface normal을 tangent-space atlas로 합성한다.</p>
+  <table><thead><tr><th>라벨</th><th>의미</th><th>GLB 기록</th></tr></thead><tbody>
+    <tr><td>SOURCE_VARYING</td><td>원본 socket의 procedural/image 입력이 표면에서 실제로 변화하고 bake가 spatial로 검증됨</td><td><code>mode=texture</code>, <code>source=linked</code>, <code>bake_validation.result=spatial</code></td></tr>
+    <tr><td>SOURCE_CONSTANT</td><td>원본 socket이 unlinked factor/color 상수</td><td><code>mode=constant</code>, glTF factor</td></tr>
+    <tr><td>BAKE_DERIVED_GEOMETRY_NORMAL</td><td>source normal/bump/displacement가 없어도 mesh smooth/custom/evaluated normal을 bake한 결과</td><td>normal texture와 provenance를 별도 기록</td></tr>
+    <tr><td>BAKE_APPROXIMATION</td><td>layered, transmission, coat, anisotropy, displacement 등 closure를 ARMN으로 투영한 근사</td><td>analytic/unsupported 여부와 fidelity를 별도 기록</td></tr>
+  </tbody></table>
+  <p>원본 source-varying 후보는 albedo 169, roughness 138, metallic 81이며 source material normal은 0이다. 최신 export 집계는 albedo texture 203, roughness 161, metallic 81, valid normal texture 88이고, flat normal 144개는 폐기됐으며 normal constant는 0이다. 이 88개도 대부분 evaluated geometry-derived normal이므로 “normal map 88개”를 “원본 normal map 88개”로 해석하면 안 된다. 이전 covered audit의 92개 수치는 historical baseline으로만 보존한다.</p>
+  <table><thead><tr><th>채널</th><th>latest texture</th><th>원본 varying 후보</th><th>나머지의 의미</th></tr></thead><tbody>
+    <tr><td>Albedo</td><td>203</td><td>169</td><td>상수 factor 73 중 일부가 rasterized; layered/analytic closure는 projected/approximation으로 분리</td></tr>
+    <tr><td>Roughness</td><td>161</td><td>138</td><td>상수 factor 104; linked가 object 표면에서 constant/black이면 strict collapse로 중단</td></tr>
+    <tr><td>Metallic</td><td>81</td><td>81</td><td>나머지 161은 대부분 dielectric/metal의 명시적 0/1 factor이며 texture가 불필요</td></tr>
+    <tr><td>Normal</td><td>88</td><td>source normal 0</td><td>88 geometry-derived; flat 144는 폐기, 남은 것은 analytic/not_applicable 및 UV coverage 상태</td></tr>
+  </tbody></table>
+  <p>현재 설치본의 valid-GLB covered audit에서 <strong>네 channel이 모두 texture record인 unit은 40/242</strong>이고, 그중 네 channel 모두 covered texel이 spatial로 검증된 unit은 <strong>24/242</strong>뿐이다. 나머지 218개는 factor/N/A가 하나 이상이거나, texture 파일이 있어도 flat/collapse/unresolved 상태다. 63개 unit은 적어도 한 linked channel이 black/constant로 붕괴해 strict unsupported이며, 이 수치는 “파일이 존재한다”는 판정과 구별해야 한다.</p>
+  <table><thead><tr><th>exportability group</th><th>units</th><th>four-map fidelity (current valid GLB)</th></tr></thead><tbody>
+    <tr><td>G1 standard PBR/constants</td><td>17</td><td>17 exact candidate</td></tr>
+    <tr><td>G2 bakeable procedural PBR</td><td>53</td><td>38 bake-equivalent candidate · 15 unsupported collapse/unresolved</td></tr>
+    <tr><td>G3 displacement-dependent</td><td>79</td><td>54 severely lossy · 25 unsupported</td></tr>
+    <tr><td>G4 transmission/glass</td><td>6</td><td>3 severely lossy · 3 unsupported</td></tr>
+    <tr><td>G5 nonstandard/layered</td><td>87</td><td>67 severely lossy · 20 unsupported</td></tr>
+  </tbody></table>
+  <table><thead><tr><th>객체별 기록 예</th><th>ARMN completeness</th><th>source semantics</th></tr></thead><tbody>
+    <tr><td>Shelf.001</td><td>albedo/roughness/metallic/normal 네 파일 가능</td><td>A=SOURCE_PROJECTED, R=SOURCE_CONSTANT, M=DEFAULT_CONSTANT, N=BAKE_DERIVED_GEOMETRY_NORMAL</td></tr>
+    <tr><td>linked procedural collapse</td><td>파일 생성 시도는 가능하지만 strict gate 실패</td><td>black/constant bake는 scalar fallback하지 않고 <code>BAKE_COLLAPSE</code>/<code>unsupported</code>로 기록</td></tr>
+  </tbody></table>
+  <p>fidelity는 <code>exact</code> (원본 socket을 손실 없이 보존), <code>bake-equivalent</code> (동일 geometry에서 multiview 외관 검증 필요), <code>acceptable approximation</code> (constant raster/geometry normal 포함), <code>severely lossy</code> (layered/transmission/displacement의 ARMN 축약), <code>unsupported</code> (UV/bake/closure 실패)로 분리한다. 이 분류가 완료되기 전까지 ARMN file completeness를 성공 지표로 사용하지 않는다.</p>
+
+  <h2 id="snapshot-reconciliation">24. backup·현재 설치본·strict staging의 snapshot reconciliation</h2>
+  <p>서로 다른 시점의 산출물을 하나의 숫자로 합치면 결론이 왜곡된다. 원본 <code>scene.blend</code> source audit는 동일하지만, bake/GLB exporter가 바뀐 시점마다 texture 수와 geometry 계약이 달라졌다.</p>
+  <table><thead><tr><th>snapshot</th><th>texture mode (A/R/M/N)</th><th>GLB·UV</th><th>strict 상태</th></tr></thead><tbody>
+    <tr><td><code>backup.20260713T100746</code> (latest texture-count backup)</td><td>203 / 161 / 81 / 88</td><td>empty 34 · degenerate UV 39</td><td>ARMN 수치는 최신이지만 GLB 계약 미충족</td></tr>
+    <tr><td><code>kr_20260625</code> (현재 설치본)</td><td>193 / 151 / 81 / 93</td><td>GLB 242/242 · UV 242/242</td><td>linked bake validation 누락/ collapse 63으로 strict 차단</td></tr>
+    <tr><td><code>staging.20260713T105100-2067801</code></td><td>40 units committed</td><td>latest exporter; first 40 validated</td><td><code>CellShelf...4231825</code> linked roughness constant collapse에서 40/242 중단</td></tr>
+  </tbody></table>
+  <p>따라서 “242개 모두 valid한 네 장의 map”을 이미 확보했다는 증거는 없다. 현재 증거가 보장하는 것은 (1) 원본 visible/renderable mesh가 242개라는 것, (2) 최신 설치본의 geometry/UV GLB는 242/242라는 것, (3) 채널별 texture·factor·N/A가 혼재한다는 것, (4) linked spatial bake의 strict 검증은 아직 통과하지 못했다는 것이다. 최종 authoritative 결과는 최신 exporter로 242개를 한 번에 재생성하고, 각 채널의 covered-pixel validation과 GLB digest를 같은 manifest에 기록한 뒤에만 확정한다.</p>
+  <p class="small">비교 산출물: <code>out/infinigen_audits/kr_20260625_original_pbr_audit.json</code>, <code>out/infinigen_audits/kr_20260625_covered_uv_pbr_audit_new.json</code>, <code>out/infinigen_audits/kr_20260625_covered_uv_pbr_audit_backup100746.json</code>.</p>
+</article></main>
+</div>
+</body>
+</html>

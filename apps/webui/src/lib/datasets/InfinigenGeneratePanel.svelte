@@ -2,7 +2,7 @@
 	import { onDestroy } from 'svelte';
 	import { startInfinigenGenerate, getInfinigenJob, type InfinigenGenerateRequest } from '$lib/api';
 
-	let { projectId }: { projectId: string | null | undefined } = $props();
+	let { projectId, onDone }: { projectId: string | null | undefined; onDone?: () => void } = $props();
 
 	const ARCHETYPES = [
 		{ value: 'apartment', label: '아파트 (거실 중심)' },
@@ -52,6 +52,7 @@
 				job = await getInfinigenJob(projectId, jobId);
 				if (job?.status === 'succeeded' || job?.status === 'failed') {
 					running = false;
+					if (job?.status === 'succeeded') onDone?.();
 					return;
 				}
 			} catch (e) {

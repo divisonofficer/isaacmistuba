@@ -59,8 +59,12 @@
 	import BottomPanel from '$lib/datasets/BottomPanel.svelte';
 	import RailSceneTab from '$lib/datasets/RailSceneTab.svelte';
 	import RailSensorsTab from '$lib/datasets/RailSensorsTab.svelte';
+	import RailSyncInspectorTab from '$lib/datasets/RailSyncInspectorTab.svelte';
 	import RailPathsTab from '$lib/datasets/RailPathsTab.svelte';
+	import InitStatusDashboard from '$lib/datasets/InitStatusDashboard.svelte';
 	import RailSelectedTab from '$lib/datasets/RailSelectedTab.svelte';
+	import RailMaterialsTab from '$lib/datasets/RailMaterialsTab.svelte';
+	import MaterialInspector from '$lib/datasets/MaterialInspector.svelte';
 	import {
 		makeStarterAuthoringMap,
 		makeVisibleStarterAuthoringMap,
@@ -138,6 +142,7 @@
 		syncOpticalNavIsaacStage,
 		syncOpticalNavRenderScene,
 		getOpticalPerturbation,
+		getEpisodePlanProgress,
 		buildOpticalPerturbation,
 		opticalNavSyncProgressWsUrl,
 		sweepOpticalNavViewpointGraph,
@@ -173,6 +178,7 @@
 		retryJob as retryRenderJob,
 		cancelJob,
 		getCameraRig,
+		getUserSettings,
 		type CameraRig,
 		type CameraRigRenderSettings,
 		type CameraRigSensor
@@ -239,16 +245,54 @@
 	// track() drives per-resource status. A loader can use both.
 	async function track<T>(key: ResourceKey, fn: () => Promise<T>): Promise<T | undefined> {
 		resourceStatus[key] = 'loading';
-		try {
-			const r = await fn();
-			resourceStatus[key] = 'ready';
-			delete resourceError[key];
-			return r;
-		} catch (err) {
-			resourceStatus[key] = 'error';
-			resourceError[key] = errorMessage(err);
-			return undefined;
+		for (let attempt = 0; ; attempt++) {
+			try {
+				const r = await fn();
+				resourceStatus[key] = 'ready';
+				delete resourceError[key];
+				return r;
+			} catch (err) {
+				const msg = errorMessage(err);
+				// A hard refresh fires many requests before the daemon/connection is
+				// ready → transient "Failed to fetch" / network errors. Auto-retry those
+				// a couple times with backoff so a momentary blip on e.g. xmlSceneIndex
+				// doesn't permanently break mesh loading.
+				const transient = /failed to fetch|networkerror|load failed|connection|fetch failed|err_|50[234]/i.test(msg);
+				if (transient && attempt < 2) {
+					await new Promise((res) => setTimeout(res, 350 * (attempt + 1)));
+					resourceStatus[key] = 'loading';
+					continue;
+				}
+				resourceStatus[key] = 'error';
+				resourceError[key] = msg;
+				return undefined;
+			}
 		}
+	}
+
+	// Re-run a single resource's loader (dashboard "Retry"). Keyed to the same
+	// loaders the initial load uses.
+	function retryResource(key: string) {
+		const loaders: Partial<Record<ResourceKey, () => unknown>> = {
+			projects: () => refreshProjects(),
+			project: () => refreshProject(),
+			authoringMap: () => refreshProject(),
+			graph: () => loadGraph(),
+			episodes: () => refreshEpisodes({ background: true }),
+			renderReadiness: () => loadRenderReadiness(),
+			renderConfig: () => loadRenderConfig(),
+			mapAssets: () => loadMapAssets(),
+			envmaps: () => loadEnvmaps(),
+			perturbation: () => loadPerturbation(),
+			renderSceneStats: () => refreshRenderSceneStats(),
+			xmlSceneIndex: () => refreshXmlSceneIndex(),
+			materializationAudit: () => refreshMaterializationAudit(),
+			roomShell: () => refreshRoomShell(),
+		};
+		loaders[key as ResourceKey]?.();
+	}
+	function retryAllFailed() {
+		for (const k of erroredResources) retryResource(k);
 	}
 
 	// Core resources whose loading blocks a usable editor. Used for the "initial
@@ -263,6 +307,8 @@
 	// Render variant: 'base' (mirrors off), 'perturbed' (mirrors/glass on), or 'both'
 	// (render each viewpoint twice into separate trees for the eval split).
 	let renderVariant = $state<'base' | 'perturbed' | 'both'>('base');
+	// Live episode-plan progress (polled while the synchronous plan request runs).
+	let episodePlanProgress = $state<{ status?: string; planned?: number; target?: number; eta_s?: number | null } | null>(null);
 	let error = $state('');
 	let info = $state('');
 	let projects = $state<any[]>([]);
@@ -277,6 +323,9 @@
 	let selectedEpisode = $state<any>(null);
 	let episodeSearch = $state('');
 	let selectedSensorNodeId = $state('');
+	// "Find sensor #" — jump the editor camera to a viewpoint/custom-sensor node by number.
+	let sensorFindQuery = $state('');
+	let sensorFindError = $state('');
 	let activeModalityTab = $state('rgb');
 	let activeRigSensorId = $state('');
 	let selectedRigSensorIds = $state<string[]>([]);
@@ -349,7 +398,7 @@
 	// Measured-pBRDF band mode for preview renders. Stable/default RGB uses single
 	// band × albedo; rgb/hybrid remain opt-in comparison modes.
 	let previewBandMode = $state('single');
-	let previewMeasuredScope = $state('analytic_priority');
+	let previewMeasuredScope = $state('analytic_only');
 	let probeResult = $state<{ batch_id: string; vp_id: string; heading_id: string; modality: string; modalities?: string[]; is_polar?: boolean; sensor_id?: string; submittedAt: number } | null>(null);
 	let probeError = $state('');
 	type HotCameraPose = {
@@ -469,11 +518,15 @@
 	});
 
 	$effect(() => {
-		if (railTab === 'preview' && selectedProjectId && sceneId) {
+		if ((railTab === 'sync' || railTab === 'preview') && selectedProjectId && sceneId) {
 			refreshRenderSceneStats();
 		}
 	});
 	let ambientRadiance = $state(1.0);
+	// Perf render options (2026-07-29): unified spectral-polar scene (band-flip, one
+	// resident scene) and mesh LOD (decimated render_scene_lod.xml). Default off.
+	let unifiedSpectral = $state(false);
+	let useLodScene = $state(false);
 	let lightboxUrl = $state('');
 	let lightboxLabel = $state('');
 
@@ -764,6 +817,42 @@
 	let exportIncludeBirdseye = $state(true);  // include a top-down bird's-eye summary PNG
 	let exportIncludeEpisodeBirdseye = $state(false);  // per-episode path map PNGs (episodes_birdseye/)
 	let exportEvalPerturbation = $state(false);  // also ship observations_perturbed/ (mirror/glass eval split)
+	let exportSelectedCameraIds = $state<string[]>([]);
+	let exportCameraSelectionSceneKey = $state('');
+	let exportCameraSelectionTouched = $state(false);
+	const exportCameraInventory = $derived.by(() => {
+		const raw = Array.isArray(observationScan?.sensor_inventory)
+			? observationScan.sensor_inventory
+			: [];
+		return raw
+			.map((item: any): exportJobsService.ExportCameraInventoryItem => ({
+				sensor_id: String(item?.sensor_id ?? ''),
+				modalities: Array.isArray(item?.modalities) ? item.modalities.map(String) : [],
+				observation_count: Number(item?.observation_count ?? 0),
+				base_count: Number(item?.base_count ?? 0),
+				perturbed_count: Number(item?.perturbed_count ?? 0),
+			}))
+			.filter((item: exportJobsService.ExportCameraInventoryItem) => Boolean(item.sensor_id));
+	});
+	$effect(() => {
+		const sceneKey = `${selectedProjectId}/${sceneId}`;
+		const availableIds = exportCameraInventory.map(
+			(item: exportJobsService.ExportCameraInventoryItem) => item.sensor_id
+		);
+		if (exportCameraSelectionSceneKey !== sceneKey) {
+			exportCameraSelectionSceneKey = sceneKey;
+			exportCameraSelectionTouched = false;
+			exportSelectedCameraIds = availableIds;
+			return;
+		}
+		if (!exportCameraSelectionTouched) {
+			exportSelectedCameraIds = availableIds;
+			return;
+		}
+		const available = new Set(availableIds);
+		const next = exportSelectedCameraIds.filter((cameraId) => available.has(cameraId));
+		if (next.length !== exportSelectedCameraIds.length) exportSelectedCameraIds = next;
+	});
 	// Active scene-bundle export job — populated when user clicks Export.
 	let activeExportJob = $state<import('$lib/datasets/services/exportJobsService').ExportJobStatus | null>(null);
 	let _exportJobUnsub: (() => void) | null = null;
@@ -834,7 +923,7 @@
 
 	type PageMode = 'map' | 'objects' | 'paths' | 'sensors' | 'lights' | 'preview' | 'export';
 	let pageMode = $state<PageMode>('map');
-	type RailTab = 'selected' | 'scene' | 'paths' | 'sensors' | 'lights' | 'preview' | 'export' | 'status';
+	type RailTab = 'selected' | 'scene' | 'paths' | 'sensors' | 'lights' | 'preview' | 'export' | 'status' | 'sync' | 'materials';
 	let railTab = $state<RailTab>('scene');
 	let lastRailSyncedPageMode: PageMode = 'map';
 	let lastRailSelectedId = '';
@@ -1819,8 +1908,9 @@
 	}
 
 	function renderSettingsFromRigSensor(sensor: any): Record<string, unknown> {
+		const sensorType = String(sensor?.canonical_sensor_type ?? sensor?.sensor_type ?? 'rgb_camera').toLowerCase();
 		const settings: Record<string, unknown> = { ambient_radiance: ambientRadiance };
-		const render = normalizeRigRenderSettings(sensor?.render, String(sensor?.canonical_sensor_type ?? sensor?.sensor_type ?? 'rgb_camera'));
+		const render = normalizeRigRenderSettings(sensor?.render, sensorType);
 		settings.path_spp = render.path_spp;
 		settings.aov_spp = render.aov_spp;
 		settings.polar_spp = render.polar_spp;
@@ -1829,8 +1919,14 @@
 		// episodes). Only sent when non-default so 'rgb' renders are unchanged and
 		// never trip a stale worker on an unknown render_settings key.
 		if (previewBandMode && previewBandMode !== 'rgb') settings.pbrdf_band_mode = previewBandMode;
-		if (previewMeasuredScope && previewMeasuredScope !== 'analytic_priority') settings.measured_scope = previewMeasuredScope;
+		if (previewMeasuredScope && previewMeasuredScope !== 'analytic_only') settings.measured_scope = previewMeasuredScope;
 		if (previewMeasuredScope === 'analytic_priority' || previewMeasuredScope === 'budgeted_measured') settings.max_measured_bsdfs = 3;
+		// Perf render options (2026-07-29). Sent only when enabled so 'off' renders are
+		// byte-identical and never trip a stale worker on an unknown key.
+		// A) unified spectral-polar: one resident scene serves rgb+nir+polar (band-flip).
+		// B) mesh LOD: render the decimated render_scene_lod.xml instead of full geometry.
+		if (unifiedSpectral) settings.unified_spectral = true;
+		if (useLodScene) settings.use_lod_scene = true;
 		return settings;
 	}
 
@@ -2382,6 +2478,37 @@
 	function onMapPointerUp(event: PointerEvent) {
 		const end = svgPoint(event);
 		handleGroundPointerUp(end);
+	}
+
+	// Resolve a free-form sensor query to a node id: exact id (vp_000092 / custom_…),
+	// bare digits ("92" → vp_000092), or a numeric suffix match against any node.
+	function resolveSensorNodeId(q: string): string | null {
+		const s = (q ?? '').trim();
+		if (!s) return null;
+		if (graphNodes.some((n: any) => n.node_id === s) || customSensorNodes.some((n) => n.id === s)) return s;
+		const digits = s.replace(/[^0-9]/g, '');
+		if (!digits) return null;
+		const padded = `vp_${digits.padStart(6, '0')}`;
+		if (graphNodes.some((n: any) => n.node_id === padded)) return padded;
+		const asNum = parseInt(digits, 10);
+		const byNum = graphNodes.find((n: any) => {
+			const m = String(n.node_id).match(/(\d+)\s*$/);
+			return m && parseInt(m[1], 10) === asNum;
+		});
+		return byNum ? byNum.node_id : null;
+	}
+
+	// Select + fly the editor camera to the matched sensor node (with a pulse ring).
+	function focusSensorNode() {
+		const id = resolveSensorNodeId(sensorFindQuery);
+		if (!id) { sensorFindError = `No sensor node matching "${sensorFindQuery.trim()}"`; return; }
+		sensorFindError = '';
+		selectedSensorNodeId = id;
+		sensorRenderResult = null;
+		placingSensor = false;
+		if (pageMode !== 'sensors') setPageMode('sensors');
+		const ok = mapEditorRef?.focusOnNode?.(id);
+		if (!ok) sensorFindError = 'Viewer not ready yet — try again in a moment.';
 	}
 
 	// World-coordinate handlers (used by MapEditor3D callbacks)
@@ -2962,14 +3089,11 @@
 		if (data) perturbation = data;
 	}
 
-	// Sweep the render for the selected render variant(s). 'both' renders each
-	// viewpoint twice (base + perturbed) into separate output trees so the same
-	// cameras get a mirror-off and mirror-on image. Returns the last sweep result.
+	// Sweep the selected render variants as one UI submission. The daemon still
+	// creates one batch per variant, but every response is retained so base jobs do
+	// not disappear when the perturbed request returns.
 	async function sweepVariants(body: Record<string, unknown>): Promise<any> {
 		const variants = renderVariant === 'both' ? ['base', 'perturbed'] : [renderVariant];
-		// Guard: a 'perturbed' sweep needs the perturbed render scene staged. Without
-		// it the daemon would (used to) silently render the base scene — a "perturbed"
-		// output identical to base. Block it here with an actionable message instead.
 		if (variants.includes('perturbed') && !perturbation?.perturbed_render_ready) {
 			const why = perturbation?.perturbed_render_stale
 				? 'perturbation을 변경한 뒤 Sync Render Scene을 다시 실행해야 합니다 (perturbed XML stale).'
@@ -2980,11 +3104,39 @@
 			pushActivity('error', 'render:variant', error);
 			throw new Error(error);
 		}
-		let last: any;
-		for (const v of variants) {
-			last = await renderService.sweepViewpointGraph(selectedProjectId, sceneId, { ...body, scene_variant_key: v });
+
+		const submissionGroupId = `sweep-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+		const batches: any[] = [];
+		for (const variant of variants) {
+			const response = await renderService.sweepViewpointGraph(selectedProjectId, sceneId, {
+				...body,
+				scene_variant_key: variant,
+				submission_group_id: submissionGroupId,
+			});
+			batches.push({
+				...response,
+				scene_variant_key: variant,
+				submission_group_id: submissionGroupId,
+			});
 		}
-		return last;
+		const last = batches[batches.length - 1] ?? null;
+		return last ? {
+			...last,
+			batches,
+			batch_ids: batches.map((batch) => batch.batch_id).filter(Boolean),
+			submission_group_id: submissionGroupId,
+		} : null;
+	}
+
+	function registerGraphSweepResult(result: any): any {
+		const batches = Array.isArray(result?.batches) ? result.batches : result ? [result] : [];
+		if (!batches.length) return null;
+		const batchIds = batches.map((batch: any) => String(batch?.batch_id ?? '')).filter(Boolean);
+		graphBatchIds = [...new Set([...graphBatchIds, ...batchIds])];
+		for (const batch of batches) graphBatch = mergeBatch(graphBatch, batch);
+		const current = batches[batches.length - 1];
+		graphBatchId = String(current?.batch_id ?? '');
+		return current;
 	}
 
 	async function saveAuthoringMap(options: { updateRenderReadiness?: boolean; deferRenderSync?: boolean } = {}): Promise<boolean> {
@@ -3348,15 +3500,29 @@
 				return [name.trim(), Number(value)];
 			})
 		);
-		const data = await run(
-			() => episodeService.planGraphEpisodes(selectedProjectId, {
-				sceneId, numPairs: Number(episodeCount), splits: splitObject,
-				scenarios: graphScenarios.split(',').map((s) => s.trim()).filter(Boolean),
-				modalities: selectedModalities, seed: Number(seed),
-			}),
-			'Graph episodes planned.',
-			'episodes:plan-graph'
-		);
+		// The plan request is synchronous; poll the side-channel for "N/M" progress.
+		episodePlanProgress = { status: 'running', planned: 0, target: Number(episodeCount) };
+		const poll = setInterval(async () => {
+			try {
+				const p = await getEpisodePlanProgress(selectedProjectId, sceneId);
+				if (p && p.status && p.status !== 'idle') episodePlanProgress = p;
+			} catch { /* transient — keep last */ }
+		}, 600);
+		let data: any;
+		try {
+			data = await run(
+				() => episodeService.planGraphEpisodes(selectedProjectId, {
+					sceneId, numPairs: Number(episodeCount), splits: splitObject,
+					scenarios: graphScenarios.split(',').map((s) => s.trim()).filter(Boolean),
+					modalities: selectedModalities, seed: Number(seed),
+				}),
+				'Graph episodes planned.',
+				'episodes:plan-graph'
+			);
+		} finally {
+			clearInterval(poll);
+			episodePlanProgress = null;
+		}
 		if (data) planResult = data;
 		await refreshProject();
 	}
@@ -3443,11 +3609,8 @@
 		if (activeCameraSpec) body.camera_spec = activeCameraSpec;
 		probeRendering = true;
 		try {
-			const data = await sweepVariants(body);
+			const data = registerGraphSweepResult(await sweepVariants(body));
 			if (data?.batch_id) {
-				graphBatchId = data.batch_id;
-				graphBatchIds = [...new Set([...graphBatchIds, data.batch_id])];
-				graphBatch = mergeBatch(graphBatch, data);
 				const renderedPose: HotCameraPose = {
 					...hotCameraPose,
 					batch_id: data.batch_id,
@@ -3673,11 +3836,8 @@
 			if (typeof h === 'number') body.node_heights = { [selectedSensorNode.node_id]: h };
 		}
 		try {
-			const data = await sweepVariants(body);
+			const data = registerGraphSweepResult(await sweepVariants(body));
 			if (data?.batch_id) {
-				graphBatchId = data.batch_id;
-				graphBatchIds = [...new Set([...graphBatchIds, data.batch_id])];
-				graphBatch = mergeBatch(graphBatch, data);
 				sensorRenderResult = { batch_id: data.batch_id, status: 'submitted' };
 				pushActivity('ok', 'sensor:render', `Render submitted: batch ${data.batch_id}`);
 				startBatchPolling();
@@ -3736,11 +3896,8 @@
 			const successMsg = renderMode === 'episode_nodes'
 				? 'Episode path sweep submitted.'
 				: 'Graph sensor sweep submitted.';
-			const data = await run(() => sweepVariants(body), successMsg, 'graph:sweep');
+			const data = registerGraphSweepResult(await run(() => sweepVariants(body), successMsg, 'graph:sweep'));
 			if (data?.batch_id) {
-				graphBatchId = data.batch_id;
-				graphBatchIds = [...new Set([...graphBatchIds, data.batch_id])];
-				graphBatch = mergeBatch(graphBatch, data);
 				startBatchPolling();
 			}
 		} else {
@@ -4034,11 +4191,16 @@
 
 	async function exportDataset() {
 		if (!selectedProjectId || !sceneId) return;
+		if (exportCameraInventory.length > 0 && exportSelectedCameraIds.length === 0) {
+			error = 'Select at least one camera before exporting.';
+			return;
+		}
 		// Scene-bundle export: always tied to the current scene. The submit
 		// returns immediately with a job_id; progress arrives over WS.
 		try {
 			const accepted = await exportJobsService.submitExportJob(selectedProjectId, {
 				scene_id: sceneId,
+				camera_ids: exportCameraInventory.length > 0 ? exportSelectedCameraIds : null,
 				only_completed: exportOnlyCompleted,
 				include_episode_thumbnails: exportIncludeThumbnails,
 				panorama_observations: exportPanoramaObservations,
@@ -4055,6 +4217,14 @@
 		} catch (err) {
 			error = `Export submit failed: ${errorMessage(err)}`;
 		}
+	}
+
+	function updateExportCameraSelection(cameraIds: string[]) {
+		const selected = new Set(cameraIds);
+		exportSelectedCameraIds = exportCameraInventory
+			.map((item: exportJobsService.ExportCameraInventoryItem) => item.sensor_id)
+			.filter((cameraId: string) => selected.has(cameraId));
+		exportCameraSelectionTouched = true;
 	}
 
 	async function cancelActiveExportJob() {
@@ -4096,6 +4266,13 @@
 		refreshProjects(selectedProjectId);
 		loadGlobalCameraRig();
 		loadMaterialLibrary();
+		// pBRDF band / measured scope now live in Settings (user_settings). Seed the
+		// render-request state from there so this editor honours the saved choice.
+		getUserSettings().then((r) => {
+			const s = r?.settings ?? {};
+			if (typeof s.pbrdf_band_mode === 'string') previewBandMode = s.pbrdf_band_mode;
+			if (typeof s.measured_scope === 'string') previewMeasuredScope = s.measured_scope;
+		}).catch(() => {});
 		return () => {
 			// Release the job-status WS subscription when the page unmounts so a
 			// route change doesn't leave the connection (and its keepalive churn)
@@ -4415,20 +4592,18 @@
 
 	<!-- Floating load-status pill (fixed; never reflows the editor). Shows what is
 	     loading and surfaces resource errors; auto-hides when idle. -->
-	{#if loadingStage || loadingResources.length || erroredResources.length}
-		<div class="load-pill" class:has-error={erroredResources.length > 0}>
-			{#if erroredResources.length}
-				<span class="load-pill-dot error" aria-hidden="true"></span>
-				<span class="load-pill-text">Failed: {erroredResources.map((k) => resourceError[k] ? `${k} (${resourceError[k]})` : k).join(', ')}</span>
-			{:else}
-				<span class="loading-spinner" aria-hidden="true"></span>
-				<span class="load-pill-text">
-					{#if loadingResources.length}Loading {loadingResources.join(', ')}…
-					{:else}{backgroundLoading ? 'Background: ' : ''}{loadingStage}{/if}
-				</span>
-			{/if}
-		</div>
-	{/if}
+	<div class="status-dash-anchor">
+		<InitStatusDashboard
+			{resourceStatus}
+			{resourceError}
+			syncStatus={currentScene?.sync_status}
+			{syncProgress}
+			{syncRunning}
+			syncStageLabel={renderService.syncStageLabel(syncProgress?.stage, 'kr')}
+			onRetry={retryResource}
+			onRetryAll={retryAllFailed}
+		/>
+	</div>
 
 	<section class="panel project-strip">
 		<label>
@@ -4665,7 +4840,11 @@
 					</div>
 					<div class="episode-generate-bar">
 						<input type="number" min="1" bind:value={episodeCount} title="Count" />
-						<button class="button button-primary" disabled={!selectedProjectId || !hasGraph || loading} onclick={planGraphEpisodes}>+ Generate</button>
+						<button class="button button-primary" disabled={!selectedProjectId || !hasGraph || loading} onclick={planGraphEpisodes}>
+							{#if episodePlanProgress}
+								{episodePlanProgress.status === 'indexing' ? 'Indexing…' : `Generating ${episodePlanProgress.planned ?? 0}/${episodePlanProgress.target ?? episodeCount}`}
+							{:else}+ Generate{/if}
+						</button>
 						{#if episodes.length > 0}
 							<button class="button button-subtle" onclick={clearEpisodes} title="Clear all episodes">✕</button>
 						{/if}
@@ -4700,6 +4879,10 @@
 					{renderMissingOnly}
 					onSetRenderMissingOnly={(v) => (renderMissingOnly = v)}
 					headingsPerNode={graphPayload?.node_heading_count ?? 0}
+					bind:sensorFindQuery
+					{sensorFindError}
+					graphNodeCount={graphNodes.length}
+					onFindSensor={focusSensorNode}
 					onRefreshBatch={refreshBatch}
 					onRemoveCustomSensor={(id) => { customSensorNodes = customSensorNodes.filter(n => n.id !== id); }}
 					onCustomSensorHeadingChange={(id, deg) => { customSensorNodes = customSensorNodes.map(n => n.id === id ? {...n, headingDeg: deg} : n); sensorRenderResult = null; }}
@@ -4721,7 +4904,9 @@
 				bind:pngOnly={exportPngOnly}
 				bind:includeBirdseye={exportIncludeBirdseye}
 				bind:includeEpisodeBirdseye={exportIncludeEpisodeBirdseye}
-				bind:evalPerturbation={exportEvalPerturbation}
+					bind:evalPerturbation={exportEvalPerturbation}
+					cameraInventory={exportCameraInventory}
+					selectedCameraIds={exportSelectedCameraIds}
 					currentSceneId={sceneId}
 					{exportableEpisodeCount}
 					exportSummary={exportResult}
@@ -4730,6 +4915,7 @@
 					onExport={exportDataset}
 					onCancelExport={cancelActiveExportJob}
 					onResetExport={resetExportJob}
+					onCameraSelectionChange={updateExportCameraSelection}
 				/>
 			{/if}
 
@@ -4951,7 +5137,9 @@
 					<div class="panel-label mt-2">Episodes</div>
 					<label><span>num pairs</span><input type="number" min="1" bind:value={episodeCount} /></label>
 					<button class="button button-primary" disabled={!selectedProjectId || !hasGraph || loading} onclick={planGraphEpisodes}>
-						Generate Episodes
+						{#if episodePlanProgress}
+							{episodePlanProgress.status === 'indexing' ? 'Indexing…' : `Generating ${episodePlanProgress.planned ?? 0}/${episodePlanProgress.target ?? episodeCount}`}
+						{:else}Generate Episodes{/if}
 					</button>
 					{#if splitCounts.train != null}
 						<div class="path-status-chips mt-1">
@@ -5056,9 +5244,11 @@
 				<button class:active={railTab === 'paths'} onclick={() => activateRailTab('paths')}>Paths</button>
 			{/if}
 			<button class:active={railTab === 'sensors'} onclick={() => activateRailTab('sensors')}>Sensors</button>
+			<button class:active={railTab === 'materials'} onclick={() => activateRailTab('materials')}>Materials</button>
 			<button class:active={railTab === 'lights'} onclick={() => activateRailTab('lights')}>Lights</button>
 			<button class:active={railTab === 'preview'} onclick={() => activateRailTab('preview')}>Preview</button>
 			<button class:active={railTab === 'export'} onclick={() => activateRailTab('export')}>Export</button>
+			<button class:active={railTab === 'sync'} onclick={() => activateRailTab('sync')}>Sync</button>
 			<button class:active={railTab === 'status'} onclick={() => activateRailTab('status')}>Status</button>
 		</div>
 
@@ -5096,6 +5286,20 @@
 				onSetTransformGridSizeM={(v) => (transformGridSizeM = v)}
 				onSetTransformAngleSnapDeg={(v) => (transformAngleSnapDeg = v)}
 			/>
+			{#if selectedAuthoringKind === 'object'}
+				<MaterialInspector
+					projectId={selectedProjectId}
+					{sceneId}
+					materialId={selectedAuthoringItem.material}
+					objectId={selectedAuthoringItem.id}
+					sourceRef={selectedAuthoringItem.source_ref}
+					entry={selectedMaterialEntry}
+				/>
+			{/if}
+		{/if}
+
+		{#if railTab === 'materials'}
+			<RailMaterialsTab projectId={selectedProjectId} {sceneId} />
 		{/if}
 
 		{#if railTab === 'paths'}
@@ -5139,6 +5343,7 @@
 				onSetRemovePassHeight={(v) => (removePassHeightM = v)}
 				onLoadEpisode={loadEpisode}
 				onGenerateEpisodes={planGraphEpisodes}
+				{episodePlanProgress}
 				onClearEpisodes={clearEpisodes}
 				onValidateEpisodes={validateGraphEpisodes}
 				onPruneStaleEpisodes={pruneStaleEpisodes}
@@ -5177,13 +5382,9 @@
 				{placingSensor} {frustumMode} {ambientRadiance} {activeModalityTab}
 				{activeRigSensorOption} {activeCameraFrustum} {activeRenderModality}
 				hotCameraPose={activeHotCameraPose}
-				{previewBandMode} {previewMeasuredScope}
 				{probeRendering} {probeError}
 				{rigMountHeightM} {authoringMap}
 				{selectedProjectId} {sceneId} {loading} {hasScene} {hasGraph}
-				{renderSceneStats} {renderSceneStatsLoading}
-				{showRoomShell} {roomShell}
-				{editorObjectsCount} {editorEmitterCount} {editorMaterialCount}
 				onLoadGlobalCameraRig={loadGlobalCameraRig}
 				onSelectRigSensor={selectRigRenderSensor}
 				{selectedRigSensorIds}
@@ -5200,6 +5401,10 @@
 				onLoadRenderConfig={loadRenderConfig}
 				onSetSensorHeight={setSelectedSensorHeight}
 				onSetAmbientRadiance={(v) => (ambientRadiance = v)}
+			{unifiedSpectral}
+			{useLodScene}
+			onSetUnifiedSpectral={(v) => (unifiedSpectral = v)}
+			onSetUseLodScene={(v) => (useLodScene = v)}
 				onClearNodeObservations={clearNodeObservations}
 				onClearAllObservations={clearAllObservations}
 				onRenderViewpoint={renderSensorViewpoint}
@@ -5211,17 +5416,17 @@
 				perturbedRenderReady={Boolean(perturbation?.perturbed_render_ready)}
 				perturbedRenderStale={Boolean(perturbation?.perturbed_render_stale)}
 				onSetRenderVariant={(v) => (renderVariant = v)}
-				onSetPreviewBandMode={(v) => (previewBandMode = v)}
-				onSetPreviewMeasuredScope={(v) => (previewMeasuredScope = v)}
 				onSetActiveModalityTab={(v) => (activeModalityTab = v)}
 				{episodeNodesAvailable}
 				{episodePathNodeCount}
 				{renderMissingOnly}
 				onSetRenderMissingOnly={(v) => (renderMissingOnly = v)}
 				headingsPerNode={graphPayload?.node_heading_count ?? 0}
+				bind:sensorFindQuery
+				{sensorFindError}
+				graphNodeCount={graphNodes.length}
+				onFindSensor={focusSensorNode}
 				onRefreshBatch={() => refreshBatch()}
-				onRefreshStats={refreshRenderSceneStats}
-				onSetShowRoomShell={(v) => { showRoomShell = v; _showRoomShellUserTouched = true; }}
 			/>
 		{/if}
 
@@ -5242,18 +5447,13 @@
 
 		{#if railTab === 'preview'}
 			<RailPreviewTab
-				{caps}
 				hotCameraPose={activeHotCameraPose}
 				{hotCameraPoses} {activeHotCameraId}
 				{activeRigSensorOption} {activeCameraFrustum} {activeRenderModality}
 				{probeResult} {activeRigSensorId}
 				{selectedProjectId} {sceneId}
-				{editorObjectsCount} {editorEmitterCount} {editorMaterialCount}
-				{renderSceneStats} {renderSceneStatsLoading}
-				{showRoomShell} {roomShell} {rigMountHeightM} {authoringMap}
+				{rigMountHeightM}
 				onRefreshBatch={() => refreshBatch()}
-				onRefreshStats={refreshRenderSceneStats}
-				onSetShowRoomShell={(v) => { showRoomShell = v; _showRoomShellUserTouched = true; }}
 				onSelectHotCamera={(id) => { activeHotCameraId = id; }}
 			/>
 		{/if}
@@ -5283,6 +5483,25 @@
 				onExport={exportDataset}
 				onCancelExport={cancelActiveExportJob}
 				onResetExport={resetExportJob}
+			/>
+		{/if}
+
+		{#if railTab === 'sync'}
+			<RailSyncInspectorTab
+				{renderSceneStats}
+				{renderSceneStatsLoading}
+				{sceneId}
+				{editorObjectsCount}
+				{editorEmitterCount}
+				{editorMaterialCount}
+				{authoringMap}
+				{rigMountHeightM}
+				{showRoomShell}
+				{roomShell}
+				refreshEnabled={caps.refreshStats.enabled}
+				refreshReason={caps.refreshStats.reason}
+				onRefreshStats={refreshRenderSceneStats}
+				onSetShowRoomShell={(v) => { showRoomShell = v; _showRoomShellUserTouched = true; }}
 			/>
 		{/if}
 
@@ -5346,7 +5565,15 @@
 <style>
 	:global {
 
-	/* --- Floating load-status pill --- */
+	/* --- Floating load-status dashboard anchor --- */
+	.status-dash-anchor {
+		position: fixed;
+		right: 16px;
+		bottom: 64px; /* clear the bottom Render Monitor bar */
+		z-index: 60;
+	}
+
+	/* --- Floating load-status pill (legacy) --- */
 	.load-pill {
 		position: fixed;
 		right: 16px;

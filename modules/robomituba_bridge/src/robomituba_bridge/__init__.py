@@ -1,4 +1,6 @@
 from .io import (
+    active_light_spec_from_payload,
+    active_light_spec_to_payload,
     assist_light_spec_from_payload,
     assist_light_spec_to_payload,
     bsdf_override_from_payload,
@@ -68,10 +70,13 @@ from .manifest import (
     validate_scene_override_spec,
     validate_scene_snapshot,
     validate_scene_state,
+    validate_sensor_spec,
 )
+from .ouster import OusterLidarMetadata, default_os1_128_metadata, load_ouster_metadata, ouster_metadata_from_mapping
 from .paths import BRIDGE_JOBS_ROOT, ensure_job_layout, ensure_observation_layout, repo_root_from, resolve_repo_path, to_repo_relative_posix
 from .shape_mapping import build_shape_mapping, read_shape_mapping, write_shape_mapping
 from .types import (
+    ActiveLightSpec,
     AssistLightSpec,
     BsdfOverride,
     CameraRecord,
@@ -106,6 +111,8 @@ from .types import (
 )
 
 __all__ = [
+    "ActiveLightSpec",
+    "OusterLidarMetadata",
     "AssistLightSpec",
     "BRIDGE_JOBS_ROOT",
     "BsdfOverride",
@@ -138,6 +145,11 @@ __all__ = [
     "SceneSnapshot",
     "SceneState",
     "SCENE_SNAPSHOT_SCHEMA_VERSION",
+    "default_os1_128_metadata",
+    "load_ouster_metadata",
+    "ouster_metadata_from_mapping",
+    "active_light_spec_from_payload",
+    "active_light_spec_to_payload",
     "assist_light_spec_from_payload",
     "assist_light_spec_to_payload",
     "bsdf_override_from_payload",
@@ -208,6 +220,7 @@ __all__ = [
     "validate_scene_override_spec",
     "validate_scene_snapshot",
     "validate_scene_state",
+    "validate_sensor_spec",
     "write_job_bundle",
     "write_scene_snapshot_package",
     "extract_scene_snapshot_package",
@@ -219,6 +232,8 @@ __all__ = [
     "SENSOR_PROFILES",
     "JAI_FS1600D",
     "LUCID_TRT053S",
+    "OUSTER_OS1_128",
+    "GENERIC_DEPTH_SENSOR",
     "get_profile",
     "list_profiles",
 ]
@@ -229,6 +244,8 @@ from .sensor_profiles import (  # noqa: E402
     SENSOR_PROFILES,
     JAI_FS1600D,
     LUCID_TRT053S,
+    OUSTER_OS1_128,
+    GENERIC_DEPTH_SENSOR,
     get_profile,
     list_profiles,
 )

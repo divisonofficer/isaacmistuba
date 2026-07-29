@@ -1,0 +1,36 @@
+{
+  "schema": "class_band_reflectance_v1",
+  "description": "Per physical-material NIR (854/940 nm) effective diffuse reflectance priors + spatial-transfer policy. Assigns a NEW physical property to assets that never authored NIR albedo (Infinigen base_color is RGB 3-point; NIR is an independent 4th channel and cannot be recovered from RGB). Values are LINEAR reflectance in [0,1], NOT 8-bit RGB or render brightness. See dev_report/report_2026-07-02.html (research) + 2026-07-14 discrete-band.",
+  "conventions": {
+    "rho_854 / rho_940": "effective diffuse reflectance at the sensor band (mean + plausible min/max spread)",
+    "rgb_structure_weight": "alpha_c in rho_NIR(x)=clip[mu_c*(1+alpha_c*(L(x)/median(L)-1)),0,0.95]; 0=flat class mean, 1=full RGB spatial pattern transferred (avoid 1 -> that is NIR=f(RGB))",
+    "albedo_channel": "true = diffuse reflectance is the right knob; false = band behaviour lives in Fresnel eta/k (metal) or transmission/absorption (glass), handle via optical_constants, NOT a diffuse map",
+    "confidence": "high|medium|low provenance of the prior",
+    "tier": "measured (own/hpBRDF) | library (external spectral) | prior (physically-reasoned distribution)"
+  },
+  "classes": {
+    "unpainted_plastic":  {"rho_854": {"mean": 0.55, "min": 0.35, "max": 0.75}, "rho_940": {"mean": 0.55}, "roughness": 0.25, "albedo_channel": true,  "rgb_structure_weight": 0.20, "tier": "prior",   "confidence": "medium", "note": "most polymers ~flat/high in NIR"},
+    "painted_plastic_dark": {"rho_854": {"mean": 0.34, "min": 0.12, "max": 0.55}, "rho_940": {"mean": 0.36}, "roughness": 0.25, "albedo_channel": true, "rgb_structure_weight": 0.20, "tier": "prior", "confidence": "low", "note": "pigment-dependent; carbon-black stays dark, organic dye rises"},
+    "rubber":             {"rho_854": {"mean": 0.30, "min": 0.10, "max": 0.50}, "rho_940": {"mean": 0.32}, "roughness": 0.40, "albedo_channel": true,  "rgb_structure_weight": 0.25, "tier": "prior",   "confidence": "low"},
+    "ceramic":            {"rho_854": {"mean": 0.72, "min": 0.55, "max": 0.88}, "rho_940": {"mean": 0.72}, "roughness": 0.12, "albedo_channel": true,  "rgb_structure_weight": 0.15, "tier": "prior",   "confidence": "medium", "note": "glaze ~uniform bright"},
+    "wood":               {"rho_854": {"mean": 0.50, "min": 0.35, "max": 0.68}, "rho_940": {"mean": 0.52}, "roughness": 0.30, "albedo_channel": true,  "rgb_structure_weight": 0.55, "tier": "library", "confidence": "medium", "note": "grain structure carries to NIR"},
+    "concrete":           {"rho_854": {"mean": 0.42, "min": 0.28, "max": 0.58}, "rho_940": {"mean": 0.43}, "roughness": 0.60, "albedo_channel": true,  "rgb_structure_weight": 0.65, "tier": "library", "confidence": "medium", "note": "ECOSTRESS manmade; texture preserved"},
+    "plaster":            {"rho_854": {"mean": 0.60, "min": 0.45, "max": 0.78}, "rho_940": {"mean": 0.60}, "roughness": 0.55, "albedo_channel": true,  "rgb_structure_weight": 0.50, "tier": "prior",   "confidence": "medium"},
+    "stone":              {"rho_854": {"mean": 0.38, "min": 0.20, "max": 0.60}, "rho_940": {"mean": 0.39}, "roughness": 0.55, "albedo_channel": true,  "rgb_structure_weight": 0.60, "tier": "library", "confidence": "medium", "note": "mineral-dependent (ECOSTRESS)"},
+    "soil":               {"rho_854": {"mean": 0.30, "min": 0.15, "max": 0.48}, "rho_940": {"mean": 0.33}, "roughness": 0.70, "albedo_channel": true,  "rgb_structure_weight": 0.60, "tier": "library", "confidence": "medium", "note": "moisture-dependent"},
+    "dyed_fabric":        {"rho_854": {"mean": 0.47, "min": 0.25, "max": 0.70}, "rho_940": {"mean": 0.50}, "roughness": 0.45, "albedo_channel": true,  "rgb_structure_weight": 0.20, "tier": "library", "confidence": "low", "note": "dye transparency: dark fabrics brighten in NIR; weak RGB coupling"},
+    "printed_surface":    {"rho_854": {"mean": 0.65, "min": 0.40, "max": 0.85}, "rho_940": {"mean": 0.66}, "roughness": 0.20, "albedo_channel": true,  "rgb_structure_weight": 0.10, "tier": "prior",   "confidence": "low", "note": "process inks NIR-transparent -> text/logo vanish, only carbon black remains; minimize RGB transfer"},
+    "vegetation_leaf":    {"rho_854": {"mean": 0.52, "min": 0.40, "max": 0.62}, "rho_940": {"mean": 0.50}, "roughness": 0.35, "albedo_channel": true,  "rgb_structure_weight": 0.05, "tier": "library", "confidence": "medium", "note": "chlorophyll red-edge: NIR plateau 0.4-0.6 regardless of visible green (LOPEX/ANGERS); DO NOT derive from RGB"},
+    "skin_like":          {"rho_854": {"mean": 0.62, "min": 0.45, "max": 0.75}, "rho_940": {"mean": 0.58}, "roughness": 0.35, "albedo_channel": true,  "rgb_structure_weight": 0.10, "tier": "library", "confidence": "low", "note": "high NIR (melanin-independent) + subsurface; SSS term ideally needed"},
+    "shell_calcite":      {"rho_854": {"mean": 0.66, "min": 0.50, "max": 0.82}, "rho_940": {"mean": 0.66}, "roughness": 0.20, "albedo_channel": true,  "rgb_structure_weight": 0.30, "tier": "prior",   "confidence": "low", "note": "calcium carbonate (shells/bone) bright+uniform in NIR IF genuinely mineral; often actually painted resin"},
+    "wax":                {"rho_854": {"mean": 0.55, "min": 0.40, "max": 0.72}, "rho_940": {"mean": 0.55}, "roughness": 0.30, "albedo_channel": true,  "rgb_structure_weight": 0.20, "tier": "prior",   "confidence": "low", "note": "subsurface; NIR transmission raises depolarization"},
+    "bare_metal":         {"rho_854": {"mean": 0.0},  "rho_940": {"mean": 0.0},  "roughness": 0.10, "albedo_channel": false, "rgb_structure_weight": 0.0,  "tier": "measured", "confidence": "high", "note": "no diffuse albedo; NIR lives in complex eta/k -> optical_constants.conductor_material_for"},
+    "clear_glass":        {"rho_854": {"mean": 0.0},  "rho_940": {"mean": 0.0},  "roughness": 0.02, "albedo_channel": false, "rgb_structure_weight": 0.0,  "tier": "measured", "confidence": "high", "note": "no diffuse albedo; interface Fresnel + internal transmission/absorption -> dielectric"},
+    "frosted_glass":      {"rho_854": {"mean": 0.05}, "rho_940": {"mean": 0.05}, "roughness": 0.30, "albedo_channel": false, "rgb_structure_weight": 0.0,  "tier": "prior",   "confidence": "low", "note": "mostly transmission; thin scattering layer only"}
+  },
+  "fallback": {
+    "unknown_dielectric": {"rho_854": {"mean": 0.45, "min": 0.10, "max": 0.85}, "rho_940": {"mean": 0.45}, "roughness": 0.35, "albedo_channel": true, "rgb_structure_weight": 0.30, "tier": "prior", "confidence": "low", "note": "broad diffuse prior + warning; NOT grayscale(RGB)"},
+    "unknown_metal":      {"rho_854": {"mean": 0.0}, "rho_940": {"mean": 0.0}, "albedo_channel": false, "rgb_structure_weight": 0.0, "tier": "prior", "confidence": "low", "note": "conductor fallback"},
+    "unknown_glass":      {"rho_854": {"mean": 0.0}, "rho_940": {"mean": 0.0}, "albedo_channel": false, "rgb_structure_weight": 0.0, "tier": "prior", "confidence": "low", "note": "dielectric transmission fallback"}
+  }
+}

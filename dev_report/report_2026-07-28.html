@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>OpticalNav VLN comparison test 구현 보고서 · 2026-07-28</title>
+<style>
+:root{--bg:#0d1117;--panel:#151b23;--line:#293241;--fg:#e9edf2;--mut:#9ba8b7;--blue:#70a7ff;--ok:#46d39a;--warn:#f4c95d;--bad:#ff7373}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.62 system-ui,-apple-system,"Noto Sans KR",sans-serif}
+main{max-width:1180px;margin:auto;padding:42px 24px 80px}h1{font-size:29px;margin:0 0 5px}h2{font-size:20px;border-top:1px solid var(--line);padding-top:24px;margin-top:42px}
+h3{font-size:16px;color:var(--blue)}p,li{max-width:1000px}.sub,.mut{color:var(--mut)}code{background:#202733;padding:2px 6px;border-radius:4px}
+.hero,.note{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:18px 20px;margin:18px 0}.note{border-left:4px solid var(--blue)}
+.warn{border-left-color:var(--warn)}.bad{border-left-color:var(--bad)}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px}
+.kpi{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px}.kpi b{display:block;font-size:23px}.kpi span{color:var(--mut);font-size:12px}
+table{border-collapse:collapse;width:100%;margin:14px 0}th,td{border:1px solid var(--line);padding:8px 10px;text-align:left}th{background:#171e27;color:var(--mut)}
+.pass{color:var(--ok)}.pending{color:var(--warn)}.fail{color:var(--bad)}a{color:var(--blue)}ul{padding-left:22px}
+</style>
+</head>
+<body><main>
+<h1>OpticalNav VLN comparison test — 구현 및 실행 착수</h1>
+<p class="sub">2026-07-28 · scene <code>infinigen_kr_20260625</code> · claim scope:
+<strong>held-out paths within a single environment</strong> ·
+<a href="report_2026-07-28_render_benchmark.html">기존 render benchmark 보존본</a></p>
+
+<div class="hero">
+<strong>결론.</strong> DUET·SkillNav·GR-DUET 비교를 위한 공통 split, graph environment,
+prediction trace, 지표·통계, official-format adapter와 smoke runner를
+<code>experiment/opticalnav_vln_comparison_20260728/</code>에 구현했다.
+세 공식 GitHub를 pinned commit으로 확보했고 Python 3.9/CUDA 11.8 환경과 MatterSim을 실제 빌드했다.
+DUET 공식 코드로 1 optimizer-update smoke까지 통과했다. 이 smoke 수치는 random initialization 진단값이며
+comparison 결과에는 포함하지 않는다. RGB primary 실험은 실행 가능하고,
+polar ablation만 <strong>Stokes 1 view 누락</strong>으로 보류한다.
+</div>
+
+<div class="grid">
+<div class="kpi"><span>complete-case</span><b>1,347</b>Goal·Turn·Landmark·Perception</div>
+<div class="kpi"><span>path-group split</span><b>943 / 202 / 202</b>train / validation / test</div>
+<div class="kpi"><span>split overlap</span><b class="pass">0 / 0</b>start-goal / exact path</div>
+<div class="kpi"><span>최대 층화 편차</span><b class="pass">0.8361%p</b>기준 ≤ 3%p</div>
+<div class="kpi"><span>paired views</span><b class="pass">1,356 × 2</b>off / on 일대일</div>
+<div class="kpi"><span>Stokes coverage</span><b class="fail">2,711 / 2,712</b>1 view 누락</div>
+</div>
+
+<h2>1. 고정 데이터와 split</h2>
+<p>대상 export는
+<code>export-infinigen_kr_20260625-20260716T030730805179</code>로 고정했다.
+core archive는 302,424,527 bytes, polar archive는 8,729,436,504 bytes다.
+archive path·size·SHA256은 <code>manifests/source_export_manifest.json</code>에 기록한다.
+core SHA256은 <code>56b8d844…bb2e</code>, polar SHA256은 <code>d1c414fe…bdb</code>로 실제 계산해 manifest에 기록했다.</p>
+<p>split은 seed <code>20260728</code>로 `(start_node, goal_node)` group을 묶고
+scenario × reference path-length bin × perturbation exposure의 joint stratum을
+MILP로 최적화했다. episode 목표 수를 정확히 맞추면서 group과 exact path가 split을 넘지 않는다.</p>
+<table>
+<tr><th>검사</th><th>실측</th><th>기준</th><th>상태</th></tr>
+<tr><td>episode 수</td><td>943 / 202 / 202</td><td>목표에서 최대 group size(4) 이내</td><td class="pass">PASS</td></tr>
+<tr><td>start-goal overlap</td><td>0</td><td>0</td><td class="pass">PASS</td></tr>
+<tr><td>exact path overlap</td><td>0</td><td>0</td><td class="pass">PASS</td></tr>
+<tr><td>scenario/path-length 최대 편차</td><td>0.8361%p</td><td>≤ 3%p</td><td class="pass">PASS</td></tr>
+</table>
+
+<h2>2. optical perturbation 계약</h2>
+<p>용어는 mirror 없음/있음이 아니라 <strong>optical perturbation off/on</strong>으로 고정한다.
+base scene에도 기존 mirror asset이 존재하고, sidecar가 추가하는 geometry는 mirror wall 11개와
+glass wall 1개다. edge polyline과 object line geometry를 다시 교차시킨 결과 disabled edge 7개는
+모두 <code>glass_auto_001</code>에 귀속되며 mirror 귀속 edge는 0개다.</p>
+<ul>
+<li>P1 rerouting: disabled edge 7개를 candidate에서 제거.</li>
+<li>P2 collision stress: base candidate를 유지하고 해당 edge 선택 시 현재 node 유지 + glass collision 기록.</li>
+<li>perturbed SPL denominator: disabled edge를 제거한 safe graph shortest path.</li>
+<li>동일 blocked edge 3회 연속 선택 시 실패 종료; max step은 <code>min(50, max(20, 3×reference edges))</code>.</li>
+</ul>
+<div class="note warn"><strong>해석 주의.</strong> 현재 geometry에서 edge-level collision cause는 glass뿐이다.
+mirror 효과는 collision count보다 decision flip, trajectory 변화와 off→on 성능 차이로 검정한다.</div>
+
+<h2>3. 공식 코드와 weight 접근성</h2>
+<table>
+<tr><th>모델</th><th>공식 source / pinned commit</th><th>weight 접근</th><th>라이선스 상태</th></tr>
+<tr><td>DUET</td><td><code>cshizhe/VLN-DUET</code><br><code>93e8b233…</code></td><td class="pass">공개. bundle 약 20.1 GB, LXMERT 912 MB</td><td class="pending">LICENSE 파일 없음 — 재배포 금지</td></tr>
+<tr><td>SkillNav</td><td><code>HLR/SkillNav</code><br><code>a733251b…</code></td><td class="pass">5 expert + temporal checkpoint 목록 공개 조회 성공</td><td class="pending">LICENSE 파일 없음 — 재배포 금지</td></tr>
+<tr><td>GR-DUET</td><td><code>honghd16/GSA-VLN</code><br><code>d7310c8e…</code></td><td class="pass">pretrained 약 1.05 GB 실제 download probe 성공</td><td class="pass">MIT</td></tr>
+</table>
+<p>코드는 ignored <code>third_party/</code>, weight는 ignored <code>external/</code>에 둔다.
+공식 구현은 MatterSim과 precomputed panorama feature를 사용하므로 Python 3.9 conda 환경을 별도로 만든다.
+현재 장비의 RTX 3090 24GB ×8에서 torch 2.1.2/CUDA 11.8 인식을 확인했다.
+MatterSim commit <code>589d091b…</code>을 EGL mode로 빌드하고 Python import와
+base/P1 connectivity 초기화를 통과했다. 공식 weight 다운로드는 시작했으나 외부 host 전송 속도가
+매우 낮아 아직 완료되지 않았다.</p>
+
+<h2>4. 구현된 실험 계약</h2>
+<ul>
+<li>Mixed training: train path마다 공식 4종 instruction을 epoch당 각 1회 노출. Legacy는 eval-only.</li>
+<li>모든 primary model은 batch 8, 40 epoch, 동일 optimizer update budget을 사용하고 validation SPL로 checkpoint 선택.</li>
+<li>DUET는 ImageNet ViT-B/16 768-D, SkillNav/GR-DUET는 CLIP ViT-B/16 512-D native feature 유지.</li>
+<li>12개 수평 RGB만 입력한다. official 36-slot panorama의 horizon 12칸에만 feature를 채우고 미렌더 상·하 슬롯은 0으로 기록.</li>
+<li>SkillNav Qwen router는 temperature 0/top-1, Vertical Movement expert는 pretrained frozen.</li>
+<li>GR-DUET cold는 upstream reset 조건상 <code>max_traj_num=1</code>로 고정한다.
+0은 첫 episode 뒤 reset되지 않으므로 cold 조건이 아니다.</li>
+<li>GR-DUET adaptation은 train split만 사용한다. validation/test instruction마다 train node memory에서
+graph를 새로 구성하고, 그 rollout에서 추가된 node는 다음 instruction 전에 폐기해 online update를 금지한다.</li>
+<li>GR-DUET polar 입력은 S0, DoLP, cos(2AoLP), sin(2AoLP), valid mask로 변환.</li>
+</ul>
+<p><code>prediction_trace.v1</code>에는 candidate score, stop score, 선택 action,
+RGB/polar reference, collision/cause/revisit/goal distance와 모델별 선택 diagnostic을 저장한다.
+400개 oracle/random smoke trace(20 episode × 5 instruction × 2 variant × 2 policy)를 생성해 schema write를 검증했다.</p>
+
+<h3>공식 DUET 1-update smoke (성능표 제외)</h3>
+<p>official loader에 8 train path × 공식 instruction 4종 = 32 sample을 넣고,
+4 validation path × 5 instruction = 20 sample로 rollout했다. MatterSim action candidate,
+36-slot HDF5 feature, forward/backward, AdamW update, validation rollout과 checkpoint 저장이 모두 통과했다.
+random initialization 1 update의 진단값은 SR 0, SPL 0, nDTW 30.15이며 모델 성능 추정치가 아니다.
+상세 기록은 <code>runs/model_smoke/duet_seed_20260728/smoke_manifest.json</code>과
+<code>logs/train.txt</code>에 남겼다.</p>
+<p>이 과정에서 official connectivity pose의 floor 좌표를 잘못 교환하던 adapter 오류를 발견해
+OpticalNav와 MatterSim 공통 좌표계인 <code>(x, y, z)</code>로 수정했다. 수정 전에는 실제 graph
+이웃이 수직 이동처럼 해석되어 candidate에서 사라졌고, 수정 후 MatterSim 후보 노출과 회귀 테스트가 통과했다.</p>
+
+<h3>공식 GR-DUET adapter smoke (성능표 제외)</h3>
+<p>CLIP 512-D feature에서 113-node <code>pano_inputs.h5</code>와 candidate-angle map을 생성했다.
+candidate map은 connectivity의 모든 인접 edge와 불일치 0으로 검증했다. cold와 scene-adapted 모두
+1 optimizer update, validation rollout과 SPL checkpoint-selection 경로를 통과했다.
+scene-adapted smoke는 train-only frozen memory를 각 validation instruction마다 재구성하며,
+validation에서 새로 방문한 node가 다음 instruction으로 전달되지 않음을 계약으로 기록한다.
+이 smoke 역시 random initialization 진단이므로 성능표에서는 제외한다.</p>
+
+<h2>5. 평가 결과물</h2>
+<p>공통 evaluator는 SR, SPL, NE, OSR, nDTW, SDTW, Stop Accuracy와 4-way
+Robust Success/Worst-option SPL/Outcome Agreement/Instruction Sensitivity/Trajectory Agreement,
+off→on delta 및 collision 지표를 계산한다. paired bootstrap은 start-goal group resampling,
+성공률은 exact McNemar, 연속 지표는 Wilcoxon, 다중 비교는 Holm correction을 적용한다.</p>
+<p>동일 trace에서 graph/reference/prediction/perturbation/disabled edge/collision/divergence를 그린
+PNG와 observation을 base64로 포함한 self-contained HTML replay를 생성하도록 구현했다.
+관측 비교 anchor는 동일한 <code>(VP, heading)</code>의 base/perturbed frame만 사용한다.
+출발 관측과 최초 decision/transition divergence 직전, 최초 optical collision 직전을 표시하며,
+서로 다른 VP에 도착한 final state는 픽셀 비교에서 제외하고 별도 결과 패널로 보여준다.
+실제 모델 trace가 생긴 뒤 success/failure/recovery 각 3개를 deterministic rule로 선택한다.</p>
+
+<h2>6. 현재 blocker와 실행 상태</h2>
+<div class="note bad">
+<strong>데이터 blocker.</strong> polar archive에
+<code>base / vp_manual_0001 / h_330 / polar_cam / stokes_core_v1.npz</code>가 없다.
+RGB와 off/on sensor index는 각각 1,356개로 정확히 대응하지만 Stokes는 2,711/2,712다.
+원본 OpticalNav 및 bridge job에서도 해당 파일을 찾지 못했다. 존재하는 2,711개 NPZ의 full scan에서는 NaN/Inf 0, invalid mask 0으로 통과했다. sensor ablation 전에 이 한 view를 재렌더해
+새 immutable export를 만들거나, 사전 등록된 missing-view 제외 규칙을 승인해야 한다.
+</div>
+<ol>
+<li class="pass">완료: 격리 conda, MatterSim build/import, BERT annotation tokenization, split/connectivity runtime staging.</li>
+<li class="pass">완료: ImageNet ViT-B/16 768-D와 CLIP ViT-B/16 512-D native HDF5 각각 339 key 생성.</li>
+<li class="pass">완료: DUET 1-update official-code smoke. 비교 성능에는 미포함.</li>
+<li class="pass">완료: GR-DUET cold/scene-adapted 1-update smoke와 train-only frozen-memory validation.</li>
+<li class="pending">진행 중: GR-DUET/DUET/SkillNav official checkpoint 다운로드. 공개 접근은 확인했으나 현재 외부 전송이 병목.</li>
+<li>checkpoint 확보 후 3 seeds의 DUET·SkillNav·GR-DUET cold/adapted를 동일 update budget으로 학습.</li>
+<li>validation SPL checkpoint 고정 후 test off/on P1/P2 및 GR-DUET sensor ablation 실행.</li>
+<li>집계표·paired 통계·replay HTML/PNG 생성. 그 전까지 표의 모델 성능 칸은 “미실행”으로 유지.</li>
+<li>polar ablation 전 missing Stokes를 복구한 새 immutable export를 만들거나 사전 등록 제외 규칙을 승인.</li>
+</ol>
+
+<p class="mut">구현 위치:
+<code>experiment/opticalnav_vln_comparison_20260728/</code>.
+주요 manifest: <code>path_group_split_v1.json</code>,
+<code>disabled_edge_causes.json</code>, <code>model_access_20260728.json</code>,
+<code>data_audit.json</code>, <code>split_audit.json</code>. 이 문서에는 측정된 audit와 아직 실행하지 않은
+model result를 의도적으로 분리했다.</p>
+</main></body></html>

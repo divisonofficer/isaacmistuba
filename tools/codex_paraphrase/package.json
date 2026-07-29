@@ -1,0 +1,8 @@
+{
+  "name": "robomituba-codex-paraphrase",
+  "private": true,
+  "type": "module",
+  "version": "0.1.0",
+  "description": "Optional codex-as-api (ChatGPT login) paraphrase helper for OpticalNav instruction generation.",
+  "dependencies": { "codex-as-api": "^0.5.1" }
+}

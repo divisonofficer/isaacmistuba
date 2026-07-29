@@ -20,8 +20,12 @@ Coordinate contract (set by Stage 1): meshes are origin-local Y-up; the authorin
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
+import shutil
+import struct
+import time
 import sys
 from pathlib import Path
 
@@ -246,6 +250,11 @@ def _material_binding(mat: dict) -> dict:
         if images and images[0].get("filepath"):
             binding["base_color_texture_ref"] = images[0]["filepath"]
 
+    # Carry optical_class into the render binding so the daemon can inject
+    # per-material IOR / metal eta-k (ROBOMITUBA_BSDF_MODE=injected) without
+    # re-deriving from the material name. (Older scenes lack this; the daemon
+    # falls back to deriving from the material_id/shader name.)
+    binding["optical_class"] = oc
     transparent = oc == "glass"
     return {
         "material_id": _san(name),
@@ -476,18 +485,223 @@ def _scene_id_from_manifest(manifest_path: Path, override: str | None) -> str:
     return _san(_j.loads(manifest_path.read_text()).get("scene_id") or manifest_path.parent.name)
 
 
+def _validate_glb_mesh_contract(path: Path) -> list[str]:
+    issues: list[str] = []
+    try:
+        with path.open("rb") as fh:
+            header = fh.read(12)
+            if len(header) != 12:
+                return ["truncated GLB header"]
+            magic, version, total_length = struct.unpack("<4sII", header)
+            if magic != b"glTF" or version != 2:
+                return ["not a GLB v2 file"]
+            chunk_header = fh.read(8)
+            if len(chunk_header) != 8:
+                return ["missing GLB JSON chunk"]
+            chunk_length, chunk_type = struct.unpack("<II", chunk_header)
+            if chunk_type != 0x4E4F534A:
+                return ["first GLB chunk is not JSON"]
+            document = json.loads(fh.read(chunk_length))
+            binary = b""
+            while fh.tell() < total_length:
+                next_header = fh.read(8)
+                if len(next_header) != 8:
+                    break
+                next_length, next_type = struct.unpack("<II", next_header)
+                payload = fh.read(next_length)
+                if next_type == 0x004E4942:
+                    binary = payload
+        if total_length != path.stat().st_size:
+            issues.append("header length does not match file size")
+        accessors = document.get("accessors") or []
+        buffer_views = document.get("bufferViews") or []
+
+        component_formats = {
+            5120: "b", 5121: "B", 5122: "h", 5123: "H", 5125: "I", 5126: "f",
+        }
+        component_counts = {"SCALAR": 1, "VEC2": 2, "VEC3": 3, "VEC4": 4}
+
+        def read_accessor(accessor_index: int, element_index: int):
+            accessor = accessors[accessor_index]
+            view_index = accessor.get("bufferView")
+            if not (isinstance(view_index, int) and 0 <= view_index < len(buffer_views)):
+                raise ValueError("accessor has no valid bufferView")
+            view = buffer_views[view_index]
+            fmt = component_formats.get(accessor.get("componentType"))
+            count = component_counts.get(accessor.get("type"))
+            if fmt is None or count is None:
+                raise ValueError("unsupported accessor component/type")
+            item_size = struct.calcsize("<" + fmt * count)
+            stride = int(view.get("byteStride") or item_size)
+            offset = int(view.get("byteOffset") or 0) + int(accessor.get("byteOffset") or 0) + element_index * stride
+            if offset < 0 or offset + item_size > len(binary):
+                raise ValueError("accessor reads outside GLB BIN chunk")
+            return struct.unpack_from("<" + fmt * count, binary, offset)
+        primitives = [
+            primitive
+            for mesh in document.get("meshes") or []
+            for primitive in mesh.get("primitives") or []
+        ]
+        if not primitives:
+            issues.append("GLB has no mesh primitives")
+        for index, primitive in enumerate(primitives):
+            attrs = primitive.get("attributes") or {}
+            counts: dict[str, int] = {}
+            for semantic in ("POSITION", "TEXCOORD_0"):
+                accessor_index = attrs.get(semantic)
+                if not (isinstance(accessor_index, int) and 0 <= accessor_index < len(accessors)):
+                    issues.append(f"primitive {index} missing {semantic} accessor")
+                    continue
+                count = int(accessors[accessor_index].get("count") or 0)
+                counts[semantic] = count
+                if count <= 0:
+                    issues.append(f"primitive {index} has empty {semantic}")
+            if counts.get("POSITION") and counts.get("TEXCOORD_0") != counts["POSITION"]:
+                issues.append(f"primitive {index} POSITION/TEXCOORD_0 count mismatch")
+            indices = primitive.get("indices")
+            if indices is not None and not (
+                isinstance(indices, int) and 0 <= indices < len(accessors)
+                and int(accessors[indices].get("count") or 0) > 0
+            ):
+                issues.append(f"primitive {index} has invalid/empty indices")
+            if primitive.get("mode", 4) != 4:
+                issues.append(f"primitive {index} is not TRIANGLES")
+                continue
+            uv_accessor = attrs.get("TEXCOORD_0")
+            if not (isinstance(uv_accessor, int) and 0 <= uv_accessor < len(accessors)):
+                continue
+            try:
+                if indices is None:
+                    index_count = int(accessors[attrs["POSITION"]].get("count") or 0)
+                else:
+                    index_count = int(accessors[indices].get("count") or 0)
+                triangle_count = index_count // 3
+                step = max(1, triangle_count // 4000)
+                nonzero_area = False
+                for triangle_index in range(0, triangle_count, step):
+                    if indices is None:
+                        vertex_indices = (triangle_index * 3, triangle_index * 3 + 1, triangle_index * 3 + 2)
+                    else:
+                        vertex_indices = tuple(
+                            int(read_accessor(indices, triangle_index * 3 + corner)[0])
+                            for corner in range(3)
+                        )
+                    uv0, uv1, uv2 = (read_accessor(uv_accessor, vertex) for vertex in vertex_indices)
+                    area2 = abs(
+                        (uv1[0] - uv0[0]) * (uv2[1] - uv0[1])
+                        - (uv1[1] - uv0[1]) * (uv2[0] - uv0[0])
+                    )
+                    if math.isfinite(area2) and area2 > 1e-10:
+                        nonzero_area = True
+                        break
+                if not nonzero_area:
+                    issues.append(f"primitive {index} has degenerate TEXCOORD_0 triangle area")
+            except Exception as exc:  # noqa: BLE001
+                issues.append(f"primitive {index} UV data invalid: {exc}")
+    except Exception as exc:  # noqa: BLE001
+        issues.append(f"cannot parse GLB: {exc}")
+    return issues
+
+
+
+def validate_infinigen_manifest(
+    manifest: dict,
+    manifest_dir: Path,
+    *,
+    allow_obj_fallback: bool = False,
+) -> list[str]:
+    """Validate the Stage-1 GLB/PBR contract."""
+    issues: list[str] = []
+    if int(manifest.get("export_contract_version") or 0) < 2:
+        issues.append("manifest export_contract_version is not 2")
+    for index, unit in enumerate(manifest.get("units") or []):
+        uid = str(unit.get("id") or unit.get("blender_name") or index)
+        glb_ref = unit.get("mesh_glb")
+        if not glb_ref:
+            issues.append(f"{uid}: missing mesh_glb")
+        else:
+            glb_path = manifest_dir / str(glb_ref)
+            if not glb_path.is_file():
+                issues.append(f"{uid}: GLB does not exist: {glb_ref}")
+            else:
+                for glb_issue in _validate_glb_mesh_contract(glb_path):
+                    issues.append(f"{uid}: {glb_issue}")
+                expected_digest = str(unit.get("glb_sha256") or "")
+                if not expected_digest:
+                    issues.append(f"{uid}: missing GLB digest")
+                else:
+                    actual_digest = hashlib.sha256(glb_path.read_bytes()).hexdigest()
+                    if actual_digest != expected_digest:
+                        issues.append(f"{uid}: GLB digest mismatch")
+        uv = unit.get("uv") if isinstance(unit.get("uv"), dict) else {}
+        if not uv.get("valid"):
+            issues.append(f"{uid}: missing or invalid UV")
+        if not str(uv.get("layer") or "").strip():
+            issues.append(f"{uid}: missing UV layer")
+        pbr = unit.get("pbr") if isinstance(unit.get("pbr"), dict) else {}
+        if pbr.get("status") != "ok":
+            issues.append(f"{uid}: unresolved PBR contract")
+        if not pbr.get("self_contained_glb"):
+            issues.append(f"{uid}: GLB is not declared self-contained")
+        channels = pbr.get("channels") if isinstance(pbr.get("channels"), dict) else {}
+        for channel in ("base_color", "roughness", "metallic", "normal"):
+            rec = channels.get(channel) if isinstance(channels.get(channel), dict) else {}
+            mode = rec.get("mode")
+            if mode not in {"texture", "constant", "not_applicable"}:
+                issues.append(f"{uid}: unresolved PBR channel {channel}")
+            elif mode == "texture":
+                ref = str(rec.get("ref") or "")
+                resolution = rec.get("resolution")
+                if not ref or not (manifest_dir / ref).is_file():
+                    issues.append(f"{uid}: missing PBR texture {channel}: {ref}")
+                if rec.get("colorspace") not in {"srgb", "raw"}:
+                    issues.append(f"{uid}: invalid colorspace for {channel}")
+                if not (isinstance(resolution, list) and len(resolution) == 2 and all(int(v) > 0 for v in resolution)):
+                    issues.append(f"{uid}: invalid texture resolution for {channel}")
+                if rec.get("source") == "linked":
+                    bake_validation = rec.get("bake_validation")
+                    if not isinstance(bake_validation, dict):
+                        issues.append(f"{uid}: missing bake validation for linked {channel}")
+                    elif bake_validation.get("result") != "spatial":
+                        issues.append(
+                            f"{uid}: linked {channel} bake validation is "
+                            f"{bake_validation.get('result', 'unknown')}"
+                        )
+            elif mode == "constant":
+                if rec.get("value") is None:
+                    issues.append(f"{uid}: missing constant value for {channel}")
+                if rec.get("colorspace") not in {"srgb", "raw"}:
+                    issues.append(f"{uid}: invalid colorspace for {channel}")
+    if issues and not allow_obj_fallback:
+        detail = "\n  - ".join(issues[:40])
+        extra = f"\n  ... and {len(issues) - 40} more" if len(issues) > 40 else ""
+        raise ValueError(
+            "strict Infinigen GLB/PBR manifest validation failed:\n  - "
+            + detail + extra
+            + "\nRe-export with the current pipeline or pass --allow-obj-fallback explicitly."
+        )
+    return issues
+
 def build_authoring_map(manifest: dict, scene_id: str, import_rel: str,
                         *, keep_empty_rooms: bool = False, room_override: str | None = None,
                         normalize_origin: bool = True, origin_margin: float = 0.5,
-                        fill_missing_lights: bool = True) -> dict:
+                        fill_missing_lights: bool = True, allow_obj_fallback: bool = False) -> dict:
     all_units = manifest.get("units") or []
     mats_in = manifest.get("materials") or {}
 
-    # Drop degenerate units (face-less OBJs: stray curves, temp/camera placeholders,
-    # animal-rig "hoof_parent_temp" leftovers at the origin) FIRST, so they don't get
-    # mis-counted as furniture during room selection.
-    units = [u for u in all_units
-             if u.get("mesh_obj") and _obj_has_faces(REPO_ROOT / import_rel / u["mesh_obj"])]
+    # GLB is authoritative. OBJ face inspection is retained only for an explicitly
+    # degraded legacy import.
+    def _has_render_geometry(unit: dict) -> bool:
+        glb_ref = unit.get("mesh_glb")
+        if glb_ref and (REPO_ROOT / import_rel / str(glb_ref)).is_file():
+            return True
+        obj_ref = unit.get("mesh_obj")
+        return bool(
+            allow_obj_fallback and obj_ref
+            and _obj_has_faces(REPO_ROOT / import_rel / str(obj_ref))
+        )
+
+    units = [u for u in all_units if _has_render_geometry(u)]
     skipped = len(all_units) - len(units)
 
     # Drop oversized door leaves (much larger than their nearest frame) that block a
@@ -539,7 +753,15 @@ def build_authoring_map(manifest: dict, scene_id: str, import_rel: str,
         sem = u.get("semantic_type") or "landmark"
         mat_names = u.get("materials") or []
         material_id = mat_id_by_name.get(mat_names[0]) if mat_names else DEFAULT_MAT
-        source_ref = f"{import_rel}/{u['mesh_obj']}"
+        glb_ref = u.get("mesh_glb")
+        if glb_ref and (REPO_ROOT / import_rel / str(glb_ref)).is_file():
+            source_ref = f"{import_rel}/{glb_ref}"
+            geometry_source = "glb"
+        elif allow_obj_fallback and u.get("mesh_obj"):
+            source_ref = f"{import_rel}/{u['mesh_obj']}"
+            geometry_source = "obj_fallback"
+        else:
+            raise ValueError(f"{u.get('id')}: no valid GLB geometry")
         # authoring yaw MUST be 0 here. Stage 1 (blender_export_scene.py) exports each
         # unit's OBJ origin-local but with the world ORIENTATION BAKED INTO THE MESH
         # vertices, and reports size_m as the rotated WORLD AABB. Both consumers of
@@ -575,6 +797,10 @@ def build_authoring_map(manifest: dict, scene_id: str, import_rel: str,
                 "factory": u.get("factory"),
                 "infinigen_yaw_deg": round(manifest_yaw, 3),
                 "glb_ref": (f"{import_rel}/{u['mesh_glb']}" if u.get("mesh_glb") else None),
+                "fallback_obj_ref": (f"{import_rel}/{u['mesh_obj']}" if u.get("mesh_obj") else None),
+                "geometry_source": geometry_source,
+                "pbr": u.get("pbr"),
+                "uv": u.get("uv"),
                 "world_bbox_min": u.get("world_bbox_min"),
                 "world_bbox_max": u.get("world_bbox_max"),
             },
@@ -820,13 +1046,92 @@ def build_authoring_map(manifest: dict, scene_id: str, import_rel: str,
     }
 
 
+_PRESERVED_ROOT_FILES = {
+    "nav_graph.json", "viewpoint_graph.json", "traversable_grid.npy",
+    "traversable_grid.npy.json", "graph_edit_history.jsonl",
+    "optical_perturbation.json",
+}
+
+def _sha256_path(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+def _preserved_scene_hashes(scene_dir: Path) -> dict:
+    # Root navigation artifacts are small enough for byte hashes. Observation trees
+    # can exceed 10 GB; the importer never opens them for writing, so snapshot their
+    # complete path/size/mtime/inode state in one constant-memory digest.  Pilot
+    # acceptance may additionally compare an offline byte digest before and after.
+    root_hashes = {
+        name: _sha256_path(scene_dir / name)
+        for name in sorted(_PRESERVED_ROOT_FILES)
+        if (scene_dir / name).is_file()
+    }
+    observation_state = hashlib.sha256()
+    observation_count = 0
+    for dirname in ("observations", "observations_perturbed"):
+        root = scene_dir / dirname
+        if not root.is_dir():
+            continue
+        for path in sorted(p for p in root.rglob("*") if p.is_file()):
+            stat = path.stat()
+            record = (
+                f"{path.relative_to(scene_dir).as_posix()}\0{stat.st_size}\0"
+                f"{stat.st_mtime_ns}\0{stat.st_ino}\n"
+            )
+            observation_state.update(record.encode("utf-8"))
+            observation_count += 1
+    return {
+        "root_byte_hashes": root_hashes,
+        "observation_state_digest": observation_state.hexdigest(),
+        "observation_file_count": observation_count,
+    }
+
+def _assert_stable_object_ids(existing: dict, candidate: dict) -> None:
+    def mapping(payload):
+        result = {}
+        for obj in payload.get("objects") or []:
+            meta = obj.get("metadata") if isinstance(obj.get("metadata"), dict) else {}
+            name = str(meta.get("blender_name") or "")
+            if meta.get("infinigen") and name:
+                result[name] = str(obj.get("id") or "")
+        return result
+    old, new = mapping(existing), mapping(candidate)
+    missing = sorted(set(old) - set(new))
+    churn = sorted(name for name in set(old) & set(new) if old[name] != new[name])
+    if missing or churn:
+        details = []
+        if missing:
+            details.append(f"missing existing objects={missing[:12]}")
+        if churn:
+            details.append(f"changed object ids={[(name, old[name], new[name]) for name in churn[:12]]}")
+        raise ValueError("object-ID stability check failed; refusing scene promotion: " + "; ".join(details))
+
+def _snapshot_generated_scene_files(scene_dir: Path, snapshot_root: Path) -> Path | None:
+    if not scene_dir.is_dir():
+        return None
+    snapshot_dir = snapshot_root / (time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + f"-{time.time_ns()}")
+    snapshot_dir.mkdir(parents=True, exist_ok=False)
+    for path in sorted(scene_dir.iterdir()):
+        if path.is_file() and path.name not in _PRESERVED_ROOT_FILES:
+            shutil.copy2(path, snapshot_dir / path.name)
+    return snapshot_dir
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--manifest", required=True)
     ap.add_argument("--scene-id", default=None)
     ap.add_argument("--project-id", default="opticalnav-v0.2")
     ap.add_argument("--force", action="store_true")
+    ap.add_argument("--validate-only", action="store_true",
+                    help="Validate the Stage-1 GLB/PBR manifest and exit.")
+    ap.add_argument("--allow-obj-fallback", action="store_true",
+                    help="Permit legacy/incomplete manifests and audited OBJ geometry fallback.")
     ap.add_argument("--no-materialize", action="store_true")
+    ap.add_argument("--allow-object-id-churn", action="store_true",
+                    help="Allow replacing an existing scene when stable Infinigen object IDs disappear or change.")
     ap.add_argument("--keep-empty-rooms", action="store_true",
                     help="Keep all rooms, including unfurnished/unsolved shells.")
     ap.add_argument("--room", default=None,
@@ -844,6 +1149,14 @@ def main():
 
     manifest_path = Path(args.manifest).resolve()
     manifest = json.loads(manifest_path.read_text())
+    validation_issues = validate_infinigen_manifest(
+        manifest, manifest_path.parent, allow_obj_fallback=args.allow_obj_fallback,
+    )
+    if args.validate_only:
+        print(f"[import] manifest validation ok: {manifest_path}")
+        if validation_issues:
+            print(f"[import] degraded validation issues: {len(validation_issues)}")
+        return
     scene_id = _scene_id_from_manifest(manifest_path, args.scene_id)
     # repo-relative import root (meshes live under here as <import_rel>/meshes/<id>.obj)
     import_rel = manifest_path.parent.relative_to(REPO_ROOT).as_posix()
@@ -851,12 +1164,27 @@ def main():
     am = build_authoring_map(manifest, scene_id, import_rel,
                              keep_empty_rooms=args.keep_empty_rooms, room_override=args.room,
                              normalize_origin=not args.no_normalize_origin,
-                             fill_missing_lights=not args.no_fill_missing_lights)
+                             fill_missing_lights=not args.no_fill_missing_lights,
+                             allow_obj_fallback=args.allow_obj_fallback)
     md = am["metadata"]
+    md["export_contract_version"] = int(manifest.get("export_contract_version") or 0)
+    md["import_degraded"] = bool(validation_issues)
+    md["manifest_validation_issues"] = validation_issues
     print(f"[import] scene_id={scene_id} objects={len(am['objects'])} materials={len(am['materials'])} "
           f"trav={am['regions'][0]['geometry']['bounds']} (skipped {md.get('skipped_degenerate', 0)} degenerate)")
     print(f"[import] kept_rooms={md.get('kept_rooms')} dropped_rooms={md.get('dropped_rooms')} "
           f"origin_offset={md.get('origin_offset')}")
+
+    scene_dir = REPO_ROOT / "out" / "opticalnav" / args.project_id / "scenes" / scene_id
+    existing_authoring = scene_dir / "authoring_map.json"
+    if existing_authoring.is_file() and not args.allow_object_id_churn:
+        _assert_stable_object_ids(json.loads(existing_authoring.read_text()), am)
+    preserved_before = _preserved_scene_hashes(scene_dir) if scene_dir.is_dir() else {}
+    snapshot_dir = _snapshot_generated_scene_files(
+        scene_dir, manifest_path.parent / "promotion_snapshots" / scene_id,
+    )
+    if snapshot_dir:
+        print(f"[import] promotion snapshot -> {snapshot_dir.relative_to(REPO_ROOT)}")
 
     fixture_path = REPO_ROOT / "out" / "infinigen_imports" / f"{scene_id}__authoring_map.json"
     fixture_path.parent.mkdir(parents=True, exist_ok=True)
@@ -868,7 +1196,19 @@ def main():
         fixture_path=fixture_path, force=args.force,
         materialize_render_scene=not args.no_materialize,
     )
-    scene_dir = REPO_ROOT / "out" / "opticalnav" / args.project_id / "scenes" / scene_id
+    preserved_after = _preserved_scene_hashes(scene_dir) if preserved_before else {}
+    if preserved_after != preserved_before:
+        changed = sorted(set(preserved_before) ^ set(preserved_after) | {
+            key for key in set(preserved_before) & set(preserved_after)
+            if preserved_before[key] != preserved_after[key]
+        })
+        raise RuntimeError(
+            "navigation artifact preservation check failed after promotion: "
+            + ", ".join(changed[:40])
+        )
+    if preserved_before:
+        print(f"[import] preserved navigation root bytes and observation state: "
+              f"{preserved_before['observation_file_count']} observation files")
     print(f"[import] installed -> {scene_dir.relative_to(REPO_ROOT)}")
     if args.optical_perturbation is not None:
         from navigation_dataset.optical_perturbation import build_optical_perturbation

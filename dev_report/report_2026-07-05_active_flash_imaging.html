@@ -1,0 +1,207 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>2026-07-05 Active Flashing Imaging System — rig-mounted RGB/NIR flash + linear polarizer</title>
+  <style>
+    :root{color-scheme:light;--bg:#f7f8fb;--paper:#fff;--ink:#1f2937;--muted:#667085;--line:#d9dee8;--accent:#1d5fd1;--ok:#087443;--warn:#a15c07;--code:#f1f4f9;}
+    body{margin:0;background:var(--bg);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;line-height:1.58;}
+    .layout{display:flex;min-height:100vh;align-items:flex-start;}
+    aside{width:260px;flex:0 0 260px;position:sticky;top:0;height:100vh;overflow-y:auto;padding:24px 16px;border-right:1px solid var(--line);background:#eef2f7;}
+    .logo{font-weight:800;color:var(--accent);font-size:16px;}
+    .date{margin-top:3px;color:var(--muted);font-size:12px;font-family:ui-monospace,Menlo,Consolas,monospace;}
+    .nav-title{margin:22px 8px 8px;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.12em;font-weight:800;}
+    .nav-link{display:block;padding:6px 8px;border-radius:5px;color:#344054;font-size:12px;text-decoration:none;margin-bottom:2px;}
+    .nav-link:hover{background:#dde3ee;color:var(--accent);}
+    main{flex:1;min-width:0;padding:36px 24px 64px;}
+    article{max-width:1080px;margin:0 auto;background:var(--paper);border:1px solid var(--line);border-radius:8px;padding:34px 40px;box-shadow:0 8px 24px rgb(16 24 40/.05);}
+    h1,h2,h3{line-height:1.25;margin:0;}
+    h1{font-size:28px;}
+    h2{margin-top:34px;padding-top:22px;border-top:1px solid var(--line);font-size:20px;}
+    h3{margin-top:22px;font-size:16px;}
+    p{margin:10px 0 0;}
+    ul{margin:10px 0 0 20px;padding:0;} li{margin:5px 0;}
+    code{background:var(--code);border:1px solid #e5e9f2;border-radius:5px;padding:1px 5px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:.92em;}
+    pre{overflow-x:auto;background:#111827;color:#e5e7eb;border-radius:8px;padding:14px 16px;font-size:13px;line-height:1.5;}
+    pre code{background:transparent;border:0;padding:0;color:inherit;}
+    table{width:100%;border-collapse:collapse;margin-top:12px;font-size:14px;}
+    th,td{border:1px solid var(--line);padding:9px 10px;text-align:left;vertical-align:top;}
+    th{background:#f3f6fb;font-weight:650;}
+    figure{margin:16px 0 0;} figure img{width:100%;border:1px solid var(--line);border-radius:8px;}
+    figcaption{margin-top:6px;color:var(--muted);font-size:13px;}
+    .meta{margin-top:10px;color:var(--muted);font-size:14px;}
+    .badge{display:inline-block;margin-right:6px;border-radius:999px;padding:2px 9px;border:1px solid var(--line);background:#f8fafc;color:var(--muted);font-size:12px;}
+    .ok{color:var(--ok);font-weight:650;} .warn{color:var(--warn);font-weight:650;}
+    .note{margin-top:12px;padding:10px 14px;border-left:3px solid var(--accent);background:#f3f6fb;border-radius:0 6px 6px 0;font-size:13.5px;}
+    @media(max-width:980px){.layout{display:block;}aside{position:relative;width:auto;height:auto;border-right:0;border-bottom:1px solid var(--line);}main{padding:20px;}article{padding:24px 20px;}}
+  </style>
+</head>
+<body>
+<div class="layout">
+<aside>
+  <div class="logo">Robomituba</div>
+  <div class="date">2026-07-05</div>
+  <div class="nav-title">오늘 보고서</div>
+  <a class="nav-link" href="#summary">요약</a>
+  <a class="nav-link" href="#why">1. 배경 — 왜 active flash</a>
+  <a class="nav-link" href="#design">2. 설계 — 기존 플러그인 조합</a>
+  <a class="nav-link" href="#impl">3. 구현 (Bridge · Staging · Rig/Sweep · UI)</a>
+  <a class="nav-link" href="#result">4. 결과 — active light ON/OFF 비교</a>
+  <a class="nav-link" href="#remain">5. 남은 일 · 설계 주의</a>
+  <div class="nav-title">이전 보고서</div>
+  <a class="nav-link" href="report_2026-06-29.html">2026-06-29 Infinigen → 렌더 · 측정 pBRDF</a>
+  <a class="nav-link" href="index.html">전체 인덱스</a>
+</aside>
+<main>
+  <article>
+    <h1>Active Flashing Imaging System — rig-mounted RGB/NIR flash + linear polarizer</h1>
+    <div class="meta">
+      <span class="badge">2026-07-05</span>
+      <span class="badge">spot/point emitter</span>
+      <span class="badge">linear polarizer BSDF</span>
+      <span class="badge">Camera Rig UI</span>
+      <span class="badge">no new C++</span>
+    </div>
+
+    <h2 id="summary">요약</h2>
+    <p>
+      로봇 base에 장착된 <b>active light(RGB flash + NIR flash)</b> 와 <b>linear polarizer(편광 조명)</b> 로
+      "active flashing imaging system" 을 렌더할 수 있게 파이프라인·스키마·UI를 준비했다.
+      <b>신규 C++ 없이</b> 이미 두 빌드에 컴파일된 Mitsuba 플러그인(<code>spot</code>/<code>point</code> emitter,
+      <code>polarizer</code> BSDF)을 조합한다. rig에 active light를 넣으면 sweep→렌더까지
+      flash 조명 + 편광 조명(Stokes)이 end-to-end로 나온다. active light <b>ON/OFF 비교 렌더로 검증</b>했다.
+    </p>
+
+    <h2 id="why">1. 배경 — 왜 active flash</h2>
+    <p>
+      OpticalNav은 편광·NIR 멀티모달 센서 데이터가 목표다. 실제 로봇 imaging system은 카메라와 함께
+      <b>flash(능동 조명)</b> 가 발광하고, specular/diffuse 분리를 위해 <b>편광자</b> 를 조명(또는 카메라) 앞에 둔다.
+      기존 파이프라인의 능동 조명은 request-level 단일 <code>AssistLightSpec</code>(<code>camera_aligned_rect</code>,
+      camera-baked, NIR grayscale proxy)뿐이라, 카메라 리그에 여러 광원을 붙이거나 UI에서 구성할 수 없었다.
+    </p>
+
+    <h2 id="design">2. 설계 — 기존 플러그인 조합</h2>
+    <ul>
+      <li><b>필요 플러그인은 이미 존재</b>: <code>spot</code>/<code>point</code> emitter(intensity=spectrum, <code>to_world</code>/<code>intensity</code> traversable),
+        <code>polarizer</code> BSDF(문서화된 linear polarizer; <code>theta</code>/<code>transmittance</code> traversable,
+        <code>*_spectral_polarized</code>에서 Mueller 행렬, RGB 변형에선 neutral ND). 두 빌드 모두 컴파일됨 → <b>C++ 불필요</b>.</li>
+      <li><b>편광 조명</b>: emitter는 unpolarized 방출이므로, 편광 조명은 <b>emitter + <code>polarizer</code> surface</b> 조합.
+        polarizer를 emitter 광축(+Z) 앞 2cm에 배치. 카메라측 분석은 기존 <b>Stokes 출력(s1/s2/dop/aolp)</b>으로 post에서 임의 analyzer각 계산.</li>
+      <li><b>base-mounted</b>: 광원 pose = <code>base_pose @ mount</code>(base_link 장착). rig-level로 관리해 여러 센서가 공유.</li>
+    </ul>
+
+    <h2 id="impl">3. 구현</h2>
+    <table>
+      <thead><tr><th>레이어</th><th>변경</th></tr></thead>
+      <tbody>
+        <tr><td><b>Bridge</b></td><td><code>ActiveLightSpec</code>(light_id·emitter_type·mount·modalities·spectrum·radiance·beam·polarized+angle) + <code>RenderRequest.active_lights</code>(legacy <code>assist_light</code> fallback 유지). io/manifest 라운드트립·검증.</td></tr>
+        <tr><td><b>Staging</b></td><td><code>multimodal.py::_append_base_active_lights</code> — <code>base_pose@mount</code>(<code>_active_light_mount_matrix</code>)에 <code>&lt;emitter spot|point&gt;</code> + 편광 시 <code>&lt;bsdf polarizer&gt;</code> surface. <code>render_modalities</code>→<code>_stage_path_scene</code>(active)/<code>_stage_stokes_scene</code>(polar)/<code>observation_bridge</code> 브랜치에 <b>가산 배선</b>(기본값 빈 값이면 기존 동작 불변).</td></tr>
+        <tr><td><b>Rig+Sweep</b></td><td><code>authoring_map.AuthoringCameraRig.active_lights</code> + 데몬 <code>_normalize_camera_rig</code> 영속화. sweep 3경로(graph/custom/direct)가 rig active_lights→RenderRequest 스레드(<code>sensor_sweep.py</code>).</td></tr>
+        <tr><td><b>UI</b></td><td><code>api.ts CameraRigActiveLight</code> + Camera Rig 편집기 <b>"Active Lights"</b> 섹션(Add RGB/NIR Flash, emitter_type·mount·spectrum·radiance·beam·modality chips·polarized+angle). svelte-check 0 errors.</td></tr>
+      </tbody>
+    </table>
+    <div class="note">
+      검증: bridge roundtrip/validation 유닛 + contract 통과, isolated GPU 렌더로 spot RGB+polarized 2개 주입·조명·polarizer 인스턴스화 확인.
+      기존 5개 contract 실패는 HEAD baseline과 동일한 <b>기존(병행 material 작업)</b> 실패로 active-light와 무관.
+    </div>
+
+    <h2 id="result">4. 결과 — active light ON/OFF 비교</h2>
+    <p>
+      저장된 polar 요청(<code>infinigen_kr_20000221</code> vp_000039/h_240)에 <code>active_lights</code>만 on/off로 달리 렌더.
+      OFF는 ambient(창광만)로 어둡고, ON은 base-mounted flash가 방 전체를 조명한다 — <b>평균 밝기 2.83× 상승</b>(mean 38.3 → 108.3).
+    </p>
+    <figure>
+      <img src="images/0705_activelight_onoff_compare.png" alt="active light on/off comparison">
+      <figcaption>polar_rgb_preview. 좌: active light OFF(ambient) · 우: active light ON(base-mounted flash). 우측 벽·문틀·구조물이 크게 밝아짐.</figcaption>
+    </figure>
+
+    <h3>고품질(spp 1024) RGB + 편광 비교 — polarized flash</h3>
+    <p>
+      같은 시점을 <b>path/polar spp 1024</b> 로, <b>편광 spot flash</b>(polarized=true) on/off로 렌더해 intensity(S0)·DoLP·AoLP를 비교했다.
+      편광 능동 조명은 <b>조명(intensity)뿐 아니라 편광 상태 자체를 부여</b>한다 — DoLP가 전반적으로 상승하고 AoLP 구조가 크게 재편된다.
+    </p>
+    <table>
+      <thead><tr><th>지표</th><th>OFF (ambient)</th><th>ON (polarized flash)</th><th>비</th></tr></thead>
+      <tbody>
+        <tr><td>Intensity S0 (mean)</td><td>31.8</td><td>101.3</td><td><b>3.19×</b></td></tr>
+        <tr><td>DoLP (dop R-channel mean)</td><td>57.7</td><td>125.1</td><td><b>2.17×</b></td></tr>
+        <tr><td>AoLP</td><td colspan="2">ambient 자연 편광각 → 편광 조명이 지배하는 구조로 재편(육안 확연)</td><td>—</td></tr>
+      </tbody>
+    </table>
+    <figure>
+      <img src="images/0705_activelight_onoff_hq_grid.png" alt="active light on/off HQ RGB+polarization grid">
+      <figcaption>spp 1024. 행: active OFF(ambient) / ON(polarized flash). 열: Intensity(S0) · DoLP(편광도) · AoLP(편광각). ON에서 씬이 밝아지고(3.19×) DoLP가 상승(2.17×)하며 AoLP가 편광 조명 기준으로 재편된다.</figcaption>
+    </figure>
+
+    <h3>Relighting sweep — active light L→R (RGB · DoLP · AoLP · s1 · s2)</h3>
+    <p>
+      고정 시점에서 편광 flash를 <b>좌→우로 8프레임 점진 이동</b>(mount x −0.6→+0.6m)하며 relighting을 캡처했다.
+      RGB(S0) 조명이 좌측 구조물→우측 기둥으로 이동하고, <b>편광 채널(DoLP·AoLP·s1·s2)이 조명–표면–카메라 기하 변화에 물리적으로 반응</b>한다
+      (능동 편광 조명이 표면 편광 응답을 바꾸는 실제 active polarimetric imaging 동작).
+    </p>
+    <figure>
+      <img src="images/0705_relight_sweep.gif" alt="active light relighting sweep (animated)">
+      <figcaption>애니메이션(GIF). 5패널 = RGB(S0) · DoLP · AoLP · s1 · s2. flash가 좌→우로 이동. mp4: <code>out/compare_measured_vs_analytic_vp039_h240/relight/relight_sweep.mp4</code></figcaption>
+    </figure>
+    <figure>
+      <img src="images/0705_relight_filmstrip.png" alt="relighting sweep filmstrip" style="max-width:520px">
+      <figcaption>정적 filmstrip(위=light 좌, 아래=light 우). GIF 미재생 환경용.</figcaption>
+    </figure>
+
+    <h3>Relighting sweep — 고프레임·spp4096 (mirror/glass 정면 씬)</h3>
+    <p>
+      위 8프레임 sweep을 <b>16프레임 · spp4096</b>로 확장하고, 관측자를 정면으로 향한
+      <b>거울(roughconductor Al α0.15) + 유리(roughdielectric α0.12)</b> 패널 씬에서
+      편광 flash를 <b>x −1.05→+1.05m 로 이동</b>했다(flash fixture는 프레임 밖으로 올림).
+      RGB(S0) specular 하이라이트가 좌(거울)→우(유리)로 이동하며 DoLP·s1·s2 편광 응답도 함께 이동한다
+      (specular DoLP ≈ 0.76).
+    </p>
+    <figure>
+      <img src="images/0705_relight_sweep_2k.gif" alt="relight sweep spp4096 16 frames">
+      <figcaption>16프레임 · spp4096 · ping-pong GIF. 5패널 = RGB(S0) · DoLP · AoLP · s1 · s2. 편광 패널은 아래 polarizer 스윕과 <b>동일한 specular 마스크</b>(S0&gt;0.12 &amp; DoLP&gt;0.06)를 써서 직접 비교 가능 — 배경(diffuse, 편광≈0)은 제거되고 거울 specular 하이라이트만 표시. flash가 좌→우로 이동하며 하이라이트도 이동.</figcaption>
+    </figure>
+    <figure>
+      <img src="images/0705_relight_filmstrip_2k.png" alt="relight sweep spp4096 filmstrip" style="max-width:520px">
+      <figcaption>정적 filmstrip(위=flash 좌, 아래=flash 우).</figcaption>
+    </figure>
+
+    <h3>Polarizer 각도 회전 — 유리/거울 정면 반사의 편광 응답</h3>
+    <p>
+      편광 조명을 <b>거울/유리 표면에 직접 조사</b>하면 광원의 specular 반사가 카메라에 강하게 잡히고,
+      그 반사광의 편광 상태는 <b>조명측 linear polarizer 각도</b>에 지배된다. area-emitter flash(unpolarized) 앞에
+      <code>polarizer</code> BSDF 판을 두고 <b>각도 θ를 0→180° 회전</b>시켰다.
+      (delta spot/point는 편광판이 NEE shadow ray를 가려 기여가 0이 되므로, 광이 편광판을 투과하려면 area emitter가 필요하다.)
+    </p>
+    <p>
+      결과: 거울 specular 영역에서 <b>DoLP ≈ 0.66</b>이 유지되고 <b>AoLP가 조명 polarizer 각도를 1:1로 추종</b>한다
+      (θ=45°→45°, 90°→90°, 135°→135°). filmstrip의 AoLP hue가 red→yellow→green→cyan→blue→magenta로 한 바퀴 도는 것이 곧 편광각 0→180° 회전이다.
+    </p>
+    <figure>
+      <img src="images/0705_polarizer_sweep.gif" alt="illumination polarizer rotation sweep (animated)">
+      <figcaption>12프레임 · spp4096 · ping-pong GIF. 좌측=거울(강한 편광 반사), 우측=유리. AoLP hue = 편광각. relight 스윕과 동일 마스크·colormap.</figcaption>
+    </figure>
+    <figure>
+      <img src="images/0705_polarizer_filmstrip.png" alt="polarizer rotation filmstrip" style="max-width:520px">
+      <figcaption>θ=0·30·60·90·120·150°. AoLP hue 회전 = 조명 편광각 회전. specular-only 마스크(S0&gt;0.12 &amp; DoLP&gt;0.06).</figcaption>
+    </figure>
+
+    <h2 id="remain">5. 남은 일 · 설계 주의</h2>
+    <ul>
+      <li class="ok"><b>완료</b>: Bridge · Staging · Rig/Sweep · UI + on/off 검증. active flash + 편광 조명이 end-to-end 동작.</li>
+      <li><b>Stage 5 (진짜 NIR)</b>: <code>_render_pass</code>에서 <code>active_nir_intensity</code> 패스는 <code>kind="rgb"</code>(RGB 필름) → 진짜 850nm emitter는 CIE 응답≈0=검정.
+        그래서 NIR intensity는 <b>grayscale proxy가 의도된 설계</b>. 정확한 NIR은 <b>850nm 샘플링 film/sensor</b>가 필요한 큰 기능.
+        단, <b>polar 브랜치는 spectral_polarized라 NIR flash가 이미 진짜 단일밴드</b>로 방출됨.</li>
+      <li><b>Stage 4 (scene 재사용)</b>: 현재 재사용은 <b>파일-해시</b>(<code>mi.traverse</code> 0건)이고 active light는 <b>pose-baked</b>(정확하지만 heading마다 재staging→polar phase 메모리 재활용 안 됨).
+        최적화하려면 topology-stable XML + 렌더 직전 <code>mi.traverse</code>로 <code>active_light_&lt;id&gt;.to_world/.intensity</code> per-heading 갱신 + per-scene lock,
+        cache key에서 pose 제외. polarizer shape transform traversable 검증 후 3-tier. GPU로 2nd heading cache hit 검증 필요.</li>
+    </ul>
+    <div class="note">
+      적용: 데몬 재시작(파이프라인 변경) + webui 리빌드 후 Camera Rig 편집기에 Active Lights 노출.
+      emitter는 unpolarized 방출이므로 편광 조명은 반드시 emitter+polarizer surface 조합임에 유의.
+    </div>
+  </article>
+</main>
+</div>
+</body>
+</html>

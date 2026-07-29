@@ -58,6 +58,7 @@
 		onDeleteGraphNode: () => void;
 		onLoadEpisode: (id: string) => void;
 		onGenerateEpisodes: () => void;
+		episodePlanProgress?: { status?: string; planned?: number; target?: number } | null;
 		onClearEpisodes: () => void;
 		onValidateEpisodes?: () => void;
 		onPruneStaleEpisodes?: () => void;
@@ -110,7 +111,7 @@
 		onBuildMap, onRequestBuildGraph, onRebuildEdges, rebuildingEdges = false, onSetPathsMode, onSetPaintRadius,
 		onRebuildRegion, onClearRegion, onClearWalkabilityOverlay, onRefreshTraversableMeta,
 		onSetShowFootprint, onSetShowTraversableMask, onAddEdgeAnyway, onDismissEdgeCheck,
-		onDeleteGraphEdge, onDeleteGraphNode, onLoadEpisode, onGenerateEpisodes,
+		onDeleteGraphEdge, onDeleteGraphNode, onLoadEpisode, onGenerateEpisodes, episodePlanProgress = null,
 		onClearEpisodes, onValidateEpisodes, onPruneStaleEpisodes,
 		staleEpisodeReport = null, validatingEpisodes = false,
 		onSetEpisodeSearch, onSetEpisodeCount,
@@ -319,7 +320,11 @@
 	</div>
 	<div class="episode-generate-bar">
 		<input type="number" min="1" value={episodeCount} oninput={(e) => onSetEpisodeCount(Number((e.currentTarget as HTMLInputElement).value))} title="Count" />
-		<button class="button button-primary" disabled={!caps.generateEpisodes.enabled} title={caps.generateEpisodes.reason} onclick={onGenerateEpisodes}>+ Generate</button>
+		<button class="button button-primary" disabled={!caps.generateEpisodes.enabled} title={caps.generateEpisodes.reason} onclick={onGenerateEpisodes}>
+			{#if episodePlanProgress}
+				{episodePlanProgress.status === 'indexing' ? 'Indexing…' : `Generating ${episodePlanProgress.planned ?? 0}/${episodePlanProgress.target ?? episodeCount}`}
+			{:else}+ Generate{/if}
+		</button>
 		{#if episodes.length > 0}
 			<button class="button button-subtle" onclick={onClearEpisodes} title="Clear all episodes">✕</button>
 		{/if}
@@ -408,7 +413,9 @@
 			<div class="rail-title mt-2">Episodes</div>
 			<label><span>num pairs</span><input type="number" min="1" value={episodeCount} oninput={(e) => onSetEpisodeCount(Number((e.currentTarget as HTMLInputElement).value))} /></label>
 			<button class="button button-primary" disabled={!caps.generateEpisodes.enabled} title={caps.generateEpisodes.reason} onclick={onGenerateEpisodes}>
-				Generate Episodes
+				{#if episodePlanProgress}
+					{episodePlanProgress.status === 'indexing' ? 'Indexing…' : `Generating ${episodePlanProgress.planned ?? 0}/${episodePlanProgress.target ?? episodeCount}`}
+				{:else}Generate Episodes{/if}
 			</button>
 			{#if splitCounts.train != null}
 				<div class="path-status-chips mt-1">

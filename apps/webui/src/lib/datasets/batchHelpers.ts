@@ -74,13 +74,22 @@ function staleStatusForBatch(batch: any, job: any, status: any): boolean {
 }
 
 function maskStaleStatus(batch: any, job: any): any {
-	const status = (job?.status && typeof job.status === 'object') ? job.status : { status: job?.status ?? 'unknown' };
-	const batchCreated = job?.batch_created_at ?? batch?.created_at;
-	if (!staleStatusForBatch(batch, job, status)) {
-		return { ...job, batch_created_at: batchCreated };
+	const contextualJob = {
+		...job,
+		source_batch_id: job?.source_batch_id ?? batch?.batch_id,
+		submission_group_id: job?.submission_group_id ?? batch?.submission_group_id,
+		scene_variant_key: job?.scene_variant_key ?? batch?.scene_variant_key,
+		batch_created_at: job?.batch_created_at ?? batch?.created_at,
+	};
+	const status = (contextualJob.status && typeof contextualJob.status === 'object')
+		? contextualJob.status
+		: { status: contextualJob.status ?? 'unknown' };
+	const batchCreated = contextualJob.batch_created_at;
+	if (!staleStatusForBatch(batch, contextualJob, status)) {
+		return contextualJob;
 	}
 	return {
-		...job,
+		...contextualJob,
 		batch_created_at: batchCreated,
 		status: {
 			job_id: status.job_id ?? job?.job_id,
@@ -186,31 +195,189 @@ export function mergeBatch(existing: any, incoming: any): any {
 	for (const j of existing?.jobs ?? []) jobMap.set(j.job_id, maskStaleStatus(existing, j));
 	for (const j of incoming?.jobs ?? []) jobMap.set(j.job_id, maskStaleStatus(incoming, j));
 	const jobs = [...jobMap.values()];
-	return withRecomputedProgress((incoming ?? existing ?? {}), jobs);
+	const batchIds = [...new Set([
+		...(existing?.batch_ids ?? []),
+		existing?.batch_id,
+		...(incoming?.batch_ids ?? []),
+		incoming?.batch_id,
+	].filter(Boolean).map(String))];
+	return withRecomputedProgress({ ...(incoming ?? existing ?? {}), batch_ids: batchIds }, jobs);
+}
+
+export interface BatchJobLane {
+	key: string;
+	label: string;
+	variant: string;
+	phase: string;
+	sensorIds: string[];
+	batchId: string;
+	createdAt: string;
+}
+
+export interface BatchJobGridCell {
+	jobs: any[];
+	representative: any | null;
+	status: NormalizedJobStatus;
+}
+
+export interface BatchJobGridRow {
+	nid: string;
+	cells: BatchJobGridCell[];
+	lanes: { lane: BatchJobLane; cells: (any | null)[] }[];
+}
+
+export function jobVariant(job: any): string {
+	const explicit = String(
+		job?.scene_variant_key
+		?? job?.render_variant
+		?? job?.status?.extras?.scene_variant_key
+		?? '',
+	).trim().toLowerCase();
+	if (explicit === 'template') return 'base';
+	if (explicit) return explicit;
+	const jobId = String(job?.job_id ?? '').toLowerCase();
+	if (jobId.includes('-perturbed-')) return 'perturbed';
+	if (jobId.includes('-template-')) return 'base';
+	return 'base';
+}
+
+export function jobSensorIds(job: any): string[] {
+	const ids: unknown[] = Array.isArray(job?.sensor_ids) && job.sensor_ids.length
+		? job.sensor_ids
+		: Array.isArray(job?.phase_sensor_ids) && job.phase_sensor_ids.length
+			? job.phase_sensor_ids
+			: job?.sensor_id ? [job.sensor_id] : Object.keys(job?.modalities_by_sensor ?? {});
+	const normalized: string[] = ids.map((item) => String(item)).filter((item) => item.length > 0);
+	return [...new Set<string>(normalized)];
+}
+
+function jobModalities(job: any): string[] {
+	const bySensor = job?.modalities_by_sensor;
+	const nested = bySensor && typeof bySensor === 'object'
+		? Object.values(bySensor).flatMap((items: any) => Array.isArray(items) ? items : [])
+		: [];
+	const direct = Array.isArray(job?.modalities) ? job.modalities : job?.modality ? [job.modality] : [];
+	return [...new Set([...nested, ...direct].map(String).filter(Boolean))];
+}
+
+export function jobPhase(job: any): string {
+	const raw = String(job?.phase ?? '').trim().toLowerCase();
+	if (raw && raw !== 'per_view') return raw;
+	const modalities = jobModalities(job).map((item) => item.toLowerCase());
+	const sensors = jobSensorIds(job).map((item) => item.toLowerCase());
+	if (
+		modalities.some((item) => item.includes('polar') || /^s[012](_|$)/.test(item) || item === 'dop' || item === 'aolp')
+		|| sensors.some((item) => item.includes('polar'))
+	) return 'polar';
+	if (modalities.some((item) => item.includes('nir')) || sensors.some((item) => item.includes('nir'))) return 'nir';
+	if (modalities.some((item) => item === 'rgb' || item.includes('color'))) return 'rgb';
+	return raw || 'per_view';
+}
+
+export function jobPhaseLabel(job: any): string {
+	const phase = jobPhase(job);
+	if (phase === 'rgb') return 'RGB';
+	if (phase === 'polar') return 'Polar';
+	if (phase === 'nir') return 'NIR';
+	if (phase === 'per_view') return 'Per view';
+	return phase.replaceAll('_', ' ').replace(/\b\w/g, (char) => char.toUpperCase());
+}
+
+export function jobVariantLabel(job: any): string {
+	const variant = jobVariant(job);
+	if (variant === 'base') return 'Base';
+	if (variant === 'perturbed') return 'Perturbed';
+	return variant.replaceAll('_', ' ').replace(/\b\w/g, (char) => char.toUpperCase());
+}
+
+export function jobSensorSummary(job: any): string {
+	const ids = jobSensorIds(job);
+	if (!ids.length) return 'No sensor';
+	if (ids.length === 1) return ids[0];
+	return `${ids.length} sensors`;
+}
+
+const JOB_STATUS_PRIORITY: Record<NormalizedJobStatus, number> = {
+	failed: 0,
+	running: 1,
+	queued: 2,
+	unknown: 3,
+	cancelled: 4,
+	done: 5,
+};
+
+export function representativeJob(jobs: any[]): any | null {
+	return [...jobs].sort(
+		(a, b) => JOB_STATUS_PRIORITY[normalizeJobStatus(a)] - JOB_STATUS_PRIORITY[normalizeJobStatus(b)],
+	)[0] ?? null;
+}
+
+function laneKeyForJob(job: any, batch: any): string {
+	const sensorKey = [...jobSensorIds(job)].sort().join(',');
+	const batchId = String(job?.source_batch_id ?? batch?.batch_id ?? 'legacy');
+	const groupId = String(job?.submission_group_id ?? batch?.submission_group_id ?? batchId);
+	return [groupId, batchId, jobVariant(job), jobPhase(job), sensorKey].join('|');
 }
 
 export function buildBatchJobGrid(batch: any): {
-	rows: { nid: string; cells: (any | null)[] }[];
+	rows: BatchJobGridRow[];
 	headings: string[];
 	counts: Record<string, number>;
+	laneCount: number;
 } {
-	const jobs: any[] = batch?.jobs ?? [];
-	if (!jobs.length) return { rows: [], headings: [], counts: {} };
+	const jobs: any[] = (batch?.jobs ?? []).map((job: any) => maskStaleStatus(batch, job));
+	if (!jobs.length) return { rows: [], headings: [], counts: {}, laneCount: 0 };
 	const headingSet = new Set<string>();
-	const nodeMap = new Map<string, Map<string, any>>();
+	const nodeMap = new Map<string, Map<string, any[]>>();
+	const laneMap = new Map<string, BatchJobLane>();
 	for (const job of jobs) {
 		const nid = String(job.preview_id ?? job.node_id ?? job.job_id ?? '');
 		const hid = String(job.heading_id ?? '');
 		headingSet.add(hid);
 		if (!nodeMap.has(nid)) nodeMap.set(nid, new Map());
-		nodeMap.get(nid)!.set(hid, job);
+		const byHeading = nodeMap.get(nid)!;
+		if (!byHeading.has(hid)) byHeading.set(hid, []);
+		byHeading.get(hid)!.push(job);
+
+		const key = laneKeyForJob(job, batch);
+		if (!laneMap.has(key)) {
+			const sensorIds = jobSensorIds(job);
+			laneMap.set(key, {
+				key,
+				label: `${jobVariantLabel(job)} · ${jobPhaseLabel(job)} · ${sensorIds.length || 1} ${sensorIds.length === 1 ? 'sensor' : 'sensors'}`,
+				variant: jobVariant(job),
+				phase: jobPhase(job),
+				sensorIds,
+				batchId: String(job?.source_batch_id ?? batch?.batch_id ?? ''),
+				createdAt: String(job?.batch_created_at ?? batch?.created_at ?? ''),
+			});
+		}
 	}
 	const headings = [...headingSet].sort();
 	const rows = [...nodeMap.entries()].map(([nid, hMap]) => ({
 		nid,
-		cells: headings.map((h) => hMap.get(h) ?? null),
+		cells: headings.map((heading) => {
+			const cellJobs = hMap.get(heading) ?? [];
+			const representative = representativeJob(cellJobs);
+			return {
+				jobs: cellJobs,
+				representative,
+				status: representative ? normalizeJobStatus(representative) : 'unknown',
+			};
+		}),
+		lanes: [...laneMap.values()].map((lane) => ({
+			lane,
+			cells: headings.map((heading) =>
+				(hMap.get(heading) ?? []).find((job: any) => laneKeyForJob(job, batch) === lane.key) ?? null
+			),
+		})).filter((entry) => entry.cells.some(Boolean)),
 	}));
-	return { rows, headings, counts: (batch?.counts ?? {}) as Record<string, number> };
+	return {
+		rows,
+		headings,
+		counts: (batch?.counts ?? {}) as Record<string, number>,
+		laneCount: laneMap.size,
+	};
 }
 
 export function buildGenericJobRows(batch: any): any[] {

@@ -12,6 +12,7 @@ from robomituba_bridge import (
     AssistLightSpec,
     CameraSpec,
     DepthApproxSpec,
+    IsaacSensorSpec,
     ObservationBundleManifest,
     RenderArtifactManifest,
     RenderRequest,
@@ -24,6 +25,7 @@ from robomituba_bridge import (
     validate_observation_bundle_manifest,
     validate_render_request,
     write_observation_bundle_manifest,
+    load_ouster_metadata,
 )
 
 from .multimodal import MODALITY_DEFINITIONS, MultimodalRenderResult, RenderConfig, camera_to_world_from_lookat, render_modalities
@@ -43,6 +45,8 @@ REFLECTIVE_ISLAND_STEP_LENGTHS_M = (0.7, 0.75, 0.8)
 AMBIENT_MODALITIES = {
     "rgb",
     "depth",
+    "depth_sensor",
+    "depth_transient",
     "albedo",
     "direct_light_map",
     "indirect_light_map",
@@ -55,6 +59,12 @@ ACTIVE_MODALITIES = {
     "nir_intensity",
     "sensor_depth_approx",
     "lidar_point_cloud",
+    "lidar_range",
+    "lidar_signal",
+    "lidar_reflectivity",
+    "lidar_near_ir",
+    "lidar_valid",
+    "lidar_xyz",
 }
 POLAR_MODALITIES = {
     "polar_rgb_preview",
@@ -184,14 +194,22 @@ def select_projected_bbox_candidate(
 def render_config_from_payload(payload: Mapping[str, Any] | None) -> RenderConfig:
     if payload is None:
         return RenderConfig()
+    settings = dict(payload)
+    # Accept old saved requests while removing the retired material fallback control.
+    settings.pop("polar_fallback_mode", None)
     allowed = {item.name for item in fields(RenderConfig)}
-    unknown = sorted(set(payload.keys()) - allowed)
+    unknown = sorted(set(settings.keys()) - allowed)
     if unknown:
         raise ValueError(f"Unknown render_settings keys: {', '.join(unknown)}")
-    return RenderConfig(**dict(payload))
+    return RenderConfig(**settings)
 
 
-def _camera_render_settings_payload(base_payload: Mapping[str, Any] | None, camera_spec: CameraSpec) -> dict[str, Any]:
+
+def _camera_render_settings_payload(
+    base_payload: Mapping[str, Any] | None,
+    camera_spec: CameraSpec,
+    modalities: Any = None,
+) -> dict[str, Any]:
     payload = dict(base_payload or {})
     extras = camera_spec.extras if isinstance(camera_spec.extras, Mapping) else {}
     overrides = extras.get("render") if isinstance(extras.get("render"), Mapping) else extras.get("render_settings")
@@ -213,7 +231,17 @@ def _camera_modalities(render_request: RenderRequest, camera_spec: CameraSpec) -
     value = extras.get("render_modality")
     if value:
         return [str(value)]
-    return list(render_request.modalities)
+    fallback = list(render_request.modalities)
+    # A mixed camera + non-camera request stores the union at request level.
+    # Do not accidentally render Ouster/depth sensor fields once per camera.
+    sensor_modalities = {
+        str(item)
+        for sensor in getattr(render_request, "sensor_specs", [])
+        for item in (getattr(sensor, "modalities", []) or [])
+    }
+    if sensor_modalities:
+        fallback = [item for item in fallback if item not in sensor_modalities]
+    return fallback or ["rgb"]
 
 
 def _camera_assist_light(render_request: RenderRequest, camera_spec: CameraSpec, camera_modalities: list[str]) -> AssistLightSpec | None:
@@ -290,6 +318,125 @@ def _artifact_manifest_from_result(
     )
 
 
+def _sensor_artifact_manifest_from_result(
+    repo_root: Path,
+    sensor_spec: IsaacSensorSpec,
+    modality: str,
+    result,
+) -> RenderArtifactManifest:
+    artifacts = {key: _repo_relative_or_value(repo_root, value) for key, value in result.artifacts.items()}
+    scene_ref = _repo_relative_or_value(repo_root, result.timing.get("scene"))
+    return RenderArtifactManifest(
+        camera_id=sensor_spec.sensor_id,
+        sensor_id=sensor_spec.sensor_id,
+        modality=modality,
+        definition=MODALITY_DEFINITIONS.get(modality, "Sensor artifact"),
+        artifact_paths=artifacts,
+        timing=dict(result.timing),
+        dependencies=_dependencies_from_result(repo_root, result),
+        scene_ref=scene_ref if isinstance(scene_ref, str) else None,
+        material_mode=result.metadata.get("material_mode"),
+        array_shape=list(result.array.shape),
+        dtype=str(result.array.dtype),
+        extras={
+            "sensor_id": sensor_spec.sensor_id,
+            "sensor_name": sensor_spec.name,
+            "sensor_type": sensor_spec.sensor_type,
+            "profile": sensor_spec.profile,
+            "sensor_sync_group": sensor_spec.sensor_sync_group,
+            "calibration_ref": sensor_spec.calibration_ref,
+            "metadata_ref": sensor_spec.metadata_ref,
+            "raw_channels": sorted(result.raw_channels.keys()),
+            "sensor_metadata": result.metadata.get("metadata"),
+            "depth_space": result.metadata.get("depth_space"),
+            "units": result.metadata.get("units"),
+            "frame": "sensor",
+            "staggered": bool(sensor_spec.sensor_type == "ouster_lidar"),
+            "destaggered_ref": artifacts.get("destaggered_npz") if sensor_spec.sensor_type == "ouster_lidar" else None,
+            "measurement_id_ref": artifacts.get("raw_npz") if sensor_spec.sensor_type == "ouster_lidar" else None,
+            "timestamp_ref": artifacts.get("raw_npz") if sensor_spec.sensor_type == "ouster_lidar" else None,
+        },
+    )
+
+
+def _sensor_render_settings_payload(
+    base_payload: Mapping[str, Any] | None,
+    sensor_spec: IsaacSensorSpec,
+) -> dict[str, Any]:
+    payload = dict(base_payload or {})
+    extras = sensor_spec.extras if isinstance(sensor_spec.extras, Mapping) else {}
+    overrides = extras.get("render") if isinstance(extras.get("render"), Mapping) else extras.get("render_settings")
+    allowed = {item.name for item in fields(RenderConfig)}
+    if isinstance(overrides, Mapping):
+        for key, value in overrides.items():
+            if key in allowed and value is not None:
+                payload[str(key)] = value
+    if sensor_spec.resolution and len(sensor_spec.resolution) == 2:
+        payload.setdefault("width", int(sensor_spec.resolution[0]))
+        payload.setdefault("height", int(sensor_spec.resolution[1]))
+    if sensor_spec.sensor_type == "ouster_lidar":
+        payload.setdefault("lidar_profile", sensor_spec.profile or "os1-128")
+        if sensor_spec.metadata_ref:
+            payload.setdefault("lidar_metadata_ref", sensor_spec.metadata_ref)
+        for source, target in (
+            ("return_mode", "lidar_return_mode"),
+            ("noise_std_m", "lidar_noise_std_m"),
+            ("dropout_probability", "lidar_dropout_probability"),
+            ("signal_scale", "lidar_signal_scale"),
+            ("destagger", "lidar_destagger"),
+            ("wavelength_nm", "lidar_wavelength_nm"),
+            ("min_range_m", "lidar_min_range_m"),
+            ("max_range_m", "lidar_max_range_m"),
+        ):
+            if source in extras and extras[source] is not None:
+                payload.setdefault(target, extras[source])
+    return payload
+
+
+def render_sensor_state(
+    scene_state: SceneState,
+    sensor_specs: list[IsaacSensorSpec],
+    render_request: RenderRequest,
+    *,
+    repo_root: str | Path,
+    out_dir: str | Path | None = None,
+    variant: str = "auto",
+) -> dict[str, MultimodalRenderResult]:
+    root = Path(repo_root).resolve()
+    scene_path = resolve_repo_path(root, scene_state.mitsuba_scene_ref)
+    sensor_root = Path(out_dir).resolve() if out_dir is not None else ensure_observation_layout(root, scene_state.job_id, scene_state.frame_id).sensors_dir
+    sensor_root.mkdir(parents=True, exist_ok=True)
+    rendered: dict[str, MultimodalRenderResult] = {}
+    for sensor_spec in sensor_specs:
+        if sensor_spec.camera_to_world is None:
+            raise ValueError(f"Sensor {sensor_spec.sensor_id} requires camera_to_world for rendering")
+        modalities = list(sensor_spec.modalities or [])
+        if not modalities:
+            raise ValueError(f"Sensor {sensor_spec.sensor_id} has no modalities")
+        sensor_dir = sensor_root / sensor_spec.sensor_id
+        sensor_dir.mkdir(parents=True, exist_ok=True)
+        settings = _sensor_render_settings_payload(render_request.render_settings, sensor_spec)
+        config = render_config_from_payload(settings)
+        metadata = None
+        if sensor_spec.sensor_type == "ouster_lidar" and sensor_spec.metadata_ref:
+            metadata = load_ouster_metadata(resolve_repo_path(root, sensor_spec.metadata_ref))
+        fov_deg = float(sensor_spec.fov_deg if sensor_spec.fov_deg is not None else (360.0 if sensor_spec.sensor_type == "ouster_lidar" else 90.0))
+        rendered[sensor_spec.sensor_id] = render_modalities(
+            scene_path,
+            np.asarray(sensor_spec.camera_to_world, dtype=np.float32).reshape(4, 4),
+            fov_deg,
+            modalities,
+            out_dir=sensor_dir,
+            config=config,
+            scene_override=render_request.scene_override,
+            assist_light=None,
+            depth_approx=render_request.depth_approx if "sensor_depth_approx" in modalities else None,
+            lidar_metadata=metadata,
+            variant=variant,
+        )
+    return rendered
+
+
 def _camera_config(base_config: RenderConfig, camera_spec: CameraSpec) -> RenderConfig:
     if camera_spec.resolution is None:
         return base_config
@@ -328,9 +475,11 @@ def render_scene_state(
         camera_dir = camera_root / camera_spec.camera_id
         camera_dir.mkdir(parents=True, exist_ok=True)
         camera_to_world = np.asarray(camera_spec.camera_to_world, dtype=np.float32).reshape(4, 4)
-        base_config = render_config_from_payload(_camera_render_settings_payload(render_request.render_settings, camera_spec))
-        config = _camera_config(base_config, camera_spec)
         camera_modalities = _camera_modalities(render_request, camera_spec)
+        base_config = render_config_from_payload(
+            _camera_render_settings_payload(render_request.render_settings, camera_spec, camera_modalities)
+        )
+        config = _camera_config(base_config, camera_spec)
         camera_assist_light = _camera_assist_light(render_request, camera_spec, camera_modalities)
         rendered[camera_spec.camera_id] = render_modalities(
             scene_path,
@@ -372,6 +521,14 @@ def render_timestep_bundle(
         out_dir=layout.cameras_dir,
         variant=variant,
     )
+    sensor_results = render_sensor_state(
+        render_request.scene_state,
+        render_request.sensor_specs,
+        render_request,
+        repo_root=root,
+        out_dir=layout.sensors_dir,
+        variant=variant,
+    )
 
     artifacts: list[RenderArtifactManifest] = []
     timing_log = {
@@ -380,6 +537,7 @@ def render_timestep_bundle(
         "frame_id": render_request.frame_id,
         "timestamp": render_request.timestamp,
         "cameras": {},
+        "sensors": {},
     }
     for camera_spec in render_request.camera_specs:
         result = camera_results[camera_spec.camera_id]
@@ -388,6 +546,12 @@ def render_timestep_bundle(
             if modality not in result.results:
                 continue
             artifacts.append(_artifact_manifest_from_result(root, camera_spec, modality, result.results[modality]))
+    for sensor_spec in render_request.sensor_specs:
+        result = sensor_results[sensor_spec.sensor_id]
+        timing_log["sensors"][sensor_spec.sensor_id] = result.pass_records
+        for modality in sensor_spec.modalities:
+            if modality in result.results:
+                artifacts.append(_sensor_artifact_manifest_from_result(root, sensor_spec, modality, result.results[modality]))
 
     timing_log_path = layout.logs_dir / "render_timing.json"
     manifest_start = time.perf_counter()
@@ -402,6 +566,7 @@ def render_timestep_bundle(
         robot_state=render_request.robot_state,
         requested_modalities=list(render_request.modalities),
         camera_specs=list(render_request.camera_specs),
+        sensor_specs=list(render_request.sensor_specs),
         artifacts=artifacts,
         bundle_root=to_repo_relative_posix(root, layout.frame_dir),
         status="complete",
@@ -466,10 +631,17 @@ def render_timestep_bundle_split_lighting(
         camera_dir = layout.cameras_dir / camera_spec.camera_id
         camera_dir.mkdir(parents=True, exist_ok=True)
         camera_to_world = np.asarray(camera_spec.camera_to_world, dtype=np.float32).reshape(4, 4)
-        base_config = render_config_from_payload(_camera_render_settings_payload(render_request.render_settings, camera_spec))
-        camera_config = _camera_config(base_config, camera_spec)
         camera_modalities = _camera_modalities(render_request, camera_spec)
+        base_config = render_config_from_payload(
+            _camera_render_settings_payload(render_request.render_settings, camera_spec, camera_modalities)
+        )
+        camera_config = _camera_config(base_config, camera_spec)
         camera_assist_light = _camera_assist_light(render_request, camera_spec, camera_modalities)
+        # Rig-mounted active lights (RGB/NIR flash + polarizer). Positioned at
+        # base_pose @ mount inside the renderer. Robot base pose comes from the
+        # request; the helper normalises matrix storage.
+        active_lights = list(render_request.active_lights or [])
+        base_pose = render_request.robot_state.base_pose if render_request.robot_state else None
         branch_modalities = _split_lighting_modalities(camera_modalities)
         branch_results: dict[str, MultimodalRenderResult] = {}
 
@@ -502,6 +674,8 @@ def render_timestep_bundle_split_lighting(
                 config=camera_config,
                 scene_override=render_request.scene_override,
                 assist_light=camera_assist_light,
+                active_lights=active_lights,
+                base_pose=base_pose,
                 depth_approx=render_request.depth_approx,
                 variant=variant,
                 progress_callback=progress_callback,
@@ -520,6 +694,8 @@ def render_timestep_bundle_split_lighting(
                 config=polar_config,
                 scene_override=render_request.scene_override,
                 assist_light=camera_assist_light,
+                active_lights=active_lights,
+                base_pose=base_pose,
                 depth_approx=None,
                 variant=variant,
                 progress_callback=progress_callback,
@@ -534,6 +710,22 @@ def render_timestep_bundle_split_lighting(
                 if modality not in result.results:
                     continue
                 artifacts.append(_artifact_manifest_from_result(root, camera_spec, modality, result.results[modality]))
+
+    sensor_results = render_sensor_state(
+        render_request.scene_state,
+        render_request.sensor_specs,
+        render_request,
+        repo_root=root,
+        out_dir=layout.sensors_dir,
+        variant=variant,
+    )
+    timing_log.setdefault("sensors", {})
+    for sensor_spec in render_request.sensor_specs:
+        result = sensor_results[sensor_spec.sensor_id]
+        timing_log["sensors"][sensor_spec.sensor_id] = result.pass_records
+        for modality in sensor_spec.modalities:
+            if modality in result.results:
+                artifacts.append(_sensor_artifact_manifest_from_result(root, sensor_spec, modality, result.results[modality]))
 
     timing_log_path = layout.logs_dir / "render_timing.json"
     if progress_callback is not None:
@@ -550,6 +742,7 @@ def render_timestep_bundle_split_lighting(
         robot_state=render_request.robot_state,
         requested_modalities=list(render_request.modalities),
         camera_specs=list(render_request.camera_specs),
+        sensor_specs=list(render_request.sensor_specs),
         artifacts=artifacts,
         bundle_root=to_repo_relative_posix(root, layout.frame_dir),
         status="complete",

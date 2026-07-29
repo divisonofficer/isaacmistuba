@@ -71,6 +71,7 @@ from robomituba_bridge import (
 )
 from robomituba_bridge.io import scene_snapshot_from_payload
 
+from . import optical_constants
 from .local_snapshot import enumerate_xml_targets, prepare_basic_scene_from_disk
 from .material_overrides_store import (
     StoredOverride,
@@ -327,6 +328,21 @@ def _load_scene_overlay_objects(scene_dir: Path) -> "list[dict[str, Any]] | None
 
 def _maybe_str(value: Any) -> str | None:
     return value if isinstance(value, str) and value else None
+
+
+def _normalize_export_camera_ids(value: Any) -> list[str] | None:
+    if value is None:
+        return None
+    if not isinstance(value, list):
+        raise ValueError("camera_ids must be an array or null")
+    camera_ids = list(dict.fromkeys(
+        str(camera_id).strip()
+        for camera_id in value
+        if str(camera_id).strip()
+    ))
+    if not camera_ids:
+        raise ValueError("camera_ids must contain at least one camera when provided")
+    return camera_ids
 
 
 def _generate_minimal_opticalnav_scene_xml(authoring_map_payload: dict[str, Any], out_path: "Path") -> None:
@@ -629,6 +645,16 @@ def _select_part_render_material(
     repo_root: "Path | None" = None,
 ) -> tuple[str | None, str]:
     material_class = _infer_material_class(part, extracted_material)
+    # Contract-v2 Infinigen GLBs preserve the Blender material name.  Resolve
+    # that exact catalog entry first so each GLB part keeps its optical_class;
+    # heuristics below are only for foreign/legacy assets without a matching entry.
+    if extracted_material:
+        from mitsuba_converter import obj_split
+        source_material_id = obj_split.sanitize_material_name(
+            str(extracted_material.get("material_id") or "")
+        )
+        if source_material_id in material_idx:
+            return source_material_id, material_class
     if material_class == "glass":
         return "clear_glass", material_class
     if material_class == "metal":
@@ -806,98 +832,129 @@ def _append_extracted_bsdf_xml(
     *,
     fallback_color: str = "0.65 0.62 0.58",
     repo_root: "Path | None" = None,
-    diffuse_bsdf_type: str = "roughplastic",
+    diffuse_bsdf_type: str = "pplastic",
+    strategy: str | None = None,
+    inject: "dict[str, Any] | None" = None,
 ) -> bool:
-    """Emit a textured BSDF from a USD ``UsdPreviewSurface`` / OBJ-MTL descriptor.
+    """Emit a polarization-compatible textured analytic BSDF.
 
-    The non-metallic case uses ``diffuse_bsdf_type`` (``roughplastic`` by default,
-    or ``pplastic`` for polarization-aware diffuse surfaces); both accept the same
-    texturable ``diffuse_reflectance`` + scalar ``alpha`` so the baked albedo flows
-    through unchanged. Returns ``True`` when a BSDF was attached, ``False`` when the
-    descriptor has nothing usable so the caller can fall back.
+    The strategy is authoritative: source PBR textures modulate the selected
+    optical class but never turn glass or metal into plastic.
     """
     import xml.etree.ElementTree as ET
 
-    base_tex = _absolutize_texture_path(extracted_material.get("base_color_texture_ref"), repo_root)
-    normal_tex = _absolutize_texture_path(extracted_material.get("normal_texture_ref"), repo_root)
-    roughness_tex = _absolutize_texture_path(extracted_material.get("roughness_texture_ref"), repo_root)
+    def _asset(key: str) -> str | None:
+        value = _absolutize_texture_path(extracted_material.get(key), repo_root)
+        return value if value and Path(value).is_file() else None
+
+    base_tex = _asset("base_color_texture_ref")
+    normal_tex = _asset("normal_texture_ref")
+    roughness_tex = _asset("roughness_texture_ref")
+    metallic_tex = _asset("metallic_texture_ref")
     base_factor = extracted_material.get("base_color_factor")
     roughness = extracted_material.get("roughness_factor")
     metallic = extracted_material.get("metallic_factor")
+    strategy = str(strategy or diffuse_bsdf_type or "pplastic").strip().lower()
+    if strategy in {"roughplastic", "diffuse", "plastic", "principled"}:
+        strategy = "pplastic"
 
-    # If the texture file no longer exists on disk, drop it (else mitsuba aborts the whole scene load).
-    if base_tex and not Path(base_tex).exists():
-        base_tex = None
-    if normal_tex and not Path(normal_tex).exists():
-        normal_tex = None
-    if roughness_tex and not Path(roughness_tex).exists():
-        roughness_tex = None
-
-    def _emit_alpha(bsdf_el: "ET.Element", scalar: float) -> None:
-        # roughplastic/pplastic/roughconductor `alpha` is texturable: prefer the
-        # per-texel baked roughness atlas (read raw — linear), else a scalar.
-        if roughness_tex:
-            tex = ET.SubElement(bsdf_el, "texture", attrib={"name": "alpha", "type": "bitmap"})
-            ET.SubElement(tex, "string", attrib={"name": "filename", "value": str(roughness_tex)})
-            ET.SubElement(tex, "boolean", attrib={"name": "raw", "value": "true"})
-        else:
-            ET.SubElement(bsdf_el, "float", attrib={"name": "alpha", "value": f"{scalar:.4f}"})
-
-    has_basecolor = bool(base_tex) or (isinstance(base_factor, (list, tuple)) and len(base_factor) >= 3)
-    if not has_basecolor and not normal_tex:
+    if not any((base_tex, normal_tex, roughness_tex, metallic_tex)) and not (
+        isinstance(base_factor, (list, tuple)) and len(base_factor) >= 3
+    ):
         return False
 
-    # Wrap in a two-sided BSDF so surfaces whose geometric normals face away from
-    # the camera (common in imported/Blender meshes — interior walls, floors, and
-    # meshes with inconsistent winding) still shade instead of rendering black.
-    # Mirrors the existing twosided handling for conductor/measured BSDFs.
-    twosided = ET.SubElement(shape, "bsdf", type="twosided")
-    inner_bsdf_parent: "ET.Element"
-    if normal_tex:
-        # Mitsuba 3 normalmap BSDF wraps an inner BSDF; provide the normal as a bitmap.
-        outer = ET.SubElement(twosided, "bsdf", type="normalmap")
-        nm_tex = ET.SubElement(outer, "texture", attrib={"name": "normalmap", "type": "bitmap"})
-        ET.SubElement(nm_tex, "string", attrib={"name": "filename", "value": str(normal_tex)})
-        # ``raw`` must be a <boolean>; <string> is rejected by Mitsuba's properties parser.
-        ET.SubElement(nm_tex, "boolean", attrib={"name": "raw", "value": "true"})
-        inner_bsdf_parent = outer
-    else:
-        inner_bsdf_parent = twosided
+    def _bitmap(parent: "ET.Element", name: str, filename: str, *, raw: bool = False) -> None:
+        tex = ET.SubElement(parent, "texture", attrib={"name": name, "type": "bitmap"})
+        ET.SubElement(tex, "string", attrib={"name": "filename", "value": filename})
+        if raw:
+            ET.SubElement(tex, "boolean", attrib={"name": "raw", "value": "true"})
 
-    # Treat fully metallic materials as roughconductor; otherwise roughplastic.
-    use_conductor = False
+    def _rgb(parent: "ET.Element", name: str) -> None:
+        if base_tex:
+            _bitmap(parent, name, base_tex)
+            return
+        if isinstance(base_factor, (list, tuple)) and len(base_factor) >= 3:
+            try:
+                value = " ".join(f"{max(0.0, min(1.0, float(c))):.6g}" for c in base_factor[:3])
+            except Exception:
+                value = fallback_color
+        else:
+            value = fallback_color
+        ET.SubElement(parent, "rgb", attrib={"name": name, "value": value})
+
+    def _alpha(parent: "ET.Element", *, floor: float, default: float) -> None:
+        if roughness_tex:
+            _bitmap(parent, "alpha", roughness_tex, raw=True)
+        else:
+            value = _clamp_bsdf_alpha(roughness, default=default, floor=floor)
+            ET.SubElement(parent, "float", attrib={"name": "alpha", "value": f"{value:.4f}"})
+
+    # Mitsuba's twosided plugin rejects any child with a transmission
+    # component. Glass must therefore be rooted directly on the shape (or on
+    # a normalmap wrapper), while opaque plastic/conductor materials retain
+    # the twosided wrapper.
+    transmissive = strategy in {"dielectric", "roughdielectric"}
+    twosided = None if transmissive else ET.SubElement(shape, "bsdf", type="twosided")
+    parent: "ET.Element" = shape if transmissive else twosided
+    if normal_tex:
+        parent = ET.SubElement(parent, "bsdf", type="normalmap")
+        _bitmap(parent, "normalmap", normal_tex, raw=True)
+
+    metal_name = (inject or {}).get("conductor_material") or "Al"
+    ior = float((inject or {}).get("ior") or 1.5)
+    class_metal = strategy in {"conductor", "roughconductor"} or bool(
+        inject and inject.get("is_metal")
+    )
+    scalar_metal = False
     try:
-        if metallic is not None and float(metallic) > 0.5:
-            use_conductor = True
+        scalar_metal = metallic is not None and float(metallic) > 0.5
     except Exception:
         pass
 
-    if use_conductor:
-        bsdf = ET.SubElement(inner_bsdf_parent, "bsdf", type="roughconductor")
-        ET.SubElement(bsdf, "string", attrib={"name": "material", "value": "Al"})
-        alpha = _clamp_bsdf_alpha(roughness, default=0.2, floor=_MIN_ROUGHCONDUCTOR_ALPHA)
-        _emit_alpha(bsdf, alpha)
-    else:
-        bsdf_type = diffuse_bsdf_type if diffuse_bsdf_type in {"roughplastic", "pplastic"} else "roughplastic"
-        bsdf = ET.SubElement(inner_bsdf_parent, "bsdf", type=bsdf_type)
-        if base_tex:
-            tex = ET.SubElement(bsdf, "texture", attrib={"name": "diffuse_reflectance", "type": "bitmap"})
-            ET.SubElement(tex, "string", attrib={"name": "filename", "value": str(base_tex)})
-        elif isinstance(base_factor, (list, tuple)) and len(base_factor) >= 3:
-            try:
-                rgb = " ".join(f"{max(0.0, min(1.0, float(c))):.6g}" for c in base_factor[:3])
-            except Exception:
-                rgb = fallback_color
-            ET.SubElement(bsdf, "rgb", attrib={"name": "diffuse_reflectance", "value": rgb})
-        else:
-            ET.SubElement(bsdf, "rgb", attrib={"name": "diffuse_reflectance", "value": fallback_color})
-        alpha = _clamp_bsdf_alpha(roughness, default=0.2, floor=_MIN_ROUGHPLASTIC_ALPHA)
-        # pplastic's dielectric coat looks glossy at low alpha; keep diffuse surfaces
-        # matte by raising the scalar floor (roughplastic keeps the original range).
-        # A per-texel roughness atlas, when present, supersedes the scalar entirely.
-        if bsdf_type == "pplastic":
-            alpha = max(0.2, alpha)
-        _emit_alpha(bsdf, alpha)
+    def _plastic(parent_el: "ET.Element", *, node_id: str | None = None) -> "ET.Element":
+        attrs = {"type": "pplastic"}
+        if node_id:
+            attrs["id"] = node_id
+        bsdf = ET.SubElement(parent_el, "bsdf", **attrs)
+        ET.SubElement(bsdf, "float", attrib={"name": "int_ior", "value": f"{ior:.4f}"})
+        _rgb(bsdf, "diffuse_reflectance")
+        _alpha(bsdf, floor=_MIN_ROUGHPLASTIC_ALPHA, default=0.2)
+        return bsdf
+
+    def _metal(parent_el: "ET.Element", *, rough: bool, node_id: str | None = None) -> "ET.Element":
+        attrs = {"type": "roughconductor" if rough else "conductor"}
+        if node_id:
+            attrs["id"] = node_id
+        bsdf = ET.SubElement(parent_el, "bsdf", **attrs)
+        ET.SubElement(bsdf, "string", attrib={"name": "material", "value": metal_name})
+        _rgb(bsdf, "specular_reflectance")
+        if rough:
+            _alpha(bsdf, floor=_MIN_ROUGHCONDUCTOR_ALPHA, default=0.2)
+        return bsdf
+
+    if strategy in {"dielectric", "roughdielectric"}:
+        rough = strategy == "roughdielectric" or bool(roughness_tex)
+        bsdf = ET.SubElement(parent, "bsdf", type="roughdielectric" if rough else "dielectric")
+        ET.SubElement(bsdf, "float", attrib={"name": "int_ior", "value": f"{ior:.4f}"})
+        if rough:
+            _alpha(bsdf, floor=_MIN_ROUGHDIELECTRIC_ALPHA, default=0.1)
+        return True
+
+    if class_metal or scalar_metal:
+        _metal(parent, rough=(strategy != "conductor" or bool(roughness_tex)))
+        return True
+
+    if metallic_tex:
+        blend = ET.SubElement(parent, "bsdf", type="blendbsdf")
+        _bitmap(blend, "weight", metallic_tex, raw=True)
+        # Child BSDF IDs are unnecessary here and Mitsuba IDs are global across
+        # the whole scene. Reusing names such as ``a_plastic`` for every shape
+        # creates a duplicate-id parse failure after shape BSDF deduplication.
+        _plastic(blend)
+        _metal(blend, rough=True)
+        return True
+
+    _plastic(parent)
     return True
 
 
@@ -938,6 +995,140 @@ def _measured_candidate_from_binding(binding: Mapping[str, Any]) -> dict[str, An
     if _binding_is_measured(dict(binding)):
         return dict(binding)
     return None
+
+
+def _baked_atlas_urls(source_ref: str | None, repo_root: "Path | None" = None) -> dict[str, Any]:
+    """Derive baked albedo/roughness/metallic/normal atlas artifact URLs from an
+    object's ``source_ref`` ("<import>/meshes/<oid>.obj" -> "<import>/textures/<oid>_<kind>.png"),
+    mirroring the webui ``bakedAtlasArtifactUrl`` derivation. ``exists`` is checked
+    against ``repo_root`` when given (None when it can't be determined; the <img>
+    404s gracefully to the base-color swatch either way)."""
+    out: dict[str, Any] = {"source_ref": source_ref}
+    ref = str(source_ref or "")
+    base, sep, tail = ref.rpartition("/meshes/")
+    ok = bool(sep) and tail.lower().endswith((".obj", ".glb"))
+    oid = tail[:-4] if ok else None
+    for kind in ("albedo", "roughness", "metallic", "normal"):
+        if not ok:
+            out[kind] = {"url": None, "exists": None}
+            continue
+        rel = f"{base}/textures/{oid}_{kind}.png"
+        exists: "bool | None" = None
+        if repo_root is not None:
+            try:
+                exists = (repo_root / rel).exists()
+            except Exception:
+                exists = None
+        out[kind] = {"url": f"/artifacts?path={quote(rel)}", "exists": exists}
+    return out
+
+
+def _split_obj_shapes_cached(abs_obj: "Path", repo_root: "Path") -> list[dict[str, Any]]:
+    """Split a multi-``usemtl`` OBJ into per-material-group sub-OBJs (cached next to
+    the source under ``_split/``) so the render staging can emit one shape+BSDF per
+    face group -- restoring the per-face-group materials that Infinigen bakes but the
+    single-material authoring object flattens away (orphan-material fix).
+
+    Returns ``[{material_id, material_name, obj_ref, triangle_count}]`` (obj_ref is
+    repo-relative for the XML ``filename``), or ``[]`` for single-material meshes.
+    """
+    from mitsuba_converter import obj_split
+
+    try:
+        src_mtime = abs_obj.stat().st_mtime
+    except OSError:
+        return []
+    groups = obj_split.iter_material_groups(abs_obj)
+    if len(groups) <= 1:
+        return []
+    out_dir = abs_obj.parent / "_split"
+    stem = abs_obj.stem
+    need = any(
+        not (out_dir / f"{stem}__{g['material_id']}.obj").exists()
+        or (out_dir / f"{stem}__{g['material_id']}.obj").stat().st_mtime < src_mtime
+        for g in groups
+    )
+    if need:
+        parts = obj_split.split_obj_by_material(abs_obj, out_dir=out_dir)
+    else:
+        parts = [{
+            "material_name": g["material_name"], "material_id": g["material_id"],
+            "path": out_dir / f"{stem}__{g['material_id']}.obj",
+            "triangle_count": g["triangle_count"],
+        } for g in groups]
+    result: list[dict[str, Any]] = []
+    for p in parts:
+        path = Path(p["path"])
+        try:
+            ref = path.relative_to(repo_root).as_posix()
+        except ValueError:
+            ref = str(path)
+        result.append({
+            "material_id": p["material_id"], "material_name": p["material_name"],
+            "obj_ref": ref, "triangle_count": p.get("triangle_count"),
+        })
+    return result
+
+
+# Route Infinigen objects through their .glb geometry (which keeps UV) instead of the
+# UV-less .obj, while STILL mapping each material part back to its authoring material_id
+# by name (so the optical_class injection is preserved). Contract-v2 imports use GLB
+# directly; this branch keeps explicit legacy manifests GLB-first as well.
+_USE_INFINIGEN_GLB = True
+
+
+def _split_glb_shapes_cached(
+    glb_ref: str,
+    repo_root: "Path",
+    *,
+    mesh_cache_dir: "Path | None",
+    texture_cache_dir: "Path | None",
+) -> list[dict[str, Any]]:
+    """GLB counterpart of :func:`_split_obj_shapes_cached`.
+
+    Infinigen's ``.obj`` export loses UV (``vt=0``) for many assets, so the baked
+    normal/roughness atlases can't map per-texel. The sibling ``.glb`` keeps UV and
+    the same per-material split. This materializes the ``.glb`` into one OBJ per glTF
+    material (via the existing DTC adapter) and maps each part's glTF material name to
+    the authoring ``material_id`` using the SAME name rule as ``obj_split`` — so the
+    optical_class injection is preserved and only the geometry (UV) is upgraded.
+
+    Returns ``[{material_id, material_name, obj_ref, triangle_count, has_uv}]`` or ``[]``.
+    """
+    from mitsuba_converter import obj_split
+    from .glb_texture_adapter import materialize_glb_texture_parts
+
+    if mesh_cache_dir is None:
+        return []
+    try:
+        glb_path = resolve_repo_path(repo_root, glb_ref)
+    except Exception:
+        return []
+    if not glb_path.exists():
+        return []
+    try:
+        result = materialize_glb_texture_parts(
+            glb_ref, glb_path=glb_path, repo_root=repo_root,
+            mesh_cache_dir=mesh_cache_dir, texture_cache_dir=texture_cache_dir,
+        )
+    except Exception:
+        return []
+    if result.status != "ok" or not result.mesh_parts:
+        return []
+    groups: list[dict[str, Any]] = []
+    for part in result.mesh_parts:
+        if int(part.triangle_count or 0) <= 0 or not part.obj_ref:
+            continue
+        em = part.extracted_material if isinstance(part.extracted_material, dict) else {}
+        mat_name = str(em.get("material_id") or part.mesh_name or "")
+        groups.append({
+            "material_id": obj_split.sanitize_material_name(mat_name),
+            "material_name": mat_name,
+            "obj_ref": part.obj_ref,
+            "triangle_count": int(part.triangle_count or 0),
+            "has_uv": bool(part.has_uv),
+        })
+    return groups
 
 
 def _material_policy_record(
@@ -993,7 +1184,7 @@ def _build_render_scene_material_policy(
     return {
         "version": "robomituba-render-scene-material-policy-v1",
         "scene_id": str(scene_id or ""),
-        "default_measured_scope": "analytic_priority",
+        "default_measured_scope": "analytic_only",
         "default_max_measured_bsdfs": 3,
         "summary": {
             "shape_policy_count": len(records),
@@ -1165,13 +1356,43 @@ def _append_bsdf_xml(
         )
         if record is not None:
             material_policy_records.append(record)
-    if isinstance(binding.get("analytic_fallback"), Mapping):
+    # measured mode (reference): prefer the measured_polarized candidate on
+    # surfaces that carry one (metals) so injected(analytic) can be compared to a
+    # measured-pBRDF anchor; other surfaces stay analytic.
+    _measured_ref = (_measured_candidate_from_binding(binding)
+                     if optical_constants.bsdf_mode() == "measured" else None)
+    if _measured_ref is not None:
+        binding_for_xml = _measured_ref
+    elif isinstance(binding.get("analytic_fallback"), Mapping):
         binding_for_xml = _analytic_fallback_from_binding(binding)
     else:
         binding_for_xml = binding
     strategy = str(binding_for_xml.get("bsdf_strategy") or "pplastic").strip().lower()
     if strategy in {"roughplastic", "diffuse", "plastic", "principled"}:
         strategy = "pplastic"
+
+    # NEW (ROBOMITUBA_BSDF_MODE=injected/measured): replace the legacy hardcoded
+    # int_ior=1.5 / material="Al" with per-material physically-plausible optical
+    # constants (dielectric IOR / real metal eta-k preset), derived from the
+    # binding's explicit fields when present else from optical_class/shader name.
+    # legacy mode leaves inject=None -> identical to the old output (no regression).
+    inject: "dict[str, Any] | None" = None
+    if optical_constants.injection_enabled():
+        oc = _maybe_str(binding_for_xml.get("optical_class"))
+        base_color = binding_for_xml.get("base_color_factor")
+        # A material classified as metal/mirror should render as a CONDUCTOR even
+        # though Infinigen's baked metallic_factor is ~0 (its Principled metal uses
+        # base_color as F0, not the metallic slot) -- legacy renders these as diffuse
+        # plastic, which is physically wrong for a metal. In injected mode force the
+        # conductor path so the real eta-k / polarization applies.
+        is_metal = strategy in {"conductor", "roughconductor"} or oc in {
+            "metal_gold", "metal_steel", "metal_aluminum", "mirror"}
+        inject = {
+            "ior": binding_for_xml.get("ior") or optical_constants.dielectric_ior_for(oc, material_id),
+            "conductor_material": (binding_for_xml.get("conductor_material")
+                                   or optical_constants.conductor_material_for(oc, material_id, base_color)),
+            "is_metal": is_metal,
+        }
 
     measured_binding = _binding_is_measured(binding_for_xml)
     measured_channels_dir = _resolve_hpbrdf_channels_dir(binding_for_xml, repo_root) if measured_binding else None
@@ -1188,33 +1409,36 @@ def _append_bsdf_xml(
     if extracted_material and ((prefer_source_texture and not measured_channels_dir) or not measured_binding):
         # Diffuse surfaces bound to `pplastic` keep their baked albedo but render
         # through the polarized-plastic BSDF (polarization signal, no Phase-0 dep).
-        diffuse_bsdf_type = "pplastic" if strategy == "pplastic" else "roughplastic"
         if _append_extracted_bsdf_xml(
             shape, extracted_material, fallback_color=fallback_color, repo_root=repo_root,
-            diffuse_bsdf_type=diffuse_bsdf_type,
+            diffuse_bsdf_type="pplastic", strategy=strategy, inject=inject,
         ):
             return
+    _ior = f"{float(inject['ior']):.4f}" if inject and inject.get("ior") else "1.5"
+    _metal = (inject.get("conductor_material") if inject else None) or "Al"
     if strategy == "pplastic":
         bsdf = _append_twosided_child_bsdf(shape, "pplastic")
         ET.SubElement(bsdf, "rgb", attrib={"name": "diffuse_reflectance", "value": fallback_color})
         ET.SubElement(bsdf, "float", attrib={"name": "alpha", "value": "0.2"})
+        if inject and inject.get("ior"):
+            ET.SubElement(bsdf, "float", attrib={"name": "int_ior", "value": _ior})
         return
     if strategy == "dielectric":
         bsdf = ET.SubElement(shape, "bsdf", type="dielectric")
-        ET.SubElement(bsdf, "float", attrib={"name": "int_ior", "value": "1.5"})
+        ET.SubElement(bsdf, "float", attrib={"name": "int_ior", "value": _ior})
         return
     if strategy == "roughdielectric":
         bsdf = ET.SubElement(shape, "bsdf", type="roughdielectric")
         ET.SubElement(bsdf, "float", attrib={"name": "alpha", "value": f"{_MIN_ROUGHDIELECTRIC_ALPHA:.4f}"})
-        ET.SubElement(bsdf, "float", attrib={"name": "int_ior", "value": "1.5"})
+        ET.SubElement(bsdf, "float", attrib={"name": "int_ior", "value": _ior})
         return
     if strategy == "conductor":
         bsdf = _append_twosided_child_bsdf(shape, "conductor")
-        ET.SubElement(bsdf, "string", attrib={"name": "material", "value": "Al"})
+        ET.SubElement(bsdf, "string", attrib={"name": "material", "value": _metal})
         return
     if strategy == "roughconductor":
         bsdf = _append_twosided_child_bsdf(shape, "roughconductor")
-        ET.SubElement(bsdf, "string", attrib={"name": "material", "value": "Al"})
+        ET.SubElement(bsdf, "string", attrib={"name": "material", "value": _metal})
         alpha = _clamp_bsdf_alpha(binding_for_xml.get("roughness"), default=0.2, floor=_MIN_ROUGHCONDUCTOR_ALPHA)
         ET.SubElement(bsdf, "float", attrib={"name": "alpha", "value": f"{alpha:.4f}"})
         return
@@ -2081,69 +2305,167 @@ def _build_editor_preview_mesh_manifest(
     return {"version": _PREVIEW_MESH_CACHE_VERSION, "stats": stats, "shapes": by_shape}
 
 
-_SCENE_MESH_CACHE_OBJ_VERSION = 2
+_SCENE_MESH_CACHE_OBJ_VERSION = 4
 
 
 def _write_normalized_obj_for_scene_cache(src: Path, dst: Path) -> dict[str, Any]:
-    """Write OBJ with vertices centered in X/Z and bottom-aligned to Y=0."""
-    text = src.read_text(encoding="utf-8", errors="replace")
-    rows = text.splitlines(keepends=True)
-    vertices: list[tuple[float, float, float]] = []
-    for line in rows:
-        stripped = line.lstrip()
-        if not stripped.startswith("v "):
-            continue
-        prefix_len = len(line) - len(stripped)
-        parts = stripped.split()
-        if len(parts) < 4:
-            continue
-        try:
-            vertices.append((float(parts[1]), float(parts[2]), float(parts[3])))
-        except (TypeError, ValueError):
-            continue
-    if not vertices:
-        shutil.copy2(src, dst)
-        return {"normalized": False, "vertex_count": 0}
+    """Normalize an OBJ with a bounded-memory, Mitsuba-safe normal pass.
 
-    min_x = min(v[0] for v in vertices)
-    max_x = max(v[0] for v in vertices)
-    min_y = min(v[1] for v in vertices)
-    min_z = min(v[2] for v in vertices)
-    max_z = max(v[2] for v in vertices)
+    Infinigen can emit very large OBJ files. Keep this pass streaming: a full
+    ``read_text``/face adjacency build can consume gigabytes before the scene
+    is even staged. Invalid/zero ``vn`` values are replaced with a safe unit
+    normal; if any face references a missing/negative normal index, all normal
+    records and face normal components are removed so Mitsuba recomputes
+    geometric normals (while retaining ``v/vt`` UV bindings).
+    """
+    def _parse_vertex(parts: list[str]) -> tuple[float, float, float] | None:
+        if len(parts) < 4:
+            return None
+        try:
+            value = (float(parts[1]), float(parts[2]), float(parts[3]))
+        except (TypeError, ValueError):
+            return None
+        return value if all(math.isfinite(x) for x in value) else None
+
+    vertex_count = 0
+    normal_count = 0
+    invalid_normal_count = 0
+    zero_normal_count = 0
+    min_x = min_y = min_z = float("inf")
+    max_x = max_y = max_z = float("-inf")
+    max_face_normal_ref = 0
+    negative_or_zero_face_normal_ref = False
+    face_without_normal_ref = False
+
+    # Pass 1: bounds, normal validity, and face normal-reference envelope.
+    with src.open("r", encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            parts = line.lstrip().split()
+            if not parts:
+                continue
+            kind = parts[0]
+            if kind == "v":
+                value = _parse_vertex(parts)
+                if value is None:
+                    continue
+                vertex_count += 1
+                x, y, z = value
+                min_x = min(min_x, x); max_x = max(max_x, x)
+                min_y = min(min_y, y); max_y = max(max_y, y)
+                min_z = min(min_z, z); max_z = max(max_z, z)
+            elif kind == "vn":
+                normal_count += 1
+                if len(parts) < 4:
+                    invalid_normal_count += 1
+                    continue
+                try:
+                    normal = (float(parts[1]), float(parts[2]), float(parts[3]))
+                except (TypeError, ValueError):
+                    invalid_normal_count += 1
+                    continue
+                length_sq = sum(x * x for x in normal)
+                if not all(math.isfinite(x) for x in normal) or not math.isfinite(length_sq):
+                    invalid_normal_count += 1
+                elif length_sq <= 1e-20:
+                    zero_normal_count += 1
+            elif kind == "f":
+                for token in parts[1:]:
+                    fields = token.split("/")
+                    if len(fields) < 3 or not fields[2]:
+                        face_without_normal_ref = True
+                        continue
+                    try:
+                        normal_index = int(fields[2])
+                    except (TypeError, ValueError):
+                        negative_or_zero_face_normal_ref = True
+                        continue
+                    if normal_index <= 0:
+                        negative_or_zero_face_normal_ref = True
+                    else:
+                        max_face_normal_ref = max(max_face_normal_ref, normal_index)
+
+    if vertex_count == 0:
+        shutil.copy2(src, dst)
+        return {"normalized": False, "vertex_count": 0, "normal_repaired": 0}
+
+    invalid_normal_reference = (
+        negative_or_zero_face_normal_ref
+        or max_face_normal_ref > normal_count
+        or (face_without_normal_ref and normal_count > 0)
+    )
+    repair_count = invalid_normal_count + zero_normal_count
+    min_x = 0.0 if not math.isfinite(min_x) else min_x
+    max_x = 0.0 if not math.isfinite(max_x) else max_x
+    min_y = 0.0 if not math.isfinite(min_y) else min_y
+    max_y = 0.0 if not math.isfinite(max_y) else max_y
+    min_z = 0.0 if not math.isfinite(min_z) else min_z
+    max_z = 0.0 if not math.isfinite(max_z) else max_z
     off_x = (min_x + max_x) / 2.0
     off_y = min_y
     off_z = (min_z + max_z) / 2.0
 
-    out: list[str] = []
-    for line in rows:
-        stripped = line.lstrip()
-        if not stripped.startswith("v "):
-            out.append(line)
-            continue
-        leading = line[:len(line) - len(stripped)]
-        newline = "\n" if line.endswith("\n") else ""
-        parts = stripped.split()
-        if len(parts) < 4:
-            out.append(line)
-            continue
-        try:
-            x = float(parts[1]) - off_x
-            y = float(parts[2]) - off_y
-            z = float(parts[3]) - off_z
-        except (TypeError, ValueError):
-            out.append(line)
-            continue
-        suffix = ""
-        if len(parts) > 4:
-            suffix = " " + " ".join(parts[4:])
-        out.append(f"{leading}v {x:.8g} {y:.8g} {z:.8g}{suffix}{newline}")
-    dst.write_text("".join(out), encoding="utf-8")
+    # Pass 2: write transformed vertices and repaired/stripped normal records.
+    written_vertices = 0
+    written_normals = 0
+    with src.open("r", encoding="utf-8", errors="replace") as inp, dst.open("w", encoding="utf-8") as out:
+        for line in inp:
+            stripped = line.lstrip()
+            parts = stripped.split()
+            if not parts:
+                out.write(line)
+                continue
+            leading = line[:len(line) - len(stripped)]
+            newline = "\n" if line.endswith("\n") else ""
+            kind = parts[0]
+            if kind == "v" and len(parts) >= 4:
+                value = _parse_vertex(parts)
+                if value is None:
+                    out.write(line)
+                    continue
+                x, y, z = value
+                suffix = " " + " ".join(parts[4:]) if len(parts) > 4 else ""
+                out.write(f"{leading}v {x - off_x:.8g} {y - off_y:.8g} {z - off_z:.8g}{suffix}{newline}")
+                written_vertices += 1
+            elif kind == "vn" and len(parts) >= 4:
+                written_normals += 1
+                if invalid_normal_reference:
+                    continue
+                try:
+                    normal = (float(parts[1]), float(parts[2]), float(parts[3]))
+                    length_sq = sum(x * x for x in normal)
+                    valid = all(math.isfinite(x) for x in normal) and math.isfinite(length_sq) and length_sq > 1e-20
+                except (TypeError, ValueError):
+                    valid = False
+                if valid:
+                    out.write(line)
+                else:
+                    out.write(f"{leading}vn 0 1 0{newline}")
+            elif kind == "vn":
+                if not invalid_normal_reference:
+                    out.write(f"{leading}vn 0 1 0{newline}")
+            elif kind == "f" and invalid_normal_reference:
+                rewritten_tokens: list[str] = []
+                for token in parts[1:]:
+                    fields = token.split("/")
+                    if len(fields) >= 3:
+                        rewritten_tokens.append(f"{fields[0]}/{fields[1]}" if fields[1] else fields[0])
+                    else:
+                        rewritten_tokens.append(token)
+                out.write(f"{leading}f {' '.join(rewritten_tokens)}{newline}")
+            else:
+                out.write(line)
+
     return {
         "normalized": True,
-        "vertex_count": len(vertices),
+        "vertex_count": written_vertices,
+        "normal_count": normal_count,
+        "normal_repaired": repair_count,
+        "normal_repair_fallback": repair_count,
+        "normal_invalid_references": invalid_normal_reference,
+        "normal_mode": "recomputed" if invalid_normal_reference else "preserved_or_repaired",
         "source_bounds": {
             "min": [min_x, min_y, min_z],
-            "max": [max_x, max(v[1] for v in vertices), max_z],
+            "max": [max_x, max_y, max_z],
             "center_xz": [off_x, off_z],
         },
         "offset_applied": [off_x, off_y, off_z],
@@ -2722,6 +3044,67 @@ def _proxy_box_xml_element(
                 )
             return shapes if len(shapes) > 1 else shapes[0]
 
+        # Infinigen meshes carry several per-face-group materials (usemtl groups) but
+        # the authoring object records only one; split into one shape+BSDF per group
+        # so each group renders with its real material (base_color atlas is shared per
+        # mesh, so all groups reuse obj_extracted_material; only the BSDF differs).
+        # For a legacy OBJ source with a GLB sidecar, prefer the .glb split (keeps UV so
+        # the baked normal/roughness atlases map per-texel) -- material_id is mapped by
+        # name so the optical_class injection is identical to the obj_split path.
+        split_groups: list[dict[str, Any]] = []
+        split_kind = "obj_file_material_group"
+        if (_USE_INFINIGEN_GLB and materialize_source_type == "obj_file" and repo_root is not None
+                and isinstance(obj_meta, dict) and obj_meta.get("infinigen") and obj_meta.get("glb_ref")):
+            try:
+                glb_groups = _split_glb_shapes_cached(
+                    str(obj_meta.get("glb_ref")), repo_root,
+                    mesh_cache_dir=scene_mesh_cache_dir, texture_cache_dir=scene_texture_cache_dir,
+                )
+            except Exception:
+                glb_groups = []
+            if glb_groups:
+                split_groups = glb_groups
+                split_kind = "glb_material_group"
+        if not split_groups and materialize_source_type == "obj_file" and repo_root is not None:
+            try:
+                split_groups = _split_obj_shapes_cached(resolve_repo_path(repo_root, obj_mesh_filename), repo_root)
+            except Exception:
+                split_groups = []
+        # obj_split only helps when >1 group; the GLB split is worth emitting even for a
+        # single group because it restores UV that the .obj lost.
+        if len(split_groups) > 1 or (split_kind == "glb_material_group" and split_groups):
+            shapes = []
+            for gi, grp in enumerate(split_groups):
+                grp_mid = grp["material_id"]
+                grp_material = grp_mid if grp_mid in material_idx else material
+                shape_id = obj_id if gi == 0 else f"{obj_id}__{grp_mid}"
+                grp_shape = _obj_shape(grp["obj_ref"], shape_id)
+                _append_bsdf_xml(
+                    grp_shape, grp_material, material_idx,
+                    fallback_color=fallback, repo_root=repo_root,
+                    extracted_material=obj_extracted_material,
+                    material_policy_records=material_policy_records,
+                )
+                shapes.append(grp_shape)
+                if mesh_stats is not None:
+                    mesh_stats["mesh_attached"] = mesh_stats.get("mesh_attached", 0) + 1
+                    if obj_extracted_material:
+                        mesh_stats["usd_material_attached"] = mesh_stats.get("usd_material_attached", 0) + 1
+                _record(
+                    "obj", split_kind,
+                    shape_id=shape_id, cache_obj=grp["obj_ref"],
+                    extras={
+                        "parent_shape_id": obj_id,
+                        "material_group": grp["material_name"],
+                        "render_material_id": grp_material,
+                        "triangle_count": grp.get("triangle_count"),
+                        "has_uv": grp.get("has_uv"),
+                        "object_material": material,
+                        "asset_id": (obj_meta.get("asset_id") if isinstance(obj_meta, dict) else None),
+                    },
+                )
+            return shapes
+
         shape = _obj_shape(obj_mesh_filename, obj_id)
         _append_bsdf_xml(
             shape, material, material_idx,
@@ -3085,6 +3468,7 @@ def _generate_opticalnav_render_scene_xml(
     mesh_stats: "dict[str, int] | None" = None,
     materialization_records: "list[dict[str, Any]] | None" = None,
     material_policy_records: "list[dict[str, Any]] | None" = None,
+    shape_progress_cb: "Callable[[int, int], None] | None" = None,
 ) -> int:
     """Generate a full Mitsuba render scene from authoring_map in authoring coordinates.
 
@@ -3228,7 +3612,9 @@ def _generate_opticalnav_render_scene_xml(
     # in one scene all share the basename "mesh.obj" and 404 in the editor).
     scene_mesh_cache_dir = out_path.parent / "mesh_cache"
     scene_texture_cache_dir = out_path.parent / "texture_cache"
-    for obj in overlay.get("objects") or []:
+    _overlay_objects = overlay.get("objects") or []
+    _obj_total = len(_overlay_objects)
+    for _obj_i, obj in enumerate(_overlay_objects):
         elem = _proxy_box_xml_element(
             obj, eg_by_label, material_idx,
             repo_root=repo_root,
@@ -3239,6 +3625,13 @@ def _generate_opticalnav_render_scene_xml(
             scene_mesh_cache_dir=scene_mesh_cache_dir,
             scene_texture_cache_dir=scene_texture_cache_dir,
         )
+        # Per-object progress so pure-OBJ / GLB-materialized scenes (no USD prims,
+        # so mesh_resolver never fires) still show a moving bar instead of 0/N.
+        if shape_progress_cb is not None:
+            try:
+                shape_progress_cb(_obj_i + 1, _obj_total)
+            except Exception:
+                pass
         if elem is not None:
             root.append(ET.Comment(_opticalnav_obj_comment_data(obj)))
             elems = elem if isinstance(elem, list) else [elem]
@@ -3318,6 +3711,13 @@ def _dedupe_shape_bsdfs_to_shared(root: "ET.Element") -> None:
     def _canonical(elem: "ET.Element") -> str:
         return ET.tostring(_strip(elem), encoding="unicode")
 
+    def _strip_nested_ids(elem: "ET.Element") -> None:
+        # IDs on child BSDFs are not referenced by the generated XML. Mitsuba
+        # treats all IDs as scene-global, so retaining them makes repeated
+        # blendbsdf children collide between otherwise independent shapes.
+        for child in list(elem.iter())[1:]:
+            child.attrib.pop("id", None)
+
     seen: dict[str, str] = {}  # canonical text → shared id
     shared_blocks: list[ET.Element] = []
 
@@ -3328,6 +3728,7 @@ def _dedupe_shape_bsdfs_to_shared(root: "ET.Element") -> None:
         # Skip if the shape already references a shared BSDF.
         if bsdf.get("type") is None and bsdf.tag == "ref":
             continue
+        _strip_nested_ids(bsdf)
         key = _canonical(bsdf)
         shared_id = seen.get(key)
         if shared_id is None:
@@ -4437,6 +4838,10 @@ class RenderDaemon:
         self._export_jobs_lock = threading.Lock()
         self._export_job_subscribers: dict[str, set[_GraphBuildSubscriber]] = {}
         self._export_job_sub_lock = threading.Lock()
+        # Live progress for the synchronous episode-plan endpoint (scene_id -> state),
+        # polled by the webui to show "planned/target" while the request is in flight.
+        self._episode_plan_progress: dict[str, dict[str, Any]] = {}
+        self._episode_plan_lock = threading.Lock()
 
         asset_root = Path(__file__).resolve().parent
         self._static_dir = asset_root / "static"
@@ -5000,14 +5405,57 @@ class RenderDaemon:
                     "wavelength_nm": self._as_finite_float(lidar_raw.get("wavelength_nm", 905.0), name=f"{sensor_id}.lidar.wavelength_nm"),
                 }
             sensors.append(sensor)
+        base_frame = str(payload.get("base_frame") or "base_link")
+        active_lights = self._normalize_camera_rig_active_lights(payload.get("active_lights"), base_frame=base_frame)
         return {
             "rig_id": normalized_rig_id,
             "label": str(payload.get("label") or normalized_rig_id),
             "robot_model": "ranger_mini_v3",
-            "base_frame": str(payload.get("base_frame") or "base_link"),
+            "base_frame": base_frame,
             "updated_at": _utc_now_iso(),
             "sensors": sensors,
+            "active_lights": active_lights,
         }
+
+    def _normalize_camera_rig_active_lights(self, value: Any, *, base_frame: str) -> list[dict[str, Any]]:
+        """Normalize rig-level active lights (RGB/NIR flash + linear polarizer).
+        Mirrors ActiveLightSpec fields; tolerant of partial/legacy payloads."""
+        if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+            return []
+        out: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for idx, raw in enumerate(value):
+            if not isinstance(raw, Mapping):
+                continue
+            light_id = str(raw.get("light_id") or f"active_light_{idx}").strip() or f"active_light_{idx}"
+            if light_id in seen:
+                raise ValueError(f"duplicate active light light_id: {light_id}")
+            seen.add(light_id)
+            mount_raw = raw.get("mount") if isinstance(raw.get("mount"), Mapping) else {}
+            modalities = [str(m) for m in (raw.get("modalities") or ["nir", "polar"]) if str(m).strip()]
+            emitter_type = str(raw.get("emitter_type")) if str(raw.get("emitter_type")) in ("spot", "point", "area") else "spot"
+            spectrum_kind = "nir" if str(raw.get("spectrum_kind")) == "nir" else "rgb"
+            out.append({
+                "light_id": light_id,
+                "enabled": bool(raw.get("enabled", True)),
+                "emitter_type": emitter_type,
+                "mount": {
+                    "parent_frame": str(mount_raw.get("parent_frame") or base_frame),
+                    "xyz_m": self._as_float_vec(mount_raw.get("xyz_m", [0.0, 0.0, 0.0]), name=f"{light_id}.mount.xyz_m", length=3),
+                    "rpy_deg": self._as_float_vec(mount_raw.get("rpy_deg", [0.0, 0.0, 0.0]), name=f"{light_id}.mount.rpy_deg", length=3),
+                },
+                "modalities": modalities or ["nir", "polar"],
+                "spectrum_kind": spectrum_kind,
+                "rgb": self._as_float_vec(raw.get("rgb", [1.0, 1.0, 1.0]), name=f"{light_id}.rgb", length=3),
+                "wavelength_nm": self._as_finite_float(raw.get("wavelength_nm", 850.0), name=f"{light_id}.wavelength_nm"),
+                "radiance": self._as_finite_float(raw.get("radiance", 40.0), name=f"{light_id}.radiance"),
+                "cutoff_angle_deg": self._as_finite_float(raw.get("cutoff_angle_deg", 45.0), name=f"{light_id}.cutoff_angle_deg"),
+                "beam_width_deg": self._as_finite_float(raw.get("beam_width_deg", 30.0), name=f"{light_id}.beam_width_deg"),
+                "area_size_m": self._as_finite_float(raw.get("area_size_m", 0.1), name=f"{light_id}.area_size_m"),
+                "polarized": bool(raw.get("polarized", False)),
+                "polarizer_angle_deg": self._as_finite_float(raw.get("polarizer_angle_deg", 0.0), name=f"{light_id}.polarizer_angle_deg"),
+            })
+        return out
 
     def _load_camera_rig(self, rig_id: str) -> dict[str, Any]:
         path = self._camera_rig_path(rig_id)
@@ -5895,6 +6343,14 @@ class RenderDaemon:
         if self._server is not None:
             return
 
+        # Persisted user render prefs (bsdf_mode / texture cap) win over the
+        # launcher env, so apply them before any scene sync / worker spawn.
+        try:
+            from .user_settings import apply_render_env_from_settings
+            apply_render_env_from_settings()
+        except Exception:
+            pass
+
         controller = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -6218,6 +6674,8 @@ class RenderDaemon:
                     "mesh_extract",
                 )
 
+            _denom = max(total_estimate, usd_backed_count, 1)
+
             def _resolve_prim_obj(usd_ref: str, prim_path: str):
                 res = self._ensure_prim_obj_cached(
                     project_dir, scene_id, usd_ref, prim_path,
@@ -6225,8 +6683,17 @@ class RenderDaemon:
                 )
                 _processed["n"] += 1
                 if progress_cb is not None and (_processed["n"] % 4 == 0 or _processed["n"] == usd_backed_count):
-                    progress_cb(_processed["n"], max(total_estimate, usd_backed_count), prim_path.rsplit("/", 1)[-1], "mesh_extract")
+                    progress_cb(_processed["n"], _denom, prim_path.rsplit("/", 1)[-1], "mesh_extract")
                 return res
+
+            def _on_shape(done: int, total: int) -> None:
+                # OBJ / GLB-materialized scenes have no USD prims, so this loop-based
+                # counter is what actually advances the "OBJ shapes" bar.
+                if progress_cb is None:
+                    return
+                if done % 4 == 0 or done == total:
+                    seen = max(done, _processed["n"])
+                    progress_cb(seen, max(_denom, total), "OBJ shapes", "mesh_extract")
 
             t_mesh_start = time.perf_counter()
             materialization_records: list[dict[str, Any]] = []
@@ -6241,6 +6708,7 @@ class RenderDaemon:
                 mesh_stats=mesh_extraction_stats,
                 materialization_records=materialization_records,
                 material_policy_records=material_policy_records,
+                shape_progress_cb=_on_shape,
             )
             mesh_extraction_stats["extraction_time_ms"] = int((time.perf_counter() - t_mesh_start) * 1000)
             render_scene_ref = render_scene_path.relative_to(self.repo_root).as_posix()
@@ -6373,6 +6841,10 @@ class RenderDaemon:
             **dict(_raw.get("metadata", {}).get("sync", {})),
             **result.sync,
             "render_scene": "synced" if readiness.get("ok") else "blocked",
+            # Clear the "syncing" flag set at job start — the editor's InitStatusDashboard
+            # reads render_scene_status preferentially, so leaving it "syncing" keeps the
+            # progress banner (OBJ 캐싱 …) spinning forever after the sync has finished.
+            "render_scene_status": "synced" if readiness.get("ok") else "blocked",
             "render_scene_mode": "editor_generated_xml",
             "scene_variant_ref": result.scene_variant_ref,
             "render_scene_overlay_ref": result.overlay_ref,
@@ -6572,6 +7044,7 @@ class RenderDaemon:
         include_polarization_raw: bool = True,
         include_episode_birdseye: bool = False,
         eval_perturbation: bool = False,
+        camera_ids: list[str] | None = None,
     ) -> None:
         """Background worker — runs the 7-/8-stage scene bundle export.
 
@@ -6587,6 +7060,7 @@ class RenderDaemon:
             find_episode_files,
             is_episode_complete,
             iter_export_files,
+            write_filtered_sensor_indexes,
             write_dataset_index_from,
             write_split_files_from,
         )
@@ -6668,6 +7142,7 @@ class RenderDaemon:
                 only_completed=only_completed,
                 episode_ids=episode_ids,
             )
+            index_payload.setdefault("filter", {})["camera_ids"] = camera_ids
             write_dataset_index_from(index_payload, staging)
             write_split_files_from(index_payload, staging)
             check_cancel()
@@ -6701,6 +7176,23 @@ class RenderDaemon:
                             best_d = d
                             best = hid
                     return best
+
+                def _thumbnail_rgb_path(heading_dir: Path) -> Path | None:
+                    if camera_ids is not None:
+                        for camera_id in camera_ids:
+                            candidate = heading_dir / "sensors" / camera_id / "rgb.png"
+                            if candidate.is_file():
+                                return candidate
+                        return None
+                    legacy = heading_dir / "rgb.png"
+                    if legacy.is_file():
+                        return legacy
+                    sensors_dir = heading_dir / "sensors"
+                    if sensors_dir.is_dir():
+                        for candidate in sorted(sensors_dir.glob("*/rgb.png")):
+                            if candidate.is_file():
+                                return candidate
+                    return None
 
                 for ep_idx, ep in enumerate(kept_episodes):
                     check_cancel()
@@ -6761,7 +7253,7 @@ class RenderDaemon:
                         available = sorted(d.name for d in vp_dir.iterdir() if d.is_dir())
                         # Snap forward to the nearest rendered heading at this vp.
                         h_fwd = _nearest_heading(int(fwd_yaw), available) or h_fwd_saved
-                        src = (vp_dir / str(h_fwd) / "rgb.png") if h_fwd else None
+                        src = _thumbnail_rgb_path(vp_dir / str(h_fwd)) if h_fwd else None
                         if not src or not src.is_file():
                             continue
                         dst = thumb_dir / f"step_{str(step_idx).zfill(pad)}_yaw{str(fwd_yaw).zfill(3)}deg_{vp}.png"
@@ -6798,7 +7290,7 @@ class RenderDaemon:
                                 sw_g = sh_g = None
                                 for yaw in cardinal_yaws:
                                     hid = _nearest_heading(yaw, goal_available)
-                                    rgb_p = (goal_dir / str(hid) / "rgb.png") if hid else None
+                                    rgb_p = _thumbnail_rgb_path(goal_dir / str(hid)) if hid else None
                                     if rgb_p and rgb_p.is_file():
                                         with _PILImage.open(rgb_p) as _src:
                                             im = _src.convert("RGB")
@@ -6927,6 +7419,7 @@ class RenderDaemon:
                 include_exr=not png_only,
                 include_polarization_raw=include_polarization_raw,
                 include_perturbed=eval_perturbation,
+                camera_ids=camera_ids,
             ))
             # Eval-perturbation paired split: ship the perturbation sidecar so a
             # reader can join base↔perturbed observations on identical (vp, h) and
@@ -6963,6 +7456,7 @@ class RenderDaemon:
             try:
                 manifest_payload = {
                     "scene_id": scene_id,
+                    "camera_ids": camera_ids,
                     "file_count": len(files),
                     "bytes_total": bytes_total,
                     "files": [{"src": str(src), "dst": dst, "bytes": src.stat().st_size} for src, dst in files],
@@ -6995,6 +7489,10 @@ class RenderDaemon:
                         current_file=dst_rel,
                     )
                     last_pub = now
+
+            generated_sensor_indexes: list[Path] = []
+            if camera_ids is not None:
+                generated_sensor_indexes = write_filtered_sensor_indexes(staging)
 
             # ── bird's-eye summary ─────────────────────────────────────────
             # Top-down PNG of the grid + viewpoint graph + episode paths. When
@@ -7086,6 +7584,8 @@ class RenderDaemon:
                 "include_episode_thumbnails": include_episode_thumbnails,
                 "include_episode_birdseye": include_episode_birdseye,
                 "eval_perturbation": eval_perturbation,
+                "selected_camera_ids": camera_ids,
+                "generated_sensor_index_count": len(generated_sensor_indexes),
                 "perturbation": perturbation_summary,
                 "episodes_total_in_scope": len(scene_paths),
                 "episodes_exported": episodes_kept,
@@ -7773,8 +8273,32 @@ class RenderDaemon:
                 }
             except Exception as exc:
                 readiness_summary = {"ok": False, "status": "unreadable", "error": str(exc)}
+        # Lightweight metadata for the scene gallery (sort by size / area / date).
+        object_count: int | None = None
+        area_m2: float | None = None
+        updated_mtime: float | None = None
+        updated_at: str | None = None
+        if authoring_map_path.exists():
+            try:
+                _am = json.loads(authoring_map_path.read_text(encoding="utf-8"))
+                object_count = len(_am.get("objects") or [])
+                _st = _am.get("settings") or {}
+                _w, _h = _st.get("map_w"), _st.get("map_h")
+                if isinstance(_w, (int, float)) and isinstance(_h, (int, float)):
+                    area_m2 = round(float(_w) * float(_h), 2)
+            except Exception:
+                pass
+            try:
+                updated_mtime = authoring_map_path.stat().st_mtime
+                updated_at = datetime.fromtimestamp(updated_mtime, tz=timezone.utc).isoformat(timespec="seconds")
+            except Exception:
+                pass
         return {
             "scene_id": scene_dir.name,
+            "object_count": object_count,
+            "area_m2": area_m2,
+            "updated_mtime": updated_mtime,
+            "updated_at": updated_at,
             "usd_ref": usd_ref,
             "usd_exists": usd_exists,
             "usd_error": usd_error,
@@ -9504,10 +10028,66 @@ class RenderDaemon:
 
     def _opticalnav_scan_observations(self, project_dir: Path, scene_id: str) -> dict[str, Any]:
         """Scan the consolidated observations dir for a scene, returning per-vp heading status."""
-        obs_root = project_dir / "scenes" / scene_id / "observations"
+        scene_dir = project_dir / "scenes" / scene_id
+        obs_root = scene_dir / "observations"
         viewpoints: dict[str, Any] = {}
+        sensor_inventory_by_id: dict[str, dict[str, Any]] = {}
+
+        known_modality_by_filename = {
+            filename: modality
+            for modality, filename in self._OPTICALNAV_OBS_PNG_FILENAMES.items()
+        }
+
+        def record_sensor(sensor_id: str, count_key: str, modalities: set[str]) -> None:
+            record = sensor_inventory_by_id.setdefault(sensor_id, {
+                "sensor_id": sensor_id,
+                "modalities": set(),
+                "base_count": 0,
+                "perturbed_count": 0,
+            })
+            record[count_key] += 1
+            record["modalities"].update(modalities)
+
+        def serialize_sensor_inventory() -> list[dict[str, Any]]:
+            inventory = []
+            for sensor_id in sorted(sensor_inventory_by_id):
+                record = sensor_inventory_by_id[sensor_id]
+                base_count = int(record["base_count"])
+                perturbed_count = int(record["perturbed_count"])
+                inventory.append({
+                    "sensor_id": sensor_id,
+                    "modalities": sorted(record["modalities"]),
+                    "observation_count": base_count + perturbed_count,
+                    "base_count": base_count,
+                    "perturbed_count": perturbed_count,
+                })
+            return inventory
+
+        # Base observations are aggregated in the existing detailed scan below.
+        # Only the optional perturbed tree needs a separate lightweight pass.
+        perturbed_root = scene_dir / "observations_perturbed"
+        if perturbed_root.is_dir():
+            for sensor_dir in sorted(perturbed_root.glob("*/*/sensors/*")):
+                if not sensor_dir.is_dir():
+                    continue
+                with os.scandir(sensor_dir) as entries:
+                    filenames = {entry.name for entry in entries if entry.is_file()}
+                if filenames:
+                    record_sensor(
+                        sensor_dir.name,
+                        "perturbed_count",
+                        {
+                            known_modality_by_filename[filename]
+                            for filename in filenames
+                            if filename in known_modality_by_filename
+                        },
+                    )
         if not obs_root.exists():
-            return {"scene_id": scene_id, "viewpoints": viewpoints}
+            return {
+                "scene_id": scene_id,
+                "viewpoints": viewpoints,
+                "sensor_inventory": serialize_sensor_inventory(),
+            }
         for vp_dir in sorted(obs_root.iterdir()):
             if not vp_dir.is_dir():
                 continue
@@ -9534,6 +10114,16 @@ class RenderDaemon:
                             f"has_{modality}": (sensor_dir / filename).exists()
                             for modality, filename in self._OPTICALNAV_OBS_PNG_FILENAMES.items()
                         }
+                        known_modalities = {
+                            key.removeprefix("has_")
+                            for key, present in sensor_status.items()
+                            if present
+                        }
+                        has_sensor_files = bool(known_modalities)
+                        if not has_sensor_files:
+                            has_sensor_files = any(path.is_file() for path in sensor_dir.iterdir())
+                        if has_sensor_files:
+                            record_sensor(sensor_dir.name, "base_count", known_modalities)
                         if any(sensor_status.values()):
                             sensors[sensor_dir.name] = sensor_status
                 completed = has_rgb or has_depth or any(
@@ -9554,7 +10144,11 @@ class RenderDaemon:
                 viewpoints[vp_id]["total"] += 1
                 if completed:
                     viewpoints[vp_id]["completed"] += 1
-        return {"scene_id": scene_id, "viewpoints": viewpoints}
+        return {
+            "scene_id": scene_id,
+            "viewpoints": viewpoints,
+            "sensor_inventory": serialize_sensor_inventory(),
+        }
 
     def _opticalnav_clear_staged_scene_cache(self, scene_dir: Path) -> dict[str, Any]:
         """Remove cached ``.staged_mitsuba/`` XMLs and texture-audit sidecars.
@@ -9958,7 +10552,7 @@ class RenderDaemon:
                 summary = dict(policy.get("summary") or {})
                 material_policy_stats = {
                     "material_policy_ref": policy_path.relative_to(self.repo_root).as_posix(),
-                    "measured_scope_default": str(policy.get("default_measured_scope") or "analytic_priority"),
+                    "measured_scope_default": str(policy.get("default_measured_scope") or "analytic_only"),
                     "max_measured_bsdfs_default": int(policy.get("default_max_measured_bsdfs") or 3),
                     "measured_candidates": int(summary.get("measured_candidates", 0) or 0),
                     "measured_enabled_default": int(summary.get("measured_enabled_default", 0) or 0),
@@ -10000,11 +10594,28 @@ class RenderDaemon:
                 }
         except Exception:  # noqa: BLE001 - best-effort status only
             pbr_bake_stats = {}
+        # BSDF injection status (ROBOMITUBA_BSDF_MODE): detect from the staged XML
+        # whether metals carry real eta-k presets (not blanket "Al"), per-material
+        # IOR was injected, and pplastic per-texel roughness (texture alpha) is used.
+        import re as _re
+        _mats = _re.findall(r'name="material"\s+value="([^"]+)"', text)
+        _iors = sorted(set(_re.findall(r'name="int_ior"\s+value="([^"]+)"', text)))
+        _injected_metals = sum(1 for _m in _mats if _m != "Al")
+        _tex_alpha = text.count('<texture name="alpha"')
+        injection_stats = {
+            "bsdf_mode": optical_constants.bsdf_mode(),
+            "bsdf_injection_active": bool(_injected_metals or len(_iors) > 1 or _tex_alpha),
+            "injected_metal_count": int(_injected_metals),
+            "conductor_material_counts": {_m: _mats.count(_m) for _m in sorted(set(_mats))},
+            "per_material_ior_variants": len(_iors),
+            "pplastic_texture_alpha_count": int(_tex_alpha),
+        }
         return {
             "exists": True,
             "scene_id": scene_id,
             "path": xml_path.relative_to(self.repo_root).as_posix(),
             "size_bytes": int(stat.st_size),
+            **injection_stats,
             "modified_at": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
             "shape_count": text.count("<shape "),
             "obj_shape_count": text.count('<shape type="obj"'),
@@ -10249,6 +10860,254 @@ class RenderDaemon:
         )
         return AuthoringRegion(id=obj_id, type=region_type, label=label, placement=placement, geometry=geometry, navigation=nav)
 
+    def _resolve_material_optics(
+        self,
+        entry: Mapping[str, Any],
+        source_ref: str | None,
+        *,
+        object_id: str | None,
+    ) -> dict[str, Any]:
+        """Resolve one authoring material into the viewer payload, mirroring the
+        render-time BSDF injection in ``_append_bsdf_xml`` so the UI reports the SAME
+        IOR / metal preset the renderer computes. IOR/eta-k are never stored on disk;
+        they are derived from ``optical_class`` via ``optical_constants`` at render time."""
+        material_id = _maybe_str(entry.get("material_id"))
+        binding = dict(entry.get("render_binding") or {}) if isinstance(entry.get("render_binding"), Mapping) else {}
+        pbr: dict[str, Any] = {}
+        params = entry.get("params")
+        if isinstance(params, Mapping) and isinstance(params.get("pbr"), Mapping):
+            pbr = dict(params["pbr"])
+        # effective binding = analytic_fallback if present, else the binding itself,
+        # with strategy normalized exactly like the renderer (_append_bsdf_xml:1196-1198).
+        if isinstance(binding.get("analytic_fallback"), Mapping):
+            binding_for_xml = _analytic_fallback_from_binding(binding)
+        else:
+            binding_for_xml = binding
+        strategy = str(binding_for_xml.get("bsdf_strategy") or "pplastic").strip().lower()
+        if strategy in {"roughplastic", "diffuse", "plastic", "principled"}:
+            strategy = "pplastic"
+        oc = _maybe_str(binding_for_xml.get("optical_class")) or _maybe_str(pbr.get("optical_class"))
+        base_color = binding_for_xml.get("base_color_factor") or pbr.get("base_color")
+        is_metal = strategy in {"conductor", "roughconductor"} or oc in {
+            "metal_gold", "metal_steel", "metal_aluminum", "mirror"}
+        # Resolve optical constants the SAME way as render_daemon injection
+        # (_append_bsdf_xml:1216-1220) -- call the optical_constants public API, never
+        # duplicate the IOR / metal tables.
+        resolved_ior = (binding_for_xml.get("ior") or pbr.get("ior")
+                        or optical_constants.dielectric_ior_for(oc, material_id))
+        conductor_preset = (binding_for_xml.get("conductor_material")
+                            or optical_constants.conductor_material_for(oc, material_id, base_color))
+        measured_candidate = _measured_candidate_from_binding(binding) if binding else None
+        measured_out = None
+        if isinstance(measured_candidate, Mapping):
+            measured_out = {
+                "kind": _maybe_str(measured_candidate.get("kind")),
+                "dataset_id": _maybe_str(measured_candidate.get("dataset_id")),
+                "material_id": _maybe_str(measured_candidate.get("material_id")),
+                "bsdf_strategy": _maybe_str(measured_candidate.get("bsdf_strategy")),
+                "channels_dir": _maybe_str(measured_candidate.get("channels_dir")),
+            }
+        # Polarimetric BRDF function the material connects to + how polarization arises.
+        if measured_out is not None:
+            brdf_fn, polar_source = "measured_polarized", "measured"
+        elif is_metal:
+            brdf_fn, polar_source = "roughconductor", "Fresnel(eta-k)"
+        elif strategy in {"dielectric", "roughdielectric"}:
+            brdf_fn, polar_source = strategy, "Fresnel(IOR)"
+        else:
+            brdf_fn, polar_source = "pplastic", "analytic"
+        caps = binding_for_xml.get("capabilities") or binding.get("capabilities") or {}
+        polarization = bool(caps.get("polarization")) or is_metal or brdf_fn in {
+            "measured_polarized", "dielectric", "roughdielectric", "pplastic"}
+
+        def _num(value: Any) -> "float | None":
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+
+        roughness = binding_for_xml.get("roughness")
+        if roughness is None:
+            roughness = pbr.get("roughness")
+        metallic = binding_for_xml.get("metallic")
+        if metallic is None:
+            metallic = pbr.get("metallic")
+        return {
+            "material_id": material_id,
+            "object_id": object_id,
+            "material": {
+                "category": _maybe_str(entry.get("category")),
+                "optical_class": oc,
+                "bsdf_strategy": strategy,
+                "polarimetric_brdf": brdf_fn,
+                "polarization_capable": polarization,
+                "polarization_source": polar_source,
+                "base_color": list(base_color) if isinstance(base_color, (list, tuple)) else None,
+                "roughness": _num(roughness),
+                "metallic": _num(metallic),
+                "is_metal": is_metal,
+            },
+            "optical_resolution": {
+                "dielectric_ior": _num(resolved_ior),
+                "conductor_preset": conductor_preset,
+                "applies_as": "conductor" if is_metal else "dielectric",
+            },
+            "measured_candidate": measured_out,
+            "atlases": _baked_atlas_urls(source_ref, self.repo_root),
+        }
+
+    def _opticalnav_object_material_view(
+        self,
+        project_dir: Path,
+        scene_id: str,
+        material_id: str | None,
+        object_id: str | None,
+    ) -> dict[str, Any] | None:
+        """Per-object / per-material optical metadata for the scene-editor material
+        viewer. With neither id -> list mode (resolve every material in the scene)."""
+        authoring_path = project_dir / "scenes" / scene_id / "authoring_map.json"
+        if not authoring_path.exists():
+            return None
+        try:
+            authoring = _read_json(authoring_path)
+        except Exception:
+            return None
+        materials = authoring.get("materials") or []
+        objects = authoring.get("objects") or []
+        mode_meta = {
+            "bsdf_mode": optical_constants.bsdf_mode(),
+            "injection_enabled": optical_constants.injection_enabled(),
+            "note": (
+                "optical_resolution values are the constants injected when "
+                f"ROBOMITUBA_BSDF_MODE=injected (current mode: {optical_constants.bsdf_mode()})."
+            ),
+        }
+
+        # Representative original-mesh source_ref per material (for atlas thumbnails),
+        # taken from authoring objects (the un-split ".../meshes/<oid>.obj").
+        source_by_material: dict[str, str] = {}
+        for obj in objects:
+            mid = _maybe_str(obj.get("material"))
+            src = _maybe_str(obj.get("source_ref"))
+            if mid and src and mid not in source_by_material:
+                source_by_material[mid] = src
+
+        # "used by" reverse index. A material is USED if it is emitted as a render
+        # shape -- which since the per-usemtl split includes the face-group materials
+        # a single authoring object carries, NOT just objects[].material. Count from
+        # render_scene_materialization.json (extras.render_material_id per shape), so
+        # split-group materials show as used. Fall back to authoring object refs when
+        # the scene hasn't been synced yet.
+        used_by: dict[str, list[dict[str, Any]]] = {}
+        seen_pairs: set[tuple[str, str]] = set()
+        matz_path = project_dir / "scenes" / scene_id / "render_scene_materialization.json"
+        if matz_path.exists():
+            try:
+                matz = _read_json(matz_path)
+            except Exception:
+                matz = {}
+            for shp in (matz.get("shapes") or matz.get("objects") or []):
+                if not isinstance(shp, Mapping):
+                    continue
+                ex = shp.get("extras") if isinstance(shp.get("extras"), Mapping) else {}
+                mat = _maybe_str(ex.get("render_material_id")) or _maybe_str(shp.get("material_id"))
+                if not mat:
+                    continue
+                oid = (_maybe_str(ex.get("parent_shape_id")) or _maybe_str(shp.get("object_id"))
+                       or _maybe_str(shp.get("shape_id")) or "")
+                if "__" in oid:
+                    oid = oid.split("__", 1)[0]
+                if (mat, oid) in seen_pairs:
+                    continue
+                seen_pairs.add((mat, oid))
+                src = _maybe_str(shp.get("source_ref"))
+                used_by.setdefault(mat, []).append({
+                    "object_id": oid or None, "label": _maybe_str(shp.get("label")), "source_ref": src,
+                })
+        if not used_by:
+            for obj in objects:
+                mid = _maybe_str(obj.get("material"))
+                if not mid:
+                    continue
+                used_by.setdefault(mid, []).append({
+                    "object_id": _maybe_str(obj.get("id")),
+                    "label": _maybe_str(obj.get("label")),
+                    "source_ref": _maybe_str(obj.get("source_ref")),
+                })
+
+        if material_id is None and object_id is None:
+            resolved = []
+            for entry in materials:
+                mid = _maybe_str(entry.get("material_id"))
+                if not mid:
+                    continue
+                rec = self._resolve_material_optics(entry, source_by_material.get(mid), object_id=None)
+                uses = used_by.get(mid, [])
+                rec["used_by"] = uses
+                rec["used_by_count"] = len(uses)
+                resolved.append(rec)
+            referenced = sum(1 for r in resolved if r["used_by_count"] > 0)
+            return {
+                "ok": True, "scene_id": scene_id, **mode_meta,
+                "count": len(resolved),
+                "summary": {
+                    "objects": len(objects),
+                    "materials": len(resolved),
+                    "referenced": referenced,
+                    "orphan": len(resolved) - referenced,
+                },
+                "materials": resolved,
+            }
+
+        source_ref = None
+        if object_id is not None:
+            obj_match = next((o for o in objects if _maybe_str(o.get("id")) == object_id), None)
+            if obj_match is not None:
+                source_ref = _maybe_str(obj_match.get("source_ref"))
+                if material_id is None:
+                    material_id = _maybe_str(obj_match.get("material"))
+        if material_id is None:
+            return None
+        entry = next((m for m in materials if _maybe_str(m.get("material_id")) == material_id), None)
+        if entry is None:
+            return None
+        if source_ref is None:
+            source_ref = source_by_material.get(material_id)
+        payload = self._resolve_material_optics(entry, source_ref, object_id=object_id)
+        uses = used_by.get(material_id, [])
+        payload["used_by"] = uses
+        payload["used_by_count"] = len(uses)
+        result = {"ok": True, "scene_id": scene_id, **mode_meta, **payload}
+
+        # object -> materials (1:N): an Infinigen mesh carries several usemtl face
+        # groups. The authoring object records only the first; enumerate the real
+        # groups from the mesh so the viewer can show every material the object uses
+        # (this is the same relationship the render splitter emits as sub-shapes).
+        if source_ref and str(source_ref).lower().endswith(".obj"):
+            try:
+                from mitsuba_converter import obj_split
+                abs_obj = resolve_repo_path(self.repo_root, source_ref)
+                groups = obj_split.iter_material_groups(abs_obj) if abs_obj.exists() else []
+            except Exception:
+                groups = []
+            if len(groups) > 1:
+                by_id = {_maybe_str(m.get("material_id")): m for m in materials}
+                obj_mats = []
+                for g in groups:
+                    entry_g = by_id.get(g["material_id"])
+                    if entry_g is None:
+                        continue
+                    rec = self._resolve_material_optics(entry_g, source_ref, object_id=object_id)
+                    rec["triangle_count"] = g.get("triangle_count")
+                    guses = used_by.get(g["material_id"], [])
+                    rec["used_by"] = guses
+                    rec["used_by_count"] = len(guses)
+                    obj_mats.append(rec)
+                if obj_mats:
+                    result["object_materials"] = obj_mats
+                    result["object_material_count"] = len(obj_mats)
+        return result
+
     def _handle_opticalnav_get(self, handler: BaseHTTPRequestHandler, path: str, query: Mapping[str, list[str]]) -> bool:
         if path == "/api/opticalnav/projects":
             projects = []
@@ -10387,6 +11246,11 @@ class RenderDaemon:
                 self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": "scene_annotation.json not found"})
                 return True
             self._send_json(handler, HTTPStatus.OK, _read_json(annotation_path))
+            return True
+        if len(parts) == 4 and parts[1] == "scenes" and parts[3] == "episode-plan-progress":
+            with self._episode_plan_lock:
+                state = self._episode_plan_progress.get(parts[2])
+            self._send_json(handler, HTTPStatus.OK, state if state is not None else {"status": "idle"})
             return True
         if len(parts) == 4 and parts[1] == "scenes" and parts[3] == "optical-perturbation":
             from navigation_dataset.optical_perturbation import load_perturbation, perturbation_path
@@ -10944,6 +11808,23 @@ class RenderDaemon:
                 "extracted_material": meta.get("extracted_material"),
             })
             return True
+        if len(parts) == 4 and parts[1] == "scenes" and parts[3] == "object-material":
+            scene_id = parts[2]
+            material_id = _maybe_str((query.get("material_id") or [None])[0])
+            object_id = _maybe_str((query.get("object_id") or [None])[0])
+            try:
+                payload = self._opticalnav_object_material_view(project_dir, scene_id, material_id, object_id)
+            except Exception as exc:
+                self._send_json(handler, HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
+                return True
+            if payload is None:
+                self._send_json(handler, HTTPStatus.NOT_FOUND, {
+                    "error": "material not found in authoring_map",
+                    "scene_id": scene_id, "material_id": material_id, "object_id": object_id,
+                })
+                return True
+            self._send_json(handler, HTTPStatus.OK, payload)
+            return True
         if len(parts) == 6 and parts[1] == "scenes" and parts[3] == "observations" and parts[5] in self._OPTICALNAV_OBS_PNG_FILENAMES:
             scene_id = parts[2]
             vp_id = parts[4]
@@ -11182,6 +12063,7 @@ class RenderDaemon:
         with self._infinigen_jobs_lock:
             state = dict(self._infinigen_jobs.get(job_id) or {})
             state.update(updates)
+            state["job_id"] = job_id
             state["updated_at"] = _utc_now_iso()
             self._infinigen_jobs[job_id] = state
         return state
@@ -11347,7 +12229,7 @@ class RenderDaemon:
             params = {"archetype": archetype, "density": density, "stage": stage,
                       "seed": seed, "scene_id": scene_id, "do_import": do_import, "bake_pbr": bake_pbr}
             self._infinigen_set_job(
-                job_id, job_id=job_id, project_id=parts[0], status="queued", stage="queued",
+                job_id, project_id=parts[0], status="queued", stage="queued",
                 params=params, scene_id=scene_id, seed=seed, created_at=_utc_now_iso(), log=[],
             )
             threading.Thread(target=self._run_infinigen_generate_job, args=(job_id, params),
@@ -12288,12 +13170,19 @@ class RenderDaemon:
                 _ep_t0 = time.monotonic()
                 _ep_log_state = {"t": 0.0}
 
+                def _set_plan_progress(**kw: Any) -> None:
+                    with self._episode_plan_lock:
+                        self._episode_plan_progress[scene_id] = kw
+
                 def _ep_progress(planned: int, target: int, attempts: int) -> None:
                     now = time.monotonic()
+                    rate = planned / max(1e-6, now - _ep_t0)
+                    eta = (target - planned) / rate if rate > 0 else 0.0
+                    # Side channel for the UI poll (cheap; every call).
+                    _set_plan_progress(status="running", stage="plan", planned=planned, target=target,
+                                       attempts=attempts, eta_s=round(eta, 1), updated_at=_utc_now_iso())
                     if planned >= target or now - _ep_log_state["t"] >= 2.0:
                         _ep_log_state["t"] = now
-                        rate = planned / max(1e-6, now - _ep_t0)
-                        eta = (target - planned) / rate if rate > 0 else 0.0
                         pct = 100.0 * planned / max(1, target)
                         print(
                             f"[episodes] {scene_id} graph-plan {planned}/{target} ({pct:.0f}%) "
@@ -12301,7 +13190,17 @@ class RenderDaemon:
                             file=sys.stderr, flush=True,
                         )
 
+                # Multi-level instruction context inputs (rooms/objects/mirror-glass).
+                _authoring_payload = None
+                _map_path = scene_dir / "authoring_map.json"
+                if _map_path.exists():
+                    from navigation_dataset.authoring_map import authoring_map_to_payload, load_authoring_map
+                    _authoring_payload = authoring_map_to_payload(load_authoring_map(_map_path))
+                from navigation_dataset.optical_perturbation import load_perturbation as _load_perturbation
+                _perturbation = _load_perturbation(scene_dir)
                 print(f"[episodes] {scene_id} graph-plan start: target={_ep_target}", file=sys.stderr, flush=True)
+                _set_plan_progress(status="running", stage="plan", planned=0, target=_ep_target,
+                                   attempts=0, eta_s=None, updated_at=_utc_now_iso())
                 episodes = plan_graph_episodes(
                     graph=graph,
                     num_pairs=_ep_target,
@@ -12313,6 +13212,9 @@ class RenderDaemon:
                     observations_root=scene_dir / "observations",
                     excluded_edge_ids=excluded_edges,
                     on_progress=_ep_progress,
+                    authoring_map=_authoring_payload,
+                    perturbation=_perturbation,
+                    use_instruction_llm=bool(payload.get("instruction_llm", False)),
                 )
                 print(f"[episodes] {scene_id} graph-plan done: {len(episodes)} planned in "
                       f"{time.monotonic() - _ep_t0:.1f}s, writing files...", file=sys.stderr, flush=True)
@@ -12328,11 +13230,18 @@ class RenderDaemon:
                         print(f"[episodes] {scene_id} index {done}/{total} episodes scanned",
                               file=sys.stderr, flush=True)
 
+                _set_plan_progress(status="indexing", stage="index", planned=len(written),
+                                   target=_ep_target, updated_at=_utc_now_iso())
                 write_dataset_index(project_dir, on_progress=_idx_progress)
                 write_split_files(project_dir)
                 print(f"[episodes] {scene_id} DONE: {len(written)} new episodes, total "
                       f"{time.monotonic() - _ep_t0:.1f}s", file=sys.stderr, flush=True)
+                _set_plan_progress(status="done", stage="done", planned=len(written),
+                                   target=_ep_target, updated_at=_utc_now_iso())
             except Exception as exc:
+                with self._episode_plan_lock:
+                    self._episode_plan_progress[scene_id] = {"status": "failed", "error": str(exc),
+                                                             "updated_at": _utc_now_iso()}
                 self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                 return True
             self._send_json(handler, HTTPStatus.OK, {
@@ -12530,6 +13439,15 @@ class RenderDaemon:
             include_polarization_raw = bool(payload.get("include_polarization_raw", True))
             include_episode_birdseye = bool(payload.get("include_episode_birdseye", False))
             eval_perturbation = bool(payload.get("eval_perturbation", False))
+            try:
+                camera_ids = _normalize_export_camera_ids(payload.get("camera_ids"))
+            except ValueError as exc:
+                self._send_json(
+                    handler,
+                    HTTPStatus.BAD_REQUEST,
+                    {"error": str(exc)},
+                )
+                return True
             job_id = f"export-{scene_id}-{_utc_now().strftime('%Y%m%dT%H%M%S%f')}"
             with self._export_jobs_lock:
                 self._export_jobs[job_id] = {
@@ -12538,6 +13456,7 @@ class RenderDaemon:
                     "scene_id": scene_id,
                     "only_completed": only_completed,
                     "include_episode_thumbnails": include_episode_thumbnails,
+                    "selected_camera_ids": camera_ids,
                     "status": "queued",
                     "stage": "scope",
                     "stage_label": self._EXPORT_STAGE_LABELS["scope"],
@@ -12554,7 +13473,7 @@ class RenderDaemon:
                 }
             threading.Thread(
                 target=self._run_export_job,
-                args=(job_id, parts[0], project_dir, scene_id, only_completed, episode_ids, include_episode_thumbnails, panorama_observations, png_only, include_birdseye, include_polarization_raw, include_episode_birdseye, eval_perturbation),
+                args=(job_id, parts[0], project_dir, scene_id, only_completed, episode_ids, include_episode_thumbnails, panorama_observations, png_only, include_birdseye, include_polarization_raw, include_episode_birdseye, eval_perturbation, camera_ids),
                 name=f"export-job-{job_id}",
                 daemon=True,
             ).start()
@@ -13250,6 +14169,16 @@ class RenderDaemon:
         camera_specs_payload = payload.get("camera_specs")
         if not isinstance(camera_specs_payload, list):
             camera_specs_payload = None
+        sensor_specs_payload = payload.get("sensor_specs")
+        if not isinstance(sensor_specs_payload, list):
+            sensor_specs_payload = None
+        # Rig-mounted active lights (RGB/NIR flash + linear polarizer). The webui
+        # sweep request carries the loaded rig's active_lights; normalize defensively.
+        try:
+            active_lights_payload = self._normalize_camera_rig_active_lights(
+                payload.get("active_lights"), base_frame=str(payload.get("base_frame") or "base_link"))
+        except Exception:
+            active_lights_payload = []
         sensor_scope = str(payload.get("sensor_scope") or "active").strip().lower()
         if sensor_scope not in {"active", "all_rig", "selected"}:
             sensor_scope = "active"
@@ -13259,6 +14188,10 @@ class RenderDaemon:
         node_heights = dict(node_heights_raw) if isinstance(node_heights_raw, Mapping) else None
         render_settings_raw = payload.get("render_settings")
         render_settings = dict(render_settings_raw) if isinstance(render_settings_raw, dict) else {}
+        # Mesh LOD render option: selects the decimated scene xml, so it is NOT a
+        # RenderConfig field — pop it here before render_settings reaches the strict
+        # render_config_from_payload field check (mirrors the `variant` pattern).
+        use_lod_scene = bool(render_settings.pop("use_lod_scene", False))
         skip_existing_observations = bool(
             payload.get("skip_existing_observations")
             or payload.get("only_missing")
@@ -13319,9 +14252,31 @@ class RenderDaemon:
                 "hint": "scene_variant.json has no valid base_scene_xml_ref or overlay_scene_xml_ref.",
             })
             return
+        # Mesh LOD render option: swap to the decimated render_scene_lod.xml (semantic-
+        # topology LOD, tools/build_lod_scene.py) when present. It is a distinct file →
+        # distinct mitsuba_scene_ref → distinct resident-scene cache key, so full and LOD
+        # renders never collide. Falls back to the full scene (with a warning) if absent.
+        if use_lod_scene:
+            _lod_abs = project_dir / "scenes" / scene_id / "render_scene_lod.xml"
+            if _lod_abs.exists():
+                try:
+                    resolved_scene_ref = str(_lod_abs.relative_to(self.repo_root))
+                except ValueError:
+                    resolved_scene_ref = str(_lod_abs)
+                print(f"[graph_sweep] use_lod_scene: rendering decimated {resolved_scene_ref}", flush=True)
+            else:
+                print(f"[graph_sweep] use_lod_scene requested but render_scene_lod.xml "
+                      f"missing for {scene_id}; using full scene", flush=True)
+        # Compute an immutable scene version before any task is queued.  The XML
+        # digest changes whenever Sync Render Scene produces a new GLB/material
+        # realization, so rerenders cannot accidentally reuse an old view.
+        _scene_version_id, _scene_digest = scene_version_id(
+            self.repo_root, scene_ref=resolved_scene_ref, graph_revision=str(payload.get("graph_revision") or ""),
+        )
+        _render_version_id = new_render_version_id(_scene_digest)
         # Always rebuild canonical scene_state — never inherit stale job_id from caller.
-        # 'perturbed' renders carry a distinct job id so their bridge-job + consolidated
-        # outputs never overwrite the base render.
+        # 'perturbed' renders carry a distinct job id so their versioned outputs
+        # never overwrite the base render.
         _job_variant = "perturbed" if _variant_key == "perturbed" else "template"
         scene_state_payload = {
             "job_id": f"opticalnav-{scene_id}-{_job_variant}",
@@ -13347,8 +14302,10 @@ class RenderDaemon:
                 sweep_requests = build_custom_position_render_requests(
                     custom_positions,
                     scene_state_payload=dict(scene_state_payload),
-                    camera_spec_payload=dict(camera_spec_payload or {}),
+                    camera_spec_payload=dict(camera_spec_payload or {}) if camera_spec_payload else None,
                     camera_specs_payload=camera_specs_payload,
+                    sensor_specs_payload=sensor_specs_payload,
+                    active_lights=active_lights_payload,
                     sensor_scope=sensor_scope,
                     sensor_ids=sensor_ids,
                     modalities=modalities,
@@ -13450,8 +14407,10 @@ class RenderDaemon:
                     dataset_root=project_dir,
                     graph_path=graph_path,
                     scene_state_payload=dict(scene_state_payload),
-                    camera_spec_payload=dict(camera_spec_payload or {}),
+                    camera_spec_payload=dict(camera_spec_payload or {}) if camera_spec_payload else None,
                     camera_specs_payload=camera_specs_payload,
+                    sensor_specs_payload=sensor_specs_payload,
+                    active_lights=active_lights_payload,
                     sensor_scope=sensor_scope,
                     sensor_ids=sensor_ids,
                     modalities=modalities,
@@ -13503,8 +14462,9 @@ class RenderDaemon:
                 scene_id=scene_id,
                 graph_path=graph_path,
                 scene_state_payload=dict(scene_state_payload),
-                camera_spec_payload=dict(camera_spec_payload or {}),
+                camera_spec_payload=dict(camera_spec_payload or {}) if camera_spec_payload else None,
                 camera_specs_payload=camera_specs_payload,
+                sensor_specs_payload=sensor_specs_payload,
                 sensor_scope=sensor_scope,
                 sensor_ids=sensor_ids,
                 modalities=modalities,
@@ -13515,6 +14475,7 @@ class RenderDaemon:
                 variant=str(payload.get("variant") or self.variant),
                 sweep_execution_policy=sweep_execution_policy,
                 skip_existing_observations=skip_existing_observations,
+                active_lights=active_lights_payload,
             ),
             daemon=True,
             name=f"sweep-{batch_id}",
@@ -13547,12 +14508,27 @@ class RenderDaemon:
                 else:
                     self._condition.wait(timeout=1.0)
 
-    def _recycle_render_workers_if_available(self, *, reason: str) -> dict[str, Any]:
+    def _recycle_render_workers_if_available(
+        self,
+        *,
+        reason: str,
+        recover_degraded: bool = False,
+    ) -> dict[str, Any]:
         with self._render_worker_manager_lock:
             manager = self._render_worker_manager
         if manager is None:
-            return {"recycled": 0, "skipped_busy": 0, "reason": reason, "manager": "not_started"}
-        return manager.recycle_idle_workers(reason=reason)
+            return {
+                "recycled": 0,
+                "started": 0,
+                "skipped_busy": 0,
+                "degraded_reset": False,
+                "reason": reason,
+                "manager": "not_started",
+            }
+        return manager.recycle_idle_workers(
+            reason=reason,
+            recover_degraded=recover_degraded,
+        )
 
     def _run_graph_sweep_submission(
         self,
@@ -13563,8 +14539,9 @@ class RenderDaemon:
         scene_id: str,
         graph_path: "Path",
         scene_state_payload: dict,
-        camera_spec_payload: dict,
+        camera_spec_payload: dict | None,
         camera_specs_payload: "list[dict] | None",
+        sensor_specs_payload: "list[dict] | None",
         sensor_scope: str,
         sensor_ids: "list[str] | None",
         modalities: list,
@@ -13575,6 +14552,7 @@ class RenderDaemon:
         variant: str,
         sweep_execution_policy: str = "auto",
         skip_existing_observations: bool = False,
+        active_lights: "list[dict] | None" = None,
     ) -> None:
         """Background thread: read graph, build RenderRequests, submit all jobs."""
         from navigation_dataset.sensor_sweep import build_sweep_render_requests, split_sweep_requests_by_modality_phase
@@ -13590,6 +14568,7 @@ class RenderDaemon:
                 scene_state_payload=scene_state_payload,
                 camera_spec_payload=camera_spec_payload,
                 camera_specs_payload=camera_specs_payload,
+                sensor_specs_payload=sensor_specs_payload,
                 sensor_scope=sensor_scope,
                 sensor_ids=sensor_ids,
                 modalities=modalities,
@@ -13598,11 +14577,30 @@ class RenderDaemon:
                 camera_height_m=camera_height_m,
                 render_settings=render_settings,
                 node_heights=node_heights,
+                active_lights=active_lights,
             )
             phases = split_sweep_requests_by_modality_phase(
                 sweep_requests,
                 sweep_execution_policy=sweep_execution_policy,
             )
+            # A separately submitted perturbed sweep is a scene-variant
+            # boundary too. If the previous base sweep tripped the worker
+            # circuit breaker, recover only after its jobs are terminal and
+            # before queueing this new sweep.
+            sweep_start_recovery = self._recycle_render_workers_if_available(
+                reason=f"graph_sweep_start:{variant}",
+                recover_degraded=True,
+            )
+            if sweep_start_recovery.get("degraded"):
+                raise RuntimeError(
+                    "worker manager remains degraded at graph-sweep boundary; "
+                    "previous jobs may still be active or worker recovery failed"
+                )
+            if sweep_start_recovery.get("skipped_busy"):
+                raise RuntimeError(
+                    "worker recycle timed out at graph-sweep boundary; "
+                    "wait for the previous sweep to become terminal before submitting a new variant"
+                )
             resolved_execution_policy = (
                 "modality_phases"
                 if len(phases) > 1 or (phases and phases[0].phase != "per_view")
@@ -13615,6 +14613,14 @@ class RenderDaemon:
             submitted_phase_job_ids: list[str] = []
             phase_order = [phase.phase for phase in phases]
             phase_recycle_events: list[dict[str, Any]] = []
+            if sweep_start_recovery.get("degraded_reset") or sweep_start_recovery.get("started"):
+                phase_recycle_events.append({
+                    "after_phase": None,
+                    "before_phase": phase_order[0] if phase_order else None,
+                    "job_status_counts": {},
+                    "worker_recycle": sweep_start_recovery,
+                    "at": _utc_now_iso(),
+                })
 
             def _write_batch(status: str, *, active_phase: str | None = None) -> None:
                 n = len(jobs)
@@ -13650,7 +14656,10 @@ class RenderDaemon:
                 if resolved_execution_policy == "modality_phases" and phase_pos > 0:
                     _write_batch("waiting_phase_boundary", active_phase=phase.phase)
                     phase_wait_counts = self._wait_for_render_jobs_terminal(submitted_phase_job_ids)
-                    recycle_result = self._recycle_render_workers_if_available(reason="modality_phase_boundary")
+                    recycle_result = self._recycle_render_workers_if_available(
+                        reason="modality_phase_boundary",
+                        recover_degraded=True,
+                    )
                     phase_recycle_events.append({
                         "after_phase": phases[phase_pos - 1].phase,
                         "before_phase": phase.phase,
@@ -13658,6 +14667,16 @@ class RenderDaemon:
                         "worker_recycle": recycle_result,
                         "at": _utc_now_iso(),
                     })
+                    if recycle_result.get("degraded"):
+                        raise RuntimeError(
+                            "worker manager remains degraded at modality phase boundary; "
+                            "perturbed/next-phase rendering was not submitted"
+                        )
+                    if recycle_result.get("skipped_busy"):
+                        raise RuntimeError(
+                            "worker recycle timed out at modality phase boundary; "
+                            "next-phase rendering was not submitted"
+                        )
                     _write_batch("recycled_phase_boundary", active_phase=phase.phase)
 
                 phase_requests = list(phase.requests)
@@ -15017,13 +16036,18 @@ class RenderDaemon:
         sync_mode = str(capture_request.extras.get("sync_mode") or "full_resync")
         sync_policy = str(capture_request.extras.get("sync_policy") or "auto")
         force_resync = bool(capture_request.extras.get("force_resync", False))
+        sensor_spec: IsaacSensorSpec | None = None
         if capture_request.sensor_id:
             sensor = session.sensors.get(capture_request.sensor_id)
             if sensor is None:
                 raise ValueError(f"Unknown sensor_id for active Isaac session: {capture_request.sensor_id}")
-            camera_spec = self._camera_spec_from_isaac_sensor(sensor)
             requested_modalities = list(capture_request.modalities or sensor.modalities or ["rgb"])
             sensor_resolution = list(sensor.resolution) if sensor.resolution is not None else None
+            if sensor.sensor_type in {"ouster_lidar", "depth_sensor"}:
+                sensor_spec = sensor
+                camera_spec = None
+            else:
+                camera_spec = self._camera_spec_from_isaac_sensor(sensor)
         elif capture_request.camera is not None:
             camera_spec = capture_request.camera
             requested_modalities = list(capture_request.modalities or ["rgb"])
@@ -15057,7 +16081,7 @@ class RenderDaemon:
             render_settings.setdefault("width", int(sensor_resolution[0]))
             if len(sensor_resolution) > 1:
                 render_settings.setdefault("height", int(sensor_resolution[1]))
-        sensor_extras = dict(camera_spec.extras or {})
+        sensor_extras = dict((sensor_spec or camera_spec).extras or {})
         if "nir_intensity" in requested_modalities:
             if sensor_extras.get("wavelength_min_nm") is not None:
                 render_settings.setdefault("nir_wavelength_min_nm", float(sensor_extras["wavelength_min_nm"]))
@@ -15065,7 +16089,7 @@ class RenderDaemon:
                 render_settings.setdefault("nir_wavelength_max_nm", float(sensor_extras["wavelength_max_nm"]))
             if sensor_extras.get("active_emitter_radiance") is not None:
                 render_settings.setdefault("nir_active_emitter_radiance", float(sensor_extras["active_emitter_radiance"]))
-        if "lidar_point_cloud" in requested_modalities:
+        if any(item in requested_modalities for item in ("lidar_point_cloud", "lidar_range", "lidar_signal", "lidar_reflectivity", "lidar_near_ir", "lidar_valid", "lidar_xyz")):
             for extra_key, setting_key in (
                 ("horizontal_fov_deg", "lidar_horizontal_fov_deg"),
                 ("vertical_fov_min_deg", "lidar_vertical_fov_min_deg"),
@@ -15103,7 +16127,8 @@ class RenderDaemon:
             frame_id=frame_id,
             timestamp=timestamp,
             scene_state=scene_state,
-            camera_specs=[camera_spec],
+            camera_specs=[camera_spec] if camera_spec is not None else [],
+            sensor_specs=[sensor_spec] if sensor_spec is not None else [],
             modalities=requested_modalities,
             robot_state=RobotState(),
             render_settings=render_settings,
@@ -15438,6 +16463,14 @@ class RenderDaemon:
             "s2": ("s2_bwr_colorbar.png", "s2.exr"),
             "s1_over_s0": ("s1_over_s0_bwr_colorbar.png",),
             "s2_over_s0": ("s2_over_s0_bwr_colorbar.png",),
+            "lidar_point_cloud": ("lidar_point_cloud.npz", "lidar_point_cloud_manifest.json"),
+            "lidar_range": ("lidar_point_cloud.npz",),
+            "lidar_signal": ("lidar_point_cloud.npz",),
+            "lidar_reflectivity": ("lidar_point_cloud.npz",),
+            "lidar_near_ir": ("lidar_point_cloud.npz",),
+            "lidar_valid": ("lidar_point_cloud.npz",),
+            "lidar_xyz": ("lidar_point_cloud.npz",),
+            "depth_sensor": ("depth_sensor_raw.npz", "depth_sensor_jet_colorbar.png"),
         }
         key = str(modality or "").strip()
         return mapping.get(key, (f"{key}.png", f"{key}.exr"))
@@ -15461,12 +16494,22 @@ class RenderDaemon:
                 "cameras" / camera_id
             )
             if not src_dir.exists():
-                cameras_root = self.repo_root / "out" / "bridge_jobs" / job_id / "observations" / frame_id / "cameras"
-                first_camera_dir = next((item for item in sorted(cameras_root.iterdir()) if item.is_dir()), None) if cameras_root.exists() else None
-                if first_camera_dir is None:
-                    return False
-                src_dir = first_camera_dir
-                camera_id = first_camera_dir.name
+                sensors_root = self.repo_root / "out" / "bridge_jobs" / job_id / "observations" / frame_id / "sensors"
+                sensor_dir = sensors_root / camera_id
+                if sensor_dir.exists():
+                    src_dir = sensor_dir
+                else:
+                    cameras_root = self.repo_root / "out" / "bridge_jobs" / job_id / "observations" / frame_id / "cameras"
+                    first_camera_dir = next((item for item in sorted(cameras_root.iterdir()) if item.is_dir()), None) if cameras_root.exists() else None
+                    if first_camera_dir is None:
+                        first_sensor_dir = next((item for item in sorted(sensors_root.iterdir()) if item.is_dir()), None) if sensors_root.exists() else None
+                        if first_sensor_dir is None:
+                            return False
+                        src_dir = first_sensor_dir
+                        camera_id = first_sensor_dir.name
+                    else:
+                        src_dir = first_camera_dir
+                        camera_id = first_camera_dir.name
             dst_dir = self.repo_root / "out" / "opticalnav" / project_id / "scenes" / scene_id / _obs_subdir(_variant_from_job_id(job_id)) / vp_id / heading_id
             sensor_dst_dir = dst_dir / "sensors" / camera_id
             copy_map = {
@@ -15504,6 +16547,22 @@ class RenderDaemon:
                     shutil.copy2(src, sensor_dst_dir / src.name)
             except OSError:
                 pass
+            # LiDAR has no preview PNG; preserve its NPZ and sensor manifest.
+            try:
+                for src in src_dir.iterdir():
+                    if not src.is_file() or src.suffix.lower() not in {".npz", ".json"}:
+                        continue
+                    if src.name == "manifest.json" or src.name == "_sensor_index.json":
+                        continue
+                    if not (src.suffix.lower() == ".npz" or src.name.endswith("_manifest.json")):
+                        continue
+                    if not copied:
+                        dst_dir.mkdir(parents=True, exist_ok=True)
+                        sensor_dst_dir.mkdir(parents=True, exist_ok=True)
+                        copied = True
+                    shutil.copy2(src, sensor_dst_dir / src.name)
+            except OSError:
+                pass
             if copied:
                 index_path = dst_dir / "_sensor_index.json"
                 try:
@@ -15524,21 +16583,24 @@ class RenderDaemon:
     def _opticalnav_sweep_output_exists(self, project_dir: Path, scene_id: str, sweep_request: Any, modalities: Sequence[str]) -> bool:
         request = sweep_request.request
         camera_specs = list(getattr(request, "camera_specs", []) or [])
+        sensor_specs = list(getattr(request, "sensor_specs", []) or [])
+        sensor_entries = [("camera", item) for item in camera_specs] + [("sensor", item) for item in sensor_specs]
         vp_id = str(sweep_request.node_id)
         heading_id = str(sweep_request.heading_id)
         dst_dir = project_dir / "scenes" / scene_id / _obs_subdir(_variant_from_job_id(request.job_id)) / vp_id / heading_id
         modalities_by_sensor = dict(getattr(sweep_request, "modalities_by_sensor", None) or getattr(request, "extras", {}).get("modalities_by_sensor") or {})
-        if not camera_specs:
-            camera_specs = [type("_Camera", (), {"camera_id": "opticalnav_front_cam"})()]
+        if not sensor_entries:
+            sensor_entries = [("camera", type("_Camera", (), {"camera_id": "opticalnav_front_cam"})())]
 
         def _has_consolidated() -> bool:
-            for camera_spec in camera_specs:
-                camera_id = str(getattr(camera_spec, "camera_id", "") or "opticalnav_front_cam")
-                sensor_dst_dir = dst_dir / "sensors" / camera_id
-                camera_modalities = [str(item) for item in modalities_by_sensor.get(camera_id, modalities)]
-                for modality in camera_modalities:
+            for kind, spec in sensor_entries:
+                sensor_id = str(getattr(spec, "camera_id", "") if kind == "camera" else getattr(spec, "sensor_id", "") or "")
+                sensor_id = sensor_id or "opticalnav_front_cam"
+                sensor_dst_dir = dst_dir / "sensors" / sensor_id
+                sensor_modalities = [str(item) for item in modalities_by_sensor.get(sensor_id, modalities)]
+                for modality in sensor_modalities:
                     names = self._opticalnav_modality_output_names(str(modality))
-                    if len(camera_specs) == 1:
+                    if len(sensor_entries) == 1:
                         exists = any((sensor_dst_dir / name).exists() or (dst_dir / name).exists() for name in names)
                     else:
                         exists = any((sensor_dst_dir / name).exists() for name in names)
@@ -15551,7 +16613,8 @@ class RenderDaemon:
 
         manifest_path = self.repo_root / "out" / "bridge_jobs" / request.job_id / "observations" / request.frame_id / "manifest.json"
         if manifest_path.exists():
-            for camera_spec in camera_specs:
+            for kind, spec in sensor_entries:
+                sensor_id = str(getattr(spec, "camera_id", "") if kind == "camera" else getattr(spec, "sensor_id", "") or "")
                 self._opticalnav_copy_observation_files(
                     project_id=project_dir.name,
                     scene_id=scene_id,
@@ -15559,7 +16622,7 @@ class RenderDaemon:
                     heading_id=heading_id,
                     job_id=request.job_id,
                     frame_id=request.frame_id,
-                    camera_id=str(getattr(camera_spec, "camera_id", "") or "opticalnav_front_cam"),
+                    camera_id=sensor_id or "opticalnav_front_cam",
                 )
             return _has_consolidated()
         return False
@@ -15577,14 +16640,19 @@ class RenderDaemon:
                 return
             frame_id = job.render_request.frame_id
             camera_specs = list(getattr(job.render_request, "camera_specs", []) or [])
-            camera_id = str(getattr(camera_specs[0], "camera_id", "") or "opticalnav_front_cam") if camera_specs else "opticalnav_front_cam"
+            sensor_specs = list(getattr(job.render_request, "sensor_specs", []) or [])
+            entries = [("camera", item) for item in camera_specs] + [("sensor", item) for item in sensor_specs]
+            if not entries:
+                entries = [("camera", type("_Camera", (), {"camera_id": "opticalnav_front_cam"})())]
             copied_any = False
-            for camera_spec in (camera_specs or [type("_Camera", (), {"camera_id": camera_id})()]):
+            for kind, spec in entries:
+                sensor_id = str(getattr(spec, "camera_id", "") if kind == "camera" else getattr(spec, "sensor_id", "") or "")
                 copied_any = self._opticalnav_copy_observation_files(
                     project_id=str(proj_id), scene_id=str(sc_id), vp_id=str(vp_id), heading_id=str(h_id),
                     job_id=job.render_request.job_id, frame_id=frame_id,
-                    camera_id=str(getattr(camera_spec, "camera_id", "") or camera_id),
+                    camera_id=sensor_id or "opticalnav_front_cam",
                 ) or copied_any
+            camera_id = str(getattr(camera_specs[0], "camera_id", "") or "opticalnav_front_cam") if camera_specs else (str(getattr(sensor_specs[0], "sensor_id", "") or "opticalnav_front_cam") if sensor_specs else "opticalnav_front_cam")
             if copied_any:
                 return
             src_dir = (
@@ -15593,12 +16661,22 @@ class RenderDaemon:
                 "cameras" / camera_id
             )
             if not src_dir.exists():
-                cameras_root = self.repo_root / "out" / "bridge_jobs" / job.render_request.job_id / "observations" / frame_id / "cameras"
-                first_camera_dir = next((item for item in sorted(cameras_root.iterdir()) if item.is_dir()), None) if cameras_root.exists() else None
-                if first_camera_dir is None:
-                    return
-                src_dir = first_camera_dir
-                camera_id = first_camera_dir.name
+                sensors_root = self.repo_root / "out" / "bridge_jobs" / job.render_request.job_id / "observations" / frame_id / "sensors"
+                sensor_dir = sensors_root / camera_id
+                if sensor_dir.exists():
+                    src_dir = sensor_dir
+                else:
+                    cameras_root = self.repo_root / "out" / "bridge_jobs" / job.render_request.job_id / "observations" / frame_id / "cameras"
+                    first_camera_dir = next((item for item in sorted(cameras_root.iterdir()) if item.is_dir()), None) if cameras_root.exists() else None
+                    if first_camera_dir is None:
+                        first_sensor_dir = next((item for item in sorted(sensors_root.iterdir()) if item.is_dir()), None) if sensors_root.exists() else None
+                        if first_sensor_dir is None:
+                            return
+                        src_dir = first_sensor_dir
+                        camera_id = first_sensor_dir.name
+                    else:
+                        src_dir = first_camera_dir
+                        camera_id = first_camera_dir.name
             dst_dir = (
                 self.repo_root / "out" / "opticalnav" / proj_id /
                 "scenes" / sc_id / _obs_subdir(_variant_from_job_id(job.render_request.job_id)) / vp_id / h_id
@@ -15641,6 +16719,21 @@ class RenderDaemon:
             try:
                 for src in src_dir.iterdir():
                     if not src.is_file() or src.suffix.lower() != ".exr":
+                        continue
+                    if not copied:
+                        dst_dir.mkdir(parents=True, exist_ok=True)
+                        sensor_dst_dir.mkdir(parents=True, exist_ok=True)
+                        copied = True
+                    shutil.copy2(src, sensor_dst_dir / src.name)
+            except OSError:
+                pass
+            try:
+                for src in src_dir.iterdir():
+                    if not src.is_file() or src.suffix.lower() not in {".npz", ".json"}:
+                        continue
+                    if src.name == "manifest.json" or src.name == "_sensor_index.json":
+                        continue
+                    if not (src.suffix.lower() == ".npz" or src.name.endswith("_manifest.json")):
                         continue
                     if not copied:
                         dst_dir.mkdir(parents=True, exist_ok=True)
@@ -16554,7 +17647,11 @@ class RenderDaemon:
         })
 
     def _handle_user_settings_post(self, handler: BaseHTTPRequestHandler, payload: dict) -> None:
-        from .user_settings import load_user_settings, save_user_settings, MIN_PREVIEW_SPP, MAX_PREVIEW_SPP
+        from .user_settings import (
+            load_user_settings, save_user_settings, apply_render_env_from_settings,
+            MIN_PREVIEW_SPP, MAX_PREVIEW_SPP, MIN_TEXTURE_RES, MAX_TEXTURE_RES,
+            VALID_BSDF_MODES, VALID_PBRDF_BANDS, VALID_MEASURED_SCOPES,
+        )
         if not isinstance(payload, dict):
             self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": "payload must be an object"})
             return
@@ -16592,7 +17689,57 @@ class RenderDaemon:
                     )
                     return
                 current["material_preview_spp"] = n
+        # Render / BSDF preferences. Empty string / null clears the override.
+        if "bsdf_mode" in payload:
+            mode = payload.get("bsdf_mode")
+            if mode in (None, ""):
+                current.pop("bsdf_mode", None)
+            elif isinstance(mode, str) and mode in VALID_BSDF_MODES:
+                current["bsdf_mode"] = mode
+            else:
+                self._send_json(handler, HTTPStatus.BAD_REQUEST,
+                                {"error": f"bsdf_mode must be one of {VALID_BSDF_MODES}"})
+                return
+        if "texture_max_resolution" in payload:
+            tv = payload.get("texture_max_resolution")
+            if tv in (None, "", 0, "0"):
+                current.pop("texture_max_resolution", None)
+            else:
+                try:
+                    n = int(tv)
+                except (TypeError, ValueError):
+                    self._send_json(handler, HTTPStatus.BAD_REQUEST,
+                                    {"error": "texture_max_resolution must be an integer"})
+                    return
+                if not (MIN_TEXTURE_RES <= n <= MAX_TEXTURE_RES):
+                    self._send_json(handler, HTTPStatus.BAD_REQUEST,
+                                    {"error": f"texture_max_resolution must be in [{MIN_TEXTURE_RES}, {MAX_TEXTURE_RES}]"})
+                    return
+                current["texture_max_resolution"] = n
+        if "pbrdf_band_mode" in payload:
+            bv = payload.get("pbrdf_band_mode")
+            if bv in (None, ""):
+                current.pop("pbrdf_band_mode", None)
+            elif isinstance(bv, str) and bv in VALID_PBRDF_BANDS:
+                current["pbrdf_band_mode"] = bv
+            else:
+                self._send_json(handler, HTTPStatus.BAD_REQUEST,
+                                {"error": f"pbrdf_band_mode must be one of {VALID_PBRDF_BANDS}"})
+                return
+        if "measured_scope" in payload:
+            sv = payload.get("measured_scope")
+            if sv in (None, ""):
+                current.pop("measured_scope", None)
+            elif isinstance(sv, str) and sv in VALID_MEASURED_SCOPES:
+                current["measured_scope"] = sv
+            else:
+                self._send_json(handler, HTTPStatus.BAD_REQUEST,
+                                {"error": f"measured_scope must be one of {VALID_MEASURED_SCOPES}"})
+                return
         save_user_settings(current)
+        # bsdf_mode / texture cap are env-backed: mirror them into this daemon's
+        # os.environ now so the next sync/render honours them without a restart.
+        apply_render_env_from_settings()
         self._send_json(handler, HTTPStatus.OK, {"settings": current})
 
     def _handle_material_preview_get(
@@ -17900,10 +19047,13 @@ class RenderDaemon:
 
     def _capture_records(self, bundle: ObservationBundleManifest) -> list[dict[str, Any]]:
         camera_map = {camera.camera_id: camera for camera in bundle.camera_specs}
+        sensor_map = {sensor.sensor_id: sensor for sensor in getattr(bundle, "sensor_specs", [])}
         per_camera: dict[str, dict[str, Any]] = {}
         for artifact in bundle.artifacts:
             camera_id = artifact.camera_id
-            camera_payload = self._capture_camera_payload_from_spec(camera_map.get(camera_id))
+            camera_spec = camera_map.get(camera_id)
+            sensor_spec = sensor_map.get(getattr(artifact, "sensor_id", None) or camera_id)
+            camera_payload = self._capture_camera_payload_from_spec(camera_spec)
             capture = per_camera.setdefault(
                 camera_id,
                 {
@@ -17912,9 +19062,13 @@ class RenderDaemon:
                     "scene_id": bundle.scene_id,
                     "timestamp": bundle.timestamp,
                     "camera_id": camera_id,
-                    "camera_name": camera_map.get(camera_id).name if camera_map.get(camera_id) else camera_id,
-                    "sensor_sync_group": camera_map.get(camera_id).sensor_sync_group if camera_map.get(camera_id) else None,
-                    "calibration_ref": camera_map.get(camera_id).calibration_ref if camera_map.get(camera_id) else None,
+                    "sensor_id": getattr(artifact, "sensor_id", None),
+                    "sensor_type": sensor_spec.sensor_type if sensor_spec else None,
+                    "profile": sensor_spec.profile if sensor_spec else None,
+                    "camera_name": camera_spec.name if camera_spec else (sensor_spec.name if sensor_spec else camera_id),
+                    "sensor_sync_group": camera_spec.sensor_sync_group if camera_spec else (sensor_spec.sensor_sync_group if sensor_spec else None),
+                    "calibration_ref": camera_spec.calibration_ref if camera_spec else (sensor_spec.calibration_ref if sensor_spec else None),
+                    "metadata_ref": sensor_spec.metadata_ref if sensor_spec else None,
                     "scene_ref": bundle.scene_state.mitsuba_scene_ref,
                     "manifest_path": f"{bundle.bundle_root}/manifest.json",
                     "manifest_href": self._artifact_href(f"{bundle.bundle_root}/manifest.json"),

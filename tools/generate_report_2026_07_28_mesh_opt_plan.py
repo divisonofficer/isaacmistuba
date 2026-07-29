@@ -1,0 +1,248 @@
+#!/usr/bin/env python3
+"""2026-07-28 experiment PLAN report: polarization-preserving mesh optimization
+for over-tessellated Infinigen props.
+
+This is a planning document — it records the diagnosis measured so far and the
+design of the single-object polarization LOD experiment to be run once the GPU
+frees. Results will be appended in a follow-up report.
+
+Writes dev_report/report_2026-07-28_mesh_opt_plan.html
+"""
+from __future__ import annotations
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parents[1]
+OUT = REPO / "dev_report" / "report_2026-07-28_mesh_opt_plan.html"
+
+# --- measured facts (provenance in captions) ---
+M = dict(
+    total_polys_M=27.1, units=242, biggest_tris=4083328, biggest_dim_cm=11,
+    tex_gb=1.3, tex_res="512×512", n_tex=424,
+    struct_pct=7, obj_disk_gb=11.5, scene_gpu_gb=26,
+    # smoothness (adjacent face-normal angle) + polar proxy meanDoLP
+    smooth=[  # name, tris, median_deg, p90_deg, meanDoLP, note
+        ("산호 trinket (diffuse, 11cm)", "4.0M", 4.4, 31.8, 0.62, "유기적 bumpy · diffuse라 편광 약함(AoLP-coh 0.13)"),
+        ("유리 화분 (glass, 28cm)", "1.2M", 0.5, 2.1, 0.65, "매끈한 곡면 과분할 · 편광 핵심"),
+        ("금속 화분 (metal, 60cm)", "2.0M", 0.7, 2.5, 0.66, "매끈한 곡면 과분할 · 편광 핵심"),
+    ],
+    groups=[  # group, units, polys_M, pct, verdict
+        ("NatureShelfTrinkets", "~40", 15.0, 55, "최우선 강한 LOD/단순화"),
+        ("PlantContainer (glass·metal)", "8", 5.0, 18, "별도 보존·검증 그룹 (편광 신호원)"),
+        ("실제 책장·캐비닛", "12", 0.6, 2, "유지 (이미 정상 폴리곤)"),
+        ("기타 구조물(벽·바닥·문·프레임)", "~180", 2.0, 7, "유지"),
+    ],
+)
+
+CSS = """
+:root { --bg:#0f1216; --fg:#e6e9ef; --mut:#9aa4b2; --line:#232a33; --ok:#39d98a; --bad:#ff6b6b; --acc:#6aa9ff; --warn:#ffcc66; }
+* { box-sizing:border-box; }
+body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.65 -apple-system,"Segoe UI",Roboto,"Noto Sans KR",sans-serif; }
+.wrap { max-width:1080px; margin:0 auto; padding:40px 24px 80px; }
+h1 { font-size:26px; margin:0 0 6px; letter-spacing:-.01em; }
+h2 { font-size:20px; margin:42px 0 12px; padding-top:18px; border-top:1px solid var(--line); }
+h3 { font-size:16px; margin:24px 0 8px; color:var(--acc); }
+.sub { color:var(--mut); margin:0 0 24px; }
+p { margin:10px 0; } a { color:var(--acc); }
+code { background:#1a1f26; padding:1px 6px; border-radius:4px; font-size:13px; color:#d7dee8; }
+table { border-collapse:collapse; width:100%; margin:14px 0; font-size:14px; }
+th,td { border:1px solid var(--line); padding:7px 10px; text-align:left; vertical-align:top; }
+th { background:#161b22; font-weight:600; color:var(--mut); }
+td.num { text-align:right; font-variant-numeric:tabular-nums; }
+.kpi { display:flex; gap:14px; flex-wrap:wrap; margin:18px 0; }
+.kpi div { flex:1; min-width:170px; background:#141920; border:1px solid var(--line); border-radius:10px; padding:14px 16px; }
+.kpi .k { color:var(--mut); font-size:12px; text-transform:uppercase; letter-spacing:.05em; }
+.kpi .v { font-size:21px; font-weight:650; margin-top:4px; font-variant-numeric:tabular-nums; }
+.note { background:#141920; border-left:3px solid var(--acc); padding:12px 16px; margin:16px 0; border-radius:0 8px 8px 0; }
+.warn { border-left-color:var(--warn); }
+.bad { border-left-color:var(--bad); }
+.scroll { overflow-x:auto; }
+ul { margin:10px 0; padding-left:22px; } li { margin:5px 0; }
+pre { background:#0b0e12; border:1px solid var(--line); border-radius:8px; padding:12px 14px; overflow-x:auto; font-size:13px; }
+pre code { background:none; padding:0; }
+.tag { display:inline-block; padding:1px 8px; border-radius:999px; font-size:11px; font-weight:600; }
+.meas { background:rgba(57,217,138,.14); color:var(--ok); }
+.plan { background:rgba(106,169,255,.14); color:var(--acc); }
+.mut { color:var(--mut); font-size:12px; }
+"""
+
+
+def T(cls, txt): return f'<span class="tag {cls}">{txt}</span>'
+
+
+def main() -> int:
+    g_rows = "".join(
+        f'<tr><td>{g}</td><td class="num">{u}</td><td class="num">{p:.1f}M</td>'
+        f'<td class="num">{pct}%</td><td>{v}</td></tr>'
+        for g, u, p, pct, v in M["groups"])
+    s_rows = "".join(
+        f'<tr><td>{n}</td><td class="num">{t}</td><td class="num">{md:.1f}° / {p90:.1f}°</td>'
+        f'<td class="num">{dolp:.2f}</td><td>{note}</td></tr>'
+        for n, t, md, p90, dolp, note in M["smooth"])
+
+    html = f"""<!doctype html>
+<html lang="ko"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>편광 보존 메시 최적화 — 실험 계획 · 2026-07-28</title>
+<style>{CSS}</style></head><body><div class="wrap">
+
+<h1>편광을 보존하면서 과분할 Infinigen 소품을 최적화하기 — 실험 계획</h1>
+<p class="sub">2026-07-28 · 계획 문서(결과는 후속 리포트) · discrete-band <code>cuda_ad_rgb_polarized</code> ·
+관련: <a href="report_2026-07-27.html">07-27 메모리/OOM</a> ·
+<a href="report_2026-07-06_optical_class_polarization.html">07-06 단일오브젝트 편광</a></p>
+
+<div class="note">
+<strong>한 줄 요약.</strong> 실내 편광 nav 씬이 GPU {M['scene_gpu_gb']}&nbsp;GB를 먹는 원인은 텍스처가 아니라
+<strong>과분할된 지오메트리</strong>({M['total_polys_M']}M 삼각형, 11&nbsp;cm 소품 하나가 {M['biggest_tris']:,}개)다.
+이 소품들을 <strong>편광 렌더의 자연스러움을 유지한 채</strong> 줄일 수 있는지를, 단일 오브젝트 · 다중 LOD ·
+편광 조명 스윕으로 실측하는 것이 이 실험의 목표다. 아래는 지금까지의 <span class="tag meas">측정</span>과
+<span class="tag plan">계획</span>이다.
+</div>
+
+<h2>1. 배경 — 왜 이 실험인가 {T('meas','측정')}</h2>
+<div class="kpi">
+  <div><div class="k">씬 GPU</div><div class="v">≈{M['scene_gpu_gb']} GB</div></div>
+  <div><div class="k">총 지오메트리</div><div class="v">{M['total_polys_M']}M tris</div></div>
+  <div><div class="k">최대 단일 메시</div><div class="v">{M['biggest_tris']/1e6:.1f}M ({M['biggest_dim_cm']}cm)</div></div>
+  <div><div class="k">텍스처 전체</div><div class="v">{M['tex_gb']} GB</div></div>
+</div>
+<p>
+<a href="report_2026-07-27.html">07-27 리포트</a>에서 이 씬이 GPU를 거의 꽉 채워(≈{M['scene_gpu_gb']}&nbsp;GB / 32&nbsp;GB)
+spp를 올릴 여유가 없음을 확인했다. 분해해 보니 텍스처는 {M['n_tex']}개 전부 {M['tex_res']}로 <strong>{M['tex_gb']}&nbsp;GB뿐</strong>
+(해상도 캡핑 무의미)이고, OBJ 지오메트리가 디스크 {M['obj_disk_gb']}&nbsp;GB·<strong>{M['total_polys_M']}M 삼각형</strong>으로 지배적이다.
+구조물(벽·바닥·문·프레임)은 전부 합쳐 {M['struct_pct']}%뿐이라, 줄일 여지는 <strong>소품 지오메트리</strong>에 있다.
+</p>
+
+<h2>2. 오브젝트 분류와 최적화 기준 {T('meas','측정')}</h2>
+<div class="scroll"><table>
+<tr><th>그룹</th><th>유닛</th><th>폴리곤</th><th>씬 비중</th><th>처분</th></tr>
+{g_rows}
+</table></div>
+<p>
+기존의 "노멀맵 없음" 필터는 최적화 기준으로 <strong>너무 넓다</strong> — 실제 가구(책장·캐비닛)까지 걸린다.
+앞으로의 후보 기준은:
+</p>
+<pre><code>최적화 후보 =
+    작은 소품
+  ∧ 비구조물
+  ∧ 매우 높은 삼각형 밀도
+  ∧ 유리·거울·금속 등 광학 핵심 재질이 아님
+  ∧ 주행 카메라에서 투영 면적이 작음</code></pre>
+<div class="note warn">
+<p><strong>정정.</strong> "episode 참조 0건"은 <em>언어적 목표·랜드마크·장애물이 아님</em>을 뜻할 뿐,
+"삭제해도 영향 없음"의 충분조건은 아니다. 소품은 배경·그림자·간접광·시각 복잡도에 기여할 수 있다.
+따라서 <strong>완전 제외는 영향 상한을 보는 실험 조건</strong>이고, 운영 기본값은 <strong>강한 LOD/단순화</strong>다.</p>
+</div>
+
+<h2>3. 왜 Infinigen 소품이 이렇게 무거운가 {T('plan','해석')}</h2>
+<p>
+버그가 아니라 <strong>설계 철학의 충돌</strong>이다. Infinigen은 깊이·표면 법선·광류의 3D 정답 정확성을 위해
+미세 형상을 노멀맵으로 흉내 내지 않고 <strong>실제 지오메트리로</strong> 만든다. 그래서 10&nbsp;cm 소품에도
+돌기·굴곡이 실제 삼각형으로 들어간다. 이는 근접 3D 인식·임의 시점 실루엣엔 좋지만,
+<strong>실내 주행 카메라에서 수천 spp 분광·편광을 반복 생성</strong>하는 지금 목적엔 정보 대비 BVH·메모리·교차비용이 과도하다.
+</p>
+<div class="note"><p><strong>결론:</strong> "원본이 틀렸다"가 아니라, 원본은 정확한 3D 정답용이고
+<strong>우리는 주행-거리 광학 렌더용 표현을 따로 만들어야 한다.</strong></p></div>
+
+<h2>4. 순수 지오메트리는 편광에 정확한가 — 3층으로 {T('meas','측정 포함')}</h2>
+<p>답은 <strong>조건부 그렇다</strong>. 정확성을 세 층으로 나눈다.</p>
+<ul>
+<li><strong>① 기하학적 정확성</strong> — 고밀도 원본은 표면 위치·실루엣·가림·국소 법선에 가장 충실. 유리·금속은 국소 법선이
+입사각·반사면을 정해 편광에 직접 관여하므로, 형상·BSDF가 맞으면 순수 지오메트리도 Stokes/Mueller 편광 계산에 그대로 쓸 수 있다.</li>
+<li><strong>② 재질의 분광·편광 정확성 (진짜 병목)</strong> — 지오메트리는 n(λ)·k(λ)·거칠기·확산/정반사 비·투과·편광 소멸을
+알려주지 않는다. trinket을 diffuse <code>pplastic</code> + placeholder NIR ρ로 처리하면 <strong>형상은 4M 삼각형인데 광학 사실성은 근사</strong>다.</li>
+<li><strong>③ 픽셀 수준 수렴</strong> — 주행 거리에서 수많은 미세 면이 한 픽셀에 들어가면 S1·S2 부호가 법선에 급변,
+DoLP·AoLP가 spp에 흔들리고 시점 이동 시 반짝인다(specular aliasing). <strong>원본은 이론적 기준일 뿐, 유한 spp에서 가장 안정한 관측 표현은 아니다.</strong></li>
+</ul>
+
+<h3>측정 — 이 씬에서는 "위험 요인이 반상관"이라 유리하다 {T('meas','측정')}</h3>
+<div class="scroll"><table>
+<tr><th>대상</th><th>tris</th><th>인접면 노멀각 med / 90pct</th><th>meanDoLP proxy</th><th>해석</th></tr>
+{s_rows}
+</table></div>
+<p class="mut">인접면 노멀각 = 메시 매끄러움 지표(작을수록 매끈한 곡면의 과분할). meanDoLP = 면적가중 Fresnel DoLP proxy(n=1.52), 렌더 아님.</p>
+<div class="note">
+<p><strong>핵심.</strong> 편광 핵심(유리·금속 화분)은 인접면 각도 median <strong>&lt;1°</strong> = <strong>매끈한 곡면의 과분할</strong>
+→ 노멀 분포가 좁아 decimation/노멀맵이 노멀 필드를 거의 보존 → <strong>③ aliasing·AoLP 발산 위험이 낮다</strong>.
+반대로 aliasing 위험이 있는 산호 trinket은 <strong>diffuse라 편광 자체가 약하다</strong>(DoLP proxy는 높게 나오나 AoLP 코히런스 0.13로 방향 무질서).
+즉 "bumpy해서 위험"과 "편광적으로 중요"가 <strong>서로 다른 오브젝트</strong> — 좋은 소식이나 §6 노이즈 기준으로 실측 확인한다.</p>
+</div>
+
+<h2>5. 노멀맵 베이킹의 trade-off와 멀티모달 일관성 {T('plan','설계')}</h2>
+<p>저폴리+노멀맵은 국소 shading normal·범프 하이라이트는 보존하지만 <strong>실루엣·깊이·LiDAR 교차점·자기 그림자·유리 두께</strong>는 잃는다.
+게다가 노멀맵은 법선을 평균하므로 원본 법선 <em>분포</em>와 같은 반사 응답을 보장하지 않아, RGB가 비슷해도 AoLP가 달라질 수 있다.</p>
+<div class="note warn">
+<p><strong>데이터셋 일관성 관점의 권고.</strong> 이 파이프라인은 depth/normal/LiDAR AOV도 낸다.
+<strong>노멀맵 변형은 광학(bumpy) vs 기하(flat) GT를 desync</strong>시킨다. 멀티모달 nav 데이터셋에선 모든 modality가 같은 저폴리를 봐야
+일관되므로, trinket엔 <strong>단순 decimation을 기본</strong>으로, 노멀맵은 RGB/편광 이득이 desync를 정당화하는 경우(유리 화분 등)에만.</p>
+</div>
+<div class="note bad">
+<p><strong>선행 확인(07-06 연결).</strong> 유리 슬롯이 <code>roughdielectric</code>(frosted)로 바인딩되면 이 빌드에서 <strong>DoLP≡0 버그</strong>다.
+PlantContainer 최적화 전에 glass 슬롯이 smooth <code>dielectric</code>로 들어가는지부터 확인해야 "순수 지오메트리 편광 정확성"이 성립한다.</p>
+</div>
+
+<h2>6. 실험 설계 {T('plan','계획')}</h2>
+<h3>6.1 대표 자산 6 × 변형 4</h3>
+<div class="scroll"><table>
+<tr><th>대표 자산</th><th>목적</th></tr>
+<tr><td>4.08M NatureShelfTrinket</td><td>최악의 메모리·시간 사례</td></tr>
+<tr><td>≈0.53M trinket ×2 (동일 공장)</td><td>일반적 동일-공장 사례</td></tr>
+<tr><td>금속 PlantContainer</td><td>곡률·Fresnel·DoLP 보존 검사</td></tr>
+<tr><td>유리 PlantContainer</td><td>투과·굴절·AoLP 보존 검사</td></tr>
+<tr><td>SimpleBookcase / Cabinet</td><td>최적화하면 안 되는 <strong>음성 대조군</strong></td></tr>
+</table></div>
+<p>각 자산의 4 변형: <strong>A 원본 고밀도 · B decimate만 · C decimate+노멀-베이크 · D 완전 제거</strong>.
+trinket과 PlantContainer는 <strong>별도 실험으로 분리</strong>한다(성격이 다름).</p>
+
+<h3>6.2 편광 조명 (07-06 셋업 재사용)</h3>
+<ul>
+<li>능동 편광 조명 = <code>area</code> emitter + 앞에 <code>polarizer</code> BSDF 사각형(delta 광원은 편광 불가 — area 필수).</li>
+<li>재질 = 편광 트리오: glass→smooth <code>dielectric</code>, metal→<code>roughconductor</code>(Al η/k), diffuse→<code>pplastic</code>.
+<code>roughdielectric</code>·<code>plastic</code>은 이 빌드에서 DoLP=0이라 금지.</li>
+<li>모션: 입사각 orbit(grazing→Brewster) + polarizer 회전. 밴드: visible / NIR&nbsp;854(discrete-band).</li>
+<li>출력: Stokes → RGB(S0) · DoLP · AoLP · s1/s0 · s2/s0 · s3/s0 (6패널).</li>
+</ul>
+
+<h3>6.3 비교 지표 (RGB 중심 아님)</h3>
+<div class="scroll"><table>
+<tr><th>성능</th><th>기하</th><th>분광·편광</th></tr>
+<tr>
+<td>메시 크기 · 삼각형 수 · 씬 로드 · BVH 생성 · peak GPU · 고정 spp 렌더시간</td>
+<td>실루엣 IoU · 깊이 오차 · geometric normal 각오차 · 가시 면적 차</td>
+<td>밴드 S0 rel · s1/s0·s2/s0 오차 · DoLP abs · AoLP 원형오차 · S0·(S0×DoLP) 가중</td>
+</tr>
+</table></div>
+<div class="note">
+<p><strong>판정 기준 = Monte-Carlo 노이즈 바닥.</strong> 절대 임계값을 먼저 정하지 않고, <strong>원본을 같은 spp·다른 seed로 두 번 렌더한 차이</strong>를
+잡음 기준으로 삼는다. <code>최적화 오차 ≤ 원본 반복 렌더 변동</code>이면 주행 데이터 생성 관점에서 <strong>사실상 구분 불가</strong>로 판정한다.
+AoLP는 <code>S0 충분히 밝고 ∧ DoLP&gt;임계</code> 픽셀에서만 <code>S0×DoLP</code> 가중으로 평가한다.</p>
+</div>
+
+<h2>7. 시퀀스와 현재 상태</h2>
+<ol>
+<li>{T('meas','완료')} 메모리 진단 · 오브젝트 분류 · 매끄러움/편광 proxy 측정.</li>
+<li>{T('plan','대기')} 6 대표 자산 × 4 변형 메시 픽스(trimesh decimation + 노멀 베이크) — <em>GPU 불필요, 준비 중</em>.</li>
+<li>{T('plan','GPU 대기')} 50뷰 depth/mask로 대상들의 <strong>투영 면적·가시 시점 비율 확정</strong>(폐색 포함; bbox 수학은 Z-up/Y-up 프레임 이슈로 예비값만).</li>
+<li>{T('plan','GPU 대기')} 단일 오브젝트 A/B/C/D × 편광 조명 스윕 렌더 → §6.3 지표 · 노이즈 기준 판정.</li>
+<li>{T('plan','대기')} 결과 리포트(07-06 6패널 스타일 + LOD×변형 fidelity 곡선).</li>
+</ol>
+<p class="mut">현재 GPU는 50-뷰포인트 메모리-재사용 벤치마크가 점유 중. 종료 즉시 (3)(4)를 실행한다.</p>
+
+<h2>8. 주의점 / 한계</h2>
+<ul>
+<li>투영 면적 예비값은 <strong>Infinigen Z-up ↔ Mitsuba Y-up 프레임 변환</strong>이 필요 — 렌더 mask로 확정 예정.</li>
+<li>NIR 반사율은 placeholder(ρ854). 밴드 계약 provenance는 Stage&nbsp;1의 몫(재질 병목 §4-②와 직결).</li>
+<li>WSL device-level 메모리 측정(±수백 MiB) · CIFS 로드시간은 절대값이 부풀려짐 — 구조적 비교엔 무관.</li>
+<li>meanDoLP는 <strong>렌더 아닌 면적가중 Fresnel proxy</strong>. 실제 DoLP/AoLP는 §6 렌더로 측정.</li>
+</ul>
+
+<p class="mut">준비: <code>tools/benchmark_band_sweep.py</code>(메모리/뷰포인트) · <code>tools/single_object_polar_lod.py</code>(예정, 단일오브젝트 LOD 편광).</p>
+
+</div></body></html>
+"""
+    OUT.write_text(html, encoding="utf-8")
+    print(f"wrote {OUT}  ({len(html)/1024:.1f} KB)")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

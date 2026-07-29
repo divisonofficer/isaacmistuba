@@ -8,9 +8,11 @@ import secrets
 
 from .paths import JobLayout, to_repo_relative_posix
 from .types import (
+    ActiveLightSpec,
     AssistLightSpec,
     CameraSpec,
     DepthApproxSpec,
+    IsaacSensorSpec,
     JobManifest,
     JobPaths,
     ObservationBundleManifest,
@@ -144,6 +146,29 @@ def validate_camera_spec(camera_spec: CameraSpec) -> None:
         validate_repo_relative_path(camera_spec.calibration_ref)
 
 
+def validate_sensor_spec(sensor_spec: IsaacSensorSpec) -> None:
+    if not sensor_spec.sensor_id:
+        raise ValueError("sensor_spec.sensor_id must not be empty.")
+    if not sensor_spec.name:
+        raise ValueError("sensor_spec.name must not be empty.")
+    allowed_types = {"rgb_camera", "polar_camera", "depth_sensor", "ouster_lidar"}
+    if sensor_spec.sensor_type not in allowed_types:
+        raise ValueError(f"Unsupported sensor_spec.sensor_type: {sensor_spec.sensor_type}")
+    if not sensor_spec.modalities:
+        raise ValueError("sensor_spec.modalities must not be empty.")
+    if sensor_spec.camera_to_world is not None and len(sensor_spec.camera_to_world) != 16:
+        raise ValueError("sensor_spec.camera_to_world must contain 16 values when provided.")
+    if sensor_spec.resolution is not None:
+        if len(sensor_spec.resolution) != 2 or any(int(value) <= 0 for value in sensor_spec.resolution):
+            raise ValueError("sensor_spec.resolution must contain two positive values.")
+    if not sensor_spec.sensor_sync_group:
+        raise ValueError("sensor_spec.sensor_sync_group must not be empty.")
+    for field_name in ("calibration_ref", "metadata_ref"):
+        value = getattr(sensor_spec, field_name)
+        if value:
+            validate_repo_relative_path(value)
+
+
 def validate_scene_override_spec(scene_override: SceneOverrideSpec) -> None:
     if (
         not scene_override.target_shape_filenames
@@ -170,6 +195,26 @@ def validate_assist_light_spec(assist_light: AssistLightSpec) -> None:
         raise ValueError("assist_light.size_world values must be positive.")
     if not assist_light.spectrum_mode:
         raise ValueError("assist_light.spectrum_mode must not be empty.")
+
+
+def validate_active_light_spec(active_light: "ActiveLightSpec") -> None:
+    if not active_light.light_id:
+        raise ValueError("active_light.light_id must not be empty.")
+    if active_light.emitter_type not in ("spot", "point", "area"):
+        raise ValueError(f"Unsupported active_light.emitter_type: {active_light.emitter_type}")
+    if active_light.spectrum_kind not in ("rgb", "nir"):
+        raise ValueError(f"Unsupported active_light.spectrum_kind: {active_light.spectrum_kind}")
+    if active_light.emitter_type == "area" and active_light.area_size_m <= 0:
+        raise ValueError("active_light.area_size_m must be positive for area emitter.")
+    mount = active_light.mount or {}
+    xyz = mount.get("xyz_m", [])
+    rpy = mount.get("rpy_deg", [])
+    if len(xyz) != 3 or len(rpy) != 3:
+        raise ValueError("active_light.mount must have xyz_m[3] and rpy_deg[3].")
+    if active_light.radiance < 0:
+        raise ValueError("active_light.radiance must be non-negative.")
+    if active_light.spectrum_kind == "nir" and active_light.wavelength_nm <= 0:
+        raise ValueError("active_light.wavelength_nm must be positive for nir.")
 
 
 def validate_depth_approx_spec(depth_approx: DepthApproxSpec) -> None:
@@ -203,8 +248,8 @@ def validate_render_request(render_request: RenderRequest) -> None:
         raise ValueError("render_request.timestamp must not be empty.")
     if not render_request.modalities:
         raise ValueError("render_request.modalities must not be empty.")
-    if not render_request.camera_specs:
-        raise ValueError("render_request.camera_specs must not be empty.")
+    if not render_request.camera_specs and not render_request.sensor_specs:
+        raise ValueError("render_request must contain camera_specs or sensor_specs.")
     validate_scene_state(render_request.scene_state)
     validate_robot_state(render_request.robot_state)
     if render_request.job_id != render_request.scene_state.job_id:
@@ -219,16 +264,33 @@ def validate_render_request(render_request: RenderRequest) -> None:
         if camera_spec.camera_id in seen:
             raise ValueError(f"Duplicate camera_id in render_request.camera_specs: {camera_spec.camera_id}")
         seen.add(camera_spec.camera_id)
+    for sensor_spec in render_request.sensor_specs:
+        validate_sensor_spec(sensor_spec)
+        if sensor_spec.sensor_id in seen:
+            raise ValueError(f"Duplicate sensor_id in render_request: {sensor_spec.sensor_id}")
+        seen.add(sensor_spec.sensor_id)
     if render_request.scene_override is not None:
         validate_scene_override_spec(render_request.scene_override)
     if render_request.assist_light is not None:
         validate_assist_light_spec(render_request.assist_light)
+    active_light_ids: set[str] = set()
+    for active_light in render_request.active_lights:
+        validate_active_light_spec(active_light)
+        if active_light.light_id in active_light_ids:
+            raise ValueError(f"Duplicate active_light.light_id: {active_light.light_id}")
+        active_light_ids.add(active_light.light_id)
     if render_request.depth_approx is not None:
         validate_depth_approx_spec(render_request.depth_approx)
     if "sensor_depth_approx" in render_request.modalities and render_request.depth_approx is None:
         raise ValueError("sensor_depth_approx requires render_request.depth_approx.")
-    if any(item in render_request.modalities for item in ("active_nir_intensity", "nir_intensity")) and render_request.assist_light is None:
-        raise ValueError("active NIR modalities require render_request.assist_light.")
+    # Active NIR needs an illumination source: either the legacy camera-aligned
+    # assist_light or at least one rig-mounted active light that covers the nir pass.
+    _has_nir_active_light = any(
+        light.enabled and "nir" in (light.modalities or []) for light in render_request.active_lights
+    )
+    if any(item in render_request.modalities for item in ("active_nir_intensity", "nir_intensity")) \
+            and render_request.assist_light is None and not _has_nir_active_light:
+        raise ValueError("active NIR modalities require render_request.assist_light or an nir active_light.")
     try:
         json.dumps(render_request.render_settings)
     except TypeError as exc:
@@ -305,5 +367,7 @@ def validate_observation_bundle_manifest(bundle: ObservationBundleManifest) -> N
         raise ValueError("bundle.timestamp must match scene_state.timestamp.")
     for camera_spec in bundle.camera_specs:
         validate_camera_spec(camera_spec)
+    for sensor_spec in bundle.sensor_specs:
+        validate_sensor_spec(sensor_spec)
     for artifact in bundle.artifacts:
         validate_render_artifact_manifest(artifact)

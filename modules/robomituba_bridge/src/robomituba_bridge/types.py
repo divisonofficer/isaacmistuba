@@ -291,6 +291,11 @@ class IsaacSensorSpec:
     resolution: Optional[List[int]] = None
     sensor_sync_group: str = "default"
     pose_source: Optional[str] = None
+    # First-class non-camera sensor contract.  Existing payloads omit these
+    # fields and remain rgb-camera sensors by default.
+    sensor_type: str = "rgb_camera"
+    profile: Optional[str] = None
+    metadata_ref: Optional[str] = None
     extras: JsonDict = field(default_factory=dict)
 
 
@@ -329,6 +334,38 @@ class AssistLightSpec:
 
 
 @dataclass
+class ActiveLightSpec:
+    """Rig-mounted active light (flash) for an active flashing imaging system.
+
+    Composed from existing Mitsuba plugins at render time: a ``spot``/``point``
+    emitter + (optional) a ``polarizer`` BSDF surface for polarized illumination.
+    Pose is derived at render time as ``base_pose @ mount`` (base_link-mounted),
+    so a sweep can reuse a topology-stable scene across headings.
+    """
+    light_id: str
+    enabled: bool = True
+    emitter_type: str = "spot"                # "spot" | "point" | "area"
+    # Local mount relative to base_frame: {parent_frame, xyz_m[3], rpy_deg[3]}.
+    mount: JsonDict = field(default_factory=lambda: {"parent_frame": "base_link", "xyz_m": [0.0, 0.0, 0.0], "rpy_deg": [0.0, 0.0, 0.0]})
+    # Which render passes this light participates in: subset of {"rgb","nir","polar"}.
+    modalities: List[str] = field(default_factory=lambda: ["nir", "polar"])
+    spectrum_kind: str = "rgb"                # "rgb" | "nir"
+    rgb: Vec3 = field(default_factory=lambda: [1.0, 1.0, 1.0])
+    wavelength_nm: float = 850.0              # used when spectrum_kind == "nir"
+    radiance: float = 40.0                    # intensity/radiance scale
+    cutoff_angle_deg: float = 45.0            # spot only
+    beam_width_deg: float = 30.0             # spot only
+    # area emitter half-extent (m). NOTE: polarized illumination REQUIRES an area
+    # emitter — a delta spot/point cannot transmit through a `polarizer` surface
+    # (its NEE shadow ray is blocked by the polarizer and a delta light cannot be
+    # BSDF-sampled), so a polarized spot/point yields ~no genuine polarization.
+    area_size_m: float = 0.1                  # area only (rectangle half-extent)
+    polarized: bool = False
+    polarizer_angle_deg: float = 0.0
+    extras: JsonDict = field(default_factory=dict)
+
+
+@dataclass
 class DepthApproxSpec:
     mode: str = "planar_reflective_proxy"
     target_shape_filenames: List[str] = field(default_factory=list)
@@ -355,11 +392,15 @@ class RenderRequest:
     timestamp: str
     scene_state: SceneState
     camera_specs: List[CameraSpec] = field(default_factory=list)
+    sensor_specs: List[IsaacSensorSpec] = field(default_factory=list)
     modalities: List[str] = field(default_factory=list)
     robot_state: RobotState = field(default_factory=RobotState)
     render_settings: JsonDict = field(default_factory=dict)
     scene_override: Optional[SceneOverrideSpec] = None
     assist_light: Optional[AssistLightSpec] = None
+    # Rig-mounted active lights (flash). When non-empty, take precedence over the
+    # legacy single camera-aligned `assist_light`; empty keeps legacy behaviour.
+    active_lights: List["ActiveLightSpec"] = field(default_factory=list)
     depth_approx: Optional[DepthApproxSpec] = None
     action_ref: Optional[str] = None
     prev_observation_ref: Optional[str] = None
@@ -406,6 +447,7 @@ class RenderArtifactManifest:
     material_mode: Optional[str] = None
     array_shape: List[int] = field(default_factory=list)
     dtype: Optional[str] = None
+    sensor_id: Optional[str] = None
     extras: JsonDict = field(default_factory=dict)
 
 
@@ -419,6 +461,7 @@ class ObservationBundleManifest:
     robot_state: RobotState
     requested_modalities: List[str] = field(default_factory=list)
     camera_specs: List[CameraSpec] = field(default_factory=list)
+    sensor_specs: List[IsaacSensorSpec] = field(default_factory=list)
     artifacts: List[RenderArtifactManifest] = field(default_factory=list)
     bundle_root: str = ""
     status: str = "complete"

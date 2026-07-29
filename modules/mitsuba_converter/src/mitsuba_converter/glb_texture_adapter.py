@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 
-GLB_TEXTURE_ADAPTER_VERSION = 4
+GLB_TEXTURE_ADAPTER_VERSION = 6
 
 
 @dataclass
@@ -141,6 +141,40 @@ def _save_embedded_texture(
     return _rel_or_abs(dst, repo_root)
 
 
+
+def _save_metallic_roughness_channels(
+    image: Any,
+    *,
+    glb_path: Path,
+    mtime_ns: int,
+    material_key: str,
+    texture_cache_dir: Path | None,
+    repo_root: Path | None,
+    record_embedded_refs: bool = False,
+) -> tuple[str | None, str | None]:
+    """Materialize glTF packed MR channels (G=roughness, B=metallic)."""
+    if image is None:
+        return None, None
+    try:
+        rgb = image.convert("RGB")
+        rough = rgb.getchannel("G").convert("RGB")
+        metal = rgb.getchannel("B").convert("RGB")
+    except Exception:
+        return None, None
+    rough_ref = _save_embedded_texture(
+        rough, glb_path=glb_path, mtime_ns=mtime_ns,
+        material_key=material_key, slot="roughness",
+        texture_cache_dir=texture_cache_dir, repo_root=repo_root,
+        record_embedded_refs=record_embedded_refs,
+    )
+    metal_ref = _save_embedded_texture(
+        metal, glb_path=glb_path, mtime_ns=mtime_ns,
+        material_key=material_key, slot="metallic",
+        texture_cache_dir=texture_cache_dir, repo_root=repo_root,
+        record_embedded_refs=record_embedded_refs,
+    )
+    return rough_ref, metal_ref
+
 def _material_texture(mat: Any, names: tuple[str, ...]) -> Any | None:
     for name in names:
         try:
@@ -210,12 +244,21 @@ def _extract_material_dict(
     base_ref = _save_embedded_texture(base_img, glb_path=glb_path, mtime_ns=mtime_ns, material_key=material_key, slot="base_color", texture_cache_dir=texture_cache_dir, repo_root=repo_root, record_embedded_refs=record_embedded_refs)
     normal_ref = _save_embedded_texture(normal_img, glb_path=glb_path, mtime_ns=mtime_ns, material_key=material_key, slot="normal", texture_cache_dir=texture_cache_dir, repo_root=repo_root, record_embedded_refs=record_embedded_refs)
     mr_ref = _save_embedded_texture(mr_img, glb_path=glb_path, mtime_ns=mtime_ns, material_key=material_key, slot="metallic_roughness", texture_cache_dir=texture_cache_dir, repo_root=repo_root, record_embedded_refs=record_embedded_refs)
+    rough_ref, metallic_ref = _save_metallic_roughness_channels(
+        mr_img, glb_path=glb_path, mtime_ns=mtime_ns, material_key=material_key,
+        texture_cache_dir=texture_cache_dir, repo_root=repo_root,
+        record_embedded_refs=record_embedded_refs,
+    )
     if base_ref:
         slot_counts["base_color"] = 1
     if normal_ref:
         slot_counts["normal"] = 1
     if mr_ref:
         slot_counts["metallic_roughness"] = 1
+    if rough_ref:
+        slot_counts["roughness"] = 1
+    if metallic_ref:
+        slot_counts["metallic"] = 1
     material_name = str(getattr(mat, "name", "") or material_key)
     em = {
         "source": "glb_pbr",
@@ -225,6 +268,8 @@ def _extract_material_dict(
         "base_color_texture_ref": base_ref,
         "normal_texture_ref": normal_ref,
         "metallic_roughness_texture_ref": mr_ref,
+        "roughness_texture_ref": rough_ref,
+        "metallic_texture_ref": metallic_ref,
         "metallic_factor": _float_factor(mat, ("metallicFactor", "metallic_factor")),
         "roughness_factor": _float_factor(mat, ("roughnessFactor", "roughness_factor")),
     }
@@ -250,6 +295,34 @@ def _mesh_has_normal(mesh: Any) -> bool:
 
 def _scene_geometries(loaded: Any) -> list[tuple[str, Any]]:
     geometry = getattr(loaded, "geometry", None)
+    graph = getattr(loaded, "graph", None)
+    # Bake each geometry's scene-graph node transform into its vertices before export.
+    # Infinigen GLBs keep the object's world orientation on the NODE (local geometry
+    # differs from the world-oriented .obj the render pipeline expects), so a local
+    # export mis-places rotated furniture. Applying the node transform matches the
+    # .obj convention; for DTC single-mesh GLBs the transform is identity (no-op).
+    if graph is not None and isinstance(geometry, Mapping):
+        try:
+            nodes = list(graph.nodes_geometry)
+        except Exception:
+            nodes = []
+        out: list[tuple[str, Any]] = []
+        for node in nodes:
+            try:
+                transform, geom_name = graph[node]
+            except Exception:
+                continue
+            mesh = geometry.get(geom_name)
+            if mesh is None:
+                continue
+            try:
+                m = mesh.copy()
+                m.apply_transform(transform)
+            except Exception:
+                m = mesh
+            out.append((str(geom_name), m))
+        if out:
+            return out
     if isinstance(geometry, Mapping):
         return [(str(name), mesh) for name, mesh in geometry.items()]
     return [("mesh", loaded)]
@@ -333,7 +406,11 @@ def materialize_glb_texture_parts(
     try:
         combined = loaded.to_geometry() if hasattr(loaded, "to_geometry") else geometries[0][1]
         if hasattr(combined, "vertices") and hasattr(combined, "faces"):
-            combined.export(str(combined_obj), file_type="obj")
+            # Keep the GLB's vertex normals in the intermediate OBJ.  Without
+            # this explicit flag trimesh may omit ``vn`` when its cache has not
+            # been populated; the resulting duplicated UV-corner vertices then
+            # render flat per triangle and expose triangulation seams.
+            combined.export(str(combined_obj), file_type="obj", include_normals=True)
     except Exception:
         combined_obj = None  # type: ignore[assignment]
 
@@ -349,7 +426,7 @@ def materialize_glb_texture_parts(
         slug = _safe_slug(name, fallback=f"part_{index:03d}")
         part_path = part_dir / f"{index:03d}_{slug}.obj"
         try:
-            mesh.export(str(part_path), file_type="obj")
+            mesh.export(str(part_path), file_type="obj", include_normals=True)
         except Exception:
             continue
         material = getattr(getattr(mesh, "visual", None), "material", None)
@@ -475,4 +552,3 @@ def extract_glb_mesh_for_editor(glb_path: Path, *, max_triangles: int = 3500) ->
         "triangle_count": int(len(compact_faces)),
         "source_triangle_count": int(len(np.asarray(mesh.faces))),
     }
-

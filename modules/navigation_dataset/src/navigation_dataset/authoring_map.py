@@ -146,6 +146,11 @@ class AuthoringCameraRig:
     rig_id: str = "mobile_base_default"
     base_frame: str = "base_link"
     sensors: list[AuthoringCameraRigSensor] = field(default_factory=list)
+    # Rig-level active lights (RGB/NIR flash + linear polarizer) mounted on the
+    # base_frame. Each dict mirrors ActiveLightSpec fields (light_id, emitter_type,
+    # mount, modalities, spectrum_kind, rgb, wavelength_nm, radiance, cutoff/beam,
+    # polarized, polarizer_angle_deg). Empty → passive (ambient/measured) only.
+    active_lights: list[JsonDict] = field(default_factory=list)
 
 
 @dataclass
@@ -346,6 +351,34 @@ def _normalize_camera_rig_sensor(payload: Any) -> AuthoringCameraRigSensor:
     )
 
 
+def _normalize_active_light(payload: Any, index: int = 0) -> JsonDict:
+    data = dict(payload or {})
+    mount = data.get("mount") if isinstance(data.get("mount"), dict) else {}
+    xyz = list(mount.get("xyz_m") or [0.0, 0.0, 0.0])[:3]
+    rpy = list(mount.get("rpy_deg") or [0.0, 0.0, 0.0])[:3]
+    xyz += [0.0] * (3 - len(xyz)); rpy += [0.0] * (3 - len(rpy))
+    modalities = [str(m) for m in (data.get("modalities") or ["nir", "polar"]) if str(m)]
+    rgb = list(data.get("rgb") or [1.0, 1.0, 1.0])[:3]
+    rgb += [1.0] * (3 - len(rgb))
+    return {
+        "light_id": str(data.get("light_id") or f"active_light_{index}"),
+        "enabled": bool(data.get("enabled", True)),
+        "emitter_type": str(data.get("emitter_type")) if str(data.get("emitter_type")) in ("spot", "point", "area") else "spot",
+        "mount": {"parent_frame": str(mount.get("parent_frame") or "base_link"),
+                  "xyz_m": [float(v) for v in xyz], "rpy_deg": [float(v) for v in rpy]},
+        "modalities": modalities,
+        "spectrum_kind": "nir" if str(data.get("spectrum_kind")) == "nir" else "rgb",
+        "rgb": [float(v) for v in rgb],
+        "wavelength_nm": float(data.get("wavelength_nm") or 850.0),
+        "radiance": float(data.get("radiance") if data.get("radiance") is not None else 40.0),
+        "cutoff_angle_deg": float(data.get("cutoff_angle_deg") or 45.0),
+        "beam_width_deg": float(data.get("beam_width_deg") or 30.0),
+        "area_size_m": float(data.get("area_size_m") or 0.1),
+        "polarized": bool(data.get("polarized", False)),
+        "polarizer_angle_deg": float(data.get("polarizer_angle_deg") or 0.0),
+    }
+
+
 def _normalize_camera_rig(payload: Any) -> AuthoringCameraRig:
     if isinstance(payload, AuthoringCameraRig):
         return payload
@@ -354,6 +387,7 @@ def _normalize_camera_rig(payload: Any) -> AuthoringCameraRig:
         rig_id=str(data.get("rig_id") or "mobile_base_default"),
         base_frame=str(data.get("base_frame") or "base_link"),
         sensors=[_normalize_camera_rig_sensor(item) for item in data.get("sensors", [])],
+        active_lights=[_normalize_active_light(item, i) for i, item in enumerate(data.get("active_lights") or [])],
     )
 
 

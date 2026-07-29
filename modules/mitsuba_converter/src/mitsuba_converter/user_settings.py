@@ -83,6 +83,61 @@ def get_material_preview_spp(default: int = 2048) -> int:
     return default
 
 
+# ── Render / BSDF preferences ────────────────────────────────────────────────
+# These control render behaviour that was previously env-only. bsdf_mode and
+# texture_max_resolution are mirrored into os.environ (apply_render_env_from_settings)
+# so the existing env readers pick them up without a daemon restart.
+
+VALID_BSDF_MODES = ("legacy", "injected", "measured")
+VALID_PBRDF_BANDS = ("rgb", "hybrid", "single")
+VALID_MEASURED_SCOPES = ("analytic_only", "analytic_priority", "budgeted_measured", "measured_full")
+MIN_TEXTURE_RES = 128
+MAX_TEXTURE_RES = 8192
+
+
+def get_bsdf_mode() -> str | None:
+    """User-configured BSDF injection mode, or None when unset (falls back to env)."""
+    val = load_user_settings().get("bsdf_mode")
+    if isinstance(val, str) and val in VALID_BSDF_MODES:
+        return val
+    return None
+
+
+def get_texture_max_resolution() -> int | None:
+    """User-configured texture downsample cap, or None when unset (falls back to env)."""
+    val = load_user_settings().get("texture_max_resolution")
+    if isinstance(val, bool):
+        return None
+    if isinstance(val, (int, float)):
+        n = int(val)
+        if MIN_TEXTURE_RES <= n <= MAX_TEXTURE_RES:
+            return n
+    return None
+
+
+def get_pbrdf_band_mode(default: str = "single") -> str:
+    val = load_user_settings().get("pbrdf_band_mode")
+    return val if isinstance(val, str) and val in VALID_PBRDF_BANDS else default
+
+
+def get_measured_scope(default: str = "analytic_only") -> str:
+    val = load_user_settings().get("measured_scope")
+    return val if isinstance(val, str) and val in VALID_MEASURED_SCOPES else default
+
+
+def apply_render_env_from_settings() -> None:
+    """Mirror persisted bsdf_mode / texture_max_resolution into os.environ so the
+    existing env readers (optical_constants.bsdf_mode, multimodal texture cap,
+    worker env_overrides) honour the user's choice without a restart. A persisted
+    setting wins over the launcher default; when unset the env is left untouched."""
+    mode = get_bsdf_mode()
+    if mode is not None:
+        os.environ["ROBOMITUBA_BSDF_MODE"] = mode
+    res = get_texture_max_resolution()
+    if res is not None:
+        os.environ["ROBOMITUBA_TEXTURE_MAX_RESOLUTION"] = str(res)
+
+
 def resolve_dataset_path(
     repo_root: Path,
     dataset_id: str,

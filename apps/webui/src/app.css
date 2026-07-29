@@ -504,6 +504,20 @@ img { display: block; max-width: 100%; }
   gap: 0.4rem;
 }
 
+.nav-group-label {
+  padding: 0.6rem 0.95rem 0.2rem;
+  font-size: 0.66rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+  opacity: 0.65;
+}
+.nav-group-label:not(:first-child) {
+  margin-top: 0.5rem;
+  border-top: 1px solid var(--line, rgba(0, 0, 0, 0.08));
+}
+
 .nav-link {
   display: flex;
   align-items: center;

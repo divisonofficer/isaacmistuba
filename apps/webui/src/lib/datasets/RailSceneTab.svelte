@@ -1,7 +1,6 @@
 <script lang="ts">
 	import { opticalNavEnvmapPreviewUrl } from '$lib/api';
 	import type { Capabilities } from '$lib/datasets/capabilityHelpers';
-	import InfinigenGeneratePanel from '$lib/datasets/InfinigenGeneratePanel.svelte';
 
 	interface Props {
 		caps: Capabilities;
@@ -121,10 +120,6 @@
 				</button>
 			</div>
 			{#if authoringMapDirty}<p class="inline-hint">Unsaved changes.</p>{/if}
-			<details class="infinigen-details">
-				<summary>＋ Infinigen 씬 생성 (절차적)</summary>
-				<InfinigenGeneratePanel projectId={selectedProjectId} />
-			</details>
 			{#if currentScene?.sync_status}
 				{@const _ss = currentScene.sync_status}
 				{@const _rs = _ss.render_scene_status ?? _ss.render_scene ?? 'pending'}

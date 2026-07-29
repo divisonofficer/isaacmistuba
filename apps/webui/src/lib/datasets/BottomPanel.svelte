@@ -1,7 +1,14 @@
 <script lang="ts">
 	import { healthStore } from '$lib/stores/health';
 	import { bottomPanelMode, setBottomPanelMode, type BottomPanelMode } from '$lib/stores/shell';
-	import { buildBatchJobGrid, buildRenderSummary, normalizeJobStatus, isGraphSweepRenderMode } from '$lib/datasets/batchHelpers';
+	import {
+		buildBatchJobGrid,
+		buildRenderSummary,
+		isGraphSweepRenderMode,
+		jobPhase,
+		jobVariant,
+		normalizeJobStatus,
+	} from '$lib/datasets/batchHelpers';
 	import GenericJobList from '$lib/datasets/GenericJobList.svelte';
 	import JobDetailDrawer from '$lib/datasets/JobDetailDrawer.svelte';
 	import LogViewer from '$lib/datasets/LogViewer.svelte';
@@ -47,16 +54,32 @@
 	let activeTab = $state<'overview' | 'jobs' | 'logs'>('overview');
 	let jobFilter = $state<'all' | 'running' | 'failed' | 'queued'>('all');
 	let graphView = $state<'grid' | 'list'>('grid');
+	let gridMode = $state<'lanes' | 'compact'>('lanes');
+	let variantFilter = $state('all');
+	let phaseFilter = $state('all');
 
 	const health = $derived($healthStore);
 	const summary = $derived(buildRenderSummary(activeBatch, health, renderMode));
-	const graphGrid = $derived(isGraphSweepRenderMode(renderMode) ? buildBatchJobGrid(activeBatch) : { rows: [], headings: [], counts: {} });
+	const variantOptions = $derived(
+		[...new Set((activeBatch?.jobs ?? []).map((job: any) => jobVariant(job)))].sort(),
+	);
+	const phaseOptions = $derived(
+		[...new Set((activeBatch?.jobs ?? []).map((job: any) => jobPhase(job)))].sort(),
+	);
 	const filteredBatch = $derived.by(() => {
-		if (jobFilter === 'all') return activeBatch;
-		const jobs = (activeBatch?.jobs ?? []).filter((job: any) => normalizeJobStatus(job) === jobFilter);
+		const jobs = (activeBatch?.jobs ?? []).filter((job: any) => {
+			if (jobFilter !== 'all' && normalizeJobStatus(job) !== jobFilter) return false;
+			if (variantFilter !== 'all' && jobVariant(job) !== variantFilter) return false;
+			if (phaseFilter !== 'all' && jobPhase(job) !== phaseFilter) return false;
+			return true;
+		});
 		return { ...(activeBatch ?? {}), jobs };
 	});
-	const filteredGraphGrid = $derived(isGraphSweepRenderMode(renderMode) ? buildBatchJobGrid(filteredBatch) : { rows: [], headings: [], counts: {} });
+	const filteredGraphGrid = $derived(
+		isGraphSweepRenderMode(renderMode)
+			? buildBatchJobGrid(filteredBatch)
+			: { rows: [], headings: [], counts: {}, laneCount: 0 },
+	);
 	const hasActiveJobs = $derived((summary.counts.running ?? 0) + (summary.counts.queued ?? 0) > 0);
 	const failedJobs = $derived((activeBatch?.jobs ?? []).filter((job: any) => normalizeJobStatus(job) === 'failed'));
 
@@ -137,12 +160,34 @@
 			{:else if activeTab === 'jobs'}
 				<div class="jobs-panel">
 					<div class="jobs-toolbar">
-						{#if isGraphSweepRenderMode(renderMode)}
-							<div class="segmented">
-								<button class:active={graphView === 'grid'} onclick={() => graphView = 'grid'}>Grid</button>
-								<button class:active={graphView === 'list'} onclick={() => graphView = 'list'}>List</button>
-							</div>
-						{/if}
+						<div class="toolbar-left">
+							{#if isGraphSweepRenderMode(renderMode)}
+								<div class="segmented">
+									<button class:active={graphView === 'grid'} onclick={() => graphView = 'grid'}>Grid</button>
+									<button class:active={graphView === 'list'} onclick={() => graphView = 'list'}>List</button>
+								</div>
+								{#if graphView === 'grid'}
+									<div class="segmented">
+										<button class:active={gridMode === 'lanes'} onclick={() => gridMode = 'lanes'}>Lanes</button>
+										<button class:active={gridMode === 'compact'} onclick={() => gridMode = 'compact'}>Compact</button>
+									</div>
+								{/if}
+								<label class="filter-select">
+									<span>Variant</span>
+									<select bind:value={variantFilter} aria-label="Filter jobs by render variant">
+										<option value="all">All</option>
+										{#each variantOptions as variant}<option value={variant}>{variant}</option>{/each}
+									</select>
+								</label>
+								<label class="filter-select">
+									<span>Phase</span>
+									<select bind:value={phaseFilter} aria-label="Filter jobs by render phase">
+										<option value="all">All</option>
+										{#each phaseOptions as phase}<option value={phase}>{phase}</option>{/each}
+									</select>
+								</label>
+							{/if}
+						</div>
 						<div class="segmented">
 							<button class:active={jobFilter === 'all'} onclick={() => jobFilter = 'all'}>All</button>
 							<button class:active={jobFilter === 'running'} onclick={() => jobFilter = 'running'}>Running</button>
@@ -151,7 +196,7 @@
 						</div>
 					</div>
 					{#if isGraphSweepRenderMode(renderMode) && graphView === 'grid'}
-						<SweepJobGrid batchJobGrid={jobFilter === 'all' ? graphGrid : filteredGraphGrid} {selectedBatchJobId} {onSelectBatchJob} />
+						<SweepJobGrid batchJobGrid={filteredGraphGrid} mode={gridMode} {selectedBatchJobId} {onSelectBatchJob} />
 					{:else}
 						<GenericJobList activeBatch={filteredBatch} {selectedBatchJobId} {onSelectBatchJob} />
 					{/if}
@@ -216,7 +261,9 @@
 	.monitor-tabs,
 	.size-controls,
 	.segmented,
-	.jobs-toolbar {
+	.jobs-toolbar,
+	.toolbar-left,
+	.filter-select {
 		display: flex;
 		align-items: center;
 		gap: var(--space-2);
@@ -298,6 +345,22 @@
 		height: 100%;
 	}
 	.jobs-toolbar { justify-content: space-between; flex-wrap: wrap; }
+	.toolbar-left { flex-wrap: wrap; }
+	.filter-select {
+		gap: 5px;
+		color: var(--muted);
+		font-size: 10px;
+	}
+	.filter-select select {
+		height: 28px;
+		max-width: 128px;
+		border: 1px solid var(--panel-border);
+		border-radius: var(--radius-sm);
+		background: var(--surface-1);
+		color: var(--text);
+		padding: 0 24px 0 7px;
+		font-size: var(--font-size-xs);
+	}
 	@media (max-width: 1100px) {
 		.monitor-head { grid-template-columns: 1fr; }
 		.monitor-actions { justify-content: flex-start; }

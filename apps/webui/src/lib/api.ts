@@ -176,6 +176,28 @@ export type CameraRigSensor = {
 		wavelength_nm: number;
 	};
 };
+export type CameraRigActiveLight = {
+	light_id: string;
+	enabled: boolean;
+	emitter_type: 'spot' | 'point' | 'area';
+	mount: {
+		parent_frame: string;
+		xyz_m: [number, number, number];
+		rpy_deg: [number, number, number];
+	};
+	// Which render passes this light participates in: subset of rgb/nir/polar.
+	modalities: string[];
+	spectrum_kind: 'rgb' | 'nir';
+	rgb: [number, number, number];
+	wavelength_nm: number;
+	radiance: number;
+	cutoff_angle_deg: number;
+	beam_width_deg: number;
+	// area emitter half-extent (m). Required for genuine polarized illumination.
+	area_size_m: number;
+	polarized: boolean;
+	polarizer_angle_deg: number;
+};
 export type CameraRig = {
 	rig_id: string;
 	label: string;
@@ -183,6 +205,7 @@ export type CameraRig = {
 	base_frame: string;
 	updated_at: string;
 	sensors: CameraRigSensor[];
+	active_lights?: CameraRigActiveLight[];
 };
 export type CameraRigMeshPayload = {
 	robot_model: string;
@@ -298,6 +321,10 @@ export const getUserSettings = () =>
 export const setUserSettings = (payload: {
 	dataset_storage_overrides?: Record<string, string>;
 	material_preview_spp?: number | null;
+	bsdf_mode?: string | null;
+	texture_max_resolution?: number | null;
+	pbrdf_band_mode?: string | null;
+	measured_scope?: string | null;
 }) => post('/api/user-settings', payload);
 
 export const invalidateCuratedPreview = (materialId: string) =>
@@ -449,6 +476,9 @@ export const syncOpticalNavIsaacStage = (projectId: string, sceneId: string, pay
 	post(`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/sync/isaac-stage`, payload);
 export const getOpticalPerturbation = (projectId: string, sceneId: string) =>
 	fetch(`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/optical-perturbation`).then(json);
+// Live progress for the (synchronous) graph episode-plan request — polled while planning.
+export const getEpisodePlanProgress = (projectId: string, sceneId: string) =>
+	fetch(`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/episode-plan-progress`).then(json);
 export const buildOpticalPerturbation = (projectId: string, sceneId: string, payload: unknown = {}) =>
 	post(`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/optical-perturbation`, payload);
 export const buildOpticalNavMap = (projectId: string, sceneId: string, payload: { resolution: number }) =>
@@ -516,6 +546,22 @@ export const getOpticalNavMaterializationAudit = (projectId: string, sceneId: st
 	fetch(`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/render-scene-materialization`).then(json);
 export const getOpticalNavXmlSceneIndex = (projectId: string, sceneId: string) =>
 	fetch(`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/xml-scene-index`).then(json);
+// Per-object material viewer: resolves optical_class -> IOR / metal eta-k the same
+// way the render daemon injects them (single source of truth). Omit both ids for
+// list mode (every material in the scene, for the dedicated Materials tab).
+export const getObjectMaterialView = (
+	projectId: string,
+	sceneId: string,
+	opts: { materialId?: string | null; objectId?: string | null } = {},
+) => {
+	const params = new URLSearchParams();
+	if (opts.materialId) params.set('material_id', opts.materialId);
+	if (opts.objectId) params.set('object_id', opts.objectId);
+	const qs = params.toString();
+	return fetch(
+		`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/object-material${qs ? `?${qs}` : ''}`,
+	).then(json);
+};
 // PR2: serve raw OBJ bytes from mesh_cache for the XML-native editor preview.
 // xml_scene_index.shapes[].mesh_path stores absolute paths after PR1's
 // _absolutize_filename_refs(); the editor reduces them to a basename and hits
@@ -607,6 +653,7 @@ export const submitOpticalNavExportJob = (
 	projectId: string,
 	payload: {
 		scene_id: string;
+		camera_ids?: string[] | null;
 		only_completed?: boolean;
 		episode_ids?: string[] | null;
 		include_episode_thumbnails?: boolean;

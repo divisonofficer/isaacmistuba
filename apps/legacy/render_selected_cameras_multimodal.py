@@ -88,7 +88,6 @@ def build_render_config(args: argparse.Namespace) -> RenderConfig:
             "diffuse_map": "scene_diffuse_map.xml",
             "aov": "scene_aov.xml",
             "polar": "scene_polar.xml",
-            "polar_fallback": "scene_polar_fallback.xml",
         },
     )
 

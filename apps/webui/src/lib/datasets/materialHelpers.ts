@@ -193,6 +193,7 @@ const OPTICAL_CLASS_LABEL: Record<string, string> = {
 };
 const BSDF_STRATEGY_LABEL: Record<string, string> = {
 	pplastic: 'pplastic', roughplastic: 'roughplastic', conductor: 'mirror',
+	roughconductor: 'metal (rough)',
 	dielectric: 'glass', roughdielectric: 'frosted glass',
 	measured_polarized: 'measured pBRDF', measured: 'measured', diffuse: 'diffuse',
 };
@@ -233,14 +234,38 @@ export function rgbCss(c: number[] | null | undefined): string {
 	return `rgb(${f(c[0])}, ${f(c[1])}, ${f(c[2])})`;
 }
 
-/** Derive the baked-albedo atlas artifact URL from an object's `source_ref`.
- *  "<import>/meshes/<oid>.obj" -> "/artifacts?path=<import>/textures/<oid>_albedo.png".
+/** Derive a baked atlas artifact URL (albedo/roughness/normal) from an object's
+ *  `source_ref`: "<import>/meshes/<oid>.obj" -> "/artifacts?path=<import>/textures/<oid>_<kind>.png".
  *  Returns '' when the ref doesn't match (the <img> 404s gracefully to the swatch). */
-export function bakedAtlasArtifactUrl(sourceRef: string | null | undefined): string {
+export function bakedAtlasUrlFor(
+	sourceRef: string | null | undefined,
+	kind: 'albedo' | 'roughness' | 'metallic' | 'normal',
+): string {
 	if (!sourceRef) return '';
 	const m = String(sourceRef).match(/^(.*)\/meshes\/(.+)\.obj$/);
 	if (!m) return '';
-	return `/artifacts?path=${encodeURIComponent(`${m[1]}/textures/${m[2]}_albedo.png`)}`;
+	return `/artifacts?path=${encodeURIComponent(`${m[1]}/textures/${m[2]}_${kind}.png`)}`;
+}
+
+/** Baked-albedo atlas artifact URL from an object's `source_ref` (back-compat shim). */
+export function bakedAtlasArtifactUrl(sourceRef: string | null | undefined): string {
+	return bakedAtlasUrlFor(sourceRef, 'albedo');
+}
+
+/** "IOR 1.50" for dielectrics, or "eta-k · <preset>" for conductors, from an
+ *  object-material endpoint `optical_resolution` block. */
+export function opticalIorLabel(res: any): string {
+	if (!res) return '';
+	if (res.applies_as === 'conductor')
+		return `eta-k · ${res.conductor_preset ?? '—'}`;
+	const ior = Number(res.dielectric_ior);
+	return Number.isFinite(ior) ? `IOR ${ior.toFixed(2)}` : '';
+}
+
+/** Human label for the polarimetric BSDF plugin a material connects to. */
+export function polarimetricBrdfLabel(brdf: string | null | undefined): string {
+	if (!brdf) return '';
+	return BSDF_STRATEGY_LABEL[brdf] ?? brdf;
 }
 
 export function ensureAuthoringMaterial(

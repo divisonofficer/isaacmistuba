@@ -1,6 +1,15 @@
 <script lang="ts">
 	import JobTimeline from '$lib/datasets/JobTimeline.svelte';
-	import { compactDetail, formatJobRunDuration, jobStatusClass, normalizeJobStatus } from '$lib/datasets/batchHelpers';
+	import {
+		compactDetail,
+		formatJobRunDuration,
+		jobPhaseLabel,
+		jobSensorIds,
+		jobSensorSummary,
+		jobStatusClass,
+		jobVariantLabel,
+		normalizeJobStatus,
+	} from '$lib/datasets/batchHelpers';
 
 	interface Props {
 		job: any;
@@ -45,7 +54,8 @@
 				<div class="drawer-sub">
 					<span>{job.preview_id ?? job.node_id ?? 'custom'}</span>
 					{#if job.heading_id}<span>· {job.heading_id}</span>{/if}
-					<span>· {job.modality ?? 'rgb'} / {job.sensor_id ?? 'sensor'}</span>
+					<span>· {jobVariantLabel(job)} / {jobPhaseLabel(job)}</span>
+					<span>· {jobSensorSummary(job)}</span>
 				</div>
 			</div>
 			<button class="icon-btn" onclick={onClose} aria-label="Close job detail">x</button>
@@ -63,6 +73,9 @@
 			<div><span>Cache</span><strong>{job?.status?.extras?.scene_cache_hit ? 'Hit' : 'Miss/unknown'}</strong></div>
 			<div><span>Texture</span><strong>{textureProfile ? `max${textureProfile}` : '-'}</strong></div>
 			<div><span>Duration</span><strong>{duration || '-'}</strong></div>
+			<div><span>Variant</span><strong>{jobVariantLabel(job)}</strong></div>
+			<div><span>Phase</span><strong>{jobPhaseLabel(job)}</strong></div>
+			<div class="wide"><span>Sensors</span><strong title={jobSensorIds(job).join(', ')}>{jobSensorIds(job).join(', ') || '-'}</strong></div>
 			{#if textureAudit?.texture_refs}
 				<div class="wide"><span>Texture refs</span><strong>{textureAudit.downsampled_refs ?? 0}/{textureAudit.texture_refs} downsampled</strong></div>
 			{/if}

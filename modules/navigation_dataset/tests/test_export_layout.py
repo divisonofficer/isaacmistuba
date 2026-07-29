@@ -9,10 +9,14 @@ Covers two behaviours added for the trainable-bundle cleanup:
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from navigation_dataset.episode_schema import EpisodeManifest
-from navigation_dataset.exporters.custom_json import iter_export_files
+from navigation_dataset.exporters.custom_json import (
+    iter_export_files,
+    write_filtered_sensor_indexes,
+)
 
 
 def _episode(scene_id: str, vp: str, heading: str) -> EpisodeManifest:
@@ -83,3 +87,79 @@ def test_include_perturbed_ships_paired_tree(tmp_path: Path) -> None:
     pbase = f"scenes/{scene_id}/observations_perturbed/{vp}/{heading}"
     assert f"{pbase}/sensors/cam_front/rgb.png" in paired
     assert f"{pbase}/rgb.png" not in paired  # same dedup applies to the perturbed tree
+
+
+def test_camera_filter_applies_to_base_and_perturbed(tmp_path: Path) -> None:
+    scene_id, vp, heading = "scene_c", "vp_000001", "h_000"
+    project_dir = _build_project(tmp_path, scene_id, vp, heading, perturbed=True)
+    index_payload = {"scene_artifacts": [{"scene_id": scene_id}]}
+    ep = [_episode(scene_id, vp, heading)]
+
+    filtered = {
+        dst
+        for _src, dst in iter_export_files(
+            project_dir,
+            index_payload,
+            ep,
+            include_perturbed=True,
+            camera_ids=["cam_rear"],
+        )
+    }
+
+    assert any("/sensors/cam_rear/" in dst for dst in filtered)
+    assert not any("/sensors/cam_front/" in dst for dst in filtered)
+    assert not any(dst.endswith("/rgb.png") and "/sensors/" not in dst for dst in filtered)
+    assert not any(dst.endswith("/_sensor_index.json") for dst in filtered)
+
+
+def test_filtered_sensor_index_matches_staging_tree(tmp_path: Path) -> None:
+    heading_dir = tmp_path / "staging" / "scenes" / "scene_d" / "observations" / "vp_1" / "h_000"
+    selected = heading_dir / "sensors" / "cam_rear"
+    selected.mkdir(parents=True)
+    (selected / "rgb.png").write_bytes(b"rear")
+
+    written = write_filtered_sensor_indexes(tmp_path / "staging")
+
+    assert written == [heading_dir / "_sensor_index.json"]
+    payload = json.loads(written[0].read_text())
+    assert payload == {
+        "sensors": {
+            "cam_rear": {
+                "camera_id": "cam_rear",
+                "files": ["rgb.png"],
+            }
+        }
+    }
+
+
+def test_camera_filter_applies_to_bridge_job_exr(tmp_path: Path) -> None:
+    scene_id, vp, heading = "scene_e", "vp_000001", "h_000"
+    project_dir = _build_project(tmp_path, scene_id, vp, heading, perturbed=False)
+    bridge_obs = (
+        tmp_path
+        / "out"
+        / "bridge_jobs"
+        / f"opticalnav-{scene_id}-template-{vp}-{heading}-rgb"
+        / "observations"
+        / "frame_000001"
+        / "cameras"
+    )
+    for camera_id in ("cam_front", "cam_rear"):
+        camera_dir = bridge_obs / camera_id
+        camera_dir.mkdir(parents=True, exist_ok=True)
+        (camera_dir / "rgb.exr").write_bytes(camera_id.encode())
+
+    index_payload = {"scene_artifacts": [{"scene_id": scene_id}]}
+    filtered = {
+        dst
+        for _src, dst in iter_export_files(
+            project_dir,
+            index_payload,
+            [_episode(scene_id, vp, heading)],
+            include_exr=True,
+            camera_ids=["cam_rear"],
+        )
+    }
+
+    assert any(dst.endswith("/sensors/cam_rear/rgb.exr") for dst in filtered)
+    assert not any(dst.endswith("/sensors/cam_front/rgb.exr") for dst in filtered)

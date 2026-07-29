@@ -264,8 +264,11 @@ def cmd_graph_qa(args) -> None:
 
 def cmd_graph_sweep(args) -> None:
     root = _dataset_root(args.dataset)
-    if not args.scene_state or not args.camera_spec:
-        raise SystemExit("--scene-state and --camera-spec JSON payloads are required for graph sensor sweep.")
+    if not args.scene_state or (not args.camera_spec and not args.sensor_specs):
+        raise SystemExit("--scene-state and at least one of --camera-spec/--sensor-specs JSON payloads are required for graph sensor sweep.")
+    scene_state_payload = _read_json(args.scene_state)
+    camera_spec_payload = _read_json(args.camera_spec) if args.camera_spec else None
+    sensor_specs_payload = _read_json(args.sensor_specs) if args.sensor_specs else None
     if args.backend == "daemon":
         project_id = args.project_id or root.name
         url = f"{args.daemon_url.rstrip('/')}/api/opticalnav/projects/{project_id}/scenes/{args.scene_id}/graph/sweep"
@@ -274,8 +277,9 @@ def cmd_graph_sweep(args) -> None:
             {
                 "backend": "daemon",
                 "modalities": _modalities(args.modalities),
-                "scene_state": _read_json(args.scene_state),
-                "camera_spec": _read_json(args.camera_spec),
+                "scene_state": scene_state_payload,
+                "camera_spec": camera_spec_payload,
+                "sensor_specs": sensor_specs_payload or [],
                 "variant": args.variant,
             },
         )
@@ -287,8 +291,9 @@ def cmd_graph_sweep(args) -> None:
         graph,
         dataset_root=root,
         graph_path=graph_path,
-        scene_state_payload=_read_json(args.scene_state),
-        camera_spec_payload=_read_json(args.camera_spec),
+        scene_state_payload=scene_state_payload,
+        camera_spec_payload=camera_spec_payload,
+        sensor_specs_payload=sensor_specs_payload,
         modalities=_modalities(args.modalities),
         variant=args.variant,
     )
@@ -305,7 +310,17 @@ def cmd_graph_episodes_plan(args) -> None:
     annotation = read_scene_annotation(annotation_path) if annotation_path.exists() else None
     graph = read_viewpoint_graph(graph_path)
     # Exclude edges cut by an enabled glass/mirror perturbation overlay from planning.
-    excluded_edges = disabled_edges_for_scene(root / "scenes" / args.scene_id, graph)
+    scene_dir = root / "scenes" / args.scene_id
+    excluded_edges = disabled_edges_for_scene(scene_dir, graph)
+    # Authoring map + perturbation drive the multi-level instruction context
+    # (rooms / objects / mirror-glass). Best-effort: absent files just degrade.
+    authoring_payload = None
+    map_path = scene_dir / "authoring_map.json"
+    if map_path.exists():
+        from .authoring_map import authoring_map_to_payload, load_authoring_map
+        authoring_payload = authoring_map_to_payload(load_authoring_map(map_path))
+    from .optical_perturbation import load_perturbation
+    perturbation = load_perturbation(scene_dir)
     episodes = plan_graph_episodes(
         graph=graph,
         num_pairs=args.num_pairs,
@@ -315,11 +330,72 @@ def cmd_graph_episodes_plan(args) -> None:
         annotation=annotation,
         seed=args.seed,
         excluded_edge_ids=excluded_edges,
+        authoring_map=authoring_payload,
+        perturbation=perturbation,
+        use_instruction_llm=bool(getattr(args, "instruction_llm", False)),
     )
     written = write_graph_episodes(root, episodes)
     write_dataset_index(root)
     write_split_files(root)
     print(json.dumps({"planned": len(written), "scene_id": args.scene_id, "mode": "viewpoint_graph"}, indent=2))
+
+
+def cmd_graph_episodes_augment_instructions(args) -> None:
+    """Regenerate the multi-level `instructions` set for a scene's EXISTING graph
+    episodes in place (no re-planning). Rebuilds each episode's EpisodeCore from
+    its saved path + timesteps and rewrites only `instructions` + metadata."""
+    from .graph_episode_sampler import _nearest_goal_label
+    from .instruction_generators import EpisodeCore, build_instruction_context, generate_instructions
+
+    root = _dataset_root(args.dataset)
+    scene_dir = root / "scenes" / args.scene_id
+    graph = read_viewpoint_graph(args.graph and Path(args.graph) or scene_dir / "viewpoint_graph.json")
+    annotation_path = scene_dir / "scene_annotation.json"
+    annotation = read_scene_annotation(annotation_path) if annotation_path.exists() else None
+    authoring_payload = None
+    map_path = scene_dir / "authoring_map.json"
+    if map_path.exists():
+        from .authoring_map import authoring_map_to_payload, load_authoring_map
+        authoring_payload = authoring_map_to_payload(load_authoring_map(map_path))
+    from .optical_perturbation import load_perturbation
+    perturbation = load_perturbation(scene_dir)
+    ctx = build_instruction_context(graph, annotation, authoring_payload, perturbation)
+
+    nodes = {n.node_id: n for n in graph.nodes}
+    use_llm = bool(getattr(args, "instruction_llm", False))
+    updated = 0
+    skipped = 0
+    for ep_path in sorted((root / "episodes").glob("*/*.json")):
+        try:
+            ep = read_episode(ep_path)
+        except Exception:
+            continue
+        if ep.scene_id != args.scene_id or ep.navigation_mode != "viewpoint_graph" or not ep.path_nodes:
+            continue
+        goal_node = ep.goal_node or ep.path_nodes[-1]
+        goal_region, goal_label = _nearest_goal_label(annotation, nodes[goal_node]) if goal_node in nodes else (ep.goal_region, ep.goal_region)
+        if str(goal_label).strip().lower() in ("goal", "the goal"):
+            goal_label = "the goal"
+        expanded = [
+            (t.extras.get("node_id"), t.extras.get("heading_id"), t.action, dict(t.extras))
+            for t in ep.timesteps
+        ]
+        core = EpisodeCore(
+            episode_id=ep.episode_id,
+            scenario=str(ep.metadata.get("scenario", "goal_only")),
+            path_nodes=list(ep.path_nodes),
+            node_xy={n: (float(nodes[n].position[0]), float(nodes[n].position[1])) for n in ep.path_nodes if n in nodes},
+            expanded_steps=expanded,
+            goal_label=goal_label,
+        )
+        ep.instructions = generate_instructions(core, ctx, use_llm=use_llm)
+        ep.metadata["instruction_types"] = sorted({str(i.get("type")) for i in ep.instructions})
+        write_episode(ep_path, ep)
+        updated += 1
+    print(json.dumps({
+        "scene_id": args.scene_id, "episodes_updated": updated, "skipped": skipped,
+        "instruction_llm": use_llm and __import__("navigation_dataset.instruction_paraphrase", fromlist=["codex_available"]).codex_available(),
+    }, indent=2))
 
 
 def cmd_validate_dataset(args) -> None:
@@ -451,6 +527,8 @@ def main() -> None:
     p_graph_sweep.add_argument("--project-id", default=None)
     p_graph_sweep.add_argument("--scene-state", default=None)
     p_graph_sweep.add_argument("--camera-spec", default=None)
+    p_graph_sweep.add_argument("--sensor-specs", default=None,
+                               help="JSON array of IsaacSensorSpec payloads (for example an Ouster OS1-128 sensor)")
     p_graph_sweep.add_argument("--variant", default="auto")
     p_graph_sweep.set_defaults(fn=cmd_graph_sweep)
     p_graph_episodes = graph_sub.add_parser("episodes")
@@ -464,7 +542,18 @@ def main() -> None:
     p_graph_plan.add_argument("--scenarios", default=",".join(GRAPH_SCENARIOS))
     p_graph_plan.add_argument("--modalities", default=",".join(DEFAULT_MODALITIES))
     p_graph_plan.add_argument("--seed", type=int, default=0)
+    p_graph_plan.add_argument("--instruction-llm", action="store_true",
+                              help="Augment template instructions with codex-as-api (ChatGPT login) paraphrases. Falls back to template-only if no LLM auth.")
     p_graph_plan.set_defaults(fn=cmd_graph_episodes_plan)
+
+    # Backfill: regenerate the instructions set for a scene's existing episodes in place.
+    p_graph_aug = graph_episodes_sub.add_parser("augment-instructions")
+    p_graph_aug.add_argument("--dataset", default=".")
+    p_graph_aug.add_argument("--scene-id", required=True)
+    p_graph_aug.add_argument("--graph", default=None)
+    p_graph_aug.add_argument("--instruction-llm", action="store_true",
+                             help="Use codex-as-api (ChatGPT login) paraphrases; template-only if no LLM auth.")
+    p_graph_aug.set_defaults(fn=cmd_graph_episodes_augment_instructions)
 
     p_validate = sub.add_parser("validate")
     validate_sub = p_validate.add_subparsers(dest="validate_cmd", required=True)

@@ -41,7 +41,7 @@ class SensorProfile:
     model: str
 
     # ── Optical / imaging ─────────────────────────────────────────────────────
-    sensor_type: str           # "rgb" | "nir" | "rgb_nir_dual" | "swir" | "hdr"
+    sensor_type: str           # "rgb" | "nir" | "rgb_nir_dual" | "swir" | "hdr" | "lidar" | "depth"
     resolution_wh: tuple[int, int]
     pixel_size_um: float       # μm, square pixels assumed unless noted
     bit_depth: int             # native ADC depth
@@ -202,12 +202,72 @@ LUCID_TRT053S = SensorProfile(
 )
 
 
+# -----------------------------------------------------------------------------
+# Generic active depth sensor
+# -----------------------------------------------------------------------------
+GENERIC_DEPTH_SENSOR = SensorProfile(
+    sensor_id="generic_depth_sensor",
+    display_name="Generic Metric Depth Sensor",
+    manufacturer="simulation",
+    model="depth_sensor",
+    sensor_type="depth",
+    resolution_wh=(640, 480),
+    pixel_size_um=0.0,
+    bit_depth=32,
+    fps_max=60.0,
+    spectral_bands=[],
+    interface="simulated",
+    lens_mount="virtual",
+    mitsuba_modalities=["depth", "depth_sensor"],
+    mitsuba_variant_hint="cuda_rgb",
+    notes="Geometric depth plus explicit quantization/noise/dropout sensor model.",
+)
+
+
+# -----------------------------------------------------------------------------
+# Ouster OS1-128
+# -----------------------------------------------------------------------------
+# Ouster lidar modes are written as columns x scan rate (for example 1024x10);
+# 128 is the vertical channel count.  Revision-specific calibration is supplied
+# by an exported metadata JSON at capture time.
+OUSTER_OS1_128 = SensorProfile(
+    sensor_id="ouster_os1_128",
+    display_name="Ouster OS1-128 (360° LiDAR)",
+    manufacturer="Ouster",
+    model="OS1-128",
+    sensor_type="lidar",
+    resolution_wh=(1024, 128),
+    pixel_size_um=0.0,
+    bit_depth=32,
+    fps_max=10.0,
+    spectral_bands=[SpectralBand(
+        name="near_ir_lidar",
+        wavelength_min_nm=850.0,
+        wavelength_max_nm=880.0,
+        peak_nm=865.0,
+        description="Ouster OS1 near-infrared lidar return band",
+    )],
+    interface="UDP over Gigabit Ethernet",
+    lens_mount="integrated lidar head",
+    mitsuba_modalities=["lidar_point_cloud", "depth_sensor"],
+    mitsuba_variant_hint="cuda_rgb",
+    notes=(
+        "Default synthetic calibration is 128 rings × 1024 columns at 1024x10. "
+        "Provide Ouster sensor metadata for revision-specific calibration."
+    ),
+)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Registry
 # ─────────────────────────────────────────────────────────────────────────────
 SENSOR_PROFILES: dict[str, SensorProfile] = {
     JAI_FS1600D.sensor_id: JAI_FS1600D,
     LUCID_TRT053S.sensor_id: LUCID_TRT053S,
+    OUSTER_OS1_128.sensor_id: OUSTER_OS1_128,
+    GENERIC_DEPTH_SENSOR.sensor_id: GENERIC_DEPTH_SENSOR,
+    "depth_sensor": GENERIC_DEPTH_SENSOR,
+    "os1-128": OUSTER_OS1_128,
 }
 
 
@@ -221,4 +281,11 @@ def get_profile(sensor_id: str) -> SensorProfile:
 
 
 def list_profiles() -> list[SensorProfile]:
-    return list(SENSOR_PROFILES.values())
+    seen: set[str] = set()
+    profiles: list[SensorProfile] = []
+    for profile in SENSOR_PROFILES.values():
+        if profile.sensor_id in seen:
+            continue
+        seen.add(profile.sensor_id)
+        profiles.append(profile)
+    return profiles

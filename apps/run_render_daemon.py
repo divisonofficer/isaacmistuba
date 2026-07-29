@@ -69,6 +69,26 @@ def _is_subprocess_mode() -> bool:
     return raw in ("0", "false", "no", "off")
 
 
+def _check_bridge_schema() -> None:
+    """Fail early when a daemon mixes a stale bridge package with new code.
+
+    Sensor sweeps require the additive ``RenderRequest.sensor_specs`` field.
+    A long-lived daemon can otherwise keep an older imported bridge module in
+    memory and fail later with an opaque unexpected-keyword TypeError.
+    """
+    try:
+        from dataclasses import fields
+        from robomituba_bridge import RenderRequest
+        field_names = {item.name for item in fields(RenderRequest)}
+    except Exception as exc:
+        raise RuntimeError(f"Cannot inspect robomituba_bridge RenderRequest schema: {exc}") from exc
+    if "sensor_specs" not in field_names:
+        raise RuntimeError(
+            "Stale robomituba_bridge detected: RenderRequest.sensor_specs is missing. "
+            "Restart the render daemon/queue after updating the local modules."
+        )
+
+
 def _check_runtime() -> None:
     """Fail fast if drjit/mitsuba can't import or were built for a different Python.
 
@@ -113,6 +133,7 @@ def _check_runtime() -> None:
 
 
 def main() -> None:
+    _check_bridge_schema()
     _check_runtime()
 
     from mitsuba_converter import serve_render_daemon

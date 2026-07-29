@@ -326,6 +326,10 @@
 	let camera: any = null;
 	let controls: any = null;
 	let rootGroup: any = null;
+	// Transient "focus this sensor/node" pulse ring (see focusOnNode()).
+	let _focusMarker: any = null;
+	let _focusMarkerUntil = 0;
+	const _FOCUS_MARKER_MS = 2000;
 	let baseGroup: any = null;
 	let ghostGroup: any = null;
 	let robotGroup: any = null;
@@ -2112,6 +2116,19 @@
 			lastFrameMs = now;
 			updateKeyboardCamera(dt);
 			controls?.update();
+			if (_focusMarker) {
+				const rem = _focusMarkerUntil - now;
+				if (rem <= 0) {
+					hoverGroup?.remove(_focusMarker);
+					_focusMarker.geometry?.dispose?.();
+					_focusMarker.material?.dispose?.();
+					_focusMarker = null;
+				} else {
+					const frac = rem / _FOCUS_MARKER_MS;
+					_focusMarker.scale.setScalar(1 + 0.5 * Math.abs(Math.sin(now / 140)));
+					_focusMarker.material.opacity = 0.9 * frac;
+				}
+			}
 			renderer?.render(scene3D!, camera!);
 		};
 		loop();
@@ -2153,6 +2170,47 @@
 		camera.position.set(-4, 3, 2);
 		controls.target.set(3, 0, 2);
 		controls.update();
+	}
+
+	/** Recenter the orbit camera on a viewpoint/custom-sensor node and flash a pulse
+	 *  ring so the user can locate it fast. Keeps the current view direction, just
+	 *  pulls to a close framing. Returns false when the node id can't be resolved. */
+	export function focusOnNode(nodeId: string): boolean {
+		if (!camera || !controls || !hoverGroup) return false;
+		let x: number | null = null;
+		let z: number | null = null;
+		const gn = graphNodes.find((n: any) => n.node_id === nodeId);
+		if (gn) {
+			x = Number(gn.position?.[0] ?? 0);
+			z = Number(gn.position?.[1] ?? 0);
+		} else {
+			const cn = customSensorNodes.find((n: any) => n.id === nodeId);
+			if (cn) { x = Number(cn.x); z = Number(cn.z); }
+		}
+		if (x === null || z === null || !Number.isFinite(x) || !Number.isFinite(z)) return false;
+		const target = new THREE.Vector3(x, 0, z);
+		const dir = camera.position.clone().sub(controls.target);
+		if (dir.lengthSq() < 1e-6) dir.set(0, 6, -3);
+		dir.setLength(Math.min(Math.max(dir.length(), 3.5), 6));
+		controls.target.copy(target);
+		camera.position.copy(target.clone().add(dir));
+		controls.update();
+		// (Re)spawn the pulse ring lying flat at the node.
+		if (_focusMarker) {
+			hoverGroup.remove(_focusMarker);
+			_focusMarker.geometry?.dispose?.();
+			_focusMarker.material?.dispose?.();
+		}
+		_focusMarker = new THREE.Mesh(
+			new THREE.TorusGeometry(0.35, 0.05, 8, 32),
+			new THREE.MeshBasicMaterial({ color: 0x22d3ee, transparent: true, opacity: 0.9, depthTest: false }),
+		);
+		_focusMarker.rotation.x = Math.PI / 2;
+		_focusMarker.position.set(x, 0.12, z);
+		_focusMarker.renderOrder = 999;
+		hoverGroup.add(_focusMarker);
+		_focusMarkerUntil = performance.now() + _FOCUS_MARKER_MS;
+		return true;
 	}
 
 	/** Snapshot of the orbit camera in world coords. Used by the Preview tab to

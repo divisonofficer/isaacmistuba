@@ -40,19 +40,26 @@
 		stopTheme?.();
 	});
 
-	const NAV = [
-		{ en: 'Operations',       kr: '운영 홈',          href: '/',               icon: '🏠' },
-		{ en: 'Current Session',  kr: '현재 세션',        href: '/current-scene',  icon: '📍' },
-		{ en: 'Jobs / Queue',     kr: '작업 / 큐',        href: '/jobs',           icon: '📋' },
-		{ en: 'Datasets',         kr: '데이터셋',          href: '/datasets',       icon: 'DN' },
-		{ en: 'Camera Rig',       kr: '카메라 리그',      href: '/camera_rig',    icon: 'CAM' },
-		{ en: 'Asset Library',    kr: '에셋 라이브러리',  href: '/assets',         icon: '▣' },
-		{ en: 'Scene Registry',   kr: '장면 레지스트리',  href: '/scenes',         icon: '🎬' },
-		{ en: 'Material Library', kr: '재질 라이브러리',  href: '/materials',      icon: '🎨' },
-		{ en: 'Bridge',           kr: '연동 상태 (Bridge)', href: '/bridge',       icon: '🌉' },
-		{ en: 'System / Workers', kr: '시스템 / 워커',    href: '/system',         icon: '🖥' },
-		{ en: 'Guide',            kr: '가이드',           href: '/guide',          icon: '📘' },
-		{ en: 'Settings',         kr: '설정',             href: '/settings',       icon: '⚙' }
+	const NAV_GROUPS = [
+		{ en: '', kr: '', items: [
+			{ en: 'Operations',       kr: '운영 홈',          href: '/',               icon: '🏠' },
+			{ en: 'Current Session',  kr: '현재 세션',        href: '/current-scene',  icon: '📍' },
+			{ en: 'Jobs / Queue',     kr: '작업 / 큐',        href: '/jobs',           icon: '📋' }
+		]},
+		{ en: 'Navigation Dataset', kr: '내비게이션 데이터셋', items: [
+			{ en: 'Nav Scenes',       kr: '내비 씬',          href: '/nav-scenes',     icon: '🗺' },
+			{ en: 'Dataset Editor',   kr: '데이터셋 에디터',   href: '/datasets',       icon: 'DN' },
+			{ en: 'Camera Rig',       kr: '카메라 리그',      href: '/camera_rig',     icon: 'CAM' },
+			{ en: 'Asset Library',    kr: '에셋 라이브러리',  href: '/assets',         icon: '▣' }
+		]},
+		{ en: 'Rendering & System', kr: '렌더링 · 시스템', items: [
+			{ en: 'Scene Registry',   kr: '장면 레지스트리',  href: '/scenes',         icon: '🎬' },
+			{ en: 'Material Library', kr: '재질 라이브러리',  href: '/materials',      icon: '🎨' },
+			{ en: 'Bridge',           kr: '연동 상태 (Bridge)', href: '/bridge',       icon: '🌉' },
+			{ en: 'System / Workers', kr: '시스템 / 워커',    href: '/system',         icon: '🖥' },
+			{ en: 'Guide',            kr: '가이드',           href: '/guide',          icon: '📘' },
+			{ en: 'Settings',         kr: '설정',             href: '/settings',       icon: '⚙' }
+		]}
 	];
 
 	function isActive(href: string) {
@@ -538,11 +545,16 @@
 		</div>
 
 		<nav class="nav-list">
-			{#each NAV as item}
-				<a href={item.href} class="nav-link {isActive(item.href) ? 'nav-link-active' : ''}">
-					<span>{item.icon} {$lang === 'kr' ? item.kr : item.en}</span>
-					{#if isActive(item.href)}<span style="font-size:0.7rem;opacity:0.5">▶</span>{/if}
-				</a>
+			{#each NAV_GROUPS as group}
+				{#if group.kr}
+					<div class="nav-group-label">{$lang === 'kr' ? group.kr : group.en}</div>
+				{/if}
+				{#each group.items as item}
+					<a href={item.href} class="nav-link {isActive(item.href) ? 'nav-link-active' : ''}">
+						<span>{item.icon} {$lang === 'kr' ? item.kr : item.en}</span>
+						{#if isActive(item.href)}<span style="font-size:0.7rem;opacity:0.5">▶</span>{/if}
+					</a>
+				{/each}
 			{/each}
 		</nav>
 

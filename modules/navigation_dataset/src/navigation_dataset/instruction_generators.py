@@ -227,16 +227,18 @@ def gen_turn_by_turn(core: EpisodeCore, ctx: InstructionContext) -> list[Instruc
     flush_turn()
     if not phrases:
         return []
-    # Collapse consecutive identical "go forward" into one.
-    compact: list[str] = []
-    for p in phrases:
-        if p == "go forward" and compact and compact[-1] == "go forward":
-            continue
-        compact.append(p)
-    text = ", ".join(compact)
+    # Every step is distinct: an in-place rotation (grouped to one "turn X°" per
+    # maneuver) is its OWN step, and each node-to-node move is its OWN "go forward"
+    # — they are NOT collapsed. So a path A→B→C with a turn only at B reads
+    # "go forward, turn right 30°, go forward" (one forward per edge), faithfully
+    # mirroring the node/heading progression (A:h30 → A:h90 → B:h90 → …).
+    moves = sum(1 for p in phrases if p == "go forward")
+    turns = sum(1 for p in phrases if p.startswith("turn "))
+    text = ", ".join(phrases)
     text = text[0].upper() + text[1:] + ("." if not text.endswith(".") else "")
     return [{"type": "turn_by_turn", "level": "geometric", "text": text, "lang": "en",
-             "source": "template", "grounding": {"steps": len(core.expanded_steps)}}]
+             "source": "template",
+             "grounding": {"primitive_steps": len(core.expanded_steps), "moves": moves, "turns": turns}}]
 
 
 def gen_landmark_chain(core: EpisodeCore, ctx: InstructionContext) -> list[Instruction]:
