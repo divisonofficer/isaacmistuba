@@ -1,0 +1,302 @@
+<!doctype html><html lang=ko><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1"><title>성능 개선 종합 · 2026-07-29</title><style>
+:root{--bg:#0f1216;--fg:#e6e9ef;--mut:#9aa4b2;--line:#232a33;--ok:#39d98a;--bad:#ff6b6b;--acc:#6aa9ff;--warn:#ffcc66}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.65 -apple-system,"Segoe UI",Roboto,"Noto Sans KR",sans-serif}
+.wrap{max-width:1080px;margin:0 auto;padding:40px 24px 90px}h1{font-size:25px;margin:0 0 6px}
+h2{font-size:19px;margin:36px 0 8px;padding-top:16px;border-top:1px solid var(--line)}h3{font-size:14px;color:var(--acc);margin:16px 0 6px}
+.sub{color:var(--mut);margin:0 0 22px}code{background:#1a1f26;padding:1px 6px;border-radius:4px;font-size:13px}
+table{border-collapse:collapse;width:100%;margin:10px 0;font-size:13px}th,td{border:1px solid var(--line);padding:6px 9px;text-align:left}
+th{background:#161b22;color:var(--mut)}td.num{text-align:right;font-variant-numeric:tabular-nums}
+.big{font-size:30px;font-weight:800;color:var(--ok)}.note{background:#141920;border-left:3px solid var(--acc);padding:12px 16px;margin:14px 0;border-radius:0 8px 8px 0}
+.warn{border-left-color:var(--warn)}.bad{border-left-color:var(--bad)}.mut{color:var(--mut);font-size:12px}
+.ok{color:var(--ok)}.xx{color:var(--bad)}
+/* module graph */
+.graph{display:flex;flex-direction:column;gap:0;margin:14px 0;font-size:12.5px}
+.row{display:flex;align-items:stretch;gap:10px;flex-wrap:wrap}
+.box{background:#161b22;border:1px solid var(--line);border-radius:8px;padding:8px 12px;min-width:150px}
+.box b{color:var(--fg)}.box .f{color:var(--mut);font-size:11px;display:block;margin-top:2px}
+.box.mod{border-color:#2c3a4f}.box.hi{border-color:var(--warn);background:#20200f}
+.arrow{color:var(--acc);align-self:center;font-size:18px;padding:0 2px}
+.down{color:var(--acc);text-align:center;font-size:16px;margin:2px 0}
+.mono{font-family:ui-monospace,Menlo,monospace}
+</style></head>
+<body><div class=wrap>
+<h1>성능 개선 종합 — 단일 스펙트럴-편광 씬 통합 · mesh decimation · NIR albedo</h1>
+<p class=sub>2026-07-29 · OpticalNav 렌더 파이프라인의 메모리·시간·자산 개선을 하나로. 편광 파이프라인은
+<a href="report_polar_qualify.html">적합성 게이트</a> PASS, 디버그는 <a href="report_debug_render.html">rig-faithful 디버그 렌더</a>로 검증.</p>
+
+<h2>1 · 모달리티 통합 — 모달리티별 재로드 → 단일 스펙트럴-편광 씬</h2>
+<p class=mut>원 동기: 예전에는 modality(RGB/NIR/편광)를 바꿀 때마다 <b>씬을 clean하고 재로드</b>해 IO 병목이었고, 두 모달리티 씬을
+<b>동시 resident</b>로 두면 VRAM을 초과했다. 이제 하나의 <code>cuda_ad_rgb_polarized</code> 씬이 blendbsdf <b>band-flip</b>으로
+가시광·NIR·편광을 모두 낸다 — 한 번 로드, 스펙트럼 전환은 params.update 한 번.</p>
+<table><tr><th>방식</th><th>씬 로드</th><th>스펙트럼 전환</th><th>총 wall</th><th>VRAM</th><th>결과</th></tr>
+<tr><td><b>통합 씬 (band-flip)</b></td><td class=num>1회 (110s)</td><td class=num>25 ms</td>
+  <td class=num>155s</td><td class=num>26,103 MiB</td><td class=ok>✓ 최적</td></tr>
+<tr><td>모달리티별 재로드 (old)</td><td class=num>2회 재로드</td><td class=num>= 재로드</td>
+  <td class=num>265s</td><td class=num>26,275 MiB</td><td class=xx>IO 병목 (1.71× 느림)</td></tr>
+<tr><td>두 모달리티 씬 동시 resident (old)</td><td class=num>2회</td><td class=num>—</td>
+  <td class=num>—</td><td class=num>~52,206 MiB</td><td class=xx>VRAM 초과 → thrash 실패</td></tr></table>
+<div class=note><b>이득.</b> 스펙트럼 전환이 <b>110s 재로드 → 25ms band-flip</b>으로,
+전체 sweep은 <b>1.71× 빨라지고</b> IO 병목이 사라진다. 단일 footprint(26,103 MiB)라 이중-resident(52,206 MiB &gt; 32,607 VRAM) OOM도 회피.</div>
+
+<h2>2 · Mesh decimation — semantic-topology LOD 예산</h2>
+<p class=mut>고폴리 Infinigen 씬(infinigen_kr_20260625)을 appearance-contract·per-slot·topology veto로 압축.
+<a href="report_2026-07-29_semantic_lod.html">상세 리포트</a>.</p>
+<div class=note><span class=big>27,136,473 → 3,938,041 polys (−85.5%)</span>
+&nbsp; full vs LOD 실측: peak GPU <b>+19,369 → +10,318 MiB (−47%)</b>,
+scene load <b>110s → 19s (5.8×)</b>, mean render 동일(sampler-bound), S0·DoLP parity 확인.</div>
+
+<h2>3 · Infinigen import 파이프라인 — 모듈 연결 그래프</h2>
+<p class=mut>.blend → render_scene.xml의 실제 2-stage 흐름. <b>Stage 1</b>은 Blender 프로세스(bpy)에서 메시·bake·manifest를 만들고,
+<code>scene_manifest.json</code> 파일로 넘겨 <b>Stage 2</b>(robomituba env)가 authoring map·render_scene.xml을 짓는다.
+mesh decimation(task 1)은 <b>bpy 메시가 손에 있는 Stage 1의 per-object 루프</b>(bake 직전, <code>_ensure_uv</code> 前)에 붙어야
+OBJ·bake·GLB가 모두 경량 메시를 반영한다.</p>
+<div style="overflow-x:auto;text-align:center;margin:10px 0"><svg width="458pt" height="960pt"
+ viewBox="0.00 0.00 458.00 960.00" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+<g id="graph0" class="graph" transform="scale(1 1) rotate(0) translate(4 956)">
+<title>import_flow</title>
+<g id="clust1" class="cluster">
+<title>cluster_s1</title>
+<path fill="#12161c" stroke="#31404f" d="M70,-496C70,-496 430,-496 430,-496 436,-496 442,-502 442,-508 442,-508 442,-896 442,-896 442,-902 436,-908 430,-908 430,-908 70,-908 70,-908 64,-908 58,-902 58,-896 58,-896 58,-508 58,-508 58,-502 64,-496 70,-496"/>
+<text text-anchor="middle" x="250" y="-895.2" font-family="Helvetica,sans-Serif" font-size="11.00" fill="#9aa4b2">STAGE 1 — Blender 프로세스 (bpy) &#160;&#160;tools/infinigen/blender_export_scene.py</text>
+</g>
+<g id="clust2" class="cluster">
+<title>cluster_s2</title>
+<path fill="#12161c" stroke="#31404f" d="M20,-8C20,-8 412,-8 412,-8 418,-8 424,-14 424,-20 424,-20 424,-408 424,-408 424,-414 418,-420 412,-420 412,-420 20,-420 20,-420 14,-420 8,-414 8,-408 8,-408 8,-20 8,-20 8,-14 14,-8 20,-8"/>
+<text text-anchor="middle" x="216" y="-407.2" font-family="Helvetica,sans-Serif" font-size="11.00" fill="#9aa4b2">STAGE 2 — robomituba 프로세스 &#160;&#160;apps/import_infinigen_scene.py</text>
+</g>
+<!-- blend -->
+<g id="node1" class="node">
+<title>blend</title>
+<polygon fill="#20200f" stroke="#ffcc66" points="258.5,-952 167.5,-952 167.5,-916 264.5,-916 264.5,-946 258.5,-952"/>
+<polyline fill="none" stroke="#ffcc66" points="258.5,-952 258.5,-946 "/>
+<polyline fill="none" stroke="#ffcc66" points="264.5,-946 258.5,-946 "/>
+<text text-anchor="middle" x="216" y="-931.2" font-family="Helvetica,sans-Serif" font-size="11.00" fill="#ffcc66">Infinigen .blend</text>
+</g>
+<!-- s1_load -->
+<g id="node2" class="node">
+<title>s1_load</title>
+<path fill="#161b22" stroke="#c58bff" d="M284,-880C284,-880 148,-880 148,-880 142,-880 136,-874 136,-868 136,-868 136,-856 136,-856 136,-850 142,-844 148,-844 148,-844 284,-844 284,-844 290,-844 296,-850 296,-856 296,-856 296,-868 296,-868 296,-874 290,-880 284,-880"/>
+<text text-anchor="start" x="163.5" y="-864.2" font-family="Helvetica,sans-Serif" font-weight="bold" font-size="11.00" fill="#e6e9ef">bpy 씬 로드 · 재질 추출</text>
+<text text-anchor="start" x="148" y="-854.8" font-family="Helvetica,sans-Serif" font-size="9.00" fill="#9aa4b2">_extract_material · _optical_class</text>
+</g>
+<!-- blend&#45;&gt;s1_load -->
+<g id="edge11" class="edge">
+<title>blend&#45;&gt;s1_load</title>
+<path fill="none" stroke="#6aa9ff" stroke-width="1.2" d="M216,-915.7C216,-915.54 216,-915.39 216,-915.24"/>
+<polygon fill="#6aa9ff" stroke="#6aa9ff" stroke-width="1.2" points="218.8,-916 216,-908 213.2,-916 218.8,-916"/>
+</g>
+<!-- s1_decim -->
+<g id="node3" class="node">
+<title>s1_decim</title>
+<path fill="#20200f" stroke="#ffcc66" stroke-dasharray="5,2" d="M319.5,-812C319.5,-812 112.5,-812 112.5,-812 106.5,-812 100.5,-806 100.5,-800 100.5,-800 100.5,-788 100.5,-788 100.5,-782 106.5,-776 112.5,-776 112.5,-776 319.5,-776 319.5,-776 325.5,-776 331.5,-782 331.5,-788 331.5,-788 331.5,-800 331.5,-800 331.5,-806 325.5,-812 319.5,-812"/>
+<text text-anchor="start" x="148" y="-796.2" font-family="Helvetica,sans-Serif" font-weight="bold" font-size="11.00" fill="#ffcc66">◆ mesh decimation ✓ 구현</text>
+<text text-anchor="start" x="112.5" y="-786.8" font-family="Helvetica,sans-Serif" font-size="9.00" fill="#ffcc66">decimate_object(obj, policy) · mesh_decimation.py</text>
+</g>
+<!-- s1_load&#45;&gt;s1_decim -->
+<g id="edge1" class="edge">
+<title>s1_load&#45;&gt;s1_decim</title>
+<path fill="none" stroke="#6aa9ff" stroke-width="1.2" d="M216,-843.66C216,-836.59 216,-828.28 216,-820.54"/>
+<polygon fill="#6aa9ff" stroke="#6aa9ff" stroke-width="1.2" points="218.8,-820.45 216,-812.45 213.2,-820.45 218.8,-820.45"/>
+</g>
+<!-- s1_obj -->
+<g id="node4" class="node">
+<title>s1_obj</title>
+<path fill="#161b22" stroke="#39d98a" d="M266,-744C266,-744 166,-744 166,-744 160,-744 154,-738 154,-732 154,-732 154,-720 154,-720 154,-714 160,-708 166,-708 166,-708 266,-708 266,-708 272,-708 278,-714 278,-720 278,-720 278,-732 278,-732 278,-738 272,-744 266,-744"/>
+<text text-anchor="start" x="168.5" y="-728.2" font-family="Helvetica,sans-Serif" font-weight="bold" font-size="11.00" fill="#e6e9ef">OBJ + MTL export</text>
+<text text-anchor="start" x="166" y="-718.8" font-family="Helvetica,sans-Serif" font-size="9.00" fill="#9aa4b2">_export_obj · usemtl slot</text>
+</g>
+<!-- s1_decim&#45;&gt;s1_obj -->
+<g id="edge2" class="edge">
+<title>s1_decim&#45;&gt;s1_obj</title>
+<path fill="none" stroke="#6aa9ff" stroke-width="1.2" d="M216,-775.66C216,-768.59 216,-760.28 216,-752.54"/>
+<polygon fill="#6aa9ff" stroke="#6aa9ff" stroke-width="1.2" points="218.8,-752.45 216,-744.45 213.2,-752.45 218.8,-752.45"/>
+</g>
+<!-- s1_bake -->
+<g id="node5" class="node">
+<title>s1_bake</title>
+<path fill="#20200f" stroke="#ffcc66" d="M336.5,-676C336.5,-676 95.5,-676 95.5,-676 89.5,-676 83.5,-670 83.5,-664 83.5,-664 83.5,-652 83.5,-652 83.5,-646 89.5,-640 95.5,-640 95.5,-640 336.5,-640 336.5,-640 342.5,-640 348.5,-646 348.5,-652 348.5,-652 348.5,-664 348.5,-664 348.5,-670 342.5,-676 336.5,-676"/>
+<text text-anchor="start" x="167" y="-660.2" font-family="Helvetica,sans-Serif" font-weight="bold" font-size="11.00" fill="#e6e9ef">texture / PBR bake</text>
+<text text-anchor="start" x="95.5" y="-650.8" font-family="Helvetica,sans-Serif" font-size="9.00" fill="#9aa4b2">_bake_albedo/roughness/metallic/normal (per&#45;object atlas)</text>
+</g>
+<!-- s1_obj&#45;&gt;s1_bake -->
+<g id="edge3" class="edge">
+<title>s1_obj&#45;&gt;s1_bake</title>
+<path fill="none" stroke="#6aa9ff" stroke-width="1.2" d="M216,-707.66C216,-700.59 216,-692.28 216,-684.54"/>
+<polygon fill="#6aa9ff" stroke="#6aa9ff" stroke-width="1.2" points="218.8,-684.45 216,-676.45 213.2,-684.45 218.8,-684.45"/>
+</g>
+<!-- s1_glb -->
+<g id="node6" class="node">
+<title>s1_glb</title>
+<path fill="#161b22" stroke="#39d98a" d="M281,-608C281,-608 151,-608 151,-608 145,-608 139,-602 139,-596 139,-596 139,-584 139,-584 139,-578 145,-572 151,-572 151,-572 281,-572 281,-572 287,-572 293,-578 293,-584 293,-584 293,-596 293,-596 293,-602 287,-608 281,-608"/>
+<text text-anchor="start" x="185.5" y="-592.2" font-family="Helvetica,sans-Serif" font-weight="bold" font-size="11.00" fill="#e6e9ef">GLB export</text>
+<text text-anchor="start" x="151" y="-582.8" font-family="Helvetica,sans-Serif" font-size="9.00" fill="#9aa4b2">_export_glb · baked PBR 임베드</text>
+</g>
+<!-- s1_bake&#45;&gt;s1_glb -->
+<g id="edge4" class="edge">
+<title>s1_bake&#45;&gt;s1_glb</title>
+<path fill="none" stroke="#6aa9ff" stroke-width="1.2" d="M216,-639.66C216,-632.59 216,-624.28 216,-616.54"/>
+<polygon fill="#6aa9ff" stroke="#6aa9ff" stroke-width="1.2" points="218.8,-616.45 216,-608.45 213.2,-616.45 218.8,-616.45"/>
+</g>
+<!-- s1_unit -->
+<g id="node7" class="node">
+<title>s1_unit</title>
+<path fill="#161b22" stroke="#39d98a" d="M315.5,-540C315.5,-540 116.5,-540 116.5,-540 110.5,-540 104.5,-534 104.5,-528 104.5,-528 104.5,-516 104.5,-516 104.5,-510 110.5,-504 116.5,-504 116.5,-504 315.5,-504 315.5,-504 321.5,-504 327.5,-510 327.5,-516 327.5,-516 327.5,-528 327.5,-528 327.5,-534 321.5,-540 315.5,-540"/>
+<text text-anchor="start" x="178" y="-524.2" font-family="Helvetica,sans-Serif" font-weight="bold" font-size="11.00" fill="#e6e9ef">units[] append</text>
+<text text-anchor="start" x="116.5" y="-514.8" font-family="Helvetica,sans-Serif" font-size="9.00" fill="#9aa4b2">polys·material_slots·optical_class·baked_normal</text>
+</g>
+<!-- s1_glb&#45;&gt;s1_unit -->
+<g id="edge5" class="edge">
+<title>s1_glb&#45;&gt;s1_unit</title>
+<path fill="none" stroke="#6aa9ff" stroke-width="1.2" d="M216,-571.66C216,-564.59 216,-556.28 216,-548.54"/>
+<polygon fill="#6aa9ff" stroke="#6aa9ff" stroke-width="1.2" points="218.8,-548.45 216,-540.45 213.2,-548.45 218.8,-548.45"/>
+</g>
+<!-- manifest -->
+<g id="node8" class="node">
+<title>manifest</title>
+<path fill="#20200f" stroke="#ffcc66" d="M290.5,-468C290.5,-470.21 257.11,-472 216,-472 174.89,-472 141.5,-470.21 141.5,-468 141.5,-468 141.5,-432 141.5,-432 141.5,-429.79 174.89,-428 216,-428 257.11,-428 290.5,-429.79 290.5,-432 290.5,-432 290.5,-468 290.5,-468"/>
+<path fill="none" stroke="#ffcc66" d="M290.5,-468C290.5,-465.79 257.11,-464 216,-464 174.89,-464 141.5,-465.79 141.5,-468"/>
+<text text-anchor="start" x="162" y="-452.2" font-family="Helvetica,sans-Serif" font-weight="bold" font-size="11.00" fill="#ffcc66">scene_manifest.json</text>
+<text text-anchor="start" x="153.5" y="-442.8" font-family="Helvetica,sans-Serif" font-size="9.00" fill="#ffcc66">파일 핸드오프 (별도 Python env)</text>
+</g>
+<!-- s1_unit&#45;&gt;manifest -->
+<g id="edge12" class="edge">
+<title>s1_unit&#45;&gt;manifest</title>
+<path fill="none" stroke="#6aa9ff" stroke-width="1.2" d="M216,-503.7C216,-496.61 216,-488.2 216,-480.21"/>
+<polygon fill="#6aa9ff" stroke="#6aa9ff" stroke-width="1.2" points="218.8,-480.1 216,-472.1 213.2,-480.1 218.8,-480.1"/>
+</g>
+<!-- s2_val -->
+<g id="node9" class="node">
+<title>s2_val</title>
+<path fill="#161b22" stroke="#6aa9ff" d="M272.5,-392C272.5,-392 159.5,-392 159.5,-392 153.5,-392 147.5,-386 147.5,-380 147.5,-380 147.5,-368 147.5,-368 147.5,-362 153.5,-356 159.5,-356 159.5,-356 272.5,-356 272.5,-356 278.5,-356 284.5,-362 284.5,-368 284.5,-368 284.5,-380 284.5,-380 284.5,-386 278.5,-392 272.5,-392"/>
+<text text-anchor="start" x="182" y="-376.2" font-family="Helvetica,sans-Serif" font-weight="bold" font-size="11.00" fill="#e6e9ef">manifest 검증</text>
+<text text-anchor="start" x="159.5" y="-366.8" font-family="Helvetica,sans-Serif" font-size="9.00" fill="#9aa4b2">validate_infinigen_manifest</text>
+</g>
+<!-- manifest&#45;&gt;s2_val -->
+<g id="edge13" class="edge">
+<title>manifest&#45;&gt;s2_val</title>
+<path fill="none" stroke="#6aa9ff" stroke-width="1.2" d="M216,-427.99C216,-427.83 216,-427.67 216,-427.51"/>
+<polygon fill="#6aa9ff" stroke="#6aa9ff" stroke-width="1.2" points="218.8,-428 216,-420 213.2,-428 218.8,-428"/>
+</g>
+<!-- s2_auth -->
+<g id="node10" class="node">
+<title>s2_auth</title>
+<path fill="#161b22" stroke="#6aa9ff" d="M318.5,-324C318.5,-324 113.5,-324 113.5,-324 107.5,-324 101.5,-318 101.5,-312 101.5,-312 101.5,-300 101.5,-300 101.5,-294 107.5,-288 113.5,-288 113.5,-288 318.5,-288 318.5,-288 324.5,-288 330.5,-294 330.5,-300 330.5,-300 330.5,-312 330.5,-312 330.5,-318 324.5,-324 318.5,-324"/>
+<text text-anchor="start" x="160" y="-308.2" font-family="Helvetica,sans-Serif" font-weight="bold" font-size="11.00" fill="#e6e9ef">build_authoring_map</text>
+<text text-anchor="start" x="113.5" y="-298.8" font-family="Helvetica,sans-Serif" font-size="9.00" fill="#9aa4b2">optical_class → bsdf_strategy (_material_binding)</text>
+</g>
+<!-- s2_val&#45;&gt;s2_auth -->
+<g id="edge6" class="edge">
+<title>s2_val&#45;&gt;s2_auth</title>
+<path fill="none" stroke="#6aa9ff" stroke-width="1.2" d="M216,-355.66C216,-348.59 216,-340.28 216,-332.54"/>
+<polygon fill="#6aa9ff" stroke="#6aa9ff" stroke-width="1.2" points="218.8,-332.45 216,-324.45 213.2,-332.45 218.8,-332.45"/>
+</g>
+<!-- s2_inst -->
+<g id="node11" class="node">
+<title>s2_inst</title>
+<path fill="#161b22" stroke="#c58bff" d="M285,-256C285,-256 147,-256 147,-256 141,-256 135,-250 135,-244 135,-244 135,-232 135,-232 135,-226 141,-220 147,-220 147,-220 285,-220 285,-220 291,-220 297,-226 297,-232 297,-232 297,-244 297,-244 297,-250 291,-256 285,-256"/>
+<text text-anchor="start" x="167.5" y="-240.2" font-family="Helvetica,sans-Serif" font-weight="bold" font-size="11.00" fill="#e6e9ef">install / materialize</text>
+<text text-anchor="start" x="147" y="-230.8" font-family="Helvetica,sans-Serif" font-size="9.00" fill="#9aa4b2">navigation_dataset.office_sample</text>
+</g>
+<!-- s2_auth&#45;&gt;s2_inst -->
+<g id="edge7" class="edge">
+<title>s2_auth&#45;&gt;s2_inst</title>
+<path fill="none" stroke="#6aa9ff" stroke-width="1.2" d="M216,-287.66C216,-280.59 216,-272.28 216,-264.54"/>
+<polygon fill="#6aa9ff" stroke="#6aa9ff" stroke-width="1.2" points="218.8,-264.45 216,-256.45 213.2,-264.45 218.8,-264.45"/>
+</g>
+<!-- s2_xml -->
+<g id="node12" class="node">
+<title>s2_xml</title>
+<path fill="#161b22" stroke="#39d98a" d="M404,-188C404,-188 28,-188 28,-188 22,-188 16,-182 16,-176 16,-176 16,-164 16,-164 16,-158 22,-152 28,-152 28,-152 404,-152 404,-152 410,-152 416,-158 416,-164 416,-164 416,-176 416,-176 416,-182 410,-188 404,-188"/>
+<text text-anchor="start" x="134.5" y="-172.2" font-family="Helvetica,sans-Serif" font-weight="bold" font-size="11.00" fill="#e6e9ef">render_scene.xml (~540 shape)</text>
+<text text-anchor="start" x="28" y="-162.8" font-family="Helvetica,sans-Serif" font-size="9.00" fill="#9aa4b2">render_daemon._generate_opticalnav_render_scene_xml · GLB→OBJ glb_texture_adapter</text>
+</g>
+<!-- s2_inst&#45;&gt;s2_xml -->
+<g id="edge8" class="edge">
+<title>s2_inst&#45;&gt;s2_xml</title>
+<path fill="none" stroke="#6aa9ff" stroke-width="1.2" d="M216,-219.66C216,-212.59 216,-204.28 216,-196.54"/>
+<polygon fill="#6aa9ff" stroke="#6aa9ff" stroke-width="1.2" points="218.8,-196.45 216,-188.45 213.2,-196.45 218.8,-196.45"/>
+</g>
+<!-- s2_pol -->
+<g id="node13" class="node">
+<title>s2_pol</title>
+<path fill="#161b22" stroke="#39d98a" d="M294,-120C294,-120 138,-120 138,-120 132,-120 126,-114 126,-108 126,-108 126,-96 126,-96 126,-90 132,-84 138,-84 138,-84 294,-84 294,-84 300,-84 306,-90 306,-96 306,-96 306,-108 306,-108 306,-114 300,-120 294,-120"/>
+<text text-anchor="start" x="163" y="-104.2" font-family="Helvetica,sans-Serif" font-weight="bold" font-size="11.00" fill="#e6e9ef">material_policy.json</text>
+<text text-anchor="start" x="138" y="-94.8" font-family="Helvetica,sans-Serif" font-size="9.00" fill="#9aa4b2">_build_render_scene_material_policy</text>
+</g>
+<!-- s2_xml&#45;&gt;s2_pol -->
+<g id="edge9" class="edge">
+<title>s2_xml&#45;&gt;s2_pol</title>
+<path fill="none" stroke="#6aa9ff" stroke-width="1.2" d="M216,-151.66C216,-144.59 216,-136.28 216,-128.54"/>
+<polygon fill="#6aa9ff" stroke="#6aa9ff" stroke-width="1.2" points="218.8,-128.45 216,-120.45 213.2,-128.45 218.8,-128.45"/>
+</g>
+<!-- s2_cache -->
+<g id="node14" class="node">
+<title>s2_cache</title>
+<path fill="#161b22" stroke="#39d98a" d="M321.5,-52C321.5,-52 110.5,-52 110.5,-52 104.5,-52 98.5,-46 98.5,-40 98.5,-40 98.5,-28 98.5,-28 98.5,-22 104.5,-16 110.5,-16 110.5,-16 321.5,-16 321.5,-16 327.5,-16 333.5,-22 333.5,-28 333.5,-28 333.5,-40 333.5,-40 333.5,-46 327.5,-52 321.5,-52"/>
+<text text-anchor="start" x="165" y="-36.2" font-family="Helvetica,sans-Serif" font-weight="bold" font-size="11.00" fill="#e6e9ef">mesh_cache dedup</text>
+<text text-anchor="start" x="110.5" y="-26.8" font-family="Helvetica,sans-Serif" font-size="9.00" fill="#9aa4b2">_stage_xml_obj_filenames_to_scene_mesh_cache</text>
+</g>
+<!-- s2_pol&#45;&gt;s2_cache -->
+<g id="edge10" class="edge">
+<title>s2_pol&#45;&gt;s2_cache</title>
+<path fill="none" stroke="#6aa9ff" stroke-width="1.2" d="M216,-83.66C216,-76.59 216,-68.28 216,-60.54"/>
+<polygon fill="#6aa9ff" stroke="#6aa9ff" stroke-width="1.2" points="218.8,-60.45 216,-52.45 213.2,-60.45 218.8,-60.45"/>
+</g>
+</g>
+</svg>
+</div>
+<p class=mut><b>✓ task 1 구현됨</b> — <code>tools/infinigen/mesh_decimation.py</code>: <code>DecimationPolicy</code> 프로토콜 +
+<code>decimate_object(bpy_obj, policy, ctx)</code>. <code>blender_export_scene.py</code>의 per-object 루프(UV/OBJ/bake 前)에
+<code>--decimate-policy</code>로 배선(기본 <code>none</code>=무변화). 정책은 <b>이 모듈에서만</b> 발전 — 현재 <code>none</code>·<code>ratio_threshold</code>
+(optical/구조 보호)·<code>semantic_contract</code>(미정 stub, §2 semantic 예산이 들어올 자리). manifest에 <code>decimation</code>·<code>polys</code>(감축 후) 기록.
+기존 render-path 훅은 <b>에디터 프리뷰용</b>(<code>_write_decimated_preview_obj</code>)뿐이었다.</p>
+
+<h2>4 · NIR albedo 합성 — class→ρ₈₅₄ prior + spatial transfer, 1채널</h2>
+
+<div class=note bad><b>왜 RGB에서 NIR을 만들 수 없나.</b> Infinigen 자산의 <code>base_color</code>는 가시광 <b>RGB 3-point</b>(R·G·B 세 표본)뿐이다.
+근적외선 반사율은 <b>물리적으로 독립인 4번째 채널</b>이라 RGB로부터 함수적으로 복원할 수 없다 — 예: 초록 <b>잎</b>과 초록 <b>페인트</b>는
+RGB에서 동일해 보이지만, 잎은 red-edge 때문에 NIR에서 밝고(ρ₈₅₄≈0.5) 페인트는 어둡다. 따라서 <code>NIR = f(RGB)</code>는 원천적으로 틀린 접근이다.</div>
+
+<h3>3-tier 우선순위 (측정 → 라이브러리 → class prior)</h3>
+<div class=graph><div class=row>
+  <div class=box><b>① measured</b><span class=f>자산에 실측 NIR이 있으면 사용 (현재 거의 없음)</span></div><span class=arrow>→</span>
+  <div class=box><b>② library</b><span class=f>동일 재질군의 공개 분광 라이브러리</span></div><span class=arrow>→</span>
+  <div class=box hi><b>③ class prior ★ 구현</b><span class=f>physical class → ρ₈₅₄ 평균+분산 prior</span></div>
+</div></div>
+<p class=mut>물리-재질 분류: <code>physical_material_for(shader, optical_class)</code> → 18개 클래스 중 하나 (+confidence).
+반사율 조회: <code>nir_reflectance(pmat, band)</code> → μ_c, spread. <code>configs/datasets/class_band_reflectance_v1.json</code>.</p>
+
+<h3>spatial transfer — 절대 레벨은 물리, 공간 구조만 RGB에서</h3>
+<div class=note>
+<div style="font-size:16px;text-align:center;margin:6px 0"><b>ρ<sub>NIR</sub>(x) = clip[ μ<sub>c</sub> · ( 1 + α<sub>c</sub> · ( L(x) / median(L) − 1 ) ), 0, 0.95 ]</b></div>
+<b>μ<sub>c</sub></b> = class NIR 평균 반사율(위 표) — <u>절대 밝기를 결정</u>. &nbsp;
+<b>L(x)</b> = 픽셀의 가시광 luminance(구조/디테일). &nbsp;
+<b>α<sub>c</sub></b> = <code>rgb_structure_weight</code> — RGB의 <u>상대 밝기 패턴(구조)만</u> 얼마나 반영할지. 색(hue)은 쓰지 않는다.
+즉 나뭇결·얼룩 같은 <u>공간 텍스처는 RGB에서 빌려오되</u>, 그 위의 <u>NIR 절대 반사율은 물리 클래스</u>가 못박는다.
+<code>synthesize_nir_texture(rgb_albedo_linear, pmat, band)</code>.
+</div>
+<table><tr><th>physical class</th><th>ρ₈₅₄ (mean)</th><th></th><th>physical class</th><th>ρ₈₅₄ (mean)</th></tr>
+<tr><td>vegetation_leaf</td><td class=num>0.52</td><td></td><td>ceramic</td><td class=num>0.72</td></tr>
+<tr><td>shell_calcite</td><td class=num>0.66</td><td></td><td>wood</td><td class=num>0.5</td></tr>
+<tr><td>concrete</td><td class=num>0.42</td><td></td><td>rubber</td><td class=num>0.3</td></tr></table>
+
+<h3>metal·glass 예외 + 1채널 렌더</h3>
+<div class=note><b>금속·유리는 diffuse 반사율을 부여하지 않는다.</b> <code>nir_scalar_reflectance()</code>가 metal/glass에 <b>None</b>을 반환 →
+가짜 diffuse ρ를 씌우지 않고 <b>Fresnel(dielectric / roughconductor) 경로</b>로 처리(편광과 일관). NIR band는 discrete-band 씬에서
+<b>단일밴드 스펙트럼</b>으로 blendbsdf weight-flip 렌더되며, S0는 <b>3채널 RGB가 아니라 1채널 반사율 맵</b>이다 —
+<a href="report_2026-07-28_polar_lod.html">polar-LOD 리포트</a>에서 선인장 몸통(0.52)/흙(0.30)이 물성별로 다른 명도의 단일채널로 렌더됨을 검증.</div>
+
+<h2>5 · webui 렌더 옵션 노출 (task 3 ✓)</h2>
+<p class=mut>위 개선을 데이터셋 편집기 렌더 설정(<code>RailSensorsTab.svelte</code>)에서 <b>체크박스 2개</b>로 토글:</p>
+<table><tr><th>옵션</th><th>동작</th><th>배선</th></tr>
+<tr><td><b>Unified spectral-polar scene</b></td><td>rgb/nir 패스도 rgb_polarized Stokes carrier로 → 단일 resident 씬(§1)</td>
+  <td><code>RenderConfig.unified_spectral</code> → <code>_render_pass</code> kind override</td></tr>
+<tr><td><b>Mesh LOD (decimated scene)</b></td><td>full 대신 <code>render_scene_lod.xml</code>(§2) 렌더</td>
+  <td>daemon이 render_settings에서 pop → scene-ref 교체 (별도 캐시키)</td></tr></table>
+<p class=mut>기본 off(미전송)이라 기존 렌더는 byte-동일 · stale worker 안전. 편집 파일: <code>+page.svelte</code>(state·payload) ·
+<code>RailSensorsTab.svelte</code>(체크박스) · <code>multimodal.py</code>(RenderConfig·_render_pass) · <code>render_daemon.py</code>(scene 선택).</p>
+
+<p class=mut style="margin-top:26px">데이터: <code>band_bench_2026-07-27/metrics.json</code> · <code>lod_compare_2026-07-28/result_*.json</code> ·
+<code>class_band_reflectance_v1.json</code>. <b>task 1(§3 import decimation 모듈) · task 3(§5 webui 옵션) 완료.</b></p>
+</div></body></html>
