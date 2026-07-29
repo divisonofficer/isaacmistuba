@@ -523,6 +523,10 @@
 		}
 	});
 	let ambientRadiance = $state(1.0);
+	// Perf render options (2026-07-29): unified spectral-polar scene (band-flip, one
+	// resident scene) and mesh LOD (decimated render_scene_lod.xml). Default off.
+	let unifiedSpectral = $state(false);
+	let useLodScene = $state(false);
 	let lightboxUrl = $state('');
 	let lightboxLabel = $state('');
 
@@ -1917,6 +1921,12 @@
 		if (previewBandMode && previewBandMode !== 'rgb') settings.pbrdf_band_mode = previewBandMode;
 		if (previewMeasuredScope && previewMeasuredScope !== 'analytic_only') settings.measured_scope = previewMeasuredScope;
 		if (previewMeasuredScope === 'analytic_priority' || previewMeasuredScope === 'budgeted_measured') settings.max_measured_bsdfs = 3;
+		// Perf render options (2026-07-29). Sent only when enabled so 'off' renders are
+		// byte-identical and never trip a stale worker on an unknown key.
+		// A) unified spectral-polar: one resident scene serves rgb+nir+polar (band-flip).
+		// B) mesh LOD: render the decimated render_scene_lod.xml instead of full geometry.
+		if (unifiedSpectral) settings.unified_spectral = true;
+		if (useLodScene) settings.use_lod_scene = true;
 		return settings;
 	}
 
@@ -5391,6 +5401,10 @@
 				onLoadRenderConfig={loadRenderConfig}
 				onSetSensorHeight={setSelectedSensorHeight}
 				onSetAmbientRadiance={(v) => (ambientRadiance = v)}
+			{unifiedSpectral}
+			{useLodScene}
+			onSetUnifiedSpectral={(v) => (unifiedSpectral = v)}
+			onSetUseLodScene={(v) => (useLodScene = v)}
 				onClearNodeObservations={clearNodeObservations}
 				onClearAllObservations={clearAllObservations}
 				onRenderViewpoint={renderSensorViewpoint}

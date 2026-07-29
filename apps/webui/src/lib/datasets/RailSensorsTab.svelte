@@ -35,6 +35,8 @@
 		placingSensor: boolean;
 		frustumMode: string;
 		ambientRadiance: number;
+		unifiedSpectral?: boolean;
+		useLodScene?: boolean;
 		activeModalityTab: string;
 		activeRigSensorOption: any;
 		activeCameraFrustum: any;
@@ -58,6 +60,8 @@
 		onLoadRenderConfig: () => void;
 		onSetSensorHeight: (h: number) => void;
 		onSetAmbientRadiance: (v: number) => void;
+		onSetUnifiedSpectral?: (v: boolean) => void;
+		onSetUseLodScene?: (v: boolean) => void;
 		onClearNodeObservations: (id: string) => void;
 		onClearAllObservations: () => void;
 		onRenderViewpoint: () => void;
@@ -92,14 +96,14 @@
 		selectedCustomSensorNode, selectedSensorHeightM,
 		sceneStateText, cameraSpecText, renderConfig,
 		observationScan, graphBatch, sensorRenderResult, renderingViewpoint,
-		placingSensor, frustumMode, ambientRadiance, activeModalityTab,
+		placingSensor, frustumMode, ambientRadiance, unifiedSpectral = false, useLodScene = false, activeModalityTab,
 		activeRigSensorOption, activeCameraFrustum, activeRenderModality,
 		hotCameraPose,
 		probeRendering, probeError, rigMountHeightM, authoringMap,
 		selectedProjectId, sceneId, loading, hasScene, hasGraph,
 		onLoadGlobalCameraRig, onSelectRigSensor, onSetFrustumMode, onTogglePlacingSensor,
 		onRemoveCustomSensor, onCustomSensorHeadingChange, onLoadRenderConfig,
-		onSetSensorHeight, onSetAmbientRadiance, onClearNodeObservations, onClearAllObservations,
+		onSetSensorHeight, onSetAmbientRadiance, onSetUnifiedSpectral, onSetUseLodScene, onClearNodeObservations, onClearAllObservations,
 		onRenderViewpoint, onRunProbe, onRenderEpisodes, onRenderEpisodeNodes,
 		renderVariant = 'base', perturbationEnabled = false,
 		perturbedRenderReady = false, perturbedRenderStale = false, onSetRenderVariant,
@@ -324,6 +328,20 @@
 				oninput={(e) => onSetAmbientRadiance(Number((e.currentTarget as HTMLInputElement).value))}
 				title="Fallback constant radiance injected when the scene has no emitters"
 			/>
+		</div>
+		<div class="sensor-config-row">
+			<label class="sensor-height-label" title="One resident cuda_ad_rgb_polarized scene serves RGB + NIR + polarization via band-flip — no per-modality reload (avoids the reload IO bottleneck & dual-resident VRAM OOM).">
+				<input type="checkbox" checked={unifiedSpectral}
+					onchange={(e) => onSetUnifiedSpectral?.((e.currentTarget as HTMLInputElement).checked)} />
+				Unified spectral-polar scene
+			</label>
+		</div>
+		<div class="sensor-config-row">
+			<label class="sensor-height-label" title="Render the decimated render_scene_lod.xml (semantic-topology LOD) instead of full geometry — less VRAM, faster scene load. Requires a synced LOD scene.">
+				<input type="checkbox" checked={useLodScene}
+					onchange={(e) => onSetUseLodScene?.((e.currentTarget as HTMLInputElement).checked)} />
+				Mesh LOD (decimated scene)
+			</label>
 		</div>
 		{#if vpTotal > 0}
 			<div class="sensor-obs-header">

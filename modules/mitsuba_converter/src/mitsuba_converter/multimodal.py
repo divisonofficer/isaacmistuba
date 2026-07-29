@@ -177,6 +177,11 @@ class RenderConfig:
     # Measured stays opt-in via explicit measured_scope.
     measured_scope: str = "analytic_only"
     max_measured_bsdfs: int = 3
+    # Perf render option (2026-07-29): when true, non-polar passes (rgb/nir) run on the
+    # rgb_polarized Stokes carrier too, so ONE resident scene serves rgb+nir+polar via
+    # band-flip instead of a separate rgb-variant scene instance. Avoids per-modality
+    # reload IO + dual-resident VRAM. See report_2026-07-29_perf.html §1.
+    unified_spectral: bool = False
     artifact_stems: dict[str, str] = field(default_factory=dict)
     scene_filenames: dict[str, str] = field(default_factory=dict)
 
@@ -4847,8 +4852,21 @@ def render_modalities(
         _pass_index[0] += 1
         from .mitsuba_runtime import mark_variant_unavailable, resolve_variant
 
-        kind = "spectral_polarized" if pass_name.startswith("polar") else "rgb"
         requested_variant = variant_override or variant
+        if pass_name.startswith("polar"):
+            # Band-pinned discrete polar renders run on the rgb Stokes carrier;
+            # they must never degrade to a spectral variant (and vice versa).
+            kind = (
+                "rgb_polarized"
+                if isinstance(requested_variant, str) and requested_variant.endswith("rgb_polarized")
+                else "spectral_polarized"
+            )
+        else:
+            # unified_spectral: run rgb/nir passes on the rgb_polarized Stokes carrier
+            # too, so ONE resident scene serves rgb+nir+polar via band-flip instead of a
+            # separate rgb-variant instance (report_2026-07-29_perf.html §1). rgb S0 is
+            # channels[3:6] of the Stokes output — the same extraction the polar pass uses.
+            kind = "rgb_polarized" if getattr(config, "unified_spectral", False) else "rgb"
         v = resolve_variant(requested_variant, kind=kind, allow_cpu=True)
         if not v.startswith("cuda_"):
             try:

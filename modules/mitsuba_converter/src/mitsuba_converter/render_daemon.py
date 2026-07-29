@@ -14188,6 +14188,10 @@ class RenderDaemon:
         node_heights = dict(node_heights_raw) if isinstance(node_heights_raw, Mapping) else None
         render_settings_raw = payload.get("render_settings")
         render_settings = dict(render_settings_raw) if isinstance(render_settings_raw, dict) else {}
+        # Mesh LOD render option: selects the decimated scene xml, so it is NOT a
+        # RenderConfig field — pop it here before render_settings reaches the strict
+        # render_config_from_payload field check (mirrors the `variant` pattern).
+        use_lod_scene = bool(render_settings.pop("use_lod_scene", False))
         skip_existing_observations = bool(
             payload.get("skip_existing_observations")
             or payload.get("only_missing")
@@ -14248,9 +14252,31 @@ class RenderDaemon:
                 "hint": "scene_variant.json has no valid base_scene_xml_ref or overlay_scene_xml_ref.",
             })
             return
+        # Mesh LOD render option: swap to the decimated render_scene_lod.xml (semantic-
+        # topology LOD, tools/build_lod_scene.py) when present. It is a distinct file →
+        # distinct mitsuba_scene_ref → distinct resident-scene cache key, so full and LOD
+        # renders never collide. Falls back to the full scene (with a warning) if absent.
+        if use_lod_scene:
+            _lod_abs = project_dir / "scenes" / scene_id / "render_scene_lod.xml"
+            if _lod_abs.exists():
+                try:
+                    resolved_scene_ref = str(_lod_abs.relative_to(self.repo_root))
+                except ValueError:
+                    resolved_scene_ref = str(_lod_abs)
+                print(f"[graph_sweep] use_lod_scene: rendering decimated {resolved_scene_ref}", flush=True)
+            else:
+                print(f"[graph_sweep] use_lod_scene requested but render_scene_lod.xml "
+                      f"missing for {scene_id}; using full scene", flush=True)
+        # Compute an immutable scene version before any task is queued.  The XML
+        # digest changes whenever Sync Render Scene produces a new GLB/material
+        # realization, so rerenders cannot accidentally reuse an old view.
+        _scene_version_id, _scene_digest = scene_version_id(
+            self.repo_root, scene_ref=resolved_scene_ref, graph_revision=str(payload.get("graph_revision") or ""),
+        )
+        _render_version_id = new_render_version_id(_scene_digest)
         # Always rebuild canonical scene_state — never inherit stale job_id from caller.
-        # 'perturbed' renders carry a distinct job id so their bridge-job + consolidated
-        # outputs never overwrite the base render.
+        # 'perturbed' renders carry a distinct job id so their versioned outputs
+        # never overwrite the base render.
         _job_variant = "perturbed" if _variant_key == "perturbed" else "template"
         scene_state_payload = {
             "job_id": f"opticalnav-{scene_id}-{_job_variant}",
