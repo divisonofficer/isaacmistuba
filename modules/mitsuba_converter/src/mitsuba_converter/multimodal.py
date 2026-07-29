@@ -562,7 +562,9 @@ def _pbrdf_band_policy_inventory(scene: Path | ET.Element) -> dict[str, Any]:
         "total_bsdfs": 0,
     }
     wrapper_types = {"twosided", "normalmap", "bumpmap", "blendbsdf", "mask"}
-    polar_rgb_types = {"pplastic", "dielectric", "roughdielectric", "conductor", "roughconductor", "thindielectric"}
+    # roughdielectric/thindielectric excluded: DoLP=0 in the polarized build
+    # (dev_report 2026-07-06 §2.1); they are coerced to the trio before polar render.
+    polar_rgb_types = {"pplastic", "dielectric", "conductor", "roughconductor"}
     for bsdf in root.findall(".//bsdf"):
         counts["total_bsdfs"] += 1
         bsdf_type = str(bsdf.get("type") or "")
