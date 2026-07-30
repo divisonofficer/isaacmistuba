@@ -17,6 +17,11 @@
 #   --no-glb             Disable GLB export (requires --allow-obj-fallback)
 #   --allow-obj-fallback Permit legacy/incomplete manifests and OBJ render fallback
 #   --no-bake-metallic   With --bake-pbr, skip the (fiddly) metallic EMIT bake
+#   --decimate-policy P  Mesh LOD during export: none|ratio_threshold|semantic_contract
+#                        (default none). semantic_contract = appearance-contract budget
+#                        (report_2026-07-29_semantic_lod.html); cuts foliage/clutter hard,
+#                        protects glass/metal/structure. Applies to OBJ + atlas + GLB.
+#   --decimate-min-polys N  Objects below N faces stay at 100% (default 50000)
 #   --bake-only          Re-bake PBR into an EXISTING scene's import (Stage 1 only, no
 #                        re-import) — preserves the authoring map; busts the staged cache
 #   --no-sync            Skip Stage 3 render-scene sync (don't stage webui meshes)
@@ -54,6 +59,8 @@ PROJECT_ID="opticalnav-v0.2"
 BAKE=1
 BAKE_PBR=1
 BAKE_METALLIC=1
+DECIMATE_POLICY=""          # none|ratio_threshold|semantic_contract (empty => none)
+DECIMATE_MIN_POLYS=50000    # objects below this stay at 100% (not a compression target)
 GLB=1
 ALLOW_OBJ_FALLBACK=0
 BAKE_ONLY=0
@@ -71,6 +78,8 @@ while [[ $# -gt 0 ]]; do
     --no-glb)     GLB=0; shift;;
     --allow-obj-fallback) ALLOW_OBJ_FALLBACK=1; shift;;
     --no-bake-metallic) BAKE_METALLIC=0; shift;;
+    --decimate-policy)  DECIMATE_POLICY="$2"; shift 2;;
+    --decimate-min-polys) DECIMATE_MIN_POLYS="$2"; shift 2;;
     --bake-only)  BAKE_ONLY=1; BAKE=1; BAKE_PBR=1; SKIP_EXPORT=0; shift;;
     --no-sync)    SYNC=0; shift;;
     --skip-export) SKIP_EXPORT=1; shift;;
@@ -145,6 +154,7 @@ echo " blend     : $BLEND"
 echo " import dir: $IMPORT_DIR"
 echo " scene id  : $SCENE_ID   (project $PROJECT_ID)"
 echo " bake      : $([[ $BAKE == 1 ]] && echo on || echo off)"
+echo " decimate  : ${DECIMATE_POLICY:-none}$([[ -n "$DECIMATE_POLICY" && "$DECIMATE_POLICY" != none ]] && echo " (min ${DECIMATE_MIN_POLYS} polys)")"
 echo "═══════════════════════════════════════════════════════════════"
 
 # ── Stage 1: bpy export ───────────────────────────────────────────────────────
@@ -159,6 +169,11 @@ else
   [[ $BAKE_PBR == 1 && $BAKE_METALLIC == 0 ]] && BAKE_FLAG+=(--no-bake-metallic)
   [[ $GLB == 0 ]] && BAKE_FLAG+=(--no-glb)
   [[ $ALLOW_OBJ_FALLBACK == 1 ]] && BAKE_FLAG+=(--allow-incomplete-pbr)
+  # Semantic-topology LOD budget (report_2026-07-29_semantic_lod.html): decimate the
+  # live bpy mesh in the export loop so OBJ + baked atlas + GLB all reflect it.
+  if [[ -n "$DECIMATE_POLICY" && "$DECIMATE_POLICY" != "none" ]]; then
+    BAKE_FLAG+=(--decimate-policy "$DECIMATE_POLICY" --decimate-min-polys "$DECIMATE_MIN_POLYS")
+  fi
   DEFAULT_STAGING_DIR="${IMPORT_DIR}.staging.$(date +%Y%m%dT%H%M%S)-$$"
   STAGING_DIR="${INFINIGEN_EXPORT_RESUME_DIR:-$DEFAULT_STAGING_DIR}"
   STAGING_MANIFEST="${STAGING_DIR}/scene_manifest.json"

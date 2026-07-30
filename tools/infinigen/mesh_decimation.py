@@ -92,17 +92,65 @@ class RatioThreshold:
                                   policy=self.name)
 
 
+@dataclass
 class SemanticContractPolicy:
-    """PLACEHOLDER for the appearance-contract · per-slot · topology-veto budget
-    (tools/semantic_lod_budget.py + report_2026-07-29_semantic_lod.html). Wiring the
-    real, human-calibrated rules in here is the intended future evolution of THIS
-    module — the call-site never changes. Not the default; raises until decided."""
-    name = "semantic_contract"
+    """Appearance-contract · per-slot · projected-size LOD budget — the Phase-A
+    (manifest-only) rule engine from tools/semantic_lod_budget.py, applied live in
+    the bpy export loop (report_2026-07-29_semantic_lod.html: −85% scene polys with
+    S0/DoLP parity). Per object: semantic_type → task role, (optical_class, factory)
+    → per-slot appearance contract, world size → projected-px tier, then the budget
+    rule engine returns a tri-weighted retained ratio. One COLLAPSE ratio is applied
+    per object (the per-slot geometry-veto Phase B needs mesh I/O and is not run here).
 
-    def decide(self, ctx: DecimationContext) -> DecimationDecision:  # pragma: no cover
-        raise NotImplementedError(
-            "semantic_contract decimation policy is not decided yet; "
-            "use --decimate-policy=ratio_threshold or none.")
+    The classification tables live in one place (semantic_lod_budget /
+    build_semantic_lod_plan) and are imported lazily so this module stays pure and
+    the rules keep evolving there, not at this call-site. Any import/eval failure
+    degrades to keep-100% (never aborts an import)."""
+    name = "semantic_contract"
+    min_faces: int = 50_000
+    _engine: object = field(default=None, repr=False, compare=False)
+
+    def _load(self):
+        if self._engine is None:
+            import os, sys
+            tools = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # repo/tools
+            if tools not in sys.path:
+                sys.path.insert(0, tools)
+            from semantic_lod_budget import budget_object
+            from build_semantic_lod_plan import SEM_TASK, slot_contract, projected_proxy
+            self._engine = (budget_object, SEM_TASK, slot_contract, projected_proxy)
+        return self._engine
+
+    def decide(self, ctx: DecimationContext) -> DecimationDecision:
+        if ctx.n_faces < self.min_faces:
+            return DecimationDecision(False, 1.0, reason=f"n_faces {ctx.n_faces}<{self.min_faces} (keep)",
+                                      policy=self.name)
+        try:
+            budget_object, SEM_TASK, slot_contract, projected_proxy = self._load()
+        except Exception as exc:  # noqa: BLE001 - degrade to keep-100%, never abort
+            return DecimationDecision(False, 1.0, reason=f"semantic engine import failed: {exc}",
+                                      policy=self.name)
+        slots = ctx.material_slots or [{"name": "?", "optical_class": ctx.optical_class}]
+        task_role = SEM_TASK.get(ctx.semantic_type, "none")
+        dims = ([abs(ctx.bbox_max[i] - ctx.bbox_min[i]) for i in range(3)]
+                if ctx.bbox_max else None)
+        px = projected_proxy(dims)
+        slots_meta = []
+        for s in slots:
+            oc = s.get("optical_class", ctx.optical_class)
+            contract, amb = slot_contract(oc, ctx.factory, ctx.semantic_type)
+            slots_meta.append({"slot": s.get("name", "?"), "contract": contract,
+                               "tri_fraction": round(1.0 / len(slots), 4),
+                               "contract_ambiguous": amb})
+        b = budget_object(ctx.object_id, f"{ctx.factory}/{ctx.semantic_type}", slots_meta,
+                          task_role=task_role, projected_px=px)
+        r = float(b.target_fraction)
+        detail = ",".join(f"{s.slot.split('.')[0]}:{s.contract}:{s.retained_ratio}" for s in b.slots)
+        if r >= 0.999:
+            return DecimationDecision(False, 1.0, reason=f"budget r*={r:.2f} role={task_role} [{detail}]"[:160],
+                                      policy=self.name)
+        return DecimationDecision(True, r, reason=f"r*={r:.3f} role={task_role} [{detail}]"[:160],
+                                  policy=self.name)
 
 
 def resolve_policy(name: str, **kw) -> DecimationPolicy:
@@ -117,7 +165,7 @@ def resolve_policy(name: str, **kw) -> DecimationPolicy:
             optical_ratio=float(kw.get("optical_ratio", 0.60)),
             floor_faces=int(kw.get("floor_faces", 2_000)))
     if name == "semantic_contract":
-        return SemanticContractPolicy()
+        return SemanticContractPolicy(min_faces=int(kw.get("min_faces", 50_000)))
     raise ValueError(f"unknown decimation policy: {name!r} (choices: none, ratio_threshold, semantic_contract)")
 
 
