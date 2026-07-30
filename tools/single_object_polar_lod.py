@@ -40,9 +40,10 @@ for _p in (REPO / "modules/mitsuba_converter/src", REPO / "modules/robomituba_br
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 try:
-    from mitsuba_converter.nir_reflectance import nir_scalar_reflectance
+    from mitsuba_converter.nir_reflectance import nir_scalar_reflectance, pseudo_nir_albedo
 except Exception:  # pragma: no cover - report harness still runs (falls back to 0.45)
     nir_scalar_reflectance = None
+    pseudo_nir_albedo = None
 OUT_DIR = REPO / "dev_report/images/polar_lod_2026-07-28"
 TMP = Path(os.environ.get("POLAR_LOD_TMP", "/tmp/claude-1000/polar_lod"))
 # Source OBJs live on a slow CIFS mount; a local copy (basename match) is used
@@ -237,7 +238,8 @@ def export_ply(m: trimesh.Trimesh, path: Path) -> Path:
 def nir_slot_rho(matname: str | None, cls: str) -> float:
     """Synthesized class-prior NIR (854 nm) scalar diffuse reflectance for a slot.
     Falls back to 0.45 (unknown dielectric) if the synthesis module is unavailable
-    or returns None (metal/glass are handled by the Fresnel path, not here)."""
+    or returns None (metal/glass are handled by the Fresnel path, not here).
+    Kept as the PHYSICAL reference column; the render now uses pseudo_nir_slot()."""
     rho = None
     if nir_scalar_reflectance is not None:
         try:
@@ -245,6 +247,22 @@ def nir_slot_rho(matname: str | None, cls: str) -> float:
         except Exception:
             rho = None
     return 0.45 if rho is None else float(rho)
+
+
+def pseudo_nir_slot(albedo: list | None) -> float:
+    """pseudo-NIR (854 nm) scalar from a slot's visible RGB albedo — the CONFIRMED
+    convention for Infinigen-import objects (2026-07-30): nir = max(rgb,1-rgb)·[.229,
+    .587,.114]. Texture-preserving heuristic; single-channel here only because these
+    slot albedos are flat placeholders. Uses the same visible default [0.5,0.5,0.5]
+    the visible band uses when the slot has no albedo, so the two bands stay coherent."""
+    rgb = albedo if albedo is not None else [0.5, 0.5, 0.5]
+    if pseudo_nir_albedo is not None:
+        try:
+            return float(pseudo_nir_albedo(np.asarray([[rgb]], np.float32))[0, 0])
+        except Exception:
+            pass
+    interm = [max(float(c), 1.0 - float(c)) for c in rgb]
+    return interm[0] * 0.229 + interm[1] * 0.587 + interm[2] * 0.114
 
 
 def material_dict(cls: str, band: str, albedo: list | None = None,
@@ -261,10 +279,12 @@ def material_dict(cls: str, band: str, albedo: list | None = None,
     if band == "visible":
         refl = albedo if albedo is not None else [0.5, 0.5, 0.5]
     else:
-        # NIR: synthesized class-prior SCALAR reflectance (uniform gray per slot,
-        # so the NIR render is genuinely single-channel). NOT derived from RGB.
-        rho = nir_slot_rho(matname, cls)
-        refl = [rho, rho, rho]
+        # NIR: pseudo-NIR albedo derived from the visible RGB (CONFIRMED convention,
+        # 2026-07-30) instead of the physical class-prior scalar. Single-channel here
+        # because the slot albedo is flat; the render's diffuse/specular ratio (hence
+        # NIR-band DoLP) now follows this pseudo albedo, not the class prior.
+        p = pseudo_nir_slot(albedo)
+        refl = [p, p, p]
     return {"type": "pplastic", "diffuse_reflectance": {"type": "rgb", "value": refl}, "int_ior": 1.5}
 
 
@@ -394,16 +414,19 @@ def run(asset_keys: list[str], spp: int, dry: bool) -> None:
                  "asset_id": Path(spec["mesh"]).stem, "mesh": spec["mesh"], "lods": []}
         if spec.get("multi"):
             entry["multi"] = True
+            _diff = ("glass", "metal_aluminum", "metal", "mirror")
             entry["slots"] = [{"matname": sh["matname"], "cls": sh["cls"],
                                "faces": len(sh["mesh"].faces),
                                "nir854": (nir_slot_rho(sh["matname"], sh["cls"])
-                                          if sh["cls"] not in ("glass", "metal_aluminum", "metal", "mirror")
-                                          else None)}
+                                          if sh["cls"] not in _diff else None),
+                               "nir854_pseudo": (pseudo_nir_slot(sh["albedo"])
+                                                 if sh["cls"] not in _diff else None)}
                               for sh in lods[0]["shapes"]]
         else:
             _sh = lods[0]["shapes"][0]
             entry["shader"] = _sh["matname"]
             entry["nir854"] = nir_slot_rho(_sh["matname"], _sh["cls"])
+            entry["nir854_pseudo"] = pseudo_nir_slot(_sh["albedo"])
 
         # export a PLY per (LOD, material slot); carry cls/albedo for the scene
         for l in lods:
