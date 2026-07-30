@@ -1,0 +1,97 @@
+{
+ "schema": "robomituba.spatial_pbr_ab.v2",
+ "experiment_id": "spatial-pbr-audited-inputs-ab-2026-07-29",
+ "variant": "cuda_ad_spectral_polarized",
+ "rgb_variant": "cuda_ad_spectral",
+ "output": "out/spatial_pbr_ab/2026-07-29-audited",
+ "fov_deg": 45.0,
+ "frame_fill": 0.72,
+ "views": {
+  "front": 0.0,
+  "grazing65": 65.0
+ },
+ "lights": {
+  "left50": -50.0,
+  "right50": 50.0
+ },
+ "light_elevation_deg": 45.0,
+ "light_distance_radii": 3.25,
+ "light_half_size_radii": 0.55,
+ "light_radiance": 18.0,
+ "smoke": {
+  "resolution": 256,
+  "spp": 64
+ },
+ "final": {
+  "resolution": 640,
+  "spp": 512
+ },
+ "uv_spp": 1,
+ "seed": 0,
+ "bootstrap_samples": 2000,
+ "assets": [
+  {
+   "group": "positive",
+   "scene": "kr_20260625",
+   "id": "BottleFactory_6220686_.spawn_asset_1976314",
+   "note": "metal 14% · diel 64% · graded 21% · grad 0.030 · cov 60%"
+  },
+  {
+   "group": "positive",
+   "scene": "kr_20260625",
+   "id": "StandingSinkFactory_335794_.spawn_asset_4727617",
+   "note": "metal 31% · diel 57% · graded 13% · grad 0.070"
+  },
+  {
+   "group": "positive",
+   "scene": "kr_20260625",
+   "id": "BottleFactory_9066242_.spawn_asset_2200086",
+   "note": "metal 44% · diel 40% · graded 16% · grad 0.089"
+  },
+  {
+   "group": "positive",
+   "scene": "kr_20260625",
+   "id": "BottleFactory_129128_.spawn_asset_4533336",
+   "note": "metal 82% · diel 0% · graded 18% · grad 0.100"
+  },
+  {
+   "group": "negative",
+   "scene": "kr_20260625",
+   "id": "BedFactory_7812946_.spawn_asset_5878389"
+  },
+  {
+   "group": "negative",
+   "scene": "kr_20260625",
+   "id": "NatureShelfTrinketsFactory_7695705_.spawn_asset_742423"
+  },
+  {
+   "group": "negative",
+   "scene": "kr_20260625",
+   "id": "LargePlantContainerFactory_2686399_.spawn_asset_5396567"
+  },
+  {
+   "group": "negative",
+   "scene": "kr_20260625",
+   "id": "PlantContainerFactory_8288363_.spawn_asset_1688329"
+  }
+ ],
+ "input_selection": {
+  "note": "positive assets are drawn from kr_20260625, the scene that has a covered-UV bake audit, and every one passes: albedo/roughness/metallic all spatial_bake_candidate, GLB geometry+UV valid, metallic robust range 1.0, albedo atlas max > 0.15. The 2026-07-13 positives were all defective (see report 2026-07-29 §3).",
+  "audit": "out/infinigen_audits/kr_20260625_covered_uv_pbr_audit_new.json",
+  "criteria": {
+   "channels_spatial": [
+    "albedo",
+    "roughness",
+    "metallic"
+   ],
+   "glb_geometry_valid": true,
+   "glb_uv_area_valid": true,
+   "metallic_robust_range_min": 0.3,
+   "albedo_atlas_max_min": 0.15,
+   "metallic_graded_fraction_min": 0.12,
+   "metallic_gradient_min": 0.02,
+   "note_on_gradedness": "robust_range alone is satisfied by a pure 0/1 mask. For polar-texture validation the metallic atlas must also carry intermediate values (graded fraction = share of covered texels with 0.10 < m < 0.90) AND spatial structure (mean |grad m| over covered texels). Monitor/Toilet were rejected at graded 0.1% - a single solid binary blob.",
+   "known_limitation": "Infinigen models metallic as per-material identity, not surface detail, so no asset has a within-material metallic gradient. The spatial variation available here is multi-material packing inside one UV atlas: segmentation, not gradient."
+  }
+ }
+}

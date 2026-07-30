@@ -176,3 +176,32 @@ def nir_scalar_reflectance(shader_name: str | None, optical_class: str | None = 
     pmat, _ = physical_material_for(shader_name, optical_class)
     info = nir_reflectance(pmat, band)
     return info["mean"] if info["albedo_channel"] else None
+
+
+# BT.601-style luma weights for the pseudo-NIR heuristic (distinct from the physical
+# _LUM above — this is a deliberate perceptual weighting, not a radiometric one).
+_PSEUDO_W = (0.229, 0.587, 0.114)
+
+
+def pseudo_nir_albedo(rgb_albedo: "np.ndarray") -> "np.ndarray":
+    """Texture-preserving pseudo-NIR albedo from an RGB albedo texture.
+
+        nir(x) = max(rgb, 1-rgb) · [0.229, 0.587, 0.114]      (per texel)
+
+    Unlike the physical class-prior (:func:`nir_scalar_reflectance`, a CONSTANT per
+    material that flattens texture), this keeps the RGB texture structure. That is the
+    **decided convention for Infinigen-import objects** (2026-07-30): imported objects
+    render with the spatial-PBR (polar) material + this pseudo-NIR albedo for the NIR
+    band, because preserved surface detail matters more than physically-accurate NIR
+    reflectance. NOTE: it is a heuristic, NOT a physical reflectance — a green leaf and
+    green paint differ in real NIR but not here. See report_2026-07-29_spatial_pbr_ab.html
+    (physical vs pseudo comparison) and report_debug_render.html.
+
+    Input `rgb_albedo` is LINEAR RGB in [0,1], shape (H,W,3) or (H,W). Output (H,W)
+    float32 in ~[0.47, 0.93] (weights sum to 0.93, un-normalised, per the fixed
+    convention; max(x,1-x) >= 0.5 so darkest output = 0.5·0.93)."""
+    rgb = np.clip(np.asarray(rgb_albedo, np.float32), 0.0, 1.0)
+    if rgb.ndim == 2:
+        rgb = np.repeat(rgb[..., None], 3, axis=-1)
+    interm = np.maximum(rgb, 1.0 - rgb)
+    return (interm @ np.asarray(_PSEUDO_W, np.float32)).astype(np.float32)
