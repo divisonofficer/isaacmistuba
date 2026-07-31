@@ -22,12 +22,12 @@ OUT = REPO / "dev_report/report_2026-07-31_kitchen_multimodal.html"
 MODS = [
     ("rgb", "RGB — passive", "주변광만(무광). 실내 항법 뷰."),
     ("albedo", "Albedo (AOV)", "Mitsuba diffuse-reflectance AOV — bake 결과."),
-    ("nir_active_pseudo", "NIR — active flash", "rig NIR flash + <b>pseudo-NIR albedo</b> 규약. 근거리 밝고 원거리 falloff."),
+    ("nir_active_pseudo", "NIR — active flash", "rig NIR flash + <b>pseudo-NIR albedo</b> 규약. 근거리 밝고 falloff. 벽의 미세 요철은 flash가 normal-map을 grazing 조명한 실제 표면 relief(노이즈 아님)."),
     ("dop", "DoP (red–black)", "편광 area flash. specular/유리에서 편광(빨강), diffuse는 검정."),
     ("aolp", "AoLP", "선형 편광각 0–180°."),
-    ("map_normal", "Normal map", "baked normal map을 표면에 flat 시각화."),
-    ("map_roughness", "Roughness map", "baked roughness."),
-    ("map_metallic", "Metallic map", "baked metallic (금속 slot만)."),
+    ("map_normal", "Normal map", "baked normal(albedo AOV 읽기). no-map은 neutral (0.5,0.5,1)."),
+    ("map_roughness", "Roughness map", "baked roughness — 매트 표면 밝음, 유리/광택 어두움."),
+    ("map_metallic", "Metallic map", "baked metallic (금속만 밝음)."),
 ]
 
 CSS = """
@@ -86,7 +86,8 @@ def main() -> int:
 <title>Kitchen import + multimodal render (2026-07-31)</title><style>{CSS}</style></head><body>
 <h1>Infinigen → OpticalNav: kitchen import + 멀티모달 렌더</h1>
 <p class="sub">2026-07-31 · scene <code>{manifest['scene_id']}</code> ·
-{len(views)} viewpoints · {manifest['size'][0]}×{manifest['size'][1]} · spp {manifest['spp']} ·
+{len(views)} viewpoints · {manifest['size'][0]}×{manifest['size'][1]} ·
+spp {manifest['spp']} (NIR {manifest.get('nir_spp', manifest['spp'])}) ·
 Device 1 / RTX 5090 / <code>cuda_ad_rgb_polarized</code></p>
 
 <div class="pipe"><b>파이프라인.</b>
@@ -113,7 +114,14 @@ polarized Stokes variant는 텍스처 256 캡으로 메모리 fit.</span></div>
 <ul style="font-size:14px;line-height:1.7">
 <li>이 실험은 <code>tools/render_kitchen_multimodal.py</code>로 재현. 뷰포인트는 그래프
 노드 중 방 중심에서 먼 것을 골라 <b>중심을 바라보게</b> 프레이밍(가까운 벽 회피).</li>
-<li>NIR active 렌더는 flash falloff로 근거리 밝고 원거리 어두움(물리적으로 정상).</li>
+<li><b>NIR speckle 검증.</b> 벽의 낱알 무늬는 렌더(MC) 노이즈가 아니라 <b>실제 표면 relief</b>다 —
+동일 뷰를 <b>spp 128과 4096으로 렌더하면 픽셀 단위로 동일</b>(local-diff-std 2.44 불변). active flash가
+plaster의 <b>normal map</b> 요철을 grazing 각도로 조명해 생기는 micro-shadow로, passive RGB(부드러운 주변광)에선
+안 보이고 active 센싱에서만 드러나는 특성. pseudo-NIR albedo에 0.8px 블러를 줘도 남는다 → albedo가 아닌 normal 기인.</li>
+<li><b>재질맵 렌더 방식.</b> normal/roughness/metallic은 각 shape의 baked 맵을 <code>diffuse.reflectance</code>로
+넣고 <b>albedo AOV</b>로 읽는다(조명/occlusion 무관, self-emitter의 OptiX SBT overflow 회피). map 없는 재질은
+검정이 아니라 참값(roughness=scalar alpha, normal=neutral, metallic=0/1)으로 표시.
+baked roughness는 실제 평균 ≈0.75(매트)로 정상 — 초기 렌더의 "roughness 0" 인상은 diffuse+occlusion viz의 오류였다.</li>
 <li>DoP는 창유리·카운터 모서리 등 Fresnel specular에서 편광 신호가 집중.</li>
 <li><b>남은 작업</b>: spatial-PBR η/k(공간가변 금속 IOR) 풀배선 — 현재 렌더는
 optical_class별 polar-capable BSDF(pplastic/dielectric/roughconductor) 사용.</li>
