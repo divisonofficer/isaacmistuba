@@ -1,0 +1,50 @@
+<!doctype html><html><head><meta charset="utf-8">
+<title>Kitchen import + multimodal render (2026-07-31)</title><style>
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+ max-width:1200px;margin:0 auto;padding:24px;color:#1a1a1a;background:#fafafa}
+h1{font-size:24px} h2{font-size:19px;margin-top:32px;border-bottom:2px solid #eee;padding-bottom:6px}
+.sub{color:#666;font-size:14px} code{background:#f0f0f0;padding:1px 5px;border-radius:3px;font-size:13px}
+.note{background:#f4f7fb;border-left:3px solid #4a7fc0;padding:10px 14px;margin:12px 0;font-size:14px;line-height:1.55}
+.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin:14px 0}
+.cell{background:#fff;border:1px solid #e3e3e3;border-radius:6px;overflow:hidden}
+.cell img{width:100%;display:block;background:#222}
+.cap{padding:6px 8px;font-size:12px} .cap b{font-size:13px}
+.mut{color:#777;font-size:12px} table{border-collapse:collapse;font-size:13px;margin:8px 0}
+td,th{border:1px solid #ddd;padding:4px 10px;text-align:right} th{background:#f5f5f5}
+.pipe{background:#fff;border:1px solid #e3e3e3;border-radius:6px;padding:12px 16px;font-size:14px;line-height:1.7}
+</style></head><body>
+<h1>Infinigen → OpticalNav: kitchen import + 멀티모달 렌더</h1>
+<p class="sub">2026-07-31 · scene <code>infinigen_single_room_kitchen_20260730</code> ·
+3 viewpoints · 640×480 · spp 128 ·
+Device 1 / RTX 5090 / <code>cuda_ad_rgb_polarized</code></p>
+
+<div class="pipe"><b>파이프라인.</b>
+① Infinigen <code>.blend</code> → <code>run_infinigen_import.sh</code> (texture bake ON) →
+② <b>semantic-contract mesh decimation</b> (appearance-contract LOD 예산) →
+③ nav traversability grid + viewpoint graph (21 nodes) →
+④ 멀티모달 렌더 (아래).</div>
+
+<div class="note"><b>Mesh decimation (② 규약).</b> import 중 bpy export 루프에서
+<code>semantic_contract</code> 정책으로 객체별 retained-ratio를 계산해 decimate.
+배경 장식(선반 소품)은 3%까지, 구조물/유리/금속은 보호.
+<table><tr><th>유닛</th><th>decimated</th><th>faces before</th><th>faces after</th><th>감소</th></tr><tr><td>211</td><td>85</td><td>26,398,535</td><td>10,099,161</td><td>−61.7%</td></tr></table></div>
+
+<div class="note"><b>렌더 규약.</b>
+<b>RGB는 passive</b>(주변광), <b>NIR은 active</b>(rig NIR flash) — 목적에 맞게 분리.
+NIR 밴드는 확정된 <b>pseudo-NIR albedo</b>(<code>max(rgb,1-rgb)·[.229,.587,.114]</code>) 규약 적용.
+편광(DoP/AoLP)은 rig 편광 area flash. normal/roughness/metallic은 baked 맵을 flat 시각화.
+<br><span class="mut">주의: modality 그룹별 분리 렌더(active_nir와 dop/aolp 동시 호출 시 Dr.Jit AD 충돌),
+polarized Stokes variant는 텍스처 256 캡으로 메모리 fit.</span></div>
+
+<h2>Viewpoint 0 — <code>vp_000012</code></h2><p class="mut">position (world XZ) = [4.73, 4.08]</p><div class="grid"><div class="cell"><img src="images/kitchen_multimodal_2026-07-31/vp0_vp_000012_rgb.png" alt="RGB — passive"><div class="cap"><b>RGB — passive</b><br><span class="mut">주변광만(무광). 실내 항법 뷰.</span></div></div><div class="cell"><img src="images/kitchen_multimodal_2026-07-31/vp0_vp_000012_albedo.png" alt="Albedo (AOV)"><div class="cap"><b>Albedo (AOV)</b><br><span class="mut">Mitsuba diffuse-reflectance AOV — bake 결과.</span></div></div><div class="cell"><img src="images/kitchen_multimodal_2026-07-31/vp0_vp_000012_nir.png" alt="NIR — active flash"><div class="cap"><b>NIR — active flash</b><br><span class="mut">rig NIR flash + <b>pseudo-NIR albedo</b> 규약. 근거리 밝고 원거리 falloff.</span></div></div><div class="cell"><img src="images/kitchen_multimodal_2026-07-31/vp0_vp_000012_dop.png" alt="DoP (red–black)"><div class="cap"><b>DoP (red–black)</b><br><span class="mut">편광 area flash. specular/유리에서 편광(빨강), diffuse는 검정.</span></div></div><div class="cell"><img src="images/kitchen_multimodal_2026-07-31/vp0_vp_000012_aolp.png" alt="AoLP"><div class="cap"><b>AoLP</b><br><span class="mut">선형 편광각 0–180°.</span></div></div><div class="cell"><img src="images/kitchen_multimodal_2026-07-31/vp0_vp_000012_map_normal.png" alt="Normal map"><div class="cap"><b>Normal map</b><br><span class="mut">baked normal map을 표면에 flat 시각화.</span></div></div><div class="cell"><img src="images/kitchen_multimodal_2026-07-31/vp0_vp_000012_map_roughness.png" alt="Roughness map"><div class="cap"><b>Roughness map</b><br><span class="mut">baked roughness.</span></div></div><div class="cell"><img src="images/kitchen_multimodal_2026-07-31/vp0_vp_000012_map_metallic.png" alt="Metallic map"><div class="cap"><b>Metallic map</b><br><span class="mut">baked metallic (금속 slot만).</span></div></div></div><h2>Viewpoint 1 — <code>vp_000013</code></h2><p class="mut">position (world XZ) = [2.12, 4.08]</p><div class="grid"><div class="cell"><img src="images/kitchen_multimodal_2026-07-31/vp1_vp_000013_rgb.png" alt="RGB — passive"><div class="cap"><b>RGB — passive</b><br><span class="mut">주변광만(무광). 실내 항법 뷰.</span></div></div><div class="cell"><img src="images/kitchen_multimodal_2026-07-31/vp1_vp_000013_albedo.png" alt="Albedo (AOV)"><div class="cap"><b>Albedo (AOV)</b><br><span class="mut">Mitsuba diffuse-reflectance AOV — bake 결과.</span></div></div><div class="cell"><img src="images/kitchen_multimodal_2026-07-31/vp1_vp_000013_nir.png" alt="NIR — active flash"><div class="cap"><b>NIR — active flash</b><br><span class="mut">rig NIR flash + <b>pseudo-NIR albedo</b> 규약. 근거리 밝고 원거리 falloff.</span></div></div><div class="cell"><img src="images/kitchen_multimodal_2026-07-31/vp1_vp_000013_dop.png" alt="DoP (red–black)"><div class="cap"><b>DoP (red–black)</b><br><span class="mut">편광 area flash. specular/유리에서 편광(빨강), diffuse는 검정.</span></div></div><div class="cell"><img src="images/kitchen_multimodal_2026-07-31/vp1_vp_000013_aolp.png" alt="AoLP"><div class="cap"><b>AoLP</b><br><span class="mut">선형 편광각 0–180°.</span></div></div><div class="cell"><img src="images/kitchen_multimodal_2026-07-31/vp1_vp_000013_map_normal.png" alt="Normal map"><div class="cap"><b>Normal map</b><br><span class="mut">baked normal map을 표면에 flat 시각화.</span></div></div><div class="cell"><img src="images/kitchen_multimodal_2026-07-31/vp1_vp_000013_map_roughness.png" alt="Roughness map"><div class="cap"><b>Roughness map</b><br><span class="mut">baked roughness.</span></div></div><div class="cell"><img src="images/kitchen_multimodal_2026-07-31/vp1_vp_000013_map_metallic.png" alt="Metallic map"><div class="cap"><b>Metallic map</b><br><span class="mut">baked metallic (금속 slot만).</span></div></div></div><h2>Viewpoint 2 — <code>vp_000016</code></h2><p class="mut">position (world XZ) = [4.78, 1.82]</p><div class="grid"><div class="cell"><img src="images/kitchen_multimodal_2026-07-31/vp2_vp_000016_rgb.png" alt="RGB — passive"><div class="cap"><b>RGB — passive</b><br><span class="mut">주변광만(무광). 실내 항법 뷰.</span></div></div><div class="cell"><img src="images/kitchen_multimodal_2026-07-31/vp2_vp_000016_albedo.png" alt="Albedo (AOV)"><div class="cap"><b>Albedo (AOV)</b><br><span class="mut">Mitsuba diffuse-reflectance AOV — bake 결과.</span></div></div><div class="cell"><img src="images/kitchen_multimodal_2026-07-31/vp2_vp_000016_nir.png" alt="NIR — active flash"><div class="cap"><b>NIR — active flash</b><br><span class="mut">rig NIR flash + <b>pseudo-NIR albedo</b> 규약. 근거리 밝고 원거리 falloff.</span></div></div><div class="cell"><img src="images/kitchen_multimodal_2026-07-31/vp2_vp_000016_dop.png" alt="DoP (red–black)"><div class="cap"><b>DoP (red–black)</b><br><span class="mut">편광 area flash. specular/유리에서 편광(빨강), diffuse는 검정.</span></div></div><div class="cell"><img src="images/kitchen_multimodal_2026-07-31/vp2_vp_000016_aolp.png" alt="AoLP"><div class="cap"><b>AoLP</b><br><span class="mut">선형 편광각 0–180°.</span></div></div><div class="cell"><img src="images/kitchen_multimodal_2026-07-31/vp2_vp_000016_map_normal.png" alt="Normal map"><div class="cap"><b>Normal map</b><br><span class="mut">baked normal map을 표면에 flat 시각화.</span></div></div><div class="cell"><img src="images/kitchen_multimodal_2026-07-31/vp2_vp_000016_map_roughness.png" alt="Roughness map"><div class="cap"><b>Roughness map</b><br><span class="mut">baked roughness.</span></div></div><div class="cell"><img src="images/kitchen_multimodal_2026-07-31/vp2_vp_000016_map_metallic.png" alt="Metallic map"><div class="cap"><b>Metallic map</b><br><span class="mut">baked metallic (금속 slot만).</span></div></div></div>
+
+<h2>메모</h2>
+<ul style="font-size:14px;line-height:1.7">
+<li>이 실험은 <code>tools/render_kitchen_multimodal.py</code>로 재현. 뷰포인트는 그래프
+노드 중 방 중심에서 먼 것을 골라 <b>중심을 바라보게</b> 프레이밍(가까운 벽 회피).</li>
+<li>NIR active 렌더는 flash falloff로 근거리 밝고 원거리 어두움(물리적으로 정상).</li>
+<li>DoP는 창유리·카운터 모서리 등 Fresnel specular에서 편광 신호가 집중.</li>
+<li><b>남은 작업</b>: spatial-PBR η/k(공간가변 금속 IOR) 풀배선 — 현재 렌더는
+optical_class별 polar-capable BSDF(pplastic/dielectric/roughconductor) 사용.</li>
+</ul>
+</body></html>
