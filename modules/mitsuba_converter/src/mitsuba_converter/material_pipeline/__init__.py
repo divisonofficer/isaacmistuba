@@ -21,4 +21,12 @@ __all__ = [
     "load_material_slots",
     "SLOTS_SCHEMA_VERSION",
     "canonicalize_materials",
+    "render_property_maps",
 ]
+
+
+def __getattr__(name):  # lazy: dataset_render imports mitsuba, keep it optional
+    if name == "render_property_maps":
+        from .dataset_render import render_property_maps
+        return render_property_maps
+    raise AttributeError(name)
