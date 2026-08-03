@@ -27,6 +27,7 @@ import argparse
 import json
 import math
 import os
+import re
 import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -202,6 +203,72 @@ def write_mapviz_xml(xml_path: Path, out_path: Path, channel: str) -> Path | Non
     return out_path
 
 
+def render_normal_aov(xml_path: Path, origin, target, fov: float, w: int, h: int, spp: int,
+                      out_path: Path) -> None:
+    """Render the world-space sh_normal AOV in an ISOLATED subprocess.
+
+    A direct mi.load_file/render mixed with render_modalities in the same long-lived
+    process segfaults on the 2nd viewpoint (jit/OptiX state clash), so each normal
+    render runs in a fresh interpreter via the `--normal-worker` mode below."""
+    import subprocess
+    args = [sys.executable, str(Path(__file__).resolve()), "--normal-worker",
+            str(xml_path), ",".join(f"{v}" for v in origin), ",".join(f"{v}" for v in target),
+            f"{fov}", str(w), str(h), str(spp), str(out_path)]
+    subprocess.run(args, check=True, env=os.environ.copy())
+
+
+def _normal_aov_worker(xml_path: Path, origin, target, fov: float, w: int, h: int, spp: int,
+                       out_path: Path) -> None:
+    """The actual sh_normal AOV render (runs in the isolated subprocess). EVERY polygon
+    shows its real view-appropriate normal — geometric where no normal map, perturbed
+    where one exists. measured_polarized BSDFs (need daemon staging to load directly)
+    are swapped to diffuse; only geometry + surviving normalmap wrappers matter here."""
+    import mitsuba as mi
+    mi.set_variant("cuda_ad_rgb_polarized")
+    tree = ET.parse(xml_path)
+    root = tree.getroot()
+    for it in list(root.findall("integrator")):
+        root.remove(it)
+    aov = ET.Element("integrator", type="aov")
+    ET.SubElement(aov, "string", {"name": "aovs", "value": "nn:sh_normal"})
+    nested = ET.SubElement(aov, "integrator", type="path")
+    ET.SubElement(nested, "integer", {"name": "max_depth", "value": "2"})
+    root.insert(0, aov)
+    for b in root.iter("bsdf"):
+        if str(b.get("type", "")).startswith("measured"):
+            for ch in list(b):
+                b.remove(ch)
+            b.set("type", "diffuse")
+    s = root.find("sensor")
+    for c in list(s):
+        if c.tag == "float" and c.get("name") == "fov":
+            c.set("value", f"{fov}")
+        if c.tag == "transform":
+            for lk in list(c):
+                c.remove(lk)
+            ET.SubElement(c, "lookat", {"origin": " ".join(f"{v}" for v in origin),
+                                        "target": " ".join(f"{v}" for v in target), "up": "0 1 0"})
+        if c.tag == "film":
+            for f in c.findall("integer"):
+                if f.get("name") == "width":
+                    f.set("value", str(w))
+                if f.get("name") == "height":
+                    f.set("value", str(h))
+        if c.tag == "sampler":
+            for f in c.findall("integer"):
+                if f.get("name") == "sample_count":
+                    f.set("value", str(spp))
+    tmp = out_path.parent / "_variants" / "scene_normal_aov.xml"
+    tmp.parent.mkdir(parents=True, exist_ok=True)
+    tree.write(tmp, encoding="unicode")
+    img = np.array(mi.render(mi.load_file(str(tmp))))
+    nrm = img[..., -3:]
+    nn = nrm / (np.linalg.norm(nrm, axis=-1, keepdims=True) + 1e-9)
+    enc = np.clip(nn * 0.5 + 0.5, 0, 1)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    Image.fromarray((enc * 255).astype(np.uint8)).save(out_path)
+
+
 # ------------------------------------------------------------------ render --- #
 def _tonemap(a: np.ndarray, mode: str) -> np.ndarray:
     a = np.asarray(a, np.float32)
@@ -292,7 +359,12 @@ def main() -> int:
         print(f"[pseudo-nir] {len(swaps)} albedo maps -> pseudo-NIR")
 
     vps = pick_viewpoints(graph, a.views)
-    # merge with any prior manifest so a partial --groups re-run keeps earlier images
+    # merge with prior images so a partial --groups re-run keeps earlier modalities.
+    # Scan BOTH the prior manifest AND the images on disk (a crash can truncate the
+    # manifest while the image files survive).
+    _KIND2KEY = {"rgb": "rgb", "albedo": "albedo", "nir": "nir_active_pseudo", "dop": "dop",
+                 "aolp": "aolp", "map_normal": "map_normal", "map_roughness": "map_roughness",
+                 "map_metallic": "map_metallic"}
     prior_imgs: dict[str, dict] = {}
     mpath = out / "manifest.json"
     if mpath.is_file():
@@ -301,6 +373,10 @@ def main() -> int:
                 prior_imgs[v["node_id"]] = dict(v.get("images", {}))
         except Exception:
             pass
+    for f in out.glob("vp*_*.png"):
+        m = re.match(r"vp\d+_(vp_\d+)_(.+)\.png", f.name)
+        if m and m.group(2) in _KIND2KEY:
+            prior_imgs.setdefault(m.group(1), {}).setdefault(_KIND2KEY[m.group(2)], f.name)
     manifest = {"scene_id": a.scene_id, "views": [], "groups": a.groups,
                 "spp": a.spp, "nir_spp": a.nir_spp, "size": [a.width, a.height]}
     for vi, vp in enumerate(vps):
@@ -333,14 +409,23 @@ def main() -> int:
             print("  [polar] dop, aolp", flush=True)
 
         if "mapviz" in a.groups:
-            for ch, mode in (("normal", "gray"), ("roughness", "gray"), ("metallic", "gray")):
+            # normal: world-space sh_normal AOV (every poly shows its real view normal,
+            # geometric where no map, perturbed where a normal map exists).
+            px, py, _ = node["position"]
+            render_normal_aov(xml, (float(px), EYE_H, float(py)), vp["target"],
+                              a.fov, a.width, a.height, max(16, a.spp // 4),
+                              out / f"vp{vi}_{nid}_map_normal.png")
+            rec["images"]["map_normal"] = f"vp{vi}_{nid}_map_normal.png"
+            # roughness/metallic: baked material map read via albedo AOV (true value,
+            # no-map -> scalar alpha / 0-or-1).
+            for ch in ("roughness", "metallic"):
                 vx = write_mapviz_xml(xml, tmp / f"scene_map_{ch}.xml", ch)
                 if vx is None:
                     continue
                 r = render_group(vx, cam, a.fov, ["albedo"], cfg, tex_cap=None)
                 save_png(r["albedo"].array, out / f"vp{vi}_{nid}_map_{ch}.png", "map")
                 rec["images"][f"map_{ch}"] = f"vp{vi}_{nid}_map_{ch}.png"
-            print("  [mapviz] normal, roughness, metallic", flush=True)
+            print("  [mapviz] normal(AOV), roughness, metallic", flush=True)
 
         manifest["views"].append(rec)
         (out / "manifest.json").write_text(json.dumps(manifest, indent=2))
@@ -350,4 +435,10 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    if len(sys.argv) >= 2 and sys.argv[1] == "--normal-worker":
+        _xml, _o, _t, _fov, _w, _h, _spp, _out = sys.argv[2:10]
+        _normal_aov_worker(Path(_xml), tuple(float(x) for x in _o.split(",")),
+                           tuple(float(x) for x in _t.split(",")), float(_fov),
+                           int(_w), int(_h), int(_spp), Path(_out))
+        raise SystemExit(0)
     raise SystemExit(main())

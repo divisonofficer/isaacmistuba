@@ -25,7 +25,7 @@ MODS = [
     ("nir_active_pseudo", "NIR — active flash", "rig NIR flash + <b>pseudo-NIR albedo</b> 규약. 근거리 밝고 falloff. 벽의 미세 요철은 flash가 normal-map을 grazing 조명한 실제 표면 relief(노이즈 아님)."),
     ("dop", "DoP (red–black)", "편광 area flash. specular/유리에서 편광(빨강), diffuse는 검정."),
     ("aolp", "AoLP", "선형 편광각 0–180°."),
-    ("map_normal", "Normal map", "baked normal(albedo AOV 읽기). no-map은 neutral (0.5,0.5,1)."),
+    ("map_normal", "Normal (world sh_normal)", "픽셀별 실제 법선(AOV): normal map 있으면 perturbed, 없으면 폴리곤 기하 법선. 벽 방향별 색·바닥=위."),
     ("map_roughness", "Roughness map", "baked roughness — 매트 표면 밝음, 유리/광택 어두움."),
     ("map_metallic", "Metallic map", "baked metallic (금속만 밝음)."),
 ]
@@ -118,10 +118,13 @@ polarized Stokes variant는 텍스처 256 캡으로 메모리 fit.</span></div>
 동일 뷰를 <b>spp 128과 4096으로 렌더하면 픽셀 단위로 동일</b>(local-diff-std 2.44 불변). active flash가
 plaster의 <b>normal map</b> 요철을 grazing 각도로 조명해 생기는 micro-shadow로, passive RGB(부드러운 주변광)에선
 안 보이고 active 센싱에서만 드러나는 특성. pseudo-NIR albedo에 0.8px 블러를 줘도 남는다 → albedo가 아닌 normal 기인.</li>
-<li><b>재질맵 렌더 방식.</b> normal/roughness/metallic은 각 shape의 baked 맵을 <code>diffuse.reflectance</code>로
+<li><b>재질맵 렌더 방식.</b> roughness/metallic은 각 shape의 baked 맵을 <code>diffuse.reflectance</code>로
 넣고 <b>albedo AOV</b>로 읽는다(조명/occlusion 무관, self-emitter의 OptiX SBT overflow 회피). map 없는 재질은
-검정이 아니라 참값(roughness=scalar alpha, normal=neutral, metallic=0/1)으로 표시.
-baked roughness는 실제 평균 ≈0.75(매트)로 정상 — 초기 렌더의 "roughness 0" 인상은 diffuse+occlusion viz의 오류였다.</li>
+검정이 아니라 참값(roughness=scalar alpha, metallic=0/1)으로 표시. baked roughness는 실제 평균 ≈0.75(매트)로
+정상 — 초기 렌더의 "roughness 0" 인상은 diffuse+occlusion viz의 오류였다.
+<b>normal은 baked 텍스처가 아니라 <code>nn:sh_normal</code> world-space AOV</b>로 렌더 —
+normal map 없는 폴리곤도 검정/neutral이 아니라 <b>실제 기하 법선</b>을 카메라 뷰 기준으로 보여준다
+(map 있으면 perturbation 포함).</li>
 <li>DoP는 창유리·카운터 모서리 등 Fresnel specular에서 편광 신호가 집중.</li>
 <li><b>남은 작업</b>: spatial-PBR η/k(공간가변 금속 IOR) 풀배선 — 현재 렌더는
 optical_class별 polar-capable BSDF(pplastic/dielectric/roughconductor) 사용.</li>
