@@ -131,7 +131,8 @@ def select_viewpoints_by_preview(xml: Path, graph: dict, k: int, headings=(0, 60
     nodes = graph["nodes"]
     pos = np.array([n["position"] for n in nodes], float)
     cx, cz = pos[:, 0].mean(), pos[:, 1].mean()
-    cfg = RenderConfig(); cfg.width = width; cfg.height = height; cfg.spp = spp
+    cfg = RenderConfig(); cfg.width = width; cfg.height = height
+    cfg.path_spp = spp; cfg.aov_spp = spp
     scored = []
     for n in nodes:
         px, py, _ = n["position"]
@@ -500,11 +501,18 @@ def main() -> int:
     out.mkdir(parents=True, exist_ok=True)
     tmp = out / "_variants"
 
-    cfg = RenderConfig(); cfg.width = a.width; cfg.height = a.height; cfg.spp = a.spp
+    # RenderConfig has NO `spp` field — path_spp(default 4096)/aov_spp(default 16)/
+    # polar_spp are separate. Setting `cfg.spp` silently did nothing, so the AOV
+    # passes (albedo, nir_albedo, roughness-mapviz) ran at aov_spp=16 and the texture
+    # readout ALIASED into salt-and-pepper grain on minified (distant) textures, while
+    # RGB was secretly at 4096. Drive all three from --spp so AOVs are anti-aliased.
+    cfg = RenderConfig(); cfg.width = a.width; cfg.height = a.height
+    cfg.path_spp = a.spp; cfg.aov_spp = a.spp; cfg.polar_spp = a.spp
     # NIR point-flash pass: clamp GI fireflies + cap bounce depth so the delta light's
     # clean direct illumination dominates (see nir_point_light docstring).
     cfg_nir = RenderConfig(); cfg_nir.width = a.width; cfg_nir.height = a.height
-    cfg_nir.path_spp = a.nir_spp; cfg_nir.use_firefly_clamp = True; cfg_nir.path_max_depth = 3
+    cfg_nir.path_spp = a.nir_spp; cfg_nir.aov_spp = a.nir_spp
+    cfg_nir.use_firefly_clamp = True; cfg_nir.path_max_depth = 3
     assist_flat = AssistLightSpec(mode="camera_aligned_rect", distance_m=0.18, size_world=[5.0, 3.6],
                                   spectrum_mode="mask_proxy", polarized=False,
                                   polarizer_angle_deg=0.0, extras={"radiance": 120.0})
