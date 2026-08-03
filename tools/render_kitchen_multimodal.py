@@ -43,7 +43,21 @@ for _m in ("robomituba_bridge", "mitsuba_converter", "navigation_dataset"):
 
 from mitsuba_converter.multimodal import render_modalities, RenderConfig, camera_to_world_from_lookat  # noqa: E402
 from mitsuba_converter.nir_reflectance import pseudo_nir_albedo  # noqa: E402
-from robomituba_bridge import AssistLightSpec  # noqa: E402
+from robomituba_bridge import AssistLightSpec, ActiveLightSpec  # noqa: E402
+
+
+def nir_point_light(radiance: float = 400.0) -> ActiveLightSpec:
+    """Rig-mounted NIR flash as a POINT (delta) emitter — matches real active-NIR
+    hardware and casts crisp inter-object shadows. A delta light's DIRECT illumination
+    is analytically connected (NEE) so it carries no area-sampling noise; the only MC
+    noise is indirect GI fireflies, tamed by firefly clamp + a low path_max_depth.
+    Mounted ~at the camera (headlamp) via base_pose @ mount."""
+    return ActiveLightSpec(
+        light_id="nir_point", enabled=True, emitter_type="point",
+        mount={"xyz_m": [0.0, 0.1, 0.0], "rpy_deg": [0.0, 0.0, 0.0]},
+        modalities=["nir"], spectrum_kind="rgb", rgb=[1.0, 1.0, 1.0],
+        wavelength_nm=None, radiance=radiance, cutoff_angle_deg=0.0, beam_width_deg=0.0,
+        area_size_m=0.1, polarized=False, polarizer_angle_deg=0.0, extras={})
 
 EYE_H = 1.2   # eye height (m); mount in the scene rig is ~1.0, raised for framing
 
@@ -380,7 +394,8 @@ def save_png(arr: np.ndarray, path: Path, mode: str):
     Image.fromarray((img * 255).astype(np.uint8)).save(path)
 
 
-def render_group(scene_xml, cam, fov, mods, cfg, assist=None, tex_cap: int | None = None):
+def render_group(scene_xml, cam, fov, mods, cfg, assist=None, tex_cap: int | None = None,
+                 active_lights=(), base_pose=None):
     """Render one modality group. `tex_cap` (px) is applied ONLY for the memory-heavy
     passes (polarized Stokes / active-NIR): the RGB base-path staging audits texture
     profiles with fail_on_gt_profile and rejects a partially-capped scene (299 refs
@@ -393,7 +408,8 @@ def render_group(scene_xml, cam, fov, mods, cfg, assist=None, tex_cap: int | Non
         os.environ.pop(key, None)
     try:
         return render_modalities(str(scene_xml), cam, fov, mods, config=cfg, variant="auto",
-                                 assist_light=assist).results
+                                 assist_light=assist, active_lights=active_lights,
+                                 base_pose=base_pose).results
     finally:
         if prev is None:
             os.environ.pop(key, None)
@@ -436,7 +452,10 @@ def main() -> int:
     tmp = out / "_variants"
 
     cfg = RenderConfig(); cfg.width = a.width; cfg.height = a.height; cfg.spp = a.spp
-    cfg_nir = RenderConfig(); cfg_nir.width = a.width; cfg_nir.height = a.height; cfg_nir.spp = a.nir_spp
+    # NIR point-flash pass: clamp GI fireflies + cap bounce depth so the delta light's
+    # clean direct illumination dominates (see nir_point_light docstring).
+    cfg_nir = RenderConfig(); cfg_nir.width = a.width; cfg_nir.height = a.height
+    cfg_nir.path_spp = a.nir_spp; cfg_nir.use_firefly_clamp = True; cfg_nir.path_max_depth = 3
     assist_flat = AssistLightSpec(mode="camera_aligned_rect", distance_m=0.18, size_world=[5.0, 3.6],
                                   spectrum_mode="mask_proxy", polarized=False,
                                   polarizer_angle_deg=0.0, extras={"radiance": 120.0})
@@ -504,10 +523,16 @@ def main() -> int:
             print("  [passive] rgb, albedo", flush=True)
 
         if "active_nir" in a.groups:
-            r = render_group(pseudo_xml, cam, a.fov, ["active_nir_intensity"], cfg_nir, assist_flat, tex_cap=256)
+            r = render_group(pseudo_xml, cam, a.fov, ["active_nir_intensity"], cfg_nir, tex_cap=256,
+                             active_lights=[nir_point_light()], base_pose=cam)   # rig NIR point flash
             save_png(r["active_nir_intensity"].array, out / f"vp{vi}_{nid}_nir.png", "gray")
             rec["images"]["nir_active_pseudo"] = f"vp{vi}_{nid}_nir.png"
-            print("  [active] nir (pseudo albedo)", flush=True)
+            # pseudo-NIR ALBEDO (AOV): the NIR band's diffuse reflectance map itself,
+            # shown next to the visible albedo AOV (lighting-independent readout).
+            ra = render_group(pseudo_xml, cam, a.fov, ["albedo"], cfg, tex_cap=None)
+            save_png(ra["albedo"].array, out / f"vp{vi}_{nid}_nir_albedo.png", "gray")
+            rec["images"]["nir_pseudo_albedo"] = f"vp{vi}_{nid}_nir_albedo.png"
+            print("  [active] nir (pseudo albedo) + nir albedo AOV", flush=True)
 
         if "polar" in a.groups:
             r = render_group(xml, cam, a.fov, ["dop", "aolp"], cfg, assist_pol, tex_cap=256)

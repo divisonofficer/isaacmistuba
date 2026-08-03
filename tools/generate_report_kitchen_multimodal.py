@@ -21,8 +21,9 @@ OUT = REPO / "dev_report/report_2026-07-31_kitchen_multimodal.html"
 
 MODS = [
     ("rgb", "RGB — passive", "주변광만(무광). 실내 항법 뷰."),
-    ("albedo", "Albedo (AOV)", "Mitsuba diffuse-reflectance AOV — bake 결과."),
-    ("nir_active_pseudo", "NIR — active flash", "rig NIR flash + <b>pseudo-NIR albedo</b> 규약. 근거리 밝고 falloff. 벽의 미세 요철은 flash가 normal-map을 grazing 조명한 실제 표면 relief(노이즈 아님)."),
+    ("albedo", "Albedo (AOV)", "Mitsuba diffuse-reflectance AOV — visible bake 결과."),
+    ("nir_pseudo_albedo", "NIR albedo (pseudo)", "NIR 밴드가 쓰는 pseudo-NIR albedo 맵(AOV): max(rgb,1-rgb)·[.229,.587,.114]. visible albedo와 나란히 비교."),
+    ("nir_active_pseudo", "NIR — active point flash", "rig NIR <b>point(delta) flash</b>(하드웨어 충실) + <b>pseudo-NIR albedo</b> 규약. 오브젝트간 하드 섀도우, r² falloff. firefly clamp + max_depth 3로 GI 노이즈 제거. 벽 미세 요철은 flash가 normal-map을 조명한 실제 relief."),
     ("dop", "DoP (red–black)", "편광 area flash. specular/유리에서 편광(빨강), diffuse는 검정."),
     ("aolp", "AoLP (hue=angle)", "편광각을 <b>색상(hue)</b>으로: 각도별 다른 색. 채도=DoLP라 무편광은 흰색, 편광 강한 곳(창유리·모서리)만 선명."),
     ("map_normal", "Normal (world sh_normal)", "픽셀별 실제 법선(AOV): normal map 있으면 perturbed, 없으면 폴리곤 기하 법선. 벽 방향별 색·바닥=위."),
@@ -129,8 +130,13 @@ plaster의 <b>normal map</b> 요철을 grazing 각도로 조명해 생기는 mic
 normal map 없는 폴리곤도 검정/neutral이 아니라 <b>실제 기하 법선</b>을 카메라 뷰 기준으로 보여준다
 (map 있으면 perturbation 포함).</li>
 <li>DoP는 창유리·카운터 모서리 등 Fresnel specular에서 편광 신호가 집중.</li>
-<li><b>남은 작업</b>: spatial-PBR η/k(공간가변 금속 IOR) 풀배선 — 현재 렌더는
-optical_class별 polar-capable BSDF(pplastic/dielectric/roughconductor) 사용.</li>
+<li><b>metallic provenance 수정.</b> Blender glTF export가 절차적 재질에 metallicFactor
+기본값 1.0을 누출해 세라믹 바닥 등 41% 재질이 오금속화됐던 것을, .blend 소스 metallic
+(source_metallic)을 권위로 판정하도록 수정(render_daemon). 바닥 metallic 0.88→≈0.</li>
+<li><b>NIR = point flash.</b> area flash 대신 rig point(delta) emitter로 하드웨어 충실 +
+오브젝트간 하드 섀도우. delta light는 direct가 NEE로 노이즈 0; GI firefly는 clamp+max_depth로 제거.</li>
+<li><b>남은 작업</b>: spatial-PBR η/k(공간가변 금속 IOR) 풀배선; metallic 4-mode(pure_metal/
+pure_dielectric/mixed/unknown) + glTF factor×texture 정확 곱 (설계 확정, 미구현).</li>
 </ul>
 </body></html>"""
     OUT.write_text(html, encoding="utf-8")
