@@ -669,10 +669,26 @@ def asset_figures(assets: dict[str, list[dict[str, Any]]]) -> str:
             figs.append(
                 f"<figure><img src='{b}/{oid}_nir_albedo.png' alt='pseudo NIR albedo {esc(oid)}'>"
                 "<figcaption class='small'>③ pseudo-NIR albedo — RGB albedo→<code>max(rgb,1−rgb)·[.229,.587,.114]</code> "
-                "(<b>텍스처 보존</b>)</figcaption></figure>"
+                "(텍스처 보존하나 <b>비물리·중간회색 증폭</b>)</figcaption></figure>"
                 f"<figure><img src='{b}/{oid}_nir.png' alt='pseudo NIR 렌더 {esc(oid)}'>"
-                "<figcaption class='small'>④ pseudo-NIR 렌더 — ③을 diffuse_reflectance로 렌더 (표면 텍스처 살아있음)</figcaption></figure>")
-            nir_html = ("<div class='pair-grid' style='grid-template-columns:repeat(4,1fr)'>" + "".join(figs) + "</div>")
+                "<figcaption class='small'>④ pseudo-NIR 렌더 — ③을 diffuse_reflectance로 렌더</figcaption></figure>")
+            ncols = 4
+            if (IMAGE_DIR / f"{oid}_nir_hybrid.png").is_file():
+                ncols = 6
+                figs.append(
+                    f"<figure><img src='{b}/{oid}_nir_hybrid_albedo.png' alt='hybrid NIR albedo {esc(oid)}'>"
+                    "<figcaption class='small'>⑤ <b>hybrid</b> NIR albedo — 클래스 prior μ_c + 표준화 RGB 구조전이 "
+                    "<code>clip[μ_c(1+β_c·D)]</code> (<b>물리 평균 + 텍스처</b>)</figcaption></figure>"
+                    f"<figure><img src='{b}/{oid}_nir_hybrid.png' alt='hybrid NIR 렌더 {esc(oid)}'>"
+                    "<figcaption class='small'>⑥ hybrid NIR 렌더 — ⑤를 diffuse_reflectance로 렌더</figcaption></figure>")
+            elif (IMAGE_DIR / f"{oid}_nir_hybrid_albedo.png").is_file():
+                ncols = 6
+                figs.append(
+                    f"<figure><img src='{b}/{oid}_nir_hybrid_albedo.png' alt='hybrid NIR albedo {esc(oid)}'>"
+                    "<figcaption class='small'>⑤ <b>hybrid</b> NIR albedo (물리 μ + 텍스처)</figcaption></figure>"
+                    "<figure><figcaption class='small'>⑥ hybrid 렌더: glass/metal → Fresnel</figcaption></figure>")
+            nir_html = (f"<div class='pair-grid' style='grid-template-columns:repeat({ncols},1fr)'>"
+                        + "".join(figs) + "</div>")
 
         stats = (
             f"ΔDoLP mean {mean(rows, 'object', 'delta_dolp_mean'):.4f} · "
@@ -699,7 +715,7 @@ def asset_figures(assets: dict[str, list[dict[str, Any]]]) -> str:
                 "윗줄 A(작업 전) · 아랫줄 B(작업 후).</figcaption></figure>"
                 if stokes else ""
             )
-            + (f"<h4 class='small' style='margin:10px 0 4px;color:#9cc4ff'>NIR (근적외) — ① 물리 class-prior(상수) vs ③ pseudo-NIR(RGB→텍스처) albedo 추정 + 각각 렌더</h4>{nir_html}" if nir_html else "")
+            + (f"<h4 class='small' style='margin:10px 0 4px;color:#9cc4ff'>NIR (근적외) albedo 정책 오브젝트 레벨 비교 — ①② <b>A:constant</b>(class-prior 상수, 평탄) · ③④ <b>B:pseudo</b>(RGB heuristic, 비물리) · ⑤⑥ <b>C:hybrid</b>(class μ + 구조전이, 물리+텍스처)</h4>{nir_html}" if nir_html else "")
             + "</div>"
         )
     return "".join(blocks)
