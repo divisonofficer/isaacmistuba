@@ -251,7 +251,7 @@ def write_mapviz_xml(xml_path: Path, out_path: Path, channel: str) -> Path | Non
               "normal": "_normal.png", "metallic": "_metallic.png"}[channel]
     tree = ET.parse(xml_path)
     root = tree.getroot()
-    # bsdf id -> (map filename | None, scalar alpha | None, is_metal)
+    # bsdf id -> (map filename | None, scalar alpha | None, is_metal, analytic types)
     info: dict[str, tuple] = {}
     for b in root.findall("bsdf"):
         bid = b.get("id")
@@ -269,16 +269,33 @@ def write_mapviz_xml(xml_path: Path, out_path: Path, channel: str) -> Path | Non
                 except (TypeError, ValueError):
                     pass
                 break
-        is_metal = any(x.get("type") in ("conductor", "roughconductor") for x in b.iter("bsdf"))
-        info[bid] = (fn, alpha, is_metal)
+        types = {x.get("type") for x in b.iter("bsdf")}
+        is_metal = bool(types & {"conductor", "roughconductor"})
+        info[bid] = (fn, alpha, is_metal, types)
     for b in list(root.findall("bsdf")):
         root.remove(b)
 
-    def flat_rgb(channel, alpha, is_metal) -> str:
+    unknown = [0]  # count of shapes with no derivable roughness -> flagged, not faked
+
+    def flat_rgb(channel, alpha, is_metal, types) -> str:
         if channel == "normal":
             return "0.5 0.5 1.0"                       # neutral tangent-space normal
         if channel == "roughness":
-            return f"{alpha:.4f} {alpha:.4f} {alpha:.4f}" if alpha is not None else "0.5 0.5 0.5"
+            # Never fake a plausible 0.5. Every Mitsuba BSDF has a defined roughness;
+            # derive the REAL scalar from the material's semantics so the map is
+            # usable downstream: explicit alpha (pplastic/rough*) > smooth specular
+            # (delta dielectric/conductor = 0) > Lambertian diffuse (=1). If a shape
+            # genuinely resolves to none of these, flag it MAGENTA (visible "no data"),
+            # rather than emit a grey value that reads as a real measurement.
+            if alpha is not None:
+                a = min(max(alpha, 0.0), 1.0)
+                return f"{a:.4f} {a:.4f} {a:.4f}"
+            if types & {"dielectric", "thindielectric", "conductor"}:
+                return "0.0 0.0 0.0"                   # smooth glass/mirror: roughness≈0
+            if "diffuse" in types:
+                return "1.0 1.0 1.0"                   # Lambertian: maximally rough
+            unknown[0] += 1
+            return "1.0 0.0 1.0"                       # sentinel: no derivable roughness
         if channel == "metallic":
             return "1 1 1" if is_metal else "0.0 0.0 0.0"
         return "0.0 0.0 0.0"
@@ -290,7 +307,8 @@ def write_mapviz_xml(xml_path: Path, out_path: Path, channel: str) -> Path | Non
     n = 0
     for shape in root.findall("shape"):
         ref = shape.find("ref")
-        fn, alpha, is_metal = info.get(ref.get("id"), (None, None, False)) if ref is not None else (None, None, False)
+        fn, alpha, is_metal, types = (info.get(ref.get("id"), (None, None, False, set()))
+                                      if ref is not None else (None, None, False, set()))
         if ref is not None:
             shape.remove(ref)
         for old in list(shape.findall("emitter")):   # drop area-light shapes' emission
@@ -302,8 +320,12 @@ def write_mapviz_xml(xml_path: Path, out_path: Path, channel: str) -> Path | Non
             ET.SubElement(tex, "boolean", attrib={"name": "raw", "value": "true"})
             n += 1
         else:
-            ET.SubElement(bsdf, "rgb", attrib={"name": "reflectance", "value": flat_rgb(channel, alpha, is_metal)})
-    if n == 0:
+            ET.SubElement(bsdf, "rgb", attrib={"name": "reflectance",
+                                               "value": flat_rgb(channel, alpha, is_metal, types)})
+    if channel == "roughness" and unknown[0]:
+        print(f"  [mapviz] roughness: {unknown[0]} shape(s) had no derivable roughness "
+              f"-> flagged MAGENTA (not faked)")
+    if n == 0 and channel != "roughness":
         return None
     out_path.parent.mkdir(parents=True, exist_ok=True)
     tree.write(out_path, encoding="unicode")
