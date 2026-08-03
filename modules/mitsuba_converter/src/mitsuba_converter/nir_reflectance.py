@@ -171,12 +171,15 @@ def synthesize_nir_texture(rgb_albedo_linear: np.ndarray, pmat: str, band: int =
         D(x)  = standardize( log L(x) - LPF(log L(x)) )        # zero-mean, unit-var
         rho_NIR(x) = clip[ mu_c * (1 + beta_c * D(x)), rho_min_c, rho_max_c ]
 
-    D is a STANDARDISED high-pass residual: it drops the RGB absolute level (so the
-    class prior — not RGB luminance — sets the NIR mean) and keeps only LOCAL texture
-    (grain, grout, print, wear), scaled to unit variance so it stays VISIBLE instead
-    of collapsing to a flat mean. beta_c (rgb_structure_weight) is the per-class
-    transfer strength (wood high, dyed_fabric/print low). The previous L/median term
-    was ~±0.2 and washed out to a flat mu; this preserves the texture.
+    D(x) = clip( (L - LPF(L)) / (LPF(L) + eps), -1, 1 ) is the RELATIVE local contrast
+    (high-pass over the local mean): it drops the RGB absolute level (so the class prior
+    — not RGB luminance — sets the NIR mean) and keeps only LOCAL texture (grain, grout,
+    print, wear) at its NATURAL amplitude. A smooth wall has D≈0 and stays smooth; a
+    textured surface (wood grain) shows visible structure. beta_c (rgb_structure_weight)
+    is the per-class transfer strength. NOTE: an earlier version standardised a
+    log-luminance residual to unit variance — that AMPLIFIED smooth surfaces' micro-
+    variation (and dark-texel log excursions) into salt-and-pepper grain; relative
+    linear contrast avoids both.
 
     Returns None for metal/glass (albedo_channel False). Input LINEAR in [0,1];
     output (H,W) float32 clamped to the class NIR range.
@@ -187,10 +190,8 @@ def synthesize_nir_texture(rgb_albedo_linear: np.ndarray, pmat: str, band: int =
     rgb = np.asarray(rgb_albedo_linear, np.float32)
     L = rgb @ np.array(_LUM, np.float32) if rgb.ndim == 3 else rgb.astype(np.float32)
     beta = info["rgb_structure_weight"] if alpha_override is None else float(alpha_override)
-    logL = np.log(np.clip(L, 1e-4, None))
-    resid = logL - _lowpass(logL, lpf_sigma)                 # high-pass (local texture)
-    sd = float(resid.std())
-    D = np.clip(resid / sd, -3.0, 3.0) if sd > 1e-6 else resid * 0.0
+    lpf = _lowpass(L, lpf_sigma)
+    D = np.clip((L - lpf) / (lpf + 0.05), -1.0, 1.0)         # relative local contrast
     rho = info["mean"] * (1.0 + beta * D)
     lo = float(info.get("min", 0.0))
     hi = min(float(info.get("max", 0.95)), 0.95)

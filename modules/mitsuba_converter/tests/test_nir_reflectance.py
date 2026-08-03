@@ -100,7 +100,7 @@ def test_hybrid_preserves_texture_at_class_mean():
     base3 = np.repeat(base[..., None], 3, -1)
     out = nr.synthesize_nir_texture(base3, "wood")
     info = nr.nir_reflectance("wood")
-    assert out.std() > 0.05                                   # texture NOT washed flat
+    assert out.std() > 0.015                                  # texture present (not flat μ)
     assert abs(out.mean() - info["mean"]) < 0.08              # mean ≈ class prior (physics)
     assert out.min() >= info["min"] - 1e-3 and out.max() <= min(info["max"], 0.95) + 1e-3
     # low-structure class transfers LESS RGB texture than a high one
