@@ -42,8 +42,39 @@ for _m in ("robomituba_bridge", "mitsuba_converter", "navigation_dataset"):
         sys.path.insert(0, str(p))
 
 from mitsuba_converter.multimodal import render_modalities, RenderConfig, camera_to_world_from_lookat  # noqa: E402
-from mitsuba_converter.nir_reflectance import pseudo_nir_albedo  # noqa: E402
+from mitsuba_converter.nir_reflectance import (  # noqa: E402
+    pseudo_nir_albedo, synthesize_nir_texture, physical_material_for, nir_reflectance)
 from robomituba_bridge import AssistLightSpec, ActiveLightSpec  # noqa: E402
+
+
+def _basecolor_to_pmat(scene_dir: Path, xml_path: Path) -> dict[str, str]:
+    """Map each base_color texture filename -> physical_material class, resolved from
+    the shader NAME (material_id) via nir_reflectance.physical_material_for. Chain:
+    basecolor(in a bsdf) -> bsdf_ref -> shape -> material_id(shader) -> physical_material.
+    Lets the hybrid NIR use the right class prior (μ_c, β_c) per surface."""
+    out: dict[str, str] = {}
+    try:
+        idx = json.loads((scene_dir / "xml_scene_index.json").read_text())
+        pol = json.loads((scene_dir / "render_scene_material_policy.json").read_text())
+        sh2mat = {sp["shape_id"]: sp.get("material_id") for sp in pol.get("shape_policies", []) if sp.get("shape_id")}
+        bsdf2mat = {}
+        for sh in idx.get("shapes", []):
+            ref, mid = sh.get("bsdf_ref"), sh2mat.get(sh.get("shape_id"))
+            if ref and mid:
+                bsdf2mat.setdefault(ref, mid)
+        root = ET.parse(xml_path).getroot()
+        for b in root.findall("bsdf"):
+            mid = bsdf2mat.get(b.get("id"))
+            if not mid:
+                continue
+            pmat, _ = physical_material_for(mid, None)
+            for s in b.iter("string"):
+                v = s.get("value", "")
+                if s.get("name") == "filename" and v.endswith("_base_color.png"):
+                    out.setdefault(v, pmat)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[nir] class resolution failed ({exc}); falling back to pseudo", flush=True)
+    return out
 
 
 def nir_point_light(radiance: float = 400.0) -> ActiveLightSpec:
@@ -148,32 +179,47 @@ def _iter_basecolor_filenames(root: ET.Element):
                 yield s
 
 
-def make_pseudo_nir_maps(xml_path: Path, out_dir: Path, blur: float = 0.8) -> dict[str, str]:
-    """For every base_color.png referenced as albedo, write a grayscale pseudo-NIR
-    map (nir = max(rgb,1-rgb)*[.229,.587,.114]) and return {orig -> pseudo}.
-
-    A light Gaussian `blur` is applied AFTER the pseudo transform: the pseudo V-curve
-    is steepest at mid-gray, so it amplifies a matte wall's sub-pixel albedo micro-
-    variation into salt-and-pepper speckle that reads as render noise (it is NOT —
-    spp 128 and 4096 are pixel-identical). A ~0.8px blur removes that amplified micro-
-    noise while preserving real texture structure. Set blur=0 to keep it raw."""
+def make_nir_albedo_maps(xml_path: Path, out_dir: Path, mode: str = "hybrid",
+                         blur: float = 1.0) -> dict[str, str]:
+    """For every base_color.png referenced as albedo, write a single-channel NIR albedo
+    map and return {orig -> nir}. `mode`:
+      hybrid  = class prior μ_c + standardised RGB structure (nir_reflectance.
+                synthesize_nir_texture); RGB supplies only LOCAL texture, the measured
+                class prior sets the mean/range — physical mean + texture, not flat.
+                Falls back to pseudo when the surface class can't be resolved or is
+                metal/glass (albedo not a diffuse channel).
+      pseudo  = max(rgb,1-rgb)·[.229,.587,.114] (RGB heuristic; V-curve amplifies
+                mid-gray micro-variation, hence the light blur).
+      constant= flat class-prior scalar (physics but no texture)."""
     from PIL import ImageFilter
     out_dir.mkdir(parents=True, exist_ok=True)
     root = ET.parse(xml_path).getroot()
+    pmat_by_src = _basecolor_to_pmat(xml_path.parent, xml_path) if mode in ("hybrid", "constant") else {}
     mapping: dict[str, str] = {}
     for s in _iter_basecolor_filenames(root):
         src = s.get("value")
         if src in mapping:
             continue
-        dst = str(out_dir / (Path(src).stem + ".nirpseudo.png"))
+        dst = str(out_dir / (Path(src).stem + f".nir_{mode}.png"))
         if not Path(dst).is_file():
             rgb = np.asarray(Image.open(src).convert("RGB"), np.float32) / 255.0
-            # sRGB->linear for the pseudo formula, then back to 8-bit linear-ish gray
-            lin = np.where(rgb <= 0.04045, rgb / 12.92, ((rgb + 0.055) / 1.055) ** 2.4)
-            nir = pseudo_nir_albedo(lin)
-            img = Image.fromarray((np.clip(nir, 0, 1) * 255).astype(np.uint8))
-            if blur > 0:
-                img = img.filter(ImageFilter.GaussianBlur(radius=float(blur)))
+            lin = np.where(rgb <= 0.04045, rgb / 12.92, ((rgb + 0.055) / 1.055) ** 2.4)  # sRGB->linear
+            nir = None
+            pmat = pmat_by_src.get(src)
+            if mode in ("hybrid", "constant") and pmat:
+                info = nir_reflectance(pmat, 854)
+                if info["albedo_channel"]:
+                    if mode == "constant":
+                        nir = np.full(lin.shape[:2], float(info["mean"]), np.float32)
+                    else:
+                        nir = synthesize_nir_texture(lin, pmat, 854)
+            if nir is None:                                    # unresolved/metal/glass -> pseudo
+                nir = pseudo_nir_albedo(lin)
+                img = Image.fromarray((np.clip(nir, 0, 1) * 255).astype(np.uint8))
+                if blur > 0:
+                    img = img.filter(ImageFilter.GaussianBlur(radius=float(blur)))
+            else:
+                img = Image.fromarray((np.clip(nir, 0, 1) * 255).astype(np.uint8))
             img.save(dst)
         mapping[src] = dst
     return mapping
@@ -439,6 +485,9 @@ def main() -> int:
                     help="fixed 'node_id@yaw,node_id@yaw,...' to render EXACTLY these "
                          "framings — skips the preview selection (whose many renders "
                          "destabilise a later polarized pass in the same process).")
+    ap.add_argument("--nir-mode", choices=["hybrid", "pseudo", "constant"], default="hybrid",
+                    help="NIR albedo policy: hybrid(class prior μ + RGB structure), "
+                         "pseudo(RGB heuristic), constant(flat class prior)")
     ap.add_argument("--index-base", type=int, default=0,
                     help="offset for the vp{N} filename index (patch a single view into "
                          "an existing set without renumbering, e.g. --index-base 2).")
@@ -466,9 +515,9 @@ def main() -> int:
     # pseudo-NIR variant XML (albedo -> pseudo-NIR grayscale) built once
     pseudo_xml = None
     if "active_nir" in a.groups:
-        swaps = make_pseudo_nir_maps(xml, tmp / "nir_maps")
-        pseudo_xml = write_variant_xml(xml, tmp / "scene_pseudonir.xml", swaps)
-        print(f"[pseudo-nir] {len(swaps)} albedo maps -> pseudo-NIR")
+        swaps = make_nir_albedo_maps(xml, tmp / f"nir_maps_{a.nir_mode}", mode=a.nir_mode)
+        pseudo_xml = write_variant_xml(xml, tmp / f"scene_nir_{a.nir_mode}.xml", swaps)
+        print(f"[nir] mode={a.nir_mode}: {len(swaps)} albedo maps -> NIR")
 
     if a.viewpoints:
         import math as _m
