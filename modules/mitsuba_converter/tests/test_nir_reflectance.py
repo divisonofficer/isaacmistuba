@@ -91,3 +91,18 @@ def test_pseudo_nir_preserves_texture_and_range():
 
 def test_pseudo_nir_accepts_2d():
     assert nr.pseudo_nir_albedo(np.array([[0.3, 0.7]], np.float32)).shape == (1, 2)
+
+
+def test_hybrid_preserves_texture_at_class_mean():
+    # a textured albedo -> NIR keeps structure (not flat) BUT centered on class prior
+    rng = np.random.default_rng(1)
+    base = 0.4 + 0.15 * rng.random((48, 48))
+    base3 = np.repeat(base[..., None], 3, -1)
+    out = nr.synthesize_nir_texture(base3, "wood")
+    info = nr.nir_reflectance("wood")
+    assert out.std() > 0.05                                   # texture NOT washed flat
+    assert abs(out.mean() - info["mean"]) < 0.08              # mean ≈ class prior (physics)
+    assert out.min() >= info["min"] - 1e-3 and out.max() <= min(info["max"], 0.95) + 1e-3
+    # low-structure class transfers LESS RGB texture than a high one
+    low = nr.synthesize_nir_texture(base3, "printed_surface")
+    assert low.std() < out.std()
