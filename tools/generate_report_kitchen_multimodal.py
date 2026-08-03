@@ -24,7 +24,7 @@ MODS = [
     ("albedo", "Albedo (AOV)", "Mitsuba diffuse-reflectance AOV — bake 결과."),
     ("nir_active_pseudo", "NIR — active flash", "rig NIR flash + <b>pseudo-NIR albedo</b> 규약. 근거리 밝고 falloff. 벽의 미세 요철은 flash가 normal-map을 grazing 조명한 실제 표면 relief(노이즈 아님)."),
     ("dop", "DoP (red–black)", "편광 area flash. specular/유리에서 편광(빨강), diffuse는 검정."),
-    ("aolp", "AoLP", "선형 편광각 0–180°."),
+    ("aolp", "AoLP (hue=angle)", "편광각을 <b>색상(hue)</b>으로: 각도별 다른 색. 채도=DoLP라 무편광은 흰색, 편광 강한 곳(창유리·모서리)만 선명."),
     ("map_normal", "Normal (world sh_normal)", "픽셀별 실제 법선(AOV): normal map 있으면 perturbed, 없으면 폴리곤 기하 법선. 벽 방향별 색·바닥=위."),
     ("map_roughness", "Roughness map", "baked roughness — 매트 표면 밝음, 유리/광택 어두움."),
     ("map_metallic", "Metallic map", "baked metallic (금속만 밝음)."),
@@ -113,7 +113,10 @@ polarized Stokes variant는 텍스처 256 캡으로 메모리 fit.</span></div>
 <h2>메모</h2>
 <ul style="font-size:14px;line-height:1.7">
 <li>이 실험은 <code>tools/render_kitchen_multimodal.py</code>로 재현. 뷰포인트는 그래프
-노드 중 방 중심에서 먼 것을 골라 <b>중심을 바라보게</b> 프레이밍(가까운 벽 회피).</li>
+노드×헤딩을 저해상도 프리뷰 렌더해 <b>content 점수(공간 std×조명 비율)</b>로 자동 선택 —
+벽 모퉁이만 보는 노드는 점수 0으로 자동 제외.</li>
+<li><b>AoLP 컬러맵.</b> 편광각을 hue로 인코딩(0°≡180° cyclic), 채도=DoLP(무편광→흰색).
+grayscale 램프보다 각도 구분이 쉽다. S0≈0 픽셀의 DoLP=0/0(NaN)은 0으로 처리.</li>
 <li><b>NIR speckle 검증.</b> 벽의 낱알 무늬는 렌더(MC) 노이즈가 아니라 <b>실제 표면 relief</b>다 —
 동일 뷰를 <b>spp 128과 4096으로 렌더하면 픽셀 단위로 동일</b>(local-diff-std 2.44 불변). active flash가
 plaster의 <b>normal map</b> 요철을 grazing 각도로 조명해 생기는 micro-shadow로, passive RGB(부드러운 주변광)에선

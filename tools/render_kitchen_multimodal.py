@@ -75,6 +75,52 @@ def cam_for(node: dict, target: tuple) -> np.ndarray:
     return np.asarray(camera_to_world_from_lookat(o, list(target), [0, 1, 0]).reshape(4, 4), np.float32)
 
 
+def select_viewpoints_by_preview(xml: Path, graph: dict, k: int, headings=(0, 60, 120, 180, 240, 300),
+                                  width=160, height=120, spp=8) -> list[dict]:
+    """Pick k (node, heading) framings that actually SHOW the room, not a near wall.
+    Renders a cheap RGB preview for each candidate (node × a few headings, reusing the
+    resident scene) and scores it by content = spatial std × lit-fraction. A blank wall
+    scores low (flat + partly unlit); a view down the room with objects scores high.
+    Returns the top-k spatially-diverse winners, each aiming ALONG its best heading."""
+    import math as _m
+    nodes = graph["nodes"]
+    pos = np.array([n["position"] for n in nodes], float)
+    cx, cz = pos[:, 0].mean(), pos[:, 1].mean()
+    cfg = RenderConfig(); cfg.width = width; cfg.height = height; cfg.spp = spp
+    scored = []
+    for n in nodes:
+        px, py, _ = n["position"]
+        best = None
+        for yaw in headings:
+            a = _m.radians(yaw)
+            o = [float(px), EYE_H, float(py)]
+            t = [o[0] + _m.sin(a), EYE_H * 0.9, o[2] + _m.cos(a)]
+            try:
+                img = np.asarray(render_group(xml, np.asarray(
+                    camera_to_world_from_lookat(o, t, [0, 1, 0]).reshape(4, 4), np.float32),
+                    60.0, ["rgb"], cfg, tex_cap=None)["rgb"].array)
+            except Exception:
+                continue
+            lit = float((img.mean(-1) > 0.02).mean())
+            score = float(img.std()) * lit
+            if best is None or score > best[0]:
+                best = (score, yaw, tuple(t))
+        if best:
+            scored.append((best[0], n, best[1], best[2]))
+            print(f"  preview {n['node_id']}: best yaw={best[1]} score={best[0]:.4f}", flush=True)
+    scored.sort(key=lambda x: -x[0])
+    chosen, seen = [], []
+    for score, n, yaw, target in scored:
+        p = np.array(n["position"][:2])
+        if any(np.hypot(*(p - q)) < 1.2 for q in seen):
+            continue
+        seen.append(p)
+        chosen.append({"node": n, "target": target, "yaw": yaw, "score": score})
+        if len(chosen) >= k:
+            break
+    return chosen
+
+
 # ------------------------------------------------------- material variants --- #
 def _iter_basecolor_filenames(root: ET.Element):
     """Yield (string_element) nodes whose value is a *_base_color.png used as a
@@ -269,6 +315,43 @@ def _normal_aov_worker(xml_path: Path, origin, target, fov: float, w: int, h: in
     Image.fromarray((enc * 255).astype(np.uint8)).save(out_path)
 
 
+# ------------------------------------------------------- AoLP colormap ------ #
+def _hsv_to_rgb(h: np.ndarray, s: np.ndarray, v: np.ndarray) -> np.ndarray:
+    """Vectorised HSV->RGB (all inputs [0,1], same shape). No matplotlib dependency."""
+    i = np.floor(h * 6.0).astype(int)
+    f = h * 6.0 - i
+    p, q, t = v * (1 - s), v * (1 - f * s), v * (1 - (1 - f) * s)
+    i = i % 6
+    r = np.choose(i, [v, q, p, p, t, v])
+    g = np.choose(i, [t, v, v, q, p, p])
+    b = np.choose(i, [p, p, t, v, v, q])
+    return np.clip(np.stack([r, g, b], axis=-1), 0, 1)
+
+
+def aolp_to_rgb(aolp_deg: np.ndarray, dop: np.ndarray | None = None) -> np.ndarray:
+    """Colorise AoLP for debugging: HUE = polarization angle (cyclic, π-periodic so
+    0°≡180°), so distinct angles read as distinct colors instead of a flat gray ramp.
+    SATURATION = DoLP (auto-scaled): strongly-polarized pixels are vivid-colored by
+    their angle, weakly-polarized ones fade to WHITE (not black — so the angle field
+    stays visible even in low-polarization views, while colour still flags where the
+    signal is real). VALUE is kept at 1 so nothing blacks out."""
+    ang = np.nan_to_num(np.asarray(aolp_deg, np.float32), nan=0.0)   # S0≈0 -> undefined
+    ang = np.clip(ang, 0, 180)
+    if ang.ndim == 3:
+        ang = ang[..., 0]
+    h = ang / 180.0
+    v = np.ones_like(h)
+    if dop is not None:
+        d = np.nan_to_num(np.asarray(dop, np.float32), nan=0.0)      # DoLP=0/0 at black px
+        if d.ndim == 3:
+            d = d[..., 0]
+        ref = max(float(np.percentile(d, 98)), 0.05)                 # floor: don't over-amplify
+        s = np.clip(d / ref, 0, 1)
+    else:
+        s = np.ones_like(h)
+    return _hsv_to_rgb(h, s, v)
+
+
 # ------------------------------------------------------------------ render --- #
 def _tonemap(a: np.ndarray, mode: str) -> np.ndarray:
     a = np.asarray(a, np.float32)
@@ -333,6 +416,16 @@ def main() -> int:
     ap.add_argument("--out", default="dev_report/images/kitchen_multimodal_2026-07-31")
     ap.add_argument("--groups", nargs="*",
                     default=["passive", "active_nir", "polar", "mapviz"])
+    ap.add_argument("--no-auto-select", action="store_true",
+                    help="use the geometric farthest-node heuristic instead of the "
+                         "content-scored preview selection")
+    ap.add_argument("--viewpoints", default=None,
+                    help="fixed 'node_id@yaw,node_id@yaw,...' to render EXACTLY these "
+                         "framings — skips the preview selection (whose many renders "
+                         "destabilise a later polarized pass in the same process).")
+    ap.add_argument("--index-base", type=int, default=0,
+                    help="offset for the vp{N} filename index (patch a single view into "
+                         "an existing set without renumbering, e.g. --index-base 2).")
     a = ap.parse_args()
 
     S = REPO / a.dataset / "scenes" / a.scene_id
@@ -358,7 +451,22 @@ def main() -> int:
         pseudo_xml = write_variant_xml(xml, tmp / "scene_pseudonir.xml", swaps)
         print(f"[pseudo-nir] {len(swaps)} albedo maps -> pseudo-NIR")
 
-    vps = pick_viewpoints(graph, a.views)
+    if a.viewpoints:
+        import math as _m
+        byid = {n["node_id"]: n for n in graph["nodes"]}
+        vps = []
+        for spec in a.viewpoints.split(","):
+            nid, _, yaw = spec.partition("@")
+            n = byid[nid.strip()]; yaw = float(yaw or 0)
+            px, py, _z = n["position"]; rad = _m.radians(yaw)
+            vps.append({"node": n, "yaw": yaw,
+                        "target": (float(px) + _m.sin(rad), EYE_H * 0.9, float(py) + _m.cos(rad))})
+    elif a.no_auto_select:
+        vps = pick_viewpoints(graph, a.views)
+    else:
+        print("[select] previewing viewpoints (content-scored)…", flush=True)
+        vps = select_viewpoints_by_preview(xml, graph, a.views)
+    print("[select] chosen:", [f"{v['node']['node_id']}@yaw{v.get('yaw','?')}" for v in vps], flush=True)
     # merge with prior images so a partial --groups re-run keeps earlier modalities.
     # Scan BOTH the prior manifest AND the images on disk (a crash can truncate the
     # manifest while the image files survive).
@@ -379,7 +487,8 @@ def main() -> int:
             prior_imgs.setdefault(m.group(1), {}).setdefault(_KIND2KEY[m.group(2)], f.name)
     manifest = {"scene_id": a.scene_id, "views": [], "groups": a.groups,
                 "spp": a.spp, "nir_spp": a.nir_spp, "size": [a.width, a.height]}
-    for vi, vp in enumerate(vps):
+    for _i, vp in enumerate(vps):
+        vi = a.index_base + _i
         node = vp["node"]; nid = node["node_id"]
         cam = cam_for(node, vp["target"])
         print(f"\n=== viewpoint {vi} {nid} pos={node['position'][:2]} ===", flush=True)
@@ -403,7 +512,13 @@ def main() -> int:
         if "polar" in a.groups:
             r = render_group(xml, cam, a.fov, ["dop", "aolp"], cfg, assist_pol, tex_cap=256)
             save_png(r["dop"].array, out / f"vp{vi}_{nid}_dop.png", "dop")
-            save_png(r["aolp"].array, out / f"vp{vi}_{nid}_aolp.png", "aolp")
+            # stash raw AoLP+DoLP so the colormap can be re-tuned without re-rendering
+            raw = out / "_raw"; raw.mkdir(parents=True, exist_ok=True)
+            np.save(raw / f"vp{vi}_{nid}_aolp.npy", np.asarray(r["aolp"].array, np.float32))
+            np.save(raw / f"vp{vi}_{nid}_dop.npy", np.asarray(r["dop"].array, np.float32))
+            aolp_rgb = aolp_to_rgb(r["aolp"].array, r["dop"].array)   # hue=angle, sat=DoLP
+            (out / f"vp{vi}_{nid}_aolp.png").parent.mkdir(parents=True, exist_ok=True)
+            Image.fromarray((aolp_rgb * 255).astype(np.uint8)).save(out / f"vp{vi}_{nid}_aolp.png")
             rec["images"]["dop"] = f"vp{vi}_{nid}_dop.png"
             rec["images"]["aolp"] = f"vp{vi}_{nid}_aolp.png"
             print("  [polar] dop, aolp", flush=True)
