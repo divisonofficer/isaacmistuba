@@ -627,12 +627,17 @@ def main() -> int:
                               out / f"vp{vi}_{nid}_map_normal.png")
             rec["images"]["map_normal"] = f"vp{vi}_{nid}_map_normal.png"
             # roughness/metallic: baked material map read via albedo AOV (true value,
-            # no-map -> scalar alpha / 0-or-1).
+            # no-map -> scalar alpha / 0-or-1). Unlike the smooth base-color map, baked
+            # roughness/metallic maps carry sparse outlier texels (baking spikes); at
+            # tex_cap=None they minification-ALIAS into salt-pepper specks on otherwise
+            # flat surfaces (aov_spp doesn't fix it — it's the same clean AOV path as
+            # base-color; the base map just has no spikes). Cap the texture so it is
+            # box-prefiltered (mip-like), averaging the spikes away.
             for ch in ("roughness", "metallic"):
                 vx = write_mapviz_xml(xml, tmp / f"scene_map_{ch}.xml", ch)
                 if vx is None:
                     continue
-                r = render_group(vx, cam, a.fov, ["albedo"], cfg, tex_cap=None)
+                r = render_group(vx, cam, a.fov, ["albedo"], cfg, tex_cap=256)
                 save_png(r["albedo"].array, out / f"vp{vi}_{nid}_map_{ch}.png", "map")
                 rec["images"][f"map_{ch}"] = f"vp{vi}_{nid}_map_{ch}.png"
             print("  [mapviz] normal(AOV), roughness, metallic", flush=True)
