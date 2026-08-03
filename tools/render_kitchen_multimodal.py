@@ -471,10 +471,17 @@ def main() -> int:
     ap.add_argument("--views", type=int, default=3)
     ap.add_argument("--width", type=int, default=640)
     ap.add_argument("--height", type=int, default=480)
-    ap.add_argument("--spp", type=int, default=96)
-    ap.add_argument("--nir-spp", type=int, default=512,
-                    help="higher spp for the active-NIR flash pass (small area flash + "
-                         "distance falloff is noisier than passive/emitter passes)")
+    ap.add_argument("--spp", type=int, default=96,
+                    help="path_spp for the RGB/polar path renders (converges fast under "
+                         "the scene's own lighting; 256 is already clean).")
+    ap.add_argument("--aov-spp", type=int, default=None,
+                    help="supersampling for the AOV readouts (visible/NIR albedo, "
+                         "roughness/metallic mapviz). Higher = less texture-minification "
+                         "aliasing on distant surfaces. Defaults to --spp if unset.")
+    ap.add_argument("--nir-spp", type=int, default=4096,
+                    help="path_spp for the active-NIR point-flash render — match RGB-grade "
+                         "convergence (delta flash + distance falloff is noisier than "
+                         "passive/emitter passes, so this is the heaviest pass).")
     ap.add_argument("--fov", type=float, default=60.0)
     ap.add_argument("--out", default="dev_report/images/kitchen_multimodal_2026-07-31")
     ap.add_argument("--groups", nargs="*",
@@ -506,8 +513,9 @@ def main() -> int:
     # passes (albedo, nir_albedo, roughness-mapviz) ran at aov_spp=16 and the texture
     # readout ALIASED into salt-and-pepper grain on minified (distant) textures, while
     # RGB was secretly at 4096. Drive all three from --spp so AOVs are anti-aliased.
+    aov_spp = a.aov_spp if a.aov_spp is not None else a.spp
     cfg = RenderConfig(); cfg.width = a.width; cfg.height = a.height
-    cfg.path_spp = a.spp; cfg.aov_spp = a.spp; cfg.polar_spp = a.spp
+    cfg.path_spp = a.spp; cfg.aov_spp = aov_spp; cfg.polar_spp = a.spp
     # NIR point-flash pass: clamp GI fireflies + cap bounce depth so the delta light's
     # clean direct illumination dominates (see nir_point_light docstring).
     cfg_nir = RenderConfig(); cfg_nir.width = a.width; cfg_nir.height = a.height
@@ -562,7 +570,8 @@ def main() -> int:
         if m and m.group(2) in _KIND2KEY:
             prior_imgs.setdefault(m.group(1), {}).setdefault(_KIND2KEY[m.group(2)], f.name)
     manifest = {"scene_id": a.scene_id, "views": [], "groups": a.groups,
-                "spp": a.spp, "nir_spp": a.nir_spp, "size": [a.width, a.height]}
+                "spp": a.spp, "aov_spp": aov_spp, "nir_spp": a.nir_spp,
+                "size": [a.width, a.height]}
     for _i, vp in enumerate(vps):
         vi = a.index_base + _i
         node = vp["node"]; nid = node["node_id"]
