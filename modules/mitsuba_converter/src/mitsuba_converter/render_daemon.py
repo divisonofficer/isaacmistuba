@@ -859,6 +859,21 @@ def _metallic_texture_is_fabricated(path: str) -> bool:
         return False
 
 
+@lru_cache(maxsize=4096)
+def _roughness_texture_is_near_zero(path: str) -> bool:
+    """A GLB-leaked / mis-extracted roughness map for a procedural material can arrive
+    as a near-zero (mirror-smooth) texture, which — unlike the scalar path — is fed to
+    Mitsuba's ``alpha`` with NO floor. Returns True for that near-mirror case so the
+    caller can fall back to the .blend authored roughness. Fails open (False)."""
+    try:
+        import numpy as _np
+        from PIL import Image as _Image
+        a = _np.asarray(_Image.open(path).convert("L"), _np.float32) / 255.0
+        return bool(a.mean() < 0.10)
+    except Exception:
+        return False
+
+
 def _append_extracted_bsdf_xml(
     shape: "ET.Element",
     extracted_material: dict[str, Any],
@@ -916,10 +931,20 @@ def _append_extracted_bsdf_xml(
         ET.SubElement(parent, "rgb", attrib={"name": name, "value": value})
 
     def _alpha(parent: "ET.Element", *, floor: float, default: float) -> None:
-        if roughness_tex:
+        # A .blend-authored MATTE surface (source roughness high) whose GLB export
+        # leaked a fabricated near-0 roughness map would otherwise render as a
+        # mirror — the texture path applies no floor. When the extracted map
+        # contradicts the authored roughness, fall back to the authored scalar; a
+        # genuinely glossy material (low source roughness) keeps its texture.
+        src_rough = (inject or {}).get("source_roughness")
+        contradiction = bool(
+            roughness_tex and src_rough is not None and float(src_rough) > 0.3
+            and _roughness_texture_is_near_zero(roughness_tex))
+        if roughness_tex and not contradiction:
             _bitmap(parent, "alpha", roughness_tex, raw=True)
         else:
-            value = _clamp_bsdf_alpha(roughness, default=default, floor=floor)
+            scalar = float(src_rough) if contradiction else roughness
+            value = _clamp_bsdf_alpha(scalar, default=default, floor=floor)
             ET.SubElement(parent, "float", attrib={"name": "alpha", "value": f"{value:.4f}"})
 
     # Mitsuba's twosided plugin rejects any child with a transmission
@@ -1464,17 +1489,23 @@ def _append_bsdf_xml(
         # metallic texture, which Blender's glTF exporter fills with a default 1.0 for
         # procedural (non-Principled) materials (ceramic floor, plaster). None = unknown.
         _src_mat = material_idx.get(material_id) if isinstance(material_idx, Mapping) else None
-        _src_metallic = _src_mat.get("metallic") if isinstance(_src_mat, Mapping) else None
-        try:
-            _src_metallic = float(_src_metallic) if _src_metallic is not None else None
-        except (TypeError, ValueError):
-            _src_metallic = None
+
+        def _src_scalar(key):
+            v = _src_mat.get(key) if isinstance(_src_mat, Mapping) else None
+            try:
+                return float(v) if v is not None else None
+            except (TypeError, ValueError):
+                return None
         inject = {
             "ior": binding_for_xml.get("ior") or optical_constants.dielectric_ior_for(oc, material_id),
             "conductor_material": (binding_for_xml.get("conductor_material")
                                    or optical_constants.conductor_material_for(oc, material_id, base_color)),
             "is_metal": is_metal,
-            "source_metallic": _src_metallic,
+            "source_metallic": _src_scalar("metallic"),
+            # .blend authored roughness scalar — authority for catching a fabricated
+            # (near-0) roughness texture, which the GLB export can leak for procedural
+            # architectural materials (ceramic-tile floor) exactly like metallic=1.
+            "source_roughness": _src_scalar("roughness"),
         }
 
     measured_binding = _binding_is_measured(binding_for_xml)
