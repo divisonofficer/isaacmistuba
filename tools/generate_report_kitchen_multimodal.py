@@ -3,7 +3,7 @@
 
 Reads dev_report/images/kitchen_multimodal_2026-07-31/manifest.json (written by
 tools/render_kitchen_multimodal.py) and the import manifest, and lays out per
-viewpoint the modality grid: RGB(passive) · albedo · NIR(active, pseudo-albedo) ·
+viewpoint the modality grid: RGB(passive) · albedo · NIR(active, hybrid-albedo) ·
 DoP · AoLP · normal/roughness/metallic map renders. Documents the pipeline
 (semantic decimation → bake → nav graph → passive/active/polar render conventions).
 
@@ -22,8 +22,8 @@ OUT = REPO / "dev_report/report_2026-07-31_kitchen_multimodal.html"
 MODS = [
     ("rgb", "RGB — passive", "주변광만(무광). 실내 항법 뷰."),
     ("albedo", "Albedo (AOV)", "Mitsuba diffuse-reflectance AOV — visible bake 결과."),
-    ("nir_pseudo_albedo", "NIR albedo (pseudo)", "NIR 밴드가 쓰는 pseudo-NIR albedo 맵(AOV): max(rgb,1-rgb)·[.229,.587,.114]. visible albedo와 나란히 비교."),
-    ("nir_active_pseudo", "NIR — active point flash", "rig NIR <b>point(delta) flash</b>(하드웨어 충실) + <b>pseudo-NIR albedo</b> 규약. 오브젝트간 하드 섀도우, r² falloff. firefly clamp + max_depth 3로 GI 노이즈 제거. 벽 미세 요철은 flash가 normal-map을 조명한 실제 relief."),
+    ("nir_pseudo_albedo", "NIR albedo (hybrid)", "NIR 밴드 반사율 맵(AOV): <b>hybrid</b> = class-prior μ_c + RGB 국소구조 전이 ρ=clip[μ_c(1+β_c·D)], D=상대 국소대비. visible albedo와 나란히 비교. 매끈한 벽은 μ_c 유지(과증폭 없음)."),
+    ("nir_active_pseudo", "NIR — active point flash", "rig NIR <b>point(delta) flash</b>(하드웨어 충실) + hybrid NIR albedo. 오브젝트간 하드 섀도우, r² falloff. <b>flash pass spp=4096</b>(polar_spp 경유) + firefly clamp + max_depth 3 → MC 노이즈 소거."),
     ("dop", "DoP (red–black)", "편광 area flash. specular/유리에서 편광(빨강), diffuse는 검정."),
     ("aolp", "AoLP (hue=angle)", "편광각을 <b>색상(hue)</b>으로: 각도별 다른 색. 채도=DoLP라 무편광은 흰색, 편광 강한 곳(창유리·모서리)만 선명."),
     ("map_normal", "Normal (world sh_normal)", "픽셀별 실제 법선(AOV): normal map 있으면 perturbed, 없으면 폴리곤 기하 법선. 벽 방향별 색·바닥=위."),
@@ -88,7 +88,7 @@ def main() -> int:
 <h1>Infinigen → OpticalNav: kitchen import + 멀티모달 렌더</h1>
 <p class="sub">2026-07-31 · scene <code>{manifest['scene_id']}</code> ·
 {len(views)} viewpoints · {manifest['size'][0]}×{manifest['size'][1]} ·
-spp {manifest['spp']} (NIR {manifest.get('nir_spp', manifest['spp'])}) ·
+path/AOV spp {manifest['spp']}/{manifest.get('aov_spp', manifest['spp'])} · NIR flash spp {manifest.get('nir_spp', manifest['spp'])} ·
 Device 1 / RTX 5090 / <code>cuda_ad_rgb_polarized</code></p>
 
 <div class="pipe"><b>파이프라인.</b>
@@ -103,9 +103,10 @@ Device 1 / RTX 5090 / <code>cuda_ad_rgb_polarized</code></p>
 {decim_html}</div>
 
 <div class="note"><b>렌더 규약.</b>
-<b>RGB는 passive</b>(주변광), <b>NIR은 active</b>(rig NIR flash) — 목적에 맞게 분리.
-NIR 밴드는 확정된 <b>pseudo-NIR albedo</b>(<code>max(rgb,1-rgb)·[.229,.587,.114]</code>) 규약 적용.
-편광(DoP/AoLP)은 rig 편광 area flash. normal/roughness/metallic은 baked 맵을 flat 시각화.
+<b>RGB는 passive</b>(주변광), <b>NIR은 active</b>(rig NIR point flash) — 목적에 맞게 분리.
+NIR 밴드는 <b>hybrid NIR albedo</b>(class-prior μ_c × RGB 국소구조) 규약 적용 — pseudo/constant보다
+오브젝트 텍스처 보존과 물리적 평균을 동시에 만족.
+편광(DoP/AoLP)은 rig 편광 area flash. normal은 world sh_normal AOV, roughness/metallic은 baked 맵을 flat 시각화.
 <br><span class="mut">주의: modality 그룹별 분리 렌더(active_nir와 dop/aolp 동시 호출 시 Dr.Jit AD 충돌),
 polarized Stokes variant는 텍스처 256 캡으로 메모리 fit.</span></div>
 
@@ -118,14 +119,23 @@ polarized Stokes variant는 텍스처 256 캡으로 메모리 fit.</span></div>
 벽 모퉁이만 보는 노드는 점수 0으로 자동 제외.</li>
 <li><b>AoLP 컬러맵.</b> 편광각을 hue로 인코딩(0°≡180° cyclic), 채도=DoLP(무편광→흰색).
 grayscale 램프보다 각도 구분이 쉽다. S0≈0 픽셀의 DoLP=0/0(NaN)은 0으로 처리.</li>
-<li><b>NIR speckle 검증.</b> 벽의 낱알 무늬는 렌더(MC) 노이즈가 아니라 <b>실제 표면 relief</b>다 —
-동일 뷰를 <b>spp 128과 4096으로 렌더하면 픽셀 단위로 동일</b>(local-diff-std 2.44 불변). active flash가
-plaster의 <b>normal map</b> 요철을 grazing 각도로 조명해 생기는 micro-shadow로, passive RGB(부드러운 주변광)에선
-안 보이고 active 센싱에서만 드러나는 특성. pseudo-NIR albedo에 0.8px 블러를 줘도 남는다 → albedo가 아닌 normal 기인.</li>
+<li><b>NIR speckle 근본원인 = spp 배선 버그(수정됨).</b> 앞선 렌더의 NIR flash 낱알은 실제로
+<b>Monte-Carlo 노이즈</b>였다. multimodal은 <code>active_nir_intensity</code> 패스를 <code>config.polar_spp</code>로
+렌더하는데 harness는 <code>path_spp</code>/<code>aov_spp</code>만 세팅하고 <code>polar_spp</code>는 기본값(256)으로
+둬서 <code>--nir-spp 4096</code>이 조용히 무시됐다 → flash가 256 spp로 렌더. <code>cfg_nir.polar_spp=nir_spp</code>로
+수정해 진짜 4096으로 렌더하니 벽·선반의 salt-pepper가 소거됐다(육안 확인). <code>cfg.spp</code>·AOV=polar_spp
+계열과 동일한 "잘못된 spp 필드" 버그.</li>
+<li><b>NIR albedo(hybrid) 노이즈.</b> hybrid 맵의 초기 표준화(log-luminance/σ) 방식이 매끈한 벽의
+micro-variation을 grain으로 증폭했다. <b>상대 국소대비</b> D(x)=clip((L−LPF)/(LPF+ε),−1,1)로 바꿔
+매끈면 D≈0(유지)·텍스처는 자연 대비로 표시. AOV 자체는 256에서 이미 수렴(256→512 grain 불변,
+1024는 OOM fallback로 오히려 악화)이라 AOV spp 상향은 무효.</li>
 <li><b>재질맵 렌더 방식.</b> roughness/metallic은 각 shape의 baked 맵을 <code>diffuse.reflectance</code>로
 넣고 <b>albedo AOV</b>로 읽는다(조명/occlusion 무관, self-emitter의 OptiX SBT overflow 회피). map 없는 재질은
 검정이 아니라 참값(roughness=scalar alpha, metallic=0/1)으로 표시. baked roughness는 실제 평균 ≈0.75(매트)로
 정상 — 초기 렌더의 "roughness 0" 인상은 diffuse+occlusion viz의 오류였다.
+<b>readout tex_cap=256(수정).</b> roughness/metallic만 full-res 텍스처라 baked 맵의 sparse outlier 텍셀이
+minification에서 alias→벽에 salt-pepper speckle이 떴다(같은 AOV 경로인 base-color는 spike가 없어 클린).
+텍스처를 256 캡으로 box-prefilter하니 speckle 소거(A/B 실렌더 확인). aov_spp 상향으론 안 잡힌다.
 <b>normal은 baked 텍스처가 아니라 <code>nn:sh_normal</code> world-space AOV</b>로 렌더 —
 normal map 없는 폴리곤도 검정/neutral이 아니라 <b>실제 기하 법선</b>을 카메라 뷰 기준으로 보여준다
 (map 있으면 perturbation 포함).</li>
@@ -134,7 +144,8 @@ normal map 없는 폴리곤도 검정/neutral이 아니라 <b>실제 기하 법�
 기본값 1.0을 누출해 세라믹 바닥 등 41% 재질이 오금속화됐던 것을, .blend 소스 metallic
 (source_metallic)을 권위로 판정하도록 수정(render_daemon). 바닥 metallic 0.88→≈0.</li>
 <li><b>NIR = point flash.</b> area flash 대신 rig point(delta) emitter로 하드웨어 충실 +
-오브젝트간 하드 섀도우. delta light는 direct가 NEE로 노이즈 0; GI firefly는 clamp+max_depth로 제거.</li>
+오브젝트간 하드 섀도우. delta light는 direct가 NEE로 노이즈 0; GI firefly는 clamp+max_depth로 제거.
+flash pass는 <b>polar_spp=4096</b>로 렌더(위 spp 배선 버그 수정).</li>
 <li><b>남은 작업</b>: spatial-PBR η/k(공간가변 금속 IOR) 풀배선; metallic 4-mode(pure_metal/
 pure_dielectric/mixed/unknown) + glTF factor×texture 정확 곱 (설계 확정, 미구현).</li>
 </ul>
