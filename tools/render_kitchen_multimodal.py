@@ -519,7 +519,11 @@ def main() -> int:
     # NIR point-flash pass: clamp GI fireflies + cap bounce depth so the delta light's
     # clean direct illumination dominates (see nir_point_light docstring).
     cfg_nir = RenderConfig(); cfg_nir.width = a.width; cfg_nir.height = a.height
-    cfg_nir.path_spp = a.nir_spp; cfg_nir.aov_spp = a.nir_spp
+    # multimodal renders the active_nir_intensity pass at config.polar_spp (NOT path_spp
+    # — see multimodal.py _render_pass call for "active_nir_intensity"). Drive ALL three
+    # spp fields from --nir-spp so the flash pass actually honours it; path_spp/aov_spp
+    # alone left it stuck at the default polar_spp and --nir-spp was silently ignored.
+    cfg_nir.path_spp = a.nir_spp; cfg_nir.aov_spp = a.nir_spp; cfg_nir.polar_spp = a.nir_spp
     cfg_nir.use_firefly_clamp = True; cfg_nir.path_max_depth = 3
     assist_flat = AssistLightSpec(mode="camera_aligned_rect", distance_m=0.18, size_world=[5.0, 3.6],
                                   spectrum_mode="mask_proxy", polarized=False,
