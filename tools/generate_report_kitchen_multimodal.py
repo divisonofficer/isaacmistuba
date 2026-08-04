@@ -12,23 +12,44 @@ DoP · AoLP · normal/roughness/metallic map renders. Documents the pipeline
 from __future__ import annotations
 
 import json
+import os
+import shutil
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
 IMG_DIR = REPO / "dev_report/images/kitchen_multimodal_2026-07-31"
+
+
+def _versioned(img: str) -> str:
+    """Return a per-content filename (hardlinked copy `<stem>__v<mtime>.png`) so the
+    browser re-fetches when an image changes — same-filename caching (a real problem for
+    a file:// report) is defeated WITHOUT a `?v=` query (which breaks file:// loading).
+    Old versions of the same stem are pruned."""
+    p = IMG_DIR / img
+    ver = int(p.stat().st_mtime)
+    stem, ext = os.path.splitext(img)
+    vname = f"{stem}__v{ver}{ext}"
+    vpath = IMG_DIR / vname
+    if not vpath.exists():
+        for old in IMG_DIR.glob(f"{stem}__v*{ext}"):
+            old.unlink()
+        try:
+            os.link(p, vpath)          # hardlink: no extra disk
+        except OSError:
+            shutil.copy2(p, vpath)
+    return vname
 IMPORT_MANIFEST = REPO / "out/infinigen_imports/kr_20260730_single_room_kitchen/scene_manifest.json"
 OUT = REPO / "dev_report/report_2026-07-31_kitchen_multimodal.html"
 
 MODS = [
-    ("rgb", "RGB — passive", "주변광만(무광). 실내 항법 뷰."),
-    ("albedo", "Albedo (AOV)", "Mitsuba diffuse-reflectance AOV — visible bake 결과."),
-    ("nir_pseudo_albedo", "NIR albedo (hybrid)", "NIR 밴드 반사율 맵(AOV): <b>hybrid</b> = class-prior μ_c + RGB 국소구조 전이 ρ=clip[μ_c(1+β_c·D)], D=상대 국소대비. visible albedo와 나란히 비교. 매끈한 벽은 μ_c 유지(과증폭 없음)."),
-    ("nir_active_pseudo", "NIR — active point flash", "rig NIR <b>point(delta) flash</b>(하드웨어 충실) + hybrid NIR albedo. 오브젝트간 하드 섀도우, r² falloff. <b>flash pass spp=4096</b>(polar_spp 경유) + firefly clamp + max_depth 3 → MC 노이즈 소거."),
-    ("dop", "DoP (red–black)", "편광 area flash. specular/유리에서 편광(빨강), diffuse는 검정."),
+    ("rgb", "RGB — visible band", "band carrier의 <b>visible 밴드</b>(weight 0) Stokes S0. 동일 씬·동일 passive 조명."),
+    ("nir_active_pseudo", "NIR — 854 band", "같은 band carrier의 <b>NIR 밴드</b>(weight 1) S0. __vis와 <b>BSDF·물리파라미터 동일, diffuse albedo만</b> hybrid NIR 반사율로 교체. 컬러 박스가 NIR에서 회색으로(밴드차이), 유리는 양밴드 투명(Fresnel·max_depth 8), 금속 일관."),
+    ("dop", "DoP (red–black)", "NIR 밴드 Stokes 편광도. specular/유리에서 편광(빨강), diffuse는 검정."),
     ("aolp", "AoLP (hue=angle)", "편광각을 <b>색상(hue)</b>으로: 각도별 다른 색. 채도=DoLP라 무편광은 흰색, 편광 강한 곳(창유리·모서리)만 선명."),
-    ("map_normal", "Normal (world sh_normal)", "픽셀별 실제 법선(AOV): normal map 있으면 perturbed, 없으면 폴리곤 기하 법선. 벽 방향별 색·바닥=위."),
-    ("map_roughness", "Roughness map", "baked roughness — 매트 표면 밝음, 유리/광택 어두움."),
-    ("map_metallic", "Metallic map", "baked metallic (금속만 밝음)."),
+    ("albedo", "Albedo (ray_intersect)", "primary-ray 직접 추출한 visible base color(조명 무관). AOV 아님 — 아래 property map 참고."),
+    ("map_normal", "Normal (world sh_normal)", "primary-ray shading normal(월드): normal map 있으면 perturbed, 없으면 폴리곤 기하 법선. 벽 방향별 색·바닥=위."),
+    ("map_roughness", "Roughness map", "canonical roughness(유리=0·매트=high). ray_intersect로 UV 직접 lookup — AOV backend stripe 버그 우회."),
+    ("map_metallic", "Metallic map", "canonical metallic(전도체=1, 나머지 0). .blend authoring 권위 — 누출 glTF factor/texture 배제."),
 ]
 
 CSS = """
@@ -72,7 +93,7 @@ def main() -> int:
             img = v["images"].get(key)
             if not img or not (IMG_DIR / img).is_file():
                 continue
-            cells += (f'<div class="cell"><img src="images/kitchen_multimodal_2026-07-31/{img}" '
+            cells += (f'<div class="cell"><img src="images/kitchen_multimodal_2026-07-31/{_versioned(img)}" '
                       f'alt="{title}"><div class="cap"><b>{title}</b><br><span class="mut">{desc}</span></div></div>')
         sections += (f'<h2>Viewpoint {v["index"]} — <code>{v["node_id"]}</code></h2>'
                      f'<p class="mut">position (world XZ) = {[round(x,2) for x in v["position"][:2]]}</p>'
@@ -88,71 +109,72 @@ def main() -> int:
 <h1>Infinigen → OpticalNav: kitchen import + 멀티모달 렌더</h1>
 <p class="sub">2026-07-31 · scene <code>{manifest['scene_id']}</code> ·
 {len(views)} viewpoints · {manifest['size'][0]}×{manifest['size'][1]} ·
-path/AOV spp {manifest['spp']}/{manifest.get('aov_spp', manifest['spp'])} · NIR flash spp {manifest.get('nir_spp', manifest['spp'])} ·
+unified discrete-band Stokes carrier · 순수 analytic(pplastic·roughconductor·dielectric) · spp 8000 ·
 Device 1 / RTX 5090 / <code>cuda_ad_rgb_polarized</code></p>
 
 <div class="pipe"><b>파이프라인.</b>
-① Infinigen <code>.blend</code> → <code>run_infinigen_import.sh</code> (texture bake ON) →
-② <b>semantic-contract mesh decimation</b> (appearance-contract LOD 예산) →
-③ nav traversability grid + viewpoint graph (21 nodes) →
-④ 멀티모달 렌더 (아래).</div>
+① Infinigen <code>.blend</code> → import (texture bake · semantic-contract decimation) →
+② nav grid + viewpoint graph →
+③ <b>provenance 계약</b>(<code>material_canonical.json</code>) →
+④ <b>band carrier</b>(재질마다 <code>blendbsdf(weight,__vis,__nir)</code>) 1회 로드 →
+⑤ RGB/NIR는 weight flip Stokes, property map은 ray_intersect (아래).</div>
 
 <div class="note"><b>Mesh decimation (② 규약).</b> import 중 bpy export 루프에서
 <code>semantic_contract</code> 정책으로 객체별 retained-ratio를 계산해 decimate.
 배경 장식(선반 소품)은 3%까지, 구조물/유리/금속은 보호.
 {decim_html}</div>
 
-<div class="note"><b>렌더 규약.</b>
-<b>RGB는 passive</b>(주변광), <b>NIR은 active</b>(rig NIR point flash) — 목적에 맞게 분리.
-NIR 밴드는 <b>hybrid NIR albedo</b>(class-prior μ_c × RGB 국소구조) 규약 적용 — pseudo/constant보다
-오브젝트 텍스처 보존과 물리적 평균을 동시에 만족.
-편광(DoP/AoLP)은 rig 편광 area flash. normal은 world sh_normal AOV, roughness/metallic은 baked 맵을 flat 시각화.
-<br><span class="mut">주의: modality 그룹별 분리 렌더(active_nir와 dop/aolp 동시 호출 시 Dr.Jit AD 충돌),
-polarized Stokes variant는 텍스처 256 캡으로 메모리 fit.</span></div>
+<div class="note"><b>렌더 규약 — unified band carrier.</b>
+3-별도패스(RGB passive · pseudo-NIR-swap flash · polar)를 폐기하고, <b>모든 재질을
+<code>blendbsdf(weight, __vis, __nir)</code>로 감싼 band carrier 씬</b>(<code>spectral_band.build_band_scene</code>)을
+<code>cuda_ad_rgb_polarized</code>로 <b>1회 로드</b> → 재질 weight를 0(visible)/1(NIR)로 flip(재로드 없음) → Stokes로
+RGB·NIR·DoP·AoLP를 한 번에 뽑는다. <code>__nir</code>은 <code>__vis</code>의 deep copy라 <b>BSDF 플러그인·물리
+파라미터(alpha·normal·IOR·η/k)가 동일하고 diffuse albedo만</b> hybrid NIR 반사율(<code>synthesize_nir_texture</code>)로
+바뀐다 — 금속/유리는 diffuse albedo가 없어 Fresnel 그대로(밴드 불변). 양 밴드가 <b>동일 passive 조명 +
+max_depth 8</b>이라 유리가 투과하고 금속 반사가 일관 — 옛 flash·depth-3 아티팩트(금속거울·유리검정)가 사라진다.
+<br><span class="mut">property map(albedo/normal/roughness/metallic)은 integrator를 안 거치고 primary-ray
+<code>scene.ray_intersect</code>로 직접 추출한다(아래).</span></div>
 
 {sections}
 
 <h2>메모</h2>
 <ul style="font-size:14px;line-height:1.7">
-<li>이 실험은 <code>tools/render_kitchen_multimodal.py</code>로 재현. 뷰포인트는 그래프
-노드×헤딩을 저해상도 프리뷰 렌더해 <b>content 점수(공간 std×조명 비율)</b>로 자동 선택 —
-벽 모퉁이만 보는 노드는 점수 0으로 자동 제외.</li>
-<li><b>AoLP 컬러맵.</b> 편광각을 hue로 인코딩(0°≡180° cyclic), 채도=DoLP(무편광→흰색).
-grayscale 램프보다 각도 구분이 쉽다. S0≈0 픽셀의 DoLP=0/0(NaN)은 0으로 처리.</li>
-<li><b>NIR speckle 근본원인 = spp 배선 버그(수정됨).</b> 앞선 렌더의 NIR flash 낱알은 실제로
-<b>Monte-Carlo 노이즈</b>였다. multimodal은 <code>active_nir_intensity</code> 패스를 <code>config.polar_spp</code>로
-렌더하는데 harness는 <code>path_spp</code>/<code>aov_spp</code>만 세팅하고 <code>polar_spp</code>는 기본값(256)으로
-둬서 <code>--nir-spp 4096</code>이 조용히 무시됐다 → flash가 256 spp로 렌더. <code>cfg_nir.polar_spp=nir_spp</code>로
-수정해 진짜 4096으로 렌더하니 벽·선반의 salt-pepper가 소거됐다(육안 확인). <code>cfg.spp</code>·AOV=polar_spp
-계열과 동일한 "잘못된 spp 필드" 버그.</li>
-<li><b>NIR albedo(hybrid) 노이즈.</b> hybrid 맵의 초기 표준화(log-luminance/σ) 방식이 매끈한 벽의
-micro-variation을 grain으로 증폭했다. <b>상대 국소대비</b> D(x)=clip((L−LPF)/(LPF+ε),−1,1)로 바꿔
-매끈면 D≈0(유지)·텍스처는 자연 대비로 표시. AOV 자체는 256에서 이미 수렴(256→512 grain 불변,
-1024는 OOM fallback로 오히려 악화)이라 AOV spp 상향은 무효.</li>
-<li><b>재질맵 렌더 방식.</b> roughness/metallic은 각 shape의 baked 맵을 <code>diffuse.reflectance</code>로
-넣고 <b>albedo AOV</b>로 읽는다(조명/occlusion 무관, self-emitter의 OptiX SBT overflow 회피). map 없는 재질은
-검정이 아니라 참값(roughness=scalar alpha, metallic=0/1)으로 표시. baked roughness는 실제 평균 ≈0.75(매트)로
-정상 — 초기 렌더의 "roughness 0" 인상은 diffuse+occlusion viz의 오류였다.
-<b>readout tex_cap=256(수정).</b> roughness/metallic만 full-res 텍스처라 baked 맵의 sparse outlier 텍셀이
-minification에서 alias→벽에 salt-pepper speckle이 떴다(같은 AOV 경로인 base-color는 spike가 없어 클린).
-텍스처를 256 캡으로 box-prefilter하니 speckle 소거(A/B 실렌더 확인). aov_spp 상향으론 안 잡힌다.
-<b>meaningful fallback(수정).</b> roughness-map 없는 재질에 상수 0.5를 넣던 걸, 재질 semantics에서 실제
-스칼라를 유도하도록 바꿨다: smooth dielectric(창유리)→<b>0.0</b>(delta-specular, 가짜 0.5 아님),
-Lambertian→1.0, alpha 스칼라→그 값, 미상만 magenta 플래그. 이 규약은 provenance 계약
-(<code>material_canonical.json</code>, <code>apps/material_pipeline.py</code>)으로 정식화됐다 —
-각 파라미터가 baked/derived/prior/undefined 중 무엇인지 valid 플래그와 함께 기록.
-<b>normal은 baked 텍스처가 아니라 <code>nn:sh_normal</code> world-space AOV</b>로 렌더 —
-normal map 없는 폴리곤도 검정/neutral이 아니라 <b>실제 기하 법선</b>을 카메라 뷰 기준으로 보여준다
-(map 있으면 perturbation 포함).</li>
-<li>DoP는 창유리·카운터 모서리 등 Fresnel specular에서 편광 신호가 집중.</li>
-<li><b>metallic provenance 수정.</b> Blender glTF export가 절차적 재질에 metallicFactor
-기본값 1.0을 누출해 세라믹 바닥 등 41% 재질이 오금속화됐던 것을, .blend 소스 metallic
-(source_metallic)을 권위로 판정하도록 수정(render_daemon). 바닥 metallic 0.88→≈0.</li>
-<li><b>NIR = point flash.</b> area flash 대신 rig point(delta) emitter로 하드웨어 충실 +
-오브젝트간 하드 섀도우. delta light는 direct가 NEE로 노이즈 0; GI firefly는 clamp+max_depth로 제거.
-flash pass는 <b>polar_spp=4096</b>로 렌더(위 spp 배선 버그 수정).</li>
-<li><b>남은 작업</b>: spatial-PBR η/k(공간가변 금속 IOR) 풀배선; metallic 4-mode(pure_metal/
-pure_dielectric/mixed/unknown) + glTF factor×texture 정확 곱 (설계 확정, 미구현).</li>
+<li><b>RGB/NIR = 같은 band carrier, weight flip.</b> <code>tools/render_kitchen_unified.py</code>가
+band 씬을 1회 로드하고 재질 weight를 0/1로 바꿔 두 밴드를 뽑는다. RGB와 NIR은 <b>동일 BSDF·물리
+파라미터</b>이고 diffuse albedo만 밴드별로 다르다. 밴드 차이는 diffuse 재질에서 드러난다 — 컬러 박스가 NIR에서
+회색(NIR 반사율)으로. 금속·유리는 visible↔NIR 광학이 비슷해(Al ~92%, IOR~1.5) 두 밴드가 유사한 게 정상.</li>
+<li><b>유리/금속 아티팩트 해소.</b> 옛 pseudo-NIR는 point flash를 썼는데, 그때 금속이 거울(flash 반사)·
+유리가 검정(<code>max_depth 3</code>이 다중 굴절면 투과를 잘라 불투명)으로 렌더됐다. band carrier는 <b>양 밴드가
+동일 passive 조명 + max_depth 8</b>이라 유리가 투과하고 금속 반사가 일관 — 둘 다 렌더 설정 아티팩트였음이 확인됐다.</li>
+<li><b>property map = primary-ray ray_intersect(핵심).</b> depth/normal/roughness/metallic/albedo는 광수송이
+아니므로 integrator를 안 거치고 <code>scene.ray_intersect</code>로 직접 추출한다. 이 빌드의 <code>aov</code>
+integrator·film 누적 backend가 <b>spp에 비례해 AOV에 규칙적 세로 stripe를 주입</b>하는 버그가 있어(평면 하나
+depth가 spp=1 매끈→spp=4096 빗살, RGB path는 클린) 옛 mapviz(albedo AOV) roughness가 노이지했다. ray_intersect는
+integrator·film·spp를 통째로 우회해 clean.</li>
+<li><b>meaningful roughness + provenance 계약.</b> roughness는 canonical semantics에서 실제값을 유도한다:
+smooth dielectric(창유리)→<b>0.0</b>, Lambertian→1.0, alpha 스칼라→그 값, 미상만 magenta(가짜 0.5 안 씀).
+metallic은 <b>.blend authoring 권위</b> — Blender glTF export가 절차적 재질에 누출한 metallicFactor=1.0·
+fabricated metallic 텍스처를 배제(전도체만 1). 각 파라미터의 baked/derived/prior/undefined + valid를
+<code>material_canonical.json</code>(<code>apps/material_pipeline.py</code>)에 기록.</li>
+<li><b>AoLP 컬러맵.</b> 편광각을 hue로 인코딩(0°≡180° cyclic), 채도=DoLP(무편광→흰색). S0≈0 픽셀의
+DoLP=0/0(NaN)은 0으로 처리. DoP는 창유리·모서리 등 Fresnel specular에서 집중.</li>
+<li><b>순수 analytic 재질 계약.</b> 씬을 pplastic·roughconductor·dielectric <b>3종</b>으로 정규화
+(measured pBRDF는 편광 정확도용 옵션 anchor일 뿐 기본 아님 → build_band_scene <code>force_analytic</code>이
+measured→pplastic, smooth conductor→roughconductor로 접음). 렌더 계약(material_contract §4):
+<b>roughconductor source-faithful</b>(base_color를 F0로 1회만; Al×base_color 이중곱 제거) +
+<b>microfacet alpha=r²</b>(Blender Principled). 계약은 band carrier(렌더)에만, render_scene.xml은
+원본 r/base_color GT로 유지.</li>
+<li><b>금속 albedo.</b> rough conductor는 diffuse+specular 혼합이므로 albedo=0(거울)이 아니라
+그 <b>base_color(specular_reflectance)가 금속색</b>. property albedo가 이를 반영(어두운 gunmetal 컵은
+회색으로). 단 RGB 실렌더에선 금속이 환경을 반사하므로 어두운 환경에선 어둡게(NIR flash로 highlight 관측).</li>
+<li><b>NIR = band-gated active flash.</b> band carrier에 rig NIR point 광원을 얹고 밴드별로 radiance를
+flip: visible=0(passive), NIR=on. 한 씬·한 weight flip으로 <b>RGB엔 안 보이고 NIR엔 보이는 액티브 조명</b>
+(주변광의 ~50×, 금속 highlight 관측 목적).</li>
+<li><b>--no-polar 고속 모드.</b> 편광이 불필요하면 <code>path</code> integrator(cuda_ad_rgb)로 RGB/NIR만
+(DoP/AoLP 생략) → 실측 <b>~5× 빠름</b>(1024spp vp_000012: Stokes 76/65s vs path 12/15s). max_depth 8 +
+복잡 재질이라 Mueller 행렬 연산이 지배적. 이 리포트는 DoP/AoLP 위해 polar로 렌더.</li>
+<li><b>남은 작업</b>: band 렌더 노출/조명 튜닝, stage2 spectral η/k 정밀화, property map float EXR +
+valid mask, render_daemon 본체에 계약 채택.</li>
 </ul>
 </body></html>"""
     OUT.write_text(html, encoding="utf-8")
