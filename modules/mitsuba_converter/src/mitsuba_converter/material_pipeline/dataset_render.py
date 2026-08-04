@@ -84,11 +84,13 @@ def _load_texture(path: str) -> Optional[np.ndarray]:
 
 
 def _sample_texture(tex: np.ndarray, uv: np.ndarray) -> np.ndarray:
-    """Bilinear-sample a texture at per-pixel UV. Mitsuba UV has v=0 at the bottom, so
-    the image row is flipped. `uv` is (N,2); returns (N,) or (N,3)."""
+    """Bilinear-sample a texture at per-pixel UV. Mesh UVs tile (Mitsuba's default wrap
+    is repeat, and ~1/4 of kitchen hits fall outside [0,1]), so wrap with modulo — NOT
+    clip, which smears out-of-range UVs to the texture edge (jumbled placement). Mitsuba
+    UV has v=0 at the bottom, so the image row is flipped. `uv` is (N,2)."""
     h, w = tex.shape[:2]
-    u = np.clip(uv[:, 0], 0.0, 1.0) * (w - 1)
-    v = np.clip(1.0 - uv[:, 1], 0.0, 1.0) * (h - 1)
+    u = (uv[:, 0] % 1.0) * (w - 1)
+    v = ((1.0 - uv[:, 1]) % 1.0) * (h - 1)
     x0 = np.floor(u).astype(int); y0 = np.floor(v).astype(int)
     x1 = np.minimum(x0 + 1, w - 1); y1 = np.minimum(y0 + 1, h - 1)
     fx = (u - x0)[:, None] if tex.ndim == 3 else (u - x0)
@@ -148,16 +150,66 @@ def render_property_maps(
         valid = np.array(si.is_valid())
         return si, valid
 
-    # --- anti-aliased continuous fields over a fixed KxK sub-pixel grid ---
+    # Resolve a material parameter once to ("tex", array) | ("scalar", vec) | None.
+    from functools import lru_cache
+
+    def _resolve(mid: str, pname: str, channels: int):
+        p = (mat_by_id.get(mid, {}).get("parameters") or {}).get(pname)
+        if p is None or not p.get("valid", False):
+            return None
+        if p.get("path"):
+            tex = _load_texture(p["path"])
+            if tex is None:
+                return None
+            if channels == 1 and tex.ndim == 3:
+                tex = tex.mean(-1)
+            return ("tex", tex)
+        if p.get("value") is not None:
+            return ("scalar", np.asarray(p["value"], np.float32))
+        return None
+
+    PARAMS = [("base_color", 3), ("roughness_perceptual", 1), ("metallic", 1)]
+    resolved: dict = {}
+
+    # --- accumulate ALL fields over a fixed KxK sub-pixel grid (anti-aliased) ---
     S = max(1, int(subpixel))
     depth_sum = np.zeros(n, np.float64); ng_sum = np.zeros((n, 3), np.float64)
     shn_sum = np.zeros((n, 3), np.float64); cnt = np.zeros(n, np.float64)
+    psum = {pn: (np.zeros((n, ch), np.float64) if ch > 1 else np.zeros(n, np.float64))
+            for pn, ch in PARAMS}
+    pcnt = {pn: np.zeros(n, np.float64) for pn, _ in PARAMS}
     for i in range(S):
         for j in range(S):
             si, valid = _intersect((i + 0.5) / S, (j + 0.5) / S)
             t = np.array(si.t); ng = np.array(si.n); shn = np.array(si.sh_frame.n)
             m = valid & np.isfinite(t)
             depth_sum[m] += t[m]; ng_sum[m] += ng[m]; shn_sum[m] += shn[m]; cnt[m] += 1.0
+            uv = np.array(si.uv)
+            sidx = dr.full(mi.UInt32, len(shapes), n)
+            for k, s in enumerate(shapes):
+                sidx[dr.eq(si.shape, mi.ShapePtr(s))] = k
+            sidx = np.array(sidx)
+            for k in range(len(shapes)):
+                mask = valid & (sidx == k)
+                if not mask.any():
+                    continue
+                mid = shape2mat.get(shape_ids[k])
+                if mid is None:
+                    continue
+                for pn, ch in PARAMS:
+                    if (mid, pn) not in resolved:
+                        resolved[(mid, pn)] = _resolve(mid, pn, ch)
+                    res = resolved[(mid, pn)]
+                    if res is None:
+                        continue
+                    if res[0] == "tex":
+                        val = _sample_texture(res[1], uv[mask])
+                        if ch > 1 and val.ndim == 1:
+                            val = np.repeat(val[:, None], ch, 1)
+                    else:
+                        val = res[1]
+                    psum[pn][mask] += val
+                    pcnt[pn][mask] += 1.0
 
     valid = cnt > 0
     depth = np.where(valid, depth_sum / np.maximum(cnt, 1), 0.0)
@@ -166,18 +218,23 @@ def render_property_maps(
         return np.where(nrm > 1e-8, v / np.maximum(nrm, 1e-8), 0.0)
     geo_n = _norm(ng_sum); sh_n = _norm(shn_sum)
 
-    # --- categorical fields + material params from the CENTRE sub-pixel (deterministic) ---
+    def _avg(pn):
+        c = np.maximum(pcnt[pn], 1)
+        v = psum[pn] / (c[:, None] if psum[pn].ndim == 2 else c)
+        return v.astype(np.float32), pcnt[pn] > 0
+    basec, basec_v = _avg("base_color")
+    rough, rough_v = _avg("roughness_perceptual")
+    metal, metal_v = _avg("metallic")
+
+    # --- categorical fields (material_region_id, uv) from the CENTRE sub-pixel ---
     si_c, valid_c = _intersect(0.5, 0.5)
     uv_c = np.array(si_c.uv)
-    shape_idx = dr.full(mi.UInt32, len(shapes), n)   # sentinel = out of range
+    shape_idx = dr.full(mi.UInt32, len(shapes), n)
     for i, s in enumerate(shapes):
         shape_idx[dr.eq(si_c.shape, mi.ShapePtr(s))] = i
     shape_idx = np.array(shape_idx)
-
-    # material_region_id: dense integer per distinct material_id actually hit
     region_id = np.full(n, -1, np.int32)
     legend: dict[int, str] = {}
-    mat_of_pixel = np.array([""] * n, dtype=object)
     next_id = 0
     mid_to_region: dict[str, int] = {}
     for i in range(len(shapes)):
@@ -190,39 +247,6 @@ def render_property_maps(
         if mid not in mid_to_region:
             mid_to_region[mid] = next_id; legend[next_id] = mid; next_id += 1
         region_id[px_mask] = mid_to_region[mid]
-        mat_of_pixel[px_mask] = mid
-
-    # --- roughness / metallic / base_color via direct texture-at-UV or scalar ---
-    def _param_map(pname: str, channels: int):
-        val = np.zeros((n, channels), np.float32) if channels > 1 else np.zeros(n, np.float32)
-        pvalid = np.zeros(n, bool)
-        for mid, region in mid_to_region.items():
-            p = (mat_by_id[mid].get("parameters") or {}).get(pname)
-            if p is None or not p.get("valid", False):
-                continue
-            mask = (region_id == region)
-            if not mask.any():
-                continue
-            if p.get("path"):
-                tex = _load_texture(p["path"])
-                if tex is None:
-                    continue
-                if channels == 1 and tex.ndim == 3:
-                    tex = tex.mean(-1)
-                sampled = _sample_texture(tex, uv_c[mask])
-                if channels > 1 and sampled.ndim == 1:
-                    sampled = np.repeat(sampled[:, None], channels, 1)
-                val[mask] = sampled
-            elif p.get("value") is not None:
-                val[mask] = np.asarray(p["value"], np.float32)
-            else:
-                continue
-            pvalid[mask] = True
-        return val, pvalid
-
-    rough, rough_v = _param_map("roughness_perceptual", 1)
-    metal, metal_v = _param_map("metallic", 1)
-    basec, basec_v = _param_map("base_color", 3)
 
     def r(a, *shape):
         return a.reshape(height, width, *shape) if shape else a.reshape(height, width)
