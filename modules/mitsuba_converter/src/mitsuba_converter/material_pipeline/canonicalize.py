@@ -99,16 +99,18 @@ def _metallic(slot, is_conductor, optical_class) -> MaterialParameter:
     if is_conductor or optical_class == "metal":
         return MaterialParameter(source="derived", value=1.0,
                                  formula="conductor BSDF => metallic 1 (overrides leaked factor)")
-    ex = slot["extracted"]
-    if ex.get("metallic_texture_ref"):
-        return MaterialParameter(source="baked", path=ex["metallic_texture_ref"])
+    # .blend authoring metallic is the AUTHORITY. Blender's glTF export leaks
+    # metallicFactor=1.0 AND a fabricated ~1.0 metallic texture onto procedural
+    # (non-Principled) materials, so neither the exported factor nor the texture is
+    # trusted as a positive metal signal — render_daemon likewise only blends metal
+    # when source_metallic>=0.5. A non-conductor with no authored metallic renders as
+    # pplastic (non-metal), so it is metallic 0.
     auth = slot["authoring"].get("metallic")
     if auth is not None:
         return MaterialParameter(source="blend_authored", value=float(auth),
-                                 note=".blend authority over exported metallicFactor")
-    if ex.get("metallic_factor") is not None:
-        return MaterialParameter(source="glb_factor", value=float(ex["metallic_factor"]))
-    return MaterialParameter(source="derived", value=0.0, note="non-conductor default")
+                                 note=".blend authority; exported glTF factor/texture not trusted")
+    return MaterialParameter(source="derived", value=0.0,
+                             note="non-conductor, no authored metallic (glTF factor/texture not trusted)")
 
 
 def _normal(slot) -> MaterialParameter:
