@@ -79,9 +79,11 @@ def _diffuse(shape_bsdf_id: str, reflectance) -> ET.Element:
 
 
 def _stage_readout_xml(scene_xml: Path, canonical: Mapping[str, Any], channel: str) -> Path:
-    """Write a temp scene whose eval_diffuse_reflectance yields `channel`.
-    channel: 'albedo' keeps the real BSDFs (measured→roughconductor, so they load in an
-    RGB variant); 'roughness'/'metallic' rewrite every material to a diffuse readout."""
+    """Write a temp scene whose eval_diffuse_reflectance yields `channel` — every material
+    becomes a diffuse whose reflectance is the requested property (base color texture for
+    'albedo', roughness texture/scalar for 'roughness', metallic scalar for 'metallic'),
+    with the scene's own texture nodes (UV transform preserved). All BSDFs become diffuse
+    so the scene also loads cleanly in an RGB variant (no measured_polarized wavelength)."""
     scene_dir = scene_xml.parent
     bsdf2mat = _bsdf_to_material(scene_dir)
     mat_by_id = {m["material_id"]: m for m in canonical.get("materials", [])}
@@ -89,33 +91,35 @@ def _stage_readout_xml(scene_xml: Path, canonical: Mapping[str, Any], channel: s
     root = tree.getroot()
 
     for b in list(root.findall("bsdf")):
-        if channel == "albedo":
-            # keep material; only make measured_polarized loadable in an RGB variant
-            for m in list(b.iter("bsdf")):
-                if m.get("type") == "measured_polarized":
-                    for c in list(m):
-                        m.remove(c)
-                    m.set("type", "roughconductor")
-            continue
         bid = b.get("id")
         canon = mat_by_id.get(bsdf2mat.get(bid))
-        param = (canon or {}).get("parameters", {}).get(
-            "roughness_perceptual" if channel == "roughness" else "metallic")
         refl: Any = "0 0 0"
-        if param and param.get("valid", False):
-            if channel == "roughness" and param.get("path"):
-                node = _find_texture_node(b, "alpha")   # scene roughness tex, transform kept
-                if node is not None:
-                    refl = node
-                else:
-                    refl = "0.5 0.5 0.5"
-            elif param.get("value") is not None:
-                v = float(param["value"]) if channel == "metallic" else float(param["value"])
-                refl = f"{v:.4f} {v:.4f} {v:.4f}"
+        if channel == "albedo":
+            # the material's authored base colour = its albedo. For pplastic that is
+            # diffuse_reflectance; for a conductor it is specular_reflectance (a ROUGH
+            # metal's colour IS its albedo — only a perfect mirror has none). Copy the
+            # scene texture node with its UV transform.
+            node = (_find_texture_node(b, "diffuse_reflectance")
+                    or _find_texture_node(b, "specular_reflectance"))
+            if node is not None:
+                refl = node
+            else:
+                bc = (canon or {}).get("parameters", {}).get("base_color", {})
+                refl = (" ".join(f"{float(v):.4f}" for v in bc["value"])
+                        if bc.get("value") is not None else "0 0 0")
+        else:
+            param = (canon or {}).get("parameters", {}).get(
+                "roughness_perceptual" if channel == "roughness" else "metallic")
+            if param and param.get("valid", False):
+                if channel == "roughness" and param.get("path"):
+                    node = _find_texture_node(b, "alpha")   # scene roughness tex, transform kept
+                    refl = node if node is not None else "0.5 0.5 0.5"
+                elif param.get("value") is not None:
+                    v = float(param["value"])
+                    refl = f"{v:.4f} {v:.4f} {v:.4f}"
         for c in list(b):
             b.remove(c)
         b.set("type", "diffuse")
-        b.attrib.pop("id", None)
         b.set("id", bid)
         if isinstance(refl, ET.Element):
             b.append(refl)
