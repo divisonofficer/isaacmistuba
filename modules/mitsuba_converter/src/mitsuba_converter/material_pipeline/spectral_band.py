@@ -32,6 +32,7 @@ from mitsuba_converter.nir_reflectance import (
     physical_material_for, nir_reflectance, synthesize_nir_texture,
 )
 from mitsuba_converter.multimodal import _ensure_measured_bsdf_wavelength
+from mitsuba_converter.material_pipeline.bsdf_contract import apply_contract_to_subtree
 
 _VISIBLE_NM = 542   # representative visible band for measured pBRDF staging (matches RGB render)
 
@@ -100,8 +101,15 @@ def build_band_scene(
     band: int = 854,
     nir_dir: Optional[Path] = None,
     max_depth: int = 8,
+    nir_flash: bool = False,
 ) -> dict:
-    """Write a band carrier scene next to (or at) out_path. Returns a build summary."""
+    """Write a band carrier scene next to (or at) out_path. Returns a build summary.
+
+    ``nir_flash`` adds a rig-mounted point emitter ``id="nir_flash"`` (a headlamp) that
+    the runner band-gates: OFF (intensity 0) in the visible band so RGB stays passive,
+    ON in the NIR band so NIR shows the active illumination — an active-NIR light that
+    only the NIR band sees, from ONE weight-flip scene. Its ``position`` is moved to the
+    camera per view via mi.traverse."""
     scene = Path(scene)
     scene_xml = scene if scene.is_file() else scene / "render_scene.xml"
     scene_dir = _scene_dir(scene)
@@ -121,7 +129,14 @@ def build_band_scene(
     ET.SubElement(path, "integer", {"name": "max_depth", "value": str(int(max_depth))})
     root.insert(0, stokes)
 
+    # rig NIR headlamp — band-gated by the runner (0 in visible, on in NIR).
+    if nir_flash:
+        em = ET.SubElement(root, "emitter", {"type": "point", "id": "nir_flash"})
+        ET.SubElement(em, "rgb", {"name": "intensity", "value": "0 0 0"})  # off (visible)
+        ET.SubElement(em, "point", {"name": "position", "x": "0", "y": "1.2", "z": "0"})
+
     wrapped = nir_swapped = metal_glass = unresolved = measured = 0
+    contract_conductors = contract_alpha = 0
 
     for b in root.findall("bsdf"):
         bid = b.get("id")
@@ -146,6 +161,13 @@ def build_band_scene(
         if _ensure_measured_bsdf_wavelength(vis, target_nm=_VISIBLE_NM):
             measured += 1
         _ensure_measured_bsdf_wavelength(nir, target_nm=band)
+
+        # RENDER contract (material_contract §4): source-faithful conductor (base_color
+        # once, no metal-preset double-multiply) + microfacet alpha = r². Applied to the
+        # band carrier only; render_scene.xml stays the source-r GT for property maps.
+        cc, ca = apply_contract_to_subtree(vis, tex_dir=nir_dir.parent / "roughness_sq")
+        apply_contract_to_subtree(nir, tex_dir=nir_dir.parent / "roughness_sq")
+        contract_conductors += cc; contract_alpha += ca
 
         mid = bsdf2mat.get(bid)
         canon = mat_by_id.get(mid) if mid else None
@@ -174,7 +196,9 @@ def build_band_scene(
     summary = {
         "band": band, "materials_wrapped": wrapped, "nir_albedo_swapped": nir_swapped,
         "metal_glass_fresnel_kept": metal_glass, "unresolved": unresolved,
-        "measured_bsdf_banded": measured,
+        "measured_bsdf_banded": measured, "nir_flash": bool(nir_flash),
+        "contract_conductors_source_faithful": contract_conductors // 2,
+        "contract_alpha_r2": contract_alpha // 2,
         "xml": str(out_path), "nir_dir": str(nir_dir),
     }
     (out_path.parent / "band_build.json").write_text(json.dumps(summary, indent=2))
