@@ -22,11 +22,15 @@ __all__ = [
     "SLOTS_SCHEMA_VERSION",
     "canonicalize_materials",
     "render_property_maps",
+    "build_band_scene",
 ]
 
 
-def __getattr__(name):  # lazy: dataset_render imports mitsuba, keep it optional
+def __getattr__(name):  # lazy: these import mitsuba/multimodal, keep it optional
     if name == "render_property_maps":
         from .dataset_render import render_property_maps
         return render_property_maps
+    if name == "build_band_scene":
+        from .spectral_band import build_band_scene
+        return build_band_scene
     raise AttributeError(name)
