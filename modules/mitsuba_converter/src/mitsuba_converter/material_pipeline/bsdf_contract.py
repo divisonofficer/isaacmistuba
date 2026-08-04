@@ -76,6 +76,47 @@ def _source_faithful_conductor(bsdf: ET.Element) -> None:
     bsdf.insert(0, ET.Element("rgb", {"name": "eta", "value": "0.0001 0.0001 0.0001"}))
 
 
+def _replace_child(parent: ET.Element, old: ET.Element, new: ET.Element) -> bool:
+    for i, c in enumerate(list(parent)):
+        if c is old:
+            parent[i] = new
+            return True
+        if _replace_child(c, old, new):
+            return True
+    return False
+
+
+def force_analytic(top: ET.Element, canon: Optional[dict]) -> int:
+    """Collapse a subtree to the 3 canonical analytic BSDFs: measured_polarized(_rgb) →
+    pplastic (using the canonical base color / roughness), smooth `conductor` →
+    `roughconductor`. Returns how many nodes were converted."""
+    params = (canon or {}).get("parameters", {})
+    bc = params.get("base_color", {})
+    rp = params.get("roughness_perceptual", {})
+    alpha = (float(rp["value"]) ** 2 if rp.get("value") is not None else 0.04)
+    n = 0
+    for m in list(top.iter("bsdf")):
+        t = m.get("type")
+        if t in ("measured_polarized", "measured_polarized_rgb"):
+            pp = ET.Element("bsdf", {"type": "pplastic"})
+            ET.SubElement(pp, "float", {"name": "int_ior", "value": "1.5"})
+            if bc.get("path"):
+                tex = ET.SubElement(pp, "texture", {"name": "diffuse_reflectance", "type": "bitmap"})
+                ET.SubElement(tex, "string", {"name": "filename", "value": bc["path"]})
+            elif bc.get("value") is not None:
+                ET.SubElement(pp, "rgb", {"name": "diffuse_reflectance",
+                                          "value": " ".join(f"{float(v):.4f}" for v in bc["value"])})
+            else:
+                ET.SubElement(pp, "rgb", {"name": "diffuse_reflectance", "value": "0.7 0.7 0.7"})
+            ET.SubElement(pp, "float", {"name": "alpha", "value": f"{max(alpha, 1e-3):.4f}"})
+            _replace_child(top, m, pp); n += 1
+        elif t == "conductor":
+            m.set("type", "roughconductor")
+            ET.SubElement(m, "float", {"name": "alpha", "value": "0.05"})  # near-mirror
+            n += 1
+    return n
+
+
 def apply_contract_to_subtree(elem: ET.Element, tex_dir: Path) -> tuple[int, int]:
     """Apply #1 (source-faithful conductor) + #2 (alpha=r²) to every bsdf under `elem`.
     Use this on a band-carrier __vis/__nir subtree so the RENDER honours the contract

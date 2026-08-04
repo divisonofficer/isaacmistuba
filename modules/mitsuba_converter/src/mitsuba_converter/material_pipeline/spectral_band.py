@@ -32,7 +32,9 @@ from mitsuba_converter.nir_reflectance import (
     physical_material_for, nir_reflectance, synthesize_nir_texture,
 )
 from mitsuba_converter.multimodal import _ensure_measured_bsdf_wavelength
-from mitsuba_converter.material_pipeline.bsdf_contract import apply_contract_to_subtree
+from mitsuba_converter.material_pipeline.bsdf_contract import (
+    apply_contract_to_subtree, force_analytic as _force_analytic_subtree,
+)
 
 _VISIBLE_NM = 542   # representative visible band for measured pBRDF staging (matches RGB render)
 
@@ -102,6 +104,8 @@ def build_band_scene(
     nir_dir: Optional[Path] = None,
     max_depth: int = 8,
     nir_flash: bool = False,
+    force_analytic: bool = True,
+    polarized: bool = True,
 ) -> dict:
     """Write a band carrier scene next to (or at) out_path. Returns a build summary.
 
@@ -124,10 +128,13 @@ def build_band_scene(
     # multi-surface glass transmits (a low depth renders bottles as opaque black).
     for integ in root.findall("integrator"):
         root.remove(integ)
-    stokes = ET.Element("integrator", {"type": "stokes"})
-    path = ET.SubElement(stokes, "integrator", {"type": "path"})
+    if polarized:                                     # Stokes carrier: RGB/NIR + DoP/AoLP
+        top_integ = ET.Element("integrator", {"type": "stokes"})
+        path = ET.SubElement(top_integ, "integrator", {"type": "path"})
+    else:                                             # no-polar: plain path, RGB/NIR only
+        top_integ = path = ET.Element("integrator", {"type": "path"})
     ET.SubElement(path, "integer", {"name": "max_depth", "value": str(int(max_depth))})
-    root.insert(0, stokes)
+    root.insert(0, top_integ)
 
     # rig NIR headlamp — band-gated by the runner (0 in visible, on in NIR).
     if nir_flash:
@@ -155,12 +162,19 @@ def build_band_scene(
         for c in orig_children:
             nir.append(copy.deepcopy(c))
 
-        # measured_polarized (single-band pBRDF) needs a concrete wavelength to load in
-        # the RGB-approx variant; give each band its own so measured metals are a REAL
-        # spectral band pair (visible 542 vs nir 854 channel slice), not identical.
-        if _ensure_measured_bsdf_wavelength(vis, target_nm=_VISIBLE_NM):
-            measured += 1
-        _ensure_measured_bsdf_wavelength(nir, target_nm=band)
+        mid = bsdf2mat.get(bid)
+        canon = mat_by_id.get(mid) if mid else None
+        oc = canon.get("optical_class") if canon else None
+
+        # pure analytic (3 BSDFs): measured pBRDF → pplastic, smooth conductor →
+        # roughconductor — measured is an optional polar-accuracy anchor, not the default.
+        if force_analytic:
+            measured += _force_analytic_subtree(vis, canon) > 0
+            _force_analytic_subtree(nir, canon)
+        else:
+            if _ensure_measured_bsdf_wavelength(vis, target_nm=_VISIBLE_NM):
+                measured += 1
+            _ensure_measured_bsdf_wavelength(nir, target_nm=band)
 
         # RENDER contract (material_contract §4): source-faithful conductor (base_color
         # once, no metal-preset double-multiply) + microfacet alpha = r². Applied to the
@@ -169,9 +183,6 @@ def build_band_scene(
         apply_contract_to_subtree(nir, tex_dir=nir_dir.parent / "roughness_sq")
         contract_conductors += cc; contract_alpha += ca
 
-        mid = bsdf2mat.get(bid)
-        canon = mat_by_id.get(mid) if mid else None
-        oc = canon.get("optical_class") if canon else None
         pmat, _ = physical_material_for(mid, oc) if mid else (None, None)
         info = nir_reflectance(pmat, band) if pmat else {"albedo_channel": False}
         if pmat and info.get("albedo_channel") and _swap_diffuse_to_nir(nir, pmat, band, nir_dir):
@@ -199,6 +210,7 @@ def build_band_scene(
         "measured_bsdf_banded": measured, "nir_flash": bool(nir_flash),
         "contract_conductors_source_faithful": contract_conductors // 2,
         "contract_alpha_r2": contract_alpha // 2,
+        "force_analytic": bool(force_analytic), "polarized": bool(polarized),
         "xml": str(out_path), "nir_dir": str(nir_dir),
     }
     (out_path.parent / "band_build.json").write_text(json.dumps(summary, indent=2))

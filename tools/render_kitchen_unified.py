@@ -65,17 +65,26 @@ def main() -> int:
     ap.add_argument("--spp", type=int, default=256)
     ap.add_argument("--band", type=int, default=854)
     ap.add_argument("--rebuild", action="store_true", help="rebuild the band carrier scene")
+    ap.add_argument("--nir-flash", action="store_true",
+                    help="add a rig NIR headlamp that is OFF in the visible band and ON in "
+                         "the NIR band (active NIR only the NIR camera sees)")
+    ap.add_argument("--nir-radiance", type=float, default=400.0)
+    ap.add_argument("--no-polar", action="store_true",
+                    help="skip polarization: plain path integrator in cuda_ad_rgb, output "
+                         "RGB/NIR only (no DoP/AoLP) — ~2x faster, less GPU memory")
     ap.add_argument("--index-base", type=int, default=0)
     a = ap.parse_args()
 
     import mitsuba as mi
-    mi.set_variant(VARIANT)
+    variant = "cuda_ad_rgb" if a.no_polar else VARIANT
+    mi.set_variant(variant)
 
     scene_dir = SCENES / a.scene_id
     band_xml = scene_dir / "scene_band.xml"
-    if a.rebuild or not band_xml.is_file():
+    if a.rebuild or a.nir_flash or not band_xml.is_file():
         canonical = json.loads((scene_dir / "material_canonical.json").read_text())
-        summ = build_band_scene(scene_dir / "render_scene.xml", canonical, band_xml, band=a.band)
+        summ = build_band_scene(scene_dir / "render_scene.xml", canonical, band_xml,
+                                band=a.band, nir_flash=a.nir_flash, polarized=not a.no_polar)
         print(f"[band] built {band_xml.name}: {json.dumps(summ)}", flush=True)
 
     graph = json.loads((scene_dir / "viewpoint_graph.json").read_text())
@@ -89,7 +98,10 @@ def main() -> int:
     wkeys = [k for k in params.keys() if WEIGHT_RE.match(k)]
     cam_key = next(k for k in params.keys() if k.endswith(".to_world"))
     fov_key = next((k for k in params.keys() if k.endswith(".x_fov")), None)
-    print(f"[band] loaded {time.time()-t0:.1f}s · {len(wkeys)} band weights · cam={cam_key}", flush=True)
+    flash_i = next((k for k in params.keys() if "nir_flash" in k and "intensity" in k), None)
+    flash_p = next((k for k in params.keys() if "nir_flash" in k and "position" in k), None)
+    print(f"[band] loaded {time.time()-t0:.1f}s · {len(wkeys)} band weights · cam={cam_key}"
+          f"{' · NIR flash' if flash_i else ''}", flush=True)
 
     for k, spec in enumerate(a.viewpoints.split(",")):
         nid, _, yaw_s = spec.partition("@")
@@ -105,26 +117,36 @@ def main() -> int:
             mi.ScalarTransform4f().look_at(origin=list(o), target=list(t), up=list(u)).matrix)
         if fov_key:
             params[fov_key] = float(a.fov)
+        if flash_p is not None:
+            params[flash_p] = mi.Point3f(float(o[0]), float(o[1]), float(o[2]))  # headlamp at camera
         vi = a.index_base + k
         rec = {}
         for band in ("visible", "nir"):
             for wk in wkeys:
                 params[wk] = mi.Float(BAND_WEIGHT[band])
+            if flash_i is not None:  # band-gate the NIR headlamp: off in RGB, on in NIR
+                rad = a.nir_radiance if band == "nir" else 0.0
+                params[flash_i] = mi.Color3f(rad, rad, rad)
             params.update()
+            _tr = time.time()
             img = np.array(mi.render(scene, spp=a.spp, seed=7))
-            m = stokes(img)
-            if band == "visible":
-                save_png(m["s0_rgb"], out / f"vp{vi}_{nid}_rgb.png", "linear_gamma")
-                rec["rgb"] = m["s0_rgb"]
+            _render_s = time.time() - _tr
+            if a.no_polar:                       # plain path: img is (H,W,3) RGB, no Stokes
+                s0_rgb = np.clip(img[..., :3].astype(np.float32), 0, None)
+                S0 = np.clip((s0_rgb * _LUM).sum(2), 1e-8, None)
             else:
-                v = m["S0"]; vn = np.clip(v / max(np.percentile(v, 99), 1e-6), 0, 1)
+                m = stokes(img); s0_rgb, S0 = m["s0_rgb"], m["S0"]
+            if band == "visible":
+                save_png(s0_rgb, out / f"vp{vi}_{nid}_rgb.png", "linear_gamma")
+            else:
+                vn = np.clip(S0 / max(np.percentile(S0, 99), 1e-6), 0, 1)
                 Image.fromarray((vn ** (1 / 2.2) * 255).astype(np.uint8)).save(out / f"vp{vi}_{nid}_nir.png")
-                # polarization from the NIR band (active-sensing DoP/AoLP)
-                save_png(m["dolp"], out / f"vp{vi}_{nid}_dop.png", "dop")
-                Image.fromarray((aolp_to_rgb(m["aolp"], m["dolp"]) * 255).astype(np.uint8)).save(
-                    out / f"vp{vi}_{nid}_aolp.png")
-            print(f"  [vp{vi} {nid} {band:7s}] S0 mean {m['S0'].mean():.3f} "
-                  f"DoP {m['dolp'][m['S0']>0.05*m['S0'].max()].mean():.3f}", flush=True)
+                if not a.no_polar:               # active-sensing DoP/AoLP (NIR band Stokes)
+                    save_png(m["dolp"], out / f"vp{vi}_{nid}_dop.png", "dop")
+                    Image.fromarray((aolp_to_rgb(m["aolp"], m["dolp"]) * 255).astype(np.uint8)).save(
+                        out / f"vp{vi}_{nid}_aolp.png")
+            dpm = "" if a.no_polar else f" DoP {m['dolp'][S0>0.05*S0.max()].mean():.3f}"
+            print(f"  [vp{vi} {nid} {band:7s}] render {_render_s:5.1f}s S0 mean {S0.mean():.3f}{dpm}", flush=True)
     print("done")
     return 0
 
