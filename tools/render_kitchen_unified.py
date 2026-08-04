@@ -43,6 +43,21 @@ WEIGHT_RE = re.compile(r"^.*\.weight\.value$")
 BAND_WEIGHT = {"visible": 0.0, "nir": 1.0}
 
 
+def _declutter_fireflies(s0: np.ndarray, factor: float = 6.0) -> np.ndarray:
+    """Clamp isolated MC spikes (the active point flash's delta-light specular/caustic
+    fireflies — the white 'flour' specks in NIR that spp barely removes) to a local-median
+    ceiling. Coherent bright regions (the real flash highlight) survive: their neighbours
+    are bright too, so the median is high. Only lone hot pixels get pulled down."""
+    try:
+        from scipy.ndimage import median_filter
+        med = median_filter(s0, size=3)
+    except Exception:
+        p = np.pad(s0, 1, mode="edge")
+        med = np.median(np.stack([p[i:i + s0.shape[0], j:j + s0.shape[1]]
+                                  for i in range(3) for j in range(3)]), axis=0)
+    return np.minimum(s0, med * factor + 1e-6)
+
+
 def stokes(arr: np.ndarray) -> dict:
     s0_rgb = arr[:, :, 3:6].astype(np.float32)
     S0 = np.clip((s0_rgb * _LUM).sum(2), 1e-8, None)
@@ -139,6 +154,7 @@ def main() -> int:
             if band == "visible":
                 save_png(s0_rgb, out / f"vp{vi}_{nid}_rgb.png", "linear_gamma")
             else:
+                S0 = _declutter_fireflies(S0)   # NIR active-flash firefly clamp
                 vn = np.clip(S0 / max(np.percentile(S0, 99), 1e-6), 0, 1)
                 Image.fromarray((vn ** (1 / 2.2) * 255).astype(np.uint8)).save(out / f"vp{vi}_{nid}_nir.png")
                 if not a.no_polar:               # active-sensing DoP/AoLP (NIR band Stokes)
