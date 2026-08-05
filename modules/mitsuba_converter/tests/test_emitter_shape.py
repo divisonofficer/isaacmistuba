@@ -37,3 +37,33 @@ def test_non_ceiling_emitter_stays_cube() -> None:
     el = _emitter()  # no emitter_shape flag
     assert el.get("type") == "cube"
     assert el.find("./emitter").get("type") == "area"
+
+
+def test_rgb_directional_wall_panel_has_four_emitters_and_polarizer() -> None:
+    elements = _emitter(
+        emitter_shape="wall_panel",
+        emitter_pattern="rgb_directional",
+        emitter_polarized=True,
+        emitter_polarizer_angle_deg=17.5,
+        geometry={
+            "type": "point",
+            "center": [1.0, 2.0],
+            "size_m": [2.4, 1.35, 0.03],
+            "base_height_m": 0.6,
+            "yaw_deg": 90.0,
+        },
+    )
+    assert isinstance(elements, list) and len(elements) == 5
+    emitters = [el for el in elements if el.find("./emitter") is not None]
+    assert len(emitters) == 4
+    radiances = {
+        el.get("id"): el.find("./emitter/rgb[@name='radiance']").get("value")
+        for el in emitters
+    }
+    assert radiances["lp_upper_left"] == "0 3 3"
+    assert radiances["lp_upper_right"] == "3 0 3"
+    assert radiances["lp_lower_left"] == "0 3 0"
+    assert radiances["lp_lower_right"] == "3 0 0"
+    polarizer = next(el for el in elements if el.get("id") == "lp_polarizer")
+    theta = polarizer.find("./bsdf[@type='polarizer']/float[@name='theta']")
+    assert theta is not None and theta.get("value") == "17.5000"
