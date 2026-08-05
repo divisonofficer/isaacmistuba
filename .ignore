@@ -1,0 +1,60 @@
+# Dependency, cache, and build directories
+.git/
+.venv/
+venv/
+**/node_modules/
+**/__pycache__/
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+**/.cache/
+**/*.egg-info/
+/build/
+**/dist/
+/.playwright-mcp/
+
+# Generated render, dataset, training, and log outputs
+/out/
+/outputs/
+/renders/
+/datasets/
+/checkpoints/
+/logs/
+/scripts/out/
+*.log
+
+# Large external datasets and asset caches
+/assets/
+/vendor_datasets/
+/vendor_docs/
+/data/infinigen_generated/
+/data/freesplatter/
+/data/hpbrdf_2025/
+/data/pbrdf_2020/
+/modules/infinigen/
+/modules/FreeSplatter/
+
+# These renderer trees are active project source despite broad .gitignore rules.
+!/modules/mitsuba3/
+!/modules/mitsuba3/**
+!/modules/mitsuba3-optix7/
+!/modules/mitsuba3-optix7/**
+
+# Large binary artifacts that should not enter default text discovery
+*.blend
+*.ckpt
+*.deb
+*.exr
+*.glb
+*.hdr
+*.hpbrdf
+*.jpeg
+*.jpg
+*.npy
+*.npz
+*.pbrdf
+*.png
+*.pt
+*.pth
+*.safetensors
+*.zip
