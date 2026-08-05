@@ -7,6 +7,9 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+# Keep compiled Mitsuba/Dr.Jit artifacts on host-local storage, never in the
+# NAS checkout. Override ROBOMITUBA_MITSUBA_BUILD_DIR for a custom disk.
+
 : "${RENDER_QUEUE_AUTO_GPUS:=0}"
 : "${RENDER_QUEUE_AUTO_GPU_MEMORY_USED_PCT_MAX:=10}"
 : "${RENDER_QUEUE_HOST:=127.0.0.1}"
@@ -16,12 +19,26 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 #  - everything else             → device A build  (modules/mitsuba3-optix7, OptiX 7)
 # Override either default by exporting the env var before running this launcher.
 _compute_cap="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d '[:space:]' || true)"
+
+if [[ -z "${ROBOMITUBA_MITSUBA_BUILD_DIR:-}" ]]; then
+  if [[ "$_compute_cap" == "12.0" ]]; then
+    ROBOMITUBA_MITSUBA_BUILD_DIR="${ROBOMITUBA_DEVICE1_MITSUBA_BUILD_DIR:-${HOME:-/tmp}/robomituba-build/mitsuba3}"
+  else
+    ROBOMITUBA_MITSUBA_BUILD_DIR="${ROBOMITUBA_DEVICE2_MITSUBA_BUILD_DIR:-${HOME:-/tmp}/robomituba-build/mitsuba3-optix7}"
+  fi
+fi
+case "$ROBOMITUBA_MITSUBA_BUILD_DIR" in
+  /jarvis/*)
+    echo "[launcher] ERROR: compiled Mitsuba build must be host-local, got $ROBOMITUBA_MITSUBA_BUILD_DIR" >&2
+    exit 2
+    ;;
+esac
 if [[ "$_compute_cap" == "12.0" ]]; then
   : "${ROBOMITUBA_MITSUBA_PYTHON:=/usr/bin/python3}"
-  : "${ROBOMITUBA_MITSUBA_PYTHONPATH:=/home/jinnyeong/robomituba-build/mitsuba3/python}"
+  : "${ROBOMITUBA_MITSUBA_PYTHONPATH:=${ROBOMITUBA_MITSUBA_BUILD_DIR}/python}"
 else
   : "${ROBOMITUBA_MITSUBA_PYTHON:=/root/miniconda3/envs/mitsuba_optix7/bin/python}"
-  : "${ROBOMITUBA_MITSUBA_PYTHONPATH:=/jarvis/project/robomituba/build/mitsuba3-optix7/python}"
+  : "${ROBOMITUBA_MITSUBA_PYTHONPATH:=${ROBOMITUBA_MITSUBA_BUILD_DIR}/python}"
 fi
 : "${ROBOMITUBA_RENDER_GPU_INDICES:=1,2,3,4}"
 : "${ROBOMITUBA_RENDER_WORKER_BACKLOG_PER_GPU:=2}"
@@ -118,6 +135,7 @@ if [[ "$RENDER_QUEUE_AUTO_GPUS" == "1" ]]; then
 fi
 
 export ROBOMITUBA_MITSUBA_PYTHON
+export ROBOMITUBA_MITSUBA_BUILD_DIR
 export ROBOMITUBA_MITSUBA_PYTHONPATH
 export ROBOMITUBA_RENDER_GPU_INDICES
 export ROBOMITUBA_RENDER_WORKER_BACKLOG_PER_GPU
@@ -133,6 +151,7 @@ export ROBOMITUBA_BACKEND_ONLY
 export PYTHONUNBUFFERED
 export PYTHONPATH="$REPO_ROOT/modules/mitsuba_converter/src:$REPO_ROOT/modules/robomituba_bridge/src:$REPO_ROOT/modules/navigation_dataset/src:${PYTHONPATH:-}"
 
+echo "[render-queue] Mitsuba build: $ROBOMITUBA_MITSUBA_BUILD_DIR"
 echo "[render-queue] url: http://$RENDER_QUEUE_HOST:$RENDER_QUEUE_PORT"
 if [[ "$RENDER_QUEUE_AUTO_GPUS" == "1" ]]; then
   echo "[render-queue] auto GPUs: memory_used_pct<${RENDER_QUEUE_AUTO_GPU_MEMORY_USED_PCT_MAX}%"
