@@ -84,6 +84,31 @@ def _find_jobs(bridge_dir: Path, scene: str | None, include_probe: bool) -> list
     return jobs
 
 
+def _find_versioned_bundles(optical_root: Path, scene: str | None) -> list[Path]:
+    """Resolve active current.json pointers without scanning old render versions."""
+    bundles: list[Path] = []
+    if not optical_root.is_dir():
+        return bundles
+    for pointer in sorted(optical_root.glob("*/scenes/*/observations*/**/current.json")):
+        rel = pointer.relative_to(optical_root)
+        if len(rel.parts) < 5:
+            continue
+        scene_id = rel.parts[2]
+        if scene and scene not in scene_id:
+            continue
+        try:
+            payload = json.loads(pointer.read_text(encoding="utf-8"))
+            ref = payload.get("bundle_ref")
+            if not isinstance(ref, str) or not ref:
+                continue
+            bundle = optical_root / rel.parts[0] / ref
+            if (bundle / "manifest.json").is_file():
+                bundles.append(bundle)
+        except (OSError, ValueError, TypeError):
+            continue
+    return list(dict.fromkeys(bundles))
+
+
 def _load_manifest(job_dir: Path) -> tuple[Path, dict] | None:
     obs_root = job_dir / "observations"
     if not obs_root.is_dir():
@@ -106,7 +131,8 @@ def _camera_spec(manifest: dict, camera_id: str) -> dict:
 
 
 def _build_records(job_dir: Path, keep_manifests: bool, exact_scene: str | None = None) -> list[FrameRecord]:
-    loaded = _load_manifest(job_dir)
+    loaded = ((job_dir, json.loads((job_dir / "manifest.json").read_text(encoding="utf-8")))
+              if (job_dir / "manifest.json").is_file() else _load_manifest(job_dir))
     if loaded is None:
         return []
     obs_dir, manifest = loaded
@@ -502,7 +528,8 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--scene", default=None, help="Only export jobs whose name contains this string (e.g. shared_office_floor_001).")
     ap.add_argument("--exact-scene", action="store_true", help="Treat --scene as an exact scene_id (drops sibling scenes like '..._chairtest' that the substring filter would otherwise include).")
-    ap.add_argument("--bridge-jobs-dir", default=str(REPO_ROOT / "out" / "bridge_jobs"))
+    ap.add_argument("--bridge-jobs-dir", default=str(REPO_ROOT / "out" / "bridge_jobs"), help="Legacy bridge jobs (compatibility input).")
+    ap.add_argument("--versioned-root", default=str(REPO_ROOT / "out" / "opticalnav"), help="Versioned OpticalNav artifact root (preferred).")
     ap.add_argument("--out", required=True, help="Output dataset directory.")
     ap.add_argument("--image-format", choices=["jpeg", "webp", "png"], default="jpeg")
     ap.add_argument("--jpeg-quality", type=int, default=95, help="Quality for jpeg/webp (1-100).")
@@ -531,7 +558,11 @@ def main() -> int:
     out_dir = Path(args.out).resolve()
     ext = {"jpeg": "jpg", "webp": "webp", "png": "png"}[args.image_format]
 
-    jobs = _find_jobs(bridge_dir, args.scene, args.include_probe)
+    jobs = _find_versioned_bundles(Path(args.versioned_root).resolve(), args.scene)
+    # Legacy jobs remain an explicit compatibility input; active versioned
+    # pointers are preferred and therefore scanned first.
+    jobs.extend(_find_jobs(bridge_dir, args.scene, args.include_probe))
+    jobs = list(dict.fromkeys(jobs))
     if args.limit:
         jobs = jobs[: args.limit]
     if not jobs:

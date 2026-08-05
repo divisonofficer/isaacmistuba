@@ -5,6 +5,7 @@ import json
 import time
 from pathlib import Path
 from typing import Any, Callable, Mapping
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -30,6 +31,7 @@ from robomituba_bridge import (
 
 from .multimodal import MODALITY_DEFINITIONS, MultimodalRenderResult, RenderConfig, camera_to_world_from_lookat, render_modalities
 from .multimodal import _camera_basis, _compute_target_union_bounds, _project_bounds_to_image_bbox
+from .versioned_artifacts import versioned_bundle_dir
 
 
 REFLECTIVE_ISLAND_RGB_TARGETS = (
@@ -393,6 +395,68 @@ def _sensor_render_settings_payload(
     return payload
 
 
+
+def _versioned_bundle_dir_for_request(render_request: RenderRequest, root: Path) -> Path | None:
+    """Resolve an OpticalNav request to its immutable version directory."""
+    extras = render_request.extras if isinstance(render_request.extras, Mapping) else {}
+    project_id = str(extras.get("opticalnav_project_id") or "").strip()
+    scene_id = str(extras.get("opticalnav_scene_id") or render_request.scene_state.scene_id or "").strip()
+    render_version_id = str(extras.get("render_version_id") or "").strip()
+    node_id = str(extras.get("opticalnav_vp_id") or extras.get("node_id") or "").strip()
+    heading_id = str(extras.get("opticalnav_heading_id") or extras.get("heading_id") or "").strip()
+    if not all((project_id, scene_id, render_version_id, node_id, heading_id)):
+        return None
+    variant = str(extras.get("scene_variant_key") or ("perturbed" if "-perturbed-" in render_request.job_id else "base")).lower()
+    project_dir = root / "out" / "opticalnav" / project_id
+    return versioned_bundle_dir(
+        project_dir,
+        scene_id=scene_id,
+        render_version_id=render_version_id,
+        variant=variant,
+        node_id=node_id,
+        heading_id=heading_id,
+    )
+
+
+def _observation_layout_for_request(render_request: RenderRequest, root: Path) -> Any:
+    version_dir = _versioned_bundle_dir_for_request(render_request, root)
+    if version_dir is None:
+        return ensure_observation_layout(root, render_request.job_id, render_request.frame_id)
+    cameras_dir = version_dir / "cameras"
+    sensors_dir = version_dir / "sensors"
+    logs_dir = version_dir / "logs"
+    for path in (version_dir, cameras_dir, sensors_dir, logs_dir):
+        path.mkdir(parents=True, exist_ok=True)
+    return SimpleNamespace(frame_dir=version_dir, cameras_dir=cameras_dir, sensors_dir=sensors_dir, logs_dir=logs_dir)
+
+
+def _merge_existing_versioned_artifacts(layout: Any, artifacts: list[RenderArtifactManifest], requested_modalities: list[str]) -> tuple[list[RenderArtifactManifest], list[str]]:
+    """Merge phase manifests when RGB and polar jobs share one version dir."""
+    manifest_path = Path(layout.frame_dir) / "manifest.json"
+    if not manifest_path.exists():
+        return artifacts, requested_modalities
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        previous = payload.get("artifacts") if isinstance(payload, Mapping) else None
+        if not isinstance(previous, list):
+            return artifacts, requested_modalities
+        merged: dict[tuple[str, str], RenderArtifactManifest] = {}
+        for item in previous:
+            if not isinstance(item, Mapping):
+                continue
+            try:
+                key = (str(item.get("camera_id") or item.get("sensor_id") or ""), str(item.get("modality") or ""))
+                merged[key] = RenderArtifactManifest(**dict(item))
+            except Exception:
+                continue
+        for item in artifacts:
+            key = (str(item.camera_id or item.sensor_id or ""), str(item.modality or ""))
+            merged[key] = item
+        requested = list(dict.fromkeys([*payload.get("requested_modalities", []), *requested_modalities]))
+        return list(merged.values()), requested
+    except (OSError, ValueError, TypeError):
+        return artifacts, requested_modalities
+
 def render_sensor_state(
     scene_state: SceneState,
     sensor_specs: list[IsaacSensorSpec],
@@ -404,7 +468,7 @@ def render_sensor_state(
 ) -> dict[str, MultimodalRenderResult]:
     root = Path(repo_root).resolve()
     scene_path = resolve_repo_path(root, scene_state.mitsuba_scene_ref)
-    sensor_root = Path(out_dir).resolve() if out_dir is not None else ensure_observation_layout(root, scene_state.job_id, scene_state.frame_id).sensors_dir
+    sensor_root = Path(out_dir).resolve() if out_dir is not None else _observation_layout_for_request(render_request, root).sensors_dir
     sensor_root.mkdir(parents=True, exist_ok=True)
     rendered: dict[str, MultimodalRenderResult] = {}
     for sensor_spec in sensor_specs:
@@ -464,7 +528,7 @@ def render_scene_state(
     root = Path(repo_root).resolve()
     scene_path = resolve_repo_path(root, scene_state.mitsuba_scene_ref)
     if out_dir is None:
-        layout = ensure_observation_layout(root, scene_state.job_id, scene_state.frame_id)
+        layout = _observation_layout_for_request(render_request, root)
         camera_root = layout.cameras_dir
     else:
         camera_root = Path(out_dir).resolve()
@@ -511,7 +575,7 @@ def render_timestep_bundle(
 ) -> ObservationBundleManifest:
     validate_render_request(render_request)
     root = Path(repo_root).resolve()
-    layout = ensure_observation_layout(root, render_request.job_id, render_request.frame_id)
+    layout = _observation_layout_for_request(render_request, root)
 
     camera_results = render_scene_state(
         render_request.scene_state,
@@ -557,6 +621,7 @@ def render_timestep_bundle(
     manifest_start = time.perf_counter()
     timing_log_path.write_text(json.dumps(timing_log, indent=2), encoding="utf-8")
 
+    artifacts, merged_modalities = _merge_existing_versioned_artifacts(layout, artifacts, list(render_request.modalities))
     bundle_manifest = ObservationBundleManifest(
         job_id=render_request.job_id,
         scene_id=render_request.scene_state.scene_id,
@@ -564,7 +629,7 @@ def render_timestep_bundle(
         timestamp=render_request.timestamp,
         scene_state=render_request.scene_state,
         robot_state=render_request.robot_state,
-        requested_modalities=list(render_request.modalities),
+        requested_modalities=merged_modalities,
         camera_specs=list(render_request.camera_specs),
         sensor_specs=list(render_request.sensor_specs),
         artifacts=artifacts,
@@ -577,6 +642,9 @@ def render_timestep_bundle(
             **render_request.extras,
             "timing_log_ref": to_repo_relative_posix(root, timing_log_path),
             "scene_version": render_request.scene_state.scene_version,
+            "scene_version_id": render_request.extras.get("scene_version_id") if isinstance(render_request.extras, Mapping) else None,
+            "render_version_id": render_request.extras.get("render_version_id") if isinstance(render_request.extras, Mapping) else None,
+            "run_id": render_request.extras.get("run_id") if isinstance(render_request.extras, Mapping) else None,
             "illumination_setup": render_request.scene_state.illumination_setup,
             "scene_override": asdict(render_request.scene_override) if render_request.scene_override is not None else None,
             "assist_light": asdict(render_request.assist_light) if render_request.assist_light is not None else None,
@@ -614,7 +682,7 @@ def render_timestep_bundle_split_lighting(
 ) -> ObservationBundleManifest:
     validate_render_request(render_request)
     root = Path(repo_root).resolve()
-    layout = ensure_observation_layout(root, render_request.job_id, render_request.frame_id)
+    layout = _observation_layout_for_request(render_request, root)
     scene_path = resolve_repo_path(root, render_request.scene_state.mitsuba_scene_ref)
 
     artifacts: list[RenderArtifactManifest] = []
@@ -733,6 +801,7 @@ def render_timestep_bundle_split_lighting(
     manifest_start = time.perf_counter()
     timing_log_path.write_text(json.dumps(timing_log, indent=2), encoding="utf-8")
 
+    artifacts, merged_modalities = _merge_existing_versioned_artifacts(layout, artifacts, list(render_request.modalities))
     bundle_manifest = ObservationBundleManifest(
         job_id=render_request.job_id,
         scene_id=render_request.scene_state.scene_id,
@@ -740,7 +809,7 @@ def render_timestep_bundle_split_lighting(
         timestamp=render_request.timestamp,
         scene_state=render_request.scene_state,
         robot_state=render_request.robot_state,
-        requested_modalities=list(render_request.modalities),
+        requested_modalities=merged_modalities,
         camera_specs=list(render_request.camera_specs),
         sensor_specs=list(render_request.sensor_specs),
         artifacts=artifacts,
@@ -753,6 +822,9 @@ def render_timestep_bundle_split_lighting(
             **render_request.extras,
             "timing_log_ref": to_repo_relative_posix(root, timing_log_path),
             "scene_version": render_request.scene_state.scene_version,
+            "scene_version_id": render_request.extras.get("scene_version_id") if isinstance(render_request.extras, Mapping) else None,
+            "render_version_id": render_request.extras.get("render_version_id") if isinstance(render_request.extras, Mapping) else None,
+            "run_id": render_request.extras.get("run_id") if isinstance(render_request.extras, Mapping) else None,
             "illumination_setup": render_request.scene_state.illumination_setup,
             "scene_override": asdict(render_request.scene_override) if render_request.scene_override is not None else None,
             "assist_light": asdict(render_request.assist_light) if render_request.assist_light is not None else None,

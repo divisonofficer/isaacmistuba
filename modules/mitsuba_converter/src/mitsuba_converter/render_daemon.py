@@ -142,9 +142,15 @@ def _is_render_queue_proxy_path(method: str, path: str) -> bool:
         return method == "POST"
     if len(parts) >= 2 and parts[1] in {"graph-render-batches", "render-batches"}:
         return method in {"GET", "POST"}
-    if len(parts) >= 2 and parts[1] in {"graph-render-runs", "scenes"}:
-        # Version listing/promote/prune and durable run status/resume must go
-        # through the render queue when this process is backend-only.
+    if len(parts) >= 4 and parts[1] == "scenes" and parts[3] == "render-versions":
+        # Render-version listing/promote/prune is durable render-queue state.
+        # Everything else under scenes/{id}/ (authoring-map, annotation,
+        # editor-geometry, prim-mesh, optical-perturbation, ...) is plain
+        # scene-description I/O that MUST stay local so scene loading and node
+        # authoring keep working when no GPU render queue is running.
+        return method in {"GET", "POST"}
+    if len(parts) >= 2 and parts[1] == "graph-render-runs":
+        # Durable run status / resume live in the render queue.
         return method in {"GET", "POST"}
     if len(parts) >= 2 and parts[1:] == ["episodes", "render"]:
         return method == "POST"
@@ -1407,7 +1413,12 @@ _DEFAULT_EMITTER_RADIANCE = (15.0, 14.0, 12.0)
 _MAX_EMITTER_RADIANCE = float(os.environ.get("ROBOMITUBA_MAX_EMITTER_RADIANCE", "80.0"))
 
 
-def _append_area_emitter_xml(shape: "ET.Element", obj: dict[str, Any]) -> None:
+def _append_area_emitter_xml(
+    shape: "ET.Element",
+    obj: dict[str, Any],
+    *,
+    channel_mask: tuple[float, float, float] | None = None,
+) -> None:
     """Wrap ``shape`` with an area emitter using the object's authored radiance."""
     import xml.etree.ElementTree as ET
 
@@ -1419,6 +1430,8 @@ def _append_area_emitter_xml(shape: "ET.Element", obj: dict[str, Any]) -> None:
             base = _DEFAULT_EMITTER_RADIANCE
     else:
         base = _DEFAULT_EMITTER_RADIANCE
+    if channel_mask is not None:
+        base = tuple(base[i] * max(0.0, float(channel_mask[i])) for i in range(3))
     try:
         intensity = float(obj.get("emitter_intensity") or 1.0)
     except (TypeError, ValueError):
@@ -1428,6 +1441,153 @@ def _append_area_emitter_xml(shape: "ET.Element", obj: dict[str, Any]) -> None:
     rgb = " ".join(f"{min(cap, max(0.0, c * intensity)):.6g}" for c in base)
     emitter = ET.SubElement(shape, "emitter", type="area")
     ET.SubElement(emitter, "rgb", attrib={"name": "radiance", "value": rgb})
+
+
+def _wall_panel_matrix(
+    *,
+    cx: float,
+    cy: float,
+    cz: float,
+    yaw_deg: float,
+    pitch_deg: float,
+    roll_deg: float,
+    scale_x: float,
+    scale_y: float,
+    offset_x: float = 0.0,
+    offset_y: float = 0.0,
+    offset_z: float = 0.0,
+) -> np.ndarray:
+    """Return a stable local-panel-to-world transform for Mitsuba rectangles."""
+    def _rot_x(deg: float) -> np.ndarray:
+        angle = math.radians(deg)
+        c, s = math.cos(angle), math.sin(angle)
+        return np.array(
+            [[1, 0, 0, 0], [0, c, -s, 0], [0, s, c, 0], [0, 0, 0, 1]],
+            dtype=np.float64,
+        )
+
+    def _rot_y(deg: float) -> np.ndarray:
+        angle = math.radians(deg)
+        c, s = math.cos(angle), math.sin(angle)
+        return np.array(
+            [[c, 0, s, 0], [0, 1, 0, 0], [-s, 0, c, 0], [0, 0, 0, 1]],
+            dtype=np.float64,
+        )
+
+    def _rot_z(deg: float) -> np.ndarray:
+        angle = math.radians(deg)
+        c, s = math.cos(angle), math.sin(angle)
+        return np.array(
+            [[c, -s, 0, 0], [s, c, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]],
+            dtype=np.float64,
+        )
+
+    scale = np.diag([scale_x, scale_y, 1.0, 1.0]).astype(np.float64)
+    local = np.eye(4, dtype=np.float64)
+    local[:3, 3] = [offset_x, offset_y, offset_z]
+    world = np.eye(4, dtype=np.float64)
+    world[:3, 3] = [cx, cy, cz]
+    return world @ _rot_y(yaw_deg) @ _rot_z(pitch_deg) @ _rot_x(roll_deg) @ local @ scale
+
+
+def _append_matrix_transform(shape: "ET.Element", matrix: np.ndarray) -> None:
+    import xml.etree.ElementTree as ET
+
+    xf = ET.SubElement(shape, "transform", attrib={"name": "to_world"})
+    value = " ".join(
+        f"{float(item):.9f}" for item in np.asarray(matrix, dtype=np.float32).reshape(-1)
+    )
+    ET.SubElement(xf, "matrix", attrib={"value": value})
+
+
+def _wall_panel_emitter_elements(
+    obj: dict[str, Any],
+    *,
+    obj_id: str,
+    cx: float,
+    cy: float,
+    cz: float,
+    sx: float,
+    sy: float,
+    yaw_deg: float,
+    pitch_deg: float,
+    roll_deg: float,
+) -> list["ET.Element"]:
+    """Build a white or RGB-directional wall LCD and its optional polarizer."""
+    import xml.etree.ElementTree as ET
+
+    pattern = str(obj.get("emitter_pattern") or "white").strip()
+    elements: list[ET.Element] = []
+    if pattern == "rgb_directional":
+        # +local Y is the upper half. The overlaps reproduce the common
+        # left=G, right=R, upper=B spectrally multiplexed display pattern.
+        quadrants = (
+            ("upper_left", -sx / 4.0, sy / 4.0, (0.0, 1.0, 1.0)),
+            ("upper_right", sx / 4.0, sy / 4.0, (1.0, 0.0, 1.0)),
+            ("lower_left", -sx / 4.0, -sy / 4.0, (0.0, 1.0, 0.0)),
+            ("lower_right", sx / 4.0, -sy / 4.0, (1.0, 0.0, 0.0)),
+        )
+        for suffix, ox, oy, mask in quadrants:
+            shape = ET.Element("shape", type="rectangle", id=f"{obj_id}_{suffix}")
+            _append_matrix_transform(
+                shape,
+                _wall_panel_matrix(
+                    cx=cx,
+                    cy=cy,
+                    cz=cz,
+                    yaw_deg=yaw_deg,
+                    pitch_deg=pitch_deg,
+                    roll_deg=roll_deg,
+                    scale_x=sx / 4.0,
+                    scale_y=sy / 4.0,
+                    offset_x=ox,
+                    offset_y=oy,
+                ),
+            )
+            _append_area_emitter_xml(shape, obj, channel_mask=mask)
+            elements.append(shape)
+    else:
+        shape = ET.Element("shape", type="rectangle", id=obj_id)
+        _append_matrix_transform(
+            shape,
+            _wall_panel_matrix(
+                cx=cx,
+                cy=cy,
+                cz=cz,
+                yaw_deg=yaw_deg,
+                pitch_deg=pitch_deg,
+                roll_deg=roll_deg,
+                scale_x=sx / 2.0,
+                scale_y=sy / 2.0,
+            ),
+        )
+        _append_area_emitter_xml(shape, obj)
+        elements.append(shape)
+
+    if bool(obj.get("emitter_polarized")):
+        polarizer = ET.Element("shape", type="rectangle", id=f"{obj_id}_polarizer")
+        _append_matrix_transform(
+            polarizer,
+            _wall_panel_matrix(
+                cx=cx,
+                cy=cy,
+                cz=cz,
+                yaw_deg=yaw_deg,
+                pitch_deg=pitch_deg,
+                roll_deg=roll_deg,
+                scale_x=(sx / 2.0) * 1.01,
+                scale_y=(sy / 2.0) * 1.01,
+                offset_z=0.03,
+            ),
+        )
+        bsdf = ET.SubElement(polarizer, "bsdf", type="polarizer")
+        try:
+            theta = float(obj.get("emitter_polarizer_angle_deg") or 0.0)
+        except (TypeError, ValueError):
+            theta = 0.0
+        ET.SubElement(bsdf, "float", name="theta", value=f"{theta:.4f}")
+        elements.append(polarizer)
+    return elements
 
 
 def _append_bsdf_xml(
@@ -1609,6 +1769,10 @@ def _opticalnav_obj_comment_data(obj: dict[str, Any]) -> str:
         "is_emitter": bool(obj.get("is_emitter")),
         "emitter_radiance": obj.get("emitter_radiance"),
         "emitter_intensity": obj.get("emitter_intensity"),
+        "emitter_shape": obj.get("emitter_shape"),
+        "emitter_polarized": bool(obj.get("emitter_polarized")),
+        "emitter_polarizer_angle_deg": obj.get("emitter_polarizer_angle_deg"),
+        "emitter_pattern": obj.get("emitter_pattern"),
         "geometry": {
             "type": geom.get("type"),
             "center": geom.get("center"),
@@ -3279,6 +3443,36 @@ def _proxy_box_xml_element(
             mesh_stats["emitter_panel"] = mesh_stats.get("emitter_panel", 0) + 1
         _record("emitter_panel", "primitive", shape_id=obj_id, reason="ceiling_panel")
         return shape
+
+    # Wall-mounted LCD panel. Local +Z is the emission direction; yaw/pitch/roll
+    # orient the screen while local X/Y retain the authored width/height.
+    if is_emitter and str(obj.get("emitter_shape") or "").strip() == "wall_panel":
+        elements = _wall_panel_emitter_elements(
+            obj,
+            obj_id=obj_id,
+            cx=cx,
+            cy=cy_cube,
+            cz=cz,
+            sx=sx,
+            sy=sy,
+            yaw_deg=yaw_deg,
+            pitch_deg=pitch_deg,
+            roll_deg=roll_deg,
+        )
+        if mesh_stats is not None:
+            mesh_stats["emitter_wall_panel"] = mesh_stats.get("emitter_wall_panel", 0) + 1
+        _record(
+            "emitter_wall_panel",
+            "primitive",
+            shape_id=obj_id,
+            reason=str(obj.get("emitter_pattern") or "white"),
+            extras={
+                "polarized": bool(obj.get("emitter_polarized")),
+                "polarizer_angle_deg": obj.get("emitter_polarizer_angle_deg"),
+                "pattern": str(obj.get("emitter_pattern") or "white"),
+            },
+        )
+        return elements
 
     # Cube fallback (or emitter, which always uses a cube).
     shape = ET.Element("shape", type="cube", id=obj_id)
@@ -16256,6 +16450,10 @@ class RenderDaemon:
         backend = str(payload.get("backend") or "daemon")
         scene_state_payload = payload.get("scene_state")
         camera_spec_payload = payload.get("camera_spec")
+        render_settings = payload.get("render_settings")
+        if render_settings is not None and not isinstance(render_settings, Mapping):
+            self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": "render_settings must be an object."})
+            return
         episode_ids = payload.get("episode_ids")
         split = _maybe_str(payload.get("split"))
         if isinstance(episode_ids, list) and episode_ids:
@@ -16285,6 +16483,7 @@ class RenderDaemon:
                     scene_state_payload=dict(scene_state_payload),
                     camera_spec_payload=dict(camera_spec_payload or {}),
                     modalities=modalities,
+                    render_settings=dict(render_settings or {}),
                     render_fn=self.render_fn,
                     variant=str(payload.get("variant") or self.variant),
                 )
@@ -16305,6 +16504,7 @@ class RenderDaemon:
                     scene_state_payload=dict(scene_state_payload),
                     camera_spec_payload=dict(camera_spec_payload or {}),
                     modalities=modalities,
+                    render_settings=dict(render_settings or {}),
                     job_id_mode="per_timestep",
                 )
                 for request in requests:
@@ -16325,6 +16525,7 @@ class RenderDaemon:
             "backend": "daemon",
             "created_at": _utc_now_iso(),
             "modalities": modalities,
+            "render_settings": dict(render_settings or {}),
             "jobs": jobs,
         }
         batch_path = project_dir / "render_batches" / f"{batch_id}.json"

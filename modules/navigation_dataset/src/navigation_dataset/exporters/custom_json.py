@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict
 import json
+import os
 from pathlib import Path
 from typing import Callable, Iterable
 import zipfile
@@ -32,6 +33,39 @@ def _scene_id_from_path(path: Path, split: str) -> str:
 
 
 _OBS_FILE_SUFFIXES = (".png", ".exr", ".jpg", ".jpeg", ".npy")
+
+
+def _active_observation_dir(
+    dataset_root: Path,
+    *,
+    scene_id: str,
+    variant: str,
+    node_id: str,
+    heading_id: str,
+) -> Path | None:
+    """Resolve a versioned ``current.json`` observation pointer.
+
+    Scene-bundle export must follow the active pointer but retain the stable
+    observation path inside the ZIP.  Keep this resolver local to the pure
+    navigation exporter to avoid importing the Mitsuba daemon package.
+    """
+    root = Path(dataset_root).resolve()
+    observation_name = "observations_perturbed" if variant == "perturbed" else "observations"
+    stable = root / "scenes" / str(scene_id) / observation_name / str(node_id) / str(heading_id)
+    pointer = stable / "current.json"
+    if pointer.is_file():
+        try:
+            payload = json.loads(pointer.read_text(encoding="utf-8"))
+            ref = payload.get("bundle_ref")
+            if isinstance(ref, str) and ref:
+                candidate = (root / ref).resolve()
+                # Never allow a malformed pointer to escape the project tree.
+                candidate.relative_to(root)
+                if candidate.is_dir():
+                    return candidate
+        except (OSError, ValueError, TypeError):
+            pass
+    return stable if stable.is_dir() else None
 
 
 def is_episode_complete(episode: EpisodeManifest, dataset_root: Path) -> bool:
@@ -69,13 +103,17 @@ def is_episode_complete(episode: EpisodeManifest, dataset_root: Path) -> bool:
         if not obs_root.exists():
             return False
         for node_id, heading_id in zip(episode.path_nodes, episode.path_headings):
-            heading_dir = obs_root / str(node_id) / str(heading_id)
-            if not heading_dir.is_dir():
+            heading_dir = _active_observation_dir(
+                project_dir, scene_id=str(episode.scene_id), variant="base",
+                node_id=str(node_id), heading_id=str(heading_id),
+            )
+            if heading_dir is None:
                 return False
-            # At least one rendered modality file present (rgb.png etc.).
+            # At least one rendered modality file present (including files under
+            # versioned bundle cameras/ or sensors/ subdirectories).
             has_modality = any(
                 p.is_file() and p.suffix.lower() in _OBS_FILE_SUFFIXES
-                for p in heading_dir.iterdir()
+                for p in heading_dir.rglob("*")
             )
             if not has_modality:
                 return False
@@ -363,6 +401,7 @@ def iter_export_files(
     include_polarization_raw: bool = True,
     include_perturbed: bool = False,
     camera_ids: Iterable[str] | None = None,
+    on_progress: Callable[[int, int], None] | None = None,
 ) -> Iterable[tuple[Path, str]]:
     """Yield (src_path, dst_relative_posix_path) pairs for the scene bundle.
 
@@ -392,6 +431,14 @@ def iter_export_files(
         if camera_ids is not None
         else None
     )
+    resolved_heading_count = 0
+    source_exr_keys: set[tuple[str, str, str]] = set()
+
+    def _notify_resolved() -> None:
+        nonlocal resolved_heading_count
+        resolved_heading_count += 1
+        if on_progress is not None:
+            on_progress(resolved_heading_count, 0)
 
     def _emit(src: Path, dst_rel: str):
         if dst_rel in yielded_dst:
@@ -399,57 +446,70 @@ def iter_export_files(
         yielded_dst.add(dst_rel)
         return (src, dst_rel)
 
-    def _emit_observation_dir(obs_dir: Path) -> Iterable[tuple[Path, str]]:
-        """Yield de-duplicated (src, dst) pairs for one consolidated <vp>/<h>/ dir.
-
-        The daemon mirrors a "primary" view's rasters at the heading root
-        (e.g. <vp>/<h>/rgb.png) *and* under `sensors/<camera>/`. The root copies
-        are byte-identical to a sensors/ file, so the bundle would carry every
-        primary modality twice and present an asymmetric tree (root = one camera
-        only, sub-folders = all cameras). Ship per-camera modalities under
-        `sensors/<camera>/` only; drop the root-level duplicates.
-        """
+    def _emit_observation_dir(
+        obs_dir: Path,
+        destination_root: Path | None = None,
+        observation_key: tuple[str, str, str] | None = None,
+    ) -> Iterable[tuple[Path, str]]:
+        """Yield observation files, resolving versioned bundles to stable paths."""
         if not obs_dir.is_dir():
             return
-        sensors_root = obs_dir / "sensors"
-        sensor_file_names: set[str] = set()
-        if sensors_root.is_dir():
-            sensor_file_names = {
-                p.name
-                for p in sensors_root.rglob("*")
-                if p.is_file()
-                and (
-                    allowed_camera_ids is None
-                    or p.relative_to(sensors_root).parts[0] in allowed_camera_ids
-                )
-            }
-        for src in sorted(obs_dir.rglob("*")):
-            if not src.is_file():
+        per_camera_roots = [root for root in (obs_dir / "sensors", obs_dir / "cameras") if root.is_dir()]
+        # One filesystem walk per heading. The former implementation walked
+        # each sensors tree once to find duplicate names and again to emit files;
+        # on a large panorama sweep that doubled the NFS/stat cost at Collect.
+        all_files = sorted(
+            Path(root) / name
+            for root, _dirs, names in os.walk(obs_dir)
+            for name in names
+        )
+        if observation_key is not None and any(path.suffix.lower() == ".exr" for path in all_files):
+            source_exr_keys.add(observation_key)
+        per_camera_names: set[str] = set()
+        for src in all_files:
+            for camera_root in per_camera_roots:
+                if camera_root in src.parents:
+                    camera_rel = src.relative_to(camera_root)
+                    if allowed_camera_ids is None or camera_rel.parts[0] in allowed_camera_ids:
+                        per_camera_names.add(src.name)
+                    break
+        for src in all_files:
+            # current.json is a resolver control plane pointer, not an
+            # observation artifact; never package it as if it were a raster.
+            if src.parent == obs_dir and src.name == "current.json":
                 continue
-            if sensors_root in src.parents:
-                sensor_rel = src.relative_to(sensors_root)
-                if allowed_camera_ids is not None and sensor_rel.parts[0] not in allowed_camera_ids:
-                    continue
-            if allowed_camera_ids is not None and src.parent == obs_dir:
-                # A filtered bundle is camera-explicit. Never let a primary
-                # camera's legacy root copy bypass the sensors/<camera> filter.
-                if src.name == "_sensor_index.json":
-                    continue
-                if src.suffix.lower() in {".png", ".exr", ".hdr", ".jpg", ".jpeg", ".npy", ".npz"}:
-                    continue
-            # Skip a root-level observation file (directly under <vp>/<h>/)
-            # when the same modality is already carried under sensors/.
-            if src.parent == obs_dir and src.name in sensor_file_names:
+            mapped_rel: Path | None = None
+            for camera_root in per_camera_roots:
+                if camera_root in src.parents:
+                    camera_rel = src.relative_to(camera_root)
+                    if allowed_camera_ids is not None and camera_rel.parts[0] not in allowed_camera_ids:
+                        mapped_rel = None
+                        break
+                    # Consolidated exports historically expose every camera
+                    # under sensors/, while versioned bundles may call the
+                    # source directory cameras/.
+                    mapped_rel = Path("sensors") / camera_rel
+                    break
+            if per_camera_roots and mapped_rel is None and any(root in src.parents for root in per_camera_roots):
                 continue
-            # PNG-only mode: drop heavy HDR/raw rasters, keep PNG + metadata.
-            # Exception: keep the polarization Stokes raw (stokes_data.npz) so
-            # downstream code can recompute any Stokes representation, even when
-            # other .npz/.exr are dropped. Representation PNGs (s1_over_s0_*.png,
-            # dop/aolp colorbars) are .png and kept regardless.
+            if mapped_rel is None:
+                if allowed_camera_ids is not None and src.parent == obs_dir:
+                    if src.name == "_sensor_index.json":
+                        continue
+                    if src.suffix.lower() in {".png", ".exr", ".hdr", ".jpg", ".jpeg", ".npy", ".npz"}:
+                        continue
+                # Drop root-level duplicates when the same modality exists in
+                # a per-camera subtree.
+                if src.parent == obs_dir and src.name in per_camera_names:
+                    continue
+                mapped_rel = Path(src.name)
             if not include_exr and src.suffix.lower() in {".exr", ".hdr", ".npz"}:
                 if not (include_polarization_raw and src.name == "stokes_data.npz"):
                     continue
-            rel = src.relative_to(pdir).as_posix()
+            if destination_root is None:
+                rel = src.relative_to(pdir).as_posix()
+            else:
+                rel = (destination_root / mapped_rel).as_posix()
             pair = _emit(src, rel)
             if pair is not None:
                 yield pair
@@ -513,8 +573,22 @@ def iter_export_files(
                         if gt_h in disk_headings:
                             heading_ids = [gt_h]
             # 3a. Consolidated observation files for every heading at this vp.
+            versioned_heading_ids: set[str] = set()
             for h_id in heading_ids:
-                yield from _emit_observation_dir(vp_dir / h_id)
+                source_dir = _active_observation_dir(
+                    pdir, scene_id=str(ep.scene_id), variant="base",
+                    node_id=str(vp_id), heading_id=str(h_id),
+                )
+                destination = Path("scenes") / str(ep.scene_id) / "observations" / str(vp_id) / str(h_id)
+                _notify_resolved()
+                if source_dir is not None:
+                    if "versions" in source_dir.parts:
+                        versioned_heading_ids.add(str(h_id))
+                    yield from _emit_observation_dir(
+                        source_dir, destination,
+                        observation_key=(str(ep.scene_id), str(vp_id), str(h_id)),
+                    )
+
             # 3c. Paired perturbation variant (eval split): the same viewpoints
             # rendered with the optical-perturbation overlay (mirrors/glass) live
             # under `observations_perturbed/`. Ship them alongside the base tree
@@ -525,7 +599,15 @@ def iter_export_files(
                     p_disk = sorted(p.name for p in pvp_dir.iterdir() if p.is_dir())
                     p_headings = p_disk if panorama_observations else [h for h in heading_ids if h in p_disk]
                     for h_id in p_headings:
-                        yield from _emit_observation_dir(pvp_dir / h_id)
+                        source_dir = _active_observation_dir(
+                            pdir, scene_id=str(ep.scene_id), variant="perturbed",
+                            node_id=str(vp_id), heading_id=str(h_id),
+                        )
+                        destination = Path("scenes") / str(ep.scene_id) / "observations_perturbed" / str(vp_id) / str(h_id)
+                        _notify_resolved()
+                        if source_dir is not None:
+                            yield from _emit_observation_dir(source_dir, destination)
+
             # 3b. EXR (HDR) pulled from bridge_jobs for every heading at this
             # vp. The daemon's PNG-only consolidation skipped these so we
             # mirror them under `sensors/<camera>/<modality>.exr`. This is the
@@ -538,8 +620,15 @@ def iter_export_files(
             # iterate the heading ids discovered above. When the consolidated
             # dir is missing (no PNG was written yet), still fall back to a
             # glob for any heading matching the scene/vp.
-            bridge_heading_pool: list[str] = list(heading_ids)
-            if not bridge_heading_pool:
+            # A self-contained versioned bundle is authoritative; do not scan
+            # the legacy bridge_jobs tree for those headings. Keep the fallback
+            # for old consolidated observations that genuinely lack EXR files.
+            bridge_heading_pool: list[str] = [
+                h for h in heading_ids
+                if str(h) not in versioned_heading_ids
+                and (str(ep.scene_id), str(vp_id), str(h)) not in source_exr_keys
+            ]
+            if not bridge_heading_pool and not versioned_heading_ids:
                 if panorama_observations:
                     bridge_root = repo_root / "out" / "bridge_jobs"
                     if bridge_root.exists():
