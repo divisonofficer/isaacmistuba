@@ -17,7 +17,13 @@ import {
 	syncOpticalNavIsaacStage,
 	getOpticalNavRenderBatch,
 	getOpticalNavGraphRenderBatch,
+	getOpticalNavGraphRenderBatchSummary,
 	getOpticalNavGraphBatchLogs,
+	listOpticalNavRenderVersions,
+	promoteOpticalNavRenderVersion,
+	pruneOpticalNavRenderVersion,
+	getOpticalNavGraphRun,
+	resumeOpticalNavGraphRun,
 	sweepOpticalNavViewpointGraph,
 	renderOpticalNavEpisodes,
 } from '$lib/api';
@@ -179,9 +185,14 @@ export async function renderEpisodes(projectId: string, body: Record<string, unk
 	return renderOpticalNavEpisodes(projectId, body);
 }
 
-/** Fetch a graph render batch status. */
+/** Fetch full graph render batch metadata/job rows (on-demand; potentially large). */
 export async function fetchGraphBatch(projectId: string, batchId: string) {
 	return getOpticalNavGraphRenderBatch(projectId, batchId);
+}
+
+/** Fetch only aggregate graph progress; safe to poll for thousand-task sweeps. */
+export async function fetchGraphBatchSummary(projectId: string, batchId: string) {
+	return getOpticalNavGraphRenderBatchSummary(projectId, batchId);
 }
 
 /** Fetch an episode render batch status. */
@@ -192,4 +203,20 @@ export async function fetchRenderBatch(projectId: string, batchId: string) {
 /** Fetch batch log entries. */
 export async function fetchBatchLogs(projectId: string, batchId: string, limit = 20) {
 	return getOpticalNavGraphBatchLogs(projectId, batchId, limit);
+}
+/** Versioned OpticalNav observation controls. */
+export async function fetchRenderVersions(projectId: string, sceneId: string) {
+	return listOpticalNavRenderVersions(projectId, sceneId);
+}
+export async function promoteRenderVersion(projectId: string, sceneId: string, versionId: string) {
+	return promoteOpticalNavRenderVersion(projectId, sceneId, versionId);
+}
+export async function pruneRenderVersion(projectId: string, sceneId: string, versionId: string) {
+	return pruneOpticalNavRenderVersion(projectId, sceneId, versionId);
+}
+export async function fetchGraphRun(projectId: string, runId: string) {
+	return getOpticalNavGraphRun(projectId, runId);
+}
+export async function resumeGraphRun(projectId: string, runId: string, payload: unknown = {}) {
+	return resumeOpticalNavGraphRun(projectId, runId, payload);
 }

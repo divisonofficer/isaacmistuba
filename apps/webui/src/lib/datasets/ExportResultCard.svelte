@@ -10,6 +10,7 @@
 	} = $props();
 
 	const summary = $derived(job?.summary ?? {});
+	const archives = $derived(Array.isArray(summary.archives) ? summary.archives : []);
 
 	function fmtBytes(b: number | undefined): string {
 		if (!b || b < 0) return '0 B';
@@ -30,15 +31,26 @@
 		<div><span class="er-num">{summary.files_packaged ?? 0}</span><span class="er-label">files</span></div>
 		<div><span class="er-num">{fmtBytes(summary.zip_size_bytes)}</span><span class="er-label">zip size</span></div>
 	</div>
+	{#if summary.export_profile}
+		<div class="er-sub">profile: {summary.export_profile}</div>
+	{/if}
 	<div class="er-actions">
-		{#if summary.download_url}
-			<a class="button button-primary" href={summary.download_url} download>⬇ Download ZIP</a>
+		{#if archives().length}
+			{#each archives() as archive}
+				<a class="button button-primary" href={archive.download_url} download>{archive.kind === 'polar_extension' ? 'Download Polar ZIP' : 'Download Core ZIP'} ({fmtBytes(archive.bytes)})</a>
+			{/each}
+		{:else if summary.download_url}
+			<a class="button button-primary" href={summary.download_url} download>Download ZIP</a>
 		{/if}
 		{#if onReset}
 			<button type="button" class="button button-subtle" onclick={onReset}>New export</button>
 		{/if}
 	</div>
-	{#if summary.zip_ref}
+	{#if archives().length}
+		{#each archives() as archive}
+			<div class="er-path" title={archive.zip_ref}>{archive.zip_ref}</div>
+		{/each}
+	{:else if summary.zip_ref}
 		<div class="er-path" title={summary.zip_ref}>{summary.zip_ref}</div>
 	{/if}
 </div>

@@ -39,6 +39,12 @@
 		onRetryJob: (job: any) => void;
 		onCancelJob: (job: any) => void;
 		onRefreshSelectedJobLog: () => void;
+		renderVersions?: any[];
+		renderVersionsLoading?: boolean;
+		onRefreshVersions?: () => void;
+		onResumeRun?: () => void;
+		onPromoteVersion?: (version: any) => void;
+		onPruneVersion?: (version: any) => void;
 	}
 
 	let {
@@ -49,6 +55,8 @@
 		onTogglePanel, onRefreshBatch, onSelectBatchJob,
 		onCancelStaleBatchJobs, onCloseJobDetail,
 		onRetryJob, onCancelJob, onRefreshSelectedJobLog,
+		renderVersions = [], renderVersionsLoading = false, onRefreshVersions = () => {},
+		onResumeRun = () => {}, onPromoteVersion = () => {}, onPruneVersion = () => {},
 	}: Props = $props();
 
 	let activeTab = $state<'overview' | 'jobs' | 'logs'>('overview');
@@ -143,6 +151,25 @@
 						onRetryFailedJobs={retryFailedJobs}
 					/>
 					<RenderBottleneckBanner {activeBatch} {health} />
+					{#if isGraphSweepRenderMode(renderMode)}
+						<section class="version-strip" aria-label="Versioned render artifacts">
+							<div class="version-strip-head">
+								<strong>Render versions</strong>
+								<button class="button button-subtle" disabled={renderVersionsLoading} onclick={onRefreshVersions}>Refresh</button>
+								{#if activeBatch?.resume_available}<button class="button button-primary" disabled={actionInFlight} onclick={onResumeRun}>Resume incomplete</button>{/if}
+							</div>
+							{#if renderVersions.length === 0}<small>No versioned runs yet.</small>{/if}
+							{#each renderVersions.slice(0, 6) as version}
+								<div class="version-row">
+									<span class="version-status status-{version.status}">{version.status}</span>
+									<code>{version.render_version_id}</code>
+									<small>{version.created_at ?? ''}</small>
+									{#if version.status !== 'active'}<button class="button button-subtle" disabled={version.status === 'pruned'} onclick={() => onPromoteVersion(version)}>Promote</button>{/if}
+									{#if version.status !== 'active'}<button class="button button-subtle danger" disabled={version.status === 'pruned'} onclick={() => onPruneVersion(version)}>Prune</button>{/if}
+								</div>
+							{/each}
+						</section>
+					{/if}
 					{#if failedJobs.length > 0}
 						<section class="failure-strip">
 							<strong>Recent failures ({failedJobs.length})</strong>
@@ -159,6 +186,14 @@
 				</div>
 			{:else if activeTab === 'jobs'}
 				<div class="jobs-panel">
+					{#if activeBatch?.summary_only && (activeBatch?.jobs?.length ?? 0) === 0}
+						<div class="empty">
+							Large sweep summary mode — per-job rows are not repeatedly fetched.
+							{#each activeBatch?.graph_batch_summaries ?? [] as batch}
+								<span> · {batch.scene_variant_key ?? 'base'} {batch.progress?.completed ?? 0}/{batch.progress?.total ?? 0}</span>
+							{/each}
+						</div>
+					{/if}
 					<div class="jobs-toolbar">
 						<div class="toolbar-left">
 							{#if isGraphSweepRenderMode(renderMode)}
@@ -366,4 +401,15 @@
 		.monitor-actions { justify-content: flex-start; }
 		.monitor-body.drawer-open { padding-right: var(--space-3); }
 	}
+
+	.version-strip { margin: 0.5rem 0; padding: 0.6rem 0.75rem; border: 1px solid var(--border); border-radius: 6px; background: var(--surface-2); }
+	.version-strip-head, .version-row { display: flex; align-items: center; gap: 0.5rem; }
+	.version-strip-head { justify-content: space-between; margin-bottom: 0.35rem; }
+	.version-row { padding: 0.2rem 0; font-size: 0.75rem; }
+	.version-row code { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+	.version-status { min-width: 4.5rem; text-transform: uppercase; font-size: 0.65rem; }
+	.status-active { color: var(--success, #4ade80); }
+	.status-staging, .status-ready { color: var(--warning, #fbbf24); }
+	.status-superseded, .status-pruned { color: var(--text-muted, #94a3b8); }
+
 </style>

@@ -390,7 +390,8 @@ export const listOpticalNavProjects = () =>
 
 // --- Infinigen procedural scene generation (background job, polled) ---------
 export type InfinigenGenerateRequest = {
-	archetype: 'apartment' | 'office';
+	archetype: 'apartment' | 'office' | 'single_room';
+	room_type?: 'living-room' | 'bedroom' | 'kitchen' | 'bathroom';
 	density: 'model_house' | 'normal_lived_in' | 'family_home' | 'storage_heavy';
 	stage: 'full' | 'layout';
 	seed: string; // 8 digits, 'today', or 'random'
@@ -519,8 +520,20 @@ export const saveOpticalNavRenderConfig = (projectId: string, sceneId: string, p
 	put(`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/render-config`, payload);
 export const getOpticalNavGraphRenderBatch = (projectId: string, batchId: string) =>
 	fetch(`${opticalProject(projectId)}/graph-render-batches/${encodeURIComponent(batchId)}`).then(json);
+export const getOpticalNavGraphRenderBatchSummary = (projectId: string, batchId: string) =>
+	fetch(`${opticalProject(projectId)}/graph-render-batches/${encodeURIComponent(batchId)}?view=summary`).then(json);
 export const getOpticalNavGraphBatchLogs = (projectId: string, batchId: string, perJob = 30) =>
 	fetch(`${opticalProject(projectId)}/graph-render-batches/${encodeURIComponent(batchId)}/logs?per_job=${perJob}`).then(json);
+export const listOpticalNavRenderVersions = (projectId: string, sceneId: string) =>
+	fetch(`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/render-versions`).then(json);
+export const promoteOpticalNavRenderVersion = (projectId: string, sceneId: string, renderVersionId: string) =>
+	post(`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/render-versions`, { action: 'promote', render_version_id: renderVersionId });
+export const pruneOpticalNavRenderVersion = (projectId: string, sceneId: string, renderVersionId: string) =>
+	post(`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/render-versions`, { action: 'prune', render_version_id: renderVersionId });
+export const getOpticalNavGraphRun = (projectId: string, runId: string) =>
+	fetch(`${opticalProject(projectId)}/graph-render-runs/${encodeURIComponent(runId)}`).then(json);
+export const resumeOpticalNavGraphRun = (projectId: string, runId: string, payload: unknown = {}) =>
+	post(`${opticalProject(projectId)}/graph-render-runs/${encodeURIComponent(runId)}/resume`, payload);
 export const planOpticalNavEpisodes = (projectId: string, payload: unknown) =>
 	post(`${opticalProject(projectId)}/episodes/plan`, payload);
 export const planOpticalNavGraphEpisodes = (projectId: string, payload: unknown) =>
@@ -662,6 +675,7 @@ export const submitOpticalNavExportJob = (
 		include_birdseye?: boolean;
 		include_episode_birdseye?: boolean;
 		include_polarization_raw?: boolean;
+		export_profile?: 'compact_with_polar_extension' | 'single_lossless_core' | 'navigation_only' | 'legacy_full';
 		eval_perturbation?: boolean;
 	},
 ) => post(`${opticalProject(projectId)}/export-jobs`, payload);
