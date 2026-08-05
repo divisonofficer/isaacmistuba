@@ -65,6 +65,11 @@ def build_render_scene_sync_payload(
             "emitter_radiance": getattr(obj, "emitter_radiance", None),
             "emitter_intensity": float(getattr(obj, "emitter_intensity", 1.0) or 1.0),
             "emitter_shape": getattr(obj, "emitter_shape", None),
+            "emitter_polarized": bool(getattr(obj, "emitter_polarized", False)),
+            "emitter_polarizer_angle_deg": float(
+                getattr(obj, "emitter_polarizer_angle_deg", 0.0) or 0.0
+            ),
+            "emitter_pattern": getattr(obj, "emitter_pattern", None),
         }
         overlay_objects.append(entry)
         if obj.material:

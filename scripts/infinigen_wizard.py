@@ -5,7 +5,7 @@ Run it with no args and answer the prompts:
 
     python scripts/infinigen_wizard.py
 
-It asks for archetype / furnishing density / stage / seed, then:
+It asks for archetype / room type (single-room) / furnishing density / stage / seed, then:
   1. generates a VALID procedural floor plan + scene.blend via infinigen_gen.py
   2. (optionally) runs run_infinigen_import.sh to land an OpticalNav scene.
 
@@ -27,6 +27,13 @@ REPO = Path(__file__).resolve().parent.parent
 ARCHETYPES = {
     "apartment": "gen_apartment",   # 거실 중심 radial + 복도 + open LDK
     "office": "gen_office",          # 척추+분기 코리더망 + 수십 개 방
+    "single_room": "single_room",    # 방 하나 + entrance + exterior window
+}
+ROOM_TYPES = {
+    "living-room": "거실",
+    "bedroom": "침실",
+    "kitchen": "주방",
+    "bathroom": "욕실",
 }
 # furnishing density -> compose_indoors.num_floating (mirrors infinigen_gen.parse_seed)
 DENSITIES = {
@@ -100,6 +107,8 @@ def _parse_args(argv):
                     "플래그를 모두 주고 --yes 면 비대화식(서버/배치)으로 동작.")
     ap.add_argument("--archetype", choices=list(ARCHETYPES))
     ap.add_argument("--density", choices=list(DENSITIES))
+    ap.add_argument("--room-type", choices=list(ROOM_TYPES), default=None,
+                    help="single_room 모드의 방 타입")
     ap.add_argument("--stage", choices=STAGES)
     ap.add_argument("--seed", help="8자리 seed, 'today', 또는 'random'")
     ap.add_argument("--import", dest="do_import", action="store_true", default=None)
@@ -141,27 +150,36 @@ def main(argv=None) -> int:
 
     archetype = args.archetype or ("apartment" if auto else
                                    _pick("1. archetype (방 구조)", list(ARCHETYPES), "apartment"))
+    room_type = args.room_type
+    if archetype == "single_room" and room_type is None:
+        room_type = "living-room" if auto else _pick("2. 방 타입", list(ROOM_TYPES), "living-room")
+    density_prompt = "3. 가구 밀도" if archetype == "single_room" else "2. 가구 밀도"
     density = args.density or ("normal_lived_in" if auto else
-                               _pick("2. 가구 밀도", list(DENSITIES), "normal_lived_in"))
-    stage = args.stage or ("full" if auto else _pick("3. stage", STAGES, "full"))
+                               _pick(density_prompt, list(DENSITIES), "normal_lived_in"))
+    stage_prompt = "4. stage" if archetype == "single_room" else "3. stage"
+    stage = args.stage or ("full" if auto else _pick(stage_prompt, STAGES, "full"))
     seed = _resolve_seed(args.seed) if (args.seed or auto) else _ask_seed()
 
     if args.do_import is not None:
         do_import = args.do_import
     else:
-        do_import = True if auto else _yesno("\n4. 생성 후 OpticalNav import 까지 진행?", True)
+        import_prompt = "5" if archetype == "single_room" else "4"
+        do_import = True if auto else _yesno(f"\n{import_prompt}. 생성 후 OpticalNav import 까지 진행?", True)
     bake_pbr = bool(args.bake_pbr)
     if do_import and args.bake_pbr is None and not auto:
         bake_pbr = _yesno("   └ PBR(roughness/normal/metallic) 베이크? (~4배 느림)", False)
 
     floor_plan = ARCHETYPES[archetype]
     num_floating = DENSITIES[density]
-    out_dir = REPO / "data" / "infinigen_generated" / "outputs" / f"kr_{seed}_{archetype}" / stage
-    scene_id = args.scene_id or f"infinigen_{archetype}_{seed}"
+    room_suffix = f"_{room_type.replace('-', '_')}" if archetype == "single_room" else ""
+    out_dir = REPO / "data" / "infinigen_generated" / "outputs" / f"kr_{seed}_{archetype}{room_suffix}" / stage
+    scene_id = args.scene_id or f"infinigen_{archetype}{room_suffix}_{seed}"
 
     print("\n" + "-" * 64)
     print("요약")
     print(f"  archetype     : {archetype}  (--floor-plan {floor_plan})")
+    if archetype == "single_room":
+        print(f"  room type     : {room_type} ({ROOM_TYPES[room_type]})")
     print(f"  density       : {density}  (num_floating={num_floating})")
     print(f"  stage         : {stage}")
     print(f"  seed          : {seed}")
@@ -178,6 +196,7 @@ def main(argv=None) -> int:
         sys.executable, "scripts/infinigen_gen.py",
         "--seed", seed,
         "--floor-plan", floor_plan,
+        *( ["--room-type", room_type] if archetype == "single_room" else [] ),
         "--stage", stage,
         "--out", str(out_dir),
         "--override", f"compose_indoors.num_floating={num_floating}",

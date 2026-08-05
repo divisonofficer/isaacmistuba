@@ -169,9 +169,16 @@ class AuthoringObject:
     is_emitter: bool = False
     emitter_radiance: list[float] | None = None  # linear [r, g, b]; None → warm-white default
     emitter_intensity: float = 1.0
-    # Emitter geometry: None → 6-face cube (default). "ceiling_panel" → renderer
-    # builds a downward-facing flat rectangle (all light into the room, low variance).
+    # Emitter geometry: None -> 6-face cube (default), "ceiling_panel" ->
+    # downward rectangle, "wall_panel" -> forward-facing LCD-style rectangle.
     emitter_shape: str | None = None
+    # Scene-fixed polarized emitters use the same physical construction as rig
+    # active lights: an area emitter followed by a Mitsuba polarizer surface.
+    emitter_polarized: bool = False
+    emitter_polarizer_angle_deg: float = 0.0
+    # None/"white" keeps a uniform panel. "rgb_directional" encodes left=G,
+    # right=R, upper=B using four RGB quadrant emitters under one polarizer.
+    emitter_pattern: str | None = None
 
 
 @dataclass
@@ -412,6 +419,13 @@ def _normalize_object(payload: Any) -> AuthoringObject:
         emitter_intensity = float(intensity_raw) if intensity_raw is not None else 1.0
     except (TypeError, ValueError):
         emitter_intensity = 1.0
+    try:
+        emitter_polarizer_angle_deg = float(data.get("emitter_polarizer_angle_deg") or 0.0)
+    except (TypeError, ValueError):
+        emitter_polarizer_angle_deg = 0.0
+    emitter_pattern = str(data.get("emitter_pattern") or "").strip() or None
+    if emitter_pattern not in (None, "white", "rgb_directional"):
+        emitter_pattern = None
     return AuthoringObject(
         id=str(data.get("id") or ""),
         type=object_type,
@@ -426,6 +440,9 @@ def _normalize_object(payload: Any) -> AuthoringObject:
         emitter_radiance=_normalize_emitter_radiance(data.get("emitter_radiance")),
         emitter_intensity=emitter_intensity,
         emitter_shape=(str(data["emitter_shape"]) if data.get("emitter_shape") else None),
+        emitter_polarized=bool(data.get("emitter_polarized", False)),
+        emitter_polarizer_angle_deg=emitter_polarizer_angle_deg,
+        emitter_pattern=emitter_pattern,
     )
 
 
@@ -581,4 +598,3 @@ def save_authoring_map(path: str | Path, authoring_map: AuthoringMap | JsonDict)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(authoring_map_to_payload(model), ensure_ascii=False, indent=2), encoding="utf-8")
     return output
-

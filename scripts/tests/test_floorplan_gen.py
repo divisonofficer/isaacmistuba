@@ -12,6 +12,7 @@ import floorplan_gen as fg  # noqa: E402
 
 APARTMENT_SEEDS = range(20_010_000, 20_010_200)
 OFFICE_SEEDS = range(20_510_000, 20_510_200)
+SINGLE_ROOM_SEEDS = range(20_710_000, 20_710_020)
 
 
 def _all(arch, seeds):
@@ -93,3 +94,21 @@ def test_archetype_signatures():
     off = fg.build_floor_plan(20_510_001, "office")
     types = {n.split("_")[0] for n in off["rooms"]}
     assert "hallway" in types and "office" in types
+
+
+def test_single_room_types_valid_and_windowed():
+    for room_type in fg.SINGLE_ROOM_TYPES:
+        for seed in SINGLE_ROOM_SEEDS:
+            plan = fg.build_single_room_plan(seed, room_type)
+            assert fg.validate_plan(plan) == [], (room_type, seed)
+            assert len(plan["rooms"]) == 1
+            assert f"{room_type}_0/0" in plan["rooms"]
+            assert len(plan["doors"]) == 1
+            assert len(plan["windows"]) == 1
+
+
+def test_single_room_determinism_and_panoramic_living_room():
+    for room_type in fg.SINGLE_ROOM_TYPES:
+        assert fg.build_single_room_plan(20_710_042, room_type) == fg.build_single_room_plan(20_710_042, room_type)
+    living = fg.build_single_room_plan(20_710_042, "living-room")
+    assert next(iter(living["windows"].values()))["is_panoramic"] == 1
