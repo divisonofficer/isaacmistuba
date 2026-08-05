@@ -103,7 +103,10 @@ def build_band_scene(
     band: int = 854,
     nir_dir: Optional[Path] = None,
     max_depth: int = 8,
+    integrator: str = "path",
+    drop_dielectric: bool = False,
     nir_flash: bool = False,
+    nir_flash_half_m: float = 0.015,
     force_analytic: bool = True,
     polarized: bool = True,
 ) -> dict:
@@ -124,23 +127,59 @@ def build_band_scene(
     tree = ET.parse(scene_xml)
     root = tree.getroot()
 
-    # A Stokes carrier: the unified runner reads S0..S3 from one render. max_depth 8 so
-    # multi-surface glass transmits (a low depth renders bottles as opaque black).
+    # Optionally REMOVE every dielectric (glass) object. A bright compact NIR flash makes
+    # smooth dielectrics a high-risk caustic (firefly) source; this materializes a
+    # "glass-free scenario" (glass assets not restored) whose observation is inherently
+    # cleaner. A shape is glass if it references a top-level bsdf whose subtree contains a
+    # dielectric (covers `dielectric` refs and blends-with-dielectric); emitter shapes
+    # (area lights, the flash) are never dropped.
+    dropped_dielectric = 0
+    if drop_dielectric:
+        _DT = {"dielectric", "roughdielectric", "thindielectric"}
+        diel_ids = {b.get("id") for b in root.findall("bsdf")
+                    if any(x.get("type") in _DT for x in b.iter("bsdf"))}
+        diel_ids.discard(None)
+        for sh in list(root.findall("shape")):
+            if sh.find("emitter") is not None:
+                continue
+            is_diel = (any(x.get("type") in _DT for x in sh.iter("bsdf"))
+                       or any(r.get("id") in diel_ids for r in sh.iter("ref")))
+            if is_diel:
+                root.remove(sh)
+                dropped_dielectric += 1
+
+    # A Stokes carrier: the unified runner reads S0..S3 from one render.
+    #   integrator="path"   → global-illumination OBSERVATION pass (max_depth 8 so
+    #                         multi-surface glass transmits; a low depth renders bottles
+    #                         as opaque black). Fireflies/indirect are legitimate here —
+    #                         this is what the sensor actually records.
+    #   integrator="direct" → direct-illumination-only pass. No indirect paths at all, so
+    #                         the flash-only response is firefly-free BY CONSTRUCTION — the
+    #                         clean specular-recovery GT. (max_depth is ignored by `direct`.)
     for integ in root.findall("integrator"):
         root.remove(integ)
+    inner_type = "direct" if integrator == "direct" else "path"
     if polarized:                                     # Stokes carrier: RGB/NIR + DoP/AoLP
         top_integ = ET.Element("integrator", {"type": "stokes"})
-        path = ET.SubElement(top_integ, "integrator", {"type": "path"})
-    else:                                             # no-polar: plain path, RGB/NIR only
-        top_integ = path = ET.Element("integrator", {"type": "path"})
-    ET.SubElement(path, "integer", {"name": "max_depth", "value": str(int(max_depth))})
+        inner = ET.SubElement(top_integ, "integrator", {"type": inner_type})
+    else:                                             # no-polar: plain integrator, RGB/NIR only
+        top_integ = inner = ET.Element("integrator", {"type": inner_type})
+    if inner_type == "path":
+        ET.SubElement(inner, "integer", {"name": "max_depth", "value": str(int(max_depth))})
     root.insert(0, top_integ)
 
-    # rig NIR headlamp — band-gated by the runner (0 in visible, on in NIR).
+    # rig NIR headlamp — a FINITE-AREA emitter (real LED/diffuser has size; an
+    # infinitesimal `point` delta produces subpixel-specular / caustic fireflies that spp
+    # barely removes). A camera-mounted rectangle (half-size ~1.5cm) whose emitting +Z
+    # face points into the scene; band-gated by the runner (radiance 0 in visible, on in
+    # NIR) and its to_world moved to the camera per view. One-sided → the camera behind it
+    # does not see the emitter.
     if nir_flash:
-        em = ET.SubElement(root, "emitter", {"type": "point", "id": "nir_flash"})
-        ET.SubElement(em, "rgb", {"name": "intensity", "value": "0 0 0"})  # off (visible)
-        ET.SubElement(em, "point", {"name": "position", "x": "0", "y": "1.2", "z": "0"})
+        sh = ET.SubElement(root, "shape", {"type": "rectangle", "id": "nir_flash"})
+        tr = ET.SubElement(sh, "transform", {"name": "to_world"})
+        ET.SubElement(tr, "scale", {"value": f"{float(nir_flash_half_m):.5f}"})
+        em = ET.SubElement(sh, "emitter", {"type": "area"})
+        ET.SubElement(em, "rgb", {"name": "radiance", "value": "0 0 0"})  # off (visible)
 
     wrapped = nir_swapped = metal_glass = unresolved = measured = 0
     contract_conductors = contract_alpha = 0
@@ -205,7 +244,8 @@ def build_band_scene(
     out_path.parent.mkdir(parents=True, exist_ok=True)
     tree.write(out_path, encoding="unicode")
     summary = {
-        "band": band, "materials_wrapped": wrapped, "nir_albedo_swapped": nir_swapped,
+        "band": band, "integrator": inner_type, "dropped_dielectric": dropped_dielectric,
+        "materials_wrapped": wrapped, "nir_albedo_swapped": nir_swapped,
         "metal_glass_fresnel_kept": metal_glass, "unresolved": unresolved,
         "measured_bsdf_banded": measured, "nir_flash": bool(nir_flash),
         "contract_conductors_source_faithful": contract_conductors // 2,

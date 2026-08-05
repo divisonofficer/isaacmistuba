@@ -1,0 +1,69 @@
+<!doctype html><html><head><meta charset="utf-8">
+<title>Active-NIR differential imaging protocol (2026-08-05)</title><style>
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+ max-width:1400px;margin:0 auto;padding:24px;color:#1a1a1a;background:#fafafa}
+h1{font-size:24px} h2{font-size:19px;margin-top:32px;border-bottom:2px solid #eee;padding-bottom:6px}
+.sub{color:#666;font-size:14px} code{background:#f0f0f0;padding:1px 5px;border-radius:3px;font-size:13px}
+.note{background:#f4f7fb;border-left:3px solid #4a7fc0;padding:10px 14px;margin:12px 0;font-size:14px;line-height:1.55}
+.good{background:#f2faf3;border-left:3px solid #3fa34d}
+.grid{display:grid;grid-template-columns:repeat(7,1fr);gap:8px;margin:14px 0}
+.cell{background:#fff;border:1px solid #e3e3e3;border-radius:6px;overflow:hidden}
+.cell img{width:100%;display:block;background:#222}
+.cap{padding:6px 8px;font-size:11px} .cap b{font-size:12px}
+.mut{color:#777;font-size:11px} table{border-collapse:collapse;font-size:13px;margin:8px 0}
+td,th{border:1px solid #ddd;padding:4px 10px;text-align:right} th{background:#f5f5f5}
+td.l,th.l{text-align:left}
+.pipe{background:#fff;border:1px solid #e3e3e3;border-radius:6px;padding:12px 16px;font-size:14px;line-height:1.7}
+</style></head><body>
+<h1>Active-NIR flash/no-flash 차분 이미징 프로토콜 — firefly 근본해결</h1>
+<p class="sub">2026-08-05 · scene <code>infinigen_single_room_kitchen_20260730</code> ·
+4 viewpoints · 640×480 · unified discrete-band Stokes carrier ·
+순수 analytic(pplastic·roughconductor·dielectric) · spp 256 ·
+Device 1 / RTX 5090 / <code>cuda_ad_rgb_polarized</code> · 산출물 <code>dev_report/images/kitchen_diff_nir_2026-08-04</code></p>
+
+<div class="pipe"><b>문제.</b> NIR active-flash 관측에 흰 "밀가루" 반점(firefly)이 낀다. 이는 밝고 작은 광원이
+near-mirror(source-faithful roughconductor η≈0.0001/k≈1) · 유리에서 diffuse로 만드는 <b>caustic(SDS 간접경로)</b>이며
+spp를 올려도 잘 안 사라진다. <b>clamp/despeckle로 지우면 안 된다</b> — inverse-rendering GT의 bright-path 에너지를
+잘라 관측·타깃을 왜곡한다. point→area emitter 교체(I/(4·half²)≈444k radiance)로도 안 줄었다(작은 LED는 본질적으로 near-delta).
+근본해결은 <b>integrator/pass 구조</b>다.</div>
+
+<div class="note good"><b>해결 — flash/no-flash 차분 프로토콜(뷰포인트당 5패스).</b> 모든 패스의 raw는 <b>unclamped float EXR</b>.
+<table>
+<tr><th class="l">패스</th><th>ambient</th><th>flash</th><th class="l">integrator</th><th class="l">역할</th></tr>
+<tr><td class="l">RGB passive</td><td>ON</td><td>OFF</td><td class="l">path d8</td><td class="l">visible 관측</td></tr>
+<tr><td class="l">NIR I_off</td><td>ON</td><td>OFF</td><td class="l">path d8</td><td class="l">수동 NIR</td></tr>
+<tr><td class="l">NIR I_on</td><td>ON</td><td>ON</td><td class="l">path d8</td><td class="l"><b>관측</b>(네트워크 입력) — firefly 정당·보존</td></tr>
+<tr><td class="l">ΔI=I_on−I_off</td><td>—</td><td>—</td><td class="l">파생(선형)</td><td class="l">active-light response(센서 differential)</td></tr>
+<tr><td class="l">flash DIRECT GT</td><td><b>OFF</b></td><td>ON</td><td class="l"><b>direct</b></td><td class="l"><b>clean specular GT</b> — firefly 구조적 부재</td></tr>
+</table>
+관측(I_on)의 firefly는 로봇 센서가 실제로 기록하는 정당한 신호라 그대로 두고, specular 복원용 <b>깨끗한 타깃</b>은
+indirect 경로가 아예 없는 <b>flash-only <code>direct</code></b> 패스에서 얻는다. clamp 불필요.</div>
+
+<div class="note"><b>검증(spp64 smoke, vp_000005@180).</b> NIR I_on의 3×3 firefly <b>120개</b>(raw max 23419) →
+flash DIRECT GT <b>26개(−78%)</b>. direct의 raw max는 여전히 높지만(30420) 그건 <b>진짜 direct specular lobe</b>
+(near-mirror에 flash 정반사)이지 dirt가 아니다. 프리뷰상 I_on의 어두운 창에 흩뿌려진 반점이 DIRECT GT에선
+<b>깨끗한 검정</b>으로 사라지고 정반사점 1개만 남는다.</div>
+
+<h2>Viewpoint <code>vp_000005</code></h2><div class="grid"><div class="cell"><img src="images/kitchen_diff_nir_2026-08-04/vp0_vp_000005_rgb__v1785832315.png" alt="RGB passive"><div class="cap"><b>RGB passive</b><br><span class="mut">visible 밴드(weight 0) Stokes S0 · ambient only · path d8. 표준 passive 관측.</span></div></div><div class="cell"><img src="images/kitchen_diff_nir_2026-08-04/vp0_vp_000005_nir_passive__v1785832364.png" alt="NIR I_off"><div class="cap"><b>NIR I_off</b><br><span class="mut">NIR 밴드(weight 1) · ambient only, flash OFF · path d8. 수동 NIR.</span></div></div><div class="cell"><img src="images/kitchen_diff_nir_2026-08-04/vp0_vp_000005_nir_active__v1785832393.png" alt="NIR I_on (관측)"><div class="cap"><b>NIR I_on (관측)</b><br><span class="mut">ambient + flash · path d8. <b>네트워크가 보는 전체 관측</b>: highlight+shadow+wall bounce+glass+indirect+caustic. <b>firefly는 정당한 센서 신호</b> → raw EXR unclamped, despeckle 안 함.</span></div></div><div class="cell"><img src="images/kitchen_diff_nir_2026-08-04/vp0_vp_000005_nir_dflash__v1785832393.png" alt="ΔI = I_on − I_off"><div class="cap"><b>ΔI = I_on − I_off</b><br><span class="mut">선형 이미지 공간 차분 = <b>active-light response</b>(실센서 flash/no-flash differential과 동일). signed EXR. 두 독립 MC 렌더 차분이라 노이즈 증폭됨.</span></div></div><div class="cell"><img src="images/kitchen_diff_nir_2026-08-04/vp0_vp_000005_nir_flash_direct__v1785832728.png" alt="flash DIRECT GT"><div class="cap"><b>flash DIRECT GT</b><br><span class="mut">flash ON, <b>ambient OFF</b>, <code>direct</code> integrator. indirect 경로 0 → caustic firefly가 <b>구조적으로 없음</b>. specular-recovery <b>GT(clean)</b>.</span></div></div><div class="cell"><img src="images/kitchen_diff_nir_2026-08-04/vp0_vp_000005_dop__v1785832393.png" alt="DoP (I_on)"><div class="cap"><b>DoP (I_on)</b><br><span class="mut">관측(I_on) 밴드 Stokes 편광도. glass/specular에서 편광(빨강), diffuse 검정.</span></div></div><div class="cell"><img src="images/kitchen_diff_nir_2026-08-04/vp0_vp_000005_aolp__v1785832393.png" alt="AoLP (I_on)"><div class="cap"><b>AoLP (I_on)</b><br><span class="mut">편광각을 hue로 · 채도=DoLP(무편광 흰색). 창유리·모서리에서 선명.</span></div></div></div><h2>Viewpoint <code>vp_000009</code></h2><div class="grid"><div class="cell"><img src="images/kitchen_diff_nir_2026-08-04/vp1_vp_000009_rgb__v1785832422.png" alt="RGB passive"><div class="cap"><b>RGB passive</b><br><span class="mut">visible 밴드(weight 0) Stokes S0 · ambient only · path d8. 표준 passive 관측.</span></div></div><div class="cell"><img src="images/kitchen_diff_nir_2026-08-04/vp1_vp_000009_nir_passive__v1785832450.png" alt="NIR I_off"><div class="cap"><b>NIR I_off</b><br><span class="mut">NIR 밴드(weight 1) · ambient only, flash OFF · path d8. 수동 NIR.</span></div></div><div class="cell"><img src="images/kitchen_diff_nir_2026-08-04/vp1_vp_000009_nir_active__v1785832478.png" alt="NIR I_on (관측)"><div class="cap"><b>NIR I_on (관측)</b><br><span class="mut">ambient + flash · path d8. <b>네트워크가 보는 전체 관측</b>: highlight+shadow+wall bounce+glass+indirect+caustic. <b>firefly는 정당한 센서 신호</b> → raw EXR unclamped, despeckle 안 함.</span></div></div><div class="cell"><img src="images/kitchen_diff_nir_2026-08-04/vp1_vp_000009_nir_dflash__v1785832478.png" alt="ΔI = I_on − I_off"><div class="cap"><b>ΔI = I_on − I_off</b><br><span class="mut">선형 이미지 공간 차분 = <b>active-light response</b>(실센서 flash/no-flash differential과 동일). signed EXR. 두 독립 MC 렌더 차분이라 노이즈 증폭됨.</span></div></div><div class="cell"><img src="images/kitchen_diff_nir_2026-08-04/vp1_vp_000009_nir_flash_direct__v1785832758.png" alt="flash DIRECT GT"><div class="cap"><b>flash DIRECT GT</b><br><span class="mut">flash ON, <b>ambient OFF</b>, <code>direct</code> integrator. indirect 경로 0 → caustic firefly가 <b>구조적으로 없음</b>. specular-recovery <b>GT(clean)</b>.</span></div></div><div class="cell"><img src="images/kitchen_diff_nir_2026-08-04/vp1_vp_000009_dop__v1785832478.png" alt="DoP (I_on)"><div class="cap"><b>DoP (I_on)</b><br><span class="mut">관측(I_on) 밴드 Stokes 편광도. glass/specular에서 편광(빨강), diffuse 검정.</span></div></div><div class="cell"><img src="images/kitchen_diff_nir_2026-08-04/vp1_vp_000009_aolp__v1785832478.png" alt="AoLP (I_on)"><div class="cap"><b>AoLP (I_on)</b><br><span class="mut">편광각을 hue로 · 채도=DoLP(무편광 흰색). 창유리·모서리에서 선명.</span></div></div></div><h2>Viewpoint <code>vp_000016</code></h2><div class="grid"><div class="cell"><img src="images/kitchen_diff_nir_2026-08-04/vp2_vp_000016_rgb__v1785832507.png" alt="RGB passive"><div class="cap"><b>RGB passive</b><br><span class="mut">visible 밴드(weight 0) Stokes S0 · ambient only · path d8. 표준 passive 관측.</span></div></div><div class="cell"><img src="images/kitchen_diff_nir_2026-08-04/vp2_vp_000016_nir_passive__v1785832537.png" alt="NIR I_off"><div class="cap"><b>NIR I_off</b><br><span class="mut">NIR 밴드(weight 1) · ambient only, flash OFF · path d8. 수동 NIR.</span></div></div><div class="cell"><img src="images/kitchen_diff_nir_2026-08-04/vp2_vp_000016_nir_active__v1785832565.png" alt="NIR I_on (관측)"><div class="cap"><b>NIR I_on (관측)</b><br><span class="mut">ambient + flash · path d8. <b>네트워크가 보는 전체 관측</b>: highlight+shadow+wall bounce+glass+indirect+caustic. <b>firefly는 정당한 센서 신호</b> → raw EXR unclamped, despeckle 안 함.</span></div></div><div class="cell"><img src="images/kitchen_diff_nir_2026-08-04/vp2_vp_000016_nir_dflash__v1785832565.png" alt="ΔI = I_on − I_off"><div class="cap"><b>ΔI = I_on − I_off</b><br><span class="mut">선형 이미지 공간 차분 = <b>active-light response</b>(실센서 flash/no-flash differential과 동일). signed EXR. 두 독립 MC 렌더 차분이라 노이즈 증폭됨.</span></div></div><div class="cell"><img src="images/kitchen_diff_nir_2026-08-04/vp2_vp_000016_nir_flash_direct__v1785832773.png" alt="flash DIRECT GT"><div class="cap"><b>flash DIRECT GT</b><br><span class="mut">flash ON, <b>ambient OFF</b>, <code>direct</code> integrator. indirect 경로 0 → caustic firefly가 <b>구조적으로 없음</b>. specular-recovery <b>GT(clean)</b>.</span></div></div><div class="cell"><img src="images/kitchen_diff_nir_2026-08-04/vp2_vp_000016_dop__v1785832565.png" alt="DoP (I_on)"><div class="cap"><b>DoP (I_on)</b><br><span class="mut">관측(I_on) 밴드 Stokes 편광도. glass/specular에서 편광(빨강), diffuse 검정.</span></div></div><div class="cell"><img src="images/kitchen_diff_nir_2026-08-04/vp2_vp_000016_aolp__v1785832565.png" alt="AoLP (I_on)"><div class="cap"><b>AoLP (I_on)</b><br><span class="mut">편광각을 hue로 · 채도=DoLP(무편광 흰색). 창유리·모서리에서 선명.</span></div></div></div><h2>Viewpoint <code>vp_000012</code></h2><div class="grid"><div class="cell"><img src="images/kitchen_diff_nir_2026-08-04/vp3_vp_000012_rgb__v1785832595.png" alt="RGB passive"><div class="cap"><b>RGB passive</b><br><span class="mut">visible 밴드(weight 0) Stokes S0 · ambient only · path d8. 표준 passive 관측.</span></div></div><div class="cell"><img src="images/kitchen_diff_nir_2026-08-04/vp3_vp_000012_nir_passive__v1785832625.png" alt="NIR I_off"><div class="cap"><b>NIR I_off</b><br><span class="mut">NIR 밴드(weight 1) · ambient only, flash OFF · path d8. 수동 NIR.</span></div></div><div class="cell"><img src="images/kitchen_diff_nir_2026-08-04/vp3_vp_000012_nir_active__v1785832655.png" alt="NIR I_on (관측)"><div class="cap"><b>NIR I_on (관측)</b><br><span class="mut">ambient + flash · path d8. <b>네트워크가 보는 전체 관측</b>: highlight+shadow+wall bounce+glass+indirect+caustic. <b>firefly는 정당한 센서 신호</b> → raw EXR unclamped, despeckle 안 함.</span></div></div><div class="cell"><img src="images/kitchen_diff_nir_2026-08-04/vp3_vp_000012_nir_dflash__v1785832655.png" alt="ΔI = I_on − I_off"><div class="cap"><b>ΔI = I_on − I_off</b><br><span class="mut">선형 이미지 공간 차분 = <b>active-light response</b>(실센서 flash/no-flash differential과 동일). signed EXR. 두 독립 MC 렌더 차분이라 노이즈 증폭됨.</span></div></div><div class="cell"><img src="images/kitchen_diff_nir_2026-08-04/vp3_vp_000012_nir_flash_direct__v1785832788.png" alt="flash DIRECT GT"><div class="cap"><b>flash DIRECT GT</b><br><span class="mut">flash ON, <b>ambient OFF</b>, <code>direct</code> integrator. indirect 경로 0 → caustic firefly가 <b>구조적으로 없음</b>. specular-recovery <b>GT(clean)</b>.</span></div></div><div class="cell"><img src="images/kitchen_diff_nir_2026-08-04/vp3_vp_000012_dop__v1785832655.png" alt="DoP (I_on)"><div class="cap"><b>DoP (I_on)</b><br><span class="mut">관측(I_on) 밴드 Stokes 편광도. glass/specular에서 편광(빨강), diffuse 검정.</span></div></div><div class="cell"><img src="images/kitchen_diff_nir_2026-08-04/vp3_vp_000012_aolp__v1785832655.png" alt="AoLP (I_on)"><div class="cap"><b>AoLP (I_on)</b><br><span class="mut">편광각을 hue로 · 채도=DoLP(무편광 흰색). 창유리·모서리에서 선명.</span></div></div></div>
+
+<h2>메모</h2>
+<ul style="font-size:14px;line-height:1.7">
+<li><b>firefly = caustic이지 MC dirt 아님.</b> Mitsuba3엔 BDPT/PPM/MLT가 없고 ptracer만 caustic 지향이나,
+이 프로토콜에선 <b>ptracer 불필요</b> — 관측은 path 그대로(firefly OK), GT는 direct로 clean.</li>
+<li><b>raw는 절대 clamp 안 함.</b> <code>_declutter_fireflies</code>는 preview PNG 전용·기본 off(<code>--preview-despeckle</code>).
+raw float EXR(GT·관측·ΔI)은 항상 unclamped.</li>
+<li><b>scene-sequential 필수.</b> path·direct 두 밴드씬(각 424 material×2 blendbsdf)을 동시 resident 하면 GPU 메모리
+고갈→Dr.Jit malloc-cache thrash(무한 느려짐). path씬으로 전 뷰포인트 관측 → <code>del</code>+<code>gc</code>+
+<code>dr.flush_malloc_cache()</code> → direct씬 로드해 GT.</li>
+<li><b>integrator는 traverse로 못 바꿈</b> → <code>build_band_scene(integrator="path"|"direct")</code>로 XML 2개
+(<code>scene_band.xml</code>·<code>scene_band_direct.xml</code>) 생성. ambient 토글은 <code>.radiance.value</code> 중
+flash 아닌 4개(constant sky + area ceiling 3개)를 0으로.</li>
+<li><b>ΔI 노이즈.</b> 두 독립 MC 렌더 차분이라 노이즈가 증폭된다(spp 올리면 개선). 관측 자체의 spp256 Stokes 그레인은
+firefly와 별개(필요시 denoise/고spp).</li>
+<li><b>vp_000016 관측.</b> 이 뷰포인트는 passive S0≈0.001(RGB·NIR passive가 거의 검정 — 어두운 코너를 봄). flash가
+씬을 드러내는 유일한 광원이라 <b>active 조명이 가장 중요한 케이스</b>이고 DIRECT GT가 가장 깨끗하다.</li>
+<li><b>실행.</b> <code>LD_LIBRARY_PATH=/usr/lib/wsl/lib PYTHONPATH=build/mitsuba3-optix7/python /usr/bin/python3
+tools/render_kitchen_unified.py --nir-flash --spp 256 --viewpoints ...</code>
+(이 호스트의 <code>cuda_ad_rgb_polarized</code>는 repo-local optix7 빌드에만 있고 <b>/usr/bin/python3(3.10)</b> 필요).</li>
+</ul>
+</body></html>
