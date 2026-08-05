@@ -47,6 +47,30 @@ def _read_json(path: Path):
         return None
 
 
+def _active_pointer_job_ids(repo_root: Path) -> set[str]:
+    """Return legacy job ids still named by promoted current bundles."""
+    result: set[str] = set()
+    optical_root = repo_root / "out" / "opticalnav"
+    if not optical_root.exists():
+        return result
+    for pointer in optical_root.glob("*/scenes/*/observations*/**/current.json"):
+        payload = _read_json(pointer)
+        if not isinstance(payload, dict):
+            continue
+        ref = payload.get("bundle_ref")
+        if not isinstance(ref, str):
+            continue
+        try:
+            project_id = pointer.relative_to(optical_root).parts[0]
+        except (ValueError, IndexError):
+            continue
+        manifest = (optical_root / project_id / ref / "manifest.json")
+        data = _read_json(manifest)
+        if isinstance(data, dict) and data.get("job_id"):
+            result.add(str(data["job_id"]))
+    return result
+
+
 def _job_status(job_dir: Path) -> str | None:
     data = _read_json(job_dir / "job_status.json")
     if not isinstance(data, dict):
@@ -173,6 +197,7 @@ def main() -> None:
         print(f"[archive] cannot list {jobs_root}: {exc}", file=sys.stderr)
         return
 
+    active_pointer_job_ids = _active_pointer_job_ids(REPO_ROOT)
     throttle_s = max(0.0, args.throttle_ms) / 1000.0
     throttle_every = max(1, args.throttle_every)
     reached_end = True
@@ -191,6 +216,8 @@ def main() -> None:
             print(f"[archive]   …scanned {counts['scanned']}/{len(job_dirs)} "
                   f"(eligible={counts['eligible']})", flush=True)
 
+        if job_dir.name in active_pointer_job_ids:
+            skip("active_pointer_reference"); continue
         status = _job_status(job_dir)
         if status is None:
             skip("no_status"); continue

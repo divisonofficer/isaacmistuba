@@ -225,6 +225,51 @@ def _dataset_config_by_id(configs: list[dict]) -> dict[str, dict]:
     return {d["id"]: d for d in configs}
 
 
+def dataset_deprecation(repo_root: Path, dataset_id: str) -> dict[str, Any] | None:
+    """The `deprecated:` block for a dataset, or None when it is live.
+
+    Measured pBRDF (pbrdf_2020, hpbrdf_2025) was deleted locally on 2026-08-05
+    to reclaim ~203 GB while the project runs full-analytic BSDFs. The data is
+    recoverable, so a miss is not corruption - callers should surface the
+    restore recipe. datasets.yaml is the single source of truth.
+    """
+    for entry in load_dataset_config(repo_root):
+        if entry.get("id") == dataset_id:
+            block = entry.get("deprecated")
+            return dict(block) if isinstance(block, dict) else None
+    return None
+
+
+def deprecation_message(repo_root: Path, dataset_id: str) -> str | None:
+    """One-line, actionable message for a deprecated dataset (None if live)."""
+    block = dataset_deprecation(repo_root, dataset_id)
+    if not block:
+        return None
+    parts = [f"dataset '{dataset_id}' is deprecated since {block.get('since', '?')}"]
+    if block.get("reason"):
+        parts.append(str(block["reason"]).strip())
+    restore = block.get("restore_command") or block.get("restore")
+    if restore:
+        parts.append(f"restore: {str(restore).strip()}")
+    if block.get("restore_url"):
+        parts.append(str(block["restore_url"]))
+    return " | ".join(parts)
+
+
+def require_dataset(repo_root: Path, dataset_id: str) -> None:
+    """Raise with the restore recipe when a deprecated dataset is actually used.
+
+    Call this at the point of real consumption (loading a .pbsdf / channel
+    slice), not at import time - listing materials in the UI should keep
+    working and simply report them unavailable.
+    """
+    message = deprecation_message(repo_root, dataset_id)
+    if message:
+        raise FileNotFoundError(
+            f"{message}\nLocal data was removed; see data/{dataset_id}/RESTORE.md"
+        )
+
+
 # ---------------------------------------------------------------------------
 # Helper: material status check
 # ---------------------------------------------------------------------------
