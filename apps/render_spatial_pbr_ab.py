@@ -17,6 +17,12 @@ import numpy as np
 from PIL import Image, ImageDraw
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+MITSUBA_BUILD_ROOT = Path(
+    os.environ.get(
+        "ROBOMITUBA_MITSUBA_BUILD_DIR",
+        str(Path.home() / "robomituba-build" / "mitsuba3-optix7"),
+    )
+).expanduser()
 for source in ("modules/robomituba_bridge/src", "modules/mitsuba_converter/src"):
     candidate = str(REPO_ROOT / source)
     if candidate not in sys.path:
@@ -84,6 +90,30 @@ def constant(unit: Mapping[str, Any], name: str, default: float) -> float:
     return float(default)
 
 
+def part_optical_classes(unit: Mapping[str, Any], materialized: Any) -> list[str]:
+    """Per-GLB-part optical class, resolved through the unit's material slots.
+
+    A unit's ``optical_class`` names its container material only.  Rendering
+    every part with it turns mushrooms into glass - see dev_report 2026-07-28
+    (polar LOD), which fixed the same defect in the per-slot renderer.  Parts
+    whose material id has no slot entry fall back to the unit class.
+    """
+    by_name = {
+        str(slot.get("name")): str(slot.get("optical_class") or "")
+        for slot in (unit.get("material_slots") or [])
+        if slot.get("name")
+    }
+    fallback = str(unit.get("optical_class") or "diffuse")
+    classes: list[str] = []
+    for part in getattr(materialized, "mesh_parts", []) or []:
+        extracted = getattr(part, "extracted_material", None) or {}
+        if not isinstance(extracted, Mapping):
+            extracted = getattr(extracted, "__dict__", {}) or {}
+        material_id = str(extracted.get("material_id") or "")
+        classes.append(by_name.get(material_id) or fallback)
+    return classes
+
+
 def prepare_material(asset: Mapping[str, Any], out: Path) -> dict[str, Any]:
     scene = str(asset["scene"]); object_id = str(asset["id"])
     manifest, unit = resolve_asset_unit(scene, object_id)
@@ -121,7 +151,7 @@ def prepare_material(asset: Mapping[str, Any], out: Path) -> dict[str, Any]:
     if base is None or not base.is_file() or not obj.is_file():
         raise FileNotFoundError(f"missing OBJ/basecolor for {object_id}: {obj}, {base}")
     maps_dir = out / "asset_maps" / object_id
-    ior_dir = REPO_ROOT / "build/mitsuba3-optix7/data/ior"
+    ior_dir = MITSUBA_BUILD_ROOT / "data/ior"
     record = convert_spatial_pbr_textures(
         object_id=object_id, output_dir=maps_dir, base_color_path=base,
         roughness_path=rough, metallic_path=metallic, normal_path=normal,
@@ -151,6 +181,13 @@ def prepare_material(asset: Mapping[str, Any], out: Path) -> dict[str, Any]:
         "optical_npz": Path(record["outputs"]["optical_maps_npz"]).resolve(),
         "conductor_index": Path(record["outputs"]["conductor_index"]).resolve(),
         "optical_class": unit.get("optical_class") or "diffuse", "record": record,
+        # Per-slot optical class only.  The PBR atlas stays unit-level on
+        # purpose: measured UV bounds show the GLB parts occupy distinct
+        # sub-regions of ONE shared 0..1 UV space, so the unit atlas is the
+        # correct texture for every part.
+        "part_optical_classes": part_optical_classes(unit, materialized)
+        if glb is not None and glb_materialization.get("source") == "glb_materialized_obj"
+        else [],
     }
     material["input_sha256"] = {
         key: sha256_file(Path(value)) for key, value in {
@@ -420,11 +457,11 @@ def main() -> int:
         assets = [assets[0], next(asset for asset in assets if asset["id"].startswith("BedFactory"))]
     state_path = out / "resume_manifest.json"
     state = load_json(state_path) if args.resume and state_path.is_file() else {"schema": config["schema"], "pairs": {}}
-    build_conf = REPO_ROOT / "build/mitsuba3-optix7/mitsuba.conf"
+    build_conf = MITSUBA_BUILD_ROOT / "mitsuba.conf"
     experiment = {"config": str(args.config.resolve()), "config_sha256": sha256_file(args.config),
                   "variant": config["variant"], "rgb_variant": config.get("rgb_variant", "cuda_ad_spectral"),
                   "render_modes": ["rgb", "polarized"], "resolution": res, "spp": spp, "seed": config["seed"],
-                  "mitsuba_build": {"root": str(REPO_ROOT / "build/mitsuba3-optix7"),
+                  "mitsuba_build": {"root": str(MITSUBA_BUILD_ROOT),
                                     "pythonpath": os.environ.get("PYTHONPATH"),
                                     "mitsuba_conf_sha256": sha256_file(build_conf) if build_conf.is_file() else None},
                   "assets": assets, "started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}

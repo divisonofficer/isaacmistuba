@@ -115,7 +115,11 @@ def test_glass_strategy_cannot_be_overridden_by_source_albedo(tmp_path: Path) ->
         strategy="dielectric",
         inject={"ior": 1.52, "is_metal": False},
     )
-    assert shape.find(".//bsdf[@type='roughdielectric']") is not None
+    # Smooth dielectric, never roughdielectric: the polarized build returns
+    # DoLP=0 for roughdielectric (dev_report 2026-07-06 §2.1), so glass must
+    # keep the smooth Fresnel path to retain any polarization signal at all.
+    assert shape.find(".//bsdf[@type='dielectric']") is not None
+    assert shape.find(".//bsdf[@type='roughdielectric']") is None
     assert shape.find(".//bsdf[@type='pplastic']") is None
     assert shape.find(".//bsdf[@type='roughplastic']") is None
 
