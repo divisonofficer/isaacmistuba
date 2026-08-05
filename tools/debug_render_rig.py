@@ -103,6 +103,85 @@ def modalities(arr) -> dict:
             "s3s0": np.clip(S3 / S0, -1, 1)}
 
 
+# ------------------------------------------------------ depth + lidar ------- #
+_SEQ = np.array([[0.27, 0.00, 0.33], [0.13, 0.57, 0.55], [0.99, 0.91, 0.14]], np.float32)  # viridis-ish
+
+
+def _seq_cmap(v, valid=None, lo=None, hi=None):
+    """Sequential colormap (near→far) with NaN/miss → black. Percentile-normalized."""
+    v = np.asarray(v, np.float32)
+    m = np.isfinite(v) if valid is None else (valid & np.isfinite(v))
+    out = np.zeros((*v.shape, 3), np.uint8)
+    if not m.any():
+        return out
+    lo = np.percentile(v[m], 2) if lo is None else lo
+    hi = np.percentile(v[m], 98) if hi is None else hi
+    t = np.nan_to_num(np.clip((v - lo) / max(hi - lo, 1e-6), 0, 1), nan=0.0)
+    idx = t * 2
+    a = np.clip(idx.astype(int), 0, 1); fr = (idx - a)[..., None]
+    rgb = _SEQ[a] * (1 - fr) + _SEQ[np.clip(a + 1, 0, 2)] * fr
+    out[m] = (np.clip(rgb, 0, 1)[m] * 255).astype(np.uint8)
+    return out
+
+
+def render_depth(mi, scene, spp=64) -> np.ndarray:
+    """AOV camera depth (distance from pinhole) through the current sensor pose."""
+    integ = mi.load_dict({"type": "aov", "aovs": "dd:depth",
+                          "integrator": {"type": "path", "max_depth": 2}})
+    img = np.array(integ.render(scene, spp=spp))
+    return np.nan_to_num(img[:, :, -1], nan=0.0)   # last channel = depth
+
+
+def render_lidar(mi, scene, origin, yaw_rad, n_rings=128, n_az=1024, vfov_deg=45.0,
+                 specular_bounces=6):
+    """Spinning-LiDAR range image (Ouster OS1-128-like) by ray-casting the resident
+    scene from `origin`. Azimuth 0 aligned to robot heading (yaw).
+
+    Physical specular behaviour (specular_bounces>0): a real LiDAR beam does NOT stop at
+    a mirror/glass surface — it reflects/refracts and ranges the geometry it reaches via
+    that folded path. So on a **delta** (perfect mirror / smooth dielectric) hit we
+    follow the sampled specular direction and keep accumulating path length until a
+    diffuse/rough return; only then is the range recorded. specular_bounces=0 reproduces
+    the naive 'stops at first surface' cast (recognises mirrors as opaque — not physical).
+
+    Returns (range[n_rings×n_az] metres NaN=no return, spec_mask[...] = went through ≥1
+    specular bounce). NOTE: geometric ranging — TRUE transient ToF LiDAR (depth_transient)
+    still needs mitransient + a transient variant (unavailable in the OptiX7 build)."""
+    import drjit as dr
+    el = np.deg2rad(np.linspace(vfov_deg / 2, -vfov_deg / 2, n_rings))[:, None]
+    az = np.deg2rad(np.linspace(0, 360, n_az, endpoint=False))[None, :] + yaw_rad
+    dx = (np.cos(el) * np.sin(az)).ravel().astype("float32")
+    dy = np.broadcast_to(np.sin(el), (n_rings, n_az)).ravel().astype("float32")
+    dz = (np.cos(el) * np.cos(az)).ravel().astype("float32")
+    n = dx.size
+    o = mi.Point3f(np.full(n, float(origin[0]), "float32"),
+                   np.full(n, float(origin[1]), "float32"),
+                   np.full(n, float(origin[2]), "float32"))
+    ray = mi.Ray3f(o, mi.Vector3f(dx, dy, dz))
+    ctx = mi.BSDFContext()
+    total = dr.zeros(mi.Float, n)          # accumulated path length
+    rng = dr.full(mi.Float, dr.inf, n)     # recorded range at first diffuse return
+    spec = dr.zeros(mi.Float, n)           # 1 if a specular bounce happened
+    active = dr.full(mi.Bool, True, n)
+    for b in range(int(specular_bounces) + 1):
+        si = scene.ray_intersect(ray, active)
+        hit = si.is_valid() & active
+        total = dr.select(hit, total + si.t, total)
+        bs, _ = si.bsdf().sample(ctx, si, 0.0, mi.Point2f(0.0, 0.0), hit)
+        is_delta = mi.has_flag(bs.sampled_type, mi.BSDFFlags.Delta) & hit
+        # diffuse/rough return (or last allowed bounce) -> record range here
+        finalize = hit & (~is_delta | (b == int(specular_bounces)))
+        rng = dr.select(finalize, total, rng)
+        spec = dr.select(is_delta, mi.Float(1.0), spec)
+        wo_w = si.to_world(bs.wo)
+        ray = mi.Ray3f(si.p + wo_w * 1e-4, wo_w)
+        active = is_delta & (mi.UInt32(b) < int(specular_bounces))
+        if not bool(dr.any(active)):
+            break
+    r = np.array(rng); r = np.where(np.isfinite(r) & (r < 1e30), r, np.nan)
+    return r.reshape(n_rings, n_az), np.array(spec).reshape(n_rings, n_az) > 0.5
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--rig", default="ranger_mini_default")
@@ -113,6 +192,13 @@ def main() -> int:
     ap.add_argument("--height", type=float, default=1.0, help="fallback height when mount is all-zero")
     ap.add_argument("--mount-convention", choices=["zup", "pipeline"], default="zup",
                     help="zup=author intent [lateral,forward,height]; pipeline=current sweep [lateral,height,forward]")
+    ap.add_argument("--no-depth", action="store_true", help="skip per-sensor AOV depth map")
+    ap.add_argument("--no-lidar", action="store_true", help="skip per-viewpoint geometric LiDAR range cast")
+    ap.add_argument("--lidar-rings", type=int, default=128, help="LiDAR vertical channels (OS1-128=128)")
+    ap.add_argument("--lidar-az", type=int, default=1024, help="LiDAR azimuth samples per revolution")
+    ap.add_argument("--lidar-height", type=float, default=1.0, help="LiDAR mount height (m) above the viewpoint")
+    ap.add_argument("--lidar-specular", type=int, default=6,
+                    help="follow N specular (mirror/glass) bounces so LiDAR ranges reflected geometry (0=naive, stops at first surface)")
     a = ap.parse_args()
 
     import mitsuba as mi
@@ -163,7 +249,39 @@ def main() -> int:
                                        "dop_mean": float(m["dop"][lit].mean())}
                 print(f"  [vp{vi} {s['sensor_id']:22s} {band:7s}] S0 {srec['bands'][band]['s0_mean']:.4f} "
                       f"DoP {srec['bands'][band]['dop_mean']:.3f}", flush=True)
+            # depth (AOV) — same sensor pose, band-independent
+            if not a.no_depth:
+                from PIL import Image
+                dep = render_depth(mi, scene, spp=min(a.spp, 256))
+                Image.fromarray(_seq_cmap(dep, valid=dep > 0)).save(OUT / f"vp{vi}_{s['sensor_id']}_depth.png")
+                dv = dep[dep > 0]
+                srec["depth"] = {"valid_frac": round(float((dep > 0).mean()), 3),
+                                 "min_m": round(float(dv.min()), 2) if dv.size else None,
+                                 "max_m": round(float(dv.max()), 2) if dv.size else None}
+                print(f"  [vp{vi} {s['sensor_id']:22s} depth  ] valid {srec['depth']['valid_frac']*100:.0f}% "
+                      f"{srec['depth']['min_m']}–{srec['depth']['max_m']} m", flush=True)
             vprec["sensors"].append(srec)
+        # LiDAR (geometric spinning range cast) — one per viewpoint from robot origin
+        if not a.no_lidar:
+            from PIL import Image
+            lorigin = _mat4_from_xy_yaw(vp["x"], vp["y"], yaw_rad, height_m=a.lidar_height)[:3, 3]
+            rng, spec = render_lidar(mi, scene, lorigin, yaw_rad, n_rings=a.lidar_rings,
+                                     n_az=a.lidar_az, specular_bounces=a.lidar_specular)
+            Image.fromarray(_seq_cmap(rng, valid=np.isfinite(rng))).save(OUT / f"vp{vi}_lidar.png")
+            # specular overlay: red-tint the returns that came via a mirror/glass bounce
+            base = _seq_cmap(rng, valid=np.isfinite(rng)).astype(np.float32)
+            base[spec] = base[spec] * 0.4 + np.array([210, 40, 40], np.float32) * 0.6
+            Image.fromarray(base.astype(np.uint8)).save(OUT / f"vp{vi}_lidar_specular.png")
+            rv = rng[np.isfinite(rng)]
+            vprec["lidar"] = {"rings": a.lidar_rings, "az": a.lidar_az,
+                              "specular_bounces": a.lidar_specular,
+                              "hit_frac": round(float(np.isfinite(rng).mean()), 3),
+                              "specular_frac": round(float(spec.mean()), 3),
+                              "min_m": round(float(rv.min()), 2) if rv.size else None,
+                              "max_m": round(float(rv.max()), 2) if rv.size else None}
+            print(f"  [vp{vi} LiDAR {a.lidar_rings}x{a.lidar_az} spec{a.lidar_specular}] hit "
+                  f"{vprec['lidar']['hit_frac']*100:.0f}% specular {vprec['lidar']['specular_frac']*100:.1f}% "
+                  f"{vprec['lidar']['min_m']}–{vprec['lidar']['max_m']} m", flush=True)
         result["viewpoints"].append(vprec)
     result["n_render"] = n_render
     (OUT / "debug_render.json").write_text(json.dumps(result, indent=1))

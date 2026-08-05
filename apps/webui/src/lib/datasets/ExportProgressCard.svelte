@@ -21,6 +21,14 @@
 	];
 
 	const currentStageIdx = $derived(STAGES.findIndex((s) => s.key === (job?.stage ?? '')));
+	type EstimateGroup = {
+		source_bytes?: number;
+		core_estimated_bytes?: number;
+		polar_extension_estimated_bytes?: number;
+	};
+	const sizeEstimate = $derived(job?.summary?.size_estimate ?? null);
+	const estimateVariantRows = $derived(Object.entries(sizeEstimate?.breakdown?.by_variant ?? {}) as Array<[string, EstimateGroup]>);
+	const estimateSensorRows = $derived(Object.entries(sizeEstimate?.breakdown?.by_sensor ?? {}) as Array<[string, EstimateGroup]>);
 	const percent = $derived(() => {
 		const t = job?.total ?? 0;
 		const c = job?.current ?? 0;
@@ -78,6 +86,34 @@
 		</div>
 	{/if}
 
+	{#if sizeEstimate}
+		<div class="ep-message">
+			Estimate: Core {fmtBytes(sizeEstimate.core_estimated_bytes)}
+			{#if (sizeEstimate.polar_extension_estimated_bytes ?? 0) > 0}
+				+ Polar {fmtBytes(sizeEstimate.polar_extension_estimated_bytes)}
+			{/if}
+			= {fmtBytes(sizeEstimate.single_estimated_bytes)}
+			<span class="ep-legacy">(selected legacy inputs: {fmtBytes(sizeEstimate.legacy_selected_bytes ?? sizeEstimate.source_bytes)})</span>
+		</div>
+		{#if estimateVariantRows.length}
+			<div class="ep-breakdown" aria-label="Export size estimate by variant">
+				{#each estimateVariantRows as [variant, values]}
+					<span>{variant}: {fmtBytes(values.source_bytes ?? 0)} → {fmtBytes((values.core_estimated_bytes ?? 0) + (values.polar_extension_estimated_bytes ?? 0))}</span>
+				{/each}
+			</div>
+		{/if}
+		{#if estimateSensorRows.length}
+			<details class="ep-breakdown-details">
+				<summary>Sensor/modality estimate</summary>
+				<div class="ep-breakdown">
+					{#each estimateSensorRows as [sensor, values]}
+						<span>{sensor}: {fmtBytes(values.source_bytes ?? 0)} → {fmtBytes((values.core_estimated_bytes ?? 0) + (values.polar_extension_estimated_bytes ?? 0))}</span>
+					{/each}
+				</div>
+			</details>
+		{/if}
+	{/if}
+
 	{#if job.current_file}
 		<div class="ep-current-file" title={job.current_file}>📄 {job.current_file}</div>
 	{:else if job.message}
@@ -105,6 +141,11 @@
 	.ep-counters { display: flex; gap: 12px; font-size: 11px; color: var(--text-muted, #64748b); flex-wrap: wrap; }
 	.ep-current-file { font-size: 10px; color: var(--text-muted, #64748b); font-family: monospace; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; padding: 4px 6px; background: rgba(0,0,0,0.04); border-radius: 4px; max-width: 100%; min-width: 0; box-sizing: border-box; }
 	.ep-message { font-size: 11px; color: var(--text-muted, #64748b); font-style: italic; overflow-wrap: anywhere; }
+	.ep-legacy { display: block; margin-top: 2px; font-size: 10px; }
+	.ep-breakdown { display: flex; flex-wrap: wrap; gap: 4px 10px; font-size: 10px; color: var(--text-muted, #64748b); }
+	.ep-breakdown span { font-family: monospace; }
+	.ep-breakdown-details { font-size: 10px; color: var(--text-muted, #64748b); }
+	.ep-breakdown-details summary { cursor: pointer; margin-bottom: 4px; }
 	.ep-status { font-size: 11px; padding: 6px 8px; border-radius: 4px; }
 	.ep-status.cancelled { background: #fef3c7; color: #92400e; }
 	.ep-status.failed { background: #fee2e2; color: #991b1b; }

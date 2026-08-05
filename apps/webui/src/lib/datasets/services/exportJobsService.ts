@@ -19,6 +19,7 @@ export interface ExportJobSubmitPayload {
 	png_only?: boolean;
 	include_birdseye?: boolean;
 	include_episode_birdseye?: boolean;
+	export_profile?: 'compact_with_polar_extension' | 'single_lossless_core' | 'navigation_only' | 'legacy_full';
 	eval_perturbation?: boolean;
 }
 
@@ -34,6 +35,7 @@ export interface ExportJobStatus {
 	job_id: string;
 	project_id?: string;
 	scene_id?: string;
+	export_profile?: 'compact_with_polar_extension' | 'single_lossless_core' | 'navigation_only' | 'legacy_full';
 	status: 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'unknown';
 	stage?: string;
 	stage_label?: string;

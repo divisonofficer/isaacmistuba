@@ -74,3 +74,35 @@ def test_band_940_available():
     i940 = nr.nir_reflectance("vegetation_leaf", 940)
     assert i854["band"] == 854 and i940["band"] == 940
     assert 0 < i940["mean"] <= 1
+
+
+def test_pseudo_nir_preserves_texture_and_range():
+    # V-shape: extremes -> bright, mid-gray -> darkest; texture (spatial variance) survives
+    rgb = np.array([[[0.0, 0, 0], [0.5, 0.5, 0.5], [1, 1, 1], [0.2, 0.8, 0.1]]], np.float32)
+    out = nr.pseudo_nir_albedo(rgb)
+    assert out.shape == (1, 4)
+    assert abs(out[0, 0] - out[0, 2]) < 1e-6          # black and white both -> 0.93
+    assert out[0, 1] < out[0, 0]                        # mid-gray is the darkest
+    assert 0.46 <= out.min() and out.max() <= 0.931    # weights sum 0.93
+    # a textured input keeps variance (unlike the class-prior constant)
+    tex = np.random.default_rng(0).random((16, 16, 3)).astype(np.float32)
+    assert nr.pseudo_nir_albedo(tex).std() > 0.02
+
+
+def test_pseudo_nir_accepts_2d():
+    assert nr.pseudo_nir_albedo(np.array([[0.3, 0.7]], np.float32)).shape == (1, 2)
+
+
+def test_hybrid_preserves_texture_at_class_mean():
+    # a textured albedo -> NIR keeps structure (not flat) BUT centered on class prior
+    rng = np.random.default_rng(1)
+    base = 0.4 + 0.15 * rng.random((48, 48))
+    base3 = np.repeat(base[..., None], 3, -1)
+    out = nr.synthesize_nir_texture(base3, "wood")
+    info = nr.nir_reflectance("wood")
+    assert out.std() > 0.015                                  # texture present (not flat μ)
+    assert abs(out.mean() - info["mean"]) < 0.08              # mean ≈ class prior (physics)
+    assert out.min() >= info["min"] - 1e-3 and out.max() <= min(info["max"], 0.95) + 1e-3
+    # low-structure class transfers LESS RGB texture than a high one
+    low = nr.synthesize_nir_texture(base3, "printed_surface")
+    assert low.std() < out.std()

@@ -1,6 +1,21 @@
+# Measured pBRDF datasets (pbrdf_2020, hpbrdf_2025) were removed from local disk
+# on 2026-08-05 to reclaim ~203 GB. They are DEPRECATED, not gone upstream: the
+# project runs full-analytic BSDFs, so nothing on the active render path needs
+# them. Each entry carries a `deprecated:` block with a `restore:` recipe.
+# To bring one back: follow `restore`, then flip `enabled` to true.
 datasets:
   - id: pbrdf_2020
-    enabled: true
+    enabled: false
+    deprecated:
+      since: 2026-08-05
+      reason: >-
+        Local copy deleted to reclaim disk; measured pBRDF is not on the
+        active render path (full-analytic is).
+      freed_gb: 23
+      restore: >-
+        Download the KAIST pBRDF dataset (Baek et al. 2020) and unpack to
+        data/pbrdf_2020/mitsuba/, then set enabled: true.
+      restore_url: https://vclab.kaist.ac.kr/siggraph2020/index.html
     source_role: canonical_baseline
     local_root: data/pbrdf_2020
     kind: measured_polarized
@@ -17,7 +32,23 @@ datasets:
       - spectralon
 
   - id: hpbrdf_2025
-    enabled: true
+    enabled: false
+    deprecated:
+      since: 2026-08-05
+      reason: >-
+        Local copy deleted to reclaim disk; measured pBRDF is not on the
+        active render path (full-analytic is).
+      freed_gb: 180
+      restore: >-
+        Channel-split slices (the canonical source, ~10 GB for the RGB+NIR
+        tier) come from bean - run `python tools/hpbrdf/mirror.py`, which
+        rsyncs /bean_yunseong/hpbrdf/table_publish_final into
+        data/hpbrdf_2025/channels/. The 170 GB monolithic .hpbrdf blobs that
+        used to sit in data/hpbrdf_2025/raw/ are legacy and are NOT needed to
+        render; re-download from KAIST only for full-spectrum analysis.
+        Then set enabled: true.
+      restore_command: python tools/hpbrdf/mirror.py
+      restore_url: https://vclab.kaist.ac.kr/siggraphasia2025p3/
     source_role: canonical_nir_polarization
     local_root: data/hpbrdf_2025
     kind: measured_polarized

@@ -6,7 +6,14 @@
 
 	const ARCHETYPES = [
 		{ value: 'apartment', label: '아파트 (거실 중심)' },
-		{ value: 'office', label: '오피스 (복도망·수십 방)' }
+		{ value: 'office', label: '오피스 (복도망·수십 방)' },
+		{ value: 'single_room', label: 'Single room (방 하나·창문 포함)' }
+	] as const;
+	const ROOM_TYPES = [
+		{ value: 'living-room', label: '거실' },
+		{ value: 'bedroom', label: '침실' },
+		{ value: 'kitchen', label: '주방' },
+		{ value: 'bathroom', label: '욕실' }
 	] as const;
 	const DENSITIES = [
 		{ value: 'model_house', label: 'model_house (거의 빈)' },
@@ -21,6 +28,7 @@
 	};
 
 	let archetype = $state<InfinigenGenerateRequest['archetype']>('apartment');
+	let roomType = $state<NonNullable<InfinigenGenerateRequest['room_type']>>('living-room');
 	let density = $state<InfinigenGenerateRequest['density']>('normal_lived_in');
 	let stage = $state<InfinigenGenerateRequest['stage']>('full');
 	let seed = $state(todaySeed());
@@ -70,12 +78,14 @@
 		job = null;
 		jobId = null;
 		try {
-			const res = await startInfinigenGenerate(projectId, {
+			const request: InfinigenGenerateRequest = {
 				archetype, density, stage,
 				seed: seed.trim() || 'today',
 				import_scene: importScene,
 				bake_pbr: bakePbr
-			});
+			};
+			if (archetype === 'single_room') request.room_type = roomType;
+			const res = await startInfinigenGenerate(projectId, request);
 			jobId = res.job_id;
 			job = { status: 'queued', stage: 'queued', scene_id: res.scene_id, seed: res.seed };
 			poll();
@@ -88,7 +98,7 @@
 
 <section class="infinigen-gen">
 	<h4>Infinigen 씬 생성</h4>
-	<p class="hint">절차적 floor plan(아파트/오피스)을 생성하고 OpticalNav scene으로 import 합니다.</p>
+	<p class="hint">절차적 floor plan을 생성하고 OpticalNav scene으로 import 합니다. Single room은 terrain 없이 창문 opening만 만들고 envmap은 후속 렌더 단계에서 적용합니다.</p>
 
 	<div class="grid">
 		<label><span>archetype</span>
@@ -96,6 +106,13 @@
 				{#each ARCHETYPES as o}<option value={o.value}>{o.label}</option>{/each}
 			</select>
 		</label>
+		{#if archetype === 'single_room'}
+			<label><span>방 타입</span>
+				<select bind:value={roomType} disabled={running}>
+					{#each ROOM_TYPES as o}<option value={o.value}>{o.label}</option>{/each}
+				</select>
+			</label>
+		{/if}
 		<label><span>가구 밀도</span>
 			<select bind:value={density} disabled={running}>
 				{#each DENSITIES as o}<option value={o.value}>{o.label}</option>{/each}

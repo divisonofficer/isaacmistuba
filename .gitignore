@@ -76,3 +76,7 @@ data/hpbrdf_2025/
 *:Zone.Identifier
 # machine-local infinigen env path (scripts/infinigen_env.py)
 .infinigen_env
+
+# 로컬 실험/외부 프로젝트 산출물 — git 외부에서 관리
+experiment/
+piper_manipulation/

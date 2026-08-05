@@ -30,6 +30,11 @@ __all__ = [
     "render_scene_floorplan",
     "RenderDaemon",
     "serve_render_daemon",
+    "RenderLedger",
+    "scene_version_id",
+    "new_render_version_id",
+    "versioned_bundle_dir",
+    "resolve_current_bundle_dir",
 ]
 
 from .usd_loader import UsdSceneLoader
@@ -71,3 +76,5 @@ from .observation_bridge import (
 )
 from .scene_floorplan import render_scene_floorplan
 from .render_daemon import RenderDaemon, serve_render_daemon
+
+from .versioned_artifacts import (RenderLedger, new_render_version_id, resolve_current_bundle_dir, scene_version_id, versioned_bundle_dir)

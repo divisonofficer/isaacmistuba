@@ -35,8 +35,8 @@ export_optical_nav_dataset.py → 학습용 번들 (images + index.jsonl + graph
 │   ├── robomituba_bridge/         # Job manifest / snapshot 계약 (pure Python)
 │   ├── mitsuba_converter/         # USD→Mitsuba 변환 + 멀티모달 렌더 + render daemon
 │   ├── navigation_dataset/        # ⭐ OpticalNav: episode/grid/graph/planner/exporter/evaluator
-│   ├── mitsuba3/                  # Mitsuba 3 (submodule) — 표준 빌드 트리
-│   ├── mitsuba3-optix7/           # ⭐ Mitsuba 3 OptiX7 변형 — 프로덕션 렌더러 소스
+│   ├── mitsuba3/                  # Device 1: WSL2 + RTX 5090용 Mitsuba/OptiX 8 소스
+│   ├── mitsuba3-optix7/           # Device 2: Ubuntu + RTX 3090 ×8용 OptiX 7 호환 소스
 │   └── README.md
 │
 ├── apps/                          # ⭐ 16 일반 도구 (루트) + 4 서브폴더 (특화)
@@ -75,7 +75,7 @@ export_optical_nav_dataset.py → 학습용 번들 (images + index.jsonl + graph
 ├── tests/         scripts/       tools/    third_party/
 ├── dev_report/    docs/   notes/   related_works/       # 보고서·문서
 ├── vendor_datasets/   vendor_docs/
-├── build/mitsuba3-optix7/         # ⭐ 프로덕션 Mitsuba 빌드 산출물 (data/, plugins/, python/)
+├── build/mitsuba3-optix7/         # legacy/NAS artifact (런처는 사용하지 않음)
 ├── AGENTS.md  CLAUDE.md           # 이 파일 (둘은 동일 미러)
 └── 각 모듈/앱 디렉토리의 CLAUDE.md  # 상세 가이드
 ```
@@ -89,23 +89,27 @@ export_optical_nav_dataset.py → 학습용 번들 (images + index.jsonl + graph
 | **robomituba_bridge** | Job manifest / SceneSnapshot / RenderRequest 데이터 계약 (의존성 없는 pure Python) | `types.py`, `manifest.py`, `paths.py`, `io.py`, `material_mapping.py` |
 | **mitsuba_converter** | USD→IR→Mitsuba dict, 멀티모달 렌더, observation manifest, HTTP render daemon | `usd_loader.py`, `mitsuba_builder.py`, `multimodal.py`(대형), `observation_bridge.py`, `render_daemon.py`, `pipeline.py`, `cli.py`, `mitsuba_runtime.py` |
 | **navigation_dataset** | OpticalNav 저작: episode schema, scene annotation, traversability grid, A* planner, instruction template, rollout, exporter, evaluator | `episode_schema.py`, `scene_annotations.py`, `planner.py`, `renderer.py`, `authoring_compile.py`, `cli.py` |
-| **mitsuba3** | Mitsuba 3 표준 submodule. 표준 빌드 트리에서 사용 | `src/bsdfs/`, `src/integrators/` 등 |
-| **mitsuba3-optix7** | ⭐ **프로덕션 렌더러 소스** (OptiX7 변형). 측정 pBRDF BSDF 커스터마이즈 포함 | `src/bsdfs/measured_polarized.cpp`, `measured_polarized_rgb.cpp` |
+| **mitsuba3** | Device 1(Windows + WSL2 + RTX 5090)의 OptiX 8 계열 렌더러 소스 | `src/bsdfs/`, `src/integrators/` 등 |
+| **mitsuba3-optix7** | Device 2(Ubuntu + RTX 3090 ×8)의 OptiX 7 호환 렌더러 소스. 측정 pBRDF BSDF 커스터마이즈 포함 | `src/bsdfs/measured_polarized.cpp`, `measured_polarized_rgb.cpp` |
 
 ---
 
-## 🔭 Mitsuba 빌드 — 두 개가 공존 (주의!)
+## 🔭 Mitsuba 빌드 — NAS 공유 소스, 장비별 빌드 (주의!)
 
-이 저장소에는 **두 개의 Mitsuba 소스/빌드**가 있고, 어느 것이 런타임에 쓰이는지 반드시 구분해야 한다.
+저장소 소스는 NAS의 `/jarvis/project/robomituba`에서 공유하지만, Mitsuba/Dr.Jit 빌드 산출물은 OS, Python ABI, NVIDIA driver, OptiX ABI와 GPU 세대에 종속된다. 따라서 아래 두 빌드는 “실험용/프로덕션용” 구분이 아니라 **서로 다른 실행 장비를 위한 호스트별 빌드**다.
 
-| 소스 | 빌드 위치 | 사용처 |
-|------|-----------|--------|
-| `modules/mitsuba3` | `/home/jinnyeong/robomituba-build/mitsuba3` | 실험·검증용. `setpath.sh` + `LD_LIBRARY_PATH=/usr/lib/wsl/lib` 로 로드 |
-| `modules/mitsuba3-optix7` | `build/mitsuba3-optix7` | ⭐ **프로덕션 데몬/control-plane** (conda env `mitsuba_optix7`, `ROBOMITUBA_MITSUBA_PYTHONPATH=build/mitsuba3-optix7/python`) |
+| 장비 | 실행 환경 | 렌더러 소스 | 빌드·Python 경로 |
+|------|-----------|-------------|------------------|
+| **Device 1** | Windows + WSL2 + RTX 5090 (Blackwell, compute capability 12.0) | `modules/mitsuba3` | `/home/jinnyeong/robomituba-build/mitsuba3`, 보통 `/usr/bin/python3` |
+| **Device 2** | Ubuntu server + RTX 3090 ×8 cluster | `modules/mitsuba3-optix7` | `${ROBOMITUBA_MITSUBA_BUILD_DIR:-$HOME/robomituba-build/mitsuba3-optix7}`, `/root/miniconda3/envs/mitsuba_optix7/bin/python` |
 
-- 플랫폼: WSL2 + RTX GPU. OptiX 드라이버는 `/usr/lib/wsl/lib/libnvoptix.so.1`.
-- 컴파일된 variant(표준 빌드 기준): `scalar_rgb, cuda_rgb, cuda_spectral, cuda_ad_spectral, cuda_ad_spectral_polarized`.
-- **BSDF/플러그인을 고치면 두 트리 중 "프로덕션에서 쓰는 빌드"를 재컴파일했는지 확인할 것.** `modules/mitsuba3` 만 고치면 데몬에는 반영되지 않는다.
+- Device 1은 OptiX 8 계열 빌드이며 WSL driver library가 필요할 때 `LD_LIBRARY_PATH=/usr/lib/wsl/lib`를 사용한다.
+- Device 2는 기존 cluster driver와의 호환을 위해 OptiX 7 계열 빌드를 사용한다. 자세한 환경 제약은 `docs/2026-05-19_phase_r_environment_handoff.md`를 참고한다.
+- `scripts/run_daemon_optix7.sh`와 관련 런처는 첫 GPU의 compute capability가 `12.0`이면 Device 1 빌드, 그 외에는 Device 2 빌드를 기본 선택한다. 환경변수로 덮어쓸 수 있으므로 실제 worker 경로를 로그에서 다시 확인한다.
+- **NAS에서 소스 commit은 공유해도 `build/`, 가상환경, `.so`, Dr.Jit cache는 장비 사이에 복사하거나 교차 재사용하지 않는다.** 각 장비에서 자기 toolchain으로 다시 빌드한다.
+- C++ BSDF/플러그인 변경을 양쪽 장비에 배포하려면 두 소스 트리의 대응 변경 여부를 확인하고, 각 장비 빌드를 별도로 재컴파일·검증한다. 한쪽의 성공은 다른 쪽 반영을 의미하지 않는다.
+- 렌더 또는 플러그인 검증 기록에는 최소한 `hostname`, GPU 이름/compute capability, driver, Python 경로, `ROBOMITUBA_MITSUBA_PYTHONPATH`, Mitsuba variants와 plugin `.so` 경로를 남긴다.
+- “현재 프로덕션 빌드”를 경로명만 보고 단정하지 않는다. 작업을 실행하는 장비와 daemon worker가 실제 로드한 경로가 기준이다.
 
 ---
 
@@ -138,7 +142,7 @@ out/bridge_jobs/opticalnav-shared_office_floor_001-template-vp_000083-h_090-rgb/
 - **`apps/run_control_plane_dev.sh`** — render daemon + webui 를 함께 띄우는 개발 런처. daemon 기본 `127.0.0.1:8765`.
 - **render daemon** (`mitsuba_converter/render_daemon.py`) — RenderRequest 큐, 멀티 GPU 워커(서브프로세스 분리), scene cache.
 - **webui** (`apps/webui`, SvelteKit + Three.js) — OpticalNav 장면/그래프 에디터, 렌더 모니터, XML-native preview.
-- 주요 환경변수(런처에서 주입): `ROBOMITUBA_RENDER_GPU_INDICES`(예 `0,1,2,3`), `ROBOMITUBA_SCENE_LOAD_CONCURRENCY`, `ROBOMITUBA_MITSUBA_PYTHON`/`_PYTHONPATH`(프로덕션 optix7 빌드 지정), `ROBOMITUBA_DISABLE_CUDA`, `ROBOMITUBA_DISABLE_CPU_FALLBACK`.
+- 주요 환경변수(런처에서 주입): `ROBOMITUBA_RENDER_GPU_INDICES`(예 `0,1,2,3`), `ROBOMITUBA_SCENE_LOAD_CONCURRENCY`, `ROBOMITUBA_MITSUBA_PYTHON`/`_PYTHONPATH`(현재 장비의 빌드 지정), `ROBOMITUBA_DISABLE_CUDA`, `ROBOMITUBA_DISABLE_CPU_FALLBACK`.
 
 ---
 
@@ -149,14 +153,13 @@ out/bridge_jobs/opticalnav-shared_office_floor_001-template-vp_000083-h_090-rgb/
 - BSDF 플러그인 `measured_polarized` (분광/편광) 와 `measured_polarized_rgb` (RGB 합성) 가 이를 담당.
 - **렌더 파이프라인 분기** (`multimodal.py`): `use_channel_rgb_plugin` 이면 단일패스 `measured_polarized_rgb` 렌더, 실패 시 3-pass channel-split fallback(`_compose_channel_split_rgb`).
 
-### ⚠️ 알려진 이슈 / Action item (2026-06-15 기준)
+### ⚠️ 과거 이슈 / 현재 확인 절차
 
-- **3-pass fallback의 compose(`_rgb_channel_intensity`)가 각 파장 패스를 luminance로 붕괴**시켜, 측정 재질이 아닌 일반 재질이 **gray(R=G=B)** 로 죽는다. 결과적으로 OpticalNav grid 데이터셋(shared_office_floor 등)이 사실상 흑백 + 일부 컬러 오브젝트로 렌더됨.
-- 근본 원인: 프로덕션 빌드 `build/mitsuba3-optix7` 에 **`measured_polarized_rgb.so` 가 컴파일되어 있지 않아** 플러그인 로드 실패 → 매 프레임 fallback.
-- 상태:
-  - `modules/mitsuba3-optix7/src/bsdfs/measured_polarized_rgb.cpp` 는 존재·등록되어 있으나 **빌드 안 됨** (RGB-only 설계 → cuda_ad_spectral 패스에서 로드 가능한지 검증 필요).
-  - `modules/mitsuba3` 에 rgb+spectral+polarized 모두 지원하는 별도 구현이 추가되어 `/home/jinnyeong/robomituba-build/mitsuba3` 에서 end-to-end 컬러 복원이 검증됨 — 단, **이건 프로덕션 빌드가 아님**.
-- **할 일**: 프로덕션(optix7) 빌드에 cuda_ad_spectral 에서 로드 가능한 `measured_polarized_rgb` 를 컴파일 → 전체 grid 재렌더(`apps/migrations/rerender_optical_nav_grid.py`, `--only-gray` 는 부분만 잡으니 전체 권장). black 프레임(EXR≈0)은 별도 원인.
+- 2026-06-15에는 Device 2 빌드에서 `measured_polarized_rgb` 로드 실패로 3-pass fallback이 실행됐고, compose(`_rgb_channel_intensity`)가 일반 재질을 gray(R=G=B)로 만드는 문제가 있었다.
+- 이후 두 빌드에 플러그인 산출물이 존재한 기록이 있지만, NAS의 소스나 다른 장비의 `.so` 존재만으로 현재 worker 반영을 판단하면 안 된다.
+- gray 렌더가 재발하면 재빌드부터 하지 말고 daemon log의 worker Python/PYTHONPATH, 해당 장비의 `plugins/measured_polarized_rgb.so`, `mi.variants()`와 실제 plugin load smoke를 순서대로 확인한다.
+- 플러그인이 현재 장비 빌드에 없거나 stale일 때만 대응 소스 트리를 그 장비에서 재컴파일한다. Device 1 성공은 Device 2 반영을, Device 2 성공은 Device 1 반영을 보장하지 않는다.
+- black frame(EXR≈0)은 이 channel-split gray 문제와 별개이므로 조명, 카메라와 scene staging을 조사한다.
 
 ---
 
@@ -166,10 +169,15 @@ out/bridge_jobs/opticalnav-shared_office_floor_001-template-vp_000083-h_090-rgb/
 # 모듈 (editable install)
 pip install -e modules/robomituba_bridge -e modules/mitsuba_converter -e modules/navigation_dataset
 
-# Mitsuba 런타임 (검증용 표준 빌드)
+# Device 1: WSL2 + RTX 5090 빌드 확인
 export LD_LIBRARY_PATH=/usr/lib/wsl/lib:$LD_LIBRARY_PATH
 source /home/jinnyeong/robomituba-build/mitsuba3/setpath.sh
 python -c "import mitsuba as mi; print(mi.variants())"
+
+# Device 2: Ubuntu + RTX 3090 cluster 빌드 확인
+PYTHONPATH="${ROBOMITUBA_MITSUBA_BUILD_DIR:-$HOME/robomituba-build/mitsuba3-optix7}/python" \
+  /root/miniconda3/envs/mitsuba_optix7/bin/python \
+  -c "import mitsuba as mi; print(mi.variants())"
 
 # OpticalNav CLI
 python apps/opticalnav.py --help
@@ -200,15 +208,29 @@ cd modules/navigation_dataset  && pytest tests/   # viewpoint_graph, authoring_m
 
 ---
 
+## 🔎 Agent Search Scope
+
+대용량 렌더 출력과 외부 데이터가 소스 탐색에 섞이지 않도록 다음 규칙을 따른다.
+
+1. 기본 소스 탐색 범위는 `apps/`, `modules/*/src/`, `modules/*/tests/`, `tools/`, `scripts/`, `configs/`, `docs/` 및 루트 설정 파일이다. WebUI는 `apps/webui/src/`를 우선한다.
+2. `.ignore`에 정의된 `out/`, 외부 데이터셋, asset cache, build/cache 디렉터리와 EXR/NPZ 등 대형 바이너리는 기본 재귀 탐색에서 제외한다. `configs/datasets/`는 소스 설정이므로 제외하지 않는다.
+3. 소스 탐색에는 `rg`와 `rg --files`를 사용하고 `.ignore`를 우회하는 `-uuu`, `--no-ignore`는 관련 산출물 조사가 명시적으로 필요한 경우에만 사용한다.
+4. 저장소 전체 재귀 검색은 최초 위치 파악 용도로 최대 한 번만 수행한다. 파일 위치를 찾은 뒤에는 디렉터리, 확장자 또는 glob을 지정해 범위를 좁힌다.
+5. 렌더 장애를 조사할 때는 `out/` 전체를 검색하지 않는다. 해당 scene/job ID를 먼저 확정하고 `out/bridge_jobs/<job>/job_status.json`, `render_progress.log`, `requests/`, `observations/`처럼 알려진 경로를 직접 읽는다.
+6. 병렬/background 탐색은 서로 독립적인 범위에만 사용하며 최대 2개로 제한한다. 여러 탐색기가 동일한 저장소 전체 검색을 반복하지 않게 한다.
+7. `.ignore`는 탐색 성능을 위한 규칙이며 파일 소유권이나 삭제 정책이 아니다. 무시된 파일을 수정·삭제해야 한다는 의미로 해석하지 않는다.
+
+---
+
 ## 🐛 Troubleshooting
 
 | 문제 | 원인 | 해결 |
 |------|------|------|
-| `No module mitsuba` | 런타임 미로드 | `setpath.sh` + `LD_LIBRARY_PATH=/usr/lib/wsl/lib` |
-| `Could not initialize OptiX` | WSL OptiX 미연결 | `LD_LIBRARY_PATH` 에 `/usr/lib/wsl/lib` 추가 |
-| 렌더가 흑백(gray)으로 나옴 | `measured_polarized_rgb` 미빌드 → channel-split fallback | 위 "알려진 이슈" 참고 (프로덕션 빌드에 플러그인 컴파일 + 재렌더) |
+| `No module mitsuba` | 현재 장비와 Python/PYTHONPATH 불일치 | worker가 선택한 Device 1/2 경로와 `ROBOMITUBA_MITSUBA_*` 확인 |
+| `Could not initialize OptiX` | 장비별 driver/OptiX ABI 불일치 | Device 1은 WSL library path, Device 2는 OptiX 7 호환 build와 driver 확인 |
+| 렌더가 흑백(gray)으로 나옴 | `measured_polarized_rgb` 로드 실패 → channel-split fallback | worker 경로와 현재 장비 plugin load smoke 후 필요한 빌드만 재컴파일 |
 | 검은색(black) 렌더 | 조명/카메라/씬 staging 문제 | manifest/scene XML, 조명 확인 |
-| 플러그인 수정이 반영 안 됨 | 잘못된 빌드 트리 컴파일 | 프로덕션은 `build/mitsuba3-optix7` 임을 확인 |
+| 플러그인 수정이 반영 안 됨 | 다른 장비의 소스/빌드를 수정함 | daemon worker 경로를 확인하고 해당 Device 1/2 빌드를 그 장비에서 재컴파일 |
 | GPU OOM | spp/resolution 과다 | 값 감소, `ROBOMITUBA_TEXTURE_MAX_RESOLUTION` 조정 |
 
 ---

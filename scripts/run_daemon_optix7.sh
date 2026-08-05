@@ -7,17 +7,34 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+# Compiled Mitsuba/Dr.Jit artifacts are host-specific and must not live below
+# the NAS-backed repository. Override this per host when needed.
+
 # Pick the Mitsuba build that matches the host GPU's compute capability.
 #  - sm_120 (RTX 50 / Blackwell) → device B build  (modules/mitsuba3, OptiX 8)
 #  - everything else             → device A build  (modules/mitsuba3-optix7, OptiX 7)
 # Override either default by exporting the env var before running this launcher.
 _compute_cap="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d '[:space:]' || true)"
+
+if [[ -z "${ROBOMITUBA_MITSUBA_BUILD_DIR:-}" ]]; then
+  if [[ "$_compute_cap" == "12.0" ]]; then
+    ROBOMITUBA_MITSUBA_BUILD_DIR="${ROBOMITUBA_DEVICE1_MITSUBA_BUILD_DIR:-${HOME:-/tmp}/robomituba-build/mitsuba3}"
+  else
+    ROBOMITUBA_MITSUBA_BUILD_DIR="${ROBOMITUBA_DEVICE2_MITSUBA_BUILD_DIR:-${HOME:-/tmp}/robomituba-build/mitsuba3-optix7}"
+  fi
+fi
+case "$ROBOMITUBA_MITSUBA_BUILD_DIR" in
+  /jarvis/*)
+    echo "[launcher] ERROR: compiled Mitsuba build must be host-local, got $ROBOMITUBA_MITSUBA_BUILD_DIR" >&2
+    exit 2
+    ;;
+esac
 if [[ "$_compute_cap" == "12.0" ]]; then
   : "${ROBOMITUBA_MITSUBA_PYTHON:=/usr/bin/python3}"
-  : "${ROBOMITUBA_MITSUBA_PYTHONPATH:=/home/jinnyeong/robomituba-build/mitsuba3/python}"
+  : "${ROBOMITUBA_MITSUBA_PYTHONPATH:=${ROBOMITUBA_MITSUBA_BUILD_DIR}/python}"
 else
   : "${ROBOMITUBA_MITSUBA_PYTHON:=/root/miniconda3/envs/mitsuba_optix7/bin/python}"
-  : "${ROBOMITUBA_MITSUBA_PYTHONPATH:=/jarvis/project/robomituba/build/mitsuba3-optix7/python}"
+  : "${ROBOMITUBA_MITSUBA_PYTHONPATH:=${ROBOMITUBA_MITSUBA_BUILD_DIR}/python}"
 fi
 : "${ROBOMITUBA_RENDER_GPU_INDICES:=0,1,2,3}"
 : "${ROBOMITUBA_RENDER_WORKER_BACKLOG_PER_GPU:=2}"
@@ -31,6 +48,7 @@ fi
 : "${PYTHONUNBUFFERED:=1}"
 
 export ROBOMITUBA_MITSUBA_PYTHON
+export ROBOMITUBA_MITSUBA_BUILD_DIR
 export ROBOMITUBA_MITSUBA_PYTHONPATH
 export ROBOMITUBA_RENDER_GPU_INDICES
 export ROBOMITUBA_RENDER_WORKER_BACKLOG_PER_GPU
@@ -42,5 +60,7 @@ export ROBOMITUBA_WORKER_HEARTBEAT_TIMEOUT_S
 export ROBOMITUBA_SCENE_LOAD_CONCURRENCY
 export ROBOMITUBA_RENDER_INPROCESS
 export PYTHONUNBUFFERED
+
+echo "[launcher] Mitsuba build: $ROBOMITUBA_MITSUBA_BUILD_DIR"
 
 exec python -u "$REPO_ROOT/apps/run_render_daemon.py" "$@"

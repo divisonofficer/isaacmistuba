@@ -52,11 +52,53 @@ def test_resolve_policy():
         pass
 
 
-def test_semantic_is_a_documented_stub():
-    try:
-        SemanticContractPolicy().decide(ctx(500_000)); assert False
-    except NotImplementedError:
-        pass
+def _mslots(*pairs):
+    return [{"name": n, "optical_class": oc} for n, oc in pairs]
+
+
+def test_semantic_below_min_faces_keeps_full():
+    d = SemanticContractPolicy(min_faces=50_000).decide(ctx(40_000, semantic_type="plant"))
+    assert d.decimate is False and d.target_ratio == 1.0
+
+
+def test_semantic_foliage_background_is_aggressive():
+    # cactus/dirt in a container, background decoration -> organic_mass, deep cut
+    d = SemanticContractPolicy().decide(ctx(
+        2_000_000, factory="PlantContainerFactory", semantic_type="plant",
+        optical_class="diffuse",
+        material_slots=_mslots(("cactus", "diffuse"), ("dirt", "diffuse")),
+        bbox_max=(0.4, 0.4, 0.4)))
+    assert d.decimate is True and d.target_ratio <= 0.10
+
+
+def test_semantic_structural_landmark_is_protected():
+    # cabinet is a structural landmark -> rigid_planar + landmark step -> keep full
+    d = SemanticContractPolicy().decide(ctx(
+        500_000, factory="SingleCabinetFactory", semantic_type="wall",
+        optical_class="diffuse", material_slots=_mslots(("wood", "diffuse")),
+        bbox_max=(1.2, 1.2, 1.2)))
+    assert d.target_ratio >= 0.5
+
+
+def test_semantic_navcritical_glass_floor():
+    # navigation-critical glass door: optical slot floored >= 30%
+    d = SemanticContractPolicy().decide(ctx(
+        900_000, factory="DoorFactory", semantic_type="glass_door",
+        optical_class="glass", material_slots=_mslots(("glass", "glass")),
+        bbox_max=(2.0, 2.0, 0.1)))
+    assert d.target_ratio >= 0.30
+
+
+def test_semantic_import_failure_degrades_to_keep():
+    p = SemanticContractPolicy()
+    p._engine = None
+    # force the lazy import to fail by pointing at a bogus attr path
+    import mesh_decimation as _md
+    orig = p._load
+    p._load = lambda: (_ for _ in ()).throw(ImportError("boom"))
+    d = p.decide(ctx(2_000_000, semantic_type="plant"))
+    p._load = orig
+    assert d.decimate is False and d.target_ratio == 1.0
 
 
 class _FakeMesh:

@@ -157,7 +157,39 @@ class AuthoringMapTests(unittest.TestCase):
         self.assertEqual(restored["objects"][-1]["geometry"]["size_m"], [0.5, 0.8, 0.4])
         self.assertEqual(restored["materials"][0]["render_binding"]["bsdf_strategy"], "measured_polarized")
 
+    def test_polarized_lcd_emitter_roundtrip(self) -> None:
+        payload = self.minimum_map()
+        payload["objects"].append({
+            "id": "polarized_lcd_001",
+            "type": "landmark",
+            "label": "Polarized LCD",
+            "placement": "point",
+            "geometry": {
+                "type": "point",
+                "center": [0.5, 1.5],
+                "size_m": [2.4, 1.35, 0.03],
+                "base_height_m": 0.6,
+                "yaw_deg": 90.0,
+            },
+            "navigation": {"blocks_navigation": False},
+            "is_emitter": True,
+            "emitter_shape": "wall_panel",
+            "emitter_radiance": [10.0, 10.0, 10.0],
+            "emitter_intensity": 1.0,
+            "emitter_polarized": True,
+            "emitter_polarizer_angle_deg": 15.0,
+            "emitter_pattern": "rgb_directional",
+        })
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "authoring_map.json"
+            save_authoring_map(path, payload)
+            restored = authoring_map_to_payload(load_authoring_map(path))
+        lcd = restored["objects"][-1]
+        self.assertEqual(lcd["emitter_shape"], "wall_panel")
+        self.assertTrue(lcd["emitter_polarized"])
+        self.assertEqual(lcd["emitter_polarizer_angle_deg"], 15.0)
+        self.assertEqual(lcd["emitter_pattern"], "rgb_directional")
+
 
 if __name__ == "__main__":
     unittest.main()
-

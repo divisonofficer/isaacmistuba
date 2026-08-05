@@ -6,13 +6,16 @@ produce (rooms / doors / opens / interiors / windows, each ``{"shape": "<shapely
 expr string>"}``), but *generated* from a seed so every plan differs while staying
 VALID for Infinigen's solver.
 
-Two archetypes:
+Three archetypes:
   - "apartment": living-room-centered, one central corridor band, open LDK
     (living/kitchen/dining joined by ``opens``), bedrooms + bathroom off the
     corridor. Hub-and-spoke nav graph.
   - "office": a corridor network (full-width spine + vertical branches) with many
     small rooms budding off the corridors; rooms at spine x branch junctions touch
     two corridors -> varied entry counts.
+  - "single_room": exactly one semantic room with a south entrance and a north
+    exterior window; outdoor context is intentionally deferred to a Mitsuba
+    environment map.
 
 WHY BSP: a recursive rectangular partition guarantees Infinigen's #1 hard
 constraint by construction -- rooms tile the footprint with no gaps/overlaps, so
@@ -44,6 +47,17 @@ OPEN_W = 1.8        # LDK / corridor-junction open width
 WIN_MIN = 1.2       # min exterior edge to place a window
 WIN_MAX = 3.0       # max window width
 CW = 1.5            # corridor width (> MARGIN)
+
+SINGLE_ROOM_TYPES = ("living-room", "bedroom", "kitchen", "bathroom")
+
+# Room-specific dimensions keep furniture placement plausible while retaining
+# enough variation for inverse-rendering batches.
+SINGLE_ROOM_PROFILES = {
+    "living-room": {"sizes": [(5.5, 4.5), (6.0, 5.0), (6.5, 5.0)], "window_width": 3.5, "panoramic": True},
+    "bedroom": {"sizes": [(4.0, 3.5), (4.5, 4.0), (5.0, 4.0)], "window_width": 2.2, "panoramic": False},
+    "kitchen": {"sizes": [(4.0, 3.5), (4.5, 4.0), (5.0, 4.0)], "window_width": 2.4, "panoramic": False},
+    "bathroom": {"sizes": [(2.8, 2.8), (3.0, 3.0), (3.5, 3.0)], "window_width": 1.4, "panoramic": False},
+}
 
 
 def q(v: float, unit: float = UNIT) -> float:
@@ -225,6 +239,39 @@ def build_office(rng: random.Random, target_rooms: int):
     cells.extend(rooms)
 
     return cells, W, H
+
+
+def build_single_room(rng: random.Random, room_type: str):
+    """Build one furnished-room semantic with an entrance and exterior window.
+
+    The floor plan intentionally contains no terrain or outdoor geometry. The
+    window is a stable optical opening; a later Mitsuba environment-map policy
+    supplies the view outside it without inflating the Infinigen scene.
+    """
+    room_type = room_type.replace("_", "-")
+    if room_type not in SINGLE_ROOM_PROFILES:
+        raise ValueError(f"unknown single-room type {room_type!r}; have {SINGLE_ROOM_TYPES}")
+    profile = SINGLE_ROOM_PROFILES[room_type]
+    width, depth = rng.choice(profile["sizes"])
+    width, depth = q(width), q(depth)
+    room = (0.0, 0.0, width, depth)
+
+    # Put the entrance on the south wall and the window on the opposite wall,
+    # ensuring a walkable route and an unobstructed exterior ray direction.
+    door_width = min(DOOR_W, q(width - 2 * UNIT))
+    door_x = q((width - door_width) * 0.25)
+    window_width = min(float(profile["window_width"]), q(width - 2 * UNIT))
+    window_x = q((width - window_width) * 0.5)
+    window = {"shape": _line_str((window_x, depth), (q(window_x + window_width), depth))}
+    if profile["panoramic"]:
+        window["is_panoramic"] = 1
+
+    return [Cell(room, room_type)], width, depth, {
+        "doors": {
+            "door": {"shape": _line_str((door_x, 0.0), (q(door_x + door_width), 0.0))}
+        },
+        "windows": {"window": window},
+    }
 
 
 # --- emission --------------------------------------------------------------
@@ -443,6 +490,8 @@ def build_floor_plan(seed: int, archetype: str, target_rooms: int | None = None)
         elif archetype == "office":
             tr = target_rooms or rng.randint(20, 40)
             cells, W, H = build_office(rng, tr)
+        elif archetype == "single_room":
+            raise ValueError("single_room requires build_single_room_plan(seed, room_type)")
         else:
             raise ValueError(f"unknown archetype {archetype!r}")
         plan = emit(cells, W, H, rng)
@@ -453,16 +502,35 @@ def build_floor_plan(seed: int, archetype: str, target_rooms: int | None = None)
         f"floorplan_gen: no valid plan for seed={seed} archetype={archetype}: {errs}")
 
 
+def build_single_room_plan(seed: int, room_type: str) -> dict:
+    """Build and validate one deterministic room plan for an Infinigen scene."""
+    canonical = room_type.replace("_", "-")
+    if canonical not in SINGLE_ROOM_TYPES:
+        raise ValueError(f"unknown single-room type {room_type!r}; have {SINGLE_ROOM_TYPES}")
+    rng = random.Random(int(seed) * 1000 + 17)
+    cells, W, H, openings = build_single_room(rng, canonical)
+    plan = emit(cells, W, H, rng)
+    plan["doors"] = openings["doors"]
+    plan["windows"] = openings["windows"]
+    errs = validate_plan(plan)
+    if errs:
+        raise ValueError(f"single-room floorplan invalid for seed={seed} type={canonical}: {errs}")
+    return plan
+
+
 if __name__ == "__main__":
     import argparse
     import json
 
     ap = argparse.ArgumentParser(description="Dump a generated floor plan as JSON.")
     ap.add_argument("--seed", type=int, required=True)
-    ap.add_argument("--archetype", choices=["apartment", "office"], default="apartment")
+    ap.add_argument("--archetype", choices=["apartment", "office", "single_room"], default="apartment")
+    ap.add_argument("--room-type", choices=SINGLE_ROOM_TYPES, default="living-room")
     ap.add_argument("--rooms", type=int, default=None)
     a = ap.parse_args()
-    plan = build_floor_plan(a.seed, a.archetype, a.rooms)
+    plan = (build_single_room_plan(a.seed, a.room_type)
+            if a.archetype == "single_room"
+            else build_floor_plan(a.seed, a.archetype, a.rooms))
     print(json.dumps(plan, indent=2))
     print("# rooms:", len(plan["rooms"]), "doors:", len(plan["doors"]),
           "opens:", len(plan["opens"]), "windows:", len(plan["windows"]))

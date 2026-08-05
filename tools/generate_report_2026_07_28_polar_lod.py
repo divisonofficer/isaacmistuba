@@ -173,8 +173,11 @@ def main() -> int:
         slot_html = ""
         if e.get("slots"):
             def _slot_nir(s):
-                r = s.get("nir854")
-                return f", ρ854={r:.2f}" if isinstance(r, (int, float)) else ", NIR=Fresnel"
+                p, r = s.get("nir854_pseudo"), s.get("nir854")
+                if isinstance(p, (int, float)):
+                    ref = f" (물리 ρ854={r:.2f})" if isinstance(r, (int, float)) else ""
+                    return f", NIR_pseudo={p:.2f}{ref}"
+                return ", NIR=Fresnel"
             parts = " · ".join(
                 f'<code>{s["matname"]}</code> ({s["cls"]}, {s["faces"]:,} tri{_slot_nir(s)})'
                 for s in e["slots"])
@@ -182,7 +185,7 @@ def main() -> int:
             tot_tri = sum(s["faces"] for s in e["slots"]) or 1
             container_pct = 100.0 * metal_tri / tot_tri
             slot_html = (
-                f'<p class="mut">material_slots (slot별 렌더 · NIR ρ854): {parts}</p>'
+                f'<p class="mut">material_slots (slot별 렌더 · NIR pseudo albedo): {parts}</p>'
                 f'<div class="note good" style="margin:8px 0"><strong>무엇을 고쳤나.</strong> 유닛 optical_class는 '
                 f'<em>용기</em>({e["cls"]}) 재질이라, 이전엔 메시 전체를 그 BSDF 하나로 렌더했다 — 용기는 전체 삼각형의 '
                 f'<strong>{container_pct:.1f}%</strong>뿐이고 나머지 <strong>{100-container_pct:.1f}%</strong>(식생·흙·모래)가 '
@@ -190,10 +193,11 @@ def main() -> int:
                 f'per-slot optical_class로 분리해 slot마다 올바른 BSDF(glass→dielectric, metal→roughconductor Al, '
                 f'diffuse→pplastic)로 렌더한다.</div>')
         elif e.get("shader"):
-            _r = e.get("nir854")
+            _p, _r = e.get("nir854_pseudo"), e.get("nir854")
+            _ptxt = f"{_p:.2f}" if isinstance(_p, (int, float)) else "—"
             _rtxt = f"{_r:.2f}" if isinstance(_r, (int, float)) else "—"
-            slot_html = (f'<p class="mut">shader <code>{e["shader"]}</code> · NIR ρ854 = '
-                         f'<strong>{_rtxt}</strong> (class-prior, single-channel)</p>')
+            slot_html = (f'<p class="mut">shader <code>{e["shader"]}</code> · NIR pseudo albedo = '
+                         f'<strong>{_ptxt}</strong> (RGB→pseudo, single-channel · 참고 물리 class-prior ρ854 = {_rtxt})</p>')
         sections += f"""
 <h2>{ASSET_LABEL[key]} &nbsp;<span class="{_vc}" style="font-size:14px">[{_vl}]</span></h2>
 <p class="mut">asset id <code>{_asset_id(key, e)}</code></p>
@@ -261,9 +265,11 @@ def main() -> int:
 <strong>보는 법.</strong> 각 자산을 원본 고밀도 → 중간 → 최저폴리로 decimate하며 <strong>RGB · DoLP · AoLP · S1/S0 · S2/S0</strong>를
 visible/NIR 두 밴드로 렌더했다. <strong>visible S0 열은 실제 3채널 컬러</strong>(Stokes S0의 R/G/B, 톤맵)이며 — 단일재질 자산은
 gray placeholder(pplastic ρ0.5)라 무채색으로 보이는 게 정상이고, 다중재질 화분은 slot별 diffuse albedo로 컬러가 보인다.
-<strong>NIR S0 열은 실제 1채널 반사율 맵</strong>이다 — 각 재질 slot이 class-prior NIR 반사율(ρ854; 식생≈0.52·흙≈0.30·
-모래≈0.30·조개/산호≈0.66·나무≈0.50)로 칠해져 <strong>slot마다 다른 회색</strong>으로 나온다(metal/glass은 Fresnel). NIR은 RGB에서
-유도하지 않는 독립 채널이다. 열을 가로질러 각 모달리티가 <strong>얼마나 무너지는지 눈으로</strong> 보고,
+<strong>NIR S0 열은 실제 1채널 반사율 맵</strong>이다 — <strong>확정 규약(2026-07-30)</strong>에 따라 각 재질 slot을
+visible RGB albedo에서 만든 <strong>pseudo-NIR albedo</strong>(<code>max(rgb,1-rgb)·[.229,.587,.114]</code>)로 칠했다.
+어두운 slot(흙 등)은 <code>1-rgb</code>의 밝은 쪽을 취해 물리 class-prior보다 밝아지며(예: 흙 물리 0.30 → pseudo 0.78), metal/glass은
+여전히 Fresnel 경로다. 이전 버전은 class-prior ρ854(식생≈0.52·흙≈0.30·나무≈0.50) 상수를 썼다 — Infinigen import 규약이
+pseudo-NIR로 확정돼 이 실험도 같은 재렌더로 갱신했다. 열을 가로질러 각 모달리티가 <strong>얼마나 무너지는지 눈으로</strong> 보고,
 아래 표에서 <strong>원본 2-seed 노이즈 바닥</strong> 대비 오차가 그 이하(≤noise)면 주행 데이터로는 사실상 구분 불가로 판정한다.
 </div>
 
@@ -312,11 +318,13 @@ S1/S0·S2/S0 <span class="sw" style="background:linear-gradient(90deg,#3b4cbf,#f
 <h2>메모</h2>
 <ul>
 <li>재질은 optical_class로 편광 트리오 주입(glass→smooth <code>dielectric</code>, metal→<code>roughconductor</code> Al, diffuse→<code>pplastic</code>).</li>
-<li><strong>NIR ρ854 = class-prior 합성값</strong>(<code>modules/mitsuba_converter/nir_reflectance.py</code> +
-<code>configs/datasets/class_band_reflectance_v1.json</code>). diffuse slot은 shader/optical_class → physical_material
-클래스 평균 NIR 반사율을 <em>uniform scalar</em>로 주입(그래서 NIR S0가 1채널)하고, metal/glass은 diffuse가 아니라 Fresnel(eta·k@854 /
-dielectric) 경로를 쓴다 — NIR을 RGB에서 유도하지 않는다. <strong>주의: ρ854 값은 물리적으로 추론한 class prior이며 측정
-provenance(Stage-1)는 미완이다</strong> — 절대 NIR 밝기의 정량 결론에는 쓰지 말 것.</li>
+<li><strong>NIR = pseudo-NIR albedo (확정 규약, 2026-07-30)</strong> — <code>modules/mitsuba_converter/nir_reflectance.py</code>의
+<code>pseudo_nir_albedo()</code>로 visible RGB albedo에서 <code>max(rgb,1-rgb)·[.229,.587,.114]</code>를 계산해 diffuse slot에
+주입한다(여기선 slot albedo가 flat이라 NIR S0가 1채널). metal/glass은 diffuse가 아니라 Fresnel(eta·k@854 / dielectric) 경로.
+Infinigen import 오브젝트는 polar 재질(pplastic 등) + 이 pseudo-NIR albedo로 렌더한다는 규약이 확정돼, 이 고폴리 LOD 실험도
+동일 조건으로 재렌더했다. <strong>주의: pseudo-NIR은 텍스처 보존 heuristic이지 물리 반사율이 아니다</strong>(초록잎과 초록페인트가
+실제 NIR에선 다르지만 여기선 동일) — NIR 밝기의 정량 결론에는 쓰지 말 것. slot별 <em>참고 물리 class-prior ρ854</em>는
+표기로 병기(<code>class_band_reflectance_v1.json</code>).</li>
 <li>단일 오브젝트를 0.3&nbsp;m로 정규화해 근접 프레이밍 — 주행 거리(투영 수십 px)에서는 sub-pixel 평균으로 편광 차이가 더 줄어든다(별도 scene A/B에서 검증 예정).</li>
 <li>노멀맵 베이크 변형(C)은 미포함 — 여기서는 <strong>단순 decimation(B)</strong>만으로 편광이 얼마나 보존되는지를 본다.</li>
 <li><strong>메시 LOD 알고리즘</strong>: quadric error metric decimation (QEM, Garland–Heckbert 1997). 구현은

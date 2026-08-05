@@ -116,7 +116,10 @@ def test_glass_transmission_is_not_nested_under_twosided(tmp_path: Path) -> None
     assert shape.find("./bsdf[@type='twosided']") is None
     normalmap = shape.find("./bsdf[@type='normalmap']")
     assert normalmap is not None
-    assert normalmap.find("./bsdf[@type='roughdielectric']") is not None
+    # Smooth dielectric only: roughdielectric yields DoLP=0 in the polarized
+    # build, so the analytic glass baseline must not use it.
+    assert normalmap.find("./bsdf[@type='dielectric']") is not None
+    assert normalmap.find("./bsdf[@type='roughdielectric']") is None
 
 
 def test_uv_resampling_rois_never_leak_outside_object() -> None:

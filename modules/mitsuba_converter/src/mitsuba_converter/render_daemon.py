@@ -5,6 +5,7 @@ from collections import deque
 import concurrent.futures
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
+from functools import lru_cache
 import hashlib
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -87,6 +88,16 @@ from .scene_floorplan import CameraOverlay, LightOverlay, render_scene_floorplan
 from .glb_texture_adapter import extract_glb_mesh_for_editor as extract_glb_mesh_for_editor_preview
 from .usd_editor_geometry import build_usd_editor_geometry, extract_prim_mesh_for_editor
 from .worker_manager import WorkerManager
+from .versioned_artifacts import (
+    RenderLedger,
+    new_render_version_id,
+    scene_version_id,
+    task_key as versioned_task_key,
+    write_current_pointer,
+    versioned_bundle_dir,
+    version_root,
+    resolve_current_bundle_dir,
+)
 
 
 RenderFn = Callable[..., ObservationBundleManifest]
@@ -130,6 +141,16 @@ def _is_render_queue_proxy_path(method: str, path: str) -> bool:
     if len(parts) >= 4 and parts[1] == "scenes" and parts[3:] == ["graph", "sweep"]:
         return method == "POST"
     if len(parts) >= 2 and parts[1] in {"graph-render-batches", "render-batches"}:
+        return method in {"GET", "POST"}
+    if len(parts) >= 4 and parts[1] == "scenes" and parts[3] == "render-versions":
+        # Render-version listing/promote/prune is durable render-queue state.
+        # Everything else under scenes/{id}/ (authoring-map, annotation,
+        # editor-geometry, prim-mesh, optical-perturbation, ...) is plain
+        # scene-description I/O that MUST stay local so scene loading and node
+        # authoring keep working when no GPU render queue is running.
+        return method in {"GET", "POST"}
+    if len(parts) >= 2 and parts[1] == "graph-render-runs":
+        # Durable run status / resume live in the render queue.
         return method in {"GET", "POST"}
     if len(parts) >= 2 and parts[1:] == ["episodes", "render"]:
         return method == "POST"
@@ -826,6 +847,39 @@ def _extract_obj_mtl_material(obj_path: "Path", *, repo_root: "Path | None" = No
     return None
 
 
+@lru_cache(maxsize=4096)
+def _metallic_texture_is_fabricated(path: str) -> bool:
+    """A legitimate Disney/glTF metallic map VARIES spatially (some texels metal, some
+    dielectric). Blender's glTF exporter, however, leaks a DEFAULT metallicFactor=1.0
+    into the packed metallic-roughness texture for procedural (non-Principled)
+    Infinigen materials, yielding a UNIFORM ≈1.0 map on genuinely non-metal surfaces
+    (ceramic-tile floor, plaster). Returns True for that fabricated near-uniform-high
+    case so the caller can drop it while keeping real spatial metallic maps. Fails
+    open (False = keep the texture) if the image can't be read."""
+    try:
+        import numpy as _np
+        from PIL import Image as _Image
+        a = _np.asarray(_Image.open(path).convert("L"), _np.float32) / 255.0
+        return bool(a.mean() > 0.90 and a.std() < 0.06)
+    except Exception:
+        return False
+
+
+@lru_cache(maxsize=4096)
+def _roughness_texture_is_near_zero(path: str) -> bool:
+    """A GLB-leaked / mis-extracted roughness map for a procedural material can arrive
+    as a near-zero (mirror-smooth) texture, which — unlike the scalar path — is fed to
+    Mitsuba's ``alpha`` with NO floor. Returns True for that near-mirror case so the
+    caller can fall back to the .blend authored roughness. Fails open (False)."""
+    try:
+        import numpy as _np
+        from PIL import Image as _Image
+        a = _np.asarray(_Image.open(path).convert("L"), _np.float32) / 255.0
+        return bool(a.mean() < 0.10)
+    except Exception:
+        return False
+
+
 def _append_extracted_bsdf_xml(
     shape: "ET.Element",
     extracted_material: dict[str, Any],
@@ -883,10 +937,20 @@ def _append_extracted_bsdf_xml(
         ET.SubElement(parent, "rgb", attrib={"name": name, "value": value})
 
     def _alpha(parent: "ET.Element", *, floor: float, default: float) -> None:
-        if roughness_tex:
+        # A .blend-authored MATTE surface (source roughness high) whose GLB export
+        # leaked a fabricated near-0 roughness map would otherwise render as a
+        # mirror — the texture path applies no floor. When the extracted map
+        # contradicts the authored roughness, fall back to the authored scalar; a
+        # genuinely glossy material (low source roughness) keeps its texture.
+        src_rough = (inject or {}).get("source_roughness")
+        contradiction = bool(
+            roughness_tex and src_rough is not None and float(src_rough) > 0.3
+            and _roughness_texture_is_near_zero(roughness_tex))
+        if roughness_tex and not contradiction:
             _bitmap(parent, "alpha", roughness_tex, raw=True)
         else:
-            value = _clamp_bsdf_alpha(roughness, default=default, floor=floor)
+            scalar = float(src_rough) if contradiction else roughness
+            value = _clamp_bsdf_alpha(scalar, default=default, floor=floor)
             ET.SubElement(parent, "float", attrib={"name": "alpha", "value": f"{value:.4f}"})
 
     # Mitsuba's twosided plugin rejects any child with a transmission
@@ -933,38 +997,72 @@ def _append_extracted_bsdf_xml(
         return bsdf
 
     if strategy in {"dielectric", "roughdielectric"}:
-        rough = strategy == "roughdielectric" or bool(roughness_tex)
-        bsdf = ET.SubElement(parent, "bsdf", type="roughdielectric" if rough else "dielectric")
+        # Always emit SMOOTH dielectric: roughdielectric produces DoLP=0 in the
+        # polarized build (dev_report 2026-07-06 §2.1), so frosted/rough glass is
+        # consumed as smooth dielectric to keep the Fresnel polarization signal.
+        bsdf = ET.SubElement(parent, "bsdf", type="dielectric")
         ET.SubElement(bsdf, "float", attrib={"name": "int_ior", "value": f"{ior:.4f}"})
-        if rough:
-            _alpha(bsdf, floor=_MIN_ROUGHDIELECTRIC_ALPHA, default=0.1)
         return True
 
+    # Metal-classified (optical_class) surfaces render as CONDUCTORS regardless of the
+    # exported metallic map — this also fixes the symmetric export bug (a real metal
+    # whose GLB metallic leaks a fabricated all-0 map must not become plastic).
     if class_metal or scalar_metal:
         _metal(parent, rough=(strategy != "conductor" or bool(roughness_tex)))
         return True
 
+    # NON-metal-classified surface with a metallic map. AUTHORITY = the .blend
+    # material's authored metallic (source_metallic, from Stage-1 _extract_material),
+    # NOT the map's pixel statistics: a uniform 0 or 1 map is a perfectly valid
+    # metallic workflow (ceramic=0, stainless=1), so "uniform ⇒ fake" is wrong in
+    # general. Blender's glTF exporter, however, fills a DEFAULT metallic=1.0 for
+    # procedural (non-Principled) materials, so a .blend-authored dielectric (floor
+    # tile metallic=0) arrives with a spurious metal map (41% of this scene's maps).
+    #   source_metallic ≳ 0.5  -> honour the metallic map (real metal / mixed inlay)
+    #   source_metallic ≈ 0     -> .blend says dielectric; the map contradicts it and
+    #                              is dropped -> render pplastic (preserves .blend intent)
+    #   source_metallic unknown -> fall back to the uniform-high anomaly heuristic
+    #                              (the only signal left for non-Infinigen assets)
     if metallic_tex:
-        blend = ET.SubElement(parent, "bsdf", type="blendbsdf")
-        _bitmap(blend, "weight", metallic_tex, raw=True)
-        # Child BSDF IDs are unnecessary here and Mitsuba IDs are global across
-        # the whole scene. Reusing names such as ``a_plastic`` for every shape
-        # creates a duplicate-id parse failure after shape BSDF deduplication.
-        _plastic(blend)
-        _metal(blend, rough=True)
-        return True
+        src_metallic = (inject or {}).get("source_metallic")
+        if src_metallic is None:
+            honour_map = not _metallic_texture_is_fabricated(metallic_tex)
+        else:
+            honour_map = float(src_metallic) >= 0.5
+        if honour_map:
+            blend = ET.SubElement(parent, "bsdf", type="blendbsdf")
+            _bitmap(blend, "weight", metallic_tex, raw=True)
+            # Child BSDF IDs are unnecessary here and Mitsuba IDs are global across
+            # the whole scene; reusing names creates duplicate-id parse failures.
+            _plastic(blend)
+            _metal(blend, rough=True)
+            return True
 
     _plastic(parent)
     return True
 
 
+# Only these analytic BSDFs actually produce a polarized Fresnel response in the
+# RGB-polarized build. roughdielectric / thindielectric / plastic / roughplastic
+# yield DoLP=0 (dev_report 2026-07-06 §2.1), so they are NOT here — they must be
+# coerced to the polarizing trio (see _POLAR_BSDF_SUBSTITUTION) before the polar
+# pass, never marked polar-capable.
 _POLAR_RGB_ANALYTIC_BSDFS = {
     "pplastic",
     "dielectric",
-    "roughdielectric",
     "conductor",
     "roughconductor",
-    "thindielectric",
+}
+
+# forbidden (DoLP=0) analytic BSDF -> polarizing-trio substitute, enforced on the
+# polar path so every surface is consumed by dielectric / roughconductor / pplastic.
+_POLAR_BSDF_SUBSTITUTION = {
+    "roughdielectric": "dielectric",
+    "thindielectric": "dielectric",
+    "plastic": "pplastic",
+    "roughplastic": "pplastic",
+    "diffuse": "pplastic",
+    "principled": "pplastic",
 }
 
 
@@ -975,8 +1073,12 @@ def _analytic_fallback_from_binding(binding: Mapping[str, Any]) -> dict[str, Any
     else:
         resolved = dict(binding)
     strategy = str(resolved.get("bsdf_strategy") or "").strip().lower()
-    if strategy in {"roughplastic", "diffuse", "plastic", "principled"}:
-        strategy = "pplastic"
+    # Consume every non-polarizing analytic BSDF into the polarizing trio
+    # (dielectric / roughconductor / pplastic). roughdielectric/thindielectric ->
+    # dielectric so frosted/rough glass still polarizes (Fresnel), rather than
+    # silently rendering DoLP=0.
+    if strategy in _POLAR_BSDF_SUBSTITUTION:
+        strategy = _POLAR_BSDF_SUBSTITUTION[strategy]
     if not strategy or strategy in {"measured", "measured_polarized"}:
         strategy = "pplastic"
     resolved["bsdf_strategy"] = strategy
@@ -1311,7 +1413,12 @@ _DEFAULT_EMITTER_RADIANCE = (15.0, 14.0, 12.0)
 _MAX_EMITTER_RADIANCE = float(os.environ.get("ROBOMITUBA_MAX_EMITTER_RADIANCE", "80.0"))
 
 
-def _append_area_emitter_xml(shape: "ET.Element", obj: dict[str, Any]) -> None:
+def _append_area_emitter_xml(
+    shape: "ET.Element",
+    obj: dict[str, Any],
+    *,
+    channel_mask: tuple[float, float, float] | None = None,
+) -> None:
     """Wrap ``shape`` with an area emitter using the object's authored radiance."""
     import xml.etree.ElementTree as ET
 
@@ -1323,6 +1430,8 @@ def _append_area_emitter_xml(shape: "ET.Element", obj: dict[str, Any]) -> None:
             base = _DEFAULT_EMITTER_RADIANCE
     else:
         base = _DEFAULT_EMITTER_RADIANCE
+    if channel_mask is not None:
+        base = tuple(base[i] * max(0.0, float(channel_mask[i])) for i in range(3))
     try:
         intensity = float(obj.get("emitter_intensity") or 1.0)
     except (TypeError, ValueError):
@@ -1332,6 +1441,153 @@ def _append_area_emitter_xml(shape: "ET.Element", obj: dict[str, Any]) -> None:
     rgb = " ".join(f"{min(cap, max(0.0, c * intensity)):.6g}" for c in base)
     emitter = ET.SubElement(shape, "emitter", type="area")
     ET.SubElement(emitter, "rgb", attrib={"name": "radiance", "value": rgb})
+
+
+def _wall_panel_matrix(
+    *,
+    cx: float,
+    cy: float,
+    cz: float,
+    yaw_deg: float,
+    pitch_deg: float,
+    roll_deg: float,
+    scale_x: float,
+    scale_y: float,
+    offset_x: float = 0.0,
+    offset_y: float = 0.0,
+    offset_z: float = 0.0,
+) -> np.ndarray:
+    """Return a stable local-panel-to-world transform for Mitsuba rectangles."""
+    def _rot_x(deg: float) -> np.ndarray:
+        angle = math.radians(deg)
+        c, s = math.cos(angle), math.sin(angle)
+        return np.array(
+            [[1, 0, 0, 0], [0, c, -s, 0], [0, s, c, 0], [0, 0, 0, 1]],
+            dtype=np.float64,
+        )
+
+    def _rot_y(deg: float) -> np.ndarray:
+        angle = math.radians(deg)
+        c, s = math.cos(angle), math.sin(angle)
+        return np.array(
+            [[c, 0, s, 0], [0, 1, 0, 0], [-s, 0, c, 0], [0, 0, 0, 1]],
+            dtype=np.float64,
+        )
+
+    def _rot_z(deg: float) -> np.ndarray:
+        angle = math.radians(deg)
+        c, s = math.cos(angle), math.sin(angle)
+        return np.array(
+            [[c, -s, 0, 0], [s, c, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]],
+            dtype=np.float64,
+        )
+
+    scale = np.diag([scale_x, scale_y, 1.0, 1.0]).astype(np.float64)
+    local = np.eye(4, dtype=np.float64)
+    local[:3, 3] = [offset_x, offset_y, offset_z]
+    world = np.eye(4, dtype=np.float64)
+    world[:3, 3] = [cx, cy, cz]
+    return world @ _rot_y(yaw_deg) @ _rot_z(pitch_deg) @ _rot_x(roll_deg) @ local @ scale
+
+
+def _append_matrix_transform(shape: "ET.Element", matrix: np.ndarray) -> None:
+    import xml.etree.ElementTree as ET
+
+    xf = ET.SubElement(shape, "transform", attrib={"name": "to_world"})
+    value = " ".join(
+        f"{float(item):.9f}" for item in np.asarray(matrix, dtype=np.float32).reshape(-1)
+    )
+    ET.SubElement(xf, "matrix", attrib={"value": value})
+
+
+def _wall_panel_emitter_elements(
+    obj: dict[str, Any],
+    *,
+    obj_id: str,
+    cx: float,
+    cy: float,
+    cz: float,
+    sx: float,
+    sy: float,
+    yaw_deg: float,
+    pitch_deg: float,
+    roll_deg: float,
+) -> list["ET.Element"]:
+    """Build a white or RGB-directional wall LCD and its optional polarizer."""
+    import xml.etree.ElementTree as ET
+
+    pattern = str(obj.get("emitter_pattern") or "white").strip()
+    elements: list[ET.Element] = []
+    if pattern == "rgb_directional":
+        # +local Y is the upper half. The overlaps reproduce the common
+        # left=G, right=R, upper=B spectrally multiplexed display pattern.
+        quadrants = (
+            ("upper_left", -sx / 4.0, sy / 4.0, (0.0, 1.0, 1.0)),
+            ("upper_right", sx / 4.0, sy / 4.0, (1.0, 0.0, 1.0)),
+            ("lower_left", -sx / 4.0, -sy / 4.0, (0.0, 1.0, 0.0)),
+            ("lower_right", sx / 4.0, -sy / 4.0, (1.0, 0.0, 0.0)),
+        )
+        for suffix, ox, oy, mask in quadrants:
+            shape = ET.Element("shape", type="rectangle", id=f"{obj_id}_{suffix}")
+            _append_matrix_transform(
+                shape,
+                _wall_panel_matrix(
+                    cx=cx,
+                    cy=cy,
+                    cz=cz,
+                    yaw_deg=yaw_deg,
+                    pitch_deg=pitch_deg,
+                    roll_deg=roll_deg,
+                    scale_x=sx / 4.0,
+                    scale_y=sy / 4.0,
+                    offset_x=ox,
+                    offset_y=oy,
+                ),
+            )
+            _append_area_emitter_xml(shape, obj, channel_mask=mask)
+            elements.append(shape)
+    else:
+        shape = ET.Element("shape", type="rectangle", id=obj_id)
+        _append_matrix_transform(
+            shape,
+            _wall_panel_matrix(
+                cx=cx,
+                cy=cy,
+                cz=cz,
+                yaw_deg=yaw_deg,
+                pitch_deg=pitch_deg,
+                roll_deg=roll_deg,
+                scale_x=sx / 2.0,
+                scale_y=sy / 2.0,
+            ),
+        )
+        _append_area_emitter_xml(shape, obj)
+        elements.append(shape)
+
+    if bool(obj.get("emitter_polarized")):
+        polarizer = ET.Element("shape", type="rectangle", id=f"{obj_id}_polarizer")
+        _append_matrix_transform(
+            polarizer,
+            _wall_panel_matrix(
+                cx=cx,
+                cy=cy,
+                cz=cz,
+                yaw_deg=yaw_deg,
+                pitch_deg=pitch_deg,
+                roll_deg=roll_deg,
+                scale_x=(sx / 2.0) * 1.01,
+                scale_y=(sy / 2.0) * 1.01,
+                offset_z=0.03,
+            ),
+        )
+        bsdf = ET.SubElement(polarizer, "bsdf", type="polarizer")
+        try:
+            theta = float(obj.get("emitter_polarizer_angle_deg") or 0.0)
+        except (TypeError, ValueError):
+            theta = 0.0
+        ET.SubElement(bsdf, "float", name="theta", value=f"{theta:.4f}")
+        elements.append(polarizer)
+    return elements
 
 
 def _append_bsdf_xml(
@@ -1387,11 +1643,29 @@ def _append_bsdf_xml(
         # conductor path so the real eta-k / polarization applies.
         is_metal = strategy in {"conductor", "roughconductor"} or oc in {
             "metal_gold", "metal_steel", "metal_aluminum", "mirror"}
+        # source_metallic = the .blend material's Metallic scalar as extracted in
+        # Stage 1 (_extract_material). This is the authoring PROVENANCE for how
+        # metallic the surface was authored, and it is trusted OVER the GLB-exported
+        # metallic texture, which Blender's glTF exporter fills with a default 1.0 for
+        # procedural (non-Principled) materials (ceramic floor, plaster). None = unknown.
+        _src_mat = material_idx.get(material_id) if isinstance(material_idx, Mapping) else None
+
+        def _src_scalar(key):
+            v = _src_mat.get(key) if isinstance(_src_mat, Mapping) else None
+            try:
+                return float(v) if v is not None else None
+            except (TypeError, ValueError):
+                return None
         inject = {
             "ior": binding_for_xml.get("ior") or optical_constants.dielectric_ior_for(oc, material_id),
             "conductor_material": (binding_for_xml.get("conductor_material")
                                    or optical_constants.conductor_material_for(oc, material_id, base_color)),
             "is_metal": is_metal,
+            "source_metallic": _src_scalar("metallic"),
+            # .blend authored roughness scalar — authority for catching a fabricated
+            # (near-0) roughness texture, which the GLB export can leak for procedural
+            # architectural materials (ceramic-tile floor) exactly like metallic=1.
+            "source_roughness": _src_scalar("roughness"),
         }
 
     measured_binding = _binding_is_measured(binding_for_xml)
@@ -1495,6 +1769,10 @@ def _opticalnav_obj_comment_data(obj: dict[str, Any]) -> str:
         "is_emitter": bool(obj.get("is_emitter")),
         "emitter_radiance": obj.get("emitter_radiance"),
         "emitter_intensity": obj.get("emitter_intensity"),
+        "emitter_shape": obj.get("emitter_shape"),
+        "emitter_polarized": bool(obj.get("emitter_polarized")),
+        "emitter_polarizer_angle_deg": obj.get("emitter_polarizer_angle_deg"),
+        "emitter_pattern": obj.get("emitter_pattern"),
         "geometry": {
             "type": geom.get("type"),
             "center": geom.get("center"),
@@ -3165,6 +3443,36 @@ def _proxy_box_xml_element(
             mesh_stats["emitter_panel"] = mesh_stats.get("emitter_panel", 0) + 1
         _record("emitter_panel", "primitive", shape_id=obj_id, reason="ceiling_panel")
         return shape
+
+    # Wall-mounted LCD panel. Local +Z is the emission direction; yaw/pitch/roll
+    # orient the screen while local X/Y retain the authored width/height.
+    if is_emitter and str(obj.get("emitter_shape") or "").strip() == "wall_panel":
+        elements = _wall_panel_emitter_elements(
+            obj,
+            obj_id=obj_id,
+            cx=cx,
+            cy=cy_cube,
+            cz=cz,
+            sx=sx,
+            sy=sy,
+            yaw_deg=yaw_deg,
+            pitch_deg=pitch_deg,
+            roll_deg=roll_deg,
+        )
+        if mesh_stats is not None:
+            mesh_stats["emitter_wall_panel"] = mesh_stats.get("emitter_wall_panel", 0) + 1
+        _record(
+            "emitter_wall_panel",
+            "primitive",
+            shape_id=obj_id,
+            reason=str(obj.get("emitter_pattern") or "white"),
+            extras={
+                "polarized": bool(obj.get("emitter_polarized")),
+                "polarizer_angle_deg": obj.get("emitter_polarizer_angle_deg"),
+                "pattern": str(obj.get("emitter_pattern") or "white"),
+            },
+        )
+        return elements
 
     # Cube fallback (or emitter, which always uses a cube).
     shape = ET.Element("shape", type="cube", id=obj_id)
@@ -5552,29 +5860,32 @@ class RenderDaemon:
         }
 
     def _ranger_mini_mesh_for_camera_rig(self) -> dict[str, Any]:
-        usd_ref = "assets/robots/ranger_mini_v3/ranger_mini_v3.usda"
-        usd_path = self.repo_root / usd_ref
-        if usd_path.exists():
+        # Pre-baked lightweight editor mesh for the rokace robot assembly. Baked
+        # offline by assets/robots/ranger_mini_v3/tools/bake_editor_mesh.py:
+        # vertex-clustering decimation (759k -> ~97k tris, no holes), base_link
+        # origin preserved (so sensor mounts align with the real body), already
+        # in the editor's three.js axes (x=lateral, y=up, z=forward). Baking it
+        # once keeps the daemon free of open3d/USD at request time and the
+        # payload under 1 MB instead of the 32 MB full mesh.
+        mesh_ref = "assets/robots/ranger_mini_v3/ranger_mini_rokace_editor.npz"
+        mesh_path = self.repo_root / mesh_ref
+        if mesh_path.exists():
             try:
-                mesh = extract_prim_mesh_for_editor(
-                    usd_path,
-                    "/RangerMini",
-                    max_triangles=12000,
-                    max_mesh_prims=160,
-                )
-                if mesh and mesh.get("vertices") and mesh.get("indices"):
-                    vertices = list(mesh["vertices"])
-                    return {
-                        "robot_model": "ranger_mini_v3",
-                        "source": usd_ref,
-                        "status": "ready",
-                        "vertices": vertices,
-                        "indices": list(mesh["indices"]),
-                        "bounds": self._bounds_for_flat_vertices(vertices),
-                        "center_offset": mesh.get("center_offset"),
-                        "vertex_count": mesh.get("vertex_count"),
-                        "triangle_count": mesh.get("triangle_count"),
-                    }
+                data = np.load(mesh_path)
+                vertices = data["vertices"].astype(np.float32).reshape(-1, 3)
+                indices = data["indices"].astype(np.int32).reshape(-1)
+                vflat = vertices.flatten().tolist()
+                return {
+                    "robot_model": "ranger_mini_v3",
+                    "source": mesh_ref,
+                    "status": "ready",
+                    "vertices": vflat,
+                    "indices": indices.tolist(),
+                    "bounds": self._bounds_for_flat_vertices(vflat),
+                    "center_offset": [0.0, 0.0, 0.0],  # base_link origin, not re-centered
+                    "vertex_count": int(len(vertices)),
+                    "triangle_count": int(len(indices) // 3),
+                }
             except Exception as exc:
                 proxy = self._camera_rig_proxy_mesh()
                 proxy["error"] = str(exc)
@@ -7029,6 +7340,408 @@ class RenderDaemon:
         with self._export_jobs_lock:
             return bool((self._export_jobs.get(job_id) or {}).get("cancel_requested"))
 
+    def _run_profiled_export_materialization(
+        self,
+        *,
+        job_id: str,
+        project_id: str,
+        project_dir: Path,
+        scene_id: str,
+        exports_root: Path,
+        staging: Path,
+        timestamp: str,
+        export_profile: str,
+        index_payload: dict[str, Any],
+        kept_episodes: list[Any],
+        scene_paths: list[Path],
+        episodes_kept: int,
+        episodes_skipped: int,
+        only_completed: bool,
+        panorama_observations: bool,
+        include_birdseye: bool,
+        include_episode_birdseye: bool,
+        eval_perturbation: bool,
+        camera_ids: list[str] | None,
+        check_cancel: Callable[[], None],
+        publish: Callable[..., None],
+    ) -> None:
+        """Materialize a compact profile after the common index/episode stages."""
+        from navigation_dataset.exporters.compact_bundle import (
+            POLAR_LUMA_WEIGHTS,
+            POLAR_PREVIEW_RECIPE,
+            POLAR_STOKES_CORE_SCHEMA,
+            build_perturbation_pair_index,
+            estimate_bundle_plan,
+            plan_compact_bundle_files,
+            resolve_export_profile,
+            rewrite_observation_manifests,
+            sha256_file,
+            transcode_rgb_png_to_lossless_webp,
+            write_polar_thumbnail,
+            write_stokes_core,
+        )
+        from navigation_dataset.exporters.custom_json import (
+            iter_export_files,
+            write_filtered_sensor_indexes,
+        )
+
+        import shutil
+
+        profile = resolve_export_profile(export_profile)
+        if profile.name == "legacy_full":
+            raise ValueError("legacy_full must use the legacy export materializer")
+        polar_staging = exports_root / "polar_staging"
+        core_zip = exports_root / f"{scene_id}_{timestamp}_core.zip"
+        polar_zip = exports_root / f"{scene_id}_{timestamp}_polar_stokes.zip"
+        single_zip = exports_root / f"{scene_id}_{timestamp}.zip"
+
+        publish(stage="collect_files", message=f"resolving {profile.name}", current=0, total=0)
+        resolve_last_publish_s = 0.0
+
+        def on_resolve(current: int, _total: int) -> None:
+            nonlocal resolve_last_publish_s
+            check_cancel()
+            now = time.monotonic()
+            if now - resolve_last_publish_s < 0.5:
+                return
+            resolve_last_publish_s = now
+            publish(
+                stage="collect_files",
+                current=current,
+                total=0,
+                message=f"resolving compact observation bundles ({current})",
+            )
+
+        # Compact profiles intentionally do not pull HDR buffers from legacy bridge
+        # jobs, but request Stokes paths so they can be repacked into the extension.
+        resolved_files = list(iter_export_files(
+            project_dir,
+            index_payload,
+            kept_episodes,
+            panorama_observations=panorama_observations,
+            include_exr=False,
+            include_polarization_raw=True,
+            include_perturbed=eval_perturbation,
+            camera_ids=camera_ids,
+            on_progress=on_resolve,
+        ))
+        bundle_plan = plan_compact_bundle_files(resolved_files, profile)
+        estimate = estimate_bundle_plan(bundle_plan)
+
+        source_paths: dict[Path, None] = {}
+        for item in bundle_plan.copied + bundle_plan.webp_rgb:
+            source_paths[item.src] = None
+        for thumbnail in bundle_plan.polar_thumbnails:
+            for source in thumbnail.sources.values():
+                source_paths[source] = None
+        for raw in bundle_plan.polar_core:
+            source_paths[raw.src] = None
+        missing = [str(path) for path in source_paths if not path.is_file()]
+        if missing:
+            raise FileNotFoundError(f"{len(missing)} selected export sources are missing: {missing[:3]}")
+
+        operations: list[tuple[str, Any]] = []
+        operations.extend(("copy", item) for item in bundle_plan.copied)
+        operations.extend(("webp", item) for item in bundle_plan.webp_rgb)
+        operations.extend(("polar_thumbnail", item) for item in bundle_plan.polar_thumbnails)
+        operations.extend(("stokes_core", item) for item in bundle_plan.polar_core)
+        total_operations = len(operations)
+        expected_bytes = (
+            int(estimate["single_estimated_bytes"])
+            if not profile.split_polar_extension
+            else int(estimate["core_estimated_bytes"]) + int(estimate["polar_extension_estimated_bytes"])
+        )
+        publish(
+            stage="collect_files",
+            current=0,
+            total=total_operations,
+            bytes_current=0,
+            bytes_total=expected_bytes,
+            message=f"{profile.name}: {total_operations} output artifacts planned",
+            summary={"export_profile": profile.name, "size_estimate": estimate},
+        )
+
+        def register_source(source: Path, destination: str, mapping: dict[str, str]) -> None:
+            source = source.resolve()
+            mapping[str(source)] = destination
+            try:
+                relative = source.relative_to(self.repo_root.resolve()).as_posix()
+                mapping[relative] = destination
+                mapping[f"/{relative}"] = destination
+            except ValueError:
+                pass
+
+        source_to_exported: dict[str, str] = {}
+        raw_records: list[dict[str, Any]] = []
+        output_records: list[dict[str, Any]] = []
+        destinations: list[str] = []
+        bytes_current = 0
+        last_publish_s = 0.0
+        for index, (kind, item) in enumerate(operations, start=1):
+            check_cancel()
+            if kind == "copy":
+                destination = staging / item.dst
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(item.src, destination)
+                written = destination.stat().st_size
+                register_source(item.src, item.dst, source_to_exported)
+                output_records.append({"kind": kind, "src": str(item.src), "dst": item.dst, "bytes": written})
+                destinations.append(item.dst)
+            elif kind == "webp":
+                destination = staging / item.dst
+                written = transcode_rgb_png_to_lossless_webp(item.src, destination)
+                register_source(item.src, item.dst, source_to_exported)
+                output_records.append({"kind": kind, "src": str(item.src), "dst": item.dst, "bytes": written})
+                destinations.append(item.dst)
+            elif kind == "polar_thumbnail":
+                written = write_polar_thumbnail(item, staging)
+                if written:
+                    for source in item.sources.values():
+                        register_source(source, item.dst, source_to_exported)
+                    output_records.append({
+                        "kind": kind,
+                        "src": [str(source) for source in item.sources.values()],
+                        "dst": item.dst,
+                        "bytes": written,
+                    })
+                    destinations.append(item.dst)
+            elif kind == "stokes_core":
+                target_root = polar_staging if profile.split_polar_extension else staging
+                destination = target_root / item.dst
+                metadata = write_stokes_core(item.src, destination)
+                written = int(metadata["bytes"])
+                if not profile.split_polar_extension:
+                    register_source(item.src, item.dst, source_to_exported)
+                    destinations.append(item.dst)
+                raw_records.append({"member": item.dst, **metadata})
+                output_records.append({"kind": kind, "src": str(item.src), "dst": item.dst, "bytes": written})
+            else:
+                raise RuntimeError(f"Unknown compact export operation: {kind}")
+            bytes_current += written
+            now = time.monotonic()
+            if now - last_publish_s > 0.2 or index == total_operations:
+                publish(
+                    stage="collect_files",
+                    current=index,
+                    total=total_operations,
+                    bytes_current=bytes_current,
+                    bytes_total=expected_bytes,
+                    current_file=output_records[-1]["dst"] if output_records else None,
+                )
+                last_publish_s = now
+
+        perturbation_summary: dict[str, Any] | None = None
+        if eval_perturbation:
+            try:
+                from navigation_dataset.optical_perturbation import PERTURBATION_FILENAME, load_perturbation
+
+                perturbation = load_perturbation(project_dir / "scenes" / scene_id)
+                if perturbation is not None:
+                    destination = staging / "scenes" / scene_id / PERTURBATION_FILENAME
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    destination.write_text(json.dumps(perturbation, ensure_ascii=False, indent=2), encoding="utf-8")
+                    perturbation_summary = {
+                        "enabled": bool(perturbation.get("enabled")),
+                        "object_count": len(perturbation.get("objects") or []),
+                        "disabled_edge_ids": perturbation.get("disabled_edge_ids") or [],
+                    }
+            except Exception:
+                pass
+
+        pair_index: dict[str, Any] | None = None
+        if eval_perturbation:
+            pair_index = build_perturbation_pair_index(destinations)
+            pair_destination = staging / "pairs" / "perturbation_pairs.json"
+            pair_destination.parent.mkdir(parents=True, exist_ok=True)
+            pair_destination.write_text(json.dumps(pair_index, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        generated_sensor_indexes = write_filtered_sensor_indexes(staging)
+
+        # Summary maps are generated from source graph data, but only live in the
+        # compact core archive.  They are never part of the polar extension.
+        if include_birdseye or include_episode_birdseye:
+            try:
+                from navigation_dataset.birdseye import render_birdseye
+
+                scene_root = project_dir / "scenes" / scene_id
+                grid_path = scene_root / "traversable_grid.npy"
+                graph_path = scene_root / "viewpoint_graph.json"
+                grid_meta = scene_root / "traversable_grid.npy.json"
+                if grid_path.exists() and graph_path.exists():
+                    grid_spec = (_read_json(grid_meta).get("grid") if grid_meta.exists() else {}) or {}
+                    graph_payload = _read_json(graph_path)
+                    episode_data: list[dict[str, Any]] = []
+                    by_id: dict[str, tuple[Any, dict[str, Any]]] = {}
+                    for episode in kept_episodes:
+                        path = project_dir / "episodes" / episode.split / f"{episode.episode_id}.json"
+                        if path.is_file():
+                            payload = _read_json(path)
+                            episode_data.append(payload)
+                            by_id[episode.episode_id] = (episode, payload)
+                    if include_birdseye:
+                        render_birdseye(
+                            grid_path,
+                            grid_spec,
+                            graph_payload,
+                            episode_data,
+                            staging / "scenes" / scene_id / f"{scene_id}__birdseye.png",
+                            scale=4,
+                        )
+                    if include_episode_birdseye:
+                        publish(stage="episode_birdseye", current=0, total=len(by_id), message="rendering per-episode path maps")
+                        for count, (episode, payload) in enumerate(by_id.values(), start=1):
+                            check_cancel()
+                            render_birdseye(
+                                grid_path,
+                                grid_spec,
+                                graph_payload,
+                                [payload],
+                                staging / "episodes_birdseye" / episode.split / f"{episode.episode_id}.png",
+                                scale=4,
+                            )
+                            publish(stage="episode_birdseye", current=count, total=len(by_id), message=episode.episode_id)
+            except Exception:
+                pass
+
+        def archive_tree(source_root: Path, destination: Path, *, archive_name: str) -> tuple[int, int]:
+            files = sorted(path for path in source_root.rglob("*") if path.is_file())
+            total_bytes = sum(path.stat().st_size for path in files)
+            publish(stage="zip_files", current=0, total=len(files), bytes_current=0, bytes_total=total_bytes, message=f"compressing {archive_name}")
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            temporary = destination.with_suffix(destination.suffix + ".partial")
+            if temporary.exists():
+                temporary.unlink()
+            completed_bytes = 0
+            last_zip_publish = 0.0
+            stored_suffixes = {".npz", ".webp", ".png", ".jpg", ".jpeg", ".exr", ".hdr"}
+            with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+                for count, path in enumerate(files, start=1):
+                    check_cancel()
+                    compression = zipfile.ZIP_STORED if path.suffix.lower() in stored_suffixes else zipfile.ZIP_DEFLATED
+                    archive.write(path, path.relative_to(source_root).as_posix(), compress_type=compression)
+                    completed_bytes += path.stat().st_size
+                    now = time.monotonic()
+                    if now - last_zip_publish > 0.2 or count == len(files):
+                        publish(stage="zip_files", current=count, total=len(files), bytes_current=completed_bytes, bytes_total=total_bytes, current_file=path.name)
+                        last_zip_publish = now
+            temporary.replace(destination)
+            return len(files), destination.stat().st_size
+
+        polar_extension: dict[str, Any] | None = None
+        polar_archive_records: list[dict[str, Any]] = []
+        if profile.split_polar_extension and raw_records:
+            extension_manifest = {
+                "schema": "opticalnav.polarization_extension.v1",
+                "scene_id": scene_id,
+                "profile": profile.name,
+                "stokes_schema": POLAR_STOKES_CORE_SCHEMA,
+                "canonical_arrays": ["rgb", "s0", "s1", "s2", "s3", "mask"],
+                "derived_channels": {
+                    "luma_weights": list(POLAR_LUMA_WEIGHTS),
+                    "preview_recipe": POLAR_PREVIEW_RECIPE,
+                    "reconstruct": ["s0_l", "s1_l", "s2_l", "s3_l", "s1_over_s0", "s2_over_s0", "dop", "aolp"],
+                },
+                "files": raw_records,
+            }
+            polar_staging.mkdir(parents=True, exist_ok=True)
+            (polar_staging / "polarization_extension_manifest.json").write_text(
+                json.dumps(extension_manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            polar_file_count, polar_zip_size = archive_tree(polar_staging, polar_zip, archive_name="polar Stokes extension")
+            polar_extension = {
+                "archive": polar_zip.name,
+                "sha256": sha256_file(polar_zip),
+                "required": True,
+                "schema": POLAR_STOKES_CORE_SCHEMA,
+                "file_count": polar_file_count,
+                "zip_size_bytes": polar_zip_size,
+            }
+            polar_archive_records.append({
+                "kind": "polar_extension",
+                "zip_ref": polar_zip.relative_to(self.repo_root).as_posix(),
+                "download_url": f"/artifacts?path={quote(polar_zip.relative_to(self.repo_root).as_posix())}",
+                "bytes": polar_zip_size,
+            })
+
+        rewritten_manifest_count = rewrite_observation_manifests(
+            staging,
+            profile=profile,
+            source_to_exported=source_to_exported,
+            polar_extension=polar_extension,
+        )
+        bundle_manifest = {
+            "schema": "opticalnav.dataset_bundle.v1",
+            "scene_id": scene_id,
+            "profile": profile.name,
+            "size_estimate": estimate,
+            "polarization": {
+                "stokes_schema": POLAR_STOKES_CORE_SCHEMA if profile.include_stokes_core else None,
+                "preview_recipe": POLAR_PREVIEW_RECIPE if profile.include_polar_thumbnails else None,
+                "extension": polar_extension,
+            },
+            "manifest_rewrite_count": rewritten_manifest_count,
+            "perturbation_pairs": {
+                "pair_count": pair_index.get("pair_count", 0),
+                "unpaired_base": len(pair_index.get("unpaired_base", [])),
+                "unpaired_perturbed": len(pair_index.get("unpaired_perturbed", [])),
+            } if pair_index is not None else None,
+        }
+        (staging / "bundle_manifest.json").write_text(json.dumps(bundle_manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        core_destination = single_zip if not profile.split_polar_extension else core_zip
+        core_file_count, core_zip_size = archive_tree(staging, core_destination, archive_name="dataset core")
+        core_ref = core_destination.relative_to(self.repo_root).as_posix()
+        archive_records = [{
+            "kind": "dataset_core",
+            "zip_ref": core_ref,
+            "download_url": f"/artifacts?path={quote(core_ref)}",
+            "bytes": core_zip_size,
+        }, *polar_archive_records]
+        report_payload = {
+            "job_id": job_id,
+            "project_id": project_id,
+            "scene_id": scene_id,
+            "export_profile": profile.name,
+            "only_completed": only_completed,
+            "selected_camera_ids": camera_ids,
+            "episodes_total_in_scope": len(scene_paths),
+            "episodes_exported": episodes_kept,
+            "episodes_skipped": episodes_skipped,
+            "files_packaged": core_file_count,
+            "generated_sensor_index_count": len(generated_sensor_indexes),
+            "perturbation": perturbation_summary,
+            "perturbation_pairs": pair_index,
+            "size_estimate": estimate,
+            "archives": archive_records,
+            "zip_size_bytes": core_zip_size,
+            "zip_ref": core_ref,
+            "download_url": archive_records[0]["download_url"],
+            "generated_at": _utc_now_iso(),
+        }
+        (exports_root / "export_file_manifest.json").write_text(
+            json.dumps({
+                "scene_id": scene_id,
+                "export_profile": profile.name,
+                "size_estimate": estimate,
+                "files": output_records,
+                "archives": archive_records,
+            }, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        (exports_root / "export_report.json").write_text(json.dumps(report_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        publish(
+            status="succeeded",
+            stage="finalize",
+            message="compact export complete",
+            summary=report_payload,
+            current=core_file_count,
+            total=core_file_count,
+            bytes_current=core_zip_size,
+            bytes_total=core_zip_size,
+        )
+        shutil.rmtree(staging, ignore_errors=True)
+        shutil.rmtree(polar_staging, ignore_errors=True)
+
     def _run_export_job(
         self,
         job_id: str,
@@ -7045,6 +7758,7 @@ class RenderDaemon:
         include_episode_birdseye: bool = False,
         eval_perturbation: bool = False,
         camera_ids: list[str] | None = None,
+        export_profile: str = "compact_with_polar_extension",
     ) -> None:
         """Background worker — runs the 7-/8-stage scene bundle export.
 
@@ -7178,20 +7892,39 @@ class RenderDaemon:
                     return best
 
                 def _thumbnail_rgb_path(heading_dir: Path) -> Path | None:
+                    # A stable heading directory may contain only current.json
+                    # after versioned rendering. Resolve the active bundle before
+                    # looking for the thumbnail RGB.
+                    source_dir = heading_dir
+                    pointer = heading_dir / "current.json"
+                    if pointer.is_file():
+                        try:
+                            pointer_payload = _read_json(pointer)
+                            bundle_ref = pointer_payload.get("bundle_ref")
+                            if isinstance(bundle_ref, str) and bundle_ref:
+                                candidate_dir = (project_dir / bundle_ref).resolve()
+                                candidate_dir.relative_to(project_dir.resolve())
+                                if candidate_dir.is_dir():
+                                    source_dir = candidate_dir
+                        except Exception:
+                            pass
                     if camera_ids is not None:
                         for camera_id in camera_ids:
-                            candidate = heading_dir / "sensors" / camera_id / "rgb.png"
-                            if candidate.is_file():
-                                return candidate
+                            for root_name in ("sensors", "cameras"):
+                                candidate = source_dir / root_name / camera_id / "rgb.png"
+                                if candidate.is_file():
+                                    return candidate
                         return None
-                    legacy = heading_dir / "rgb.png"
-                    if legacy.is_file():
-                        return legacy
-                    sensors_dir = heading_dir / "sensors"
-                    if sensors_dir.is_dir():
-                        for candidate in sorted(sensors_dir.glob("*/rgb.png")):
+                    for root_name in ("", "sensors", "cameras"):
+                        root = source_dir if not root_name else source_dir / root_name
+                        if root_name == "":
+                            candidate = root / "rgb.png"
                             if candidate.is_file():
                                 return candidate
+                        elif root.is_dir():
+                            for candidate in sorted(root.glob("*/rgb.png")):
+                                if candidate.is_file():
+                                    return candidate
                     return None
 
                 for ep_idx, ep in enumerate(kept_episodes):
@@ -7411,8 +8144,54 @@ class RenderDaemon:
                         message=ep.episode_id,
                     )
 
+            # Compact profiles replace the legacy verbatim collector below. They
+            # still reuse the completed index/episode/thumbnail staging above.
+            if export_profile != "legacy_full":
+                self._run_profiled_export_materialization(
+                    job_id=job_id,
+                    project_id=project_id,
+                    project_dir=project_dir,
+                    scene_id=scene_id,
+                    exports_root=exports_root,
+                    staging=staging,
+                    timestamp=ts,
+                    export_profile=export_profile,
+                    index_payload=index_payload,
+                    kept_episodes=kept_episodes,
+                    scene_paths=scene_paths,
+                    episodes_kept=episodes_kept,
+                    episodes_skipped=episodes_skipped,
+                    only_completed=only_completed,
+                    panorama_observations=panorama_observations,
+                    include_birdseye=include_birdseye,
+                    include_episode_birdseye=include_episode_birdseye,
+                    eval_perturbation=eval_perturbation,
+                    camera_ids=camera_ids,
+                    check_cancel=check_cancel,
+                    publish=publish,
+                )
+                return
+
             # ── collect_files ──────────────────────────────────────────────
             publish(stage="collect_files", message="resolving bundle contents", current=0, total=0)
+            resolve_last_publish_s = 0.0
+
+            def _on_collect_resolve(current: int, _total: int) -> None:
+                # Resolution can touch tens of thousands of files; make the
+                # Cancel button responsive while the generator is walking.
+                check_cancel()
+                nonlocal resolve_last_publish_s
+                now = time.monotonic()
+                if now - resolve_last_publish_s < 0.5:
+                    return
+                resolve_last_publish_s = now
+                publish(
+                    stage="collect_files",
+                    current=current,
+                    total=0,
+                    message=f"resolving observation bundles ({current})",
+                )
+
             files = list(iter_export_files(
                 project_dir, index_payload, kept_episodes,
                 panorama_observations=panorama_observations,
@@ -7420,6 +8199,7 @@ class RenderDaemon:
                 include_polarization_raw=include_polarization_raw,
                 include_perturbed=eval_perturbation,
                 camera_ids=camera_ids,
+                on_progress=_on_collect_resolve,
             ))
             # Eval-perturbation paired split: ship the perturbation sidecar so a
             # reader can join base↔perturbed observations on identical (vp, h) and
@@ -7444,7 +8224,40 @@ class RenderDaemon:
                         }
                 except Exception:
                     pass
-            bytes_total = sum(src.stat().st_size for src, _ in files)
+            file_records: list[dict[str, Any]] = []
+            missing_sources: list[dict[str, str]] = []
+            for src, dst_rel in files:
+                try:
+                    size = int(src.stat().st_size)
+                except OSError as exc:
+                    missing_sources.append({"src": str(src), "dst": dst_rel, "error": str(exc)})
+                    continue
+                file_records.append({"src": str(src), "dst": dst_rel, "bytes": size})
+            bytes_total = sum(int(item["bytes"]) for item in file_records)
+            manifest_payload = {
+                "scene_id": scene_id,
+                "camera_ids": camera_ids,
+                "planned_file_count": len(files),
+                "file_count": len(file_records),
+                "bytes_total": bytes_total,
+                "missing_sources": missing_sources,
+                "copy_errors": [],
+                "files": file_records,
+            }
+            (exports_root / "export_file_manifest.json").write_text(
+                json.dumps(manifest_payload, ensure_ascii=False, indent=2), encoding="utf-8",
+            )
+            if missing_sources:
+                publish(
+                    status="failed",
+                    stage="collect_files",
+                    current=0,
+                    total=len(files),
+                    bytes_total=bytes_total,
+                    error=f"{len(missing_sources)} planned source files are missing",
+                    summary={"planned": len(files), "missing": len(missing_sources), "manifest": str(exports_root / "export_file_manifest.json")},
+                )
+                return
             publish(
                 stage="collect_files",
                 current=0,
@@ -7452,32 +8265,25 @@ class RenderDaemon:
                 bytes_total=bytes_total,
                 message=f"{len(files)} files queued",
             )
-            # Persist file manifest for audit.
-            try:
-                manifest_payload = {
-                    "scene_id": scene_id,
-                    "camera_ids": camera_ids,
-                    "file_count": len(files),
-                    "bytes_total": bytes_total,
-                    "files": [{"src": str(src), "dst": dst, "bytes": src.stat().st_size} for src, dst in files],
-                }
-                (exports_root / "export_file_manifest.json").write_text(
-                    json.dumps(manifest_payload, ensure_ascii=False, indent=2), encoding="utf-8",
-                )
-            except OSError:
-                pass
-            # Copy into staging with throttled publishes (~200ms).
+            # Copy into staging with throttled publishes (~200ms). A copy or
+            # size mismatch is a hard collection failure; silently dropping an
+            # unreadable raster produces a corrupt ZIP that looks successful.
             last_pub = 0.0
             bytes_current = 0
+            copy_errors: list[dict[str, str]] = []
             for i, (src, dst_rel) in enumerate(files):
                 check_cancel()
                 dst = staging / dst_rel
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 try:
                     shutil.copy2(src, dst)
-                    bytes_current += src.stat().st_size
-                except OSError:
-                    pass
+                    source_size = int(src.stat().st_size)
+                    copied_size = int(dst.stat().st_size)
+                    if copied_size != source_size:
+                        raise OSError(f"size mismatch source={source_size} copied={copied_size}")
+                    bytes_current += copied_size
+                except OSError as exc:
+                    copy_errors.append({"src": str(src), "dst": dst_rel, "error": str(exc)})
                 now = time.monotonic()
                 if now - last_pub > 0.2 or i + 1 == len(files):
                     publish(
@@ -7489,6 +8295,24 @@ class RenderDaemon:
                         current_file=dst_rel,
                     )
                     last_pub = now
+            manifest_payload["copy_errors"] = copy_errors
+            manifest_payload["copied_file_count"] = len(files) - len(copy_errors)
+            manifest_payload["bytes_copied"] = bytes_current
+            (exports_root / "export_file_manifest.json").write_text(
+                json.dumps(manifest_payload, ensure_ascii=False, indent=2), encoding="utf-8",
+            )
+            if copy_errors:
+                publish(
+                    status="failed",
+                    stage="collect_files",
+                    current=len(files),
+                    total=len(files),
+                    bytes_current=bytes_current,
+                    bytes_total=bytes_total,
+                    error=f"{len(copy_errors)} files failed during collection",
+                    summary={"planned": len(files), "copied": len(files) - len(copy_errors), "copy_errors": len(copy_errors), "manifest": str(exports_root / "export_file_manifest.json")},
+                )
+                return
 
             generated_sensor_indexes: list[Path] = []
             if camera_ids is not None:
@@ -7862,6 +8686,23 @@ class RenderDaemon:
                 "sync_mode": str(render_request.extras.get("sync_mode") or "unknown"),
                 "sync_policy": str(render_request.extras.get("sync_policy") or "default"),
             }
+            # Status rows are the source of the worker WebSocket feed. Preserve
+            # the sweep identity here rather than requiring clients to reopen the
+            # saved request payload for every job update.
+            for key in (
+                "scene_variant_key",
+                "render_variant",
+                "submission_group_id",
+                "variant_sequence_index",
+                "variant_sequence_total",
+                "previous_variant_batch_id",
+                "run_id",
+                "task_key",
+                "phase",
+                "phase_index",
+            ):
+                if key in render_request.extras:
+                    status_extras[key] = render_request.extras[key]
             worker_gpu_index = runtime_override_payload.get("worker_gpu_index")
             if worker_gpu_index is not None:
                 try:
@@ -10144,6 +10985,56 @@ class RenderDaemon:
                 viewpoints[vp_id]["total"] += 1
                 if completed:
                     viewpoints[vp_id]["completed"] += 1
+        # Versioned runs are exposed through tiny current.json pointers rather
+        # than copied files. Overlay pointer-backed bundles so the UI/exporter
+        # sees the promoted version even when the legacy consolidated tree is
+        # absent.
+        for pointer_path in sorted(scene_dir.glob("observations*/**/current.json")):
+            try:
+                pointer = _read_json(pointer_path)
+                variant = "perturbed" if pointer_path.parts[-4] == "observations_perturbed" else "base"
+                vp_id, heading_id = pointer_path.parent.parent.name, pointer_path.parent.name
+                bundle = resolve_current_bundle_dir(
+                    project_dir, scene_id=scene_id, variant=variant, node_id=vp_id, heading_id=heading_id,
+                )
+                if bundle is None or not bundle.is_dir():
+                    continue
+                has_rgb = (bundle / "rgb.png").exists()
+                has_depth = (bundle / "depth.png").exists()
+                has_albedo = (bundle / "albedo.png").exists()
+                has_active_nir = (bundle / "active_nir_intensity.png").exists()
+                has_hazard = (bundle / "hazard_mask.png").exists()
+                has_polar_rgb = (bundle / "polar_rgb_preview.png").exists()
+                sensors: dict[str, Any] = {}
+                sensors_dir = bundle / "sensors"
+                if sensors_dir.is_dir():
+                    for sensor_dir in sorted(sensors_dir.iterdir()):
+                        if not sensor_dir.is_dir():
+                            continue
+                        sensor_status = {
+                            f"has_{modality}": (sensor_dir / filename).exists()
+                            for modality, filename in self._OPTICALNAV_OBS_PNG_FILENAMES.items()
+                        }
+                        known_modalities = {key.removeprefix("has_") for key, present in sensor_status.items() if present}
+                        if any(sensor_dir.iterdir()):
+                            record_sensor(sensor_dir.name, "perturbed_count" if variant == "perturbed" else "base_count", known_modalities)
+                        if any(sensor_status.values()):
+                            sensors[sensor_dir.name] = sensor_status
+                completed = has_rgb or has_depth or any(bool(v.get("has_rgb") or v.get("has_depth")) for v in sensors.values())
+                viewpoints.setdefault(vp_id, {"headings": {}, "total": 0, "completed": 0})
+                if heading_id not in viewpoints[vp_id]["headings"] or variant == "perturbed":
+                    viewpoints[vp_id]["headings"][heading_id] = {
+                        "job_id": None, "status": "succeeded" if completed else "unknown",
+                        "has_rgb": has_rgb, "has_depth": has_depth, "has_albedo": has_albedo,
+                        "has_active_nir_intensity": has_active_nir, "has_hazard_mask": has_hazard,
+                        "has_polar_rgb_preview": has_polar_rgb, "sensors": sensors,
+                        "render_version_id": pointer.get("render_version_id"),
+                        "variant": variant,
+                    }
+                    viewpoints[vp_id]["total"] = len(viewpoints[vp_id]["headings"])
+                    viewpoints[vp_id]["completed"] = sum(1 for item in viewpoints[vp_id]["headings"].values() if item.get("status") == "succeeded")
+            except (OSError, TypeError, ValueError, IndexError):
+                continue
         return {
             "scene_id": scene_id,
             "viewpoints": viewpoints,
@@ -10646,7 +11537,9 @@ class RenderDaemon:
         filename = self._OPTICALNAV_OBS_PNG_FILENAMES.get(modality)
         if not filename:
             return None
-        heading_dir = project_dir / "scenes" / scene_id / _obs_subdir(variant) / vp_id / heading_id
+        heading_dir = resolve_current_bundle_dir(
+            project_dir, scene_id=scene_id, variant=variant, node_id=vp_id, heading_id=heading_id,
+        ) or (project_dir / "scenes" / scene_id / _obs_subdir(variant) / vp_id / heading_id)
         if sensor_id:
             path = heading_dir / "sensors" / sensor_id / filename
             if path.exists():
@@ -10657,9 +11550,14 @@ class RenderDaemon:
             return path.read_bytes()
         return None
 
-    def _opticalnav_observation_rgb_png(self, project_dir: Path, scene_id: str, vp_id: str, heading_id: str) -> bytes | None:
-        """Return the rgb.png bytes for a completed observation from the consolidated dir."""
-        path = project_dir / "scenes" / scene_id / "observations" / vp_id / heading_id / "rgb.png"
+    def _opticalnav_observation_rgb_png(
+        self, project_dir: Path, scene_id: str, vp_id: str, heading_id: str, *, variant: str = "base"
+    ) -> bytes | None:
+        """Return the active rgb.png bytes, resolving a version pointer first."""
+        path = resolve_current_bundle_dir(
+            project_dir, scene_id=scene_id, variant=variant, node_id=vp_id, heading_id=heading_id,
+        ) or (project_dir / "scenes" / scene_id / _obs_subdir(variant) / vp_id / heading_id)
+        path = path / "rgb.png"
         if path.exists():
             return path.read_bytes()
         return None
@@ -10743,7 +11641,406 @@ class RenderDaemon:
         batch_path = project_dir / "graph_render_batches" / f"{batch_id}.json"
         if not batch_path.exists():
             raise KeyError(batch_id)
-        return self._batch_payload_with_statuses(_read_json(batch_path))
+        payload = self._batch_payload_with_statuses(_read_json(batch_path))
+        try:
+            ledger_payload = RenderLedger(project_dir).run_payload(batch_id)
+            if ledger_payload is not None:
+                tasks = ledger_payload.get("tasks") or []
+                counts: dict[str, int] = {}
+                task_by_key = {}
+                task_by_job = {}
+                for task in tasks:
+                    state = str(task.get("state") or "planned")
+                    counts[state] = counts.get(state, 0) + 1
+                    if task.get("task_key"):
+                        task_by_key[str(task["task_key"])] = task
+                    if task.get("job_id"):
+                        task_by_job[str(task["job_id"])] = task
+                # The ledger is authoritative after daemon restart. Replace
+                # in-memory job statuses (which become ``unknown``) with the
+                # durable task state while keeping the original job metadata.
+                repaired_jobs = []
+                for item in payload.get("jobs") or []:
+                    task = task_by_key.get(str(item.get("task_key") or "")) or task_by_job.get(str(item.get("job_id") or ""))
+                    if task is None:
+                        repaired_jobs.append(item)
+                        continue
+                    state = str(task.get("state") or "planned")
+                    state_map = {"succeeded": "completed", "skipped": "completed", "planned": "queued", "queued": "queued", "running": "running", "failed": "failed", "partial": "failed", "blocked": "failed"}
+                    repaired_jobs.append({**item, "status": {"job_id": item.get("job_id"), "status": state_map.get(state, "unknown"), "task_state": state, "error": task.get("error")}})
+                if repaired_jobs:
+                    payload["jobs"] = repaired_jobs
+                payload["run_id"] = batch_id
+                payload["ledger_status"] = ledger_payload.get("status")
+                payload["plan_total"] = len(tasks)
+                payload["ledger_counts"] = counts
+                terminal_done = int(counts.get("succeeded", 0)) + int(counts.get("skipped", 0))
+                terminal_failed = int(counts.get("failed", 0)) + int(counts.get("blocked", 0))
+                payload["progress"] = {"completed": terminal_done, "failed": terminal_failed, "total": len(tasks), "fraction": ((terminal_done + terminal_failed) / max(1, len(tasks)))}
+                if ledger_payload.get("status") == "completed":
+                    payload["status"] = "completed"
+                elif ledger_payload.get("status") == "paused":
+                    payload["status"] = "paused"
+                payload["resume_available"] = any(state in {"planned", "queued", "failed", "partial", "blocked"} for state in counts)
+                payload["tasks"] = tasks
+        except Exception:
+            pass
+        return payload
+
+    def _graph_batch_static_snapshot(self, project_dir: Path, batch_id: str) -> dict[str, Any]:
+        """Cache immutable batch metadata and job ids, never per-job statuses."""
+        batch_path = project_dir / "graph_render_batches" / f"{batch_id}.json"
+        if not batch_path.exists():
+            raise KeyError(batch_id)
+        stat = batch_path.stat()
+        cache = getattr(self, "_graph_batch_static_cache", None)
+        if cache is None:
+            cache = {}
+            self._graph_batch_static_cache = cache
+        cache_key = str(batch_path)
+        cached = cache.get(cache_key)
+        signature = (int(stat.st_mtime_ns), int(stat.st_size))
+        if cached is not None and cached.get("signature") == signature:
+            return cached["value"]
+        raw = _read_json(batch_path)
+        metadata_keys = (
+            "batch_id", "project_id", "scene_id", "graph_id", "backend", "created_at",
+            "run_id", "scene_version_id", "render_version_id", "scene_variant_key",
+            "render_variant", "submission_group_id", "variant_sequence_index",
+            "variant_sequence_total", "previous_variant_batch_id", "modalities",
+            "sensor_scope", "sensor_ids", "execution_policy", "phase_order",
+            "phase_count", "active_phase", "phase_recycle_events", "scheduling_policy",
+            "gpu_indices", "static_gpu_shards", "skip_existing_observations",
+            "requested_jobs", "skipped_existing", "plan_total", "status", "pause_reason",
+            "error", "resume_available",
+        )
+        value = {
+            "metadata": {key: raw.get(key) for key in metadata_keys if key in raw},
+            "job_ids": [str(item.get("job_id") or "") for item in raw.get("jobs", []) if str(item.get("job_id") or "")],
+        }
+        cache[cache_key] = {"signature": signature, "value": value}
+        return value
+
+    def _graph_batch_memory_summary(
+        self,
+        *,
+        metadata: Mapping[str, Any],
+        batch_id: str,
+        job_ids: Sequence[str],
+        expected_total: int,
+        live_states: Mapping[str, str],
+    ) -> dict[str, Any]:
+        """Summarize a live batch from in-memory worker state only."""
+        counts = {"queued": 0, "running": 0, "completed": 0, "failed": 0, "cancelled": 0, "unknown": 0}
+        for job_id in job_ids:
+            raw_state = live_states.get(job_id)
+            if raw_state is None:
+                # A job absent from this daemon is either not submitted yet or
+                # belongs to a prior process. Treat it as queued rather than
+                # making a NAS status-file lookup for every row.
+                counts["queued"] += 1
+                continue
+            state = self._normalize_batch_job_state(raw_state)
+            counts[state] = counts.get(state, 0) + 1
+        total = max(expected_total, len(job_ids))
+        known = sum(counts.values())
+        if total > known:
+            counts["queued"] += total - known
+        terminal = counts["completed"] + counts["failed"] + counts["cancelled"]
+        root_status = str(metadata.get("status") or "ready")
+        if total > 0 and terminal >= total:
+            status = "paused" if counts["failed"] else "completed"
+        else:
+            status = root_status
+        return {
+            **dict(metadata),
+            "batch_id": batch_id,
+            "summary_only": True,
+            "jobs": [],
+            "counts": counts,
+            "progress": {
+                "completed": counts["completed"],
+                "failed": counts["failed"] + counts["cancelled"],
+                "total": total,
+                "fraction": (counts["completed"] + counts["failed"] + counts["cancelled"]) / max(1, total),
+            },
+            "status": status,
+            "resume_available": status in {"paused", "error"},
+        }
+
+    def _opticalnav_graph_batch_summary(self, project_dir: Path, batch_id: str) -> dict[str, Any]:
+        """Return progress for a large graph batch without expanding job/task rows."""
+        static = self._graph_batch_static_snapshot(project_dir, batch_id)
+        metadata = dict(static["metadata"])
+        job_ids = list(static["job_ids"])
+        expected_total = int(metadata.get("plan_total") or metadata.get("requested_jobs") or len(job_ids) or 0)
+        with self._condition:
+            live_states = {job_id: job.status.status for job_id, job in self._jobs.items()}
+        # The active daemon already owns every submitted job state in memory.
+        # Prefer it over SQLite on the NAS; the latter is only a restart fallback.
+        if any(job_id in live_states for job_id in job_ids):
+            return self._graph_batch_memory_summary(
+                metadata=metadata,
+                batch_id=batch_id,
+                job_ids=job_ids,
+                expected_total=expected_total,
+                live_states=live_states,
+            )
+        ledger_summary = RenderLedger(project_dir).run_summary(batch_id)
+        if ledger_summary is not None and int(ledger_summary.get("task_count") or 0) >= expected_total:
+            state_counts = dict(ledger_summary.get("state_counts") or {})
+            completed = int(state_counts.get("succeeded", 0)) + int(state_counts.get("skipped", 0))
+            failed = int(state_counts.get("failed", 0)) + int(state_counts.get("partial", 0)) + int(state_counts.get("blocked", 0))
+            counts = {
+                "queued": int(state_counts.get("planned", 0)) + int(state_counts.get("queued", 0)),
+                "running": int(state_counts.get("running", 0)),
+                "completed": completed,
+                "failed": failed,
+                "cancelled": int(state_counts.get("cancelled", 0)),
+                "unknown": 0,
+            }
+            total = int(ledger_summary.get("task_count") or 0)
+            run_status = str(ledger_summary.get("status") or metadata.get("status") or "planned")
+            return {
+                **metadata,
+                "batch_id": batch_id,
+                "run_id": batch_id,
+                "ledger_status": run_status,
+                "ledger_counts": state_counts,
+                "summary_only": True,
+                "jobs": [],
+                "counts": counts,
+                "progress": {
+                    "completed": completed,
+                    "failed": failed + int(state_counts.get("cancelled", 0)),
+                    "total": total,
+                    "fraction": (completed + failed + int(state_counts.get("cancelled", 0))) / max(1, total),
+                },
+                "status": "completed" if run_status == "completed" else "paused" if run_status == "paused" else run_status,
+                "resume_available": any(state in {"planned", "queued", "failed", "partial", "blocked"} for state in state_counts),
+            }
+
+        # Restart/legacy fallback when no active worker owns this batch.
+        return self._graph_batch_memory_summary(
+            metadata=metadata,
+            batch_id=batch_id,
+            job_ids=job_ids,
+            expected_total=expected_total,
+            live_states=live_states,
+        )
+
+
+    def _opticalnav_resume_graph_run(self, project_dir: Path, source_run_id: str, payload: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        """Create a new render version containing only incomplete task attempts.
+
+        Completed tasks are represented as ``skipped`` rows referencing the
+        previous immutable bundle.  That lets promotion atomically switch all
+        viewpoints while avoiding a second render of work that already exists.
+        """
+        ledger = RenderLedger(project_dir)
+        source = ledger.run_payload(source_run_id)
+        if source is None:
+            raise KeyError(source_run_id)
+        tasks = list(source.get("tasks") or [])
+        if not tasks:
+            raise ValueError("run has no durable tasks")
+        source_scene_version_id = str(source.get("scene_version_id") or "")
+        scene_version = ledger.scene_version_payload(source_scene_version_id)
+        if scene_version is None:
+            raise ValueError(f"missing scene version {source_scene_version_id}")
+        scene_id = str(source.get("scene_id") or scene_version.get("scene_id") or "")
+        scene_digest = str(scene_version.get("scene_digest") or "")
+        render_version_id = new_render_version_id(scene_digest)
+        run_id = f"{source_run_id}-resume-{_utc_now().strftime('%Y%m%dT%H%M%S%f')}"
+        ledger.create_render_run(
+            run_id=run_id,
+            project_id=project_dir.name,
+            scene_id=scene_id,
+            scene_version_id_value=source_scene_version_id,
+            render_version_id=render_version_id,
+            source_run_id=source_run_id,
+            supersedes_render_version_id=str(source.get("render_version_id") or "") or None,
+            metadata={"resume": True, "source_run_id": source_run_id, "requested_at": _utc_now_iso()},
+        )
+        batch_path = project_dir / "graph_render_batches" / f"{run_id}.json"
+        batch_path.parent.mkdir(parents=True, exist_ok=True)
+        stub = {
+            "batch_id": run_id,
+            "run_id": run_id,
+            "source_run_id": source_run_id,
+            "project_id": project_dir.name,
+            "scene_id": scene_id,
+            "scene_version_id": source_scene_version_id,
+            "render_version_id": render_version_id,
+            "created_at": _utc_now_iso(),
+            "status": "building",
+            "plan_total": len(tasks),
+            "jobs": [],
+            "resume": True,
+        }
+        batch_path.write_text(json.dumps(stub, ensure_ascii=False, indent=2), encoding="utf-8")
+        plan: list[dict[str, Any]] = []
+        for ordinal, source_task in enumerate(tasks):
+            source_task_key = str(source_task.get("task_key") or "")
+            request_payload = ledger.get_request_blob(str(source_task.get("request_blob_digest") or "")) if source_task.get("request_blob_digest") else None
+            metadata = dict(source_task.get("metadata") or {})
+            source_variant = str(
+                source_task.get("scene_variant_key")
+                or metadata.get("scene_variant_key")
+                or source_task.get("variant")
+                or metadata.get("variant")
+                or "base"
+            ).lower()
+            if source_variant not in {"base", "perturbed"}:
+                source_variant = "base"
+            source_render_variant = str(
+                source_task.get("render_variant")
+                or metadata.get("render_variant")
+                or (source_task.get("variant") if str(source_task.get("variant") or "") not in {"base", "perturbed"} else "auto")
+                or "auto"
+            )
+            task_payload = {
+                "run_id": run_id,
+                "scene_id": scene_id,
+                "scene_version_id": source_scene_version_id,
+                "render_version_id": render_version_id,
+                "variant": source_variant,
+                "render_variant": source_render_variant,
+                "scene_variant_key": source_variant,
+                "phase": str(source_task.get("phase") or metadata.get("phase") or "per_view"),
+                "phase_index": int(source_task.get("phase_index") or metadata.get("phase_index") or 0),
+                "node_id": str(source_task.get("node_id") or metadata.get("node_id") or ""),
+                "heading_id": str(source_task.get("heading_id") or metadata.get("heading_id") or ""),
+                "sensor_ids": list(metadata.get("sensor_ids") or []),
+                "modalities_by_sensor": dict(metadata.get("modalities_by_sensor") or {}),
+            }
+            logical_payload = {key: value for key, value in task_payload.items() if key not in {"run_id", "render_version_id"}}
+            logical_key = str(source_task.get("logical_task_key") or metadata.get("logical_task_key") or versioned_task_key(logical_payload))
+            task_payload["logical_task_key"] = logical_key
+            new_task_key = versioned_task_key(task_payload)
+            source_state = str(source_task.get("state") or "planned")
+            source_bundle = versioned_bundle_dir(
+                project_dir, scene_id=scene_id,
+                render_version_id=str(source.get("render_version_id") or ""),
+                variant=task_payload["variant"], node_id=task_payload["node_id"], heading_id=task_payload["heading_id"],
+            )
+            source_bundle_ref = source_bundle.relative_to(project_dir).as_posix()
+            if source_state in {"succeeded", "skipped"} and (source_bundle / "manifest.json").exists():
+                metadata.update({"source_bundle_ref": source_bundle_ref, "source_task_key": source_task_key})
+            elif request_payload is not None:
+                # Give every retry a new job/request identity while retaining
+                # the exact scene and sensor payload in the request blob.
+                short = new_task_key[-10:]
+                request_payload = dict(request_payload)
+                request_payload["request_id"] = f"{request_payload.get('request_id') or 'request'}-resume-{short}"
+                request_payload["job_id"] = f"{request_payload.get('job_id') or 'job'}-resume-{short}"
+                extras = dict(request_payload.get("extras") or {})
+                extras.update({
+                    "opticalnav_project_id": project_dir.name,
+                    "opticalnav_scene_id": scene_id,
+                    "run_id": run_id,
+                    "scene_version_id": source_scene_version_id,
+                    "render_version_id": render_version_id,
+                    "task_key": new_task_key,
+                    "source_run_id": source_run_id,
+                    "scene_variant_key": task_payload["variant"],
+                    "render_variant": task_payload["render_variant"],
+                    "opticalnav_vp_id": task_payload["node_id"],
+                    "opticalnav_heading_id": task_payload["heading_id"],
+                })
+                request_payload["extras"] = extras
+                metadata["source_task_key"] = source_task_key
+            blob_digest = ledger.put_request_blob(request_payload) if request_payload is not None else None
+            ledger.put_task(
+                task_key_value=new_task_key, run_id=run_id, render_version_id=render_version_id,
+                variant=task_payload["variant"], phase=task_payload["phase"], phase_index=task_payload["phase_index"],
+                ordinal=ordinal, node_id=task_payload["node_id"], heading_id=task_payload["heading_id"],
+                metadata={**metadata, **task_payload}, request_blob_digest=blob_digest, logical_task_key=logical_key,
+            )
+            if metadata.get("source_bundle_ref"):
+                ledger.update_task(new_task_key, state="skipped", attempt_count=0)
+            plan.append({"task_key": new_task_key, "payload": request_payload, "metadata": metadata, "task": task_payload})
+
+        ledger.update_run(run_id, status="planned", metadata={"resume": True, "source_run_id": source_run_id, "plan_total": len(plan)})
+
+        def _submit_resume() -> None:
+            jobs: list[dict[str, Any]] = []
+            try:
+                for item in plan:
+                    task = item["task"]
+                    task_key_value = str(item["task_key"])
+                    if item["metadata"].get("source_bundle_ref"):
+                        continue
+                    request_payload = item["payload"]
+                    if not isinstance(request_payload, Mapping):
+                        ledger.update_task(task_key_value, state="failed", error="request blob missing")
+                        continue
+                    request = render_request_from_payload(dict(request_payload))
+                    accepted = self.submit(request, variant=str(task.get("render_variant") or "auto"), lazy_persist=True)
+                    ledger.update_task(task_key_value, state="queued", job_id=accepted.job_id)
+                    ledger.record_event("queued", run_id=run_id, task_key_value=task_key_value, payload={"job_id": accepted.job_id, "resume": True})
+                    jobs.append({"job_id": accepted.job_id, "task_key": task_key_value, **task})
+                    batch = dict(_read_json(batch_path))
+                    batch.update({"status": "ready", "jobs": jobs, "plan_total": len(plan), "completed_from_source": sum(1 for x in plan if x["metadata"].get("source_bundle_ref"))})
+                    batch_path.write_text(json.dumps(batch, ensure_ascii=False, indent=2), encoding="utf-8")
+                ledger.update_run(run_id, status="ready", metadata={"resume": True, "source_run_id": source_run_id, "plan_total": len(plan), "job_count": len(jobs)})
+            except Exception as exc:
+                ledger.update_run(run_id, status="paused", metadata={"resume": True, "source_run_id": source_run_id, "error": str(exc)})
+                try:
+                    batch = dict(_read_json(batch_path))
+                    batch.update({"status": "paused", "error": str(exc), "jobs": jobs})
+                    batch_path.write_text(json.dumps(batch, ensure_ascii=False, indent=2), encoding="utf-8")
+                except Exception:
+                    pass
+
+        threading.Thread(target=_submit_resume, name=f"resume-{run_id}", daemon=True).start()
+        return {**stub, "status": "planned", "plan_total": len(plan), "completed_from_source": sum(1 for item in plan if item["metadata"].get("source_bundle_ref"))}
+
+    def _opticalnav_promote_render_version(self, project_dir: Path, render_version_id: str) -> dict[str, Any]:
+        ledger = RenderLedger(project_dir)
+        versions = [item for item in ledger.list_versions() if item.get("render_version_id") == render_version_id]
+        if not versions:
+            raise KeyError(render_version_id)
+        version = versions[0]
+        run_id = str(version.get("run_id") or "")
+        run = ledger.run_payload(run_id) if run_id else None
+        tasks = list((run or {}).get("tasks") or [])
+        if not tasks or any(str(item.get("state") or "") not in {"succeeded", "skipped"} for item in tasks):
+            raise ValueError("render version is not complete; failed/planned tasks must be resumed first")
+        scene_id = str(version.get("scene_id") or "")
+        scene_version = str(version.get("scene_version_id") or "")
+        for task in tasks:
+            variant = str(task.get("variant") or "base")
+            node_id = str(task.get("node_id") or "")
+            heading_id = str(task.get("heading_id") or "")
+            source_ref = str((task.get("metadata") or {}).get("source_bundle_ref") or "")
+            bundle = (project_dir / source_ref).resolve() if source_ref else versioned_bundle_dir(
+                project_dir, scene_id=scene_id, render_version_id=render_version_id,
+                variant=variant, node_id=node_id, heading_id=heading_id,
+            )
+            if not (bundle / "manifest.json").exists():
+                raise ValueError(f"missing manifest for task {task.get('task_key') or node_id + '/' + heading_id}")
+            bundle_ref = bundle.relative_to(project_dir).as_posix()
+            write_current_pointer(
+                project_dir, scene_id=scene_id, variant=variant, node_id=node_id, heading_id=heading_id,
+                render_version_id=render_version_id, bundle_ref=bundle_ref, scene_version_id_value=scene_version,
+            )
+        result = ledger.promote_version(render_version_id)
+        if run_id:
+            ledger.update_run(run_id, status="completed")
+        return {**result, "scene_id": scene_id, "run_id": run_id, "task_count": len(tasks)}
+
+    def _opticalnav_prune_render_version(self, project_dir: Path, render_version_id: str) -> dict[str, Any]:
+        ledger = RenderLedger(project_dir)
+        versions = [item for item in ledger.list_versions() if item.get("render_version_id") == render_version_id]
+        if not versions:
+            raise KeyError(render_version_id)
+        version = versions[0]
+        result = ledger.prune_version(render_version_id)
+        root = version_root(project_dir, str(version.get("scene_id") or ""), render_version_id)
+        if root.exists():
+            shutil.rmtree(root)
+        return {**result, "path": root.relative_to(project_dir).as_posix()}
 
     # --- OpticalNav Agent API helpers ---
 
@@ -11194,6 +12491,26 @@ class RenderDaemon:
         if len(parts) == 1:
             self._send_json(handler, HTTPStatus.OK, self._opticalnav_project_summary(project_dir))
             return True
+        if len(parts) == 4 and parts[1] == "scenes" and parts[3] == "render-versions":
+            scene_id = parts[2]
+            try:
+                versions = RenderLedger(project_dir).list_versions(scene_id=scene_id)
+            except Exception as exc:
+                self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return True
+            self._send_json(handler, HTTPStatus.OK, {"scene_id": scene_id, "versions": versions})
+            return True
+        if len(parts) == 3 and parts[1] == "graph-render-runs":
+            try:
+                payload = RenderLedger(project_dir).run_payload(parts[2])
+            except Exception as exc:
+                self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return True
+            if payload is None:
+                self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": f"Unknown graph run_id: {parts[2]}"})
+            else:
+                self._send_json(handler, HTTPStatus.OK, payload)
+            return True
         if len(parts) == 2 and parts[1] == "infinigen-generate":
             with self._infinigen_jobs_lock:
                 jobs = [dict(v) for v in self._infinigen_jobs.values() if v.get("project_id") == parts[0]]
@@ -11534,7 +12851,13 @@ class RenderDaemon:
             return True
         if len(parts) == 3 and parts[1] == "graph-render-batches":
             try:
-                self._send_json(handler, HTTPStatus.OK, self._opticalnav_graph_batch_payload(project_dir, parts[2]))
+                summary_requested = _maybe_str((query.get("view") or [None])[0]) == "summary"
+                payload = (
+                    self._opticalnav_graph_batch_summary(project_dir, parts[2])
+                    if summary_requested
+                    else self._opticalnav_graph_batch_payload(project_dir, parts[2])
+                )
+                self._send_json(handler, HTTPStatus.OK, payload)
             except KeyError:
                 self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": f"Unknown graph batch_id: {parts[2]}"})
             return True
@@ -12055,7 +13378,8 @@ class RenderDaemon:
             return True
         return False
 
-    _INFINIGEN_ARCHETYPES = ("apartment", "office")
+    _INFINIGEN_ARCHETYPES = ("apartment", "office", "single_room")
+    _INFINIGEN_ROOM_TYPES = ("living-room", "bedroom", "kitchen", "bathroom")
     _INFINIGEN_DENSITIES = ("model_house", "normal_lived_in", "family_home", "storage_heavy")
     _INFINIGEN_STAGES = ("full", "layout")
 
@@ -12097,6 +13421,8 @@ class RenderDaemon:
             "--import" if params.get("do_import", True) else "--no-import",
             "--yes",
         ]
+        if params.get("archetype") == "single_room":
+            cmd.extend(["--room-type", str(params.get("room_type") or "living-room")])
         if params.get("bake_pbr"):
             cmd.append("--bake-pbr")
         self._infinigen_set_job(job_id, status="running", stage="generating",
@@ -12197,10 +13523,44 @@ class RenderDaemon:
         if not project_dir.exists():
             self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": f"Unknown OpticalNav project_id: {parts[0]}"})
             return True
+        if len(parts) == 4 and parts[1] == "scenes" and parts[3] == "render-versions" and payload.get("action") == "promote":
+            try:
+                result = self._opticalnav_promote_render_version(project_dir, str(payload.get("render_version_id") or ""))
+            except KeyError as exc:
+                self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": f"Unknown render_version_id: {exc.args[0] if exc.args else ''}"})
+                return True
+            except ValueError as exc:
+                self._send_json(handler, HTTPStatus.CONFLICT, {"error": str(exc)})
+                return True
+            self._send_json(handler, HTTPStatus.OK, result)
+            return True
+        if len(parts) == 4 and parts[1] == "scenes" and parts[3] == "render-versions" and payload.get("action") == "prune":
+            try:
+                result = self._opticalnav_prune_render_version(project_dir, str(payload.get("render_version_id") or ""))
+            except KeyError as exc:
+                self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": f"Unknown render_version_id: {exc.args[0] if exc.args else ''}"})
+                return True
+            except ValueError as exc:
+                self._send_json(handler, HTTPStatus.CONFLICT, {"error": str(exc)})
+                return True
+            self._send_json(handler, HTTPStatus.OK, result)
+            return True
+        if len(parts) == 4 and parts[1] == "graph-render-runs" and parts[3] == "resume":
+            try:
+                result = self._opticalnav_resume_graph_run(project_dir, parts[2], payload if isinstance(payload, Mapping) else {})
+            except KeyError as exc:
+                self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": f"Unknown graph run_id: {exc.args[0] if exc.args else ''}"})
+                return True
+            except ValueError as exc:
+                self._send_json(handler, HTTPStatus.CONFLICT, {"error": str(exc)})
+                return True
+            self._send_json(handler, HTTPStatus.ACCEPTED, result)
+            return True
         if len(parts) == 2 and parts[1] == "infinigen-generate":
             import random
 
             archetype = str(payload.get("archetype") or "apartment")
+            room_type = str(payload.get("room_type") or "living-room").replace("_", "-")
             density = str(payload.get("density") or "normal_lived_in")
             stage = str(payload.get("stage") or "full")
             seed_in = (str(payload.get("seed") or "today").strip() or "today")
@@ -12208,6 +13568,9 @@ class RenderDaemon:
             bake_pbr = self._coerce_bool(payload.get("bake_pbr"), False)
             if archetype not in self._INFINIGEN_ARCHETYPES:
                 self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": f"archetype must be one of {list(self._INFINIGEN_ARCHETYPES)}"})
+                return True
+            if archetype == "single_room" and room_type not in self._INFINIGEN_ROOM_TYPES:
+                self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": f"room_type must be one of {list(self._INFINIGEN_ROOM_TYPES)} for single_room"})
                 return True
             if density not in self._INFINIGEN_DENSITIES:
                 self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": f"density must be one of {list(self._INFINIGEN_DENSITIES)}"})
@@ -12224,10 +13587,12 @@ class RenderDaemon:
                 seed = f"{random.randint(0, 99999999):08d}"
             else:
                 seed = seed_in
-            scene_id = _maybe_str(payload.get("scene_id")) or f"infinigen_{archetype}_{seed}"
+            room_suffix = f"_{room_type.replace('-', '_')}" if archetype == "single_room" else ""
+            scene_id = _maybe_str(payload.get("scene_id")) or f"infinigen_{archetype}{room_suffix}_{seed}"
             job_id = f"infinigen-{_utc_now().strftime('%Y%m%dT%H%M%S%f')}-{hashlib.sha1(scene_id.encode()).hexdigest()[:6]}"
-            params = {"archetype": archetype, "density": density, "stage": stage,
-                      "seed": seed, "scene_id": scene_id, "do_import": do_import, "bake_pbr": bake_pbr}
+            params = {"archetype": archetype, "room_type": room_type if archetype == "single_room" else None,
+                      "density": density, "stage": stage, "seed": seed, "scene_id": scene_id,
+                      "do_import": do_import, "bake_pbr": bake_pbr}
             self._infinigen_set_job(
                 job_id, project_id=parts[0], status="queued", stage="queued",
                 params=params, scene_id=scene_id, seed=seed, created_at=_utc_now_iso(), log=[],
@@ -13439,7 +14804,10 @@ class RenderDaemon:
             include_polarization_raw = bool(payload.get("include_polarization_raw", True))
             include_episode_birdseye = bool(payload.get("include_episode_birdseye", False))
             eval_perturbation = bool(payload.get("eval_perturbation", False))
+            export_profile = str(payload.get("export_profile") or "compact_with_polar_extension")
             try:
+                from navigation_dataset.exporters.compact_bundle import resolve_export_profile
+                export_profile = resolve_export_profile(export_profile).name
                 camera_ids = _normalize_export_camera_ids(payload.get("camera_ids"))
             except ValueError as exc:
                 self._send_json(
@@ -13456,6 +14824,7 @@ class RenderDaemon:
                     "scene_id": scene_id,
                     "only_completed": only_completed,
                     "include_episode_thumbnails": include_episode_thumbnails,
+                    "export_profile": export_profile,
                     "selected_camera_ids": camera_ids,
                     "status": "queued",
                     "stage": "scope",
@@ -13473,7 +14842,7 @@ class RenderDaemon:
                 }
             threading.Thread(
                 target=self._run_export_job,
-                args=(job_id, parts[0], project_dir, scene_id, only_completed, episode_ids, include_episode_thumbnails, panorama_observations, png_only, include_birdseye, include_polarization_raw, include_episode_birdseye, eval_perturbation, camera_ids),
+                args=(job_id, parts[0], project_dir, scene_id, only_completed, episode_ids, include_episode_thumbnails, panorama_observations, png_only, include_birdseye, include_polarization_raw, include_episode_birdseye, eval_perturbation, camera_ids, export_profile),
                 name=f"export-job-{job_id}",
                 daemon=True,
             ).start()
@@ -13481,6 +14850,7 @@ class RenderDaemon:
                 "job_id": job_id,
                 "status": "queued",
                 "scene_id": scene_id,
+                "export_profile": export_profile,
                 "ws_url": f"/api/ws/opticalnav-export?job_id={job_id}",
                 "status_url": f"/api/opticalnav/projects/{parts[0]}/export-jobs/{job_id}",
             })
@@ -14217,6 +15587,18 @@ class RenderDaemon:
         _variant_key = str(payload.get("scene_variant_key")
                            or (payload.get("extras") or {}).get("scene_variant_key")
                            or "base").lower()
+        if _variant_key not in {"base", "perturbed"}:
+            _variant_key = "base"
+        submission_group_id = _maybe_str(payload.get("submission_group_id"))
+        previous_variant_batch_id = _maybe_str(payload.get("previous_variant_batch_id"))
+        try:
+            variant_sequence_index = int(payload.get("variant_sequence_index", 0) or 0)
+        except (TypeError, ValueError):
+            variant_sequence_index = 0
+        try:
+            variant_sequence_total = max(1, int(payload.get("variant_sequence_total", 1) or 1))
+        except (TypeError, ValueError):
+            variant_sequence_total = 1
         if _sv_path.exists():
             _sv = _read_json(_sv_path)
             if _variant_key == "perturbed":
@@ -14285,7 +15667,8 @@ class RenderDaemon:
             "timestamp": _utc_now_iso(),
             "scene_snapshot_ref": resolved_scene_ref,
             "mitsuba_scene_ref": resolved_scene_ref,
-            "extras": {},
+            "scene_version": _scene_version_id,
+            "extras": {"scene_version_id": _scene_version_id, "scene_digest": _scene_digest},
         }
 
         # Custom positions: no graph required
@@ -14295,6 +15678,8 @@ class RenderDaemon:
                 self._send_json(handler, HTTPStatus.BAD_REQUEST, precondition)
                 return
             batch_id = f"opticalnav-custom-{_utc_now().strftime('%Y%m%dT%H%M%S%f')}"
+            # Custom-position submissions remain synchronous at this endpoint;
+            # BOTH sequencing is enforced by the UI before this request is sent.
             jobs = []
             skipped_existing = 0
             requested_count = 0
@@ -14337,6 +15722,11 @@ class RenderDaemon:
                     sweep_request.request.extras["opticalnav_scene_id"] = scene_id
                     sweep_request.request.extras["opticalnav_vp_id"] = sweep_request.node_id
                     sweep_request.request.extras["opticalnav_heading_id"] = sweep_request.heading_id
+                    sweep_request.request.extras["scene_variant_key"] = _variant_key
+                    sweep_request.request.extras["submission_group_id"] = submission_group_id
+                    sweep_request.request.extras["variant_sequence_index"] = variant_sequence_index
+                    sweep_request.request.extras["variant_sequence_total"] = variant_sequence_total
+                    sweep_request.request.extras["previous_variant_batch_id"] = previous_variant_batch_id
                     accepted = self.submit(
                         sweep_request.request,
                         variant=str(payload.get("variant") or self.variant),
@@ -14347,6 +15737,11 @@ class RenderDaemon:
                         "scene_id": scene_id,
                         "node_id": sweep_request.node_id,
                         "heading_id": sweep_request.heading_id,
+                        "scene_variant_key": _variant_key,
+                        "submission_group_id": submission_group_id,
+                        "variant_sequence_index": variant_sequence_index,
+                        "variant_sequence_total": variant_sequence_total,
+                        "previous_variant_batch_id": previous_variant_batch_id,
                         "render_mode": sweep_request.request.extras.get("render_mode"),
                         "preview_id": sweep_request.request.extras.get("preview_id"),
                         "sensor_id": sweep_request.request.camera_specs[0].camera_id if sweep_request.request.camera_specs else None,
@@ -14367,6 +15762,11 @@ class RenderDaemon:
                 "scene_id": scene_id,
                 "backend": "daemon",
                 "created_at": _utc_now_iso(),
+                "scene_variant_key": _variant_key,
+                "submission_group_id": submission_group_id,
+                "variant_sequence_index": variant_sequence_index,
+                "variant_sequence_total": variant_sequence_total,
+                "previous_variant_batch_id": previous_variant_batch_id,
                 "modalities": modalities,
                 "sensor_scope": sensor_scope,
                 "sensor_ids": sensor_ids or [],
@@ -14378,6 +15778,7 @@ class RenderDaemon:
                 "requested_jobs": requested_count or len(jobs),
                 "skipped_existing": skipped_existing,
                 "jobs": jobs,
+                "status": "completed" if not jobs else "ready",
             }
             batch_path = project_dir / "graph_render_batches" / f"{batch_id}.json"
             batch_path.parent.mkdir(parents=True, exist_ok=True)
@@ -14432,6 +15833,33 @@ class RenderDaemon:
         # to the worker queue takes seconds-to-minutes and must not block the HTTP handler.
         node_ids_filter = [str(n) for n in payload["node_ids"]] if payload.get("node_ids") else None
         batch_id = f"opticalnav-graph-{_utc_now().strftime('%Y%m%dT%H%M%S%f')}"
+        ledger = RenderLedger(project_dir)
+        ledger.create_scene_version(
+            project_id=project_dir.name, scene_id=scene_id,
+            scene_version_id_value=_scene_version_id, scene_digest=_scene_digest,
+            metadata={
+                "scene_ref": resolved_scene_ref,
+                "variant": _variant_key,
+                "scene_variant_key": _variant_key,
+                "submission_group_id": submission_group_id,
+                "variant_sequence_index": variant_sequence_index,
+                "variant_sequence_total": variant_sequence_total,
+                "previous_variant_batch_id": previous_variant_batch_id,
+            },
+        )
+        ledger.create_render_run(
+            run_id=batch_id, project_id=project_dir.name, scene_id=scene_id,
+            scene_version_id_value=_scene_version_id, render_version_id=_render_version_id,
+            metadata={
+                "variant": _variant_key,
+                "scene_variant_key": _variant_key,
+                "execution_policy": sweep_execution_policy,
+                "submission_group_id": submission_group_id,
+                "variant_sequence_index": variant_sequence_index,
+                "variant_sequence_total": variant_sequence_total,
+                "previous_variant_batch_id": previous_variant_batch_id,
+            },
+        )
         batch_path = project_dir / "graph_render_batches" / f"{batch_id}.json"
         batch_path.parent.mkdir(parents=True, exist_ok=True)
         stub = {
@@ -14440,6 +15868,15 @@ class RenderDaemon:
             "scene_id": scene_id,
             "backend": "daemon",
             "created_at": _utc_now_iso(),
+            "run_id": batch_id,
+            "scene_version_id": _scene_version_id,
+            "render_version_id": _render_version_id,
+            "scene_variant_key": _variant_key,
+            "submission_group_id": submission_group_id,
+            "variant_sequence_index": variant_sequence_index,
+            "variant_sequence_total": variant_sequence_total,
+            "previous_variant_batch_id": previous_variant_batch_id,
+            "plan_total": 0,
             "modalities": modalities,
             "sensor_scope": sensor_scope,
             "sensor_ids": sensor_ids or [],
@@ -14462,6 +15899,9 @@ class RenderDaemon:
                 scene_id=scene_id,
                 graph_path=graph_path,
                 scene_state_payload=dict(scene_state_payload),
+                run_id=batch_id,
+                scene_version_id_value=_scene_version_id,
+                render_version_id=_render_version_id,
                 camera_spec_payload=dict(camera_spec_payload or {}) if camera_spec_payload else None,
                 camera_specs_payload=camera_specs_payload,
                 sensor_specs_payload=sensor_specs_payload,
@@ -14473,6 +15913,11 @@ class RenderDaemon:
                 render_settings=render_settings,
                 node_heights=node_heights,
                 variant=str(payload.get("variant") or self.variant),
+                scene_variant_key=_variant_key,
+                submission_group_id=submission_group_id,
+                variant_sequence_index=variant_sequence_index,
+                variant_sequence_total=variant_sequence_total,
+                previous_variant_batch_id=previous_variant_batch_id,
                 sweep_execution_policy=sweep_execution_policy,
                 skip_existing_observations=skip_existing_observations,
                 active_lights=active_lights_payload,
@@ -14481,6 +15926,49 @@ class RenderDaemon:
             name=f"sweep-{batch_id}",
         ).start()
         self._send_json(handler, HTTPStatus.ACCEPTED, stub)
+
+    def _wait_for_graph_batch_terminal(
+        self,
+        project_dir: "Path",
+        batch_id: str,
+        *,
+        timeout_s: float | None = None,
+    ) -> dict[str, Any]:
+        """Wait for a preceding scene-variant batch before queueing the next one.
+
+        This is intentionally ledger-backed rather than tied to in-memory jobs so
+        a daemon restart cannot make a perturbed submission race a still-running
+        base batch. A failed/paused predecessor is a hard barrier: callers must
+        resume or retry the base run explicitly.
+        """
+        timeout = float(timeout_s if timeout_s is not None else os.environ.get(
+            "ROBOMITUBA_VARIANT_SWEEP_BARRIER_TIMEOUT_S", 24 * 60 * 60,
+        ))
+        deadline = time.time() + max(1.0, timeout)
+        failure_states = {"paused", "failed", "error", "cancelled", "canceled"}
+        while True:
+            try:
+                payload = self._opticalnav_graph_batch_payload(project_dir, str(batch_id))
+            except Exception:
+                payload = None
+            if payload is not None:
+                ledger_status = str(payload.get("ledger_status") or "").lower()
+                batch_status = str(payload.get("status") or "").lower()
+                status = ledger_status or batch_status
+                progress = payload.get("progress") if isinstance(payload.get("progress"), Mapping) else {}
+                total = int(progress.get("total") or 0)
+                done = int(progress.get("completed") or 0) + int(progress.get("failed") or 0)
+                if status == "completed" or (total > 0 and done >= total and status not in {"building", "submitting"}):
+                    return payload
+                if status in failure_states:
+                    raise RuntimeError(
+                        f"previous variant batch {batch_id} ended with {status}; "
+                        "resume or rerun the base variant before submitting perturbed"
+                    )
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                raise TimeoutError(f"timed out waiting for previous variant batch {batch_id}")
+            time.sleep(min(1.0, remaining))
 
     def _wait_for_render_jobs_terminal(self, job_ids: Sequence[str], *, timeout_s: float | None = None) -> dict[str, int]:
         terminal = {"succeeded", "failed", "cancelled"}
@@ -14539,6 +16027,9 @@ class RenderDaemon:
         scene_id: str,
         graph_path: "Path",
         scene_state_payload: dict,
+        run_id: str,
+        scene_version_id_value: str,
+        render_version_id: str,
         camera_spec_payload: dict | None,
         camera_specs_payload: "list[dict] | None",
         sensor_specs_payload: "list[dict] | None",
@@ -14550,6 +16041,11 @@ class RenderDaemon:
         render_settings: dict,
         node_heights: "dict | None",
         variant: str,
+        scene_variant_key: str = "base",
+        submission_group_id: str | None = None,
+        variant_sequence_index: int = 0,
+        variant_sequence_total: int = 1,
+        previous_variant_batch_id: str | None = None,
         sweep_execution_policy: str = "auto",
         skip_existing_observations: bool = False,
         active_lights: "list[dict] | None" = None,
@@ -14557,7 +16053,13 @@ class RenderDaemon:
         """Background thread: read graph, build RenderRequests, submit all jobs."""
         from navigation_dataset.sensor_sweep import build_sweep_render_requests, split_sweep_requests_by_modality_phase
         from navigation_dataset.viewpoint_graph import read_viewpoint_graph
+        ledger = RenderLedger(project_dir)
         try:
+            # Keep the ordering guarantee in the daemon as well as the UI: a
+            # direct/retried client cannot enqueue perturbed work before the
+            # previous variant batch is terminal.
+            if previous_variant_batch_id:
+                self._wait_for_graph_batch_terminal(project_dir, previous_variant_batch_id)
             try:
                 batch_created_at = _maybe_str(_read_json(batch_path).get("created_at")) or _utc_now_iso()
             except Exception:
@@ -14583,6 +16085,121 @@ class RenderDaemon:
                 sweep_requests,
                 sweep_execution_policy=sweep_execution_policy,
             )
+            # Persist the complete plan before submitting the first worker job.
+            # This is the durable cursor that allows a later resume to include
+            # tasks that were never accepted by the in-memory queue.
+            # Keep the bulk plan in memory.  Persisting one SQLite connection,
+            # blob commit, task insert, and event per viewpoint made a 2,000-view
+            # sweep appear frozen before the first job reached a GPU worker.
+            # The complete plan is persisted once below; queued/running and
+            # attempt state are materialized lazily at worker consumption.
+            task_keys: dict[int, str] = {}
+            task_records: dict[int, dict[str, Any]] = {}
+            preplans: list[tuple[Any, dict[str, Any], str, str, int]] = []
+            plan_ordinal = 0
+            logical_keys: list[str] = []
+            for phase in phases:
+                for sweep_request in phase.requests:
+                    request = sweep_request.request
+                    task_payload = {
+                        "run_id": run_id,
+                        "scene_id": scene_id,
+                        "scene_version_id": scene_version_id_value,
+                        "render_version_id": render_version_id,
+                        "variant": scene_variant_key,
+                        "render_variant": variant,
+                        "scene_variant_key": scene_variant_key,
+                        "submission_group_id": submission_group_id,
+                        "variant_sequence_index": variant_sequence_index,
+                        "variant_sequence_total": variant_sequence_total,
+                        "previous_variant_batch_id": previous_variant_batch_id,
+                        "phase": phase.phase,
+                        "phase_index": phase.phase_index,
+                        "node_id": sweep_request.node_id,
+                        "heading_id": sweep_request.heading_id,
+                        "sensor_ids": list(sweep_request.sensor_ids or []),
+                        "modalities_by_sensor": dict(sweep_request.modalities_by_sensor or {}),
+                    }
+                    logical_payload = {key: value for key, value in task_payload.items() if key not in {"run_id", "render_version_id"}}
+                    logical_key = versioned_task_key(logical_payload)
+                    task_id = versioned_task_key(task_payload)
+                    logical_keys.append(logical_key)
+                    preplans.append((sweep_request, task_payload, logical_key, task_id, plan_ordinal))
+                    plan_ordinal += 1
+
+            existing_by_logical = ledger.find_complete_tasks(
+                scene_version_id_value=scene_version_id_value,
+                logical_task_keys=logical_keys,
+            )
+            for sweep_request, task_payload, logical_key, task_id, ordinal in preplans:
+                existing = existing_by_logical.get(logical_key)
+                if existing:
+                    prior_bundle = versioned_bundle_dir(
+                        project_dir, scene_id=scene_id, render_version_id=str(existing.get("render_version_id") or ""),
+                        variant=scene_variant_key, node_id=sweep_request.node_id, heading_id=sweep_request.heading_id,
+                    )
+                    if (prior_bundle / "manifest.json").exists():
+                        task_payload["source_bundle_ref"] = prior_bundle.relative_to(project_dir).as_posix()
+                task_payload["logical_task_key"] = logical_key
+                request.extras.update({
+                    "run_id": run_id,
+                    "scene_version_id": scene_version_id_value,
+                    "render_version_id": render_version_id,
+                    "scene_variant_key": scene_variant_key,
+                    "render_variant": variant,
+                    "submission_group_id": submission_group_id,
+                    "variant_sequence_index": variant_sequence_index,
+                    "variant_sequence_total": variant_sequence_total,
+                    "previous_variant_batch_id": previous_variant_batch_id,
+                    "task_key": task_id,
+                    "logical_task_key": logical_key,
+                    "plan_ordinal": ordinal,
+                    "task_plan_persisted": True,
+                    "phase": task_payload["phase"],
+                    "phase_index": task_payload["phase_index"],
+                    "opticalnav_project_id": project_dir.name,
+                    "opticalnav_scene_id": scene_id,
+                    "opticalnav_vp_id": sweep_request.node_id,
+                    "opticalnav_heading_id": sweep_request.heading_id,
+                    **({"source_bundle_ref": task_payload["source_bundle_ref"]} if task_payload.get("source_bundle_ref") else {}),
+                })
+                task_keys[id(request)] = task_id
+                task_records[id(request)] = {
+                    "task_key": task_id,
+                    "run_id": run_id,
+                    "render_version_id": render_version_id,
+                    "variant": scene_variant_key,
+                    "render_variant": variant,
+                    "scene_variant_key": scene_variant_key,
+                    "submission_group_id": submission_group_id,
+                    "variant_sequence_index": variant_sequence_index,
+                    "variant_sequence_total": variant_sequence_total,
+                    "previous_variant_batch_id": previous_variant_batch_id,
+                    "phase": phase.phase,
+                    "phase_index": phase.phase_index,
+                    "ordinal": ordinal,
+                    "node_id": sweep_request.node_id,
+                    "heading_id": sweep_request.heading_id,
+                    "logical_task_key": logical_key,
+                    "metadata": task_payload,
+                    "request_payload": render_request_to_payload(request),
+                    "state": "skipped" if task_payload.get("source_bundle_ref") else "planned",
+                }
+            requested_plan_count = plan_ordinal
+            # Preserve the complete restart/resume plan with one bulk SQLite
+            # transaction. Runtime queued/running/attempt state is updated when
+            # the worker consumes each in-memory request.
+            ledger.put_tasks_batch(list(task_records.values()))
+            ledger.update_run(run_id, status="planned", metadata={
+                "phase_order": [phase.phase for phase in phases],
+                "plan_total": requested_plan_count,
+                "scene_variant_key": scene_variant_key,
+                "render_variant": variant,
+                "submission_group_id": submission_group_id,
+                "variant_sequence_index": variant_sequence_index,
+                "variant_sequence_total": variant_sequence_total,
+                "previous_variant_batch_id": previous_variant_batch_id,
+            })
             # A separately submitted perturbed sweep is a scene-variant
             # boundary too. If the previous base sweep tripped the worker
             # circuit breaker, recover only after its jobs are terminal and
@@ -14606,7 +16223,7 @@ class RenderDaemon:
                 if len(phases) > 1 or (phases and phases[0].phase != "per_view")
                 else "per_view"
             )
-            requested_count = sum(len(phase.requests) for phase in phases)
+            requested_count = requested_plan_count
             skipped_existing = 0
             gpu_indices = _render_gpu_indices_from_env()
             jobs = []
@@ -14631,6 +16248,16 @@ class RenderDaemon:
                     "graph_id": graph.graph_id,
                     "backend": "daemon",
                     "created_at": batch_created_at,
+                    "run_id": run_id,
+                    "scene_version_id": scene_version_id_value,
+                    "render_version_id": render_version_id,
+                    "scene_variant_key": scene_variant_key,
+                    "render_variant": variant,
+                    "submission_group_id": submission_group_id,
+                    "variant_sequence_index": variant_sequence_index,
+                    "variant_sequence_total": variant_sequence_total,
+                    "previous_variant_batch_id": previous_variant_batch_id,
+                    "plan_total": requested_count,
                     "modalities": modalities,
                     "sensor_scope": sensor_scope,
                     "sensor_ids": sensor_ids or [],
@@ -14680,18 +16307,67 @@ class RenderDaemon:
                     _write_batch("recycled_phase_boundary", active_phase=phase.phase)
 
                 phase_requests = list(phase.requests)
+                phase_skips: list[dict[str, Any]] = []
                 if skip_existing_observations:
                     kept_requests = []
                     for sweep_request in phase_requests:
-                        if self._opticalnav_sweep_output_exists(project_dir, scene_id, sweep_request, sweep_request.request.modalities):
+                        existing_versioned = bool(sweep_request.request.extras.get("source_bundle_ref"))
+                        # The render-version extras are present on every new
+                        # request, so they must not disable the legacy-output
+                        # existence check for --missing-only sweeps.
+                        existing_legacy = self._opticalnav_sweep_output_exists(
+                            project_dir, scene_id, sweep_request, sweep_request.request.modalities,
+                        )
+                        if existing_versioned or existing_legacy:
                             skipped_existing += 1
+                            task_id = task_keys.get(id(sweep_request.request)) or str(sweep_request.request.extras.get("task_key") or "")
+                            record = task_records.get(id(sweep_request.request))
+                            if record is not None:
+                                record["state"] = "skipped"
+                                record["metadata"] = {
+                                    **dict(record.get("metadata") or {}),
+                                    "skip_reason": "complete_scene_version_task" if existing_versioned else "existing_observation",
+                                }
+                                phase_skips.append(record)
                         else:
                             kept_requests.append(sweep_request)
                     phase_requests = kept_requests
+                else:
+                    # Completed scene-version tasks are always skipped, even
+                    # when the user requested a full (non-missing-only) sweep.
+                    kept_requests = []
+                    for sweep_request in phase_requests:
+                        if sweep_request.request.extras.get("source_bundle_ref"):
+                            skipped_existing += 1
+                            record = task_records.get(id(sweep_request.request))
+                            if record is not None:
+                                record["state"] = "skipped"
+                                record["metadata"] = {
+                                    **dict(record.get("metadata") or {}),
+                                    "skip_reason": "complete_scene_version_task",
+                                }
+                                phase_skips.append(record)
+                        else:
+                            kept_requests.append(sweep_request)
+                    phase_requests = kept_requests
+                # Only skip rows are persisted here, in one transaction. Render
+                # rows are created by the worker at actual GPU consumption time.
+                if phase_skips:
+                    ledger.update_tasks_batch(
+                        [{"task_key": item["task_key"], "state": "skipped", "attempt_count": 0,
+                          "payload": {"reason": item.get("metadata", {}).get("skip_reason")}}
+                         for item in phase_skips],
+                        run_id=run_id,
+                        event_type="skipped",
+                    )
 
                 shard_assignments = _interleaved_gpu_shard_assignments(len(phase_requests), gpu_indices)
                 submitted_phase_job_ids = []
+                _write_batch("submitting", active_phase=phase.phase)
                 for sweep_request, shard in zip(phase_requests, shard_assignments):
+                    if sweep_request.request.extras.get("source_bundle_ref"):
+                        skipped_existing += 1
+                        continue
                     runtime_overrides = {
                         "shard_index": shard["shard_index"],
                         "shard_count": shard["shard_count"],
@@ -14713,6 +16389,10 @@ class RenderDaemon:
                         runtime_overrides=runtime_overrides,
                         lazy_persist=True,
                     )
+                    task_id = task_keys.get(id(sweep_request.request)) or str(sweep_request.request.extras.get("task_key") or "")
+                    # Do not touch SQLite for each queued request.  The worker
+                    # creates the task row and records the running state when it
+                    # actually consumes this in-memory job.
                     submitted_phase_job_ids.append(accepted.job_id)
                     jobs.append({
                         "job_id": accepted.job_id,
@@ -14725,12 +16405,22 @@ class RenderDaemon:
                         "sensor_count": len(sweep_request.sensor_ids or []),
                         "phase": phase.phase,
                         "phase_index": phase.phase_index,
+                        "task_key": task_id,
+                        "scene_version_id": scene_version_id_value,
+                        "render_version_id": render_version_id,
+                        "scene_variant_key": scene_variant_key,
+                        "submission_group_id": submission_group_id,
+                        "variant_sequence_index": variant_sequence_index,
+                        "variant_sequence_total": variant_sequence_total,
+                        "previous_variant_batch_id": previous_variant_batch_id,
                         "phase_sensor_ids": list(sweep_request.sensor_ids or []),
                         "modalities_by_sensor": dict(sweep_request.modalities_by_sensor or {}),
                         "status_url": accepted.status_url,
                         **runtime_overrides,
                         **({"target_gpu_index": shard["target_gpu_index"]} if _static_gpu_shards_enabled() else {}),
                     })
+                    if len(jobs) % 128 == 0:
+                        _write_batch("submitting", active_phase=phase.phase)
                 _write_batch("ready", active_phase=phase.phase)
 
             _write_batch("ready", active_phase=None)
@@ -14739,16 +16429,14 @@ class RenderDaemon:
             print(f"[daemon] sweep-submission-thread error batch_id={batch_id}: {exc}", file=sys.stderr, flush=True)
             traceback.print_exc(file=sys.stderr)
             try:
+                ledger.update_run(run_id, status="paused", metadata={"error": str(exc)})
+                previous = _read_json(batch_path) if batch_path.exists() else {"batch_id": batch_id, "jobs": []}
                 error_batch = {
-                    "batch_id": batch_id,
-                    "project_id": project_dir.name,
-                    "scene_id": scene_id,
-                    "backend": "daemon",
-                    "status": "error",
+                    **previous,
+                    "status": "paused",
+                    "pause_reason": str(exc),
                     "error": str(exc),
-                    "jobs": [],
-                    "counts": {"queued": 0, "running": 0, "completed": 0, "failed": 0, "cancelled": 0, "unknown": 0},
-                    "progress": {"completed": 0, "failed": 0, "total": 0, "fraction": 0.0},
+                    "plan_total": int(previous.get("plan_total") or previous.get("requested_jobs") or 0),
                 }
                 batch_path.write_text(json.dumps(error_batch, ensure_ascii=False, indent=2), encoding="utf-8")
             except Exception:
@@ -14762,6 +16450,10 @@ class RenderDaemon:
         backend = str(payload.get("backend") or "daemon")
         scene_state_payload = payload.get("scene_state")
         camera_spec_payload = payload.get("camera_spec")
+        render_settings = payload.get("render_settings")
+        if render_settings is not None and not isinstance(render_settings, Mapping):
+            self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": "render_settings must be an object."})
+            return
         episode_ids = payload.get("episode_ids")
         split = _maybe_str(payload.get("split"))
         if isinstance(episode_ids, list) and episode_ids:
@@ -14791,6 +16483,7 @@ class RenderDaemon:
                     scene_state_payload=dict(scene_state_payload),
                     camera_spec_payload=dict(camera_spec_payload or {}),
                     modalities=modalities,
+                    render_settings=dict(render_settings or {}),
                     render_fn=self.render_fn,
                     variant=str(payload.get("variant") or self.variant),
                 )
@@ -14811,6 +16504,7 @@ class RenderDaemon:
                     scene_state_payload=dict(scene_state_payload),
                     camera_spec_payload=dict(camera_spec_payload or {}),
                     modalities=modalities,
+                    render_settings=dict(render_settings or {}),
                     job_id_mode="per_timestep",
                 )
                 for request in requests:
@@ -14831,6 +16525,7 @@ class RenderDaemon:
             "backend": "daemon",
             "created_at": _utc_now_iso(),
             "modalities": modalities,
+            "render_settings": dict(render_settings or {}),
             "jobs": jobs,
         }
         batch_path = project_dir / "render_batches" / f"{batch_id}.json"
@@ -16366,6 +18061,9 @@ class RenderDaemon:
             if job.lazy_persist:
                 self._persist_request_unlocked(job)
                 self._record_render_job_telemetry(job, event_type="queued")
+            # Versioned graph tasks are persisted at worker consumption, not
+            # during the submitter's bulk in-memory enqueue loop.
+            self._record_versioned_job_state(job, "running")
             self._persist_status_unlocked(job)
             self._record_render_job_telemetry(job, event_type="running")
             self._append_job_log_line(job, event_type="running", stage="starting", message="Job started")
@@ -16632,6 +18330,11 @@ class RenderDaemon:
         try:
             import shutil
             ex = job.render_request.extras
+            # Versioned OpticalNav renders already write directly into the
+            # immutable observation store. Never create a duplicate bridge-job
+            # copy for them.
+            if ex.get("render_version_id"):
+                return
             proj_id = ex.get("opticalnav_project_id")
             sc_id = ex.get("opticalnav_scene_id")
             vp_id = ex.get("opticalnav_vp_id")
@@ -16758,6 +18461,48 @@ class RenderDaemon:
         except Exception:
             pass
 
+    def _record_versioned_job_state(self, job: "_QueuedJob", state: str, *, error: str | None = None) -> None:
+        extras = job.render_request.extras if isinstance(job.render_request.extras, Mapping) else {}
+        project_id = str(extras.get("opticalnav_project_id") or "").strip()
+        task_id = str(extras.get("task_key") or "").strip()
+        run_id = str(extras.get("run_id") or "").strip()
+        if not (project_id and task_id):
+            return
+        try:
+            project_dir = self._opticalnav_project_dir(project_id)
+            ledger = RenderLedger(project_dir)
+            # Graph sweep plans are inserted once before submission. Legacy or
+            # externally-created versioned jobs may not have that marker, so
+            # retain a guarded lazy insert for those jobs only.
+            if not bool(extras.get("task_plan_persisted")):
+                try:
+                    ordinal = int(extras.get("plan_ordinal", 0) or 0)
+                except (TypeError, ValueError):
+                    ordinal = 0
+                ledger.put_tasks_batch([{
+                    "task_key": task_id,
+                    "run_id": run_id,
+                    "render_version_id": str(extras.get("render_version_id") or ""),
+                    "variant": str(extras.get("scene_variant_key") or "base"),
+                    "phase": str(extras.get("phase") or "per_view"),
+                    "phase_index": int(extras.get("phase_index", 0) or 0),
+                    "ordinal": ordinal,
+                    "node_id": str(extras.get("opticalnav_vp_id") or ""),
+                    "heading_id": str(extras.get("opticalnav_heading_id") or ""),
+                    "logical_task_key": str(extras.get("logical_task_key") or "") or None,
+                    "metadata": dict(extras),
+                    "request_payload": job.request_payload,
+                    "state": "planned",
+                }])
+            attempt_count = int(job.status.extras.get("retry_attempts", 0) or 0) + 1
+            ledger.update_task(task_id, state=state, job_id=job.render_request.job_id, error=error, attempt_count=attempt_count)
+            ledger.record_attempt(task_id, job_id=job.render_request.job_id, attempt_no=attempt_count, state=state, error=error)
+            ledger.record_event(state, run_id=run_id or None, task_key_value=task_id, payload={"job_id": job.render_request.job_id, "error": error})
+        except Exception:
+            # A ledger write must not turn a successfully rendered observation
+            # into a daemon failure; the next status reconciliation can repair it.
+            pass
+
     def _mark_succeeded(self, job_id: str, *, manifest_path: str, event_ts: Any = None) -> None:
         with self._condition:
             job = self._jobs[job_id]
@@ -16774,6 +18519,7 @@ class RenderDaemon:
         self._update_job_render_timing_summary(job, manifest_path=manifest_path)
         # Disk I/O outside the lock
         self._persist_status_unlocked(job)
+        self._record_versioned_job_state(job, "succeeded")
         self._opticalnav_copy_observation_rgb(job)
         with self._condition:
             self._condition.notify_all()
@@ -16792,6 +18538,7 @@ class RenderDaemon:
             self._condition.notify_all()
         # Disk I/O outside the lock
         self._persist_status_unlocked(job)
+        self._record_versioned_job_state(job, "failed", error=error)
         self._record_render_job_telemetry(job, event_type="failed")
         self._append_job_log_line(job, event_type="failed", stage="failed", message=error or "Job failed", event_ts=event_ts)
 
@@ -16860,6 +18607,8 @@ class RenderDaemon:
         return self.repo_root / "out" / "bridge_jobs" / job_id / "render_progress.log"
 
     def _append_job_log_line(self, job: "_QueuedJob", *, event_type: str, stage: str, message: str, event_ts: Any = None) -> None:
+        if isinstance(job.render_request.extras, Mapping) and job.render_request.extras.get("render_version_id"):
+            return
         try:
             log_path = self._job_log_path(job.render_request.job_id)
             log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -16874,11 +18623,15 @@ class RenderDaemon:
         return self.repo_root / "out" / "bridge_jobs" / job.render_request.job_id / "requests" / f"{job.render_request.frame_id}.json"
 
     def _persist_request_unlocked(self, job: _QueuedJob) -> None:
+        if isinstance(job.render_request.extras, Mapping) and job.render_request.extras.get("render_version_id"):
+            return
         request_path = self._request_path(job)
         request_path.parent.mkdir(parents=True, exist_ok=True)
         request_path.write_text(json.dumps(job.request_payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def _persist_status_unlocked(self, job: _QueuedJob) -> None:
+        if isinstance(job.render_request.extras, Mapping) and job.render_request.extras.get("render_version_id"):
+            return
         status_path = self._status_path(job.render_request.job_id)
         status_path.parent.mkdir(parents=True, exist_ok=True)
         write_render_job_status(status_path, job.status)
@@ -18799,6 +20552,12 @@ class RenderDaemon:
             "elapsed_s": round(elapsed_s, 2) if elapsed_s is not None else None,
             "queue_wait_s": round(queue_wait_s, 2) if queue_wait_s is not None else None,
             "is_stuck": is_stuck,
+            # Keep scene variant at top level for WS/UI consumers while also
+            # retaining the complete request extras for diagnostics.
+            "scene_variant_key": str(status.extras.get("scene_variant_key") or "base"),
+            "submission_group_id": status.extras.get("submission_group_id"),
+            "variant_sequence_index": status.extras.get("variant_sequence_index"),
+            "variant_sequence_total": status.extras.get("variant_sequence_total"),
             "extras": dict(status.extras),
         }
 
@@ -18981,7 +20740,13 @@ class RenderDaemon:
         index = self._bundle_manifest_index
         seen: set[str] = set()
         bundles: list[ObservationBundleManifest] = []
-        for manifest_path in root.glob("*/observations/*/manifest.json"):
+        manifest_paths = list(root.glob("*/observations/*/manifest.json"))
+        # Versioned OpticalNav bundles are authoritative after promotion; keep
+        # them in the same manifest index for generic render-status consumers.
+        optical_root = self.repo_root / "out" / "opticalnav"
+        if optical_root.exists():
+            manifest_paths.extend(optical_root.glob("*/scenes/*/observations/versions/*/*/*/manifest.json"))
+        for manifest_path in manifest_paths:
             key = str(manifest_path)
             seen.add(key)
             try:

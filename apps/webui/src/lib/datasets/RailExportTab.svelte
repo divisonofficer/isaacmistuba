@@ -27,6 +27,7 @@
 		currentSceneOnly?: boolean;
 		includeThumbnails?: boolean;
 		panoramaObservations?: boolean;
+		exportProfile?: 'compact_with_polar_extension' | 'single_lossless_core' | 'navigation_only' | 'legacy_full';
 		pngOnly?: boolean;
 		includeBirdseye?: boolean;
 		includeEpisodeBirdseye?: boolean;
@@ -52,6 +53,7 @@
 		currentSceneOnly = $bindable(true),
 		includeThumbnails = $bindable(false),
 		panoramaObservations = $bindable(true),
+		exportProfile = $bindable<'compact_with_polar_extension' | 'single_lossless_core' | 'navigation_only' | 'legacy_full'>('compact_with_polar_extension'),
 		pngOnly = $bindable(true),
 		includeBirdseye = $bindable(true),
 		includeEpisodeBirdseye = $bindable(false),
@@ -157,11 +159,34 @@
 			GT (vp, heading) 만 (slim)
 		{/if}
 	</div>
+	<div class="rail-title mt-2">Bundle profile</div>
 	<label class="export-filter-row">
-		<input type="checkbox" bind:checked={pngOnly} />
-		<span>PNG only (exclude EXR)</span>
+		<select bind:value={exportProfile} disabled={Boolean(jobInFlight)}>
+			<option value="compact_with_polar_extension">Core + Polar extension</option>
+			<option value="single_lossless_core">Single lossless core</option>
+			<option value="navigation_only">Navigation only</option>
+			<option value="legacy_full">Legacy full</option>
+		</select>
 	</label>
-	<div class="export-filter-hint">{pngOnly ? 'EXR 제외 — 가볍고 빠름' : 'EXR(HDR) 포함 — 무거움'}</div>
+	<div class="export-filter-hint">
+		{#if exportProfile === 'compact_with_polar_extension'}
+			Small Core ZIP plus a lossless float32 Stokes extension.
+		{:else if exportProfile === 'single_lossless_core'}
+			One ZIP contains compact lossless Stokes core data.
+		{:else if exportProfile === 'navigation_only'}
+			No Stokes raw payload; thumbnails only.
+		{:else}
+			Original PNG and legacy full Stokes NPZ compatibility mode.
+		{/if}
+	</div>
+	{#if exportProfile === 'legacy_full'}
+		<label class="export-filter-row">
+			<input type="checkbox" bind:checked={pngOnly} />
+			<span>Exclude EXR/HDR</span>
+		</label>
+	{:else}
+		<div class="export-filter-hint">PNG-only does not decide Polar raw in compact profiles.</div>
+	{/if}
 	<label class="export-filter-row">
 		<input type="checkbox" bind:checked={includeBirdseye} />
 		<span>Bird's-eye summary</span>

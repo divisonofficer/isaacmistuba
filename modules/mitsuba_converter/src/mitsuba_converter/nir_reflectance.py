@@ -148,26 +148,54 @@ def nir_reflectance(pmat: str, band: int = 854) -> dict:
     }
 
 
-def synthesize_nir_texture(rgb_albedo_linear: np.ndarray, pmat: str, band: int = 854,
-                           alpha_override: float | None = None) -> Optional[np.ndarray]:
-    """Synthesise a single-channel LINEAR NIR reflectance map from an RGB albedo.
+def _lowpass(img: np.ndarray, sigma: float) -> np.ndarray:
+    """Gaussian low-pass. scipy if present, else a separable box-blur fallback."""
+    try:
+        from scipy.ndimage import gaussian_filter
+        return gaussian_filter(img.astype(np.float32), sigma=float(sigma), mode="reflect")
+    except Exception:
+        r = max(1, int(round(sigma)))
+        k = np.ones(2 * r + 1, np.float32) / (2 * r + 1)
+        out = img.astype(np.float32)
+        for ax in (0, 1):
+            out = np.apply_along_axis(lambda m: np.convolve(np.pad(m, r, "reflect"), k, "valid"), ax, out)
+        return out
 
-    rho_NIR(x) = clip[ mu * (1 + alpha * (L(x)/median(L) - 1)), 0, 0.95 ]
-    Only a class-controlled fraction (alpha=rgb_structure_weight) of the RGB
-    spatial structure is transferred, so vegetation etc. do NOT become f(RGB).
-    Returns None for metal/glass (albedo_channel False) — those are not diffuse.
-    Input albedo must be LINEAR (not sRGB) in [0,1]. Output is (H,W) float32.
+
+def synthesize_nir_texture(rgb_albedo_linear: np.ndarray, pmat: str, band: int = 854,
+                           alpha_override: float | None = None, lpf_sigma: float = 8.0) -> Optional[np.ndarray]:
+    """Synthesise a single-channel LINEAR NIR reflectance map — the HYBRID of a
+    measured class prior (mean/range) and a class-controlled slice of the RGB atlas's
+    *spatial* structure:
+
+        D(x)  = standardize( log L(x) - LPF(log L(x)) )        # zero-mean, unit-var
+        rho_NIR(x) = clip[ mu_c * (1 + beta_c * D(x)), rho_min_c, rho_max_c ]
+
+    D(x) = clip( (L - LPF(L)) / (LPF(L) + eps), -1, 1 ) is the RELATIVE local contrast
+    (high-pass over the local mean): it drops the RGB absolute level (so the class prior
+    — not RGB luminance — sets the NIR mean) and keeps only LOCAL texture (grain, grout,
+    print, wear) at its NATURAL amplitude. A smooth wall has D≈0 and stays smooth; a
+    textured surface (wood grain) shows visible structure. beta_c (rgb_structure_weight)
+    is the per-class transfer strength. NOTE: an earlier version standardised a
+    log-luminance residual to unit variance — that AMPLIFIED smooth surfaces' micro-
+    variation (and dark-texel log excursions) into salt-and-pepper grain; relative
+    linear contrast avoids both.
+
+    Returns None for metal/glass (albedo_channel False). Input LINEAR in [0,1];
+    output (H,W) float32 clamped to the class NIR range.
     """
     info = nir_reflectance(pmat, band)
     if not info["albedo_channel"]:
         return None
     rgb = np.asarray(rgb_albedo_linear, np.float32)
     L = rgb @ np.array(_LUM, np.float32) if rgb.ndim == 3 else rgb.astype(np.float32)
-    med = float(np.median(L[L > 1e-4])) if np.any(L > 1e-4) else 1.0
-    med = max(med, 1e-4)
-    alpha = info["rgb_structure_weight"] if alpha_override is None else float(alpha_override)
-    rho = info["mean"] * (1.0 + alpha * (L / med - 1.0))
-    return np.clip(rho, 0.0, 0.95).astype(np.float32)
+    beta = info["rgb_structure_weight"] if alpha_override is None else float(alpha_override)
+    lpf = _lowpass(L, lpf_sigma)
+    D = np.clip((L - lpf) / (lpf + 0.05), -1.0, 1.0)         # relative local contrast
+    rho = info["mean"] * (1.0 + beta * D)
+    lo = float(info.get("min", 0.0))
+    hi = min(float(info.get("max", 0.95)), 0.95)
+    return np.clip(rho, lo, hi).astype(np.float32)
 
 
 def nir_scalar_reflectance(shader_name: str | None, optical_class: str | None = None,
@@ -176,3 +204,32 @@ def nir_scalar_reflectance(shader_name: str | None, optical_class: str | None = 
     pmat, _ = physical_material_for(shader_name, optical_class)
     info = nir_reflectance(pmat, band)
     return info["mean"] if info["albedo_channel"] else None
+
+
+# BT.601-style luma weights for the pseudo-NIR heuristic (distinct from the physical
+# _LUM above — this is a deliberate perceptual weighting, not a radiometric one).
+_PSEUDO_W = (0.229, 0.587, 0.114)
+
+
+def pseudo_nir_albedo(rgb_albedo: "np.ndarray") -> "np.ndarray":
+    """Texture-preserving pseudo-NIR albedo from an RGB albedo texture.
+
+        nir(x) = max(rgb, 1-rgb) · [0.229, 0.587, 0.114]      (per texel)
+
+    Unlike the physical class-prior (:func:`nir_scalar_reflectance`, a CONSTANT per
+    material that flattens texture), this keeps the RGB texture structure. That is the
+    **decided convention for Infinigen-import objects** (2026-07-30): imported objects
+    render with the spatial-PBR (polar) material + this pseudo-NIR albedo for the NIR
+    band, because preserved surface detail matters more than physically-accurate NIR
+    reflectance. NOTE: it is a heuristic, NOT a physical reflectance — a green leaf and
+    green paint differ in real NIR but not here. See report_2026-07-29_spatial_pbr_ab.html
+    (physical vs pseudo comparison) and report_debug_render.html.
+
+    Input `rgb_albedo` is LINEAR RGB in [0,1], shape (H,W,3) or (H,W). Output (H,W)
+    float32 in ~[0.47, 0.93] (weights sum to 0.93, un-normalised, per the fixed
+    convention; max(x,1-x) >= 0.5 so darkest output = 0.5·0.93)."""
+    rgb = np.clip(np.asarray(rgb_albedo, np.float32), 0.0, 1.0)
+    if rgb.ndim == 2:
+        rgb = np.repeat(rgb[..., None], 3, axis=-1)
+    interm = np.maximum(rgb, 1.0 - rgb)
+    return (interm @ np.asarray(_PSEUDO_W, np.float32)).astype(np.float32)

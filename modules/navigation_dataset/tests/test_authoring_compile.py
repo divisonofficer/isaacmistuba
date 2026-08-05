@@ -116,6 +116,13 @@ class AuthoringCompileTests(unittest.TestCase):
 
     def test_render_scene_sync_payload_materializes_overlay_manifest(self) -> None:
         payload = self.minimum_map()
+        payload["objects"][0].update({
+            "is_emitter": True,
+            "emitter_shape": "wall_panel",
+            "emitter_polarized": True,
+            "emitter_polarizer_angle_deg": 22.5,
+            "emitter_pattern": "rgb_directional",
+        })
         result = compile_authoring_map(payload, usd_ref="scenes/glass_corridor_001/scene.usd")
         scene_variant, overlay, sync = build_render_scene_sync_payload(payload, result.annotation)
         self.assertEqual(sync["render_scene"], "synced")
@@ -124,6 +131,10 @@ class AuthoringCompileTests(unittest.TestCase):
         self.assertEqual(scene_variant["base_usd_ref"], "scenes/glass_corridor_001/scene.usd")
         self.assertEqual(overlay["hazard_mask_targets"][0]["object_id"], "glass_wall_001")
         self.assertEqual(overlay["material_bindings"][0]["material"], "clear_glass")
+        emitter = overlay["objects"][0]
+        self.assertTrue(emitter["emitter_polarized"])
+        self.assertEqual(emitter["emitter_polarizer_angle_deg"], 22.5)
+        self.assertEqual(emitter["emitter_pattern"], "rgb_directional")
 
     def test_validation_requires_synced_render_scene_artifacts(self) -> None:
         payload = self.minimum_map()

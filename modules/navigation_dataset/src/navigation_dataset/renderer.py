@@ -28,6 +28,7 @@ def build_episode_render_requests(
     scene_state_payload: dict,
     camera_spec_payload: dict,
     modalities: list[str],
+    render_settings: dict | None = None,
     job_id_mode: str = "shared",
 ) -> list:
     """Build one RenderRequest per episode timestep.
@@ -69,6 +70,7 @@ def build_episode_render_requests(
             camera_specs=[camera_spec],
             modalities=list(modalities),
             robot_state=RobotState(base_pose=_mat4_from_pose_xy_yaw(timestep.agent_pose)),
+            render_settings=dict(render_settings or {}),
             extras={"episode_id": episode.episode_id, "timestep_index": timestep.timestep_index},
         )
         requests.append(request)
@@ -82,6 +84,7 @@ def render_episode_direct(
     scene_state_payload: dict,
     camera_spec_payload: dict,
     modalities: list[str],
+    render_settings: dict | None = None,
     render_fn: Callable | None = None,
     variant: str = "auto",
 ) -> EpisodeManifest:
@@ -102,6 +105,7 @@ def render_episode_direct(
         scene_state_payload=scene_state_payload,
         camera_spec_payload=camera_spec_payload,
         modalities=modalities,
+        render_settings=render_settings,
         job_id_mode="shared",
     )
     for timestep, request in zip(episode.timesteps, requests):

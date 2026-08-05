@@ -14,6 +14,7 @@ from pathlib import Path
 
 from navigation_dataset.episode_schema import EpisodeManifest
 from navigation_dataset.exporters.custom_json import (
+    is_episode_complete,
     iter_export_files,
     write_filtered_sensor_indexes,
 )
@@ -163,3 +164,33 @@ def test_camera_filter_applies_to_bridge_job_exr(tmp_path: Path) -> None:
 
     assert any(dst.endswith("/sensors/cam_rear/rgb.exr") for dst in filtered)
     assert not any(dst.endswith("/sensors/cam_front/rgb.exr") for dst in filtered)
+
+
+def test_versioned_current_pointer_is_collected_into_stable_layout(tmp_path: Path) -> None:
+    scene_id, vp, heading = "scene_versioned", "vp_000001", "h_000"
+    project_dir = _build_project(tmp_path, scene_id, vp, heading, perturbed=False)
+    stable = project_dir / "scenes" / scene_id / "observations" / vp / heading
+    # Replace the stable raster directory with a pointer-only observation.
+    for child in list(stable.iterdir()):
+        if child.is_dir():
+            import shutil
+            shutil.rmtree(child)
+        else:
+            child.unlink()
+    render_bundle = project_dir / "scenes" / scene_id / "observations" / "versions" / "rv_test" / "base" / vp / heading
+    camera_dir = render_bundle / "cameras" / "cam_front"
+    camera_dir.mkdir(parents=True)
+    (camera_dir / "rgb.png").write_bytes(b"versioned-rgb")
+    (render_bundle / "manifest.json").write_text("{}")
+    (stable / "current.json").write_text(json.dumps({
+        "bundle_ref": render_bundle.relative_to(project_dir).as_posix(),
+        "render_version_id": "rv_test",
+    }))
+
+    ep = _episode(scene_id, vp, heading)
+    pairs = list(iter_export_files(project_dir, {"scene_artifacts": [{"scene_id": scene_id}]}, [ep]))
+    destinations = {dst for _src, dst in pairs}
+    base = f"scenes/{scene_id}/observations/{vp}/{heading}"
+    assert f"{base}/sensors/cam_front/rgb.png" in destinations
+    assert not any(dst.endswith("current.json") for dst in destinations)
+    assert is_episode_complete(ep, project_dir)

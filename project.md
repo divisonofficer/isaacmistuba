@@ -21,6 +21,16 @@ Treat it as the current working summary unless newer code or artifacts clearly s
 - For now, prefer one representative glass-door or dining/interior scene with a minimal material set over broad asset coverage.
 - Initial collaboration is RGB-first. Polarization and NIR are staged expansions, not the first milestone.
 
+## Repository Exploration Rules
+
+- Default source discovery to `apps/`, `modules/*/src/`, `modules/*/tests/`, `tools/`, `scripts/`, `configs/`, `docs/`, and root configuration files. Prefer `apps/webui/src/` for WebUI work.
+- Respect the root `.ignore`. Do not recursively search generated renders, datasets, asset caches, build trees, external vendor data, or large EXR/NPZ/model artifacts during normal code discovery.
+- Use `rg` or `rg --files`. Use `-uuu` or `--no-ignore` only when the task explicitly requires inspecting an ignored artifact.
+- Perform at most one repository-wide recursive search for initial orientation, then constrain later searches by directory, extension, or glob.
+- For render incidents, identify the scene/job first and read exact files under `out/bridge_jobs/<job>/`; never recursively scan all of `out/` by default.
+- Limit parallel or background exploration to two independent scopes and do not duplicate full-repository searches.
+- `.ignore` controls discovery performance only. It does not grant permission to modify or delete ignored files.
+
 ## Current Verdict
 
 - Narrow curated path: partially proven.
@@ -32,7 +42,10 @@ Treat it as the current working summary unless newer code or artifacts clearly s
 - Project root: `/jarvis/project/robomituba`
 - Main converter package: `modules/mitsuba_converter`
 - MooreLane USD asset: `assets/moorelane/Intel_mooreLane_v1_2_0/Intel_mooreLane/USD/MooreLane_ASWF_0621_fullComposition.usda`
-- Existing Mitsuba build noted in progress log: `/home/jinnyeong/robomituba-build/mitsuba3`
+- Shared source root: `/jarvis/project/robomituba` on NAS
+- Device 1 build (Windows + WSL2 + RTX 5090): `/home/jinnyeong/robomituba-build/mitsuba3` from `modules/mitsuba3`
+- Device 2 build (Ubuntu + RTX 3090 ×8): `${ROBOMITUBA_MITSUBA_BUILD_DIR:-$HOME/robomituba-build/mitsuba3-optix7}` from `modules/mitsuba3-optix7`
+- Mitsuba/Dr.Jit build products are host-specific; share source commits through NAS, but rebuild and validate separately on each device.
 - Project tracking page: `https://www.notion.so/2fee09c820b781a899acf0d042aaf554`
 - External planning docs used to clarify scope:
   - `/home/jinnyeong/codex_workspace/2026NRF/조인트_프로젝트_매니지먼트_플랜.md`

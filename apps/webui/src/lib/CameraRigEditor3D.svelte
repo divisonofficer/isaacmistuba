@@ -28,6 +28,7 @@
 	let dragSensorId: string | null = null;
 	let dragPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
 	let sensorGroup = new THREE.Group();
+	let lightGroup = new THREE.Group();
 	let sensorObjects = new Map<string, any>();
 	let sensorPickTargets: any[] = [];
 
@@ -147,6 +148,7 @@
 		scene.add(floorGrid);
 		addOrientationMarker();
 		scene.add(sensorGroup);
+		scene.add(lightGroup);
 
 		renderer.domElement.addEventListener('pointerdown', onPointerDown);
 		renderer.domElement.addEventListener('pointermove', onPointerMove);
@@ -202,6 +204,13 @@
 		robotMesh.castShadow = true;
 		robotMesh.receiveShadow = true;
 		scene.add(robotMesh);
+		// Drop the ground grid to the robot's lowest point (wheel bottoms) so the
+		// body rests on the plane instead of being half-buried: the mesh keeps the
+		// base_link origin (y≈0 is mid-body), so the origin plane cuts the wheels.
+		// Read straight from the computed bounding box — independent of payload shape.
+		if (floorGrid && geometry.boundingBox) {
+			floorGrid.position.y = geometry.boundingBox.min.y;
+		}
 	}
 
 	function frustumGeometry(sensor: CameraRigSensor) {
@@ -303,6 +312,96 @@
 		}
 	}
 
+	// Rig-mounted active lights (RGB/NIR flash + optional linear polarizer).
+	// Mount convention matches sensors (toThree + rpy z/x swap); beam points +z.
+	function rebuildLights() {
+		if (!scene) return;
+		while (lightGroup.children.length) {
+			const child = lightGroup.children.pop();
+			if (!child) continue;
+			child.traverse((obj: any) => {
+				if (obj.geometry) obj.geometry.dispose();
+				const material = obj.material;
+				if (Array.isArray(material)) material.forEach((m) => m.dispose());
+				else material?.dispose?.();
+			});
+		}
+		for (const light of rig?.active_lights ?? []) {
+			const group = new THREE.Group();
+			group.name = light.light_id;
+			group.position.copy(toThree(light.mount.xyz_m));
+			group.rotation.set(
+				THREE.MathUtils.degToRad(light.mount.rpy_deg[0]),
+				THREE.MathUtils.degToRad(light.mount.rpy_deg[2]),
+				THREE.MathUtils.degToRad(light.mount.rpy_deg[1])
+			);
+			const on = light.enabled !== false;
+			const col = light.spectrum_kind === 'nir' ? 0xd946ef : 0xf59e0b;
+			const bulb = new THREE.Mesh(
+				new THREE.SphereGeometry(0.026, 16, 12),
+				new THREE.MeshStandardMaterial({
+					color: col,
+					emissive: col,
+					emissiveIntensity: on ? 0.7 : 0.12,
+					roughness: 0.4
+				})
+			);
+			group.add(bulb);
+			if (light.emitter_type === 'area') {
+				const s = Math.max(0.04, light.area_size_m);
+				const plane = new THREE.Mesh(
+					new THREE.PlaneGeometry(s * 2, s * 2),
+					new THREE.MeshBasicMaterial({
+						color: col,
+						transparent: true,
+						opacity: on ? 0.28 : 0.1,
+						side: THREE.DoubleSide,
+						depthWrite: false
+					})
+				);
+				group.add(plane); // PlaneGeometry normal is +z (forward)
+			} else if (light.emitter_type === 'spot') {
+				const h = 0.28;
+				const half = Math.min(80, Math.max(2, light.cutoff_angle_deg));
+				const r = h * Math.tan(THREE.MathUtils.degToRad(half));
+				const cone = new THREE.Mesh(
+					new THREE.ConeGeometry(r, h, 28, 1, true),
+					new THREE.MeshBasicMaterial({
+						color: col,
+						transparent: true,
+						opacity: on ? 0.16 : 0.06,
+						side: THREE.DoubleSide,
+						depthWrite: false
+					})
+				);
+				cone.rotation.x = -Math.PI / 2; // apex at emitter, opening toward +z
+				cone.position.z = h / 2;
+				group.add(cone);
+			} else {
+				const glow = new THREE.Mesh(
+					new THREE.SphereGeometry(0.05, 16, 12),
+					new THREE.MeshBasicMaterial({
+						color: col,
+						transparent: true,
+						opacity: on ? 0.14 : 0.05,
+						depthWrite: false
+					})
+				);
+				group.add(glow);
+			}
+			if (light.polarized) {
+				const ring = new THREE.Mesh(
+					new THREE.TorusGeometry(0.044, 0.005, 8, 40),
+					new THREE.MeshBasicMaterial({ color: 0x0ea5e9, transparent: true, opacity: 0.9 })
+				);
+				ring.rotation.z = THREE.MathUtils.degToRad(light.polarizer_angle_deg); // faces +z
+				ring.position.z = 0.006;
+				group.add(ring);
+			}
+			lightGroup.add(group);
+		}
+	}
+
 	function updatePointer(event: PointerEvent) {
 		if (!renderer) return;
 		const rect = renderer.domElement.getBoundingClientRect();
@@ -400,6 +499,7 @@
 
 	$: if (scene && meshPayload) rebuildRobotMesh();
 	$: if (scene && rig && selectedSensorId !== undefined) rebuildSensors();
+	$: if (scene && rig) rebuildLights();
 </script>
 
 <div class="rig-viewport" bind:this={host}></div>

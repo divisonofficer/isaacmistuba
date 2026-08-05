@@ -48,7 +48,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from floorplan_gen import build_floor_plan  # noqa: E402  (sibling module)
+from floorplan_gen import (  # noqa: E402  (sibling module)
+    SINGLE_ROOM_TYPES,
+    build_floor_plan,
+    build_single_room_plan,
+)
 import infinigen_env  # noqa: E402  (sibling: env path detection + persistence)
 
 # --- env -------------------------------------------------------------------
@@ -184,6 +188,8 @@ FLOOR_PLANS = {
     "kr_glasswall_demo": _kr_glasswall_demo,
     "gen_apartment": _gen_apartment,
     "gen_office": _gen_office,
+    # Handled specially because it needs the explicit --room-type argument.
+    "single_room": None,
 }
 
 
@@ -199,6 +205,7 @@ class AptPreset:
     num_floating: int
     camera_profile: str
     archetype: str | None = None
+    room_type: str | None = None
     overrides: list[str] = field(default_factory=list)
 
 
@@ -269,6 +276,10 @@ def build_command(preset: AptPreset, *, out: Path, stage: str, fast: bool,
         # absolute path so cwd (the install dir) doesn't matter
         f"Solver.floor_plan='{floor_plan_json}'",
     ]
+    if preset.floor_plan_key == "single_room":
+        # Keep the generated asset light. The room itself owns the window
+        # opening; outdoor context is injected later by the Mitsuba envmap.
+        overrides.append("home_room_constraints.has_fewer_rooms=True")
     if stage == "full":
         overrides += [
             "compose_indoors.invisible_room_ceilings_enabled=True",
@@ -287,7 +298,7 @@ def build_command(preset: AptPreset, *, out: Path, stage: str, fast: bool,
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Generate Korean-apartment Infinigen scenes.")
+    ap = argparse.ArgumentParser(description="Generate Infinigen indoor scenes.")
     ap.add_argument("--seed", type=int, required=True, help="8-digit AABBCCDD seed.")
     ap.add_argument("--stage", choices=["layout", "full"], default="layout",
                     help="layout = no-objects wall/cutter check (fast); full = object solve.")
@@ -297,6 +308,8 @@ def main() -> int:
                     help="Output folder (default: data/infinigen_generated/outputs/kr_<seed>/<stage>).")
     ap.add_argument("--floor-plan", default=None,
                     help=f"Override floor-plan key. Available: {', '.join(FLOOR_PLANS)}")
+    ap.add_argument("--room-type", choices=SINGLE_ROOM_TYPES, default="living-room",
+                    help="Single-room semantic type: living-room, bedroom, kitchen, or bathroom.")
     ap.add_argument("-p", "--override", action="append", default=[],
                     help="Extra raw gin override (repeatable), e.g. -p compose_indoors.num_floating=12")
     ap.add_argument("--run", action="store_true",
@@ -309,15 +322,21 @@ def main() -> int:
             ap.error(f"unknown floor plan {args.floor_plan!r}; have {list(FLOOR_PLANS)}")
         preset.floor_plan_key = args.floor_plan
         preset.archetype = {"gen_apartment": "apartment",
-                            "gen_office": "office"}.get(args.floor_plan)
+                            "gen_office": "office",
+                            "single_room": "single_room"}.get(args.floor_plan)
+    if preset.floor_plan_key == "single_room":
+        preset.room_type = args.room_type.replace("_", "-")
 
     repo_root = Path(__file__).resolve().parent.parent
+    room_suffix = f"_single_room_{preset.room_type.replace('-', '_')}" if preset.floor_plan_key == "single_room" else ""
     out = args.out or (repo_root / "data" / "infinigen_generated" / "outputs"
-                       / f"kr_{args.seed}" / args.stage)
+                       / f"kr_{args.seed}{room_suffix}" / args.stage)
     out.mkdir(parents=True, exist_ok=True)
 
     # Emit the floor plan as JSON (the most robust way to hand it to Solver).
-    floor_plan = FLOOR_PLANS[preset.floor_plan_key](args.seed)
+    floor_plan = (build_single_room_plan(args.seed, preset.room_type or args.room_type)
+                  if preset.floor_plan_key == "single_room"
+                  else FLOOR_PLANS[preset.floor_plan_key](args.seed))
     floor_plan_json = (out / "floor_plan.json").resolve()
     floor_plan_json.write_text(json.dumps(floor_plan, indent=2), encoding="utf-8")
 
@@ -327,13 +346,19 @@ def main() -> int:
         "floor_plan_key": preset.floor_plan_key, "archetype": preset.archetype,
         "density": preset.density,
         "num_floating": preset.num_floating, "camera_profile": preset.camera_profile,
+        "scene_mode": "single_room" if preset.floor_plan_key == "single_room" else "multi_room",
+        "room_type": preset.room_type,
+        "outdoor_context": "environment_map_pending",
+        "terrain_enabled": False,
+        "window_policy": "required",
     }, indent=2), encoding="utf-8")
 
     cmd = build_command(preset, out=out, stage=args.stage, fast=args.fast,
                         floor_plan_json=floor_plan_json, extra_overrides=args.override)
 
     idir = infinigen_dir()
-    print(f"# preset: {preset.unit_type} / {preset.floor_plan_key} / density={preset.density}"
+    print(f"# preset: {preset.unit_type} / {preset.floor_plan_key}"
+          f"{('/' + str(preset.room_type)) if preset.room_type else ''} / density={preset.density}"
           f" (num_floating={preset.num_floating}) / camera={preset.camera_profile}")
     print(f"# INFINIGEN_DIR = {idir}")
     print(f"# floor_plan    = {floor_plan_json}")

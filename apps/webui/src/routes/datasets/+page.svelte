@@ -345,6 +345,8 @@
 	let graphBatch = $state<any>(null);
 	let graphBatchId = $state('');
 	let graphBatchIds = $state<string[]>([]); // all batch IDs submitted this session
+	let renderVersions = $state<any[]>([]);
+	let renderVersionsLoading = $state(false);
 
 	// sessionStorage key for active render batches, scoped per (project, scene)
 	// so jumping between scenes shows the right pending work.
@@ -813,7 +815,10 @@
 	// context). OFF restricts to just the (vp, heading) pairs the episode
 	// visits along its GT path (much slimmer bundle).
 	let exportPanoramaObservations = $state(true);
-	let exportPngOnly = $state(true);          // default to the lighter PNG-only bundle (no EXR)
+	// Compact core + a separate lossless Stokes extension is the default.
+	// pngOnly remains only as a legacy_full compatibility switch.
+	let exportProfile = $state<'compact_with_polar_extension' | 'single_lossless_core' | 'navigation_only' | 'legacy_full'>('compact_with_polar_extension');
+	let exportPngOnly = $state(true);
 	let exportIncludeBirdseye = $state(true);  // include a top-down bird's-eye summary PNG
 	let exportIncludeEpisodeBirdseye = $state(false);  // per-episode path map PNGs (episodes_birdseye/)
 	let exportEvalPerturbation = $state(false);  // also ship observations_perturbed/ (mirror/glass eval split)
@@ -3090,8 +3095,50 @@
 	}
 
 	// Sweep the selected render variants as one UI submission. The daemon still
-	// creates one batch per variant, but every response is retained so base jobs do
-	// not disappear when the perturbed request returns.
+	// creates one batch per variant, but BOTH is deliberately a barriered
+	// submission: the perturbed batch is not created until the base batch has
+	// reached a successful terminal state. This keeps the worker scene cache and
+	// the UI job lanes aligned with the requested base -> perturbed order.
+	const VARIANT_SWEEP_POLL_MS = 1500;
+	const VARIANT_SWEEP_TIMEOUT_MS = 24 * 60 * 60 * 1000;
+
+	function recordVariantBatch(batch: any, variant: string, submissionGroupId: string): any {
+		const annotated = {
+			...(batch ?? {}),
+			scene_variant_key: variant,
+			submission_group_id: submissionGroupId,
+		};
+		registerGraphSweepResult({ ...annotated, batches: [annotated] });
+		return annotated;
+	}
+
+	async function waitForVariantBatchTerminal(
+		batchId: string,
+		variant: string,
+		submissionGroupId: string,
+	): Promise<any> {
+		const deadline = Date.now() + VARIANT_SWEEP_TIMEOUT_MS;
+		while (Date.now() < deadline) {
+			const fetched = await renderService.fetchGraphBatchSummary(selectedProjectId, batchId);
+			if (fetched) {
+				const observed = recordVariantBatch(fetched, variant, submissionGroupId);
+				const ledgerStatus = String(observed?.ledger_status ?? '').toLowerCase();
+				const batchStatus = String(observed?.status ?? '').toLowerCase();
+				const terminalStatus = ledgerStatus || batchStatus;
+				if (terminalStatus === 'completed' || batchStatus === 'completed') return observed;
+				if (['paused', 'error', 'failed', 'cancelled', 'canceled'].includes(terminalStatus)) return observed;
+				const total = Number(observed?.progress?.total ?? 0);
+				const completed = Number(observed?.progress?.completed ?? 0);
+				const failed = Number(observed?.progress?.failed ?? 0);
+				if (total > 0 && completed + failed >= total) {
+					return { ...observed, status: failed > 0 ? 'failed' : 'completed' };
+				}
+			}
+			await new Promise((resolve) => setTimeout(resolve, VARIANT_SWEEP_POLL_MS));
+		}
+		throw new Error(`${variant} sweep batch ${batchId} did not reach a terminal state within 24 hours.`);
+	}
+
 	async function sweepVariants(body: Record<string, unknown>): Promise<any> {
 		const variants = renderVariant === 'both' ? ['base', 'perturbed'] : [renderVariant];
 		if (variants.includes('perturbed') && !perturbation?.perturbed_render_ready) {
@@ -3107,17 +3154,29 @@
 
 		const submissionGroupId = `sweep-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 		const batches: any[] = [];
-		for (const variant of variants) {
+		for (const [variantIndex, variant] of variants.entries()) {
 			const response = await renderService.sweepViewpointGraph(selectedProjectId, sceneId, {
 				...body,
 				scene_variant_key: variant,
 				submission_group_id: submissionGroupId,
+				variant_sequence_index: variantIndex,
+				variant_sequence_total: variants.length,
+				...(variantIndex > 0 ? { previous_variant_batch_id: batches[variantIndex - 1]?.batch_id } : {}),
 			});
-			batches.push({
-				...response,
-				scene_variant_key: variant,
-				submission_group_id: submissionGroupId,
-			});
+			const submitted = recordVariantBatch(response, variant, submissionGroupId);
+			batches.push(submitted);
+			if (variant === 'base' && variants.length > 1 && submitted?.batch_id) {
+				pushActivity('info', 'render:variant', `Base sweep queued (${submitted.batch_id}); perturbed waits for completion.`);
+				const terminal = await waitForVariantBatchTerminal(
+					String(submitted.batch_id), variant, submissionGroupId,
+				);
+				batches[batches.length - 1] = terminal;
+				const status = String(terminal?.ledger_status ?? terminal?.status ?? '').toLowerCase();
+				if (status !== 'completed') {
+					throw new Error(`Base sweep ${submitted.batch_id} ended with ${status || 'unknown'}; perturbed sweep was not submitted.`);
+				}
+				pushActivity('ok', 'render:variant', `Base sweep complete (${submitted.batch_id}); submitting perturbed sweep.`);
+			}
 		}
 		const last = batches[batches.length - 1] ?? null;
 		return last ? {
@@ -3912,20 +3971,95 @@
 		await refreshEpisodes();
 	}
 
+	async function refreshRenderVersions() {
+		if (!selectedProjectId || !sceneId) { renderVersions = []; return; }
+		renderVersionsLoading = true;
+		try {
+			const data = await renderService.fetchRenderVersions(selectedProjectId, sceneId);
+			renderVersions = Array.isArray(data?.versions) ? data.versions : [];
+		} catch {
+			renderVersions = [];
+		} finally {
+			renderVersionsLoading = false;
+		}
+	}
+	$effect(() => {
+		if (selectedProjectId && sceneId) void refreshRenderVersions();
+	});
+
+	async function resumeActiveGraphRun() {
+		const runId = String(activeBatch?.run_id || activeBatch?.batch_id || '');
+		if (!selectedProjectId || !runId) return;
+		const data = await renderService.resumeGraphRun(selectedProjectId, runId);
+		if (data?.run_id) {
+			graphBatchIds = [...new Set([...graphBatchIds, String(data.run_id)])];
+			graphBatchId = String(data.run_id);
+		}
+		await refreshRenderVersions();
+		startBatchPolling();
+	}
+
+	async function promoteRenderVersion(version: any) {
+		if (!selectedProjectId || !sceneId || !version?.render_version_id) return;
+		await renderService.promoteRenderVersion(selectedProjectId, sceneId, String(version.render_version_id));
+		await refreshRenderVersions();
+		scanObservations();
+	}
+
+	async function pruneRenderVersion(version: any) {
+		if (!selectedProjectId || !sceneId || !version?.render_version_id || version.status === 'active') return;
+		await renderService.pruneRenderVersion(selectedProjectId, sceneId, String(version.render_version_id));
+		await refreshRenderVersions();
+	}
+
+	function applyGraphBatchSummaries(summaries: any[]) {
+		const batches = summaries.filter(Boolean);
+		if (!batches.length) return null;
+		const counts = { queued: 0, running: 0, completed: 0, failed: 0, cancelled: 0, unknown: 0 };
+		let total = 0;
+		for (const batch of batches) {
+			for (const key of Object.keys(counts)) counts[key as keyof typeof counts] += Number(batch?.counts?.[key] ?? 0);
+			total += Number(batch?.progress?.total ?? 0);
+		}
+		const completed = counts.completed;
+		const failed = counts.failed + counts.cancelled;
+		const statuses = batches.map((batch) => String(batch?.ledger_status ?? batch?.status ?? '').toLowerCase());
+		const status = statuses.some((value) => ['paused', 'error', 'failed'].includes(value))
+			? 'paused'
+			: total > 0 && completed + failed >= total
+				? 'completed'
+				: statuses.find((value) => value && !['completed', 'ready'].includes(value)) || 'running';
+		const latest = batches[batches.length - 1];
+		const previousJobs = Array.isArray(graphBatch?.jobs) ? graphBatch.jobs : [];
+		graphBatch = {
+			...(graphBatch ?? {}),
+			...latest,
+			batch_ids: [...new Set(batches.map((batch) => String(batch?.batch_id ?? '')).filter(Boolean))],
+			jobs: previousJobs,
+			summary_only: true,
+			counts,
+			progress: { completed, failed, total, fraction: (completed + failed) / Math.max(1, total) },
+			status,
+			graph_batch_summaries: batches,
+		};
+		return graphBatch;
+	}
+
 	async function refreshBatch(options: RunOptions = {}) {
 		if (!selectedProjectId) return;
 		if (isGraphSweepRenderMode(renderMode)) {
 			if (!graphBatchIds.length) return;
 			const prevCompleted = graphBatch?.progress?.completed ?? 0;
 			const batches = await Promise.all(
-				graphBatchIds.map(id => renderService.fetchGraphBatch(selectedProjectId, id).catch(() => null))
+				graphBatchIds.map(id => renderService.fetchGraphBatchSummary(selectedProjectId, id).catch(() => null))
 			);
-			let merged: any = null;
-			for (const b of batches) {
-				if (b) merged = merged ? mergeBatch(merged, b) : normalizeBatchForDisplay(b);
-			}
-			if (merged) graphBatch = merged;
+			const merged = applyGraphBatchSummaries(batches);
 			if ((merged?.progress?.completed ?? 0) !== prevCompleted) scanObservations();
+			const total = merged?.progress?.total ?? 0;
+			const done = (merged?.progress?.completed ?? 0) + (merged?.progress?.failed ?? 0);
+			if (merged?.status === 'paused' || merged?.status === 'error' || (total > 0 && done >= total)) {
+				stopBatchPolling({ clearDebounced: false });
+			}
 		} else {
 			if (!renderBatchId) return;
 			const data = await run(() => renderService.fetchRenderBatch(selectedProjectId, renderBatchId), undefined, 'batch:episodes', options);
@@ -4075,25 +4209,15 @@
 	async function startBatchPolling() {
 		stopBatchPolling();
 		if (isGraphSweepRenderMode(renderMode)) {
-			// Ensure batch metadata (graph_id / node_id / heading_id / preview_id)
-			// AND the full job_id list are present *before* subscribing — the WS
-			// listener short-circuits when graphBatch.jobs is empty, so a frame
-			// arriving in that gap would be dropped and the user would see no
-			// updates until the next status change. The submit response is often
-			// just a stub (no jobs yet) because the daemon enqueues asynchronously;
-			// awaiting fetch closes that race.
-			if (!graphBatch || !Array.isArray(graphBatch.jobs) || graphBatch.jobs.length === 0) {
-				await refreshBatch().catch(() => {});
-				// The daemon's submission thread populates batch.json shortly after
-				// the synchronous handler returns. Retry once with a small delay
-				// when the first fetch caught the stub.
-				if (!graphBatch?.jobs?.length) {
-					await new Promise((r) => setTimeout(r, 750));
-					await refreshBatch().catch(() => {});
-				}
-			}
+			// Thousand-task sweeps use a constant-size summary endpoint. Full job
+			// rows stay on-demand; continuously rebuilding them blocks the daemon.
+			await refreshBatch().catch(() => {});
 			_jobStatusPrevCompleted = graphBatch?.progress?.completed ?? 0;
 			_jobStatusUnsub = subscribeJobStatus(_onJobStatusUpdate);
+			batchPollTimer = setInterval(async () => {
+				if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return;
+				await refreshBatch({ background: true });
+			}, 2000);
 			return;
 		}
 		// Episode mode: keep the 4s poll, but skip when tab is hidden so a
@@ -4205,6 +4329,7 @@
 				include_episode_thumbnails: exportIncludeThumbnails,
 				panorama_observations: exportPanoramaObservations,
 				png_only: exportPngOnly,
+				export_profile: exportProfile,
 				include_birdseye: exportIncludeBirdseye,
 				include_episode_birdseye: exportIncludeEpisodeBirdseye,
 				eval_perturbation: exportEvalPerturbation,
@@ -4901,6 +5026,7 @@
 					bind:currentSceneOnly={exportCurrentSceneOnly}
 					bind:includeThumbnails={exportIncludeThumbnails}
 					bind:panoramaObservations={exportPanoramaObservations}
+					bind:exportProfile={exportProfile}
 				bind:pngOnly={exportPngOnly}
 				bind:includeBirdseye={exportIncludeBirdseye}
 				bind:includeEpisodeBirdseye={exportIncludeEpisodeBirdseye}
@@ -5471,6 +5597,7 @@
 				bind:currentSceneOnly={exportCurrentSceneOnly}
 				bind:includeThumbnails={exportIncludeThumbnails}
 				bind:panoramaObservations={exportPanoramaObservations}
+				bind:exportProfile={exportProfile}
 				bind:pngOnly={exportPngOnly}
 				bind:includeBirdseye={exportIncludeBirdseye}
 				bind:includeEpisodeBirdseye={exportIncludeEpisodeBirdseye}
@@ -5559,6 +5686,11 @@
 		onRetryJob={retryBatchJob}
 		onCancelJob={cancelBatchJob}
 		onRefreshSelectedJobLog={() => refreshSelectedBatchJobLog()}
+		{renderVersions} {renderVersionsLoading}
+		onRefreshVersions={refreshRenderVersions}
+		onResumeRun={resumeActiveGraphRun}
+		onPromoteVersion={promoteRenderVersion}
+		onPruneVersion={pruneRenderVersion}
 	/>
 {/snippet}
 

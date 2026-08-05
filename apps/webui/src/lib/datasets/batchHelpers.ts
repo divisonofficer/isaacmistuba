@@ -477,9 +477,21 @@ export function isGraphSweepRenderMode(renderMode: string): boolean {
 
 export function buildRenderSummary(batch: any, health: any, renderMode = '') {
 	const jobs: any[] = batch?.jobs ?? [];
-	const counts = normalizedCounts(jobs);
-	const total = jobs.length || Number(batch?.progress?.total ?? 0) || 0;
-	const complete = counts.done || Number(batch?.progress?.completed ?? 0) || 0;
+	const supplied = batch?.summary_only && batch?.counts && typeof batch.counts === 'object'
+		? batch.counts
+		: null;
+	const counts = supplied
+		? {
+			done: Number(supplied.completed ?? supplied.done ?? 0),
+			running: Number(supplied.running ?? 0),
+			queued: Number(supplied.queued ?? 0),
+			failed: Number(supplied.failed ?? 0),
+			cancelled: Number(supplied.cancelled ?? 0),
+			unknown: Number(supplied.unknown ?? 0),
+		}
+		: normalizedCounts(jobs);
+	const total = supplied ? Number(batch?.progress?.total ?? 0) : jobs.length || Number(batch?.progress?.total ?? 0) || 0;
+	const complete = supplied ? Number(batch?.progress?.completed ?? 0) : counts.done || Number(batch?.progress?.completed ?? 0) || 0;
 	const percent = total ? Math.round((complete / total) * 100) : 0;
 	const runningJobs = jobs.filter((job) => normalizeJobStatus(job) === 'running');
 	const textureProfile = jobs.find((job) => job?.status?.extras?.texture_profile || job?.status?.extras?.texture_audit?.texture_profile)?.status?.extras?.texture_profile
@@ -504,6 +516,14 @@ export function buildRenderSummary(batch: any, health: any, renderMode = '') {
 
 export function buildBottleneckSummary(batch: any, health: any) {
 	const jobs: any[] = batch?.jobs ?? [];
+	if (batch?.summary_only && batch?.counts) {
+		const failedCount = Number(batch.counts.failed ?? 0);
+		const runningCount = Number(batch.counts.running ?? 0);
+		const queuedCount = Number(batch.counts.queued ?? 0);
+		if (failedCount > 0) return { tone: 'failed', title: `${failedCount} failed job(s)`, message: 'Open Resume incomplete to requeue durable failed tasks.' };
+		if (runningCount > 0) return { tone: 'running', title: 'Sweep is rendering', message: `${runningCount} running · ${queuedCount} queued (aggregate summary).` };
+		if (queuedCount > 0) return { tone: 'queued', title: 'Queued, waiting for worker', message: `${queuedCount} job(s) queued (aggregate summary).` };
+	}
 	const failed = jobs.filter((job) => normalizeJobStatus(job) === 'failed');
 	if (failed.length > 0) {
 		const err = String(failed[0]?.status?.error ?? failed[0]?.error ?? failed[0]?.status?.progress_message ?? 'Open failed job detail for the error log.');

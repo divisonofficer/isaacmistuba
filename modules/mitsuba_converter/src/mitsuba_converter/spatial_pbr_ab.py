@@ -112,12 +112,27 @@ def _base_texture(parent: ET.Element, name: str, material: Mapping[str, Any]) ->
     _bitmap(parent, name, Path(material["base_color"]), raw=False)
 
 
-def _wrap_normal(shape: ET.Element, material: Mapping[str, Any]) -> ET.Element:
-    # Mitsuba rejects transmission BSDFs nested below ``twosided``.  The glass
-    # assets in the fixed experiment are roughdielectric, so keep their normal
-    # map (when present) but attach it directly to the shape.  Opaque branches
-    # retain the historical twosided wrapper for back-face visibility.
-    optical_class = str(material.get("optical_class") or "diffuse").lower()
+def part_optical_class(material: Mapping[str, Any], part_index: int) -> str:
+    """Optical class of one material slot, not of the whole unit.
+
+    A unit's ``optical_class`` describes its *container* material only.  The
+    mushroom-in-a-jar unit is 90K triangles of glass and 2.9M of diffuse
+    mushrooms/sand, so applying the unit class to every part renders the
+    mushrooms as glass - the exact defect dev_report 2026-07-28 (polar LOD)
+    fixed for the per-slot renderer.  Resolve per part and fall back to the
+    unit class only when the part carries no material id.
+    """
+    classes = material.get("part_optical_classes") or []
+    if 0 <= part_index < len(classes) and classes[part_index]:
+        return str(classes[part_index]).lower()
+    return str(material.get("optical_class") or "diffuse").lower()
+
+
+def _wrap_normal(shape: ET.Element, material: Mapping[str, Any],
+                 optical_class: str) -> ET.Element:
+    # Mitsuba rejects transmission BSDFs nested below ``twosided``.  Only the
+    # transmissive slot skips the wrapper; opaque slots keep it for back-face
+    # visibility.
     is_transmissive = optical_class.startswith("glass")
     outer = shape if is_transmissive else ET.SubElement(shape, "bsdf", {"type": "twosided"})
     normal = material.get("normal")
@@ -128,14 +143,18 @@ def _wrap_normal(shape: ET.Element, material: Mapping[str, Any]) -> ET.Element:
     return outer
 
 
-def _analytic_material(parent: ET.Element, material: Mapping[str, Any]) -> dict[str, Any]:
-    optical_class = str(material.get("optical_class") or "diffuse").lower()
+def _analytic_material(parent: ET.Element, material: Mapping[str, Any],
+                       optical_class: str) -> dict[str, Any]:
     roughness = Path(material["roughness_raw"])
     if optical_class.startswith("glass"):
-        bsdf = ET.SubElement(parent, "bsdf", {"type": "roughdielectric"})
+        # Smooth dielectric only. roughdielectric returns DoLP=0 in the polarized
+        # build (dev_report 2026-07-06 §2.1), which would make the analytic
+        # baseline trivially unpolarized and void the A/B polarization contrast.
+        # Roughness is therefore dropped rather than fed to a BSDF that cannot
+        # carry the Fresnel polarization signal.
+        bsdf = ET.SubElement(parent, "bsdf", {"type": "dielectric"})
         ET.SubElement(bsdf, "float", {"name": "int_ior", "value": "1.5"})
-        _bitmap(bsdf, "alpha", roughness, raw=True)
-        return {"type": "roughdielectric", "alpha": "raw_roughness", "int_ior": 1.5}
+        return {"type": "dielectric", "alpha": "dropped_smooth_only", "int_ior": 1.5}
     if optical_class.startswith("metal"):
         preset = "Al"
         for token, candidate in (("gold", "Au"), ("copper", "Cu"), ("steel", "Cr"), ("iron", "Cr")):
@@ -153,7 +172,16 @@ def _analytic_material(parent: ET.Element, material: Mapping[str, Any]) -> dict[
     return {"type": "pplastic", "alpha": "raw_roughness", "int_ior": 1.5}
 
 
-def _spatial_material(parent: ET.Element, material: Mapping[str, Any]) -> dict[str, Any]:
+def _spatial_material(parent: ET.Element, material: Mapping[str, Any],
+                      optical_class: str) -> dict[str, Any]:
+    if optical_class.startswith("glass"):
+        # The spatial layer has no transmission path: blendbsdf(pplastic,
+        # roughconductor) is opaque by construction.  Routing a glass slot
+        # through it would turn the jar into stone, so transmissive slots keep
+        # the analytic dielectric in BOTH branches and act as a true no-op.
+        summary = _analytic_material(parent, material, optical_class)
+        summary["spatial"] = "bypassed_transmissive_slot"
+        return summary
     blend = ET.SubElement(parent, "bsdf", {"type": "blendbsdf"})
     _bitmap(blend, "weight", Path(material["metallic"]), raw=True)
     plastic = ET.SubElement(blend, "bsdf", {"type": "pplastic"})
@@ -203,13 +231,22 @@ def build_scene_xml(*, path: Path, branch: str, obj_path: Path,
     # part as a separate shape; using trimesh's combined Scene export can drop
     # node transforms and collapse the object to a thin subset of the mesh.
     obj_parts = [Path(value) for value in (material.get("obj_parts") or [obj_path])]
+    part_materials = list(material.get("parts") or [])
     summary: dict[str, Any] | None = None
     for part_index, part_path in enumerate(obj_parts):
         shape_id = "experiment_object" if part_index == 0 else f"experiment_object_part_{part_index:03d}"
         shape = ET.SubElement(root, "shape", {"type": "obj", "id": shape_id})
         ET.SubElement(shape, "string", {"name": "filename", "value": str(part_path.resolve())})
-        parent = _wrap_normal(shape, material)
-        part_summary = _analytic_material(parent, material) if branch == "A" else _spatial_material(parent, material)
+        # Each GLB part owns its UV layout and its own converted atlas.  Fall
+        # back to the unit-level maps only when no per-part material exists
+        # (single-mesh assets and the OBJ fallback path).
+        part_material = part_materials[part_index] if part_index < len(part_materials) else material
+        optical_class = part_optical_class(material, part_index)
+        parent = _wrap_normal(shape, part_material, optical_class)
+        part_summary = (
+            _analytic_material(parent, part_material, optical_class) if branch == "A"
+            else _spatial_material(parent, part_material, optical_class)
+        )
         if summary is None:
             summary = part_summary
     assert summary is not None

@@ -75,6 +75,13 @@ from .manifest import (
 from .ouster import OusterLidarMetadata, default_os1_128_metadata, load_ouster_metadata, ouster_metadata_from_mapping
 from .paths import BRIDGE_JOBS_ROOT, ensure_job_layout, ensure_observation_layout, repo_root_from, resolve_repo_path, to_repo_relative_posix
 from .shape_mapping import build_shape_mapping, read_shape_mapping, write_shape_mapping
+from .canonical_material import (
+    CANONICAL_MATERIAL_SCHEMA_VERSION,
+    CanonicalMaterial,
+    MaterialParameter,
+    canonical_document,
+    tier_for_source,
+)
 from .types import (
     ActiveLightSpec,
     AssistLightSpec,
@@ -112,6 +119,11 @@ from .types import (
 
 __all__ = [
     "ActiveLightSpec",
+    "CanonicalMaterial",
+    "MaterialParameter",
+    "CANONICAL_MATERIAL_SCHEMA_VERSION",
+    "canonical_document",
+    "tier_for_source",
     "OusterLidarMetadata",
     "AssistLightSpec",
     "BRIDGE_JOBS_ROOT",

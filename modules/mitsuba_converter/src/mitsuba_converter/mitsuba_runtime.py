@@ -111,7 +111,8 @@ def resolve_variant(
 ) -> str:
     """Resolve a preferred variant or ``auto`` to a working runtime variant.
 
-    ``kind`` can be ``"rgb"``, ``"spectral"``, or ``"spectral_polarized"``.
+    ``kind`` can be ``"rgb"``, ``"spectral"``, ``"rgb_polarized"``, or
+    ``"spectral_polarized"``.
     CUDA variants are tried first for speed, but activation failures are
     treated as a runtime compatibility signal and the resolver falls back to
     LLVM/scalar variants when ``allow_cpu`` is true.
@@ -152,6 +153,16 @@ def resolve_variant(
             failures.append(f"{candidate}: not compiled")
             continue
         if _can_set_variant(candidate):
+            if requested is not None and candidate != requested:
+                logger.warning(
+                    "Mitsuba variant fallback: requested %r is unavailable (%s); "
+                    "rendering with %r instead. Set %s=1 to hard-fail instead of "
+                    "silently changing variant.",
+                    requested,
+                    "; ".join(failures) or "not compiled",
+                    candidate,
+                    ENV_DISABLE_CPU_FALLBACK,
+                )
             return candidate
         failures.append(f"{candidate}: {variant_failure(candidate) or 'activation failed'}")
 
@@ -212,6 +223,19 @@ def _priority_order(kind: str, *, allow_cpu: bool) -> Sequence[str]:
             "llvm_ad_spectral_polarized",
             "llvm_spectral_polarized",
             "scalar_spectral_polarized",
+        )
+    elif kind == "rgb_polarized":
+        # Discrete-band polarized rendering: raw RGB Stokes carrier channels
+        # with per-band material pinning. Never degrade to a spectral variant
+        # here — band-pinned scenes are only meaningful on an rgb carrier.
+        cuda = (
+            "cuda_rgb_polarized",
+            "cuda_ad_rgb_polarized",
+        )
+        cpu = (
+            "llvm_ad_rgb_polarized",
+            "llvm_rgb_polarized",
+            "scalar_rgb_polarized",
         )
     elif kind == "rgb":
         cuda = (
