@@ -520,6 +520,14 @@ export function buildBottleneckSummary(batch: any, health: any) {
 		const failedCount = Number(batch.counts.failed ?? 0);
 		const runningCount = Number(batch.counts.running ?? 0);
 		const queuedCount = Number(batch.counts.queued ?? 0);
+		const durableStatus = String(batch?.ledger_status ?? batch?.status ?? '').toLowerCase();
+		if (['paused', 'error', 'failed'].includes(durableStatus)) {
+			return {
+				tone: failedCount > 0 ? 'failed' : 'queued',
+				title: 'Sweep paused',
+				message: `${queuedCount + failedCount} incomplete durable task(s). These are not currently queued on a worker.`,
+			};
+		}
 		if (failedCount > 0) return { tone: 'failed', title: `${failedCount} failed job(s)`, message: 'Open Resume incomplete to requeue durable failed tasks.' };
 		if (runningCount > 0) return { tone: 'running', title: 'Sweep is rendering', message: `${runningCount} running · ${queuedCount} queued (aggregate summary).` };
 		if (queuedCount > 0) return { tone: 'queued', title: 'Queued, waiting for worker', message: `${queuedCount} job(s) queued (aggregate summary).` };

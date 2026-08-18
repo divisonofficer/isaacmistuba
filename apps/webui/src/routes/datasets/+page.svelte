@@ -346,7 +346,9 @@
 	let graphBatchId = $state('');
 	let graphBatchIds = $state<string[]>([]); // all batch IDs submitted this session
 	let renderVersions = $state<any[]>([]);
+	let renderSensorProgress = $state<any[]>([]);
 	let renderVersionsLoading = $state(false);
+	let sweepSubmissionInFlight = $state(false);
 
 	// sessionStorage key for active render batches, scoped per (project, scene)
 	// so jumping between scenes shows the right pending work.
@@ -3915,6 +3917,10 @@
 	}
 
 	async function renderEpisodes(modeOverride?: 'graph_sweep' | 'episode_nodes' | 'episodes') {
+		if (sweepSubmissionInFlight) {
+			pushActivity('warn', 'graph:sweep', 'A graph sweep submission is already in progress.');
+			return;
+		}
 		// Persist the chosen mode in state so downstream code (WS subscribe,
 		// batch grid, refreshBatch) treats this submission consistently.
 		if (modeOverride && modeOverride !== renderMode) renderMode = modeOverride;
@@ -3955,9 +3961,18 @@
 			const successMsg = renderMode === 'episode_nodes'
 				? 'Episode path sweep submitted.'
 				: 'Graph sensor sweep submitted.';
-			const data = registerGraphSweepResult(await run(() => sweepVariants(body), successMsg, 'graph:sweep'));
-			if (data?.batch_id) {
-				startBatchPolling();
+			// A new click starts a new monitor session. Variants created by this
+			// one submission are still merged by sweepVariants, while completed or
+			// abandoned batches from earlier clicks no longer dilute its progress.
+			graphBatch = null;
+			graphBatchId = '';
+			graphBatchIds = [];
+			sweepSubmissionInFlight = true;
+			try {
+				const data = registerGraphSweepResult(await run(() => sweepVariants(body), successMsg, 'graph:sweep'));
+				if (data?.batch_id) startBatchPolling();
+			} finally {
+				sweepSubmissionInFlight = false;
 			}
 		} else {
 			body.split = renderSplit;
@@ -3971,12 +3986,25 @@
 		await refreshEpisodes();
 	}
 
+	async function refreshRenderCoverage() {
+		if (!selectedProjectId || !sceneId) { renderSensorProgress = []; return; }
+		try {
+			const data = await renderService.fetchRenderCoverage(selectedProjectId, sceneId);
+			renderSensorProgress = Array.isArray(data?.sensor_progress) ? data.sensor_progress : [];
+		} catch {
+			renderSensorProgress = [];
+		}
+	}
+
 	async function refreshRenderVersions() {
-		if (!selectedProjectId || !sceneId) { renderVersions = []; return; }
+		if (!selectedProjectId || !sceneId) { renderVersions = []; renderSensorProgress = []; return; }
 		renderVersionsLoading = true;
+		void refreshRenderCoverage();
 		try {
 			const data = await renderService.fetchRenderVersions(selectedProjectId, sceneId);
-			renderVersions = Array.isArray(data?.versions) ? data.versions : [];
+			renderVersions = Array.isArray(data?.versions)
+				? data.versions.filter((version: any) => String(version?.status ?? '') !== 'pruned')
+				: [];
 		} catch {
 			renderVersions = [];
 		} finally {
@@ -3987,8 +4015,8 @@
 		if (selectedProjectId && sceneId) void refreshRenderVersions();
 	});
 
-	async function resumeActiveGraphRun() {
-		const runId = String(activeBatch?.run_id || activeBatch?.batch_id || '');
+	async function resumeActiveGraphRun(runIdOverride = '') {
+		const runId = String(runIdOverride || activeBatch?.run_id || activeBatch?.batch_id || '');
 		if (!selectedProjectId || !runId) return;
 		const data = await renderService.resumeGraphRun(selectedProjectId, runId);
 		if (data?.run_id) {
@@ -4013,23 +4041,39 @@
 	}
 
 	function applyGraphBatchSummaries(summaries: any[]) {
-		const batches = summaries.filter(Boolean);
+		const batches = summaries.filter(Boolean).sort((a, b) =>
+			String(a?.created_at ?? '').localeCompare(String(b?.created_at ?? '')),
+		);
 		if (!batches.length) return null;
+		const statusOf = (batch: any) => String(batch?.ledger_status ?? batch?.status ?? '').toLowerCase();
+		const liveBatches = batches.filter((batch) =>
+			!['completed', 'paused', 'error', 'failed', 'cancelled'].includes(statusOf(batch)),
+		);
+		const latestResumable = [...batches].reverse().find((batch) =>
+			Boolean(batch?.resume_available) || ['paused', 'error', 'failed'].includes(statusOf(batch)),
+		);
+		// Old paused submissions are history, not jobs waiting in the daemon.
+		// Aggregate genuinely live phase/variant batches; otherwise show only the
+		// newest resumable run so repeated crashed submissions do not become a
+		// fictitious multi-thousand-job queue or an ambiguous Resume target.
+		const displayedBatches = liveBatches.length
+			? liveBatches
+			: [latestResumable ?? batches[batches.length - 1]];
 		const counts = { queued: 0, running: 0, completed: 0, failed: 0, cancelled: 0, unknown: 0 };
 		let total = 0;
-		for (const batch of batches) {
+		for (const batch of displayedBatches) {
 			for (const key of Object.keys(counts)) counts[key as keyof typeof counts] += Number(batch?.counts?.[key] ?? 0);
 			total += Number(batch?.progress?.total ?? 0);
 		}
 		const completed = counts.completed;
 		const failed = counts.failed + counts.cancelled;
-		const statuses = batches.map((batch) => String(batch?.ledger_status ?? batch?.status ?? '').toLowerCase());
+		const statuses = displayedBatches.map(statusOf);
 		const status = statuses.some((value) => ['paused', 'error', 'failed'].includes(value))
 			? 'paused'
 			: total > 0 && completed + failed >= total
 				? 'completed'
 				: statuses.find((value) => value && !['completed', 'ready'].includes(value)) || 'running';
-		const latest = batches[batches.length - 1];
+		const latest = displayedBatches[displayedBatches.length - 1];
 		const previousJobs = Array.isArray(graphBatch?.jobs) ? graphBatch.jobs : [];
 		graphBatch = {
 			...(graphBatch ?? {}),
@@ -4054,6 +4098,7 @@
 				graphBatchIds.map(id => renderService.fetchGraphBatchSummary(selectedProjectId, id).catch(() => null))
 			);
 			const merged = applyGraphBatchSummaries(batches);
+			void refreshRenderCoverage();
 			if ((merged?.progress?.completed ?? 0) !== prevCompleted) scanObservations();
 			const total = merged?.progress?.total ?? 0;
 			const done = (merged?.progress?.completed ?? 0) + (merged?.progress?.failed ?? 0);
@@ -5649,6 +5694,7 @@
 				onNormalizeLayout={() => normalizeLayoutToPositive()}
 				onAddScene={addScene}
 				onSaveMap={saveMap}
+				onSyncRenderScene={syncRenderScene}
 				onEnableAllEmitters={enableAllDetectedEmitters}
 				onDisableAllEmitters={disableAllEmitters}
 				{perturbation}
@@ -5687,6 +5733,8 @@
 		onCancelJob={cancelBatchJob}
 		onRefreshSelectedJobLog={() => refreshSelectedBatchJobLog()}
 		{renderVersions} {renderVersionsLoading}
+		{renderSensorProgress} {observationScan}
+		expectedRenderViews={graphNodes.length * Number(graphPayload?.node_heading_count ?? headingCount ?? 0)}
 		onRefreshVersions={refreshRenderVersions}
 		onResumeRun={resumeActiveGraphRun}
 		onPromoteVersion={promoteRenderVersion}

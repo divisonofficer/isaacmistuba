@@ -1187,10 +1187,11 @@ def _effective_stage_signature(signature: tuple[Any, ...]) -> tuple[Any, ...]:
     return (*tuple(signature), _texture_cache_signature())
 
 
-def _texture_cache_root(out_scene: Path) -> Path:
-    override = os.environ.get("ROBOMITUBA_TEXTURE_CACHE_DIR")
+def _texture_cache_root(out_scene: Path, *, override: Path | None = None) -> Path:
+    override = override or (Path(os.environ["ROBOMITUBA_TEXTURE_CACHE_DIR"]).expanduser()
+                            if os.environ.get("ROBOMITUBA_TEXTURE_CACHE_DIR") else None)
     if override:
-        return Path(override).expanduser().resolve()
+        return Path(override).resolve()
     return Path.cwd().resolve() / "out" / "texture_cache" / "mitsuba_downsampled"
 
 
@@ -1272,7 +1273,20 @@ def _ensure_downsampled_texture(src: Path, *, cache_root: Path, max_resolution: 
             save_kwargs: dict[str, Any] = {}
             if cached.suffix.lower() in {".jpg", ".jpeg"}:
                 save_kwargs.update({"quality": 92, "subsampling": 0})
-            resized.save(cached, **save_kwargs)
+            # Multiple GPU workers commonly reach the same source texture at
+            # once.  Publish only complete cache files; a partially written
+            # PNG must never become another worker's renderer input.
+            temporary = cached.with_name(
+                f".{cached.stem}.tmp.{os.getpid()}.{threading.get_ident()}{cached.suffix}"
+            )
+            try:
+                resized.save(temporary, **save_kwargs)
+                os.replace(temporary, cached)
+            finally:
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError:
+                    pass
             return cached
     except Exception as exc:
         print(
@@ -1283,11 +1297,17 @@ def _ensure_downsampled_texture(src: Path, *, cache_root: Path, max_resolution: 
         return None
 
 
-def _rewrite_texture_filenames(root: ET.Element, *, out_scene: Path) -> dict[str, int]:
-    max_resolution = _texture_max_resolution()
+def _rewrite_texture_filenames(
+    root: ET.Element,
+    *,
+    out_scene: Path,
+    max_resolution: int | None = None,
+    cache_root: Path | None = None,
+) -> dict[str, int]:
+    max_resolution = _texture_max_resolution() if max_resolution is None else max(0, int(max_resolution))
     if max_resolution <= 0:
         return {"rewritten": 0, "skipped": 0}
-    cache_root = _texture_cache_root(out_scene)
+    cache_root = _texture_cache_root(out_scene, override=cache_root)
     rewritten = 0
     skipped = 0
     for node in root.iter():
@@ -1304,8 +1324,20 @@ def _rewrite_texture_filenames(root: ET.Element, *, out_scene: Path) -> dict[str
             continue
         src = Path(value)
         if not src.is_absolute():
-            skipped += 1
-            continue
+            # Material-policy injection stores repo-relative texture refs.  The
+            # render-scene sync capped the original XML, but staging then appends
+            # these analytic BSDFs and used to skip every relative filename,
+            # silently resurrecting 4K atlases in the GPU worker.  Workers run from
+            # the repo root; also support XML-relative paths for standalone scenes.
+            cwd_candidate = (Path.cwd() / src).resolve()
+            scene_candidate = (out_scene.parent / src).resolve()
+            if cwd_candidate.is_file():
+                src = cwd_candidate
+            elif scene_candidate.is_file():
+                src = scene_candidate
+            else:
+                skipped += 1
+                continue
         cached = _ensure_downsampled_texture(src, cache_root=cache_root, max_resolution=max_resolution)
         if cached is None:
             skipped += 1
@@ -1340,9 +1372,15 @@ def _texture_image_size(path: Path) -> tuple[int, int] | None:
         return None
 
 
-def _build_texture_audit(root: ET.Element, *, out_scene: Path) -> dict[str, Any]:
-    max_resolution = _texture_max_resolution()
-    cache_root = _texture_cache_root(out_scene)
+def _build_texture_audit(
+    root: ET.Element,
+    *,
+    out_scene: Path,
+    max_resolution: int | None = None,
+    cache_root: Path | None = None,
+) -> dict[str, Any]:
+    max_resolution = _texture_max_resolution() if max_resolution is None else max(0, int(max_resolution))
+    cache_root = _texture_cache_root(out_scene, override=cache_root)
     texture_refs = 0
     downsampled_refs = 0
     original_refs = 0
@@ -1398,8 +1436,17 @@ def _build_texture_audit(root: ET.Element, *, out_scene: Path) -> dict[str, Any]
     return audit
 
 
-def _write_texture_audit(root: ET.Element, *, out_scene: Path, fail_on_gt_profile: bool = False) -> dict[str, Any]:
-    audit = _build_texture_audit(root, out_scene=out_scene)
+def _write_texture_audit(
+    root: ET.Element,
+    *,
+    out_scene: Path,
+    fail_on_gt_profile: bool = False,
+    max_resolution: int | None = None,
+    cache_root: Path | None = None,
+) -> dict[str, Any]:
+    audit = _build_texture_audit(
+        root, out_scene=out_scene, max_resolution=max_resolution, cache_root=cache_root,
+    )
     audit_path = _texture_audit_path(out_scene)
     audit_path.write_text(json.dumps(audit, ensure_ascii=False, indent=2), encoding="utf-8")
     if fail_on_gt_profile and int(audit.get("original_gt_profile_refs", 0) or 0) > 0:
@@ -1459,6 +1506,63 @@ def _write_scene(root: ET.Element, out_scene: Path) -> Path:
             pass
     out_scene.write_text(scene_text, encoding="utf-8")
     return out_scene
+
+
+def cap_scene_texture_resolution(
+    scene_path: Path,
+    *,
+    max_resolution: int,
+    cache_dir: Path | None = None,
+    fail_on_unbounded: bool = True,
+) -> dict[str, Any]:
+    """Rewrite one derived render XML to use a bounded, shared texture cache.
+
+    This is intentionally a *render-scene* operation: source GLB/PBR atlases
+    stay authoritative at their export resolution, while a memory-limited
+    worker uses content-addressed downsampled copies.  It is safe for several
+    processes to share ``cache_dir`` because cache publication is atomic.
+    """
+    scene_path = Path(scene_path).resolve()
+    max_resolution = max(0, int(max_resolution))
+    cache_dir = Path(cache_dir).expanduser().resolve() if cache_dir is not None else None
+    try:
+        # Render-scene XML carries ``opticalnav-obj:`` comments used by the
+        # editor index and by additive perturbation publishing. Preserve them
+        # while applying a texture-only rewrite.
+        tree = ET.parse(
+            scene_path,
+            parser=ET.XMLParser(target=ET.TreeBuilder(insert_comments=True)),
+        )
+    except (OSError, ET.ParseError) as exc:
+        raise RuntimeError(f"cannot apply texture cap to {scene_path}: {exc}") from exc
+    root = tree.getroot()
+    rewrite = _rewrite_texture_filenames(
+        root, out_scene=scene_path, max_resolution=max_resolution, cache_root=cache_dir,
+    )
+    # Do not mutate a scene in place while Mitsuba might read it.  The IR
+    # workers call this before ``mi.load_file``; the atomic replace also makes
+    # the helper safe for a retry using the same batch directory.
+    temporary = scene_path.with_name(
+        f".{scene_path.stem}.texture-cap.{os.getpid()}.{threading.get_ident()}{scene_path.suffix}"
+    )
+    try:
+        ET.indent(tree, space="  ")
+        tree.write(temporary, encoding="utf-8", xml_declaration=True)
+        os.replace(temporary, scene_path)
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+    audit = _write_texture_audit(
+        root,
+        out_scene=scene_path,
+        fail_on_gt_profile=fail_on_unbounded,
+        max_resolution=max_resolution,
+        cache_root=cache_dir,
+    )
+    return {**audit, "rewritten": int(rewrite["rewritten"]), "skipped": int(rewrite["skipped"]),
+            "cache_dir": str(_texture_cache_root(scene_path, override=cache_dir))}
 
 
 def _has_emitter(root: ET.Element) -> bool:

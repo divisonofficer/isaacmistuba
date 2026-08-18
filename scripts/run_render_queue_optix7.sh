@@ -53,6 +53,8 @@ fi
 : "${ROBOMITUBA_BACKEND_ONLY:=0}"
 : "${PYTHONUNBUFFERED:=1}"
 
+EXPLICIT_GPUS=""
+EXPLICIT_GPUS_SET=0
 
 discover_idle_gpus() {
   local threshold="$1"
@@ -91,6 +93,20 @@ discover_idle_gpus() {
 DAEMON_ARGS=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --gpus)
+      if [[ $# -lt 2 ]]; then
+        echo "[render-queue] ERROR: --gpus requires comma-separated GPU indices (for example: --gpus 1,2,3)" >&2
+        exit 2
+      fi
+      EXPLICIT_GPUS="$2"
+      EXPLICIT_GPUS_SET=1
+      shift 2
+      ;;
+    --gpus=*)
+      EXPLICIT_GPUS="${1#*=}"
+      EXPLICIT_GPUS_SET=1
+      shift
+      ;;
     --auto-gpus)
       RENDER_QUEUE_AUTO_GPUS=1
       shift
@@ -119,6 +135,19 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 set -- "${DAEMON_ARGS[@]}"
+
+if [[ "$EXPLICIT_GPUS_SET" == "1" ]]; then
+  if [[ "$RENDER_QUEUE_AUTO_GPUS" == "1" ]]; then
+    echo "[render-queue] ERROR: --gpus and --auto-gpus cannot be used together" >&2
+    exit 2
+  fi
+  if ! [[ "$EXPLICIT_GPUS" =~ ^[0-9]+(,[0-9]+)*$ ]]; then
+    echo "[render-queue] ERROR: --gpus must be comma-separated GPU indices (for example: --gpus 1,2,3)" >&2
+    exit 2
+  fi
+  ROBOMITUBA_RENDER_GPU_INDICES="$EXPLICIT_GPUS"
+  ROBOMITUBA_RENDER_WORKER_COUNT="$(awk -F, '{ print NF }' <<<"$ROBOMITUBA_RENDER_GPU_INDICES")"
+fi
 
 if [[ "$RENDER_QUEUE_AUTO_GPUS" == "1" ]]; then
   if ! [[ "$RENDER_QUEUE_AUTO_GPU_MEMORY_USED_PCT_MAX" =~ ^[0-9]+([.][0-9]+)?$ ]]; then

@@ -4,6 +4,7 @@ from dataclasses import asdict
 import json
 import os
 from pathlib import Path
+import sqlite3
 from typing import Callable, Iterable
 import zipfile
 
@@ -66,6 +67,86 @@ def _active_observation_dir(
         except (OSError, ValueError, TypeError):
             pass
     return stable if stable.is_dir() else None
+
+
+def _completed_sensor_bundle_index(
+    dataset_root: Path,
+    scene_ids: Iterable[str],
+) -> dict[tuple[str, str, str, str, str], Path]:
+    """Resolve the newest durable source directory for every rendered sensor.
+
+    A graph sweep version is intentionally immutable, and modality-only sweeps
+    therefore store different cameras in different version directories.  A
+    single heading-level ``current.json`` cannot represent that union: promoting
+    a later polar run would otherwise hide an earlier RGB camera at export time.
+    Build one small ledger index up front so collection can compose the cameras
+    without querying SQLite once per heading.
+    """
+    root = Path(dataset_root).resolve()
+    ledger_path = root / "render_ledger.sqlite3"
+    scenes = sorted({str(scene_id) for scene_id in scene_ids if str(scene_id)})
+    if not ledger_path.is_file() or not scenes:
+        return {}
+    placeholders = ",".join("?" for _ in scenes)
+    try:
+        connection = sqlite3.connect(f"file:{ledger_path}?mode=ro", uri=True, timeout=5.0)
+        connection.row_factory = sqlite3.Row
+        try:
+            rows = connection.execute(
+                f"""SELECT r.scene_id, r.created_at, t.variant, t.node_id,
+                           t.heading_id, t.render_version_id, t.metadata_json
+                    FROM sweep_tasks t
+                    JOIN sweep_runs r ON r.run_id = t.run_id
+                    LEFT JOIN render_versions v
+                      ON v.render_version_id = t.render_version_id
+                    WHERE r.scene_id IN ({placeholders})
+                      AND (
+                        t.state = 'succeeded'
+                        OR (t.state = 'skipped' AND json_extract(t.metadata_json, '$.source_bundle_ref') IS NOT NULL)
+                      )
+                      AND COALESCE(v.status, '') <> 'pruned'
+                    ORDER BY r.created_at, t.ordinal""",
+                scenes,
+            ).fetchall()
+        finally:
+            connection.close()
+    except (OSError, sqlite3.Error):
+        return {}
+
+    result: dict[tuple[str, str, str, str, str], Path] = {}
+    for row in rows:
+        try:
+            metadata = json.loads(row["metadata_json"] or "{}")
+        except (TypeError, ValueError):
+            metadata = {}
+        sensor_ids = [str(value) for value in metadata.get("sensor_ids") or [] if str(value)]
+        if not sensor_ids:
+            continue
+        source_ref = str(metadata.get("source_bundle_ref") or "")
+        if source_ref:
+            bundle = (root / source_ref).resolve()
+            try:
+                bundle.relative_to(root)
+            except ValueError:
+                continue
+        else:
+            bundle = (
+                root / "scenes" / str(row["scene_id"]) / "observations" / "versions"
+                / str(row["render_version_id"]) / str(row["variant"] or "base")
+                / str(row["node_id"]) / str(row["heading_id"])
+            )
+        for sensor_id in sensor_ids:
+            sensor_root = next(
+                (candidate for candidate in (bundle / "sensors" / sensor_id, bundle / "cameras" / sensor_id)
+                 if candidate.is_dir()),
+                None,
+            )
+            if sensor_root is not None:
+                result[(
+                    str(row["scene_id"]), str(row["variant"] or "base"),
+                    str(row["node_id"]), str(row["heading_id"]), sensor_id,
+                )] = sensor_root
+    return result
 
 
 def is_episode_complete(episode: EpisodeManifest, dataset_root: Path) -> bool:
@@ -433,6 +514,7 @@ def iter_export_files(
     )
     resolved_heading_count = 0
     source_exr_keys: set[tuple[str, str, str]] = set()
+    versioned_sensor_sources: dict[tuple[str, str, str, str], dict[str, Path]] = {}
 
     def _notify_resolved() -> None:
         nonlocal resolved_heading_count
@@ -514,6 +596,32 @@ def iter_export_files(
             if pair is not None:
                 yield pair
 
+    def _emit_versioned_sensors(
+        *,
+        scene_id: str,
+        variant: str,
+        node_id: str,
+        heading_id: str,
+        destination_root: Path,
+    ) -> Iterable[tuple[Path, str]]:
+        """Compose per-camera outputs that live in separate render versions."""
+        prefix = (str(scene_id), str(variant), str(node_id), str(heading_id))
+        entries = sorted(versioned_sensor_sources.get(prefix, {}).items())
+        for sensor_id, sensor_root in entries:
+            if allowed_camera_ids is not None and sensor_id not in allowed_camera_ids:
+                continue
+            for root_dir, _dirs, names in os.walk(sensor_root):
+                for name in sorted(names):
+                    src = Path(root_dir) / name
+                    if not include_exr and src.suffix.lower() in {".exr", ".hdr", ".npz"}:
+                        if not (include_polarization_raw and src.name == "stokes_data.npz"):
+                            continue
+                    rel = src.relative_to(sensor_root)
+                    destination = (destination_root / "sensors" / sensor_id / rel).as_posix()
+                    pair = _emit(src, destination)
+                    if pair is not None:
+                        yield pair
+
     # 1. Scene artifact files from index_payload.scene_artifacts.
     for artifact in index_payload.get("scene_artifacts") or []:
         for key, ref in artifact.items():
@@ -537,6 +645,12 @@ def iter_export_files(
                     yield pair
     # 2. Episode JSON for each kept episode.
     kept_list = list(kept_episodes)
+    flat_versioned_sources = _completed_sensor_bundle_index(
+        pdir,
+        (str(ep.scene_id) for ep in kept_list if ep.scene_id),
+    )
+    for key, source in flat_versioned_sources.items():
+        versioned_sensor_sources.setdefault(key[:4], {})[key[4]] = source
     for ep in kept_list:
         ep_path = pdir / "episodes" / ep.split / f"{ep.episode_id}.json"
         if ep_path.is_file():
@@ -562,16 +676,20 @@ def iter_export_files(
             seen_viewpoints.add(vp_key)
             vp_dir = pdir / "scenes" / str(ep.scene_id) / "observations" / str(vp_id)
             heading_ids: list[str] = []
-            if vp_dir.is_dir():
-                disk_headings = sorted(p.name for p in vp_dir.iterdir() if p.is_dir())
-                if panorama_observations:
-                    heading_ids = disk_headings
-                else:
-                    # GT-only: just the heading this episode visits at vp_idx.
-                    if vp_idx < len(path_pairs):
-                        gt_h = path_pairs[vp_idx][1]
-                        if gt_h in disk_headings:
-                            heading_ids = [gt_h]
+            disk_headings = {p.name for p in vp_dir.iterdir() if p.is_dir()} if vp_dir.is_dir() else set()
+            version_headings = {
+                key[3] for key in versioned_sensor_sources
+                if key[:3] == (str(ep.scene_id), "base", str(vp_id))
+            }
+            available_headings = sorted(disk_headings | version_headings)
+            if panorama_observations:
+                heading_ids = available_headings
+            else:
+                # GT-only: just the heading this episode visits at vp_idx.
+                if vp_idx < len(path_pairs):
+                    gt_h = path_pairs[vp_idx][1]
+                    if gt_h in available_headings:
+                        heading_ids = [gt_h]
             # 3a. Consolidated observation files for every heading at this vp.
             versioned_heading_ids: set[str] = set()
             for h_id in heading_ids:
@@ -581,6 +699,10 @@ def iter_export_files(
                 )
                 destination = Path("scenes") / str(ep.scene_id) / "observations" / str(vp_id) / str(h_id)
                 _notify_resolved()
+                yield from _emit_versioned_sensors(
+                    scene_id=str(ep.scene_id), variant="base", node_id=str(vp_id),
+                    heading_id=str(h_id), destination_root=destination,
+                )
                 if source_dir is not None:
                     if "versions" in source_dir.parts:
                         versioned_heading_ids.add(str(h_id))
@@ -595,18 +717,26 @@ def iter_export_files(
             # so downstream can join base↔perturbed on identical (vp, heading).
             if include_perturbed:
                 pvp_dir = pdir / "scenes" / str(ep.scene_id) / "observations_perturbed" / str(vp_id)
-                if pvp_dir.is_dir():
-                    p_disk = sorted(p.name for p in pvp_dir.iterdir() if p.is_dir())
-                    p_headings = p_disk if panorama_observations else [h for h in heading_ids if h in p_disk]
-                    for h_id in p_headings:
-                        source_dir = _active_observation_dir(
-                            pdir, scene_id=str(ep.scene_id), variant="perturbed",
-                            node_id=str(vp_id), heading_id=str(h_id),
-                        )
-                        destination = Path("scenes") / str(ep.scene_id) / "observations_perturbed" / str(vp_id) / str(h_id)
-                        _notify_resolved()
-                        if source_dir is not None:
-                            yield from _emit_observation_dir(source_dir, destination)
+                p_disk = {p.name for p in pvp_dir.iterdir() if p.is_dir()} if pvp_dir.is_dir() else set()
+                p_version = {
+                    key[3] for key in versioned_sensor_sources
+                    if key[:3] == (str(ep.scene_id), "perturbed", str(vp_id))
+                }
+                p_available = sorted(p_disk | p_version)
+                p_headings = p_available if panorama_observations else [h for h in heading_ids if h in p_available]
+                for h_id in p_headings:
+                    source_dir = _active_observation_dir(
+                        pdir, scene_id=str(ep.scene_id), variant="perturbed",
+                        node_id=str(vp_id), heading_id=str(h_id),
+                    )
+                    destination = Path("scenes") / str(ep.scene_id) / "observations_perturbed" / str(vp_id) / str(h_id)
+                    _notify_resolved()
+                    yield from _emit_versioned_sensors(
+                        scene_id=str(ep.scene_id), variant="perturbed", node_id=str(vp_id),
+                        heading_id=str(h_id), destination_root=destination,
+                    )
+                    if source_dir is not None:
+                        yield from _emit_observation_dir(source_dir, destination)
 
             # 3b. EXR (HDR) pulled from bridge_jobs for every heading at this
             # vp. The daemon's PNG-only consolidation skipped these so we

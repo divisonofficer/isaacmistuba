@@ -20,6 +20,7 @@ import {
 	getOpticalNavGraphRenderBatchSummary,
 	getOpticalNavGraphBatchLogs,
 	listOpticalNavRenderVersions,
+	getOpticalNavRenderCoverage,
 	promoteOpticalNavRenderVersion,
 	pruneOpticalNavRenderVersion,
 	getOpticalNavGraphRun,
@@ -207,6 +208,9 @@ export async function fetchBatchLogs(projectId: string, batchId: string, limit =
 /** Versioned OpticalNav observation controls. */
 export async function fetchRenderVersions(projectId: string, sceneId: string) {
 	return listOpticalNavRenderVersions(projectId, sceneId);
+}
+export async function fetchRenderCoverage(projectId: string, sceneId: string) {
+	return getOpticalNavRenderCoverage(projectId, sceneId);
 }
 export async function promoteRenderVersion(projectId: string, sceneId: string, versionId: string) {
 	return promoteOpticalNavRenderVersion(projectId, sceneId, versionId);

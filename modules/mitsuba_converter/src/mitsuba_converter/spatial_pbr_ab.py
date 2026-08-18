@@ -198,7 +198,8 @@ def _spatial_material(parent: ET.Element, material: Mapping[str, Any],
     _bitmap(metal, "alpha", Path(material["alpha"]), raw=True)
     return {
         "type": "blendbsdf", "weight": "continuous_metallic", "plastic": "pplastic",
-        "conductor": "roughconductor", "alpha": "roughness_squared", "eta_k": "F0_nearest_preset",
+        "conductor": "roughconductor", "alpha": "roughness_squared",
+        "eta_k": "continuous_F0_eta1",
     }
 
 

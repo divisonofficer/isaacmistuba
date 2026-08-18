@@ -33,8 +33,8 @@ for m in ("robomituba_bridge", "mitsuba_converter", "navigation_dataset"):
 sys.path.insert(0, str(REPO / "tools"))
 
 from render_kitchen_multimodal import cam_for, EYE_H, aolp_to_rgb, save_png  # noqa: E402
-from mitsuba_converter.multimodal import camera_to_world_to_lookat  # noqa: E402
 from mitsuba_converter.material_pipeline.spectral_band import build_band_scene  # noqa: E402
+from robomituba_bridge import resolve_viewpoint_pose  # noqa: E402
 
 SCENES = REPO / "out/opticalnav/opticalnav-v0.2/scenes"
 VARIANT = "cuda_ad_rgb_polarized"
@@ -181,13 +181,12 @@ def main() -> int:
     vps = []
     for k, spec in enumerate(a.viewpoints.split(",")):
         nid, _, yaw_s = spec.partition("@")
-        nid = nid.strip(); yaw = math.radians(float(yaw_s or 0))
+        nid = nid.strip(); yaw_deg = float(yaw_s or 0)
         node = byid[nid]
-        px, py, _z = node["position"]
-        target = (float(px) + math.sin(yaw), EYE_H * 0.9, float(py) + math.cos(yaw))
-        # cam_for is the render_modalities intermediate (matrix[:,2] = -forward); convert to a
-        # Mitsuba sensor to_world via look_at, else the camera faces backward.
-        o, t, u = camera_to_world_to_lookat(cam_for(node, target))
+        pose = resolve_viewpoint_pose(node["position"], yaw_deg, eye_height_m=EYE_H)
+        o = np.asarray(pose.origin_mitsuba, dtype=np.float32)
+        t = np.asarray(pose.target_mitsuba, dtype=np.float32)
+        u = np.asarray(pose.up_mitsuba, dtype=np.float32)
         vps.append((a.index_base + k, nid, o, t, u))
 
     def _amb(vals):

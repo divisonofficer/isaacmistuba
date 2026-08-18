@@ -57,6 +57,7 @@ from robomituba_bridge import (
     isaac_session_open_from_payload,
     isaac_state_patch_from_payload,
     bsdf_override_to_payload,
+    canonical_document,
     read_shape_mapping,
     make_job_id,
     observation_bundle_manifest_to_payload,
@@ -82,12 +83,19 @@ from .material_overrides_store import (
     overrides_ref_for_scene as _overrides_ref_for_scene,
     save_overrides as _save_material_overrides,
 )
-from .multimodal import SUPPORTED_MODALITIES, camera_to_world_to_lookat, normalize_mat4_storage
+from .material_pipeline import canonicalize_materials, extract_material_slots
+from .multimodal import (
+    SUPPORTED_MODALITIES,
+    camera_to_world_to_lookat,
+    cap_scene_texture_resolution,
+    normalize_mat4_storage,
+)
 from .observation_bridge import render_timestep_bundle_split_lighting
 from .scene_floorplan import CameraOverlay, LightOverlay, render_scene_floorplan
 from .glb_texture_adapter import extract_glb_mesh_for_editor as extract_glb_mesh_for_editor_preview
 from .usd_editor_geometry import build_usd_editor_geometry, extract_prim_mesh_for_editor
 from .worker_manager import WorkerManager
+from .render_persistence import RenderPersistenceWriter
 from .versioned_artifacts import (
     RenderLedger,
     new_render_version_id,
@@ -313,12 +321,185 @@ def _interleaved_gpu_shard_assignments(item_count: int, gpu_indices: list[int]) 
     return assignments
 
 
+def _bind_graph_sweep_task_record(
+    sweep_request: Any,
+    task_payload: dict[str, Any],
+    *,
+    logical_key: str,
+    task_id: str,
+    ordinal: int,
+    project_id: str,
+    scene_id: str,
+    run_id: str,
+    scene_version_id_value: str,
+    render_version_id: str,
+    scene_variant_key: str,
+    render_variant: str,
+    submission_group_id: str | None,
+    variant_sequence_index: int,
+    variant_sequence_total: int,
+    previous_variant_batch_id: str | None,
+) -> tuple[int, dict[str, Any]]:
+    """Attach one durable graph-sweep task to its actual phase request."""
+    request = sweep_request.request
+    request.extras.update({
+        "run_id": run_id,
+        "scene_version_id": scene_version_id_value,
+        "render_version_id": render_version_id,
+        "scene_variant_key": scene_variant_key,
+        "render_variant": render_variant,
+        "submission_group_id": submission_group_id,
+        "variant_sequence_index": variant_sequence_index,
+        "variant_sequence_total": variant_sequence_total,
+        "previous_variant_batch_id": previous_variant_batch_id,
+        "task_key": task_id,
+        "logical_task_key": logical_key,
+        "plan_ordinal": ordinal,
+        "task_plan_persisted": True,
+        "phase": task_payload["phase"],
+        "phase_index": task_payload["phase_index"],
+        "opticalnav_project_id": project_id,
+        "opticalnav_scene_id": scene_id,
+        "opticalnav_vp_id": sweep_request.node_id,
+        "opticalnav_heading_id": sweep_request.heading_id,
+        **({"source_bundle_ref": task_payload["source_bundle_ref"]} if task_payload.get("source_bundle_ref") else {}),
+    })
+    return id(request), {
+        "task_key": task_id,
+        "run_id": run_id,
+        "render_version_id": render_version_id,
+        "variant": scene_variant_key,
+        "render_variant": render_variant,
+        "scene_variant_key": scene_variant_key,
+        "submission_group_id": submission_group_id,
+        "variant_sequence_index": variant_sequence_index,
+        "variant_sequence_total": variant_sequence_total,
+        "previous_variant_batch_id": previous_variant_batch_id,
+        "phase": task_payload["phase"],
+        "phase_index": task_payload["phase_index"],
+        "ordinal": ordinal,
+        "node_id": sweep_request.node_id,
+        "heading_id": sweep_request.heading_id,
+        "logical_task_key": logical_key,
+        "metadata": task_payload,
+        "request_payload": render_request_to_payload(request),
+        "state": "skipped" if task_payload.get("source_bundle_ref") else "planned",
+    }
+
+
 def _safe_sort_ts(value: str | None) -> tuple[int, str]:
     return (1 if value else 0, value or "")
 
 
 def _read_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+_RENDER_SCENE_SYNC_GATE_FILENAME = "render_scene_sync_gate.json"
+_RENDER_SCENE_SYNC_GATE_VERSION = "opticalnav-render-scene-sync-gate-v1"
+_RENDER_SCENE_BASE_ARTIFACTS = (
+    "render_scene.xml",
+    "editor_preview_mesh_manifest.json",
+    "xml_scene_index.json",
+    "render_scene_material_policy.json",
+    "material_canonical.json",
+)
+_RENDER_SCENE_RECONSTRUCTION_SIDECARS = (
+    "render_readiness.json",
+    "render_scene_materialization.json",
+)
+
+
+@dataclass
+class _RenderSceneSyncOutcome:
+    """Private result shared by explicit and authoring-map render-scene syncs."""
+
+    status_code: int
+    body: dict[str, Any]
+    authoring_payload: dict[str, Any]
+    overlay_shape_count: int = 0
+
+
+def _sha1_file_or_empty(path: Path) -> str:
+    if not path.is_file():
+        return ""
+    digest = hashlib.sha1()
+    try:
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError:
+        return ""
+    return digest.hexdigest()
+
+
+def _render_scene_texture_gate_config(
+    authoring_payload: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    settings = (
+        authoring_payload.get("settings")
+        if isinstance(authoring_payload, Mapping) else None
+    )
+    scene_override = (
+        settings.get("render_texture_max_resolution")
+        if isinstance(settings, Mapping) else None
+    )
+    raw = (
+        scene_override
+        if scene_override not in (None, "", 0, "0")
+        else os.environ.get("ROBOMITUBA_TEXTURE_MAX_RESOLUTION", "0")
+    )
+    try:
+        max_resolution = max(0, int(str(raw).strip() or "0"))
+    except (TypeError, ValueError):
+        max_resolution = 0
+    cache_raw = os.environ.get("ROBOMITUBA_TEXTURE_CACHE_DIR") or ""
+    try:
+        cache_path = (
+            Path(cache_raw).expanduser()
+            if cache_raw
+            else Path.cwd() / "out" / "texture_cache" / "mitsuba_downsampled"
+        )
+        cache_dir = str(cache_path.resolve())
+    except OSError:
+        cache_dir = cache_raw
+    return {
+        "max_resolution": max_resolution,
+        "source": "scene" if scene_override not in (None, "", 0, "0") else "daemon",
+        # Record the actual default as well as explicit values. This mirrors
+        # multimodal._texture_cache_root and prevents a cwd change from silently
+        # reusing XML that points at a different texture cache.
+        "cache_dir": cache_dir,
+    }
+
+
+def _read_json_mapping(path: Path) -> dict[str, Any] | None:
+    try:
+        value = _read_json(path)
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+    return dict(value) if isinstance(value, Mapping) else None
+
+
+def _render_scene_sync_gate_document(
+    *,
+    authoring_source_hash: str,
+    editor_geometry_hash: str,
+    perturbation_hash: str,
+    texture: Mapping[str, Any],
+    perturbed_scene_ref: str | None,
+) -> dict[str, Any]:
+    return {
+        "version": _RENDER_SCENE_SYNC_GATE_VERSION,
+        "authoring_source_hash": authoring_source_hash,
+        "editor_geometry_hash": editor_geometry_hash,
+        "perturbation_hash": perturbation_hash,
+        "texture": dict(texture),
+        "required_artifacts": list(_RENDER_SCENE_BASE_ARTIFACTS),
+        "reconstruction_sidecars": list(_RENDER_SCENE_RECONSTRUCTION_SIDECARS),
+        "perturbed_scene_ref": perturbed_scene_ref,
+        "written_at": _utc_now_iso(),
+    }
 
 
 # --- optical-perturbation render variants ---------------------------------- #
@@ -880,6 +1061,61 @@ def _roughness_texture_is_near_zero(path: str) -> bool:
         return False
 
 
+def _materialize_scaled_scalar_texture(filename: str, factor: float) -> str:
+    """Return a renderer-owned raw scalar atlas multiplied by ``factor``.
+
+    Mitsuba's OptiX7 production build intentionally does not ship the generic
+    ``scale`` texture plugin.  glTF nevertheless defines a scalar channel as
+    ``texture * factor``.  For a non-unit metallic factor, bake that simple
+    arithmetic into a cache image instead of emitting unsupported XML or
+    changing the authoritative GLB.  The cache lives beside its staged source
+    texture, is content/version keyed, and is explicitly a derived renderer
+    artifact (not a Stage-1 source-PBR atlas).
+    """
+    from PIL import Image as _Image
+
+    source = Path(filename).resolve()
+    if not source.is_file():
+        raise FileNotFoundError(f"metallic texture does not exist: {source}")
+    amount = max(0.0, min(1.0, float(factor)))
+    stat = source.stat()
+    key = hashlib.sha256(
+        f"raw_scalar_v1|{source}|{stat.st_size}|{stat.st_mtime_ns}|{amount:.9g}".encode("utf-8")
+    ).hexdigest()[:20]
+    cache_dir = source.parent / ".robomituba_derived_scalar_maps"
+    target = cache_dir / f"{source.stem}__x{amount:.7g}_{key}.png"
+    if target.is_file():
+        return str(target)
+
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    # GLB metallic maps are scalar raw PNGs.  Convert to L deliberately: this
+    # gives the legacy texture-only consumer the same dense scalar field it
+    # expects, while source RGB channel differences cannot leak into a scalar
+    # BSDF weight.
+    with _Image.open(source) as image:
+        values = np.asarray(image.convert("L"), dtype=np.float32) / 255.0
+    # The source GLB atlas is commonly 8-bit, but the multiplication by a
+    # non-unit factor need not introduce another 8-bit quantization step.
+    # PNG16 is supported by Mitsuba's bitmap loader and keeps the added error
+    # below 1/65535 for direct RGB/NIR/polar materialization.
+    encoded = np.rint(np.clip(values * amount, 0.0, 1.0) * 65535.0).astype(np.uint16)
+    temporary = cache_dir / f".{target.name}.{os.getpid()}.{threading.get_ident()}.tmp.png"
+    _Image.fromarray(encoded).save(temporary, format="PNG")
+    try:
+        os.replace(temporary, target)
+    except FileNotFoundError:
+        # Another render-scene compiler populated exactly the same immutable
+        # cache key first.  Its file is equivalent by construction.
+        if not target.is_file():
+            raise
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+    return str(target)
+
+
 def _append_extracted_bsdf_xml(
     shape: "ET.Element",
     extracted_material: dict[str, Any],
@@ -969,11 +1205,18 @@ def _append_extracted_bsdf_xml(
     class_metal = strategy in {"conductor", "roughconductor"} or bool(
         inject and inject.get("is_metal")
     )
-    scalar_metal = False
+    # glTF metallic is a continuous blend weight, not a material-class switch.
+    # In particular, a valid constant ``metallicFactor=0.38756`` must not become
+    # pure pplastic just because it is below an arbitrary 0.5 threshold.  Keep
+    # only the exact endpoint as a direct roughconductor fast path; all other
+    # scalar values are emitted as a blendbsdf float weight below.
+    metallic_factor: float | None = None
     try:
-        scalar_metal = metallic is not None and float(metallic) > 0.5
-    except Exception:
-        pass
+        if metallic is not None:
+            metallic_factor = max(0.0, min(1.0, float(metallic)))
+    except (TypeError, ValueError):
+        metallic_factor = None
+    endpoint_metal = metallic_factor is not None and metallic_factor >= 1.0 - 1e-6
 
     def _plastic(parent_el: "ET.Element", *, node_id: str | None = None) -> "ET.Element":
         attrs = {"type": "pplastic"}
@@ -1007,7 +1250,7 @@ def _append_extracted_bsdf_xml(
     # Metal-classified (optical_class) surfaces render as CONDUCTORS regardless of the
     # exported metallic map — this also fixes the symmetric export bug (a real metal
     # whose GLB metallic leaks a fabricated all-0 map must not become plastic).
-    if class_metal or scalar_metal:
+    if class_metal or endpoint_metal:
         _metal(parent, rough=(strategy != "conductor" or bool(roughness_tex)))
         return True
 
@@ -1031,12 +1274,32 @@ def _append_extracted_bsdf_xml(
             honour_map = float(src_metallic) >= 0.5
         if honour_map:
             blend = ET.SubElement(parent, "bsdf", type="blendbsdf")
-            _bitmap(blend, "weight", metallic_tex, raw=True)
+            # glTF defines metallic = texture.B * metallicFactor. The OptiX7
+            # build has no generic ``scale`` texture plugin, so preserve a
+            # non-unit factor by materializing a renderer-owned derived cache
+            # atlas instead of silently treating it as 1.
+            if metallic_factor is not None and metallic_factor < 1.0 - 1e-6:
+                scaled_weight = _materialize_scaled_scalar_texture(metallic_tex, metallic_factor)
+                _bitmap(blend, "weight", scaled_weight, raw=True)
+            else:
+                _bitmap(blend, "weight", metallic_tex, raw=True)
             # Child BSDF IDs are unnecessary here and Mitsuba IDs are global across
             # the whole scene; reusing names creates duplicate-id parse failures.
             _plastic(blend)
             _metal(blend, rough=True)
             return True
+
+    # A scalar factor is authoritative when there is no metallic texture.  It
+    # needs no PNG in the GLB contract, but it still needs to be materialized
+    # in the analytic renderer.  Use a scalar blend rather than fabricating a
+    # source metallic atlas; texture-only legacy consumers produce their own
+    # explicitly-derived cache atlas in spatial_pbr.py.
+    if metallic_factor is not None and metallic_factor > 1e-6:
+        blend = ET.SubElement(parent, "bsdf", type="blendbsdf")
+        ET.SubElement(blend, "float", attrib={"name": "weight", "value": f"{metallic_factor:.8g}"})
+        _plastic(blend)
+        _metal(blend, rough=True)
+        return True
 
     _plastic(parent)
     return True
@@ -2356,6 +2619,8 @@ def _build_editor_preview_mesh_manifest(
                 if isinstance(entry, Mapping):
                     prev_shapes[str(sid)] = dict(entry)
     stats["reused_from_prev"] = 0
+    stats["heavy_skipped_from_metadata"] = 0
+    scan_cache: dict[tuple[str, int, int], dict[str, Any]] = {}
 
     scene_mesh_cache_dir.mkdir(parents=True, exist_ok=True)
     obj_shapes = [s for s in tree.getroot().findall(".//shape") if s.attrib.get("type") == "obj"]
@@ -2436,9 +2701,49 @@ def _build_editor_preview_mesh_manifest(
                 if _status in stats and isinstance(stats[_status], int):
                     stats[_status] += 1
                 continue
-        mesh_info = _scan_obj_bounds_and_faces(src)
-        face_count = int(mesh_info.get("face_count") or 0)
         rec = mat_by_shape.get(shape_id)
+        extras = rec.get("extras") if isinstance(rec, Mapping) and isinstance(rec.get("extras"), Mapping) else {}
+        metadata_faces = int(extras.get("triangle_count") or 0) if isinstance(extras, Mapping) else 0
+        metadata_bounds = extras.get("bounds") if isinstance(extras, Mapping) and isinstance(extras.get("bounds"), Mapping) else None
+        if metadata_faces > _preview_mesh_max_source_faces():
+            bounds: dict[str, Any] | None = dict(metadata_bounds) if metadata_bounds else None
+            if bounds and isinstance(bounds.get("min"), list) and isinstance(bounds.get("max"), list):
+                mn = [float(v) for v in bounds["min"][:3]]
+                mx = [float(v) for v in bounds["max"][:3]]
+                if len(mn) == 3 and len(mx) == 3:
+                    bounds["size"] = [max(mx[i] - mn[i], 1e-6) for i in range(3)]
+                    bounds["center"] = [(mx[i] + mn[i]) * 0.5 for i in range(3)]
+            mesh_info = {"face_count": metadata_faces, "bounds": bounds}
+            arch_kind = _preview_architecture_kind(shape_id, rec, mesh_info)
+            is_architecture = bool(arch_kind)
+            by_shape[shape_id] = {
+                "preview_mesh_status": "skipped_heavy_source",
+                "preview_mesh_reason": f"source_faces {metadata_faces} > max {_preview_mesh_max_source_faces()} (metadata)",
+                "source_mesh_faces": metadata_faces,
+                "editor_layer": "architecture" if is_architecture else "object",
+                "editor_pickable": (not is_architecture) or arch_kind == "glass",
+                **({
+                    "editor_proxy": {
+                        "kind": arch_kind,
+                        "bounds": bounds,
+                        "material_hint": rec.get("material_id") if isinstance(rec, Mapping) else None,
+                    },
+                } if is_architecture else {}),
+            }
+            stats.setdefault("skipped_heavy_source", 0)
+            stats["skipped_heavy_source"] += 1
+            stats["heavy_skipped_from_metadata"] += 1
+            continue
+        scan_key = (
+            str(src.resolve()),
+            int(stat_now.st_mtime_ns) if stat_now is not None else 0,
+            int(stat_now.st_size) if stat_now is not None else 0,
+        )
+        mesh_info = scan_cache.get(scan_key)
+        if mesh_info is None:
+            mesh_info = _scan_obj_bounds_and_faces(src)
+            scan_cache[scan_key] = mesh_info
+        face_count = int(mesh_info.get("face_count") or 0)
         arch_kind = _preview_architecture_kind(shape_id, rec, mesh_info)
         is_architecture = bool(arch_kind)
         editor_layer = "architecture" if is_architecture else "object"
@@ -2583,10 +2888,37 @@ def _build_editor_preview_mesh_manifest(
     return {"version": _PREVIEW_MESH_CACHE_VERSION, "stats": stats, "shapes": by_shape}
 
 
-_SCENE_MESH_CACHE_OBJ_VERSION = 4
+_SCENE_MESH_CACHE_OBJ_VERSION = 5
+_ASSEMBLY_BOUNDS_TOLERANCE_M = 1e-5
 
 
-def _write_normalized_obj_for_scene_cache(src: Path, dst: Path) -> dict[str, Any]:
+def _obj_vertex_bounds(path: Path) -> tuple[tuple[float, float, float], tuple[float, float, float]] | None:
+    low = [float("inf")] * 3
+    high = [float("-inf")] * 3
+    count = 0
+    with path.open("r", encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            parts = line.lstrip().split()
+            if len(parts) < 4 or parts[0] != "v":
+                continue
+            try:
+                value = tuple(float(parts[i]) for i in range(1, 4))
+            except ValueError:
+                continue
+            if not all(math.isfinite(item) for item in value):
+                continue
+            count += 1
+            for axis in range(3):
+                low[axis] = min(low[axis], value[axis])
+                high[axis] = max(high[axis], value[axis])
+    if count == 0:
+        return None
+    return tuple(low), tuple(high)  # type: ignore[return-value]
+
+
+def _write_normalized_obj_for_scene_cache(
+    src: Path, dst: Path, *, preserve_positions: bool = False,
+) -> dict[str, Any]:
     """Normalize an OBJ with a bounded-memory, Mitsuba-safe normal pass.
 
     Infinigen can emit very large OBJ files. Keep this pass streaming: a full
@@ -2678,9 +3010,17 @@ def _write_normalized_obj_for_scene_cache(src: Path, dst: Path) -> dict[str, Any
     max_y = 0.0 if not math.isfinite(max_y) else max_y
     min_z = 0.0 if not math.isfinite(min_z) else min_z
     max_z = 0.0 if not math.isfinite(max_z) else max_z
-    off_x = (min_x + max_x) / 2.0
-    off_y = min_y
-    off_z = (min_z + max_z) / 2.0
+    if preserve_positions:
+        # GLB material parts have already received their node transforms in
+        # glb_texture_adapter.  Recentring each material part independently
+        # destroys their assembly-relative placement (cabinet doors, shelves,
+        # countertops, ...).  Only legacy standalone/world-space OBJs use the
+        # historical center-XZ/min-Y normalization below.
+        off_x = off_y = off_z = 0.0
+    else:
+        off_x = (min_x + max_x) / 2.0
+        off_y = min_y
+        off_z = (min_z + max_z) / 2.0
 
     # Pass 2: write transformed vertices and repaired/stripped normal records.
     written_vertices = 0
@@ -2734,7 +3074,8 @@ def _write_normalized_obj_for_scene_cache(src: Path, dst: Path) -> dict[str, Any
                 out.write(line)
 
     return {
-        "normalized": True,
+        "normalized": not preserve_positions,
+        "position_policy": "preserve_assembly_local" if preserve_positions else "legacy_recenter",
         "vertex_count": written_vertices,
         "normal_count": normal_count,
         "normal_repaired": repair_count,
@@ -2757,6 +3098,7 @@ def _stage_xml_obj_filenames_to_scene_mesh_cache(
     repo_root: Path,
     progress_cb: "Callable[[int, int, str, str], None] | None" = None,
     progress_stage: str = "stage_obj_cache",
+    materialization_records: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Copy OBJ files referenced by render_scene.xml into scene-local mesh_cache.
 
@@ -2766,26 +3108,42 @@ def _stage_xml_obj_filenames_to_scene_mesh_cache(
     pass stages every OBJ filename from the XML into the scene's ``mesh_cache``
     and rewrites the XML filename to the staged repo-relative path.
     """
+    t0 = time.perf_counter()
     if not xml_path.exists():
-        return {"staged": 0, "missing": 0, "rewritten": 0}
+        return {"staged": 0, "missing": 0, "rewritten": 0, "elapsed_ms": 0}
     import xml.etree.ElementTree as ET
 
     try:
         parser = ET.XMLParser(target=ET.TreeBuilder(insert_comments=True))
         tree = ET.parse(str(xml_path), parser=parser)
     except Exception as exc:
-        return {"staged": 0, "missing": 0, "rewritten": 0, "error": str(exc)}
+        return {"staged": 0, "missing": 0, "rewritten": 0, "elapsed_ms": 0, "error": str(exc)}
 
     scene_mesh_cache_dir.mkdir(parents=True, exist_ok=True)
     staged = 0
     missing = 0
     rewritten = 0
+    cache_hits = 0
+    source_bytes = 0
+    cache_bytes = 0
+    normalized = 0
+    offset_nonzero = 0
+    normal_repaired = 0
+    invalid_normal_references = 0
+    canonical_safe_reused = 0
     root = tree.getroot()
     obj_shapes = [s for s in root.findall(".//shape") if s.attrib.get("type") == "obj"]
     total_shapes = len(obj_shapes)
     publish_every = max(1, total_shapes // 40)
     if progress_cb is not None and total_shapes:
         progress_cb(0, total_shapes, "staging OBJs", progress_stage)
+    source_type_by_shape = {
+        str(record.get("shape_id")): str(record.get("source_type") or "")
+        for record in (materialization_records or [])
+        if record.get("shape_id")
+    }
+    preserved_positions = 0
+    preserved_part_paths: list[tuple[str, Path, Path]] = []
     for processed_idx, shape in enumerate(obj_shapes, start=1):
         fn = shape.find("./string[@name='filename']")
         if fn is None:
@@ -2808,19 +3166,52 @@ def _stage_xml_obj_filenames_to_scene_mesh_cache(
         except OSError:
             missing += 1
             continue
+        source_bytes += int(stat.st_size)
+        source_type = source_type_by_shape.get(str(shape.attrib.get("id") or ""), "")
+        canonical_safe = source_type == "glb_part_safe"
+        preserve_positions = source_type in {"glb_part", "glb_part_safe"}
+        position_policy = "preserve_assembly_local" if preserve_positions else "legacy_recenter"
+        if canonical_safe:
+            # Adapter-v7 parts are already finite, normal-safe, transformed, and
+            # scene-local.  A second textual OBJ copy was the main 32 GiB cache
+            # amplification and is intentionally bypassed.
+            dst = src
+            cache_hits += 1
+            canonical_safe_reused += 1
+            preserved_positions += 1
+            try:
+                cache_bytes += int(dst.stat().st_size)
+            except OSError:
+                pass
+            staged_ref = str(dst.resolve())
+            if raw != staged_ref:
+                fn.set("value", staged_ref)
+                rewritten += 1
+            continue
         digest = hashlib.sha1(
-            f"{src.resolve()}|{stat.st_mtime_ns}|{stat.st_size}|stage_obj_v{_SCENE_MESH_CACHE_OBJ_VERSION}".encode("utf-8")
+            f"{src.resolve()}|{stat.st_mtime_ns}|{stat.st_size}|{position_policy}|stage_obj_v{_SCENE_MESH_CACHE_OBJ_VERSION}".encode("utf-8")
         ).hexdigest()[:16]
         dst = scene_mesh_cache_dir / f"{digest}.obj"
+        cache_hit = src.resolve() == dst.resolve() or dst.exists()
+        if cache_hit:
+            cache_hits += 1
         if src.resolve() != dst.resolve() and not dst.exists():
             tmp = scene_mesh_cache_dir / f"{digest}.tmp.{os.getpid()}.{threading.get_ident()}.obj"
             try:
-                _write_normalized_obj_for_scene_cache(src, tmp)
+                normalize_info = _write_normalized_obj_for_scene_cache(
+                    src, tmp, preserve_positions=preserve_positions,
+                )
                 try:
                     tmp.replace(dst)
                 except FileNotFoundError:
                     pass
                 staged += 1
+                normalized += int(bool(normalize_info.get("normalized")))
+                offset = normalize_info.get("offset_applied") or []
+                if any(abs(float(value)) > 1e-9 for value in offset):
+                    offset_nonzero += 1
+                normal_repaired += int(normalize_info.get("normal_repaired") or 0)
+                invalid_normal_references += int(bool(normalize_info.get("normal_invalid_references")))
             except OSError:
                 try:
                     tmp.unlink(missing_ok=True)
@@ -2828,6 +3219,13 @@ def _stage_xml_obj_filenames_to_scene_mesh_cache(
                     pass
                 missing += 1
                 continue
+        preserved_positions += int(preserve_positions)
+        if preserve_positions:
+            preserved_part_paths.append((str(shape.attrib.get("id") or ""), src, dst))
+        try:
+            cache_bytes += int(dst.stat().st_size)
+        except OSError:
+            pass
         # Write the staged path as absolute. Mitsuba loads the XML from
         # `.staged_mitsuba/base/<hash>.xml` and resolves relative paths against
         # *that* directory — a repo-relative `out/opticalnav/.../<digest>.obj`
@@ -2840,13 +3238,47 @@ def _stage_xml_obj_filenames_to_scene_mesh_cache(
             fn.set("value", staged_ref)
             rewritten += 1
 
+    max_bounds_delta = 0.0
+    for shape_id, source_path, staged_path in preserved_part_paths:
+        source_bounds = _obj_vertex_bounds(source_path)
+        staged_bounds = _obj_vertex_bounds(staged_path)
+        if source_bounds is None or staged_bounds is None:
+            raise ValueError(f"{shape_id}: GLB part has no finite vertices after staging")
+        delta = max(
+            abs(source_bounds[edge][axis] - staged_bounds[edge][axis])
+            for edge in range(2) for axis in range(3)
+        )
+        max_bounds_delta = max(max_bounds_delta, delta)
+        if delta > _ASSEMBLY_BOUNDS_TOLERANCE_M:
+            raise ValueError(
+                f"{shape_id}: GLB assembly-local bounds changed during staging "
+                f"(max_abs={delta:.8g}m, tolerance={_ASSEMBLY_BOUNDS_TOLERANCE_M:.8g}m)"
+            )
+
     if rewritten:
         try:
             ET.indent(tree, space="  ")
         except Exception:
             pass
         tree.write(str(xml_path), encoding="utf-8", xml_declaration=True)
-    return {"staged": staged, "missing": missing, "rewritten": rewritten}
+    return {
+        "staged": staged,
+        "cache_hits": cache_hits,
+        "missing": missing,
+        "rewritten": rewritten,
+        "source_bytes": source_bytes,
+        "cache_bytes": cache_bytes,
+        "normalized": normalized,
+        "offset_nonzero": offset_nonzero,
+        "normal_repaired": normal_repaired,
+        "invalid_normal_references": invalid_normal_references,
+        "canonical_safe_reused": canonical_safe_reused,
+        "preserved_positions": preserved_positions,
+        "position_contract": "glb_part_assembly_local_v1",
+        "preserved_bounds_max_abs_delta_m": max_bounds_delta,
+        "preserved_bounds_tolerance_m": _ASSEMBLY_BOUNDS_TOLERANCE_M,
+        "elapsed_ms": int((time.perf_counter() - t0) * 1000),
+    }
 
 
 def _glb_cache_write_meta(cache_dir: Path, payload: dict[str, Any]) -> None:
@@ -2951,7 +3383,10 @@ def _materialize_glb_obj_for_overlay(
             mesh_stats["glb_mesh_parts"] = mesh_stats.get("glb_mesh_parts", 0) + int(result.mesh_part_count)
             if result.texture_slots.get("base_color"):
                 mesh_stats["glb_base_textures"] = mesh_stats.get("glb_base_textures", 0) + int(result.texture_slots.get("base_color") or 0)
-        return result.combined_obj_path
+        # Adapter v7 stores only canonical material parts.  The primary path is
+        # retained as a success sentinel for the existing shape-emission path;
+        # actual XML shapes are emitted from ``mesh_parts`` below.
+        return result.combined_obj_path or (result.mesh_parts[0].obj_path if result.mesh_parts else None)
     except Exception as exc:
         if mesh_stats is not None:
             mesh_stats["glb_materialize_error"] = mesh_stats.get("glb_materialize_error", 0) + 1
@@ -3286,7 +3721,13 @@ def _proxy_box_xml_element(
                         mesh_stats["usd_material_attached"] = mesh_stats.get("usd_material_attached", 0) + 1
                 material_status = _classify_extracted_material(em) if em else "n/a"
                 _record(
-                    "obj", "glb_part" if materialize_source_type == "glb" else "usd_prim_part",
+                    "obj", (
+                        "glb_part_safe"
+                        if materialize_source_type == "glb" and part.get("obj_contract") == "mitsuba_safe_glb_part_v1"
+                        else "glb_part"
+                        if materialize_source_type == "glb"
+                        else "usd_prim_part"
+                    ),
                     shape_id=shape_id, cache_obj=str(part.get("obj_ref")),
                     extras={
                         "parent_shape_id": obj_id,
@@ -3294,6 +3735,8 @@ def _proxy_box_xml_element(
                         "mesh_prim_path": part.get("mesh_prim_path"),
                         "mesh_name": part.get("mesh_name"),
                         "triangle_count": part.get("triangle_count"),
+                        "bounds": part.get("bounds"),
+                        "obj_contract": part.get("obj_contract"),
                         "material_class": material_class,
                         "render_material_id": selected_material,
                         "asset_id": (obj_meta.get("asset_id") if isinstance(obj_meta, dict) else None),
@@ -4253,7 +4696,7 @@ def _build_opticalnav_render_readiness(
     elif proxy_warnings:
         warnings.append({"key": "proxy_primitive", "label": "Proxy primitive used", "message": f"{proxy_warnings} objects have no materialized asset mesh and will render as proxy primitives."})
 
-    texture_profile = os.environ.get("ROBOMITUBA_TEXTURE_MAX_RESOLUTION") or "1024"
+    texture_profile = _render_scene_texture_gate_config(authoring_map_payload).get("max_resolution") or 1024
     checks.append({"key": "texture_profile", "ok": True, "label": "Texture profile active", "level": "info", "message": f"max{texture_profile}"})
     checks.append({"key": "catalog_fallback", "ok": True, "label": "No catalog fallback", "level": "error", "message": "editor_generated_xml"})
     ok = not errors
@@ -4518,6 +4961,18 @@ class _GraphBuildSubscriber:
             if daemon is None:
                 raise RuntimeError("graph-build handler is missing daemon")
             daemon._write_ws_frame(self.handler, data)
+
+
+@dataclass
+class _RenderSceneSyncJob:
+    job_id: str
+    project_dir: Path
+    scene_id: str
+    payload: dict[str, Any]
+    requested_fingerprint: str
+    requested_revision: int = 1
+    active_fingerprint: str | None = None
+    active_revision: int = 0
 
 
 _download_jobs: dict[str, dict[str, Any]] = {}
@@ -5111,11 +5566,27 @@ class RenderDaemon:
         # rollout never pays the worker startup cost.
         self._render_worker_manager: WorkerManager | None = None
         self._render_worker_manager_lock = threading.Lock()
+        # Accessed only by the single persistence writer thread. Reusing each
+        # project ledger avoids repeating schema/WAL initialization on NFS for
+        # every 64-event batch.
+        self._render_persistence_ledgers: dict[str, RenderLedger] = {}
+        self._render_persistence = RenderPersistenceWriter(
+            self._persist_render_events_batch,
+            batch_size=max(1, int(os.environ.get("ROBOMITUBA_PERSIST_BATCH_SIZE", "64") or "64")),
+            batch_interval_s=max(0.0, float(os.environ.get("ROBOMITUBA_PERSIST_BATCH_INTERVAL_S", "0.05") or "0.05")),
+            max_attempts=max(1, int(os.environ.get("ROBOMITUBA_PERSIST_MAX_ATTEMPTS", "5") or "5")),
+            retry_base_s=max(0.0, float(os.environ.get("ROBOMITUBA_PERSIST_RETRY_BASE_S", "0.1") or "0.1")),
+        )
 
         self._graph_build_progress: dict[str, dict[str, Any]] = {}
         self._graph_build_lock = threading.Lock()
         self._graph_edit_locks: dict[tuple[str, str], threading.RLock] = {}
         self._graph_edit_locks_lock = threading.Lock()
+        # Render-scene sync mutates XML, sidecars, and the staged-scene cache.
+        # Serialize only the same project/scene pair; unrelated scenes remain
+        # independently syncable.
+        self._render_scene_sync_locks: dict[tuple[str, str], threading.RLock] = {}
+        self._render_scene_sync_locks_lock = threading.Lock()
 
         self._job_status_subscribers: set[_JobStatusSubscriber] = set()
         self._job_status_sub_lock = threading.Lock()
@@ -5135,6 +5606,8 @@ class RenderDaemon:
         # late-connecting WS subscriber can still pick it up.
         self._opticalnav_sync_progress: dict[str, dict[str, Any]] = {}
         self._opticalnav_sync_lock = threading.Lock()
+        self._render_scene_sync_jobs: dict[tuple[str, str], _RenderSceneSyncJob] = {}
+        self._render_scene_sync_jobs_lock = threading.Lock()
         self._opticalnav_sync_subscribers: dict[str, set[_GraphBuildSubscriber]] = {}
         self._opticalnav_sync_sub_lock = threading.Lock()
 
@@ -5162,6 +5635,15 @@ class RenderDaemon:
             if lock is None:
                 lock = threading.RLock()
                 self._graph_edit_locks[key] = lock
+            return lock
+
+    def _opticalnav_render_scene_sync_lock(self, project_dir: Path, scene_id: str) -> threading.RLock:
+        key = (str(Path(project_dir).resolve()), str(scene_id))
+        with self._render_scene_sync_locks_lock:
+            lock = self._render_scene_sync_locks.get(key)
+            if lock is None:
+                lock = threading.RLock()
+                self._render_scene_sync_locks[key] = lock
             return lock
 
     @staticmethod
@@ -6777,6 +7259,11 @@ class RenderDaemon:
             name="robomituba-stale-job-scan",
             daemon=True,
         ).start()
+        threading.Thread(
+            target=self._mark_stale_export_jobs_at_startup,
+            name="robomituba-stale-export-scan",
+            daemon=True,
+        ).start()
 
     def shutdown(self) -> None:
         with self._condition:
@@ -6788,6 +7275,11 @@ class RenderDaemon:
             self._server.server_close()
             self._server = None
 
+        with self._render_worker_manager_lock:
+            render_worker_manager = self._render_worker_manager
+        if render_worker_manager is not None:
+            render_worker_manager.shutdown()
+
         if self._worker_thread is not None:
             self._worker_thread.join(timeout=5.0)
             self._worker_thread = None
@@ -6795,6 +7287,19 @@ class RenderDaemon:
         if self._server_thread is not None:
             self._server_thread.join(timeout=5.0)
             self._server_thread = None
+
+        flush_timeout_s = max(
+            0.0,
+            float(os.environ.get("ROBOMITUBA_PERSIST_SHUTDOWN_TIMEOUT_S", "30") or "30"),
+        )
+        try:
+            self._render_persistence.stop(timeout_s=flush_timeout_s)
+        except Exception as exc:
+            print(
+                f"[daemon] render persistence shutdown flush failed: {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
 
     def wait_forever(self) -> None:
         if self._server_thread is None:
@@ -6888,6 +7393,21 @@ class RenderDaemon:
         except Exception:
             return False
 
+    def _sync_opticalnav_render_scene(
+        self,
+        project_dir: Path,
+        scene_id: str,
+        payload: Mapping[str, Any],
+        *,
+        sync_job_id: str | None,
+        progress_cb: "Callable[[int, int, str, str], None] | None",
+    ) -> _RenderSceneSyncOutcome:
+        """Shared render-scene sync module for explicit and save-triggered paths."""
+        with self._opticalnav_render_scene_sync_lock(project_dir, scene_id):
+            return self._sync_opticalnav_render_scene_locked(
+                project_dir, scene_id, payload, sync_job_id=sync_job_id, progress_cb=progress_cb,
+            )
+
     def _run_render_scene_sync_inner(
         self,
         project_dir: Path,
@@ -6897,14 +7417,29 @@ class RenderDaemon:
         sync_job_id: str | None,
         progress_cb: "Callable[[int, int, str, str], None] | None",
     ) -> "tuple[int, dict[str, Any]]":
-        """Render-scene sync body. Returns (status_code, response_body) without sending."""
+        """Compatibility adapter for the explicit Sync HTTP route."""
+        outcome = self._sync_opticalnav_render_scene(
+            project_dir, scene_id, payload, sync_job_id=sync_job_id, progress_cb=progress_cb,
+        )
+        return outcome.status_code, outcome.body
+
+    def _sync_opticalnav_render_scene_locked(
+        self,
+        project_dir: Path,
+        scene_id: str,
+        payload: Mapping[str, Any],
+        *,
+        sync_job_id: str | None,
+        progress_cb: "Callable[[int, int, str, str], None] | None",
+    ) -> _RenderSceneSyncOutcome:
+        """Locked implementation of :meth:`_sync_opticalnav_render_scene`."""
         from navigation_dataset.authoring_map import (
             authoring_map_to_payload as _am_to_payload,
             load_authoring_map,
             save_authoring_map,
         )
-        from navigation_dataset.scene_annotations import SceneAnnotation, read_scene_annotation, write_scene_annotation
-        from navigation_dataset.scene_sync import write_render_scene_sync
+        from navigation_dataset.scene_annotations import SceneAnnotation, read_scene_annotation
+        from navigation_dataset.scene_sync import compute_authoring_source_hash, write_render_scene_sync
 
         scene_dir = project_dir / "scenes" / scene_id
         map_path = scene_dir / "authoring_map.json"
@@ -6918,15 +7453,21 @@ class RenderDaemon:
         # back to a minimal one (scene_id only) so XML emit always succeeds.
         # Dataset compile remains as a separate workflow.
         annotation_missing = False
-        # Wipe the .staged_mitsuba/ cache up-front: any in-flight render job that
-        # already resolved a staged_xml path under the previous render_scene.xml
-        # would otherwise keep loading stale envmap / texture refs.
-        staged_cleared = self._opticalnav_clear_staged_scene_cache(scene_dir)
+        staged_cleared: dict[str, Any] = {"removed_files": 0}
         try:
             authoring_map = load_authoring_map(map_path)
             envmap_invalidated = self._opticalnav_invalidate_missing_envmap(
                 authoring_map, map_path, scene_dir,
             )
+            authoring_payload = _am_to_payload(authoring_map)
+            eg_path = scene_dir / "editor_geometry.json"
+            eg_data = _read_json_mapping(eg_path) if eg_path.exists() else None
+            gate_path = scene_dir / _RENDER_SCENE_SYNC_GATE_FILENAME
+            gate_prev = _read_json_mapping(gate_path)
+            gate_authoring_hash = compute_authoring_source_hash(authoring_payload)
+            gate_editor_geometry_hash = _sha1_file_or_empty(eg_path)
+            gate_perturbation_hash = _sha1_file_or_empty(scene_dir / "optical_perturbation.json")
+            gate_texture = _render_scene_texture_gate_config(authoring_payload)
             try:
                 annotation = read_scene_annotation(annotation_path)
             except (FileNotFoundError, ValueError, OSError):
@@ -6941,16 +7482,62 @@ class RenderDaemon:
                 scene_variant_id=_maybe_str(payload.get("scene_variant_id")),
             )
         except Exception as exc:
-            return int(HTTPStatus.BAD_REQUEST), {"error": str(exc)}
+            return _RenderSceneSyncOutcome(
+                int(HTTPStatus.BAD_REQUEST), {"error": str(exc)}, {},
+            )
 
-        authoring_payload = _am_to_payload(authoring_map)
         render_scene_path = scene_dir / "render_scene.xml"
         render_readiness_path = scene_dir / "render_readiness.json"
         render_scene_ref: str | None = None
         perturbed_scene_ref: str | None = None
         overlay_shape_count = 0
         generation_error: str | None = None
-        mesh_extraction_stats: dict[str, int] = {}
+        mesh_extraction_stats: dict[str, Any] = {}
+        materialization_records: list[dict[str, Any]] = []
+        material_policy_records: list[dict[str, Any]] = []
+
+        required_base_ok = (
+            all((scene_dir / name).is_file() for name in _RENDER_SCENE_BASE_ARTIFACTS)
+            and all((scene_dir / name).is_file() for name in _RENDER_SCENE_RECONSTRUCTION_SIDECARS)
+        )
+        prior_audit = _read_json_mapping(scene_dir / "render_scene_materialization.json")
+        prior_readiness = _read_json_mapping(render_readiness_path)
+        base_reusable = bool(
+            gate_prev
+            and required_base_ok
+            and prior_audit is not None
+            and prior_readiness is not None
+            and gate_prev.get("version") == _RENDER_SCENE_SYNC_GATE_VERSION
+            and gate_prev.get("authoring_source_hash") == gate_authoring_hash
+            and gate_prev.get("editor_geometry_hash") == gate_editor_geometry_hash
+            and gate_prev.get("texture") == gate_texture
+            and list(gate_prev.get("required_artifacts") or []) == list(_RENDER_SCENE_BASE_ARTIFACTS)
+            and list(gate_prev.get("reconstruction_sidecars") or []) == list(_RENDER_SCENE_RECONSTRUCTION_SIDECARS)
+        )
+        perturbation_doc = _read_json_mapping(scene_dir / "optical_perturbation.json")
+        perturbation_enabled = bool(
+            perturbation_doc and perturbation_doc.get("enabled") and perturbation_doc.get("objects")
+        )
+        prior_perturbed_ref = _maybe_str((gate_prev or {}).get("perturbed_scene_ref"))
+        try:
+            prior_perturbed_exists = bool(
+                prior_perturbed_ref
+                and resolve_repo_path(self.repo_root, prior_perturbed_ref).is_file()
+            )
+        except (OSError, ValueError):
+            prior_perturbed_exists = False
+        perturbation_reusable = bool(
+            base_reusable
+            and gate_prev is not None
+            and gate_prev.get("perturbation_hash") == gate_perturbation_hash
+            and ((not perturbation_enabled and not prior_perturbed_ref) or (perturbation_enabled and prior_perturbed_exists))
+        )
+        sync_mode = (
+            "reuse_all" if perturbation_reusable else
+            "perturbation_only_rebuild" if base_reusable else
+            "full_rebuild"
+        )
+        mesh_extraction_stats["sync_mode"] = sync_mode
 
         # Total estimate: every overlay object is one unit of "stage" work — XML
         # emit + mesh-cache copy + preview-manifest entry each touch every object.
@@ -6969,9 +7556,110 @@ class RenderDaemon:
         if progress_cb is not None:
             progress_cb(0, total_estimate, "preparing", "scene_sync")
 
+        if base_reusable:
+            # ``write_render_scene_sync`` above refreshes the cheap authoring
+            # sidecars, so reconstruct the heavyweight values it intentionally
+            # resets from the last complete materialization audit.
+            materialization_records = list(prior_audit.get("objects") or []) if prior_audit else []
+            mesh_extraction_stats.update(dict(prior_audit.get("mesh_stats") or {}) if prior_audit else {})
+            mesh_extraction_stats["sync_mode"] = sync_mode
+            overlay_shape_count = int((prior_readiness or {}).get("overlay_shape_count") or 0)
+            render_scene_ref = render_scene_path.relative_to(self.repo_root).as_posix()
+            scene_mesh_cache_dir = self._opticalnav_mesh_cache_dir(project_dir, scene_id)
+            if sync_mode == "perturbation_only_rebuild":
+                perturbed_scene_ref = self._stage_perturbed_render_xml(
+                    scene_dir, authoring_payload, result.overlay, eg_data,
+                    self._make_mesh_resolver(project_dir, scene_id), scene_mesh_cache_dir,
+                    progress_cb=progress_cb, metrics_out=mesh_extraction_stats,
+                )
+                if perturbation_enabled and not perturbed_scene_ref:
+                    generation_error = "perturbed render-scene generation failed"
+            else:
+                perturbed_scene_ref = prior_perturbed_ref
+
+            if progress_cb is not None:
+                progress_cb(total_estimate, total_estimate, "checking readiness", "readiness")
+            readiness = _build_opticalnav_render_readiness(
+                authoring_payload,
+                repo_root=self.repo_root,
+                render_scene_path=render_scene_path,
+                render_scene_ref=render_scene_ref,
+                overlay_shape_count=overlay_shape_count,
+                generation_error=generation_error,
+                materialization_records=materialization_records,
+            )
+            render_readiness_path.write_text(json.dumps(readiness, ensure_ascii=False, indent=2), encoding="utf-8")
+            readiness_ref = render_readiness_path.relative_to(project_dir).as_posix()
+            sv_path = scene_dir / "scene_variant.json"
+            sv = _read_json(sv_path)
+            sv.update({
+                "render_sync_mode": "editor_generated_xml",
+                "base_scene_xml_ref": None,
+                "overlay_scene_xml_ref": render_scene_ref,
+                "perturbed_scene_xml_ref": perturbed_scene_ref,
+                "render_readiness_ref": readiness_ref,
+                "environment_profile": authoring_payload.get("environment") or {},
+                "camera_rig_id": (authoring_payload.get("camera_rig") or {}).get("rig_id"),
+                "camera_rig": authoring_payload.get("camera_rig") or {},
+                "texture_profile": readiness.get("texture_profile"),
+            })
+            sv_path.write_text(json.dumps(sv, ensure_ascii=False, indent=2), encoding="utf-8")
+            try:
+                raw_annotation = json.loads(annotation_path.read_text(encoding="utf-8"))
+            except Exception:
+                raw_annotation = {"scene_id": scene_id}
+            sync_payload = {
+                **dict(raw_annotation.get("metadata", {}).get("sync", {})),
+                **result.sync,
+                "render_scene": "synced" if readiness.get("ok") else "blocked",
+                "render_scene_status": "synced" if readiness.get("ok") else "blocked",
+                "render_scene_mode": "editor_generated_xml",
+                "scene_variant_ref": result.scene_variant_ref,
+                "render_scene_overlay_ref": result.overlay_ref,
+                "render_scene_xml_ref": render_scene_ref,
+                "render_readiness_ref": readiness_ref,
+                "render_readiness_status": readiness.get("status"),
+            }
+            raw_annotation.setdefault("metadata", {})["sync"] = sync_payload
+            annotation_path.write_text(json.dumps(raw_annotation, ensure_ascii=False, indent=2), encoding="utf-8")
+            if generation_error is None:
+                try:
+                    gate_path.write_text(json.dumps(_render_scene_sync_gate_document(
+                        authoring_source_hash=gate_authoring_hash,
+                        editor_geometry_hash=gate_editor_geometry_hash,
+                        perturbation_hash=gate_perturbation_hash,
+                        texture=gate_texture,
+                        perturbed_scene_ref=perturbed_scene_ref,
+                    ), ensure_ascii=False, indent=2), encoding="utf-8")
+                except OSError as exc:
+                    mesh_extraction_stats["sync_gate_error"] = str(exc)
+            body = {
+                "ok": bool(readiness.get("ok")), "stage": "sync_render_scene",
+                "status": "done" if readiness.get("ok") else "blocked",
+                "message": f"Render-scene XML reused ({overlay_shape_count} proxy shapes)." if readiness.get("ok") else "Render-scene XML reused but render readiness is blocked.",
+                "scene_id": scene_id, "scene_variant_ref": result.scene_variant_ref,
+                "render_scene_overlay_ref": result.overlay_ref, "render_scene_xml_ref": render_scene_ref,
+                "render_readiness_ref": readiness_ref, "sync": sync_payload, "scene_variant": sv,
+                "overlay": result.overlay, "render_readiness": readiness,
+                "mesh_extraction_stats": mesh_extraction_stats,
+                "room_shell": _compute_room_shell_geometry(authoring_payload),
+                "project": self._opticalnav_project_summary(project_dir), "sync_job_id": sync_job_id,
+                "envmap_invalidated": envmap_invalidated, "staged_cleared": staged_cleared,
+                "annotation_missing": annotation_missing, "overlay_shape_count": overlay_shape_count,
+            }
+            return _RenderSceneSyncOutcome(int(HTTPStatus.OK), body, authoring_payload, overlay_shape_count)
+
+        # A base rebuild changes XML references, so only this path invalidates
+        # previously resolved staged scenes.
+        # A stale successful token must never hide a failed required sidecar on
+        # the next request with the same source digest.
         try:
-            eg_path = scene_dir / "editor_geometry.json"
-            eg_data = _read_json(eg_path) if eg_path.exists() else None
+            gate_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        staged_cleared = self._opticalnav_clear_staged_scene_cache(scene_dir)
+        required_sidecar_errors: list[str] = []
+        try:
             _shared_stage_cache: dict[str, Any] = {}
             _processed = {"n": 0}
 
@@ -7025,6 +7713,19 @@ class RenderDaemon:
             render_scene_ref = render_scene_path.relative_to(self.repo_root).as_posix()
             scene_mesh_cache_dir = self._opticalnav_mesh_cache_dir(project_dir, scene_id)
 
+            # Keep the texture rewrite before OBJ staging. Both the render and the
+            # editor preview must observe this exact derived XML, and its normalized
+            # settings are part of the gate token above.
+            texture_cache_dir = (
+                Path(str(gate_texture["cache_dir"]))
+                if gate_texture.get("cache_dir") else None
+            )
+            mesh_extraction_stats["texture_cap"] = cap_scene_texture_resolution(
+                render_scene_path,
+                max_resolution=int(gate_texture["max_resolution"]),
+                cache_dir=texture_cache_dir,
+            )
+
             # Stage: copy every OBJ referenced by render_scene.xml into the scene's
             # mesh_cache under a hash filename. Cache-aware (skips existing hashes),
             # so the second sync flies through. The function publishes per-shape
@@ -7035,12 +7736,14 @@ class RenderDaemon:
                 repo_root=self.repo_root,
                 progress_cb=progress_cb,
                 progress_stage="stage_obj_cache",
+                materialization_records=materialization_records,
             )
 
             # 'perturbed' variant: base + enabled optical-perturbation objects (eval).
             perturbed_scene_ref = self._stage_perturbed_render_xml(
                 scene_dir, authoring_payload, result.overlay, eg_data,
                 _resolve_prim_obj, scene_mesh_cache_dir, progress_cb=progress_cb,
+                metrics_out=mesh_extraction_stats,
             )
 
             # Stage: build editor preview meshes (decimate when fast_simplification is
@@ -7072,6 +7775,7 @@ class RenderDaemon:
                 )
             except Exception as exc:
                 mesh_extraction_stats["editor_preview_mesh_manifest_error"] = str(exc)
+                required_sidecar_errors.append(f"editor preview manifest: {exc}")
 
             # PR1: per-object materialization audit + XML scene index sidecars.
             # Both consume the records collected during XML emit and the freshly written
@@ -7086,6 +7790,7 @@ class RenderDaemon:
                 )
             except Exception as exc:
                 mesh_extraction_stats["material_policy_error"] = str(exc)
+                required_sidecar_errors.append(f"material policy: {exc}")
             try:
                 audit_payload = _build_materialization_audit(
                     scene_id=scene_id,
@@ -7098,6 +7803,7 @@ class RenderDaemon:
                 )
             except Exception as exc:
                 mesh_extraction_stats["materialization_audit_error"] = str(exc)
+                required_sidecar_errors.append(f"materialization audit: {exc}")
             try:
                 xml_index = _build_xml_scene_index(
                     render_scene_path,
@@ -7109,10 +7815,30 @@ class RenderDaemon:
                     (scene_dir / "xml_scene_index.json").write_text(
                         json.dumps(xml_index, ensure_ascii=False, indent=2), encoding="utf-8",
                     )
+                else:
+                    required_sidecar_errors.append("XML scene index was not generated")
             except Exception as exc:
                 mesh_extraction_stats["xml_scene_index_error"] = str(exc)
+                required_sidecar_errors.append(f"XML scene index: {exc}")
+            try:
+                material_slots = extract_material_slots(scene_dir)
+                canonical_materials = canonicalize_materials(material_slots)
+                canonical_payload = canonical_document(
+                    str(material_slots.get("scene_id") or scene_id), canonical_materials,
+                )
+                (scene_dir / "material_canonical.json").write_text(
+                    json.dumps(canonical_payload, ensure_ascii=False, indent=2), encoding="utf-8",
+                )
+            except Exception as exc:
+                mesh_extraction_stats["material_canonical_error"] = str(exc)
+                required_sidecar_errors.append(f"canonical material: {exc}")
+            if perturbation_enabled and not perturbed_scene_ref:
+                required_sidecar_errors.append("enabled perturbation XML was not generated")
         except Exception as exc:
             generation_error = str(exc)
+
+        if generation_error is None and required_sidecar_errors:
+            generation_error = "required render-scene sidecar failed: " + "; ".join(required_sidecar_errors)
 
         if progress_cb is not None:
             progress_cb(total_estimate, total_estimate, "checking readiness", "readiness")
@@ -7165,6 +7891,19 @@ class RenderDaemon:
         }
         _raw.setdefault("metadata", {})["sync"] = sync_payload
         annotation_path.write_text(json.dumps(_raw, ensure_ascii=False, indent=2), encoding="utf-8")
+        if generation_error is None:
+            try:
+                gate_path.write_text(json.dumps(_render_scene_sync_gate_document(
+                    authoring_source_hash=gate_authoring_hash,
+                    editor_geometry_hash=gate_editor_geometry_hash,
+                    perturbation_hash=gate_perturbation_hash,
+                    texture=gate_texture,
+                    perturbed_scene_ref=perturbed_scene_ref,
+                ), ensure_ascii=False, indent=2), encoding="utf-8")
+            except OSError as exc:
+                # The source artifacts stay usable, but a missing token forces a
+                # safe retry next time instead of claiming a reusable base build.
+                mesh_extraction_stats["sync_gate_error"] = str(exc)
         body = {
             "ok": bool(readiness.get("ok")),
             "stage": "sync_render_scene",
@@ -7190,8 +7929,194 @@ class RenderDaemon:
             "envmap_invalidated": envmap_invalidated,
             "staged_cleared": staged_cleared,
             "annotation_missing": annotation_missing,
+            "overlay_shape_count": overlay_shape_count,
         }
-        return int(HTTPStatus.OK), body
+        return _RenderSceneSyncOutcome(int(HTTPStatus.OK), body, authoring_payload, overlay_shape_count)
+
+    def _render_scene_sync_key(self, project_dir: Path, scene_id: str) -> tuple[str, str]:
+        return (str(project_dir.resolve()), str(scene_id))
+
+    def _render_scene_sync_fingerprint(
+        self, project_dir: Path, scene_id: str, payload: Mapping[str, Any],
+    ) -> str:
+        scene_dir = project_dir / "scenes" / scene_id
+        fingerprint_payload = {
+            "authoring_map": _sha1_file_or_empty(scene_dir / "authoring_map.json"),
+            "editor_geometry": _sha1_file_or_empty(scene_dir / "editor_geometry.json"),
+            "perturbation": _sha1_file_or_empty(scene_dir / "optical_perturbation.json"),
+            "texture": _render_scene_texture_gate_config(
+                _read_json_mapping(scene_dir / "authoring_map.json")
+            ),
+            "payload": dict(payload),
+        }
+        return hashlib.sha1(
+            json.dumps(
+                fingerprint_payload, ensure_ascii=False, sort_keys=True,
+                separators=(",", ":"), default=str,
+            ).encode("utf-8")
+        ).hexdigest()
+
+    def _render_scene_sync_is_active(self, project_dir: Path, scene_id: str) -> bool:
+        key = self._render_scene_sync_key(project_dir, scene_id)
+        with self._render_scene_sync_jobs_lock:
+            return key in self._render_scene_sync_jobs
+
+    def _accept_render_scene_sync(
+        self, project_dir: Path, scene_id: str, payload: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        key = self._render_scene_sync_key(project_dir, scene_id)
+        fingerprint = self._render_scene_sync_fingerprint(project_dir, scene_id, payload)
+        with self._render_scene_sync_jobs_lock:
+            existing = self._render_scene_sync_jobs.get(key)
+            if existing is not None:
+                deduplicated = fingerprint == existing.requested_fingerprint
+                if not deduplicated:
+                    existing.payload = dict(payload)
+                    existing.requested_fingerprint = fingerprint
+                    existing.requested_revision += 1
+                revision = existing.requested_revision
+                job_id = existing.job_id
+                coalesced = not deduplicated
+            else:
+                job_id = (
+                    f"sync-{_utc_now().strftime('%Y%m%dT%H%M%S%f')}-"
+                    f"{hashlib.sha1(str(project_dir / 'scenes' / scene_id).encode()).hexdigest()[:6]}"
+                )
+                existing = _RenderSceneSyncJob(
+                    job_id=job_id,
+                    project_dir=project_dir,
+                    scene_id=scene_id,
+                    payload=dict(payload),
+                    requested_fingerprint=fingerprint,
+                )
+                self._render_scene_sync_jobs[key] = existing
+                revision = 1
+                deduplicated = False
+                coalesced = False
+
+        if deduplicated or coalesced:
+            self._patch_opticalnav_annotation_sync(project_dir, scene_id, {
+                "render_scene": "pending",
+                "render_scene_status": "syncing",
+                "render_readiness_status": "pending",
+                "sync_job_id": job_id,
+                "sync_revision": revision,
+                "message": (
+                    "Render-scene sync request deduplicated."
+                    if deduplicated else
+                    "Render-scene changes coalesced into the latest revision."
+                ),
+            })
+            return {
+                "ok": True, "sync_job_id": job_id, "scene_id": scene_id,
+                "ws_url": f"/api/ws/opticalnav-sync-progress?sync_job_id={job_id}",
+                "deduplicated": deduplicated, "coalesced": coalesced,
+                "revision": revision,
+            }
+
+        self._patch_opticalnav_annotation_sync(project_dir, scene_id, {
+            "render_scene": "pending",
+            "render_scene_status": "syncing",
+            "render_readiness_status": "pending",
+            "sync_job_id": job_id,
+            "sync_revision": revision,
+            "message": "Render-scene sync is running.",
+        })
+        self._publish_opticalnav_sync_progress(job_id, {
+            "status": "started", "processed": 0, "total": 0,
+            "stage": "queued", "revision": revision,
+            "deduplicated": False, "coalesced": False,
+        })
+        threading.Thread(
+            target=self._run_render_scene_sync_job,
+            args=(key, existing),
+            name=f"opticalnav-sync-{job_id}",
+            daemon=True,
+        ).start()
+        return {
+            "ok": True, "sync_job_id": job_id, "scene_id": scene_id,
+            "ws_url": f"/api/ws/opticalnav-sync-progress?sync_job_id={job_id}",
+            "deduplicated": False, "coalesced": False, "revision": revision,
+        }
+
+    def _run_render_scene_sync_job(
+        self, key: tuple[str, str], job: _RenderSceneSyncJob,
+    ) -> None:
+        while True:
+            with self._render_scene_sync_jobs_lock:
+                current = self._render_scene_sync_jobs.get(key)
+                if current is not job:
+                    return
+                payload = dict(job.payload)
+                fingerprint = job.requested_fingerprint
+                revision = job.requested_revision
+                job.active_fingerprint = fingerprint
+                job.active_revision = revision
+
+            self._publish_opticalnav_sync_progress(job.job_id, {
+                "status": "running", "processed": 0, "total": 0,
+                "label": "starting", "stage": "queued", "revision": revision,
+            })
+            try:
+                status_code, body = self._run_render_scene_sync_inner(
+                    job.project_dir, job.scene_id, payload,
+                    sync_job_id=job.job_id,
+                    progress_cb=lambda p, t, label, stage, _revision=revision: self._publish_opticalnav_sync_progress(
+                        job.job_id, {
+                            "status": "running", "processed": int(p), "total": int(t),
+                            "label": label, "stage": stage, "revision": _revision,
+                        },
+                    ),
+                )
+                error: Exception | None = None
+            except Exception as exc:  # noqa: BLE001 - terminal state is reported below
+                status_code, body, error = int(HTTPStatus.INTERNAL_SERVER_ERROR), {"error": str(exc)}, exc
+
+            with self._render_scene_sync_jobs_lock:
+                current = self._render_scene_sync_jobs.get(key)
+                superseded = bool(
+                    current is job
+                    and (
+                        job.requested_fingerprint != fingerprint
+                        or job.requested_revision != revision
+                    )
+                )
+                if not superseded and current is job:
+                    self._render_scene_sync_jobs.pop(key, None)
+
+            if superseded:
+                self._patch_opticalnav_annotation_sync(job.project_dir, job.scene_id, {
+                    "render_scene": "pending",
+                    "render_scene_status": "syncing",
+                    "render_readiness_status": "pending",
+                    "sync_job_id": job.job_id,
+                    "sync_revision": job.requested_revision,
+                    "message": "Applying the latest coalesced render-scene revision.",
+                })
+                self._publish_opticalnav_sync_progress(job.job_id, {
+                    "status": "running", "processed": 0, "total": 0,
+                    "label": "latest revision queued", "stage": "coalesced_rerun",
+                    "revision": job.requested_revision, "coalesced": True,
+                })
+                continue
+
+            if error is not None:
+                print(f"[sync] scene={job.scene_id}: job {job.job_id} FAILED: {error}", file=sys.stderr, flush=True)
+                traceback.print_exception(error, file=sys.stderr)
+                self._patch_opticalnav_annotation_sync(job.project_dir, job.scene_id, {
+                    "render_scene": "blocked", "render_scene_status": "error",
+                    "render_readiness_status": "blocked", "sync_job_id": job.job_id,
+                    "sync_revision": revision, "message": f"Render-scene sync failed: {error}",
+                })
+            body = dict(body)
+            body.update({"sync_job_id": job.job_id, "revision": revision})
+            ok = status_code == int(HTTPStatus.OK)
+            self._publish_opticalnav_sync_progress(job.job_id, {
+                "status": "done" if ok else "error", "result": body,
+                "status_code": int(status_code), "revision": revision,
+                "deduplicated": False, "coalesced": revision > 1,
+            })
+            return
 
     def _publish_opticalnav_sync_progress(self, sync_job_id: str, payload: dict[str, Any]) -> None:
         """Record latest progress and broadcast to any WebSocket subscribers."""
@@ -7306,6 +8231,103 @@ class RenderDaemon:
     def _export_status_path(self, project_dir: Path, job_id: str) -> Path:
         return project_dir / "exports" / job_id / "export_status.json"
 
+    def _export_request_path(self, project_dir: Path, job_id: str) -> Path:
+        """Durable, replayable input for a scene-bundle export job."""
+        return project_dir / "exports" / job_id / "export_request.json"
+
+    @staticmethod
+    def _write_json_atomic(path: Path, payload: Mapping[str, Any]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(path.suffix + ".tmp")
+        temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        temporary.replace(path)
+
+    def _export_source_fingerprint(self, project_dir: Path, scene_id: str) -> str:
+        """Cheap immutable-enough guard for resuming an export.
+
+        Rendered observations use stable ``current.json`` pointers. Hashing those
+        pointers plus the scene/episode metadata catches a rerender or authoring
+        change without hashing the multi-GB raster payload itself.
+        """
+        digest = hashlib.sha256()
+        scene_root = project_dir / "scenes" / scene_id
+        candidates: list[Path] = []
+        for name in (
+            "authoring_map.json", "scene_annotation.json", "viewpoint_graph.json",
+            "traversable_grid.npy.json", "render_scene.xml", "render_scene_base.xml",
+            "render_scene_perturbed.xml", "optical_perturbation.json",
+        ):
+            path = scene_root / name
+            if path.is_file():
+                candidates.append(path)
+        observations = scene_root / "observations"
+        if observations.is_dir():
+            candidates.extend(observations.rglob("current.json"))
+        episodes_root = project_dir / "episodes"
+        if episodes_root.is_dir():
+            for path in episodes_root.rglob("*.json"):
+                try:
+                    if _read_json(path).get("scene_id") == scene_id:
+                        candidates.append(path)
+                except Exception:
+                    continue
+        for path in sorted(set(candidates), key=lambda item: str(item)):
+            try:
+                relative = path.relative_to(project_dir).as_posix()
+                digest.update(relative.encode("utf-8"))
+                digest.update(path.read_bytes())
+            except OSError:
+                digest.update(f"missing:{path}".encode("utf-8"))
+        return digest.hexdigest()
+
+    def _write_export_request(self, project_dir: Path, job_id: str, request: Mapping[str, Any]) -> None:
+        self._write_json_atomic(self._export_request_path(project_dir, job_id), dict(request))
+
+    def _load_export_request(self, project_dir: Path, job_id: str) -> dict[str, Any] | None:
+        path = self._export_request_path(project_dir, job_id)
+        try:
+            payload = _read_json(path)
+        except Exception:
+            return None
+        return dict(payload) if isinstance(payload, Mapping) else None
+
+    def _export_stage_checkpoint_path(self, project_dir: Path, job_id: str) -> Path:
+        return project_dir / "exports" / job_id / "staging_checkpoint.json"
+
+    def _load_export_stage_checkpoint(self, project_dir: Path, job_id: str) -> dict[str, Any]:
+        try:
+            payload = _read_json(self._export_stage_checkpoint_path(project_dir, job_id))
+        except Exception:
+            payload = {}
+        return dict(payload) if isinstance(payload, Mapping) else {}
+
+    @staticmethod
+    def _sha256_path(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for block in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(block)
+        return digest.hexdigest()
+
+    def _checkpoint_reusable_file(self, checkpoint: Mapping[str, Any], key: str, path: Path) -> bool:
+        entry = checkpoint.get("files", {}).get(key) if isinstance(checkpoint.get("files"), Mapping) else None
+        if not isinstance(entry, Mapping) or not path.is_file():
+            return False
+        try:
+            return int(entry.get("bytes", -1)) == path.stat().st_size and str(entry.get("sha256")) == self._sha256_path(path)
+        except OSError:
+            return False
+
+    def _record_export_checkpoint_file(
+        self, project_dir: Path, job_id: str, checkpoint: dict[str, Any], key: str, path: Path, **metadata: Any,
+    ) -> None:
+        checkpoint.setdefault("files", {})[key] = {
+            "bytes": path.stat().st_size,
+            "sha256": self._sha256_path(path),
+            **metadata,
+        }
+        self._write_json_atomic(self._export_stage_checkpoint_path(project_dir, job_id), checkpoint)
+
     def _publish_export_progress(self, job_id: str, project_dir: Path, **updates: Any) -> None:
         """Apply updates to the in-memory job state, write status.json atomically,
         and broadcast to any WS subscribers."""
@@ -7316,6 +8338,11 @@ class RenderDaemon:
             state["updated_at"] = _utc_now_iso()
             if "stage" in updates and updates["stage"]:
                 state["stage_label"] = self._EXPORT_STAGE_LABELS.get(updates["stage"], updates["stage"])
+                state["checkpoint_stage"] = updates["stage"]
+            if updates.get("status") in {"failed", "interrupted", "cancelled"}:
+                state["resume_available"] = True
+            elif updates.get("status") == "succeeded":
+                state["resume_available"] = False
             self._export_jobs[job_id] = state
             snapshot = dict(state)
         # Atomic write to disk (tmp + rename) so polling readers never see a
@@ -7340,6 +8367,51 @@ class RenderDaemon:
         with self._export_jobs_lock:
             return bool((self._export_jobs.get(job_id) or {}).get("cancel_requested"))
 
+    def _start_export_job_thread(self, job_id: str, project_id: str, project_dir: Path, request: Mapping[str, Any]) -> None:
+        """Start one durable export worker from its persisted request payload."""
+        threading.Thread(
+            target=self._run_export_job,
+            args=(
+                job_id, project_id, project_dir, str(request["scene_id"]),
+                bool(request.get("only_completed", True)), request.get("episode_ids"),
+                bool(request.get("include_episode_thumbnails", False)),
+                bool(request.get("panorama_observations", True)), bool(request.get("png_only", False)),
+                bool(request.get("include_birdseye", True)), bool(request.get("include_polarization_raw", True)),
+                bool(request.get("include_episode_birdseye", False)), bool(request.get("eval_perturbation", False)),
+                request.get("camera_ids"), str(request.get("export_profile") or "compact_with_polar_extension"),
+            ),
+            name=f"export-job-{job_id}",
+            daemon=True,
+        ).start()
+
+    def _mark_stale_export_jobs_at_startup(self) -> None:
+        """Make restart-interrupted exports explicitly resumable instead of stale."""
+        root = self.repo_root / "out" / "opticalnav"
+        if not root.is_dir():
+            return
+        count = 0
+        for status_path in root.glob("*/exports/export-*/export_status.json"):
+            try:
+                state = _read_json(status_path)
+            except Exception:
+                continue
+            if not isinstance(state, Mapping) or state.get("status") not in {"queued", "running"}:
+                continue
+            state = dict(state)
+            state.update({
+                "status": "interrupted",
+                "resume_available": True,
+                "error": state.get("error") or "daemon restarted before export completed",
+                "updated_at": _utc_now_iso(),
+            })
+            try:
+                self._write_json_atomic(status_path, state)
+                count += 1
+            except OSError:
+                continue
+        if count:
+            print(f"[daemon] Marked {count} export job(s) as interrupted on startup.", flush=True)
+
     def _run_profiled_export_materialization(
         self,
         *,
@@ -7360,6 +8432,7 @@ class RenderDaemon:
         panorama_observations: bool,
         include_birdseye: bool,
         include_episode_birdseye: bool,
+        include_polarization_raw: bool,
         eval_perturbation: bool,
         camera_ids: list[str] | None,
         check_cancel: Callable[[], None],
@@ -7413,14 +8486,14 @@ class RenderDaemon:
             )
 
         # Compact profiles intentionally do not pull HDR buffers from legacy bridge
-        # jobs, but request Stokes paths so they can be repacked into the extension.
+        # jobs. Stokes can be retained as a compact core when requested.
         resolved_files = list(iter_export_files(
             project_dir,
             index_payload,
             kept_episodes,
             panorama_observations=panorama_observations,
             include_exr=False,
-            include_polarization_raw=True,
+            include_polarization_raw=include_polarization_raw,
             include_perturbed=eval_perturbation,
             camera_ids=camera_ids,
             on_progress=on_resolve,
@@ -7477,24 +8550,38 @@ class RenderDaemon:
         destinations: list[str] = []
         bytes_current = 0
         last_publish_s = 0.0
+        checkpoint = self._load_export_stage_checkpoint(project_dir, job_id)
         for index, (kind, item) in enumerate(operations, start=1):
             check_cancel()
+            checkpoint_key = f"compact:{kind}:{item.dst}"
             if kind == "copy":
                 destination = staging / item.dst
                 destination.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(item.src, destination)
+                if not self._checkpoint_reusable_file(checkpoint, checkpoint_key, destination):
+                    shutil.copy2(item.src, destination)
+                    self._record_export_checkpoint_file(project_dir, job_id, checkpoint, checkpoint_key, destination)
                 written = destination.stat().st_size
                 register_source(item.src, item.dst, source_to_exported)
                 output_records.append({"kind": kind, "src": str(item.src), "dst": item.dst, "bytes": written})
                 destinations.append(item.dst)
             elif kind == "webp":
                 destination = staging / item.dst
-                written = transcode_rgb_png_to_lossless_webp(item.src, destination)
+                if not self._checkpoint_reusable_file(checkpoint, checkpoint_key, destination):
+                    written = transcode_rgb_png_to_lossless_webp(item.src, destination)
+                    self._record_export_checkpoint_file(project_dir, job_id, checkpoint, checkpoint_key, destination)
+                else:
+                    written = destination.stat().st_size
                 register_source(item.src, item.dst, source_to_exported)
                 output_records.append({"kind": kind, "src": str(item.src), "dst": item.dst, "bytes": written})
                 destinations.append(item.dst)
             elif kind == "polar_thumbnail":
-                written = write_polar_thumbnail(item, staging)
+                destination = staging / item.dst
+                if not self._checkpoint_reusable_file(checkpoint, checkpoint_key, destination):
+                    written = write_polar_thumbnail(item, staging)
+                    if written:
+                        self._record_export_checkpoint_file(project_dir, job_id, checkpoint, checkpoint_key, destination)
+                else:
+                    written = destination.stat().st_size
                 if written:
                     for source in item.sources.values():
                         register_source(source, item.dst, source_to_exported)
@@ -7508,7 +8595,12 @@ class RenderDaemon:
             elif kind == "stokes_core":
                 target_root = polar_staging if profile.split_polar_extension else staging
                 destination = target_root / item.dst
-                metadata = write_stokes_core(item.src, destination)
+                if not self._checkpoint_reusable_file(checkpoint, checkpoint_key, destination):
+                    metadata = write_stokes_core(item.src, destination)
+                    self._record_export_checkpoint_file(project_dir, job_id, checkpoint, checkpoint_key, destination, stokes_metadata=metadata)
+                else:
+                    metadata = dict(checkpoint.get("files", {}).get(checkpoint_key, {}).get("stokes_metadata") or {})
+                    metadata.setdefault("bytes", destination.stat().st_size)
                 written = int(metadata["bytes"])
                 if not profile.split_polar_extension:
                     register_source(item.src, item.dst, source_to_exported)
@@ -8165,6 +9257,7 @@ class RenderDaemon:
                     panorama_observations=panorama_observations,
                     include_birdseye=include_birdseye,
                     include_episode_birdseye=include_episode_birdseye,
+                    include_polarization_raw=include_polarization_raw,
                     eval_perturbation=eval_perturbation,
                     camera_ids=camera_ids,
                     check_cancel=check_cancel,
@@ -8271,13 +9364,17 @@ class RenderDaemon:
             last_pub = 0.0
             bytes_current = 0
             copy_errors: list[dict[str, str]] = []
+            checkpoint = self._load_export_stage_checkpoint(project_dir, job_id)
             for i, (src, dst_rel) in enumerate(files):
                 check_cancel()
                 dst = staging / dst_rel
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 try:
-                    shutil.copy2(src, dst)
                     source_size = int(src.stat().st_size)
+                    checkpoint_key = f"legacy:copy:{dst_rel}"
+                    if not self._checkpoint_reusable_file(checkpoint, checkpoint_key, dst):
+                        shutil.copy2(src, dst)
+                        self._record_export_checkpoint_file(project_dir, job_id, checkpoint, checkpoint_key, dst)
                     copied_size = int(dst.stat().st_size)
                     if copied_size != source_size:
                         raise OSError(f"size mismatch source={source_size} copied={copied_size}")
@@ -8375,9 +9472,12 @@ class RenderDaemon:
                 message=f"compressing {len(staging_files)} files",
             )
             zip_path.parent.mkdir(parents=True, exist_ok=True)
+            zip_temporary = zip_path.with_suffix(zip_path.suffix + ".partial")
+            if zip_temporary.exists():
+                zip_temporary.unlink()
             zip_bytes_current = 0
             last_pub = 0.0
-            with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            with zipfile.ZipFile(zip_temporary, "w", compression=zipfile.ZIP_DEFLATED) as zf:
                 for i, p in enumerate(staging_files):
                     check_cancel()
                     arcname = p.relative_to(staging).as_posix()
@@ -8394,6 +9494,7 @@ class RenderDaemon:
                             current_file=p.name,
                         )
                         last_pub = now
+            zip_temporary.replace(zip_path)
 
             # ── finalize ──────────────────────────────────────────────────
             publish(stage="finalize", message="writing report")
@@ -8775,6 +9876,8 @@ class RenderDaemon:
         return read_observation_bundle_manifest(manifest_path)
 
     def cancel(self, job_id: str) -> RenderJobStatus:
+        cancelled_job: _QueuedJob | None = None
+        cancelled_message = "Job cancelled"
         with self._condition:
             job = self._jobs.get(job_id)
             if job is None:
@@ -8788,12 +9891,9 @@ class RenderDaemon:
                 job.status.finished_at = _utc_now_iso()
                 job.status.progress_stage = "cancelled"
                 job.status.extras["cancelled_before_start"] = True
-                self._persist_status_unlocked(job)
-                self._record_render_job_telemetry(job, event_type="cancelled")
-                self._append_job_log_line(job, event_type="cancelled", stage="cancelled", message="Job cancelled before start")
-                self._condition.notify_all()
-                return RenderJobStatus(**render_job_status_to_payload(job.status))
-            if job.status.status == "running":
+                cancelled_job = job
+                cancelled_message = "Job cancelled before start"
+            elif job.status.status == "running":
                 job.status.status = "cancelled"
                 job.status.finished_at = _utc_now_iso()
                 job.status.progress_stage = "cancelled"
@@ -8802,12 +9902,19 @@ class RenderDaemon:
                 manager = self._render_worker_manager
                 if manager is not None:
                     job.status.extras["worker_cancel_requested"] = bool(manager.cancel(job_id))
-                self._persist_status_unlocked(job)
-                self._record_render_job_telemetry(job, event_type="cancelled")
-                self._append_job_log_line(job, event_type="cancelled", stage="cancelled", message="Job cancelled")
+                cancelled_job = job
+            if cancelled_job is not None:
+                self._enqueue_render_persistence(cancelled_job, "cancelled")
                 self._condition.notify_all()
-                return RenderJobStatus(**render_job_status_to_payload(job.status))
-            return RenderJobStatus(**render_job_status_to_payload(job.status))
+            result = RenderJobStatus(**render_job_status_to_payload(job.status))
+        if cancelled_job is not None:
+            # The general persistence callback owns status/telemetry. Preserve
+            # the more specific legacy log wording without blocking the lock.
+            self._append_job_log_line(
+                cancelled_job, event_type="cancelled", stage="cancelled",
+                message=cancelled_message,
+            )
+        return result
 
     def delete_job(self, job_id: str, *, force: bool = False) -> None:
         """Remove a finished/cancelled/failed job record and its log file.
@@ -9068,6 +10175,18 @@ class RenderDaemon:
                     sync_status.update(dict(_raw_ann.get("metadata", {}).get("sync", {})))
                 except Exception:
                     pass
+        if (
+            sync_status.get("render_scene_status") == "syncing"
+            and not self._render_scene_sync_is_active(project_dir, scene_dir.name)
+        ):
+            interrupted = {
+                "render_scene": "pending",
+                "render_scene_status": "interrupted",
+                "render_readiness_status": "pending",
+                "message": "Previous render-scene sync was interrupted by daemon shutdown; retry sync.",
+            }
+            sync_status.update(interrupted)
+            self._patch_opticalnav_annotation_sync(project_dir, scene_dir.name, interrupted)
         if authoring_map_path.exists() and annotation_path.exists():
             sync_status["annotation_stale"] = authoring_map_path.stat().st_mtime > annotation_path.stat().st_mtime
         if annotation_path.exists() and traversable_grid_path.exists():
@@ -11136,37 +12255,199 @@ class RenderDaemon:
     def _stage_perturbed_render_xml(self, scene_dir: Path, authoring_payload: dict[str, Any],
                                     base_overlay: dict[str, Any] | None, eg_data: Any,
                                     mesh_resolver: Any, scene_mesh_cache_dir: Path,
-                                    progress_cb: Any = None) -> str | None:
-        """Stage a SECOND render-scene XML = base overlay + the enabled optical
-        perturbation objects (mirrors/glass), so the same scene can be rendered with
-        them ('perturbed' variant) vs without ('base'). Returns the perturbed render
-        ref, or None when there is no enabled perturbation overlay."""
+                                    progress_cb: Any = None,
+                                    metrics_out: dict[str, Any] | None = None) -> str | None:
+        """Publish the enabled optical-perturbation variant.
+
+        Mirror/glass wall perturbations can be appended to an already materialized
+        base XML. Source-backed objects retain the previous full-build fallback.
+        """
         try:
             from navigation_dataset.optical_perturbation import load_perturbation
         except Exception:
             return None
         pert = load_perturbation(scene_dir)
         if not (isinstance(pert, dict) and pert.get("enabled") and pert.get("objects")):
+            if metrics_out is not None:
+                metrics_out["perturbed_scene"] = {"mode": "disabled", "object_count": 0, "elapsed_ms": 0}
             return None
-        merged = dict(base_overlay or {})
-        merged["objects"] = list((base_overlay or {}).get("objects") or []) + list(pert.get("objects") or [])
-        perturbed_path = scene_dir / "render_scene_perturbed.xml"
+
+        objects = [dict(item) for item in pert.get("objects") or [] if isinstance(item, Mapping)]
+        t0 = time.perf_counter()
+        fast_path = all(
+            str(item.get("type") or "") in {"mirror_wall", "glass_wall"}
+            and not item.get("source_ref")
+            for item in objects
+        )
+        if fast_path:
+            try:
+                ref = self._stage_perturbed_render_xml_additive(
+                    scene_dir, authoring_payload, objects, eg_data, mesh_resolver,
+                )
+                if metrics_out is not None:
+                    metrics_out["perturbed_scene"] = {
+                        "mode": "additive",
+                        "object_count": len(objects),
+                        "base_obj_cache_reused": True,
+                        "elapsed_ms": int((time.perf_counter() - t0) * 1000),
+                    }
+                return ref
+            except Exception as exc:  # noqa: BLE001
+                self._push_debug_event("warn", f"additive perturbed XML generation failed; falling back: {exc}")
+
+        ref = self._stage_perturbed_render_xml_full(
+            scene_dir, authoring_payload, base_overlay, eg_data, mesh_resolver,
+            scene_mesh_cache_dir, objects, progress_cb=progress_cb,
+        )
+        if metrics_out is not None:
+            metrics_out["perturbed_scene"] = {
+                "mode": "full_fallback",
+                "object_count": len(objects),
+                "base_obj_cache_reused": False,
+                "elapsed_ms": int((time.perf_counter() - t0) * 1000),
+                "ok": bool(ref),
+            }
+        return ref
+
+    def _stage_perturbed_render_xml_additive(
+        self,
+        scene_dir: Path,
+        authoring_payload: dict[str, Any],
+        perturbation_objects: list[dict[str, Any]],
+        eg_data: Any,
+        mesh_resolver: Any,
+    ) -> str:
+        """Clone base XML and append proxy-only perturbation shapes atomically."""
+        import xml.etree.ElementTree as ET
+
+        base_path = scene_dir / "render_scene.xml"
+        if not base_path.is_file():
+            raise FileNotFoundError(f"base render scene is missing: {base_path}")
+        parser = ET.XMLParser(target=ET.TreeBuilder(insert_comments=True))
+        base_tree = ET.parse(base_path, parser=parser)
+        base_root = base_tree.getroot()
+        wanted_ids = {str(item.get("id") or "") for item in perturbation_objects}
+        if not wanted_ids:
+            raise ValueError("enabled perturbation has no object ids")
+
+        fd, delta_name = tempfile.mkstemp(
+            prefix=".render_scene_perturbed_delta.", suffix=".xml", dir=scene_dir,
+        )
+        os.close(fd)
+        delta_path = Path(delta_name)
+        published_path = scene_dir / (
+            f".render_scene_perturbed.{os.getpid()}.{threading.get_ident()}.xml"
+        )
+        target_path = scene_dir / "render_scene_perturbed.xml"
         try:
             _generate_opticalnav_render_scene_xml(
-                authoring_payload, merged, perturbed_path,
+                authoring_payload,
+                {"objects": perturbation_objects},
+                delta_path,
+                editor_geometry=eg_data,
+                repo_root=self.repo_root,
+                mesh_resolver=mesh_resolver,
+                mesh_stats={},
+                materialization_records=[],
+                material_policy_records=[],
+            )
+            delta_tree = ET.parse(delta_path, parser=ET.XMLParser(target=ET.TreeBuilder(insert_comments=True)))
+            delta_root = delta_tree.getroot()
+
+            existing_bsdf_ids = {
+                str(node.get("id"))
+                for node in base_root.findall("./bsdf")
+                if node.get("id")
+            }
+            insert_at = next(
+                (idx for idx, node in enumerate(list(base_root)) if node.tag == "shape"),
+                len(base_root),
+            )
+            for bsdf in delta_root.findall("./bsdf"):
+                bsdf_id = str(bsdf.get("id") or "")
+                if not bsdf_id or bsdf_id in existing_bsdf_ids:
+                    continue
+                base_root.insert(insert_at, ET.fromstring(ET.tostring(bsdf)))
+                insert_at += 1
+                existing_bsdf_ids.add(bsdf_id)
+
+            active_object = False
+            appended = 0
+            for child in list(delta_root):
+                if not isinstance(child.tag, str):
+                    text = (child.text or "").strip()
+                    if text.startswith("opticalnav-obj:"):
+                        try:
+                            marker = json.loads(text[len("opticalnav-obj:"):])
+                        except (TypeError, ValueError, json.JSONDecodeError):
+                            marker = {}
+                        active_object = str(marker.get("id") or "") in wanted_ids
+                        if active_object:
+                            base_root.append(ET.Comment(child.text or ""))
+                    continue
+                if active_object and child.tag == "shape":
+                    if child.attrib.get("type") == "obj":
+                        raise ValueError("proxy-only perturbation emitted an OBJ shape")
+                    base_root.append(ET.fromstring(ET.tostring(child)))
+                    appended += 1
+            if appended <= 0:
+                raise ValueError("no perturbation shapes were appended")
+            try:
+                ET.indent(base_tree, space="  ")
+            except AttributeError:
+                pass
+            base_tree.write(published_path, encoding="utf-8", xml_declaration=True)
+            os.replace(published_path, target_path)
+        finally:
+            for path in (delta_path, published_path):
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+        return target_path.relative_to(self.repo_root).as_posix()
+
+    def _stage_perturbed_render_xml_full(
+        self,
+        scene_dir: Path,
+        authoring_payload: dict[str, Any],
+        base_overlay: dict[str, Any] | None,
+        eg_data: Any,
+        mesh_resolver: Any,
+        scene_mesh_cache_dir: Path,
+        perturbation_objects: list[dict[str, Any]],
+        *,
+        progress_cb: Any = None,
+    ) -> str | None:
+        """Compatibility fallback for source-backed perturbation objects."""
+        merged = dict(base_overlay or {})
+        merged["objects"] = list((base_overlay or {}).get("objects") or []) + perturbation_objects
+        target_path = scene_dir / "render_scene_perturbed.xml"
+        temporary_path = scene_dir / (
+            f".render_scene_perturbed.{os.getpid()}.{threading.get_ident()}.xml"
+        )
+        try:
+            perturbation_materialization_records: list[dict[str, Any]] = []
+            _generate_opticalnav_render_scene_xml(
+                authoring_payload, merged, temporary_path,
                 editor_geometry=eg_data, repo_root=self.repo_root,
                 mesh_resolver=mesh_resolver, mesh_stats={},
-                materialization_records=[], material_policy_records=[],
+                materialization_records=perturbation_materialization_records, material_policy_records=[],
             )
             _stage_xml_obj_filenames_to_scene_mesh_cache(
-                perturbed_path, scene_mesh_cache_dir=scene_mesh_cache_dir,
+                temporary_path, scene_mesh_cache_dir=scene_mesh_cache_dir,
                 repo_root=self.repo_root, progress_cb=progress_cb,
                 progress_stage="stage_obj_cache_perturbed",
+                materialization_records=perturbation_materialization_records,
             )
+            os.replace(temporary_path, target_path)
         except Exception as exc:  # noqa: BLE001
             self._push_debug_event("warn", f"perturbed render XML generation failed: {exc}")
+            try:
+                temporary_path.unlink(missing_ok=True)
+            except OSError:
+                pass
             return None
-        return perturbed_path.relative_to(self.repo_root).as_posix()
+        return target_path.relative_to(self.repo_root).as_posix()
 
     def _opticalnav_texture_cache_dir(self, project_dir: Path, scene_id: str) -> Path:
         return project_dir / "scenes" / scene_id / "texture_cache"
@@ -11776,17 +13057,16 @@ class RenderDaemon:
         expected_total = int(metadata.get("plan_total") or metadata.get("requested_jobs") or len(job_ids) or 0)
         with self._condition:
             live_states = {job_id: job.status.status for job_id, job in self._jobs.items()}
-        # The active daemon already owns every submitted job state in memory.
-        # Prefer it over SQLite on the NAS; the latter is only a restart fallback.
-        if any(job_id in live_states for job_id in job_ids):
-            return self._graph_batch_memory_summary(
-                metadata=metadata,
-                batch_id=batch_id,
-                job_ids=job_ids,
-                expected_total=expected_total,
-                live_states=live_states,
-            )
-        ledger_summary = RenderLedger(project_dir).run_summary(batch_id)
+        owns_live_jobs = any(job_id in live_states for job_id in job_ids)
+        # Memory only contains jobs actually submitted to workers. A
+        # missing-only sweep can have thousands of durable ``skipped`` tasks
+        # but just one live job, so memory cannot summarize the full plan in
+        # that case. Consult the constant-size ledger summary whenever the
+        # persisted job list is smaller than the expected task plan (or after
+        # a restart when this daemon owns none of the jobs).
+        ledger_summary = None
+        if len(job_ids) < expected_total or not owns_live_jobs:
+            ledger_summary = RenderLedger(project_dir).run_summary(batch_id)
         if ledger_summary is not None and int(ledger_summary.get("task_count") or 0) >= expected_total:
             state_counts = dict(ledger_summary.get("state_counts") or {})
             completed = int(state_counts.get("succeeded", 0)) + int(state_counts.get("skipped", 0))
@@ -11819,6 +13099,17 @@ class RenderDaemon:
                 "status": "completed" if run_status == "completed" else "paused" if run_status == "paused" else run_status,
                 "resume_available": any(state in {"planned", "queued", "failed", "partial", "blocked"} for state in state_counts),
             }
+
+        # When every planned task has a submitted job, the active daemon's
+        # in-memory state is cheaper and more current than SQLite on the NAS.
+        if owns_live_jobs:
+            return self._graph_batch_memory_summary(
+                metadata=metadata,
+                batch_id=batch_id,
+                job_ids=job_ids,
+                expected_total=expected_total,
+                live_states=live_states,
+            )
 
         # Restart/legacy fallback when no active worker owns this batch.
         return self._graph_batch_memory_summary(
@@ -11880,6 +13171,13 @@ class RenderDaemon:
         }
         batch_path.write_text(json.dumps(stub, ensure_ascii=False, indent=2), encoding="utf-8")
         plan: list[dict[str, Any]] = []
+        reusable_by_logical = ledger.find_complete_tasks(
+            scene_version_id_value=source_scene_version_id,
+            logical_task_keys=[
+                str(task.get("logical_task_key") or (task.get("metadata") or {}).get("logical_task_key") or "")
+                for task in tasks
+            ],
+        )
         for ordinal, source_task in enumerate(tasks):
             source_task_key = str(source_task.get("task_key") or "")
             request_payload = ledger.get_request_blob(str(source_task.get("request_blob_digest") or "")) if source_task.get("request_blob_digest") else None
@@ -11927,7 +13225,22 @@ class RenderDaemon:
             source_bundle_ref = source_bundle.relative_to(project_dir).as_posix()
             if source_state in {"succeeded", "skipped"} and (source_bundle / "manifest.json").exists():
                 metadata.update({"source_bundle_ref": source_bundle_ref, "source_task_key": source_task_key})
-            elif request_payload is not None:
+            elif reusable_by_logical.get(logical_key):
+                reusable = reusable_by_logical[logical_key]
+                reusable_metadata = dict(reusable.get("metadata") or {})
+                reusable_ref = str(reusable_metadata.get("source_bundle_ref") or "")
+                reusable_bundle = (project_dir / reusable_ref).resolve() if reusable_ref else versioned_bundle_dir(
+                    project_dir, scene_id=scene_id,
+                    render_version_id=str(reusable.get("render_version_id") or ""),
+                    variant=task_payload["variant"], node_id=task_payload["node_id"],
+                    heading_id=task_payload["heading_id"],
+                )
+                if (reusable_bundle / "manifest.json").exists():
+                    metadata.update({
+                        "source_bundle_ref": reusable_bundle.relative_to(project_dir).as_posix(),
+                        "source_task_key": str(reusable.get("task_key") or ""),
+                    })
+            if not metadata.get("source_bundle_ref") and request_payload is not None:
                 # Give every retry a new job/request identity while retaining
                 # the exact scene and sensor payload in the request blob.
                 short = new_task_key[-10:]
@@ -12494,11 +13807,53 @@ class RenderDaemon:
         if len(parts) == 4 and parts[1] == "scenes" and parts[3] == "render-versions":
             scene_id = parts[2]
             try:
-                versions = RenderLedger(project_dir).list_versions(scene_id=scene_id)
+                ledger = RenderLedger(project_dir)
+                versions = ledger.list_versions(scene_id=scene_id)
+                for version in versions:
+                    run_id = str(version.get("run_id") or "")
+                    run_summary = ledger.run_summary(run_id) if run_id else None
+                    if run_summary is None:
+                        continue
+                    state_counts = dict(run_summary.get("state_counts") or {})
+                    completed = int(state_counts.get("succeeded", 0)) + int(state_counts.get("skipped", 0))
+                    failed = (
+                        int(state_counts.get("failed", 0))
+                        + int(state_counts.get("partial", 0))
+                        + int(state_counts.get("blocked", 0))
+                    )
+                    cancelled = int(state_counts.get("cancelled", 0))
+                    total = int(run_summary.get("task_count") or 0)
+                    version["run_status"] = run_summary.get("status")
+                    version["run_counts"] = {
+                        "queued": int(state_counts.get("planned", 0)) + int(state_counts.get("queued", 0)),
+                        "running": int(state_counts.get("running", 0)),
+                        "completed": completed,
+                        "failed": failed,
+                        "cancelled": cancelled,
+                    }
+                    version["run_progress"] = {
+                        "completed": completed,
+                        "failed": failed + cancelled,
+                        "total": total,
+                        "fraction": (completed + failed + cancelled) / max(1, total),
+                    }
             except Exception as exc:
                 self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                 return True
             self._send_json(handler, HTTPStatus.OK, {"scene_id": scene_id, "versions": versions})
+            return True
+        if len(parts) == 4 and parts[1] == "scenes" and parts[3] == "render-coverage":
+            scene_id = parts[2]
+            try:
+                progress = RenderLedger(project_dir).scene_sensor_progress(scene_id)
+            except Exception as exc:
+                self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return True
+            self._send_json(
+                handler,
+                HTTPStatus.OK,
+                {"scene_id": scene_id, "sensor_progress": progress},
+            )
             return True
         if len(parts) == 3 and parts[1] == "graph-render-runs":
             try:
@@ -13723,64 +15078,22 @@ class RenderDaemon:
             query_str = urlparse(handler.path).query or ""
             qparams = parse_qs(query_str)
             inline = (qparams.get("sync", ["false"])[0]).lower() in ("1", "true", "yes")
+            print(f"[sync] POST sync/render-scene scene={scene_id} inline={inline}", file=sys.stderr, flush=True)
             if inline:
                 status_code, body = self._run_render_scene_sync_inner(project_dir, scene_id, payload, sync_job_id=None, progress_cb=None)
+                print(f"[sync] scene={scene_id}: inline sync -> {status_code} "
+                      f"render_scene={'synced' if status_code == int(HTTPStatus.OK) else 'blocked'}",
+                      file=sys.stderr, flush=True)
                 self._send_json(handler, status_code, body)
                 return True
-            sync_job_id = f"sync-{_utc_now().strftime('%Y%m%dT%H%M%S%f')}-{hashlib.sha1(str(scene_dir).encode()).hexdigest()[:6]}"
-            self._patch_opticalnav_annotation_sync(project_dir, scene_id, {
-                "render_scene": "pending",
-                "render_scene_status": "syncing",
-                "render_readiness_status": "pending",
-                "sync_job_id": sync_job_id,
-                "message": "Render-scene sync is running.",
-            })
-            self._publish_opticalnav_sync_progress(sync_job_id, {
-                "status": "started",
-                "processed": 0,
-                "total": 0,
-                "stage": "queued",
-            })
-
-            def _bg() -> None:
-                try:
-                    status_code, body = self._run_render_scene_sync_inner(
-                        project_dir, scene_id, dict(payload),
-                        sync_job_id=sync_job_id,
-                        progress_cb=lambda p, t, label, stage: self._publish_opticalnav_sync_progress(sync_job_id, {
-                            "status": "running",
-                            "processed": int(p),
-                            "total": int(t),
-                            "label": label,
-                            "stage": stage,
-                        }),
-                    )
-                    self._publish_opticalnav_sync_progress(sync_job_id, {
-                        "status": "done" if status_code == int(HTTPStatus.OK) else "error",
-                        "result": body,
-                        "status_code": int(status_code),
-                    })
-                except Exception as exc:
-                    self._patch_opticalnav_annotation_sync(project_dir, scene_id, {
-                        "render_scene": "blocked",
-                        "render_scene_status": "error",
-                        "render_readiness_status": "blocked",
-                        "sync_job_id": sync_job_id,
-                        "message": f"Render-scene sync failed: {exc}",
-                    })
-                    self._publish_opticalnav_sync_progress(sync_job_id, {
-                        "status": "error",
-                        "result": {"error": str(exc)},
-                        "status_code": int(HTTPStatus.INTERNAL_SERVER_ERROR),
-                    })
-
-            threading.Thread(target=_bg, name=f"opticalnav-sync-{sync_job_id}", daemon=True).start()
-            self._send_json(handler, HTTPStatus.ACCEPTED, {
-                "ok": True,
-                "sync_job_id": sync_job_id,
-                "scene_id": scene_id,
-                "ws_url": f"/api/ws/opticalnav-sync-progress?sync_job_id={sync_job_id}",
-            })
+            accepted = self._accept_render_scene_sync(project_dir, scene_id, payload)
+            print(
+                f"[sync] scene={scene_id}: async job {accepted['sync_job_id']} "
+                f"revision={accepted['revision']} deduplicated={accepted['deduplicated']} "
+                f"coalesced={accepted['coalesced']}",
+                file=sys.stderr, flush=True,
+            )
+            self._send_json(handler, HTTPStatus.ACCEPTED, accepted)
             return True
         if len(parts) == 5 and parts[1] == "scenes" and parts[3] == "sync" and parts[4] == "isaac-stage":
             scene_id = parts[2]
@@ -14781,6 +16094,62 @@ class RenderDaemon:
                 response["download_url"] = f"/artifacts?path={quote(response['zip_ref'])}"
             self._send_json(handler, HTTPStatus.OK, response)
             return True
+        if len(parts) == 4 and parts[1] == "export-jobs" and parts[3] == "resume":
+            job_id = parts[2]
+            request = self._load_export_request(project_dir, job_id)
+            if request is None:
+                self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": f"No durable request for export job {job_id}"})
+                return True
+            scene_id = str(request.get("scene_id") or "")
+            if not scene_id or not (project_dir / "scenes" / scene_id).is_dir():
+                self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": "Saved export request references an unavailable scene"})
+                return True
+            expected = str(request.get("source_fingerprint") or "")
+            actual = self._export_source_fingerprint(project_dir, scene_id)
+            if not expected or expected != actual:
+                self._send_json(handler, HTTPStatus.CONFLICT, {
+                    "error": "Export source changed; create a new export instead of resuming",
+                    "expected_source_fingerprint": expected,
+                    "actual_source_fingerprint": actual,
+                })
+                return True
+            status_path = self._export_status_path(project_dir, job_id)
+            try:
+                prior = _read_json(status_path) if status_path.is_file() else {}
+            except Exception:
+                prior = {}
+            if isinstance(prior, Mapping) and prior.get("status") == "succeeded":
+                self._send_json(handler, HTTPStatus.OK, dict(prior))
+                return True
+            state = {
+                **(dict(prior) if isinstance(prior, Mapping) else {}),
+                "job_id": job_id,
+                "project_id": parts[0],
+                "scene_id": scene_id,
+                "status": "queued",
+                "message": "resuming durable export",
+                "error": None,
+                "cancel_requested": False,
+                "resume_available": False,
+                "source_fingerprint": expected,
+                "resumed_at": _utc_now_iso(),
+            }
+            with self._export_jobs_lock:
+                self._export_jobs[job_id] = state
+            self._publish_export_progress(
+                job_id, project_dir,
+                status="queued", message="resuming durable export", error=None,
+                cancel_requested=False, resume_available=False,
+                source_fingerprint=expected,
+            )
+            self._start_export_job_thread(job_id, parts[0], project_dir, request)
+            self._send_json(handler, HTTPStatus.ACCEPTED, {
+                "job_id": job_id,
+                "status": "queued",
+                "resume": True,
+                "status_url": f"/api/opticalnav/projects/{parts[0]}/export-jobs/{job_id}",
+            })
+            return True
         if len(parts) == 2 and parts[1] == "export-jobs":
             scene_id = _maybe_str(payload.get("scene_id"))
             if not scene_id:
@@ -14817,6 +16186,26 @@ class RenderDaemon:
                 )
                 return True
             job_id = f"export-{scene_id}-{_utc_now().strftime('%Y%m%dT%H%M%S%f')}"
+            source_fingerprint = self._export_source_fingerprint(project_dir, scene_id)
+            request = {
+                "job_id": job_id,
+                "project_id": parts[0],
+                "scene_id": scene_id,
+                "only_completed": only_completed,
+                "episode_ids": episode_ids,
+                "include_episode_thumbnails": include_episode_thumbnails,
+                "panorama_observations": panorama_observations,
+                "png_only": png_only,
+                "include_birdseye": include_birdseye,
+                "include_polarization_raw": include_polarization_raw,
+                "include_episode_birdseye": include_episode_birdseye,
+                "eval_perturbation": eval_perturbation,
+                "camera_ids": camera_ids,
+                "export_profile": export_profile,
+                "source_fingerprint": source_fingerprint,
+                "created_at": _utc_now_iso(),
+            }
+            self._write_export_request(project_dir, job_id, request)
             with self._export_jobs_lock:
                 self._export_jobs[job_id] = {
                     "job_id": job_id,
@@ -14838,14 +16227,12 @@ class RenderDaemon:
                     "summary": None,
                     "error": None,
                     "cancel_requested": False,
+                    "resume_available": False,
+                    "checkpoint_stage": "scope",
+                    "source_fingerprint": source_fingerprint,
                     "created_at": _utc_now_iso(),
                 }
-            threading.Thread(
-                target=self._run_export_job,
-                args=(job_id, parts[0], project_dir, scene_id, only_completed, episode_ids, include_episode_thumbnails, panorama_observations, png_only, include_birdseye, include_polarization_raw, include_episode_birdseye, eval_perturbation, camera_ids, export_profile),
-                name=f"export-job-{job_id}",
-                daemon=True,
-            ).start()
+            self._start_export_job_thread(job_id, parts[0], project_dir, request)
             self._send_json(handler, HTTPStatus.ACCEPTED, {
                 "job_id": job_id,
                 "status": "queued",
@@ -15054,7 +16441,14 @@ class RenderDaemon:
                 self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                 return True
 
+            _sync_t0 = time.perf_counter()
+            print(f"[sync] PUT authoring-map scene={scene_id} defer={defer_render_scene_sync} "
+                  f"objects={len(saved.get('objects') or [])}", file=sys.stderr, flush=True)
+
             if defer_render_scene_sync:
+                print(f"[sync] scene={scene_id}: render-scene sync SKIPPED (deferred) — render_scene "
+                      f"stays 'pending'; a non-deferred sync must run to compile render_scene.xml",
+                      file=sys.stderr, flush=True)
                 self._patch_opticalnav_annotation_sync(project_dir, scene_id, {
                     "render_scene": "pending",
                     "render_scene_status": "deferred",
@@ -15071,168 +16465,29 @@ class RenderDaemon:
                 })
                 return True
 
-            # Phase 3: Immediately regenerate render_scene.xml so it stays in sync
-            # with the authoring map without a separate "Sync" step.
-            render_scene_path = scene_dir / "render_scene.xml"
-            xml_shape_count = 0
-            render_readiness: dict[str, Any] | None = None
-            try:
-                editor_geometry: dict[str, Any] | None = None
-                eg_path = scene_dir / "editor_geometry.json"
-                if eg_path.exists():
-                    try:
-                        editor_geometry = _read_json(eg_path)
-                    except Exception:
-                        pass
-                mesh_resolver = self._make_mesh_resolver(project_dir, scene_id)
-                mesh_stats: dict[str, int] = {}
-                materialization_records: list[dict[str, Any]] = []
-                material_policy_records: list[dict[str, Any]] = []
-                xml_shape_count = _generate_opticalnav_render_scene_xml(
-                    saved,
-                    saved,  # overlay == authoring map itself (objects live here)
-                    render_scene_path,
-                    editor_geometry=editor_geometry,
-                    repo_root=self.repo_root,
-                    mesh_resolver=mesh_resolver,
-                    mesh_stats=mesh_stats,
-                    materialization_records=materialization_records,
-                    material_policy_records=material_policy_records,
-                )
-                try:
-                    material_policy = _build_render_scene_material_policy(
-                        scene_id=scene_id,
-                        material_policy_records=material_policy_records,
-                    )
-                    (scene_dir / "render_scene_material_policy.json").write_text(
-                        json.dumps(material_policy, ensure_ascii=False, indent=2), encoding="utf-8",
-                    )
-                except Exception as exc:
-                    mesh_stats["material_policy_error"] = str(exc)
-                scene_mesh_cache_dir = self._opticalnav_mesh_cache_dir(project_dir, scene_id)
-                mesh_stats["scene_mesh_cache"] = _stage_xml_obj_filenames_to_scene_mesh_cache(
-                    render_scene_path,
-                    scene_mesh_cache_dir=scene_mesh_cache_dir,
-                    repo_root=self.repo_root,
-                )
-                perturbed_scene_ref = self._stage_perturbed_render_xml(
-                    scene_dir, saved, saved, editor_geometry, mesh_resolver, scene_mesh_cache_dir)
-                preview_mesh_manifest = _build_editor_preview_mesh_manifest(
-                    render_scene_path,
-                    scene_mesh_cache_dir=scene_mesh_cache_dir,
-                    repo_root=self.repo_root,
-                    materialization_records=materialization_records,
-                )
-                mesh_stats["editor_preview_mesh_cache"] = preview_mesh_manifest.get("stats", {})
-                try:
-                    (scene_dir / "editor_preview_mesh_manifest.json").write_text(
-                        json.dumps(preview_mesh_manifest, ensure_ascii=False, indent=2), encoding="utf-8",
-                    )
-                except Exception as exc:
-                    mesh_stats["editor_preview_mesh_manifest_error"] = str(exc)
-                render_scene_ref = render_scene_path.relative_to(self.repo_root).as_posix()
-                try:
-                    audit_payload = _build_materialization_audit(
-                        scene_id=scene_id,
-                        overlay_objects=list(saved.get("objects") or []),
-                        materialization_records=materialization_records,
-                        mesh_stats=mesh_stats,
-                    )
-                    (scene_dir / "render_scene_materialization.json").write_text(
-                        json.dumps(audit_payload, ensure_ascii=False, indent=2), encoding="utf-8",
-                    )
-                except Exception as exc:
-                    mesh_stats["materialization_audit_error"] = str(exc)
-                try:
-                    xml_index = _build_xml_scene_index(
-                        render_scene_path,
-                        scene_id=scene_id,
-                        materialization_records=materialization_records,
-                        preview_mesh_manifest=preview_mesh_manifest.get("shapes", {}),
-                    )
-                    if xml_index is not None:
-                        (scene_dir / "xml_scene_index.json").write_text(
-                            json.dumps(xml_index, ensure_ascii=False, indent=2), encoding="utf-8",
-                        )
-                except Exception as exc:
-                    mesh_stats["xml_scene_index_error"] = str(exc)
-                render_readiness = _build_opticalnav_render_readiness(
-                    saved,
-                    repo_root=self.repo_root,
-                    render_scene_path=render_scene_path,
-                    render_scene_ref=render_scene_ref,
-                    overlay_shape_count=xml_shape_count,
-                )
-                # Update scene_variant.json pointer so Graph Sweep picks up the fresh XML.
-                sv_path = scene_dir / "scene_variant.json"
-                sv: dict[str, Any] = {}
-                if sv_path.exists():
-                    try:
-                        sv = dict(_read_json(sv_path))
-                    except Exception:
-                        pass
-                sv["render_sync_mode"] = "editor_generated_xml"
-                sv["overlay_scene_xml_ref"] = render_scene_ref
-                sv["base_scene_xml_ref"] = None
-                sv["perturbed_scene_xml_ref"] = perturbed_scene_ref
-                sv_path.write_text(json.dumps(sv, ensure_ascii=False, indent=2), encoding="utf-8")
-
-                # Write render_readiness.json so loadRenderReadiness() reads OK on page reload.
-                readiness_path = scene_dir / "render_readiness.json"
-                readiness_path.write_text(json.dumps(render_readiness, ensure_ascii=False, indent=2), encoding="utf-8")
-
-                # Update scene_annotation.json sync status so sync_status.render_scene === 'synced'.
-                # This is read by _opticalnav_render_precondition_payload() before allowing renders.
-                # We patch metadata.sync directly in raw JSON to avoid triggering full annotation
-                # validation (which requires goal_regions/traversable_regions and would fail
-                # silently on uncommitted scenes, leaving the old "blocked" state in place).
-                annotation_path = scene_dir / "scene_annotation.json"
-                if annotation_path.exists():
-                    try:
-                        _sv_ref = sv_path.relative_to(project_dir).as_posix()
-                        _overlay_ref = render_scene_path.relative_to(project_dir).as_posix()
-                        _raw = json.loads(annotation_path.read_text(encoding="utf-8"))
-                        _raw.setdefault("metadata", {})["sync"] = {
-                            **dict(_raw.get("metadata", {}).get("sync", {})),
-                            "render_scene": "synced" if render_readiness.get("ok") else "blocked",
-                            "render_scene_mode": "editor_generated_xml",
-                            "render_scene_xml_ref": render_scene_ref,
-                            "scene_variant_ref": _sv_ref,
-                            "render_scene_overlay_ref": _overlay_ref,
-                            "render_readiness_ref": readiness_path.relative_to(project_dir).as_posix(),
-                            "render_readiness_status": render_readiness.get("status"),
-                        }
-                        annotation_path.write_text(json.dumps(_raw, ensure_ascii=False, indent=2), encoding="utf-8")
-                    except Exception:
-                        pass  # Annotation may not exist yet; not fatal
-
-            except Exception as xml_exc:
-                # XML generation failure is non-fatal for the authoring save itself;
-                # the response will include the error so the UI can surface it.
-                render_readiness = {
-                    "ok": False,
-                    "status": "blocked",
-                    "errors": [{"key": "xml_gen", "message": str(xml_exc)}],
-                }
-                try:
-                    readiness_path = scene_dir / "render_readiness.json"
-                    readiness_path.write_text(json.dumps(render_readiness, ensure_ascii=False, indent=2), encoding="utf-8")
-                    self._patch_opticalnav_annotation_sync(project_dir, scene_id, {
-                        "render_scene": "blocked",
-                        "render_scene_status": "error",
-                        "render_readiness_ref": readiness_path.relative_to(project_dir).as_posix(),
-                        "render_readiness_status": "blocked",
-                        "message": f"Render-scene XML generation failed: {xml_exc}",
-                    })
-                except Exception:
-                    pass
-
+            # The authoring-map write and the explicit Sync route intentionally
+            # share the same locked digest gate.  Keeping this call here avoids
+            # a second, subtly different XML/OBJ/preview pipeline.
+            outcome = self._sync_opticalnav_render_scene(
+                project_dir, scene_id, {}, sync_job_id=None, progress_cb=None,
+            )
+            render_readiness = outcome.body.get("render_readiness")
+            xml_shape_count = outcome.overlay_shape_count
+            print(
+                f"[sync] scene={scene_id}: mode="
+                f"{dict(outcome.body.get('mesh_extraction_stats') or {}).get('sync_mode', 'error')} "
+                f"readiness={dict(render_readiness or {}).get('status')} "
+                f"({time.perf_counter() - _sync_t0:.1f}s total)",
+                file=sys.stderr, flush=True,
+            )
             self._send_json(handler, HTTPStatus.OK, {
                 "ok": True,
                 "authoring_map": authoring_map_to_payload(saved),
                 "authoring_map_ref": path_out.relative_to(project_dir).as_posix(),
                 "render_readiness": render_readiness,
                 "xml_shape_count": xml_shape_count,
+                "sync": outcome.body.get("sync"),
+                "mesh_extraction_stats": outcome.body.get("mesh_extraction_stats"),
                 "project": self._opticalnav_project_summary(project_dir),
             })
             return True
@@ -15274,6 +16529,23 @@ class RenderDaemon:
             return True
         return False
 
+    def _report_unhandled_http_exception(
+        self,
+        method: str,
+        handler: BaseHTTPRequestHandler,
+        exc: BaseException,
+    ) -> None:
+        """Make top-level HTTP 500s actionable in the daemon terminal and API."""
+        path = str(getattr(handler, "path", "<unknown>"))
+        message = f"unhandled {method} {path}: {type(exc).__name__}: {exc}"
+        print(f"[http] {message}", file=sys.stderr, flush=True)
+        traceback.print_exception(type(exc), exc, exc.__traceback__, file=sys.stderr)
+        try:
+            self._push_debug_event("error", message)
+        except Exception:
+            # Error reporting must never hide the original request failure.
+            pass
+
     def _handle_delete(self, handler: BaseHTTPRequestHandler) -> None:
         try:
             parsed = urlparse(handler.path)
@@ -15289,6 +16561,7 @@ class RenderDaemon:
         except _ClientDisconnectedError:
             return
         except Exception as exc:
+            self._report_unhandled_http_exception("DELETE", handler, exc)
             try:
                 self._send_json(handler, HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
             except _ClientDisconnectedError:
@@ -15947,6 +17220,11 @@ class RenderDaemon:
         deadline = time.time() + max(1.0, timeout)
         failure_states = {"paused", "failed", "error", "cancelled", "canceled"}
         while True:
+            # A separately submitted variant may be waiting on events that are
+            # already terminal in memory but still queued for NFS persistence.
+            # Flush only at this boundary; GPU workers remain decoupled while
+            # the predecessor is rendering.
+            self._flush_render_persistence(run_id=str(batch_id))
             try:
                 payload = self._opticalnav_graph_batch_payload(project_dir, str(batch_id))
             except Exception:
@@ -15969,6 +17247,22 @@ class RenderDaemon:
             if remaining <= 0:
                 raise TimeoutError(f"timed out waiting for previous variant batch {batch_id}")
             time.sleep(min(1.0, remaining))
+
+    def _flush_render_persistence(
+        self,
+        *,
+        run_id: str | None = None,
+        timeout_s: float | None = None,
+    ) -> None:
+        timeout = float(
+            timeout_s
+            if timeout_s is not None
+            else os.environ.get("ROBOMITUBA_PERSIST_BARRIER_TIMEOUT_S", "300") or "300"
+        )
+        self._render_persistence.flush(
+            run_id=run_id,
+            timeout_s=max(0.0, timeout),
+        )
 
     def _wait_for_render_jobs_terminal(self, job_ids: Sequence[str], *, timeout_s: float | None = None) -> dict[str, int]:
         terminal = {"succeeded", "failed", "cancelled"}
@@ -16141,50 +17435,26 @@ class RenderDaemon:
                     if (prior_bundle / "manifest.json").exists():
                         task_payload["source_bundle_ref"] = prior_bundle.relative_to(project_dir).as_posix()
                 task_payload["logical_task_key"] = logical_key
-                request.extras.update({
-                    "run_id": run_id,
-                    "scene_version_id": scene_version_id_value,
-                    "render_version_id": render_version_id,
-                    "scene_variant_key": scene_variant_key,
-                    "render_variant": variant,
-                    "submission_group_id": submission_group_id,
-                    "variant_sequence_index": variant_sequence_index,
-                    "variant_sequence_total": variant_sequence_total,
-                    "previous_variant_batch_id": previous_variant_batch_id,
-                    "task_key": task_id,
-                    "logical_task_key": logical_key,
-                    "plan_ordinal": ordinal,
-                    "task_plan_persisted": True,
-                    "phase": task_payload["phase"],
-                    "phase_index": task_payload["phase_index"],
-                    "opticalnav_project_id": project_dir.name,
-                    "opticalnav_scene_id": scene_id,
-                    "opticalnav_vp_id": sweep_request.node_id,
-                    "opticalnav_heading_id": sweep_request.heading_id,
-                    **({"source_bundle_ref": task_payload["source_bundle_ref"]} if task_payload.get("source_bundle_ref") else {}),
-                })
-                task_keys[id(request)] = task_id
-                task_records[id(request)] = {
-                    "task_key": task_id,
-                    "run_id": run_id,
-                    "render_version_id": render_version_id,
-                    "variant": scene_variant_key,
-                    "render_variant": variant,
-                    "scene_variant_key": scene_variant_key,
-                    "submission_group_id": submission_group_id,
-                    "variant_sequence_index": variant_sequence_index,
-                    "variant_sequence_total": variant_sequence_total,
-                    "previous_variant_batch_id": previous_variant_batch_id,
-                    "phase": phase.phase,
-                    "phase_index": phase.phase_index,
-                    "ordinal": ordinal,
-                    "node_id": sweep_request.node_id,
-                    "heading_id": sweep_request.heading_id,
-                    "logical_task_key": logical_key,
-                    "metadata": task_payload,
-                    "request_payload": render_request_to_payload(request),
-                    "state": "skipped" if task_payload.get("source_bundle_ref") else "planned",
-                }
+                request_key, task_record = _bind_graph_sweep_task_record(
+                    sweep_request,
+                    task_payload,
+                    logical_key=logical_key,
+                    task_id=task_id,
+                    ordinal=ordinal,
+                    project_id=project_dir.name,
+                    scene_id=scene_id,
+                    run_id=run_id,
+                    scene_version_id_value=scene_version_id_value,
+                    render_version_id=render_version_id,
+                    scene_variant_key=scene_variant_key,
+                    render_variant=variant,
+                    submission_group_id=submission_group_id,
+                    variant_sequence_index=variant_sequence_index,
+                    variant_sequence_total=variant_sequence_total,
+                    previous_variant_batch_id=previous_variant_batch_id,
+                )
+                task_keys[request_key] = task_id
+                task_records[request_key] = task_record
             requested_plan_count = plan_ordinal
             # Preserve the complete restart/resume plan with one bulk SQLite
             # transaction. Runtime queued/running/attempt state is updated when
@@ -16283,6 +17553,7 @@ class RenderDaemon:
                 if resolved_execution_policy == "modality_phases" and phase_pos > 0:
                     _write_batch("waiting_phase_boundary", active_phase=phase.phase)
                     phase_wait_counts = self._wait_for_render_jobs_terminal(submitted_phase_job_ids)
+                    self._flush_render_persistence(run_id=run_id)
                     recycle_result = self._recycle_render_workers_if_available(
                         reason="modality_phase_boundary",
                         recover_degraded=True,
@@ -16860,6 +18131,7 @@ class RenderDaemon:
         except _ClientDisconnectedError:
             return
         except Exception as exc:  # pragma: no cover - defensive path
+            self._report_unhandled_http_exception("GET", handler, exc)
             try:
                 self._send_json(handler, HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
             except _ClientDisconnectedError:
@@ -17297,6 +18569,7 @@ class RenderDaemon:
         except _ClientDisconnectedError:
             return
         except Exception as exc:  # pragma: no cover - defensive path
+            self._report_unhandled_http_exception("POST", handler, exc)
             try:
                 self._send_json(handler, HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
             except _ClientDisconnectedError:
@@ -17318,6 +18591,7 @@ class RenderDaemon:
         except _ClientDisconnectedError:
             return
         except Exception as exc:  # pragma: no cover - defensive path
+            self._report_unhandled_http_exception("PUT", handler, exc)
             try:
                 self._send_json(handler, HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
             except _ClientDisconnectedError:
@@ -18003,6 +19277,8 @@ class RenderDaemon:
 
     def _retry_render_job(self, job_id: str, *, reason: str, message: str) -> bool:
         with self._condition:
+            if self._shutdown:
+                return False
             job = self._jobs.get(job_id)
             if job is None or job.status.status == "cancelled":
                 return False
@@ -18013,6 +19289,15 @@ class RenderDaemon:
             max_retries = self._max_render_retries(job)
             if attempts >= max_retries:
                 return False
+            self._enqueue_render_persistence(
+                job,
+                "failed",
+                error=message,
+                event_type="retry_failed",
+                attempt_no=attempts + 1,
+                task_state="running",
+                postprocess=False,
+            )
             job.status.status = "queued"
             job.status.started_at = None
             job.status.worker_started_at = None
@@ -18029,15 +19314,15 @@ class RenderDaemon:
                 job.status.extras["texture_profile"] = 1024
                 retry_message += " · texture_profile=max1024"
             self._enqueue_pending_unlocked(job_id, job)
-            self._persist_status_unlocked(job)
+            self._enqueue_render_persistence(job, "queued")
             self._condition.notify_all()
-        self._record_render_job_telemetry(job, event_type="retry_queued")
-        self._append_job_log_line(
-            job,
-            event_type="retry",
-            stage="retry_queued",
-            message=retry_message,
-        )
+        if not job.render_request.extras.get("render_version_id"):
+            self._append_job_log_line(
+                job,
+                event_type="retry",
+                stage="retry_queued",
+                message=retry_message,
+            )
         return True
 
     def _worker_loop(self) -> None:
@@ -18045,7 +19330,7 @@ class RenderDaemon:
             with self._condition:
                 while not self._pending and not self._shutdown:
                     self._condition.wait()
-                if self._shutdown and not self._pending:
+                if self._shutdown:
                     return
                 job_id = self._pending.popleft()
                 job = self._jobs.get(job_id)
@@ -18055,18 +19340,19 @@ class RenderDaemon:
                 job.status.started_at = _utc_now_iso()
                 job.status.worker_started_at = job.status.started_at if _RENDER_INPROCESS else None
                 job.status.progress_stage = "starting"
-            # Disk I/O outside the lock.
-            # For lazy_persist jobs (bulk sweep), the request file and initial "queued"
-            # telemetry were deferred to here so that submit() is near-instant.
-            if job.lazy_persist:
-                self._persist_request_unlocked(job)
-                self._record_render_job_telemetry(job, event_type="queued")
-            # Versioned graph tasks are persisted at worker consumption, not
-            # during the submitter's bulk in-memory enqueue loop.
-            self._record_versioned_job_state(job, "running")
-            self._persist_status_unlocked(job)
-            self._record_render_job_telemetry(job, event_type="running")
-            self._append_job_log_line(job, event_type="running", stage="starting", message="Job started")
+            is_versioned = bool(job.render_request.extras.get("render_version_id"))
+            if is_versioned:
+                # Keep NFS/SQLite completely off the dispatcher and worker
+                # event paths for bulk graph sweeps.
+                self._enqueue_render_persistence(job, "running")
+            else:
+                # Legacy jobs retain their request-before-render durability.
+                if job.lazy_persist:
+                    self._persist_request_unlocked(job)
+                    self._record_render_job_telemetry(job, event_type="queued")
+                self._persist_status_unlocked(job)
+                self._record_render_job_telemetry(job, event_type="running")
+                self._append_job_log_line(job, event_type="running", stage="starting", message="Job started")
 
             try:
                 scene_cache_key = self._scene_cache_key(job.render_request, job.variant)
@@ -18283,6 +19569,7 @@ class RenderDaemon:
         camera_specs = list(getattr(request, "camera_specs", []) or [])
         sensor_specs = list(getattr(request, "sensor_specs", []) or [])
         sensor_entries = [("camera", item) for item in camera_specs] + [("sensor", item) for item in sensor_specs]
+        has_explicit_sensor_entries = bool(sensor_entries)
         vp_id = str(sweep_request.node_id)
         heading_id = str(sweep_request.heading_id)
         dst_dir = project_dir / "scenes" / scene_id / _obs_subdir(_variant_from_job_id(request.job_id)) / vp_id / heading_id
@@ -18298,10 +19585,14 @@ class RenderDaemon:
                 sensor_modalities = [str(item) for item in modalities_by_sensor.get(sensor_id, modalities)]
                 for modality in sensor_modalities:
                     names = self._opticalnav_modality_output_names(str(modality))
-                    if len(sensor_entries) == 1:
-                        exists = any((sensor_dst_dir / name).exists() or (dst_dir / name).exists() for name in names)
-                    else:
-                        exists = any((sensor_dst_dir / name).exists() for name in names)
+                    # Root-level rasters are legacy aliases of an unspecified
+                    # primary camera. They cannot prove that an explicitly
+                    # requested sensor (notably rear_cam_copy) is complete.
+                    # Accept that fallback only for old requests which carried
+                    # no camera/sensor declaration at all.
+                    exists = any((sensor_dst_dir / name).exists() for name in names)
+                    if not exists and not has_explicit_sensor_entries:
+                        exists = any((dst_dir / name).exists() for name in names)
                     if not exists:
                         return False
             return True
@@ -18461,47 +19752,136 @@ class RenderDaemon:
         except Exception:
             pass
 
-    def _record_versioned_job_state(self, job: "_QueuedJob", state: str, *, error: str | None = None) -> None:
+    def _versioned_job_state_event(
+        self,
+        job: "_QueuedJob",
+        state: str,
+        *,
+        error: str | None = None,
+        event_ts: Any = None,
+        event_type: str | None = None,
+        attempt_no: int | None = None,
+        task_state: str | None = None,
+    ) -> dict[str, Any] | None:
         extras = job.render_request.extras if isinstance(job.render_request.extras, Mapping) else {}
         project_id = str(extras.get("opticalnav_project_id") or "").strip()
         task_id = str(extras.get("task_key") or "").strip()
         run_id = str(extras.get("run_id") or "").strip()
         if not (project_id and task_id):
-            return
-        try:
-            project_dir = self._opticalnav_project_dir(project_id)
-            ledger = RenderLedger(project_dir)
-            # Graph sweep plans are inserted once before submission. Legacy or
-            # externally-created versioned jobs may not have that marker, so
-            # retain a guarded lazy insert for those jobs only.
-            if not bool(extras.get("task_plan_persisted")):
-                try:
-                    ordinal = int(extras.get("plan_ordinal", 0) or 0)
-                except (TypeError, ValueError):
-                    ordinal = 0
-                ledger.put_tasks_batch([{
-                    "task_key": task_id,
-                    "run_id": run_id,
-                    "render_version_id": str(extras.get("render_version_id") or ""),
-                    "variant": str(extras.get("scene_variant_key") or "base"),
-                    "phase": str(extras.get("phase") or "per_view"),
-                    "phase_index": int(extras.get("phase_index", 0) or 0),
-                    "ordinal": ordinal,
-                    "node_id": str(extras.get("opticalnav_vp_id") or ""),
-                    "heading_id": str(extras.get("opticalnav_heading_id") or ""),
-                    "logical_task_key": str(extras.get("logical_task_key") or "") or None,
-                    "metadata": dict(extras),
-                    "request_payload": job.request_payload,
-                    "state": "planned",
-                }])
-            attempt_count = int(job.status.extras.get("retry_attempts", 0) or 0) + 1
-            ledger.update_task(task_id, state=state, job_id=job.render_request.job_id, error=error, attempt_count=attempt_count)
-            ledger.record_attempt(task_id, job_id=job.render_request.job_id, attempt_no=attempt_count, state=state, error=error)
-            ledger.record_event(state, run_id=run_id or None, task_key_value=task_id, payload={"job_id": job.render_request.job_id, "error": error})
-        except Exception:
-            # A ledger write must not turn a successfully rendered observation
-            # into a daemon failure; the next status reconciliation can repair it.
-            pass
+            return None
+        return {
+            "project_id": project_id,
+            "task_key": task_id,
+            "run_id": run_id,
+            "job_id": job.render_request.job_id,
+            "state": state,
+            "task_state": task_state or state,
+            "event_type": event_type or state,
+            "attempt_no": int(attempt_no or (int(job.status.extras.get("retry_attempts", 0) or 0) + 1)),
+            "error": error,
+            "created_at": _event_ts_iso(event_ts) or _utc_now_iso(),
+            "payload": {"job_id": job.render_request.job_id, "error": error},
+        }
+
+    def _enqueue_render_persistence(
+        self,
+        job: "_QueuedJob",
+        state: str,
+        *,
+        error: str | None = None,
+        event_ts: Any = None,
+        manifest_path: str | None = None,
+        event_type: str | None = None,
+        attempt_no: int | None = None,
+        task_state: str | None = None,
+        postprocess: bool = True,
+    ) -> int:
+        versioned_event = self._versioned_job_state_event(
+            job, state, error=error, event_ts=event_ts,
+            event_type=event_type, attempt_no=attempt_no, task_state=task_state,
+        )
+        run_id = str((versioned_event or {}).get("run_id") or "")
+        return self._render_persistence.enqueue(
+            {
+                "job": job,
+                "state": state,
+                "error": error,
+                "event_ts": event_ts,
+                "manifest_path": manifest_path,
+                "versioned_event": versioned_event,
+                "postprocess": postprocess,
+            },
+            run_id=run_id,
+        )
+
+    def _persist_render_events_batch(self, items: Sequence[Mapping[str, Any]]) -> None:
+        """Background writer callback; never runs on a worker stdout reader."""
+        by_project: dict[str, list[dict[str, Any]]] = {}
+        for item in items:
+            event = item.get("versioned_event")
+            if isinstance(event, Mapping):
+                project_id = str(event.get("project_id") or "")
+                if project_id:
+                    by_project.setdefault(project_id, []).append(dict(event))
+
+        # SQLite durability is the retryable/observable part of this batch.
+        # Each project is one transaction and all projects share this one writer.
+        for project_id, events in by_project.items():
+            ledger = self._render_persistence_ledgers.get(project_id)
+            if ledger is None:
+                project_dir = self._opticalnav_project_dir(project_id)
+                ledger = RenderLedger(project_dir)
+                self._render_persistence_ledgers[project_id] = ledger
+            ledger.apply_task_events_batch(events)
+
+        # Legacy status files, consolidated copies, timing summaries and
+        # telemetry also stay off the reader thread. They are best-effort like
+        # their former call sites; a ledger commit must not be duplicated merely
+        # because an advisory telemetry append failed afterward.
+        for item in items:
+            if not bool(item.get("postprocess", True)):
+                continue
+            job = item.get("job")
+            if job is None:
+                continue
+            state = str(item.get("state") or "")
+            error = item.get("error")
+            event_ts = item.get("event_ts")
+            manifest_path = str(item.get("manifest_path") or "")
+            try:
+                if state == "succeeded":
+                    if manifest_path:
+                        self._update_job_render_timing_summary(job, manifest_path=manifest_path)
+                    self._persist_status_unlocked(job)
+                    self._opticalnav_copy_observation_rgb(job)
+                    self._record_render_job_telemetry(job, event_type="complete")
+                    self._append_job_log_line(
+                        job, event_type="complete", stage="complete",
+                        message="Job succeeded", event_ts=event_ts,
+                    )
+                elif state == "failed":
+                    self._persist_status_unlocked(job)
+                    self._record_render_job_telemetry(job, event_type="failed")
+                    self._append_job_log_line(
+                        job, event_type="failed", stage="failed",
+                        message=str(error or "Job failed"), event_ts=event_ts,
+                    )
+                elif state == "cancelled":
+                    self._persist_status_unlocked(job)
+                    self._record_render_job_telemetry(job, event_type="cancelled")
+                elif state in {"running", "queued"} and item.get("versioned_event") is not None:
+                    # Versioned jobs deliberately skip per-job status/request files,
+                    # but retain lightweight telemetry on the background writer.
+                    self._record_render_job_telemetry(
+                        job, event_type="running" if state == "running" else "retry_queued",
+                    )
+            except Exception as exc:
+                print(
+                    f"[daemon] render persistence postprocess failed "
+                    f"job_id={job.render_request.job_id}: {type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
 
     def _mark_succeeded(self, job_id: str, *, manifest_path: str, event_ts: Any = None) -> None:
         with self._condition:
@@ -18516,15 +19896,11 @@ class RenderDaemon:
             # New observation bundles written — invalidate the bundle manifest cache
             self._bundle_manifest_cache = None
             self._bundle_manifest_cache_ts = 0.0
-        self._update_job_render_timing_summary(job, manifest_path=manifest_path)
-        # Disk I/O outside the lock
-        self._persist_status_unlocked(job)
-        self._record_versioned_job_state(job, "succeeded")
-        self._opticalnav_copy_observation_rgb(job)
+        self._enqueue_render_persistence(
+            job, "succeeded", event_ts=event_ts, manifest_path=manifest_path,
+        )
         with self._condition:
             self._condition.notify_all()
-        self._record_render_job_telemetry(job, event_type="complete")
-        self._append_job_log_line(job, event_type="complete", stage="complete", message="Job succeeded", event_ts=event_ts)
 
     def _mark_failed(self, job_id: str, error: str, *, event_ts: Any = None) -> None:
         with self._condition:
@@ -18535,12 +19911,9 @@ class RenderDaemon:
             job.status.finished_at = _event_ts_iso(event_ts) or _utc_now_iso()
             job.status.progress_stage = "failed"
             job.status.error = error
+        self._enqueue_render_persistence(job, "failed", error=error, event_ts=event_ts)
+        with self._condition:
             self._condition.notify_all()
-        # Disk I/O outside the lock
-        self._persist_status_unlocked(job)
-        self._record_versioned_job_state(job, "failed", error=error)
-        self._record_render_job_telemetry(job, event_type="failed")
-        self._append_job_log_line(job, event_type="failed", stage="failed", message=error or "Job failed", event_ts=event_ts)
 
     def _update_progress(self, job_id: str, stage: str, payload: Mapping[str, Any] | None, *, event_ts: Any = None) -> None:
         command_id = None
@@ -20319,6 +21692,7 @@ class RenderDaemon:
             "backend_only": _backend_only_mode(),
             "render_queue_enabled": not _backend_only_mode(),
             "render_workers": render_workers,
+            "render_persistence": self._render_persistence.health(),
             "isaac_connected": session is not None,
             "isaac_scene_id": session.scene_id if session else None,
             "isaac_opened_at": session.opened_at if session else None,

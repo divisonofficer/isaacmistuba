@@ -28,6 +28,7 @@
 		onNormalizeLayout: () => void;
 		onAddScene: () => void;
 		onSaveMap: () => void;
+		onSyncRenderScene: () => void;
 		onEnableAllEmitters: () => void;
 		onDisableAllEmitters: () => void;
 		perturbation: any;
@@ -53,7 +54,7 @@
 		effectiveRenderReadiness, mapWidth, mapHeight, loading,
 		envmapFiles, envmapUploading,
 		onSceneChange, onSetMapWidth, onSetMapHeight, onTranslateLayout, onNormalizeLayout,
-		onAddScene, onSaveMap, onEnableAllEmitters, onDisableAllEmitters,
+		onAddScene, onSaveMap, onSyncRenderScene, onEnableAllEmitters, onDisableAllEmitters,
 		perturbation, perturbationSeed,
 		onGeneratePerturbation, onSetPerturbationEnabled, onSetPerturbationSeed,
 		onUpdateEnvironmentField, onUpdateSettingsField, onUploadEnvmap,
@@ -144,6 +145,12 @@
 						{#if _ss.annotation_stale}<div class="sync-stale">⚠ scene_annotation.json is stale (re-sync recommended)</div>{/if}
 						{#if _ss.traversable_map_stale}<div class="sync-stale">⚠ traversable_map is stale</div>{/if}
 						{#if _ss.viewpoint_graph_stale}<div class="sync-stale">⚠ viewpoint_graph is stale</div>{/if}
+						{#if _ss.render_scene !== 'synced'}
+							<!-- Save Map defers the render-scene compile; if that async job
+								 never ran (or its progress WebSocket dropped) the scene is stuck
+								 at "pending" with no way forward. This is the explicit re-trigger. -->
+							<button class="button button-primary sync-now" onclick={onSyncRenderScene}>Sync render scene now</button>
+						{/if}
 					{/if}
 				</div>
 			{/if}

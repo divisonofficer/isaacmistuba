@@ -30,9 +30,9 @@ from PIL import Image
 RGB_WAVELENGTHS_NM = np.asarray([650.0, 550.0, 450.0], dtype=np.float32)
 DEFAULT_DIELECTRIC_IOR = 1.5
 
-# Keep the matching set intentionally conservative.  Mitsuba's IOR directory
-# also contains semiconductors/dielectrics (e.g. ThF4, MgO, TiO2); treating all
-# of them as roughconductors caused the July-13 ThF4 false-match failure.
+# These presets are retained for diagnostics and human-readable nearest-metal
+# labels only. Render eta/k are derived continuously from the metallic-workflow
+# F0, so a dark authored metal is never replaced by a much brighter preset.
 DEFAULT_CONDUCTOR_PRESETS = ("Ag", "Al", "Au", "Cr", "Cu", "Ni_palik", "W")
 
 
@@ -89,6 +89,20 @@ def build_conductor_table(
 def srgb_to_linear(values: np.ndarray) -> np.ndarray:
     x = np.asarray(values, dtype=np.float32)
     return np.where(x <= 0.04045, x / 12.92, ((x + 0.055) / 1.055) ** 2.4)
+
+
+def conductor_eta_k_from_f0(f0: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Return a deterministic conductor whose normal-incidence Fresnel is ``f0``.
+
+    A metallic-roughness texture specifies F0 but not the unique complex IOR.
+    Fixing eta=1 gives the closed-form solution
+    ``k = 2 * sqrt(F0 / (1 - F0))``. This preserves every authored RGB texel
+    exactly at normal incidence without guessing a discrete real-metal preset.
+    """
+    target = np.clip(np.asarray(f0, dtype=np.float32), 0.0, 1.0 - 1e-6)
+    eta = np.ones_like(target, dtype=np.float32)
+    k = 2.0 * np.sqrt(target / np.maximum(1.0 - target, 1e-6), dtype=np.float32)
+    return eta, k.astype(np.float32)
 
 
 def _load_rgb(path: Path) -> np.ndarray:
@@ -171,7 +185,14 @@ def convert_spatial_pbr_textures(
     write_exr: bool = True,
     provenance: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Create Mitsuba-ready spatial PBR and optical maps for one UV atlas."""
+    """Create Mitsuba-ready spatial PBR and optical maps for one UV atlas.
+
+    A missing scalar-channel bitmap is valid glTF: the corresponding constant
+    factor is authoritative.  Texture-only consumers nevertheless need a
+    dense input image, so this function creates one *derived cache atlas* and
+    labels its provenance accordingly.  It never changes the source GLB
+    contract or claims that the cache was a spatial source texture.
+    """
     output_dir.mkdir(parents=True, exist_ok=True)
     base_color_path = Path(base_color_path)
     base = _load_rgb(base_color_path)
@@ -208,14 +229,24 @@ def convert_spatial_pbr_textures(
     k_map = np.zeros((height, width, 3), dtype=np.float32)
     index_map = np.zeros((height, width), dtype=np.uint8)
     match_error = np.empty(0, dtype=np.float32)
+    preset_match_error = np.empty(0, dtype=np.float32)
     if np.any(conductor):
         base_linear = srgb_to_linear(base.astype(np.float32) / 255.0)
         pixel_f0 = base_linear[conductor]
+        continuous_eta, continuous_k = conductor_eta_k_from_f0(pixel_f0)
+        eta_map[conductor] = continuous_eta
+        k_map[conductor] = continuous_k
+
+        # Nearest real-metal names remain useful diagnostics, but are not used
+        # by the renderer: their mismatch can be very large for procedural PBR.
         best = _nearest_conductors(pixel_f0, f0_table)
-        eta_map[conductor] = eta_table[best]
-        k_map[conductor] = k_table[best]
         index_map[conductor] = (best + 1).astype(np.uint8)
-        match_error = np.linalg.norm(pixel_f0 - f0_table[best], axis=1)
+        preset_match_error = np.linalg.norm(pixel_f0 - f0_table[best], axis=1)
+        reconstructed_f0 = (
+            ((continuous_eta - 1.0) ** 2 + continuous_k**2)
+            / ((continuous_eta + 1.0) ** 2 + continuous_k**2)
+        )
+        match_error = np.linalg.norm(pixel_f0 - reconstructed_f0, axis=1)
 
     prefix = output_dir / object_id
     base_out = prefix.with_name(f"{object_id}_basecolor.png")
@@ -261,8 +292,10 @@ def convert_spatial_pbr_textures(
         if count
     ]
     matches.sort(key=lambda row: row["pixels"], reverse=True)
+    roughness_mode = "texture" if roughness_path else "constant_factor"
+    metallic_mode = "texture" if metallic_path else "constant_factor"
     record: dict[str, Any] = {
-        "schema": "robomituba.spatial_pbr.v1",
+        "schema": "robomituba.spatial_pbr.v3",
         "object_id": object_id,
         "size": [width, height],
         "inputs": {
@@ -276,6 +309,8 @@ def convert_spatial_pbr_textures(
             "metallic_factor": float(metallic_factor),
             "roughness_constant": float(roughness_constant),
             "metallic_constant": float(metallic_constant),
+            "roughness_source_mode": roughness_mode,
+            "metallic_source_mode": metallic_mode,
         },
         "outputs": {
             "base_color": str(base_out),
@@ -288,6 +323,30 @@ def convert_spatial_pbr_textures(
             "k_exr": str(k_exr) if k_exr else None,
             "conductor_index": str(index_out),
         },
+        "output_provenance": {
+            "roughness": (
+                {"kind": "source_texture", "path": str(roughness_path)}
+                if roughness_path else
+                {
+                    "kind": "derived_constant_factor_atlas",
+                    "factor": float(roughness_constant),
+                    "reason": "texture_only_consumer_compatibility",
+                }
+            ),
+            "metallic": (
+                {"kind": "source_texture", "path": str(metallic_path)}
+                if metallic_path else
+                {
+                    "kind": "derived_constant_factor_atlas",
+                    "factor": float(metallic_constant),
+                    "reason": "texture_only_consumer_compatibility",
+                }
+            ),
+            "bsdf_weight": {
+                "kind": "derived_from_metallic",
+                "formula": "metallic_texture * metallic_factor or metallic_constant",
+            },
+        },
         "stats": {
             "roughness_min": float(roughness.min()),
             "roughness_max": float(roughness.max()),
@@ -298,7 +357,16 @@ def convert_spatial_pbr_textures(
             "metallic_mean": float(metallic.mean()),
             "conductor_fraction": float(conductor.mean()),
             "f0_match_l2_mean": float(match_error.mean()) if len(match_error) else None,
+            "nearest_preset_f0_l2_mean": (
+                float(preset_match_error.mean()) if len(preset_match_error) else None
+            ),
             "matches": matches,
+        },
+        "conductor_parameterization": {
+            "method": "continuous_f0_eta1",
+            "eta": 1.0,
+            "k_formula": "2*sqrt(F0/(1-F0))",
+            "nearest_preset_role": "diagnostic_only",
         },
         "conductor_presets": names,
         "wavelengths_nm": np.asarray(table["wavelengths_nm"]).tolist(),

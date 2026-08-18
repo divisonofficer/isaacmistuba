@@ -186,10 +186,10 @@
 		</div>
 		<div class="rig-sensor-toolbar">
 			<button class="button button-subtle" onclick={() => onSetRigSweepSensors?.(rigSensorOptions.map((option) => String(option.sensor_id)))}>
-				All active
+				All sensors
 			</button>
 			<button class="button button-subtle" onclick={() => onSetRigSweepSensors?.(activeRigSensorId ? [activeRigSensorId] : [])}>
-				Off
+				Active only
 			</button>
 		</div>
 		<div class="rig-sensor-list">
@@ -436,7 +436,10 @@
 		<input type="checkbox" checked={renderMissingOnly} onchange={(e) => onSetRenderMissingOnly?.((e.currentTarget as HTMLInputElement).checked)} />
 		<span>Only missing renders</span>
 	</label>
-	<div class="sensor-sweep-summary">Sweep sensors: {selectedRigSensorIds.length || 1} selected</div>
+	<div class="sensor-sweep-summary" title="Only these sensors/modalities are submitted by the graph sweep.">
+		Sweep sensors: {selectedRigSensorIds.length || 1} selected
+		· {selectedRigSensorIds.length ? selectedRigSensorIds.join(', ') : (activeRigSensorId || 'active sensor')}
+	</div>
 	<button class="button button-subtle full" disabled={!caps.renderSweepAll.enabled} title={caps.renderSweepAll.reason} onclick={onRenderEpisodes}>
 		{renderMissingOnly ? 'Graph Sweep · missing only' : 'Graph Sweep · all viewpoints'}
 	</button>

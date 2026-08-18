@@ -2342,8 +2342,10 @@
 		const { halfW, halfH } = frustumHalfExtents(displayDist, args.intrinsics ?? frustumIntrinsics);
 		const yaw = (args.yawDeg * Math.PI) / 180;
 		const origin = new THREE.Vector3(args.x, args.height, args.z);
-		const fwd = new THREE.Vector3(-Math.sin(yaw), 0, -Math.cos(yaw));
-		const right = new THREE.Vector3(Math.cos(yaw), 0, -Math.sin(yaw));
+		// Match navigation_dataset's canonical heading convention:
+		// yaw=0 -> +Z, yaw=90 -> +X. Mitsuba camera local -Z is forward.
+		const fwd = new THREE.Vector3(Math.sin(yaw), 0, Math.cos(yaw));
+		const right = new THREE.Vector3(-Math.cos(yaw), 0, Math.sin(yaw));
 		const up = new THREE.Vector3(0, 1, 0);
 		const negFwd = fwd.clone().negate();
 		const center = origin.clone().addScaledVector(fwd, displayDist);
@@ -3002,11 +3004,11 @@
 		if (!camera) return 0;
 		const dir = new THREE.Vector3();
 		camera.getWorldDirection(dir);
-		// Camera convention: yaw=0 → fwd=(-sin0,0,-cos0)=(0,0,-1).
-		// getWorldDirection gives orbit camera's look direction (≈+Z when looking into scene).
-		// To select the heading whose image faces the orbit camera, add 180° so orbit-yaw=0
-		// selects heading yaw=180° (fwd=+Z), whose image plane BackSide faces the orbit camera.
-		return ((Math.atan2(dir.x, dir.z) * 180 / Math.PI) + 360 + 180) % 360;
+		// Canonical heading convention: yaw=0 → +Z, yaw=90 → +X.
+		// View-aligned mode shows the rendered camera pointing in the same world
+		// direction as the editor observer. The old +180 compensated for the
+		// formerly inverted frustum geometry and must not be retained here.
+		return ((Math.atan2(dir.x, dir.z) * 180 / Math.PI) + 360) % 360;
 	}
 
 	function buildFrustumForHeading(
@@ -3028,7 +3030,7 @@
 
 		const yaw = (yawDeg * Math.PI) / 180;
 		const origin = new THREE.Vector3(nx, camY, nz);
-		const fwd = new THREE.Vector3(-Math.sin(yaw), 0, -Math.cos(yaw));
+		const fwd = new THREE.Vector3(Math.sin(yaw), 0, Math.cos(yaw));
 
 		const group = new THREE.Group();
 		group.userData = { vpId, headingId, yawDeg };
@@ -3198,10 +3200,10 @@
 				const hYaw = (hYawDeg * Math.PI) / 180;
 				const hasModality = hasHeadingModality(hdata, modalityKey);
 				const segColor = hasModality ? 0x3b82f6 : 0x94a3b8;
-				// Camera forward: fwd = (-sin(yaw), 0, -cos(yaw)) — same direction as frustum
+				// Camera forward follows the canonical graph/render heading convention.
 				const roseGeo = new THREE.BufferGeometry().setFromPoints([
 					new THREE.Vector3(nx, baseY + 0.01, nz),
-					new THREE.Vector3(nx - Math.sin(hYaw) * roseR, baseY + 0.01, nz - Math.cos(hYaw) * roseR)
+					new THREE.Vector3(nx + Math.sin(hYaw) * roseR, baseY + 0.01, nz + Math.cos(hYaw) * roseR)
 				]);
 				frustumGroup.add(new THREE.LineSegments(roseGeo, new THREE.LineBasicMaterial({ color: segColor, transparent: true, opacity: hasModality ? 0.8 : 0.4 })));
 			}

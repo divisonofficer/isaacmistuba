@@ -526,6 +526,8 @@ export const getOpticalNavGraphBatchLogs = (projectId: string, batchId: string, 
 	fetch(`${opticalProject(projectId)}/graph-render-batches/${encodeURIComponent(batchId)}/logs?per_job=${perJob}`).then(json);
 export const listOpticalNavRenderVersions = (projectId: string, sceneId: string) =>
 	fetch(`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/render-versions`).then(json);
+export const getOpticalNavRenderCoverage = (projectId: string, sceneId: string) =>
+	fetch(`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/render-coverage`).then(json);
 export const promoteOpticalNavRenderVersion = (projectId: string, sceneId: string, renderVersionId: string) =>
 	post(`${opticalProject(projectId)}/scenes/${encodeURIComponent(sceneId)}/render-versions`, { action: 'promote', render_version_id: renderVersionId });
 export const pruneOpticalNavRenderVersion = (projectId: string, sceneId: string, renderVersionId: string) =>

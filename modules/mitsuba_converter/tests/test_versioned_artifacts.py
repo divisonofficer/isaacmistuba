@@ -106,3 +106,133 @@ def test_batch_plan_and_complete_lookup(tmp_path: Path):
     assert list(found) == ["logical-3"]
     assert ledger.get_request_blob(found["logical-3"]["request_blob_digest"]) == {"request_id": "3"}
 
+
+def test_invalid_legacy_skip_is_not_reusable(tmp_path: Path):
+    ledger, scene_version, _digest, render_id = _run(tmp_path)
+    ledger.put_tasks_batch([{
+        "task_key": "false-skip", "run_id": "run-1", "render_version_id": render_id,
+        "variant": "base", "phase": "rgb", "ordinal": 0,
+        "node_id": "vp-1", "heading_id": "h-000", "logical_task_key": "logical-skip",
+        "metadata": {"sensor_ids": ["rear-copy"], "skip_reason": "existing_observation"},
+        "state": "skipped",
+    }])
+
+    assert ledger.find_complete_tasks(
+        scene_version_id_value=scene_version,
+        logical_task_keys=["logical-skip"],
+    ) == {}
+    assert ledger.scene_sensor_progress("scene")[0]["completed"] == 0
+
+
+def test_atomic_runtime_events_update_attempts_and_terminal_run(tmp_path: Path):
+    ledger, _scene_version, _digest, render_id = _run(tmp_path)
+    ledger.put_tasks_batch([
+        {
+            "task_key": f"task-{index}", "run_id": "run-1", "render_version_id": render_id,
+            "variant": "base", "phase": "rgb", "phase_index": 0, "ordinal": index,
+            "node_id": f"vp_{index:04d}", "heading_id": "h_000",
+            "request_payload": {"request_id": str(index)},
+        }
+        for index in range(2)
+    ])
+    events = [
+        {
+            "task_key": "task-0", "run_id": "run-1", "job_id": "job-0",
+            "state": "running", "attempt_no": 1, "created_at": "2026-08-13T00:00:00+00:00",
+        },
+        {
+            "task_key": "task-0", "run_id": "run-1", "job_id": "job-0",
+            "state": "succeeded", "attempt_no": 1, "created_at": "2026-08-13T00:00:01+00:00",
+        },
+        {
+            "task_key": "task-1", "run_id": "run-1", "job_id": "job-1",
+            "state": "succeeded", "attempt_no": 1, "created_at": "2026-08-13T00:00:02+00:00",
+        },
+    ]
+    ledger.apply_task_events_batch(events)
+    # A cross-project writer retry may replay a project sub-batch after another
+    # project's NFS commit failed. Runtime event keys make that replay idempotent.
+    ledger.apply_task_events_batch(events)
+
+    summary = ledger.run_summary("run-1")
+    assert summary["status"] == "completed"
+    assert summary["state_counts"]["succeeded"] == 2
+    assert ledger.list_versions(scene_id="scene")[0]["status"] == "ready"
+    with ledger.connection() as conn:
+        attempt = conn.execute(
+            "SELECT state, started_at, finished_at FROM render_attempts WHERE task_key='task-0'"
+        ).fetchone()
+        event_count = conn.execute(
+            "SELECT COUNT(*) FROM render_events WHERE run_id='run-1'"
+        ).fetchone()[0]
+    assert tuple(attempt) == (
+        "succeeded", "2026-08-13T00:00:00+00:00", "2026-08-13T00:00:01+00:00",
+    )
+    assert event_count == 3
+
+
+def test_retry_failure_does_not_pause_run_between_attempts(tmp_path: Path):
+    ledger, _scene_version, _digest, render_id = _run(tmp_path)
+    ledger.put_tasks_batch([{
+        "task_key": "task-0", "run_id": "run-1", "render_version_id": render_id,
+        "variant": "base", "phase": "rgb", "phase_index": 0, "ordinal": 0,
+        "node_id": "vp_0000", "heading_id": "h_000",
+        "request_payload": {"request_id": "0"},
+    }])
+    ledger.apply_task_events_batch([{
+        "task_key": "task-0", "run_id": "run-1", "job_id": "job-0",
+        "state": "failed", "task_state": "running", "event_type": "retry_failed",
+        "attempt_no": 1, "error": "temporary GPU failure",
+    }])
+
+    summary = ledger.run_summary("run-1")
+    assert summary["status"] != "paused"
+    assert summary["state_counts"] == {"running": 1}
+    with ledger.connection() as conn:
+        attempt_state = conn.execute(
+            "SELECT state FROM render_attempts WHERE task_key='task-0' AND attempt_no=1"
+        ).fetchone()[0]
+    assert attempt_state == "failed"
+
+
+def test_scene_sensor_progress_deduplicates_resumed_runs(tmp_path: Path):
+    ledger, scene_version, _digest, render_id = _run(tmp_path)
+    first_run = [
+        {
+            "task_key": f"first-{index}", "run_id": "run-1", "render_version_id": render_id,
+            "variant": "base", "phase": "rgb", "ordinal": index,
+            "node_id": f"vp-{index}", "heading_id": "h-000",
+            "metadata": {"sensor_ids": ["rgb-cam"]},
+            "state": "succeeded" if index == 0 else "planned",
+        }
+        for index in range(2)
+    ]
+    ledger.put_tasks_batch(first_run)
+    ledger.create_render_run(
+        run_id="run-2", project_id="project", scene_id="scene",
+        scene_version_id_value=scene_version, render_version_id="render-2",
+    )
+    ledger.put_tasks_batch([
+        {
+            "task_key": f"second-{index}", "run_id": "run-2", "render_version_id": "render-2",
+            "variant": "base", "phase": "rgb", "ordinal": index,
+            "node_id": f"vp-{index}", "heading_id": "h-000",
+            "metadata": {"sensor_ids": ["rgb-cam"]},
+            "state": "succeeded" if index == 1 else "planned",
+        }
+        for index in range(2)
+    ])
+
+    progress = ledger.scene_sensor_progress("scene")
+
+    assert progress == [{
+        "scene_version_id": scene_version,
+        "variant": "base",
+        "sensor_id": "rgb-cam",
+        "completed": 2,
+        "running": 0,
+        "queued": 0,
+        "failed": 0,
+        "total": 2,
+        "fraction": 1.0,
+    }]
