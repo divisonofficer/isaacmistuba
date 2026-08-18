@@ -12,6 +12,7 @@ dependencies = [
   "Jinja2",
   "numpy",
   "Pillow",
+  "opencv-python-headless>=4.8",
   "fast-simplification",
   "trimesh",
   "huggingface_hub>=0.23",

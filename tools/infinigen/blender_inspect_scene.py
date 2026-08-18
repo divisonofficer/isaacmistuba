@@ -63,6 +63,7 @@ def main():
     out_path = "/tmp/blend_inspect.json"
     if "--out" in args:
         out_path = args[args.index("--out") + 1]
+    only = [args[index + 1].lower() for index, value in enumerate(args[:-1]) if value == "--only"]
 
     scene = bpy.context.scene
     summary = {
@@ -87,6 +88,8 @@ def main():
     for o in bpy.data.objects:
         if o.type != "MESH":
             continue
+        if only and not any(needle in o.name.lower() for needle in only):
+            continue
         me = o.data
         try:
             npoly = len(me.polygons)
@@ -103,6 +106,12 @@ def main():
             "collections": [c.name for c in o.users_collection],
             "parent": o.parent.name if o.parent else None,
             "polys": npoly,
+            "smooth_polygon_count": sum(1 for polygon in me.polygons if polygon.use_smooth),
+            "smooth_polygon_ratio": (
+                sum(1 for polygon in me.polygons if polygon.use_smooth) / max(1, npoly)
+            ),
+            "sharp_edge_count": sum(1 for edge in me.edges if edge.use_edge_sharp),
+            "uv_layers": [layer.name for layer in me.uv_layers],
             "world_bbox_min": [min(xs), min(ys), min(zs)],
             "world_bbox_max": [max(xs), max(ys), max(zs)],
             "dimensions": list(o.dimensions),
@@ -110,7 +119,7 @@ def main():
             "custom_props": props,
         })
     meshes.sort(key=lambda m: -(m["polys"] if m["polys"] and m["polys"] > 0 else 0))
-    summary["mesh_objects_top"] = meshes[:80]
+    summary["mesh_objects_top"] = meshes if only else meshes[:80]
     summary["mesh_objects_total"] = len(meshes)
 
     # Materials

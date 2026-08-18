@@ -5,8 +5,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from mesh_decimation import (  # noqa: E402
-    DecimationContext, NoDecimation, RatioThreshold, SemanticContractPolicy,
-    resolve_policy, decimate_object)
+    DecimationContext, IRSemanticLodPolicy, NoDecimation, RatioThreshold, SemanticContractPolicy,
+    resolve_policy, decimate_object, map_material_slot_indices)
 
 
 def ctx(n, **kw):
@@ -50,6 +50,27 @@ def test_resolve_policy():
         resolve_policy("bogus"); assert False
     except ValueError:
         pass
+
+
+def test_material_slot_mapping_accepts_blender_suffix_family_shift():
+    source = ["shader_hair_shader", "shader_hair_shader.001", "shader_hair_shader.002",
+              "shader_hair_shader.003", "shader_hair_shader.004"]
+    imported = ["shader_hair_shader.005", "shader_hair_shader.006", "shader_hair_shader.007",
+                "shader_hair_shader.008", "shader_hair_shader.009"]
+    assert map_material_slot_indices(source, imported) == {index: index for index in range(5)}
+
+
+def test_material_slot_mapping_rejects_ambiguous_reordering():
+    try:
+        map_material_slot_indices(["hair", "hair.001"], ["hair.003", "other.004"])
+    except ValueError as exc:
+        assert "unambiguously" in str(exc)
+    else:
+        raise AssertionError("changed repeated material family must be rejected")
+
+
+def test_material_slot_mapping_allows_only_a_source_subset_when_requested():
+    assert map_material_slot_indices(["used", "unused"], ["used"], allow_source_subset=True) == {0: 0}
 
 
 def _mslots(*pairs):
@@ -108,6 +129,15 @@ class _FakeMesh:
 class _FakeObj:
     def __init__(self, n): self.data = _FakeMesh(n)
 
+def test_ir_semantic_lod_ladder_never_exceeds_thirty_percent():
+    policy = IRSemanticLodPolicy(min_faces=50_000)
+    assert policy.decide(ctx(49_999)).target_ratio == 1.0
+    assert policy.decide(ctx(100_000)).target_ratio == 0.30
+    assert policy.decide(ctx(300_000)).target_ratio == 0.10
+    assert policy.decide(ctx(1_500_000)).target_ratio == 0.03
+    assert policy.decide(ctx(6_000_000)).target_ratio == 0.01
+
+
 
 def test_decimate_object_record_no_bpy():
     # policy=none -> no bpy call, clean record
@@ -120,6 +150,21 @@ def test_decimate_object_bpy_missing_is_caught():
     # decimate_object must catch and record the error (never abort an import)
     rec = decimate_object(_FakeObj(500_000), RatioThreshold(min_faces=1000, ratio=0.3), ctx(500_000))
     assert rec["decimated"] is False and rec["error"] and rec["faces_after"] == 500_000
+
+def test_strict_decimation_rejects_no_effect(monkeypatch=None):
+    import mesh_decimation as module
+    original = module.apply_decimation
+    module.apply_decimation = lambda obj, decision: len(obj.data.polygons)
+    try:
+        try:
+            decimate_object(_FakeObj(500_000), RatioThreshold(min_faces=1_000, ratio=0.3), ctx(500_000), strict=True)
+        except RuntimeError as exc:
+            assert "no_effect" in str(exc)
+        else:
+            raise AssertionError("strict no-effect decimation must fail")
+    finally:
+        module.apply_decimation = original
+
 
 
 if __name__ == "__main__":

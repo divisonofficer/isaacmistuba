@@ -148,6 +148,45 @@ def _room_softbox_specs(aabb: list[float], *, strong_fill: bool) -> list[dict]:
 # the whole room). Furniture carves; walls/floor/ceiling do not.
 NO_CARVE_KINDS = {"structure", "window"}
 
+# Infinigen keeps room-shell prototypes in this asset-library collection. They
+# are authoring templates centered near the Blender origin, not placed scene
+# instances. Importing them produces one large room-sized box per template,
+# all stacked at the same normalized map corner.
+_ROOM_EXTERIOR_PROTOTYPE_COLLECTION = "unique_assets:room_exterior"
+
+# Infinigen's NatureShelfTrinkets assets are sometimes sculpt-resolution meshes
+# even though their placed extent is only a few centimetres.  They are neither
+# navigation geometry nor optical-evaluation targets, and one apartment seed can
+# spend most of its triangle budget on them.  Drop only the pathological corner:
+# shelf-decoration semantics, <=15 cm world extent, and >=250k triangles.  The
+# narrow factory/semantic guard deliberately keeps jars, plants, landmarks and
+# structural meshes even when they happen to be small.
+_TINY_HIGHPOLY_MAX_EXTENT_M = 0.15
+_TINY_HIGHPOLY_MIN_TRIANGLES = 250_000
+_TINY_HIGHPOLY_FACTORIES = frozenset({"NatureShelfTrinketsFactory"})
+
+
+def _is_room_exterior_prototype(unit: dict) -> bool:
+    return any(
+        str(collection).strip().lower() == _ROOM_EXTERIOR_PROTOTYPE_COLLECTION
+        for collection in (unit.get("collections") or [])
+    )
+
+
+def _is_tiny_highpoly_decoration(unit: dict) -> bool:
+    dimensions = unit.get("dimensions") or unit.get("place_size_m") or []
+    try:
+        max_extent = max(float(value) for value in dimensions)
+        triangles = int(unit.get("triangles") or 0)
+    except (TypeError, ValueError):
+        return False
+    return (
+        str(unit.get("factory") or "") in _TINY_HIGHPOLY_FACTORIES
+        and str(unit.get("semantic_type") or "") == "shelf"
+        and max_extent <= _TINY_HIGHPOLY_MAX_EXTENT_M
+        and triangles >= _TINY_HIGHPOLY_MIN_TRIANGLES
+    )
+
 
 def _san(name: str) -> str:
     import re
@@ -401,6 +440,13 @@ def _nav_flags(unit: dict) -> dict:
     elif kind == "window":
         flags["hazard_type"] = "transparent_obstacle"
         flags["include_in_hazard_mask"] = True
+    elif sem in {"glass_wall", "transparent_partition"}:
+        # Structural modern-office panes are real mesh obstacles, unlike a
+        # legacy optical-perturbation overlay.  Keep their transparent-obstacle
+        # semantics while making them participate in traversability.
+        flags["blocks_navigation"] = True
+        flags["hazard_type"] = "transparent_obstacle"
+        flags["include_in_hazard_mask"] = True
     return flags
 
 
@@ -609,11 +655,22 @@ def validate_infinigen_manifest(
     manifest_dir: Path,
     *,
     allow_obj_fallback: bool = False,
+    stage1_profile: str = "strict-pbr-v1",
 ) -> list[str]:
     """Validate the Stage-1 GLB/PBR contract."""
+    actual_profile = str(manifest.get("stage1_profile") or "strict-pbr-v1")
+    if actual_profile != stage1_profile:
+        raise ValueError(
+            f"Stage-1 profile mismatch: expected {stage1_profile!r}, got {actual_profile!r}"
+        )
+    bootstrap = stage1_profile == "ir-bootstrap-v1"
+    if stage1_profile not in {"strict-pbr-v1", "strict-pbr-v2-slot-aware", "ir-bootstrap-v1"}:
+        raise ValueError(f"unsupported Stage-1 profile: {stage1_profile!r}")
     issues: list[str] = []
     if int(manifest.get("export_contract_version") or 0) < 2:
         issues.append("manifest export_contract_version is not 2")
+    if bootstrap and not isinstance(manifest.get("materials"), dict):
+        issues.append("manifest materials provenance is missing")
     for index, unit in enumerate(manifest.get("units") or []):
         uid = str(unit.get("id") or unit.get("blender_name") or index)
         glb_ref = unit.get("mesh_glb")
@@ -638,6 +695,17 @@ def validate_infinigen_manifest(
             issues.append(f"{uid}: missing or invalid UV")
         if not str(uv.get("layer") or "").strip():
             issues.append(f"{uid}: missing UV layer")
+        if bootstrap:
+            if not str(unit.get("blender_name") or "").strip():
+                issues.append(f"{uid}: missing Blender object provenance")
+            if not isinstance(unit.get("materials"), list):
+                issues.append(f"{uid}: missing material-name provenance")
+            slots = unit.get("material_slots")
+            if not isinstance(slots, list):
+                issues.append(f"{uid}: missing material-slot provenance")
+            elif any(not isinstance(slot, dict) or not str(slot.get("name") or "").strip() for slot in slots):
+                issues.append(f"{uid}: invalid material-slot provenance")
+            continue
         pbr = unit.get("pbr") if isinstance(unit.get("pbr"), dict) else {}
         if pbr.get("status") != "ok":
             issues.append(f"{uid}: unresolved PBR contract")
@@ -703,6 +771,20 @@ def build_authoring_map(manifest: dict, scene_id: str, import_rel: str,
 
     units = [u for u in all_units if _has_render_geometry(u)]
     skipped = len(all_units) - len(units)
+
+    room_exterior_prototypes = [u for u in units if _is_room_exterior_prototype(u)]
+    if room_exterior_prototypes:
+        units = [u for u in units if not _is_room_exterior_prototype(u)]
+        print(f"[import] dropped {len(room_exterior_prototypes)} room-exterior prototype(s)")
+
+    tiny_highpoly_decorations = [u for u in units if _is_tiny_highpoly_decoration(u)]
+    if tiny_highpoly_decorations:
+        units = [u for u in units if not _is_tiny_highpoly_decoration(u)]
+        dropped_triangles = sum(int(u.get("triangles") or 0) for u in tiny_highpoly_decorations)
+        print(
+            f"[import] dropped {len(tiny_highpoly_decorations)} tiny high-poly "
+            f"decoration(s), {dropped_triangles:,} triangles"
+        )
 
     # Drop oversized door leaves (much larger than their nearest frame) that block a
     # passage. Removing them keeps the scene nav-clean (no wall-sized door mesh) and
@@ -795,6 +877,7 @@ def build_authoring_map(manifest: dict, scene_id: str, import_rel: str,
                 "blender_name": u.get("blender_name"),
                 "kind": u.get("kind"),
                 "factory": u.get("factory"),
+                "source_collections": list(u.get("collections") or []),
                 "infinigen_yaw_deg": round(manifest_yaw, 3),
                 "glb_ref": (f"{import_rel}/{u['mesh_glb']}" if u.get("mesh_glb") else None),
                 "fallback_obj_ref": (f"{import_rel}/{u['mesh_obj']}" if u.get("mesh_obj") else None),
@@ -803,6 +886,7 @@ def build_authoring_map(manifest: dict, scene_id: str, import_rel: str,
                 "uv": u.get("uv"),
                 "world_bbox_min": u.get("world_bbox_min"),
                 "world_bbox_max": u.get("world_bbox_max"),
+                "source_custom_properties": dict(u.get("source_custom_properties") or {}),
             },
         }
         objects.append(obj)
@@ -1041,6 +1125,16 @@ def build_authoring_map(manifest: dict, scene_id: str, import_rel: str,
         },
         "metadata": {"source": "infinigen", "import_root": import_rel,
                      "unit_count": len(objects), "skipped_degenerate": skipped,
+                     "dropped_room_exterior_prototypes": len(room_exterior_prototypes),
+                     "dropped_tiny_highpoly_decorations": len(tiny_highpoly_decorations),
+                     "dropped_tiny_highpoly_triangles": sum(
+                         int(u.get("triangles") or 0) for u in tiny_highpoly_decorations
+                     ),
+                     "tiny_highpoly_filter": {
+                         "max_extent_m": _TINY_HIGHPOLY_MAX_EXTENT_M,
+                         "min_triangles": _TINY_HIGHPOLY_MIN_TRIANGLES,
+                         "factories": sorted(_TINY_HIGHPOLY_FACTORIES),
+                     },
                      "kept_rooms": sorted(kept_rooms), "dropped_rooms": dropped_rooms,
                      "origin_offset": origin_offset},
     }
@@ -1119,6 +1213,42 @@ def _snapshot_generated_scene_files(scene_dir: Path, snapshot_root: Path) -> Pat
             shutil.copy2(path, snapshot_dir / path.name)
     return snapshot_dir
 
+
+def _repo_relative_import_root(manifest_dir: Path, scene_id: str) -> str:
+    """Return a stable package-relative alias for a Stage-1 artifact root.
+
+    OpticalNav ``source_ref`` values are deliberately package-relative.  IR
+    geometry builds, however, live on the dataset work volume (normally
+    ``/bean``), outside ``REPO_ROOT``.  Keep the package contract intact by
+    placing a small, deterministic symlink in the ignored import tree instead
+    of copying the authoritative GLBs and texture atlases back into the repo.
+    """
+    root = manifest_dir.resolve()
+    try:
+        return root.relative_to(REPO_ROOT).as_posix()
+    except ValueError:
+        pass
+
+    digest = hashlib.sha256(str(root).encode("utf-8")).hexdigest()[:16]
+    alias = REPO_ROOT / "out" / "infinigen_imports" / "_external" / f"{_san(scene_id)}-{digest}"
+    alias.parent.mkdir(parents=True, exist_ok=True)
+    if alias.is_symlink():
+        if alias.resolve() != root:
+            raise RuntimeError(f"external import alias points elsewhere: {alias}")
+    elif alias.exists():
+        raise RuntimeError(f"external import alias is not a symlink: {alias}")
+    else:
+        alias.symlink_to(root, target_is_directory=True)
+    return alias.relative_to(REPO_ROOT).as_posix()
+
+
+def _display_path(path: Path) -> str:
+    """Use a concise repo-relative path when possible, otherwise an absolute path."""
+    try:
+        return path.relative_to(REPO_ROOT).as_posix()
+    except ValueError:
+        return str(path)
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--manifest", required=True)
@@ -1127,6 +1257,9 @@ def main():
     ap.add_argument("--force", action="store_true")
     ap.add_argument("--validate-only", action="store_true",
                     help="Validate the Stage-1 GLB/PBR manifest and exit.")
+    ap.add_argument("--stage1-profile", choices=("strict-pbr-v1", "ir-bootstrap-v1"),
+                    default="strict-pbr-v1",
+                    help="Expected Stage-1 contract; bootstrap keeps geometry/material provenance without atlases.")
     ap.add_argument("--allow-obj-fallback", action="store_true",
                     help="Permit legacy/incomplete manifests and audited OBJ geometry fallback.")
     ap.add_argument("--no-materialize", action="store_true")
@@ -1151,6 +1284,7 @@ def main():
     manifest = json.loads(manifest_path.read_text())
     validation_issues = validate_infinigen_manifest(
         manifest, manifest_path.parent, allow_obj_fallback=args.allow_obj_fallback,
+        stage1_profile=args.stage1_profile,
     )
     if args.validate_only:
         print(f"[import] manifest validation ok: {manifest_path}")
@@ -1159,7 +1293,7 @@ def main():
         return
     scene_id = _scene_id_from_manifest(manifest_path, args.scene_id)
     # repo-relative import root (meshes live under here as <import_rel>/meshes/<id>.obj)
-    import_rel = manifest_path.parent.relative_to(REPO_ROOT).as_posix()
+    import_rel = _repo_relative_import_root(manifest_path.parent, scene_id)
 
     am = build_authoring_map(manifest, scene_id, import_rel,
                              keep_empty_rooms=args.keep_empty_rooms, room_override=args.room,
@@ -1168,6 +1302,7 @@ def main():
                              allow_obj_fallback=args.allow_obj_fallback)
     md = am["metadata"]
     md["export_contract_version"] = int(manifest.get("export_contract_version") or 0)
+    md["stage1_profile"] = str(manifest.get("stage1_profile") or "strict-pbr-v1")
     md["import_degraded"] = bool(validation_issues)
     md["manifest_validation_issues"] = validation_issues
     print(f"[import] scene_id={scene_id} objects={len(am['objects'])} materials={len(am['materials'])} "
@@ -1184,7 +1319,7 @@ def main():
         scene_dir, manifest_path.parent / "promotion_snapshots" / scene_id,
     )
     if snapshot_dir:
-        print(f"[import] promotion snapshot -> {snapshot_dir.relative_to(REPO_ROOT)}")
+        print(f"[import] promotion snapshot -> {_display_path(snapshot_dir)}")
 
     fixture_path = REPO_ROOT / "out" / "infinigen_imports" / f"{scene_id}__authoring_map.json"
     fixture_path.parent.mkdir(parents=True, exist_ok=True)

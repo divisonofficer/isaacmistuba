@@ -23,7 +23,9 @@ for m in ("robomituba_bridge", "mitsuba_converter", "navigation_dataset"):
 
 from robomituba_bridge import canonical_document                       # noqa: E402
 from mitsuba_converter.material_pipeline import (                      # noqa: E402
+    OPAQUE_PBR_DOMAIN, SUPPORTED_SURFACE_DOMAINS,
     extract_material_slots, load_material_slots, canonicalize_materials,
+    materialize_ir_effective_scene,
 )
 from mitsuba_converter.material_pipeline.extract import write_material_slots  # noqa: E402
 
@@ -63,6 +65,20 @@ def cmd_extract(scene: Path) -> int:
     return 0
 
 
+def cmd_effective_scene(scene: Path, out: Path, surface_domain: str) -> int:
+    contract = materialize_ir_effective_scene(
+        (scene.parent if scene.is_file() else scene), out, surface_domain=surface_domain, reuse_existing=True,
+    )
+    exclusion = dict(contract.get("exclusion") or {})
+    print(f"[effective-scene] {out}")
+    print(
+        f"  domain={contract['surface_domain']} digest={contract['effective_scene_digest'][:16]} "
+        f"excluded_shapes={exclusion.get('excluded_shape_count', 0)} "
+        f"retained_shapes={exclusion.get('retained_shape_count', 0)}"
+    )
+    return 0
+
+
 def cmd_canonicalize(scene: Path) -> int:
     slots = load_material_slots(scene)
     if slots is None:
@@ -86,10 +102,16 @@ def cmd_canonicalize(scene: Path) -> int:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("stage", choices=["extract", "canonicalize"])
+    ap.add_argument("stage", choices=["extract", "canonicalize", "effective-scene"])
     ap.add_argument("--scene", required=True, help="scene id or path to scene dir / render_scene.xml")
+    ap.add_argument("--out", type=Path, help="output directory for effective-scene")
+    ap.add_argument("--surface-domain", choices=sorted(SUPPORTED_SURFACE_DOMAINS), default=OPAQUE_PBR_DOMAIN)
     a = ap.parse_args()
     scene = resolve_scene(a.scene)
+    if a.stage == "effective-scene":
+        if a.out is None:
+            ap.error("effective-scene requires --out")
+        return cmd_effective_scene(scene, a.out, a.surface_domain)
     return {"extract": cmd_extract, "canonicalize": cmd_canonicalize}[a.stage](scene)
 
 

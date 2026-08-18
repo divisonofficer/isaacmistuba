@@ -15,12 +15,34 @@ material contract). Rendering-heavy stages import Mitsuba lazily.
 """
 from .extract import extract_material_slots, load_material_slots, SLOTS_SCHEMA_VERSION
 from .canonicalize import canonicalize_materials
+from .ir_effective_scene import (
+    ALL_SURFACES_DOMAIN,
+    IR_SCENE_DOMAIN_SCHEMA,
+    OPAQUE_PBR_DOMAIN,
+    SPECULAR_MASKED_PBR_DOMAIN,
+    STRUCTURAL_SPECULAR_PBR_DOMAIN,
+    uses_specular_semantic_masks,
+    SUPPORTED_SURFACE_DOMAINS,
+    materialize_ir_effective_scene,
+    source_scene_digest,
+    validate_ir_effective_scene,
+)
 
 __all__ = [
     "extract_material_slots",
     "load_material_slots",
     "SLOTS_SCHEMA_VERSION",
     "canonicalize_materials",
+    "ALL_SURFACES_DOMAIN",
+    "IR_SCENE_DOMAIN_SCHEMA",
+    "OPAQUE_PBR_DOMAIN",
+    "SPECULAR_MASKED_PBR_DOMAIN",
+    "STRUCTURAL_SPECULAR_PBR_DOMAIN",
+    "uses_specular_semantic_masks",
+    "SUPPORTED_SURFACE_DOMAINS",
+    "materialize_ir_effective_scene",
+    "source_scene_digest",
+    "validate_ir_effective_scene",
     "render_property_maps",
     "build_band_scene",
 ]

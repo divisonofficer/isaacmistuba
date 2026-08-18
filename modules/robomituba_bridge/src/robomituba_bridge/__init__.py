@@ -82,6 +82,19 @@ from .canonical_material import (
     canonical_document,
     tier_for_source,
 )
+from .camera_pose import (
+    AXIS_TRANSFORM_ID,
+    LEGACY_FLAT_LAYOUT,
+    MATRIX_LAYOUT,
+    TRANSLATION_LAYOUT,
+    CanonicalCameraPose,
+    legacy_flat_to_matrix,
+    matrix_to_legacy_flat,
+    mitsuba_camera_to_blender,
+    mitsuba_point_to_blender,
+    pose_from_mitsuba_camera_to_world,
+    resolve_viewpoint_pose,
+)
 from .types import (
     ActiveLightSpec,
     AssistLightSpec,
@@ -119,6 +132,17 @@ from .types import (
 
 __all__ = [
     "ActiveLightSpec",
+    "AXIS_TRANSFORM_ID",
+    "LEGACY_FLAT_LAYOUT",
+    "MATRIX_LAYOUT",
+    "TRANSLATION_LAYOUT",
+    "CanonicalCameraPose",
+    "legacy_flat_to_matrix",
+    "matrix_to_legacy_flat",
+    "mitsuba_camera_to_blender",
+    "mitsuba_point_to_blender",
+    "pose_from_mitsuba_camera_to_world",
+    "resolve_viewpoint_pose",
     "CanonicalMaterial",
     "MaterialParameter",
     "CANONICAL_MATERIAL_SCHEMA_VERSION",

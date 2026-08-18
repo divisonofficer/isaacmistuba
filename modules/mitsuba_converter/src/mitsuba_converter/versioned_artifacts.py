@@ -28,7 +28,7 @@ import zlib
 from typing import Any, Iterator, Mapping, Sequence
 
 
-LEDGER_SCHEMA_VERSION = 1
+LEDGER_SCHEMA_VERSION = 2
 
 
 def utc_now_iso() -> str:
@@ -321,6 +321,7 @@ class RenderLedger:
                 );
                 CREATE TABLE IF NOT EXISTS render_events (
                     event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_key TEXT,
                     run_id TEXT,
                     task_key TEXT,
                     event_type TEXT NOT NULL,
@@ -335,7 +336,11 @@ class RenderLedger:
             columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(sweep_tasks)").fetchall()}
             if "logical_task_key" not in columns:
                 conn.execute("ALTER TABLE sweep_tasks ADD COLUMN logical_task_key TEXT")
+            event_columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(render_events)").fetchall()}
+            if "event_key" not in event_columns:
+                conn.execute("ALTER TABLE render_events ADD COLUMN event_key TEXT")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_logical ON sweep_tasks(logical_task_key, state)")
+            conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_events_key ON render_events(event_key)")
             conn.execute(
                 "INSERT OR REPLACE INTO ledger_meta(key, value) VALUES('schema_version', ?)",
                 (str(LEDGER_SCHEMA_VERSION),),
@@ -415,7 +420,10 @@ class RenderLedger:
                     f"""SELECT t.*, r.scene_version_id FROM sweep_tasks t
                         JOIN sweep_runs r ON r.run_id = t.run_id
                         WHERE r.scene_version_id = ? AND t.logical_task_key IN ({placeholders})
-                          AND t.state IN ('succeeded', 'skipped')""",
+                          AND (
+                            t.state = 'succeeded'
+                            OR (t.state = 'skipped' AND json_extract(t.metadata_json, '$.source_bundle_ref') IS NOT NULL)
+                          )""",
                     [scene_version_id_value, *chunk],
                 ).fetchall()
                 for row in rows:
@@ -471,6 +479,112 @@ class RenderLedger:
                     conn.execute("UPDATE render_versions SET status = 'ready' WHERE render_version_id = (SELECT render_version_id FROM sweep_runs WHERE run_id = ?) AND status = 'staging'", (touched_run,))
                 elif any(state in {"failed", "partial", "blocked"} for state in states):
                     conn.execute("UPDATE sweep_runs SET status = 'paused' WHERE run_id = ?", (touched_run,))
+            conn.commit()
+
+    def apply_task_events_batch(self, events: Sequence[Mapping[str, Any]]) -> None:
+        """Persist ordered runtime task events in one transaction.
+
+        This is the hot-path counterpart to :meth:`put_tasks_batch`.  A render
+        daemon may hand events to this method from a background writer after
+        several GPU workers finish close together.  Task state, attempt state,
+        audit events, and run/version terminal state therefore become durable
+        together instead of requiring three connections and commits per event.
+        """
+        rows = list(events)
+        if not rows:
+            return
+        with self.connection() as conn:
+            touched_runs: set[str] = set()
+            for event in rows:
+                task_key_value = str(event["task_key"])
+                state = str(event.get("state") or "planned")
+                task_state = str(event.get("task_state") or state)
+                run_id = str(event.get("run_id") or "")
+                job_id = str(event.get("job_id") or "")
+                error = event.get("error")
+                attempt_no = max(1, int(event.get("attempt_no", 1) or 1))
+                created_at = str(event.get("created_at") or utc_now_iso())
+                payload = dict(event.get("payload") or {})
+
+                conn.execute(
+                    """UPDATE sweep_tasks
+                       SET state = ?, error = ?, job_id = ?, attempt_count = ?
+                       WHERE task_key = ?""",
+                    (task_state, error, job_id or None, attempt_no, task_key_value),
+                )
+                task_row = conn.execute(
+                    "SELECT run_id FROM sweep_tasks WHERE task_key = ?",
+                    (task_key_value,),
+                ).fetchone()
+                effective_run_id = str(task_row["run_id"]) if task_row is not None else run_id
+                if effective_run_id:
+                    touched_runs.add(effective_run_id)
+
+                started_at = created_at if state in {"queued", "running"} else None
+                finished_at = created_at if state in {"succeeded", "failed", "cancelled"} else None
+                conn.execute(
+                    """INSERT INTO render_attempts
+                       (task_key, job_id, attempt_no, state, created_at, started_at, finished_at, error)
+                       VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(task_key, attempt_no) DO UPDATE SET
+                         job_id=excluded.job_id,
+                         state=excluded.state,
+                         started_at=COALESCE(render_attempts.started_at, excluded.started_at),
+                         finished_at=COALESCE(excluded.finished_at, render_attempts.finished_at),
+                         error=excluded.error""",
+                    (
+                        task_key_value, job_id, attempt_no, state, created_at,
+                        started_at, finished_at, error,
+                    ),
+                )
+                event_type = str(event.get("event_type") or state)
+                event_key = str(
+                    event.get("event_key")
+                    or f"{task_key_value}:{attempt_no}:{event_type}"
+                )
+                conn.execute(
+                    """INSERT OR IGNORE INTO render_events
+                       (event_key, run_id, task_key, event_type, created_at, payload_json)
+                       VALUES(?, ?, ?, ?, ?, ?)""",
+                    (
+                        event_key,
+                        effective_run_id or None,
+                        task_key_value,
+                        event_type,
+                        created_at,
+                        json.dumps(payload, ensure_ascii=False, sort_keys=True),
+                    ),
+                )
+
+            for touched_run in touched_runs:
+                aggregate = conn.execute(
+                    """SELECT
+                         COUNT(*) AS total,
+                         SUM(CASE WHEN state NOT IN ('succeeded', 'skipped') THEN 1 ELSE 0 END) AS unfinished,
+                         SUM(CASE WHEN state IN ('failed', 'partial', 'blocked') THEN 1 ELSE 0 END) AS failed
+                       FROM sweep_tasks WHERE run_id = ?""",
+                    (touched_run,),
+                ).fetchone()
+                total = int(aggregate["total"] or 0)
+                unfinished = int(aggregate["unfinished"] or 0)
+                failed = int(aggregate["failed"] or 0)
+                if total > 0 and unfinished == 0:
+                    conn.execute(
+                        "UPDATE sweep_runs SET status = 'completed' WHERE run_id = ?",
+                        (touched_run,),
+                    )
+                    conn.execute(
+                        """UPDATE render_versions SET status = 'ready'
+                           WHERE render_version_id = (
+                             SELECT render_version_id FROM sweep_runs WHERE run_id = ?
+                           ) AND status = 'staging'""",
+                        (touched_run,),
+                    )
+                elif failed > 0:
+                    conn.execute(
+                        "UPDATE sweep_runs SET status = 'paused' WHERE run_id = ?",
+                        (touched_run,),
+                    )
             conn.commit()
 
     def get_request_blob(self, digest: str) -> dict[str, Any] | None:
@@ -616,7 +730,10 @@ class RenderLedger:
                 """SELECT t.*, r.scene_version_id FROM sweep_tasks t
                    JOIN sweep_runs r ON r.run_id = t.run_id
                    WHERE r.scene_version_id = ? AND t.logical_task_key = ?
-                     AND t.state IN ('succeeded', 'skipped')
+                     AND (
+                       t.state = 'succeeded'
+                       OR (t.state = 'skipped' AND json_extract(t.metadata_json, '$.source_bundle_ref') IS NOT NULL)
+                     )
                    ORDER BY t.attempt_count DESC, t.ordinal DESC LIMIT 1""",
                 (scene_version_id_value, logical_task_key_value),
             ).fetchone()
@@ -720,6 +837,96 @@ class RenderLedger:
             payload["task_count"] = sum(payload["state_counts"].values())
             return payload
 
+    def scene_sensor_progress(self, scene_id: str) -> list[dict[str, Any]]:
+        """Return deduplicated render coverage per scene variant and sensor.
+
+        Repeated, resumed, and paused sweeps may all contain the same
+        viewpoint/heading.  Monitor coverage must count that logical view once
+        and consider it complete when *any* run for the latest scene version
+        produced or reused a valid bundle.
+        """
+        with self.connection() as conn:
+            rows = conn.execute(
+                """WITH expanded_all AS (
+                     SELECT r.scene_version_id, r.created_at, t.run_id, t.variant,
+                            CAST(sensor.value AS TEXT) AS sensor_id,
+                            t.node_id, t.heading_id, t.state, t.metadata_json
+                     FROM sweep_tasks t
+                     JOIN sweep_runs r ON r.run_id = t.run_id
+                     JOIN json_each(t.metadata_json, '$.sensor_ids') AS sensor
+                     WHERE r.scene_id = ? AND CAST(sensor.value AS TEXT) <> ''
+                   ), latest_versions AS (
+                     SELECT variant, scene_version_id
+                     FROM (
+                       SELECT variant, scene_version_id, MAX(created_at) AS latest_at,
+                              ROW_NUMBER() OVER (
+                                PARTITION BY variant ORDER BY MAX(created_at) DESC, scene_version_id DESC
+                              ) AS rank
+                       FROM expanded_all
+                       GROUP BY variant, scene_version_id
+                     ) WHERE rank = 1
+                   ), expanded AS (
+                     SELECT e.* FROM expanded_all e
+                     JOIN latest_versions latest
+                       ON latest.variant = e.variant
+                      AND latest.scene_version_id = e.scene_version_id
+                   ), run_totals AS (
+                     SELECT scene_version_id, variant, sensor_id, run_id, COUNT(*) AS total
+                     FROM expanded
+                     GROUP BY scene_version_id, variant, sensor_id, run_id
+                   ), expected AS (
+                     SELECT scene_version_id, variant, sensor_id, MAX(total) AS total
+                     FROM run_totals
+                     GROUP BY scene_version_id, variant, sensor_id
+                   ), pairs AS (
+                     SELECT scene_version_id, variant, sensor_id, node_id, heading_id,
+                            MAX(CASE WHEN state = 'succeeded' OR (
+                                  state = 'skipped' AND json_extract(metadata_json, '$.source_bundle_ref') IS NOT NULL
+                                ) THEN 1 ELSE 0 END) AS complete,
+                            MAX(CASE WHEN state = 'running' THEN 1 ELSE 0 END) AS running,
+                            MAX(CASE WHEN state IN ('failed', 'partial', 'blocked') THEN 1 ELSE 0 END) AS failed
+                     FROM expanded
+                     GROUP BY scene_version_id, variant, sensor_id, node_id, heading_id
+                   ), progress AS (
+                     SELECT scene_version_id, variant, sensor_id,
+                            COUNT(*) AS observed_total,
+                            SUM(CASE WHEN complete = 1 THEN 1 ELSE 0 END) AS completed,
+                            SUM(CASE WHEN complete = 0 AND running = 1 THEN 1 ELSE 0 END) AS running,
+                            SUM(CASE WHEN complete = 0 AND running = 0 AND failed = 1 THEN 1 ELSE 0 END) AS failed
+                     FROM pairs
+                     GROUP BY scene_version_id, variant, sensor_id
+                   )
+                   SELECT p.scene_version_id, p.variant, p.sensor_id,
+                          MAX(e.total, p.observed_total) AS total,
+                          p.completed, p.running, p.failed
+                   FROM progress p
+                   JOIN expected e
+                     ON e.scene_version_id = p.scene_version_id
+                    AND e.variant = p.variant
+                    AND e.sensor_id = p.sensor_id
+                   ORDER BY p.sensor_id, p.variant""",
+                (str(scene_id),),
+            ).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            total = int(row["total"] or 0)
+            completed = int(row["completed"] or 0)
+            running = int(row["running"] or 0)
+            failed = int(row["failed"] or 0)
+            queued = max(0, total - completed - running - failed)
+            result.append({
+                "scene_version_id": str(row["scene_version_id"] or ""),
+                "variant": str(row["variant"] or "base"),
+                "sensor_id": str(row["sensor_id"] or "unknown"),
+                "completed": completed,
+                "running": running,
+                "queued": queued,
+                "failed": failed,
+                "total": total,
+                "fraction": completed / max(1, total),
+            })
+        return result
+
     def list_versions(self, *, scene_id: str | None = None) -> list[dict[str, Any]]:
         with self.connection() as conn:
             if scene_id:
@@ -758,4 +965,3 @@ class RenderLedger:
             conn.execute("UPDATE render_versions SET status = 'pruned' WHERE render_version_id = ?", (render_version_id,))
             conn.commit()
             return {"render_version_id": render_version_id, "status": "pruned"}
-

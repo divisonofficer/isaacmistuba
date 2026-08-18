@@ -23,11 +23,18 @@ import json
 import math
 import os
 import re
+import shutil
+import subprocess
+import tempfile
 import struct
 import sys
+from pathlib import Path
 
 import bpy  # type: ignore
 from mathutils import Matrix, Vector  # type: ignore
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from pbr_bake_coverage import adaptive_resolutions, validate_uv_coverage
 
 try:
     from tqdm import tqdm as _tqdm  # progress bar (present in the infinigen env)
@@ -72,6 +79,45 @@ def _log(msg: str, bar=None) -> None:
         bar.write(msg)
     else:
         print(msg)
+
+
+STRICT_PBR_PROFILE = "strict-pbr-v1"
+# v2 fixes the historical object-atlas bug: a mesh with two material slots used
+# to bake both slots into one image and Stage 2 then sampled that same image from
+# each Principled material.  Keep v1 readable for published scenes, but make new
+# IR geometry explicitly slot-addressable.
+STRICT_PBR_SLOT_AWARE_PROFILE = "strict-pbr-v2-slot-aware"
+IR_BOOTSTRAP_PROFILE = "ir-bootstrap-v1"
+STAGE1_PROFILES = {STRICT_PBR_PROFILE, STRICT_PBR_SLOT_AWARE_PROFILE, IR_BOOTSTRAP_PROFILE}
+
+
+def _configure_cycles_bake_device(requested: str) -> tuple[str, list[str]]:
+    """Select one explicit Cycles bake backend and audit the exposed devices."""
+    device = str(requested or "CPU").upper()
+    if device not in {"CPU", "CUDA", "OPTIX"}:
+        raise ValueError(f"unsupported Cycles bake device: {requested!r}")
+    scene = bpy.context.scene
+    scene.render.engine = "CYCLES"
+    if device == "CPU":
+        scene.cycles.device = "CPU"
+        print("[bake-device] requested=CPU enabled=CPU", flush=True)
+        return device, ["CPU"]
+    preferences = bpy.context.preferences.addons["cycles"].preferences
+    preferences.compute_device_type = device
+    preferences.get_devices()
+    enabled = []
+    for candidate in preferences.devices:
+        candidate.use = candidate.type == device
+        if candidate.use:
+            enabled.append(candidate.name)
+    if not enabled:
+        raise RuntimeError(
+            f"Cycles exposes no {device} device under CUDA_VISIBLE_DEVICES="
+            f"{os.environ.get('CUDA_VISIBLE_DEVICES', '')!r}"
+        )
+    scene.cycles.device = "GPU"
+    print(f"[bake-device] requested={device} enabled={','.join(enabled)}", flush=True)
+    return device, enabled
 
 
 # ── classification ────────────────────────────────────────────────────────────
@@ -148,6 +194,14 @@ def _classify(obj):
     colls = {c.name for c in obj.users_collection}
     name = obj.name
     lname = name.lower()
+
+    # Repository-authored architectural overlays carry explicit Blender custom
+    # properties.  They must win over generic mesh/structure suffixes so the
+    # OpticalNav importer and graph retain transparent-partition semantics.
+    if obj.get("transparent_partition") or obj.get("glass_wall"):
+        return "structure", "glass_wall", "transparent_partition"
+    if obj.get("glass_door"):
+        return "door", "glass_door", "door"
 
     # Room structure (per-room .wall/.floor/.ceiling/.exterior meshes)
     for suf, sub in STRUCT_SUFFIX.items():
@@ -441,7 +495,83 @@ def _planar_uv_fallback(obj):
         return False
 
 
-def _ensure_uv(obj):
+def _face_atlas_uv(obj):
+    """Assign one non-overlapping UV tile to every source polygon.
+
+    Smart Project normally supplies a much better continuous chart, but some
+    Infinigen generated assets contain coincident/repeated components.  Blender
+    is allowed to stack those islands, which is visually harmless in Blender yet
+    makes a single glTF PBR atlas ambiguous.  This last-resort atlas deliberately
+    trades continuity for an unambiguous per-face parametrisation: every polygon
+    receives a unique tile and Cycles still evaluates the original procedural
+    shader at each surface point while baking it.
+
+    It is only selected after the strict coverage audit rejects a fresh Smart UV
+    layer, never as the normal unwrap path.
+    """
+    try:
+        import numpy as np
+
+        mesh = obj.data
+        polygon_count = len(mesh.polygons)
+        if polygon_count <= 0:
+            return False
+        while mesh.uv_layers:
+            mesh.uv_layers.remove(mesh.uv_layers[0])
+        layer = mesh.uv_layers.new(name="IRFaceAtlasUV")
+        side = int(math.ceil(math.sqrt(polygon_count)))
+        inset = 0.06
+        scale = (1.0 - 2.0 * inset) / float(side)
+        uv = np.zeros((len(mesh.loops), 2), dtype=np.float32)
+        for polygon_index, polygon in enumerate(mesh.polygons):
+            col = polygon_index % side
+            row = polygon_index // side
+            base_u = (col + inset) / float(side)
+            base_v = (row + inset) / float(side)
+            loop_indices = range(polygon.loop_start, polygon.loop_start + polygon.loop_total)
+            count = max(3, int(polygon.loop_total))
+            for local_index, loop_index in enumerate(loop_indices):
+                if polygon.loop_total == 3:
+                    local_u, local_v = ((0.0, 0.0), (1.0, 0.0), (0.0, 1.0))[local_index]
+                elif polygon.loop_total == 4:
+                    local_u, local_v = ((0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0))[local_index]
+                else:
+                    # N-gons are rare after the LOD pass.  A convex regular
+                    # polygon gives every corner a finite, non-degenerate local
+                    # chart without relying on the source's potentially broken
+                    # topology UVs.
+                    theta = (2.0 * math.pi * local_index / float(count)) - (math.pi / 2.0)
+                    local_u = 0.5 + 0.5 * math.cos(theta)
+                    local_v = 0.5 + 0.5 * math.sin(theta)
+                uv[loop_index, 0] = base_u + scale * local_u
+                uv[loop_index, 1] = base_v + scale * local_v
+        layer.data.foreach_set("uv", uv.ravel())
+        mesh.update()
+        ok = bool(mesh.uv_layers) and not _uv_is_degenerate(mesh)
+        if ok:
+            print(f"[bake] face-atlas UV fallback: {obj.name} polygons={polygon_count}", file=sys.stderr)
+        return ok
+    except Exception as exc:  # noqa: BLE001
+        print(f"[bake] face-atlas UV fallback FAIL {obj.name}: {exc}", file=sys.stderr)
+        return False
+
+
+def _face_atlas_min_resolution(obj, requested_resolution):
+    """Keep enough texels across a face-atlas tile after a UV repair.
+
+    The coverage bake has an 8px dilation margin at 1K.  Four texels per tile
+    therefore leaves high-face-count meshes with no reliable interior sample:
+    the coverage validator quite correctly reports the small material part as
+    unbaked even though the LOD mesh itself is valid.  Eight texels is the
+    minimum that leaves an interior at the 1--4K atlas sizes used here.
+    """
+    polygons = max(1, len(getattr(obj.data, "polygons", ())))
+    target = int(math.ceil(math.sqrt(polygons))) * 8
+    resolution = max(int(requested_resolution), target)
+    return 1 << int(math.ceil(math.log2(max(1, resolution))))
+
+
+def _ensure_uv(obj, *, force=False):
     """Guarantee a *usable* UV map for baking. Smart-UV-project objects that have
     none, OR whose existing UV is degenerate (zero-area — see _uv_is_degenerate).
 
@@ -449,7 +579,7 @@ def _ensure_uv(obj):
     non-overlapping UV (even a fresh Smart Project) captures the look correctly.
     """
     me = obj.data
-    if me.uv_layers and not _uv_is_degenerate(me):
+    if not force and me.uv_layers and not _uv_is_degenerate(me):
         return True
     try:
         bpy.ops.object.select_all(action="DESELECT")
@@ -514,7 +644,7 @@ def _bake_pass(obj, out_png, res, samples, *, bake_type="DIFFUSE",
     bake.use_pass_indirect = False
     if color_pass:
         bake.use_pass_color = True
-    bake.margin = 4
+    bake.margin = _bake_margin(res)
 
     img = bpy.data.images.new(f"bake_{obj.name}", width=res, height=res, alpha=False)
     if non_color:
@@ -542,7 +672,8 @@ def _bake_pass(obj, out_png, res, samples, *, bake_type="DIFFUSE",
         bpy.ops.object.select_all(action="DESELECT")
         obj.select_set(True)
         bpy.context.view_layer.objects.active = obj
-        bpy.ops.object.bake(type=bake_type)
+        with _neutral_cycles_film_exposure(scene):
+            bpy.ops.object.bake(type=bake_type)
         img.filepath_raw = out_png
         img.file_format = "PNG"
         img.save()
@@ -567,8 +698,383 @@ def _bake_albedo(obj, out_png, res, samples):
     return _bake_principled_channel(obj, out_png, res, samples, "Base Color", non_color=False)
 
 
+def _bake_margin(res):
+    """Pixel-space island dilation scaled with adaptive atlas resolution."""
+    return max(4, min(32, int(res) // 128))
+
+
+def _bake_coverage(obj, out_png, res):
+    """Bake a material-independent white mask proving which UV texels received a bake."""
+    if not obj.material_slots:
+        return False
+    material = bpy.data.materials.new(name=f"__robomituba_coverage_{obj.name}")
+    material.use_nodes = True
+    nodes = material.node_tree.nodes
+    nodes.clear()
+    output = nodes.new("ShaderNodeOutputMaterial")
+    emission = nodes.new("ShaderNodeEmission")
+    emission.inputs["Color"].default_value = (1.0, 1.0, 1.0, 1.0)
+    material.node_tree.links.new(emission.outputs["Emission"], output.inputs["Surface"])
+    originals = [slot.material for slot in obj.material_slots]
+    try:
+        for slot in obj.material_slots:
+            slot.material = material
+        bpy.context.view_layer.update()
+        return _bake_pass(obj, out_png, res, 1, bake_type="EMIT", non_color=True)
+    finally:
+        for slot, original in zip(obj.material_slots, originals):
+            slot.material = original
+        try:
+            bpy.data.materials.remove(material)
+        except Exception:  # noqa: BLE001
+            pass
+        bpy.context.view_layer.update()
+
+
+def _coverage_validation(obj, path, *, max_unbaked_ratio=0.001):
+    """Validate saved coverage against every loop triangle and material slot."""
+    result = {"attempted": True, "passed": False, "reason": "unreadable"}
+    image = None
+    try:
+        import numpy as np
+        from array import array
+
+        image = bpy.data.images.load(str(path), check_existing=False)
+        width, height = int(image.size[0]), int(image.size[1])
+        pixels = array("f", [0.0]) * len(image.pixels)
+        image.pixels.foreach_get(pixels)
+        # Blender's pixel buffer begins at the lower-left; saved PNG readers begin at top-left.
+        coverage = np.asarray(pixels, np.float32).reshape(height, width, 4)[::-1, :, 0] > 0.5
+        mesh = obj.data
+        mesh.calc_loop_triangles()
+        layer = mesh.uv_layers.active
+        if layer is None:
+            result["reason"] = "missing_uv_layer"
+            return result
+        triangles = []
+        areas = []
+        material_indices = []
+        for triangle in mesh.loop_triangles:
+            triangles.append([[float(layer.data[index].uv.x), float(layer.data[index].uv.y)]
+                              for index in triangle.loops])
+            areas.append(float(triangle.area))
+            material_indices.append(int(mesh.polygons[triangle.polygon_index].material_index))
+        # A face atlas has one deliberately tiny island per polygon.  Testing
+        # its analytic/rasterized union at a fixed 512px grid reports those
+        # islands as "overlap" even when their UV tiles are mathematically
+        # disjoint.  Validate it at the saved coverage resolution instead.
+        # Ordinary authored UVs retain the inexpensive 512px overlap audit.
+        face_atlas = str(layer.name or "").startswith("IRFaceAtlasUV")
+        overlap_resolution = max(width, height) if face_atlas else 512
+        result = validate_uv_coverage(
+            np.asarray(triangles), np.asarray(areas), np.asarray(material_indices), coverage,
+            max_unbaked_ratio=float(max_unbaked_ratio),
+            # Preserve 99.9% whole-object coverage while absorbing raster
+            # quantisation in tiny material slots on million-face foliage.
+            max_material_slot_unbaked_ratio=max(
+                0.005, 4.0 * float(max_unbaked_ratio),
+            ),
+            overlap_resolution=overlap_resolution,
+            known_disjoint_face_atlas=face_atlas,
+        )
+        result["attempted"] = True
+        result["resolution"] = [width, height]
+        result["uv_layer"] = str(layer.name or "")
+        result["overlap_validation_resolution"] = int(overlap_resolution)
+        return result
+    except Exception as exc:  # noqa: BLE001
+        result["error"] = str(exc)
+        return result
+    finally:
+        if image is not None:
+            try:
+                bpy.data.images.remove(image)
+            except Exception:  # noqa: BLE001
+                pass
+
+
+def _bake_coverage_adaptive(obj, out_png, base_res, max_res, max_unbaked_ratio):
+    """Bake coverage, repairing a UV that fails the full surface audit once.
+
+    `_ensure_uv`'s cheap preflight only proves that every slot has *some* valid
+    triangle. The coverage validator additionally catches partially degenerate,
+    overlapping, or severely under-resolved source UVs. For those cases,
+    discard the old layer and rebuild it before deciding that a linked PBR
+    channel is unbakeable. Merely escalating an under-resolved source atlas to
+    4K cannot repair islands that were packed at near-zero area.
+    """
+    attempts = []
+    rebuilt_uv = False
+    for resolution in adaptive_resolutions(base_res, max_res):
+        baked = bool(_bake_coverage(obj, out_png, resolution))
+        validation = (
+            _coverage_validation(obj, out_png, max_unbaked_ratio=max_unbaked_ratio)
+            if baked else {"attempted": True, "passed": False, "reason": "bake_failed"}
+        )
+        validation["resolution"] = [resolution, resolution]
+        attempts.append(validation)
+        if validation.get("passed"):
+            result = dict(validation)
+            result["adaptive_attempts"] = attempts
+            result["uv_rebuild_attempted"] = rebuilt_uv
+            return resolution, result
+        print(
+            "[bake] coverage retry "
+            f"{obj.name}: res={resolution} reason={validation.get('reason')} "
+            f"unbaked={validation.get('referenced_unbaked_ratio', 'n/a')} "
+            f"slot_max={validation.get('max_material_slot_unbaked_ratio', 'n/a')} "
+            f"uv_p01={validation.get('uv_triangle_pixel_area_p01', 'n/a')}",
+            file=sys.stderr,
+        )
+        if validation.get("reason") in {
+            "degenerate_uv_triangles",
+            "overlapping_uv_triangles",
+            "referenced_unbaked_texels",
+        }:
+            if rebuilt_uv:
+                break
+            rebuilt_uv = True
+            rebuilt = _ensure_uv(obj, force=True)
+            validation["uv_rebuild_attempted"] = True
+            validation["uv_rebuild_succeeded"] = bool(rebuilt)
+            if not rebuilt:
+                break
+            # Validate the rebuilt layer at the same resolution before escalating;
+            # this keeps a repair of a small mesh cheap and deterministic.
+            baked = bool(_bake_coverage(obj, out_png, resolution))
+            repaired = (
+                _coverage_validation(obj, out_png, max_unbaked_ratio=max_unbaked_ratio)
+                if baked else {"attempted": True, "passed": False, "reason": "bake_failed"}
+            )
+            repaired["resolution"] = [resolution, resolution]
+            repaired["uv_rebuild_attempted"] = True
+            repaired["uv_rebuild_succeeded"] = True
+            attempts.append(repaired)
+            if repaired.get("passed"):
+                result = dict(repaired)
+                result["adaptive_attempts"] = attempts
+                result["uv_rebuild_attempted"] = True
+                return resolution, result
+            print(
+                "[bake] coverage repaired-UV retry "
+                f"{obj.name}: res={resolution} reason={repaired.get('reason')} "
+                f"unbaked={repaired.get('referenced_unbaked_ratio', 'n/a')} "
+                f"slot_max={repaired.get('max_material_slot_unbaked_ratio', 'n/a')}",
+                file=sys.stderr,
+            )
+            if repaired.get("reason") in {
+                "degenerate_uv_triangles",
+                "overlapping_uv_triangles",
+                "referenced_unbaked_texels",
+            }:
+                # Smart Project can intentionally retain stacked islands for
+                # coincident generated components.  That is not a valid shared
+                # atlas contract, so rebuild as one unique tile per polygon
+                # instead of accepting the overlap or silently downgrading a
+                # linked PBR channel to a scalar factor.
+                face_atlas_ok = _face_atlas_uv(obj)
+                repaired["face_atlas_uv_attempted"] = True
+                repaired["face_atlas_uv_succeeded"] = bool(face_atlas_ok)
+                if not face_atlas_ok:
+                    break
+                face_base_resolution = min(
+                    int(max_res), _face_atlas_min_resolution(obj, resolution)
+                )
+                # A unique tile eliminates UV ambiguity, but a high-face-count
+                # LOD can still have tiles too small for Cycles' raster/bake
+                # footprint.  Keep escalating after the face-atlas repair rather
+                # than treating its first coverage pass as terminal.
+                for face_resolution in adaptive_resolutions(face_base_resolution, max_res):
+                    baked = bool(_bake_coverage(obj, out_png, face_resolution))
+                    face_repaired = (
+                        _coverage_validation(obj, out_png, max_unbaked_ratio=max_unbaked_ratio)
+                        if baked else {"attempted": True, "passed": False, "reason": "bake_failed"}
+                    )
+                    face_repaired["resolution"] = [face_resolution, face_resolution]
+                    face_repaired["uv_rebuild_attempted"] = True
+                    face_repaired["uv_rebuild_succeeded"] = True
+                    face_repaired["face_atlas_uv_attempted"] = True
+                    face_repaired["face_atlas_uv_succeeded"] = True
+                    attempts.append(face_repaired)
+                    if face_repaired.get("passed"):
+                        result = dict(face_repaired)
+                        result["adaptive_attempts"] = attempts
+                        result["uv_rebuild_attempted"] = True
+                        return face_resolution, result
+                    print(
+                        "[bake] coverage face-atlas retry "
+                        f"{obj.name}: res={face_resolution} reason={face_repaired.get('reason')} "
+                        f"unbaked={face_repaired.get('referenced_unbaked_ratio', 'n/a')} "
+                        f"slot_max={face_repaired.get('max_material_slot_unbaked_ratio', 'n/a')}",
+                        file=sys.stderr,
+                    )
+                    # A face atlas should make genuine UV overlap impossible.
+                    # At its first viable resolution, however, the overlap
+                    # auditor can still be sampling subpixel tiles.  Continue
+                    # through 2K -> 4K for *any* validation failure other than
+                    # a bake operation itself failing.
+                    if face_repaired.get("reason") == "bake_failed":
+                        break
+                break
+    result = dict(attempts[-1]) if attempts else {
+        "attempted": True, "passed": False, "reason": "no_resolution_attempted",
+    }
+    result["adaptive_attempts"] = attempts
+    result["uv_rebuild_attempted"] = rebuilt_uv
+    return int(max_res), result
+
+
 def _bake_normal(obj, out_png, res, samples):
     return _bake_pass(obj, out_png, res, samples, bake_type="NORMAL", non_color=True)
+
+
+@contextlib.contextmanager
+def _isolated_material_slot(obj, slot_index):
+    """Yield a disposable one-slot mesh for a slot-local Cycles bake.
+
+    Cycles bakes every material slot that has the active image node.  That is
+    correct for a single atlas, but not for the IR contract: a multi-slot wall
+    needs one independent texture/provenance record per slot.  Duplicating the
+    mesh is intentionally safer than temporarily deleting faces from the live
+    object (the latter used to corrupt long-running resumable exports).
+    """
+    if slot_index < 0 or slot_index >= len(obj.material_slots):
+        raise IndexError(f"invalid material slot {slot_index} for {obj.name}")
+    material = obj.material_slots[slot_index].material
+    if material is None:
+        yield None
+        return
+    clone = obj.copy()
+    clone.data = obj.data.copy()
+    clone.name = f"__ir_slot_{obj.name}_{slot_index}"
+    bpy.context.scene.collection.objects.link(clone)
+    try:
+        # Retain only faces belonging to this original slot, then make their
+        # material index zero in the single-slot clone.
+        mesh = clone.data
+        selected = {poly.index for poly in mesh.polygons if int(poly.material_index) == int(slot_index)}
+        if not selected:
+            yield None
+            return
+        import bmesh  # Blender bundled module; keep non-bpy imports lightweight.
+        bm = bmesh.new()
+        try:
+            bm.from_mesh(mesh)
+            bm.faces.ensure_lookup_table()
+            delete = [face for face in bm.faces if face.index not in selected]
+            if delete:
+                bmesh.ops.delete(bm, geom=delete, context="FACES")
+            bm.to_mesh(mesh)
+        finally:
+            bm.free()
+        mesh.materials.clear()
+        mesh.materials.append(material)
+        for poly in mesh.polygons:
+            poly.material_index = 0
+        clone.matrix_world = obj.matrix_world.copy()
+        yield clone
+    finally:
+        try:
+            bpy.data.objects.remove(clone, do_unlink=True)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _slot_atlas_paths(textures_dir, oid, slot):
+    stem = f"{oid}__slot_{int(slot):02d}"
+    return {
+        "base_color": os.path.join(textures_dir, f"{stem}_albedo.png"),
+        "roughness": os.path.join(textures_dir, f"{stem}_roughness.png"),
+        "metallic": os.path.join(textures_dir, f"{stem}_metallic.png"),
+        "normal": os.path.join(textures_dir, f"{stem}_normal.png"),
+        "coverage": os.path.join(textures_dir, f"{stem}_coverage.png"),
+    }
+
+
+def _bake_slot_pbr_contract(obj, *, oid, slot, textures_dir, out_dir, bake_res,
+                            max_bake_res, bake_samples, bake_pbr, bake_metallic,
+                            max_unbaked_ratio, do_bake, glb_rel):
+    """Bake and validate one material slot; return v2 slot-local contract/maps."""
+    atlas_abs = _slot_atlas_paths(textures_dir, oid, slot)
+    atlas_rel = {key: os.path.relpath(value, out_dir) for key, value in atlas_abs.items()}
+    with _isolated_material_slot(obj, slot) as isolated:
+        if isolated is None:
+            return None
+        inputs = _pbr_input_contract(isolated)
+        uv_valid = bool(_ensure_uv(isolated))
+        coverage = {"attempted": False, "passed": False, "reason": "not_baked"}
+        validation = {}
+        normal_validation = {"attempted": False, "result": "not_applicable"}
+        baked = {key: None for key in ("base_color", "roughness", "metallic", "normal")}
+        effective_res = int(bake_res)
+        if do_bake and uv_valid:
+            with _render_isolate(isolated):
+                effective_res, coverage = _bake_coverage_adaptive(
+                    isolated, atlas_abs["coverage"], bake_res, max_bake_res, max_unbaked_ratio
+                )
+                if coverage.get("passed"):
+                    jobs = (
+                        ("base_color", _bake_albedo, True),
+                        ("roughness", _bake_roughness, bool(bake_pbr)),
+                        ("metallic", _bake_metallic, bool(bake_pbr and bake_metallic)),
+                    )
+                    for channel, baker, enabled in jobs:
+                        if not enabled or inputs[channel]["source"] not in {"linked", "mixed_constant"}:
+                            continue
+                        with _silence_fds(1):
+                            ok = baker(isolated, atlas_abs[channel], effective_res, bake_samples)
+                        if ok:
+                            spatial, result = _pbr_texture_validation(
+                                atlas_abs[channel], channel, coverage_path=atlas_abs["coverage"]
+                            )
+                            validation[channel] = result
+                            if spatial or (inputs[channel]["source"] == "mixed_constant" and result.get("result") in {"constant", "black"}):
+                                baked[channel] = atlas_rel[channel]
+                    if bake_pbr and inputs["normal"]["source"] in {"linked", "mixed_constant"}:
+                        normal_validation = {"attempted": True, "result": "failed"}
+                        with _silence_fds(1):
+                            normal_ok = _bake_normal(isolated, atlas_abs["normal"], effective_res, bake_samples)
+                        if normal_ok:
+                            spatial, normal_validation = _normal_bake_validation(atlas_abs["normal"])
+                            if spatial:
+                                baked["normal"] = atlas_rel["normal"]
+                            else:
+                                inputs["normal"] = {"source": "not_applicable", "constants": []}
+        channels, issues, assumptions = {}, [], []
+        for channel in ("base_color", "roughness", "metallic", "normal"):
+            source = inputs[channel]["source"]
+            ref = baked[channel]
+            result = normal_validation if channel == "normal" else validation.get(channel, {"attempted": False, "result": "not_applicable"})
+            if source == "linked" and not ref:
+                issues.append(f"{channel}: linked input was not baked")
+            if source == "linked" and result.get("result") != "spatial":
+                issues.append(f"{channel}: linked bake validation={result.get('result', 'unknown')}")
+            if source == "unresolved":
+                assumptions.append(f"{channel}: assumed default factor (no traced socket)")
+            default = {"base_color": [[0.6, 0.6, 0.6]], "roughness": [0.6], "metallic": [0.0], "normal": []}[channel]
+            channels[channel] = _channel_record(
+                source, ref, constant=inputs[channel].get("constants") or default,
+                colorspace="srgb" if channel == "base_color" else "raw",
+                resolution=[effective_res, effective_res] if ref else None,
+            )
+            channels[channel]["bake_validation"] = result
+        if not uv_valid:
+            issues.append("invalid UV")
+        if do_bake and not coverage.get("passed"):
+            issues.append("UV-referenced bake coverage failed: " + str(coverage.get("reason", "unknown")))
+        if not glb_rel:
+            issues.append("missing GLB")
+        contract = {
+            "status": "ok" if not issues else "degraded",
+            "appearance_authoritative": not issues,
+            "channels": channels,
+            "coverage": {"ref": atlas_rel["coverage"] if coverage.get("passed") else None, **coverage},
+            "issues": issues,
+            "assumptions": assumptions,
+            "material_slot": int(slot),
+        }
+        artifacts = {"coverage": contract["coverage"]["ref"], **baked}
+        return contract, artifacts
 
 
 @contextlib.contextmanager
@@ -615,6 +1121,23 @@ def _render_isolate(obj):
                 pass
 
 
+@contextlib.contextmanager
+def _neutral_cycles_film_exposure(scene):
+    """Bake material properties without the scene's observation exposure.
+
+    The kitchen source stores ``cycles.film_exposure=3``.  If inherited by EMIT
+    property bakes it changes roughness 0.18 to about 0.54 and clips bright base
+    colors.  One is Blender's neutral multiplier; restore the authored value after
+    each bake so observation rendering remains unchanged.
+    """
+    previous = float(scene.cycles.film_exposure)
+    scene.cycles.film_exposure = 1.0
+    try:
+        yield
+    finally:
+        scene.cycles.film_exposure = previous
+
+
 def _png_max(path):
     """Max pixel value of a saved atlas PNG (0..1), for detecting a collapsed bake."""
     try:
@@ -627,15 +1150,31 @@ def _png_max(path):
         return 0.0
 
 
-def _pbr_texture_validation(path, channel, threshold=1.0e-4):
+def _pbr_texture_validation(
+    path,
+    channel,
+    threshold=1.0e-4,
+    *,
+    coverage_path=None,
+    minimum_cluster_fraction=1.0e-4,
+    minimum_cluster_samples=16,
+):
     """Reject a linked bake that is black or spatially constant.
 
     A successful Cycles operator call is not sufficient evidence that a
     procedural socket made it into the atlas: unsupported nested closures can
-    save an all-black image.  Padding is ignored by measuring the robust range
-    of non-zero covered samples.  Constants are intentionally rejected for a
-    linked source; only an originally unlinked socket may be represented by a
-    glTF factor.
+    save an all-black image.  When the companion coverage atlas is available,
+    padding is ignored *exactly*, rather than by discarding the outer 1% of
+    values.  This distinction matters for multi-material Infinigen meshes: a
+    real, spatial material part can occupy less than 1% of an object's UV area
+    (the kitchen SimpleBookcase's brushed-metal trim is 0.38%).  Treating it as
+    an outlier silently converts a linked source to a scalar factor.
+
+    Constants are intentionally rejected for a linked source; only an
+    originally unlinked socket may be represented by a glTF factor.  The
+    cluster trim merely rejects isolated raster artefacts: each extremum must
+    have at least ``minimum_cluster_samples`` samples, or 0.01% of the covered
+    atlas, behind it.
     """
     result = {"attempted": True, "result": "unreadable", "threshold": threshold}
     try:
@@ -644,30 +1183,72 @@ def _pbr_texture_validation(path, channel, threshold=1.0e-4):
         pixels = image.pixels
         values = array("f", [0.0]) * len(pixels)
         pixels.foreach_get(values)
+        width, height = int(image.size[0]), int(image.size[1])
         bpy.data.images.remove(image)
+        coverage_values = None
+        coverage_used = False
+        if coverage_path and os.path.isfile(str(coverage_path)):
+            coverage_image = bpy.data.images.load(str(coverage_path), check_existing=False)
+            try:
+                if tuple(int(v) for v in coverage_image.size[:]) == (width, height):
+                    coverage_values = array("f", [0.0]) * len(coverage_image.pixels)
+                    coverage_image.pixels.foreach_get(coverage_values)
+                    coverage_used = True
+            finally:
+                bpy.data.images.remove(coverage_image)
         count = len(values) // 4
         step = max(1, count // 250000)
         samples = []
         for index in range(0, count, step):
             off = index * 4
+            if coverage_values is not None and float(coverage_values[off]) <= 0.5:
+                continue
             if channel == "base_color":
-                value = (float(values[off]) + float(values[off + 1]) + float(values[off + 2])) / 3.0
+                value = tuple(float(values[off + component]) for component in range(3))
+                # Preserve legacy all-black failure behaviour while measuring
+                # true RGB variation rather than only luminance variation.
+                valid = all(math.isfinite(component) for component in value) and max(value) > threshold
             else:
                 value = float(values[off])
-            if math.isfinite(value) and value > threshold:
+                valid = math.isfinite(value) and value > threshold
+            if valid:
                 samples.append(value)
         if not samples:
-            result.update({"result": "black", "sample_count": 0, "robust_range": 0.0})
+            result.update({
+                "result": "black", "sample_count": 0, "robust_range": 0.0,
+                "coverage_used": coverage_used,
+            })
             return False, result
-        samples.sort()
-        low = samples[min(len(samples) - 1, int(len(samples) * 0.01))]
-        high = samples[min(len(samples) - 1, max(0, int(len(samples) * 0.99) - 1))]
-        robust_range = float(high - low)
+        cluster_samples = max(
+            int(minimum_cluster_samples),
+            int(math.ceil(len(samples) * float(minimum_cluster_fraction))),
+        )
+        cluster_samples = min(max(1, cluster_samples), max(1, len(samples) // 2))
+        if channel == "base_color":
+            ranges = []
+            percentiles = []
+            for component in range(3):
+                component_values = sorted(value[component] for value in samples)
+                low = component_values[cluster_samples - 1]
+                high = component_values[-cluster_samples]
+                ranges.append(float(high - low))
+                percentiles.append([float(low), float(high)])
+            robust_range = max(ranges)
+            percentile_range = percentiles
+        else:
+            samples.sort()
+            low = samples[cluster_samples - 1]
+            high = samples[-cluster_samples]
+            robust_range = float(high - low)
+            percentile_range = [float(low), float(high)]
         result.update({
             "result": "spatial" if robust_range > threshold else "constant",
             "sample_count": len(samples),
             "robust_range": robust_range,
-            "percentile_01_99": [float(low), float(high)],
+            "cluster_samples": cluster_samples,
+            "minimum_cluster_fraction": float(minimum_cluster_fraction),
+            "coverage_used": coverage_used,
+            "percentile_cluster_range": percentile_range,
         })
         return robust_range > threshold, result
     except Exception as exc:  # noqa: BLE001
@@ -739,7 +1320,7 @@ def _bake_principled_channel_legacy(obj, out_png, res, samples, input_name, *, n
     scene.cycles.use_denoising = False
     scene.render.bake.use_pass_direct = False
     scene.render.bake.use_pass_indirect = False
-    scene.render.bake.margin = 4
+    scene.render.bake.margin = _bake_margin(res)
     img = bpy.data.images.new(f"bakeC_{obj.name}", width=res, height=res, alpha=False)
     if non_color:
         try:
@@ -851,7 +1432,7 @@ def _bake_principled_channel(obj, out_png, res, samples, input_name, *, non_colo
     scene.cycles.use_denoising = False
     scene.render.bake.use_pass_direct = False
     scene.render.bake.use_pass_indirect = False
-    scene.render.bake.margin = 4
+    scene.render.bake.margin = _bake_margin(res)
     image = bpy.data.images.new(f"bakeV_{obj.name}", width=res, height=res, alpha=False)
     if non_color:
         try:
@@ -977,7 +1558,8 @@ def _bake_principled_channel(obj, out_png, res, samples, input_name, *, non_colo
             obj.select_set(True)
             bpy.context.view_layer.objects.active = obj
             bpy.context.view_layer.update()
-            bpy.ops.object.bake(type="EMIT")
+            with _neutral_cycles_film_exposure(scene):
+                bpy.ops.object.bake(type="EMIT")
             image.filepath_raw = out_png
             image.file_format = "PNG"
             image.save()
@@ -1130,6 +1712,125 @@ def _export_glb(obj, path):
         bpy.data.objects.remove(proxy, do_unlink=True)
 
 
+def _gltfpack_binary():
+    """Return the host-local meshoptimizer binary; never use a NAS build."""
+    configured = os.environ.get("ROBOMITUBA_GLTFPACK")
+    candidates = ([configured] if configured else []) + [
+        str(Path.home() / "robomituba-build" / "meshoptimizer" / "gltfpack"),
+        shutil.which("gltfpack"),
+    ]
+    for candidate in candidates:
+        if candidate and Path(candidate).is_file() and os.access(candidate, os.X_OK):
+            return str(Path(candidate).resolve())
+    raise RuntimeError(
+        "gltfpack fallback is required but unavailable; install meshoptimizer under "
+        "$HOME/robomituba-build/meshoptimizer or set ROBOMITUBA_GLTFPACK"
+    )
+
+
+def _mesh_triangle_count(mesh):
+    mesh.calc_loop_triangles()
+    return len(mesh.loop_triangles)
+
+
+def _gltfpack_simplify_object(obj, target_max_triangles):
+    """Simplify a Blender-decimator-resistant object through meshoptimizer.
+
+    The temporary OBJ→GLB conversion is geometry-only transport: original Blender materials are
+    reattached by slot name, and the imported node transform is converted back
+    into the original object local space. Any UV/material ambiguity is fatal.
+    """
+    binary = _gltfpack_binary()
+    source_mesh = obj.data
+    source_materials = list(source_mesh.materials)
+    source_material_names = [material.name if material else None for material in source_materials]
+    source_triangles = _mesh_triangle_count(source_mesh)
+    if source_triangles <= target_max_triangles:
+        return {"backend": "meshoptimizer_gltfpack", "triangles_after": source_triangles, "skipped": True}
+    source_matrix = obj.matrix_world.copy()
+    source_had_uv = bool(source_mesh.uv_layers)
+    imported_objects = []
+    with tempfile.TemporaryDirectory(prefix="robomituba-gltfpack-") as tmp:
+        input_path = Path(tmp) / "input.obj"
+        output_path = Path(tmp) / "output.glb"
+        # Blender GLB export can emit a node with a primitive that meshoptimizer
+        # drops for Infinigen's degenerate procedural meshes.  OBJ triangulates
+        # the same evaluated mesh and is a reliable geometry-only interchange.
+        _export_obj(obj, str(input_path))
+        ratio = max(1e-4, min(1.0, float(target_max_triangles) / float(source_triangles)))
+        command = [
+            binary, "-i", str(input_path), "-o", str(output_path),
+            # ``-se 1`` permits 100% geometric error and can legally erase every
+            # primitive for otherwise valid multi-material assets.  ``-sa`` already
+            # requests the target ratio aggressively; keep meshoptimizer's bounded
+            # error handling so the fallback cannot turn a chair into an empty GLB.
+            "-si", f"{ratio:.9f}", "-sa",
+            "-noq", "-km", "-kn", "-kv", "-vpf", "-vtf", "-vnf",
+        ]
+        completed = subprocess.run(command, capture_output=True, text=True, timeout=180)
+        if completed.returncode != 0 or not output_path.is_file():
+            detail = (completed.stderr or completed.stdout or "gltfpack did not create output").strip()
+            raise RuntimeError(f"gltfpack failed: {detail[-1200:]}")
+        known_pointers = {candidate.as_pointer() for candidate in bpy.data.objects}
+        try:
+            bpy.ops.import_scene.gltf(filepath=str(output_path))
+            imported_objects = [candidate for candidate in bpy.data.objects
+                                if candidate.as_pointer() not in known_pointers and candidate.type == "MESH"]
+            if len(imported_objects) != 1:
+                raise RuntimeError(f"gltfpack import expected one mesh object, got {len(imported_objects)}")
+            imported = imported_objects[0]
+            candidate_mesh = imported.data.copy()
+            candidate_mesh.transform(source_matrix.inverted() @ imported.matrix_world)
+            if source_had_uv and not candidate_mesh.uv_layers:
+                raise RuntimeError("gltfpack dropped an existing UV layer")
+            imported_names = [material.name if material else None for material in candidate_mesh.materials]
+            if len(source_materials) == 1:
+                for poly in candidate_mesh.polygons:
+                    poly.material_index = 0
+            else:
+                try:
+                    from mesh_decimation import map_material_slot_indices
+                    # gltfpack can omit source material slots that have no
+                    # primitive after simplification. That is safe only when
+                    # the omitted slots were already unused by the original
+                    # mesh; restore the full original slot list below.
+                    imported_to_source = map_material_slot_indices(
+                        source_material_names, imported_names, allow_source_subset=True,
+                    )
+                    source_used = {int(poly.material_index) for poly in source_mesh.polygons}
+                    omitted_used = source_used - set(imported_to_source.values())
+                    if omitted_used:
+                        raise ValueError(
+                            "gltfpack dropped used material slot(s): " + ", ".join(map(str, sorted(omitted_used)))
+                        )
+                except ValueError as exc:
+                    raise RuntimeError(f"gltfpack {exc}") from exc
+                for poly in candidate_mesh.polygons:
+                    if poly.material_index < 0 or poly.material_index >= len(imported_names):
+                        raise RuntimeError("gltfpack polygon has an invalid material index")
+                    poly.material_index = imported_to_source[poly.material_index]
+            candidate_mesh.materials.clear()
+            for material in source_materials:
+                candidate_mesh.materials.append(material)
+            triangles_after = _mesh_triangle_count(candidate_mesh)
+            if triangles_after >= source_triangles:
+                raise RuntimeError(
+                    f"gltfpack did not reduce topology ({source_triangles}->{triangles_after} triangles)"
+                )
+            obj.data = candidate_mesh
+            return {
+                "backend": "meshoptimizer_gltfpack", "binary": binary,
+                "source_triangles": source_triangles, "target_max_triangles": int(target_max_triangles),
+                "triangles_after": triangles_after, "ratio_requested": ratio,
+                "command": command[1:], "uv_preserved": bool(candidate_mesh.uv_layers),
+                "material_slots_preserved": True,
+            }
+        finally:
+            for imported in imported_objects:
+                if imported.name in bpy.data.objects:
+                    bpy.data.objects.remove(imported, do_unlink=True)
+
+
 def _glb_mesh_contract(path):
     result = {
         "valid": False, "mesh_count": 0, "primitive_count": 0,
@@ -1188,6 +1889,49 @@ def _sha256_file(path):
     return h.hexdigest()
 
 
+_RESUME_UNIT_STATE_SCHEMA = "robomituba.infinigen.stage1-unit-state.v1"
+
+
+def _resume_unit_state_path(out_dir, object_id):
+    return os.path.join(out_dir, ".stage1_unit_state", f"{object_id}.json")
+
+
+def _load_resume_unit_state(out_dir, object_id, blender_name, *, bake_contract):
+    """Load a per-unit completion checkpoint only when its contract still matches.
+
+    The final scene manifest is deliberately atomic and therefore absent after
+    an interrupted Stage-1 run.  A per-unit sidecar lets a later resume retain
+    semantic decisions such as "normal was baked and proven flat", without
+    ever treating a partial coverage image as complete.
+    """
+    path = _resume_unit_state_path(out_dir, object_id)
+    try:
+        with open(path, encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, ValueError, TypeError):
+        return None
+    if (
+        payload.get("schema") != _RESUME_UNIT_STATE_SCHEMA
+        or payload.get("object_id") != object_id
+        or payload.get("blender_name") != blender_name
+        or payload.get("bake_contract") != bake_contract
+    ):
+        return None
+    return payload
+
+
+def _write_resume_unit_state(out_dir, payload):
+    object_id = str(payload["object_id"])
+    path = _resume_unit_state_path(out_dir, object_id)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    temporary = f"{path}.tmp.{os.getpid()}"
+    with open(temporary, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, default=str)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, path)
+
+
 def _iter_principled_sockets(node_tree, socket_name, seen=None):
     """Yield Principled sockets through arbitrarily nested shader groups."""
     if node_tree is None:
@@ -1204,6 +1948,138 @@ def _iter_principled_sockets(node_tree, socket_name, seen=None):
                 yield socket
         elif node.type == "GROUP" and getattr(node, "node_tree", None) is not None:
             yield from _iter_principled_sockets(node.node_tree, socket_name, seen)
+
+
+def _reachable_principled_sockets(node_tree, socket_name):
+    """Yield only surface-reachable Principled sockets with group-input bindings."""
+    if node_tree is None:
+        return []
+    found = []
+
+    def walk(socket, bindings, seen):
+        for link in getattr(socket, "links", ()):
+            node = link.from_node
+            key = (node.as_pointer(), link.from_socket.identifier, socket.as_pointer())
+            if key in seen:
+                continue
+            child_seen = set(seen)
+            child_seen.add(key)
+            if node.type == "GROUP_INPUT":
+                binding = bindings.get(link.from_socket.identifier) or bindings.get(link.from_socket.name)
+                if binding is not None:
+                    outer, parent_bindings = binding
+                    walk(outer, parent_bindings, child_seen)
+                continue
+            if node.type == "GROUP" and getattr(node, "node_tree", None):
+                child_bindings = {}
+                for inp in node.inputs:
+                    child_bindings[inp.identifier] = (inp, bindings)
+                    child_bindings[inp.name] = (inp, bindings)
+                for group_output in (n for n in node.node_tree.nodes if n.type == "GROUP_OUTPUT"):
+                    target = (
+                        group_output.inputs.get(link.from_socket.identifier)
+                        or group_output.inputs.get(link.from_socket.name)
+                    )
+                    if target is not None:
+                        walk(target, child_bindings, child_seen)
+                        break
+                continue
+            if node.type == "BSDF_PRINCIPLED":
+                target = node.inputs.get(socket_name)
+                if target is not None:
+                    found.append((target, bindings))
+                continue
+            for nested_input in getattr(node, "inputs", ()):
+                if nested_input.is_linked:
+                    walk(nested_input, bindings, child_seen)
+
+    for output in (n for n in node_tree.nodes if n.type == "OUTPUT_MATERIAL"):
+        surface = output.inputs.get("Surface")
+        if surface is not None and surface.is_linked:
+            walk(surface, {}, set())
+    return found
+
+
+def _bound_socket_constant(socket, bindings, seen=None):
+    """Resolve constants passed through nested Group Input/Output sockets.
+
+    Returns ``(True, value)`` only when the complete upstream expression is an
+    authored constant. Any procedural/image/attribute expression remains linked.
+    """
+    seen = set() if seen is None else seen
+    if socket is None:
+        return False, None
+    if not socket.is_linked:
+        return True, _socket_value(socket)
+    link = socket.links[0]
+    node = link.from_node
+    key = (node.as_pointer(), link.from_socket.identifier)
+    if key in seen:
+        return False, None
+    seen = set(seen)
+    seen.add(key)
+    if node.type == "GROUP_INPUT":
+        binding = bindings.get(link.from_socket.identifier) or bindings.get(link.from_socket.name)
+        if binding is None:
+            return False, None
+        outer, parent_bindings = binding
+        return _bound_socket_constant(outer, parent_bindings, seen)
+    if node.type in {"RGB", "VALUE"}:
+        return True, _socket_value(link.from_socket)
+    if node.type == "REROUTE" and node.inputs:
+        return _bound_socket_constant(node.inputs[0], bindings, seen)
+    if node.type == "MAP_RANGE":
+        # Infinigen's standard plastic/metal groups feed an authored outer
+        # ``Roughness`` value through a Map Range node before the reachable
+        # Principled socket.  A linked socket is not necessarily spatial: when
+        # every Map Range input is an authored constant, the resulting value is
+        # an authored constant too.  Treating that graph as procedural makes a
+        # valid glTF factor look like a failed linked bake.
+        #
+        # Be intentionally conservative: only the scalar linear form is
+        # folded.  Any vector/color input, non-linear interpolation, missing
+        # input, or invalid denominator remains bake-required.
+        if getattr(node, "data_type", "FLOAT") != "FLOAT" or getattr(node, "interpolation_type", "LINEAR") != "LINEAR":
+            return False, None
+
+        def _scalar(name):
+            input_socket = node.inputs.get(name)
+            resolved, value = _bound_socket_constant(input_socket, bindings, seen)
+            if not resolved or isinstance(value, (list, tuple)):
+                return False, None
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                return False, None
+            return (math.isfinite(value), value if math.isfinite(value) else None)
+
+        values = {}
+        for input_name in ("Value", "From Min", "From Max", "To Min", "To Max"):
+            resolved, value = _scalar(input_name)
+            if not resolved:
+                return False, None
+            values[input_name] = value
+        denominator = values["From Max"] - values["From Min"]
+        if abs(denominator) <= 1.0e-12:
+            return False, None
+        factor = (values["Value"] - values["From Min"]) / denominator
+        output = values["To Min"] + factor * (values["To Max"] - values["To Min"])
+        if getattr(node, "clamp", False):
+            output = min(max(output, min(values["To Min"], values["To Max"])), max(values["To Min"], values["To Max"]))
+        return True, float(output)
+    if node.type == "GROUP" and getattr(node, "node_tree", None):
+        child_bindings = {}
+        for inp in node.inputs:
+            child_bindings[inp.identifier] = (inp, bindings)
+            child_bindings[inp.name] = (inp, bindings)
+        for group_output in (n for n in node.node_tree.nodes if n.type == "GROUP_OUTPUT"):
+            target = (
+                group_output.inputs.get(link.from_socket.identifier)
+                or group_output.inputs.get(link.from_socket.name)
+            )
+            if target is not None:
+                return _bound_socket_constant(target, child_bindings, seen)
+    return False, None
 
 def _node_tree_has_normal_detail(node_tree, seen=None):
     if node_tree is None:
@@ -1222,7 +2098,25 @@ def _node_tree_has_normal_detail(node_tree, seen=None):
 
 def _pbr_input_contract(obj):
     """Describe spatial/constant Principled channels, including nested groups."""
-    material_slots = [slot for slot in obj.material_slots if slot.material is not None]
+    # The PBR atlas represents faces that are actually emitted by this object.
+    # Infinigen frequently leaves construction-time material slots on a mesh
+    # after all of their faces have been reassigned (Cube is one example: it
+    # retains unused glass and metal slots).  Including those orphan slots in
+    # the source contract creates false ``linked`` requirements for channels
+    # with no coverage in the bake.  Keep unused slots in the GLB for Blender
+    # compatibility, but do not let them define this object's render contract.
+    used_material_indices = {
+        int(poly.material_index)
+        for poly in getattr(obj.data, "polygons", ())
+        if 0 <= int(poly.material_index) < len(obj.material_slots)
+    }
+    material_slots = [
+        slot for index, slot in enumerate(obj.material_slots)
+        if index in used_material_indices and slot.material is not None
+    ]
+    # Preserve the old safe behaviour for unusual meshes with no polygons.
+    if not material_slots and not used_material_indices:
+        material_slots = [slot for slot in obj.material_slots if slot.material is not None]
     if not material_slots:
         return {
             "base_color": {"source": "constant", "constants": [[0.6, 0.6, 0.6]]},
@@ -1236,7 +2130,7 @@ def _pbr_input_contract(obj):
     # a valid analytic material into a false strict-export failure.
     has_principled = any(
         mat and mat.use_nodes and mat.node_tree
-        and any(_iter_principled_sockets(mat.node_tree, "Base Color"))
+        and bool(_reachable_principled_sockets(mat.node_tree, "Base Color"))
         for slot in material_slots
         for mat in (slot.material,)
     )
@@ -1262,12 +2156,12 @@ def _pbr_input_contract(obj):
             mat = slot.material
             if not (mat and mat.use_nodes and mat.node_tree):
                 continue
-            sockets = list(_iter_principled_sockets(mat.node_tree, socket_name))
+            sockets = _reachable_principled_sockets(mat.node_tree, socket_name)
             found = found or bool(sockets)
-            for socket in sockets:
-                linked = linked or bool(socket.is_linked)
-                if not socket.is_linked and key != "normal":
-                    value = _socket_value(socket)
+            for socket, bindings in sockets:
+                is_constant, value = _bound_socket_constant(socket, bindings)
+                linked = linked or not is_constant
+                if is_constant and key != "normal":
                     if isinstance(value, list):
                         value = value[:3]
                     constants.append(value)
@@ -1402,7 +2296,22 @@ def _channel_record(source, texture_rel, *, constant=None, colorspace="raw", res
 def main():
     args = _argv_after_ddash()
     out_dir = args[args.index("--out") + 1] if "--out" in args else "/tmp/infinigen_export"
+    stage1_profile = (
+        args[args.index("--stage1-profile") + 1]
+        if "--stage1-profile" in args else STRICT_PBR_PROFILE
+    )
+    if stage1_profile not in STAGE1_PROFILES:
+        raise ValueError(f"unsupported Stage-1 profile: {stage1_profile!r}")
     limit = int(args[args.index("--limit") + 1]) if "--limit" in args else 0
+    derived_blend = args[args.index("--save-derived-blend") + 1] if "--save-derived-blend" in args else None
+    ir_scene_domain_path = args[args.index("--ir-scene-domain") + 1] if "--ir-scene-domain" in args else None
+    ir_domain_handles = []
+    ir_domain_report = None
+    if ir_scene_domain_path is not None:
+        from blender_ir_scene_domain import apply_face_exclusion, load_domain
+        _ir_domain = load_domain(Path(ir_scene_domain_path))
+        ir_domain_handles, ir_domain_report = apply_face_exclusion(_ir_domain)
+        print(f"[export] applied IR face exclusion selectors={ir_domain_report['resolved_selector_count']}", flush=True)
     skip = int(args[args.index("--skip") + 1]) if "--skip" in args else 0
     # Repeatable so several known objects can be re-baked in one Blender load. This
     # matters for multi-GB Infinigen scenes where startup dominates a targeted audit.
@@ -1415,14 +2324,35 @@ def main():
     reuse_atlas = "--reuse-atlas" in args
     no_glb = "--no-glb" in args
     do_bake = "--bake" in args
+    if stage1_profile == IR_BOOTSTRAP_PROFILE:
+        if do_bake:
+            raise ValueError("ir-bootstrap-v1 forbids --bake")
+        reuse_atlas = False
     # Targeted re-bake of ONLY the objects whose (present) UV is degenerate/zero-area
     # -- the black-atlas cause. Combine with --merge to splice the re-baked units back
     # into the existing full scene_manifest.json (matched by blender_name, reusing each
     # unit's existing id so the right mesh/texture files are overwritten in place).
     only_degenerate = "--only-degenerate" in args
     merge = "--merge" in args
+    if derived_blend is not None and (limit or skip or merge):
+        raise ValueError("--save-derived-blend requires one full non-merge export")
     bake_res = int(args[args.index("--bake-res") + 1]) if "--bake-res" in args else 512
+    max_bake_res = int(args[args.index("--max-bake-res") + 1]) if "--max-bake-res" in args else 4096
+    max_unbaked_ratio = (
+        float(args[args.index("--max-unbaked-ratio") + 1])
+        if "--max-unbaked-ratio" in args else 0.001
+    )
+    if max_bake_res < bake_res:
+        raise ValueError("--max-bake-res must be >= --bake-res")
     bake_samples = int(args[args.index("--bake-samples") + 1]) if "--bake-samples" in args else 12
+    requested_cycles_device = (
+        args[args.index("--cycles-device") + 1]
+        if "--cycles-device" in args else "CPU"
+    )
+    bake_device, bake_devices = (
+        _configure_cycles_bake_device(requested_cycles_device)
+        if do_bake else ("NONE", [])
+    )
     # Per-texel PBR maps (roughness/normal/metallic) in addition to albedo. Opt-in
     # because each is a full extra Cycles bake (~4x bake time). Metallic uses the
     # EMIT trick; skip it with --no-bake-metallic if only roughness/normal wanted.
@@ -1443,17 +2373,20 @@ def main():
     decimate_policy_name = args[args.index("--decimate-policy") + 1] if "--decimate-policy" in args else "none"
     decimate_min_polys = int(args[args.index("--decimate-min-polys") + 1]) if "--decimate-min-polys" in args else 50000
     decimate_ratio = float(args[args.index("--decimate-ratio") + 1]) if "--decimate-ratio" in args else 0.30
+    decimate_strict = "--decimate-strict" in args
     decimation_policy = None
     _DecCtx = _decimate_object = None
     try:
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
         from mesh_decimation import (resolve_policy as _resolve_dec_policy,
-                                      DecimationContext as _DecCtx, decimate_object as _decimate_object)
+                                      DecimationContext as _DecCtx, decimate_object as _decimate_object, triangle_count as _triangle_count)
         decimation_policy = _resolve_dec_policy(decimate_policy_name, min_faces=decimate_min_polys, ratio=decimate_ratio)
         if decimate_policy_name not in ("none", "off", ""):
-            print(f"[decimate] policy={decimation_policy.name} min_polys={decimate_min_polys} ratio={decimate_ratio}")
+            print(f"[decimate] policy={decimation_policy.name} min_polys={decimate_min_polys} ratio={decimate_ratio} strict={decimate_strict}")
     except Exception as _dec_exc:  # noqa: BLE001
         print(f"[decimate] disabled ({_dec_exc})")
+        if decimate_strict:
+            raise
 
     meshes_dir = os.path.join(out_dir, "meshes")
     os.makedirs(meshes_dir, exist_ok=True)
@@ -1464,7 +2397,19 @@ def main():
     scene_id = args[args.index("--scene-id") + 1] if "--scene-id" in args else os.path.basename(os.path.normpath(out_dir))
     manifest = {
         "export_contract_version": 2,
+        "stage1_profile": stage1_profile,
+        "appearance_authority": (
+            "stage1_pbr_atlases" if stage1_profile == STRICT_PBR_PROFILE else "source_blend_deferred"
+        ),
+        "bake_device": {
+            "requested": requested_cycles_device,
+            "effective": bake_device,
+            "devices": bake_devices,
+            "assigned_gpu": os.environ.get("ROBOMITUBA_ASSIGNED_BAKE_GPU"),
+        },
         "scene_id": scene_id,
+        "ir_scene_domain_ref": os.path.abspath(ir_scene_domain_path) if ir_scene_domain_path else None,
+        "ir_face_exclusion": ir_domain_report,
         "source_blend": bpy.data.filepath,
         "unit_system": bpy.context.scene.unit_settings.system,
         "unit_scale": bpy.context.scene.unit_settings.scale_length,
@@ -1521,7 +2466,7 @@ def main():
             if _u.get("blender_name"):
                 existing_oid_by_name[_u["blender_name"]] = _u.get("id")
         print(f"[export] merge: {len(existing_manifest.get('units', []))} existing units, "
-              f"re-baking {len(mesh_objs)}", flush=True)
+              f"processing next {len(mesh_objs)} selected units", flush=True)
 
     # Memory hygiene for big scenes (14M-poly Infinigen blends OOM on low-RAM/WSL
     # boxes mid-bake). Disabling global undo stops Blender from snapshotting the
@@ -1535,6 +2480,9 @@ def main():
     used_ids = set()
     baked_count = 0
     fail_count = 0
+    reused_atlas_count = 0
+    stale_atlas_rebake_count = 0
+    fresh_atlas_bake_count = 0
     total = len(mesh_objs)
     bar = _tqdm(total=total, desc="export", unit="obj", file=sys.stderr,
                 dynamic_ncols=True) if _tqdm else None
@@ -1560,6 +2508,9 @@ def main():
         used_ids.add(oid)
 
         bmin, bmax = _world_bbox(obj)
+        _pre_material_slots = [slot.material.name if slot.material else None for slot in obj.material_slots]
+        _pre_used_material_indices = sorted({int(poly.material_index) for poly in obj.data.polygons})
+        _pre_matrix_world = tuple(tuple(float(value) for value in row) for row in obj.matrix_world)
         # Origin-local export: the render (`_obj_shape`) translates the mesh by the
         # authoring center + base_height, so the OBJ must be centred at its own
         # origin (horizontal bbox centre at X/Z=0, bottom at Y=0). We temporarily
@@ -1580,15 +2531,18 @@ def main():
             _dslots = [{"name": ms.material.name,
                         "optical_class": manifest["materials"].get(ms.material.name, {}).get("optical_class", "diffuse")}
                        for ms in obj.material_slots if ms.material]
-            _dctx = _DecCtx(object_id=oid, n_faces=len(obj.data.polygons), kind=kind,
+            _dctx = _DecCtx(object_id=oid, n_faces=_triangle_count(obj), kind=kind,
                             semantic_type=sem, subtype=subtype, factory=_factory_of(obj.name) or "",
                             optical_class=(_dslots[0]["optical_class"] if _dslots else "diffuse"),
                             material_slots=_dslots, bbox_min=tuple(bmin), bbox_max=tuple(bmax),
                             has_baked_normal=False)
-            decimation_record = _decimate_object(obj, decimation_policy, _dctx)
+            decimation_record = _decimate_object(
+                obj, decimation_policy, _dctx, strict=decimate_strict,
+                fallback=_gltfpack_simplify_object if decimate_strict and decimation_policy.name == "ir_semantic_lod_v1" else None,
+            )
             if decimation_record.get("decimated"):
-                _log(f"[decimate] {obj.name}: {decimation_record['faces_before']}"
-                     f"→{decimation_record['faces_after']} ({decimation_record['policy']})", bar)
+                _log(f"[decimate] {obj.name}: {decimation_record['triangles_before']}"
+                     f"→{decimation_record['triangles_after']} triangles ({decimation_record['policy']})", bar)
             elif decimation_record.get("error"):
                 _log(f"[decimate] {obj.name} FAIL: {decimation_record['error']}", bar)
 
@@ -1597,8 +2551,94 @@ def main():
         baked_rel = None
         baked_roughness = baked_normal = baked_metallic = None
         pbr_inputs = _pbr_input_contract(obj)
+        # Some Infinigen structural meshes intentionally carry geometry only
+        # (zero material slots).  Blender records their polygons with the
+        # default material index 0, but there is no surface graph to bake.
+        # They are still exported as UV-valid GLB geometry with explicit
+        # default PBR factors; requiring a Cycles coverage bake for them would
+        # always fail before it could create an active image node.
+        requires_surface_bake = any(slot.material is not None for slot in obj.material_slots)
+        resume_bake_contract = {
+            "stage1_profile": stage1_profile,
+            "cycles_device": bake_device,
+            "bake_res": int(bake_res),
+            "max_bake_res": int(max_bake_res),
+            "max_unbaked_ratio": float(max_unbaked_ratio),
+            "bake_pbr": bool(bake_pbr),
+            "decimation_policy": getattr(decimation_policy, "name", None),
+            "decimation_min_polys": int(decimate_min_polys),
+        }
+        resume_unit_state = (
+            _load_resume_unit_state(
+                out_dir, oid, obj.name, bake_contract=resume_bake_contract,
+            ) if reuse_atlas else None
+        )
+        # A source normal network can be linked yet evaluate to a flat normal.
+        # Stage 1 correctly discards that atlas and records not_applicable. On
+        # resume, retain that completed semantic decision rather than treating
+        # the intentionally absent PNG as an interrupted bake.
+        prior_normal = (
+            ((resume_unit_state.get("pbr") or {}).get("channels") or {}).get("normal")
+            if resume_unit_state else None
+        )
+        if (
+            isinstance(prior_normal, dict)
+            and prior_normal.get("mode") == "not_applicable"
+            and pbr_inputs.get("normal", {}).get("source") == "linked"
+        ):
+            pbr_inputs["normal"] = {"source": "not_applicable", "constants": []}
+            _log(f"[resume] restored flat normal decision {obj.name}", bar)
         uv_valid = bool(_ensure_uv(obj))
         uv_layer = obj.data.uv_layers.active.name if uv_valid and obj.data.uv_layers.active else None
+        if decimation_record is not None:
+            _post_bmin, _post_bmax = _world_bbox(obj)
+            _post_material_slots = [slot.material.name if slot.material else None for slot in obj.material_slots]
+            _post_indices = {int(poly.material_index) for poly in obj.data.polygons}
+            _post_matrix_world = tuple(tuple(float(value) for value in row) for row in obj.matrix_world)
+            _aabb_values = tuple(_post_bmin) + tuple(_post_bmax)
+            # Blender stores ``polygon.material_index == 0`` even when a mesh
+            # deliberately has *no* material slots.  That is the unassigned
+            # default, not a dangling primitive/material reference.  Treat it
+            # as valid only for the empty-slot case; any other index would
+            # still be invalid.  Without this distinction strict IR LOD
+            # rejected geometry-only structural meshes such as
+            # ``kitchen_0/0.exterior`` after an otherwise successful
+            # decimation.
+            _valid_indices = (
+                _post_indices <= {0}
+                if not _post_material_slots
+                else all(0 <= index < len(_post_material_slots) for index in _post_indices)
+            )
+            _aabb_finite = all(math.isfinite(float(value)) for value in _aabb_values)
+            _expected_matrix_world = tuple(tuple(float(value) for value in row) for row in (Matrix.Translation(offset) @ orig_mw))
+            _transform_max_abs_delta = max(abs(actual - expected) for actual_row, expected_row in zip(_post_matrix_world, _expected_matrix_world) for actual, expected in zip(actual_row, expected_row))
+            _transform_tolerance = 1e-5
+            _transform_preserved = bool(_transform_max_abs_delta <= _transform_tolerance)
+            _validation = {
+                "uv_valid": uv_valid, "uv_layer": uv_layer,
+                "material_slots_preserved": _post_material_slots == _pre_material_slots,
+                "primitive_material_indices_valid": _valid_indices,
+                "empty_material_slot_default_index": bool(
+                    not _post_material_slots and _post_indices <= {0}
+                ),
+                "source_used_material_indices": _pre_used_material_indices,
+                "transform_max_abs_delta": _transform_max_abs_delta,
+                "transform_tolerance": _transform_tolerance,
+                "derived_used_material_indices": sorted(_post_indices),
+                "transform_preserved": _transform_preserved,
+                "saved_transform": [list(row) for row in _pre_matrix_world],
+                "aabb_finite": _aabb_finite,
+                "source_aabb": [list(bmin), list(bmax)],
+                "derived_aabb": [list(_post_bmin), list(_post_bmax)],
+            }
+            _validation["passed"] = all((
+                _validation["uv_valid"], _validation["material_slots_preserved"],
+                _validation["primitive_material_indices_valid"], _validation["transform_preserved"],
+                _validation["aabb_finite"],
+            ))
+            decimation_record["geometry_validation"] = _validation
+            if decimate_strict and not _validation["passed"]:
+                raise RuntimeError(f"strict decimation geometry validation failed for {oid}: {_validation}")
 
         try:
             with _silence_fds(1, 2):
@@ -1624,33 +2664,189 @@ def main():
             "roughness": os.path.join(textures_dir, f"{oid}_roughness.png"),
             "metallic": os.path.join(textures_dir, f"{oid}_metallic.png"),
             "normal": os.path.join(textures_dir, f"{oid}_normal.png"),
+            "coverage": os.path.join(textures_dir, f"{oid}_coverage.png"),
         }
         atlas_rel = {
             "base_color": f"textures/{oid}_albedo.png",
             "roughness": f"textures/{oid}_roughness.png",
             "metallic": f"textures/{oid}_metallic.png",
             "normal": f"textures/{oid}_normal.png",
+            "coverage": f"textures/{oid}_coverage.png",
         }
+        # Capture this before a rejected resume removes stale partial files. It
+        # makes progress logs answer the operational question directly: did the
+        # run actually bake a new unit, or merely revalidate/reuse it?
+        had_existing_atlas = bool(reuse_atlas and any(
+            os.path.isfile(path) for path in atlas_abs.values()
+        ))
         normal_validation = {"attempted": False, "result": "not_applicable"}
         bake_validations = {}
-        if reuse_atlas:
-            for key, path in atlas_abs.items():
-                if os.path.isfile(path):
-                    if key == "base_color":
-                        baked_rel = atlas_rel[key]
-                    elif key == "roughness":
-                        baked_roughness = atlas_rel[key]
-                    elif key == "metallic":
-                        baked_metallic = atlas_rel[key]
-                    else:
-                        baked_normal = atlas_rel[key]
-        elif do_bake and (max_bake_poly <= 0 or len(obj.data.polygons) <= max_bake_poly):
+        coverage_validation = {"attempted": False, "passed": False, "reason": "not_applicable"}
+        effective_bake_res = bake_res
+        reused_atlas = False
+        resume_uv_reconstruction = []
+        # ``--reuse-atlas`` is a resume primitive, not an all-or-nothing mode:
+        # a previously completed unit reuses and revalidates its baked files,
+        # while a missing/partial unit falls through to the normal strict bake.
+        # This lets an interrupted full Stage-1 run reconstruct its manifest
+        # without re-baking hundreds of already verified objects.
+        if reuse_atlas and os.path.isfile(atlas_abs["coverage"]):
+            if os.path.isfile(atlas_abs["coverage"]):
+                coverage_validation = _coverage_validation(
+                    obj, atlas_abs["coverage"], max_unbaked_ratio=max_unbaked_ratio
+                )
+                # A resume starts from the original .blend, while a completed
+                # Stage-1 unit may have received a forced Smart UV or the final
+                # per-face atlas repair.  The old code attempted that recovery
+                # only when the *first* audit literally said "overlap".  Most
+                # stacked source UVs instead first say referenced_unbaked_texels,
+                # so 81 completed kitchen units were needlessly deleted and
+                # re-baked.  Reconstruct both deterministic repairs before
+                # rejecting any saved coverage atlas, regardless of the first
+                # failure label.
+                if not coverage_validation.get("passed"):
+                    initial_reason = coverage_validation.get("reason")
+                    rebuilt = _ensure_uv(obj, force=True)
+                    resume_uv_reconstruction.append({
+                        "strategy": "smart_uv", "succeeded": bool(rebuilt),
+                        "initial_reason": initial_reason,
+                    })
+                    if rebuilt:
+                        coverage_validation = _coverage_validation(
+                            obj, atlas_abs["coverage"], max_unbaked_ratio=max_unbaked_ratio
+                        )
+                    if not coverage_validation.get("passed"):
+                        face_atlas_ok = _face_atlas_uv(obj)
+                        resume_uv_reconstruction.append({
+                            "strategy": "face_atlas", "succeeded": bool(face_atlas_ok),
+                            "reason_after_smart_uv": coverage_validation.get("reason"),
+                        })
+                        if face_atlas_ok:
+                            coverage_validation = _coverage_validation(
+                                obj, atlas_abs["coverage"], max_unbaked_ratio=max_unbaked_ratio
+                            )
+                    coverage_validation["resume_uv_reconstruction"] = list(resume_uv_reconstruction)
+                resolution = coverage_validation.get("resolution") or [bake_res, bake_res]
+                effective_bake_res = int(resolution[0])
+            else:
+                coverage_validation = {
+                    "attempted": True,
+                    "passed": False,
+                    "reason": "missing_coverage_mask",
+                }
+            if coverage_validation.get("passed"):
+                if os.path.isfile(atlas_abs["base_color"]):
+                    baked_rel = atlas_rel["base_color"]
+                    _spatial, bake_validations["base_color"] = _pbr_texture_validation(
+                        atlas_abs["base_color"], "base_color", coverage_path=atlas_abs["coverage"]
+                    )
+                if os.path.isfile(atlas_abs["roughness"]):
+                    baked_roughness = atlas_rel["roughness"]
+                    _spatial, bake_validations["roughness"] = _pbr_texture_validation(
+                        atlas_abs["roughness"], "roughness", coverage_path=atlas_abs["coverage"]
+                    )
+                if os.path.isfile(atlas_abs["metallic"]):
+                    baked_metallic = atlas_rel["metallic"]
+                    _spatial, bake_validations["metallic"] = _pbr_texture_validation(
+                        atlas_abs["metallic"], "metallic", coverage_path=atlas_abs["coverage"]
+                    )
+                if os.path.isfile(atlas_abs["normal"]):
+                    baked_normal = atlas_rel["normal"]
+                    _spatial, normal_validation = _normal_bake_validation(atlas_abs["normal"])
+
+                # A coverage mask alone is not a completion marker.  An interrupt
+                # can occur after coverage is written but before all linked PBR
+                # channels are saved; an older atlas can also be for a different
+                # decimated UV layout.  Reuse only a fully valid unit.  Everything
+                # else falls through to the ordinary adaptive bake below.
+                reuse_failures = []
+                for key, texture_ref in (
+                    ("base_color", baked_rel),
+                    ("roughness", baked_roughness),
+                    ("metallic", baked_metallic),
+                    ("normal", baked_normal),
+                ):
+                    source = pbr_inputs[key]["source"]
+                    if source not in {"linked", "mixed_constant"}:
+                        continue
+                    if not texture_ref:
+                        reuse_failures.append(f"missing_{key}_atlas")
+                        continue
+                    validation = (
+                        normal_validation if key == "normal"
+                        else bake_validations.get(key, {})
+                    )
+                    allowed = {"spatial"}
+                    if source == "mixed_constant":
+                        # Multiple authored constants behind a layered closure
+                        # still require an atlas: a material part may resolve to
+                        # zero everywhere after the structural-domain face
+                        # exclusion.  Keep its valid all-zero bake instead of
+                        # repeatedly deleting it and demanding a nonexistent
+                        # scalar factor on every resume.
+                        allowed.update({"constant", "black"})
+                    if validation.get("result") not in allowed:
+                        reuse_failures.append(
+                            f"invalid_{key}_atlas={validation.get('result', 'unknown')}"
+                        )
+                if not reuse_failures:
+                    reused_atlas = True
+                    reused_atlas_count += 1
+                    if resume_uv_reconstruction:
+                        _log(
+                            f"[resume] reused atlas after UV reconstruction {obj.name}: "
+                            f"{coverage_validation.get('uv_layer', 'unknown')}",
+                            bar,
+                        )
+                else:
+                    coverage_validation["reuse_rejected"] = reuse_failures
+            if not reused_atlas:
+                reason = coverage_validation.get("reason", "incomplete_atlas")
+                rejection = coverage_validation.get("reuse_rejected") or []
+                suffix = f" ({', '.join(str(item) for item in rejection)})" if rejection else ""
+                _log(
+                    f"[resume] re-baking stale atlas {obj.name}: {reason}{suffix}", bar
+                )
+                # Do not let a stale channel be accidentally embedded into the
+                # new GLB.  Coverage is also removed so the new UV/bake pair is
+                # published atomically as a logical unit after this object passes.
+                for path in atlas_abs.values():
+                    try:
+                        os.unlink(path)
+                    except FileNotFoundError:
+                        pass
+                baked_rel = baked_roughness = baked_metallic = baked_normal = None
+                bake_validations = {}
+                normal_validation = {"attempted": False, "result": "not_applicable"}
+        # The resumed source object may now carry a deterministic repaired UV
+        # even when no re-bake was necessary.  Persist its actual layer name in
+        # the unit contract and derived .blend, never the pre-reconstruction one.
+        uv_valid = bool(obj.data.uv_layers) and not _uv_is_degenerate(obj.data)
+        uv_layer = obj.data.uv_layers.active.name if uv_valid and obj.data.uv_layers.active else None
+        if (
+            not reused_atlas
+            and requires_surface_bake
+            and do_bake
+            and (max_bake_poly <= 0 or len(obj.data.polygons) <= max_bake_poly)
+        ):
+            if had_existing_atlas:
+                stale_atlas_rebake_count += 1
+            else:
+                fresh_atlas_bake_count += 1
             with _render_isolate(obj):
-                if pbr_inputs["base_color"]["source"] in {"linked", "mixed_constant"}:
+                effective_bake_res, coverage_validation = _bake_coverage_adaptive(
+                    obj,
+                    atlas_abs["coverage"],
+                    bake_res,
+                    max_bake_res,
+                    max_unbaked_ratio,
+                )
+                coverage_ok = bool(coverage_validation.get("passed"))
+                if coverage_ok and pbr_inputs["base_color"]["source"] in {"linked", "mixed_constant"}:
                     with _silence_fds(1):
-                        if _bake_albedo(obj, atlas_abs["base_color"], bake_res, bake_samples):
+                        if _bake_albedo(obj, atlas_abs["base_color"], effective_bake_res, bake_samples):
                             spatial, validation = _pbr_texture_validation(
-                                atlas_abs["base_color"], "base_color"
+                                atlas_abs["base_color"], "base_color", coverage_path=atlas_abs["coverage"]
                             )
                             if not spatial:
                                 # Some nested/displacement closures evaluate to
@@ -1661,13 +2857,13 @@ def main():
                                 if _bake_pass(
                                     obj,
                                     atlas_abs["base_color"],
-                                    bake_res,
+                                    effective_bake_res,
                                     bake_samples,
                                     bake_type="DIFFUSE",
                                     color_pass=True,
                                 ):
                                     fallback_spatial, fallback_validation = _pbr_texture_validation(
-                                        atlas_abs["base_color"], "base_color"
+                                        atlas_abs["base_color"], "base_color", coverage_path=atlas_abs["coverage"]
                                     )
                                     fallback_validation["fallback_from"] = validation.get("result")
                                     fallback_validation["fallback_pass"] = "DIFFUSE_COLOR"
@@ -1676,7 +2872,7 @@ def main():
                             bake_validations["base_color"] = validation
                             keep_constant = (
                                 pbr_inputs["base_color"]["source"] == "mixed_constant"
-                                and validation.get("result") == "constant"
+                                and validation.get("result") in {"constant", "black"}
                             )
                             if spatial or keep_constant:
                                 baked_rel = atlas_rel["base_color"]
@@ -1686,11 +2882,11 @@ def main():
                                     os.unlink(atlas_abs["base_color"])
                                 except FileNotFoundError:
                                     pass
-                if bake_pbr and pbr_inputs["roughness"]["source"] in {"linked", "mixed_constant"}:
+                if coverage_ok and bake_pbr and pbr_inputs["roughness"]["source"] in {"linked", "mixed_constant"}:
                     with _silence_fds(1):
-                        if _bake_roughness(obj, atlas_abs["roughness"], bake_res, bake_samples):
+                        if _bake_roughness(obj, atlas_abs["roughness"], effective_bake_res, bake_samples):
                             spatial, validation = _pbr_texture_validation(
-                                atlas_abs["roughness"], "roughness"
+                                atlas_abs["roughness"], "roughness", coverage_path=atlas_abs["coverage"]
                             )
                             if not spatial:
                                 # Blender's ROUGHNESS pass can evaluate nested
@@ -1699,13 +2895,13 @@ def main():
                                 if _bake_pass(
                                     obj,
                                     atlas_abs["roughness"],
-                                    bake_res,
+                                    effective_bake_res,
                                     bake_samples,
                                     bake_type="ROUGHNESS",
                                     non_color=True,
                                 ):
                                     fallback_spatial, fallback_validation = _pbr_texture_validation(
-                                        atlas_abs["roughness"], "roughness"
+                                        atlas_abs["roughness"], "roughness", coverage_path=atlas_abs["coverage"]
                                     )
                                     fallback_validation["fallback_from"] = validation.get("result")
                                     fallback_validation["fallback_pass"] = "ROUGHNESS"
@@ -1714,7 +2910,7 @@ def main():
                             bake_validations["roughness"] = validation
                             keep_constant = (
                                 pbr_inputs["roughness"]["source"] == "mixed_constant"
-                                and validation.get("result") == "constant"
+                                and validation.get("result") in {"constant", "black"}
                             )
                             if spatial or keep_constant:
                                 baked_roughness = atlas_rel["roughness"]
@@ -1723,16 +2919,16 @@ def main():
                                     os.unlink(atlas_abs["roughness"])
                                 except FileNotFoundError:
                                     pass
-                if bake_pbr and bake_metallic and pbr_inputs["metallic"]["source"] in {"linked", "mixed_constant"}:
+                if coverage_ok and bake_pbr and bake_metallic and pbr_inputs["metallic"]["source"] in {"linked", "mixed_constant"}:
                     with _silence_fds(1):
-                        if _bake_metallic(obj, atlas_abs["metallic"], bake_res, bake_samples):
+                        if _bake_metallic(obj, atlas_abs["metallic"], effective_bake_res, bake_samples):
                             spatial, validation = _pbr_texture_validation(
-                                atlas_abs["metallic"], "metallic"
+                                atlas_abs["metallic"], "metallic", coverage_path=atlas_abs["coverage"]
                             )
                             bake_validations["metallic"] = validation
                             keep_constant = (
                                 pbr_inputs["metallic"]["source"] == "mixed_constant"
-                                and validation.get("result") == "constant"
+                                and validation.get("result") in {"constant", "black"}
                             )
                             if spatial or keep_constant:
                                 baked_metallic = atlas_rel["metallic"]
@@ -1741,11 +2937,11 @@ def main():
                                     os.unlink(atlas_abs["metallic"])
                                 except FileNotFoundError:
                                     pass
-                if bake_pbr and obj.material_slots:
+                if coverage_ok and bake_pbr and obj.material_slots:
                     normal_validation = {"attempted": True, "result": "failed"}
                     with _silence_fds(1):
                         normal_ok = _bake_normal(
-                            obj, atlas_abs["normal"], bake_res, bake_samples
+                            obj, atlas_abs["normal"], effective_bake_res, bake_samples
                         )
                     if normal_ok:
                         spatial, normal_validation = _normal_bake_validation(atlas_abs["normal"])
@@ -1827,7 +3023,7 @@ def main():
             pbr_channels[key] = _channel_record(
                 source, texture_ref, constant=constants or default_constant,
                 colorspace="srgb" if key == "base_color" else "raw",
-                resolution=[bake_res, bake_res] if texture_ref else None,
+                resolution=[effective_bake_res, effective_bake_res] if texture_ref else None,
             )
             if key == "normal":
                 pbr_channels[key]["bake_validation"] = normal_validation
@@ -1842,21 +3038,90 @@ def main():
                 )
         if not uv_valid:
             pbr_issues.append("invalid UV")
+        if requires_surface_bake and (do_bake or reuse_atlas):
+            if not coverage_validation.get("passed"):
+                pbr_issues.append(
+                    "UV-referenced bake coverage failed: "
+                    f"{coverage_validation.get('reason', 'unknown')}"
+                )
         if not glb_rel or not os.path.isfile(os.path.join(out_dir, glb_rel)):
             pbr_issues.append("missing GLB")
+        bootstrap = stage1_profile == IR_BOOTSTRAP_PROFILE
         pbr_contract = {
-            "status": "ok" if not pbr_issues else "degraded",
-            "self_contained_glb": bool(glb_rel and not pbr_issues),
+            "status": "bootstrap" if bootstrap else ("ok" if not pbr_issues else "degraded"),
+            "appearance_authoritative": not bootstrap and not pbr_issues,
+            "geometry_self_contained_glb": bool(glb_rel),
+            "self_contained_glb": bool(glb_rel and not pbr_issues and not bootstrap),
             "channels": pbr_channels,
+            "coverage": {
+                "ref": atlas_rel["coverage"] if coverage_validation.get("passed") else None,
+                **coverage_validation,
+            },
             "issues": pbr_issues,
             "assumptions": pbr_assumptions,
         }
+        pbr_by_slot = {}
+        artifacts_by_slot = {}
+        if stage1_profile == STRICT_PBR_SLOT_AWARE_PROFILE and requires_surface_bake:
+            used_slot_indices = sorted({int(poly.material_index) for poly in obj.data.polygons})
+            for slot_index in used_slot_indices:
+                result = _bake_slot_pbr_contract(
+                    obj, oid=oid, slot=slot_index, textures_dir=textures_dir, out_dir=out_dir,
+                    bake_res=bake_res, max_bake_res=max_bake_res, bake_samples=bake_samples,
+                    bake_pbr=bake_pbr, bake_metallic=bake_metallic,
+                    max_unbaked_ratio=max_unbaked_ratio, do_bake=do_bake, glb_rel=glb_rel,
+                )
+                if result is None:
+                    continue
+                slot_contract, slot_artifacts = result
+                pbr_by_slot[str(slot_index)] = slot_contract
+                artifacts_by_slot[str(slot_index)] = slot_artifacts
+            slot_issues = [
+                f"slot {slot}: {issue}"
+                for slot, record in pbr_by_slot.items()
+                for issue in (record.get("issues") or [])
+            ]
+            # The slot-aware entries are authoritative.  Keep the old top-level
+            # record as a compatibility summary rather than allowing its shared
+            # object atlas to decide strict-v2 success.
+            pbr_contract.update({
+                "status": "ok" if not slot_issues else "degraded",
+                "appearance_authoritative": not slot_issues,
+                "self_contained_glb": bool(glb_rel and not slot_issues),
+                "pbr_by_slot": pbr_by_slot,
+                "slot_aware": True,
+                "issues": slot_issues,
+            })
         glb_digest = _sha256_file(os.path.join(out_dir, glb_rel)) if glb_rel else None
 
         _restore_hide(obj, hide_state)
         obj.matrix_world = orig_mw
-        if pbr_issues and not allow_incomplete_pbr:
-            raise RuntimeError(f"{obj.name}: strict GLB/PBR export failed: {', '.join(pbr_issues)}")
+        effective_issues = list(pbr_contract.get("issues") or [])
+        if effective_issues and not allow_incomplete_pbr and not bootstrap:
+            raise RuntimeError(f"{obj.name}: strict GLB/PBR export failed: {', '.join(effective_issues)}")
+
+        # Commit the successful unit independently of the all-scene manifest.
+        # The final manifest remains atomic, but a crash after this point no
+        # longer loses flat-normal provenance needed for a strict resume.
+        _write_resume_unit_state(out_dir, {
+            "schema": _RESUME_UNIT_STATE_SCHEMA,
+            "object_id": oid,
+            "blender_name": obj.name,
+            "bake_contract": resume_bake_contract,
+            "uv": {"layer": uv_layer, "valid": bool(uv_valid)},
+            "pbr": pbr_contract,
+            "pbr_by_slot": pbr_by_slot,
+            "artifacts": {
+                "mesh_glb": glb_rel,
+                "glb_sha256": glb_digest,
+                "coverage": atlas_rel["coverage"] if coverage_validation.get("passed") else None,
+                "base_color": baked_rel,
+                "roughness": baked_roughness,
+                "metallic": baked_metallic,
+                "normal": baked_normal,
+            },
+            "artifacts_by_slot": artifacts_by_slot,
+        })
 
         # Authoring placement (Y-up world, axis flip authoring_y = -blender_y).
         # size_m is the world AABB: [x_extent, height_extent, z_extent] (Mitsuba xyz).
@@ -1872,6 +3137,10 @@ def main():
             "semantic_type": sem,
             "subtype": subtype,
             "factory": _factory_of(obj.name),
+            "source_custom_properties": {
+                key: obj.get(key) for key in ("glass_wall", "glass_door", "transparent_partition", "office_style", "office_wall_segment_id")
+                if key in obj.keys()
+            },
             "collections": [c.name for c in obj.users_collection],
             "world_bbox_min": bmin,
             "world_bbox_max": bmax,
@@ -1882,6 +3151,7 @@ def main():
             "place_size_m": place_size,          # [x, height, z] world AABB
             "place_base_height_m": place_base_height,
             "polys": len(obj.data.polygons),
+            "triangles": _triangle_count(obj),
             "decimation": decimation_record,
             "materials": mats,
             "optical_class": unit_oc,
@@ -1896,10 +3166,15 @@ def main():
                 for name in mats
             ],
             "pbr": pbr_contract,
+            "pbr_by_slot": pbr_by_slot,
+            "artifacts_by_slot": artifacts_by_slot,
             "baked_albedo": baked_rel,
             "baked_roughness": baked_roughness,
             "baked_normal": baked_normal,
             "baked_metallic": baked_metallic,
+            "baked_coverage": (
+                atlas_rel["coverage"] if coverage_validation.get("passed") else None
+            ),
         })
         # Drop zero-user datablocks left behind by bake/export (temp images, meshes,
         # node groups) so RAM doesn't creep across hundreds of objects. orphans_purge
@@ -1914,7 +3189,13 @@ def main():
             bar.update(1)
         elif (i + 1) % 10 == 0 or (i + 1) == total:
             pct = round(100 * (i + 1) / max(total, 1))
-            print(f"[export] {i + 1}/{total} ({pct}%) units · bake={baked_count} fail={fail_count}", flush=True)
+            print(
+                f"[export] {i + 1}/{total} ({pct}%) units · "
+                f"texture_bakes={baked_count} reuse={reused_atlas_count} "
+                f"stale_rebake={stale_atlas_rebake_count} fresh_bake={fresh_atlas_bake_count} "
+                f"fail={fail_count}",
+                flush=True,
+            )
     if bar is not None:
         bar.close()
 
@@ -1978,7 +3259,24 @@ def main():
         f.flush()
         os.fsync(f.fileno())
     os.replace(manifest_tmp, manifest_path)
-    print(f"[export] DONE units={len(final_manifest['units'])} (re-baked {n_replaced}) "
+    if derived_blend is not None:
+        derived_path = os.path.abspath(derived_blend)
+        os.makedirs(os.path.dirname(derived_path), exist_ok=True)
+        bpy.ops.wm.save_as_mainfile(filepath=derived_path, check_existing=False)
+        print(f"[export] saved derived Blender scene -> {derived_path}", flush=True)
+    # The exclusion copies are deliberately the geometry saved into an IR
+    # derived ``.blend``.  Do *not* restore the original meshes after that
+    # save: decimation can legitimately have freed an original, now-unlinked
+    # mesh datablock, and restoring its stale RNA handle turns a completely
+    # published Stage-1 export into a false failure.  This script always exits
+    # after export, so the source .blend on disk remains untouched without an
+    # in-process restore.  The Blender GT renderer, which has a separate
+    # lifecycle, still restores its temporary exclusions explicitly.
+    if ir_domain_handles:
+        ir_domain_handles = []
+    print(f"[export] DONE units={len(final_manifest['units'])} (published {n_replaced}) "
+          f"reuse={reused_atlas_count} stale_rebake={stale_atlas_rebake_count} "
+          f"fresh_bake={fresh_atlas_bake_count} "
           f"materials={len(final_manifest['materials'])} lights={len(final_manifest.get('lights', []))} "
           f"cameras={len(final_manifest.get('cameras', []))} -> {manifest_path}")
 
