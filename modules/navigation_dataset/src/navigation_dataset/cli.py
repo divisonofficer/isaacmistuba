@@ -220,13 +220,22 @@ def cmd_graph_build(args) -> None:
             node_heading_count=args.heading_count, nodes=nodes, edges=edges,
             metadata={
                 "generation_version": "opticalnav-v0.2", "robot_radius_m": args.robot_radius,
+                "max_nodes_requested": args.max_nodes,
                 "min_node_spacing_m": args.min_node_spacing, "max_edge_length_m": args.max_edge_length,
                 "k_neighbors": args.k_neighbors, "seed": args.seed,
             },
         )
         write_viewpoint_graph(graph_path, graph)
-        print(json.dumps({"graph_ref": graph_path.relative_to(root).as_posix(),
-                          **graph_summary(nodes, edges, heading_count=args.heading_count)}, indent=2))
+        summary = {"graph_ref": graph_path.relative_to(root).as_posix(),
+                   **graph_summary(nodes, edges, heading_count=args.heading_count)}
+        if getattr(args, "modern_office_glass_count", 0):
+            from .optical_perturbation import build_optical_perturbation
+            overlay = build_optical_perturbation(
+                scene_dir, seed=args.seed, mirror_density=0.0,
+                max_glass_walls=args.modern_office_glass_count,
+            )
+            summary["modern_office_glass_overlay"] = overlay["metadata"]
+        print(json.dumps(summary, indent=2))
         return
 
     # Default: shared mesh-aware core (mesh-derived walkable surface + portals,
@@ -244,7 +253,15 @@ def cmd_graph_build(args) -> None:
         max_edge_length_m=args.max_edge_length, seed=args.seed,
     )
     write_viewpoint_graph(graph_path, res.graph)
-    print(json.dumps({"graph_ref": graph_path.relative_to(root).as_posix(), **res.summary}, indent=2))
+    summary = {"graph_ref": graph_path.relative_to(root).as_posix(), **res.summary}
+    if getattr(args, "modern_office_glass_count", 0):
+        from .optical_perturbation import build_optical_perturbation
+        overlay = build_optical_perturbation(
+            scene_dir, seed=args.seed, mirror_density=0.0,
+            max_glass_walls=args.modern_office_glass_count,
+        )
+        summary["modern_office_glass_overlay"] = overlay["metadata"]
+    print(json.dumps(summary, indent=2))
 
 
 def cmd_graph_qa(args) -> None:
@@ -510,6 +527,8 @@ def main() -> None:
                                help="extra node clearance beyond robot radius so cameras don't hug walls (mesh scenes)")
     p_graph_build.add_argument("--doorway-gap", type=float, default=0.45,
                                help="max wall/threshold gap (m) bridged to connect rooms whose doorway isn't in the grid")
+    p_graph_build.add_argument("--modern-office-glass-count", type=int, default=0,
+                               help="add this many deterministic transparent-partition overlays after graph build")
     p_graph_build.set_defaults(fn=cmd_graph_build)
     p_graph_qa = graph_sub.add_parser("qa")
     p_graph_qa.add_argument("--dataset", default=".")

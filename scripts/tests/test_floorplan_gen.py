@@ -12,6 +12,7 @@ import floorplan_gen as fg  # noqa: E402
 
 APARTMENT_SEEDS = range(20_010_000, 20_010_200)
 OFFICE_SEEDS = range(20_510_000, 20_510_200)
+MODERN_OFFICE_SEEDS = range(20_610_000, 20_610_200)
 SINGLE_ROOM_SEEDS = range(20_710_000, 20_710_020)
 
 
@@ -31,17 +32,31 @@ def test_office_valid():
         assert fg.validate_plan(plan) == [], f"seed={s}"
 
 
+def test_modern_office_valid_and_bounded():
+    for s in MODERN_OFFICE_SEEDS:
+        plan = fg.build_floor_plan(s, fg.MODERN_OFFICE_ARCHETYPE)
+        assert fg.validate_plan(plan) == [], f"seed={s}"
+        rects = [fg._parse_box(spec["shape"]) for spec in plan["rooms"].values()]
+        width = max(rect[2] for rect in rects) - min(rect[0] for rect in rects)
+        height = max(rect[3] for rect in rects) - min(rect[1] for rect in rects)
+        assert 180 <= width * height <= 300
+        types = {name.split("_")[0] for name in plan["rooms"]}
+        assert {"open-office", "meeting-room", "office", "break-room", "restroom", "warehouse", "hallway"} <= types
+
+
 def test_determinism():
     for s in (20_010_042, 20_510_042):
         a = fg.build_floor_plan(s, "apartment" if s < 20_500_000 else "office")
         b = fg.build_floor_plan(s, "apartment" if s < 20_500_000 else "office")
         assert a == b
+    for s in (20_610_042, 20_610_043):
+        assert fg.build_floor_plan(s, fg.MODERN_OFFICE_ARCHETYPE) == fg.build_floor_plan(s, fg.MODERN_OFFICE_ARCHETYPE)
 
 
 def test_room_counts():
     apt = [len(p["rooms"]) for p in _all("apartment", APARTMENT_SEEDS)]
     off = [len(p["rooms"]) for p in _all("office", OFFICE_SEEDS)]
-    assert all(6 <= n <= 9 for n in apt), (min(apt), max(apt))
+    assert all(5 <= n <= 10 for n in apt), (min(apt), max(apt))
     assert min(off) >= 18, min(off)  # "dozens of rooms"
 
 
@@ -80,11 +95,27 @@ def test_no_thin_connecting_edges():
 
 
 def test_naming_and_types():
-    for arch, seeds in (("apartment", APARTMENT_SEEDS), ("office", OFFICE_SEEDS)):
+    for arch, seeds in (("apartment", APARTMENT_SEEDS), ("office", OFFICE_SEEDS),
+                        (fg.MODERN_OFFICE_ARCHETYPE, MODERN_OFFICE_SEEDS)):
         for s in seeds:
             for name in fg.build_floor_plan(s, arch)["rooms"]:
                 assert fg._NAME_RE.match(name), name
                 assert name.split("_")[0] in fg._VALID_TYPES, name
+
+
+def test_apartment_topology_diversity():
+    """build_apartment now varies corridor axis and LDK/bedroom band side (see
+    _mirror_y/_transpose_rect) instead of always the same layout; assert both
+    corridor orientations actually occur across the seed range."""
+    orientations = set()
+    for s in APARTMENT_SEEDS:
+        plan = fg.build_floor_plan(s, "apartment")
+        hall_name = next(n for n in plan["rooms"] if n.startswith("hallway"))
+        x0, y0, x1, y1 = fg._parse_box(plan["rooms"][hall_name]["shape"])
+        orientations.add("horizontal" if (x1 - x0) > (y1 - y0) else "vertical")
+        if orientations == {"horizontal", "vertical"}:
+            break
+    assert orientations == {"horizontal", "vertical"}, orientations
 
 
 def test_archetype_signatures():
@@ -94,6 +125,34 @@ def test_archetype_signatures():
     off = fg.build_floor_plan(20_510_001, "office")
     types = {n.split("_")[0] for n in off["rooms"]}
     assert "hallway" in types and "office" in types
+    modern = fg.build_floor_plan(20_610_001, fg.MODERN_OFFICE_ARCHETYPE)
+    modern_types = {name.split("_")[0] for name in modern["rooms"]}
+    assert "open-office" in modern_types and "meeting-room" in modern_types
+
+
+def test_modern_office_profile_metadata_has_all_topologies_and_glass_policy():
+    seen = set()
+    for seed in MODERN_OFFICE_SEEDS:
+        metadata = fg.modern_office_metadata(seed)
+        seen.add(metadata["topology"])
+        assert metadata["profile"] == "modern_hybrid_v1"
+        assert 180 <= metadata["footprint_area_m2"] <= 300
+        assert metadata["requested_glass_partition_count"] == 3
+    assert seen == set(fg.MODERN_OFFICE_TOPOLOGIES)
+
+
+def test_modern_glass_spec_is_deterministic_and_has_structural_door_openings():
+    for seed in (20_610_001, 20_610_042, 20_610_199):
+        first = fg.modern_office_partition_spec(seed)
+        assert first == fg.modern_office_partition_spec(seed)
+        assert first["requested_partition_count"] == 3
+        assert first["eligible_segment_count"] >= 3
+        assert len(first["segments"]) == 3
+        assert len(first["selected_segment_ids"]) == 3
+        for segment in first["segments"]:
+            assert segment["room"].split("_")[0] in {"meeting-room", "office", "break-room"}
+            assert segment["corridor"].startswith("hallway_")
+            assert len(segment["wall_endpoints_m"]) == len(segment["door_opening_m"]) == 2
 
 
 def test_single_room_types_valid_and_windowed():

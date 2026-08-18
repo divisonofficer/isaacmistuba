@@ -26,7 +26,7 @@ REPO = Path(__file__).resolve().parent.parent
 
 ARCHETYPES = {
     "apartment": "gen_apartment",   # 거실 중심 radial + 복도 + open LDK
-    "office": "gen_office",          # 척추+분기 코리더망 + 수십 개 방
+    "office": "gen_office_modern_hybrid_v1",  # 180–300㎡ 현대 hybrid office suite
     "single_room": "single_room",    # 방 하나 + entrance + exterior window
 }
 ROOM_TYPES = {
@@ -34,6 +34,20 @@ ROOM_TYPES = {
     "bedroom": "침실",
     "kitchen": "주방",
     "bathroom": "욕실",
+    "dining-room": "식당",
+    "closet": "드레스룸/수납실",
+    "hallway": "복도",
+    "garage": "차고",
+    "balcony": "발코니",
+    "utility": "다용도실",
+    "staircase-room": "계단실",
+    "warehouse": "창고",
+    "office": "개인 사무실",
+    "meeting-room": "회의실",
+    "open-office": "오픈 오피스",
+    "break-room": "휴게실",
+    "restroom": "공용 화장실",
+    "factory-office": "공장 사무실",
 }
 # furnishing density -> compose_indoors.num_floating (mirrors infinigen_gen.parse_seed)
 DENSITIES = {
@@ -42,6 +56,7 @@ DENSITIES = {
     "family_home": 28,       # 물건 많은 가정집
     "storage_heavy": 40,     # 창고급
 }
+OFFICE_STYLES = ["modern_basic_v1", "modern_glass_v1"]
 STAGES = ["full", "layout"]  # full = 가구 solve, layout = 벽만(빠른 확인)
 
 
@@ -107,6 +122,15 @@ def _parse_args(argv):
                     "플래그를 모두 주고 --yes 면 비대화식(서버/배치)으로 동작.")
     ap.add_argument("--archetype", choices=list(ARCHETYPES))
     ap.add_argument("--density", choices=list(DENSITIES))
+    ap.add_argument("--logical-seed", default=None)
+    ap.add_argument("--variation-id", type=int, default=0)
+    ap.add_argument("--anchor-richness", choices=("minimal", "balanced", "rich", "storage"), default="balanced")
+    ap.add_argument("--surface-clutter", choices=("low", "balanced", "rich", "storage"), default="balanced")
+    ap.add_argument("--office-style", choices=OFFICE_STYLES, default="modern_basic_v1")
+    ap.add_argument("--graph-max-nodes", type=int, default=70)
+    ap.add_argument("--graph-heading-count", type=int, default=24)
+    ap.add_argument("--graph-min-node-spacing", type=float, default=0.25)
+    ap.add_argument("--graph-robot-radius", type=float, default=0.30)
     ap.add_argument("--room-type", choices=list(ROOM_TYPES), default=None,
                     help="single_room 모드의 방 타입")
     ap.add_argument("--stage", choices=STAGES)
@@ -150,10 +174,13 @@ def main(argv=None) -> int:
 
     archetype = args.archetype or ("apartment" if auto else
                                    _pick("1. archetype (방 구조)", list(ARCHETYPES), "apartment"))
+    office_style = args.office_style
+    if archetype == "office" and not auto and "--office-style" not in (argv if argv is not None else sys.argv[1:]):
+        office_style = _pick("2. Office style", OFFICE_STYLES, "modern_basic_v1")
     room_type = args.room_type
     if archetype == "single_room" and room_type is None:
         room_type = "living-room" if auto else _pick("2. 방 타입", list(ROOM_TYPES), "living-room")
-    density_prompt = "3. 가구 밀도" if archetype == "single_room" else "2. 가구 밀도"
+    density_prompt = "3. 가구 밀도" if archetype in {"single_room", "office"} else "2. 가구 밀도"
     density = args.density or ("normal_lived_in" if auto else
                                _pick(density_prompt, list(DENSITIES), "normal_lived_in"))
     stage_prompt = "4. stage" if archetype == "single_room" else "3. stage"
@@ -178,6 +205,13 @@ def main(argv=None) -> int:
     print("\n" + "-" * 64)
     print("요약")
     print(f"  archetype     : {archetype}  (--floor-plan {floor_plan})")
+    if archetype == "office":
+        print(f"  office style  : {office_style}")
+        print("  graph profile : "
+              f"nodes={args.graph_max_nodes}, headings={args.graph_heading_count}, "
+              f"spacing={args.graph_min_node_spacing:g}m, robot={args.graph_robot_radius:g}m")
+        if office_style == "modern_glass_v1":
+            print("  glass contract: 3 deterministic structural partitions (no graph overlay)")
     if archetype == "single_room":
         print(f"  room type     : {room_type} ({ROOM_TYPES[room_type]})")
     print(f"  density       : {density}  (num_floating={num_floating})")
@@ -195,11 +229,20 @@ def main(argv=None) -> int:
     gen_cmd = [
         sys.executable, "scripts/infinigen_gen.py",
         "--seed", seed,
+        "--logical-seed", str(args.logical_seed or seed),
+        "--variation-id", str(args.variation_id),
+        "--density", density,
+        "--anchor-richness", args.anchor_richness,
+        "--surface-clutter", args.surface_clutter,
+        *( ["--office-style", office_style] if archetype == "office" else [] ),
+        "--graph-max-nodes", str(args.graph_max_nodes),
+        "--graph-heading-count", str(args.graph_heading_count),
+        "--graph-min-node-spacing", str(args.graph_min_node_spacing),
+        "--graph-robot-radius", str(args.graph_robot_radius),
         "--floor-plan", floor_plan,
         *( ["--room-type", room_type] if archetype == "single_room" else [] ),
         "--stage", stage,
         "--out", str(out_dir),
-        "--override", f"compose_indoors.num_floating={num_floating}",
         "--run",
     ]
     rc = _run(gen_cmd)
@@ -227,6 +270,30 @@ def main(argv=None) -> int:
         print(f"\n[!] import 실패 (exit {rc}).")
         return rc
     print(f"\n[ok] 완료 — OpticalNav scene '{scene_id}' 준비됨.")
+    if archetype == "office":
+        graph_cmd = [
+            sys.executable, "apps/opticalnav.py", "graph", "build",
+            "--dataset", "out/opticalnav/opticalnav-v0.2", "--scene-id", scene_id,
+            "--seed", seed, "--max-nodes", str(args.graph_max_nodes),
+            "--heading-count", str(args.graph_heading_count),
+            "--min-node-spacing", str(args.graph_min_node_spacing),
+            "--robot-radius", str(args.graph_robot_radius),
+        ]
+        rc = _run(graph_cmd)
+        if rc != 0:
+            print(f"\n[!] OpticalNav graph build 실패 (exit {rc}).")
+            return rc
+        if office_style == "modern_glass_v1":
+            source_manifest = out_dir / "office_layout_manifest.json"
+            scene_dir = REPO / "out" / "opticalnav" / "opticalnav-v0.2" / "scenes" / scene_id
+            audit_cmd = [sys.executable, "scripts/audit_modern_office_graph.py",
+                         "--source-manifest", str(source_manifest), "--scene-dir", str(scene_dir),
+                         "--out", str(out_dir / "modern_office_graph_audit.json")]
+            rc = _run(audit_cmd)
+            if rc != 0:
+                print(f"\n[!] Modern Glass structural graph audit 실패 (exit {rc}).")
+                return rc
+            print("[ok] Modern Glass structural graph audit 통과")
     return 0
 
 

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import sqlite3
 
 from navigation_dataset.episode_schema import EpisodeManifest
 from navigation_dataset.exporters.custom_json import (
@@ -194,3 +195,58 @@ def test_versioned_current_pointer_is_collected_into_stable_layout(tmp_path: Pat
     assert f"{base}/sensors/cam_front/rgb.png" in destinations
     assert not any(dst.endswith("current.json") for dst in destinations)
     assert is_episode_complete(ep, project_dir)
+
+
+def test_export_composes_sensors_from_separate_completed_versions(tmp_path: Path) -> None:
+    scene_id, vp, heading = "scene_composed", "vp_000001", "h_000"
+    project_dir = _build_project(tmp_path, scene_id, vp, heading, perturbed=True)
+    stable = project_dir / "scenes" / scene_id / "observations" / vp / heading
+    # Legacy consolidation contains cam_front, while later immutable sweeps
+    # independently produced cam_rear and polar_cam.
+    rear_bundle = project_dir / "scenes" / scene_id / "observations" / "versions" / "rv_rear" / "base" / vp / heading
+    polar_bundle = project_dir / "scenes" / scene_id / "observations" / "versions" / "rv_polar" / "base" / vp / heading
+    (rear_bundle / "cameras" / "cam_rear").mkdir(parents=True)
+    (polar_bundle / "cameras" / "polar_cam").mkdir(parents=True)
+    (rear_bundle / "cameras" / "cam_rear" / "rgb.png").write_bytes(b"rear-version")
+    (polar_bundle / "cameras" / "polar_cam" / "stokes_data.npz").write_bytes(b"polar-version")
+    (rear_bundle / "manifest.json").write_text("{}")
+    (polar_bundle / "manifest.json").write_text("{}")
+
+    ledger = sqlite3.connect(project_dir / "render_ledger.sqlite3")
+    ledger.executescript("""
+        CREATE TABLE sweep_runs (
+            run_id TEXT PRIMARY KEY, scene_id TEXT, created_at TEXT
+        );
+        CREATE TABLE render_versions (
+            render_version_id TEXT PRIMARY KEY, status TEXT
+        );
+        CREATE TABLE sweep_tasks (
+            task_key TEXT PRIMARY KEY, run_id TEXT, render_version_id TEXT,
+            variant TEXT, node_id TEXT, heading_id TEXT, state TEXT,
+            ordinal INTEGER, metadata_json TEXT
+        );
+    """)
+    for ordinal, (render_version, sensor_id) in enumerate((("rv_rear", "cam_rear"), ("rv_polar", "polar_cam"))):
+        run_id = f"run_{ordinal}"
+        ledger.execute("INSERT INTO sweep_runs VALUES (?, ?, ?)", (run_id, scene_id, f"2026-01-01T00:00:0{ordinal}Z"))
+        ledger.execute("INSERT INTO render_versions VALUES (?, 'ready')", (render_version,))
+        ledger.execute(
+            "INSERT INTO sweep_tasks VALUES (?, ?, ?, 'base', ?, ?, 'succeeded', ?, ?)",
+            (f"task_{ordinal}", run_id, render_version, vp, heading, ordinal, json.dumps({"sensor_ids": [sensor_id]})),
+        )
+    ledger.commit()
+    ledger.close()
+
+    pairs = list(iter_export_files(
+        project_dir,
+        {"scene_artifacts": [{"scene_id": scene_id}]},
+        [_episode(scene_id, vp, heading)],
+        include_exr=False,
+        include_polarization_raw=True,
+        camera_ids=["cam_front", "cam_rear", "polar_cam"],
+    ))
+    sources = {dst: src for src, dst in pairs}
+    base = f"scenes/{scene_id}/observations/{vp}/{heading}/sensors"
+    assert sources[f"{base}/cam_front/rgb.png"] == stable / "sensors" / "cam_front" / "rgb.png"
+    assert sources[f"{base}/cam_rear/rgb.png"] == rear_bundle / "cameras" / "cam_rear" / "rgb.png"
+    assert sources[f"{base}/polar_cam/stokes_data.npz"] == polar_bundle / "cameras" / "polar_cam" / "stokes_data.npz"

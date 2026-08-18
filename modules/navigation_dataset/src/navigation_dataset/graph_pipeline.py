@@ -677,6 +677,7 @@ def build_viewpoint_graph_core(
         edges=edges,
         metadata={
             "generation_version": "opticalnav-v0.2",
+            "max_nodes_requested": int(max_nodes),
             "robot_radius_m": float(robot_radius_m),
             "min_node_spacing_m": float(min_node_spacing_m),
             "max_edge_length_m": float(max_edge_length_m),

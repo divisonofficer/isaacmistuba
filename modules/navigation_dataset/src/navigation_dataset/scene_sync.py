@@ -14,6 +14,13 @@ JsonDict = dict[str, Any]
 SCENE_VARIANT_VERSION = "opticalnav-scene-variant-v0.3"
 
 
+def compute_authoring_source_hash(authoring_payload: JsonDict) -> str:
+    """Return the stable content hash used by render-scene synchronization."""
+    return hashlib.sha1(
+        json.dumps(authoring_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+
 @dataclass
 class RenderSceneSyncResult:
     scene_id: str
@@ -120,9 +127,7 @@ def build_render_scene_sync_payload(
     ]
 
     authoring_payload = authoring_map_to_payload(model)
-    authoring_source_hash = hashlib.sha1(
-        json.dumps(authoring_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
-    ).hexdigest()
+    authoring_source_hash = compute_authoring_source_hash(authoring_payload)
     environment_payload = dict(authoring_payload.get("environment") or {})
     camera_rig_payload = dict(authoring_payload.get("camera_rig") or {})
 

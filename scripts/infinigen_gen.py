@@ -29,8 +29,27 @@ VERIFIED against Infinigen 1.19.1 (~/module/infinigen):
     dict of name -> {"shape": <shapely expr>, [is_panoramic: 1]}.
 
 NOT yet wired (need code edits in infinigen, not gin): killing the random
-curtain/shutter (WindowFactory is not @gin.configurable), per-room material bias,
-camera profile placement. The seed's camera digits are recorded in metadata only.
+curtain/shutter (WindowFactory is not @gin.configurable), per-seed material bias
+(the wall palette below is a fixed global default, not something this wrapper can
+vary via -p/--override), camera profile placement. The seed's camera digits are
+recorded in metadata only.
+
+2026-08-11: patched the INFINIGEN_DIR install directly (not gin-configurable, so
+no override path exists) to address flat wall textures and low structural
+diversity in generated apartments:
+  - assets/composition/material_assignments.py: `wall` (per-wall-face default,
+    used by living-room/bedroom/hallway/dining-room/etc) now mixes in Brick and
+    Wood alongside Plaster/Tile instead of just Plaster+Tile; new `wall_accent`
+    list (richer Plaster/Brick/Tile/Wood mix) feeds the existing feature-wall
+    mechanism in core/.../room/decorate.py's `room_wall_alternative_fns`
+    (previously that accent slot only ever resampled plain Plaster).
+  - floorplan_gen.py's `build_apartment`: corridor/LDK/bedroom-band topology
+    now varies per seed (corridor along the short vs long axis, LDK band on
+    either side of the corridor) via exact rotation/reflection of the existing
+    validated tiling, instead of always the same "corridor mid-height, LDK
+    south" layout. Room-count range widened 6-9 -> 5-10.
+These are machine-local edits to ~/module/infinigen (outside this repo's git,
+same as the Mitsuba build dirs) -- re-apply on any fresh Infinigen checkout.
 
 This script does not run Infinigen itself unless asked; default is --dry-run-safe:
 it always prints the exact command. Use --run to actually launch (heavy: needs the
@@ -40,6 +59,7 @@ conda env + Blender + GPU).
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import subprocess
@@ -49,9 +69,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from floorplan_gen import (  # noqa: E402  (sibling module)
+    MODERN_OFFICE_ARCHETYPE,
+    MODERN_OFFICE_PROFILE,
     SINGLE_ROOM_TYPES,
     build_floor_plan,
     build_single_room_plan,
+    modern_office_metadata,
+    modern_office_partition_spec,
+    MODERN_OFFICE_STYLES,
 )
 import infinigen_env  # noqa: E402  (sibling: env path detection + persistence)
 
@@ -59,6 +84,8 @@ import infinigen_env  # noqa: E402  (sibling: env path detection + persistence)
 
 DEFAULT_INFINIGEN_DIR = Path.home() / "module" / "infinigen"
 DEFAULT_INFINIGEN_PYTHON = Path.home() / "miniconda3" / "envs" / "infinigen" / "bin" / "python"
+DENSITY_FLOATING = {"model_house": 8, "normal_lived_in": 18, "family_home": 28, "storage_heavy": 40}
+SURFACE_CLUTTER_FLOATING = {"low": 8, "balanced": 18, "rich": 28, "storage": 40}
 
 
 def infinigen_dir() -> Path:
@@ -182,12 +209,19 @@ def _gen_office(seed: int) -> dict:
     return build_floor_plan(int(seed), "office")
 
 
+def _gen_office_modern_hybrid_v1(seed: int) -> dict:
+    return build_floor_plan(int(seed), MODERN_OFFICE_ARCHETYPE)
+
+
 # key -> builder
 FLOOR_PLANS = {
     "kr_apt_84": _kr_apt_84,
     "kr_glasswall_demo": _kr_glasswall_demo,
     "gen_apartment": _gen_apartment,
+    # Legacy corridor office retained solely so previously published seed/output
+    # provenance can still be regenerated.
     "gen_office": _gen_office,
+    "gen_office_modern_hybrid_v1": _gen_office_modern_hybrid_v1,
     # Handled specially because it needs the explicit --room-type argument.
     "single_room": None,
 }
@@ -273,6 +307,12 @@ def build_command(preset: AptPreset, *, out: Path, stage: str, fast: bool,
 
     overrides = [
         "compose_indoors.terrain_enabled=False",
+        # The long-lived FCL broad-phase managers used by the solver's BVH
+        # cache reproducibly segfault in python-fcl 0.7.0.8 after roughly 150
+        # annealing iterations on this deployment.  Disabling the cache keeps
+        # the collision constraints themselves enabled, but rebuilds managers
+        # instead of reusing native CollisionObjects across scene mutations.
+        "bvh_caching_config.enabled=False",
         # absolute path so cwd (the install dir) doesn't matter
         f"Solver.floor_plan='{floor_plan_json}'",
     ]
@@ -285,13 +325,17 @@ def build_command(preset: AptPreset, *, out: Path, stage: str, fast: bool,
             "compose_indoors.invisible_room_ceilings_enabled=True",
             "compose_indoors.floating_objs_enabled=True",
             f"compose_indoors.num_floating={preset.num_floating}",
-            "compose_indoors.enable_collision_floating=True",
-            "compose_indoors.enable_collision_solved=True",
+            # Floating-object placement is a later, optional clutter pass and
+            # uses the same unstable native FCL binding.  Keep it enabled but
+            # avoid its extra FCL collision-manager calls by default.
+            "compose_indoors.enable_collision_floating=False",
+            "compose_indoors.enable_collision_solved=False",
         ]
     overrides += extra_overrides
 
     py = str(infinigen_python())
-    cmd = [py, "-m", "infinigen_examples.generate_indoors",
+    safe_entry = Path(__file__).resolve().with_name("infinigen_generate_indoors_safe.py")
+    cmd = [py, str(safe_entry),
            "-s", str(preset.seed), "--task", "coarse",
            "--output_folder", str(out), "-g", *configs, "-p", *overrides]
     return cmd
@@ -309,7 +353,19 @@ def main() -> int:
     ap.add_argument("--floor-plan", default=None,
                     help=f"Override floor-plan key. Available: {', '.join(FLOOR_PLANS)}")
     ap.add_argument("--room-type", choices=SINGLE_ROOM_TYPES, default="living-room",
-                    help="Single-room semantic type: living-room, bedroom, kitchen, or bathroom.")
+                    help="Single-room semantic type (all Infinigen room semantics supported).")
+    ap.add_argument("--density", choices=tuple(DENSITY_FLOATING), default=None,
+                    help="Explicit furnishing provenance; overrides density encoded in the seed.")
+    ap.add_argument("--logical-seed", default=None, help="User-facing seed retained in provenance metadata.")
+    ap.add_argument("--variation-id", type=int, default=0)
+    ap.add_argument("--anchor-richness", choices=("minimal", "balanced", "rich", "storage"), default="balanced")
+    ap.add_argument("--surface-clutter", choices=("low", "balanced", "rich", "storage"), default="balanced")
+    ap.add_argument("--office-style", choices=MODERN_OFFICE_STYLES, default="modern_basic_v1",
+                    help="Modern Office visual/structural preset (office archetype only).")
+    ap.add_argument("--graph-max-nodes", type=int, default=70)
+    ap.add_argument("--graph-heading-count", type=int, default=24)
+    ap.add_argument("--graph-min-node-spacing", type=float, default=0.25)
+    ap.add_argument("--graph-robot-radius", type=float, default=0.30)
     ap.add_argument("-p", "--override", action="append", default=[],
                     help="Extra raw gin override (repeatable), e.g. -p compose_indoors.num_floating=12")
     ap.add_argument("--run", action="store_true",
@@ -317,12 +373,17 @@ def main() -> int:
     args = ap.parse_args()
 
     preset = parse_seed(args.seed)
+    if args.density:
+        preset.density = args.density
+        preset.num_floating = DENSITY_FLOATING[args.density]
+    preset.num_floating = SURFACE_CLUTTER_FLOATING[args.surface_clutter]
     if args.floor_plan:
         if args.floor_plan not in FLOOR_PLANS:
             ap.error(f"unknown floor plan {args.floor_plan!r}; have {list(FLOOR_PLANS)}")
         preset.floor_plan_key = args.floor_plan
         preset.archetype = {"gen_apartment": "apartment",
                             "gen_office": "office",
+                            "gen_office_modern_hybrid_v1": "office",
                             "single_room": "single_room"}.get(args.floor_plan)
     if preset.floor_plan_key == "single_room":
         preset.room_type = args.room_type.replace("_", "-")
@@ -341,8 +402,20 @@ def main() -> int:
     floor_plan_json.write_text(json.dumps(floor_plan, indent=2), encoding="utf-8")
 
     # Record the decoded preset (camera profile etc. are metadata-only for now).
+    office_style = args.office_style if preset.floor_plan_key == "gen_office_modern_hybrid_v1" else None
+    office_manifest = None
+    if office_style == "modern_glass_v1":
+        # Validate before launching Blender so an unsatisfiable topology has a
+        # clean layout error rather than a late geometry fallback.
+        office_manifest = modern_office_partition_spec(args.seed)
+    office_style_digest = (office_manifest or {}).get(
+        "digest", hashlib.sha256(str(office_style or "").encode("utf-8")).hexdigest()
+    )
     (out / "kr_preset.json").write_text(json.dumps({
         "seed": preset.seed, "unit_type": preset.unit_type,
+        "logical_seed": str(args.logical_seed or f"{args.seed:08d}"), "effective_scene_seed": preset.seed,
+        "variation_id": args.variation_id, "content_policy_version": "room-content-v1",
+        "anchor_richness": args.anchor_richness, "surface_clutter": args.surface_clutter,
         "floor_plan_key": preset.floor_plan_key, "archetype": preset.archetype,
         "density": preset.density,
         "num_floating": preset.num_floating, "camera_profile": preset.camera_profile,
@@ -351,7 +424,27 @@ def main() -> int:
         "outdoor_context": "environment_map_pending",
         "terrain_enabled": False,
         "window_policy": "required",
+        "opticalnav_graph_profile": {
+            "max_nodes": args.graph_max_nodes,
+            "heading_count": args.graph_heading_count,
+            "min_node_spacing_m": args.graph_min_node_spacing,
+            "robot_radius_m": args.graph_robot_radius,
+        },
+        **({"office_profile": {**modern_office_metadata(args.seed), "office_style": office_style,
+                                "office_style_digest": office_style_digest}}
+           if preset.floor_plan_key == "gen_office_modern_hybrid_v1" else {}),
     }, indent=2), encoding="utf-8")
+
+    if preset.floor_plan_key == "gen_office_modern_hybrid_v1":
+        (out / "office_layout_manifest.json").write_text(json.dumps({
+            "schema": "robomituba.opticalnav_office_layout.v1",
+            "profile": MODERN_OFFICE_PROFILE,
+            "source_floor_plan": "floor_plan.json",
+            "office_style": office_style,
+            "office_style_digest": office_style_digest,
+            "structural_glass": office_manifest,
+            **modern_office_metadata(args.seed),
+        }, indent=2), encoding="utf-8")
 
     cmd = build_command(preset, out=out, stage=args.stage, fast=args.fast,
                         floor_plan_json=floor_plan_json, extra_overrides=args.override)
@@ -376,8 +469,30 @@ def main() -> int:
         print(f"ERROR: INFINIGEN_DIR not found: {idir}", file=sys.stderr)
         return 2
 
-    env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+    env = {**os.environ, "PYTHONUNBUFFERED": "1",
+           "ROBOMITUBA_INFINIGEN_ROOM_TYPE": str(preset.room_type or ""),
+           "ROBOMITUBA_INFINIGEN_PROGRAM": (
+               "modern_office" if preset.floor_plan_key == "gen_office_modern_hybrid_v1" else ""
+           ),
+           "ROBOMITUBA_INFINIGEN_ANCHOR_RICHNESS": args.anchor_richness}
+    if office_style:
+        env["ROBOMITUBA_INFINIGEN_OFFICE_STYLE"] = office_style
+        env["ROBOMITUBA_INFINIGEN_OFFICE_MANIFEST"] = str(out / "office_layout_manifest.json")
     proc = subprocess.run(cmd, cwd=str(idir), env=env)
+    if proc.returncode < 0:
+        signal_number = -int(proc.returncode)
+        try:
+            import signal
+            signal_name = signal.Signals(signal_number).name
+        except (ValueError, AttributeError):
+            signal_name = "unknown signal"
+        print(
+            f"ERROR: Infinigen terminated by {signal_name} ({signal_number})",
+            file=sys.stderr,
+        )
+        # Preserve the conventional shell representation (SIGSEGV -> 139)
+        # instead of letting the nested Python wrapper turn -11 into 245.
+        return 128 + signal_number
     return proc.returncode
 
 

@@ -58,14 +58,20 @@ _PHASE_ORDER = ("rgb", "polar", "lidar")
 
 
 def _mat4_from_xy_yaw(x: float, y: float, yaw_rad: float, height_m: float = 1.0) -> list[float]:
-    c = math.cos(yaw_rad)
-    s = math.sin(yaw_rad)
-    return [
-        c, 0.0, -s, 0.0,
-        0.0, 1.0, 0.0, 0.0,
-        s, 0.0, c, 0.0,
-        float(x), float(height_m), float(y), 1.0,
-    ]
+    """Return the canonical Mitsuba camera pose in legacy flat storage.
+
+    ``x, y`` are authoring-floor coordinates (Mitsuba X/Z), while ``height_m``
+    is Mitsuba Y.  Keeping this adapter as the only sweep entry point prevents
+    graph headings from drifting from Blender GT and kitchen probes.
+    """
+    from robomituba_bridge.camera_pose import matrix_to_legacy_flat, resolve_viewpoint_pose
+
+    pose = resolve_viewpoint_pose(
+        (float(x), float(y), 0.0),
+        math.degrees(float(yaw_rad)),
+        eye_height_m=float(height_m),
+    )
+    return matrix_to_legacy_flat(pose.camera_to_world_mitsuba)
 
 
 def _sensor_pose_from_xy_yaw(

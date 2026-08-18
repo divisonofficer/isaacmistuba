@@ -149,14 +149,7 @@ def _try_materialize_render_scene(
         if module_src.exists() and str(module_src) not in sys.path:
             sys.path.insert(0, str(module_src))
     try:
-        from mitsuba_converter.render_daemon import (  # type: ignore
-            _build_materialization_audit,
-            _build_opticalnav_render_readiness,
-            _build_render_scene_material_policy,
-            _build_xml_scene_index,
-            _generate_opticalnav_render_scene_xml,
-            _stage_xml_obj_filenames_to_scene_mesh_cache,
-        )
+        from mitsuba_converter.scene_materialization import materialize_render_scene  # type: ignore
     except Exception as exc:
         readiness = _pending_render_readiness(scene_id, summary, asset_gaps)
         readiness.setdefault("warnings", []).append(
@@ -168,64 +161,13 @@ def _try_materialize_render_scene(
         )
         return "pending", readiness
 
-    render_scene_path = scene_dir / "render_scene.xml"
-    mesh_stats: dict[str, int] = {}
-    materialization_records: list[dict[str, Any]] = []
-    material_policy_records: list[dict[str, Any]] = []
     try:
-        shape_count = _generate_opticalnav_render_scene_xml(
-            authoring_map,
-            overlay,
-            render_scene_path,
-            editor_geometry=None,
-            repo_root=repo_root,
-            mesh_resolver=None,
-            mesh_stats=mesh_stats,
-            materialization_records=materialization_records,
-            material_policy_records=material_policy_records,
+        result = materialize_render_scene(
+            repo_root=repo_root, project_dir=project_dir, scene_dir=scene_dir,
+            scene_id=scene_id, authoring_map=authoring_map, overlay=overlay,
         )
-        material_policy = _build_render_scene_material_policy(
-            scene_id=scene_id,
-            material_policy_records=material_policy_records,
-        )
-        (scene_dir / "render_scene_material_policy.json").write_text(
-            json.dumps(material_policy, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        render_scene_ref = render_scene_path.relative_to(repo_root).as_posix()
-        mesh_stats["scene_mesh_cache"] = _stage_xml_obj_filenames_to_scene_mesh_cache(
-            render_scene_path,
-            scene_mesh_cache_dir=scene_dir / "mesh_cache",
-            repo_root=repo_root,
-        )
-        audit = _build_materialization_audit(
-            scene_id=scene_id,
-            overlay_objects=list(overlay.get("objects") or []),
-            materialization_records=materialization_records,
-            mesh_stats=mesh_stats,
-        )
-        (scene_dir / "render_scene_materialization.json").write_text(
-            json.dumps(audit, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        xml_index = _build_xml_scene_index(
-            render_scene_path,
-            scene_id=scene_id,
-            materialization_records=materialization_records,
-        )
-        if xml_index is not None:
-            (scene_dir / "xml_scene_index.json").write_text(
-                json.dumps(xml_index, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-        readiness = _build_opticalnav_render_readiness(
-            authoring_map,
-            repo_root=repo_root,
-            render_scene_path=render_scene_path,
-            render_scene_ref=render_scene_ref,
-            overlay_shape_count=shape_count,
-            materialization_records=materialization_records,
-        )
+        render_scene_ref = str(result["render_scene_ref"])
+        readiness = dict(result["readiness"])
         sv_path = scene_dir / "scene_variant.json"
         if sv_path.exists():
             sv = json.loads(sv_path.read_text(encoding="utf-8"))
