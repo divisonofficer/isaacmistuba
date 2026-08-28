@@ -33,7 +33,7 @@ export function makeStarterAuthoringMap(sceneId: string) {
 		},
 		materials: [
 			{ material_id: 'clear_glass', category: 'transparent', render_binding: { kind: 'preset', bsdf_strategy: 'dielectric', capabilities: { rgb: true, nir: true, polarization: true } } },
-			{ material_id: 'mirror', category: 'reflective', render_binding: { kind: 'preset', bsdf_strategy: 'conductor', capabilities: { rgb: true, nir: true, polarization: true } } },
+			{ material_id: 'mirror', category: 'reflective', render_binding: { kind: 'preset', bsdf_strategy: 'roughconductor', capabilities: { rgb: true, nir: true, polarization: true } } },
 			{ material_id: 'painted_wall', category: 'opaque', render_binding: { kind: 'preset', bsdf_strategy: 'roughplastic', capabilities: { rgb: true, nir: true, polarization: false } } },
 			{ material_id: 'wood', category: 'opaque', render_binding: { kind: 'preset', bsdf_strategy: 'roughplastic', capabilities: { rgb: true, nir: true, polarization: false } } },
 		],

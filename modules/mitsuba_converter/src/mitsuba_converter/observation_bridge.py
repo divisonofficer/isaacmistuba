@@ -254,6 +254,12 @@ def _camera_assist_light(render_request: RenderRequest, camera_spec: CameraSpec,
     if "render_modalities" in extras:
         if any(item in {"active_nir_intensity", "nir_intensity"} for item in camera_modalities) or extras.get("active_emitter"):
             return render_request.assist_light
+        # An active-polar request intentionally scopes the same camera-aligned
+        # area-emitter + polarizer construction to polar cameras only.  This
+        # keeps RGB cameras passive in a mixed rig capture.
+        request_extras = render_request.extras if isinstance(render_request.extras, Mapping) else {}
+        if bool(request_extras.get("polar_active")) and any(item in POLAR_MODALITIES for item in camera_modalities):
+            return render_request.assist_light
         return None
     return render_request.assist_light
 
@@ -316,6 +322,9 @@ def _artifact_manifest_from_result(
             "material_profile": result.metadata.get("material_profile"),
             "depth_model": result.metadata.get("depth_model"),
             "assist_light": result.metadata.get("assist_light"),
+            "polar_visualization_policy": result.metadata.get("polar_visualization_policy"),
+            "stokes_preview_recipe": result.metadata.get("stokes_preview_recipe"),
+            "derived_on_demand": result.metadata.get("derived_on_demand"),
         },
     )
 
@@ -357,6 +366,9 @@ def _sensor_artifact_manifest_from_result(
             "destaggered_ref": artifacts.get("destaggered_npz") if sensor_spec.sensor_type == "ouster_lidar" else None,
             "measurement_id_ref": artifacts.get("raw_npz") if sensor_spec.sensor_type == "ouster_lidar" else None,
             "timestamp_ref": artifacts.get("raw_npz") if sensor_spec.sensor_type == "ouster_lidar" else None,
+            "polar_visualization_policy": result.metadata.get("polar_visualization_policy"),
+            "stokes_preview_recipe": result.metadata.get("stokes_preview_recipe"),
+            "derived_on_demand": result.metadata.get("derived_on_demand"),
         },
     )
 
@@ -649,11 +661,14 @@ def render_timestep_bundle(
             "scene_override": asdict(render_request.scene_override) if render_request.scene_override is not None else None,
             "assist_light": asdict(render_request.assist_light) if render_request.assist_light is not None else None,
             "depth_approx": asdict(render_request.depth_approx) if render_request.depth_approx is not None else None,
+            "render_profile_id": render_request.extras.get("render_profile_id") if isinstance(render_request.extras, Mapping) else None,
+            "render_profile": render_request.extras.get("render_profile") if isinstance(render_request.extras, Mapping) else None,
         },
     )
     write_manifest(bundle_manifest, repo_root=root)
     manifest_s = time.perf_counter() - manifest_start
     timing_log["manifest_s"] = manifest_s
+    timing_log["manifest_publish_s"] = manifest_s
     timing_log_path.write_text(json.dumps(timing_log, indent=2), encoding="utf-8")
     bundle_manifest.extras["manifest_s"] = manifest_s
     write_manifest(bundle_manifest, repo_root=root)

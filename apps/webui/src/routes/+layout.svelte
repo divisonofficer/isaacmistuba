@@ -1,7 +1,13 @@
 <script lang="ts">
 	import '../app.css';
 	import { page } from '$app/stores';
-	import { healthStore, backendOffline, backendOfflineReason } from '$lib/stores/health';
+	import {
+		healthStore,
+		backendOffline,
+		backendOfflineReason,
+		backendReconnecting,
+		reconnectBackend
+	} from '$lib/stores/health';
 	import { debugToasts, startDebugPolling, stopDebugPolling, kindIcon } from '$lib/stores/debugEvents';
 	import { lang } from '$lib/stores/lang';
 	import { initTheme } from '$lib/stores/theme';
@@ -54,6 +60,7 @@
 		]},
 		{ en: 'Rendering & System', kr: '렌더링 · 시스템', items: [
 			{ en: 'Scene Registry',   kr: '장면 레지스트리',  href: '/scenes',         icon: '🎬' },
+			{ en: 'Mitsuba Live',      kr: 'Mitsuba 라이브',   href: '/mitsuba-live-viewer', icon: '◉' },
 			{ en: 'Material Library', kr: '재질 라이브러리',  href: '/materials',      icon: '🎨' },
 			{ en: 'Bridge',           kr: '연동 상태 (Bridge)', href: '/bridge',       icon: '🌉' },
 			{ en: 'System / Workers', kr: '시스템 / 워커',    href: '/system',         icon: '🖥' },
@@ -179,6 +186,10 @@
 
 	function toggleLang() {
 		lang.set($lang === 'kr' ? 'en' : 'kr');
+	}
+
+	async function handleBackendReconnect() {
+		await reconnectBackend();
 	}
 
 	const effectiveSceneId = $derived(
@@ -640,26 +651,29 @@
 </div>
 
 {#if $backendOffline}
-	<div style="position:fixed;inset:0;background:rgba(15,23,42,0.75);backdrop-filter:blur(4px);z-index:10000;display:flex;align-items:center;justify-content:center;padding:1rem">
-		<div style="background:var(--bg,#fff);border-radius:0.75rem;padding:2rem;max-width:28rem;width:100%;box-shadow:0 20px 50px rgba(0,0,0,0.3);border:1px solid var(--border)">
-			<div style="font-size:2.5rem;text-align:center;margin-bottom:0.5rem">🔌</div>
-			<h2 style="margin:0 0 0.5rem;text-align:center;font-size:1.1rem;font-weight:600">
-				{$lang === 'kr' ? '백엔드에 연결할 수 없습니다' : 'Cannot Connect to Backend'}
-			</h2>
-			<p class="muted text-sm" style="text-align:center;margin:0 0 0.25rem">
-				{$lang === 'kr' ? '데몬이 실행 중인지 확인해주세요.' : 'Please check that the daemon is running.'}
-			</p>
-			{#if $backendOfflineReason}
-				<p class="mono muted text-xs" style="text-align:center;margin:0 0 1rem">({$backendOfflineReason})</p>
-			{/if}
-			<div style="display:flex;gap:0.5rem;justify-content:center;margin-top:1rem">
-				<button class="button button-primary" onclick={() => location.reload()}>
-					{$lang === 'kr' ? '새로고침' : 'Refresh'}
-				</button>
+	<div
+		role="status"
+		style="position:fixed;right:1rem;bottom:1rem;z-index:10000;max-width:min(30rem,calc(100vw - 2rem));background:var(--bg,#fff);border-radius:0.75rem;padding:1rem 1.1rem;box-shadow:0 14px 36px rgba(0,0,0,0.28);border:1px solid var(--danger,#dc2626)"
+	>
+		<div style="display:flex;align-items:flex-start;gap:0.75rem">
+			<span style="font-size:1.4rem;line-height:1" aria-hidden="true">🔌</span>
+			<div style="min-width:0;flex:1">
+				<strong>{$lang === 'kr' ? '백엔드 재연결 중' : 'Reconnecting to backend'}</strong>
+				<p class="muted text-sm" style="margin:0.2rem 0 0">
+					{$lang === 'kr' ? '현재 화면과 편집 상태는 유지됩니다.' : 'Your current page and editor state are preserved.'}
+				</p>
+				{#if $backendOfflineReason}
+					<p class="mono muted text-xs" style="margin:0.35rem 0 0">{$backendOfflineReason}</p>
+				{/if}
 			</div>
-			<p class="muted text-xs" style="text-align:center;margin:1rem 0 0">
-				{$lang === 'kr' ? '자동으로 재연결 시도 중…' : 'Auto-reconnecting…'}
-			</p>
+		</div>
+		<div style="display:flex;align-items:center;gap:0.5rem;margin-top:0.75rem;margin-left:2.15rem">
+			<button class="button button-primary" disabled={$backendReconnecting} onclick={handleBackendReconnect}>
+				{$backendReconnecting
+					? ($lang === 'kr' ? '확인 중…' : 'Checking…')
+					: ($lang === 'kr' ? '지금 재연결' : 'Reconnect now')}
+			</button>
+			<span class="muted text-xs">{$lang === 'kr' ? '자동 재시도 중' : 'Retrying automatically'}</span>
 		</div>
 	</div>
 {/if}

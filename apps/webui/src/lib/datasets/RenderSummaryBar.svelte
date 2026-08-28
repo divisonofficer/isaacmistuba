@@ -15,6 +15,7 @@
 	const summary = $derived(buildRenderSummary(activeBatch, health, renderMode));
 	const failed = $derived(summary.counts.failed ?? 0);
 	const active = $derived((summary.counts.running ?? 0) + (summary.counts.queued ?? 0));
+	const execution = $derived(summary.execution ?? { queued: summary.counts.queued ?? 0, prefetched: 0, workerRunning: summary.counts.running ?? 0 });
 	const gpuLabel = $derived(
 		summary.gpus.length
 			? summary.gpus.map((gpu: any) => `GPU${gpu.index} ${gpu.util_pct ?? 0}% ${gpu.mem_used_mb ?? 0}/${gpu.mem_total_mb ?? 0}MB`).join(' · ')
@@ -34,8 +35,9 @@
 			</div>
 			<div class="summary-progress">
 				<span>{summary.complete} / {summary.total} complete</span>
-				<span>{summary.counts.running} running</span>
-				<span>{summary.counts.queued} queued</span>
+				<span>{execution.workerRunning} worker running</span>
+				{#if execution.prefetched > 0}<span>{execution.prefetched} prefetched</span>{/if}
+				<span>{execution.queued} queued</span>
 				{#if failed > 0}<span class="danger">{failed} failed</span>{/if}
 			</div>
 			<div class="progress-track">

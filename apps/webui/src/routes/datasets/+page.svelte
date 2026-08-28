@@ -39,6 +39,12 @@
 	import * as authoringMapService from '$lib/datasets/services/authoringMapService';
 	import * as projectService from '$lib/datasets/services/projectService';
 	import {
+		newPolarSampleSubmissionGroup,
+		polarFullSweepPayloads,
+		polarSampleSweepPayloads,
+		polarSampleSweepReady,
+	} from '$lib/datasets/polarSampleSweep';
+	import {
 		mergeBatch,
 		normalizeBatchForDisplay,
 		applyJobStatusUpdates,
@@ -144,6 +150,7 @@
 		getOpticalPerturbation,
 		getEpisodePlanProgress,
 		buildOpticalPerturbation,
+		planOpticalNavPolarSampleSweep,
 		opticalNavSyncProgressWsUrl,
 		sweepOpticalNavViewpointGraph,
 		deleteOpticalNavObservations,
@@ -175,6 +182,8 @@
 		opticalNavObservationRgbUrl,
 		opticalNavObservationModalityUrl,
 		getJobLog,
+		getOpticalNavRenderTaskEvents,
+		cancelOpticalNavGraphRenderBatch,
 		retryJob as retryRenderJob,
 		cancelJob,
 		getCameraRig,
@@ -208,7 +217,7 @@
 	const loading = $derived(loadingCount > 0);
 	const backgroundLoading = $derived(backgroundLoadingCount > 0);
 	const actionInFlight = $derived(actionCount > 0);
-	type RunOptions = { background?: boolean; resource?: ResourceKey; kind?: 'load' | 'action' };
+	type RunOptions = { background?: boolean; resource?: ResourceKey; kind?: 'load' | 'action'; isStillCurrent?: () => boolean };
 	// `loading` gates only foreground user actions. Background scene refreshes can
 	// take a long time on cold daemon caches, so they use `backgroundLoading`
 	// instead of keeping Save/Refresh controls disabled.
@@ -243,15 +252,17 @@
 	// Wrap a loader so its resource status tracks idle→loading→ready/error.
 	// Orthogonal to run(): run() drives the foreground spinner + activity log,
 	// track() drives per-resource status. A loader can use both.
-	async function track<T>(key: ResourceKey, fn: () => Promise<T>): Promise<T | undefined> {
+	async function track<T>(key: ResourceKey, fn: () => Promise<T>, isStillCurrent: () => boolean = () => true): Promise<T | undefined> {
 		resourceStatus[key] = 'loading';
 		for (let attempt = 0; ; attempt++) {
 			try {
 				const r = await fn();
+				if (!isStillCurrent()) return undefined;
 				resourceStatus[key] = 'ready';
 				delete resourceError[key];
 				return r;
 			} catch (err) {
+				if (!isStillCurrent()) return undefined;
 				const msg = errorMessage(err);
 				// A hard refresh fires many requests before the daemon/connection is
 				// ready → transient "Failed to fetch" / network errors. Auto-retry those
@@ -319,6 +330,8 @@
 	let selectedProjectId = $state(_urlInit.get('project') ?? _ssGet('opticalnav:lastProject') ?? '');
 	let project = $state<any>(null);
 	let episodes = $state<any[]>([]);
+	let episodeTotal = $state(0);
+	let episodeNextCursor = $state<string | null>(null);
 	let selectedEpisodeId = $state('');
 	let selectedEpisode = $state<any>(null);
 	let episodeSearch = $state('');
@@ -348,7 +361,14 @@
 	let renderVersions = $state<any[]>([]);
 	let renderSensorProgress = $state<any[]>([]);
 	let renderVersionsLoading = $state(false);
+	let renderVersionGallery = $state<any>(null);
+	let renderVersionGalleryLoading = $state(false);
+	let renderVersionGalleryError = $state('');
 	let sweepSubmissionInFlight = $state(false);
+	let polarSampleSweepSubmitting = $state(false);
+	let polarFullSweepSubmitting = $state(false);
+	let polarSampleSweepResult = $state<any>(null);
+	let polarFullSweepResult = $state<any>(null);
 
 	// sessionStorage key for active render batches, scoped per (project, scene)
 	// so jumping between scenes shows the right pending work.
@@ -434,7 +454,9 @@
 	let syncRunning = $state(false);
 	async function refreshRoomShell() {
 		if (!selectedProjectId || !sceneId) { roomShell = null; return; }
-		const res = await track('roomShell', () => renderService.fetchRoomShell(selectedProjectId, sceneId));
+		const request = captureSceneRequest();
+		const res = await track('roomShell', () => renderService.fetchRoomShell(request.projectId, request.sceneId), () => isCurrentSceneRequest(request));
+		if (!isCurrentSceneRequest(request)) return;
 		if (res === undefined) { roomShell = null; return; }
 		roomShell = res?.room_shell ?? null;
 		if (!_showRoomShellUserTouched && roomShell && typeof roomShell.enabled === 'boolean') {
@@ -459,12 +481,16 @@
 	let xmlSceneIndex = $state<any>(null);
 	async function refreshMaterializationAudit() {
 		if (!selectedProjectId || !sceneId) { materializationAudit = null; return; }
-		const res = await track('materializationAudit', () => renderService.fetchMaterializationAudit(selectedProjectId, sceneId));
+		const request = captureSceneRequest();
+		const res = await track('materializationAudit', () => renderService.fetchMaterializationAudit(request.projectId, request.sceneId), () => isCurrentSceneRequest(request));
+		if (!isCurrentSceneRequest(request)) return;
 		materializationAudit = res ?? null;
 	}
 	async function refreshXmlSceneIndex() {
 		if (!selectedProjectId || !sceneId) { xmlSceneIndex = null; return; }
-		const res = await track('xmlSceneIndex', () => renderService.fetchXmlSceneIndex(selectedProjectId, sceneId));
+		const request = captureSceneRequest();
+		const res = await track('xmlSceneIndex', () => renderService.fetchXmlSceneIndex(request.projectId, request.sceneId), () => isCurrentSceneRequest(request));
+		if (!isCurrentSceneRequest(request)) return;
 		xmlSceneIndex = res ?? null;
 	}
 	$effect(() => {
@@ -537,6 +563,27 @@
 	let projectName = $state('OpticalNav-v0.2');
 	let sceneId = $state(_urlInit.get('scene') ?? _ssGet('opticalnav:lastScene') ?? 'glass_corridor_001');
 	let usdRef = $state('scenes/glass_corridor_001/scene.usd');
+	type SceneRequest = { projectId: string; sceneId: string; generation: number };
+	let _sceneRequestKey = '';
+	let _sceneRequestGeneration = 0;
+	function captureSceneRequest(): SceneRequest {
+		const key = `${selectedProjectId}\u0000${sceneId}`;
+		if (key !== _sceneRequestKey) {
+			_sceneRequestKey = key;
+			_sceneRequestGeneration += 1;
+		}
+		return { projectId: selectedProjectId, sceneId, generation: _sceneRequestGeneration };
+	}
+	function isCurrentSceneRequest(request: SceneRequest): boolean {
+		const key = `${selectedProjectId}\u0000${sceneId}`;
+		if (key !== _sceneRequestKey) {
+			_sceneRequestKey = key;
+			_sceneRequestGeneration += 1;
+		}
+		return request.generation === _sceneRequestGeneration
+			&& request.projectId === selectedProjectId
+			&& request.sceneId === sceneId;
+	}
 
 	// URL captures ?project= and ?scene= for shareable links; sessionStorage acts
 	// as a fallback when the user navigates to a different route and back to
@@ -817,13 +864,15 @@
 	// context). OFF restricts to just the (vp, heading) pairs the episode
 	// visits along its GT path (much slimmer bundle).
 	let exportPanoramaObservations = $state(true);
-	// Compact core + a separate lossless Stokes extension is the default.
-	// pngOnly remains only as a legacy_full compatibility switch.
-	let exportProfile = $state<'compact_with_polar_extension' | 'single_lossless_core' | 'navigation_only' | 'legacy_full'>('compact_with_polar_extension');
+	// Core + lossless Polar extension preserves raw Stokes while avoiding one
+	// enormous default archive. pngOnly remains legacy_full compatibility only.
+	let exportProfile = $state<'compact_with_polar_extension' | 'single_lossless_core' | 'navigation_only' | 'png_stokes_core' | 'legacy_full'>('compact_with_polar_extension');
 	let exportPngOnly = $state(true);
 	let exportIncludeBirdseye = $state(true);  // include a top-down bird's-eye summary PNG
 	let exportIncludeEpisodeBirdseye = $state(false);  // per-episode path map PNGs (episodes_birdseye/)
 	let exportEvalPerturbation = $state(false);  // also ship observations_perturbed/ (mirror/glass eval split)
+	let exportUploadToGoogleDrive = $state(false);
+	let exportUploadDestinationSubpath = $state('dataset/opticalnav');
 	let exportSelectedCameraIds = $state<string[]>([]);
 	let exportCameraSelectionSceneKey = $state('');
 	let exportCameraSelectionTouched = $state(false);
@@ -887,6 +936,7 @@
 	let compileResult = $state<any>(null);
 	let syncResult = $state<any>(null);
 	let renderReadiness = $state<any>(null);
+	let workflowStatus = $state<any>(null);
 	// envmapFiles, envmapUploading → assetVM
 	let isaacSyncResult = $state<any>(null);
 	let authoringMapDirty = $state(false);
@@ -1016,13 +1066,32 @@
 	const currentUsdPathMissing = $derived(Boolean(currentUsdRef && currentScene?.usd_exists === false));
 	const hasPersistedAuthoringMap = $derived(Boolean(currentScene?.authoring_map_exists));
 	const hasAuthoringMap = $derived(Boolean(hasPersistedAuthoringMap || authoringMap));
-	const hasMap = $derived(Boolean(currentScene?.map_exists));
-	const hasGraph = $derived(Boolean(currentScene?.viewpoint_graph_exists));
+	const hasMap = $derived(workflowStatus ? workflowStatus?.stages?.grid?.state === 'ready' : Boolean(currentScene?.map_exists));
+	const hasGraph = $derived(workflowStatus ? workflowStatus?.stages?.graph?.state === 'ready' : Boolean(currentScene?.viewpoint_graph_exists));
 	const hasEpisodes = $derived(episodes.length > 0);
 	const renderReadinessSummary = $derived(currentScene?.render_readiness ?? null);
 	const effectiveRenderReadiness = $derived(renderReadiness ?? syncResult?.render_readiness ?? renderReadinessSummary);
-	const currentRenderSceneStatus = $derived(String(currentScene?.sync_status?.render_scene ?? ''));
 	const renderReadinessOk = $derived(Boolean(effectiveRenderReadiness?.ok));
+	// Legacy catalog rows deliberately do not open every scene_annotation.json.
+	// The selected scene's render-readiness endpoint is authoritative once it has
+	// answered OK, so do not label an actually ready legacy scene "not synced"
+	// merely because the compact project catalog has no sync_status field.
+	const currentRenderSceneStatus = $derived(String(
+		currentScene?.sync_status?.render_scene ?? (renderReadinessOk ? 'synced' : '')
+	));
+	const renderSyncMessage = $derived.by(() => {
+		const sync = currentScene?.sync_status ?? {};
+		if (typeof sync.message === 'string' && sync.message.trim()) return sync.message.trim();
+		const status = String(sync.render_scene_status ?? sync.render_scene ?? 'pending');
+		if (status === 'error') return 'The last render-scene sync failed. Retry Sync Render Scene.';
+		if (status === 'interrupted') return 'The previous render-scene sync was interrupted. Retry Sync Render Scene.';
+		if (status === 'blocked') {
+			const checks = Array.isArray(effectiveRenderReadiness?.checks) ? effectiveRenderReadiness.checks : [];
+			const failedCheck = checks.find((check: any) => check?.ok === false);
+			return failedCheck?.message ?? 'Render-scene validation is blocked; resolve the reported readiness check, then retry sync.';
+		}
+		return 'This scene has no current render-scene artifact. Save changes, then run Sync Render Scene.';
+	});
 	// Local readiness alone is not enough: annotation compile or async sync can
 	// invalidate render-scene artifacts after a previous OK response.
 	const renderSceneSynced = $derived(renderReadinessOk && currentRenderSceneStatus === 'synced');
@@ -1058,6 +1127,23 @@
 		});
 	});
 	const activeRigSensorOption = $derived(rigSensorOptions.find((item: any) => item.sensor_id === activeRigSensorId) ?? rigSensorOptions[0] ?? null);
+	const polarRigSensorOption = $derived(rigSensorOptions.find((item: any) => String(item.sensor_id) === 'polar_cam') ?? null);
+	const polarSampleSweepEnabled = $derived(polarSampleSweepReady({
+		projectId: selectedProjectId,
+		hasGraph,
+		renderSceneSynced,
+		perturbedRenderReady: Boolean(perturbation?.perturbed_render_ready),
+		hasPolarCamera: Boolean(polarRigSensorOption),
+		inFlight: polarSampleSweepSubmitting,
+	}));
+	const polarFullSweepEnabled = $derived(polarSampleSweepReady({
+		projectId: selectedProjectId,
+		hasGraph,
+		renderSceneSynced,
+		perturbedRenderReady: Boolean(perturbation?.perturbed_render_ready),
+		hasPolarCamera: Boolean(polarRigSensorOption),
+		inFlight: polarFullSweepSubmitting,
+	}));
 	const activeRenderModality = $derived(String(activeModalityTab || activeRigSensorOption?.render_modality || 'rgb'));
 	const activeCameraFrustum = $derived.by(() => {
 		const sensor: any = activeRigSensorOption?.sensor ?? {};
@@ -1299,21 +1385,34 @@
 		selectedBatchJobLog = [];
 		selectedBatchJobLoading = true;
 		try {
-			await refreshSelectedBatchJobLog(job.job_id);
-		} catch {
-			selectedBatchJobLog = [];
+			await refreshSelectedBatchJobLog(job.job_id, job);
+		} catch (error) {
+			selectedBatchJobLog = [`[log unavailable] ${errorMessage(error)}`];
 		} finally {
 			selectedBatchJobLoading = false;
 		}
 	}
 
-	async function refreshSelectedBatchJobLog(jobId = selectedBatchJobId) {
+	async function refreshSelectedBatchJobLog(jobId = selectedBatchJobId, job: any = selectedBatchJob) {
 		if (!jobId) return;
-		const data = await getJobLog(jobId, 80);
+		const taskKey = String(job?.task_key ?? job?.status?.extras?.task_key ?? '');
+		const data = taskKey && selectedProjectId && sceneId
+			? await getOpticalNavRenderTaskEvents(selectedProjectId, sceneId, taskKey, 80)
+			: await getJobLog(jobId, 80);
 		selectedBatchJobLog = Array.isArray(data?.lines) ? data.lines.map((line: unknown) => String(line)) : [];
 	}
 
 	async function cancelStaleBatchJobs() {
+		if (activeBatch?.summary_only && activeBatch?.batch_id && selectedProjectId && sceneId) {
+			try {
+				const result = await cancelOpticalNavGraphRenderBatch(selectedProjectId, sceneId, String(activeBatch.batch_id));
+				pushActivity('ok', 'batch', `Cancelled ${Number(result?.cancelled ?? 0)} live job(s); completed artifacts were preserved.`);
+				await refreshBatch();
+			} catch (err) {
+				pushActivity('error', 'batch', errorMessage(err));
+			}
+			return;
+		}
 		const jobs: any[] = activeBatch?.jobs ?? [];
 		const stale = jobs.filter((job: any) => {
 			const status = String(job?.status?.status ?? '');
@@ -1456,6 +1555,22 @@
 		const savedH = Number(normalized?.settings?.map_h);
 		if (savedW > 0) mapWidth = savedW;
 		if (savedH > 0) mapHeight = savedH;
+	}
+
+	/** Update only the selected scene after a save/sync response.
+	 *
+	 * The project endpoint is a catalog, not a required post-save transaction.
+	 * Keeping this local avoids reloading assets, episodes, and readiness for the
+	 * whole workspace merely to show that this scene now needs a render sync.
+	 */
+	function patchCurrentSceneSync(syncPatch: any) {
+		if (!project || !sceneId || !Array.isArray(project.scenes) || !syncPatch || typeof syncPatch !== 'object') return;
+		project = {
+			...project,
+			scenes: project.scenes.map((scene: any) => scene?.scene_id === sceneId
+				? { ...scene, sync_status: { ...(scene.sync_status ?? {}), ...syncPatch } }
+				: scene),
+		};
 	}
 
 	function currentAuthoringMap() {
@@ -2892,6 +3007,7 @@
 	async function run<T>(fn: () => Promise<T>, success?: string, source = 'api', options: RunOptions = {}): Promise<T | undefined> {
 		const background = options.background === true;
 		const resource = options.resource;
+		const isStillCurrent = options.isStillCurrent ?? (() => true);
 		const isAction = options.kind ? options.kind === 'action' : !resource;
 		if (resource) resourceStatus[resource] = 'loading';
 		if (isAction) actionCount += 1;
@@ -2905,18 +3021,32 @@
 		const silent = success === undefined;
 		if (!silent) pushActivity('info', source, 'Request started.');
 		try {
-			const result = await fn();
-			if (resource) { resourceStatus[resource] = 'ready'; delete resourceError[resource]; }
-			if (success) {
-				if (!background) info = success;
-				pushActivity('ok', source, success, result);
+			for (let attempt = 0; ; attempt++) {
+				try {
+					const result = await fn();
+					if (!isStillCurrent()) return undefined;
+					if (resource) { resourceStatus[resource] = 'ready'; delete resourceError[resource]; }
+					if (success) {
+						if (!background) info = success;
+						pushActivity('ok', source, success, result);
+					}
+					return result;
+				} catch (err) {
+					if (!isStillCurrent()) return undefined;
+					const msg = errorMessage(err);
+					const transient = /failed to fetch|networkerror|load failed|connection|fetch failed|err_|50[234]/i.test(msg);
+					if (resource && transient && attempt < 2) {
+						await new Promise((resolve) => setTimeout(resolve, 350 * (attempt + 1)));
+						continue;
+					}
+					throw err;
+				}
 			}
-			return result;
 		} catch (err) {
-			const msg = errorMessage(err);
-			if (resource) { resourceStatus[resource] = 'error'; resourceError[resource] = msg; }
-			if (!background) error = msg;
-			pushActivity('error', source, msg, errorPayload(err));
+			const resourceMessage = resource ? `${source}: ${errorMessage(err)}` : errorMessage(err);
+			if (resource) { resourceStatus[resource] = 'error'; resourceError[resource] = resourceMessage; }
+			if (!background) error = resourceMessage;
+			pushActivity('error', source, resourceMessage, errorPayload(err));
 			return undefined;
 		} finally {
 			if (isAction) actionCount = Math.max(0, actionCount - 1);
@@ -2939,10 +3069,12 @@
 
 	async function refreshProject() {
 		if (!selectedProjectId) return;
+		const requestProjectId = selectedProjectId;
 		loadingStage = 'Loading project…';
 		try {
-			const data = await run(() => projectService.fetchProject(selectedProjectId), undefined, 'project:detail', { resource: 'project' });
+			const data = await run(() => projectService.fetchProject(requestProjectId), undefined, 'project:detail', { resource: 'project' });
 			if (!data) return;
+			if (selectedProjectId !== requestProjectId) return;
 			project = data;
 			// Keep the current sceneId only if THIS project actually contains it; otherwise
 			// fall back to the first scene. Previously this only filled in a missing sceneId,
@@ -2952,33 +3084,40 @@
 			if (data.scenes?.length && !data.scenes.some((item: any) => item.scene_id === sceneId)) {
 				sceneId = data.scenes[0].scene_id;
 			}
+			const sceneRequest = captureSceneRequest();
 			const scene = data.scenes?.find((item: any) => item.scene_id === sceneId);
 			if (scene?.usd_ref) usdRef = scene.usd_ref;
 			// Load the authoring map FIRST so the editor is usable immediately — before the
 			// slower/secondary fetches (assets, envmaps, episodes, render config). Guard:
 			// skip if authoringMap is already populated (e.g. unsaved edits this session).
-			if (scene?.authoring_map_exists && !authoringMap) {
+			// The project endpoint is intentionally a compact catalog and no
+			// longer stats every scene just to answer authoring_map_exists.  Load
+			// the selected scene directly; the endpoint provides a starter map for
+			// a genuinely new scene, so this remains both safe and scene-local.
+			if (!authoringMap) {
 				loadingStage = 'Loading scene map…';
 				const mapData = await run(
-					() => authoringMapService.fetchAuthoringMap(selectedProjectId, sceneId),
+					() => authoringMapService.fetchAuthoringMap(sceneRequest.projectId, sceneRequest.sceneId),
 					undefined,
 					'authoring-map:load',
-					{ resource: 'authoringMap' }
+					{ resource: 'authoringMap', isStillCurrent: () => isCurrentSceneRequest(sceneRequest) }
 				);
-				if (mapData) setAuthoringMapPayload(mapData, false);
+				if (mapData && isCurrentSceneRequest(sceneRequest)) setAuthoringMapPayload(mapData, false);
 			}
 			// Secondary loads — the editor already works at this point. These four
 			// fetches are independent (same projectId/sceneId inputs, no result chained
 			// into the next), so run them in parallel to cut the unblock chain from
 			// ~1–4 s of sequential awaits down to whichever single fetch is slowest.
 			loadingStage = 'Loading scene assets…';
-			await Promise.all([
+			await Promise.allSettled([
 				loadMapAssets(),
 				loadEnvmaps(),
 				refreshEpisodes({ background: true }),
 				loadRenderReadiness(),
+				loadWorkflowStatus(),
 				loadPerturbation(),
 			]);
+			if (!isCurrentSceneRequest(sceneRequest)) return;
 			loadingStage = 'Loading render config…';
 			if (!sceneStateText.trim()) await loadRenderConfig();
 		} finally {
@@ -2991,8 +3130,8 @@
 	// the old narrow inline handlers that skipped assets/episodes/renderReadiness.
 	function _resetSceneScopedState() {
 		sceneStateText = ''; cameraSpecText = ''; renderConfig = null; syncResult = null;
-		renderReadiness = null; renderConfigError = '';
-		episodes = []; selectedEpisode = null; selectedEpisodeId = '';
+		renderReadiness = null; workflowStatus = null; renderConfigError = '';
+		episodes = []; episodeTotal = 0; episodeNextCursor = null; selectedEpisode = null; selectedEpisodeId = '';
 		graphPayload = null; observationScan = null;
 		graphBatch = null; graphBatchId = ''; graphBatchIds = [];
 		stopBatchPolling(); _showRoomShellUserTouched = false;
@@ -3056,19 +3195,22 @@
 	async function loadAuthoringMap() {
 		if (!requireReady(Boolean(selectedProjectId), 'Create or select a project first.')) return;
 		if (!requireReady(hasScene, 'Add the scene before loading the map overlay.')) return;
+		const request = captureSceneRequest();
 		const data = await run(
-			() => authoringMapService.fetchAuthoringMap(selectedProjectId, sceneId),
+			() => authoringMapService.fetchAuthoringMap(request.projectId, request.sceneId),
 			undefined,
 			'authoring-map:load',
-			{ resource: 'authoringMap' }
+			{ resource: 'authoringMap', isStillCurrent: () => isCurrentSceneRequest(request) }
 		);
-		if (data) setAuthoringMapPayload(data, false);
+		if (data && isCurrentSceneRequest(request)) setAuthoringMapPayload(data, false);
 		await loadEnvmaps();
 	}
 
 	async function loadPerturbation(): Promise<void> {
 		if (!selectedProjectId || !sceneId) { perturbation = null; return; }
-		const data = await track('perturbation', () => getOpticalPerturbation(selectedProjectId, sceneId));
+		const request = captureSceneRequest();
+		const data = await track('perturbation', () => getOpticalPerturbation(request.projectId, request.sceneId), () => isCurrentSceneRequest(request));
+		if (!isCurrentSceneRequest(request)) return;
 		perturbation = data && data.exists !== false ? data : null;
 	}
 
@@ -3096,13 +3238,9 @@
 		if (data) perturbation = data;
 	}
 
-	// Sweep the selected render variants as one UI submission. The daemon still
-	// creates one batch per variant, but BOTH is deliberately a barriered
-	// submission: the perturbed batch is not created until the base batch has
-	// reached a successful terminal state. This keeps the worker scene cache and
-	// the UI job lanes aligned with the requested base -> perturbed order.
-	const VARIANT_SWEEP_POLL_MS = 1500;
-	const VARIANT_SWEEP_TIMEOUT_MS = 24 * 60 * 60 * 1000;
+	// Sweep variants are submitted as one durable group.  The daemon keeps the
+	// base → perturbed execution barrier, rather than relying on this browser to
+	// remain open while base rendering completes.
 
 	function recordVariantBatch(batch: any, variant: string, submissionGroupId: string): any {
 		const annotated = {
@@ -3112,33 +3250,6 @@
 		};
 		registerGraphSweepResult({ ...annotated, batches: [annotated] });
 		return annotated;
-	}
-
-	async function waitForVariantBatchTerminal(
-		batchId: string,
-		variant: string,
-		submissionGroupId: string,
-	): Promise<any> {
-		const deadline = Date.now() + VARIANT_SWEEP_TIMEOUT_MS;
-		while (Date.now() < deadline) {
-			const fetched = await renderService.fetchGraphBatchSummary(selectedProjectId, batchId);
-			if (fetched) {
-				const observed = recordVariantBatch(fetched, variant, submissionGroupId);
-				const ledgerStatus = String(observed?.ledger_status ?? '').toLowerCase();
-				const batchStatus = String(observed?.status ?? '').toLowerCase();
-				const terminalStatus = ledgerStatus || batchStatus;
-				if (terminalStatus === 'completed' || batchStatus === 'completed') return observed;
-				if (['paused', 'error', 'failed', 'cancelled', 'canceled'].includes(terminalStatus)) return observed;
-				const total = Number(observed?.progress?.total ?? 0);
-				const completed = Number(observed?.progress?.completed ?? 0);
-				const failed = Number(observed?.progress?.failed ?? 0);
-				if (total > 0 && completed + failed >= total) {
-					return { ...observed, status: failed > 0 ? 'failed' : 'completed' };
-				}
-			}
-			await new Promise((resolve) => setTimeout(resolve, VARIANT_SWEEP_POLL_MS));
-		}
-		throw new Error(`${variant} sweep batch ${batchId} did not reach a terminal state within 24 hours.`);
 	}
 
 	async function sweepVariants(body: Record<string, unknown>): Promise<any> {
@@ -3168,16 +3279,12 @@
 			const submitted = recordVariantBatch(response, variant, submissionGroupId);
 			batches.push(submitted);
 			if (variant === 'base' && variants.length > 1 && submitted?.batch_id) {
-				pushActivity('info', 'render:variant', `Base sweep queued (${submitted.batch_id}); perturbed waits for completion.`);
-				const terminal = await waitForVariantBatchTerminal(
-					String(submitted.batch_id), variant, submissionGroupId,
-				);
-				batches[batches.length - 1] = terminal;
-				const status = String(terminal?.ledger_status ?? terminal?.status ?? '').toLowerCase();
-				if (status !== 'completed') {
-					throw new Error(`Base sweep ${submitted.batch_id} ended with ${status || 'unknown'}; perturbed sweep was not submitted.`);
-				}
-				pushActivity('ok', 'render:variant', `Base sweep complete (${submitted.batch_id}); submitting perturbed sweep.`);
+				// Submit the successor now, with a durable predecessor reference.
+				// The daemon owns the base→perturbed barrier, so a browser refresh,
+				// tab sleep, or client-side 24h timeout cannot lose the perturbed
+				// half of a BOTH sweep.  The queued perturbed batch remains visibly
+				// "waiting for base" until the ledger says the base batch is complete.
+				pushActivity('info', 'render:variant', `Base sweep queued (${submitted.batch_id}); registering perturbed successor.`);
 			}
 		}
 		const last = batches[batches.length - 1] ?? null;
@@ -3187,6 +3294,98 @@
 			batch_ids: batches.map((batch) => batch.batch_id).filter(Boolean),
 			submission_group_id: submissionGroupId,
 		} : null;
+	}
+
+	async function submitPolarSampleSweep(): Promise<void> {
+		if (!polarSampleSweepEnabled || polarSampleSweepSubmitting) return;
+		if (!selectedProjectId || !sceneId || !polarRigSensorOption) return;
+		polarSampleSweepSubmitting = true;
+		try {
+			const baseSpec = optionalJson(cameraSpecText);
+			const polarSpec = cameraSpecFromRigSensor(
+				polarRigSensorOption.sensor,
+				baseSpec,
+				renderModalitiesForRigOption(polarRigSensorOption),
+			);
+			if (!polarSpec) throw new Error('The polar_cam rig sensor has no renderable camera specification.');
+			const groupId = newPolarSampleSubmissionGroup();
+			const plan = await planOpticalNavPolarSampleSweep(selectedProjectId, sceneId, { submission_group_id: groupId });
+			const payloads = polarSampleSweepPayloads(plan as any);
+			const batches: any[] = [];
+			for (const [index, payload] of payloads.entries()) {
+				const response = await renderService.sweepViewpointGraph(selectedProjectId, sceneId, {
+					...payload,
+					backend,
+					camera_specs: [polarSpec],
+					modalities: renderModalitiesForRigOption(polarRigSensorOption),
+					render_settings: {
+						...renderSettingsFromRigSensor(polarRigSensorOption.sensor),
+						polar_color_mode: 'rgb_stokes_12',
+					},
+					...(index > 0 ? { previous_variant_batch_id: batches[index - 1]?.batch_id } : {}),
+				});
+				batches.push(recordVariantBatch(response, String(payload.scene_variant_key), String(plan.submission_group_id)));
+			}
+			polarSampleSweepResult = {
+				submission_group_id: plan.submission_group_id,
+				selection_manifest_ref: plan.selection_manifest_ref,
+				batch_ids: batches.map((batch) => batch?.batch_id).filter(Boolean),
+				batches,
+			};
+			pushActivity('ok', 'polar:sample-sweep', `Polar Sample Sweep queued: ${batches.length * 10} jobs in ${plan.submission_group_id}.`);
+			startBatchPolling();
+		} catch (err) {
+			error = `Polar Sample Sweep failed: ${errorMessage(err)}`;
+			pushActivity('error', 'polar:sample-sweep', error);
+		} finally {
+			polarSampleSweepSubmitting = false;
+		}
+	}
+
+	async function submitPolarFullSweep(): Promise<void> {
+		if (!polarFullSweepEnabled || polarFullSweepSubmitting) return;
+		if (!selectedProjectId || !sceneId || !polarRigSensorOption) return;
+		polarFullSweepSubmitting = true;
+		try {
+			const baseSpec = optionalJson(cameraSpecText);
+			const polarSpec = cameraSpecFromRigSensor(
+				polarRigSensorOption.sensor,
+				baseSpec,
+				renderModalitiesForRigOption(polarRigSensorOption),
+			);
+			if (!polarSpec) throw new Error('The polar_cam rig sensor has no renderable camera specification.');
+			const submissionGroupId = `polar-full-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+			const payloads = polarFullSweepPayloads(submissionGroupId);
+			const batches: any[] = [];
+			for (const [index, payload] of payloads.entries()) {
+				const scene_variant_key = String(payload.scene_variant_key);
+				const response = await renderService.sweepViewpointGraph(selectedProjectId, sceneId, {
+					...payload,
+					backend,
+					camera_specs: [polarSpec],
+					modalities: renderModalitiesForRigOption(polarRigSensorOption),
+					skip_existing_observations: false,
+					render_settings: {
+						...renderSettingsFromRigSensor(polarRigSensorOption.sensor),
+						polar_color_mode: 'rgb_stokes_12',
+					},
+					...(index > 0 ? { previous_variant_batch_id: batches[index - 1]?.batch_id } : {}),
+				});
+				batches.push(recordVariantBatch(response, scene_variant_key, submissionGroupId));
+			}
+			polarFullSweepResult = {
+				submission_group_id: submissionGroupId,
+				batch_ids: batches.map((batch) => batch?.batch_id).filter(Boolean),
+				batches,
+			};
+			pushActivity('ok', 'polar:full-sweep', `Polar Full Sweep queued: base → passive → active across all graph views (${submissionGroupId}).`);
+			startBatchPolling();
+		} catch (err) {
+			error = `Polar Full Sweep failed: ${errorMessage(err)}`;
+			pushActivity('error', 'polar:full-sweep', error);
+		} finally {
+			polarFullSweepSubmitting = false;
+		}
 	}
 
 	function registerGraphSweepResult(result: any): any {
@@ -3226,8 +3425,9 @@
 			);
 			if (!data) return false;
 			if (data?.authoring_map) setAuthoringMapPayload(data.authoring_map, false);
-			// Phase 3: PUT /authoring-map now regenerates render_scene.xml automatically.
-			// Update render readiness from the response so Sync button is no longer needed.
+			// An explicit save may either publish a fresh render scene or intentionally
+			// defer it.  The latter must remain visible and recoverable without a
+			// project-wide reload.
 			if (updateRenderReadiness && data?.render_readiness) {
 				syncResult = null;
 				renderReadiness = data.render_readiness;
@@ -3235,7 +3435,20 @@
 					pushActivity('warn', 'render-readiness', 'Map saved, but render readiness is blocked.', data.render_readiness);
 				}
 			}
-			await refreshProject();
+			if (options.deferRenderSync) {
+				syncResult = null;
+				renderReadiness = null;
+				sceneStateText = '';
+				cameraSpecText = '';
+				patchCurrentSceneSync(data?.sync ?? {
+					render_scene: 'pending',
+					render_scene_status: 'deferred',
+					render_readiness_status: 'pending',
+					message: 'Authoring map changed; sync render scene before rendering.',
+				});
+			} else {
+				await refreshProject();
+			}
 			// Reload render config (sceneStateText/cameraSpecText) if XML was freshly generated.
 			if (updateRenderReadiness && data?.render_readiness?.ok && !sceneStateText.trim()) await loadRenderConfig();
 			return true;
@@ -3247,13 +3460,10 @@
 	async function saveMap() {
 		const saved = await saveAuthoringMap({ updateRenderReadiness: false, deferRenderSync: true });
 		if (!saved) return;
-		// Phase 3 readiness split: Save Map is now render-only. The render sync
-		// path no longer needs scene_annotation.json (backend builds a minimal
-		// SceneAnnotation when missing). Dataset compile, which requires a
-		// traversable region, is a separate user action exposed elsewhere — no
-		// point gating render iteration on it. Users still get explicit access
-		// via the "Compile annotation" button.
-		await syncRenderScene();
+		// Saving is deliberately cheap and scene-local.  Sync is explicit because
+		// it can materialize XML/GLB assets and should never surprise the user by
+		// looking like a project-wide validation pass.
+		pushActivity('info', 'authoring-map:save', 'Map saved. Render scene is pending; use Sync Render Scene when ready.');
 	}
 
 	async function compileAuthoringMap(): Promise<boolean> {
@@ -3356,13 +3566,34 @@
 
 	async function loadRenderReadiness() {
 		if (!selectedProjectId || !sceneId) return;
-		const res = await track('renderReadiness', () => renderService.fetchRenderReadiness(selectedProjectId, sceneId));
+		const request = captureSceneRequest();
+		const res = await track('renderReadiness', () => renderService.fetchRenderReadiness(request.projectId, request.sceneId), () => isCurrentSceneRequest(request));
+		if (!isCurrentSceneRequest(request)) return;
 		renderReadiness = res ?? null;
+	}
+
+	async function loadWorkflowStatus() {
+		if (!selectedProjectId || !sceneId) return;
+		const request = captureSceneRequest();
+		const status = await run(() => renderService.fetchWorkflowStatus(request.projectId, request.sceneId), undefined, 'workflow:status', { background: true, isStillCurrent: () => isCurrentSceneRequest(request) });
+		if (status && isCurrentSceneRequest(request)) workflowStatus = status;
+	}
+
+	async function continueRenderWorkflow() {
+		if (!selectedProjectId || !sceneId) return;
+		const data = await run(() => renderService.continueWorkflow(selectedProjectId, sceneId), undefined, 'workflow:continue');
+		if (!data) return;
+		workflowStatus = data.workflow ?? workflowStatus;
+		await Promise.all([loadRenderReadiness(), loadWorkflowStatus()]);
+		if (workflowStatus?.stages?.graph?.state === 'ready') await loadGraph();
+		if (workflowStatus?.ready) await loadRenderConfig();
 	}
 
 	async function loadRenderConfig() {
 		if (!selectedProjectId || !sceneId) return;
-		const data = await track('renderConfig', () => renderService.fetchRenderConfig(selectedProjectId, sceneId));
+		const request = captureSceneRequest();
+		const data = await track('renderConfig', () => renderService.fetchRenderConfig(request.projectId, request.sceneId), () => isCurrentSceneRequest(request));
+		if (!isCurrentSceneRequest(request)) return;
 		if (data?.ok && data.scene_state && data.camera_spec) {
 			renderConfig = data;
 			renderConfigError = '';
@@ -3510,7 +3741,7 @@
 	}
 
 	function clearEpisodes() {
-		episodes = [];
+		episodes = []; episodeTotal = 0; episodeNextCursor = null;
 		selectedEpisode = null;
 		selectedEpisodeId = '';
 		pushActivity('info', 'episodes', 'Episodes cleared. Regenerate when ready.');
@@ -3590,18 +3821,43 @@
 
 	async function refreshEpisodes(options: RunOptions = {}) {
 		if (!selectedProjectId) return;
-		const data = await run(() => episodeService.fetchEpisodes(selectedProjectId), undefined, 'episodes:list', { ...options, resource: 'episodes' });
+		const request = captureSceneRequest();
+		if (!request.sceneId) return;
+		const data = await run(() => episodeService.fetchEpisodes(request.projectId, request.sceneId), undefined, 'episodes:list', {
+			...options,
+			resource: 'episodes',
+			isStillCurrent: () => isCurrentSceneRequest(request),
+		});
+		if (!isCurrentSceneRequest(request)) return;
 		if (!data) return;
-		const all: any[] = data.episodes ?? [];
-		episodes = sceneId ? all.filter((ep: any) => !ep.scene_id || ep.scene_id === sceneId) : all;
+		episodes = Array.isArray(data.episodes) ? data.episodes : [];
+		episodeTotal = Number(data.total ?? episodes.length);
+		episodeNextCursor = typeof data.next_cursor === 'string' ? data.next_cursor : null;
 		if (!selectedEpisodeId && episodes.length) selectedEpisodeId = episodes[0].episode_id;
 	}
 
+	async function loadMoreEpisodes() {
+		if (!selectedProjectId || !sceneId || !episodeNextCursor) return;
+		const request = captureSceneRequest();
+		const cursor = episodeNextCursor;
+		const data = await run(
+			() => episodeService.fetchEpisodes(request.projectId, request.sceneId, undefined, cursor),
+			undefined,
+			'episodes:next-page',
+			{ resource: 'episodes', isStillCurrent: () => isCurrentSceneRequest(request) },
+		);
+		if (!isCurrentSceneRequest(request) || !data) return;
+		const page = Array.isArray(data.episodes) ? data.episodes : [];
+		episodes = [...episodes, ...page];
+		episodeTotal = Number(data.total ?? episodeTotal);
+		episodeNextCursor = typeof data.next_cursor === 'string' ? data.next_cursor : null;
+	}
+
 	async function loadEpisode(id = selectedEpisodeId) {
-		if (!selectedProjectId || !id) return;
+		if (!selectedProjectId || !sceneId || !id) return;
 		selectedEpisodeId = id;
 		if (!graphPayload && hasGraph) await loadGraph();
-		const data = await run(() => episodeService.fetchEpisode(selectedProjectId, id), undefined, 'episode:detail');
+		const data = await run(() => episodeService.fetchEpisode(selectedProjectId, sceneId, id), undefined, 'episode:detail');
 		if (data) selectedEpisode = data;
 	}
 
@@ -3976,7 +4232,7 @@
 			}
 		} else {
 			body.split = renderSplit;
-			const data = await run(() => renderService.renderEpisodes(selectedProjectId, body), 'Episode render request submitted.', 'episodes:render');
+			const data = await run(() => renderService.renderEpisodes(selectedProjectId, sceneId, body), 'Episode render request submitted.', 'episodes:render');
 			if (data?.batch_id) {
 				renderBatchId = data.batch_id;
 				renderBatch = data;
@@ -4017,8 +4273,16 @@
 
 	async function resumeActiveGraphRun(runIdOverride = '') {
 		const runId = String(runIdOverride || activeBatch?.run_id || activeBatch?.batch_id || '');
-		if (!selectedProjectId || !runId) return;
-		const data = await renderService.resumeGraphRun(selectedProjectId, runId);
+		if (!selectedProjectId || !sceneId || !runId) return;
+		// Resume creates a new immutable run.  Treat it as an action so every
+		// Resume button is disabled until the server has accepted the one request.
+		// This prevents duplicate POSTs while a large source run is being planned.
+		const data = await run(
+			() => renderService.resumeGraphRun(selectedProjectId, sceneId, runId),
+			'Resume plan accepted; building retry tasks in the background.',
+			'graph:resume',
+		);
+		if (!data) return;
 		if (data?.run_id) {
 			graphBatchIds = [...new Set([...graphBatchIds, String(data.run_id)])];
 			graphBatchId = String(data.run_id);
@@ -4038,6 +4302,27 @@
 		if (!selectedProjectId || !sceneId || !version?.render_version_id || version.status === 'active') return;
 		await renderService.pruneRenderVersion(selectedProjectId, sceneId, String(version.render_version_id));
 		await refreshRenderVersions();
+	}
+
+	async function openRenderVersionGallery(version: any) {
+		if (!selectedProjectId || !sceneId || !version?.render_version_id || renderVersionGalleryLoading) return;
+		renderVersionGalleryLoading = true;
+		renderVersionGalleryError = '';
+		try {
+			renderVersionGallery = await renderService.fetchRenderVersionGallery(
+				selectedProjectId, sceneId, String(version.render_version_id),
+			);
+		} catch (err) {
+			renderVersionGallery = null;
+			renderVersionGalleryError = errorMessage(err);
+		} finally {
+			renderVersionGalleryLoading = false;
+		}
+	}
+
+	function closeRenderVersionGallery() {
+		renderVersionGallery = null;
+		renderVersionGalleryError = '';
 	}
 
 	function applyGraphBatchSummaries(summaries: any[]) {
@@ -4075,11 +4360,17 @@
 				: statuses.find((value) => value && !['completed', 'ready'].includes(value)) || 'running';
 		const latest = displayedBatches[displayedBatches.length - 1];
 		const previousJobs = Array.isArray(graphBatch?.jobs) ? graphBatch.jobs : [];
+		// Summary polling deliberately avoids thousands of rows, but the daemon
+		// supplies a bounded failed/running diagnostic set.  Keep those rows
+		// interactive so a failed count is actionable instead of a dead end.
+		const diagnosticJobs = displayedBatches.flatMap((batch) =>
+			Array.isArray(batch?.diagnostic_jobs) ? batch.diagnostic_jobs : [],
+		);
 		graphBatch = {
 			...(graphBatch ?? {}),
 			...latest,
 			batch_ids: [...new Set(batches.map((batch) => String(batch?.batch_id ?? '')).filter(Boolean))],
-			jobs: previousJobs,
+			jobs: diagnosticJobs.length ? diagnosticJobs : previousJobs,
 			summary_only: true,
 			counts,
 			progress: { completed, failed, total, fraction: (completed + failed) / Math.max(1, total) },
@@ -4094,10 +4385,21 @@
 		if (isGraphSweepRenderMode(renderMode)) {
 			if (!graphBatchIds.length) return;
 			const prevCompleted = graphBatch?.progress?.completed ?? 0;
-			const batches = await Promise.all(
-				graphBatchIds.map(id => renderService.fetchGraphBatchSummary(selectedProjectId, id).catch(() => null))
+			const results = await Promise.allSettled(
+				graphBatchIds.map(id => renderService.fetchGraphBatchSummary(selectedProjectId, sceneId, id))
 			);
+			const batches = results.flatMap((result) => result.status === 'fulfilled' ? [result.value] : []);
+			const summaryErrors = results.flatMap((result, index) => {
+				if (result.status === 'fulfilled') return [];
+				const reason = result.reason instanceof Error ? result.reason.message : String(result.reason ?? 'Unknown error');
+				return [{ batch_id: graphBatchIds[index], message: reason }];
+			});
 			const merged = applyGraphBatchSummaries(batches);
+			if (merged) {
+				graphBatch = { ...merged, summary_errors: summaryErrors };
+			} else if (summaryErrors.length && graphBatch) {
+				graphBatch = { ...graphBatch, summary_errors: summaryErrors };
+			}
 			void refreshRenderCoverage();
 			if ((merged?.progress?.completed ?? 0) !== prevCompleted) scanObservations();
 			const total = merged?.progress?.total ?? 0;
@@ -4107,7 +4409,7 @@
 			}
 		} else {
 			if (!renderBatchId) return;
-			const data = await run(() => renderService.fetchRenderBatch(selectedProjectId, renderBatchId), undefined, 'batch:episodes', options);
+			const data = await run(() => renderService.fetchRenderBatch(selectedProjectId, sceneId, renderBatchId), undefined, 'batch:episodes', options);
 			if (data) renderBatch = normalizeBatchForDisplay(data);
 		}
 	}
@@ -4378,6 +4680,9 @@
 				include_birdseye: exportIncludeBirdseye,
 				include_episode_birdseye: exportIncludeEpisodeBirdseye,
 				eval_perturbation: exportEvalPerturbation,
+				upload: exportUploadToGoogleDrive
+					? { enabled: true, target: 'google_drive', destination_subpath: exportUploadDestinationSubpath }
+					: null,
 			});
 			const jobId = (accepted as any)?.job_id;
 			if (!jobId) return;
@@ -4398,14 +4703,26 @@
 	}
 
 	async function cancelActiveExportJob() {
-		if (!selectedProjectId || !activeExportJob?.job_id) return;
-		try { await exportJobsService.cancelExportJob(selectedProjectId, activeExportJob.job_id); }
+		const exportSceneId = activeExportJob?.scene_id || sceneId;
+		if (!selectedProjectId || !activeExportJob?.job_id || !exportSceneId) return;
+		try { await exportJobsService.cancelExportJob(selectedProjectId, exportSceneId, activeExportJob.job_id); }
 		catch { /* silent */ }
 	}
 
 	function resetExportJob() {
 		if (_exportJobUnsub) { _exportJobUnsub(); _exportJobUnsub = null; }
 		activeExportJob = null;
+	}
+
+	async function resumeActiveExportJob() {
+		const exportSceneId = activeExportJob?.scene_id || sceneId;
+		if (!selectedProjectId || !activeExportJob?.job_id || !exportSceneId) return;
+		try {
+			const resumed = await exportJobsService.resumeExportJob(selectedProjectId, exportSceneId, activeExportJob.job_id);
+			activeExportJob = { ...activeExportJob, ...(resumed as any), status: 'queued' };
+		} catch (err) {
+			error = `Export resume failed: ${errorMessage(err)}`;
+		}
 	}
 
 	$effect(() => {
@@ -4987,7 +5304,7 @@
 			<!-- Paths mode: episode list panel -->
 			{#if pageMode === 'paths'}
 				<div class="map-float-inspector paths-panel">
-					<div class="panel-label">Episodes ({filteredEpisodes.length})</div>
+					<div class="panel-label">Episodes ({filteredEpisodes.length}/{episodeTotal})</div>
 					<input class="episode-search" type="search" placeholder="Search..." bind:value={episodeSearch} />
 					<div class="episode-list">
 						{#each filteredEpisodes as ep}
@@ -5008,6 +5325,9 @@
 							<div class="episode-empty">{episodes.length === 0 ? 'No episodes yet.' : 'No matches.'}</div>
 						{/if}
 					</div>
+					{#if episodeNextCursor}
+						<button class="button button-subtle" disabled={loading} onclick={loadMoreEpisodes}>Load next 100</button>
+					{/if}
 					<div class="episode-generate-bar">
 						<input type="number" min="1" bind:value={episodeCount} title="Count" />
 						<button class="button button-primary" disabled={!selectedProjectId || !hasGraph || loading} onclick={planGraphEpisodes}>
@@ -5024,8 +5344,18 @@
 
 			<!-- Sensor mode: viewpoint render panel -->
 			{#if pageMode === 'sensors'}
+				{#if workflowStatus && !workflowStatus.ready}
+					<section class="panel workflow-continue-card">
+						<strong>Render workflow: {workflowStatus.next_action}</strong>
+						<span>{workflowStatus.message}</span>
+						{#if workflowStatus.stages?.graph?.invalid_node_count}
+							<span>{workflowStatus.stages.graph.invalid_node_count}/{workflowStatus.stages.graph.node_count} graph nodes need reconciliation.</span>
+						{/if}
+						<button class="button button-primary" disabled={loading} onclick={continueRenderWorkflow}>Continue</button>
+					</section>
+				{/if}
 					<SensorsPanel
-						{renderSceneSynced} {loading} {selectedProjectId} {hasScene} {hasGraph}
+						{renderSceneSynced} renderSyncMessage={renderSyncMessage} {loading} {selectedProjectId} {hasScene} {hasGraph}
 						globalCameraRig={assetVM.globalCameraRig}
 						globalCameraRigStatus={assetVM.globalCameraRigStatus}
 						globalCameraRigError={assetVM.globalCameraRigError}
@@ -5044,6 +5374,14 @@
 					onRenderSensorViewpoint={renderSensorViewpoint}
 					onRenderEpisodes={() => renderEpisodes('graph_sweep')}
 					onRenderEpisodeNodes={() => renderEpisodes('episode_nodes')}
+					polarSampleSweepEnabled={polarSampleSweepEnabled}
+					polarSampleSweepSubmitting={polarSampleSweepSubmitting}
+					polarSampleSweepResult={polarSampleSweepResult}
+					onSubmitPolarSampleSweep={submitPolarSampleSweep}
+					polarFullSweepEnabled={polarFullSweepEnabled}
+					polarFullSweepSubmitting={polarFullSweepSubmitting}
+					polarFullSweepResult={polarFullSweepResult}
+					onSubmitPolarFullSweep={submitPolarFullSweep}
 					{episodeNodesAvailable}
 					{episodePathNodeCount}
 					{renderMissingOnly}
@@ -5076,6 +5414,8 @@
 				bind:includeBirdseye={exportIncludeBirdseye}
 				bind:includeEpisodeBirdseye={exportIncludeEpisodeBirdseye}
 					bind:evalPerturbation={exportEvalPerturbation}
+					bind:uploadToGoogleDrive={exportUploadToGoogleDrive}
+					bind:uploadDestinationSubpath={exportUploadDestinationSubpath}
 					cameraInventory={exportCameraInventory}
 					selectedCameraIds={exportSelectedCameraIds}
 					currentSceneId={sceneId}
@@ -5085,6 +5425,7 @@
 					onValidate={() => validateDataset(false)}
 					onExport={exportDataset}
 					onCancelExport={cancelActiveExportJob}
+					onResumeExport={resumeActiveExportJob}
 					onResetExport={resetExportJob}
 					onCameraSelectionChange={updateExportCameraSelection}
 				/>
@@ -5188,8 +5529,11 @@
 						<div class="sync-card">
 							<div class="panel-label">Sync</div>
 							<div class:ready={currentScene.sync_status.render_scene === 'synced'}>Render {currentScene.sync_status.render_scene ?? 'pending'}</div>
+							{#if currentScene.sync_status.message}<div class="sync-message">{currentScene.sync_status.message}</div>{/if}
 							<div class:ready={currentScene.sync_status.isaac_stage === 'synced'}>Isaac {currentScene.sync_status.isaac_stage ?? 'pending'}</div>
-							<button class="button button-subtle" disabled={!selectedProjectId || !hasScene || loading} onclick={syncRenderScene} style="display:none">Sync Render Scene</button>
+							{#if currentScene.sync_status.render_scene !== 'synced'}
+								<button class="button button-primary" disabled={!selectedProjectId || !hasScene || loading || syncRunning} onclick={syncRenderScene}>Sync Render Scene</button>
+							{/if}
 						</div>
 					{/if}
 
@@ -5542,7 +5886,7 @@
 			{#if railTab === 'sensors'}
 				<RailSensorsTab
 					{caps}
-					{renderSceneSynced}
+					{renderSceneSynced} renderSyncMessage={renderSyncMessage}
 					globalCameraRig={assetVM.globalCameraRig}
 					globalCameraRigStatus={assetVM.globalCameraRigStatus}
 					globalCameraRigError={assetVM.globalCameraRigError}
@@ -5557,6 +5901,7 @@
 				{rigMountHeightM} {authoringMap}
 				{selectedProjectId} {sceneId} {loading} {hasScene} {hasGraph}
 				onLoadGlobalCameraRig={loadGlobalCameraRig}
+					onSyncRenderScene={syncRenderScene}
 				onSelectRigSensor={selectRigRenderSensor}
 				{selectedRigSensorIds}
 				onToggleRigSweepSensor={toggleRigSweepSensor}
@@ -5582,6 +5927,14 @@
 				onRunProbe={renderHotCameraPreview}
 				onRenderEpisodes={() => renderEpisodes('graph_sweep')}
 				onRenderEpisodeNodes={() => renderEpisodes('episode_nodes')}
+				polarSampleSweepEnabled={polarSampleSweepEnabled}
+				polarSampleSweepSubmitting={polarSampleSweepSubmitting}
+				polarSampleSweepResult={polarSampleSweepResult}
+				onSubmitPolarSampleSweep={submitPolarSampleSweep}
+				polarFullSweepEnabled={polarFullSweepEnabled}
+				polarFullSweepSubmitting={polarFullSweepSubmitting}
+				polarFullSweepResult={polarFullSweepResult}
+				onSubmitPolarFullSweep={submitPolarFullSweep}
 				{renderVariant}
 				perturbationEnabled={Boolean(perturbation?.enabled)}
 				perturbedRenderReady={Boolean(perturbation?.perturbed_render_ready)}
@@ -5647,6 +6000,8 @@
 				bind:includeBirdseye={exportIncludeBirdseye}
 				bind:includeEpisodeBirdseye={exportIncludeEpisodeBirdseye}
 				bind:evalPerturbation={exportEvalPerturbation}
+				bind:uploadToGoogleDrive={exportUploadToGoogleDrive}
+				bind:uploadDestinationSubpath={exportUploadDestinationSubpath}
 				currentSceneId={sceneId}
 				{exportableEpisodeCount}
 				exportSummary={exportResult}
@@ -5654,6 +6009,7 @@
 				onValidate={() => validateDataset(false)}
 				onExport={exportDataset}
 				onCancelExport={cancelActiveExportJob}
+				onResumeExport={resumeActiveExportJob}
 				onResetExport={resetExportJob}
 			/>
 		{/if}
@@ -5736,6 +6092,9 @@
 		{renderSensorProgress} {observationScan}
 		expectedRenderViews={graphNodes.length * Number(graphPayload?.node_heading_count ?? headingCount ?? 0)}
 		onRefreshVersions={refreshRenderVersions}
+		{renderVersionGallery} {renderVersionGalleryLoading} {renderVersionGalleryError}
+		onOpenRenderVersionGallery={openRenderVersionGallery}
+		onCloseRenderVersionGallery={closeRenderVersionGallery}
 		onResumeRun={resumeActiveGraphRun}
 		onPromoteVersion={promoteRenderVersion}
 		onPruneVersion={pruneRenderVersion}

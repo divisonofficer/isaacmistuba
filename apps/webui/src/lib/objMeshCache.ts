@@ -3,10 +3,10 @@
  *
  * Mirrors the layered design of `primMeshCache.ts` (memory LRU + IndexedDB),
  * but the payload is a parsed BufferGeometry produced by Three.js OBJLoader.
- * Backed by `GET /scenes/<id>/mesh-cache/<filename>` (see opticalNavMeshCacheUrl).
+ * Backed by `GET /scenes/<id>/mesh-cache/<mesh-ref>` (see opticalNavMeshCacheUrl).
  *
  * Key scheme:
- *   `obj-mesh-cache-v1:${projectId}/${sceneId}#${filename}`
+ *   `obj-mesh-cache-v1:${projectId}/${sceneId}#${meshRef}`
  *
  * mesh_cache OBJs are hash-named (`<digest>.obj`) so their content is
  * effectively immutable; we cache aggressively and only invalidate when the
@@ -43,7 +43,7 @@ export type ObjMeshCacheStats = {
 	max_obj_bytes_for_preview: number;
 };
 
-const CACHE_VERSION = 'obj-mesh-cache-v3-head-size';
+const CACHE_VERSION = 'obj-mesh-cache-v4-relative-ref';
 // Distinct DB name from primMeshCache's `robomituba-opticalnav`. Both caches
 // opened the same DB at version 1 and each created only its own store in
 // onupgradeneeded — whichever ran first won, and the second cache's store was
@@ -129,8 +129,8 @@ function _releaseSlot() {
 // let the caller draw a placeholder; the render path still uses the full OBJ.
 const MAX_OBJ_BYTES_FOR_PREVIEW = 16 * 1024 * 1024;
 
-export function objMeshCacheKey(projectId: string, sceneId: string, filename: string): string {
-	return `${CACHE_VERSION}:${projectId}/${sceneId}#${filename}`;
+export function objMeshCacheKey(projectId: string, sceneId: string, meshRef: string): string {
+	return `${CACHE_VERSION}:${projectId}/${sceneId}#${meshRef}`;
 }
 
 export function getCachedObjMeshGeometry(key: string): ThreeBufferGeometry | null | undefined {
@@ -163,9 +163,10 @@ export function getObjMeshCacheStats(): ObjMeshCacheStats {
 export async function loadObjMeshGeometry(
 	projectId: string,
 	sceneId: string,
-	filename: string,
+	meshRef: string,
+	knownBytes?: number,
 ): Promise<ThreeBufferGeometry | null> {
-	const key = objMeshCacheKey(projectId, sceneId, filename);
+	const key = objMeshCacheKey(projectId, sceneId, meshRef);
 	if (negative.has(key)) {
 		_stats.memory_null_hits++;
 		return null;
@@ -206,11 +207,16 @@ export async function loadObjMeshGeometry(
 		// semaphore. A failed OBJ request used to be retried on every scene rebuild,
 		// producing long bursts of ERR_CONTENT_LENGTH_MISMATCH in Chrome. Cache
 		// misses as null for this page lifetime so placeholders stay cheap.
+		if (Number.isFinite(knownBytes) && Number(knownBytes) > MAX_OBJ_BYTES_FOR_PREVIEW) {
+			_stats.head_too_large++;
+			markNegative(key);
+			return null;
+		}
 		await _acquireSlot();
 		try {
-			const url = opticalNavMeshCacheUrl(projectId, sceneId, filename);
+			const url = opticalNavMeshCacheUrl(projectId, sceneId, meshRef);
 			_stats.network_fetches++;
-			const headLen = await fetchObjContentLength(url);
+			const headLen = Number.isFinite(knownBytes) ? Number(knownBytes) : await fetchObjContentLength(url);
 			if (Number.isFinite(headLen) && headLen > MAX_OBJ_BYTES_FOR_PREVIEW) {
 				_stats.head_too_large++;
 				markNegative(key);

@@ -121,14 +121,19 @@
 				</button>
 			</div>
 			{#if authoringMapDirty}<p class="inline-hint">Unsaved changes.</p>{/if}
-			{#if currentScene?.sync_status}
-				{@const _ss = currentScene.sync_status}
+			{#if hasScene}
+				{@const _ss = currentScene?.sync_status ?? {}}
 				{@const _rs = _ss.render_scene_status ?? _ss.render_scene ?? 'pending'}
+				<!-- v3 project catalogs intentionally omit per-scene filesystem state.
+					 The selected scene's render-readiness response is therefore the
+					 authoritative fallback when this compact row has no sync field. -->
+				{@const _readinessSynced = Boolean(effectiveRenderReadiness?.ok)}
+				{@const _renderSynced = _ss.render_scene === 'synced' || (!_ss.render_scene && _readinessSynced)}
 				{@const _isSyncing = _rs === 'syncing'}
 				<div class="sync-card">
 					<div class="panel-label">Sync</div>
-					<div class:ready={_ss.render_scene === 'synced'}>
-						Render {_ss.render_scene ?? 'pending'}
+					<div class:ready={_renderSynced}>
+						Render {_renderSynced ? 'synced' : (_ss.render_scene ?? 'pending')}
 						{#if _rs && _rs !== _ss.render_scene}<span class="sync-sub"> · {_rs}</span>{/if}
 					</div>
 					<!-- While the daemon is actively syncing, the `message` field carries the
@@ -139,13 +144,15 @@
 						<div class="sync-message">Render-scene sync is running…</div>
 					{:else if _ss.message}
 						<div class="sync-message">{_ss.message}</div>
+					{:else if !_renderSynced}
+						<div class="sync-message">No current render-scene artifact. Sync this scene to materialize it.</div>
 					{/if}
 					<div class:ready={_ss.isaac_stage === 'synced'}>Isaac {_ss.isaac_stage ?? 'pending'}</div>
 					{#if !_isSyncing}
 						{#if _ss.annotation_stale}<div class="sync-stale">⚠ scene_annotation.json is stale (re-sync recommended)</div>{/if}
 						{#if _ss.traversable_map_stale}<div class="sync-stale">⚠ traversable_map is stale</div>{/if}
 						{#if _ss.viewpoint_graph_stale}<div class="sync-stale">⚠ viewpoint_graph is stale</div>{/if}
-						{#if _ss.render_scene !== 'synced'}
+						{#if !_renderSynced}
 							<!-- Save Map defers the render-scene compile; if that async job
 								 never ran (or its progress WebSocket dropped) the scene is stuck
 								 at "pending" with no way forward. This is the explicit re-trigger. -->

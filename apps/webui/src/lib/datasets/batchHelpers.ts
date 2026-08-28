@@ -227,10 +227,12 @@ export interface BatchJobGridRow {
 }
 
 export function jobVariant(job: any): string {
+	const metadata = job?.metadata && typeof job.metadata === 'object' ? job.metadata : {};
 	const explicit = String(
 		job?.scene_variant_key
 		?? job?.render_variant
 		?? job?.status?.extras?.scene_variant_key
+		?? metadata?.scene_variant_key
 		?? '',
 	).trim().toLowerCase();
 	if (explicit === 'template') return 'base';
@@ -242,21 +244,28 @@ export function jobVariant(job: any): string {
 }
 
 export function jobSensorIds(job: any): string[] {
+	const metadata = job?.metadata && typeof job.metadata === 'object' ? job.metadata : {};
 	const ids: unknown[] = Array.isArray(job?.sensor_ids) && job.sensor_ids.length
 		? job.sensor_ids
 		: Array.isArray(job?.phase_sensor_ids) && job.phase_sensor_ids.length
 			? job.phase_sensor_ids
-			: job?.sensor_id ? [job.sensor_id] : Object.keys(job?.modalities_by_sensor ?? {});
+			: job?.sensor_id ? [job.sensor_id]
+				: Array.isArray(metadata?.sensor_ids) && metadata.sensor_ids.length ? metadata.sensor_ids
+					: metadata?.sensor_id ? [metadata.sensor_id]
+						: Object.keys(job?.modalities_by_sensor ?? metadata?.modalities_by_sensor ?? {});
 	const normalized: string[] = ids.map((item) => String(item)).filter((item) => item.length > 0);
 	return [...new Set<string>(normalized)];
 }
 
 function jobModalities(job: any): string[] {
-	const bySensor = job?.modalities_by_sensor;
+	const metadata = job?.metadata && typeof job.metadata === 'object' ? job.metadata : {};
+	const bySensor = job?.modalities_by_sensor ?? metadata?.modalities_by_sensor;
 	const nested = bySensor && typeof bySensor === 'object'
 		? Object.values(bySensor).flatMap((items: any) => Array.isArray(items) ? items : [])
 		: [];
-	const direct = Array.isArray(job?.modalities) ? job.modalities : job?.modality ? [job.modality] : [];
+	const direct = Array.isArray(job?.modalities) ? job.modalities
+		: job?.modality ? [job.modality]
+			: Array.isArray(metadata?.modalities) ? metadata.modalities : metadata?.modality ? [metadata.modality] : [];
 	return [...new Set([...nested, ...direct].map(String).filter(Boolean))];
 }
 
@@ -498,6 +507,17 @@ export function buildRenderSummary(batch: any, health: any, renderMode = '') {
 		?? jobs.find((job) => job?.status?.extras?.texture_audit?.texture_profile)?.status?.extras?.texture_audit?.texture_profile
 		?? '';
 	const cacheHits = jobs.filter((job) => job?.status?.extras?.scene_cache_hit).length;
+	const execution = batch?.execution_counts && typeof batch.execution_counts === 'object'
+		? {
+			queued: Number(batch.execution_counts.queued ?? 0),
+			prefetched: Number(batch.execution_counts.prefetched ?? 0),
+			workerRunning: Number(batch.execution_counts.worker_running ?? 0),
+		}
+		: {
+			queued: counts.queued,
+			prefetched: jobs.filter((job) => job?.execution_state === 'prefetched').length,
+			workerRunning: jobs.filter((job) => job?.execution_state === 'worker_running').length,
+		};
 	return {
 		label: renderModeLabel(renderMode),
 		batch_id: batch?.batch_id ?? '',
@@ -510,6 +530,7 @@ export function buildRenderSummary(batch: any, health: any, renderMode = '') {
 		gpus: Array.isArray(health?.gpus) ? health.gpus : [],
 		textureProfile,
 		cacheHits,
+		execution,
 		runningJobCount: runningJobs.length,
 	};
 }

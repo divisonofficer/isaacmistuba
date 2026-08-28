@@ -16,6 +16,7 @@
 	interface Props {
 		caps: Capabilities;
 		renderSceneSynced: boolean;
+		renderSyncMessage?: string;
 		globalCameraRig: any;
 		globalCameraRigStatus: string;
 		globalCameraRigError: string;
@@ -52,6 +53,7 @@
 		hasScene: boolean;
 		hasGraph: boolean;
 		onLoadGlobalCameraRig: () => void;
+		onSyncRenderScene: () => void;
 		onSelectRigSensor: (sensorId: string) => void;
 		onSetFrustumMode: (mode: string) => void;
 		onTogglePlacingSensor: () => void;
@@ -68,6 +70,14 @@
 		onRunProbe: () => void;
 		onRenderEpisodes: () => void;
 		onRenderEpisodeNodes?: () => void;
+		polarSampleSweepEnabled?: boolean;
+		polarSampleSweepSubmitting?: boolean;
+		polarSampleSweepResult?: any;
+		onSubmitPolarSampleSweep?: () => void;
+		polarFullSweepEnabled?: boolean;
+		polarFullSweepSubmitting?: boolean;
+		polarFullSweepResult?: any;
+		onSubmitPolarFullSweep?: () => void;
 		renderVariant?: 'base' | 'perturbed' | 'both';
 		perturbationEnabled?: boolean;
 		perturbedRenderReady?: boolean;
@@ -91,7 +101,7 @@
 
 	let {
 		caps,
-		renderSceneSynced, globalCameraRig, globalCameraRigStatus, globalCameraRigError,
+		renderSceneSynced, renderSyncMessage = '', globalCameraRig, globalCameraRigStatus, globalCameraRigError,
 		rigSensorOptions, activeRigSensorId, selectedSensorNode, selectedSensorNodeId,
 		selectedCustomSensorNode, selectedSensorHeightM,
 		sceneStateText, cameraSpecText, renderConfig,
@@ -101,10 +111,12 @@
 		hotCameraPose,
 		probeRendering, probeError, rigMountHeightM, authoringMap,
 		selectedProjectId, sceneId, loading, hasScene, hasGraph,
-		onLoadGlobalCameraRig, onSelectRigSensor, onSetFrustumMode, onTogglePlacingSensor,
+		onLoadGlobalCameraRig, onSyncRenderScene, onSelectRigSensor, onSetFrustumMode, onTogglePlacingSensor,
 		onRemoveCustomSensor, onCustomSensorHeadingChange, onLoadRenderConfig,
 		onSetSensorHeight, onSetAmbientRadiance, onSetUnifiedSpectral, onSetUseLodScene, onClearNodeObservations, onClearAllObservations,
 		onRenderViewpoint, onRunProbe, onRenderEpisodes, onRenderEpisodeNodes,
+		polarSampleSweepEnabled = false, polarSampleSweepSubmitting = false, polarSampleSweepResult, onSubmitPolarSampleSweep,
+		polarFullSweepEnabled = false, polarFullSweepSubmitting = false, polarFullSweepResult, onSubmitPolarFullSweep,
 		renderVariant = 'base', perturbationEnabled = false,
 		perturbedRenderReady = false, perturbedRenderStale = false, onSetRenderVariant,
 		onSetActiveModalityTab,
@@ -169,9 +181,25 @@
 
 	{#if !renderSceneSynced}
 		<div class="sensor-sync-warning">
-			<span>Render scene not synced</span>
+			<div class="sensor-sync-copy">
+				<strong>Render scene not synced</strong>
+				{#if renderSyncMessage}<small>{renderSyncMessage}</small>{/if}
+			</div>
+			<button class="button button-subtle" disabled={loading || !selectedProjectId || !hasScene} onclick={onSyncRenderScene}>Sync Render Scene</button>
 		</div>
 	{/if}
+
+	<section class="render-config-card" aria-label="Render configuration">
+		<div class="render-config-head">
+			<div class="rail-title">Render Config</div>
+			{#if sceneStateText.trim() && cameraSpecText.trim()}
+				<span class="chip-ok">Ready ({renderConfig?.source ?? 'custom'})</span>
+			{:else}
+				<span class="chip-warn">Not loaded</span>
+			{/if}
+		</div>
+		<button class="button button-subtle" onclick={onLoadRenderConfig} title="Auto-load render config from scene catalog">Load render config</button>
+	</section>
 
 	<div class="camera-rig-panel">
 		<div class="rail-title">Robot Camera Rig</div>
@@ -305,14 +333,6 @@
 			</button>
 		{/if}
 		<div class="sensor-config-row">
-			{#if sceneStateText.trim() && cameraSpecText.trim()}
-				<span class="chip-ok">Config ready ({renderConfig?.source ?? 'custom'})</span>
-			{:else}
-				<span class="chip-warn">No render config</span>
-			{/if}
-			<button class="button button-subtle" onclick={onLoadRenderConfig} title="Auto-load render config from scene catalog">Load</button>
-		</div>
-		<div class="sensor-config-row">
 			<label class="sensor-height-label" title={selectedSensorNodeId ? 'Per-viewpoint override (rig default = ' + rigMountHeightM.toFixed(2) + 'm)' : 'Rig defaults are read-only here. Edit them in /camera_rig.'}>
 				Camera height (m) {selectedSensorNodeId ? `· ${selectedSensorNodeId}` : `· ${activeRigSensorOption?.label ?? 'rig sensor'}`}
 			</label>
@@ -443,6 +463,30 @@
 	<button class="button button-subtle full" disabled={!caps.renderSweepAll.enabled} title={caps.renderSweepAll.reason} onclick={onRenderEpisodes}>
 		{renderMissingOnly ? 'Graph Sweep · missing only' : 'Graph Sweep · all viewpoints'}
 	</button>
+	<button class="button button-primary full" disabled={!polarFullSweepEnabled}
+		title={!polarFullSweepEnabled ? 'Requires a synced graph scene, prepared perturbation, and polar_cam rig sensor.' : 'Submits every graph view as base → perturbed passive → perturbed active-polar.'}
+		onclick={() => onSubmitPolarFullSweep?.()}>
+		{polarFullSweepSubmitting ? 'Submitting Polar Full Sweep...' : 'Polar Full Sweep · all views'}
+	</button>
+	<div class="sensor-sweep-summary">polar_cam only · base → passive → active-polar · ignores Only missing renders</div>
+	{#if polarFullSweepResult}
+		<div class="sensor-sweep-summary">Base/passive/active: {polarFullSweepResult.batch_ids?.map((id: string) => id.slice(0, 8)).join(', ')} · {polarFullSweepResult.batches?.map((batch: any) => `${batch.scene_variant_key} ${batch.status ?? 'queued'}`).join(' · ')}</div>
+	{/if}
+	<button
+		class="button button-subtle full"
+		disabled={!polarSampleSweepEnabled}
+		title={!polarSampleSweepEnabled ? 'Requires a synced graph scene, prepared perturbation, and polar_cam rig sensor.' : ''}
+		onclick={() => onSubmitPolarSampleSweep?.()}
+	>
+		{polarSampleSweepSubmitting ? 'Planning Polar Sample Sweep...' : 'Polar Sample Sweep · 10 views'}
+	</button>
+	<div class="sensor-sweep-summary">10 views × passive/active = 20 jobs</div>
+	{#if polarSampleSweepResult}
+		<div class="sensor-sweep-summary">
+			Passive/active: {polarSampleSweepResult.batch_ids?.map((id: string) => id.slice(0, 8)).join(', ')}
+			· {polarSampleSweepResult.batches?.map((batch: any) => `${batch.scene_variant_key === 'perturbed' ? 'passive' : 'active'} ${batch.status ?? 'queued'}`).join(' · ')}
+		</div>
+	{/if}
 	{#if onRenderEpisodeNodes}
 		<button class="button button-subtle full"
 			disabled={!caps.renderEpisodePath.enabled}
@@ -765,5 +809,32 @@
 	.sensor-panel .sensor-del { margin-top: 2px; color: var(--text-muted); }
 
 	.sensor-panel .sensor-config-row { display: flex; align-items: center; justify-content: space-between; gap: 6px; margin: 6px 0; }
+
+	.render-config-card {
+		display: grid;
+		grid-template-columns: minmax(0, 1fr) auto;
+		gap: 6px;
+		align-items: center;
+		margin: 10px 0;
+		padding: 8px;
+		border: 1px solid var(--panel-border);
+		border-radius: var(--radius-md);
+		background: var(--surface-2, #f8fafc);
+	}
+
+	.sensor-sync-copy {
+		display: grid;
+		gap: 2px;
+		min-width: 0;
+	}
+
+	.sensor-sync-copy small {
+		color: inherit;
+		opacity: 0.88;
+		line-height: 1.3;
+	}
+
+	.render-config-head { display: flex; align-items: center; gap: 6px; min-width: 0; }
+	.render-config-card .rail-title { margin: 0; }
 
 </style>

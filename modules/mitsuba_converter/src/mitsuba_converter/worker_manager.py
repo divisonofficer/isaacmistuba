@@ -44,12 +44,14 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Deque, Optional
 
 
 HEARTBEAT_TIMEOUT_S = 30.0
 ENV_WORKER_HEARTBEAT_TIMEOUT_S = "ROBOMITUBA_WORKER_HEARTBEAT_TIMEOUT_S"
+ENV_WORKER_START_TIMEOUT_S = "ROBOMITUBA_WORKER_START_TIMEOUT_S"
 ENV_WORKER_BACKLOG_PER_GPU = "ROBOMITUBA_RENDER_WORKER_BACKLOG_PER_GPU"
 RESTART_COOLDOWN_S = 30.0
 DEGRADED_WINDOW_S = 5 * 60.0
@@ -118,6 +120,25 @@ def _heartbeat_timeout_s() -> float:
         return HEARTBEAT_TIMEOUT_S
 
 
+def _worker_start_timeout_s() -> float:
+    """Maximum time between writing a job and receiving its ``started`` event.
+
+    Heartbeats only prove that the worker's auxiliary heartbeat thread is
+    alive.  They do *not* prove that its stdin dispatch loop consumed the
+    assigned command.  A worker can therefore remain healthy-looking while a
+    job is permanently stranded in ``assigned_job_ids`` with no in-flight
+    job.  Keep this timeout comfortably above normal IPC/startup jitter, but
+    short enough that a graph-sweep variant barrier cannot wait indefinitely.
+    """
+    raw = os.environ.get(ENV_WORKER_START_TIMEOUT_S)
+    if raw is None:
+        return 120.0
+    try:
+        return max(10.0, float(str(raw).strip()))
+    except (TypeError, ValueError):
+        return 120.0
+
+
 def _worker_backlog_per_gpu() -> int:
     raw = os.environ.get(ENV_WORKER_BACKLOG_PER_GPU)
     if raw is None:
@@ -141,6 +162,10 @@ class WorkerStats:
     failed_count: int = 0
     unexpected_exits: Deque[float] = field(default_factory=deque)
     assigned_job_ids: set[str] = field(default_factory=set)
+    # Monotonic assignment times let the watchdog distinguish a live idle
+    # worker from one that silently consumed/dropped a command before it ever
+    # emitted ``started``.
+    assigned_at: dict[str, float] = field(default_factory=dict)
 
 
 class _Worker:
@@ -229,6 +254,7 @@ class _Worker:
             self.stats.in_flight_job_id = None
             self.stats.in_flight_started_at = None
             self.stats.assigned_job_ids.clear()
+            self.stats.assigned_at.clear()
 
             self._writer_thread = threading.Thread(
                 target=self._writer_loop,
@@ -319,6 +345,14 @@ class _Worker:
                 kept.append(item)
         for item in kept:
             self._outbound.put(item)
+        # The job has already left the manager-side outbound queue but the
+        # worker never emitted ``started``.  This is the exact stranded state
+        # that otherwise leaves a graph batch permanently "running" despite a
+        # healthy heartbeat.  Mitsuba jobs are not cooperatively cancellable,
+        # so restart the worker; its exit path releases this assignment.
+        if not found and job_id in self.stats.assigned_job_ids:
+            self._manager._request_restart(self, reason="assigned_job_cancelled")
+            return True
         return found
 
     def _writer_loop(
@@ -438,6 +472,7 @@ class _Worker:
         generation: int,
     ) -> None:
         timeout_s = _heartbeat_timeout_s()
+        start_timeout_s = _worker_start_timeout_s()
         while not stop_event.wait(1.0):
             if not self._is_current_generation(proc, generation):
                 return
@@ -449,6 +484,25 @@ class _Worker:
                 )
                 self._manager._request_restart(self, reason="heartbeat_timeout")
                 return
+            # A heartbeat may continue while the worker's main stdin loop has
+            # lost a command.  If there is no job actively executing, an old
+            # assigned entry has no legitimate owner and must be failed/retried
+            # by restarting this worker.
+            if self.stats.in_flight_job_id is None and self.stats.assigned_job_ids:
+                now = time.monotonic()
+                oldest_age_s = max(
+                    (now - self.stats.assigned_at.get(job_id, now))
+                    for job_id in self.stats.assigned_job_ids
+                )
+                if oldest_age_s > start_timeout_s:
+                    _stderr(
+                        f"worker: assigned job never started "
+                        f"(age={oldest_age_s:.1f}s timeout={start_timeout_s:.1f}s "
+                        f"jobs={sorted(self.stats.assigned_job_ids)[:3]}) "
+                        f"pid={self.stats.pid} — restarting"
+                    )
+                    self._manager._request_restart(self, reason="assigned_start_timeout")
+                    return
 
     def _is_current_generation(self, proc: subprocess.Popen[bytes] | None, generation: int) -> bool:
         with self._lock:
@@ -634,6 +688,8 @@ class WorkerManager:
         job_id = str(job.get("job_id") or "")
         target_gpu_index = self._target_gpu_index(job)
         routing_fallback_event: dict | None = None
+        assigned_event: dict | None = None
+        assigned_worker: _Worker | None = None
         while True:
             with self._condition:
                 if self._degraded:
@@ -678,11 +734,23 @@ class WorkerManager:
                 if self._worker_assigned_count(worker) < self._backlog_per_gpu:
                     if job_id:
                         worker.stats.assigned_job_ids.add(job_id)
-                    worker.submit(job)
+                        worker.stats.assigned_at[job_id] = time.monotonic()
+                        assigned_event = {
+                            "job_id": job_id,
+                            "type": "assigned",
+                            "gpu_index": worker.stats.gpu_index,
+                            "ts": datetime.now(timezone.utc).isoformat(),
+                            "backlog_limit": self._backlog_per_gpu,
+                        }
+                    assigned_worker = worker
                     self._condition.notify_all()
                     event = routing_fallback_event
                     break
                 self._condition.wait(timeout=0.5)
+        if assigned_event is not None:
+            self._dispatch_synthetic(assigned_event)
+        if assigned_worker is not None:
+            assigned_worker.submit(job)
         if event is not None:
             self._dispatch_synthetic(event)
 
@@ -819,6 +887,11 @@ class WorkerManager:
         """Snapshot for ``/health``. Cheap — never blocks on workers."""
         worker_states = []
         for w in self._workers:
+            now = time.monotonic()
+            assigned_start_age_s = (
+                round(max(now - w.stats.assigned_at.get(job_id, now) for job_id in w.stats.assigned_job_ids), 2)
+                if w.stats.assigned_job_ids else None
+            )
             worker_states.append({
                 "gpu_index": w.stats.gpu_index,
                 "pid": w.stats.pid,
@@ -826,6 +899,7 @@ class WorkerManager:
                 "queue_depth": self._worker_queue_depth(w),
                 "assigned_count": self._worker_assigned_count(w),
                 "assigned_job_ids": list(w.stats.assigned_job_ids)[:8],
+                "assigned_start_age_s": assigned_start_age_s,
                 "backlog_limit": self._backlog_per_gpu,
                 "load_score": self._worker_load(w),
                 "submitted": w.stats.submitted_count,
@@ -864,6 +938,7 @@ class WorkerManager:
             return
         with self._condition:
             worker.stats.assigned_job_ids.discard(str(job_id))
+            worker.stats.assigned_at.pop(str(job_id), None)
             self._condition.notify_all()
 
     def _target_gpu_index(self, job: dict) -> int | None:

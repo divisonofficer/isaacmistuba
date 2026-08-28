@@ -31,17 +31,16 @@ export interface PlanGraphEpisodesParams {
 	seed: number;
 }
 
-export async function fetchEpisodes(projectId: string) {
-	return listOpticalNavEpisodes(projectId);
+export async function fetchEpisodes(projectId: string, sceneId: string, split?: string, cursor?: string) {
+	return listOpticalNavEpisodes(projectId, sceneId, split, cursor);
 }
 
-export async function fetchEpisode(projectId: string, episodeId: string) {
-	return getOpticalNavEpisode(projectId, episodeId);
+export async function fetchEpisode(projectId: string, sceneId: string, episodeId: string) {
+	return getOpticalNavEpisode(projectId, sceneId, episodeId);
 }
 
 export async function planEpisodes(projectId: string, params: PlanEpisodesParams) {
-	return planOpticalNavEpisodes(projectId, {
-		scene_id: params.sceneId,
+	return planOpticalNavEpisodes(projectId, params.sceneId, {
 		num_pairs: params.numPairs,
 		splits: params.splits,
 		instruction_types: params.instructionTypes,
@@ -51,8 +50,7 @@ export async function planEpisodes(projectId: string, params: PlanEpisodesParams
 }
 
 export async function planGraphEpisodes(projectId: string, params: PlanGraphEpisodesParams) {
-	return planOpticalNavGraphEpisodes(projectId, {
-		scene_id: params.sceneId,
+	return planOpticalNavGraphEpisodes(projectId, params.sceneId, {
 		num_pairs: params.numPairs,
 		splits: params.splits,
 		scenarios: params.scenarios,
@@ -78,5 +76,5 @@ export async function clearAllObservations(projectId: string, sceneId: string) {
  * the glass/mirror overlay). Pass `del=true` to prune the stale episode files.
  */
 export async function validateGraphEpisodes(projectId: string, sceneId: string, del = false) {
-	return validateOpticalNavGraphEpisodes(projectId, { scene_id: sceneId, delete: del });
+	return validateOpticalNavGraphEpisodes(projectId, sceneId, { delete: del });
 }

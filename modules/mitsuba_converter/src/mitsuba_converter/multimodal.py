@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 import hashlib
 import json
+import math
 import os
 import re
 import sys
@@ -78,7 +80,7 @@ MODALITY_DEFINITIONS = {
     "s2": "Luminance-weighted Stokes S2 signed field.",
     "s1_over_s0": "Normalized Stokes S1/S0 (luminance-weighted), range [-1, 1], fixed colorbar scale.",
     "s2_over_s0": "Normalized Stokes S2/S0 (luminance-weighted), range [-1, 1], fixed colorbar scale.",
-    "polarization": "Stokes integrator with direct nested integrator, with pplastic fallback when needed.",
+    "polarization": "Ideal Stokes polarization; physical transport uses a path nested integrator by default.",
 }
 
 _PARSED_SCENE_CACHE: dict[tuple[str, int, int], ET.Element] = {}
@@ -121,6 +123,28 @@ class RenderConfig:
     path_spp: int = 4096
     aov_spp: int = 16
     polar_spp: int = 256
+    # Optional progressive Stokes sampling.  When enabled, the renderer makes
+    # independent low-spp estimates and only spends the remaining budget on a
+    # view whose *Stokes* noise has not converged.  ``polar_spp`` remains the
+    # hard maximum, so old requests retain their fixed-SPP behaviour unless an
+    # explicit minimum/maximum pair is supplied.
+    polar_adaptive_spp_min: int | None = None
+    polar_adaptive_spp_max: int | None = None
+    polar_adaptive_noise_threshold: float = 0.035
+    # ``raw_stokes_aolp_v1`` is the compact dataset policy: persist the
+    # lossless RGB Stokes 12-channel NPZ plus the two useful human-readable
+    # images (polar RGB and AoLP).  Signed/DoLP/component previews remain
+    # reproducible from the NPZ on demand.
+    # ``core_preview_v1`` retains the historical RGB thumbnail, and ``full_v1``
+    # remains the backwards-compatible default for direct/library callers.
+    polar_visualization_policy: str = "full_v1"
+    # One RGB-polarized Stokes render returns S0/S1/S2/S3, each with RGB
+    # components: the public OpticalNav v2 ground truth has 12 scalar channels.
+    polar_color_mode: str = "rgb_stokes_12"
+    # ``physical`` is the dataset-quality default: it traces reflected and
+    # transmitted background transport through the nested path integrator.
+    # ``preview`` retains the inexpensive direct-light diagnostic path.
+    polar_transport: str = "physical"
     path_max_depth: int = 6
     direct_max_depth: int = 2
     rr_depth: int = 8
@@ -185,6 +209,14 @@ class RenderConfig:
     artifact_stems: dict[str, str] = field(default_factory=dict)
     scene_filenames: dict[str, str] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        self.polar_transport = str(self.polar_transport or "physical").strip().lower()
+        if self.polar_transport not in {"physical", "preview"}:
+            raise ValueError("polar_transport must be one of: physical, preview")
+        self.polar_color_mode = str(self.polar_color_mode or "rgb_stokes_12").strip().lower()
+        if self.polar_color_mode not in {"rgb_stokes_12", "legacy_auto"}:
+            raise ValueError("polar_color_mode must be one of: rgb_stokes_12, legacy_auto")
+
     def artifact_stem(self, modality: str, default: str) -> str:
         return self.artifact_stems.get(modality, default)
 
@@ -231,6 +263,13 @@ def _polar_quality_summary(summary: Mapping[str, Any], config: "RenderConfig | N
         "min_finite_ratio": float(min_finite_ratio),
         "max_invalid_pixels": int(max_invalid_pixels),
     }
+
+
+def _polar_transport_integrator(config: "RenderConfig") -> tuple[str, int]:
+    """Resolve the nested Stokes integrator from the public transport mode."""
+    if config.polar_transport == "physical":
+        return "path", int(config.path_max_depth)
+    return "direct", int(config.direct_max_depth)
 
 
 @dataclass
@@ -950,16 +989,44 @@ def _append_policy_analytic_bsdf(
         ET.SubElement(bsdf, "float", {"name": "alpha", "value": f"{alpha:.4f}"})
         return True
 
+    # The material policy is also used to make a Stokes-compatible analytic
+    # scene.  Do not turn ordinary PBR surfaces into a uniform colour while
+    # doing that: this used to make every carpet/wall/tile in a polar render
+    # look like white plastic, even though the source render XML referenced
+    # the correct PBR maps.  Preserve the texture inputs that ``pplastic`` and
+    # ``normalmap`` can represent in the RGB-polarized variant.
+    normal_tex = str(
+        (extracted_material or {}).get("normal_texture_ref")
+        or analytic.get("normal_texture_ref")
+        or ""
+    ).strip()
+    roughness_tex = str(
+        (extracted_material or {}).get("roughness_texture_ref")
+        or analytic.get("roughness_texture_ref")
+        or ""
+    ).strip()
     twosided = ET.SubElement(shape, "bsdf", {"type": "twosided"})
-    bsdf = ET.SubElement(twosided, "bsdf", {"type": "pplastic"})
+    parent = twosided
+    if normal_tex and Path(normal_tex).is_file():
+        normalmap = ET.SubElement(twosided, "bsdf", {"type": "normalmap"})
+        normal_texture = ET.SubElement(normalmap, "texture", {"name": "normalmap", "type": "bitmap"})
+        ET.SubElement(normal_texture, "string", {"name": "filename", "value": normal_tex})
+        ET.SubElement(normal_texture, "boolean", {"name": "raw", "value": "true"})
+        parent = normalmap
+    bsdf = ET.SubElement(parent, "bsdf", {"type": "pplastic"})
     base_tex, rgb = _base_color_from_policy(analytic, extracted_material)
     if base_tex:
         tex = ET.SubElement(bsdf, "texture", {"name": "diffuse_reflectance", "type": "bitmap"})
         ET.SubElement(tex, "string", {"name": "filename", "value": base_tex})
     else:
         ET.SubElement(bsdf, "rgb", {"name": "diffuse_reflectance", "value": rgb})
-    alpha = _clamp_bsdf_alpha(analytic.get("roughness"), default=0.2, floor=_MIN_ROUGHPLASTIC_ALPHA)
-    ET.SubElement(bsdf, "float", {"name": "alpha", "value": f"{max(0.2, alpha):.4f}"})
+    if roughness_tex and Path(roughness_tex).is_file():
+        roughness_texture = ET.SubElement(bsdf, "texture", {"name": "alpha", "type": "bitmap"})
+        ET.SubElement(roughness_texture, "string", {"name": "filename", "value": roughness_tex})
+        ET.SubElement(roughness_texture, "boolean", {"name": "raw", "value": "true"})
+    else:
+        alpha = _clamp_bsdf_alpha(analytic.get("roughness"), default=0.2, floor=_MIN_ROUGHPLASTIC_ALPHA)
+        ET.SubElement(bsdf, "float", {"name": "alpha", "value": f"{max(0.2, alpha):.4f}"})
     return True
 
 
@@ -1213,6 +1280,55 @@ def _downsampled_texture_path(src: Path, *, cache_root: Path, max_resolution: in
     return cache_root / f"max{max_resolution}" / digest[:2] / f"{src.stem}_{digest}{suffix}"
 
 
+@contextmanager
+def _texture_cache_write_guard(cached: Path):
+    """Serialize first-writer cache publication across independent GPU workers.
+
+    Worker processes do not share Python locks.  The cache filename is content/source
+    stable, so a cold fleet start can otherwise make every worker resample the same
+    source image before their atomic ``os.replace`` calls race.  A lock sidecar makes
+    the first writer authoritative while retaining atomic publication of the image.
+    """
+    if cached.exists():
+        yield False
+        return
+
+    cached.parent.mkdir(parents=True, exist_ok=True)
+    lock = cached.with_name(f".{cached.name}.lock")
+    timeout_s = max(1.0, float(os.environ.get("ROBOMITUBA_TEXTURE_CACHE_LOCK_TIMEOUT_S", "120")))
+    stale_s = max(timeout_s, float(os.environ.get("ROBOMITUBA_TEXTURE_CACHE_LOCK_STALE_S", "900")))
+    deadline = time.monotonic() + timeout_s
+    fd: int | None = None
+    while fd is None:
+        if cached.exists():
+            yield False
+            return
+        try:
+            fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        except FileExistsError:
+            try:
+                if time.time() - lock.stat().st_mtime > stale_s:
+                    lock.unlink(missing_ok=True)
+                    continue
+            except OSError:
+                pass
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"timed out waiting for texture cache writer: cache={cached} lock={lock}"
+                )
+            time.sleep(0.05)
+
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(f"pid={os.getpid()} created_at={time.time():.6f}\n")
+        yield True
+    finally:
+        try:
+            lock.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def _ensure_downsampled_exr(src: Path, cached: Path, *, max_resolution: int) -> Path | None:
     try:
         import imageio.v3 as iio
@@ -1239,8 +1355,17 @@ def _ensure_downsampled_exr(src: Path, cached: Path, *, max_resolution: int) -> 
             resized = cropped.reshape(new_height, factor, new_width, factor).mean(axis=(1, 3))
         else:
             resized = cropped.reshape(new_height, factor, new_width, factor, *image.shape[2:]).mean(axis=(1, 3))
-        cached.parent.mkdir(parents=True, exist_ok=True)
-        iio.imwrite(cached, resized.astype(np.float32, copy=False))
+        temporary = cached.with_name(
+            f".{cached.stem}.tmp.{os.getpid()}.{threading.get_ident()}{cached.suffix}"
+        )
+        try:
+            iio.imwrite(temporary, resized.astype(np.float32, copy=False))
+            os.replace(temporary, cached)
+        finally:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
         return cached
     except Exception as exc:
         print(
@@ -1257,37 +1382,38 @@ def _ensure_downsampled_texture(src: Path, *, cache_root: Path, max_resolution: 
         return None
     if cached.exists():
         return cached
-    if cached.suffix.lower() == ".exr":
-        return _ensure_downsampled_exr(src, cached, max_resolution=max_resolution)
     try:
-        with Image.open(src) as image:
-            width, height = image.size
-            largest = max(width, height)
-            if largest <= max_resolution:
-                return src
-            scale = max_resolution / float(largest)
-            new_size = (max(1, int(round(width * scale))), max(1, int(round(height * scale))))
-            resized = image.copy()
-            resized.thumbnail(new_size, Image.Resampling.LANCZOS)
-            cached.parent.mkdir(parents=True, exist_ok=True)
-            save_kwargs: dict[str, Any] = {}
-            if cached.suffix.lower() in {".jpg", ".jpeg"}:
-                save_kwargs.update({"quality": 92, "subsampling": 0})
-            # Multiple GPU workers commonly reach the same source texture at
-            # once.  Publish only complete cache files; a partially written
-            # PNG must never become another worker's renderer input.
-            temporary = cached.with_name(
-                f".{cached.stem}.tmp.{os.getpid()}.{threading.get_ident()}{cached.suffix}"
-            )
-            try:
-                resized.save(temporary, **save_kwargs)
-                os.replace(temporary, cached)
-            finally:
+        with _texture_cache_write_guard(cached) as owns_write:
+            if not owns_write:
+                return cached
+            if cached.suffix.lower() == ".exr":
+                return _ensure_downsampled_exr(src, cached, max_resolution=max_resolution)
+            with Image.open(src) as image:
+                width, height = image.size
+                largest = max(width, height)
+                if largest <= max_resolution:
+                    return src
+                scale = max_resolution / float(largest)
+                new_size = (max(1, int(round(width * scale))), max(1, int(round(height * scale))))
+                resized = image.copy()
+                resized.thumbnail(new_size, Image.Resampling.LANCZOS)
+                save_kwargs: dict[str, Any] = {}
+                if cached.suffix.lower() in {".jpg", ".jpeg"}:
+                    save_kwargs.update({"quality": 92, "subsampling": 0})
+                # The process guard above prevents redundant resampling.  Keep
+                # atomic publication as a second line of defence against a crash.
+                temporary = cached.with_name(
+                    f".{cached.stem}.tmp.{os.getpid()}.{threading.get_ident()}{cached.suffix}"
+                )
                 try:
-                    temporary.unlink(missing_ok=True)
-                except OSError:
-                    pass
-            return cached
+                    resized.save(temporary, **save_kwargs)
+                    os.replace(temporary, cached)
+                finally:
+                    try:
+                        temporary.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                return cached
     except Exception as exc:
         print(
             f"[multimodal] texture downsample skipped path={src} max={max_resolution}: {exc}",
@@ -1347,7 +1473,8 @@ def _rewrite_texture_filenames(
             rewritten += 1
     if rewritten or skipped:
         print(
-            f"[multimodal] texture cap max={max_resolution} rewritten={rewritten} skipped={skipped} cache={cache_root}",
+            f"[multimodal] texture cap max={max_resolution} references_retargeted={rewritten} "
+            f"skipped={skipped} cache={cache_root}",
             file=sys.stderr,
             flush=True,
         )
@@ -2540,6 +2667,7 @@ def _stage_stokes_scene(
     scene_override: SceneOverrideSpec | None = None,
     assist_light: AssistLightSpec | None = None,
     nested_integrator_type: str = "direct",
+    nested_max_depth: int | None = None,
     measured_scope: str = "analytic_only",
     max_measured_bsdfs: int = 3,
     active_lights: Sequence["ActiveLightSpec"] = (),
@@ -2551,6 +2679,7 @@ def _stage_stokes_scene(
         _camera_signature(camera_to_world, fov_deg=fov_deg, spp=spp, width=width, height=height),
         (
             nested_integrator_type,
+            int(nested_max_depth or 0),
             int(samples_per_pass or 0),
             str(measured_scope),
             int(max_measured_bsdfs),
@@ -2573,7 +2702,9 @@ def _stage_stokes_scene(
             integrator.remove(child)
         if samples_per_pass is not None and samples_per_pass > 0:
             ET.SubElement(integrator, "integer", {"name": "samples_per_pass", "value": str(samples_per_pass)})
-        ET.SubElement(integrator, "integrator", {"type": nested_integrator_type})
+        nested = ET.SubElement(integrator, "integrator", {"type": nested_integrator_type})
+        if nested_max_depth is not None and nested_max_depth > 0:
+            ET.SubElement(nested, "integer", {"name": "max_depth", "value": str(nested_max_depth)})
         _apply_measured_scope_policy(
             root,
             source_scene=scene_path,
@@ -2586,6 +2717,7 @@ def _stage_stokes_scene(
         branch_kind="stokes",
         branch_signature=(
             nested_integrator_type,
+            int(nested_max_depth or 0),
             int(samples_per_pass or 0),
             str(measured_scope),
             int(max_measured_bsdfs),
@@ -2619,6 +2751,7 @@ def _stage_base_stokes_scene(
     samples_per_pass: int | None,
     scene_override: SceneOverrideSpec | None = None,
     nested_integrator_type: str = "direct",
+    nested_max_depth: int | None = None,
     measured_scope: str = "analytic_only",
     max_measured_bsdfs: int = 3,
 ) -> Path:
@@ -2628,6 +2761,7 @@ def _stage_base_stokes_scene(
         _scene_cache_key(scene_path),
         (
             nested_integrator_type,
+            int(nested_max_depth or 0),
             int(samples_per_pass or 0),
             str(measured_scope),
             int(max_measured_bsdfs),
@@ -2651,7 +2785,9 @@ def _stage_base_stokes_scene(
             integrator.remove(child)
         if samples_per_pass is not None and samples_per_pass > 0:
             ET.SubElement(integrator, "integer", {"name": "samples_per_pass", "value": str(samples_per_pass)})
-        ET.SubElement(integrator, "integrator", {"type": nested_integrator_type})
+        nested = ET.SubElement(integrator, "integrator", {"type": nested_integrator_type})
+        if nested_max_depth is not None and nested_max_depth > 0:
+            ET.SubElement(nested, "integer", {"name": "max_depth", "value": str(nested_max_depth)})
         _apply_measured_scope_policy(
             root,
             source_scene=scene_path,
@@ -2664,6 +2800,7 @@ def _stage_base_stokes_scene(
         branch_kind="stokes",
         branch_signature=(
             nested_integrator_type,
+            int(nested_max_depth or 0),
             int(samples_per_pass or 0),
             str(measured_scope),
             int(max_measured_bsdfs),
@@ -3185,6 +3322,7 @@ def _render_scene(
     spp: int,
     on_loaded: Callable[[], None] | None = None,
     viewpoint: "_ViewpointSensorSpec | None" = None,
+    seed: int | None = None,
 ) -> tuple[np.ndarray, dict[str, float]]:
     mi = _import_mitsuba()
     start = time.perf_counter()
@@ -3216,11 +3354,36 @@ def _render_scene(
     if on_loaded is not None:
         on_loaded()
 
-    render_start = time.perf_counter()
+    sampler_spp: int | None = None
     if sensor is not None:
-        image = np.array(mi.render(scene, sensor=sensor, spp=spp), dtype=np.float32)
+        try:
+            sampler_spp = int(sensor.sampler().sample_count())
+        except Exception:
+            sampler_spp = None
+
+    render_start = time.perf_counter()
+    render_kwargs: dict[str, Any] = {"spp": spp}
+    # Explicit independent seeds are essential for progressive Monte-Carlo
+    # estimates.  Reusing Mitsuba's default seed would compare the same sample
+    # sequence with itself and incorrectly declare every frame converged.
+    if seed is not None:
+        render_kwargs["seed"] = int(seed)
+    if sensor is not None:
+        image_tensor = mi.render(scene, sensor=sensor, **render_kwargs)
     else:
-        image = np.array(mi.render(scene, spp=spp), dtype=np.float32)
+        image_tensor = mi.render(scene, **render_kwargs)
+    # ``mi.render`` can return a lazily scheduled Dr.Jit tensor.  Force
+    # completion before timing it; without this a later NumPy conversion or
+    # product write can accidentally absorb the CUDA work.
+    try:
+        import drjit as dr  # type: ignore
+        dr.eval(image_tensor)
+        dr.sync_thread()
+    except Exception:
+        # NumPy conversion below remains a mandatory materialization fallback
+        # for minimal/non-Dr.Jit test environments.
+        pass
+    image = np.array(image_tensor, dtype=np.float32)
     render_s = time.perf_counter() - render_start
     total_s = time.perf_counter() - start
     return image, {
@@ -3228,9 +3391,45 @@ def _render_scene(
         "load_scene_s": load_s,
         "scene_cache_hit": cache_hit,
         "sensor_build_s": sensor_build_s,
+        "requested_spp": int(spp),
+        "sensor_sampler_spp": sampler_spp,
         "render_s": render_s,
         "total_s": total_s,
     }
+
+
+def _polar_adaptive_noise_score(reference: np.ndarray, estimate: np.ndarray) -> float:
+    """Return a robust relative Stokes disagreement score for two equal-SPP estimates.
+
+    The comparison is normalized by S0 luminance, never by DoLP/AoLP.  Those
+    quantities are non-linear (and AoLP wraps), therefore estimating their
+    error directly would let a noisy dark pixel make a sound Stokes estimate
+    look unconverged.  The score is intentionally a high percentile over
+    illuminated pixels: a single caustic/firefly must not force all frames to
+    the maximum budget, but glass/reflection edges still receive extra samples.
+    """
+    if reference.shape != estimate.shape or reference.ndim != 3 or reference.shape[-1] < 3:
+        return float("inf")
+    ref = np.nan_to_num(np.asarray(reference, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+    est = np.nan_to_num(np.asarray(estimate, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+    mean = 0.5 * (ref + est)
+    # In rgb_stokes_12, S0 is the first RGB triplet.  Keep the fallback useful
+    # for a scalar/spectral carrier used by direct library callers.
+    s0 = mean[..., :3]
+    luminance = np.maximum(
+        0.2126 * np.abs(s0[..., 0]) + 0.7152 * np.abs(s0[..., 1]) + 0.0722 * np.abs(s0[..., 2]),
+        0.0,
+    )
+    reference_scale = float(np.quantile(luminance, 0.95)) if luminance.size else 0.0
+    floor = max(reference_scale * 0.02, 1e-6)
+    valid = luminance >= floor
+    if not np.any(valid):
+        return float("inf")
+    # S1/S2/S3 are bounded by the total intensity for a physical Stokes vector,
+    # so S0 luminance is a common stable normalizer across all twelve channels.
+    delta = np.max(np.abs(ref - est), axis=-1)
+    relative = delta[valid] / np.maximum(luminance[valid], floor)
+    return float(np.quantile(relative, 0.95)) if relative.size else float("inf")
 
 
 def srgb_encode(arr: np.ndarray) -> np.ndarray:
@@ -3260,6 +3459,33 @@ def save_rgb_preview(arr: np.ndarray, path: Path, percentile: float = 0.995) -> 
     preview, summary = _rgb_preview_array(arr, percentile=percentile)
     _save_preview_image(preview, path, blur_radius=0.45 if percentile <= 0.992 else 0.0)
     return summary
+
+
+def stokes_rgb_component_preview(component: np.ndarray, *, component_name: str) -> tuple[np.ndarray, dict[str, Any]]:
+    """Build a compact RGB visualization for one Stokes component.
+
+    ``S0`` is radiance-like and is displayed with the same tone mapping as an
+    RGB render.  ``S1``--``S3`` are signed quantities: each of their RGB
+    channels is retained, zero is neutral mid-grey, and a symmetric percentile
+    scale makes positive/negative values visible without discarding colour.
+    This is deliberately different from the existing luminance BWR products.
+    """
+    safe = np.where(np.isfinite(component), component, 0.0).astype(np.float32)
+    if component_name == "s0":
+        preview, summary = _rgb_preview_array(safe, percentile=0.992)
+        summary.update({"kind": "stokes_rgb", "component": "S0", "signed": False})
+        return preview, summary
+    magnitude = np.abs(safe[np.isfinite(safe)])
+    scale = float(np.quantile(magnitude, 0.99)) if magnitude.size else 1.0
+    scale = max(scale, 1e-6)
+    preview = np.clip(0.5 + 0.5 * (safe / scale), 0.0, 1.0).astype(np.float32)
+    return preview, {
+        "kind": "stokes_rgb",
+        "component": component_name.upper(),
+        "signed": True,
+        "zero_color": "#808080",
+        "symmetric_scale_abs_p99": scale,
+    }
 
 
 def save_unit_rgb_preview(arr: np.ndarray, path: Path) -> dict[str, Any]:
@@ -3784,11 +4010,13 @@ def extract_stokes_channels(image: np.ndarray) -> tuple[np.ndarray, np.ndarray, 
     else:
         raise RuntimeError(f"Unexpected stokes channel count: {image.shape[2]}")
 
-    rgb = image[:, :, 0:3]
-    s0 = image[:, :, offset + 0:offset + 3]
-    s1 = image[:, :, offset + 3:offset + 6]
-    s2 = image[:, :, offset + 6:offset + 9]
-    s3 = image[:, :, offset + 9:offset + 12]
+    # The lossless public GT contract is explicitly float32, regardless of the
+    # renderer buffer's native precision.  Each Stokes component remains RGB.
+    rgb = np.asarray(image[:, :, 0:3], dtype=np.float32)
+    s0 = np.asarray(image[:, :, offset + 0:offset + 3], dtype=np.float32)
+    s1 = np.asarray(image[:, :, offset + 3:offset + 6], dtype=np.float32)
+    s2 = np.asarray(image[:, :, offset + 6:offset + 9], dtype=np.float32)
+    s3 = np.asarray(image[:, :, offset + 9:offset + 12], dtype=np.float32)
     return rgb, s0, s1, s2, s3
 
 
@@ -3870,7 +4098,14 @@ def save_polarization_products(
     image: np.ndarray,
     out_dir: Path,
     requested_modalities: set[str],
+    *,
+    visualization_policy: str = "full_v1",
 ) -> tuple[dict[str, Any], dict[str, np.ndarray]]:
+    if visualization_policy not in {"full_v1", "core_preview_v1", "raw_stokes_aolp_v1"}:
+        raise ValueError(
+            "polar_visualization_policy must be 'full_v1', 'core_preview_v1', or 'raw_stokes_aolp_v1'"
+        )
+    write_started = time.perf_counter()
     rgb, s0, s1, s2, s3 = extract_stokes_channels(image)
 
     weights = np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
@@ -3901,6 +4136,7 @@ def save_polarization_products(
     finite_ratio = float(np.mean(finite_mask))
 
     stokes_npz = out_dir / "stokes_data.npz"
+    npz_started = time.perf_counter()
     np.savez_compressed(
         stokes_npz,
         rgb=rgb,
@@ -3918,6 +4154,7 @@ def save_polarization_products(
         aolp=aolp,
         mask=mask,
     )
+    stokes_npz_write_s = time.perf_counter() - npz_started
 
     def bwr_map(field: np.ndarray, scale: float) -> np.ndarray:
         safe_field = np.where(np.isfinite(field), field, 0.0)
@@ -3991,7 +4228,23 @@ def save_polarization_products(
     s2_scale = max(float(np.quantile(np.abs(s2_l[mask]), 0.99)) if np.any(mask) else 1.0, 1e-6)
 
     outputs: dict[str, str] = {"stokes_npz": str(stokes_npz)}
-    if "polar_rgb_preview" in requested_modalities:
+    # Keep an immediately browsable RGB representation for every Stokes
+    # component.  The immutable gallery also synthesizes these from legacy
+    # NPZs, so this only affects new renders.
+    preview_started = time.perf_counter()
+    if visualization_policy == "full_v1":
+        for component_name, component in (("s0", s0), ("s1", s1), ("s2", s2), ("s3", s3)):
+            component_path = out_dir / f"{component_name}_rgb_preview.png"
+            component_preview, _ = stokes_rgb_component_preview(component, component_name=component_name)
+            _save_preview_image(component_preview, component_path)
+            outputs[f"{component_name}_rgb_preview"] = str(component_path)
+    # The compact policy deliberately retains one normal RGB view.  It is the
+    # only image needed for quick visual QA beside AoLP, while all of the
+    # per-Stokes-component and DoLP diagnostics stay derivable from the NPZ.
+    if (
+        visualization_policy == "raw_stokes_aolp_v1"
+        or "polar_rgb_preview" in requested_modalities
+    ):
         polar_rgb_preview = out_dir / "polar_rgb_preview.png"
         preview_rgb, _ = _rgb_preview_array(rgb, percentile=0.992)
         finite_rgb_mask = np.all(np.isfinite(rgb), axis=2)
@@ -4004,43 +4257,52 @@ def save_polarization_products(
         preview_rgb = _despeckle_dark_preview_pixels(preview_rgb, iterations=3)
         _save_preview_image(preview_rgb, polar_rgb_preview, blur_radius=0.45)
         outputs["rgb_preview"] = str(polar_rgb_preview)
-    if "s1" in requested_modalities:
+    if visualization_policy == "full_v1" and "s1" in requested_modalities:
         bar, ticks = bwr_bar(s1_scale, s1_l.shape[0])
         s1_path = out_dir / "s1_bwr_colorbar.png"
         s1_rgb = _despeckle_dark_preview_pixels(bwr_map(s1_l, s1_scale), iterations=3)
         append_colorbar(s1_rgb, bar, ticks, "S1", s1_path, title_mode="signed")
         outputs["s1"] = str(s1_path)
-    if "s2" in requested_modalities:
+    if visualization_policy == "full_v1" and "s2" in requested_modalities:
         bar, ticks = bwr_bar(s2_scale, s2_l.shape[0])
         s2_path = out_dir / "s2_bwr_colorbar.png"
         s2_rgb = _despeckle_dark_preview_pixels(bwr_map(s2_l, s2_scale), iterations=3)
         append_colorbar(s2_rgb, bar, ticks, "S2", s2_path, title_mode="signed")
         outputs["s2"] = str(s2_path)
-    if "dop" in requested_modalities:
+    if visualization_policy == "full_v1" and "dop" in requested_modalities:
         bar, ticks = dop_bar(dop.shape[0])
         dop_path = out_dir / "dop_red_black_colorbar.png"
         dop_rgb = _despeckle_dark_preview_pixels(dop_map(dop), iterations=3)
         append_colorbar(dop_rgb, bar, ticks, "DoP", dop_path, title_mode="range")
         outputs["dop"] = str(dop_path)
-    if "aolp" in requested_modalities:
+    if visualization_policy in {"full_v1", "raw_stokes_aolp_v1"} and (
+        "aolp" in requested_modalities or visualization_policy == "raw_stokes_aolp_v1"
+    ):
         bar, ticks = aolp_bar(aolp_deg.shape[0])
         aolp_path = out_dir / "aolp_rainbow_colorbar.png"
         aolp_rgb = _despeckle_dark_preview_pixels(aolp_map(aolp_deg), iterations=3)
         append_colorbar(aolp_rgb, bar, ticks, "AoLP", aolp_path, title_mode="angle")
         outputs["aolp"] = str(aolp_path)
-    if "s1_over_s0" in requested_modalities:
+    if visualization_policy == "full_v1" and "s1_over_s0" in requested_modalities:
         bar, ticks = bwr_bar(1.0, s1_n.shape[0])
         s1n_path = out_dir / "s1_over_s0_bwr_colorbar.png"
         s1n_rgb = _despeckle_dark_preview_pixels(bwr_map(s1_n, 1.0), iterations=3)
         append_colorbar(s1n_rgb, bar, ticks, "S1/S0", s1n_path, title_mode="signed")
         outputs["s1_over_s0"] = str(s1n_path)
-    if "s2_over_s0" in requested_modalities:
+    if visualization_policy == "full_v1" and "s2_over_s0" in requested_modalities:
         bar, ticks = bwr_bar(1.0, s2_n.shape[0])
         s2n_path = out_dir / "s2_over_s0_bwr_colorbar.png"
         s2n_rgb = _despeckle_dark_preview_pixels(bwr_map(s2_n, 1.0), iterations=3)
         append_colorbar(s2n_rgb, bar, ticks, "S2/S0", s2n_path, title_mode="signed")
         outputs["s2_over_s0"] = str(s2n_path)
 
+    preview_write_s = time.perf_counter() - preview_started
+    derived_on_demand = sorted(
+        {"rgb_preview", "s0_rgb_preview", "s1_rgb_preview", "s2_rgb_preview", "s3_rgb_preview"}
+        | ({"s1", "s2", "dop", "aolp", "s1_over_s0", "s2_over_s0"}
+           if visualization_policy in {"core_preview_v1", "raw_stokes_aolp_v1"} else set())
+        - set(outputs)
+    )
     summary = {
         "s1_scale_abs_p995": s1_scale,
         "s2_scale_abs_p995": s2_scale,
@@ -4048,8 +4310,27 @@ def save_polarization_products(
         "s2_scale_abs_p99": s2_scale,
         "invalid_pixel_count": invalid_pixel_count,
         "finite_ratio": finite_ratio,
+        "stokes_luminance_stats": {
+            name: {
+                "min": float(np.min(values)) if values.size else 0.0,
+                "max": float(np.max(values)) if values.size else 0.0,
+                "mean": float(np.mean(values)) if values.size else 0.0,
+            }
+            for name, values in {
+                "s0": s0_l[np.isfinite(s0_l)],
+                "s1": s1_l[np.isfinite(s1_l)],
+                "s2": s2_l[np.isfinite(s2_l)],
+                "s3": s3_l[np.isfinite(s3_l)],
+            }.items()
+        },
         "dop_range": [0.0, 1.0],
         "aolp_range_degrees": [0.0, 180.0],
+        "visualization_policy": visualization_policy,
+        "stokes_preview_recipe": "stokes_preview_v1",
+        "derived_on_demand": derived_on_demand,
+        "stokes_npz_write_s": stokes_npz_write_s,
+        "preview_write_s": preview_write_s,
+        "polar_postprocess_s": time.perf_counter() - write_started,
         "outputs": outputs,
     }
     arrays = {
@@ -4069,6 +4350,36 @@ def save_polarization_products(
         "mask": mask.astype(bool),
     }
     return summary, arrays
+
+
+def materialize_stokes_visualizations(
+    stokes_npz: str | Path,
+    out_dir: str | Path,
+    requested_modalities: set[str],
+) -> dict[str, str]:
+    """Regenerate legacy Stokes PNG products without touching an observation.
+
+    This deliberately delegates to :func:`save_polarization_products` so the
+    viewer and ``legacy_full`` exporter share the exact colour-map recipe.  The
+    temporary duplicate NPZ is harmless for staging callers and is never
+    published by the on-demand viewer path.
+    """
+    source = Path(stokes_npz)
+    target = Path(out_dir)
+    target.mkdir(parents=True, exist_ok=True)
+    with np.load(source, allow_pickle=False) as data:
+        required = ("rgb", "s0", "s1", "s2", "s3")
+        missing = [key for key in required if key not in data.files]
+        if missing:
+            raise ValueError(f"{source} lacks Stokes arrays: {', '.join(missing)}")
+        image = np.concatenate([np.asarray(data[key], dtype=np.float32) for key in required], axis=2)
+    summary, _arrays = save_polarization_products(
+        image,
+        target,
+        set(requested_modalities),
+        visualization_policy="full_v1",
+    )
+    return dict(summary["outputs"])
 
 
 def _write_bitmap(path: Path, array: np.ndarray) -> None:
@@ -4313,6 +4624,8 @@ def _build_rgb_result(
             "variant": timing["variant"],
             "load_scene_s": timing["load_scene_s"],
             "scene_cache_hit": bool(timing.get("scene_cache_hit", False)),
+            "requested_spp": timing.get("requested_spp"),
+            "sensor_sampler_spp": timing.get("sensor_sampler_spp"),
             "render_s": timing["render_s"],
             "save_exr_s": save_exr_s,
             "save_filtered_exr_s": save_filtered_exr_s,
@@ -4397,6 +4710,8 @@ def _build_grayscale_result(
             "variant": timing["variant"],
             "load_scene_s": timing["load_scene_s"],
             "scene_cache_hit": bool(timing.get("scene_cache_hit", False)),
+            "requested_spp": timing.get("requested_spp"),
+            "sensor_sampler_spp": timing.get("sensor_sampler_spp"),
             "render_s": timing["render_s"],
             "save_exr_s": save_exr_s,
             "save_png_s": save_png_s,
@@ -4825,7 +5140,12 @@ def _needs_sensor_depth(modalities: set[str]) -> bool:
     return bool({"sensor_depth_approx", "depth_sensor"} & modalities)
 
 
-def _polar_variant(base_variant: str) -> str:
+def _polar_variant(base_variant: str, *, color_mode: str = "rgb_stokes_12") -> str:
+    """Return the required variant for the requested Stokes GT contract."""
+    if color_mode == "rgb_stokes_12":
+        # Do not negotiate this from ``auto``: a spectral carrier has different
+        # semantics and would silently violate the 12-channel RGB contract.
+        return "cuda_ad_rgb_polarized"
     if not base_variant or base_variant in {"auto", "default"}:
         return "auto"
     if base_variant.endswith("_polarized"):
@@ -4952,6 +5272,7 @@ def render_modalities(
         spp: int,
         variant_override: str | None = None,
         viewpoint: "_ViewpointSensorSpec | None" = None,
+        seed: int | None = None,
     ) -> tuple[np.ndarray, dict[str, float]]:
         _pass_index[0] += 1
         from .mitsuba_runtime import mark_variant_unavailable, resolve_variant
@@ -5023,7 +5344,10 @@ def render_modalities(
                 })
             _cb("rendering", base_ctx)
         try:
-            image, timing = _render_scene(scene_path, variant=v, spp=spp, on_loaded=_on_loaded, viewpoint=viewpoint)
+            image, timing = _render_scene(
+                scene_path, variant=v, spp=spp, on_loaded=_on_loaded,
+                viewpoint=viewpoint, seed=seed,
+            )
         except Exception as exc:
             if not v.startswith("cuda_"):
                 raise
@@ -5040,13 +5364,97 @@ def render_modalities(
                 "sub_total": 5,
                 "error": str(exc),
             })
-            image, timing = _render_scene(scene_path, variant=fallback, spp=spp, on_loaded=_on_loaded, viewpoint=viewpoint)
+            image, timing = _render_scene(
+                scene_path, variant=fallback, spp=spp, on_loaded=_on_loaded,
+                viewpoint=viewpoint, seed=seed,
+            )
         _cb("saving_output", {
             "pass": pass_name,
             "pass_index": _pass_index[0],
             "total_passes": _total_passes[0],
         })
         return image, timing
+
+    def _render_adaptive_polar_pass(
+        scene_path: Path,
+        *,
+        variant_override: str | None,
+        viewpoint: "_ViewpointSensorSpec | None",
+    ) -> tuple[np.ndarray, dict[str, Any]]:
+        """Progressively render physical Stokes data without discarding samples.
+
+        Two independent half-minimum passes form the minimum-SPP candidate.
+        Additional independent buckets are traced only when their Stokes
+        disagreement exceeds the configured bound; every final image is the
+        weighted mean of all samples actually traced.
+        """
+        configured_min = config.polar_adaptive_spp_min
+        configured_max = config.polar_adaptive_spp_max
+        if configured_min is None or configured_max is None:
+            return _render_pass(
+                scene_path, pass_name="polar", spp=config.polar_spp,
+                variant_override=variant_override, viewpoint=viewpoint,
+            )
+        minimum = int(configured_min)
+        maximum = min(int(configured_max), int(config.polar_spp))
+        if minimum <= 0 or maximum < minimum or minimum % 2:
+            raise ValueError(
+                "polar adaptive SPP requires an even positive polar_adaptive_spp_min "
+                "and polar_adaptive_spp_max >= min"
+            )
+        threshold = float(config.polar_adaptive_noise_threshold)
+        if not math.isfinite(threshold) or threshold <= 0.0:
+            raise ValueError("polar_adaptive_noise_threshold must be a finite positive number")
+
+        batches: list[tuple[np.ndarray, int, dict[str, Any]]] = []
+
+        def _take(spp: int, seed: int) -> tuple[np.ndarray, dict[str, Any]]:
+            image, timing = _render_pass(
+                scene_path, pass_name="polar", spp=spp,
+                variant_override=variant_override, viewpoint=viewpoint, seed=seed,
+            )
+            batches.append((image, spp, timing))
+            return image, timing
+
+        half = minimum // 2
+        first, _ = _take(half, 17011)
+        second, first_timing = _take(half, 17012)
+        combined = 0.5 * (first + second)
+        total_spp = minimum
+        noise_scores = [_polar_adaptive_noise_score(first, second)]
+
+        # The next independently sampled bucket has the same weight as the
+        # accumulated estimate, allowing an apples-to-apples convergence test.
+        if noise_scores[-1] > threshold and maximum >= minimum * 2:
+            next_bucket, _ = _take(minimum, 17013)
+            noise_scores.append(_polar_adaptive_noise_score(combined, next_bucket))
+            combined = 0.5 * (combined + next_bucket)
+            total_spp += minimum
+
+        # If the 2048 estimate remains noisy, use every remaining sample.  The
+        # final bucket is not used as a stop test: it is the configured upper
+        # quality bound and is always incorporated before products are saved.
+        if noise_scores[-1] > threshold and total_spp < maximum:
+            remaining = maximum - total_spp
+            final_bucket, _ = _take(remaining, 17014)
+            combined = ((combined * float(total_spp)) + (final_bucket * float(remaining))) / float(maximum)
+            total_spp = maximum
+
+        render_s = float(sum(float(timing.get("render_s", 0.0)) for _, _, timing in batches))
+        total_s = float(sum(float(timing.get("total_s", 0.0)) for _, _, timing in batches))
+        timing = dict(first_timing)
+        timing.update({
+            "render_s": render_s,
+            "total_s": total_s,
+            "adaptive_spp_enabled": True,
+            "adaptive_spp_min": minimum,
+            "adaptive_spp_max": maximum,
+            "adaptive_spp_used": total_spp,
+            "adaptive_noise_threshold": threshold,
+            "adaptive_noise_scores": noise_scores,
+            "adaptive_pass_count": len(batches),
+        })
+        return combined.astype(np.float32, copy=False), timing
     # ─────────────────────────────────────────────────────────────────────
 
     def stage_filename(key: str, default: str) -> Path:
@@ -5894,10 +6302,11 @@ def render_modalities(
     polarization_material_mode = "not_requested"
     if _needs_polar(requested_set):
         _polar_active_lights = [l for l in active_lights if "polar" in (l.modalities or [])]
-        _has_polarized_active = any(l.polarized for l in _polar_active_lights)
-        polar_nested = "volpath" if (assist_light is not None and assist_light.polarized) or _has_polarized_active else "direct"
+        # Physical Stokes GT must include reflected/transmitted background paths.
+        # Keep direct only as an explicit fast diagnostic preview.
+        polar_nested, polar_max_depth = _polar_transport_integrator(config)
         polar_illumination_tag = (
-            "camera_aligned_nir_active_polarized" if assist_light is not None
+            "camera_aligned_rgb_active_polarized" if assist_light is not None
             else "rig_active_light" if _polar_active_lights
             else "ambient_room"
         )
@@ -5913,6 +6322,7 @@ def render_modalities(
                 samples_per_pass=config.samples_per_pass,
                 scene_override=scene_override,
                 nested_integrator_type=polar_nested,
+                nested_max_depth=polar_max_depth,
                 measured_scope=measured_scope,
                 max_measured_bsdfs=max_measured_bsdfs,
             )
@@ -5929,6 +6339,7 @@ def render_modalities(
                 scene_override=scene_override,
                 assist_light=assist_light,
                 nested_integrator_type=polar_nested,
+                nested_max_depth=polar_max_depth,
                 measured_scope=measured_scope,
                 max_measured_bsdfs=max_measured_bsdfs,
                 active_lights=_polar_active_lights,
@@ -5938,16 +6349,25 @@ def render_modalities(
         _cb("staging_scene", {"pass": "polar"})
 
         requested_polar = {modality for modality in requested_set if modality in {"polar_rgb_preview", "dop", "aolp", "s1", "s2", "s1_over_s0", "s2_over_s0"}}
-        image, timing = _render_pass(
+        image, timing = _render_adaptive_polar_pass(
             scene_polar,
-            pass_name="polar",
-            spp=config.polar_spp,
-            variant_override=_polar_variant(variant),
+            variant_override=_polar_variant(variant, color_mode=config.polar_color_mode),
             viewpoint=polar_viewpoint,
         )
-        timing["spp"] = config.polar_spp
+        timing["spp"] = int(timing.get("adaptive_spp_used", config.polar_spp))
         timing["dynamic_sensor"] = bool(use_base_polar_scene)
-        summary, arrays = save_polarization_products(image, workspace, requested_polar)
+        summary, arrays = save_polarization_products(
+            image,
+            workspace,
+            requested_polar,
+            visualization_policy=config.polar_visualization_policy,
+        )
+        summary.update({
+            "schema": "opticalnav.stokes_rgb_12.v2",
+            "polar_color_mode": config.polar_color_mode,
+            "stokes_channel_order": ["S0_RGB", "S1_RGB", "S2_RGB", "S3_RGB"],
+            "stokes_basis": "camera_image_x_y",
+        })
         quality_summary = _polar_quality_summary(summary, config)
         polarization_material_mode = "shared_material_policy"
 
@@ -5955,10 +6375,28 @@ def render_modalities(
             "task": "polar",
             "scene": str(scene_polar),
             "spp": config.polar_spp,
+            # Persist both the caller's requested value and the dynamic
+            # sensor's local sampler value. The AD integrator's ``prepare``
+            # call overrides that sampler with requested_spp; retaining both
+            # prevents a misleading future diagnosis from the XML sampler's
+            # default sample_count alone.
+            "requested_spp": int(timing.get("requested_spp", config.polar_spp)),
+            "sensor_sampler_spp": timing.get("sensor_sampler_spp"),
+            "effective_spp": int(timing["spp"]),
+            "polar_transport": config.polar_transport,
+            "polar_color_mode": config.polar_color_mode,
+            "stokes_schema": summary["schema"],
+            "stokes_channel_order": summary["stokes_channel_order"],
+            "stokes_basis": summary["stokes_basis"],
+            "nested_integrator": polar_nested,
+            "max_depth": polar_max_depth,
             "load_scene_s": timing["load_scene_s"],
             "scene_cache_hit": bool(timing.get("scene_cache_hit", False)),
             "render_s": timing["render_s"],
             "total_s": timing["total_s"],
+            "stokes_npz_write_s": summary["stokes_npz_write_s"],
+            "preview_write_s": summary["preview_write_s"],
+            "polar_postprocess_s": summary["polar_postprocess_s"],
             "material_mode": polarization_material_mode,
             "material_policy": "shared_with_rgb",
             **quality_summary,
@@ -5968,6 +6406,15 @@ def render_modalities(
             "polarization": summary,
             "measured_scope": measured_scope,
             "max_measured_bsdfs": max_measured_bsdfs,
+            **{
+                key: timing[key]
+                for key in (
+                    "adaptive_spp_enabled", "adaptive_spp_min", "adaptive_spp_max",
+                    "adaptive_spp_used", "adaptive_noise_threshold", "adaptive_noise_scores",
+                    "adaptive_pass_count",
+                )
+                if key in timing
+            },
         }
         shared_timing = {
             "variant": timing["variant"],
@@ -5976,17 +6423,51 @@ def render_modalities(
             "render_s": timing["render_s"],
             "scene": str(scene_polar),
             "spp": config.polar_spp,
+            "requested_spp": int(timing.get("requested_spp", config.polar_spp)),
+            "sensor_sampler_spp": timing.get("sensor_sampler_spp"),
+            "effective_spp": int(timing["spp"]),
+            "polar_transport": config.polar_transport,
+            "polar_color_mode": config.polar_color_mode,
+            "stokes_schema": summary["schema"],
+            "stokes_channel_order": summary["stokes_channel_order"],
+            "stokes_basis": summary["stokes_basis"],
+            "nested_integrator": polar_nested,
+            "max_depth": polar_max_depth,
             "total_s": timing["total_s"],
+            "stokes_npz_write_s": summary["stokes_npz_write_s"],
+            "preview_write_s": summary["preview_write_s"],
+            "polar_postprocess_s": summary["polar_postprocess_s"],
             "material_mode": polarization_material_mode,
             "material_policy": "shared_with_rgb",
             **quality_summary,
             "dynamic_sensor": bool(use_base_polar_scene),
             "measured_scope": measured_scope,
             "max_measured_bsdfs": max_measured_bsdfs,
+            **{
+                key: timing[key]
+                for key in (
+                    "adaptive_spp_enabled", "adaptive_spp_min", "adaptive_spp_max",
+                    "adaptive_spp_used", "adaptive_noise_threshold", "adaptive_noise_scores",
+                    "adaptive_pass_count",
+                )
+                if key in timing
+            },
         }
         shared_artifacts = {
             "stokes_npz": summary["outputs"]["stokes_npz"],
         }
+        def _polar_artifacts(name: str) -> dict[str, Any]:
+            artifacts = {**shared_artifacts, "stokes_npz": summary["outputs"]["stokes_npz"]}
+            output = summary["outputs"].get(name)
+            if output:
+                artifacts["png"] = output
+            elif name != "rgb_preview":
+                artifacts["derived_on_demand"] = {
+                    "source": summary["outputs"]["stokes_npz"],
+                    "recipe": summary["stokes_preview_recipe"],
+                    "modality": name,
+                }
+            return artifacts
         shared_metadata = _branch_metadata(
             illumination_tag=polar_illumination_tag,
             scene_override=scene_override,
@@ -5994,11 +6475,22 @@ def render_modalities(
             extra={
                 "material_mode": polarization_material_mode,
                 "material_policy": "shared_with_rgb",
+                "polar_transport": config.polar_transport,
+                "polar_color_mode": config.polar_color_mode,
+                "stokes_schema": summary["schema"],
+                "stokes_channel_order": summary["stokes_channel_order"],
+                "stokes_basis": summary["stokes_basis"],
+                "nested_integrator": polar_nested,
+                "max_depth": polar_max_depth,
                 **quality_summary,
                 "measured_scope": measured_scope,
                 "max_measured_bsdfs": max_measured_bsdfs,
                 "invalid_pixel_count": int(summary.get("invalid_pixel_count", 0)),
                 "finite_ratio": float(summary.get("finite_ratio", 1.0)),
+                "stokes_luminance_stats": dict(summary.get("stokes_luminance_stats") or {}),
+                "polar_visualization_policy": config.polar_visualization_policy,
+                "stokes_preview_recipe": summary["stokes_preview_recipe"],
+                "derived_on_demand": list(summary["derived_on_demand"]),
             },
         )
         if "polar_rgb_preview" in requested_set:
@@ -6011,7 +6503,7 @@ def render_modalities(
                 },
                 metadata=dict(shared_metadata),
                 timing=dict(shared_timing),
-                artifacts={**shared_artifacts, "png": summary["outputs"]["rgb_preview"], "stokes_npz": summary["outputs"]["stokes_npz"]},
+                artifacts=_polar_artifacts("rgb_preview"),
             )
         if "dop" in requested_set:
             results["dop"] = ModalityResult(
@@ -6027,7 +6519,7 @@ def render_modalities(
                     "range": [0.0, 1.0],
                 },
                 timing=dict(shared_timing),
-                artifacts={**shared_artifacts, "png": summary["outputs"]["dop"], "stokes_npz": summary["outputs"]["stokes_npz"]},
+                artifacts=_polar_artifacts("dop"),
             )
         if "aolp" in requested_set:
             results["aolp"] = ModalityResult(
@@ -6043,7 +6535,7 @@ def render_modalities(
                     "range_degrees": [0.0, 180.0],
                 },
                 timing=dict(shared_timing),
-                artifacts={**shared_artifacts, "png": summary["outputs"]["aolp"], "stokes_npz": summary["outputs"]["stokes_npz"]},
+                artifacts=_polar_artifacts("aolp"),
             )
         if "s1" in requested_set:
             results["s1"] = ModalityResult(
@@ -6058,7 +6550,7 @@ def render_modalities(
                     "scale_abs_p995": summary["s1_scale_abs_p995"],
                 },
                 timing=dict(shared_timing),
-                artifacts={**shared_artifacts, "png": summary["outputs"]["s1"], "stokes_npz": summary["outputs"]["stokes_npz"]},
+                artifacts=_polar_artifacts("s1"),
             )
         if "s2" in requested_set:
             results["s2"] = ModalityResult(
@@ -6073,7 +6565,7 @@ def render_modalities(
                     "scale_abs_p995": summary["s2_scale_abs_p995"],
                 },
                 timing=dict(shared_timing),
-                artifacts={**shared_artifacts, "png": summary["outputs"]["s2"], "stokes_npz": summary["outputs"]["stokes_npz"]},
+                artifacts=_polar_artifacts("s2"),
             )
         if "s1_over_s0" in requested_set:
             results["s1_over_s0"] = ModalityResult(
@@ -6086,8 +6578,7 @@ def render_modalities(
                 },
                 metadata={**shared_metadata, "range": [-1.0, 1.0]},
                 timing=dict(shared_timing),
-                artifacts={**shared_artifacts, "png": summary["outputs"]["s1_over_s0"],
-                           "stokes_npz": summary["outputs"]["stokes_npz"]},
+                artifacts=_polar_artifacts("s1_over_s0"),
             )
         if "s2_over_s0" in requested_set:
             results["s2_over_s0"] = ModalityResult(
@@ -6100,8 +6591,7 @@ def render_modalities(
                 },
                 metadata={**shared_metadata, "range": [-1.0, 1.0]},
                 timing=dict(shared_timing),
-                artifacts={**shared_artifacts, "png": summary["outputs"]["s2_over_s0"],
-                           "stokes_npz": summary["outputs"]["stokes_npz"]},
+                artifacts=_polar_artifacts("s2_over_s0"),
             )
 
     total_arr = results["rgb"].array.astype(np.float32) if "rgb" in results else path_total_rgb

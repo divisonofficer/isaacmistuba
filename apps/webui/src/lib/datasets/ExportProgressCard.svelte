@@ -15,9 +15,11 @@
 		{ key: 'select_episodes', label: 'Episodes' },
 		{ key: 'build_manifest', label: 'Manifest' },
 		{ key: 'generate_thumbnails', label: 'Thumbnails' },
-		{ key: 'collect_files', label: 'Collect' },
-		{ key: 'zip_files', label: 'Zip' },
+		{ key: 'collect_files', label: 'Resolve' },
+		{ key: 'zip_files', label: 'Direct archive' },
 		{ key: 'finalize', label: 'Finalize' },
+		{ key: 'upload', label: 'Upload' },
+		{ key: 'verify_remote', label: 'Verify' },
 	];
 
 	const currentStageIdx = $derived(STAGES.findIndex((s) => s.key === (job?.stage ?? '')));
@@ -118,6 +120,12 @@
 		<div class="ep-current-file" title={job.current_file}>📄 {job.current_file}</div>
 	{:else if job.message}
 		<div class="ep-message">{job.message}</div>
+	{/if}
+	{#if job.remote_dir}
+		<div class="ep-current-file" title={job.remote_dir}>☁ {job.remote_dir}</div>
+	{/if}
+	{#if job.upload_rate || job.upload_eta}
+		<div class="ep-message">Google Drive: {job.upload_rate ?? 'transferring'}{job.upload_eta ? ` · ETA ${job.upload_eta}` : ''}</div>
 	{/if}
 
 	{#if job.status === 'cancelled'}
