@@ -3232,7 +3232,16 @@ class IRDatasetController:
             raise RuntimeError("prepared scene lacks valid per-material MetallicContractV2 provenance")
         override = contract.get("structural_rematerialization")
         if job.request.get("structural_rematerialize"):
-            if not isinstance(override, dict) or (override.get("selection") or {}).get("policy") != "interior_structure_only_v2_role_curated":
+            # v3 keeps the same interior-only safety boundary as v2, but
+            # derives eligibility from explicit approved structural roles.
+            # Treating it as an unknown policy prevented a fully prepared
+            # TextureCan-extended scene from ever entering Stage 0.
+            supported_structural_policies = {
+                "interior_structure_only_v2_role_curated",
+                "interior_structure_only_v3_explicit_roles",
+            }
+            policy = (override.get("selection") or {}).get("policy") if isinstance(override, dict) else None
+            if policy not in supported_structural_policies:
                 raise RuntimeError("prepared rematerialized scene lacks the interior-structure-only override audit")
             if any(record.get("structural_rematerialization") and not record.get("structural_rematerialization", {}).get("material_id") for record in records):
                 raise RuntimeError("prepared rematerialized scene has invalid external structural provenance")

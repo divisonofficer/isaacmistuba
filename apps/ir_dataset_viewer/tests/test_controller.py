@@ -726,6 +726,35 @@ def test_prepared_v1_or_missing_effective_audit_is_rejected(tmp_path: Path) -> N
         controller._assert_prepared_v2(job)
 
 
+@pytest.mark.parametrize("policy", [
+    "interior_structure_only_v2_role_curated",
+    "interior_structure_only_v3_explicit_roles",
+])
+def test_prepared_accepts_supported_structural_rematerialization_policies(tmp_path: Path, policy: str) -> None:
+    controller = _controller(tmp_path)
+    prepared = tmp_path / "prepared"; prepared.mkdir()
+    required = {
+        "base_color_rgb": {}, "base_color_nir": {}, "roughness": {}, "metallic": {},
+        "normal_geometry_world": {}, "normal_shading_world": {},
+    }
+    (prepared / "principled_material_contract.json").write_text(json.dumps({
+        "schema": "robomituba.ir_principled_material_contract.v4",
+        "contract_version": "blender42-principled-metallic-roughness-v4",
+        "compiler_version": STAGE2_COMPILER_VERSION,
+        "structural_rematerialization": {"selection": {"policy": policy}},
+        "materials": [{
+            "effective_inputs": required,
+            "metallic_contract": {"schema": "robomituba.metallic_contract.v2"},
+            "structural_rematerialization": {"material_id": "fixture-material"},
+        }],
+    }))
+    job = ControllerJob(
+        job_id="structural-policy",
+        request={"dataset_name": "audit", "structural_rematerialize": True, "paths": {"prepared": str(prepared)}},
+    )
+    controller._assert_prepared_v2(job)
+
+
 def test_stale_prepared_stage_is_rebuilt_only_via_archive_flag(tmp_path: Path) -> None:
     controller = _controller(tmp_path)
     geometry = tmp_path / "geometry"
