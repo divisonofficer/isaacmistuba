@@ -21,6 +21,9 @@ import numpy as np
 from .ir_dataset_contract import (
     ARTIFACT_SCHEMA,
     DATASET_SCHEMA,
+    SUPPORTED_ARTIFACT_SCHEMAS,
+    SUPPORTED_DATASET_SCHEMAS,
+    CLASS_MODALITIES,
     DISTANCE_MODALITIES,
     HDR_MODALITIES,
     ID_MODALITIES,
@@ -93,6 +96,9 @@ def _validate_image_bytes(data: bytes, modality: str, expected_shape: tuple[int,
     if modality in LINEAR_RGB_MODALITIES | SCALAR_MODALITIES | NORMAL_MODALITIES | DISTANCE_MODALITIES | ID_MODALITIES:
         if value.dtype != np.uint16:
             raise ValueError(f"{modality} must be uint16 PNG, got {value.dtype}")
+    if modality in CLASS_MODALITIES:
+        if value.dtype != np.uint8:
+            raise ValueError(f"{modality} must be uint8 PNG, got {value.dtype}")
     if modality in MASK_MODALITIES or modality.endswith("_mask"):
         if value.dtype != np.uint8:
             raise ValueError(f"{modality} must be uint8 PNG, got {value.dtype}")
@@ -110,10 +116,12 @@ def validate_publish_source(source: Path) -> dict[str, Any]:
     contract = _read_json(source / "artifact_contract.json")
     queue_state = _read_json(source / "rolling_queue_state.json")
     qc = _read_json(source / "qc_summary.json")
-    if config.get("schema") != DATASET_SCHEMA:
+    if config.get("schema") not in SUPPORTED_DATASET_SCHEMAS:
         raise ValueError(f"unsupported dataset schema: {config.get('schema')!r}")
-    if contract.get("schema") != ARTIFACT_SCHEMA:
+    if contract.get("schema") not in SUPPORTED_ARTIFACT_SCHEMAS:
         raise ValueError(f"unsupported artifact schema: {contract.get('schema')!r}")
+    if ((config.get("schema") == DATASET_SCHEMA) != (contract.get("schema") == ARTIFACT_SCHEMA)):
+        raise ValueError("dataset/artifact contract major versions differ")
     if queue_state.get("schema") != "robomituba.ir_principled_rolling_queue.v1":
         raise ValueError(f"unsupported rolling queue schema: {queue_state.get('schema')!r}")
     if qc.get("schema") != "robomituba.ir_principled_qc_summary.v1":

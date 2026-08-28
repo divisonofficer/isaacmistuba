@@ -10,6 +10,31 @@ from pathlib import Path
 from mitsuba_converter.ir_scene_statistics import build_scene_statistics
 
 
+def _pose_utility(pose: dict) -> dict:
+    """Return the planner utility for a pose, including showcase poses.
+
+    Showcase camera sets use arbitrary anchor headings and therefore are not
+    present in the 15-degree candidate visibility grid.  Their render-plan
+    probe is the authoritative visibility measurement; falling back to a raw
+    candidate lookup marked every lighting-expanded frame as rejected.
+    """
+    utility = pose.get("utility")
+    if isinstance(utility, dict) and utility.get("utility_class"):
+        return utility
+    probe = pose.get("probe")
+    if not isinstance(probe, dict):
+        return {}
+    if probe.get("severe_occlusion") or float(probe.get("camera_clearance_m", 0) or 0) < 0.35:
+        cls = "rejected"
+    elif int(probe.get("specular_eligible_object_count", 0) or 0) > 0 or int(probe.get("visible_pbr_object_count", 0) or 0) >= 2:
+        cls = "informative"
+    elif int(probe.get("visible_pbr_object_count", 0) or 0) > 0:
+        cls = "structural"
+    else:
+        cls = "sparse_negative"
+    return {**probe, "utility_class": cls}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", type=Path, required=True)
@@ -25,10 +50,17 @@ def main() -> int:
     content = json.loads(args.content_audit.read_text(encoding="utf-8"))
     selected = [pose for group in plan.get("groups") or [] for pose in group.get("poses") or []]
     classes = {name: 0 for name in ("informative", "structural", "sparse_negative", "rejected")}
+    enriched_selected = []
     for pose in selected:
         key = f"{pose['viewpoint_id']}@{float(pose['heading_deg']) % 360.0:.6f}"
-        utility_class = (visibility.get("candidates") or {}).get(key, {}).get("utility_class", "rejected")
+        utility = _pose_utility(pose)
+        # Non-showcase plans carry a candidate-grid utility.  Showcase plans
+        # carry an anchor probe; only use the grid when the plan has neither.
+        if not utility.get("utility_class"):
+            utility = (visibility.get("candidates") or {}).get(key, {})
+        utility_class = utility.get("utility_class", "rejected")
         classes[utility_class] = classes.get(utility_class, 0) + 1
+        enriched_selected.append({**pose, "utility": utility})
     total = max(len(selected), 1)
     failures = []
     if classes.get("rejected", 0): failures.append("rejected_view_selected")
@@ -50,7 +82,11 @@ def main() -> int:
             shutil.copy2(source, quality / name)
     material_mix = json.loads(args.material_mix.read_text(encoding="utf-8")) if args.material_mix and args.material_mix.is_file() else None
     material_visibility = json.loads(args.material_visibility.read_text(encoding="utf-8")) if args.material_visibility and args.material_visibility.is_file() else None
-    statistics = build_scene_statistics(content_audit=content, visibility=visibility, render_plan=plan,
+    statistics_plan = dict(plan)
+    statistics_plan["groups"] = [{**group, "poses": [p for p in enriched_selected
+                                                         if p in group.get("poses", [])]}
+                                  for group in (plan.get("groups") or [])]
+    statistics = build_scene_statistics(content_audit=content, visibility=visibility, render_plan=statistics_plan,
                                         requested_density=args.requested_density, material_mix=material_mix,
                                         material_visibility=material_visibility)
     (quality / "scene_statistics.json").write_text(json.dumps(statistics, ensure_ascii=False, indent=2), encoding="utf-8")

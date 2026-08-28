@@ -11,7 +11,7 @@ import pytest
 from mitsuba_converter import render_daemon as rd
 from mitsuba_converter.render_daemon import RenderDaemon
 from navigation_dataset.authoring_compile import compile_authoring_map
-from navigation_dataset.authoring_map import save_authoring_map
+from navigation_dataset.authoring_map import authoring_map_to_payload, load_authoring_map, save_authoring_map
 from navigation_dataset.scene_annotations import write_scene_annotation
 from navigation_dataset.scene_sync import compute_authoring_source_hash
 
@@ -317,6 +317,25 @@ def test_gate_invalidates_missing_sidecar_and_texture_setting(tmp_path: Path, mo
 
     monkeypatch.setenv("ROBOMITUBA_TEXTURE_MAX_RESOLUTION", "777")
     assert _sync(daemon, project_dir).body["mesh_extraction_stats"]["sync_mode"] == "full_rebuild"
+
+
+def test_render_only_override_has_its_own_gate_hash(tmp_path: Path) -> None:
+    daemon, project_dir, scene_dir = _scene_daemon(tmp_path)
+    source_hash = compute_authoring_source_hash(
+        authoring_map_to_payload(load_authoring_map(scene_dir / "authoring_map.json")),
+    )
+    assert _sync(daemon, project_dir).body["mesh_extraction_stats"]["sync_mode"] == "full_rebuild"
+
+    # The override may be ignored by this tiny fixture because it has no mesh,
+    # but it must still invalidate cached render artifacts without changing the
+    # public authoring-map identity used by scene_variant and the UI.
+    (scene_dir / "geometry_overrides.json").write_text(json.dumps({
+        "overrides": [{"object_id": "wall_001", "source_ref": "missing.obj"}],
+    }), encoding="utf-8")
+    assert _sync(daemon, project_dir).body["mesh_extraction_stats"]["sync_mode"] == "full_rebuild"
+    gate = json.loads((scene_dir / "render_scene_sync_gate.json").read_text(encoding="utf-8"))
+    assert gate["authoring_source_hash"] == source_hash
+    assert gate["geometry_override_hash"]
 
 
 def test_source_backed_perturbation_uses_compatibility_fallback(tmp_path: Path) -> None:

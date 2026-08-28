@@ -4,14 +4,18 @@ import numpy as np
 
 from navigation_dataset.ir_principled import (
     MATERIAL_CONTRACT_VERSION,
+    METALLIC_CONTRACT_SCHEMA,
     apply_matched_luminance,
     ceiling_softbox_specs,
     diffuse_shading_from_component,
+    diffuse_component_from_transport,
     formula_contract,
     matched_luminance_coefficients,
     material_normalization_record,
+    normalize_legacy_metallic_scalar,
     pseudo_nir_albedo,
     unit_source_valid,
+    validate_metallic_contract,
 )
 
 
@@ -72,7 +76,35 @@ def test_fallback_channels_are_explicit_and_do_not_use_material_class_inference(
     assert record["source_channels"]["metallic"]["source"] == "unresolved"
     assert record["applied_fallback_values"]["metallic"] == 0.0
     assert "physical_material" not in record
-    assert MATERIAL_CONTRACT_VERSION == "blender42-principled-metallic-roughness-v3"
+    assert MATERIAL_CONTRACT_VERSION == "blender42-principled-metallic-roughness-v4"
+
+
+def test_metallic_contract_v2_requires_physical_family_and_non_color_encoding():
+    contract = {
+        "schema": METALLIC_CONTRACT_SCHEMA, "family": "coverage_mixed",
+        "representation": "spatial_texture", "encoding": "linear_scalar",
+        "color_space": "non_color", "source": "generated",
+        "approximation": "principled_coverage", "generator_id": "worn_metal_coverage_v1", "seed": 7,
+    }
+    assert validate_metallic_contract(contract) == (True, [])
+    invalid = {**contract, "color_space": "sRGB"}
+    valid, failures = validate_metallic_contract(invalid)
+    assert not valid and "metallic_not_non_color" in failures
+
+
+def test_legacy_fractional_metallic_is_snapped_and_marked_as_changed():
+    dielectric = normalize_legacy_metallic_scalar(0.428296)
+    conductor = normalize_legacy_metallic_scalar(0.72)
+    assert dielectric["effective_value"] == 0.0
+    assert dielectric["reason"] == "legacy_uniform_fractional_to_dielectric"
+    assert conductor["effective_value"] == 1.0
+    assert conductor["reason"] == "legacy_uniform_fractional_to_conductor"
+    assert dielectric["changed"] is True and conductor["changed"] is True
+
+
+def test_legacy_binary_metallic_is_not_remediated():
+    assert normalize_legacy_metallic_scalar(0.0)["changed"] is False
+    assert normalize_legacy_metallic_scalar(1.0)["changed"] is False
 
 
 def test_luminance_ablation_matches_primary_mean_and_std_before_clipping():
@@ -93,6 +125,14 @@ def test_diffuse_shading_contract_reconstructs_component_and_masks_black_lobes()
     shading, valid = diffuse_shading_from_component(component, reflectance)
     np.testing.assert_allclose(shading[0, 0], expected_shading[0, 0], atol=1e-6)
     np.testing.assert_allclose(shading * reflectance, component, atol=1e-6)
+    assert valid.tolist() == [[True, False]]
+
+
+def test_v3_diffuse_transport_contract_multiplies_without_reflectance_division():
+    transport = np.asarray([[[2.0, 3.0, 4.0], [9.0, 9.0, 9.0]]], dtype=np.float32)
+    reflectance = np.asarray([[[0.5, 0.25, 0.1], [0.0, 0.0, 0.0]]], dtype=np.float32)
+    component, valid = diffuse_component_from_transport(transport, reflectance)
+    np.testing.assert_allclose(component, transport * reflectance, atol=1e-6)
     assert valid.tolist() == [[True, False]]
 
 

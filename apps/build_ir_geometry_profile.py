@@ -28,6 +28,9 @@ from mitsuba_converter.material_pipeline import (
 )
 from mitsuba_converter.scene_materialization import SCENE_MATERIALIZER_CONTRACT_VERSION
 
+sys.path.insert(0, str(REPO_ROOT / "tools" / "infinigen"))
+from small_highpoly_filter import SMALL_HIGH_POLY_POLICY_VERSION  # noqa: E402
+
 BLENDER_LAUNCHER = REPO_ROOT / "tools" / "infinigen" / "run_bundled_blender.py"
 BLENDER_EXPORT = REPO_ROOT / "tools" / "infinigen" / "blender_export_scene.py"
 IMPORT_APP = REPO_ROOT / "apps" / "import_infinigen_scene.py"
@@ -104,6 +107,18 @@ def _validate_stage1(manifest_path: Path, *, profile: str) -> dict[str, Any]:
             by_slot = dict(unit.get("pbr_by_slot") or pbr.get("pbr_by_slot") or {})
             for slot in used_slots:
                 record = dict(by_slot.get(slot) or {})
+                # GLB validation represents a mesh with no authored Blender
+                # material slots as primitive material index 0.  In that case
+                # the exporter intentionally stores the authoritative default
+                # constant contract at unit.pbr (there is no real slot record
+                # to populate).  Treat that implicit default slot as the same
+                # effective material rather than rejecting an otherwise valid
+                # structural mesh during Stage-2 finalization.
+                if (
+                    not record and slot == "0" and not (unit.get("material_slots") or [])
+                    and pbr.get("status") == "ok" and pbr.get("appearance_authoritative") is not False
+                ):
+                    record = pbr
                 if not record or record.get("status") != "ok" or record.get("appearance_authoritative") is False:
                     failures.append("{}: slot {} lacks authoritative PBR atlas contract".format(unit.get("id"), slot))
         decimation = dict(unit.get("decimation") or {})
@@ -135,6 +150,7 @@ def _validate_stage1(manifest_path: Path, *, profile: str) -> dict[str, Any]:
         raise ValueError("strict IR LOD Stage-1 validation failed: " + "; ".join(failures[:12]))
     return {
         "profile": profile,
+        "stage1_profile": stage1_profile,
         "unit_count": len(units),
         "decimated_unit_count": len(decimated),
         "triangles_before_total": triangles_before_total,
@@ -237,6 +253,11 @@ def build_profile(
     finalize_existing: bool = False,
     cycles_device: str = "CPU",
     cycles_fallback: str = "CPU",
+    filter_small_high_poly: bool = False,
+    small_high_poly_max_extent_m: float = 0.25,
+    small_high_poly_min_triangles: int = 200_000,
+    bake_samples: int | None = None,
+    max_bake_res: int | None = None,
 ) -> dict[str, Any]:
     source_scene_dir = source_scene_dir.resolve()
     source_blend = source_blend.resolve()
@@ -258,12 +279,25 @@ def build_profile(
             previous_payload = json.loads(profile_path.read_text(encoding="utf-8"))
         except Exception:
             previous_payload = {}
+    filter_ready = True
+    if filter_small_high_poly:
+        try:
+            stage1_meta = json.loads((out / "stage1" / "scene_manifest.json").read_text(encoding="utf-8"))
+            cfg = stage1_meta.get("small_high_poly_filter") or {}
+            filter_ready = (
+                bool(cfg.get("enabled"))
+                and cfg.get("policy_version") == SMALL_HIGH_POLY_POLICY_VERSION
+                and float(cfg.get("max_extent_m", -1)) == float(small_high_poly_max_extent_m)
+                and int(cfg.get("min_triangles", -1)) == int(small_high_poly_min_triangles)
+            )
+        except Exception:
+            filter_ready = False
     if not force and not finalize_existing:
         existing = _existing_matches(
             profile_path, source_digest=source_digest,
             source_blend_sha256=source_blend_sha256, profile=profile,
         )
-        if existing is not None:
+        if existing is not None and filter_ready:
             return existing
 
     reuse_published_stage1 = bool(
@@ -272,6 +306,7 @@ def build_profile(
         and previous_payload.get("profile") == profile
         and previous_payload.get("source_scene_digest") == source_digest
         and previous_payload.get("source_blend_sha256") == source_blend_sha256
+        and filter_ready
         and (out / "stage1" / "scene_manifest.json").is_file()
         and (out / "derived_ir_semantic_lod.blend").is_file()
     )
@@ -302,6 +337,18 @@ def build_profile(
     stage1_dir = out / "stage1"
     derived_blend = out / "derived_ir_semantic_lod.blend"
     stage1_manifest = stage1_dir / "scene_manifest.json"
+    if finalize_existing and not filter_ready:
+        # The published Stage-1 geometry was produced by an older filtering
+        # policy.  Finalizing it would preserve RGB-visible/PBR-untracked
+        # props forever, so reuse verified per-unit checkpoints but republish
+        # the manifest and derived blend under the current policy.
+        print(
+            "[ir-lod] Stage 1 small-detail policy changed; "
+            "switching --finalize-existing to --resume",
+            flush=True,
+        )
+        finalize_existing = False
+        resume = True
     if (
         finalize_existing
         and stage1_dir.exists()
@@ -344,6 +391,17 @@ def build_profile(
             "--ir-scene-domain", str(semantic_domain_path), "--decimate-policy", profile,
             "--decimate-min-polys", "50000", "--decimate-strict", "--save-derived-blend", str(derived_blend),
         ]
+        if bake_samples is not None:
+            if int(bake_samples) < 1:
+                raise ValueError("bake_samples must be positive")
+            command += ["--bake-samples", str(int(bake_samples))]
+        if max_bake_res is not None:
+            if int(max_bake_res) < 512:
+                raise ValueError("max_bake_res must be >= 512")
+            command += ["--max-bake-res", str(int(max_bake_res))]
+        if filter_small_high_poly:
+            command += ["--filter-small-high-poly", "--small-high-poly-max-extent-m", str(small_high_poly_max_extent_m),
+                        "--small-high-poly-min-triangles", str(small_high_poly_min_triangles)]
         if resume:
             command.append("--reuse-atlas")
         print("[ir-lod] Stage 1 strict GLB/PBR export", flush=True)
@@ -364,6 +422,7 @@ def build_profile(
     import_command = [
         sys.executable, str(IMPORT_APP), "--manifest", str(stage1_manifest),
         "--scene-id", derived_scene_id, "--project-id", project_id,
+        "--stage1-profile", str(stage1_audit.get("stage1_profile") or "strict-pbr-v1"),
         "--force", "--allow-object-id-churn",
     ]
     print("[ir-lod] Stage 2 derived scene materialization", flush=True)
@@ -427,13 +486,22 @@ def main() -> int:
                         help="validate a fully published Stage 1 and run only Stage 2/profile finalization")
     parser.add_argument("--cycles-device", choices=("CPU", "CUDA", "OPTIX"), default="CPU")
     parser.add_argument("--cycles-fallback", choices=("CPU", "CUDA", "OPTIX"), default="CPU")
+    parser.add_argument("--filter-small-high-poly", action="store_true")
+    parser.add_argument("--small-high-poly-max-extent-m", type=float, default=0.25)
+    parser.add_argument("--small-high-poly-min-triangles", type=int, default=200_000)
+    parser.add_argument("--bake-samples", type=int, default=None)
+    parser.add_argument("--max-bake-res", type=int, default=None)
     parser.add_argument("--json", action="store_true",
                         help="print the full profile JSON (default prints one concise completion summary)")
     args = parser.parse_args()
     payload = build_profile(args.source_scene_dir, args.source_blend, args.out, profile=args.profile,
                             force=args.force, resume=args.resume,
                             finalize_existing=args.finalize_existing,
-                            cycles_device=args.cycles_device, cycles_fallback=args.cycles_fallback)
+                            cycles_device=args.cycles_device, cycles_fallback=args.cycles_fallback,
+                            filter_small_high_poly=args.filter_small_high_poly,
+                            small_high_poly_max_extent_m=args.small_high_poly_max_extent_m,
+                            small_high_poly_min_triangles=args.small_high_poly_min_triangles,
+                            bake_samples=args.bake_samples, max_bake_res=args.max_bake_res)
     if args.json:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
     else:

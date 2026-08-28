@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
 from .episode_schema import EpisodeManifest, EpisodeTimestep, GENERATION_VERSION, write_episode
+from .scene_dataset import SceneDatasetPaths
 from .instruction_generators import EpisodeCore, InstructionContext, build_instruction_context, generate_instructions
 from .rollout import scale_split_counts, split_for_index
 from .scene_annotations import SceneAnnotation
@@ -551,12 +552,18 @@ def plan_graph_episodes(
 
 
 def write_graph_episodes(root: str | Path, episodes: Iterable[EpisodeManifest]) -> list[Path]:
-    dataset_root = Path(root)
-    written: list[Path] = []
-    for episode in episodes:
-        path = dataset_root / "episodes" / episode.split / f"{episode.episode_id}.json"
-        written.append(write_episode(path, episode))
-    return written
+    rows = list(episodes)
+    if not rows:
+        return []
+    scene_ids = {episode.scene_id for episode in rows}
+    if len(scene_ids) != 1:
+        raise ValueError("write_graph_episodes requires one scene; use explicit multi-scene orchestration")
+    return write_scene_graph_episodes(SceneDatasetPaths.from_project(root, scene_ids.pop()), rows)
+
+
+def write_scene_graph_episodes(paths: SceneDatasetPaths, episodes: Iterable[EpisodeManifest]) -> list[Path]:
+    """Scene-local counterpart to :func:`write_graph_episodes`."""
+    return [paths.write_episode(episode) for episode in episodes]
 
 
 def _pair(a: str, b: str) -> tuple[str, str]:

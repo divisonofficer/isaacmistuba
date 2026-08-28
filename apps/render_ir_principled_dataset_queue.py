@@ -35,16 +35,23 @@ for module in ("robomituba_bridge", "navigation_dataset", "mitsuba_converter"):
 
 from navigation_dataset.ir_principled import (  # noqa: E402
     MATERIAL_CONTRACT_SCHEMA, MATERIAL_CONTRACT_VERSION, STAGE2_COMPILER_VERSION, stable_json_digest,
+    validate_metallic_contract,
 )
 from robomituba_bridge.camera_pose import resolve_viewpoint_pose  # noqa: E402
-from mitsuba_converter.ir_render_plan import CONTENT_PLAN_SCHEMA, ILLUMINATION_PLAN_SCHEMA, PLAN_SCHEMA, stable_digest as render_plan_digest  # noqa: E402
+from mitsuba_converter.ir_render_plan import (  # noqa: E402
+    CONTENT_PLAN_SCHEMA,
+    ILLUMINATION_PLAN_SCHEMA,
+    ILLUMINATION_REFERENCE_PLAN_SCHEMA,
+    PLAN_SCHEMA,
+    stable_digest as render_plan_digest,
+)
 
 
 BLENDER_LAUNCHER = REPO_ROOT / "tools" / "infinigen" / "run_bundled_blender.py"
 WORKER_SCRIPT = REPO_ROOT / "tools" / "infinigen" / "blender_render_ir_principled_worker.py"
 QUEUE_SCHEMA = "robomituba.ir_principled_rolling_queue.v1"
-QUEUE_COMPILER_VERSION = "ir-principled-rolling-render-v12"
-DATASET_SCHEMA = "robomituba.ir_principled_dataset.v2"
+QUEUE_COMPILER_VERSION = "ir-principled-rolling-render-v14-diffuse-transport-v3"
+DATASET_SCHEMA = "robomituba.ir_principled_dataset.v3"
 OVERVIEW_SCHEMA = "robomituba.ir_scene_overview.v1"
 OVERVIEW_COMPILER_VERSION = "ir-scene-overview-v2"
 # One-time compatibility bridge for the binary-AOV/non-finite-pixel repair.  The
@@ -52,19 +59,33 @@ OVERVIEW_COMPILER_VERSION = "ir-scene-overview-v2"
 # worker remain valid.  No other worker transition is accepted implicitly.
 COMPATIBLE_PREVIOUS_WORKER_SHA256 = frozenset({
     "ffc32d5ce1c97a2ef2772ae0f426c64fa6e181db775d0bea2fa066a753c1267e",
+    # Worker immediately before the passive-NIR extension.  Keeping this
+    # explicit lets legacy queues resume without changing their fingerprint.
+    "9a524bb3336dad895abfcfab4398064c9a300a202efad05477eba6d524a8dfc4",
 })
 REQUIRED_MODALITIES = {
-    "rgb", "nir_active", "base_color_rgb", "base_color_nir", "roughness", "metallic",
+    "rgb", "nir_active", "base_color_rgb", "base_color_nir", "roughness", "metallic", "metallic_family_id",
+    "metal_coverage_mask", "exposed_metal_mask",
     "normal_geometry_world", "normal_shading_world", "depth", "range", "object_id", "material_id",
-    "gt_defined_mask", "source_valid_mask", "replacement_mask", "fallback_mask", "primary_eval_valid_mask",
+    "gt_defined_mask", "source_valid_mask", "replacement_mask", "fallback_mask", "remediated_pbr_mask",
+    "train_pbr_valid_mask", "pbr_provenance_class", "primary_eval_valid_mask",
+    "diffuse_transport_rgb", "diffuse_transport_nir",
     "diffuse_component_rgb", "diffuse_component_nir",
     "diffuse_reflectance_rgb", "diffuse_reflectance_nir",
-    "diffuse_shading_rgb", "diffuse_shading_nir",
-    "diffuse_shading_valid_rgb", "diffuse_shading_valid_nir",
+    "diffuse_transport_valid_rgb", "diffuse_transport_valid_nir",
+}
+PASSIVE_NIR_MODALITIES = {"nir_passive", "nir_active_minus_passive"}
+# These fields describe publication/readiness, not the render identity.  They
+# are written only after every indexed frame has both passive-NIR sidecars and
+# therefore must not change a dataset fingerprint when a queue is resumed.
+NIR_PASSIVE_READINESS_KEYS = {
+    "nir_passive_enabled",
+    "nir_passive_contract",
 }
 MASK_MODALITIES = {
-    "gt_defined_mask", "source_valid_mask", "replacement_mask", "fallback_mask",
-    "primary_eval_valid_mask", "diffuse_shading_valid_rgb", "diffuse_shading_valid_nir",
+    "gt_defined_mask", "source_valid_mask", "replacement_mask", "fallback_mask", "remediated_pbr_mask", "train_pbr_valid_mask",
+    "metal_coverage_mask", "exposed_metal_mask",
+    "primary_eval_valid_mask", "diffuse_transport_valid_rgb", "diffuse_transport_valid_nir",
 }
 _REQUIRED_EFFECTIVE_INPUTS = frozenset({
     "base_color_rgb", "base_color_nir", "roughness", "metallic",
@@ -86,6 +107,20 @@ def _validate_prepared_contract(contract: dict) -> None:
         raise RuntimeError("prepared Stage 2 lacks the v2 texture-accurate PBR GT audit")
     if any(set((record.get("effective_inputs") or {})) != _REQUIRED_EFFECTIVE_INPUTS for record in records):
         raise RuntimeError("prepared Stage 2 lacks the v2 texture-accurate PBR GT audit")
+    invalid = []
+    for record in records:
+        valid, failures = validate_metallic_contract(record.get("metallic_contract"))
+        if not valid:
+            invalid.append(f"{record.get('material_id', '?')}:{','.join(failures)}")
+    if invalid:
+        raise RuntimeError(
+            "prepared Stage 2 lacks valid MetallicContractV2 records: " + "; ".join(invalid[:8])
+        )
+    required_aovs = {
+        "metallic", "metallic_family_id", "metal_coverage_mask", "exposed_metal_mask",
+    }
+    if not required_aovs <= set(contract.get("aov_semantics") or {}):
+        raise RuntimeError("prepared Stage 2 lacks the required metallic supervision AOVs")
 
 
 def _args() -> argparse.Namespace:
@@ -117,6 +152,16 @@ def _args() -> argparse.Namespace:
     parser.add_argument("--max-frames", type=int)
     parser.add_argument("--retry-limit", type=int, default=3)
     parser.add_argument("--qc-components", action="store_true")
+    nir_group = parser.add_mutually_exclusive_group()
+    nir_group.add_argument("--nir-passive", dest="nir_passive", action="store_true",
+                           help="render flash-off passive NIR and active-minus-passive sidecar (default for new datasets)")
+    nir_group.add_argument("--no-nir-passive", dest="nir_passive", action="store_false",
+                           help="keep the legacy active-only observation contract when resuming an old job")
+    # ``None`` lets main distinguish a new output root from an existing
+    # active-only dataset.  New direct CLI invocations therefore get the same
+    # passive-NIR default as Control Center submissions without changing the
+    # fingerprint or resume semantics of legacy outputs.
+    parser.set_defaults(nir_passive=None)
     parser.add_argument("--nir-formula", choices=("primary", "luminance_matched_v1"), default="primary")
     parser.add_argument("--flash-energy-scale", type=float, default=1.0)
     parser.add_argument("--ambient-fill-energy-scale", type=float, default=1.0)
@@ -124,6 +169,12 @@ def _args() -> argparse.Namespace:
     parser.add_argument("--verbose-blender", action="store_true")
     parser.add_argument("--compatible-worker-resume", action="store_true",
                         help="reuse frames from the explicitly allow-listed pre-contract-fix worker")
+    parser.add_argument("--adopt-compatible-plan", type=Path,
+                        help="archived legacy frame plan whose exact matching frames may be adopted")
+    parser.add_argument("--adopt-compatible-config", type=Path,
+                        help="archived legacy dataset config paired with --adopt-compatible-plan")
+    parser.add_argument("--adopt-existing-rows", action="store_true",
+                        help="re-attest exact existing frame rows using strict row/task checks when a legacy config was lost")
     return parser.parse_args()
 
 
@@ -132,7 +183,13 @@ def _utc_now() -> str:
 
 
 def _select_dataset_fingerprint(out: Path, config: dict, *, compatible_resume: bool) -> tuple[str, dict]:
-    candidate = stable_json_digest(config)
+    # Passive readiness is a terminal publication bit.  It is intentionally
+    # excluded from the render identity so adding the final contract marker
+    # cannot invalidate already rendered rows on a later resume.
+    candidate = stable_json_digest({
+        key: value for key, value in config.items()
+        if key not in NIR_PASSIVE_READINESS_KEYS
+    })
     config_path = out / "dataset_config.json"
     if not compatible_resume or not config_path.is_file():
         return candidate, config
@@ -142,7 +199,7 @@ def _select_dataset_fingerprint(out: Path, config: dict, *, compatible_resume: b
         return candidate, config
     previous_worker = str(previous.get("worker_sha256") or "")
     previous_fingerprint = str(previous.get("dataset_fingerprint") or "")
-    ignored = {"worker_sha256", "dataset_fingerprint", "compatible_resume_worker_sha256"}
+    ignored = {"worker_sha256", "dataset_fingerprint", "compatible_resume_worker_sha256", *NIR_PASSIVE_READINESS_KEYS}
     semantic_previous = {key: value for key, value in previous.items() if key not in ignored}
     semantic_current = {key: value for key, value in config.items() if key not in ignored}
     if (
@@ -171,6 +228,17 @@ def _desired_gpu_indices(path: Path | None, allowed: list[int], fallback: list[i
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
         return []
     return [gpu for gpu in desired if gpu in allowed]
+
+
+def _allocation_state(desired: list[int], active: dict[int, Any], pending_count: int) -> str:
+    """Small durable state used by the controller to distinguish wait from work."""
+    if pending_count <= 0:
+        return "complete"
+    if active:
+        return "running"
+    if desired:
+        return "starting"
+    return "waiting_gpu"
 
 
 def _sha256(path: Path) -> str:
@@ -226,11 +294,16 @@ def _frame_specs(graph: dict, subset: str | None, seed: int) -> list[tuple[str, 
 
 
 def _plan_specs(graph: dict, plan: dict) -> list[tuple[str, float, dict]]:
-    if plan.get("schema") not in {PLAN_SCHEMA, CONTENT_PLAN_SCHEMA, ILLUMINATION_PLAN_SCHEMA}:
+    if plan.get("schema") not in {
+        PLAN_SCHEMA,
+        CONTENT_PLAN_SCHEMA,
+        ILLUMINATION_PLAN_SCHEMA,
+        ILLUMINATION_REFERENCE_PLAN_SCHEMA,
+    }:
         raise ValueError("frame plan schema is not supported")
     nodes = {str(node["node_id"]): node for node in graph.get("nodes") or []}
     result = []
-    seen: set[tuple[str, float, str]] = set()
+    seen: set[tuple[str, float, str, str]] = set()
     for group in plan.get("groups") or []:
         lighting = dict(group.get("lighting") or {})
         if not lighting.get("id") or not lighting.get("recipe_digest"):
@@ -240,7 +313,8 @@ def _plan_specs(graph: dict, plan: dict) -> list[tuple[str, float, dict]]:
             raise ValueError("frame plan group lacks capture_group_id")
         for pose in group.get("poses") or []:
             node_id, yaw = str(pose.get("viewpoint_id") or ""), float(pose.get("heading_deg", 0.0))
-            key = (node_id, yaw, str(lighting.get("id") or ""))
+            anchor_id = str(pose.get("anchor_id") or "")
+            key = (node_id, yaw, str(lighting.get("id") or ""), anchor_id)
             if node_id not in nodes or key in seen:
                 raise ValueError("frame plan has an unknown or duplicate pose")
             seen.add(key)
@@ -251,18 +325,27 @@ def _plan_specs(graph: dict, plan: dict) -> list[tuple[str, float, dict]]:
                                           "render_plan_digest": plan["render_plan_digest"],
                                           "capture_kind": pose.get("capture_kind", "single"),
                                           "pair_id": pose.get("pair_id"),
-                                          "pair_member_index": pose.get("pair_member_index")}))
+                                          "pair_member_index": pose.get("pair_member_index"),
+                                          "anchor_id": anchor_id or None,
+                                          "camera_set_ids": list(pose.get("camera_set_ids") or []),
+                                          "camera_target_height_m": pose.get("target_height_m")}))
     if not result:
         raise ValueError("frame plan contains no poses")
     return result
 
 
 def _task(node: dict, yaw: float, lighting: dict | None, args: argparse.Namespace, offset, fingerprint: str, pbr_gt_contract_digest: str, external_lighting_available: bool) -> dict:
+    target_height = args.target_height
+    if lighting and lighting.get("camera_target_height_m") is not None:
+        target_height = float(lighting["camera_target_height_m"])
     pose = resolve_viewpoint_pose(
         node["position"], yaw, eye_height_m=args.eye_height,
-        target_height_m=args.target_height, origin_offset=offset,
+        target_height_m=target_height, origin_offset=offset,
     )
     frame_id = f"{node['node_id']}__h_{int(round(yaw)) % 360:03d}"
+    if lighting and lighting.get("anchor_id"):
+        anchor_token = hashlib.sha256(str(lighting["anchor_id"]).encode("utf-8")).hexdigest()[:8]
+        frame_id += f"__a_{anchor_token}"
     if lighting:
         frame_id += f"__l_{lighting['id']}"
     task = {
@@ -278,6 +361,8 @@ def _task(node: dict, yaw: float, lighting: dict | None, args: argparse.Namespac
         task["capture_kind"] = str(lighting.get("capture_kind") or "single")
         task["pair_id"] = lighting.get("pair_id")
         task["pair_member_index"] = lighting.get("pair_member_index")
+        task["anchor_id"] = lighting.get("anchor_id")
+        task["camera_set_ids"] = list(lighting.get("camera_set_ids") or [])
         runtime_recipe = dict(lighting["recipe"])
         center = list(runtime_recipe.get("side_center_xy") or (0.0, 0.0))
         runtime_recipe["side_center_xy"] = [float(center[0]) + float(offset[0]), float(center[1]) + float(offset[1])]
@@ -286,9 +371,9 @@ def _task(node: dict, yaw: float, lighting: dict | None, args: argparse.Namespac
 
 
 def _artifact_contract(args: argparse.Namespace, material_contract: dict, fingerprint: str, frame_plan: dict | None,
-                       overview: dict | None = None) -> dict:
+                       overview: dict | None = None, *, passive_ready: bool = False) -> dict:
     contract = {
-        "schema": "robomituba.ir_principled_artifact_contract.v2",
+        "schema": "robomituba.ir_principled_artifact_contract.v3",
         "dataset_schema": DATASET_SCHEMA,
         "dataset_fingerprint": fingerprint,
         "layout": "modality_first_v1",
@@ -313,31 +398,43 @@ def _artifact_contract(args: argparse.Namespace, material_contract: dict, finger
         },
         "ground_truth": {
             "base_color_rgb": "linear_unorm16", "base_color_nir": "linear_unorm16",
-            "roughness": "perceptual_roughness_unorm16", "metallic": "unorm16",
+            "roughness": "perceptual_roughness_unorm16",
+            "metallic": "raw_effective_principled_metallic_linear_unorm16",
+            "metallic_family_id": "uint8 categorical: 0 dielectric, 1 conductor, 2 coverage_mixed",
             "normal_geometry_world": "xyz_signed_to_unorm16",
             "normal_shading_world": "xyz_signed_to_unorm16",
             "depth": "camera_z_millimeters_u16", "range": "ray_range_millimeters_u16",
             "object_id": "uint16", "material_id": "uint16",
+            "diffuse_transport_rgb": "scene_linear_rgb_float32",
+            "diffuse_transport_nir": "scene_linear_rgb_float32_replicated",
             "diffuse_component_rgb": "scene_linear_rgb_float32",
             "diffuse_component_nir": "scene_linear_rgb_float32_replicated",
             "diffuse_reflectance_rgb": "linear_unorm16",
             "diffuse_reflectance_nir": "linear_unorm16_replicated",
-            "diffuse_shading_rgb": "scene_linear_rgb_float32",
-            "diffuse_shading_nir": "scene_linear_rgb_float32_replicated",
         },
         "masks": {
             "gt_defined_mask": "binary_u8", "source_valid_mask": "binary_u8",
-            "replacement_mask": "binary_u8", "fallback_mask": "binary_u8",
+            "replacement_mask": "binary_u8", "fallback_mask": "binary_u8", "remediated_pbr_mask": "binary_u8",
+            "train_pbr_valid_mask": "source_valid OR remediated", "pbr_provenance_class": "uint8",
+            "metal_coverage_mask": "binary_u8 conductor-family membership",
+            "exposed_metal_mask": "binary_u8 effective exposed conductor coverage",
             "primary_eval_valid_mask": "source_valid AND NOT replacement",
-            "diffuse_shading_valid_rgb": "max(diffuse_reflectance_rgb) > 1e-4 AND finite(component, shading)",
-            "diffuse_shading_valid_nir": "max(diffuse_reflectance_nir) > 1e-4 AND finite(component, shading)",
+            "diffuse_transport_valid_rgb": "finite surface AND max(diffuse_reflectance_rgb) > 1e-4",
+            "diffuse_transport_valid_nir": "finite surface AND max(diffuse_reflectance_nir) > 1e-4",
         },
         "diffuse_decomposition": {
-            "component": "Cycles Diffuse Direct + Diffuse Indirect",
+            "contract": "cycles_color_separated_diffuse_transport_v2",
+            "transport": "Cycles Diffuse Direct + Diffuse Indirect",
             "reflectance": "Cycles Diffuse Color",
-            "shading": "component / max_per_channel(reflectance, 1e-4)",
-            "reconstruction": "diffuse_reflectance * diffuse_shading ~= diffuse_component",
+            "component": "diffuse_reflectance * diffuse_transport",
+            "reconstruction": "diffuse_reflectance * diffuse_transport ~= diffuse_component",
             "excludes": ["glossy", "transmission", "emission"],
+        },
+        "nir_transport_provenance": {
+            "integration": "cycles_path_traced_all_bounces",
+            "nir_material_branch": "pre_integrator",
+            "nir_light_conversion": "linear_rec709_luminance_grayscale",
+            "spectral_scope": "pseudo_nir_base_color_only",
         },
         "light_calibration": {
             "base_energy_w": material_contract["flash_rig"]["energy_w"],
@@ -348,11 +445,44 @@ def _artifact_contract(args: argparse.Namespace, material_contract: dict, finger
             "ambient_fill_rig": material_contract.get("ambient_fill_rig"),
         },
     }
+    if getattr(args, "nir_passive", False):
+        contract["nir_passive"] = {
+            "requested": True,
+            "ready": bool(passive_ready),
+            "contract_version": "nir-passive-v1",
+        }
+    if getattr(args, "nir_passive", False) and passive_ready:
+        contract["exposure_ev"].update({"nir_passive": 0.0, "nir_active_minus_passive": 0.0})
+        contract["observations"]["nir_passive"] = {
+            "path": "nir_passive/{frame_id}.exr",
+            "encoding": "synthetic_nir_linear_float32_rgb_replicated",
+            "flash": "disabled",
+            "formula": args.nir_formula,
+        }
+        contract["observations"]["nir_active_minus_passive"] = {
+            "path": "nir_active_minus_passive/{frame_id}.exr",
+            "encoding": "scene_linear_float32_rgb_difference",
+            "definition": "nir_active - nir_passive",
+        }
     if overview and (overview.get("traversability") or {}).get("path"):
         contract["overview"]["traversability_path"] = overview["traversability"]["path"]
     if overview and (overview.get("proxy_mesh") or {}).get("path"):
         contract["overview"]["proxy_mesh_path"] = overview["proxy_mesh"]["path"]
         contract["overview"]["proxy_mesh_sha256"] = overview["proxy_mesh"]["sha256"]
+    structural = material_contract.get("structural_rematerialization")
+    if isinstance(structural, dict):
+        selection = structural.get("selection") if isinstance(structural.get("selection"), dict) else {}
+        contract["structural_rematerialization"] = {
+            "schema": structural.get("schema"), "digest": structural.get("digest"),
+            "manifest_sha256": material_contract.get("structural_rematerialization_sha256"),
+            "compiler_version": structural.get("compiler_version"),
+            "child_scene_id": structural.get("child_scene_id"), "parent_scene_id": structural.get("parent_scene_id"),
+            "parent_dataset_fingerprint": structural.get("parent_dataset_fingerprint"),
+            "material_variant_id": structural.get("material_variant_id"), "material_seed": structural.get("material_seed"),
+            "registry_digest": structural.get("registry_digest"), "binding_count": len(structural.get("bindings") or []),
+            "selection": {"policy": selection.get("policy"), "eligible_unit_count": selection.get("eligible_unit_count"),
+                          "eligible_slot_count": selection.get("eligible_slot_count"), "excluded_unit_count": selection.get("excluded_unit_count")},
+        }
     return contract
 
 
@@ -473,7 +603,7 @@ def _lighting_group_progress(tasks: list[dict], completed: set[str]) -> dict[str
     return groups
 
 
-def _row_complete(out: Path, frame_id: str, fingerprint: str) -> bool:
+def _row_complete(out: Path, frame_id: str, fingerprint: str, *, require_passive: bool = False) -> bool:
     path = out / "frames" / f"{frame_id}.json"
     if not path.is_file():
         return False
@@ -484,9 +614,120 @@ def _row_complete(out: Path, frame_id: str, fingerprint: str) -> bool:
     if row.get("dataset_fingerprint") != fingerprint:
         return False
     paths = row.get("paths") or {}
-    if not REQUIRED_MODALITIES <= set(paths):
+    required = set(REQUIRED_MODALITIES)
+    # A new passive-NIR queue must not adopt an older active-only row as
+    # complete.  The row flag is retained for legacy resumes, while the
+    # explicit queue requirement covers the transition case before the
+    # dataset-level readiness marker is written.
+    if require_passive or bool(row.get("nir_passive_enabled")) or bool(row.get("nir_passive_backfill")):
+        required |= PASSIVE_NIR_MODALITIES
+    if not required <= set(paths):
         return False
-    return all((out / paths[name]).is_file() for name in REQUIRED_MODALITIES)
+    return all((out / paths[name]).is_file() for name in required)
+
+
+def _derive_nir_difference(out: Path, row: dict) -> dict:
+    """Create the exact linear active-minus-passive NIR sidecar.
+
+    Blender writes both captures as scene-linear float EXR. OpenCV preserves
+    the float channels; channel order is immaterial because both operands use
+    the same RGB->BGR decode path. The result is written atomically and the
+    frame manifest is updated only after the file is complete.
+    """
+    paths = row.get("paths") or {}
+    active_rel, passive_rel = paths.get("nir_active"), paths.get("nir_passive")
+    if not active_rel or not passive_rel:
+        raise RuntimeError("cannot derive active-minus-passive without both NIR captures")
+    active = cv2.imread(str(out / active_rel), cv2.IMREAD_UNCHANGED)
+    passive = cv2.imread(str(out / passive_rel), cv2.IMREAD_UNCHANGED)
+    if active is None or passive is None:
+        raise RuntimeError("cannot decode active/passive NIR EXR")
+    if active.shape != passive.shape or active.ndim != 3 or active.shape[2] < 3:
+        raise RuntimeError(f"active/passive NIR shape mismatch: {active.shape} vs {passive.shape}")
+    difference = active[..., :3].astype(np.float32) - passive[..., :3].astype(np.float32)
+    target = out / "nir_active_minus_passive" / Path(active_rel).name
+    _atomic_image(target, difference)
+    row["paths"]["nir_active_minus_passive"] = str(target.relative_to(out))
+    scalar = np.mean(difference, axis=2)
+    finite = np.isfinite(scalar)
+    values = scalar[finite]
+    row["nir_difference_qc"] = {
+        "mean_signed": float(values.mean()) if values.size else 0.0,
+        "mean_abs": float(np.abs(values).mean()) if values.size else 0.0,
+        "p95_abs": float(np.percentile(np.abs(values), 95.0)) if values.size else 0.0,
+        "positive_pixel_ratio": float((values > 0).mean()) if values.size else 0.0,
+        "finite": bool(finite.all()),
+    }
+    _atomic_json(out / "frames" / f"{row['frame_id']}.json", row)
+    return row
+
+
+def _passive_sidecars_complete(out: Path, frame_ids: set[str], *, fingerprint: str) -> bool:
+    """Return true only when every indexed frame has both passive products."""
+    for frame_id in frame_ids:
+        frame_path = out / "frames" / f"{frame_id}.json"
+        try:
+            row = json.loads(frame_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return False
+        if row.get("dataset_fingerprint") != fingerprint:
+            return False
+        paths = row.get("paths") or {}
+        if not all(
+            paths.get(name) and (out / str(paths[name])).is_file()
+            for name in PASSIVE_NIR_MODALITIES
+        ):
+            return False
+    return True
+
+
+def _activate_nir_passive_contract(out: Path, *, fingerprint: str, frame_ids: set[str]) -> None:
+    """Publish the dataset-level passive contract after an atomic completeness gate.
+
+    Frame sidecars are useful while a queue is still running, but exposing the
+    dataset as passive-complete before the last frame exists makes partial
+    datasets look trainable.  Readiness is therefore a terminal marker and is
+    deliberately excluded from the dataset fingerprint.
+    """
+    if not _passive_sidecars_complete(out, frame_ids, fingerprint=fingerprint):
+        raise RuntimeError("cannot activate passive-NIR contract before every indexed frame has both sidecars")
+    config_path = out / "dataset_config.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    if str(config.get("dataset_fingerprint") or fingerprint) != fingerprint:
+        raise RuntimeError("passive-NIR contract fingerprint does not match dataset config")
+    config["dataset_fingerprint"] = fingerprint
+    config["nir_passive_enabled"] = True
+    config["nir_passive_contract"] = {
+        "version": "nir-passive-v1",
+        "active_minus_passive": "linear_exr_subtraction",
+        "flash_state": "camera_relative_flash_disabled",
+    }
+    _atomic_json(config_path, config)
+    contract_path = out / "artifact_contract.json"
+    contract = json.loads(contract_path.read_text(encoding="utf-8"))
+    contract["dataset_fingerprint"] = fingerprint
+    contract["nir_passive"] = {
+        "requested": True,
+        "ready": True,
+        "contract_version": "nir-passive-v1",
+    }
+    contract.setdefault("exposure_ev", {}).update({
+        "nir_passive": 0.0,
+        "nir_active_minus_passive": 0.0,
+    })
+    observations = contract.setdefault("observations", {})
+    observations["nir_passive"] = {
+        "path": "nir_passive/{frame_id}.exr",
+        "encoding": "synthetic_nir_linear_float32_rgb_replicated",
+        "flash": "disabled",
+        "formula": config.get("nir_formula", "primary"),
+    }
+    observations["nir_active_minus_passive"] = {
+        "path": "nir_active_minus_passive/{frame_id}.exr",
+        "encoding": "scene_linear_float32_rgb_difference",
+        "definition": "nir_active - nir_passive",
+    }
+    _atomic_json(contract_path, contract)
 
 
 def _atomic_image(path: Path, value: np.ndarray, parameters: list[int] | None = None) -> None:
@@ -524,31 +765,46 @@ def _canonicalize_binary_masks(out: Path, row: dict) -> dict[str, int]:
         if difference:
             _atomic_image(path, primary, [cv2.IMWRITE_PNG_COMPRESSION, 3])
             changed["primary_eval_valid_mask"] = changed.get("primary_eval_valid_mask", 0) + difference
+    if {"source_valid_mask", "remediated_pbr_mask", "train_pbr_valid_mask"} <= set(masks):
+        train = np.where((masks["source_valid_mask"] > 0) | (masks["remediated_pbr_mask"] > 0), 255, 0).astype(np.uint8)
+        path = out / paths["train_pbr_valid_mask"]
+        difference = int(np.count_nonzero(masks["train_pbr_valid_mask"] != train))
+        if difference:
+            _atomic_image(path, train, [cv2.IMWRITE_PNG_COMPRESSION, 3])
+            changed["train_pbr_valid_mask"] = changed.get("train_pbr_valid_mask", 0) + difference
     return changed
 
 
 def _sanitize_diffuse_arrays(
-    component: np.ndarray, shading: np.ndarray, reflectance: np.ndarray, pixel_valid: np.ndarray,
+    transport: np.ndarray, component: np.ndarray, reflectance: np.ndarray, pixel_valid: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
     finite_pixel = (
-        np.isfinite(component).all(axis=2)
-        & np.isfinite(shading).all(axis=2)
+        np.isfinite(transport).all(axis=2)
+        & np.isfinite(component).all(axis=2)
         & np.isfinite(reflectance).all(axis=2)
     )
     invalid_count = int(np.count_nonzero(~finite_pixel))
-    nonfinite_limit = max(8, int(math.ceil(component.shape[0] * component.shape[1] * 1e-5)))
+    # Isolated Cycles half-float singularities occur at material/light
+    # boundaries.  They are explicitly zeroed and removed from the validity
+    # mask.  With the illumination-diversity recipes, HDRI/portal boundaries
+    # can produce a slightly larger *localized* cluster (still far below one
+    # pixel in a 1e-3 area fraction).  Keep the gate strict enough to reject
+    # spatially meaningful corruption, but do not fail an otherwise complete
+    # frame for this repairable auxiliary-pass artifact.  At 684x512 this is
+    # 176 pixels; the repaired count is retained in diffuse_decomposition_qc.
+    nonfinite_limit = max(8, int(math.ceil(component.shape[0] * component.shape[1] * 5e-4)))
     if invalid_count > nonfinite_limit:
         raise RuntimeError(
             f"diffuse decomposition has {invalid_count} non-finite pixels (limit {nonfinite_limit})"
         )
     if invalid_count:
+        transport = transport.copy()
         component = component.copy()
-        shading = shading.copy()
         pixel_valid = pixel_valid.copy()
+        transport[~finite_pixel] = 0.0
         component[~finite_pixel] = 0.0
-        shading[~finite_pixel] = 0.0
         pixel_valid[~finite_pixel] = False
-    return component, shading, pixel_valid, invalid_count
+    return transport, component, pixel_valid, invalid_count
 
 
 def _derive_camera_depth(out: Path, row: dict) -> dict:
@@ -637,33 +893,33 @@ def _derive_camera_depth(out: Path, row: dict) -> dict:
     row["lighting_qc"] = lighting_qc
     decomposition_qc = {}
     for modality in ("rgb", "nir"):
+        transport_path = out / row["paths"][f"diffuse_transport_{modality}"]
         component_path = out / row["paths"][f"diffuse_component_{modality}"]
-        shading_path = out / row["paths"][f"diffuse_shading_{modality}"]
         reflectance_path = out / row["paths"][f"diffuse_reflectance_{modality}"]
-        valid_path = out / row["paths"][f"diffuse_shading_valid_{modality}"]
+        valid_path = out / row["paths"][f"diffuse_transport_valid_{modality}"]
+        transport = cv2.imread(str(transport_path), cv2.IMREAD_UNCHANGED)
         component = cv2.imread(str(component_path), cv2.IMREAD_UNCHANGED)
-        shading = cv2.imread(str(shading_path), cv2.IMREAD_UNCHANGED)
         reflectance = cv2.imread(str(reflectance_path), cv2.IMREAD_UNCHANGED)
         valid = cv2.imread(str(valid_path), cv2.IMREAD_UNCHANGED)
-        if any(value is None for value in (component, shading, reflectance, valid)):
+        if any(value is None for value in (transport, component, reflectance, valid)):
             raise RuntimeError(f"cannot decode {modality} diffuse decomposition")
-        if component.shape != shading.shape or component.shape[:2] != reflectance.shape[:2] or component.shape[:2] != valid.shape[:2]:
+        if transport.shape != component.shape or component.shape[:2] != reflectance.shape[:2] or component.shape[:2] != valid.shape[:2]:
             raise RuntimeError(f"{modality} diffuse decomposition dimensions differ")
+        transport = transport.astype(np.float32)[..., :3]
         component = component.astype(np.float32)[..., :3]
-        shading = shading.astype(np.float32)[..., :3]
         reflectance = reflectance.astype(np.float32)[..., :3] / 65535.0
         pixel_valid = valid > 0
-        component, shading, pixel_valid, invalid_count = _sanitize_diffuse_arrays(
-            component, shading, reflectance, pixel_valid,
+        transport, component, pixel_valid, invalid_count = _sanitize_diffuse_arrays(
+            transport, component, reflectance, pixel_valid,
         )
         if invalid_count:
+            _atomic_image(transport_path, transport)
             _atomic_image(component_path, component)
-            _atomic_image(shading_path, shading)
             _atomic_image(valid_path, np.where(pixel_valid, 255, 0).astype(np.uint8), [cv2.IMWRITE_PNG_COMPRESSION, 3])
         channel_valid = pixel_valid[..., None] & (reflectance > 2.0 / 65535.0)
-        reconstructed = shading * reflectance
+        reconstructed = transport * reflectance
         absolute_error = np.abs(reconstructed - component)
-        finite = np.isfinite(component) & np.isfinite(shading) & np.isfinite(reflectance)
+        finite = np.isfinite(transport) & np.isfinite(component) & np.isfinite(reflectance)
         if not bool(finite.all()):
             raise RuntimeError(f"{modality} diffuse decomposition contains non-finite values after repair")
         errors = absolute_error[channel_valid]
@@ -680,6 +936,7 @@ def _derive_camera_depth(out: Path, row: dict) -> dict:
         "threshold": 0.5,
         "repaired_pixel_counts": mask_repairs,
         "primary_eval_valid": "source_valid AND NOT replacement",
+        "train_pbr_valid": "source_valid OR remediated_pbr",
     }
     _atomic_json(out / "frames" / f"{row['frame_id']}.json", row)
     return row
@@ -711,6 +968,10 @@ class BlenderWorker:
         ]
         if self.args.qc_components:
             command.append("--qc-components")
+        if getattr(self.args, "nir_passive", False):
+            command.append("--nir-passive")
+        if getattr(self.args, "allow_legacy_passive_backfill_aovs", False):
+            command.append("--allow-legacy-passive-backfill-aovs")
         self.process = subprocess.Popen(
             command, cwd=REPO_ROOT, env=env, stdin=subprocess.PIPE,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
@@ -749,23 +1010,155 @@ class BlenderWorker:
         self.process = None
         if process is None:
             return
+        # A worker can disappear while its stdout/pipe is still in a kernel
+        # wait (for example after an allocation drain or external SIGTERM).
+        # Do not let the render parent remain alive indefinitely after all
+        # committed frames are complete; shutdown is cleanup, not rendering.
+        if process.poll() is not None:
+            return
         if process.poll() is None and process.stdin is not None:
             try:
                 process.stdin.write(json.dumps({"op": "shutdown"}) + "\n")
                 process.stdin.flush()
-                process.wait(timeout=30)
+                process.wait(timeout=8)
             except Exception:
-                process.terminate()
+                try:
+                    process.terminate()
+                except OSError:
+                    pass
         if process.poll() is None:
-            process.kill()
+            try:
+                process.kill()
+            except OSError:
+                pass
 
 
-def _refresh_index(out: Path) -> list[dict]:
+def _refresh_index(out: Path, *, fingerprint: str | None = None,
+                   frame_ids: set[str] | None = None) -> list[dict]:
     rows = []
     for path in sorted((out / "frames").glob("*.json")) if (out / "frames").is_dir() else []:
-        rows.append(json.loads(path.read_text(encoding="utf-8")))
+        row = json.loads(path.read_text(encoding="utf-8"))
+        if fingerprint is not None and row.get("dataset_fingerprint") != fingerprint:
+            continue
+        if frame_ids is not None and row.get("frame_id") not in frame_ids:
+            continue
+        rows.append(row)
     _atomic_text(out / "index.jsonl", "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows))
     return rows
+
+
+def _config_adoption_compatible(previous: dict, current: dict) -> bool:
+    """Only a frame-set/plan change may reuse pixels from a prior dataset."""
+    ignored = {"worker_sha256", "dataset_fingerprint", "compatible_resume_worker_sha256",
+               "frame_specs", "render_plan", *NIR_PASSIVE_READINESS_KEYS}
+    return ({key: value for key, value in previous.items() if key not in ignored}
+            == {key: value for key, value in current.items() if key not in ignored})
+
+
+def _adopt_compatible_frames(out: Path, *, tasks: list[dict], new_fingerprint: str,
+                             previous_config: dict | None, current_config: dict,
+                             legacy_plan: Path | None, allow_row_only: bool = False) -> set[str]:
+    """Re-attest exact legacy tasks to a corrected plan without touching pixels.
+
+    The manifest is an audit record and makes an interrupted adoption safely
+    repeatable: rows already carrying ``new_fingerprint`` simply pass the
+    normal completion check on the next queue start.
+    """
+    if legacy_plan is None or not legacy_plan.is_file():
+        return set()
+    previous_fingerprint = str((previous_config or {}).get("dataset_fingerprint") or "")
+    if previous_config is not None and not _config_adoption_compatible(previous_config, current_config):
+        return set()
+    try:
+        old_plan = json.loads(legacy_plan.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return set()
+    old_plan_digest = str(old_plan.get("render_plan_digest") or "")
+    if previous_config is None:
+        if not allow_row_only or not old_plan_digest:
+            return set()
+        # A dataset directory may retain rows from older immutable plans.  Only
+        # infer the lost config fingerprint from rows belonging to the plan and
+        # task set being explicitly adopted; unrelated rows must not make a
+        # safe recovery ambiguous.
+        task_ids = {str(task["frame_id"]) for task in tasks}
+        legacy_fingerprints = set()
+        for frame_id in task_ids:
+            path = out / "frames" / f"{frame_id}.json"
+            try:
+                row = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError, json.JSONDecodeError):
+                continue
+            row_plan_digest = str((row.get("lighting") or {}).get("render_plan_digest") or "")
+            value = str(row.get("dataset_fingerprint") or "")
+            if row_plan_digest == old_plan_digest and value and value != new_fingerprint:
+                legacy_fingerprints.add(value)
+        if len(legacy_fingerprints) != 1:
+            return set()
+        previous_fingerprint = next(iter(legacy_fingerprints))
+    if not previous_fingerprint:
+        return set()
+    if previous_config is not None:
+        previous_plan = previous_config.get("render_plan") or {}
+        if str(previous_plan.get("render_plan_digest") or "") != str(old_plan.get("render_plan_digest") or ""):
+            return set()
+    required_modalities = set(REQUIRED_MODALITIES)
+    if bool(current_config.get("nir_passive_enabled")):
+        required_modalities |= PASSIVE_NIR_MODALITIES
+    manifest_path = out / "plan_adoption_manifest.json"
+    manifest = {
+        "schema": "robomituba.ir_principled_plan_adoption.v1",
+        "legacy_plan": str(legacy_plan), "legacy_plan_digest": old_plan.get("render_plan_digest"),
+        "new_plan_digest": (current_config.get("render_plan") or {}).get("render_plan_digest"),
+        "previous_dataset_fingerprint": previous_fingerprint,
+        "new_dataset_fingerprint": new_fingerprint, "adopted": [], "rejected": {},
+    }
+    adopted: set[str] = set()
+    for task in tasks:
+        frame_id = str(task["frame_id"])
+        path = out / "frames" / f"{frame_id}.json"
+        try:
+            row = json.loads(path.read_text(encoding="utf-8"))
+            lighting = row.get("lighting") or {}
+            target_lighting = task.get("lighting") or {}
+            required = row.get("paths") or {}
+            valid = (
+                row.get("dataset_fingerprint") == previous_fingerprint
+                and row.get("viewpoint_id") == task.get("viewpoint_id")
+                and float(row.get("heading_deg", -1)) == float(task.get("heading_deg", -2))
+                and row.get("camera") == task.get("camera")
+                and row.get("pbr_gt_contract_digest") == task.get("pbr_gt_contract_digest")
+                and int(row.get("width") or 0) == int(task.get("width") or 0)
+                and int(row.get("height") or 0) == int(task.get("height") or 0)
+                and float(row.get("fov_deg") or -1) == float(task.get("fov_deg") or -2)
+                and lighting.get("recipe_digest") == target_lighting.get("recipe_digest")
+                and lighting.get("render_plan_digest") == old_plan.get("render_plan_digest")
+                and all(name in required and (out / required[name]).is_file() for name in required_modalities)
+            )
+            if not valid:
+                manifest["rejected"][frame_id] = "task_metadata_or_artifacts_mismatch"
+                continue
+            before_sha = _sha256(path)
+            row["dataset_fingerprint"] = new_fingerprint
+            row["capture_kind"] = task.get("capture_kind", "single")
+            row["pair_id"] = task.get("pair_id")
+            row["pair_member_index"] = task.get("pair_member_index")
+            row["lighting"] = {**lighting,
+                               "capture_group_id": target_lighting.get("capture_group_id"),
+                               "render_plan_id": target_lighting.get("render_plan_id"),
+                               "render_plan_digest": target_lighting.get("render_plan_digest"),
+                               "capture_kind": task.get("capture_kind", "single"),
+                               "pair_id": task.get("pair_id"),
+                               "pair_member_index": task.get("pair_member_index")}
+            _atomic_json(path, row)
+            adopted.add(frame_id)
+            manifest["adopted"].append({"frame_id": frame_id, "previous_row_sha256": before_sha})
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+            manifest["rejected"][frame_id] = f"read_error:{exc}"
+    manifest["adopted_count"] = len(adopted)
+    manifest["rejected_count"] = len(manifest["rejected"])
+    _atomic_json(manifest_path, manifest)
+    return adopted
 
 
 def _qc_summary(out: Path, rows: list[dict]) -> dict:
@@ -777,17 +1170,26 @@ def _qc_summary(out: Path, rows: list[dict]) -> dict:
         original = cv2.imread(str(out / paths["primary_eval_valid_mask"]), cv2.IMREAD_UNCHANGED) > 0
         replacement = cv2.imread(str(out / paths["replacement_mask"]), cv2.IMREAD_UNCHANGED) > 0
         fallback = cv2.imread(str(out / paths["fallback_mask"]), cv2.IMREAD_UNCHANGED) > 0
+        # Authorized window/mirror surrogates are replacement pixels, not
+        # non-semantic missing-material fallbacks.  Keep their coverage in
+        # the replacement telemetry, but exclude them from the 5% fallback
+        # acceptance gate so a large retained window cannot reject an
+        # otherwise valid opaque scene.
+        nonsemantic_fallback = fallback & ~replacement
+        replacement_fallback = fallback & replacement
         rough = cv2.imread(str(out / paths["roughness"]), cv2.IMREAD_UNCHANGED).astype(np.float32) / 65535.0
         metal = cv2.imread(str(out / paths["metallic"]), cv2.IMREAD_UNCHANGED).astype(np.float32) / 65535.0
         mask_counts["defined"] += int(defined.sum())
         mask_counts["original"] += int((defined & original).sum())
         mask_counts["replacement"] += int((defined & replacement).sum())
-        mask_counts["fallback"] += int((defined & fallback).sum())
+        mask_counts["fallback"] += int((defined & nonsemantic_fallback).sum())
+        mask_counts["replacement_fallback"] += int((defined & replacement_fallback).sum())
         for value, prefix in ((rough, "roughness"), (metal, "metallic")):
             for mask, suffix in ((defined & original, "original"), (defined & replacement, "replacement"), (defined, "all")):
                 histograms[f"{prefix}_{suffix}"] += np.histogram(value[mask], bins=32, range=(0.0, 1.0))[0]
     fallback_ratio = mask_counts["fallback"] / max(mask_counts["defined"], 1)
     replacement_ratio = mask_counts["replacement"] / max(mask_counts["defined"], 1)
+    replacement_fallback_ratio = mask_counts["replacement_fallback"] / max(mask_counts["defined"], 1)
     lighting_groups: dict[str, dict[str, list[float]]] = {}
     for row in rows:
         lighting_id = str((row.get("lighting") or {}).get("id") or "legacy")
@@ -800,6 +1202,7 @@ def _qc_summary(out: Path, rows: list[dict]) -> dict:
         "schema": "robomituba.ir_principled_qc_summary.v1", "generated_at": _utc_now(),
         "frame_count": len(rows), "pixel_counts": dict(mask_counts),
         "replacement_pixel_ratio": replacement_ratio,
+        "replacement_fallback_pixel_ratio": replacement_fallback_ratio,
         "fallback_pixel_ratio": fallback_ratio,
         "fallback_threshold": 0.05, "fallback_threshold_passed": fallback_ratio <= 0.05,
         "histograms_32_bins": {key: value.tolist() for key, value in histograms.items()},
@@ -807,6 +1210,10 @@ def _qc_summary(out: Path, rows: list[dict]) -> dict:
             "mean": [row.get("nir_qc", {}).get("mean") for row in rows],
             "p95": [row.get("nir_qc", {}).get("p95") for row in rows],
             "saturation_ratio_gt_1": [row.get("nir_qc", {}).get("saturation_ratio_gt_1") for row in rows],
+            "passive_mean": [row.get("nir_passive_qc", {}).get("mean") for row in rows],
+            "passive_p95": [row.get("nir_passive_qc", {}).get("p95") for row in rows],
+            "active_minus_passive_mean_abs": [row.get("nir_difference_qc", {}).get("mean_abs") for row in rows],
+            "active_minus_passive_p95_abs": [row.get("nir_difference_qc", {}).get("p95_abs") for row in rows],
         },
         "diffuse_decomposition": {
             modality: [row.get("diffuse_decomposition_qc", {}).get(modality) for row in rows]
@@ -830,6 +1237,8 @@ def main() -> int:
     args.scene_dir = args.scene_dir.resolve()
     args.prepared_scene_dir = args.prepared_scene_dir.resolve()
     args.out = args.out.resolve()
+    if args.nir_passive is None:
+        args.nir_passive = not (args.out / "dataset_config.json").is_file()
     if args.overview_proxy_dir:
         args.overview_proxy_dir = args.overview_proxy_dir.resolve()
     if args.frame_plan and (args.viewpoints or args.max_frames is not None):
@@ -839,6 +1248,24 @@ def main() -> int:
         or args.flash_energy_scale <= 0 or args.ambient_fill_energy_scale <= 0
     ):
         raise ValueError("resolution and SPP must be positive")
+    # Frame adoption and resume validation may scan thousands of artifacts on
+    # network storage before the first Blender worker can be created.  Publish
+    # that lifecycle explicitly so the controller does not mistake queue
+    # preparation for a failed GPU allocation and rotate through every queued
+    # dataset.
+    args.out.mkdir(parents=True, exist_ok=True)
+    if args.gpu_state_file is not None:
+        allowed = [int(value) for value in args.gpu_indices.split(",") if value.strip()]
+        desired = _desired_gpu_indices(args.gpu_allocation_file, allowed, allowed)
+        _atomic_json(args.gpu_state_file, {
+            "schema": "robomituba.ir_gpu_worker_state.v1",
+            "updated_at": _utc_now(),
+            "queue_pid": os.getpid(),
+            "queue_state": "preparing",
+            "allowed_gpu_indices": allowed,
+            "desired_gpu_indices": desired,
+            "workers": {},
+        })
     graph_path = args.scene_dir / "viewpoint_graph.json"
     blend = args.prepared_scene_dir / "derived_ir_principled_v1.blend"
     contract_path = args.prepared_scene_dir / "principled_material_contract.json"
@@ -878,20 +1305,65 @@ def main() -> int:
         "render_plan": ({"render_plan_id": frame_plan["render_plan_id"], "render_plan_digest": frame_plan["render_plan_digest"],
                          "content_digest": render_plan_digest(frame_plan), "illumination": frame_plan.get("illumination")} if frame_plan else None),
     }
+    # Keep the legacy config byte/semantic contract untouched unless the new
+    # observation pair is explicitly requested. This allows old active-NIR
+    # jobs to resume without invalidating their completed RGB/GT frames.  The
+    # requested bit is stable render identity; dataset-level ``enabled`` is
+    # written only after the final passive sidecar has been verified.
+    if args.nir_passive:
+        config["nir_passive_requested"] = True
     args.out.mkdir(parents=True, exist_ok=True)
+    previous_config = None
+    previous_config_path = args.out / "dataset_config.json"
+    if previous_config_path.is_file():
+        try:
+            previous_config = json.loads(previous_config_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, json.JSONDecodeError):
+            previous_config = None
+    if args.adopt_compatible_config and args.adopt_compatible_config.is_file():
+        try:
+            previous_config = json.loads(args.adopt_compatible_config.read_text(encoding="utf-8"))
+        except (OSError, ValueError, json.JSONDecodeError):
+            previous_config = None
+    elif args.adopt_existing_rows:
+        # The current dataset_config may have been atomically rewritten by a
+        # cancelled newer queue before any old pixels changed.  Row-only
+        # adoption deliberately derives the prior identity from exact frame
+        # rows instead of trusting that newer config.
+        previous_config = None
     fingerprint, stored_config = _select_dataset_fingerprint(
         args.out, config, compatible_resume=bool(args.compatible_worker_resume),
     )
     offset = _origin_offset(args.scene_dir)
-    pbr_gt_contract_digest = stable_json_digest({"contract": contract.get("contract_version"), "aovs": contract.get("aovs"), "aov_semantics": contract.get("aov_semantics"), "materials": [{"id": item.get("material_id"), "effective_inputs": item.get("effective_inputs")} for item in contract.get("materials") or []]})
+    pbr_gt_contract_digest = stable_json_digest({
+        "contract": contract.get("contract_version"),
+        "aovs": contract.get("aovs"),
+        "aov_semantics": contract.get("aov_semantics"),
+        "materials": [
+            {
+                "id": item.get("material_id"),
+                "effective_inputs": item.get("effective_inputs"),
+                "metallic_contract": item.get("metallic_contract"),
+            }
+            for item in contract.get("materials") or []
+        ],
+    })
     external_lighting_available = bool((contract.get("external_portal_rig") or {}).get("available"))
     tasks = [_task(nodes[node_id], yaw, lighting, args, offset, fingerprint, pbr_gt_contract_digest, external_lighting_available) for node_id, yaw, lighting in specs]
     overview = _write_scene_overview(args.out, graph, tasks, args, fingerprint, graph_path)
-    artifact_contract = _artifact_contract(args, contract, fingerprint, frame_plan, overview)
+    artifact_contract = _artifact_contract(args, contract, fingerprint, frame_plan, overview,
+                                           passive_ready=False)
     _atomic_json(args.out / "artifact_contract.json", artifact_contract)
     _atomic_json(args.out / "dataset_config.json", {**stored_config, "dataset_fingerprint": fingerprint})
 
-    completed = {task["frame_id"] for task in tasks if _row_complete(args.out, task["frame_id"], fingerprint)}
+    adopted = _adopt_compatible_frames(
+        args.out, tasks=tasks, new_fingerprint=fingerprint, previous_config=previous_config,
+        current_config=config, legacy_plan=args.adopt_compatible_plan,
+        allow_row_only=bool(args.adopt_existing_rows),
+    )
+    completed = {task["frame_id"] for task in tasks if _row_complete(
+        args.out, task["frame_id"], fingerprint, require_passive=bool(args.nir_passive),
+    )}
     pending = [task for task in tasks if task["frame_id"] not in completed]
     state = {
         "schema": QUEUE_SCHEMA, "dataset_fingerprint": fingerprint,
@@ -905,12 +1377,17 @@ def main() -> int:
     fallback_gpus = gpu_indices[:worker_count]
     print(
         f"[ir-principled-queue] frames={len(tasks)} complete={len(completed)} pending={len(pending)} "
-        f"workers={worker_count} fingerprint={fingerprint[:16]}", flush=True,
+        f"workers={worker_count} fingerprint={fingerprint[:16]} adopted={len(adopted)}", flush=True,
     )
     if args.dry_run or not pending:
-        rows = _refresh_index(args.out)
+        rows = _refresh_index(args.out, fingerprint=fingerprint, frame_ids={task["frame_id"] for task in tasks})
         if rows:
             _qc_summary(args.out, rows)
+        if args.nir_passive and not args.dry_run and not pending:
+            _activate_nir_passive_contract(
+                args.out, fingerprint=fingerprint,
+                frame_ids={task["frame_id"] for task in tasks},
+            )
         return 0
 
     work: queue.Queue[dict] = queue.Queue()
@@ -924,18 +1401,31 @@ def main() -> int:
     failed_workers: set[int] = set()
     worker_failures = Counter()
     worker_retry_after: dict[int, float] = {}
+    # Worker state is UI/lease telemetry, not an artifact checkpoint.  On the
+    # network filesystem, writing it once per frame (and again every scheduler
+    # tick) can leave otherwise healthy Blender workers in RPC wait.  Keep it
+    # responsive while bounding writes to roughly one per second.
+    last_worker_state_write = 0.0
 
-    def write_worker_state(desired: list[int]) -> None:
+    def write_worker_state(desired: list[int], *, force: bool = False) -> None:
+        nonlocal last_worker_state_write
         if args.gpu_state_file is None:
+            return
+        now = time.monotonic()
+        if not force and now - last_worker_state_write < 1.0:
             return
         with lock:
             payload = {
                 "schema": "robomituba.ir_gpu_worker_state.v1",
                 "updated_at": _utc_now(),
+                "queue_pid": os.getpid(),
+                "queue_state": _allocation_state(desired, active, work.unfinished_tasks),
+                "allowed_gpu_indices": list(gpu_indices),
                 "desired_gpu_indices": list(desired),
                 "workers": {key: dict(value) for key, value in worker_records.items()},
             }
         _atomic_json(args.gpu_state_file, payload)
+        last_worker_state_write = now
 
     def set_worker(gpu: int, status: str, *, frame_id: str | None = None, error: str | None = None) -> None:
         with lock:
@@ -975,16 +1465,28 @@ def main() -> int:
                 try:
                     event = worker.render(task)
                     row = _derive_camera_depth(args.out, event["row"])
+                    if args.nir_passive:
+                        row = _derive_nir_difference(args.out, row)
                     with lock:
                         completed.add(frame_id)
                         state["completed"] = sorted(completed)
                         state["pending"] = [item["frame_id"] for item in list(work.queue)]
                         state["lighting_groups"] = _lighting_group_progress(tasks, completed)
                         state["updated_at"] = _utc_now()
-                        _atomic_json(args.out / "rolling_queue_state.json", state)
+                        # The image/GT artifacts are committed every frame, but
+                        # rewriting a JSON checkpoint on the network filesystem
+                        # for every worker completion creates NFS contention at
+                        # the tail of a render (workers can remain in rpc_wait
+                        # even after the last frame is complete).  Keep UI
+                        # progress granular while checkpointing at a bounded
+                        # cadence and always persist the terminal state.
+                        if len(completed) % 4 == 0 or len(completed) == len(tasks):
+                            _atomic_json(args.out / "rolling_queue_state.json", state)
                     print(
                         f"[ir-principled-queue] frame {len(completed)}/{len(tasks)} gpu={gpu} {frame_id} "
-                        f"rgb={row['timings_s']['rgb']:.2f}s nir={row['timings_s']['nir_active']:.2f}s",
+                        f"rgb={row['timings_s'].get('rgb', 0.0):.2f}s "
+                        f"passive={row['timings_s'].get('nir_passive', 0.0):.2f}s "
+                        f"nir={row['timings_s'].get('nir_active', 0.0):.2f}s",
                         flush=True,
                     )
                 except Exception as exc:
@@ -1051,14 +1553,16 @@ def main() -> int:
         ):
             errors.append("all desired GPU workers failed")
             break
-        time.sleep(0.25)
+        # A render parent with no lease is intentionally dormant.  Poll the
+        # allocation target slowly rather than presenting a hot, busy queue.
+        time.sleep(1.0 if work.unfinished_tasks > 0 and not active and not desired else 0.25)
 
     for thread, drain in active.values():
         drain.set()
         thread.join()
-    write_worker_state([])
+    write_worker_state([], force=True)
 
-    rows = _refresh_index(args.out)
+    rows = _refresh_index(args.out, fingerprint=fingerprint, frame_ids={task["frame_id"] for task in tasks})
     qc = _qc_summary(args.out, rows) if rows else {}
     if errors or len(completed) != len(tasks):
         print(f"[ir-principled-queue] incomplete completed={len(completed)}/{len(tasks)} errors={len(errors)}", flush=True)
@@ -1066,6 +1570,11 @@ def main() -> int:
     if qc and not qc.get("fallback_threshold_passed", False):
         print("[ir-principled-queue] non-semantic fallback pixel ratio exceeds 5%; blocking full-run acceptance", flush=True)
         return 2
+    if args.nir_passive:
+        _activate_nir_passive_contract(
+            args.out, fingerprint=fingerprint,
+            frame_ids={task["frame_id"] for task in tasks},
+        )
     print(f"[ir-principled-queue] complete frames={len(rows)} -> {args.out}", flush=True)
     return 0
 

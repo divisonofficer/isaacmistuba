@@ -95,7 +95,45 @@ def _microfacet_alpha(rough: MaterialParameter, has_micro, smooth_spec) -> Mater
                              formula="alpha = r^2")
 
 
+def _trusted_metallic_contract(slot: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    contract = (slot.get("authoring") or {}).get("metallic_contract")
+    if not isinstance(contract, Mapping):
+        contract = (slot.get("extracted") or {}).get("metallic_contract")
+    if not isinstance(contract, Mapping):
+        return None
+    if contract.get("schema") != "robomituba.metallic_contract.v2":
+        return None
+    if contract.get("family") not in {"dielectric", "conductor", "coverage_mixed"}:
+        return None
+    if contract.get("encoding") != "linear_scalar" or contract.get("color_space") != "non_color":
+        return None
+    return contract
+
+
 def _metallic(slot, is_conductor, optical_class) -> MaterialParameter:
+    contract = _trusted_metallic_contract(slot)
+    if contract is not None:
+        ex = slot["extracted"]
+        if ex.get("metallic_texture_ref"):
+            return MaterialParameter(
+                source="baked", path=ex["metallic_texture_ref"],
+                note="trusted MetallicContractV2 linear Non-Color effective socket",
+            )
+        auth = slot["authoring"].get("metallic")
+        if auth is not None:
+            return MaterialParameter(
+                source="blend_authored", value=float(auth),
+                note="trusted MetallicContractV2 effective scalar",
+            )
+        if contract.get("family") == "conductor":
+            return MaterialParameter(source="derived", value=1.0,
+                                     formula="MetallicContractV2 conductor => metallic 1")
+        if contract.get("family") == "dielectric":
+            return MaterialParameter(source="derived", value=0.0,
+                                     formula="MetallicContractV2 dielectric => metallic 0")
+        return MaterialParameter.undefined(
+            "coverage_mixed MetallicContractV2 requires an authored effective metallic texture"
+        )
     if is_conductor or optical_class == "metal":
         return MaterialParameter(source="derived", value=1.0,
                                  formula="conductor BSDF => metallic 1 (overrides leaked factor)")
@@ -138,6 +176,9 @@ def canonicalize_slot(slot: Mapping[str, Any]) -> CanonicalMaterial:
         "normal": _normal(slot),
     }
     extras = {}
+    trusted_metallic = _trusted_metallic_contract(slot)
+    if trusted_metallic is not None:
+        extras["metallic_contract"] = dict(trusted_metallic)
     if is_measured and slot.get("measured_candidate"):
         extras["measured_candidate"] = slot["measured_candidate"]
     return CanonicalMaterial(

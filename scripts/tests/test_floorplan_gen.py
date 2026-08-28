@@ -13,6 +13,7 @@ import floorplan_gen as fg  # noqa: E402
 APARTMENT_SEEDS = range(20_010_000, 20_010_200)
 OFFICE_SEEDS = range(20_510_000, 20_510_200)
 MODERN_OFFICE_SEEDS = range(20_610_000, 20_610_200)
+WIDE_GLASS_OFFICE_SEEDS = range(20_620_000, 20_620_200)
 SINGLE_ROOM_SEEDS = range(20_710_000, 20_710_020)
 
 
@@ -42,6 +43,24 @@ def test_modern_office_valid_and_bounded():
         assert 180 <= width * height <= 300
         types = {name.split("_")[0] for name in plan["rooms"]}
         assert {"open-office", "meeting-room", "office", "break-room", "restroom", "warehouse", "hallway"} <= types
+
+
+def test_wide_glass_office_v2_valid_bounded_and_programmed():
+    for seed in WIDE_GLASS_OFFICE_SEEDS:
+        plan = fg.build_floor_plan(seed, fg.WIDE_GLASS_OFFICE_ARCHETYPE)
+        assert fg.validate_plan(plan) == [], f"seed={seed}"
+        metadata = fg.wide_glass_office_metadata(seed)
+        assert metadata["profile"] == "modern_glass_office_v2"
+        assert 400 <= metadata["footprint_area_m2"] <= 550
+        assert 3 <= metadata["work_bay_count"] <= 4
+        assert len(metadata["work_bay_rooms"]) == metadata["work_bay_count"]
+        assert max(metadata["work_bay_area_m2"]) <= 75
+        assert metadata["program_counts"] == {
+            "open-office": metadata["work_bay_count"], "hallway": 3,
+            "meeting-room": 3, "office": 4, "factory-office": 1, "break-room": 1,
+            "restroom": 2, "warehouse": 1,
+        }
+        assert len(metadata["reception_support_rooms"]) == 1
 
 
 def test_determinism():
@@ -153,6 +172,22 @@ def test_modern_glass_spec_is_deterministic_and_has_structural_door_openings():
             assert segment["room"].split("_")[0] in {"meeting-room", "office", "break-room"}
             assert segment["corridor"].startswith("hallway_")
             assert len(segment["wall_endpoints_m"]) == len(segment["door_opening_m"]) == 2
+            assert segment["opaque_wall_owners"] == [segment["room"], segment["corridor"]]
+
+
+def test_wide_glass_v2_spec_has_ten_door_preserving_partitions():
+    for seed in (20_620_001, 20_620_042, 20_620_199):
+        first = fg.wide_glass_office_partition_spec(seed)
+        assert first == fg.wide_glass_office_partition_spec(seed)
+        assert first["requested_partition_count"] == 10
+        assert first["requested_pane_count"] == 20
+        assert first["eligible_segment_count"] >= 10
+        assert len(first["segments"]) == 10
+        types = [segment["room"].split("_")[0] for segment in first["segments"]]
+        assert types.count("open-office") in {3, 4}
+        assert all(room_type in {"open-office", "meeting-room", "office"} for room_type in types)
+        assert all(segment["opaque_wall_owners"] == [segment["room"], segment["corridor"]]
+                   for segment in first["segments"])
 
 
 def test_single_room_types_valid_and_windowed():

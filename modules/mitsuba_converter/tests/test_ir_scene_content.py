@@ -9,6 +9,11 @@ def test_office_program_accepts_anchors_and_rejects_bedroom_content() -> None:
     passed = audit_scene_content({"objects": [_obj("SimpleDeskFactory"), _obj("OfficeChairFactory"),
                                                        _obj("MonitorFactory"), _obj("ShelfFactory")]}, room_type="office")
     assert passed["status"] == "passed"
+    tv_display = audit_scene_content(
+        {"objects": [_obj("SimpleDeskFactory"), _obj("OfficeChairFactory"),
+                     _obj("TVFactory"), _obj("ShelfFactory")]}, room_type="office"
+    )
+    assert tv_display["status"] == "passed"
     failed = audit_scene_content({"objects": [_obj("BedFactory") for _ in range(5)]}, room_type="office")
     assert failed["status"] == "failed"
     assert "forbidden_room_content" in failed["failures"]

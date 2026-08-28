@@ -10,6 +10,7 @@
 #
 # Options:
 #   --scene-id ID        OpticalNav scene id        (default: infinigen_<dirname>)
+#   --import-name NAME   isolated Stage-1 import directory name (default derived from input)
 #   --project-id ID      OpticalNav project         (default: opticalnav-v0.2)
 #   --stage1-profile P   strict-pbr-v1|ir-bootstrap-v1 (default strict-pbr-v1)
 #   --no-bake            Skip procedural material bake (explicit degraded preview mode)
@@ -24,6 +25,10 @@
 #                        protects glass/metal/structure. Applies to OBJ + atlas + GLB.
 #   --decimate-strict    Fail export if a requested decimation does not meet its target face count
 #   --decimate-min-polys N  Objects below N faces stay at 100% (default 50000)
+#   --filter-small-high-poly  Drop tiny high-poly non-structural detail units
+#   --small-high-poly-max-extent-m M  Maximum extent for the filter (default 0.5)
+#   --small-high-poly-min-triangles N Minimum triangles for the filter (default 100000)
+#   --allow-object-id-churn  Allow showcase composition imports to change source object IDs
 #   --bake-only          Re-bake PBR into an EXISTING scene's import (Stage 1 only, no
 #                        re-import) — preserves the authoring map; busts the staged cache
 #   --no-sync            Skip Stage 3 render-scene sync (don't stage webui meshes)
@@ -32,6 +37,7 @@
 #   --room KEY           Keep only this room        (e.g. "dining-room_0/0")
 #   --keep-empty-rooms   Keep unfurnished/empty rooms
 #   --no-normalize-origin  Keep raw Infinigen world coords (don't snap to origin/floor)
+#   --office-population-audit FILE  Require and preserve a passed Office v2 population audit
 #
 # Env overrides:
 #   INFINIGEN_PYTHON   python with the `bpy` module (default: infinigen conda env)
@@ -58,6 +64,7 @@ INFINIGEN_PYTHON="${INFINIGEN_PYTHON:-$HOME/miniconda3/envs/infinigen/bin/python
 # ── parse args ────────────────────────────────────────────────────────────────
 INPUT=""
 SCENE_ID=""
+IMPORT_NAME=""
 PROJECT_ID="opticalnav-v0.2"
 STAGE1_PROFILE="strict-pbr-v1"
 BAKE=1
@@ -66,17 +73,23 @@ BAKE_METALLIC=1
 DECIMATE_POLICY=""          # none|ratio_threshold|semantic_contract|ir_semantic_lod_v1 (empty => none)
 DECIMATE_MIN_POLYS=50000    # objects below this evaluated-triangle count stay at 100% (not a compression target)
 DECIMATE_STRICT=0         # requested geometry reduction must succeed (IR LOD only)
+FILTER_SMALL_HIGH_POLY=0
+SMALL_HIGH_POLY_MAX_EXTENT_M=0.5
+SMALL_HIGH_POLY_MIN_TRIANGLES=100000
 GLB=1
 ALLOW_OBJ_FALLBACK=0
+ALLOW_OBJECT_ID_CHURN=0
 BAKE_ONLY=0
 SKIP_EXPORT=0
 FRESH_EXPORT=0
 SYNC=1
 DAEMON_URL="${ROBOMITUBA_DAEMON_URL:-http://127.0.0.1:8765}"
+OFFICE_POPULATION_AUDIT=""
 STAGE2_EXTRA=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --scene-id)   SCENE_ID="$2"; shift 2;;
+    --import-name) IMPORT_NAME="$2"; shift 2;;
     --project-id) PROJECT_ID="$2"; shift 2;;
     --stage1-profile) STAGE1_PROFILE="$2"; shift 2;;
     --no-bake)    BAKE=0; shift;;
@@ -84,15 +97,20 @@ while [[ $# -gt 0 ]]; do
     --no-bake-pbr) BAKE_PBR=0; shift;;
     --no-glb)     GLB=0; shift;;
     --allow-obj-fallback) ALLOW_OBJ_FALLBACK=1; shift;;
+    --allow-object-id-churn) ALLOW_OBJECT_ID_CHURN=1; shift;;
     --no-bake-metallic) BAKE_METALLIC=0; shift;;
     --decimate-strict)  DECIMATE_STRICT=1; shift;;
     --decimate-policy)  DECIMATE_POLICY="$2"; shift 2;;
     --decimate-min-polys) DECIMATE_MIN_POLYS="$2"; shift 2;;
+    --filter-small-high-poly) FILTER_SMALL_HIGH_POLY=1; shift;;
+    --small-high-poly-max-extent-m) SMALL_HIGH_POLY_MAX_EXTENT_M="$2"; shift 2;;
+    --small-high-poly-min-triangles) SMALL_HIGH_POLY_MIN_TRIANGLES="$2"; shift 2;;
     --bake-only)  BAKE_ONLY=1; BAKE=1; BAKE_PBR=1; SKIP_EXPORT=0; shift;;
     --no-sync)    SYNC=0; shift;;
     --skip-export) SKIP_EXPORT=1; shift;;
     --fresh-export) FRESH_EXPORT=1; shift;;
     --room)       STAGE2_EXTRA+=(--room "$2"); shift 2;;
+    --office-population-audit) OFFICE_POPULATION_AUDIT="$2"; shift 2;;
     --keep-empty-rooms|--no-normalize-origin) STAGE2_EXTRA+=("$1"); shift;;
     -h|--help)    sed -n '2,30p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0;;
     -*)           echo "[error] unknown option: $1" >&2; exit 2;;
@@ -115,6 +133,15 @@ if [[ "$STAGE1_PROFILE" == "strict-pbr-v1" && ("$BAKE" == 0 || "$BAKE_PBR" == 0)
   ALLOW_OBJ_FALLBACK=1
 fi
 [[ $ALLOW_OBJ_FALLBACK == 1 ]] && STAGE2_EXTRA+=(--allow-obj-fallback)
+[[ $ALLOW_OBJECT_ID_CHURN == 1 ]] && STAGE2_EXTRA+=(--allow-object-id-churn)
+if [[ -n "$OFFICE_POPULATION_AUDIT" ]]; then
+  [[ -f "$OFFICE_POPULATION_AUDIT" ]] || { echo "[error] office population audit not found: $OFFICE_POPULATION_AUDIT" >&2; exit 2; }
+  STAGE2_EXTRA+=(--office-population-audit "$OFFICE_POPULATION_AUDIT")
+fi
+if [[ "$FILTER_SMALL_HIGH_POLY" == 1 ]]; then
+  STAGE2_EXTRA+=(--filter-small-high-poly --small-high-poly-max-extent-m "$SMALL_HIGH_POLY_MAX_EXTENT_M" \
+    --small-high-poly-min-triangles "$SMALL_HIGH_POLY_MIN_TRIANGLES")
+fi
 
 # ── resolve a readable .blend ─────────────────────────────────────────────────
 # Infinigen's main scene.blend is often header-corrupt; the scene.blend1 backup
@@ -159,6 +186,10 @@ case "$DIRNAME" in
     DIRNAME="$(basename "$(dirname "$PARENT_DIR")")";;
 esac
 NAME="$(echo "$DIRNAME" | tr -cs 'A-Za-z0-9._-' '_' | sed 's/^_*//;s/_*$//')"
+if [[ -n "$IMPORT_NAME" ]]; then
+  [[ "$IMPORT_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$ ]] || { echo "[error] invalid --import-name" >&2; exit 2; }
+  NAME="$IMPORT_NAME"
+fi
 [[ -z "$SCENE_ID" ]] && SCENE_ID="infinigen_${NAME}"
 IMPORT_DIR="out/infinigen_imports/${NAME}"
 MANIFEST="${IMPORT_DIR}/scene_manifest.json"
@@ -206,6 +237,10 @@ else
   if [[ -n "$DECIMATE_POLICY" && "$DECIMATE_POLICY" != "none" ]]; then
   [[ $DECIMATE_STRICT == 1 ]] && BAKE_FLAG+=(--decimate-strict)
     BAKE_FLAG+=(--decimate-policy "$DECIMATE_POLICY" --decimate-min-polys "$DECIMATE_MIN_POLYS")
+  fi
+  if [[ "$FILTER_SMALL_HIGH_POLY" == 1 ]]; then
+    BAKE_FLAG+=(--filter-small-high-poly --small-high-poly-max-extent-m "$SMALL_HIGH_POLY_MAX_EXTENT_M" \
+      --small-high-poly-min-triangles "$SMALL_HIGH_POLY_MIN_TRIANGLES")
   fi
   DEFAULT_STAGING_DIR="${IMPORT_DIR}.${STAGE1_PROFILE}.staging.$(date +%Y%m%dT%H%M%S)-$$"
   STAGING_DIR="${INFINIGEN_EXPORT_RESUME_DIR:-}"

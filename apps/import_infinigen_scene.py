@@ -36,6 +36,8 @@ for _src in ("modules/navigation_dataset/src", "modules/mitsuba_converter/src", 
         sys.path.insert(0, str(p))
 
 from navigation_dataset.office_sample import install_shared_office_sample  # noqa: E402
+sys.path.insert(0, str(REPO_ROOT / "tools" / "infinigen"))
+from small_highpoly_filter import is_small_highpoly_record  # noqa: E402
 
 
 # Semantic type -> default OpticalNav material id (a material we synthesise per
@@ -227,7 +229,7 @@ def _material_binding(mat: dict) -> dict:
     The `optical_class` (set by Stage 1, re-derived here for old manifests) drives
     the render bsdf_strategy:
       glass  -> dielectric / roughdielectric (clear; analytic, renders today)
-      mirror -> conductor (Al; analytic, renders today)
+      mirror -> roughconductor (Al; analytic, renders today)
       metal_*-> roughconductor analytic fallback plus a measured_polarized candidate
                 recorded for render-time opt-in scopes
       diffuse-> pplastic with baked albedo (polarization-aware analytic fallback)
@@ -251,7 +253,7 @@ def _material_binding(mat: dict) -> dict:
                    "base_color_factor": base, "roughness": rough, "metallic": metallic,
                    "capabilities": {"rgb": True, "polarization": True}}
     elif oc == "mirror":
-        binding = {"kind": "preset", "bsdf_strategy": "conductor",
+        binding = {"kind": "preset", "bsdf_strategy": "roughconductor",
                    "base_color_factor": base, "roughness": rough, "metallic": metallic,
                    "capabilities": {"rgb": True, "polarization": True}}
     elif oc in _METAL_MEASURED_ID:
@@ -730,7 +732,17 @@ def validate_infinigen_manifest(
                     bake_validation = rec.get("bake_validation")
                     if not isinstance(bake_validation, dict):
                         issues.append(f"{uid}: missing bake validation for linked {channel}")
-                    elif bake_validation.get("result") != "spatial":
+                    elif bake_validation.get("result") not in (
+                        {"spatial", "constant", "black"}
+                        if channel in {"roughness", "metallic"}
+                        # ``black_confirmed_dual_pass`` is intentionally more
+                        # stringent than a normal spatial bake: the exporter
+                        # has independently proved both EMIT and Diffuse Color
+                        # are finite, coverage-backed, and black.  Rejecting
+                        # it here made the importer disagree with the current
+                        # Stage-1 exporter and stranded otherwise valid jobs.
+                        else {"spatial", "constant", "black_confirmed_dual_pass"}
+                    ):
                         issues.append(
                             f"{uid}: linked {channel} bake validation is "
                             f"{bake_validation.get('result', 'unknown')}"
@@ -753,7 +765,10 @@ def validate_infinigen_manifest(
 def build_authoring_map(manifest: dict, scene_id: str, import_rel: str,
                         *, keep_empty_rooms: bool = False, room_override: str | None = None,
                         normalize_origin: bool = True, origin_margin: float = 0.5,
-                        fill_missing_lights: bool = True, allow_obj_fallback: bool = False) -> dict:
+                        fill_missing_lights: bool = True, allow_obj_fallback: bool = False,
+                        filter_small_high_poly: bool = False,
+                        small_high_poly_max_extent_m: float = 0.25,
+                        small_high_poly_min_triangles: int = 200_000) -> dict:
     all_units = manifest.get("units") or []
     mats_in = manifest.get("materials") or {}
 
@@ -786,6 +801,27 @@ def build_authoring_map(manifest: dict, scene_id: str, import_rel: str,
             f"decoration(s), {dropped_triangles:,} triangles"
         )
 
+    policy_filtered = []
+    if filter_small_high_poly:
+        kept = []
+        for unit in units:
+            drop, reason = is_small_highpoly_record(
+                unit, max_extent_m=small_high_poly_max_extent_m,
+                min_triangles=small_high_poly_min_triangles,
+            )
+            if drop:
+                policy_filtered.append({
+                    "id": unit.get("id"), "blender_name": unit.get("blender_name"),
+                    "triangles": int(unit.get("triangles") or 0),
+                    "dimensions": unit.get("dimensions") or unit.get("place_size_m"),
+                    "reason": reason,
+                })
+            else:
+                kept.append(unit)
+        units = kept
+        if policy_filtered:
+            print(f"[import] filtered {len(policy_filtered)} tiny high-poly detail unit(s)")
+
     # Drop oversized door leaves (much larger than their nearest frame) that block a
     # passage. Removing them keeps the scene nav-clean (no wall-sized door mesh) and
     # lets doorway portal detection resolve so the rooms stay connected.
@@ -800,6 +836,20 @@ def build_authoring_map(manifest: dict, scene_id: str, import_rel: str,
     dropped_rooms = sorted(set(room_floor) - kept_rooms)
 
     def _unit_kept(u: dict) -> bool:
+        # Modern Glass office partitions are standalone structure units rather
+        # than room-named ``*.wall`` meshes.  They carry an explicit semantic
+        # marker from the Blender export; keep them when their footprint lies
+        # in a retained room.  Previously these units fell through the generic
+        # structure branch below (``_room_key`` returned None) and all 20 panes
+        # plus their frames disappeared from authoring_map.json, making the
+        # office graph audit unable to verify the glass contract.
+        props = u.get("source_custom_properties") or {}
+        if (u.get("subtype") == "transparent_partition"
+                or props.get("transparent_partition")):
+            c = u.get("place_center")
+            if not c:
+                return False
+            return any(_xy_in(a, c[0], c[1], margin=0.8) for a in kept_aabbs)
         if u.get("kind") == "structure":
             return _room_key(u.get("blender_name")) in kept_rooms
         c = u.get("place_center")
@@ -1130,6 +1180,8 @@ def build_authoring_map(manifest: dict, scene_id: str, import_rel: str,
                      "dropped_tiny_highpoly_triangles": sum(
                          int(u.get("triangles") or 0) for u in tiny_highpoly_decorations
                      ),
+                     "policy_filtered_small_highpoly": len(policy_filtered),
+                     "policy_filtered_small_highpoly_units": policy_filtered,
                      "tiny_highpoly_filter": {
                          "max_extent_m": _TINY_HIGHPOLY_MAX_EXTENT_M,
                          "min_triangles": _TINY_HIGHPOLY_MIN_TRIANGLES,
@@ -1257,7 +1309,7 @@ def main():
     ap.add_argument("--force", action="store_true")
     ap.add_argument("--validate-only", action="store_true",
                     help="Validate the Stage-1 GLB/PBR manifest and exit.")
-    ap.add_argument("--stage1-profile", choices=("strict-pbr-v1", "ir-bootstrap-v1"),
+    ap.add_argument("--stage1-profile", choices=("strict-pbr-v1", "strict-pbr-v2-slot-aware", "ir-bootstrap-v1"),
                     default="strict-pbr-v1",
                     help="Expected Stage-1 contract; bootstrap keeps geometry/material provenance without atlases.")
     ap.add_argument("--allow-obj-fallback", action="store_true",
@@ -1278,10 +1330,29 @@ def main():
                          "graph; rerun `opticalnav perturbation build` after graph build for those.")
     ap.add_argument("--no-fill-missing-lights", action="store_true",
                     help="Do not synthesize ceiling lights for rooms Infinigen left unlit.")
+    ap.add_argument("--filter-small-high-poly", action="store_true",
+                    help="Drop only tiny, high-poly non-structural detail units.")
+    ap.add_argument("--small-high-poly-max-extent-m", type=float, default=0.25)
+    ap.add_argument("--small-high-poly-min-triangles", type=int, default=200_000)
+    ap.add_argument("--office-population-audit", type=Path, default=None,
+                    help="Passed modern_glass_office_v2 audit to preserve with imported scene metadata.")
     args = ap.parse_args()
 
     manifest_path = Path(args.manifest).resolve()
     manifest = json.loads(manifest_path.read_text())
+    office_population_audit = None
+    office_layout_manifest = None
+    if args.office_population_audit is not None:
+        audit_path = args.office_population_audit.resolve()
+        office_population_audit = json.loads(audit_path.read_text(encoding="utf-8"))
+        if office_population_audit.get("status") != "passed" or office_population_audit.get("profile") != "modern_glass_office_v2":
+            raise ValueError("--office-population-audit must be a passed modern_glass_office_v2 audit")
+        layout_path = audit_path.parent / "office_layout_manifest.json"
+        if not layout_path.is_file():
+            raise FileNotFoundError(f"office layout manifest required beside audit: {layout_path}")
+        office_layout_manifest = json.loads(layout_path.read_text(encoding="utf-8"))
+        if office_layout_manifest.get("profile") != "modern_glass_office_v2" or office_layout_manifest.get("office_style") != "modern_glass_v2":
+            raise ValueError("office audit/layout profile mismatch")
     validation_issues = validate_infinigen_manifest(
         manifest, manifest_path.parent, allow_obj_fallback=args.allow_obj_fallback,
         stage1_profile=args.stage1_profile,
@@ -1299,12 +1370,31 @@ def main():
                              keep_empty_rooms=args.keep_empty_rooms, room_override=args.room,
                              normalize_origin=not args.no_normalize_origin,
                              fill_missing_lights=not args.no_fill_missing_lights,
-                             allow_obj_fallback=args.allow_obj_fallback)
+                             allow_obj_fallback=args.allow_obj_fallback,
+                             filter_small_high_poly=args.filter_small_high_poly,
+                             small_high_poly_max_extent_m=args.small_high_poly_max_extent_m,
+                             small_high_poly_min_triangles=args.small_high_poly_min_triangles)
     md = am["metadata"]
     md["export_contract_version"] = int(manifest.get("export_contract_version") or 0)
     md["stage1_profile"] = str(manifest.get("stage1_profile") or "strict-pbr-v1")
     md["import_degraded"] = bool(validation_issues)
     md["manifest_validation_issues"] = validation_issues
+    if office_population_audit is not None:
+        md["office_population_audit"] = {
+            "schema": office_population_audit.get("schema"),
+            "status": "passed",
+            "profile": office_population_audit.get("profile"),
+            "audit_digest": office_population_audit.get("audit_digest"),
+            "asset_count": office_population_audit.get("asset_count"),
+        }
+        md["office_layout"] = {
+            "profile": office_layout_manifest.get("profile"),
+            "office_style": office_layout_manifest.get("office_style"),
+            "office_style_digest": office_layout_manifest.get("office_style_digest"),
+            "structural_glass_digest": (office_layout_manifest.get("structural_glass") or {}).get("digest"),
+            "work_bay_rooms": office_layout_manifest.get("work_bay_rooms"),
+            "reception_support_rooms": office_layout_manifest.get("reception_support_rooms"),
+        }
     print(f"[import] scene_id={scene_id} objects={len(am['objects'])} materials={len(am['materials'])} "
           f"trav={am['regions'][0]['geometry']['bounds']} (skipped {md.get('skipped_degenerate', 0)} degenerate)")
     print(f"[import] kept_rooms={md.get('kept_rooms')} dropped_rooms={md.get('dropped_rooms')} "
@@ -1329,8 +1419,19 @@ def main():
     result = install_shared_office_sample(
         REPO_ROOT, project_id=args.project_id, scene_id=scene_id,
         fixture_path=fixture_path, force=args.force,
+        # Infinigen import materializes OBJ/XML, not a colocated USD stage.
+        usd_ref=None,
         materialize_render_scene=not args.no_materialize,
     )
+    if office_population_audit is not None:
+        for filename, value in {
+            "office_population_audit.json": office_population_audit,
+            "office_layout_manifest.json": office_layout_manifest,
+        }.items():
+            target = scene_dir / filename
+            tmp = target.with_suffix(target.suffix + ".tmp")
+            tmp.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
+            tmp.replace(target)
     preserved_after = _preserved_scene_hashes(scene_dir) if preserved_before else {}
     if preserved_after != preserved_before:
         changed = sorted(set(preserved_before) ^ set(preserved_after) | {

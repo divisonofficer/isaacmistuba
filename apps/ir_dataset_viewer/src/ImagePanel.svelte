@@ -3,20 +3,23 @@
   export type ViewTransform = { zoom: number; offsetX: number; offsetY: number };
   type Cursor = { x: number; y: number } | null;
   interface Props {
-    title: string; url: string; width: number; height: number; available?: boolean;
+    title: string; url: string; fallbackUrl?: string; width: number; height: number; available?: boolean;
     transform: ViewTransform; cursor: Cursor;
     onTransform: (value: ViewTransform) => void;
     onProbe: (x: number, y: number) => void;
+    onPreviewLoaded?: (stage: 'fallback' | 'full') => void;
     eager?: boolean;
   }
-  let { title, url, width, height, available = true, transform, cursor, onTransform, onProbe, eager = false }: Props = $props();
+  let { title, url, fallbackUrl = '', width, height, available = true, transform, cursor, onTransform, onProbe, onPreviewLoaded, eager = false }: Props = $props();
   let svg = $state<SVGSVGElement>();
   let stage = $state<HTMLDivElement>();
   let dragging = $state(false);
   let moved = false;
   let lastX = 0; let lastY = 0;
   let intersected = $state(false);
-  let imageHref = $derived(intersected ? url : '');
+  let displayUrl = $state('');
+  let promotionToken = 0;
+  let imageHref = $derived(intersected ? displayUrl : '');
   const viewX = $derived((width - width / transform.zoom) / 2 + transform.offsetX);
   const viewY = $derived((height - height / transform.zoom) / 2 + transform.offsetY);
 
@@ -52,6 +55,15 @@
     const zoom = Math.max(1, Math.min(16, transform.zoom * Math.exp(-event.deltaY * 0.0015)));
     onTransform({ ...transform, zoom });
   }
+  $effect(() => {
+    const token = ++promotionToken;
+    const first = intersected ? (fallbackUrl || url) : '';
+    displayUrl = first;
+    if (!first || !url || first === url) return;
+    const full = new Image();
+    full.onload = () => { if (token === promotionToken) { displayUrl = url; onPreviewLoaded?.('full'); } };
+    full.src = url;
+  });
   onMount(() => {
     if (eager) { intersected = true; return; }
     if (!stage) return;
@@ -72,7 +84,7 @@
     {#if available}
       <svg bind:this={svg} viewBox={`${viewX} ${viewY} ${width / transform.zoom} ${height / transform.zoom}`}
         preserveAspectRatio="xMidYMid meet" role="img" aria-label={title}>
-        {#if imageHref}<image href={imageHref} x="0" y="0" width={width} height={height} />{:else}<text x={width / 2} y={height / 2} text-anchor="middle" class="loading">Preview pending</text>{/if}
+        {#if imageHref}<image href={imageHref} x="0" y="0" width={width} height={height} onload={() => { if (displayUrl === fallbackUrl && fallbackUrl !== url) onPreviewLoaded?.('fallback'); else if (displayUrl === url) onPreviewLoaded?.('full'); }} />{:else}<text x={width / 2} y={height / 2} text-anchor="middle" class="loading">Preview pending</text>{/if}
         {#if cursor}
           <line x1={cursor.x} y1="0" x2={cursor.x} y2={height} class="crosshair" vector-effect="non-scaling-stroke" />
           <line x1="0" y1={cursor.y} x2={width} y2={cursor.y} class="crosshair" vector-effect="non-scaling-stroke" />

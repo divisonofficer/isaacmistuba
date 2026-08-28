@@ -25,6 +25,9 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 NAV_SRC = REPO_ROOT / "modules" / "navigation_dataset" / "src"
 if str(NAV_SRC) not in sys.path:
     sys.path.insert(0, str(NAV_SRC))
+INFINIGEN_TOOLS = REPO_ROOT / "tools" / "infinigen"
+if str(INFINIGEN_TOOLS) not in sys.path:
+    sys.path.insert(0, str(INFINIGEN_TOOLS))
 
 from navigation_dataset.ir_principled import (  # noqa: E402
     DEFAULT_BASE_COLOR,
@@ -32,6 +35,8 @@ from navigation_dataset.ir_principled import (  # noqa: E402
     DEFAULT_ROUGHNESS,
     MATERIAL_CONTRACT_SCHEMA,
     MATERIAL_CONTRACT_VERSION,
+    METALLIC_CONTRACT_SCHEMA,
+    METALLIC_FAMILY_IDS,
     STAGE2_COMPILER_VERSION,
     PSEUDO_NIR_FORMULA_ID,
     SURROGATE_MIN_ROUGHNESS,
@@ -39,7 +44,14 @@ from navigation_dataset.ir_principled import (  # noqa: E402
     formula_contract,
     ceiling_softbox_specs,
     material_normalization_record,
+    metallic_contract_for_slot,
+    normalize_legacy_metallic_scalar,
     pbr_for_slot,
+    validate_metallic_contract,
+)
+from render_visibility_contract import (  # noqa: E402
+    hide_untracked_render_meshes,
+    visible_untracked_mesh_names,
 )
 
 
@@ -48,6 +60,9 @@ _AOV_TYPES = {
     "GT_BaseColorNIR": "COLOR",
     "GT_Roughness": "VALUE",
     "GT_Metallic": "VALUE",
+    "GT_MetallicFamilyID": "VALUE",
+    "GT_MetalCoverage": "VALUE",
+    "GT_ExposedMetal": "VALUE",
     "GT_GeometryNormalWorld": "COLOR",
     "GT_ShadingNormalWorld": "COLOR",
     "GT_MaterialID": "VALUE",
@@ -55,7 +70,131 @@ _AOV_TYPES = {
     "GT_SourceValid": "VALUE",
     "GT_Replacement": "VALUE",
     "GT_Fallback": "VALUE",
+    "GT_Remediated": "VALUE",
+    "GT_PBRProvenance": "VALUE",
 }
+
+
+def _source_scalar(channel: dict, default: float = 0.0) -> float:
+    value = channel.get("value") if isinstance(channel, dict) else None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, list) and value:
+        try:
+            return float(sum(float(item) for item in value) / len(value))
+        except (TypeError, ValueError):
+            pass
+    return float(default)
+
+
+def _effective_metallic_contract(
+    *, unit: dict, slot: int, source_material: str, semantic_class: str,
+    metallic_source: str, structural_binding: dict | None, prop_binding: dict | None,
+    legacy_fractional_normalization: dict | None = None,
+) -> dict:
+    """Resolve a physical family without inventing fractional metalness."""
+    # A reviewed structural overlay is the material authority for its slot.
+    # It deliberately takes precedence over authored Stage-1 metadata.
+    if structural_binding:
+        specification = structural_binding.get("metallic") or {}
+        mode = str(specification.get("mode") or "constant") if isinstance(specification, dict) else "constant"
+        if mode == "texture":
+            family, value, source = "coverage_mixed", 0.0, "remediated"
+        else:
+            value = float(specification.get("value") or 0.0) if isinstance(specification, dict) else 0.0
+            family = "conductor" if value >= 1.0 - 1e-6 else "dielectric"
+            source = "remediated"
+        return {
+            "schema": METALLIC_CONTRACT_SCHEMA, "family": family,
+            "representation": "spatial_texture" if family == "coverage_mixed" else "scalar",
+            "encoding": "linear_scalar", "color_space": "non_color", "source": source,
+            "approximation": "principled_coverage" if family == "coverage_mixed" else "none",
+            "generator_id": "external_structural_texturecan_v1" if family == "coverage_mixed"
+                            else "external_structural_conductor_v1" if family == "conductor"
+                            else "external_structural_dielectric_v1",
+            "seed": 0, "legacy_inferred": False,
+        }
+    authored = metallic_contract_for_slot(unit, slot)
+    if authored is not None:
+        valid, failures = validate_metallic_contract(authored)
+        if not valid:
+            raise RuntimeError(
+                f"{unit.get('id')} slot {slot}: invalid MetallicContractV2: {', '.join(failures)}"
+            )
+        return dict(authored)
+
+    pbr = pbr_for_slot(unit, slot)
+    channel = ((pbr.get("channels") or {}).get("metallic") or {})
+    if legacy_fractional_normalization:
+        value = float(legacy_fractional_normalization["effective_value"])
+        family = "conductor" if value >= 1.0 - 1e-6 else "dielectric"
+        source = "remediated"
+    elif semantic_class in {"window_glass", "mirror"}:
+        family, value, source = "dielectric", 0.0, "remediated"
+    elif prop_binding:
+        value = float((((prop_binding.get("profile") or {}).get("values") or {}).get("metallic", 0.0)))
+        family, source = ("conductor" if value >= 1.0 - 1e-6 else "dielectric"), "remediated"
+    elif metallic_source == "texture":
+        # A legacy authored metallic texture is retained as spatial coverage,
+        # never collapsed to a guessed scalar. Stage-0's near-binary audit is
+        # the authority that decides whether it is publishable.
+        family, value, source = "coverage_mixed", 0.0, "original"
+    else:
+        value = _source_scalar(channel, 0.0)
+        tokens = " ".join((source_material, str(unit.get("optical_class") or ""))).lower()
+        family = "conductor" if value >= 1.0 - 1e-6 or any(
+            token in tokens for token in ("metal", "alumin", "steel", "iron", "brass", "copper", "galvan", "brush")
+        ) else "dielectric"
+        source = "original"
+        if metallic_source == "constant" and 1e-6 < value < 1.0 - 1e-6:
+            raise RuntimeError(
+                f"{unit.get('id')} slot {slot}: uniform fractional metallic={value:g} is diagnostic-only"
+            )
+    generator_id = (
+        "legacy_uniform_fractional_snap_v1" if legacy_fractional_normalization
+        else "legacy_authored_coverage_v1" if family == "coverage_mixed"
+        else "legacy_pure_conductor_v1" if family == "conductor"
+        else "legacy_dielectric_v1"
+    )
+    result = {
+        "schema": METALLIC_CONTRACT_SCHEMA,
+        "family": family,
+        "representation": "spatial_texture" if family == "coverage_mixed" else "scalar",
+        "encoding": "linear_scalar",
+        "color_space": "non_color",
+        "source": source,
+        "approximation": "principled_coverage" if family == "coverage_mixed" else "none",
+        "generator_id": generator_id,
+        "seed": 0,
+        "legacy_inferred": True,
+    }
+    if legacy_fractional_normalization:
+        result["normalization"] = dict(legacy_fractional_normalization)
+    return result
+
+
+def _interior_structural_eligibility(unit: dict) -> dict:
+    """Mirror the manifest compiler's conservative no-furniture policy.
+
+    Keep this local because this bpy bootstrap intentionally depends only on
+    navigation_dataset; importing the converter package would initialize its
+    optional USD/Mitsuba dependencies in Blender's Python.
+    """
+    kind = str(unit.get("kind") or "").lower()
+    subtype = str(unit.get("subtype") or "").lower()
+    semantic = str(unit.get("semantic_type") or "").lower()
+    collections = [str(value).lower() for value in (unit.get("collections") or [])]
+    text = " ".join((semantic, subtype, *collections))
+    if kind != "structure": return {"eligible": False, "reason": "not_exporter_structure"}
+    if any(token in text for token in ("exterior", "outside", "door", "window", "glass", "mirror")):
+        return {"eligible": False, "reason": "excluded_structural_or_opening"}
+    if subtype not in {"wall", "floor", "ceiling", "column", "panel"}:
+        return {"eligible": False, "reason": "unknown_structural_subtype"}
+    room = next((name for name in collections if "room_" in name), None)
+    if room is None: return {"eligible": False, "reason": "missing_room_structural_membership"}
+    if subtype not in {"column", "panel"} and f"room_{subtype}" not in room:
+        return {"eligible": False, "reason": "room_membership_subtype_mismatch"}
+    return {"eligible": True, "reason": "interior_structural_slot"}
 
 
 def _args() -> argparse.Namespace:
@@ -82,6 +221,8 @@ def _args() -> argparse.Namespace:
     parser.add_argument("--illumination-manifest", type=Path)
     parser.add_argument("--structural-material-manifest", type=Path,
                         help="optional canonical external-PBR bindings for a rematerialized child scene")
+    parser.add_argument("--prop-material-manifest", type=Path,
+                        help="optional slot-local curated opaque-PBR overlay for small props")
     return parser.parse_args(argv)
 
 
@@ -156,24 +297,32 @@ def _image_socket(tree, path: Path, *, color: bool):
 
 
 def _external_pbr_socket(tree, binding: dict, channel: str):
-    key = {"base_color": "base_color", "roughness": "roughness", "metallic": None,
-           "normal": "normal_gl"}[channel]
+    key = {"base_color": "base_color", "roughness": "roughness", "normal": "normal_gl"}.get(channel)
+    if channel == "metallic":
+        specification = binding.get("metallic") or {"mode": "constant", "value": 0.0}
+        if isinstance(specification, dict) and specification.get("mode") == "texture":
+            key = str(specification.get("map") or "metallic")
+        else:
+            value = float(specification.get("value") or 0.0) if isinstance(specification, dict) else 0.0
+            return _value_constant(tree, value), "external_pbr_metallic_constant"
     if key is None:
-        return _value_constant(tree, 0.0), "external_fixed_zero"
+        raise ValueError(f"unsupported external PBR channel: {channel}")
     path = Path(str((binding.get("resolved_maps") or {}).get(key) or ""))
     socket = _image_socket(tree, path, color=channel == "base_color")
     if socket is None:
         raise FileNotFoundError(f"external PBR map missing: {binding.get('material_id')} {channel}")
     texture = socket.node
+    # Object coordinates are Blender length units; unlike Generated coordinates,
+    # they preserve the CC0 registry physical_size_m meter-repeat contract.
     texcoord = tree.nodes.new("ShaderNodeTexCoord")
     mapping = tree.nodes.new("ShaderNodeMapping")
     size = binding.get("physical_size_m") or {}
     width = max(float(size.get("width") or 1.0), 1e-4)
     height = max(float(size.get("height") or width), 1e-4)
     mapping.inputs["Scale"].default_value = (1.0 / width, 1.0 / height, 1.0)
-    tree.links.new(texcoord.outputs["Generated"], mapping.inputs["Vector"])
+    tree.links.new(texcoord.outputs["Object"], mapping.inputs["Vector"])
     tree.links.new(mapping.outputs["Vector"], texture.inputs["Vector"])
-    return socket, "external_pbr_texture"
+    return socket, "external_pbr_metallic_texture" if channel == "metallic" else "external_pbr_texture"
 
 
 def _rgb_constant(tree, value):
@@ -302,10 +451,25 @@ def _effective_input(*, route: str, artifact: str | None = None, color_space: st
     return result
 
 
+def _prop_pbr_socket(tree, binding: dict, channel: str):
+    """Curated props deliberately use constants until a map-backed profile is selected.
+
+    Constants are still an exact effective socket shared by Principled and the
+    AOV; the manifest records the profile digest and deterministic assignment.
+    """
+    values = ((binding.get("profile") or {}).get("values") or {})
+    if channel == "base_color":
+        return _rgb_constant(tree, values.get("base_color", DEFAULT_BASE_COLOR[:3])), "curated_profile_constant"
+    if channel == "normal":
+        return None, "geometry_normal_fallback"
+    default = DEFAULT_ROUGHNESS if channel == "roughness" else DEFAULT_METALLIC
+    return _value_constant(tree, float(values.get(channel, default))), "curated_profile_constant"
+
+
 def _make_material(
     *, stage1_dir: Path, unit: dict, slot: int, source_material: str,
     semantic_class: str, material_id: int, luminance_scale: float, luminance_bias: float,
-    structural_binding: dict | None = None, scene_id: str = "",
+    structural_binding: dict | None = None, prop_binding: dict | None = None, scene_id: str = "",
 ) -> tuple[object, dict]:
     decision = material_normalization_record(unit, source_material, semantic_class, slot=slot)
     material = bpy.data.materials.new(f"IRPBR::{unit['id']}::{slot:03d}")
@@ -328,10 +492,37 @@ def _make_material(
         rgb, rgb_source = _external_pbr_socket(tree, structural_binding, "base_color")
         roughness, rough_source = _external_pbr_socket(tree, structural_binding, "roughness")
         metallic, metallic_source = _external_pbr_socket(tree, structural_binding, "metallic")
+    elif prop_binding:
+        rgb, rgb_source = _prop_pbr_socket(tree, prop_binding, "base_color")
+        roughness, rough_source = _prop_pbr_socket(tree, prop_binding, "roughness")
+        metallic, metallic_source = _prop_pbr_socket(tree, prop_binding, "metallic")
     else:
         rgb, rgb_source = _channel_socket(tree, stage1_dir, unit, "base_color", slot)
         roughness, rough_source = _channel_socket(tree, stage1_dir, unit, "roughness", slot)
         metallic, metallic_source = _channel_socket(tree, stage1_dir, unit, "metallic", slot)
+
+    legacy_fractional_normalization = None
+    if (
+        not structural_binding
+        and not prop_binding
+        and semantic_class not in {"window_glass", "mirror"}
+        and metallic_contract_for_slot(unit, slot) is None
+        and metallic_source == "constant"
+    ):
+        metallic_channel = ((pbr_for_slot(unit, slot).get("channels") or {}).get("metallic") or {})
+        raw_metallic = _value_for_slot(metallic_channel, slot, DEFAULT_METALLIC)
+        try:
+            normalization = normalize_legacy_metallic_scalar(float(raw_metallic))
+        except (TypeError, ValueError):
+            normalization = None
+        if normalization and normalization["changed"]:
+            legacy_fractional_normalization = normalization
+            metallic = _value_constant(tree, float(normalization["effective_value"]))
+            metallic_source = "legacy_fractional_snap_v1"
+            decision["source_valid"] = False
+            decision["replacement"] = True
+            decision["replacement_reasons"].append(str(normalization["reason"]))
+            decision["legacy_fractional_metallic_normalization"] = dict(normalization)
     # These four sockets are the single authority for both rendering and GT.
     # Never create an AOV-only image sampler or fallback branch.
     effective_base_color_rgb = rgb
@@ -390,6 +581,8 @@ def _make_material(
         tree.links.new(normal_rgb, normal_map.inputs["Color"])
         raw_shading_normal = normal_map.outputs["Normal"]
         normal_source = "external_pbr_normal_texture"
+    elif prop_binding:
+        normal_source = "geometry_normal_fallback"
     elif normal_artifact:
         normal_rgb = _image_socket(tree, stage1_dir / str(normal_artifact), color=False)
         if normal_rgb is not None:
@@ -411,6 +604,19 @@ def _make_material(
     _aov(tree, "GT_BaseColorNIR", effective_base_color_nir, kind="COLOR")
     _aov(tree, "GT_Roughness", effective_roughness, kind="VALUE")
     _aov(tree, "GT_Metallic", effective_metallic, kind="VALUE")
+    metallic_contract = _effective_metallic_contract(
+        unit=unit, slot=slot, source_material=source_material,
+        semantic_class=semantic_class, metallic_source=metallic_source,
+        structural_binding=structural_binding, prop_binding=prop_binding,
+        legacy_fractional_normalization=legacy_fractional_normalization,
+    )
+    family = str(metallic_contract["family"])
+    family_id = METALLIC_FAMILY_IDS[family]
+    family_membership = _value_constant(tree, float(family in {"conductor", "coverage_mixed"}))
+    exposed_metal = effective_metallic if family == "coverage_mixed" else family_membership
+    _aov(tree, "GT_MetallicFamilyID", _value_constant(tree, float(family_id)), kind="VALUE")
+    _aov(tree, "GT_MetalCoverage", family_membership, kind="VALUE")
+    _aov(tree, "GT_ExposedMetal", exposed_metal, kind="VALUE")
     _aov(tree, "GT_GeometryNormalWorld", geometry.outputs["True Normal"], kind="COLOR")
     _aov(tree, "GT_ShadingNormalWorld", effective_shading_normal, kind="COLOR")
     _aov(tree, "GT_MaterialID", _value_constant(tree, material_id), kind="VALUE")
@@ -418,6 +624,10 @@ def _make_material(
     _aov(tree, "GT_SourceValid", _value_constant(tree, float(decision["source_valid"])), kind="VALUE")
     _aov(tree, "GT_Replacement", _value_constant(tree, float(decision["replacement"])), kind="VALUE")
     _aov(tree, "GT_Fallback", _value_constant(tree, float(bool(decision["fallback_channels"]))), kind="VALUE")
+    remediated = bool(structural_binding) or bool(prop_binding) or bool(legacy_fractional_normalization)
+    provenance_code = 3 if remediated else (5 if semantic_class in {"window_glass", "mirror"} else (1 if decision["source_valid"] else 4))
+    _aov(tree, "GT_Remediated", _value_constant(tree, float(remediated)), kind="VALUE")
+    _aov(tree, "GT_PBRProvenance", _value_constant(tree, float(provenance_code)), kind="VALUE")
 
     material["ir_material_contract"] = MATERIAL_CONTRACT_VERSION
     material["ir_object_id"] = str(unit["id"])
@@ -426,8 +636,14 @@ def _make_material(
     material["ir_source_valid"] = bool(decision["source_valid"])
     material["ir_replacement"] = bool(decision["replacement"])
     material["ir_fallback"] = bool(decision["fallback_channels"])
+    material["ir_remediated"] = remediated
+    material["ir_pbr_provenance_class"] = provenance_code
+    material["ir_metallic_family"] = family
+    material["ir_metallic_contract"] = json.dumps(metallic_contract, sort_keys=True)
     decision["prepared_material"] = material.name
     decision["material_id"] = material_id
+    decision["metallic_contract"] = metallic_contract
+    decision["metallic_family_id"] = family_id
     decision["channel_runtime_sources"] = {
         "base_color": rgb_source, "roughness": rough_source,
         "metallic": metallic_source, "normal": normal_source,
@@ -436,11 +652,18 @@ def _make_material(
     source_channels = (slot_pbr.get("channels") or {})
     def artifact_for(name: str):
         return channel_artifacts.get(name) or (source_channels.get(name) or {}).get("ref")
+    def external_artifact_for(name: str):
+        if name == "metallic":
+            specification = (structural_binding or {}).get("metallic") or {}
+            key = str(specification.get("map") or "metallic") if specification.get("mode") == "texture" else None
+        else:
+            key = {"base_color": "base_color", "roughness": "roughness", "normal": "normal_gl"}[name]
+        return ((structural_binding or {}).get("resolved_maps") or {}).get(key) if key else None
     decision["effective_inputs"] = {
         "base_color_rgb": _effective_input(
             route=rgb_source,
-            artifact=artifact_for("base_color") if rgb_source == "texture" else None,
-            color_space="sRGB" if rgb_source == "texture" else None,
+            artifact=(artifact_for("base_color") if rgb_source == "texture" else external_artifact_for("base_color") if rgb_source == "external_pbr_texture" else None),
+            color_space="sRGB" if rgb_source in {"texture", "external_pbr_texture"} else None,
         ),
         "base_color_nir": _effective_input(
             route="derived_from_effective_base_color_rgb",
@@ -448,19 +671,19 @@ def _make_material(
         ),
         "roughness": _effective_input(
             route=rough_source,
-            artifact=artifact_for("roughness") if rough_source == "texture" else None,
-            color_space="Non-Color" if rough_source == "texture" else None,
+            artifact=(artifact_for("roughness") if rough_source == "texture" else external_artifact_for("roughness") if rough_source == "external_pbr_texture" else None),
+            color_space="Non-Color" if rough_source == "texture" or rough_source == "external_pbr_texture" else None,
         ),
         "metallic": _effective_input(
             route=metallic_source,
-            artifact=artifact_for("metallic") if metallic_source == "texture" else None,
-            color_space="Non-Color" if metallic_source == "texture" else None,
+            artifact=(artifact_for("metallic") if metallic_source == "texture" else external_artifact_for("metallic") if metallic_source == "external_pbr_metallic_texture" else None),
+            color_space="Non-Color" if metallic_source in {"texture", "external_pbr_metallic_texture"} else None,
         ),
         "normal_shading_world": _effective_input(
             route=normal_source,
-            artifact=str(normal_artifact) if normal_source == "normal_map_texture" else None,
-            color_space="Non-Color" if normal_source == "normal_map_texture" else None,
-            expression=("normalize(tangent_space_normal_map_to_world)" if normal_source == "normal_map_texture"
+            artifact=(str(normal_artifact) if normal_source == "normal_map_texture" else external_artifact_for("normal") if normal_source == "external_pbr_normal_texture" else None),
+            color_space="Non-Color" if normal_source in {"normal_map_texture", "external_pbr_normal_texture"} else None,
+            expression=("normalize(tangent_space_normal_map_to_world)" if normal_source in {"normal_map_texture", "external_pbr_normal_texture"}
                         else "Geometry.Normal world-space fallback"),
         ),
         "normal_geometry_world": _effective_input(
@@ -468,12 +691,22 @@ def _make_material(
         ),
     }
     decision["material_instance_id"] = f"{scene_id}:{unit['id']}:{slot}"
+    decision["remediated_pbr"] = remediated
+    decision["pbr_provenance_class"] = {1: "source_authored", 3: "curated_remediated", 4: "fallback", 5: "semantic_surrogate"}[provenance_code]
+    if prop_binding:
+        decision["prop_remediation"] = {
+            "policy": "hybrid_prop_pbr_v1", "profile_id": prop_binding.get("profile_id"),
+            "profile_digest": prop_binding.get("profile_digest"), "assignment_seed": prop_binding.get("assignment_seed"),
+            "source_route": prop_binding.get("source_channels"),
+        }
     if structural_binding:
         decision["structural_rematerialization"] = {
             "material_id": structural_binding.get("material_id"),
             "projection": structural_binding.get("projection"),
             "maps": structural_binding.get("maps"),
             "map_sha256": structural_binding.get("map_sha256"),
+            "approved_roles": structural_binding.get("approved_roles"),
+            "metallic": structural_binding.get("metallic"),
         }
     return material, decision
 
@@ -673,13 +906,36 @@ def main() -> int:
     semantic = _semantic_index(args.semantic_regions.resolve() if args.semantic_regions else None)
     structural_manifest = None
     structural_bindings = {}
+    prop_manifest = None
+    prop_bindings = {}
+    prop_audit = {}
     if args.structural_material_manifest:
         structural_manifest = json.loads(args.structural_material_manifest.read_text(encoding="utf-8"))
         if structural_manifest.get("schema") != "robomituba.ir_structural_rematerialization.v1":
             raise RuntimeError("unsupported structural rematerialization manifest")
+        selection = structural_manifest.get("selection") or {}
+        if selection.get("policy") not in {"interior_structure_only_v1", "interior_structure_only_v2_role_curated", "interior_structure_only_v3_explicit_roles"}:
+            raise RuntimeError("structural rematerialization manifest lacks interior-only selection policy")
         for binding in structural_manifest.get("bindings") or []:
-            structural_bindings[(str(binding.get("unit_id")), int(binding.get("slot_index") or 0))] = binding
+            if not bool((binding.get("eligibility") or {}).get("eligible")):
+                raise RuntimeError("external PBR binding is not marked interior-structural eligible")
+            key = (str(binding.get("unit_id")), int(binding.get("slot_index") or 0))
+            if key in structural_bindings:
+                raise RuntimeError(f"duplicate external PBR binding for {key}")
+            structural_bindings[key] = binding
         digest_paths.append(args.structural_material_manifest.resolve())
+    if args.prop_material_manifest:
+        prop_manifest = json.loads(args.prop_material_manifest.read_text(encoding="utf-8"))
+        if prop_manifest.get("schema") != "robomituba.ir_prop_pbr_remediation.v1":
+            raise RuntimeError("unsupported prop PBR remediation manifest")
+        for binding in prop_manifest.get("bindings") or []:
+            key = (str(binding.get("unit_id")), int(binding.get("slot_index") or 0))
+            if key in prop_bindings or not bool((binding.get("eligibility") or {}).get("eligible")):
+                raise RuntimeError(f"invalid prop PBR binding for {key}")
+            prop_bindings[key] = binding
+        for row in prop_manifest.get("audit") or []:
+            prop_audit[(str(row.get("unit_id")), int(row.get("slot_index") or 0))] = row
+        digest_paths.append(args.prop_material_manifest.resolve())
     if args.semantic_regions and args.semantic_regions.is_file():
         digest_paths.append(args.semantic_regions.resolve())
     if args.room_manifest and args.room_manifest.is_file():
@@ -687,6 +943,7 @@ def main() -> int:
 
     records = []
     missing_objects = []
+    applied_binding_keys = set()
     material_id = 1
     object_id = 1
     for unit in units:
@@ -703,14 +960,31 @@ def main() -> int:
                 obj.data.materials[slot].name if obj.data.materials[slot] else f"missing_slot_{slot}"
             )
             semantic_class = semantic.get((str(unit["id"]), str(source_name)), "none")
+            binding = structural_bindings.get((str(unit["id"]), slot))
+            prop_binding = prop_bindings.get((str(unit["id"]), slot))
+            eligibility = _interior_structural_eligibility(unit)
+            if binding and not eligibility["eligible"]:
+                raise RuntimeError(
+                    f"refusing external PBR on nonstructural unit {unit['id']} slot {slot}: "
+                    f"{eligibility['reason']}"
+                )
+            if binding:
+                applied_binding_keys.add((str(unit["id"]), slot))
+            if prop_binding:
+                applied_binding_keys.add(("prop", str(unit["id"]), slot))
             material, record = _make_material(
                 stage1_dir=stage1_dir, unit=unit, slot=slot,
                 source_material=str(source_name), semantic_class=semantic_class,
                 material_id=material_id,
                 luminance_scale=args.luminance_scale, luminance_bias=args.luminance_bias,
-                structural_binding=structural_bindings.get((str(unit["id"]), slot)),
+                structural_binding=binding,
+                prop_binding=prop_binding,
                 scene_id=str((structural_manifest or {}).get("child_scene_id") or manifest.get("scene_id") or ""),
             )
+            prop_row = prop_audit.get((str(unit["id"]), slot))
+            if prop_row is not None:
+                record["prop_pbr_eligibility"] = prop_row.get("eligibility")
+                record["prop_pbr_action"] = prop_row.get("action")
             obj.data.materials[slot] = material
             records.append(record)
             material_id += 1
@@ -721,6 +995,24 @@ def main() -> int:
 
     if missing_objects:
         raise RuntimeError(f"Stage-1 derived blend lacks {len(missing_objects)} unit object(s): {missing_objects[:8]}")
+    unused_bindings = set(structural_bindings) - applied_binding_keys
+    if unused_bindings:
+        raise RuntimeError(f"external PBR bindings did not map to a prepared structural slot: {sorted(unused_bindings)[:8]}")
+    unused_prop_bindings = {("prop", *key) for key in prop_bindings} - applied_binding_keys
+    if unused_prop_bindings:
+        raise RuntimeError(f"prop PBR bindings did not map to a prepared slot: {sorted(unused_prop_bindings)[:8]}")
+
+    tracked_object_names = {
+        str(unit.get("blender_name") or "") for unit in units
+        if str(unit.get("blender_name") or "")
+    }
+    untracked_mesh_audit = hide_untracked_render_meshes(bpy.data.objects, tracked_object_names)
+    visible_untracked = visible_untracked_mesh_names(bpy.data.objects, tracked_object_names)
+    if visible_untracked:
+        raise RuntimeError(
+            "render-visible meshes lack Stage-1/PBR AOV bindings: "
+            f"{visible_untracked[:12]}"
+        )
 
     _prepare_view_layer()
     ambient_fill = _install_ambient_fill(args)
@@ -739,6 +1031,8 @@ def main() -> int:
         counts["replacement"] += int(record["replacement"])
         counts[f"semantic_{record['semantic_class']}"] += 1
         counts["fallback"] += int(bool(record["fallback_channels"]))
+        counts["remediated_pbr"] += int(bool(record.get("remediated_pbr")))
+        counts[f"metallic_family_{(record.get('metallic_contract') or {}).get('family', 'unknown')}"] += 1
     contract = {
         "schema": MATERIAL_CONTRACT_SCHEMA,
         "contract_version": MATERIAL_CONTRACT_VERSION,
@@ -752,6 +1046,8 @@ def main() -> int:
         "stage1_contract_digest": files_digest(digest_paths),
         "structural_rematerialization": structural_manifest,
         "structural_rematerialization_sha256": (_sha256(args.structural_material_manifest) if args.structural_material_manifest else None),
+        "prop_pbr_remediation": prop_manifest,
+        "prop_pbr_remediation_sha256": (_sha256(args.prop_material_manifest) if args.prop_material_manifest else None),
         "material_model": {
             "name": "Blender 4.2 Principled Metallic-Roughness Subset",
             "variable_parameters": ["base_color", "roughness", "metallic", "normal"],
@@ -765,9 +1061,15 @@ def main() -> int:
             "base_color_rgb": "effective Principled Base Color RGB branch",
             "base_color_nir": "effective Principled Base Color selected NIR branch",
             "roughness": "effective Principled Roughness input",
-            "metallic": "effective Principled Metallic input",
+            "metallic": "raw effective Principled Metallic input (linear Non-Color; no GT-only correction)",
+            "metallic_family_id": "0 dielectric; 1 conductor; 2 coverage_mixed",
+            "metal_coverage_mask": "membership in a conductor or coverage-mixed material family",
+            "exposed_metal_mask": "effective exposed conductor coverage; equals effective metallic for coverage_mixed",
             "normal_geometry_world": "Geometry.True Normal in world space",
             "normal_shading_world": "effective Principled Normal input in world space, after tangent normal-map evaluation",
+            "remediated_pbr_mask": "curated opaque PBR patch for an eligible small prop",
+            "train_pbr_valid_mask": "source_valid_mask OR remediated_pbr_mask",
+            "pbr_provenance_class": "1 source-authored; 3 curated-remediated; 4 fallback; 5 semantic-surrogate",
         },
         "pseudo_nir": formula_contract(),
         "pseudo_nir_ablation": {
@@ -802,6 +1104,16 @@ def main() -> int:
         "illumination_manifest": (json.loads(args.illumination_manifest.read_text(encoding="utf-8")) if args.illumination_manifest and args.illumination_manifest.is_file() else None),
         "illumination_manifest_sha256": (_sha256(args.illumination_manifest) if args.illumination_manifest and args.illumination_manifest.is_file() else None),
         "counts": dict(counts),
+        "render_visibility_contract": {
+            "policy": "stage1_authority_or_hidden_v1",
+            "tracked_mesh_count": len(tracked_object_names),
+            "untracked_mesh_count": len(untracked_mesh_audit),
+            "newly_hidden_mesh_count": sum(
+                int(row["was_render_visible"]) for row in untracked_mesh_audit
+            ),
+            "visible_untracked_mesh_count": 0,
+            "untracked_meshes": untracked_mesh_audit,
+        },
         "materials": records,
     }
     args.out_contract.parent.mkdir(parents=True, exist_ok=True)

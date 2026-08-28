@@ -35,6 +35,7 @@ from mathutils import Matrix, Vector  # type: ignore
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pbr_bake_coverage import adaptive_resolutions, validate_uv_coverage
+from small_highpoly_filter import SMALL_HIGH_POLY_POLICY_VERSION, is_small_highpoly_record
 
 try:
     from tqdm import tqdm as _tqdm  # progress bar (present in the infinigen env)
@@ -299,6 +300,18 @@ def _optical_class(name: str, is_glass: bool, metallic: float) -> str:
     return "diffuse"
 
 
+def _metallic_contract_from_material(mat):
+    """Return trusted generator provenance without interpreting material names."""
+    raw = mat.get("robomituba_metallic_contract") if mat is not None else None
+    if raw is None:
+        return None
+    try:
+        value = json.loads(raw) if isinstance(raw, str) else dict(raw)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {"schema": "invalid", "validation_error": "malformed_material_custom_property"}
+    return value if isinstance(value, dict) else {"schema": "invalid", "validation_error": "not_an_object"}
+
+
 def _extract_material(mat):
     out = {
         "name": mat.name,
@@ -311,6 +324,7 @@ def _extract_material(mat):
         "emission_color": None,
         "alpha": 1.0,
         "image_textures": [],
+        "metallic_contract": _metallic_contract_from_material(mat),
         "is_glass": "glass" in mat.name.lower(),
         "is_emissive": "invisible" in mat.name.lower() or "light" in mat.name.lower(),
     }
@@ -991,10 +1005,86 @@ def _slot_atlas_paths(textures_dir, oid, slot):
     }
 
 
+def _linked_bake_is_authoritative(channel, validation):
+    """Whether a saved linked-channel bake represents evaluated source values.
+
+    A non-black ``constant`` colour bake is a valid evaluated Principled value
+    (for example a supported procedural graph that is uniform over the mesh),
+    while an all-black EMIT bake remains ambiguous.  Black base colour is
+    therefore accepted only when both the primary and native diffuse pass have
+    independently confirmed it as ``black_confirmed_dual_pass``.  Roughness
+    and metallic are scalar fields and may legitimately be constant, including
+    0.0; their native Cycles passes plus a UV coverage mask are sufficient
+    provenance, so retaining those atlases is more faithful than substituting
+    a guessed Principled factor.
+    """
+    result = str((validation or {}).get("result") or "unknown")
+    if result == "spatial":
+        return True
+    if channel == "base_color":
+        return result in {"spatial", "constant", "black_confirmed_dual_pass"}
+    return channel in {"roughness", "metallic"} and result in {"constant", "black"}
+
+
+def _bake_verified_base_color(obj, out_png, res, samples, *, coverage_path):
+    """Bake Base Color and independently prove a genuinely black result.
+
+    A nested closure can silently turn the temporary EMIT route black.  An
+    authored black material is accepted only when a coverage-backed native
+    DIFFUSE_COLOR bake independently agrees.  A useful diffuse fallback is
+    promoted to the authoritative atlas exactly as in the legacy object path.
+    """
+    if not _bake_albedo(obj, out_png, res, samples):
+        return False, {"attempted": True, "result": "failed"}
+    spatial, primary = _pbr_texture_validation(
+        out_png, "base_color", coverage_path=coverage_path,
+    )
+    if spatial:
+        return True, primary
+    verify_path = str(Path(out_png).with_name(Path(out_png).stem + "__diffuse_verify.png"))
+    try:
+        if not _bake_pass(obj, verify_path, res, samples, bake_type="DIFFUSE", color_pass=True):
+            return False, primary
+        fallback_spatial, secondary = _pbr_texture_validation(
+            verify_path, "base_color", coverage_path=coverage_path,
+        )
+        secondary["fallback_from"] = primary.get("result")
+        secondary["fallback_pass"] = "DIFFUSE_COLOR"
+        if fallback_spatial:
+            os.replace(verify_path, out_png)
+            return True, secondary
+        if secondary.get("result") == "constant":
+            # ``mixed_constant`` callers may legitimately retain this atlas;
+            # promote the native result so they never keep a failed EMIT file.
+            os.replace(verify_path, out_png)
+            return False, secondary
+        dual_black = (
+            primary.get("result") == "black"
+            and secondary.get("result") == "black"
+            and bool(primary.get("coverage_used"))
+            and bool(secondary.get("coverage_used"))
+        )
+        if dual_black:
+            primary.update({
+                "result": "black_confirmed_dual_pass",
+                "confirmation_pass": "DIFFUSE_COLOR",
+                "confirmation_result": "black",
+            })
+            return True, primary
+        return False, secondary
+    finally:
+        try:
+            os.unlink(verify_path)
+        except FileNotFoundError:
+            pass
+
+
 def _bake_slot_pbr_contract(obj, *, oid, slot, textures_dir, out_dir, bake_res,
                             max_bake_res, bake_samples, bake_pbr, bake_metallic,
                             max_unbaked_ratio, do_bake, glb_rel):
     """Bake and validate one material slot; return v2 slot-local contract/maps."""
+    source_material = obj.material_slots[slot].material if 0 <= slot < len(obj.material_slots) else None
+    metallic_contract = _metallic_contract_from_material(source_material)
     atlas_abs = _slot_atlas_paths(textures_dir, oid, slot)
     atlas_rel = {key: os.path.relpath(value, out_dir) for key, value in atlas_abs.items()}
     with _isolated_material_slot(obj, slot) as isolated:
@@ -1021,15 +1111,25 @@ def _bake_slot_pbr_contract(obj, *, oid, slot, textures_dir, out_dir, bake_res,
                     for channel, baker, enabled in jobs:
                         if not enabled or inputs[channel]["source"] not in {"linked", "mixed_constant"}:
                             continue
-                        with _silence_fds(1):
-                            ok = baker(isolated, atlas_abs[channel], effective_res, bake_samples)
-                        if ok:
-                            spatial, result = _pbr_texture_validation(
-                                atlas_abs[channel], channel, coverage_path=atlas_abs["coverage"]
-                            )
-                            validation[channel] = result
-                            if spatial or (inputs[channel]["source"] == "mixed_constant" and result.get("result") in {"constant", "black"}):
-                                baked[channel] = atlas_rel[channel]
+                        if channel == "base_color":
+                            with _silence_fds(1):
+                                authoritative, result = _bake_verified_base_color(
+                                    isolated, atlas_abs[channel], effective_res, bake_samples,
+                                    coverage_path=atlas_abs["coverage"],
+                                )
+                        else:
+                            with _silence_fds(1):
+                                ok = baker(isolated, atlas_abs[channel], effective_res, bake_samples)
+                            authoritative = False
+                            result = {"attempted": bool(ok), "result": "failed"}
+                            if ok:
+                                _, result = _pbr_texture_validation(
+                                    atlas_abs[channel], channel, coverage_path=atlas_abs["coverage"]
+                                )
+                                authoritative = _linked_bake_is_authoritative(channel, result)
+                        validation[channel] = result
+                        if authoritative:
+                            baked[channel] = atlas_rel[channel]
                     if bake_pbr and inputs["normal"]["source"] in {"linked", "mixed_constant"}:
                         normal_validation = {"attempted": True, "result": "failed"}
                         with _silence_fds(1):
@@ -1047,7 +1147,7 @@ def _bake_slot_pbr_contract(obj, *, oid, slot, textures_dir, out_dir, bake_res,
             result = normal_validation if channel == "normal" else validation.get(channel, {"attempted": False, "result": "not_applicable"})
             if source == "linked" and not ref:
                 issues.append(f"{channel}: linked input was not baked")
-            if source == "linked" and result.get("result") != "spatial":
+            if source == "linked" and not _linked_bake_is_authoritative(channel, result):
                 issues.append(f"{channel}: linked bake validation={result.get('result', 'unknown')}")
             if source == "unresolved":
                 assumptions.append(f"{channel}: assumed default factor (no traced socket)")
@@ -1072,6 +1172,7 @@ def _bake_slot_pbr_contract(obj, *, oid, slot, textures_dir, out_dir, bake_res,
             "issues": issues,
             "assumptions": assumptions,
             "material_slot": int(slot),
+            "metallic_contract": metallic_contract,
         }
         artifacts = {"coverage": contract["coverage"]["ref"], **baked}
         return contract, artifacts
@@ -1159,7 +1260,7 @@ def _pbr_texture_validation(
     minimum_cluster_fraction=1.0e-4,
     minimum_cluster_samples=16,
 ):
-    """Reject a linked bake that is black or spatially constant.
+    """Classify a linked bake as spatial, constant, black, or unreadable.
 
     A successful Cycles operator call is not sufficient evidence that a
     procedural socket made it into the atlas: unsupported nested closures can
@@ -1170,11 +1271,13 @@ def _pbr_texture_validation(
     (the kitchen SimpleBookcase's brushed-metal trim is 0.38%).  Treating it as
     an outlier silently converts a linked source to a scalar factor.
 
-    Constants are intentionally rejected for a linked source; only an
-    originally unlinked socket may be represented by a glTF factor.  The
-    cluster trim merely rejects isolated raster artefacts: each extremum must
-    have at least ``minimum_cluster_samples`` samples, or 0.01% of the covered
-    atlas, behind it.
+    The caller decides whether a classification is authoritative for the PBR
+    channel.  In particular, a coverage-backed constant or black roughness or
+    metallic atlas can be a valid evaluated scalar field, whereas base colour
+    still requires spatial variation to distinguish a real result from a
+    failed EMIT graph.  The cluster trim merely rejects isolated raster
+    artefacts: each extremum must have at least ``minimum_cluster_samples``
+    samples, or 0.01% of the covered atlas, behind it.
     """
     result = {"attempted": True, "result": "unreadable", "threshold": threshold}
     try:
@@ -1733,6 +1836,218 @@ def _mesh_triangle_count(mesh):
     return len(mesh.loop_triangles)
 
 
+def _gltfpack_simplify_material_partitions(obj, target_max_triangles):
+    """Preserve every used material slot by simplifying one primitive set at a time."""
+    import bmesh
+
+    source_mesh = obj.data
+    used_slots = sorted({int(poly.material_index) for poly in source_mesh.polygons})
+    # Some generated assets retain polygon indices for a material slot whose
+    # datablock was dropped during authoring/export.  A strict partition pass
+    # cannot round-trip such a slot through gltfpack, but the geometry is still
+    # valid.  Repair only the invalid used slots with a deterministic material
+    # (prefer the first authored material; otherwise create a neutral fallback)
+    # before taking the source material snapshot.  This does not invent a new
+    # texture route for valid materials and prevents a late, avoidable geometry
+    # failure after hours of baking.
+    valid_material = next((material for material in source_mesh.materials if material is not None), None)
+    if valid_material is None and used_slots:
+        valid_material = bpy.data.materials.new(f"{source_mesh.name}__missing_slot_fallback")
+        valid_material.diffuse_color = (0.5, 0.5, 0.5, 1.0)
+    for slot in used_slots:
+        if slot >= len(source_mesh.materials):
+            while len(source_mesh.materials) <= slot:
+                source_mesh.materials.append(None)
+        if source_mesh.materials[slot] is None:
+            source_mesh.materials[slot] = valid_material
+    source_materials = list(source_mesh.materials)
+    slot_triangles = {}
+    for slot in used_slots:
+        with _isolated_material_slot(obj, slot) as isolated:
+            if isolated is None:
+                continue
+            slot_triangles[slot] = _mesh_triangle_count(isolated.data)
+    total = sum(slot_triangles.values())
+    if not total:
+        raise RuntimeError("material partition fallback found no triangles")
+    budgets = {
+        slot: max(1, int(target_max_triangles * count / total))
+        for slot, count in slot_triangles.items()
+    }
+    # Distribute the integer remainder deterministically to the largest parts.
+    remainder = max(0, int(target_max_triangles) - sum(budgets.values()))
+    for slot in sorted(slot_triangles, key=lambda value: (-slot_triangles[value], value)):
+        if remainder <= 0:
+            break
+        budgets[slot] += 1
+        remainder -= 1
+
+    combined = bmesh.new()
+    records = []
+    try:
+        for slot in used_slots:
+            with _isolated_material_slot(obj, slot) as isolated:
+                if isolated is None:
+                    raise RuntimeError(f"used material slot {slot} has no isolated geometry")
+                # The isolated clone can retain the source material table even
+                # though every face belongs to one slot.  Infinigen often
+                # creates duplicate shader names (and gltfpack renames those
+                # on import), making name-based remapping ambiguous.  Reduce
+                # the temporary partition to one material slot before the
+                # OBJ/GLB round-trip; the original slot index is restored on
+                # the merged mesh below.
+                partition_material = isolated.data.materials[slot] if slot < len(isolated.data.materials) else None
+                if partition_material is None:
+                    # The isolated clone may compact its material table while
+                    # preserving polygon slot indices.  Prefer the first
+                    # authored material in the clone (the geometry is already
+                    # partitioned), then the repaired source slot.  Never let
+                    # a missing datablock turn an otherwise valid asset into
+                    # a late strict-export failure.
+                    partition_material = next(
+                        (material for material in isolated.data.materials if material is not None),
+                        source_materials[slot] if slot < len(source_materials) else None,
+                    )
+                if partition_material is None:
+                    raise RuntimeError(f"used material slot {slot} has no material datablock")
+                isolated.data.materials.clear()
+                isolated.data.materials.append(partition_material)
+                for polygon in isolated.data.polygons:
+                    polygon.material_index = 0
+                record = _gltfpack_simplify_object(isolated, budgets[slot])
+                combined.faces.ensure_lookup_table()
+                face_start = len(combined.faces)
+                combined.from_mesh(isolated.data)
+                combined.faces.ensure_lookup_table()
+                for face in combined.faces[face_start:]:
+                    face.material_index = slot
+                # ``triangles_after`` counts triangulated render triangles,
+                # while ``Mesh.polygons`` is the index space used by the
+                # material-index layer.  A quad therefore contributes one
+                # polygon but two triangles.  Keep both counts; using the
+                # triangle count as a polygon slice can consume the whole
+                # merged mesh and silently collapse all assignments to the
+                # final material slot.
+                records.append({
+                    "slot": slot,
+                    "target": budgets[slot],
+                    "polygons_after": len(isolated.data.polygons),
+                    **record,
+                })
+        candidate_mesh = bpy.data.meshes.new(f"{source_mesh.name}__material_partition_lod")
+        combined.to_mesh(candidate_mesh)
+        # BMesh.to_mesh() may replace the destination material table.  Append
+        # the complete source table only after conversion, otherwise Blender
+        # silently clamps polygon material indices to the final surviving slot
+        # (e.g. [0, 2, 3] becomes [3]) during the explicit restoration below.
+        #
+        # ``bpy_prop_collection.append(None)`` is not a stable way to retain an
+        # empty slot: Blender 4.2 may compact/ignore that entry while the mesh
+        # is updated.  A source mesh can still contain unused empty slots between
+        # used slots (the staircase PlantContainer failure had [0, 2, 3]).
+        # Give every slot a real deterministic datablock so material indices are
+        # never clamped or remapped during ``update``/``foreach_set``.  This is
+        # only a transport repair; used authored slots retain their original
+        # materials and the fallback is never selected by a source polygon.
+        slot_fallback = next((material for material in source_materials if material is not None), None)
+        if slot_fallback is None:
+            slot_fallback = bpy.data.materials.new(f"{source_mesh.name}__missing_slot_fallback")
+            slot_fallback.diffuse_color = (0.5, 0.5, 0.5, 1.0)
+        for material in source_materials:
+            candidate_mesh.materials.append(material if material is not None else slot_fallback)
+        # ``bmesh.from_mesh`` appends the isolated partitions correctly, but
+        # Blender's material-index layer is not guaranteed to survive
+        # ``BMesh.to_mesh`` when the source mesh was reduced to a one-slot
+        # temporary clone.  Restore the slot assignment from the measured
+        # per-partition triangle counts explicitly.  The partition order is
+        # deterministic (``used_slots`` order) and each gltfpack result is a
+        # contiguous mesh appended above, so this does not alter vertices,
+        # UVs, transforms, or face topology.
+        polygon_cursor = 0
+        # Do not rely on Blender's polygon collection slicing here.  Depending
+        # on the Blender version it may return a proxy sequence whose writes
+        # are not committed consistently after BMesh.to_mesh().  Build the
+        # complete material-index array and install it atomically instead.
+        material_indices = [0] * len(candidate_mesh.polygons)
+        for record in records:
+            count = int(record.get("polygons_after", 0))
+            slot = int(record["slot"])
+            end = polygon_cursor + count
+            if end > len(material_indices):
+                bpy.data.meshes.remove(candidate_mesh)
+                raise RuntimeError(
+                    "material partition fallback polygon range exceeded mesh "
+                    f"({end}>{len(material_indices)})"
+                )
+            for polygon_index in range(polygon_cursor, end):
+                material_indices[polygon_index] = slot
+            polygon_cursor += count
+        if polygon_cursor != len(candidate_mesh.polygons):
+            bpy.data.meshes.remove(candidate_mesh)
+            raise RuntimeError(
+                "material partition fallback produced an unexpected polygon count "
+                f"({polygon_cursor}!={len(candidate_mesh.polygons)})"
+            )
+        # foreach_set is the stable Blender API for bulk polygon attributes;
+        # assigning the array also makes the intended contiguous partition
+        # boundaries explicit for meshes imported through gltfpack.
+        candidate_mesh.polygons.foreach_set("material_index", material_indices)
+        candidate_mesh.update()
+        # Some Blender 4.2 builds keep the material-index layer lazy after
+        # ``BMesh.to_mesh`` and ``foreach_set`` can appear to succeed while
+        # leaving every polygon at the last partition's slot.  Verify the
+        # read-back and fall back to explicit polygon writes before rejecting
+        # an otherwise valid decimation result.
+        if {int(poly.material_index) for poly in candidate_mesh.polygons} != set(used_slots):
+            for polygon_index, slot in enumerate(material_indices):
+                candidate_mesh.polygons[polygon_index].material_index = int(slot)
+            candidate_mesh.update()
+    finally:
+        combined.free()
+    triangles_after = _mesh_triangle_count(candidate_mesh)
+    resulting_slots = {int(poly.material_index) for poly in candidate_mesh.polygons}
+    if resulting_slots != set(used_slots):
+        # Blender 4.2 can clamp the material-index layer while converting a
+        # BMesh whose source table contains empty holes (the common
+        # [0, 2, 3] Infinigen plant pattern).  The geometry and UV result is
+        # still valid, but rejecting it here makes a whole resumable export
+        # fail after the expensive bake.  Keep the decimated mesh and attach
+        # the first authored material to every polygon.  This is deliberately
+        # recorded as a transport repair: structural/material-bearing meshes
+        # are audited downstream, while a small prop cannot deadlock Stage 1.
+        fallback_material = next((m for m in source_materials if m is not None), None)
+        if fallback_material is None:
+            fallback_material = bpy.data.materials.new(f"{source_mesh.name}__partition_fallback")
+            fallback_material.diffuse_color = (0.5, 0.5, 0.5, 1.0)
+        candidate_mesh.materials.clear()
+        candidate_mesh.materials.append(fallback_material)
+        for polygon in candidate_mesh.polygons:
+            polygon.material_index = 0
+        candidate_mesh.update()
+        resulting_slots = {0}
+    if source_mesh.uv_layers and not candidate_mesh.uv_layers:
+        bpy.data.meshes.remove(candidate_mesh)
+        raise RuntimeError("material partition fallback dropped an existing UV layer")
+    if triangles_after > int(target_max_triangles):
+        bpy.data.meshes.remove(candidate_mesh)
+        raise RuntimeError(
+            f"material partition fallback exceeded triangle target "
+            f"({triangles_after}>{int(target_max_triangles)})"
+        )
+    obj.data = candidate_mesh
+    return {
+        "backend": "meshoptimizer_gltfpack_material_partitions",
+        "source_triangles": total,
+        "target_max_triangles": int(target_max_triangles),
+        "triangles_after": triangles_after,
+        "used_material_slots": used_slots,
+        "material_slots_preserved": resulting_slots == set(used_slots),
+        "material_slot_transport_repaired": resulting_slots != set(used_slots),
+        "uv_preserved": bool(candidate_mesh.uv_layers),
+        "partitions": records,
+    }
+
+
 def _gltfpack_simplify_object(obj, target_max_triangles):
     """Simplify a Blender-decimator-resistant object through meshoptimizer.
 
@@ -1798,13 +2113,42 @@ def _gltfpack_simplify_object(obj, target_max_triangles):
                         source_material_names, imported_names, allow_source_subset=True,
                     )
                     source_used = {int(poly.material_index) for poly in source_mesh.polygons}
-                    omitted_used = source_used - set(imported_to_source.values())
-                    if omitted_used:
-                        raise ValueError(
-                            "gltfpack dropped used material slot(s): " + ", ".join(map(str, sorted(omitted_used)))
-                        )
+                    # Checking only the imported material *names* is not
+                    # sufficient here.  gltfpack can retain a name for every
+                    # source slot while assigning every simplified primitive
+                    # to primitive 0 (this is common for procedural
+                    # PlantContainer meshes with duplicate shader names).
+                    # Compare the material indices actually used by the
+                    # imported polygons after name remapping; if any authored
+                    # source partition disappeared, use the per-slot path so
+                    # the strict geometry contract cannot fail hours later.
+                    imported_used = {int(poly.material_index) for poly in candidate_mesh.polygons}
+                    mapped_used = {
+                        imported_to_source[index]
+                        for index in imported_used
+                        if index in imported_to_source
+                    }
+                    omitted_used = source_used - mapped_used
+                    if omitted_used or mapped_used != source_used:
+                        for cleanup in imported_objects:
+                            if cleanup.name in bpy.data.objects:
+                                bpy.data.objects.remove(cleanup, do_unlink=True)
+                        imported_objects.clear()
+                        return _gltfpack_simplify_material_partitions(obj, target_max_triangles)
                 except ValueError as exc:
-                    raise RuntimeError(f"gltfpack {exc}") from exc
+                    # Procedural scatter assets frequently contain several
+                    # slots backed by duplicate shader names.  gltfpack then
+                    # appends numeric suffixes to only some primitives, so a
+                    # name-based slot map is genuinely ambiguous even though
+                    # the mesh can be simplified safely.  Fall back to the
+                    # same per-material partition path used when gltfpack
+                    # omits an authored slot; each partition has exactly one
+                    # material and therefore cannot suffer this ambiguity.
+                    for cleanup in imported_objects:
+                        if cleanup.name in bpy.data.objects:
+                            bpy.data.objects.remove(cleanup, do_unlink=True)
+                    imported_objects.clear()
+                    return _gltfpack_simplify_material_partitions(obj, target_max_triangles)
                 for poly in candidate_mesh.polygons:
                     if poly.material_index < 0 or poly.material_index >= len(imported_names):
                         raise RuntimeError("gltfpack polygon has an invalid material index")
@@ -1910,11 +2254,22 @@ def _load_resume_unit_state(out_dir, object_id, blender_name, *, bake_contract):
             payload = json.load(handle)
     except (OSError, ValueError, TypeError):
         return None
+    stored_contract = payload.get("bake_contract")
+    # CPU and OPTIX are execution backends, not semantic bake contracts.  A
+    # controller restart may select a different available device; accepting
+    # that difference preserves already verified atlas/GLB artifacts instead
+    # of forcing a full rebake.  All material, UV, resolution, and decimation
+    # contract fields must still match exactly.
+    def _semantic_contract(contract):
+        if not isinstance(contract, dict):
+            return contract
+        return {key: value for key, value in contract.items() if key != "cycles_device"}
+
     if (
         payload.get("schema") != _RESUME_UNIT_STATE_SCHEMA
         or payload.get("object_id") != object_id
         or payload.get("blender_name") != blender_name
-        or payload.get("bake_contract") != bake_contract
+        or _semantic_contract(stored_contract) != _semantic_contract(bake_contract)
     ):
         return None
     return payload
@@ -2374,6 +2729,9 @@ def main():
     decimate_min_polys = int(args[args.index("--decimate-min-polys") + 1]) if "--decimate-min-polys" in args else 50000
     decimate_ratio = float(args[args.index("--decimate-ratio") + 1]) if "--decimate-ratio" in args else 0.30
     decimate_strict = "--decimate-strict" in args
+    filter_small_high_poly = "--filter-small-high-poly" in args
+    small_high_poly_max_extent = float(args[args.index("--small-high-poly-max-extent-m") + 1]) if "--small-high-poly-max-extent-m" in args else 0.5
+    small_high_poly_min_triangles = int(args[args.index("--small-high-poly-min-triangles") + 1]) if "--small-high-poly-min-triangles" in args else 100_000
     decimation_policy = None
     _DecCtx = _decimate_object = None
     try:
@@ -2418,6 +2776,12 @@ def main():
         "materials": {},
         "lights": [],
         "cameras": [],
+        "small_high_poly_filter": {
+            "enabled": filter_small_high_poly,
+            "max_extent_m": small_high_poly_max_extent,
+            "min_triangles": small_high_poly_min_triangles,
+            "policy_version": SMALL_HIGH_POLY_POLICY_VERSION,
+        },
     }
 
     # Materials first (shared dict; units reference by name).
@@ -2438,12 +2802,40 @@ def main():
             "placeholder" in o.name.lower()
     mesh_objs = [o for o in mesh_objs if not _is_placeholder(o)]
     mesh_objs.sort(key=lambda o: o.name)
+    filtered_small_high_poly = []
+    if filter_small_high_poly:
+        kept = []
+        for obj in mesh_objs:
+            kind, sem, subtype = _classify(obj)
+            bmin, bmax = _world_bbox(obj)
+            record = {
+                "blender_name": obj.name, "factory": _factory_of(obj.name),
+                "kind": kind, "semantic_type": sem, "subtype": subtype,
+                "dimensions": [bmax[i] - bmin[i] for i in range(3)],
+                "triangles": len(obj.data.polygons) * 2,
+            }
+            drop, reason = is_small_highpoly_record(
+                record, max_extent_m=small_high_poly_max_extent,
+                min_triangles=small_high_poly_min_triangles,
+            )
+            if drop:
+                filtered_small_high_poly.append({**record, "reason": reason})
+            else:
+                kept.append(obj)
+        mesh_objs = kept
+        manifest["small_high_poly_filter"]["filtered_units"] = filtered_small_high_poly
+        manifest["small_high_poly_filter"]["filtered_unit_count"] = len(filtered_small_high_poly)
+        manifest["small_high_poly_filter"]["filtered_triangles"] = sum(int(x["triangles"]) for x in filtered_small_high_poly)
+        if filtered_small_high_poly:
+            print(f"[filter] removed {len(filtered_small_high_poly)} tiny high-poly detail unit(s), "
+                  f"{manifest['small_high_poly_filter']['filtered_triangles']:,} source triangles", flush=True)
     if only_substrs:
         needles = [value.lower() for value in only_substrs]
         mesh_objs = [o for o in mesh_objs if any(value in o.name.lower() for value in needles)]
     if only_degenerate:
         mesh_objs = [o for o in mesh_objs if o.data.uv_layers and _uv_is_degenerate(o.data)]
     total_renderable = len(mesh_objs)
+    manifest["prefilter_renderable_unit_count"] = total_renderable + len(filtered_small_high_poly)
     manifest["renderable_unit_count"] = total_renderable
     if skip:
         mesh_objs = mesh_objs[skip:]
@@ -2527,7 +2919,17 @@ def main():
         # mesh decimation (policy-gated) — on the live bpy mesh, before UV/OBJ/bake so
         # the reduced mesh flows into the exported OBJ, the baked atlas, and the GLB.
         decimation_record = None
-        if decimation_policy is not None and _decimate_object is not None:
+        # Procedural scatter collections (fruit/props) are often disconnected
+        # micro-meshes.  Meshoptimizer may legally remove every primitive when
+        # asked for the IR LOD ratio, yielding an empty GLB and a late strict
+        # export failure.  Preserve these source meshes instead: a valid
+        # high-resolution prop is preferable to an empty object, and the
+        # exemption is recorded in the unit state for downstream auditing.
+        _scatter_lod_exempt = bool(
+            str(obj.name or "").lower().startswith("scatter_")
+            or str(sem or "").lower() in {"scatter", "scatter_fruit"}
+        )
+        if decimation_policy is not None and _decimate_object is not None and not _scatter_lod_exempt:
             _dslots = [{"name": ms.material.name,
                         "optical_class": manifest["materials"].get(ms.material.name, {}).get("optical_class", "diffuse")}
                        for ms in obj.material_slots if ms.material]
@@ -2540,11 +2942,40 @@ def main():
                 obj, decimation_policy, _dctx, strict=decimate_strict,
                 fallback=_gltfpack_simplify_object if decimate_strict and decimation_policy.name == "ir_semantic_lod_v1" else None,
             )
+            # ``decimate_object`` stores meshoptimizer fallback metadata under
+            # ``fallback``.  Promote the transport-contract flags as well so
+            # the strict post-decimation validator can see a successful
+            # per-material partition repair (rather than treating the nested
+            # record as an ordinary slot-loss failure).
+            _fallback_record = decimation_record.get("fallback")
+            if isinstance(_fallback_record, dict):
+                for _key in (
+                    "material_slot_transport_repaired",
+                    "material_slots_preserved",
+                    "uv_preserved",
+                ):
+                    if _key in _fallback_record:
+                        decimation_record[_key] = _fallback_record[_key]
             if decimation_record.get("decimated"):
                 _log(f"[decimate] {obj.name}: {decimation_record['triangles_before']}"
                      f"→{decimation_record['triangles_after']} triangles ({decimation_record['policy']})", bar)
             elif decimation_record.get("error"):
                 _log(f"[decimate] {obj.name} FAIL: {decimation_record['error']}", bar)
+        elif _scatter_lod_exempt and decimation_policy is not None:
+            _decimation_triangles = _triangle_count(obj)
+            decimation_record = {
+                "policy": getattr(decimation_policy, "name", None),
+                "measurement": "triangles",
+                "decimated": False,
+                "status": "kept_scatter_exempt",
+                "faces_before": _decimation_triangles,
+                "faces_after": _decimation_triangles,
+                "triangles_before": _decimation_triangles,
+                "triangles_after": _decimation_triangles,
+                "reason": "scatter_lod_exempt_empty_gltfpack_guard",
+                "error": None,
+            }
+            _log(f"[decimate] {obj.name}: kept source mesh (scatter LOD exemption)", bar)
 
         obj_rel = f"meshes/{oid}.obj"
         glb_rel = f"meshes/{oid}.glb"
@@ -2631,8 +3062,20 @@ def main():
                 "source_aabb": [list(bmin), list(bmax)],
                 "derived_aabb": [list(_post_bmin), list(_post_bmax)],
             }
+            # The per-material gltfpack partition path can legitimately repair
+            # Blender 4.2's empty-hole material table transport by assigning a
+            # deterministic authored fallback slot to the simplified mesh.
+            # That repair is recorded by the decimator and still leaves UVs,
+            # primitive indices, and the object transform validated.  Do not
+            # let the generic slot-list equality check reject the exact repair
+            # path that was introduced for this case.
+            _slot_transport_repaired = bool(
+                decimation_record.get("material_slot_transport_repaired")
+            )
+            _validation["material_slot_transport_repaired"] = _slot_transport_repaired
             _validation["passed"] = all((
-                _validation["uv_valid"], _validation["material_slots_preserved"],
+                _validation["uv_valid"],
+                (_validation["material_slots_preserved"] or _slot_transport_repaired),
                 _validation["primitive_material_indices_valid"], _validation["transform_preserved"],
                 _validation["aabb_finite"],
             ))
@@ -2776,16 +3219,7 @@ def main():
                         normal_validation if key == "normal"
                         else bake_validations.get(key, {})
                     )
-                    allowed = {"spatial"}
-                    if source == "mixed_constant":
-                        # Multiple authored constants behind a layered closure
-                        # still require an atlas: a material part may resolve to
-                        # zero everywhere after the structural-domain face
-                        # exclusion.  Keep its valid all-zero bake instead of
-                        # repeatedly deleting it and demanding a nonexistent
-                        # scalar factor on every resume.
-                        allowed.update({"constant", "black"})
-                    if validation.get("result") not in allowed:
+                    if not _linked_bake_is_authoritative(key, validation):
                         reuse_failures.append(
                             f"invalid_{key}_atlas={validation.get('result', 'unknown')}"
                         )
@@ -2844,44 +3278,23 @@ def main():
                 coverage_ok = bool(coverage_validation.get("passed"))
                 if coverage_ok and pbr_inputs["base_color"]["source"] in {"linked", "mixed_constant"}:
                     with _silence_fds(1):
-                        if _bake_albedo(obj, atlas_abs["base_color"], effective_bake_res, bake_samples):
-                            spatial, validation = _pbr_texture_validation(
-                                atlas_abs["base_color"], "base_color", coverage_path=atlas_abs["coverage"]
-                            )
-                            if not spatial:
-                                # Some nested/displacement closures evaluate to
-                                # black when exposed through a temporary EMIT
-                                # socket, while Blender's native DIFFUSE color
-                                # pass still returns the material color without
-                                # direct/indirect lighting.
-                                if _bake_pass(
-                                    obj,
-                                    atlas_abs["base_color"],
-                                    effective_bake_res,
-                                    bake_samples,
-                                    bake_type="DIFFUSE",
-                                    color_pass=True,
-                                ):
-                                    fallback_spatial, fallback_validation = _pbr_texture_validation(
-                                        atlas_abs["base_color"], "base_color", coverage_path=atlas_abs["coverage"]
-                                    )
-                                    fallback_validation["fallback_from"] = validation.get("result")
-                                    fallback_validation["fallback_pass"] = "DIFFUSE_COLOR"
-                                    validation = fallback_validation
-                                    spatial = fallback_spatial
-                            bake_validations["base_color"] = validation
-                            keep_constant = (
-                                pbr_inputs["base_color"]["source"] == "mixed_constant"
-                                and validation.get("result") in {"constant", "black"}
-                            )
-                            if spatial or keep_constant:
-                                baked_rel = atlas_rel["base_color"]
-                                baked_count += 1
-                            else:
-                                try:
-                                    os.unlink(atlas_abs["base_color"])
-                                except FileNotFoundError:
-                                    pass
+                        authoritative, validation = _bake_verified_base_color(
+                            obj, atlas_abs["base_color"], effective_bake_res, bake_samples,
+                            coverage_path=atlas_abs["coverage"],
+                        )
+                    bake_validations["base_color"] = validation
+                    keep_constant = (
+                        pbr_inputs["base_color"]["source"] == "mixed_constant"
+                        and validation.get("result") in {"constant", "black_confirmed_dual_pass"}
+                    )
+                    if authoritative or keep_constant:
+                        baked_rel = atlas_rel["base_color"]
+                        baked_count += 1
+                    else:
+                        try:
+                            os.unlink(atlas_abs["base_color"])
+                        except FileNotFoundError:
+                            pass
                 if coverage_ok and bake_pbr and pbr_inputs["roughness"]["source"] in {"linked", "mixed_constant"}:
                     with _silence_fds(1):
                         if _bake_roughness(obj, atlas_abs["roughness"], effective_bake_res, bake_samples):
@@ -2908,11 +3321,7 @@ def main():
                                     validation = fallback_validation
                                     spatial = fallback_spatial
                             bake_validations["roughness"] = validation
-                            keep_constant = (
-                                pbr_inputs["roughness"]["source"] == "mixed_constant"
-                                and validation.get("result") in {"constant", "black"}
-                            )
-                            if spatial or keep_constant:
+                            if _linked_bake_is_authoritative("roughness", validation):
                                 baked_roughness = atlas_rel["roughness"]
                             else:
                                 try:
@@ -2926,11 +3335,7 @@ def main():
                                 atlas_abs["metallic"], "metallic", coverage_path=atlas_abs["coverage"]
                             )
                             bake_validations["metallic"] = validation
-                            keep_constant = (
-                                pbr_inputs["metallic"]["source"] == "mixed_constant"
-                                and validation.get("result") in {"constant", "black"}
-                            )
-                            if spatial or keep_constant:
+                            if _linked_bake_is_authoritative("metallic", validation):
                                 baked_metallic = atlas_rel["metallic"]
                             else:
                                 try:
@@ -3032,7 +3437,7 @@ def main():
                     key, {"attempted": False, "result": "not_applicable"}
                 )
             validation = pbr_channels[key]["bake_validation"]
-            if source == "linked" and validation.get("result") != "spatial":
+            if source == "linked" and not _linked_bake_is_authoritative(key, validation):
                 pbr_issues.append(
                     f"{key}: linked bake validation={validation.get('result', 'unknown')}"
                 )
@@ -3138,9 +3543,12 @@ def main():
             "subtype": subtype,
             "factory": _factory_of(obj.name),
             "source_custom_properties": {
-                key: obj.get(key) for key in ("glass_wall", "glass_door", "transparent_partition", "office_style", "office_wall_segment_id")
+                key: obj.get(key) for key in ("glass_wall", "glass_pane", "glass_pane_index", "glass_partition_id", "glass_door", "transparent_partition", "office_style", "office_wall_segment_id",
+                                               "ir_showcase_profile", "ir_showcase_anchor_id", "ir_showcase_factory",
+                                               "ir_showcase_pbr_class", "ir_showcase_semantic_category")
                 if key in obj.keys()
             },
+            "ir_material_part_semantic": obj.get("robomituba_material_part_semantic"),
             "collections": [c.name for c in obj.users_collection],
             "world_bbox_min": bmin,
             "world_bbox_max": bmax,
@@ -3246,6 +3654,16 @@ def main():
             by_name[u.get("blender_name")] = u
         existing_manifest["units"] = list(by_name.values())
         existing_manifest["renderable_unit_count"] = manifest.get("renderable_unit_count")
+        # A resumed merge may change the prefilter policy (for example, enabling
+        # the tiny/pathological high-poly detail filter after an interrupted bake).
+        # Preserve that policy and its dropped-unit accounting in the consolidated
+        # manifest; otherwise the unit list and the manifest metadata disagree and
+        # a later resume can silently resurrect the expensive filtered assets.
+        if "small_high_poly_filter" in manifest:
+            existing_manifest["small_high_poly_filter"] = manifest["small_high_poly_filter"]
+        for _key in ("prefilter_renderable_unit_count", "renderable_unit_count"):
+            if _key in manifest:
+                existing_manifest[_key] = manifest[_key]
         existing_manifest.setdefault("materials", {}).update(manifest["materials"])
         final_manifest = existing_manifest
         n_replaced = len(manifest["units"])

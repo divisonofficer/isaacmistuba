@@ -6,13 +6,23 @@ import json
 import math
 import os
 import shutil
+import struct
 import sys
 import time
 import traceback
+import zlib
 from pathlib import Path
 
 import bpy  # type: ignore
 from mathutils import Matrix  # type: ignore
+
+# Blender's ``--python`` execution does not place the repository root (or the
+# script directory) on sys.path.  Add only this tool directory so the worker
+# can share its pure compatibility contract with ordinary Python tests.
+_SCRIPT_DIR = Path(__file__).resolve().parent
+if str(_SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_DIR))
+from ir_worker_aov_contract import required_aov_sources  # noqa: E402
 
 
 _REC709 = (0.2126, 0.7152, 0.0722)
@@ -23,6 +33,9 @@ _GT_SPECS = {
     "base_color_nir": ("GT_BaseColorNIR", "RGB", "16", "linear_unorm16"),
     "roughness": ("GT_Roughness", "BW", "16", "perceptual_roughness_unorm16"),
     "metallic": ("GT_Metallic", "BW", "16", "unorm16"),
+    "metallic_family_id": ("GT_MetallicFamilyID", "BW", "8", "categorical_uint8"),
+    "metal_coverage_mask": ("GT_MetalCoverage", "BW", "8", "binary_mask_u8"),
+    "exposed_metal_mask": ("GT_ExposedMetal", "BW", "8", "binary_mask_u8"),
     "normal_geometry_world": ("GT_GeometryNormalWorld", "RGB", "16", "xyz_signed_to_unorm16"),
     "normal_shading_world": ("GT_ShadingNormalWorld", "RGB", "16", "xyz_signed_to_unorm16"),
     # Cycles' Z pass is camera-to-surface ray distance.  The parent derives
@@ -34,15 +47,22 @@ _GT_SPECS = {
     "source_valid_mask": ("GT_SourceValid", "BW", "8", "binary_mask_u8"),
     "replacement_mask": ("GT_Replacement", "BW", "8", "binary_mask_u8"),
     "fallback_mask": ("GT_Fallback", "BW", "8", "binary_mask_u8"),
+    "remediated_pbr_mask": ("GT_Remediated", "BW", "8", "binary_mask_u8"),
+    "train_pbr_valid_mask": ("GT_SourceValid", "BW", "8", "binary_mask_u8"),
+    "pbr_provenance_class": ("GT_PBRProvenance", "BW", "8", "provenance_uint8"),
     "primary_eval_valid_mask": ("GT_SourceValid", "BW", "8", "binary_mask_u8"),
 }
+# Older v3 prepared blends predate the optional remediation/provenance AOVs.
+# They remain valid for the core PBR contract; the renderer synthesizes these
+# optional channels below rather than rejecting an otherwise usable scene.
+_OPTIONAL_AOV_SOURCES = frozenset({"GT_Remediated", "GT_PBRProvenance"})
 _DIFFUSE_EXR_STEMS = {
-    "rgb": ("diffuse_component_rgb", "diffuse_shading_rgb"),
-    "nir": ("diffuse_component_nir", "diffuse_shading_nir"),
+    "rgb": ("diffuse_transport_rgb", "diffuse_component_rgb"),
+    "nir": ("diffuse_transport_nir", "diffuse_component_nir"),
 }
 _DIFFUSE_PNG_STEMS = {
-    "rgb": ("diffuse_reflectance_rgb", "diffuse_shading_valid_rgb"),
-    "nir": ("diffuse_reflectance_nir", "diffuse_shading_valid_nir"),
+    "rgb": ("diffuse_reflectance_rgb", "diffuse_transport_valid_rgb"),
+    "nir": ("diffuse_reflectance_nir", "diffuse_transport_valid_nir"),
 }
 
 
@@ -64,6 +84,15 @@ def _args() -> argparse.Namespace:
     parser.add_argument("--nir-formula", choices=("primary", "luminance_matched_v1"), default="primary")
     parser.add_argument("--flash-energy-scale", type=float, default=1.0)
     parser.add_argument("--ambient-fill-energy-scale", type=float, default=1.0)
+    parser.add_argument(
+        "--nir-passive", action="store_true",
+        help="also render flash-off passive NIR; the parent queue derives active-minus-passive",
+    )
+    parser.add_argument(
+        "--allow-legacy-passive-backfill-aovs", action="store_true",
+        help=("allow only the MetallicContractV2 auxiliary AOVs to be absent; "
+              "valid exclusively for passive-only backfill of legacy prepared blends"),
+    )
     return parser.parse_args(argv)
 
 
@@ -101,10 +130,15 @@ def _configure_cycles(scene, args: argparse.Namespace) -> list[str]:
     return enabled
 
 
-def _view_layer_setup(scene) -> None:
+def _view_layer_setup(scene, *, allow_legacy_passive_backfill_aovs: bool = False) -> None:
+    required_sources = required_aov_sources(
+        (source for source, _, _, _ in _GT_SPECS.values()),
+        always_optional=_OPTIONAL_AOV_SOURCES,
+        allow_legacy_passive_backfill=allow_legacy_passive_backfill_aovs,
+    )
     for view_layer in scene.view_layers:
-        for source, _, _, _ in _GT_SPECS.values():
-            if source.startswith("GT_") and view_layer.aovs.get(source) is None:
+        for source in required_sources:
+            if view_layer.aovs.get(source) is None:
                 raise RuntimeError(f"prepared blend lacks required AOV: {source}")
         view_layer.use_pass_z = True
         view_layer.use_pass_normal = True
@@ -337,45 +371,39 @@ def _setup_diffuse_decomposition(tree, layers, staging: Path, frame_id: str, mod
             f"available={available}"
         )
 
-    component = tree.nodes.new("CompositorNodeMixRGB")
-    component.blend_type = "ADD"
-    component.inputs[0].default_value = 1.0
-    tree.links.new(direct, component.inputs[1])
-    tree.links.new(indirect, component.inputs[2])
+    # Cycles Diffuse Direct/Indirect explicitly exclude the BSDF colour.
+    # Their sum is transport T, not a diffuse component.  Fan the exact
+    # Diffuse Color pass R into both the PNG ground truth and C=R*T, avoiding
+    # the old unstable post-hoc division diagnostic entirely.
+    transport = tree.nodes.new("CompositorNodeMixRGB")
+    transport.blend_type = "ADD"
+    transport.inputs[0].default_value = 1.0
+    tree.links.new(direct, transport.inputs[1])
+    tree.links.new(indirect, transport.inputs[2])
 
-    component_stem, shading_stem = _DIFFUSE_EXR_STEMS[modality]
+    transport_stem, component_stem = _DIFFUSE_EXR_STEMS[modality]
     reflectance_stem, valid_stem = _DIFFUSE_PNG_STEMS[modality]
-    component_out = _file_node(
-        tree, staging / component_stem, frame_id, mode="RGB", depth="32", file_format="OPEN_EXR",
+    transport_out = _file_node(
+        tree, staging / transport_stem, frame_id, mode="RGB", depth="32", file_format="OPEN_EXR",
     )
-    tree.links.new(component.outputs[0], component_out.inputs[0])
+    tree.links.new(transport.outputs[0], transport_out.inputs[0])
     reflectance_out = _file_node(
         tree, staging / reflectance_stem, frame_id, mode="RGB", depth="16", file_format="PNG",
     )
     tree.links.new(reflectance, reflectance_out.inputs[0])
 
+    component = tree.nodes.new("CompositorNodeMixRGB")
+    component.blend_type = "MULTIPLY"
+    component.inputs[0].default_value = 1.0
+    tree.links.new(reflectance, component.inputs[1])
+    tree.links.new(transport.outputs[0], component.inputs[2])
+    component_out = _file_node(
+        tree, staging / component_stem, frame_id, mode="RGB", depth="32", file_format="OPEN_EXR",
+    )
+    tree.links.new(component.outputs[0], component_out.inputs[0])
+
     separate = tree.nodes.new("CompositorNodeSepRGBA")
     tree.links.new(reflectance, separate.inputs[0])
-    safe_channels = []
-    for channel in range(3):
-        maximum = tree.nodes.new("CompositorNodeMath")
-        maximum.operation = "MAXIMUM"
-        maximum.inputs[1].default_value = _DIFFUSE_EPSILON
-        tree.links.new(separate.outputs[channel], maximum.inputs[0])
-        safe_channels.append(maximum.outputs[0])
-    safe_rgb = tree.nodes.new("CompositorNodeCombRGBA")
-    for channel, source in enumerate(safe_channels):
-        tree.links.new(source, safe_rgb.inputs[channel])
-    safe_rgb.inputs[3].default_value = 1.0
-    divide = tree.nodes.new("CompositorNodeMixRGB")
-    divide.blend_type = "DIVIDE"
-    divide.inputs[0].default_value = 1.0
-    tree.links.new(component.outputs[0], divide.inputs[1])
-    tree.links.new(safe_rgb.outputs[0], divide.inputs[2])
-    shading_out = _file_node(
-        tree, staging / shading_stem, frame_id, mode="RGB", depth="32", file_format="OPEN_EXR",
-    )
-    tree.links.new(divide.outputs[0], shading_out.inputs[0])
 
     max_rg = tree.nodes.new("CompositorNodeMath")
     max_rg.operation = "MAXIMUM"
@@ -419,10 +447,24 @@ def _setup_rgb_compositor(scene, staging: Path, frame_id: str, *, qc_components:
             socket_names=("Combined_DATASET_AMBIENT_FILL", "DATASET_AMBIENT_FILL"),
             stem="qc_rgb_ambient_fill",
         )
+    def _constant(value: float):
+        node = tree.nodes.new("CompositorNodeValue")
+        node.outputs[0].default_value = float(value)
+        return node.outputs[0]
+
     for stem, (source_name, mode, depth, encoding) in _GT_SPECS.items():
         source = layers.outputs.get(source_name)
         if source is None:
-            raise RuntimeError(f"render layer lacks required pass socket: {source_name}")
+            if source_name == "GT_Remediated":
+                # Legacy v3 scenes did not carry the remediation mask.  Such
+                # pixels are source-valid/fallback-only, never remediated.
+                source = _constant(0.0)
+            elif source_name == "GT_PBRProvenance":
+                # Provenance is unknown for legacy prepared material graphs;
+                # encode the documented zero/unknown class.
+                source = _constant(0.0)
+            else:
+                raise RuntimeError(f"render layer lacks required pass socket: {source_name}")
         output = _file_node(tree, staging / stem, frame_id, mode=mode, depth=depth, file_format="PNG")
         encoded = source
         if stem == "primary_eval_valid_mask":
@@ -440,6 +482,17 @@ def _setup_rgb_compositor(scene, staging: Path, frame_id: str, *, qc_components:
             tree.links.new(valid, primary.inputs[0])
             tree.links.new(invert_replacement.outputs[0], primary.inputs[1])
             encoded = primary.outputs[0]
+        elif stem == "train_pbr_valid_mask":
+            source_valid = _binary_mask(tree, source)
+            remediated_source = layers.outputs.get("GT_Remediated")
+            if remediated_source is None:
+                remediated_source = _constant(0.0)
+            remediated = _binary_mask(tree, remediated_source)
+            union = tree.nodes.new("CompositorNodeMath")
+            union.operation = "MAXIMUM"
+            tree.links.new(source_valid, union.inputs[0])
+            tree.links.new(remediated, union.inputs[1])
+            encoded = union.outputs[0]
         elif encoding == "binary_mask_u8":
             encoded = _binary_mask(tree, source)
         elif encoding == "xyz_signed_to_unorm16":
@@ -448,6 +501,10 @@ def _setup_rgb_compositor(scene, staging: Path, frame_id: str, *, qc_components:
             encoded = _scale_value(tree, source, 1000.0 / _PNG16_MAX)
         elif encoding == "uint16":
             encoded = _scale_value(tree, source, 1.0 / _PNG16_MAX)
+        elif encoding == "provenance_uint8":
+            encoded = _scale_value(tree, source, 1.0 / 255.0)
+        elif encoding == "categorical_uint8":
+            encoded = _scale_value(tree, source, 1.0 / 255.0)
         tree.links.new(encoded, output.inputs[0])
 
 
@@ -486,6 +543,28 @@ def _setup_nir_compositor(scene, staging: Path, frame_id: str, *, qc_components:
             tree.links.new(flash_rgb.outputs[0], flash.inputs[0])
 
 
+def _setup_nir_passive_compositor(scene, staging: Path, frame_id: str) -> None:
+    """Write the flash-off NIR observation using the same evaluated scene.
+
+    Passive NIR deliberately has no independent material or GT path.  It is
+    the exact same NIR band/world/light state as the active capture with only
+    the camera-relative flash disabled.  The queue computes the linear
+    active-minus-passive artifact after both EXRs are committed.
+    """
+    scene.use_nodes = True
+    tree = scene.node_tree
+    tree.nodes.clear()
+    layers = tree.nodes.new("CompositorNodeRLayers")
+    bw = tree.nodes.new("CompositorNodeRGBToBW")
+    tree.links.new(layers.outputs["Image"], bw.inputs[0])
+    combine = tree.nodes.new("CompositorNodeCombRGBA")
+    for channel in range(3):
+        tree.links.new(bw.outputs[0], combine.inputs[channel])
+    combine.inputs[3].default_value = 1.0
+    output = _file_node(tree, staging / "nir_passive", frame_id, mode="RGB", depth="32", file_format="OPEN_EXR")
+    tree.links.new(combine.outputs[0], output.inputs[0])
+
+
 def _collect_one(directory: Path, frame_id: str, suffix: str) -> Path:
     matches = sorted(directory.glob(f"{frame_id}*{suffix}"))
     if not matches:
@@ -498,6 +577,22 @@ def _collect_one(directory: Path, frame_id: str, suffix: str) -> Path:
     for extra in matches[1:]:
         extra.unlink(missing_ok=True)
     return target
+
+
+def _write_zero_mask(path: Path, width: int, height: int) -> None:
+    """Write a dependency-free grayscale PNG for an optional legacy AOV."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    raw = b"".join(b"\x00" + (b"\x00" * int(width)) for _ in range(int(height)))
+
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        return (struct.pack(">I", len(data)) + kind + data
+                + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF))
+
+    png = (b"\x89PNG\r\n\x1a\n"
+           + chunk(b"IHDR", struct.pack(">IIBBBBB", int(width), int(height), 8, 0, 0, 0, 0))
+           + chunk(b"IDAT", zlib.compress(raw, level=1))
+           + chunk(b"IEND", b""))
+    path.write_bytes(png)
 
 
 def _pass_stats(scene) -> dict:
@@ -520,20 +615,45 @@ def _pass_stats(scene) -> dict:
     }
 
 
-def _publish(staging: Path, out: Path, frame_id: str, task: dict, timings: dict, qc: dict) -> dict:
+def _publish(staging: Path, out: Path, frame_id: str, task: dict, timings: dict, qc: dict,
+             *, width: int, height: int) -> dict:
+    passive_only = str(task.get("render_mode") or "") == "nir_passive_only"
+    passive_enabled = bool(task.get("nir_passive") or (not passive_only and task.get("nir_passive_enabled")))
     paths = {}
-    exr_stems = {
-        "rgb", "nir_active",
-        *(stem for stems in _DIFFUSE_EXR_STEMS.values() for stem in stems),
-    }
-    stems = [
-        "rgb", "nir_active", *_GT_SPECS.keys(),
-        *(stem for stems in _DIFFUSE_EXR_STEMS.values() for stem in stems),
-        *(stem for stems in _DIFFUSE_PNG_STEMS.values() for stem in stems),
-    ]
+    if passive_only:
+        exr_stems = {"nir_passive"}
+        stems = ["nir_passive"]
+    else:
+        passive_stems = ("nir_passive",) if passive_enabled else ()
+        exr_stems = {
+            "rgb", "nir_active", *passive_stems,
+            *(stem for stems in _DIFFUSE_EXR_STEMS.values() for stem in stems),
+        }
+        stems = [
+            "rgb", "nir_active", *passive_stems, *_GT_SPECS.keys(),
+            *(stem for stems in _DIFFUSE_EXR_STEMS.values() for stem in stems),
+            *(stem for stems in _DIFFUSE_PNG_STEMS.values() for stem in stems),
+        ]
     for stem in stems:
         suffix = ".exr" if stem in exr_stems else ".png"
-        source = _collect_one(staging / stem, frame_id, suffix)
+        source_dir = staging / stem
+        # Optional AOVs are absent from older v3 prepared blends.  A Blender
+        # VALUE node is not guaranteed to emit a raster when it is the sole
+        # compositor input, so materialize the documented zero/unknown image
+        # here using the already-rendered RGB dimensions.  This keeps the
+        # artifact contract complete without changing any core PBR channel.
+        if stem in {"remediated_pbr_mask", "pbr_provenance_class"}:
+            matches = sorted(source_dir.glob(f"{frame_id}*{suffix}")) if source_dir.is_dir() else []
+            if not matches:
+                # ``rgb`` is the first stem in this loop and has already been
+                # moved to the dataset output by the time optional masks are
+                # materialized.  Look in both the transient staging directory
+                # and the final output directory.
+                # Dimensions are taken from the current render settings; no
+                # OpenCV/numpy dependency is needed in Blender's Python.
+                source_dir.mkdir(parents=True, exist_ok=True)
+                _write_zero_mask(source_dir / f"{frame_id}{suffix}", width, height)
+        source = _collect_one(source_dir, frame_id, suffix)
         target = out / stem / source.name
         target.parent.mkdir(parents=True, exist_ok=True)
         os.replace(source, target)
@@ -550,7 +670,19 @@ def _publish(staging: Path, out: Path, frame_id: str, task: dict, timings: dict,
             target.parent.mkdir(parents=True, exist_ok=True)
             os.replace(source, target)
             paths[staging_stem] = str(target.relative_to(out))
+    # A passive-only backfill must never replace the existing RGB/GT manifest.
+    # Merge paths and timing telemetry atomically so an interrupted backfill
+    # can be retried without changing any original artifact.
+    existing = {}
+    if task.get("preserve_existing_row"):
+        existing_path = out / "frames" / f"{frame_id}.json"
+        if existing_path.is_file():
+            try:
+                existing = json.loads(existing_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError, json.JSONDecodeError) as exc:
+                raise RuntimeError(f"cannot read existing frame manifest for passive backfill: {existing_path}") from exc
     row = {
+        **existing,
         "schema": "robomituba.ir_principled_frame.v2",
         "frame_id": frame_id,
         "viewpoint_id": task["viewpoint_id"],
@@ -559,13 +691,21 @@ def _publish(staging: Path, out: Path, frame_id: str, task: dict, timings: dict,
         "pbr_gt_contract_digest": task.get("pbr_gt_contract_digest"),
         "width": int(task["width"]), "height": int(task["height"]),
         "fov_deg": float(task["fov_deg"]),
-        "paths": paths, "timings_s": timings, "nir_qc": qc,
+        "paths": {**(existing.get("paths") or {}), **paths},
+        "timings_s": {**(existing.get("timings_s") or {}), **timings},
         "camera": task["camera"],
+        "nir_passive_enabled": bool(task.get("nir_passive_enabled")),
         "capture_kind": task.get("capture_kind", "single"),
         "pair_id": task.get("pair_id"),
         "pair_member_index": task.get("pair_member_index"),
         "external_lighting_available": bool(task.get("external_lighting_available", False)),
     }
+    if passive_only:
+        row["nir_passive_qc"] = qc
+        row["nir_passive_backfill"] = True
+    else:
+        row["nir_qc"] = qc
+        row.pop("nir_passive_backfill", None)
     if task.get("lighting"):
         row["lighting"] = {key: value for key, value in task["lighting"].items() if key != "runtime_recipe"}
     frame_path = out / "frames" / f"{frame_id}.json"
@@ -584,22 +724,27 @@ def _render_task(scene, args, lighting_state, task: dict) -> dict:
     staging.mkdir(parents=True)
     camera = _camera(scene, task, args.fov)
     timings = {}
+    passive_only = str(task.get("render_mode") or "") == "nir_passive_only"
+    passive_enabled = bool(args.nir_passive or task.get("nir_passive"))
+    task = dict(task)
+    task["nir_passive_enabled"] = passive_enabled
     try:
-        _band_nodes(0.0)
-        _nir_formula_nodes(args.nir_formula)
-        _set_lighting(
-            scene, lighting_state, nir=False,
-            ambient_fill_energy_scale=args.ambient_fill_energy_scale,
-            recipe=(task.get("lighting") or {}).get("runtime_recipe") or (task.get("lighting") or {}).get("recipe"),
-        )
-        _set_environment(scene, nir=False, recipe=(task.get("lighting") or {}).get("runtime_recipe") or (task.get("lighting") or {}).get("recipe"))
-        _place_flash(camera, enabled=False, energy_scale=args.flash_energy_scale)
-        _setup_rgb_compositor(scene, staging, frame_id, qc_components=args.qc_components)
-        scene.cycles.samples = int(args.rgb_spp)
-        scene.cycles.seed = int(args.seed)
-        started = time.perf_counter()
-        bpy.ops.render.render(write_still=False)
-        timings["rgb"] = time.perf_counter() - started
+        if not passive_only:
+            _band_nodes(0.0)
+            _nir_formula_nodes(args.nir_formula)
+            _set_lighting(
+                scene, lighting_state, nir=False,
+                ambient_fill_energy_scale=args.ambient_fill_energy_scale,
+                recipe=(task.get("lighting") or {}).get("runtime_recipe") or (task.get("lighting") or {}).get("recipe"),
+            )
+            _set_environment(scene, nir=False, recipe=(task.get("lighting") or {}).get("runtime_recipe") or (task.get("lighting") or {}).get("recipe"))
+            _place_flash(camera, enabled=False, energy_scale=args.flash_energy_scale)
+            _setup_rgb_compositor(scene, staging, frame_id, qc_components=args.qc_components)
+            scene.cycles.samples = int(args.rgb_spp)
+            scene.cycles.seed = int(args.seed)
+            started = time.perf_counter()
+            bpy.ops.render.render(write_still=False)
+            timings["rgb"] = time.perf_counter() - started
 
         _band_nodes(1.0)
         _nir_formula_nodes(args.nir_formula)
@@ -609,15 +754,32 @@ def _render_task(scene, args, lighting_state, task: dict) -> dict:
             recipe=(task.get("lighting") or {}).get("runtime_recipe") or (task.get("lighting") or {}).get("recipe"),
         )
         _set_environment(scene, nir=True, recipe=(task.get("lighting") or {}).get("runtime_recipe") or (task.get("lighting") or {}).get("recipe"))
+        if passive_enabled:
+            _place_flash(camera, enabled=False, energy_scale=args.flash_energy_scale)
+            _setup_nir_passive_compositor(scene, staging, frame_id)
+            scene.cycles.samples = int(args.nir_spp)
+            scene.cycles.seed = int(args.seed) + 1
+            started = time.perf_counter()
+            bpy.ops.render.render(write_still=False)
+            timings["nir_passive"] = time.perf_counter() - started
+        if passive_only:
+            qc = _pass_stats(scene)
+            return _publish(staging, args.out, frame_id, task, timings, qc,
+                            width=args.width, height=args.height)
+
         _place_flash(camera, enabled=True, energy_scale=args.flash_energy_scale)
         _setup_nir_compositor(scene, staging, frame_id, qc_components=args.qc_components)
         scene.cycles.samples = int(args.nir_spp)
+        # Reuse the passive seed for common-random-number cancellation: the
+        # active-minus-passive image should expose the flash contribution, not
+        # amplify two unrelated Monte-Carlo noise realizations.
         scene.cycles.seed = int(args.seed) + 1
         started = time.perf_counter()
         bpy.ops.render.render(write_still=False)
         timings["nir_active"] = time.perf_counter() - started
         qc = _pass_stats(scene)
-        row = _publish(staging, args.out, frame_id, task, timings, qc)
+        row = _publish(staging, args.out, frame_id, task, timings, qc,
+                       width=args.width, height=args.height)
         return row
     finally:
         if staging.exists():
@@ -630,7 +792,10 @@ def main() -> int:
     scene = bpy.context.scene
     started = time.perf_counter()
     devices = _configure_cycles(scene, args)
-    _view_layer_setup(scene)
+    _view_layer_setup(
+        scene,
+        allow_legacy_passive_backfill_aovs=bool(args.allow_legacy_passive_backfill_aovs),
+    )
     lighting_state = _lighting_state(scene)
     _emit({
         "type": "ready", "worker_id": args.worker_id,
@@ -648,6 +813,11 @@ def main() -> int:
             task = dict(message["task"])
             if task.get("dataset_fingerprint") != args.fingerprint:
                 raise ValueError("task dataset fingerprint differs from worker fingerprint")
+            if (args.allow_legacy_passive_backfill_aovs
+                    and str(task.get("render_mode") or "") != "nir_passive_only"):
+                raise ValueError(
+                    "legacy AOV compatibility is restricted to nir_passive_only tasks"
+                )
             row = _render_task(scene, args, lighting_state, task)
             _emit({
                 "type": "complete", "worker_id": args.worker_id,

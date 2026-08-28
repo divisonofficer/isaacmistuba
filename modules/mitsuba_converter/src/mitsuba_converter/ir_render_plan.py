@@ -13,9 +13,10 @@ from pathlib import Path
 from typing import Any
 
 PLAN_SCHEMA = "robomituba.ir_principled_render_plan.v1"
-SAMPLER_VERSION = "coverage-fps-pose-heading-v1"
+SAMPLER_VERSION = "coverage-fps-pose-heading-v2"
 CONTENT_PLAN_SCHEMA = "robomituba.ir_principled_render_plan.v2"
 ILLUMINATION_PLAN_SCHEMA = "robomituba.ir_principled_render_plan.v3"
+ILLUMINATION_REFERENCE_PLAN_SCHEMA = "robomituba.ir_principled_render_plan.v4"
 CONTENT_SAMPLER_VERSION = "content-aware-fps-v2"
 LIGHTING_PRESET_VERSION = "indoor-capture-groups-v1"
 LIGHTING_PRESETS = (
@@ -59,6 +60,11 @@ def _distance(a: dict[str, Any], b: dict[str, Any], spatial_scale: float) -> flo
     spatial = math.hypot(dx, dy) / max(spatial_scale, 1e-6)
     delta = abs((a["heading_deg"] - b["heading_deg"] + 180.0) % 360.0 - 180.0) / 180.0
     return spatial + 0.35 * delta
+
+
+def _camera_key(item: dict[str, Any]) -> tuple[str, float, str]:
+    """Distinguish two anchor sets that intentionally share one graph node."""
+    return (str(item["viewpoint_id"]), round(float(item["heading_deg"]) % 360.0, 6), str(item.get("anchor_id") or ""))
 
 
 def _fps(candidates: list[dict[str, Any]], count: int, rng: random.Random, spatial_scale: float) -> list[dict[str, Any]]:
@@ -160,92 +166,186 @@ def build_render_plan(graph: dict[str, Any], *, requested_pose_count: int, seed:
                       visibility: dict[str, Any] | None = None, adaptive_budget: bool = False,
                       max_headings_per_node: int = 6, sparse_fraction: float = 0.15,
                       reserve_fraction: float = 0.20, illumination: dict[str, Any] | None = None,
-                      paired_fraction: float = 0.25) -> dict[str, Any]:
+                      paired_fraction: float = 0.25, camera_sets: dict[str, Any] | None = None,
+                      showcase_provenance: dict[str, Any] | None = None,
+                      min_unique_pose_count: int = 1,
+                      illumination_pairing_policy: str = "legacy_six_way_v1") -> dict[str, Any]:
     """Select unique node-heading poses in balanced lighting capture groups."""
     if requested_pose_count < 1:
         raise ValueError("requested_pose_count must be positive")
     candidates: list[dict[str, Any]] = []
-    for node in graph.get("nodes") or []:
-        node_id = str(node.get("node_id") or "")
-        if not node_id:
-            continue
-        position_xy = _position(node)
-        for heading in node.get("headings") or []:
-            candidates.append({"viewpoint_id": node_id, "heading_deg": float(heading.get("yaw_deg", 0.0)), "position_xy": list(position_xy)})
-    candidates.sort(key=lambda item: (item["viewpoint_id"], item["heading_deg"]))
+    if camera_sets is not None:
+        # Showcase cameras are already assembled from walkable nodes and look
+        # at their local anchor.  Do not resurrect OpticalNav's heading sweep.
+        for pose in camera_sets.get("poses") or []:
+            if not isinstance(pose, dict) or not pose.get("viewpoint_id"):
+                continue
+            candidate = dict(pose)
+            candidate["heading_deg"] = float(candidate.get("heading_deg") or 0.0)
+            candidate["position_xy"] = list(_position({"position": candidate.get("position_xy")}))
+            candidates.append(candidate)
+    else:
+        for node in graph.get("nodes") or []:
+            node_id = str(node.get("node_id") or "")
+            if not node_id:
+                continue
+            position_xy = _position(node)
+            for heading in node.get("headings") or []:
+                candidates.append({"viewpoint_id": node_id, "heading_deg": float(heading.get("yaw_deg", 0.0)), "position_xy": list(position_xy)})
+    candidates.sort(key=lambda item: (item["viewpoint_id"], item["heading_deg"], str(item.get("anchor_id") or "")))
     if not candidates:
         raise ValueError("viewpoint graph has no node-heading candidates")
     room_cap, room_size_class = _adaptive_cap(candidates)
-    target = min(int(requested_pose_count), room_cap) if adaptive_budget else int(requested_pose_count)
+    target = int(requested_pose_count) if camera_sets is not None else (
+        min(int(requested_pose_count), room_cap) if adaptive_budget else int(requested_pose_count)
+    )
     actual = min(target, len(candidates))
     points = [tuple(item["position_xy"]) for item in candidates]
     center, side_axis = _axis(points)
     span = max(math.hypot(x - center[0], y - center[1]) for x, y in points) * 2.0
     rng = random.Random(int(seed))
     selection_meta = None
-    if visibility is not None:
+    if camera_sets is not None:
+        # build_camera_sets has already applied the anchor-set cardinality,
+        # clearance and baseline invariants.  Preserve each selected pose.
+        remaining = list(candidates)
+    elif visibility is not None:
         selected_all, selection_meta = _content_select(candidates, visibility, actual, rng, span,
                                                        max_headings_per_node=max_headings_per_node,
                                                        sparse_fraction=sparse_fraction)
         actual = len(selected_all)
         remaining = list(selected_all)
     else:
-        remaining = list(candidates)
+        # Coverage mode has no visibility probe, but it must still honour the
+        # requested/adaptive pose budget.  The previous implementation left
+        # every graph candidate here, which only became visible after the
+        # lighting expansion multiplied the accidental excess by six.
+        remaining = _fps(candidates, actual, rng, span) if not illumination else list(candidates)
     groups = []
     if illumination:
         conditions = list(illumination.get("conditions") or [])
         if len(conditions) != 6:
             raise ValueError("illumination diversity requires six conditions")
+        if illumination_pairing_policy not in {"legacy_six_way_v1", "reference_subset_v2"}:
+            raise ValueError(f"unsupported illumination pairing policy: {illumination_pairing_policy}")
         fraction = max(0.0, min(1.0, float(paired_fraction)))
         paired_count = min(actual, max(1, round(actual * fraction)))
-        paired = _fps(remaining, paired_count, rng, span)
-        paired_keys = {(item["viewpoint_id"], item["heading_deg"]) for item in paired}
-        singles = [item for item in remaining if (item["viewpoint_id"], item["heading_deg"]) not in paired_keys]
-        # A pair has the exact same camera pose under all conditions. Singles keep
-        # scene coverage without multiplying the full production budget.
-        for index, condition in enumerate(conditions):
-            external_id = str(condition["external_asset"])
-            asset = dict((illumination.get("assets") or {}).get(external_id) or {})
-            recipe = {
-                "id": str(condition["id"]), "label": str(condition["id"]),
-                "version": "illumination-diversity-paired-v1",
-                "native_energy_scale": float(condition.get("internal_energy_scale", 1.0)),
-                "ambient_fill_scale": 1.0,
-                "rgb_color_multiplier": list(condition.get("internal_color") or (1.0, 1.0, 1.0)),
-                "side_key": bool(condition.get("side_key", False)),
-                "key_energy_scale": float(condition.get("key_energy_scale", 1.45)),
-                "opposite_energy_scale": float(condition.get("opposite_energy_scale", 0.35)),
-                "side_axis_xy": side_axis, "side_center_xy": center,
-                "external": {"asset_id": external_id, "path": asset.get("path"), "sha256": asset.get("sha256"),
-                             "world_strength": float(condition.get("world_strength", 0.0)),
-                             "portal_strength": float(condition.get("portal_strength", 0.0))},
-            }
-            recipe["recipe_digest"] = stable_digest(recipe)
-            group_poses = []
-            for member_index, pose in enumerate(paired):
-                pair_id = f"{scene_id}:{pose['viewpoint_id']}:{pose['heading_deg'] % 360.0:.3f}"
-                group_poses.append({**pose, "capture_kind": "paired", "pair_id": pair_id,
-                                    "pair_member_index": index})
-            for single_index, pose in enumerate(singles):
-                if single_index % len(conditions) == index:
+        if illumination_pairing_policy == "reference_subset_v2":
+            reference_indices = [index for index, condition in enumerate(conditions)
+                                 if str(condition.get("id") or "") == "reference_neutral_v1"]
+            if len(reference_indices) != 1:
+                raise ValueError("reference_subset_v2 requires exactly one reference_neutral_v1 condition")
+            reference_index = reference_indices[0]
+            base_poses = _fps(remaining, actual, rng, span) if len(remaining) > actual else list(remaining)
+            actual = len(base_poses)
+            variation_indices = [index for index in range(len(conditions)) if index != reference_index]
+            variation_pool = list(base_poses)
+            variation_groups: dict[int, list[dict[str, Any]]] = {}
+            for ordinal, condition_index in enumerate(variation_indices):
+                groups_left = len(variation_indices) - ordinal
+                quota = len(variation_pool) // groups_left if groups_left else 0
+                selected = _fps(variation_pool, quota, rng, span)
+                selected_keys = {_camera_key(item) for item in selected}
+                variation_pool = [item for item in variation_pool if _camera_key(item) not in selected_keys]
+                variation_groups[condition_index] = selected
+
+            def paired_pose(pose: dict[str, Any], member_index: int) -> dict[str, Any]:
+                anchor_key = str(pose.get("anchor_id") or "")
+                pair_id = f"{scene_id}:{pose['viewpoint_id']}:{pose['heading_deg'] % 360.0:.3f}:{anchor_key}"
+                return {**pose, "capture_kind": "paired", "pair_id": pair_id,
+                        "pair_member_index": member_index}
+
+            for index, condition in enumerate(conditions):
+                external_id = str(condition["external_asset"])
+                asset = dict((illumination.get("assets") or {}).get(external_id) or {})
+                recipe = {
+                    "id": str(condition["id"]), "label": str(condition["id"]),
+                    "version": "illumination-reference-subset-v2",
+                    "native_energy_scale": float(condition.get("internal_energy_scale", 1.0)),
+                    "ambient_fill_scale": 1.0,
+                    "rgb_color_multiplier": list(condition.get("internal_color") or (1.0, 1.0, 1.0)),
+                    "side_key": bool(condition.get("side_key", False)),
+                    "key_energy_scale": float(condition.get("key_energy_scale", 1.45)),
+                    "opposite_energy_scale": float(condition.get("opposite_energy_scale", 0.35)),
+                    "side_axis_xy": side_axis, "side_center_xy": center,
+                    "external": {"asset_id": external_id, "path": asset.get("path"), "sha256": asset.get("sha256"),
+                                 "world_strength": float(condition.get("world_strength", 0.0)),
+                                 "portal_strength": float(condition.get("portal_strength", 0.0))},
+                }
+                recipe["recipe_digest"] = stable_digest(recipe)
+                poses = ([paired_pose(pose, 0) for pose in base_poses] if index == reference_index
+                         else [paired_pose(pose, 1) for pose in variation_groups[index]])
+                groups.append({"lighting": recipe,
+                               "capture_group_id": f"{scene_id}:{recipe['id']}", "poses": poses})
+            paired_count = actual
+            singles = []
+        else:
+            # Legacy contract: one subset is repeated under every condition;
+            # remaining poses receive exactly one condition.
+            paired = _fps(remaining, paired_count, rng, span)
+            paired_keys = {_camera_key(item) for item in paired}
+            legacy_singles = [item for item in remaining if _camera_key(item) not in paired_keys]
+            legacy_single_groups = [
+                [pose for ordinal, pose in enumerate(legacy_singles) if ordinal % len(conditions) == index]
+                for index in range(len(conditions))
+            ]
+            single_total = max(0, actual - paired_count)
+            single_quotas = [single_total // len(conditions) + (1 if index < single_total % len(conditions) else 0)
+                             for index in range(len(conditions))]
+            selected_singles = [_fps(pool, quota, rng, span)
+                                for pool, quota in zip(legacy_single_groups, single_quotas)]
+            singles = [pose for group in selected_singles for pose in group]
+            for index, condition in enumerate(conditions):
+                external_id = str(condition["external_asset"])
+                asset = dict((illumination.get("assets") or {}).get(external_id) or {})
+                recipe = {
+                    "id": str(condition["id"]), "label": str(condition["id"]),
+                    "version": "illumination-diversity-paired-v1",
+                    "native_energy_scale": float(condition.get("internal_energy_scale", 1.0)),
+                    "ambient_fill_scale": 1.0,
+                    "rgb_color_multiplier": list(condition.get("internal_color") or (1.0, 1.0, 1.0)),
+                    "side_key": bool(condition.get("side_key", False)),
+                    "key_energy_scale": float(condition.get("key_energy_scale", 1.45)),
+                    "opposite_energy_scale": float(condition.get("opposite_energy_scale", 0.35)),
+                    "side_axis_xy": side_axis, "side_center_xy": center,
+                    "external": {"asset_id": external_id, "path": asset.get("path"), "sha256": asset.get("sha256"),
+                                 "world_strength": float(condition.get("world_strength", 0.0)),
+                                 "portal_strength": float(condition.get("portal_strength", 0.0))},
+                }
+                recipe["recipe_digest"] = stable_digest(recipe)
+                group_poses = []
+                for pose in paired:
+                    anchor_key = str(pose.get("anchor_id") or "")
+                    pair_id = f"{scene_id}:{pose['viewpoint_id']}:{pose['heading_deg'] % 360.0:.3f}:{anchor_key}"
+                    group_poses.append({**pose, "capture_kind": "paired", "pair_id": pair_id,
+                                        "pair_member_index": index})
+                for pose in selected_singles[index]:
                     group_poses.append({**pose, "capture_kind": "single", "pair_id": None,
                                         "pair_member_index": None})
-            groups.append({"lighting": recipe, "capture_group_id": f"{scene_id}:{recipe['id']}", "poses": group_poses})
+                groups.append({"lighting": recipe, "capture_group_id": f"{scene_id}:{recipe['id']}", "poses": group_poses})
     else:
         quotas = [actual // len(LIGHTING_PRESETS) + (1 if index < actual % len(LIGHTING_PRESETS) else 0) for index in range(len(LIGHTING_PRESETS))]
         for index, (preset, quota) in enumerate(zip(LIGHTING_PRESETS, quotas)):
             selected = _fps(remaining, quota, rng, span)
-            selected_keys = {(item["viewpoint_id"], item["heading_deg"]) for item in selected}
-            remaining = [item for item in remaining if (item["viewpoint_id"], item["heading_deg"]) not in selected_keys]
+            selected_keys = {_camera_key(item) for item in selected}
+            remaining = [item for item in remaining if _camera_key(item) not in selected_keys]
             recipe = {**preset, "version": LIGHTING_PRESET_VERSION, "side_axis_xy": side_axis, "side_center_xy": center}
             recipe["recipe_digest"] = stable_digest(recipe)
             groups.append({"lighting": recipe, "capture_group_id": f"{scene_id}:{preset['id']}", "poses": selected})
+    # Count physical camera poses after lighting assignment.  A paired pose
+    # appears in every condition group but must count once for the minimum.
+    unique_selected = {_camera_key(pose) for group in groups for pose in group.get("poses") or []}
+    if len(unique_selected) < int(min_unique_pose_count):
+        raise ValueError(f"independent camera pose minimum not met: {len(unique_selected)} < {int(min_unique_pose_count)} (lighting ignored)")
     plan_core = {
-        "schema": ILLUMINATION_PLAN_SCHEMA if illumination else (CONTENT_PLAN_SCHEMA if visibility is not None else PLAN_SCHEMA),
-        "sampler_version": CONTENT_SAMPLER_VERSION if visibility is not None else SAMPLER_VERSION, "scene_id": scene_id,
+        "schema": ((ILLUMINATION_REFERENCE_PLAN_SCHEMA if illumination_pairing_policy == "reference_subset_v2"
+                    else ILLUMINATION_PLAN_SCHEMA) if illumination else
+                   (CONTENT_PLAN_SCHEMA if (visibility is not None or camera_sets is not None) else PLAN_SCHEMA)),
+        "sampler_version": "anchor-centric-walkable-v1" if camera_sets is not None else (CONTENT_SAMPLER_VERSION if visibility is not None else SAMPLER_VERSION), "scene_id": scene_id,
         "source_graph_digest": stable_digest(graph),
         "sampling_seed": int(seed), "requested_pose_count": int(requested_pose_count), "actual_pose_count": actual,
         "candidate_pose_count": len(candidates), "clamped": actual != int(requested_pose_count),
+        "unique_pose_count": len(unique_selected), "min_unique_pose_count": int(min_unique_pose_count),
         "clamp_reason": ("utility_candidates" if visibility is not None and actual < min(target, len(candidates)) else
                          "adaptive_room_cap" if adaptive_budget and target < int(requested_pose_count) else
                          "candidate_pose_count" if actual != int(requested_pose_count) else None),
@@ -253,10 +353,15 @@ def build_render_plan(graph: dict[str, Any], *, requested_pose_count: int, seed:
         "scene_center_xy": center, "side_key_axis_xy": side_axis, "groups": groups,
     }
     if illumination:
+        variation_counts = {group["lighting"]["id"]: len(group["poses"]) for group in groups}
         plan_core["illumination"] = {"contract": illumination.get("contract"), "manifest_digest": illumination.get("manifest_digest"),
+                                      "pairing_policy": illumination_pairing_policy,
                                       "paired_fraction": float(paired_fraction), "paired_pose_count": paired_count,
                                       "single_pose_count": len(singles), "condition_count": len(conditions),
-                                      "expected_frame_count": paired_count * len(conditions) + len(singles)}
+                                      "reference_condition_id": "reference_neutral_v1" if illumination_pairing_policy == "reference_subset_v2" else None,
+                                      "base_pose_count": actual if illumination_pairing_policy == "reference_subset_v2" else None,
+                                      "condition_pose_counts": variation_counts,
+                                      "expected_frame_count": sum(variation_counts.values())}
     if visibility is not None:
         selected_keys = {(pose["viewpoint_id"], pose["heading_deg"]) for group in groups for pose in group["poses"]}
         reserve_pool = [item for item in candidates if (item["viewpoint_id"], item["heading_deg"]) not in selected_keys
@@ -267,6 +372,13 @@ def build_render_plan(graph: dict[str, Any], *, requested_pose_count: int, seed:
                           "room_pose_cap": room_cap, "max_headings_per_node": max_headings_per_node,
                           "sparse_negative_max_fraction": sparse_fraction, "selection": selection_meta,
                           "reserve_poses": _fps(reserve_pool, reserve_count, rng, span)})
+    if camera_sets is not None:
+        plan_core["camera_sets"] = {
+            "camera_set_digest": camera_sets.get("camera_set_digest"),
+            "camera_set_count": len(camera_sets.get("camera_sets") or []),
+            "sets": list(camera_sets.get("camera_sets") or []),
+        }
+        plan_core["showcase_provenance"] = dict(showcase_provenance or {})
     digest = stable_digest(plan_core)
     return {**plan_core, "render_plan_id": digest[:16], "render_plan_digest": digest}
 
@@ -274,13 +386,26 @@ def build_render_plan(graph: dict[str, Any], *, requested_pose_count: int, seed:
 def write_render_plan(path: Path, graph_path: Path, *, requested_pose_count: int, seed: int, scene_id: str,
                       visibility_path: Path | None = None, adaptive_budget: bool = False,
                       max_headings_per_node: int = 6, sparse_fraction: float = 0.15,
-                      illumination: dict[str, Any] | None = None, paired_fraction: float = 0.25) -> dict[str, Any]:
+                      illumination: dict[str, Any] | None = None, paired_fraction: float = 0.25,
+                      camera_sets_path: Path | None = None,
+                      showcase_provenance: dict[str, Any] | None = None,
+                      min_unique_pose_count: int = 1,
+                      illumination_pairing_policy: str = "legacy_six_way_v1") -> dict[str, Any]:
     graph = json.loads(graph_path.read_text(encoding="utf-8"))
     visibility = json.loads(visibility_path.read_text(encoding="utf-8")) if visibility_path else None
+    camera_sets = json.loads(camera_sets_path.read_text(encoding="utf-8")) if camera_sets_path else None
+    # A showcase raster probe is a broader durable report whose selected
+    # camera-set contract is nested under ``camera_sets``.  Accept that report
+    # directly so plan provenance binds to the exact raster selection.
+    if camera_sets is not None and isinstance(camera_sets.get("camera_sets"), dict):
+        camera_sets = dict(camera_sets["camera_sets"])
     plan = build_render_plan(graph, requested_pose_count=requested_pose_count, seed=seed, scene_id=scene_id,
                              visibility=visibility, adaptive_budget=adaptive_budget,
                              max_headings_per_node=max_headings_per_node, sparse_fraction=sparse_fraction,
-                             illumination=illumination, paired_fraction=paired_fraction)
+                             illumination=illumination, paired_fraction=paired_fraction,
+                             camera_sets=camera_sets, showcase_provenance=showcase_provenance,
+                             min_unique_pose_count=min_unique_pose_count,
+                             illumination_pairing_policy=illumination_pairing_policy)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")

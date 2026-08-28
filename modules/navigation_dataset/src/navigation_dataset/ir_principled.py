@@ -14,9 +14,12 @@ from typing import Any, Mapping
 import numpy as np
 
 
-MATERIAL_CONTRACT_SCHEMA = "robomituba.ir_principled_material_contract.v3"
-MATERIAL_CONTRACT_VERSION = "blender42-principled-metallic-roughness-v3"
-STAGE2_COMPILER_VERSION = "ir-principled-stage2-v10-slot-aware"
+MATERIAL_CONTRACT_SCHEMA = "robomituba.ir_principled_material_contract.v4"
+MATERIAL_CONTRACT_VERSION = "blender42-principled-metallic-roughness-v4"
+STAGE2_COMPILER_VERSION = "ir-principled-stage2-v12-render-visibility-contract"
+METALLIC_CONTRACT_SCHEMA = "robomituba.metallic_contract.v2"
+METALLIC_CONTRACT_FAMILIES = ("dielectric", "conductor", "coverage_mixed")
+METALLIC_FAMILY_IDS = {"dielectric": 0, "conductor": 1, "coverage_mixed": 2}
 PSEUDO_NIR_FORMULA_ID = "pseudo_max_complement_bt601_v1"
 PSEUDO_NIR_WEIGHTS = np.asarray((0.229, 0.587, 0.114), dtype=np.float32)
 LUMINANCE_WEIGHTS = np.asarray((0.2126, 0.7152, 0.0722), dtype=np.float32)
@@ -30,6 +33,39 @@ DIFFUSE_SHADING_EPSILON = 1e-4
 SUPPORTED_CHANNELS = ("base_color", "roughness", "metallic", "normal")
 SEMANTIC_SURROGATES = frozenset({"window_glass", "mirror"})
 INVALID_CHANNEL_SOURCES = frozenset({"missing", "unresolved", "invalid", "error"})
+
+
+def normalize_legacy_metallic_scalar(value: float, *, threshold: float = 0.5) -> dict[str, Any]:
+    """Normalize an uncontracted legacy scalar to physical binary metalness.
+
+    This is intentionally limited to compatibility preparation of legacy
+    materials.  Authored MetallicContractV2 values and spatial metallic maps
+    must bypass it.  The returned metadata is persisted so the affected
+    pixels can be excluded from source-valid evaluation.
+    """
+    scalar = float(value)
+    if not math.isfinite(scalar):
+        raise ValueError("legacy metallic scalar must be finite")
+    if not 0.0 < threshold < 1.0:
+        raise ValueError("metallic normalization threshold must be in (0, 1)")
+    clamped = min(1.0, max(0.0, scalar))
+    effective = 1.0 if clamped >= float(threshold) else 0.0
+    changed = abs(scalar - effective) > 1e-6
+    return {
+        "policy": "legacy_uniform_fractional_snap_v1",
+        "source_value": scalar,
+        "clamped_value": clamped,
+        "effective_value": effective,
+        "threshold": float(threshold),
+        "changed": changed,
+        "reason": (
+            "legacy_uniform_fractional_to_conductor"
+            if changed and effective == 1.0
+            else "legacy_uniform_fractional_to_dielectric"
+            if changed
+            else "already_binary"
+        ),
+    }
 
 
 def pseudo_nir_albedo(rgb_linear: np.ndarray) -> np.ndarray:
@@ -70,6 +106,28 @@ def diffuse_shading_from_component(
     shading = component / np.maximum(reflectance, float(epsilon))
     valid = np.max(reflectance, axis=-1) > float(epsilon)
     return shading.astype(np.float32), valid
+
+
+def diffuse_component_from_transport(
+    diffuse_transport: np.ndarray, diffuse_reflectance: np.ndarray,
+    *, epsilon: float = DIFFUSE_SHADING_EPSILON,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return v3 diffuse component C=R*T and its transport-valid mask.
+
+    ``diffuse_transport`` is Cycles Diffuse Direct + Diffuse Indirect and
+    ``diffuse_reflectance`` is Cycles Diffuse Color.  Unlike the legacy v2
+    helper above this does not divide by reflectance.
+    """
+    transport = np.asarray(diffuse_transport, dtype=np.float32)
+    reflectance = np.asarray(diffuse_reflectance, dtype=np.float32)
+    if transport.shape != reflectance.shape or transport.shape[-1:] != (3,):
+        raise ValueError(f"expected equal RGB tensors, got {transport.shape} and {reflectance.shape}")
+    if epsilon <= 0:
+        raise ValueError("epsilon must be positive")
+    component = transport * reflectance
+    valid = np.isfinite(transport).all(axis=-1) & np.isfinite(reflectance).all(axis=-1)
+    valid &= np.max(reflectance, axis=-1) > float(epsilon)
+    return component.astype(np.float32), valid
 
 
 def ceiling_softbox_specs(
@@ -153,6 +211,41 @@ def pbr_for_slot(unit: Mapping[str, Any], slot: int | None = None) -> Mapping[st
     return value if isinstance(value, Mapping) else {}
 
 
+def validate_metallic_contract(value: Mapping[str, Any] | None) -> tuple[bool, list[str]]:
+    """Validate the strict, renderer-independent MetallicContractV2 payload."""
+    if not isinstance(value, Mapping):
+        return False, ["missing_metallic_contract"]
+    failures = []
+    if value.get("schema") != METALLIC_CONTRACT_SCHEMA:
+        failures.append("invalid_schema")
+    family = str(value.get("family") or "")
+    if family not in METALLIC_CONTRACT_FAMILIES:
+        failures.append("invalid_family")
+    expected_representation = "spatial_texture" if family == "coverage_mixed" else "scalar"
+    if value.get("representation") != expected_representation:
+        failures.append("invalid_representation")
+    if value.get("encoding") != "linear_scalar":
+        failures.append("invalid_encoding")
+    if value.get("color_space") != "non_color":
+        failures.append("metallic_not_non_color")
+    if family == "coverage_mixed" and value.get("approximation") != "principled_coverage":
+        failures.append("invalid_coverage_approximation")
+    if family != "coverage_mixed" and value.get("approximation") not in {None, "none"}:
+        failures.append("unexpected_approximation")
+    if not str(value.get("generator_id") or ""):
+        failures.append("missing_generator_id")
+    if not isinstance(value.get("seed"), int):
+        failures.append("invalid_seed")
+    return not failures, failures
+
+
+def metallic_contract_for_slot(unit: Mapping[str, Any], slot: int | None = None) -> Mapping[str, Any] | None:
+    value = pbr_for_slot(unit, slot).get("metallic_contract")
+    if isinstance(value, Mapping):
+        return value
+    return None
+
+
 def unit_source_valid(unit: Mapping[str, Any], slot: int | None = None) -> bool:
     pbr = pbr_for_slot(unit, slot)
     if str(pbr.get("status") or "").lower() != "ok":
@@ -174,7 +267,7 @@ def material_normalization_record(
     if surrogate:
         replacement_reasons.append(f"{semantic}_to_opaque_principled")
     replacement_reasons.extend(f"missing_{name}_fallback" for name in missing)
-    source_valid = unit_source_valid(unit) and not surrogate
+    source_valid = unit_source_valid(unit, slot) and not surrogate
     source_channels = {
         name: {
             key: channels.get(name, {}).get(key)
@@ -202,6 +295,7 @@ def material_normalization_record(
         "source_channels": source_channels,
         "material_slot": slot,
         "applied_fallback_values": {name: fallback_values[name] for name in missing},
+        "metallic_contract": metallic_contract_for_slot(unit, slot),
     }
 
 

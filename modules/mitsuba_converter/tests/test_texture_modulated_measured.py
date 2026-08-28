@@ -489,3 +489,43 @@ def test_usd_prim_mesh_parts_emit_multiple_shapes_with_part_materials(tmp_path: 
     assert by_mesh["Chair_Leather"]["material_class"] == "leather"
     assert by_mesh["Chair_Metal"]["material_class"] == "metal"
     assert by_mesh["Chair_wood"]["material_class"] == "wood"
+
+
+def test_analytic_polar_policy_preserves_pbr_color_normal_and_roughness_maps(tmp_path: Path) -> None:
+    base = tmp_path / "carpet_base.jpg"
+    normal = tmp_path / "carpet_normal.jpg"
+    roughness = tmp_path / "carpet_roughness.jpg"
+    for path in (base, normal, roughness):
+        path.write_bytes(b"map")
+    scene_path = tmp_path / "render_scene.xml"
+    scene_path.write_text(
+        """
+        <scene version="3.0.0"><integrator type="path"/>
+          <shape type="obj" id="floor"><string name="filename" value="floor.obj"/><bsdf type="diffuse"/></shape>
+        </scene>
+        """,
+        encoding="utf-8",
+    )
+    policy = {
+        "shape_policies": [{
+            "shape_id": "floor",
+            "analytic_fallback": {
+                "bsdf_strategy": "pplastic",
+                "base_color_texture_ref": str(base),
+                "normal_texture_ref": str(normal),
+                "roughness_texture_ref": str(roughness),
+                "roughness": 0.6,
+            },
+            "extracted_material": {},
+        }],
+    }
+    (tmp_path / "render_scene_material_policy.json").write_text(json.dumps(policy), encoding="utf-8")
+    root = ET.parse(scene_path).getroot()
+    _apply_measured_scope_policy(root, source_scene=scene_path, measured_scope="analytic_only", max_measured_bsdfs=0)
+    normalmap = root.find(".//shape[@id='floor']//bsdf[@type='normalmap']")
+    assert normalmap is not None
+    assert normalmap.find("./texture[@name='normalmap']/string[@name='filename']").get("value") == str(normal)
+    plastic = normalmap.find("./bsdf[@type='pplastic']")
+    assert plastic is not None
+    assert plastic.find("./texture[@name='diffuse_reflectance']/string[@name='filename']").get("value") == str(base)
+    assert plastic.find("./texture[@name='alpha']/string[@name='filename']").get("value") == str(roughness)

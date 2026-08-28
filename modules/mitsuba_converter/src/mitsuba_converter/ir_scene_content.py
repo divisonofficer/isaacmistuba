@@ -8,9 +8,12 @@ from typing import Any
 
 SCHEMA = "robomituba.ir_scene_content_audit.v1"
 PROGRAMS: dict[str, dict[str, Any]] = {
-    "office": {"required": [{"desk"}, {"officechair", "chair"}, {"monitor", "computer", "laptop"}], "forbidden": {"bed", "bathtub", "toilet"}},
-    "factory-office": {"required": [{"desk", "table"}, {"officechair", "chair"}, {"monitor", "computer"}], "forbidden": {"bed", "bathtub"}},
-    "open-office": {"required": [{"desk"}, {"officechair", "chair"}, {"monitor", "computer"}], "forbidden": {"bed", "bathtub"}},
+    # Infinigen's TV factory is also used for flat-panel desktop displays.
+    # Treat it as a display anchor when the room already satisfies desk/chair;
+    # this does not excuse a sparse room and still rejects bedroom content.
+    "office": {"required": [{"desk"}, {"officechair", "chair"}, {"monitor", "computer", "laptop", "tv"}], "forbidden": {"bed", "bathtub", "toilet"}},
+    "factory-office": {"required": [{"desk", "table"}, {"officechair", "chair"}, {"monitor", "computer", "tv"}], "forbidden": {"bed", "bathtub"}},
+    "open-office": {"required": [{"desk"}, {"officechair", "chair"}, {"monitor", "computer", "tv"}], "forbidden": {"bed", "bathtub"}},
     "meeting-room": {"required": [{"meetingtable", "diningtable", "table"}, {"chair"}], "forbidden": {"bed", "bathtub", "toilet"}},
     "restroom": {"required": [{"toilet", "urinal"}, {"sink", "bathroomsink"}], "forbidden": {"bed", "sofa", "diningtable"}},
     "bathroom": {"required": [{"toilet", "bathtub", "shower"}, {"sink", "bathroomsink"}], "forbidden": {"bed", "desk"}},

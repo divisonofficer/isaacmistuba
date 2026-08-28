@@ -8,6 +8,7 @@ from statistics import mean
 
 from .episode_schema import EpisodeManifest, Pose2D, read_episode
 from .exporters.custom_json import find_episode_files
+from .scene_dataset import SceneDatasetPaths
 
 
 @dataclass
@@ -56,8 +57,15 @@ def evaluate_episode(episode: EpisodeManifest, *, success_radius: float = 0.5) -
     )
 
 
-def evaluate_dataset(dataset_root: str | Path, *, success_radius: float = 0.5) -> dict:
-    episode_metrics = [evaluate_episode(read_episode(path), success_radius=success_radius) for path in find_episode_files(dataset_root)]
+def evaluate_dataset(
+    dataset_root: str | Path,
+    *,
+    success_radius: float = 0.5,
+    scene_id: str | None = None,
+) -> dict:
+    paths = (SceneDatasetPaths.from_project(dataset_root, scene_id).episode_paths()
+             if scene_id is not None else find_episode_files(dataset_root))
+    episode_metrics = [evaluate_episode(read_episode(path), success_radius=success_radius) for path in paths]
     if not episode_metrics:
         return {"episode_count": 0, "metrics": {}, "episodes": []}
     payloads = [vars(item) for item in episode_metrics]
@@ -75,8 +83,17 @@ def evaluate_dataset(dataset_root: str | Path, *, success_radius: float = 0.5) -
     }
 
 
-def write_evaluation(path: str | Path, dataset_root: str | Path, *, success_radius: float = 0.5) -> Path:
+def write_evaluation(
+    path: str | Path,
+    dataset_root: str | Path,
+    *,
+    success_radius: float = 0.5,
+    scene_id: str | None = None,
+) -> Path:
     output = Path(path)
     output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(json.dumps(evaluate_dataset(dataset_root, success_radius=success_radius), indent=2), encoding="utf-8")
+    output.write_text(
+        json.dumps(evaluate_dataset(dataset_root, success_radius=success_radius, scene_id=scene_id), indent=2),
+        encoding="utf-8",
+    )
     return output

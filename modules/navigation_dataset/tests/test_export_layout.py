@@ -91,6 +91,44 @@ def test_include_perturbed_ships_paired_tree(tmp_path: Path) -> None:
     assert f"{pbase}/rgb.png" not in paired  # same dedup applies to the perturbed tree
 
 
+def test_panorama_includes_rendered_viewpoints_outside_episode_paths(tmp_path: Path) -> None:
+    """Full-panorama exports are scene-wide, not episode-path scoped."""
+    scene_id, vp, heading = "scene_full_graph", "vp_000001", "h_000"
+    project_dir = _build_project(tmp_path, scene_id, vp, heading, perturbed=True)
+    extra_vp, extra_heading = "vp_000099", "h_030"
+    scene_dir = project_dir / "scenes" / scene_id
+    _write_obs(scene_dir / "observations", extra_vp, extra_heading)
+    _write_obs(scene_dir / "observations_perturbed", extra_vp, extra_heading)
+    index_payload = {"scene_artifacts": [{"scene_id": scene_id}]}
+    ep = [_episode(scene_id, vp, heading)]
+
+    full_destinations = {
+        dst for _src, dst in iter_export_files(
+            project_dir,
+            index_payload,
+            ep,
+            panorama_observations=True,
+            include_perturbed=True,
+        )
+    }
+    extra_base = f"scenes/{scene_id}/observations/{extra_vp}/{extra_heading}/sensors/cam_front/rgb.png"
+    extra_perturbed = f"scenes/{scene_id}/observations_perturbed/{extra_vp}/{extra_heading}/sensors/cam_front/rgb.png"
+    assert extra_base in full_destinations
+    assert extra_perturbed in full_destinations
+
+    trajectory_destinations = {
+        dst for _src, dst in iter_export_files(
+            project_dir,
+            index_payload,
+            ep,
+            panorama_observations=False,
+            include_perturbed=True,
+        )
+    }
+    assert extra_base not in trajectory_destinations
+    assert extra_perturbed not in trajectory_destinations
+
+
 def test_camera_filter_applies_to_base_and_perturbed(tmp_path: Path) -> None:
     scene_id, vp, heading = "scene_c", "vp_000001", "h_000"
     project_dir = _build_project(tmp_path, scene_id, vp, heading, perturbed=True)
@@ -195,6 +233,37 @@ def test_versioned_current_pointer_is_collected_into_stable_layout(tmp_path: Pat
     assert f"{base}/sensors/cam_front/rgb.png" in destinations
     assert not any(dst.endswith("current.json") for dst in destinations)
     assert is_episode_complete(ep, project_dir)
+
+
+def test_episode_completion_accepts_ledger_version_without_current_pointer(tmp_path: Path) -> None:
+    """Daemon sweeps may have immutable bundles before a base pointer exists."""
+    scene_id, vp, heading = "scene_ledger_only", "vp_000001", "h_000"
+    project_dir = tmp_path / "out" / "opticalnav" / "v0"
+    bundle = project_dir / "scenes" / scene_id / "observations" / "versions" / "rv_base" / "base" / vp / heading
+    (bundle / "cameras" / "polar_cam").mkdir(parents=True)
+    (bundle / "cameras" / "polar_cam" / "rgb.png").write_bytes(b"rendered")
+    (bundle / "manifest.json").write_text("{}")
+
+    ledger = sqlite3.connect(project_dir / "render_ledger.sqlite3")
+    ledger.executescript("""
+        CREATE TABLE sweep_runs (run_id TEXT PRIMARY KEY, scene_id TEXT, created_at TEXT);
+        CREATE TABLE render_versions (render_version_id TEXT PRIMARY KEY, status TEXT);
+        CREATE TABLE sweep_tasks (
+            task_key TEXT PRIMARY KEY, run_id TEXT, render_version_id TEXT,
+            variant TEXT, node_id TEXT, heading_id TEXT, state TEXT,
+            ordinal INTEGER, metadata_json TEXT
+        );
+    """)
+    ledger.execute("INSERT INTO sweep_runs VALUES ('run', ?, '2026-01-01T00:00:00Z')", (scene_id,))
+    ledger.execute("INSERT INTO render_versions VALUES ('rv_base', 'ready')")
+    ledger.execute(
+        "INSERT INTO sweep_tasks VALUES ('task', 'run', 'rv_base', 'base', ?, ?, 'succeeded', 0, ?)",
+        (vp, heading, json.dumps({"sensor_ids": ["polar_cam"]})),
+    )
+    ledger.commit()
+    ledger.close()
+
+    assert is_episode_complete(_episode(scene_id, vp, heading), project_dir)
 
 
 def test_export_composes_sensors_from_separate_completed_versions(tmp_path: Path) -> None:

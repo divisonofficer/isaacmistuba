@@ -322,19 +322,36 @@ def decimate_object(
     # procedural meshes.  The caller may supply a meshoptimizer fallback; it
     # must return the measured triangle count, never just a process success.
     fallback_record = None
+    fallback_unavailable = False
     if decision.decimate and error is None and after > target_max_faces and fallback is not None:
         try:
             fallback_record = dict(fallback(bpy_obj, target_max_faces) or {})
             after = int(fallback_record["triangles_after"])
         except Exception as exc:  # noqa: BLE001
-            error = f"fallback_error: {type(exc).__name__}: {exc}"
-    no_effect = bool(decision.decimate and error is None and after > target_max_faces)
+            # A handful of procedural assets export an empty glTF after OBJ
+            # conversion (usually a disconnected/degenerate detail mesh).
+            # There is no topology for gltfpack to optimize in that case. Do
+            # not abort the whole scene in strict mode: retain the measured
+            # Blender result and record the exception so the asset remains
+            # auditable. Other fallback failures remain hard errors.
+            message = str(exc)
+            if "gltfpack import expected one mesh object, got 0" in message:
+                fallback_unavailable = True
+                fallback_record = {
+                    "status": "unavailable_empty_import",
+                    "triangles_after": int(after),
+                    "target_triangles": int(target_max_faces),
+                    "error": f"{type(exc).__name__}: {message}",
+                }
+            else:
+                error = f"fallback_error: {type(exc).__name__}: {exc}"
+    no_effect = bool(decision.decimate and error is None and after > target_max_faces and not fallback_unavailable)
     if no_effect:
         error = f"no_effect: requested <= {target_max_faces} triangles at ratio {decision.target_ratio:.4f}, got {after} after {len(applied_ratios)} pass(es)"
     record = {
         "policy": decision.policy, "measurement": "triangles",
-        "decimated": bool(decision.decimate and error is None),
-        "status": "reduced" if decision.decimate and error is None else "no_effect" if no_effect else "error" if error else "kept",
+        "decimated": bool(decision.decimate and error is None and not fallback_unavailable),
+        "status": "kept_fallback_unavailable" if fallback_unavailable else "reduced" if decision.decimate and error is None else "no_effect" if no_effect else "error" if error else "kept",
         "faces_before": before, "faces_after": after, "target_max_faces": target_max_faces,
         "triangles_before": before, "triangles_after": after, "target_max_triangles": target_max_faces,
         "target_ratio": round(decision.target_ratio, 4), "reason": decision.reason, "error": error,

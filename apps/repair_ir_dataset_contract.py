@@ -8,6 +8,9 @@ import sys
 from collections import Counter
 from pathlib import Path
 
+import cv2
+import numpy as np
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 for module in ("robomituba_bridge", "navigation_dataset", "mitsuba_converter"):
     sys.path.insert(0, str(REPO_ROOT / "modules" / module / "src"))
@@ -16,15 +19,91 @@ from render_ir_principled_dataset_queue import (  # noqa: E402
     _atomic_json, _canonicalize_binary_masks, _derive_camera_depth, _qc_summary,
     _refresh_index, _row_complete,
 )
+from mitsuba_converter.ir_dataset_contract import LEGACY_DATASET_SCHEMA, _safe_artifact_path  # noqa: E402
+
+
+def _row_complete_for_repair(dataset: Path, frame_id: str, fingerprint: str, *, legacy_v2: bool) -> bool:
+    """Check completeness without applying the current renderer's v3 schema to v2.
+
+    A v2 dataset is immutable and legitimately lacks later v3 modalities such
+    as metal-family and diffuse-transport maps.  Contract repair is invoked
+    immediately before publish, so applying ``_row_complete`` unconditionally
+    reset an otherwise finished v2 rolling state to zero completed frames.
+    The publisher still decodes and validates every indexed artifact below.
+    """
+    if not legacy_v2:
+        return _row_complete(dataset, frame_id, fingerprint)
+    path = dataset / "frames" / f"{frame_id}.json"
+    if not path.is_file():
+        return False
+    try:
+        row = json.loads(path.read_text(encoding="utf-8"))
+        paths = row.get("paths") or {}
+        if row.get("dataset_fingerprint") != fingerprint or not isinstance(paths, dict) or not paths:
+            return False
+        return all(_safe_artifact_path(dataset, str(relative)).is_file() for relative in paths.values())
+    except Exception:
+        return False
 
 
 def repair_dataset(dataset: Path) -> dict:
     dataset = dataset.resolve()
     config = json.loads((dataset / "dataset_config.json").read_text(encoding="utf-8"))
     fingerprint = str(config.get("dataset_fingerprint") or "")
+    legacy_v2 = config.get("schema") == LEGACY_DATASET_SCHEMA
     state_path = dataset / "rolling_queue_state.json"
     state = json.loads(state_path.read_text(encoding="utf-8")) if state_path.is_file() else None
-    rows = _refresh_index(dataset)
+    # A compatible-plan resume deliberately leaves old frame metadata and
+    # pixels in place for provenance.  Contract repair must never reintroduce
+    # those legacy rows into the authoritative index.
+    rows = _refresh_index(dataset, fingerprint=fingerprint)
+
+    # v3 prepared scenes predate the optional remediation/provenance AOVs.  A
+    # completed render from those scenes is still valid: materialize the
+    # documented neutral values and add the paths to each frame record so the
+    # v2 completeness contract can be checked without an expensive rerender.
+    # ``train_pbr_valid_mask`` is the conservative source-valid mask for a
+    # legacy frame; the other two channels are zero/unknown.
+    legacy_upgrades = 0
+    for row in rows:
+        frame_id = str(row.get("frame_id") or "")
+        row_path = dataset / "frames" / f"{frame_id}.json"
+        if not frame_id or not row_path.is_file():
+            continue
+        paths = dict(row.get("paths") or {})
+        source_rel = paths.get("source_valid_mask")
+        source_path = dataset / source_rel if source_rel else None
+        if source_path is None or not source_path.is_file():
+            continue
+        source = cv2.imread(str(source_path), cv2.IMREAD_UNCHANGED)
+        if source is None or source.dtype != np.uint8 or source.ndim != 2:
+            continue
+        changed = False
+        for modality, value in (
+            ("remediated_pbr_mask", np.zeros_like(source, dtype=np.uint8)),
+            ("pbr_provenance_class", np.zeros_like(source, dtype=np.uint8)),
+            ("train_pbr_valid_mask", np.where(source >= 128, 255, 0).astype(np.uint8)),
+        ):
+            rel = paths.get(modality) or f"{modality}/{frame_id}.png"
+            target = dataset / rel
+            if not target.is_file():
+                target.parent.mkdir(parents=True, exist_ok=True)
+                temp = target.with_name(f".{target.name}.{id(row)}.tmp.png")
+                if not cv2.imwrite(str(temp), value, [cv2.IMWRITE_PNG_COMPRESSION, 3]):
+                    raise RuntimeError(f"failed to materialize legacy contract artifact: {target}")
+                temp.replace(target)
+            if paths.get(modality) != rel:
+                paths[modality] = rel
+                changed = True
+        if changed:
+            row["paths"] = paths
+            temp_row = row_path.with_name(f".{row_path.name}.{id(row)}.tmp")
+            temp_row.write_text(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n", encoding="utf-8")
+            temp_row.replace(row_path)
+            legacy_upgrades += 1
+    if legacy_upgrades:
+        rows = _refresh_index(dataset, fingerprint=fingerprint)
+        print(f"[ir-contract-repair] upgraded legacy frame metadata rows={legacy_upgrades}", flush=True)
     report_path = dataset / "contract_repair.json"
     if report_path.is_file():
         previous = json.loads(report_path.read_text(encoding="utf-8"))
@@ -46,7 +125,7 @@ def repair_dataset(dataset: Path) -> dict:
             if not row_path.is_file():
                 continue
             row = json.loads(row_path.read_text(encoding="utf-8"))
-            if _row_complete(dataset, frame_id, fingerprint):
+            if _row_complete_for_repair(dataset, frame_id, fingerprint, legacy_v2=legacy_v2):
                 finalized_frames.append(frame_id)
                 continue
             try:
@@ -54,13 +133,13 @@ def repair_dataset(dataset: Path) -> dict:
             except Exception as exc:
                 print(f"[ir-contract-repair] cannot finalize {frame_id}: {exc}", flush=True)
                 continue
-            if _row_complete(dataset, frame_id, fingerprint):
+            if _row_complete_for_repair(dataset, frame_id, fingerprint, legacy_v2=legacy_v2):
                 finalized_frames.append(frame_id)
 
-        rows = _refresh_index(dataset)
+        rows = _refresh_index(dataset, fingerprint=fingerprint)
         completed = {
             str(row["frame_id"]) for row in rows
-            if _row_complete(dataset, str(row["frame_id"]), fingerprint)
+            if _row_complete_for_repair(dataset, str(row["frame_id"]), fingerprint, legacy_v2=legacy_v2)
         }
         unresolved = sorted(incomplete - completed)
         old_failed = state.get("failed") or {}

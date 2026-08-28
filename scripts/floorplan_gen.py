@@ -66,8 +66,23 @@ MODERN_OFFICE_DIMENSIONS = (
     (18.0, 16.0),  # 288 m²
 )
 MODERN_OFFICE_TOPOLOGIES = ("facade_bar", "side_core", "split_neighborhood")
-MODERN_OFFICE_STYLES = ("modern_basic_v1", "modern_glass_v1")
+MODERN_OFFICE_STYLES = ("modern_basic_v1", "modern_glass_v1", "modern_glass_v2")
 MODERN_GLASS_PARTITION_COUNT = 3
+
+# v2 deliberately keeps the compact v1 profile immutable.  It is a separate
+# wide-floorplate programme for data generation, not a revision of a published
+# seed contract.  The lower work area is eight metres deep, which keeps a
+# three-bay layout below 75 m² per bay even for the 28 m facade option.
+WIDE_GLASS_OFFICE_PROFILE = "modern_glass_office_v2"
+WIDE_GLASS_OFFICE_ARCHETYPE = "office_modern_glass_v2"
+WIDE_GLASS_OFFICE_DIMENSIONS = (
+    (24.0, 18.0),  # 432 m²
+    (26.0, 18.0),  # 468 m²
+    (28.0, 18.0),  # 504 m²
+    (26.0, 20.0),  # 520 m²
+)
+WIDE_GLASS_OFFICE_STYLES = ("modern_glass_v2",)
+WIDE_GLASS_PARTITION_COUNT = 10
 
 SINGLE_ROOM_TYPES = (
     "living-room",
@@ -229,6 +244,33 @@ def cut_band(rect: Rect, axis: str, n: int | None, rng: random.Random):
     return out
 
 
+def balanced_cut_band(rect: Rect, axis: str, n: int, rng: random.Random):
+    """Split a band nearly evenly instead of giving all spare width to one cell.
+
+    ``partition_widths`` intentionally produces irregular residential rooms. A
+    work bay has a maximum-area contract, so its remainder is spread one grid
+    unit at a time across distinct bays.
+    """
+    x0, y0, x1, y1 = rect
+    span = (x1 - x0) if axis == "x" else (y1 - y0)
+    units = int(round(span / UNIT))
+    if n < 1 or units < n * int(round(MIN_DIM / UNIT)):
+        raise ValueError(f"cannot make {n} balanced cells in span={span}")
+    base, remainder = divmod(units, n)
+    widths = [base] * n
+    for index in rng.sample(range(n), remainder):
+        widths[index] += 1
+    out, cur = [], (x0 if axis == "x" else y0)
+    for units_w in widths:
+        width = q(units_w * UNIT)
+        if axis == "x":
+            out.append((q(cur), y0, q(cur + width), y1))
+        else:
+            out.append((x0, q(cur), x1, q(cur + width)))
+        cur += width
+    return out
+
+
 # --- archetype builders ----------------------------------------------------
 
 
@@ -386,6 +428,58 @@ def build_modern_office(rng: random.Random):
     return _modern_office_base(rng)
 
 
+def _wide_glass_office_base(rng: random.Random):
+    """Return the v2 wide office programme.
+
+    The plan is intentionally rectilinear and every private room directly
+    faces a real corridor.  This keeps Infinigen's solver in its reliable
+    regime while providing enough corridor-facing wall segments for ten
+    structural glass partitions.
+
+    ``open-office`` cells form three or four true work bays below the primary
+    spine.  Above it, a short connector and a second spine serve twelve
+    support rooms: three meetings, four focus offices, a reception/support
+    room, a break room, two restrooms, and storage/IT.  There are no home-only
+    room semantics.
+    """
+    W, H = rng.choice(WIDE_GLASS_OFFICE_DIMENSIONS)
+    work_bay_count = rng.choice((3, 3, 4))
+    # 28 m / 3 bays needs a half-metre shallower band to stay under the
+    # 75 m² work-bay contract after grid quantization.
+    work_depth = 7.5 if W >= 28.0 and work_bay_count == 3 else 8.0
+    primary_y0, primary_y1 = work_depth, q(work_depth + CW)
+    lower_y0, lower_y1 = primary_y1, q(primary_y1 + 3.0)
+    upper_corridor_y0, upper_corridor_y1 = lower_y1, q(lower_y1 + CW)
+
+    cells: list[Cell] = []
+    for rect in balanced_cut_band((0.0, 0.0, W, work_depth), "x", work_bay_count, rng):
+        cells.append(Cell(rect, "open-office"))
+
+    # Primary spine, a left-side connector, and the upper support spine make
+    # the full programme connected without private-room to private-room doors.
+    cells.append(Cell((0.0, primary_y0, W, primary_y1), "hallway", is_corridor=True))
+    cells.append(Cell((0.0, lower_y0, CW, lower_y1), "hallway", is_corridor=True))
+    lower_rects = cut_band((CW, lower_y0, W, lower_y1), "x", 6, rng)
+    for rect, room_type in zip(
+        lower_rects,
+        ("meeting-room", "meeting-room", "factory-office", "office", "restroom", "warehouse"),
+    ):
+        cells.append(Cell(rect, room_type))
+    cells.append(Cell((0.0, upper_corridor_y0, W, upper_corridor_y1), "hallway", is_corridor=True))
+    upper_rects = cut_band((0.0, upper_corridor_y1, W, H), "x", 6, rng)
+    for rect, room_type in zip(
+        upper_rects,
+        ("meeting-room", "office", "office", "office", "break-room", "restroom"),
+    ):
+        cells.append(Cell(rect, room_type))
+    return cells, W, H, work_bay_count
+
+
+def build_wide_glass_office(rng: random.Random):
+    """Build a 400–550 m² office with independently navigable work bays."""
+    return _wide_glass_office_base(rng)
+
+
 def modern_office_metadata(seed: int) -> dict:
     """Stable provenance summary written next to generated modern-office plans."""
     rng = random.Random(int(seed) * 1000)
@@ -405,6 +499,38 @@ def modern_office_metadata(seed: int) -> dict:
         "program_area_m2": areas,
         "glass_partition_policy": "structural_blender_postprocess_v1",
         "requested_glass_partition_count": MODERN_GLASS_PARTITION_COUNT,
+    }
+
+
+def wide_glass_office_metadata(seed: int) -> dict:
+    """Stable provenance summary for ``modern_glass_office_v2``."""
+    rng = random.Random(int(seed) * 1000)
+    cells, W, H, work_bay_count = _wide_glass_office_base(rng)
+    # ``emit`` assigns the same deterministic room names used by the persisted
+    # plan, allowing graph and population audits to require every work bay.
+    emit(cells, W, H, rng)
+    counts: dict[str, int] = {}
+    areas: dict[str, float] = {}
+    for cell in cells:
+        counts[cell.type] = counts.get(cell.type, 0) + 1
+        areas[cell.type] = round(areas.get(cell.type, 0.0) + area(cell.rect), 3)
+    work_bays = [cell for cell in cells if cell.type == "open-office"]
+    return {
+        "profile": WIDE_GLASS_OFFICE_PROFILE,
+        "archetype": WIDE_GLASS_OFFICE_ARCHETYPE,
+        "topology": "dual_spine_work_bays_v1",
+        "footprint_m": [W, H],
+        "footprint_area_m2": round(W * H, 3),
+        "work_bay_count": work_bay_count,
+        "work_bay_rooms": [cell.name for cell in work_bays],
+        "work_bay_area_m2": [round(area(cell.rect), 3) for cell in work_bays],
+        "reception_support_rooms": [cell.name for cell in cells if cell.type == "factory-office"],
+        "program_counts": counts,
+        "program_area_m2": areas,
+        "glass_partition_policy": "structural_blender_postprocess_v2",
+        "requested_glass_partition_count": WIDE_GLASS_PARTITION_COUNT,
+        "requested_glass_pane_count": WIDE_GLASS_PARTITION_COUNT * 2,
+        "population_policy": "office_constraints_v2_audited_retry",
     }
 
 
@@ -452,6 +578,11 @@ def modern_office_partition_spec(seed: int, count: int = MODERN_GLASS_PARTITION_
         candidates.append({
             "room": room, "corridor": corridor, "door_id": door_id,
             "priority": priority[room.split("_")[0]],
+            # A room program owns both sides of a shared boundary.  The
+            # Blender post-process must remove the opaque surface from both
+            # shells before installing the glass; cutting only ``room.wall``
+            # leaves ``corridor.wall`` directly behind the dielectric pane.
+            "opaque_wall_owners": [room, corridor],
             "wall_endpoints_m": _segment_endpoints(edge),
             "orientation": "vertical" if edge[0] == "v" else "horizontal",
             "door_opening_m": [[p0[0], p0[1]], [p1[0], p1[1]]],
@@ -469,8 +600,71 @@ def modern_office_partition_spec(seed: int, count: int = MODERN_GLASS_PARTITION_
             "frame": {"profile_m": 0.04, "top_clearance_m": 0.10},
         })
     core = {
-        "schema": "robomituba.opticalnav_modern_glass_spec.v1",
+        "schema": "robomituba.opticalnav_modern_glass_spec.v3",
         "requested_partition_count": count,
+        "eligible_segment_count": len(candidates),
+        "selected_segment_ids": [item["segment_id"] for item in selected],
+        "segments": selected,
+    }
+    core["digest"] = hashlib.sha256(json.dumps(core, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    return core
+
+
+def wide_glass_office_partition_spec(seed: int, count: int = WIDE_GLASS_PARTITION_COUNT) -> dict:
+    """Return ten corridor-facing structural-glass replacements for office v2.
+
+    Work bays are prioritised first, followed by meeting rooms and focus offices.
+    With three bays this resolves to 3 + 3 + 4; with four bays it resolves to
+    4 + 3 + 3.  In both cases every selected wall already owns a generated door
+    opening, so the later Blender operation cannot make a navigation barrier.
+    """
+    if count != WIDE_GLASS_PARTITION_COUNT:
+        raise ValueError(f"{WIDE_GLASS_OFFICE_PROFILE} requires exactly {WIDE_GLASS_PARTITION_COUNT} partitions")
+    plan = build_floor_plan(int(seed), WIDE_GLASS_OFFICE_ARCHETYPE)
+    rects = {name: _parse_box(spec["shape"]) for name, spec in plan["rooms"].items()}
+    priority = {"open-office": 0, "meeting-room": 1, "office": 2, "break-room": 3}
+    candidates = []
+    for door_id, door in plan["doors"].items():
+        p0, p1 = _parse_line(door["shape"])
+        touched = []
+        for name, rect in rects.items():
+            x0, y0, x1, y1 = rect
+            if abs(p0[0] - p1[0]) < 1e-6:
+                if (abs(x0 - p0[0]) < 1e-6 or abs(x1 - p0[0]) < 1e-6) and min(y1, max(p0[1], p1[1])) - max(y0, min(p0[1], p1[1])) > 1e-6:
+                    touched.append(name)
+            elif (abs(y0 - p0[1]) < 1e-6 or abs(y1 - p0[1]) < 1e-6) and min(x1, max(p0[0], p1[0])) - max(x0, min(p0[0], p1[0])) > 1e-6:
+                touched.append(name)
+        corridor = next((name for name in touched if name.startswith("hallway_")), None)
+        room = next((name for name in touched if name.split("_")[0] in priority), None)
+        if not corridor or not room:
+            continue
+        edge = shared_edge(rects[corridor], rects[room])
+        if not edge:
+            continue
+        candidates.append({
+            "room": room,
+            "corridor": corridor,
+            "door_id": door_id,
+            "priority": priority[room.split("_")[0]],
+            "opaque_wall_owners": [room, corridor],
+            "wall_endpoints_m": _segment_endpoints(edge),
+            "orientation": "vertical" if edge[0] == "v" else "horizontal",
+            "door_opening_m": [[p0[0], p0[1]], [p1[0], p1[1]]],
+        })
+    candidates.sort(key=lambda item: (item["priority"], item["room"], item["door_id"]))
+    if len(candidates) < count:
+        raise ValueError(f"{WIDE_GLASS_OFFICE_PROFILE} requires {count} eligible corridor walls; found {len(candidates)}")
+    selected = []
+    for index, item in enumerate(candidates[:count], 1):
+        selected.append({
+            "segment_id": f"office_glass_v2_{index:02d}",
+            **{key: value for key, value in item.items() if key != "priority"},
+            "frame": {"profile_m": 0.04, "top_clearance_m": 0.10},
+        })
+    core = {
+        "schema": "robomituba.opticalnav_modern_glass_spec.v3",
+        "requested_partition_count": count,
+        "requested_pane_count": count * 2,
         "eligible_segment_count": len(candidates),
         "selected_segment_ids": [item["segment_id"] for item in selected],
         "segments": selected,
@@ -728,6 +922,8 @@ def build_floor_plan(seed: int, archetype: str, target_rooms: int | None = None)
             cells, W, H = build_office(rng, tr)
         elif archetype == MODERN_OFFICE_ARCHETYPE:
             cells, W, H, _topology = build_modern_office(rng)
+        elif archetype == WIDE_GLASS_OFFICE_ARCHETYPE:
+            cells, W, H, _work_bays = build_wide_glass_office(rng)
         elif archetype == "single_room":
             raise ValueError("single_room requires build_single_room_plan(seed, room_type)")
         else:
@@ -762,7 +958,8 @@ if __name__ == "__main__":
 
     ap = argparse.ArgumentParser(description="Dump a generated floor plan as JSON.")
     ap.add_argument("--seed", type=int, required=True)
-    ap.add_argument("--archetype", choices=["apartment", "office", "single_room"], default="apartment")
+    ap.add_argument("--archetype", choices=["apartment", "office", MODERN_OFFICE_ARCHETYPE,
+                                              WIDE_GLASS_OFFICE_ARCHETYPE, "single_room"], default="apartment")
     ap.add_argument("--room-type", choices=SINGLE_ROOM_TYPES, default="living-room")
     ap.add_argument("--rooms", type=int, default=None)
     a = ap.parse_args()

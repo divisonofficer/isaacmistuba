@@ -94,6 +94,9 @@ class PortalSpec:
     region_a: int | None = None
     region_b: int | None = None
     resolved: bool = True
+    # ``declared`` comes from an authored door object; ``inferred`` is a
+    # geometry-validated transition between authoring traversable regions.
+    source: str = "declared"
 
 
 @dataclass

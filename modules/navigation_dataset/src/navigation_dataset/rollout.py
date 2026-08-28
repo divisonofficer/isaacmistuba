@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Callable, Iterable
 
 from .episode_schema import EpisodeManifest, EpisodeTimestep, GENERATION_VERSION, write_episode
+from .scene_dataset import SceneDatasetPaths
 from .instruction_templates import make_instruction
 from .planner import plan_path, sample_start_goal_pairs
 from .scene_annotations import SceneAnnotation
@@ -146,9 +147,15 @@ def plan_episodes(
 
 
 def write_episodes(root: str | Path, episodes: Iterable[EpisodeManifest]) -> list[Path]:
-    dataset_root = Path(root)
-    written: list[Path] = []
-    for episode in episodes:
-        path = dataset_root / "episodes" / episode.split / f"{episode.episode_id}.json"
-        written.append(write_episode(path, episode))
-    return written
+    rows = list(episodes)
+    if not rows:
+        return []
+    scene_ids = {episode.scene_id for episode in rows}
+    if len(scene_ids) != 1:
+        raise ValueError("write_episodes requires one scene; use explicit multi-scene orchestration")
+    return write_scene_episodes(SceneDatasetPaths.from_project(root, scene_ids.pop()), rows)
+
+
+def write_scene_episodes(paths: SceneDatasetPaths, episodes: Iterable[EpisodeManifest]) -> list[Path]:
+    """Write episodes to one scene workspace without a project-wide path."""
+    return [paths.write_episode(episode) for episode in episodes]

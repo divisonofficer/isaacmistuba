@@ -166,6 +166,25 @@ def test_strict_decimation_rejects_no_effect(monkeypatch=None):
         module.apply_decimation = original
 
 
+def test_strict_decimation_tolerates_empty_gltf_fallback(monkeypatch=None):
+    import mesh_decimation as module
+    original = module.apply_decimation
+    module.apply_decimation = lambda obj, decision: len(obj.data.polygons)
+    try:
+        def empty_gltf(_obj, _target):
+            raise RuntimeError("gltfpack import expected one mesh object, got 0")
+        rec = decimate_object(
+            _FakeObj(500_000), RatioThreshold(min_faces=1_000, ratio=0.3),
+            ctx(500_000), strict=True, fallback=empty_gltf,
+        )
+        assert rec["status"] == "kept_fallback_unavailable"
+        assert rec["decimated"] is False
+        assert rec["fallback"]["status"] == "unavailable_empty_import"
+        assert rec["error"] is None
+    finally:
+        module.apply_decimation = original
+
+
 
 if __name__ == "__main__":
     import traceback

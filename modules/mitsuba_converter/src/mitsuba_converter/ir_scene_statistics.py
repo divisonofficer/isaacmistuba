@@ -27,8 +27,18 @@ def _summary(values: list[float]) -> dict[str, float | None]:
 
 
 def _classify(objects_per_m2: float | None, visible_median: float | None) -> str:
-    if objects_per_m2 is None or visible_median is None:
+    if objects_per_m2 is None:
         return "unknown"
+    # Backfilled legacy scenes can have a graph snapshot whose node IDs no
+    # longer match the rendered plan.  Their source inventory and footprint
+    # are still authoritative, so retain a density class from objects/m² and
+    # let the caller expose visibility as unavailable in provenance.
+    if visible_median is None:
+        if objects_per_m2 < 1.0:
+            return "sparse"
+        if objects_per_m2 < 3.0:
+            return "moderate"
+        return "dense"
     if objects_per_m2 < 1.0 or visible_median < 2.0:
         return "sparse"
     if objects_per_m2 < 3.0 or visible_median < 5.0:

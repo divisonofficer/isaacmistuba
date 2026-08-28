@@ -102,11 +102,16 @@ def main() -> int:
     read_names = (
         "rgb", "nir_active", "base_color_rgb", "base_color_nir", "roughness", "metallic",
         "material_id", "source_valid_mask", "replacement_mask", "fallback_mask", "gt_defined_mask",
-        "diffuse_shading_rgb", "diffuse_shading_nir",
     )
     for row in candidates:
         paths = row["paths"]
         raw = {name: _read(root / paths[name]) for name in read_names}
+        # v2 called T "diffuse_component".  Preserve old datasets as input
+        # without pretending their stored name had v3 semantics.
+        for modality in ("rgb", "nir"):
+            transport_name = f"diffuse_transport_{modality}"
+            legacy_name = f"diffuse_component_{modality}"
+            raw[transport_name] = _read(root / paths.get(transport_name, paths[legacy_name]))
         if not all(value.shape[:2] == raw["rgb"].shape[:2] for value in raw.values()):
             raise RuntimeError(f"RGB/NIR/GT dimensions differ for {row['frame_id']}")
         rough = _unorm(raw["roughness"])
@@ -146,7 +151,7 @@ def main() -> int:
             _display(raw["rgb"], hdr=True), _display(raw["nir_active"], hdr=True),
             _display(raw["base_color_rgb"]), _display(raw["base_color_nir"]),
             _display(raw["roughness"]), _display(raw["metallic"]),
-            _display(raw["diffuse_shading_rgb"], hdr=True), _display(raw["diffuse_shading_nir"], hdr=True),
+            _display(raw["diffuse_transport_rgb"], hdr=True), _display(raw["diffuse_transport_nir"], hdr=True),
             _display(raw["replacement_mask"]),
         )
         bounds = _crop_bounds(mask, size)

@@ -8,6 +8,36 @@ from typing import Any
 CONCRETE_WALL_HINTS = frozenset({"vertical", "alternating", "shape", "is_ceramic"})
 
 
+def install_callable_floor_material_compat(material_assignments: Any, ceramic_module: Any) -> int:
+    """Repair the deployed utility-floor registry's ``ceramic.tile`` typo.
+
+    Infinigen 1.19.1 lists the *module* ``ceramic.tile`` alongside material
+    generator classes in ``utility_floor``.  The room decorator samples that
+    list and calls the result, raising ``TypeError: 'module' object is not
+    callable``.  Replace only that exact known module with ``ceramic.Tile``;
+    unknown non-callables remain intact so an upstream material-contract bug
+    cannot be silently hidden.
+
+    Returns the number of repaired entries and is idempotent.
+    """
+    entries = getattr(material_assignments, "utility_floor", None)
+    bad = getattr(ceramic_module, "tile", None)
+    good = getattr(ceramic_module, "Tile", None)
+    if not isinstance(entries, list) or bad is None or not callable(good):
+        return 0
+    repaired = 0
+    replacement: list[tuple[Any, Any]] = []
+    for factory, weight in entries:
+        if factory is bad:
+            replacement.append((good, weight))
+            repaired += 1
+        else:
+            replacement.append((factory, weight))
+    if repaired:
+        material_assignments.utility_floor = replacement
+    return repaired
+
+
 def install_concrete_wall_hint_compat(concrete_cls: type[Any]) -> None:
     """Allow non-semantic room-wall layout hints on legacy Concrete."""
     original = concrete_cls.generate

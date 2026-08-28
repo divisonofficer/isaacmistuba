@@ -177,22 +177,20 @@ def _nearest_node_within(
 # ── metrics ───────────────────────────────────────────────────────────────────
 
 
-def audit(
-    history_path: Path,
-    graph_path: Path,
+def _audit_graph(
+    events: list[dict],
+    graph: dict,
     *,
     fill_eps_m: float = 0.25,
     endpoint_eps_m: float = 0.30,
     prune_eps_m: float = 0.25,
 ) -> dict:
-    events = _events(history_path)
     baseline = _baseline_counts(events)
     deleted_ids = _deleted_node_ids(events)
     deleted_pos = _deleted_node_positions(events)
     added = _added_node_positions(events)
     forced = _forced_edges(events)
 
-    graph = _load_graph(graph_path)
     node_pos = _graph_node_positions(graph)
     edge_pairs = _graph_edge_pairs(graph)
     node_ids = set(node_pos.keys())
@@ -268,6 +266,117 @@ def audit(
     }
 
 
+def audit(
+    history_path: Path,
+    graph_path: Path,
+    *,
+    fill_eps_m: float = 0.25,
+    endpoint_eps_m: float = 0.30,
+    prune_eps_m: float = 0.25,
+) -> dict:
+    """Audit a persisted candidate graph without modifying any scene artifact."""
+    return _audit_graph(
+        _events(history_path), _load_graph(graph_path),
+        fill_eps_m=fill_eps_m, endpoint_eps_m=endpoint_eps_m, prune_eps_m=prune_eps_m,
+    )
+
+
+_FRESH_BUILD_DEFAULTS = {
+    "resolution": 0.05,
+    "robot_radius_m": 0.25,
+    "robot_height_m": 1.2,
+    "heading_count": 12,
+    "min_node_spacing_m": 0.5,
+    "min_clearance_m": 0.10,
+    "camera_margin_m": 0.10,
+    "doorway_gap_m": 0.45,
+    "max_nodes": 300,
+    "k_neighbors": 8,
+    "max_edge_length_m": 1.5,
+    "seed": 0,
+}
+
+
+def _latest_build_config(events: list[dict], overrides: dict[str, object | None]) -> dict[str, object]:
+    """Use the latest build request when available; explicit CLI values win."""
+    config: dict[str, object] = dict(_FRESH_BUILD_DEFAULTS)
+    for event in reversed(events):
+        if event.get("operation") != "build_graph":
+            continue
+        params = event.get("params") or {}
+        for key in config:
+            if params.get(key) is not None:
+                config[key] = params[key]
+        break
+    for key, value in overrides.items():
+        if value is not None:
+            config[key] = value
+    for key in ("max_nodes", "heading_count", "k_neighbors", "seed"):
+        config[key] = int(config[key])
+    for key in set(config) - {"max_nodes", "heading_count", "k_neighbors", "seed"}:
+        config[key] = float(config[key])
+    return config
+
+
+def fresh_build_audit(
+    history_path: Path,
+    scene_dir: Path,
+    *,
+    overrides: dict[str, object | None] | None = None,
+    fill_eps_m: float = 0.75,
+    endpoint_eps_m: float = 0.30,
+    prune_eps_m: float = 0.25,
+) -> dict:
+    """Build a disposable auto-only candidate and audit it against edit history.
+
+    ``persist_grid=False`` and ``existing_graph=None`` are intentional: this is the
+    regression path for the generator, not a request to alter manual corrections.
+    """
+    from navigation_dataset.graph_pipeline import _max_wall_run_cells, build_viewpoint_graph_core
+    from navigation_dataset.viewpoint_graph import compute_connected_components
+
+    events = _events(history_path)
+    config = _latest_build_config(events, overrides or {})
+    result = build_viewpoint_graph_core(
+        str(scene_dir.name), scene_dir,
+        graph_id=f"{scene_dir.name}_fresh_audit",
+        persist_grid=False,
+        existing_graph=None,
+        **config,
+    )
+    graph_payload = {
+        "scene_id": result.graph.scene_id,
+        "graph_id": result.graph.graph_id,
+        "nodes": [{"node_id": n.node_id, "position": list(n.position)} for n in result.graph.nodes],
+        "edges": [{"edge_id": e.edge_id, "source": e.source, "target": e.target,
+                   "distance_m": e.distance_m} for e in result.graph.edges],
+    }
+    report = _audit_graph(
+        events, graph_payload,
+        fill_eps_m=fill_eps_m, endpoint_eps_m=endpoint_eps_m, prune_eps_m=prune_eps_m,
+    )
+    positions = {n.node_id: n.position for n in result.graph.nodes}
+    wall_crossings = 0
+    if result.surface is not None and result.surface.wall_band_mask is not None:
+        for edge in result.graph.edges:
+            src, tgt = positions.get(edge.source), positions.get(edge.target)
+            if src is not None and tgt is not None and _max_wall_run_cells(
+                result.surface.wall_band_mask, result.grid.spec, src, tgt,
+            ) > 0:
+                wall_crossings += 1
+    report["fresh_build"] = {
+        "non_mutating": True,
+        "config": config,
+        "summary": result.summary,
+        "edge_quality": {
+            "max_edge_length_m": _round(max((e.distance_m for e in result.graph.edges), default=0.0), 4),
+            "wall_crossing_edges": wall_crossings,
+        },
+        "connected_components": len(compute_connected_components(result.graph).get("components", [])),
+    }
+    return report
+
+
 def _round(x: float | None, digits: int = 3) -> float | None:
     if x is None:
         return None
@@ -291,6 +400,12 @@ def _print_table(report: dict) -> None:
     print(f"{'outdoor_pruning_recall_pos':<32} {str(m['outdoor_pruning_recall_pos']):>8}  {d['outdoor_pruned_pos']}/{s['deleted_nodes_with_positions']} deleted positions empty within {report['params']['prune_eps_m']}m (re-import safe)")
     print(f"{'rug_fill_recall':<32} {str(m['rug_fill_recall']):>8}  {d['rug_filled']}/{s['added_nodes']} manual adds met by auto node within {report['params']['fill_eps_m']}m")
     print(f"{'carving_relaxation_rate':<32} {str(m['carving_relaxation_rate']):>8}  {d['carving_relaxed']}/{s['forced_edges_blocked']} blocked-edges now auto-connected ({d['carving_endpoints_matched']} endpoint-pairs matched)")
+    if report.get("fresh_build"):
+        fresh = report["fresh_build"]
+        quality = fresh["edge_quality"]
+        print()
+        print(f"fresh build (non-mutating): components={fresh['connected_components']}  "
+              f"max_edge={quality['max_edge_length_m']}m  wall_crossings={quality['wall_crossing_edges']}")
 
 
 def main() -> int:
@@ -299,11 +414,27 @@ def main() -> int:
     ap.add_argument("--project", default="opticalnav-v0.2", help="OpticalNav project id (default: opticalnav-v0.2)")
     ap.add_argument("--graph", default=None, help="Path to viewpoint_graph.json to audit (default: scene's current).")
     ap.add_argument("--history", default=None, help="Path to graph_edit_history.jsonl (default: scene's current).")
-    ap.add_argument("--fill-eps-m", type=float, default=0.25)
+    ap.add_argument("--fresh-build", action="store_true", help="Build an in-memory auto-only candidate; never writes graph/grid/history.")
+    ap.add_argument("--fill-eps-m", type=float, default=None)
     ap.add_argument("--endpoint-eps-m", type=float, default=0.30)
     ap.add_argument("--prune-eps-m", type=float, default=0.25,
                     help="position-based outdoor: a deleted spot counts as pruned when no node within this radius.")
     ap.add_argument("--json", action="store_true", help="Emit JSON to stdout instead of the human table.")
+    for flag, key, cast in (
+        ("--resolution", "resolution", float),
+        ("--robot-radius-m", "robot_radius_m", float),
+        ("--robot-height-m", "robot_height_m", float),
+        ("--heading-count", "heading_count", int),
+        ("--min-node-spacing-m", "min_node_spacing_m", float),
+        ("--min-clearance-m", "min_clearance_m", float),
+        ("--camera-margin-m", "camera_margin_m", float),
+        ("--doorway-gap-m", "doorway_gap_m", float),
+        ("--max-nodes", "max_nodes", int),
+        ("--k-neighbors", "k_neighbors", int),
+        ("--max-edge-length-m", "max_edge_length_m", float),
+        ("--seed", "seed", int),
+    ):
+        ap.add_argument(flag, dest=key, type=cast, default=None)
     args = ap.parse_args()
 
     scene_dir = REPO_ROOT / "out" / "opticalnav" / args.project / "scenes" / args.scene
@@ -313,15 +444,25 @@ def main() -> int:
     if not history_path.is_file():
         print(f"[error] history not found: {history_path}", file=sys.stderr)
         return 2
-    if not graph_path.is_file():
+    if not args.fresh_build and not graph_path.is_file():
         print(f"[error] graph not found: {graph_path}", file=sys.stderr)
         return 2
 
-    report = audit(
-        history_path, graph_path,
-        fill_eps_m=args.fill_eps_m, endpoint_eps_m=args.endpoint_eps_m,
-        prune_eps_m=args.prune_eps_m,
-    )
+    fill_eps_m = args.fill_eps_m if args.fill_eps_m is not None else (0.75 if args.fresh_build else 0.25)
+    if args.fresh_build:
+        overrides = {key: getattr(args, key) for key in _FRESH_BUILD_DEFAULTS}
+        report = fresh_build_audit(
+            history_path, scene_dir,
+            overrides=overrides,
+            fill_eps_m=fill_eps_m, endpoint_eps_m=args.endpoint_eps_m,
+            prune_eps_m=args.prune_eps_m,
+        )
+    else:
+        report = audit(
+            history_path, graph_path,
+            fill_eps_m=fill_eps_m, endpoint_eps_m=args.endpoint_eps_m,
+            prune_eps_m=args.prune_eps_m,
+        )
     if args.json:
         print(json.dumps(report, ensure_ascii=False, indent=2))
     else:

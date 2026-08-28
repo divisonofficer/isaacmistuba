@@ -217,6 +217,30 @@ def append_manual_node(graph: ViewpointGraph, x: float, y: float, *, heading_cou
     return node
 
 
+def reset_node_headings(node: ViewpointNode, heading_count: int) -> bool:
+    """Replace a node's heading sweep to match a graph-level heading count.
+
+    A graph has one authoritative ``node_heading_count``.  This is primarily used
+    when a full graph rebuild preserves manually placed nodes while the requested
+    sweep cardinality changes.
+
+    Returns ``True`` when the node was changed.
+    """
+    heading_count = int(heading_count)
+    if heading_count < 1:
+        raise ValueError("heading_count must be positive.")
+    if len(node.headings) == heading_count:
+        return False
+    node.headings = [
+        ViewpointHeading(
+            heading_id=f"h_{int(round(360 * index / heading_count)):03d}",
+            yaw_deg=float(360 * index / heading_count),
+        )
+        for index in range(heading_count)
+    ]
+    return True
+
+
 def remove_node(graph: ViewpointGraph, node_id: str) -> bool:
     """Remove a node by id along with any edges that touch it."""
     before = len(graph.nodes)

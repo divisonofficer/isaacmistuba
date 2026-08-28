@@ -34,6 +34,7 @@ class ExportProfile:
     include_polar_thumbnails: bool
     webp_lossless_rgb: bool
     include_exr: bool = False
+    retain_polar_visuals: bool = False
 
 
 EXPORT_PROFILES: dict[str, ExportProfile] = {
@@ -61,6 +62,15 @@ EXPORT_PROFILES: dict[str, ExportProfile] = {
         include_polar_thumbnails=True,
         webp_lossless_rgb=True,
     ),
+    "png_stokes_core": ExportProfile(
+        name="png_stokes_core",
+        split_polar_extension=False,
+        include_stokes_core=True,
+        include_legacy_stokes=False,
+        include_polar_thumbnails=False,
+        webp_lossless_rgb=False,
+        retain_polar_visuals=True,
+    ),
     "legacy_full": ExportProfile(
         name="legacy_full",
         split_polar_extension=False,
@@ -74,8 +84,8 @@ EXPORT_PROFILES: dict[str, ExportProfile] = {
 
 
 def resolve_export_profile(value: str | None) -> ExportProfile:
-    """Return an explicit profile, defaulting to the compact public contract."""
-    key = str(value or "compact_with_polar_extension").strip().lower()
+    """Return an explicit profile, defaulting to the PNG + canonical Stokes contract."""
+    key = str(value or "png_stokes_core").strip().lower()
     try:
         return EXPORT_PROFILES[key]
     except KeyError as exc:
@@ -156,6 +166,9 @@ def plan_compact_bundle_files(
                 plan.omitted.append(item)
             continue
         if _is_polar_visual(src, polar_dirs):
+            if profile.retain_polar_visuals:
+                plan.copied.append(item)
+                continue
             if profile.include_polar_thumbnails:
                 thumb_dst = str(Path(item.dst).with_name("polar_thumbnail.webp")).replace("\\", "/")
                 thumbnail_sources.setdefault(thumb_dst, {})[src.name] = src
@@ -293,6 +306,8 @@ def estimate_bundle_plan(plan: CompactBundlePlan) -> dict[str, Any]:
                 variant = "base"
             elif part == "observations_perturbed":
                 variant = "perturbed"
+            elif part == "observations_perturbed_active_polar":
+                variant = "perturbed_active_polar"
             elif part == "sensors" and index + 1 < len(parts):
                 sensor = parts[index + 1]
         return variant, sensor
@@ -395,6 +410,79 @@ def estimate_bundle_plan(plan: CompactBundlePlan) -> dict[str, Any]:
         "estimate_method": "conservative_profile_v2",
     }
 
+def rewrite_observation_manifest_payload(
+    payload: dict[str, Any],
+    *,
+    profile: ExportProfile,
+    source_to_exported: dict[str, str],
+    polar_extension: dict[str, Any] | None = None,
+) -> bool:
+    """Rewrite one observation manifest for a self-contained export."""
+    artifacts = payload.get("artifacts")
+    if not isinstance(artifacts, list):
+        return False
+    changed = False
+    for artifact in artifacts:
+        if not isinstance(artifact, dict):
+            continue
+        original = artifact.get("artifact_paths")
+        if not isinstance(original, dict):
+            continue
+        exported: dict[str, Any] = {}
+        for key, value in original.items():
+            if not isinstance(value, str):
+                continue
+            # The canonical core replaces the legacy container rather than
+            # advertising the same data under both keys.
+            if key == "stokes_npz" and profile.include_stokes_core:
+                continue
+            mapped = source_to_exported.get(value)
+            if mapped is None:
+                continue
+            if mapped.endswith("polar_thumbnail.webp"):
+                exported["polar_thumbnail"] = mapped
+            else:
+                exported["webp" if mapped.endswith(".webp") else key] = mapped
+        if "stokes_npz" in original:
+            if profile.include_stokes_core and not profile.split_polar_extension:
+                original_core = original.get("stokes_npz")
+                core = source_to_exported.get(original_core) if isinstance(original_core, str) else None
+                if core:
+                    exported["stokes_core_v1"] = core
+            elif profile.include_stokes_core and polar_extension is not None:
+                artifact["polarization_extension"] = polar_extension
+            elif profile.include_polar_thumbnails:
+                original_png = original.get("png")
+                thumb = source_to_exported.get(original_png) if isinstance(original_png, str) else None
+                if thumb:
+                    exported["polar_thumbnail"] = thumb
+        artifact_extras = artifact.get("extras")
+        if not isinstance(artifact_extras, dict):
+            artifact_extras = {}
+            artifact["extras"] = artifact_extras
+        # RenderArtifactManifest stores this alongside its artifact paths.  The
+        # older in-path spelling is accepted so a bundle rewrite also repairs
+        # manifests written during the transition.
+        virtual = original.get("derived_on_demand") or artifact_extras.get("derived_on_demand")
+        if isinstance(virtual, dict):
+            artifact_extras["derived_on_demand"] = {
+                "recipe": str(virtual.get("recipe") or POLAR_PREVIEW_RECIPE),
+                "modality": virtual.get("modality"),
+                "source": exported.get("stokes_core_v1") or None,
+                "extension_required": bool(profile.include_stokes_core and profile.split_polar_extension),
+            }
+        artifact["artifact_paths"] = exported
+        artifact["export_profile"] = profile.name
+        changed = True
+    if changed:
+        payload["bundle_export"] = {
+            "profile": profile.name,
+            "polar_stokes_schema": POLAR_STOKES_CORE_SCHEMA if profile.include_stokes_core else None,
+            "preview_recipe": POLAR_PREVIEW_RECIPE if profile.include_polar_thumbnails else None,
+        }
+    return changed
+
+
 def rewrite_observation_manifests(
     root: Path,
     *,
@@ -444,6 +532,18 @@ def rewrite_observation_manifests(
                     thumb = source_to_exported.get(original_png) if isinstance(original_png, str) else None
                     if thumb:
                         exported["polar_thumbnail"] = thumb
+            artifact_extras = artifact.get("extras")
+            if not isinstance(artifact_extras, dict):
+                artifact_extras = {}
+                artifact["extras"] = artifact_extras
+            virtual = original.get("derived_on_demand") or artifact_extras.get("derived_on_demand")
+            if isinstance(virtual, dict):
+                artifact_extras["derived_on_demand"] = {
+                    "recipe": str(virtual.get("recipe") or POLAR_PREVIEW_RECIPE),
+                    "modality": virtual.get("modality"),
+                    "source": exported.get("stokes_core_v1") or None,
+                    "extension_required": bool(profile.include_stokes_core and profile.split_polar_extension),
+                }
             artifact["artifact_paths"] = exported
             artifact["export_profile"] = profile.name
             changed = True
@@ -492,4 +592,47 @@ def build_perturbation_pair_index(destinations: Iterable[str]) -> dict[str, Any]
             {"scene_id": scene_id, "vp_id": vp_id, "heading_id": heading_id}
             for scene_id, vp_id, heading_id in sorted(perturbed - base)
         ],
+    }
+
+
+def build_polar_observation_triad_index(destinations: Iterable[str]) -> dict[str, Any]:
+    """Index exact base/perturbed/active-polar observation triplets.
+
+    The active-polar tree intentionally has a distinct name: it shares the
+    perturbation overlay with ``perturbed`` but has different illumination and
+    must never replace the passive observation.
+    """
+    roots = {
+        "observations": "base",
+        "observations_perturbed": "perturbed",
+        "observations_perturbed_active_polar": "perturbed_active_polar",
+    }
+    found: dict[str, set[tuple[str, str, str]]] = {variant: set() for variant in roots.values()}
+    for dst in destinations:
+        parts = Path(dst).parts
+        if len(parts) < 6 or parts[0] != "scenes" or parts[2] not in roots:
+            continue
+        found[roots[parts[2]]].add((parts[1], parts[3], parts[4]))
+    complete = set.intersection(*found.values()) if found else set()
+    return {
+        "schema": "opticalnav.polar_observation_triads.v1",
+        "triad_count": len(complete),
+        "triads": [
+            {
+                "scene_id": scene_id,
+                "vp_id": vp_id,
+                "heading_id": heading_id,
+                "base_ref": f"scenes/{scene_id}/observations/{vp_id}/{heading_id}",
+                "perturbed_ref": f"scenes/{scene_id}/observations_perturbed/{vp_id}/{heading_id}",
+                "perturbed_active_polar_ref": f"scenes/{scene_id}/observations_perturbed_active_polar/{vp_id}/{heading_id}",
+            }
+            for scene_id, vp_id, heading_id in sorted(complete)
+        ],
+        "incomplete": {
+            variant: [
+                {"scene_id": scene_id, "vp_id": vp_id, "heading_id": heading_id}
+                for scene_id, vp_id, heading_id in sorted(keys - complete)
+            ]
+            for variant, keys in found.items()
+        },
     }

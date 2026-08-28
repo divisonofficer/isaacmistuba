@@ -5,12 +5,22 @@ import json
 from pathlib import Path
 from typing import Any
 
-DATASET_SCHEMA = "robomituba.ir_principled_dataset.v2"
-ARTIFACT_SCHEMA = "robomituba.ir_principled_artifact_contract.v2"
+# These are the schemas emitted by newly prepared/renders.  Keep the v2
+# identifiers explicitly supported below: published v2 datasets are immutable
+# and must remain inspectable/publish-verifiable as legacy data.
+DATASET_SCHEMA = "robomituba.ir_principled_dataset.v3"
+ARTIFACT_SCHEMA = "robomituba.ir_principled_artifact_contract.v3"
+LEGACY_DATASET_SCHEMA = "robomituba.ir_principled_dataset.v2"
+LEGACY_ARTIFACT_SCHEMA = "robomituba.ir_principled_artifact_contract.v2"
+SUPPORTED_DATASET_SCHEMAS = frozenset((DATASET_SCHEMA, LEGACY_DATASET_SCHEMA))
+SUPPORTED_ARTIFACT_SCHEMAS = frozenset((ARTIFACT_SCHEMA, LEGACY_ARTIFACT_SCHEMA))
 OVERVIEW_SCHEMA = "robomituba.ir_scene_overview.v1"
 
 HDR_MODALITIES = {
-    "rgb", "nir_active", "diffuse_component_rgb", "diffuse_component_nir",
+    "rgb", "nir_active", "nir_passive", "nir_active_minus_passive",
+    "diffuse_component_rgb", "diffuse_component_nir",
+    "diffuse_transport_rgb", "diffuse_transport_nir",
+    # v2 compatibility only.  They are deliberately absent from v3 contracts.
     "diffuse_shading_rgb", "diffuse_shading_nir",
 }
 LINEAR_RGB_MODALITIES = {
@@ -19,11 +29,29 @@ LINEAR_RGB_MODALITIES = {
 SCALAR_MODALITIES = {"roughness", "metallic"}
 NORMAL_MODALITIES = {"normal_geometry_world", "normal_shading_world"}
 DISTANCE_MODALITIES = {"depth", "range"}
+# Object and material IDs use the full uint16 PNG range.  Provenance is a
+# compact categorical map (currently 0--255) and is intentionally emitted as
+# uint8 by both the rolling renderer and the contract-repair tool.
 ID_MODALITIES = {"object_id", "material_id"}
+CLASS_MODALITIES = {"pbr_provenance_class"}
 MASK_MODALITIES = {
     "gt_defined_mask", "source_valid_mask", "replacement_mask", "fallback_mask",
-    "primary_eval_valid_mask", "diffuse_shading_valid_rgb", "diffuse_shading_valid_nir",
+    "remediated_pbr_mask", "train_pbr_valid_mask", "primary_eval_valid_mask",
+    "diffuse_transport_valid_rgb", "diffuse_transport_valid_nir",
+    "diffuse_shading_valid_rgb", "diffuse_shading_valid_nir",  # v2 legacy
 }
+
+
+def is_supported_dataset_schema(value: object) -> bool:
+    return str(value) in SUPPORTED_DATASET_SCHEMAS
+
+
+def is_supported_artifact_schema(value: object) -> bool:
+    return str(value) in SUPPORTED_ARTIFACT_SCHEMAS
+
+
+def is_legacy_v2_schema(value: object) -> bool:
+    return str(value) == LEGACY_DATASET_SCHEMA
 
 
 def _read_json(path: Path) -> dict[str, Any]:

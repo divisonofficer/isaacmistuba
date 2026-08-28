@@ -1,0 +1,32 @@
+{
+  "schema": "robomituba.infinigen_prop_pbr_registry.v1",
+  "registry_version": "v1",
+  "audit_method": "native_factory_offline_audit_v1",
+  "props": [
+    {"factory":"BottleFactory","factory_import":"infinigen.assets.objects.tableware.bottle:BottleFactory","asset_seed":101,"semantic_category":"bottle","pbr_class":"glossy_dielectric","footprint_m":[0.12,0.12],"valid_support_object":true},
+    {"factory":"JarFactory","factory_import":"infinigen.assets.objects.tableware.jar:JarFactory","asset_seed":102,"semantic_category":"jar","pbr_class":"glossy_dielectric","footprint_m":[0.15,0.15],"valid_support_object":true},
+    {"factory":"WineglassFactory","factory_import":"infinigen.assets.objects.tableware.wineglass:WineglassFactory","asset_seed":103,"semantic_category":"glassware","pbr_class":"glossy_dielectric","footprint_m":[0.14,0.14],"valid_support_object":true},
+    {"factory":"CupFactory","factory_import":"infinigen.assets.objects.tableware.cup:CupFactory","asset_seed":104,"semantic_category":"cup","pbr_class":"glossy_dielectric","footprint_m":[0.13,0.13],"valid_support_object":true},
+    {"factory":"VaseFactory","factory_import":"infinigen.assets.objects.table_decorations.vase:VaseFactory","asset_seed":105,"semantic_category":"vase","pbr_class":"glossy_dielectric","footprint_m":[0.18,0.18],"valid_support_object":true},
+    {"factory":"PanFactory","factory_import":"infinigen.assets.objects.tableware.pan:PanFactory","asset_seed":201,"semantic_category":"cookware","pbr_class":"polished_metallic","footprint_m":[0.30,0.24],"valid_support_object":true},
+    {"factory":"PotFactory","factory_import":"infinigen.assets.objects.tableware.pot:PotFactory","asset_seed":202,"semantic_category":"pot","pbr_class":"polished_metallic","footprint_m":[0.24,0.24],"valid_support_object":true},
+    {"factory":"SpoonFactory","factory_import":"infinigen.assets.objects.tableware.spoon:SpoonFactory","asset_seed":203,"semantic_category":"cutlery","pbr_class":"polished_metallic","footprint_m":[0.20,0.06],"valid_support_object":true},
+    {"factory":"ForkFactory","factory_import":"infinigen.assets.objects.tableware.fork:ForkFactory","asset_seed":204,"semantic_category":"fork","pbr_class":"polished_metallic","footprint_m":[0.20,0.06],"valid_support_object":true},
+    {"factory":"KnifeFactory","factory_import":"infinigen.assets.objects.tableware.knife:KnifeFactory","asset_seed":205,"semantic_category":"knife","pbr_class":"polished_metallic","footprint_m":[0.22,0.05],"valid_support_object":true},
+    {"factory":"CanFactory","factory_import":"infinigen.assets.objects.tableware.can:CanFactory","asset_seed":301,"semantic_category":"can","pbr_class":"coated","footprint_m":[0.10,0.10],"valid_support_object":true},
+    {"factory":"FoodBoxFactory","factory_import":"infinigen.assets.objects.tableware.food_box:FoodBoxFactory","asset_seed":302,"semantic_category":"food_box","pbr_class":"coated","footprint_m":[0.18,0.13],"valid_support_object":true},
+    {"factory":"BowlFactory","factory_import":"infinigen.assets.objects.tableware.bowl:BowlFactory","asset_seed":303,"semantic_category":"bowl","pbr_class":"coated","footprint_m":[0.19,0.19],"valid_support_object":true},
+    {"factory":"PlateFactory","factory_import":"infinigen.assets.objects.tableware.plate:PlateFactory","asset_seed":304,"semantic_category":"plate","pbr_class":"coated","footprint_m":[0.24,0.24],"valid_support_object":true},
+    {"factory":"PlantPotFactory","factory_import":"infinigen.assets.objects.tableware.plant_container:PlantPotFactory","asset_seed":305,"semantic_category":"planter","pbr_class":"coated","footprint_m":[0.20,0.20],"valid_support_object":true},
+    {"factory":"BookFactory","factory_import":"infinigen.assets.objects.table_decorations.book:BookFactory","asset_seed":401,"semantic_category":"book","pbr_class":"rough_textured","footprint_m":[0.18,0.14],"valid_support_object":true},
+    {"factory":"BookStackFactory","factory_import":"infinigen.assets.objects.table_decorations.book:BookStackFactory","asset_seed":402,"semantic_category":"book_stack","pbr_class":"rough_textured","footprint_m":[0.24,0.18],"valid_support_object":true},
+    {"factory":"FoodBagFactory","factory_import":"infinigen.assets.objects.tableware.food_bag:FoodBagFactory","asset_seed":403,"semantic_category":"bag","pbr_class":"rough_textured","footprint_m":[0.18,0.13],"valid_support_object":true},
+    {"factory":"PlantContainerFactory","factory_import":"infinigen.assets.objects.tableware.plant_container:PlantContainerFactory","asset_seed":404,"semantic_category":"plant","pbr_class":"rough_textured","footprint_m":[0.22,0.22],"valid_support_object":true},
+    {"factory":"BookColumnFactory","factory_import":"infinigen.assets.objects.table_decorations.book:BookColumnFactory","asset_seed":405,"semantic_category":"book_column","pbr_class":"rough_textured","footprint_m":[0.18,0.18],"valid_support_object":true},
+    {"factory":"LargePlantContainerFactory","factory_import":"infinigen.assets.objects.tableware.plant_container:LargePlantContainerFactory","asset_seed":406,"semantic_category":"large_planter","pbr_class":"rough_textured","footprint_m":[0.28,0.28],"valid_support_object":true},
+    {"factory":"SpatulaFactory","factory_import":"infinigen.assets.objects.tableware.fork:SpatulaFactory","asset_seed":206,"semantic_category":"spatula","pbr_class":"polished_metallic","footprint_m":[0.22,0.07],"valid_support_object":true},
+    {"factory":"ChopsticksFactory","factory_import":"infinigen.assets.objects.tableware.chopsticks:ChopsticksFactory","asset_seed":207,"semantic_category":"chopsticks","pbr_class":"polished_metallic","footprint_m":[0.22,0.06],"valid_support_object":true},
+    {"factory":"LidFactory","factory_import":"infinigen.assets.objects.tableware.lid:LidFactory","asset_seed":306,"semantic_category":"lid","pbr_class":"coated","footprint_m":[0.18,0.18],"valid_support_object":true},
+    {"factory":"FruitContainerFactory","factory_import":"infinigen.assets.objects.tableware.fruit_container:FruitContainerFactory","asset_seed":307,"semantic_category":"fruit_container","pbr_class":"coated","footprint_m":[0.20,0.20],"valid_support_object":true}
+  ]
+}

@@ -314,6 +314,7 @@ def build_sweep_render_requests(
     modalities: list[str],
     job_id_mode: str = "per_heading",
     node_ids: list[str] | None = None,
+    heading_ids_by_node: Mapping[str, Sequence[str]] | None = None,
     camera_height_m: float = 1.0,
     render_settings: dict | None = None,
     node_heights: dict | None = None,
@@ -344,11 +345,18 @@ def build_sweep_render_requests(
         sensor_ids=sensor_ids,
     )
     node_id_set = set(node_ids) if node_ids else None
+    heading_id_sets = {
+        str(node_id): {str(heading_id) for heading_id in heading_ids}
+        for node_id, heading_ids in (heading_ids_by_node or {}).items()
+    }
     requests: list[SweepRenderRequest] = []
     for node in graph.nodes:
         if node_id_set is not None and node.node_id not in node_id_set:
             continue
         for heading in node.headings:
+            allowed_headings = heading_id_sets.get(node.node_id)
+            if allowed_headings is not None and heading.heading_id not in allowed_headings:
+                continue
             frame_id = f"{graph.scene_id}_{node.node_id}_{heading.heading_id}"
             timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
             yaw_rad = math.radians(float(heading.yaw_deg))

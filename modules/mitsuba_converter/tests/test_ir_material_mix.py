@@ -30,3 +30,19 @@ def test_material_mix_fails_when_no_authored_metal_candidate_exists() -> None:
     report = audit_material_mix({"materials": [_record("constant", 0.2), _record("surrogate_zero", 0.0, replacement=True)]})
     assert report["status"] == "failed"
     assert report["failures"] == ["no_authored_high_metallic_candidate"]
+
+
+def test_v4_contract_rejects_uniform_fractional_and_srgb_metallic() -> None:
+    fractional = _record("constant", 0.35)
+    fractional["metallic_contract"] = {
+        "schema": "robomituba.metallic_contract.v2", "family": "conductor",
+        "representation": "scalar", "encoding": "linear_scalar", "color_space": "sRGB",
+        "source": "generated", "approximation": "none", "generator_id": "bad", "seed": 1,
+    }
+    report = audit_material_mix({
+        "schema": "robomituba.ir_principled_material_contract.v4",
+        "materials": [fractional, _record("constant", 1.0)],
+    })
+    assert report["status"] == "failed"
+    assert any("uniform_fractional" in failure for failure in report["failures"])
+    assert any("color_space" in failure for failure in report["failures"])

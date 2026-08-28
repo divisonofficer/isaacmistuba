@@ -22,7 +22,7 @@ if str(NAV_SRC) not in sys.path:
 
 from navigation_dataset.ir_principled import (  # noqa: E402
     MATERIAL_CONTRACT_SCHEMA, MATERIAL_CONTRACT_VERSION, STAGE2_COMPILER_VERSION,
-    files_digest, matched_luminance_coefficients,
+    files_digest, matched_luminance_coefficients, validate_metallic_contract,
 )
 
 
@@ -47,6 +47,10 @@ def _args() -> argparse.Namespace:
     parser.add_argument("--illumination-manifest", type=Path)
     parser.add_argument("--structural-material-manifest", type=Path,
                         help="immutable external-PBR overlay for an independent rematerialized scene")
+    parser.add_argument("--prop-material-manifest", type=Path,
+                        help="immutable curated opaque-PBR overlay for eligible small props")
+    parser.add_argument("--rebuild-stale", action="store_true",
+                        help="archive an incompatible/incomplete local Stage-2 output before rebuilding it")
     parser.add_argument("--force", action="store_true")
     return parser.parse_args()
 
@@ -75,8 +79,17 @@ def _validate_output(directory: Path) -> dict:
             raise RuntimeError("Principled Stage 2 material lacks the effective-input audit")
         if not all(isinstance(effective[name], dict) and effective[name].get("route") for name in required_effective):
             raise RuntimeError("Principled Stage 2 material has an invalid effective-input audit")
+        valid, failures = validate_metallic_contract(record.get("metallic_contract"))
+        if not valid:
+            raise RuntimeError(
+                f"Principled Stage 2 material {record.get('material_id')} has invalid MetallicContractV2: "
+                + ", ".join(failures)
+            )
     if not isinstance(contract.get("aov_semantics"), dict):
         raise RuntimeError("Principled Stage 2 lacks the v2 AOV semantics audit")
+    required_metal_aovs = {"metallic_family_id", "metal_coverage_mask", "exposed_metal_mask"}
+    if not required_metal_aovs <= set(contract["aov_semantics"]):
+        raise RuntimeError("Principled Stage 2 lacks metallic family/coverage AOV semantics")
     return contract
 
 
@@ -86,6 +99,20 @@ def _sha256(path: Path) -> str:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _archive_stale_output(directory: Path) -> Path:
+    """Move only a stale Stage-2 directory aside; never delete it in place."""
+    contract = directory / "principled_material_contract.json"
+    marker = _sha256(contract)[:16] if contract.is_file() else "incomplete"
+    archive = directory.with_name(f"{directory.name}.stale-{marker}")
+    suffix = 2
+    while archive.exists():
+        archive = directory.with_name(f"{directory.name}.stale-{marker}-r{suffix:02d}")
+        suffix += 1
+    os.replace(directory, archive)
+    print(f"[ir-principled] archived incompatible Stage 2 -> {archive}", flush=True)
+    return archive
 
 
 def _luminance_ablation(stage1_dir: Path) -> tuple[dict[str, float], str]:
@@ -141,25 +168,38 @@ def main() -> int:
     out = args.out.resolve()
     illumination_sha = _sha256(args.illumination_manifest.resolve()) if args.illumination_manifest else None
     structural_sha = _sha256(args.structural_material_manifest.resolve()) if args.structural_material_manifest else None
+    prop_sha = _sha256(args.prop_material_manifest.resolve()) if args.prop_material_manifest else None
     if out.exists() and not args.force:
-        contract = _validate_output(out)
-        digest_paths = [stage1_dir / "scene_manifest.json", *sorted((stage1_dir / ".stage1_unit_state").glob("*.json"))]
-        if semantic.is_file():
-            digest_paths.append(semantic)
-        if room_manifest.is_file():
-            digest_paths.append(room_manifest)
-        expected_stage1_digest = files_digest(digest_paths)
-        if (
-            contract.get("stage1_contract_digest") == expected_stage1_digest
-            and contract.get("source_blend_sha256") == _sha256(source_blend)
-            and contract.get("illumination_manifest_sha256") == illumination_sha
-            and contract.get("structural_rematerialization_sha256") == structural_sha
-        ):
-            print(f"[ir-principled] reuse verified Stage 2: {out}")
-            return 0
-        raise RuntimeError(
-            f"existing Stage 2 does not match current Stage 1 inputs: {out}; choose a new --out"
-        )
+        try:
+            contract = _validate_output(out)
+        # A truncated/corrupt contract is also an incompatible local Stage-2
+        # output.  With the explicit recovery flag it is preserved by an
+        # atomic archive, just like a schema/version mismatch.
+        except (RuntimeError, ValueError, json.JSONDecodeError):
+            if not args.rebuild_stale:
+                raise
+            _archive_stale_output(out)
+        else:
+            digest_paths = [stage1_dir / "scene_manifest.json", *sorted((stage1_dir / ".stage1_unit_state").glob("*.json"))]
+            if semantic.is_file():
+                digest_paths.append(semantic)
+            if room_manifest.is_file():
+                digest_paths.append(room_manifest)
+            expected_stage1_digest = files_digest(digest_paths)
+            if (
+                contract.get("stage1_contract_digest") == expected_stage1_digest
+                and contract.get("source_blend_sha256") == _sha256(source_blend)
+                and contract.get("illumination_manifest_sha256") == illumination_sha
+                and contract.get("structural_rematerialization_sha256") == structural_sha
+                and contract.get("prop_pbr_remediation_sha256") == prop_sha
+            ):
+                print(f"[ir-principled] reuse verified Stage 2: {out}")
+                return 0
+            if not args.rebuild_stale:
+                raise RuntimeError(
+                    f"existing Stage 2 does not match current Stage 1 inputs: {out}; choose a new --out"
+                )
+            _archive_stale_output(out)
     if out.exists() and args.force:
         raise RuntimeError(
             "--force does not delete an existing Stage 2 directory; choose a new --out or move it aside explicitly"
@@ -193,6 +233,8 @@ def main() -> int:
             command.extend(("--illumination-manifest", str(args.illumination_manifest.resolve())))
         if args.structural_material_manifest:
             command.extend(("--structural-material-manifest", str(args.structural_material_manifest.resolve())))
+        if args.prop_material_manifest:
+            command.extend(("--prop-material-manifest", str(args.prop_material_manifest.resolve())))
         if semantic.is_file():
             command.extend(("--semantic-regions", str(semantic)))
         if room_manifest.is_file():

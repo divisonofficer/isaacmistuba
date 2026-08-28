@@ -4,7 +4,7 @@ from pathlib import Path
 
 from PIL import Image
 
-from mitsuba_converter.multimodal import cap_scene_texture_resolution
+from mitsuba_converter.multimodal import _ensure_downsampled_texture, cap_scene_texture_resolution
 
 
 def test_ir_texture_cap_rewrites_only_derived_xml_to_host_cache(tmp_path):
@@ -59,3 +59,21 @@ def test_texture_cap_resolves_repo_relative_policy_texture(tmp_path, monkeypatch
     assert Image.open(rewritten).size == (16, 8)
     assert audit["rewritten"] == 1
     assert audit["skipped"] == 0
+
+
+def test_texture_cache_reuses_published_file_without_reencoding(tmp_path):
+    """Independent worker starts must consume the same immutable cache artifact."""
+    source = tmp_path / "source.png"
+    Image.new("RGB", (64, 32), color=(11, 22, 33)).save(source)
+    cache = tmp_path / "cache"
+
+    first = _ensure_downsampled_texture(source, cache_root=cache, max_resolution=16)
+    assert first is not None and first.is_file()
+    first_mtime = first.stat().st_mtime_ns
+    first_bytes = first.read_bytes()
+
+    second = _ensure_downsampled_texture(source, cache_root=cache, max_resolution=16)
+    assert second == first
+    assert second.stat().st_mtime_ns == first_mtime
+    assert second.read_bytes() == first_bytes
+    assert not list(first.parent.glob(f".{first.name}.lock"))

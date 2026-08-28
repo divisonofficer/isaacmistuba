@@ -20,6 +20,7 @@ Env (Device 1): LD_LIBRARY_PATH, PYTHONPATH as usual (trimesh+Open3D only; no GP
 """
 from __future__ import annotations
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -56,12 +57,6 @@ def _process_job(job: dict) -> dict:
     lod_dir = Path(job["lod_dir"])
     out = {"key": job["key"], "faces": 0, "target": 0, "r": r, "contract": contract,
            "veto": None, "lod_mesh": job["mesh"], "status": "keep"}
-    # pre-load skip: this (mesh) already has a decimated output -> reuse, no CIFS load
-    prior = sorted(lod_dir.glob(f"{src.stem}_f*.obj"))
-    if prior:
-        tf = int(prior[0].stem.rsplit("_f", 1)[1])
-        out.update(faces=0, target=tf, lod_mesh=str(prior[0]), status="cached")
-        return out
     try:
         local = _local_copy(src)
         m = trimesh.load(local, force="mesh", process=False)
@@ -95,13 +90,31 @@ def _process_job(job: dict) -> dict:
         out["target"] = target
         if target >= faces:
             out["status"] = "keep"; out["lod_mesh"] = job["mesh"]; return out
-        dst = Path(job["lod_dir"]) / f"{src.stem}_f{target}.obj"
+        # Mesh-cache files frequently have generic names such as
+        # ``000_GLTF.obj``.  A basename-only target collides across unrelated
+        # GLBs and can make a low-memory scene *larger* than its source.  The
+        # resolved source path is stable for this scene and makes the cache
+        # identity unambiguous while keeping outputs inspectable.
+        source_key = hashlib.sha256(str(src.resolve()).encode("utf-8")).hexdigest()[:12]
+        dst = Path(job["lod_dir"]) / f"{src.stem}_{source_key}_f{target}.obj"
         out["lod_mesh"] = str(dst)
         if dst.is_file():
-            out["status"] = "cached"; return out
+            cached = trimesh.load(dst, force="mesh", process=False)
+            cached_faces = int(len(cached.faces))
+            # A corrupt/stale cache must never be selected merely because its
+            # filename happens to match.  Rebuild instead of silently
+            # increasing geometry or using a different object's mesh.
+            if 0 < cached_faces <= faces and cached_faces <= max(target * 1.05, target + 8):
+                out.update(target=cached_faces, status="cached")
+                return out
+            try:
+                dst.unlink()
+            except OSError:
+                pass
         simp = m.simplify_quadric_decimation(face_count=int(target))
         tmp = dst.with_name(f"{dst.stem}.tmp.{os.getpid()}{dst.suffix}")
         simp.export(tmp); tmp.replace(dst)
+        out["target"] = int(len(simp.faces))
         out["status"] = "ok"; out["actual"] = int(len(simp.faces))
     except Exception as exc:
         out["status"] = f"ERR {type(exc).__name__}: {exc}"
@@ -113,10 +126,22 @@ def main() -> int:
     ap.add_argument("--scene", default="kr_20260625")
     ap.add_argument("--annotation-scene", default="infinigen_kr_20260625")
     ap.add_argument("--workers", type=int, default=8)
+    ap.add_argument(
+        "--source-scene", default="render_scene.xml",
+        help="Source Mitsuba XML within the annotation scene (for example render_scene_perturbed.xml).",
+    )
+    ap.add_argument(
+        "--output-scene", default="render_scene_lod.xml",
+        help="LOD Mitsuba XML filename to write within the annotation scene.",
+    )
     a = ap.parse_args()
 
     sdir = SCENE_DIR / a.annotation_scene
-    xml = (sdir / "render_scene.xml").read_text()
+    source_xml = sdir / a.source_scene
+    output_xml = sdir / a.output_scene
+    if source_xml.parent != sdir or output_xml.parent != sdir:
+        raise ValueError("--source-scene and --output-scene must be filenames within the annotation scene")
+    xml = source_xml.read_text()
     plan = json.loads((IMPORT_DIR / a.scene / "semantic_lod_plan.json").read_text())
     policy = {p["shape_id"]: p for p in
               json.loads((sdir / "render_scene_material_policy.json").read_text())["shape_policies"]}
@@ -191,7 +216,10 @@ def main() -> int:
         return block.replace(f'value="{r["mesh"]}"', f'value="{r["lod_mesh"]}"')
 
     new_xml = re.sub(r'<shape type="obj" id="[^"]+">.*?</shape>', repl, xml, flags=re.S)
-    (sdir / "render_scene_lod.xml").write_text(new_xml)
+    # The XML alone is not proof that it was built from this particular scene.
+    # Keep a small adjacent attestation so the render daemon can refuse an old
+    # or hand-edited LOD file rather than silently substituting geometry.
+    output_xml.write_text(new_xml)
     n_sw = sum(1 for r in shape_recs if r["lod_mesh"] != r["mesh"])
 
     result = {"scene": a.annotation_scene, "import_scene": a.scene, "shapes": len(shape_recs),
@@ -199,9 +227,24 @@ def main() -> int:
               "reduction_pct": round(100 * (1 - lod_total / max(orig_total, 1)), 1),
               "shapes_swapped": n_sw, "shape_records": shape_recs}
     (sdir / "semantic_lod_shapes.json").write_text(json.dumps(result, ensure_ascii=False, indent=1))
+    lod_attestation = {
+        "schema_version": 2,
+        "builder": "tools/build_lod_scene.py",
+        "source_scene": source_xml.name,
+        "output_scene": output_xml.name,
+        "source_xml_sha256": hashlib.sha256(xml.encode("utf-8")).hexdigest(),
+        "output_xml_sha256": hashlib.sha256(new_xml.encode("utf-8")).hexdigest(),
+        "mesh_cache_identity": "sha256(resolved_source_mesh_path)+target_faces",
+        "shapes_swapped": n_sw,
+        "candidate_source_faces": orig_total,
+        "candidate_lod_faces": lod_total,
+    }
+    output_xml.with_suffix(output_xml.suffix + ".manifest.json").write_text(
+        json.dumps(lod_attestation, ensure_ascii=False, indent=2) + "\n"
+    )
 
     print(f"\norig {orig_total:,} -> lod {lod_total:,} faces  (-{result['reduction_pct']}%)")
-    print(f"rewrote {n_sw} shape filenames -> {sdir/'render_scene_lod.xml'}")
+    print(f"rewrote {n_sw} shape filenames -> {output_xml}")
     from collections import defaultdict
     agg = defaultdict(lambda: [0, 0, 0])
     for s in shape_recs:

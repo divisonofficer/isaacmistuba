@@ -220,6 +220,37 @@ def test_manifest_v2_accepts_resolved_glb(tmp_path: Path) -> None:
     assert importer.validate_infinigen_manifest(manifest, tmp_path) == []
 
 
+def test_manifest_v2_accepts_dual_confirmed_black_linked_base_color(tmp_path: Path) -> None:
+    """Import must accept the exporter’s current strict black-bake proof."""
+    importer = _load_importer()
+    glb = tmp_path / "meshes" / "u.glb"
+    glb.parent.mkdir()
+    glb.write_bytes(_minimal_uv_glb_bytes())
+    base = tmp_path / "textures" / "base.png"
+    base.parent.mkdir()
+    Image.new("RGB", (2, 2), "black").save(base)
+    channels = {
+        "base_color": {
+            "mode": "texture", "ref": "textures/base.png", "source": "linked",
+            "colorspace": "srgb", "resolution": [2, 2],
+            "bake_validation": {"attempted": True, "result": "black_confirmed_dual_pass"},
+        },
+        "roughness": {"mode": "constant", "value": [0.4], "colorspace": "raw"},
+        "metallic": {"mode": "constant", "value": [0.0], "colorspace": "raw"},
+        "normal": {"mode": "not_applicable"},
+    }
+    manifest = {
+        "export_contract_version": 2,
+        "units": [{
+            "id": "u", "mesh_glb": "meshes/u.glb",
+            "glb_sha256": hashlib.sha256(glb.read_bytes()).hexdigest(),
+            "uv": {"valid": True, "layer": "UVMap"},
+            "pbr": {"status": "ok", "self_contained_glb": True, "channels": channels},
+        }],
+    }
+    assert importer.validate_infinigen_manifest(manifest, tmp_path) == []
+
+
 def test_bootstrap_manifest_requires_provenance_but_no_pbr_atlas(tmp_path: Path) -> None:
     importer = _load_importer()
     glb = tmp_path / "meshes" / "u.glb"
@@ -316,6 +347,42 @@ def test_manifest_v2_rejects_collapsed_linked_texture(tmp_path: Path) -> None:
         assert "linked base_color bake validation is black" in str(exc)
     else:
         raise AssertionError("collapsed linked texture unexpectedly passed strict validation")
+
+
+def test_manifest_v2_accepts_black_linked_roughness_atlas(tmp_path: Path) -> None:
+    """A linked scalar roughness graph may validly evaluate to 0 everywhere."""
+    importer = _load_importer()
+    glb = tmp_path / "meshes" / "u.glb"
+    glb.parent.mkdir()
+    glb.write_bytes(_minimal_uv_glb_bytes())
+    textures = tmp_path / "textures"
+    textures.mkdir()
+    Image.new("RGB", (2, 2), "black").save(textures / "base.png")
+    Image.new("L", (2, 2), 0).save(textures / "roughness.png")
+    channels = {
+        "base_color": {
+            "mode": "texture", "ref": "textures/base.png", "source": "linked",
+            "colorspace": "srgb", "resolution": [2, 2],
+            "bake_validation": {"attempted": True, "result": "spatial"},
+        },
+        "roughness": {
+            "mode": "texture", "ref": "textures/roughness.png", "source": "linked",
+            "colorspace": "raw", "resolution": [2, 2],
+            "bake_validation": {"attempted": True, "result": "black"},
+        },
+        "metallic": {"mode": "constant", "value": [0.0], "colorspace": "raw"},
+        "normal": {"mode": "not_applicable"},
+    }
+    manifest = {
+        "export_contract_version": 2,
+        "units": [{
+            "id": "u", "mesh_glb": "meshes/u.glb",
+            "glb_sha256": hashlib.sha256(glb.read_bytes()).hexdigest(),
+            "uv": {"valid": True, "layer": "UVMap"},
+            "pbr": {"status": "ok", "self_contained_glb": True, "channels": channels},
+        }],
+    }
+    importer.validate_infinigen_manifest(manifest, tmp_path)
 
 
 def test_glb_contract_rejects_collinear_uv_triangles(tmp_path: Path) -> None:
