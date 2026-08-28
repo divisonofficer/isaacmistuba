@@ -12,6 +12,7 @@
 
 	interface Props {
 		renderSceneSynced: boolean;
+		renderSyncMessage?: string;
 		loading: boolean;
 		selectedProjectId: string;
 		hasScene: boolean;
@@ -43,6 +44,14 @@
 		onRenderSensorViewpoint: () => void;
 		onRenderEpisodes: () => void;
 		onRenderEpisodeNodes?: () => void;
+		polarSampleSweepEnabled?: boolean;
+		polarSampleSweepSubmitting?: boolean;
+		polarSampleSweepResult?: any;
+		onSubmitPolarSampleSweep?: () => void;
+		polarFullSweepEnabled?: boolean;
+		polarFullSweepSubmitting?: boolean;
+		polarFullSweepResult?: any;
+		onSubmitPolarFullSweep?: () => void;
 		renderMissingOnly?: boolean;
 		onSetRenderMissingOnly?: (value: boolean) => void;
 		episodeNodesAvailable?: boolean;
@@ -57,7 +66,7 @@
 		onCustomSensorHeadingChange: (id: string, deg: number) => void;
 	}
 	let {
-		renderSceneSynced, loading, selectedProjectId, hasScene, hasGraph,
+		renderSceneSynced, renderSyncMessage = '', loading, selectedProjectId, hasScene, hasGraph,
 		globalCameraRig, globalCameraRigStatus, globalCameraRigError,
 		rigSensorOptions, activeRigSensorId,
 		frustumMode = $bindable<string>(),
@@ -71,6 +80,8 @@
 		onLoadGlobalCameraRig, onSyncRenderScene, onSelectRigRenderSensor,
 		onLoadRenderConfig, onOptionalJson,
 		onRenderSensorViewpoint, onRenderEpisodes, onRenderEpisodeNodes,
+		polarSampleSweepEnabled = false, polarSampleSweepSubmitting = false, polarSampleSweepResult, onSubmitPolarSampleSweep,
+		polarFullSweepEnabled = false, polarFullSweepSubmitting = false, polarFullSweepResult, onSubmitPolarFullSweep,
 		renderMissingOnly = true, onSetRenderMissingOnly,
 		episodeNodesAvailable = false, episodePathNodeCount = 0, headingsPerNode = 0,
 		sensorFindQuery = $bindable(''), sensorFindError = '', graphNodeCount = 0, onFindSensor,
@@ -111,10 +122,31 @@
 
 	{#if !renderSceneSynced}
 		<div class="sensor-sync-warning">
-			<span>Render scene not synced</span>
-			<button class="button button-subtle" disabled={loading || !selectedProjectId || !hasScene} onclick={onSyncRenderScene} style="display:none">Sync Render Scene</button>
+			<div class="sensor-sync-copy">
+				<strong>Render scene not synced</strong>
+				{#if renderSyncMessage}<small>{renderSyncMessage}</small>{/if}
+			</div>
+			<button class="button button-subtle" disabled={loading || !selectedProjectId || !hasScene} onclick={onSyncRenderScene}>Sync Render Scene</button>
 		</div>
 	{/if}
+
+	<section class="render-config-card" aria-label="Render configuration">
+		<div class="render-config-head">
+			<div class="rail-title">Render Config</div>
+			{#if sceneStateText.trim() && cameraSpecText.trim()}
+				<span class="chip-ok">Ready ({renderConfig?.source ?? 'custom'})</span>
+			{:else}
+				<span class="chip-warn" title={renderConfigError || undefined}>Not loaded{renderConfigError ? ' ⚠' : ''}</span>
+			{/if}
+		</div>
+		<button class="button button-subtle" onclick={onLoadRenderConfig} title="Auto-load render config from scene catalog">Load render config</button>
+		{#if sceneStateText.trim()}
+			{@const _ref = (onOptionalJson(sceneStateText) as any)?.mitsuba_scene_ref}
+			{#if _ref}<div class="config-scene-ref" title={_ref}>Scene XML: {_ref.split('/').slice(-2).join('/')}</div>{/if}
+		{:else if renderConfigError}
+			<div class="config-scene-ref config-scene-error">{renderConfigError}</div>
+		{/if}
+	</section>
 
 	<div class="camera-rig-panel">
 		<div class="rail-title">Robot Camera Rig</div>
@@ -207,22 +239,6 @@
 				{/each}
 			</div>
 		{/if}
-		<div class="sensor-config-row">
-			{#if sceneStateText.trim() && cameraSpecText.trim()}
-				<span class="chip-ok">Config ready ({renderConfig?.source ?? 'custom'})</span>
-			{:else}
-				<span class="chip-warn" title={renderConfigError || undefined}>No render config{renderConfigError ? ' ⚠' : ''}</span>
-			{/if}
-			<button class="button button-subtle" onclick={onLoadRenderConfig} title="Auto-load render config from scene catalog">Load</button>
-		</div>
-		{#if sceneStateText.trim()}
-			{@const _ref = (onOptionalJson(sceneStateText) as any)?.mitsuba_scene_ref}
-			{#if _ref}
-				<div class="config-scene-ref" title={_ref}>Scene XML: {_ref.split('/').slice(-2).join('/')}</div>
-			{/if}
-		{:else if renderConfigError}
-			<div class="config-scene-ref config-scene-error">{renderConfigError}</div>
-		{/if}
 		{@const vpScan2 = observationScan?.viewpoints?.[selectedSensorNodeId]}
 		{@const vpCompleted2 = vpScan2?.completed ?? 0}
 		{@const vpTotal2 = vpScan2?.total ?? 0}
@@ -277,6 +293,40 @@
 	{:else}
 		<div class="sensor-hint">Click a viewpoint (blue dot) to select it</div>
 	{/if}
+
+	<div class="polar-sample-sweep">
+		<button
+			class="button button-primary full"
+			disabled={!polarFullSweepEnabled}
+			title={!polarFullSweepEnabled ? 'Requires a synced graph scene, prepared perturbation, and polar_cam rig sensor.' : 'Submits every graph view as base → perturbed passive → perturbed active-polar.'}
+			onclick={() => onSubmitPolarFullSweep?.()}
+		>
+			{polarFullSweepSubmitting ? 'Submitting Polar Full Sweep...' : 'Polar Full Sweep · all views'}
+		</button>
+		<small>polar_cam only · base → passive → active-polar · ignores Only missing renders</small>
+		{#if polarFullSweepResult}
+			<div class="polar-sample-status">
+				<span>Base/passive/active batches: {polarFullSweepResult.batch_ids?.map((id: string) => id.slice(0, 8)).join(', ')}</span>
+				<span>Queue: {polarFullSweepResult.batches?.map((batch: any) => `${batch.scene_variant_key} ${batch.status ?? 'queued'}`).join(' · ')}</span>
+			</div>
+		{/if}
+		<button
+			class="button button-subtle full"
+			disabled={!polarSampleSweepEnabled}
+			title={!polarSampleSweepEnabled ? 'Requires a synced graph scene, prepared perturbation, and polar_cam rig sensor.' : ''}
+			onclick={() => onSubmitPolarSampleSweep?.()}
+		>
+			{polarSampleSweepSubmitting ? 'Planning Polar Sample Sweep...' : 'Polar Sample Sweep · 10 views'}
+		</button>
+		<small>10 views × passive/active = 20 jobs</small>
+		{#if polarSampleSweepResult}
+			<div class="polar-sample-status">
+				<span>Passive/active batches: {polarSampleSweepResult.batch_ids?.map((id: string) => id.slice(0, 8)).join(', ')}</span>
+				<span>Queue: {polarSampleSweepResult.batches?.map((batch: any) => `${batch.scene_variant_key === 'perturbed' ? 'passive' : 'active'} ${batch.status ?? 'queued'}`).join(' · ')}</span>
+				{#if polarSampleSweepResult.selection_manifest_ref}<span>Selection: {polarSampleSweepResult.selection_manifest_ref}</span>{/if}
+			</div>
+		{/if}
+	</div>
 </div>
 
 <style>
@@ -311,7 +361,29 @@
 			display: grid;
 			gap: 8px;
 			margin-bottom: 10px;
-		}
+	}
+
+	.sensor-sync-copy {
+		display: grid;
+		gap: 2px;
+		min-width: 0;
+	}
+
+	.sensor-sync-copy small {
+		color: inherit;
+		opacity: 0.88;
+		line-height: 1.3;
+	}
+
+	.polar-sample-sweep {
+		display: grid;
+		gap: 4px;
+		margin-top: 10px;
+		padding-top: 10px;
+		border-top: 1px solid var(--panel-border);
+	}
+	.polar-sample-sweep small { color: var(--text-muted); font-size: 11px; }
+	.polar-sample-status { display: grid; gap: 2px; color: var(--text-muted); font-size: 10px; overflow-wrap: anywhere; }
 
 	.sensor-panel .rig-sensor-card {
 			border: 1px solid var(--panel-border);
@@ -443,5 +515,19 @@
 
 	.sensor-panel .sensor-del { margin-top: 2px; color: var(--text-muted); }
 
-	.sensor-panel .sensor-config-row { display: flex; align-items: center; justify-content: space-between; gap: 6px; margin: 6px 0; }
+	.render-config-card {
+		display: grid;
+		grid-template-columns: minmax(0, 1fr) auto;
+		gap: 6px;
+		align-items: center;
+		margin: 10px 0;
+		padding: 8px;
+		border: 1px solid var(--panel-border);
+		border-radius: var(--radius-md);
+		background: var(--surface-2, #f8fafc);
+	}
+
+	.render-config-head { display: flex; align-items: center; gap: 6px; min-width: 0; }
+	.render-config-card .rail-title { margin: 0; }
+	.render-config-card .config-scene-ref { grid-column: 1 / -1; margin: 0; }
 </style>

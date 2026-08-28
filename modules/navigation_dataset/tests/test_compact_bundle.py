@@ -12,6 +12,7 @@ from navigation_dataset.exporters.compact_bundle import (
     estimate_bundle_plan,
     plan_compact_bundle_files,
     resolve_export_profile,
+    rewrite_observation_manifest_payload,
     rewrite_observation_manifests,
     transcode_rgb_png_to_lossless_webp,
     write_polar_thumbnail,
@@ -65,7 +66,7 @@ def test_compact_plan_replaces_polar_visuals_and_keeps_stokes_core(tmp_path: Pat
         (sensor / "dop_red_black_colorbar.png", "scenes/s/observations/vp/h/sensors/polar_cam/dop_red_black_colorbar.png"),
         (rgb, "scenes/s/observations/vp/h/sensors/rgb_cam/rgb.png"),
         (manifest, "scenes/s/observations/vp/h/manifest.json"),
-    ], resolve_export_profile(None))
+    ], resolve_export_profile("compact_with_polar_extension"))
 
     assert len(plan.polar_core) == 1
     assert plan.polar_core[0].dst.endswith("stokes_core_v1.npz")
@@ -142,3 +143,87 @@ def test_manifest_rewrite_and_pair_index_are_self_contained(tmp_path: Path) -> N
     ])
     assert pairs["pair_count"] == 1
     assert pairs["unpaired_perturbed"] == [{"scene_id": "s", "vp_id": "vp_b", "heading_id": "h_090"}]
+
+
+def test_manifest_rewrite_preserves_virtual_polar_recipe_in_artifact_extras() -> None:
+    payload = {"artifacts": [{
+        "artifact_paths": {
+            "stokes_npz": "out/source/stokes_data.npz",
+            "derived_on_demand": {
+                "source": "out/source/stokes_data.npz",
+                "recipe": "stokes_preview_v1",
+                "modality": "dop",
+            },
+        },
+        "extras": {"derived_on_demand": ["dop", "aolp"]},
+    }]}
+    assert rewrite_observation_manifest_payload(
+        payload,
+        profile=resolve_export_profile("compact_with_polar_extension"),
+        source_to_exported={},
+        polar_extension={"archive": "polar.zip", "required": True},
+    )
+    artifact = payload["artifacts"][0]
+    assert artifact["extras"]["derived_on_demand"] == {
+        "recipe": "stokes_preview_v1",
+        "modality": "dop",
+        "source": None,
+        "extension_required": True,
+    }
+
+def test_png_stokes_core_keeps_original_pngs_and_rewrites_manifest(tmp_path: Path) -> None:
+    polar = tmp_path / "sensors" / "polar_cam"
+    stokes = polar / "stokes_data.npz"
+    _write_stokes(stokes)
+    preview = polar / "polar_rgb_preview.png"
+    dop = polar / "dop_red_black_colorbar.png"
+    _png(preview, (10, 20, 30))
+    _png(dop, (40, 50, 60))
+    rgb = tmp_path / "sensors" / "rgb_cam" / "rgb.png"
+    raw = tmp_path / "sensors" / "rgb_cam" / "rgb_raw.npz"
+    _png(rgb, (1, 2, 3))
+    raw.parent.mkdir(parents=True, exist_ok=True)
+    raw.write_bytes(b"raw")
+
+    profile = resolve_export_profile("png_stokes_core")
+    plan = plan_compact_bundle_files([
+        (stokes, "scenes/s/observations/vp/h/sensors/polar_cam/stokes_data.npz"),
+        (preview, "scenes/s/observations/vp/h/sensors/polar_cam/polar_rgb_preview.png"),
+        (dop, "scenes/s/observations/vp/h/sensors/polar_cam/dop_red_black_colorbar.png"),
+        (rgb, "scenes/s/observations/vp/h/sensors/rgb_cam/rgb.png"),
+        (raw, "scenes/s/observations/vp/h/sensors/rgb_cam/rgb_raw.npz"),
+    ], profile)
+
+    assert sorted(item.dst for item in plan.copied) == [
+        "scenes/s/observations/vp/h/sensors/polar_cam/dop_red_black_colorbar.png",
+        "scenes/s/observations/vp/h/sensors/polar_cam/polar_rgb_preview.png",
+        "scenes/s/observations/vp/h/sensors/rgb_cam/rgb.png",
+    ]
+    assert [item.dst for item in plan.polar_core] == [
+        "scenes/s/observations/vp/h/sensors/polar_cam/stokes_core_v1.npz",
+    ]
+    assert not plan.webp_rgb
+    assert not plan.polar_thumbnails
+    assert [item.dst for item in plan.omitted] == [
+        "scenes/s/observations/vp/h/sensors/rgb_cam/rgb_raw.npz",
+    ]
+
+    payload = {"artifacts": [{"artifact_paths": {
+        "png": "source/polar_rgb_preview.png",
+        "stokes_npz": "source/stokes_data.npz",
+        "exr": "source/rgb.exr",
+    }}]}
+    assert rewrite_observation_manifest_payload(
+        payload,
+        profile=profile,
+        source_to_exported={
+            "source/polar_rgb_preview.png": "scenes/s/observations/vp/h/sensors/polar_cam/polar_rgb_preview.png",
+            "source/stokes_data.npz": "scenes/s/observations/vp/h/sensors/polar_cam/stokes_core_v1.npz",
+        },
+    )
+    artifact_paths = payload["artifacts"][0]["artifact_paths"]
+    assert artifact_paths == {
+        "png": "scenes/s/observations/vp/h/sensors/polar_cam/polar_rgb_preview.png",
+        "stokes_core_v1": "scenes/s/observations/vp/h/sensors/polar_cam/stokes_core_v1.npz",
+    }
+    assert payload["bundle_export"]["profile"] == "png_stokes_core"

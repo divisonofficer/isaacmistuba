@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Optical-VLN 문제 정의와 현재 근거 · 2026-08-10</title>
+<style>
+:root{--bg:#0d1117;--panel:#151b23;--line:#293241;--fg:#e9edf2;--mut:#9ba8b7;--blue:#70a7ff;--ok:#46d39a;--warn:#f4c95d;--bad:#ff7373;--violet:#bd91ff}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.62 system-ui,-apple-system,"Noto Sans KR",sans-serif}
+main{max-width:1180px;margin:auto;padding:42px 24px 80px}h1{font-size:30px;margin:0 0 5px}h2{font-size:20px;border-top:1px solid var(--line);padding-top:25px;margin-top:42px}h3{font-size:16px;color:var(--blue)}
+p,li{max-width:1040px}.sub,.mut,small{color:var(--mut)}code{background:#202733;padding:2px 6px;border-radius:4px}.hero,.note{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:18px 20px;margin:18px 0}.note{border-left:4px solid var(--blue)}.warn{border-left-color:var(--warn)}.bad{border-left-color:var(--bad)}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px}.kpi{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px}.kpi b{display:block;font-size:23px}.kpi span{color:var(--mut);font-size:12px}.kpi em{font-style:normal;font-size:12px;color:var(--mut)}
+table{border-collapse:collapse;width:100%;margin:14px 0}th,td{border:1px solid var(--line);padding:9px 10px;text-align:left;vertical-align:top}th{background:#171e27;color:var(--mut)}.pass{color:var(--ok)}.pending{color:var(--warn)}.fail{color:var(--bad)}a{color:var(--blue)}ul,ol{padding-left:23px}
+.flow{display:grid;grid-template-columns:1fr auto 1fr auto 1fr;gap:10px;align-items:center;margin:18px 0}.flow div{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px}.arrow{color:var(--mut);font-size:22px}.claim{font-weight:700}.tag{display:inline-block;border:1px solid var(--line);border-radius:999px;padding:2px 8px;font-size:12px}.tag.ok{color:var(--ok)}.tag.wait{color:var(--warn)}.tag.no{color:var(--bad)}
+@media(max-width:760px){.flow{grid-template-columns:1fr}.arrow{transform:rotate(90deg);text-align:center}}
+</style>
+</head>
+<body><main>
+<h1>Optical-VLN 문제 정의와 additional optical cue의 가능성</h1>
+<p class="sub">2026-08-10 · <code>infinigen_kr_20260625</code> · 주장 범위: <strong>held-out paths within a single environment</strong></p>
+
+<div class="hero">
+<strong>현재 결론.</strong> mirror/glass가 포함된 장면에서 동일 VLN 정책의 행동이 optical perturbation off/on에 따라 달라지고 성공이 비대칭적으로 감소하는 현상은 <strong>Optical-VLN 문제의 파일럿 신호</strong>로 정의할 수 있다. 그러나 현재 P1은 영상과 graph candidate를 동시에 변경하며, DUET 한 checkpoint·한 seed의 절대 성공률도 낮다. 따라서 아직 시각적 optical ambiguity의 독립적 인과 효과나 편광 cue의 개선 효과를 논문 결론으로 주장할 수는 없다.
+</div>
+
+<div class="grid">
+<div class="kpi"><span>paired instruction</span><b>1,010</b><em>same model·seed·episode·instruction</em></div>
+<div class="kpi"><span>trajectory changed</span><b>85.05%</b><em>off/on strict-budget paths</em></div>
+<div class="kpi"><span>strict SR</span><b>3.07 → 1.88%</b><em>Δ −1.19%p</em></div>
+<div class="kpi"><span>discordant outcomes</span><b>16 vs 4</b><em>off-only vs on-only success</em></div>
+<div class="kpi"><span>optical geometry</span><b>11 + 1</b><em>mirror walls + glass wall</em></div>
+<div class="kpi"><span>polar coverage</span><b class="fail">2,711 / 2,712</b><em>sensor ablation 미실행</em></div>
+</div>
+
+<h2>1. 우리가 정의할 문제</h2>
+<p><strong>Optical-VLN</strong>은 언어 이해나 일반적인 경로 계획 실패 전체가 아니라, 반사·투과·편광처럼 RGB appearance와 실제 traversability가 불일치할 때 발생하는 navigation policy의 오류를 대상으로 한다. 한 episode의 start, goal, instruction, scene layout, model checkpoint와 seed를 고정하고 optical state 또는 sensor cue만 바꾼 counterfactual pair로 측정한다.</p>
+<div class="flow">
+<div><b>통제</b><br>start·goal·instruction<br>checkpoint·seed·budget</div><span class="arrow">→</span>
+<div><b>개입</b><br>mirror/glass optical state<br>또는 RGB→RGB+Polar</div><span class="arrow">→</span>
+<div><b>관찰</b><br>decision flip·collision<br>SR/SPL/nDTW 변화</div>
+</div>
+<p>핵심 오류 유형은 다음처럼 분리한다.</p>
+<table>
+<thead><tr><th>오류 유형</th><th>운영 정의</th><th>주 지표</th></tr></thead>
+<tbody>
+<tr><td>Optical decision instability</td><td>동일 상태에서 optical off/on만 달라졌을 때 첫 행동 또는 전체 trajectory가 바뀜</td><td>Decision Flip, first divergence, Trajectory Agreement</td></tr>
+<tr><td>False traversability</td><td>glass/mirror에 의해 통과 가능해 보이는 방향을 선택하지만 실제로는 막힌 행동</td><td>P2 Optical Collision, cause별 collision</td></tr>
+<tr><td>Optical detour cost</td><td>충돌을 피하더라도 긴 우회·반복·timeout이 발생</td><td>ΔSPL, ΔnDTW, revisit, step-budget failure</td></tr>
+<tr><td>Cue protection</td><td>추가 cue가 동일 optical-on pair의 실패·충돌·경로 저하를 회복</td><td>Modality Protection Gain, paired recovery</td></tr>
+</tbody></table>
+
+<h2>2. 현재 paired DUET 파일럿 결과</h2>
+<p>202개 test episode의 5 instruction을 동일 DUET checkpoint와 seed로 off/P1에서 실행한 1,010 pair다. 성공은 goal 0.5 m 이내이면서 <code>min(50, max(20, 3×GT edge))</code> 이동 budget 이내인 경우다. 현재 trace에는 명시적 STOP 원인이 없어 terminal-location proxy를 쓴다.</p>
+<table>
+<thead><tr><th>조건</th><th>Strict success</th><th>SR</th><th>Timeout</th><th>Mean NE</th></tr></thead>
+<tbody>
+<tr><td>Optical perturbation off</td><td>31 / 1,010</td><td>3.07%</td><td>50.50%</td><td>3.191 m</td></tr>
+<tr><td>Optical perturbation on · P1</td><td>19 / 1,010</td><td>1.88%</td><td>41.98%</td><td>3.180 m</td></tr>
+<tr><td>차이</td><td>−12</td><td class="fail">−1.19%p</td><td>−8.51%p</td><td>−0.011 m</td></tr>
+</tbody></table>
+<p>결과 pair는 off-only success 16, on-only success 4, both success 15, both failure 975다. instruction-level McNemar exact two-sided 값은 <code>p=0.0118</code>이지만, 동일 episode의 여러 instruction을 독립 표본처럼 다룬 값이므로 <strong>진단용</strong>이다. 최종 검정은 start-goal group bootstrap과 3 seed 집계로 다시 해야 한다.</p>
+<div class="note warn"><strong>NE가 악화되지 않았다고 optical effect가 없는 것은 아니다.</strong> 양쪽 모두 실패한 975 pair가 평균을 지배하고, P1 timeout은 오히려 줄었다. 현재 가장 직접적인 신호는 85.05% trajectory change와 16:4의 성공 방향 비대칭이다. 동시에 낮은 절대 SR은 이 결과의 일반화를 제한한다.</div>
+<p><a href="../experiment/opticalnav_vln_comparison_20260728/runs/paired_flip_20260803/navigation_replays/index.html">GT + off/on bird-eye·camera navigation replay 열기</a> · <a href="../experiment/opticalnav_vln_comparison_20260728/runs/paired_flip_20260803/base_success_p1_failure.html">16개 strict flip 표 열기</a></p>
+
+<h2>3. instruction cue와 optical sensor cue는 다른 주장이다</h2>
+<table>
+<thead><tr><th>Cue</th><th>현재 결과</th><th>판정</th><th>말할 수 있는 범위</th></tr></thead>
+<tbody>
+<tr><td>Perception-aware language</td><td>SR off/on 모두 0.495% (각 202개)</td><td><span class="tag no">효과 미입증</span></td><td>문장에 위험 정보를 넣는 semantic prior이며 추가 optical sensing 증거가 아니다.</td></tr>
+<tr><td>Landmark language</td><td>8.42%→5.94%</td><td><span class="tag wait">탐색적</span></td><td>현재 가장 높은 절대 SR이나 전체 성능이 낮아 instruction 우열 결론은 보류한다.</td></tr>
+<tr><td>Polar sensor</td><td>GR-DUET RGB/RGB+Polar paired test 미실행</td><td><span class="tag no">결론 없음</span></td><td>Stokes 한 view 복구 후 modality protection을 직접 측정해야 한다.</td></tr>
+</tbody></table>
+<p class="claim">따라서 현재 가능한 문장: “additional optical cue가 도움을 줄 수 있다는 검증 가능한 가설과 평가 프로토콜을 구성했다.”</p>
+<p class="claim fail">현재 불가능한 문장: “편광 cue가 mirror/glass navigation 성능을 개선한다.”</p>
+
+<h2>4. mirror와 glass를 지금 분리해 말할 수 있는가</h2>
+<p>perturbation sidecar에는 mirror wall 11개와 glass wall 1개가 있고 off/on view 1,356쌍이 정확히 대응한다. 그러나 geometry audit에서 disabled edge 7개는 모두 <code>glass_auto_001</code>에 귀속되고 mirror 귀속 edge는 0개다.</p>
+<table>
+<thead><tr><th>대상</th><th>현재 관측 가능</th><th>현재 부족한 것</th></tr></thead>
+<tbody>
+<tr><td>Glass</td><td>P1 rerouting, P2 collision cause 정의, 7 disabled edges</td><td>P2 full paired run과 cause별 통계</td></tr>
+<tr><td>Mirror</td><td>off/on 이미지 변화와 trajectory/decision 변화</td><td>mirror exposure label, mirror-attributed interaction edge 또는 시선 기반 hazard event</td></tr>
+</tbody></table>
+<div class="note"><strong>권장 표현.</strong> 현재 묶음 결과는 <em>mirror/glass optical perturbation sensitivity</em>로 부르되 collision 감소를 말할 때는 glass로 한정한다. mirror collision 감소는 현재 graph annotation으로 측정되지 않는다.</div>
+
+<h2>5. 현재 증거의 결정적 교란 요인</h2>
+<ol>
+<li><strong>P1은 visual-only가 아니다.</strong> perturbed RGB뿐 아니라 disabled edge를 candidate에서 제거하므로 policy 입력의 행동 공간도 바뀐다.</li>
+<li><strong>한 모델·한 seed 파일럿이다.</strong> paired 결과 checkpoint는 20260729 DUET source이며, validation SPL 34.29로 선택한 221-update candidate의 off/on test는 아직 없다.</li>
+<li><strong>모델 비교가 완성되지 않았다.</strong> GR-DUET은 adapter/training smoke와 checkpoint가 있으나 paired sensor ablation이 없고, SkillNav 최종 통합 비교도 없다.</li>
+<li><strong>성공 판정이 proxy다.</strong> 명시적 STOP 대신 terminal location과 physical movement budget을 사용한다.</li>
+<li><strong>편광 coverage가 99.963%다.</strong> <code>base/vp_manual_0001/h_330</code> Stokes가 누락되어 사전 등록한 100% 승인 기준을 통과하지 않았다.</li>
+</ol>
+
+<h2>6. 논문 주장을 결정할 최소 후속 실험</h2>
+<table>
+<thead><tr><th>우선순위</th><th>실험</th><th>고정/변경</th><th>결정할 주장</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>V0 appearance-only pair</td><td>graph·candidate·physics 고정, off/on RGB만 변경</td><td>optical appearance가 행동을 바꾸는가</td></tr>
+<tr><td>2</td><td>P2 collision stress</td><td>candidate 동일, blocked 선택 시 collision/stay</td><td>glass를 실제 traversable로 오인하는가</td></tr>
+<tr><td>3</td><td>GR-DUET RGB vs RGB+Polar</td><td>split·instruction·budget·updates 동일, modality만 변경</td><td>additional optical cue가 저하를 보호하는가</td></tr>
+<tr><td>4</td><td>Mirror exposure stratification</td><td>view-frustum/거리/방향으로 mirror 노출 pair 라벨</td><td>mirror-specific sensitivity가 존재하는가</td></tr>
+<tr><td>5</td><td>3 seeds × models</td><td>DUET·SkillNav·GR-DUET, group-level paired inference</td><td>특정 checkpoint가 아닌 모델 계열 결론인가</td></tr>
+</tbody></table>
+<p>주요 endpoint는 optical-on에서의 <strong>ΔSR, ΔSPL, ΔnDTW, Decision Flip, P2 Optical Collision</strong>이다. cue 효과는 <code>(RGB+cue의 off→on 저하) − (RGB의 off→on 저하)</code>인 Modality Protection Gain과, RGB 실패→RGB+cue 성공의 paired recovery count로 보고한다.</p>
+
+<h2>7. 최종 claim gate</h2>
+<table>
+<thead><tr><th>주장</th><th>현재 상태</th><th>승인 조건</th></tr></thead>
+<tbody>
+<tr><td>Optical perturbation에서 VLN 행동이 불안정해진다</td><td><span class="tag wait">파일럿 지지</span></td><td>V0/P2, 3 seeds, group CI에서 방향 재현</td></tr>
+<tr><td>Glass가 collision/실패를 증가시킨다</td><td><span class="tag wait">프로토콜 준비</span></td><td>P2 glass cause 통계와 paired significance</td></tr>
+<tr><td>Mirror가 collision을 증가시킨다</td><td><span class="tag no">측정 불가</span></td><td>mirror-specific hazard event 정의</td></tr>
+<tr><td>Perception-aware instruction이 보호한다</td><td><span class="tag no">미입증</span></td><td>충분한 성공률과 group-paired robustness</td></tr>
+<tr><td>Polar cue가 보호한다</td><td><span class="tag no">미실행</span></td><td>Stokes 복구 후 RGB/RGB+Polar ablation</td></tr>
+<tr><td>Unseen-scene 일반화</td><td><span class="tag no">범위 밖</span></td><td>scene-disjoint dataset과 evaluation</td></tr>
+</tbody></table>
+
+<h2>8. 재현 근거</h2>
+<ul>
+<li><a href="../experiment/opticalnav_vln_comparison_20260728/manifests/optical_vln_evidence_20260810.json">이 보고서의 수치·claim manifest</a></li>
+<li><a href="../experiment/opticalnav_vln_comparison_20260728/manifests/data_audit.json">RGB/Stokes data audit</a></li>
+<li><a href="../experiment/opticalnav_vln_comparison_20260728/manifests/disabled_edge_causes.json">glass/mirror edge-cause audit</a></li>
+<li><a href="../experiment/opticalnav_vln_comparison_20260728/manifests/duet_warmstart_validation_20260803.json">DUET warm-start 및 221-update 선택 audit</a></li>
+<li><a href="report_2026-07-28.html">구현·실행 상세 보고서</a></li>
+</ul>
+</main></body></html>

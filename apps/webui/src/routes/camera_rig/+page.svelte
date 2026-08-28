@@ -102,7 +102,13 @@
 		if (type === 'lidar_3d') {
 			return { path_spp: 1, aov_spp: 1, polar_spp: 1, samples_per_pass: null };
 		}
-		return { path_spp: 4096, aov_spp: 16, polar_spp: 256, samples_per_pass: null };
+		return {
+			path_spp: 4096,
+			aov_spp: 16,
+			polar_spp: type === 'polar_camera' ? 768 : 256,
+			polar_visualization_policy: type === 'polar_camera' ? 'core_preview_v1' : 'full_v1',
+			samples_per_pass: null
+		};
 	}
 
 	function renderSettingValue(sensor: CameraRigSensor, key: RenderSettingKey): number | '' {
@@ -585,9 +591,18 @@
 					<div class="form-grid">
 						<label>Path SPP<input type="number" min="1" step="1" value={renderSettingValue(selectedSensor, 'path_spp')} on:input={(event) => updateRenderNumber('path_spp', (event.currentTarget as HTMLInputElement).value)} /></label>
 						<label>AOV SPP<input type="number" min="1" step="1" value={renderSettingValue(selectedSensor, 'aov_spp')} on:input={(event) => updateRenderNumber('aov_spp', (event.currentTarget as HTMLInputElement).value)} /></label>
-						<label>Polar/NIR SPP<input type="number" min="1" step="1" value={renderSettingValue(selectedSensor, 'polar_spp')} on:input={(event) => updateRenderNumber('polar_spp', (event.currentTarget as HTMLInputElement).value)} /></label>
+						<label>{selectedSensor.sensor_type === 'polar_camera' ? 'Polar SPP' : selectedSensor.sensor_type === 'nir_camera' ? 'NIR SPP' : 'Polar SPP (unused)'}<input type="number" min="1" step="1" value={renderSettingValue(selectedSensor, 'polar_spp')} on:input={(event) => updateRenderNumber('polar_spp', (event.currentTarget as HTMLInputElement).value)} /></label>
 						<label>Samples / pass<input type="number" min="1" step="1" placeholder="auto" value={renderSettingValue(selectedSensor, 'samples_per_pass')} on:input={(event) => updateRenderNumber('samples_per_pass', (event.currentTarget as HTMLInputElement).value)} /></label>
 					</div>
+					{#if selectedSensor.sensor_type === 'polar_camera'}
+						<label>Polar visualization
+							<select value={selectedSensor.render?.polar_visualization_policy ?? 'full_v1'} on:change={(event) => patchSensor(selectedSensor!.sensor_id, (sensor) => { sensor.render ??= defaultRenderSettingsFor(sensor.sensor_type); sensor.render.polar_visualization_policy = (event.currentTarget as HTMLSelectElement).value as 'full_v1' | 'core_preview_v1' | 'raw_stokes_aolp_v1'; })}>
+								<option value="raw_stokes_aolp_v1">Dataset compact (Stokes NPZ + RGB + AoLP)</option>
+								<option value="core_preview_v1">Core preview (NPZ + RGB)</option>
+								<option value="full_v1">Full diagnostic PNGs</option>
+							</select>
+						</label>
+					{/if}
 
 					<div class="danger-row">
 						<button class="outline" on:click={duplicateSensor}>Duplicate</button>

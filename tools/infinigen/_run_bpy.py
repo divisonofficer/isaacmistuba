@@ -9,8 +9,10 @@ already-open scene) run without the Blender binary, since the bundled binary's
 libs are broken and the file opens fine through the bpy module.
 """
 
+import os
 import runpy
 import sys
+import traceback
 
 import bpy  # type: ignore
 
@@ -26,4 +28,13 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:  # noqa: BLE001
+        # The PyPI bpy runtime can segfault while destructing a multi-GB scene
+        # after an otherwise ordinary exporter exception. Preserve the real
+        # traceback and bypass only interpreter teardown on this failed path.
+        traceback.print_exc()
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(1)

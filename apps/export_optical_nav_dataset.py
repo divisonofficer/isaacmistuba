@@ -69,6 +69,7 @@ class FrameRecord:
     modality: str = "rgb"
     stokes_npz_src: Path | None = None
     src_exr: Path | None = None
+    variant: str = "base"
 
 
 def _find_jobs(bridge_dir: Path, scene: str | None, include_probe: bool) -> list[Path]:
@@ -84,26 +85,47 @@ def _find_jobs(bridge_dir: Path, scene: str | None, include_probe: bool) -> list
     return jobs
 
 
-def _find_versioned_bundles(optical_root: Path, scene: str | None) -> list[Path]:
+def _find_versioned_bundles(optical_root: Path, scene: str | None) -> list[tuple[Path, str]]:
     """Resolve active current.json pointers without scanning old render versions."""
-    bundles: list[Path] = []
+    bundles: list[tuple[Path, str]] = []
     if not optical_root.is_dir():
         return bundles
-    for pointer in sorted(optical_root.glob("*/scenes/*/observations*/**/current.json")):
-        rel = pointer.relative_to(optical_root)
-        if len(rel.parts) < 5:
-            continue
-        scene_id = rel.parts[2]
-        if scene and scene not in scene_id:
-            continue
+    # Accept either the OpticalNav parent (out/opticalnav/) or one project
+    # directory.  The latter lets the wizard avoid an expensive NFS walk of
+    # every unrelated project before it reaches the selected scene.
+    projects = [optical_root] if (optical_root / "scenes").is_dir() else [
+        candidate for candidate in optical_root.iterdir()
+        if candidate.is_dir() and (candidate / "scenes").is_dir()
+    ]
+    pointers: list[tuple[Path, Path, str, str]] = []
+    print(f"[discover] locating active pointers for scene={scene!r} in {len(projects)} project(s) ...", flush=True)
+    for project_dir in projects:
+        scenes_dir = project_dir / "scenes"
+        scene_dirs = [candidate for candidate in scenes_dir.iterdir() if candidate.is_dir() and (not scene or scene in candidate.name)]
+        for scene_dir in scene_dirs:
+            for pointer in scene_dir.glob("observations*/**/current.json"):
+                try:
+                    observation_root = pointer.relative_to(scene_dir).parts[0]
+                except ValueError:
+                    continue
+                pointers.append((pointer, project_dir, scene_dir.name, observation_root))
+    print(f"[discover] reading {len(pointers)} active pointers ...", flush=True)
+    for index, (pointer, project_dir, scene_id, observation_root) in enumerate(sorted(pointers), 1):
+        if index == 1 or index % 100 == 0 or index == len(pointers):
+            print(f"[discover] pointer {index}/{len(pointers)} · {len(bundles)} usable bundles", flush=True)
         try:
             payload = json.loads(pointer.read_text(encoding="utf-8"))
             ref = payload.get("bundle_ref")
             if not isinstance(ref, str) or not ref:
                 continue
-            bundle = optical_root / rel.parts[0] / ref
+            bundle = project_dir / ref
             if (bundle / "manifest.json").is_file():
-                bundles.append(bundle)
+                variant = {
+                    "observations": "base",
+                    "observations_perturbed": "perturbed",
+                    "observations_perturbed_active_polar": "perturbed_active_polar",
+                }.get(observation_root, observation_root.removeprefix("observations_") or "base")
+                bundles.append((bundle, variant))
         except (OSError, ValueError, TypeError):
             continue
     return list(dict.fromkeys(bundles))
@@ -130,7 +152,13 @@ def _camera_spec(manifest: dict, camera_id: str) -> dict:
     return {}
 
 
-def _build_records(job_dir: Path, keep_manifests: bool, exact_scene: str | None = None) -> list[FrameRecord]:
+def _build_records(
+    job_dir: Path,
+    keep_manifests: bool,
+    exact_scene: str | None = None,
+    variant: str = "base",
+    camera_ids: set[str] | None = None,
+) -> list[FrameRecord]:
     loaded = ((job_dir, json.loads((job_dir / "manifest.json").read_text(encoding="utf-8")))
               if (job_dir / "manifest.json").is_file() else _load_manifest(job_dir))
     if loaded is None:
@@ -150,7 +178,7 @@ def _build_records(job_dir: Path, keep_manifests: bool, exact_scene: str | None 
     for artifact in manifest.get("artifacts", []) or []:
         camera_id = artifact.get("camera_id")
         png_rel = (artifact.get("artifact_paths") or {}).get("png")
-        if not camera_id or not png_rel:
+        if not camera_id or not png_rel or (camera_ids is not None and camera_id not in camera_ids):
             continue
         src_png = (REPO_ROOT / png_rel).resolve()
         if not src_png.is_file():
@@ -163,11 +191,15 @@ def _build_records(job_dir: Path, keep_manifests: bool, exact_scene: str | None 
         # with multiple modalities (e.g. a polarization camera emitting s1_over_s0,
         # s2_over_s0, dop, aolp, polar_rgb_preview) doesn't overwrite itself.
         mod_suffix = "" if modality == "rgb" else f"__{modality}"
-        image_rel = f"images/{frame_id}__{camera_id}{mod_suffix}.{{ext}}"
+        # Frame IDs are shared by base/passive/active submissions. Keep the
+        # branch in the relative path so a three-variant polar export never
+        # overwrites one branch with another.
+        image_rel = f"images/{variant}/{frame_id}__{camera_id}{mod_suffix}.{{ext}}"
         stokes_rel = (artifact.get("artifact_paths") or {}).get("stokes_npz")
         stokes_src = (REPO_ROOT / stokes_rel).resolve() if stokes_rel else None
         record = {
             "frame_id": frame_id,
+            "variant": variant,
             "scene_id": scene_id,
             "camera_id": camera_id,
             "image": image_rel,  # ext filled in later
@@ -196,6 +228,7 @@ def _build_records(job_dir: Path, keep_manifests: bool, exact_scene: str | None 
                 modality=modality,
                 stokes_npz_src=stokes_src if (stokes_src and stokes_src.is_file()) else None,
                 src_exr=src_exr if (src_exr and src_exr.is_file()) else None,
+                variant=variant,
             )
         )
     return records
@@ -227,7 +260,11 @@ def _slim_manifest(manifest: dict) -> dict:
 
 
 def _autodetect_nav_root(scene_id: str, search_root: Path) -> Path | None:
-    """Find the OpticalNav dataset root whose dataset.json lists this scene."""
+    """Find the project catalog which contains ``scene_id``.
+
+    v3 catalog lookup remains metadata-only; it must not enumerate episodes in
+    unrelated scene workspaces.
+    """
     if not search_root.is_dir():
         return None
     for ds in sorted(search_root.glob("*/dataset.json")):
@@ -235,13 +272,22 @@ def _autodetect_nav_root(scene_id: str, search_root: Path) -> Path | None:
             data = json.loads(ds.read_text())
         except (json.JSONDecodeError, OSError):
             continue
-        for art in data.get("scene_artifacts", []) or []:
+        entries = data.get("scenes", []) or data.get("scene_artifacts", []) or []
+        for art in entries:
             if art.get("scene_id") == scene_id:
                 return ds.parent
     return None
 
 
 def _find_scene_artifact(nav_root: Path, scene_id: str) -> dict | None:
+    scene_manifest = nav_root / "scenes" / scene_id / "dataset.json"
+    if scene_manifest.is_file():
+        try:
+            payload = json.loads(scene_manifest.read_text())
+        except (json.JSONDecodeError, OSError):
+            payload = None
+        if isinstance(payload, dict):
+            return {"scene_id": scene_id, "scene_dataset_ref": scene_manifest.relative_to(nav_root).as_posix(), **payload}
     ds = nav_root / "dataset.json"
     try:
         data = json.loads(ds.read_text())
@@ -254,8 +300,18 @@ def _find_scene_artifact(nav_root: Path, scene_id: str) -> dict | None:
 
 
 def _collect_episodes(nav_root: Path, scene_id: str) -> list[tuple[Path, dict]]:
-    """Return (path, payload) for every episode whose scene_id matches."""
+    """Return records from one v3 scene workspace (legacy fallback retained)."""
     eps: list[tuple[Path, dict]] = []
+    scene_episodes = nav_root / "scenes" / scene_id / "episodes"
+    if scene_episodes.is_dir():
+        for p in sorted(scene_episodes.glob("*/*.json")):
+            try:
+                d = json.loads(p.read_text())
+            except (json.JSONDecodeError, OSError):
+                continue
+            if d.get("scene_id") == scene_id:
+                eps.append((p, d))
+        return eps
     ep_dir = nav_root / "episodes"
     if not ep_dir.is_dir():
         return eps
@@ -541,6 +597,9 @@ def main() -> int:
     ap.add_argument("--tone-scan-limit", type=int, default=600, help="Max rgb frames sampled in pass-1 (evenly spaced; 0 = all).")
     ap.add_argument("--tone-pixel-stride", type=int, default=4, help="Pass-1 pixel subsample stride.")
     ap.add_argument("--include-probe", action="store_true", help="Also export probe_* jobs (default: grid vp only).")
+    ap.add_argument("--camera-ids", default=None, help="Comma-separated camera IDs to export (default: all).")
+    ap.add_argument("--variants", default=None, help="Comma-separated variants: base,perturbed,perturbed_active_polar (default: all).")
+    ap.add_argument("--no-legacy-bridge-jobs", action="store_true", help="Do not merge legacy out/bridge_jobs input with versioned observations.")
     ap.add_argument("--keep-manifests", action="store_true", help="Also write slimmed per-frame manifest.json for full provenance.")
     ap.add_argument("--no-polarization-raw", action="store_true", help="Skip copying polarization stokes_data.npz (raw Stokes) into polarization_raw/.")
     ap.add_argument("--nav-dataset-root", default=None, help="OpticalNav dataset root (dataset.json + scenes/ + episodes/). Auto-detected under out/opticalnav/* if omitted.")
@@ -561,7 +620,14 @@ def main() -> int:
     jobs = _find_versioned_bundles(Path(args.versioned_root).resolve(), args.scene)
     # Legacy jobs remain an explicit compatibility input; active versioned
     # pointers are preferred and therefore scanned first.
-    jobs.extend(_find_jobs(bridge_dir, args.scene, args.include_probe))
+    if not args.no_legacy_bridge_jobs:
+        jobs.extend((job, "base") for job in _find_jobs(bridge_dir, args.scene, args.include_probe))
+    variants = {item.strip() for item in (args.variants or "").split(",") if item.strip()} or None
+    if variants is not None:
+        unknown = variants - {"base", "perturbed", "perturbed_active_polar"}
+        if unknown:
+            ap.error(f"unknown --variants value(s): {', '.join(sorted(unknown))}")
+        jobs = [(job, variant) for job, variant in jobs if variant in variants]
     jobs = list(dict.fromkeys(jobs))
     if args.limit:
         jobs = jobs[: args.limit]
@@ -574,12 +640,16 @@ def main() -> int:
     records: list[FrameRecord] = []
     skipped = 0
     exact_scene = args.scene if (args.exact_scene and args.scene) else None
-    for job_dir in jobs:
-        frame_records = _build_records(job_dir, args.keep_manifests, exact_scene)
+    camera_ids = {item.strip() for item in (args.camera_ids or "").split(",") if item.strip()} or None
+    print(f"[scan] reading manifests for {len(jobs)} bundles ...", flush=True)
+    for index, (job_dir, variant) in enumerate(jobs, 1):
+        frame_records = _build_records(job_dir, args.keep_manifests, exact_scene, variant, camera_ids)
         if not frame_records:
             skipped += 1
             continue
         records.extend(frame_records)
+        if index == 1 or index % 100 == 0 or index == len(jobs):
+            print(f"[scan] manifest {index}/{len(jobs)} · {len(records)} export records · {skipped} skipped", flush=True)
     print(f"[scan] {len(records)} frames to export ({skipped} jobs skipped: no manifest/png)")
 
     src_bytes = sum(r.src_png.stat().st_size for r in records)
@@ -620,8 +690,9 @@ def main() -> int:
     tasks = []
     for r in records:
         mod_suffix = "" if r.modality == "rgb" else f"__{r.modality}"
-        dst = images_dir / f"{r.frame_id}__{r.camera_id}{mod_suffix}.{ext}"
-        r.record["image"] = f"images/{dst.name}"
+        dst = images_dir / r.variant / f"{r.frame_id}__{r.camera_id}{mod_suffix}.{ext}"
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        r.record["image"] = str(dst.relative_to(out_dir))
         if use_exr and r.modality == "rgb" and r.src_exr is not None:
             tasks.append(("exr", str(r.src_exr), str(dst), args.image_format, args.jpeg_quality,
                           tone["tone_exposure"], tone["tone_white"]))
@@ -638,16 +709,18 @@ def main() -> int:
         for r in records:
             if r.stokes_npz_src is None:
                 continue
-            dst_name = f"{r.frame_id}__{r.camera_id}__stokes.npz"
+            dst_name = f"{r.variant}/{r.frame_id}__{r.camera_id}__stokes.npz"
             if dst_name in seen_raw:
                 continue
             seen_raw.add(dst_name)
-            raw_dir.mkdir(parents=True, exist_ok=True)
+            (raw_dir / r.variant).mkdir(parents=True, exist_ok=True)
             try:
                 shutil.copy2(r.stokes_npz_src, raw_dir / dst_name)
                 polar_raw_copied += 1
             except OSError as exc:
                 print(f"[warn] stokes copy failed {dst_name}: {exc}", file=sys.stderr)
+            if polar_raw_copied and polar_raw_copied % 100 == 0:
+                print(f"[encode] copied {polar_raw_copied} polarization Stokes files ...", flush=True)
         if polar_raw_copied:
             print(f"[encode] copied {polar_raw_copied} polarization stokes_data.npz → polarization_raw/")
 
@@ -664,8 +737,8 @@ def main() -> int:
                 print(f"[warn] encode failed {Path(dst).name}: {err}", file=sys.stderr)
             else:
                 out_bytes += nbytes
-            if done % 500 == 0:
-                print(f"[encode] {done}/{len(tasks)} ...")
+            if done == 1 or done % 100 == 0 or done == len(tasks):
+                print(f"[encode] {done}/{len(tasks)} · {errors} failed ...", flush=True)
     print(f"[encode] done: {done - errors} ok, {errors} failed")
 
     # Write index.jsonl.
@@ -681,7 +754,9 @@ def main() -> int:
         man_dir.mkdir(exist_ok=True)
         for r in records:
             if r.manifest_slim is not None:
-                (man_dir / f"{r.frame_id}.json").write_text(
+                variant_dir = man_dir / r.variant
+                variant_dir.mkdir(parents=True, exist_ok=True)
+                (variant_dir / f"{r.frame_id}.json").write_text(
                     json.dumps(r.manifest_slim, ensure_ascii=False, indent=2)
                 )
         print(f"[write] manifests/ ({len(records)} files)")
@@ -707,6 +782,7 @@ def main() -> int:
         "scene_filter": args.scene,
         "scenes": scenes,
         "cameras": cameras,
+        "variants": sorted({r.variant for r in records}),
         "frame_count": len(records),
         "image_format": args.image_format,
         "jpeg_quality": args.jpeg_quality if args.image_format != "png" else None,

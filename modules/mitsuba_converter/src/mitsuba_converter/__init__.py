@@ -35,6 +35,8 @@ __all__ = [
     "new_render_version_id",
     "versioned_bundle_dir",
     "resolve_current_bundle_dir",
+    "SCENE_MATERIALIZER_CONTRACT_VERSION",
+    "materialize_render_scene",
 ]
 
 from .usd_loader import UsdSceneLoader
@@ -75,6 +77,7 @@ from .observation_bridge import (
     write_manifest,
 )
 from .scene_floorplan import render_scene_floorplan
+from .scene_materialization import SCENE_MATERIALIZER_CONTRACT_VERSION, materialize_render_scene
 from .render_daemon import RenderDaemon, serve_render_daemon
 
 from .versioned_artifacts import (RenderLedger, new_render_version_id, resolve_current_bundle_dir, scene_version_id, versioned_bundle_dir)

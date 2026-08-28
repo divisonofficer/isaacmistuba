@@ -22,7 +22,7 @@ _EXTRACTED_KEYS = (
     "base_color_factor", "base_color_texture_ref",
     "normal_texture_ref", "roughness_texture_ref", "metallic_texture_ref",
     "metallic_roughness_texture_ref",
-    "roughness_factor", "metallic_factor", "opacity_factor",
+    "roughness_factor", "metallic_factor", "opacity_factor", "metallic_contract",
 )
 
 
@@ -91,6 +91,11 @@ def _new_slot(material_id: str, sp: Mapping[str, Any]) -> dict:
             "base_color_factor": fb.get("base_color_factor"),
             "roughness": fb.get("roughness"),
             "metallic": fb.get("metallic"),
+            "metallic_contract": (
+                sp.get("metallic_contract")
+                or fb.get("metallic_contract")
+                or extracted.get("metallic_contract")
+            ),
         },
         "extracted": {k: extracted.get(k) for k in _EXTRACTED_KEYS},
         "measured_candidate": ({

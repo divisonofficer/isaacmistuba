@@ -26,11 +26,13 @@
 		currentSceneOnly = $bindable(true),
 		includeThumbnails = $bindable(false),
 		panoramaObservations = $bindable(true),
-		exportProfile = $bindable<'compact_with_polar_extension' | 'single_lossless_core' | 'navigation_only' | 'legacy_full'>('compact_with_polar_extension'),
+		exportProfile = $bindable<'compact_with_polar_extension' | 'single_lossless_core' | 'navigation_only' | 'png_stokes_core' | 'legacy_full'>('compact_with_polar_extension'),
 		pngOnly = $bindable(true),
 		includeBirdseye = $bindable(true),
 		includeEpisodeBirdseye = $bindable(false),
 		evalPerturbation = $bindable(false),
+		uploadToGoogleDrive = $bindable(false),
+		uploadDestinationSubpath = $bindable('dataset/opticalnav'),
 		cameraInventory = [],
 		selectedCameraIds = [],
 		currentSceneId = '',
@@ -40,6 +42,7 @@
 		onValidate,
 		onExport,
 		onCancelExport,
+		onResumeExport,
 		onResetExport,
 		onCameraSelectionChange,
 	}: {
@@ -61,11 +64,13 @@
 		currentSceneOnly?: boolean;
 		includeThumbnails?: boolean;
 		panoramaObservations?: boolean;
-		exportProfile?: 'compact_with_polar_extension' | 'single_lossless_core' | 'navigation_only' | 'legacy_full';
+		exportProfile?: 'compact_with_polar_extension' | 'single_lossless_core' | 'navigation_only' | 'png_stokes_core' | 'legacy_full';
 		pngOnly?: boolean;
 		includeBirdseye?: boolean;
 		includeEpisodeBirdseye?: boolean;
 		evalPerturbation?: boolean;
+		uploadToGoogleDrive?: boolean;
+		uploadDestinationSubpath?: string;
 		cameraInventory?: ExportCameraInventoryItem[];
 		selectedCameraIds?: string[];
 		currentSceneId?: string;
@@ -75,6 +80,7 @@
 		onValidate: () => void;
 		onExport: () => void;
 		onCancelExport?: () => void;
+		onResumeExport?: () => void;
 		onResetExport?: () => void;
 		onCameraSelectionChange: (cameraIds: string[]) => void;
 	} = $props();
@@ -249,10 +255,11 @@
 	<div class="panel-label mt-2">Bundle profile</div>
 	<label class="export-filter-row">
 		<span>Output</span>
-		<select bind:value={exportProfile} disabled={Boolean(jobInFlight)}>
+		<select bind:value={exportProfile} onchange={() => { if (exportProfile === 'legacy_full') pngOnly = false; }} disabled={Boolean(jobInFlight)}>
 			<option value="compact_with_polar_extension">Core + Polar extension</option>
 			<option value="single_lossless_core">Single lossless core</option>
 			<option value="navigation_only">Navigation only</option>
+			<option value="png_stokes_core">PNG + canonical Stokes</option>
 			<option value="legacy_full">Legacy full</option>
 		</select>
 	</label>
@@ -263,6 +270,8 @@
 			One ZIP with lossless RGB WebP, polar thumbnails, and compact float32 Stokes core.
 		{:else if exportProfile === 'navigation_only'}
 			Smallest bundle: navigation RGB plus polar thumbnails; no Stokes raw payload.
+		{:else if exportProfile === 'png_stokes_core'}
+			Source camera PNGs and all polar PNGs, with canonical float32 Stokes core; RGB EXR/raw buffers are excluded.
 		{:else}
 			Compatibility export: source PNG and full legacy Stokes NPZ.
 		{/if}
@@ -275,6 +284,18 @@
 		<div class="export-filter-hint">{pngOnly ? 'EXR/HDR excluded. Legacy Stokes NPZ remains included.' : 'EXR/HDR included - large and slow.'}</div>
 	{:else}
 		<div class="export-filter-hint">Profile estimate is recorded before collection; PNG-only does not control Polar raw in compact profiles.</div>
+	{/if}
+	<div class="panel-label mt-2">Delivery</div>
+	<label class="export-filter-row">
+		<input type="checkbox" bind:checked={uploadToGoogleDrive} disabled={Boolean(jobInFlight)} />
+		<span>Upload to Google Drive</span>
+	</label>
+	{#if uploadToGoogleDrive}
+		<label class="export-filter-row">
+			<span>Drive folder</span>
+			<input class="export-path-input" bind:value={uploadDestinationSubpath} disabled={Boolean(jobInFlight)} />
+		</label>
+		<div class="export-filter-hint">A new scene/job subfolder is created under this configured Google Drive path.</div>
 	{/if}
 	<label class="export-filter-row">
 		<input type="checkbox" bind:checked={includeBirdseye} />
@@ -316,9 +337,16 @@
 		>
 			{loading ? 'Submitting…' : 'Export Dataset'}
 		</button>
-		{#if activeExportJob && (activeExportJob.status === 'failed' || activeExportJob.status === 'cancelled')}
-			<div class="export-summary" class:val-fail={activeExportJob.status === 'failed'}>
-				{activeExportJob.status === 'failed' ? `Failed: ${activeExportJob.error ?? 'unknown error'}` : 'Cancelled.'}
+	{#if activeExportJob && (activeExportJob.status === 'failed' || activeExportJob.status === 'cancelled' || activeExportJob.status === 'interrupted')}
+		<div class="export-summary" class:val-fail={activeExportJob.status === 'failed'}>
+			{activeExportJob.status === 'failed'
+				? `Failed: ${activeExportJob.error ?? 'unknown error'}`
+				: activeExportJob.status === 'interrupted'
+					? 'Interrupted. Local archives and verified remote files are retained.'
+					: 'Cancelled.'}
+				{#if activeExportJob.resume_available && onResumeExport}
+					<button type="button" class="button button-primary" onclick={onResumeExport}>Resume upload/export</button>
+				{/if}
 				<button type="button" class="button button-subtle" onclick={onResetExport}>Dismiss</button>
 			</div>
 		{/if}
@@ -400,6 +428,7 @@
 	.export-filter-row { display: flex; align-items: center; gap: 6px; margin-top: 8px; font-size: 12px; color: var(--text-primary); cursor: pointer; }
 	.export-filter-row input { margin: 0; }
 	.export-filter-hint { font-size: 11px; color: var(--text-muted); margin: 2px 0 6px; }
+	.export-path-input { min-width: 0; flex: 1; font: inherit; font-size: 11px; padding: 3px 5px; }
 	.export-camera-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 6px; }
 	.export-camera-actions { display: flex; gap: 4px; }
 	.export-camera-actions .button { min-height: 24px; padding: 2px 7px; font-size: 10px; }

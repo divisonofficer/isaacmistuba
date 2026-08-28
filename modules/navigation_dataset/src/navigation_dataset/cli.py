@@ -8,14 +8,21 @@ import shutil
 import urllib.error
 import urllib.request
 
-from .episode_schema import DEFAULT_MODALITIES, DatasetProject, read_episode, write_project, write_episode
+from .episode_schema import DEFAULT_MODALITIES, DatasetProject, read_episode, write_episode
 from .evaluator import evaluate_dataset, write_evaluation
-from .exporters.custom_json import export_dataset_zip, write_dataset_index, write_split_files
 from .edge_builder import build_viewpoint_edges, graph_summary
-from .graph_episode_sampler import GRAPH_SCENARIOS, plan_graph_episodes, write_graph_episodes
+from .graph_episode_sampler import GRAPH_SCENARIOS, plan_graph_episodes, write_scene_graph_episodes
 from .node_sampler import sample_viewpoint_nodes
-from .renderer import render_episode_direct, write_rendered_episode
-from .rollout import plan_episodes, split_counts_from_spec, write_episodes
+from .renderer import render_episode_direct, write_scene_rendered_episode
+from .rollout import plan_episodes, split_counts_from_spec, write_scene_episodes
+from .scene_dataset import (
+    SceneDatasetPaths,
+    export_scene_workspace_zip,
+    snapshot_graph_revision,
+    write_episode_index,
+    write_project_catalog,
+    write_scene_dataset,
+)
 from .scene_annotations import read_scene_annotation
 from .sensor_sweep import render_viewpoint_sweep_direct
 from .traversability import build_traversability_grid, load_traversability_grid, save_traversability_grid, write_nav_graph
@@ -68,27 +75,10 @@ def cmd_init(args) -> None:
     root = Path(args.root).resolve()
     for rel in (
         "scenes",
-        "episodes/train",
-        "episodes/val_seen",
-        "episodes/val_unseen",
-        "episodes/test",
-        "observations",
-        "viewpoint_observations",
-        "splits",
-        "evaluation",
         "docs",
-        "render_batches",
-        "graph_render_batches",
     ):
         (root / rel).mkdir(parents=True, exist_ok=True)
-    project = DatasetProject(
-        project_name=args.project_name,
-        dataset_type=args.dataset_type,
-        target_scenario=args.target_scenario,
-        robot_profile=args.robot_profile,
-        modalities=_modalities(args.modalities),
-    )
-    write_project(root / "dataset.json", project)
+    write_project_catalog(root)
     (root / "README.md").write_text(
         f"# {args.project_name}\n\nTargeted synthetic fine-tuning dataset for optical-hazard navigation.\n",
         encoding="utf-8",
@@ -110,8 +100,8 @@ def cmd_init(args) -> None:
 
 def cmd_scene_add(args) -> None:
     root = _dataset_root(args.dataset)
-    scene_dir = root / "scenes" / args.scene_id
-    scene_dir.mkdir(parents=True, exist_ok=True)
+    paths = SceneDatasetPaths.from_project(root, args.scene_id).ensure_layout()
+    scene_dir = paths.scene_dir
     usd_src = Path(args.usd)
     usd_dst = scene_dir / usd_src.name
     if usd_src.exists() and usd_src.resolve() != usd_dst.resolve():
@@ -135,7 +125,15 @@ def cmd_scene_add(args) -> None:
                 "metadata": {"status": "annotation_required"},
             },
         )
-    print(f"Registered scene: {scene_dir}")
+    write_episode_index(paths)
+    write_scene_dataset(paths, metadata={
+        "dataset_type": args.dataset_type if hasattr(args, "dataset_type") else "Synthetic fine-tuning dataset",
+        "target_scenario": args.target_scenario if hasattr(args, "target_scenario") else "glass / mirror / transparent partition navigation",
+        "robot_profile": args.robot_profile if hasattr(args, "robot_profile") else "mobile_base_front_camera",
+        "modalities": _modalities(args.modalities) if hasattr(args, "modalities") else list(DEFAULT_MODALITIES),
+    })
+    write_project_catalog(root)
+    print(f"Registered scene workspace: {scene_dir}")
 
 
 def cmd_scene_validate(args) -> None:
@@ -156,6 +154,7 @@ def cmd_map_build(args) -> None:
 
 def cmd_episodes_plan(args) -> None:
     root = _dataset_root(args.dataset)
+    paths = SceneDatasetPaths.from_project(root, args.scene_id).ensure_layout()
     annotation = read_scene_annotation(root / "scenes" / args.scene_id / "scene_annotation.json")
     grid_path = Path(args.grid) if args.grid else root / "scenes" / args.scene_id / "traversable_grid.npy"
     grid = load_traversability_grid(grid_path)
@@ -168,14 +167,16 @@ def cmd_episodes_plan(args) -> None:
         modalities=_modalities(args.modalities),
         seed=args.seed,
     )
-    write_episodes(root, episodes)
-    write_dataset_index(root)
-    write_split_files(root)
+    write_scene_episodes(paths, episodes)
+    write_episode_index(paths)
+    write_scene_dataset(paths)
+    write_project_catalog(root)
     print(json.dumps({"planned": len(episodes), "scene_id": args.scene_id}, indent=2))
 
 
 def cmd_episodes_render(args) -> None:
     root = _dataset_root(args.dataset)
+    paths = SceneDatasetPaths.from_project(root, args.scene_id).ensure_layout()
     if args.backend != "direct":
         raise SystemExit("Only --backend direct is implemented in v0.1 CLI. Use the existing render daemon API separately for queued jobs.")
     if not args.scene_state or not args.camera_spec:
@@ -183,7 +184,7 @@ def cmd_episodes_render(args) -> None:
     scene_state = _read_json(args.scene_state)
     camera_spec = _read_json(args.camera_spec)
     count = 0
-    for episode_path in sorted((root / "episodes").glob("*/*.json")):
+    for episode_path in paths.episode_paths(split=args.split):
         episode = read_episode(episode_path)
         rendered = render_episode_direct(
             episode,
@@ -193,15 +194,26 @@ def cmd_episodes_render(args) -> None:
             modalities=_modalities(args.modalities),
             variant=args.variant,
         )
-        write_rendered_episode(root, rendered)
+        write_scene_rendered_episode(paths, rendered)
         count += 1
     print(json.dumps({"rendered_episodes": count}, indent=2))
 
 
 def cmd_graph_build(args) -> None:
     root = _dataset_root(args.dataset)
-    scene_dir = root / "scenes" / args.scene_id
+    paths = SceneDatasetPaths.from_project(root, args.scene_id).ensure_layout()
+    scene_dir = paths.scene_dir
     graph_path = scene_dir / "viewpoint_graph.json"
+    if graph_path.exists() and not args.rebuild_graph:
+        print(json.dumps({
+            "scene_id": args.scene_id,
+            "graph_ref": graph_path.relative_to(root).as_posix(),
+            "preserved": True,
+            "reason": "existing graph is immutable unless --rebuild-graph is explicit",
+        }, indent=2))
+        return
+    if graph_path.exists():
+        snapshot_graph_revision(paths, graph_path, reason="rebuild_graph")
 
     # Explicit --grid path forces the legacy direct flow over a pre-built grid.
     if args.grid:
@@ -220,13 +232,22 @@ def cmd_graph_build(args) -> None:
             node_heading_count=args.heading_count, nodes=nodes, edges=edges,
             metadata={
                 "generation_version": "opticalnav-v0.2", "robot_radius_m": args.robot_radius,
+                "max_nodes_requested": args.max_nodes,
                 "min_node_spacing_m": args.min_node_spacing, "max_edge_length_m": args.max_edge_length,
                 "k_neighbors": args.k_neighbors, "seed": args.seed,
             },
         )
         write_viewpoint_graph(graph_path, graph)
-        print(json.dumps({"graph_ref": graph_path.relative_to(root).as_posix(),
-                          **graph_summary(nodes, edges, heading_count=args.heading_count)}, indent=2))
+        summary = {"graph_ref": graph_path.relative_to(root).as_posix(),
+                   **graph_summary(nodes, edges, heading_count=args.heading_count)}
+        if getattr(args, "modern_office_glass_count", 0):
+            from .optical_perturbation import build_optical_perturbation
+            overlay = build_optical_perturbation(
+                scene_dir, seed=args.seed, mirror_density=0.0,
+                max_glass_walls=args.modern_office_glass_count,
+            )
+            summary["modern_office_glass_overlay"] = overlay["metadata"]
+        print(json.dumps(summary, indent=2))
         return
 
     # Default: shared mesh-aware core (mesh-derived walkable surface + portals,
@@ -244,7 +265,15 @@ def cmd_graph_build(args) -> None:
         max_edge_length_m=args.max_edge_length, seed=args.seed,
     )
     write_viewpoint_graph(graph_path, res.graph)
-    print(json.dumps({"graph_ref": graph_path.relative_to(root).as_posix(), **res.summary}, indent=2))
+    summary = {"graph_ref": graph_path.relative_to(root).as_posix(), **res.summary}
+    if getattr(args, "modern_office_glass_count", 0):
+        from .optical_perturbation import build_optical_perturbation
+        overlay = build_optical_perturbation(
+            scene_dir, seed=args.seed, mirror_density=0.0,
+            max_glass_walls=args.modern_office_glass_count,
+        )
+        summary["modern_office_glass_overlay"] = overlay["metadata"]
+    print(json.dumps(summary, indent=2))
 
 
 def cmd_graph_qa(args) -> None:
@@ -303,6 +332,7 @@ def cmd_graph_sweep(args) -> None:
 
 def cmd_graph_episodes_plan(args) -> None:
     root = _dataset_root(args.dataset)
+    paths = SceneDatasetPaths.from_project(root, args.scene_id).ensure_layout()
     from .optical_perturbation import disabled_edges_for_scene
 
     graph_path = Path(args.graph) if args.graph else root / "scenes" / args.scene_id / "viewpoint_graph.json"
@@ -334,9 +364,10 @@ def cmd_graph_episodes_plan(args) -> None:
         perturbation=perturbation,
         use_instruction_llm=bool(getattr(args, "instruction_llm", False)),
     )
-    written = write_graph_episodes(root, episodes)
-    write_dataset_index(root)
-    write_split_files(root)
+    written = write_scene_graph_episodes(paths, episodes)
+    write_episode_index(paths)
+    write_scene_dataset(paths)
+    write_project_catalog(root)
     print(json.dumps({"planned": len(written), "scene_id": args.scene_id, "mode": "viewpoint_graph"}, indent=2))
 
 
@@ -365,7 +396,8 @@ def cmd_graph_episodes_augment_instructions(args) -> None:
     use_llm = bool(getattr(args, "instruction_llm", False))
     updated = 0
     skipped = 0
-    for ep_path in sorted((root / "episodes").glob("*/*.json")):
+    paths = SceneDatasetPaths.from_project(root, args.scene_id)
+    for ep_path in paths.episode_paths():
         try:
             ep = read_episode(ep_path)
         except Exception:
@@ -399,7 +431,11 @@ def cmd_graph_episodes_augment_instructions(args) -> None:
 
 
 def cmd_validate_dataset(args) -> None:
-    report = validate_dataset(args.dataset, require_observations=args.require_observations)
+    report = validate_dataset(
+        args.dataset,
+        require_observations=args.require_observations,
+        scene_id=args.scene_id,
+    )
     print(json.dumps(report.to_payload(), indent=2))
     if not report.ok:
         raise SystemExit(1)
@@ -407,9 +443,10 @@ def cmd_validate_dataset(args) -> None:
 
 def cmd_evaluate(args) -> None:
     root = _dataset_root(args.dataset)
-    output = root / "evaluation" / f"{args.policy}.json"
-    write_evaluation(output, root, success_radius=args.success_radius)
-    print(json.dumps(evaluate_dataset(root, success_radius=args.success_radius)["metrics"], indent=2))
+    paths = SceneDatasetPaths.from_project(root, args.scene_id).ensure_layout()
+    output = paths.operations_dir / "evaluation" / f"{args.policy}.json"
+    write_evaluation(output, root, success_radius=args.success_radius, scene_id=args.scene_id)
+    print(json.dumps(evaluate_dataset(root, success_radius=args.success_radius, scene_id=args.scene_id)["metrics"], indent=2))
 
 
 def cmd_perturbation_build(args) -> None:
@@ -427,13 +464,26 @@ def cmd_perturbation_build(args) -> None:
 
 def cmd_export(args) -> None:
     root = _dataset_root(args.dataset)
-    write_dataset_index(root)
-    write_split_files(root)
+    paths = SceneDatasetPaths.from_project(root, args.scene_id).ensure_layout()
+    write_episode_index(paths)
+    write_scene_dataset(paths)
+    write_project_catalog(root)
     if args.zip:
-        zip_path = export_dataset_zip(root, args.out)
+        # This CLI exports exactly one workspace. The daemon's richer exporter
+        # may add observations, but must still receive this same scene scope.
+        zip_path = export_scene_workspace_zip(paths, args.out)
         print(f"Wrote export zip: {zip_path}")
     else:
         print(f"Wrote dataset index and splits: {root}")
+
+
+def cmd_migrate_scene_layout(args) -> None:
+    if not args.all:
+        raise SystemExit("migrate-scene-layout is project-wide; pass --all explicitly")
+    from .scene_workspace_migration import migrate_scene_layout
+
+    report = migrate_scene_layout(args.project, dry_run=bool(args.dry_run), resume=bool(args.resume))
+    print(json.dumps(report, ensure_ascii=False, indent=2))
 
 
 def main() -> None:
@@ -483,6 +533,8 @@ def main() -> None:
     p_plan.set_defaults(fn=cmd_episodes_plan)
     p_render = episodes_sub.add_parser("render")
     p_render.add_argument("--dataset", required=True)
+    p_render.add_argument("--scene-id", required=True)
+    p_render.add_argument("--split", choices=["train", "val_seen", "val_unseen", "test"], default=None)
     p_render.add_argument("--modalities", default=",".join(DEFAULT_MODALITIES))
     p_render.add_argument("--backend", choices=["direct", "daemon"], default="direct")
     p_render.add_argument("--scene-state", default=None)
@@ -510,6 +562,10 @@ def main() -> None:
                                help="extra node clearance beyond robot radius so cameras don't hug walls (mesh scenes)")
     p_graph_build.add_argument("--doorway-gap", type=float, default=0.45,
                                help="max wall/threshold gap (m) bridged to connect rooms whose doorway isn't in the grid")
+    p_graph_build.add_argument("--modern-office-glass-count", type=int, default=0,
+                               help="add this many deterministic transparent-partition overlays after graph build")
+    p_graph_build.add_argument("--rebuild-graph", action="store_true",
+                               help="snapshot and explicitly replace an existing viewpoint graph")
     p_graph_build.set_defaults(fn=cmd_graph_build)
     p_graph_qa = graph_sub.add_parser("qa")
     p_graph_qa.add_argument("--dataset", default=".")
@@ -559,11 +615,13 @@ def main() -> None:
     validate_sub = p_validate.add_subparsers(dest="validate_cmd", required=True)
     p_validate_dataset = validate_sub.add_parser("dataset")
     p_validate_dataset.add_argument("--dataset", required=True)
+    p_validate_dataset.add_argument("--scene-id", required=True)
     p_validate_dataset.add_argument("--require-observations", action="store_true")
     p_validate_dataset.set_defaults(fn=cmd_validate_dataset)
 
     p_eval = sub.add_parser("evaluate")
     p_eval.add_argument("--dataset", required=True)
+    p_eval.add_argument("--scene-id", required=True)
     p_eval.add_argument("--policy", default="shortest_oracle")
     p_eval.add_argument("--success-radius", type=float, default=0.5)
     p_eval.set_defaults(fn=cmd_evaluate)
@@ -582,10 +640,33 @@ def main() -> None:
 
     p_export = sub.add_parser("export")
     p_export.add_argument("--dataset", required=True)
+    p_export.add_argument("--scene-id", required=True)
     p_export.add_argument("--format", default="custom_json", choices=["custom_json"])
     p_export.add_argument("--zip", action="store_true")
     p_export.add_argument("--out", default=None)
     p_export.set_defaults(fn=cmd_export)
+
+    p_migrate = sub.add_parser("migrate-scene-layout", help="archive v2 project-global data into scene-local v3 workspaces")
+    p_migrate.add_argument("--project", required=True)
+    p_migrate.add_argument("--all", action="store_true", help="acknowledge that every legacy scene will be migrated")
+    p_migrate.add_argument("--dry-run", action="store_true")
+    # A staged migration is safe to resume only when its legacy-input contract
+    # still matches.  Make that recovery path the normal behaviour; callers
+    # that deliberately want a fresh stage can opt out explicitly.
+    p_migrate.add_argument(
+        "--resume",
+        dest="resume",
+        action="store_true",
+        default=True,
+        help="resume a compatible staged migration (default)",
+    )
+    p_migrate.add_argument(
+        "--no-resume",
+        dest="resume",
+        action="store_false",
+        help="start a fresh migration stage instead of resuming one",
+    )
+    p_migrate.set_defaults(fn=cmd_migrate_scene_layout)
 
     args = parser.parse_args()
     args.fn(args)

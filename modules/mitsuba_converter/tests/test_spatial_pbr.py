@@ -5,7 +5,10 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-from mitsuba_converter.spatial_pbr import convert_spatial_pbr_textures
+from mitsuba_converter.spatial_pbr import (
+    conductor_eta_k_from_f0,
+    convert_spatial_pbr_textures,
+)
 
 
 def _table() -> dict:
@@ -78,3 +81,75 @@ def test_continuous_metallic_weight_is_not_blurred_or_binarized(tmp_path: Path) 
     assert np.array_equal(maps["conductor_index"] > 0, [[False, True, True]])
     weight = np.asarray(Image.open(record["outputs"]["bsdf_weight"]))
     assert np.array_equal(weight, values[None, :])
+
+
+def test_constant_metallic_factor_materializes_derived_legacy_atlas(tmp_path: Path) -> None:
+    base = tmp_path / "base.png"
+    _rgb(base, np.full((2, 3, 3), 200, dtype=np.uint8))
+
+    record = convert_spatial_pbr_textures(
+        object_id="constant_metal",
+        output_dir=tmp_path / "out",
+        base_color_path=base,
+        metallic_constant=0.3875638246536255,
+        conductor_table=_table(),
+        write_exr=False,
+    )
+
+    # The 8-bit texture-only adapter cache has expected quantization, while
+    # its provenance retains the exact GLB factor that generated it.
+    metallic = np.asarray(Image.open(record["outputs"]["metallic"]))
+    assert np.all(metallic == round(0.3875638246536255 * 255))
+    assert record["inputs"]["metallic_source_mode"] == "constant_factor"
+    assert record["output_provenance"]["metallic"] == {
+        "kind": "derived_constant_factor_atlas",
+        "factor": 0.3875638246536255,
+        "reason": "texture_only_consumer_compatibility",
+    }
+
+
+def test_continuous_eta_k_reconstructs_authored_f0_without_preset_fallback(
+    tmp_path: Path,
+) -> None:
+    authored_f0 = np.asarray(
+        [[0.012, 0.016, 0.027], [0.2, 0.5, 0.9]], dtype=np.float32
+    )
+    eta, k = conductor_eta_k_from_f0(authored_f0)
+    reconstructed = ((eta - 1.0) ** 2 + k**2) / ((eta + 1.0) ** 2 + k**2)
+    assert np.all(eta == 1.0)
+    assert np.allclose(reconstructed, authored_f0, atol=2e-7)
+
+    base = tmp_path / "base.png"
+    srgb = np.where(
+        authored_f0[0] <= 0.0031308,
+        12.92 * authored_f0[0],
+        1.055 * np.power(authored_f0[0], 1 / 2.4) - 0.055,
+    )
+    _rgb(base, np.rint(np.clip(srgb, 0, 1) * 255)[None, None, :])
+    record = convert_spatial_pbr_textures(
+        object_id="dark_metal",
+        output_dir=tmp_path / "out",
+        base_color_path=base,
+        metallic_constant=1.0,
+        conductor_table=_table(),
+        write_exr=False,
+    )
+    maps = np.load(record["outputs"]["optical_maps_npz"])
+    rendered_f0 = (
+        (maps["eta"] - 1.0) ** 2 + maps["k"] ** 2
+    ) / (
+        (maps["eta"] + 1.0) ** 2 + maps["k"] ** 2
+    )
+    encoded_f0 = srgb_to_linear_for_test(np.asarray(Image.open(base), np.float32) / 255.0)
+    assert np.allclose(rendered_f0[0, 0], encoded_f0[0, 0], atol=2e-7)
+    assert record["conductor_parameterization"]["method"] == "continuous_f0_eta1"
+    assert record["stats"]["f0_match_l2_mean"] < 1e-6
+    assert record["stats"]["nearest_preset_f0_l2_mean"] > 0.1
+
+
+def srgb_to_linear_for_test(values: np.ndarray) -> np.ndarray:
+    return np.where(
+        values <= 0.04045,
+        values / 12.92,
+        ((values + 0.055) / 1.055) ** 2.4,
+    )

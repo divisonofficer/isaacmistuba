@@ -58,14 +58,20 @@ _PHASE_ORDER = ("rgb", "polar", "lidar")
 
 
 def _mat4_from_xy_yaw(x: float, y: float, yaw_rad: float, height_m: float = 1.0) -> list[float]:
-    c = math.cos(yaw_rad)
-    s = math.sin(yaw_rad)
-    return [
-        c, 0.0, -s, 0.0,
-        0.0, 1.0, 0.0, 0.0,
-        s, 0.0, c, 0.0,
-        float(x), float(height_m), float(y), 1.0,
-    ]
+    """Return the canonical Mitsuba camera pose in legacy flat storage.
+
+    ``x, y`` are authoring-floor coordinates (Mitsuba X/Z), while ``height_m``
+    is Mitsuba Y.  Keeping this adapter as the only sweep entry point prevents
+    graph headings from drifting from Blender GT and kitchen probes.
+    """
+    from robomituba_bridge.camera_pose import matrix_to_legacy_flat, resolve_viewpoint_pose
+
+    pose = resolve_viewpoint_pose(
+        (float(x), float(y), 0.0),
+        math.degrees(float(yaw_rad)),
+        eye_height_m=float(height_m),
+    )
+    return matrix_to_legacy_flat(pose.camera_to_world_mitsuba)
 
 
 def _sensor_pose_from_xy_yaw(
@@ -308,6 +314,7 @@ def build_sweep_render_requests(
     modalities: list[str],
     job_id_mode: str = "per_heading",
     node_ids: list[str] | None = None,
+    heading_ids_by_node: Mapping[str, Sequence[str]] | None = None,
     camera_height_m: float = 1.0,
     render_settings: dict | None = None,
     node_heights: dict | None = None,
@@ -338,11 +345,18 @@ def build_sweep_render_requests(
         sensor_ids=sensor_ids,
     )
     node_id_set = set(node_ids) if node_ids else None
+    heading_id_sets = {
+        str(node_id): {str(heading_id) for heading_id in heading_ids}
+        for node_id, heading_ids in (heading_ids_by_node or {}).items()
+    }
     requests: list[SweepRenderRequest] = []
     for node in graph.nodes:
         if node_id_set is not None and node.node_id not in node_id_set:
             continue
         for heading in node.headings:
+            allowed_headings = heading_id_sets.get(node.node_id)
+            if allowed_headings is not None and heading.heading_id not in allowed_headings:
+                continue
             frame_id = f"{graph.scene_id}_{node.node_id}_{heading.heading_id}"
             timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
             yaw_rad = math.radians(float(heading.yaw_deg))

@@ -101,10 +101,16 @@ class OfficeAssetCoverageTests(unittest.TestCase):
             if (scene_dir / "xml_scene_index.json").exists():
                 xml_index = json.loads((scene_dir / "xml_scene_index.json").read_text(encoding="utf-8"))
                 for shape in xml_index.get("shapes", []):
+                    mesh_ref = shape.get("mesh_ref")
+                    if mesh_ref:
+                        self.assertTrue((scene_dir / "mesh_cache" / mesh_ref).exists(), mesh_ref)
+                        continue
                     mesh_path = shape.get("mesh_path")
                     if not mesh_path:
                         continue
                     self.assertTrue((scene_dir / "mesh_cache" / Path(mesh_path).name).exists(), mesh_path)
+            annotation = json.loads((scene_dir / "scene_annotation.json").read_text(encoding="utf-8"))
+            self.assertIsNone(annotation.get("usd_ref"))
             self.assertEqual(result.compile_summary["transparent_surface_count"], 3)
             self.assertIn("printer_copier", result.asset_gap_categories)
 

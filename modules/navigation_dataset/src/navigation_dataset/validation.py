@@ -6,6 +6,7 @@ from typing import Iterable
 
 from .episode_schema import read_episode
 from .exporters.custom_json import find_episode_files
+from .scene_dataset import SceneDatasetPaths
 from .scene_annotations import read_scene_annotation
 from .viewpoint_graph import read_viewpoint_graph
 
@@ -43,14 +44,24 @@ def validate_dataset(
     *,
     require_observations: bool = False,
     scene_ids: Iterable[str] | None = None,
+    scene_id: str | None = None,
 ) -> ValidationReport:
     root = Path(dataset_root)
     errors: list[str] = []
     warnings: list[str] = []
-    scene_filter = set(str(sid) for sid in scene_ids) if scene_ids is not None else None
+    if scene_id is not None and scene_ids is not None:
+        raise ValueError("pass scene_id or scene_ids, not both")
+    scene_filter = ({str(scene_id)} if scene_id is not None else
+                    (set(str(sid) for sid in scene_ids) if scene_ids is not None else None))
     if not (root / "dataset.json").exists():
         warnings.append("dataset.json is missing; run opticalnav export or write_dataset_index.")
-    for annotation_path in sorted((root / "scenes").glob("*/scene_annotation.json")):
+    annotation_paths = (
+        [root / "scenes" / str(scene_id) / "scene_annotation.json"]
+        if scene_id is not None else sorted((root / "scenes").glob("*/scene_annotation.json"))
+    )
+    for annotation_path in annotation_paths:
+        if not annotation_path.exists():
+            continue
         try:
             annotation = read_scene_annotation(annotation_path)
         except Exception as exc:
@@ -84,7 +95,13 @@ def validate_dataset(
                         errors.append(f"{annotation.scene_id}: render readiness is blocked.")
                 except Exception as exc:
                     errors.append(f"{annotation.scene_id}: render readiness cannot be read: {exc}")
-    for graph_path in sorted((root / "scenes").glob("*/viewpoint_graph.json")):
+    graph_paths = (
+        [root / "scenes" / str(scene_id) / "viewpoint_graph.json"]
+        if scene_id is not None else sorted((root / "scenes").glob("*/viewpoint_graph.json"))
+    )
+    for graph_path in graph_paths:
+        if not graph_path.exists():
+            continue
         try:
             graph = read_viewpoint_graph(graph_path)
         except Exception as exc:
@@ -99,7 +116,13 @@ def validate_dataset(
                         errors.append(f"{graph.graph_id}/{node.node_id}/{heading.heading_id}/{modality}: missing observation ref")
                     if ref and not (root / ref).exists():
                         errors.append(f"{graph.graph_id}/{node.node_id}/{heading.heading_id}/{modality}: missing observation bundle {ref}")
-    all_episode_paths = find_episode_files(root)
+    if scene_id is not None:
+        # The scene-local resolver is deliberately used before any legacy glob:
+        # an invalid or enormous episode directory in another scene cannot
+        # affect this validation request.
+        all_episode_paths = SceneDatasetPaths.from_project(root, scene_id).episode_paths()
+    else:
+        all_episode_paths = find_episode_files(root)
     episode_paths: list[Path] = []
     for episode_path in all_episode_paths:
         try:

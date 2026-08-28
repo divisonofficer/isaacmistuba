@@ -72,6 +72,12 @@ export function normalizeRigRenderSettings(
 		path_spp: positiveInt(render?.path_spp, lidar ? 1 : 4096),
 		aov_spp: positiveInt(render?.aov_spp, lidar ? 1 : 16),
 		polar_spp: positiveInt(render?.polar_spp, lidar ? 1 : 256),
+		polar_visualization_policy:
+			render?.polar_visualization_policy === 'raw_stokes_aolp_v1'
+				? 'raw_stokes_aolp_v1'
+				: render?.polar_visualization_policy === 'core_preview_v1'
+					? 'core_preview_v1'
+					: 'full_v1',
 		samples_per_pass:
 			render?.samples_per_pass == null || render?.samples_per_pass === ''
 				? null

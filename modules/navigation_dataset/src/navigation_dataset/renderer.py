@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Callable
 
 from .episode_schema import EpisodeManifest, Pose2D, write_episode
+from .scene_dataset import SceneDatasetPaths
 
 
 def _mat4_from_pose_xy_yaw(pose: list[float]) -> list[float]:
@@ -118,3 +119,7 @@ def render_episode_direct(
 
 def write_rendered_episode(dataset_root: str | Path, episode: EpisodeManifest) -> Path:
     return write_episode(Path(dataset_root) / "episodes" / episode.split / f"{episode.episode_id}.json", episode)
+
+
+def write_scene_rendered_episode(paths: SceneDatasetPaths, episode: EpisodeManifest) -> Path:
+    return paths.write_episode(episode)

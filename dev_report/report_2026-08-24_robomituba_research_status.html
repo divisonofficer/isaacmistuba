@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Robomituba 연구 현황 기준선 · 2026-08-24</title>
+  <style>
+    :root { --bg:#10151d; --panel:#18212d; --line:#314156; --text:#eaf0f7; --muted:#aebdcb; --ok:#7ed6a2; --warn:#f1c96a; --plan:#8db7ff; }
+    * { box-sizing:border-box; } body { margin:0; background:var(--bg); color:var(--text); font:16px/1.65 system-ui,sans-serif; }
+    main { max-width:1020px; margin:auto; padding:48px 24px 72px; } h1 { margin:0 0 8px; font-size:2rem; } h2 { margin-top:42px; padding-top:20px; border-top:1px solid var(--line); }
+    h3 { margin-bottom:6px; } a { color:#9fc4ff; } .meta,.note { color:var(--muted); } .card { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:18px 20px; margin:16px 0; }
+    .tag { display:inline-block; padding:2px 9px; border:1px solid var(--line); border-radius:999px; font-size:.78rem; margin-left:7px; } .verified { color:var(--ok); border-color:var(--ok); } .implemented { color:var(--warn); border-color:var(--warn); } .planned { color:var(--plan); border-color:var(--plan); }
+    table { border-collapse:collapse; width:100%; margin:16px 0; } th,td { border:1px solid var(--line); padding:9px; text-align:left; vertical-align:top; } th { background:#202c3b; } code { background:#0c1118; padding:2px 5px; border-radius:4px; overflow-wrap:anywhere; }
+  </style>
+</head>
+<body><main>
+  <h1>Robomituba 연구 현황 기준선</h1>
+  <p class="meta">작성일: 2026-08-24 · 범위: Infinigen 기반 inverse rendering(IR) 및 OpticalNav 데이터셋 연구 · 저장소 문서가 정본</p>
+
+  <div class="card"><strong>운영 원칙.</strong> Notion은 상태·결정·실험을 탐색하는 운영 인덱스이고, 재현 가능한 근거는 이 저장소의 문서, commit, RenderRequest/manifest와 export 경로에 남긴다. EXR, NPZ, GPU cache와 대규모 <code>out/</code> 배치는 Notion에 업로드하지 않는다.</div>
+
+  <h2>현재 연구축</h2>
+  <div class="card">
+    <h3>1. Infinigen 기반 inverse rendering <span class="tag implemented">구현·검증 분리 필요</span></h3>
+    <p>Infinigen 장면을 IR 학습·평가에 사용할 수 있도록 구조·재질·조명·카메라·GT 정보를 다루는 파이프라인을 확장 중이다. 최근 작업 트리에는 principled RGB/active-NIR, geometry contract, scene statistics, material-mix/structural-PBR 품질 검사와 관련 테스트가 포함되어 있으나, 이 보고서 작성 시점에 전체 테스트나 GPU 재렌더를 다시 실행한 것은 아니다.</p>
+    <p><strong>다음 검증:</strong> canonical <code>frame_id</code> 기반 observation↔GT join, full NIR-albedo coverage와 split, 재질/구조 품질 계약의 실제 render 검증.</p>
+  </div>
+  <div class="card">
+    <h3>2. OpticalNav 데이터셋 저작·렌더·export <span class="tag verified">구현 근거 있음</span></h3>
+    <p>결정적 Modern Office 생성 규칙, scene/graph metadata, 다중 GPU daemon의 batch·sharding·resume 상태, modality-aware UI/export 흐름 및 <code>out/</code> 보존 기준이 2026-08-11~18 기간 보고서에 기록돼 있다. 이 근거는 기능 변경과 회귀 테스트 추가를 가리키며, 장시간 GPU queue의 실제 재개·ledger·export manifest 일치는 별도 검증 항목이다.</p>
+    <p><strong>다음 검증:</strong> Modern Office 실생성, shard 재개와 batch summary의 ledger/manifest 일치, export 버전 계약 문서화.</p>
+  </div>
+  <div class="card">
+    <h3>교차 검증: 편광·mirror/glass 관측 <span class="tag planned">물리 품질 미확정</span></h3>
+    <p>thumbnail 보고서는 mirror/glass geometry가 보이는 RGB·polar preview 후보를 제공하는 데이터셋 품질 요약이다. 이는 편광 transport 성능 평가가 아니며, KR base/on은 matching request-level extrinsics가 확인되기 전까지 clean aligned ablation으로 해석하지 않는다.</p>
+  </div>
+
+  <h2>구현 지도</h2>
+  <table><thead><tr><th>계층</th><th>역할</th><th>정본 위치</th></tr></thead><tbody>
+    <tr><td>계약</td><td>job manifest, snapshot, RenderRequest의 pure-Python 데이터 계약</td><td><code>modules/robomituba_bridge/</code></td></tr>
+    <tr><td>변환·렌더</td><td>USD→Mitsuba, multimodal observation, render daemon</td><td><code>modules/mitsuba_converter/</code></td></tr>
+    <tr><td>데이터셋</td><td>authoring, traversability/grid, viewpoint graph, episode, exporter</td><td><code>modules/navigation_dataset/</code></td></tr>
+    <tr><td>운영 도구</td><td>OpticalNav CLI, daemon, export, IR/Infinigen audit 및 report 도구</td><td><code>apps/</code>, <code>scripts/</code></td></tr>
+    <tr><td>렌더러</td><td>장비별 Mitsuba 3/OptiX 소스와 measured pBRDF plugin</td><td><code>modules/mitsuba3/</code>, <code>modules/mitsuba3-optix7/</code></td></tr>
+  </tbody></table>
+
+  <h2>근거 문서와 해석 경계</h2>
+  <table><thead><tr><th>문서</th><th>용도</th><th>해석</th></tr></thead><tbody>
+    <tr><td><a href="report_2026-08-11_2026-08-18_optical_navigation.html">2026-08-11~18 Optical Navigation 개발 보고서</a></td><td>Modern Office, daemon, UI/export, 보존 기준</td><td>구현·commit 근거; 전체 테스트·GPU 재실행은 이 보고서 범위 밖</td></tr>
+    <tr><td><a href="report_2026-08-18_infinigen_dataset_thumbnails.html">2026-08-18 Infinigen thumbnail 보고서</a></td><td>mirror/glass 후보 및 RGB/polar preview</td><td>데이터셋 품질 요약; 편광 성능 평가 아님</td></tr>
+    <tr><td><a href="../docs/out_cleanup_inventory_2026-08-18.md">out cleanup inventory</a></td><td>산출물 보존·역참조 계약</td><td>읽기 전용 inventory; 삭제 실행 근거가 아님</td></tr>
+  </tbody></table>
+
+  <h2>다음 기준선 갱신 조건</h2>
+  <ol>
+    <li>IR과 OpticalNav의 각 변경을 의도별로 테스트·commit하고, 실행 환경과 GPU 검증 근거를 연결한다.</li>
+    <li>실험 결과는 Request/manifest, commit, report 경로를 함께 기록한다.</li>
+    <li>편광·mirror/glass 품질 주장은 raw Stokes와 통제 실험을 통해 transport 경로를 확인한 경우에만 갱신한다.</li>
+  </ol>
+</main></body></html>

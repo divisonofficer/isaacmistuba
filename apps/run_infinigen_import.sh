@@ -10,25 +10,34 @@
 #
 # Options:
 #   --scene-id ID        OpticalNav scene id        (default: infinigen_<dirname>)
+#   --import-name NAME   isolated Stage-1 import directory name (default derived from input)
 #   --project-id ID      OpticalNav project         (default: opticalnav-v0.2)
+#   --stage1-profile P   strict-pbr-v1|ir-bootstrap-v1 (default strict-pbr-v1)
 #   --no-bake            Skip procedural material bake (explicit degraded preview mode)
 #   --bake-pbr           Deprecated compatibility no-op (PBR bake is now the default)
 #   --no-bake-pbr        Disable roughness/normal/metallic bake (degraded preview mode)
 #   --no-glb             Disable GLB export (requires --allow-obj-fallback)
 #   --allow-obj-fallback Permit legacy/incomplete manifests and OBJ render fallback
 #   --no-bake-metallic   With --bake-pbr, skip the (fiddly) metallic EMIT bake
-#   --decimate-policy P  Mesh LOD during export: none|ratio_threshold|semantic_contract
+#   --decimate-policy P  Mesh LOD during export: none|ratio_threshold|semantic_contract|ir_semantic_lod_v1
 #                        (default none). semantic_contract = appearance-contract budget
 #                        (report_2026-07-29_semantic_lod.html); cuts foliage/clutter hard,
 #                        protects glass/metal/structure. Applies to OBJ + atlas + GLB.
+#   --decimate-strict    Fail export if a requested decimation does not meet its target face count
 #   --decimate-min-polys N  Objects below N faces stay at 100% (default 50000)
+#   --filter-small-high-poly  Drop tiny high-poly non-structural detail units
+#   --small-high-poly-max-extent-m M  Maximum extent for the filter (default 0.5)
+#   --small-high-poly-min-triangles N Minimum triangles for the filter (default 100000)
+#   --allow-object-id-churn  Allow showcase composition imports to change source object IDs
 #   --bake-only          Re-bake PBR into an EXISTING scene's import (Stage 1 only, no
 #                        re-import) — preserves the authoring map; busts the staged cache
 #   --no-sync            Skip Stage 3 render-scene sync (don't stage webui meshes)
 #   --skip-export        Reuse an existing Stage-1 manifest (only run Stage 2)
+#   --fresh-export       Ignore resumable Stage-1 staging and start a new export
 #   --room KEY           Keep only this room        (e.g. "dining-room_0/0")
 #   --keep-empty-rooms   Keep unfurnished/empty rooms
 #   --no-normalize-origin  Keep raw Infinigen world coords (don't snap to origin/floor)
+#   --office-population-audit FILE  Require and preserve a passed Office v2 population audit
 #
 # Env overrides:
 #   INFINIGEN_PYTHON   python with the `bpy` module (default: infinigen conda env)
@@ -55,41 +64,64 @@ INFINIGEN_PYTHON="${INFINIGEN_PYTHON:-$HOME/miniconda3/envs/infinigen/bin/python
 # ── parse args ────────────────────────────────────────────────────────────────
 INPUT=""
 SCENE_ID=""
+IMPORT_NAME=""
 PROJECT_ID="opticalnav-v0.2"
+STAGE1_PROFILE="strict-pbr-v1"
 BAKE=1
 BAKE_PBR=1
 BAKE_METALLIC=1
-DECIMATE_POLICY=""          # none|ratio_threshold|semantic_contract (empty => none)
-DECIMATE_MIN_POLYS=50000    # objects below this stay at 100% (not a compression target)
+DECIMATE_POLICY=""          # none|ratio_threshold|semantic_contract|ir_semantic_lod_v1 (empty => none)
+DECIMATE_MIN_POLYS=50000    # objects below this evaluated-triangle count stay at 100% (not a compression target)
+DECIMATE_STRICT=0         # requested geometry reduction must succeed (IR LOD only)
+FILTER_SMALL_HIGH_POLY=0
+SMALL_HIGH_POLY_MAX_EXTENT_M=0.5
+SMALL_HIGH_POLY_MIN_TRIANGLES=100000
 GLB=1
 ALLOW_OBJ_FALLBACK=0
+ALLOW_OBJECT_ID_CHURN=0
 BAKE_ONLY=0
 SKIP_EXPORT=0
+FRESH_EXPORT=0
 SYNC=1
 DAEMON_URL="${ROBOMITUBA_DAEMON_URL:-http://127.0.0.1:8765}"
+OFFICE_POPULATION_AUDIT=""
 STAGE2_EXTRA=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --scene-id)   SCENE_ID="$2"; shift 2;;
+    --import-name) IMPORT_NAME="$2"; shift 2;;
     --project-id) PROJECT_ID="$2"; shift 2;;
+    --stage1-profile) STAGE1_PROFILE="$2"; shift 2;;
     --no-bake)    BAKE=0; shift;;
     --bake-pbr)   BAKE_PBR=1; shift;;
     --no-bake-pbr) BAKE_PBR=0; shift;;
     --no-glb)     GLB=0; shift;;
     --allow-obj-fallback) ALLOW_OBJ_FALLBACK=1; shift;;
+    --allow-object-id-churn) ALLOW_OBJECT_ID_CHURN=1; shift;;
     --no-bake-metallic) BAKE_METALLIC=0; shift;;
+    --decimate-strict)  DECIMATE_STRICT=1; shift;;
     --decimate-policy)  DECIMATE_POLICY="$2"; shift 2;;
     --decimate-min-polys) DECIMATE_MIN_POLYS="$2"; shift 2;;
+    --filter-small-high-poly) FILTER_SMALL_HIGH_POLY=1; shift;;
+    --small-high-poly-max-extent-m) SMALL_HIGH_POLY_MAX_EXTENT_M="$2"; shift 2;;
+    --small-high-poly-min-triangles) SMALL_HIGH_POLY_MIN_TRIANGLES="$2"; shift 2;;
     --bake-only)  BAKE_ONLY=1; BAKE=1; BAKE_PBR=1; SKIP_EXPORT=0; shift;;
     --no-sync)    SYNC=0; shift;;
     --skip-export) SKIP_EXPORT=1; shift;;
+    --fresh-export) FRESH_EXPORT=1; shift;;
     --room)       STAGE2_EXTRA+=(--room "$2"); shift 2;;
+    --office-population-audit) OFFICE_POPULATION_AUDIT="$2"; shift 2;;
     --keep-empty-rooms|--no-normalize-origin) STAGE2_EXTRA+=("$1"); shift;;
     -h|--help)    sed -n '2,30p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0;;
     -*)           echo "[error] unknown option: $1" >&2; exit 2;;
     *)            INPUT="$1"; shift;;
   esac
 done
+case "$STAGE1_PROFILE" in
+  strict-pbr-v1) ;;
+  ir-bootstrap-v1) BAKE=0; BAKE_PBR=0; BAKE_METALLIC=0;;
+  *) echo "[error] invalid --stage1-profile: $STAGE1_PROFILE" >&2; exit 2;;
+esac
 if [[ -z "$INPUT" ]]; then
   echo "[error] missing <scene.blend | scene-dir>. See --help." >&2; exit 2
 fi
@@ -97,10 +129,19 @@ if [[ "$GLB" == 0 && "$ALLOW_OBJ_FALLBACK" == 0 ]]; then
   echo "[error] --no-glb requires --allow-obj-fallback (default import is strict GLB)." >&2
   exit 2
 fi
-if [[ "$BAKE" == 0 || "$BAKE_PBR" == 0 ]]; then
+if [[ "$STAGE1_PROFILE" == "strict-pbr-v1" && ("$BAKE" == 0 || "$BAKE_PBR" == 0) ]]; then
   ALLOW_OBJ_FALLBACK=1
 fi
 [[ $ALLOW_OBJ_FALLBACK == 1 ]] && STAGE2_EXTRA+=(--allow-obj-fallback)
+[[ $ALLOW_OBJECT_ID_CHURN == 1 ]] && STAGE2_EXTRA+=(--allow-object-id-churn)
+if [[ -n "$OFFICE_POPULATION_AUDIT" ]]; then
+  [[ -f "$OFFICE_POPULATION_AUDIT" ]] || { echo "[error] office population audit not found: $OFFICE_POPULATION_AUDIT" >&2; exit 2; }
+  STAGE2_EXTRA+=(--office-population-audit "$OFFICE_POPULATION_AUDIT")
+fi
+if [[ "$FILTER_SMALL_HIGH_POLY" == 1 ]]; then
+  STAGE2_EXTRA+=(--filter-small-high-poly --small-high-poly-max-extent-m "$SMALL_HIGH_POLY_MAX_EXTENT_M" \
+    --small-high-poly-min-triangles "$SMALL_HIGH_POLY_MIN_TRIANGLES")
+fi
 
 # ── resolve a readable .blend ─────────────────────────────────────────────────
 # Infinigen's main scene.blend is often header-corrupt; the scene.blend1 backup
@@ -145,14 +186,30 @@ case "$DIRNAME" in
     DIRNAME="$(basename "$(dirname "$PARENT_DIR")")";;
 esac
 NAME="$(echo "$DIRNAME" | tr -cs 'A-Za-z0-9._-' '_' | sed 's/^_*//;s/_*$//')"
+if [[ -n "$IMPORT_NAME" ]]; then
+  [[ "$IMPORT_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$ ]] || { echo "[error] invalid --import-name" >&2; exit 2; }
+  NAME="$IMPORT_NAME"
+fi
 [[ -z "$SCENE_ID" ]] && SCENE_ID="infinigen_${NAME}"
 IMPORT_DIR="out/infinigen_imports/${NAME}"
 MANIFEST="${IMPORT_DIR}/scene_manifest.json"
+
+# A resumable Stage-1 staging tree has a single writer.  Without this lock a
+# controller restart can leave bpy alive and a second resume would corrupt the
+# same chunk manifest/atlas directory.
+mkdir -p "$(dirname "$IMPORT_DIR")"
+LOCK_FILE="${IMPORT_DIR}.import.lock"
+exec 9>"$LOCK_FILE"
+if ! flock -n 9; then
+  echo "[error] another importer already owns ${IMPORT_DIR}; wait for it or stop it before resuming" >&2
+  exit 75
+fi
 
 echo "═══════════════════════════════════════════════════════════════"
 echo " blend     : $BLEND"
 echo " import dir: $IMPORT_DIR"
 echo " scene id  : $SCENE_ID   (project $PROJECT_ID)"
+echo " profile   : $STAGE1_PROFILE"
 echo " bake      : $([[ $BAKE == 1 ]] && echo on || echo off)"
 echo " decimate  : ${DECIMATE_POLICY:-none}$([[ -n "$DECIMATE_POLICY" && "$DECIMATE_POLICY" != none ]] && echo " (min ${DECIMATE_MIN_POLYS} polys)")"
 echo "═══════════════════════════════════════════════════════════════"
@@ -161,21 +218,53 @@ echo "════════════════════════�
 if [[ "$SKIP_EXPORT" == 1 ]]; then
   echo "[stage1] skipped (--skip-export); using existing $MANIFEST"
   [[ -f "$MANIFEST" ]] || { echo "[error] manifest not found: $MANIFEST" >&2; exit 1; }
+  "$PYTHON" -c 'import json,sys; p=json.load(open(sys.argv[1])).get("stage1_profile", "strict-pbr-v1"); raise SystemExit(0 if p == sys.argv[2] else 1)' "$MANIFEST" "$STAGE1_PROFILE" || {
+    echo "[error] existing manifest profile does not match $STAGE1_PROFILE: $MANIFEST" >&2; exit 1; }
 else
   [[ -x "$INFINIGEN_PYTHON" || -f "$INFINIGEN_PYTHON" ]] || {
     echo "[error] infinigen python not found: $INFINIGEN_PYTHON (set INFINIGEN_PYTHON=...)" >&2; exit 1; }
-  BAKE_FLAG=(); [[ $BAKE == 1 ]] && BAKE_FLAG=(--bake)
+  BAKE_FLAG=(--stage1-profile "$STAGE1_PROFILE"); [[ $BAKE == 1 ]] && BAKE_FLAG+=(--bake)
   [[ $BAKE == 1 && $BAKE_PBR == 1 ]] && BAKE_FLAG+=(--bake-pbr)
+  # Unit atlases and completion sidecars are committed before the chunk-level
+  # scene manifest. Revalidate/reuse them after a late strict failure instead
+  # of spending hours baking the successful prefix again.
+  [[ $BAKE == 1 ]] && BAKE_FLAG+=(--reuse-atlas)
   [[ $BAKE_PBR == 1 && $BAKE_METALLIC == 0 ]] && BAKE_FLAG+=(--no-bake-metallic)
   [[ $GLB == 0 ]] && BAKE_FLAG+=(--no-glb)
   [[ $ALLOW_OBJ_FALLBACK == 1 ]] && BAKE_FLAG+=(--allow-incomplete-pbr)
   # Semantic-topology LOD budget (report_2026-07-29_semantic_lod.html): decimate the
   # live bpy mesh in the export loop so OBJ + baked atlas + GLB all reflect it.
   if [[ -n "$DECIMATE_POLICY" && "$DECIMATE_POLICY" != "none" ]]; then
+  [[ $DECIMATE_STRICT == 1 ]] && BAKE_FLAG+=(--decimate-strict)
     BAKE_FLAG+=(--decimate-policy "$DECIMATE_POLICY" --decimate-min-polys "$DECIMATE_MIN_POLYS")
   fi
-  DEFAULT_STAGING_DIR="${IMPORT_DIR}.staging.$(date +%Y%m%dT%H%M%S)-$$"
-  STAGING_DIR="${INFINIGEN_EXPORT_RESUME_DIR:-$DEFAULT_STAGING_DIR}"
+  if [[ "$FILTER_SMALL_HIGH_POLY" == 1 ]]; then
+    BAKE_FLAG+=(--filter-small-high-poly --small-high-poly-max-extent-m "$SMALL_HIGH_POLY_MAX_EXTENT_M" \
+      --small-high-poly-min-triangles "$SMALL_HIGH_POLY_MIN_TRIANGLES")
+  fi
+  DEFAULT_STAGING_DIR="${IMPORT_DIR}.${STAGE1_PROFILE}.staging.$(date +%Y%m%dT%H%M%S)-$$"
+  STAGING_DIR="${INFINIGEN_EXPORT_RESUME_DIR:-}"
+  if [[ -z "$STAGING_DIR" && $FRESH_EXPORT == 0 ]]; then
+    # Prefer the newest interrupted export for this exact scene name. A usable
+    # staging directory has either an atomically committed chunk manifest or
+    # per-unit checkpoints from a chunk that failed before manifest publish.
+    while IFS= read -r candidate; do
+      if [[ -f "$candidate/scene_manifest.json" ]] || \
+         find "$candidate/.stage1_unit_state" -maxdepth 1 -type f -name '*.json' -print -quit 2>/dev/null | grep -q .; then
+        STAGING_DIR="$candidate"
+        break
+      fi
+    done < <(
+      find "$(dirname "$IMPORT_DIR")" -maxdepth 1 -type d \
+        -name "$(basename "$IMPORT_DIR").${STAGE1_PROFILE}.staging.*" -printf '%T@ %p\n' 2>/dev/null \
+        | sort -nr | cut -d' ' -f2-
+    )
+  fi
+  if [[ -n "$STAGING_DIR" ]]; then
+    echo "[stage1] auto-resume staging: $STAGING_DIR"
+  else
+    STAGING_DIR="$DEFAULT_STAGING_DIR"
+  fi
   STAGING_MANIFEST="${STAGING_DIR}/scene_manifest.json"
   echo "[stage1] exporting meshes/materials with bpy -> $STAGING_DIR"
   # Long-lived bpy processes are unstable on multi-GB scenes. Export bounded
@@ -185,11 +274,21 @@ else
   chunk_skip=0
   unit_count=0
   total_count=-1
-  if [[ -n "${INFINIGEN_EXPORT_RESUME_DIR:-}" && -f "$STAGING_MANIFEST" ]]; then
+  if [[ -f "$STAGING_MANIFEST" ]]; then
     counts="$("$PYTHON" -c "import json,sys; d=json.load(open(sys.argv[1])); print(len(d.get(\"units\", [])), d.get(\"renderable_unit_count\", -1))" "$STAGING_MANIFEST")"
     read -r unit_count total_count <<< "$counts"
     chunk_skip=$unit_count
     echo "[stage1] resuming committed staging at $unit_count/$total_count units"
+    checkpoint_count=0
+    if [[ -d "$STAGING_DIR/.stage1_unit_state" ]]; then
+      checkpoint_count="$(find "$STAGING_DIR/.stage1_unit_state" -maxdepth 1 -type f -name '*.json' | wc -l)"
+    fi
+    if (( checkpoint_count > unit_count )); then
+      echo "[stage1] reusable per-unit checkpoints: $checkpoint_count ($((checkpoint_count - unit_count)) beyond manifest)"
+    fi
+  elif [[ -d "$STAGING_DIR/.stage1_unit_state" ]]; then
+    checkpoint_count="$(find "$STAGING_DIR/.stage1_unit_state" -maxdepth 1 -type f -name '*.json' 2>/dev/null | wc -l)"
+    echo "[stage1] resuming pre-manifest unit checkpoints: $checkpoint_count"
   fi
   while (( total_count < 0 || unit_count < total_count )); do
     before_count=$unit_count
@@ -213,7 +312,8 @@ else
     chunk_skip=$((chunk_skip + CHUNK_SIZE))
   done
   VALIDATE_FLAG=(); [[ $ALLOW_OBJ_FALLBACK == 1 ]] && VALIDATE_FLAG+=(--allow-obj-fallback)
-  "$PYTHON" apps/import_infinigen_scene.py --manifest "$STAGING_MANIFEST" --validate-only "${VALIDATE_FLAG[@]}"
+  "$PYTHON" apps/import_infinigen_scene.py --manifest "$STAGING_MANIFEST" --validate-only \
+    --stage1-profile "$STAGE1_PROFILE" "${VALIDATE_FLAG[@]}"
   if [[ -d "$IMPORT_DIR" ]]; then
     BACKUP_DIR="${IMPORT_DIR}.backup.$(date +%Y%m%dT%H%M%S)"
     mv "$IMPORT_DIR" "$BACKUP_DIR"
@@ -243,6 +343,7 @@ fi
 echo "[stage2] converting manifest → OpticalNav scene…"
 "$PYTHON" apps/import_infinigen_scene.py \
   --manifest "$MANIFEST" \
+  --stage1-profile "$STAGE1_PROFILE" \
   --scene-id "$SCENE_ID" \
   --project-id "$PROJECT_ID" \
   --force "${STAGE2_EXTRA[@]}"

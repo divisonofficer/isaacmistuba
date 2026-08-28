@@ -10,13 +10,16 @@ import hashlib
 import json
 import os
 import re
+import shutil
+import tempfile
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
 
 
-GLB_TEXTURE_ADAPTER_VERSION = 6
+GLB_TEXTURE_ADAPTER_VERSION = 7
+GLB_SAFE_OBJ_CONTRACT = "mitsuba_safe_glb_part_v1"
 
 
 @dataclass
@@ -31,6 +34,8 @@ class GlbPart:
     has_uv: bool
     has_normal: bool
     extracted_material: dict[str, Any] | None
+    bounds: dict[str, list[float]] | None = None
+    obj_contract: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -44,6 +49,8 @@ class GlbPart:
             "has_uv": bool(self.has_uv),
             "has_normal": bool(self.has_normal),
             "extracted_material": self.extracted_material,
+            "bounds": self.bounds,
+            "obj_contract": self.obj_contract,
         }
 
 
@@ -63,6 +70,9 @@ class GlbMaterialization:
     texture_slots: dict[str, int] = field(default_factory=dict)
     mesh_parts: list[GlbPart] = field(default_factory=list)
     error: str | None = None
+    source_mtime_ns: int = 0
+    source_size: int = 0
+    obj_contract: str | None = None
 
     def to_meta(self) -> dict[str, Any]:
         return {
@@ -82,6 +92,9 @@ class GlbMaterialization:
             "texture_slots": dict(self.texture_slots),
             "mesh_parts": [part.to_dict() for part in self.mesh_parts],
             "error": self.error,
+            "source_mtime_ns": int(self.source_mtime_ns),
+            "source_size": int(self.source_size),
+            "obj_contract": self.obj_contract,
         }
 
 
@@ -97,6 +110,26 @@ def _rel_or_abs(path: Path, repo_root: Path | None) -> str:
         except Exception:
             pass
     return str(path)
+
+
+def _cached_texture_refs_valid(material: Mapping[str, Any] | None, repo_root: Path | None) -> bool:
+    """Confirm every file-backed texture referenced by cached adapter metadata."""
+    if not material:
+        return True
+    for key, value in material.items():
+        if not str(key).endswith("_texture_ref") or not isinstance(value, str) or not value:
+            continue
+        if value.startswith("embedded://"):
+            continue
+        path = Path(value)
+        if not path.is_absolute() and repo_root is not None:
+            path = repo_root / path
+        try:
+            if not path.is_file() or path.stat().st_size <= 0:
+                return False
+        except OSError:
+            return False
+    return True
 
 
 def _image_digest_key(glb_path: Path, mtime_ns: int, material_key: str, slot: str, image: Any) -> str:
@@ -293,6 +326,41 @@ def _mesh_has_normal(mesh: Any) -> bool:
         return False
 
 
+def _prepare_mitsuba_safe_mesh(mesh: Any) -> tuple[Any, dict[str, list[float]] | None]:
+    """Return a finite mesh whose exported OBJ has valid positive normal indices.
+
+    ``trimesh`` owns the OBJ index generation, so repairing its vertex-normal
+    array before export avoids the old second, full-file normalization pass.
+    Node transforms have already been baked by :func:`_scene_geometries`.
+    """
+    import numpy as np
+
+    prepared = mesh.copy()
+    vertices = np.asarray(getattr(prepared, "vertices", []), dtype=np.float64)
+    if vertices.ndim != 2 or vertices.shape[0] == 0 or vertices.shape[1] < 3:
+        raise ValueError("mesh has no vertices")
+    if not np.isfinite(vertices[:, :3]).all():
+        raise ValueError("mesh contains non-finite vertices")
+
+    normals = np.asarray(getattr(prepared, "vertex_normals", []), dtype=np.float64)
+    if normals.shape != vertices[:, :3].shape:
+        normals = np.zeros_like(vertices[:, :3])
+    else:
+        normals = normals.copy()
+    lengths = np.linalg.norm(normals, axis=1)
+    invalid = ~np.isfinite(normals).all(axis=1) | ~np.isfinite(lengths) | (lengths <= 1e-10)
+    if invalid.any():
+        normals[invalid] = (0.0, 1.0, 0.0)
+    valid = ~invalid
+    if valid.any():
+        normals[valid] /= lengths[valid, None]
+    prepared.vertex_normals = normals
+
+    mn = vertices[:, :3].min(axis=0).astype(float).tolist()
+    mx = vertices[:, :3].max(axis=0).astype(float).tolist()
+    return prepared, {"min": mn, "max": mx}
+
+
 def _scene_geometries(loaded: Any) -> list[tuple[str, Any]]:
     geometry = getattr(loaded, "geometry", None)
     graph = getattr(loaded, "graph", None)
@@ -348,16 +416,33 @@ def materialize_glb_texture_parts(
     ).hexdigest()[:16]
     mesh_cache_dir.mkdir(parents=True, exist_ok=True)
     meta_path = mesh_cache_dir / f"glb_{digest}.meta.json"
-    combined_obj = mesh_cache_dir / f"glb_{digest}.obj"
-    if meta_path.exists() and combined_obj.exists():
+    if meta_path.exists():
         try:
             meta = json.loads(meta_path.read_text(encoding="utf-8"))
-            if int(meta.get("adapter_version") or 0) >= GLB_TEXTURE_ADAPTER_VERSION and meta.get("status") == "ok":
+            if (
+                int(meta.get("adapter_version") or 0) >= GLB_TEXTURE_ADAPTER_VERSION
+                and meta.get("status") == "ok"
+                and meta.get("obj_contract") == GLB_SAFE_OBJ_CONTRACT
+            ):
                 parts = []
                 for raw in meta.get("mesh_parts") or []:
                     obj_path = Path(str(raw.get("obj_path") or ""))
                     if not obj_path.is_absolute() and repo_root is not None:
                         obj_path = repo_root / obj_path
+                    if (
+                        not obj_path.is_file()
+                        or obj_path.stat().st_size <= 0
+                        or raw.get("obj_contract") != GLB_SAFE_OBJ_CONTRACT
+                    ):
+                        parts = []
+                        break
+                    extracted_material = (
+                        raw.get("extracted_material")
+                        if isinstance(raw.get("extracted_material"), dict) else None
+                    )
+                    if not _cached_texture_refs_valid(extracted_material, repo_root):
+                        parts = []
+                        break
                     parts.append(GlbPart(
                         part_id=str(raw.get("part_id") or ""),
                         obj_path=obj_path,
@@ -368,15 +453,19 @@ def materialize_glb_texture_parts(
                         vertex_count=int(raw.get("vertex_count") or 0),
                         has_uv=bool(raw.get("has_uv")),
                         has_normal=bool(raw.get("has_normal")),
-                        extracted_material=raw.get("extracted_material") if isinstance(raw.get("extracted_material"), dict) else None,
+                        extracted_material=extracted_material,
+                        bounds=raw.get("bounds") if isinstance(raw.get("bounds"), dict) else None,
+                        obj_contract=str(raw.get("obj_contract") or "") or None,
                     ))
+                if not parts:
+                    raise ValueError("canonical GLB part cache is incomplete")
                 return GlbMaterialization(
                     source_ref=source_ref,
                     source_path=str(glb_path),
                     digest=digest,
                     status="ok",
-                    combined_obj_path=combined_obj,
-                    combined_obj_ref=_rel_or_abs(combined_obj, repo_root),
+                    combined_obj_path=None,
+                    combined_obj_ref=None,
                     vertex_count=int(meta.get("vertex_count") or 0),
                     triangle_count=int(meta.get("triangle_count") or 0),
                     mesh_part_count=len(parts),
@@ -384,6 +473,9 @@ def materialize_glb_texture_parts(
                     has_normal=bool(meta.get("has_normal")),
                     texture_slots=dict(meta.get("texture_slots") or {}),
                     mesh_parts=parts,
+                    source_mtime_ns=int(meta.get("source_mtime_ns") or stat.st_mtime_ns),
+                    source_size=int(meta.get("source_size") or stat.st_size),
+                    obj_contract=GLB_SAFE_OBJ_CONTRACT,
                 )
         except Exception:
             pass
@@ -403,17 +495,6 @@ def materialize_glb_texture_parts(
     if not geometries:
         return GlbMaterialization(source_ref, str(glb_path), digest, "failed", error="no_geometry")
 
-    try:
-        combined = loaded.to_geometry() if hasattr(loaded, "to_geometry") else geometries[0][1]
-        if hasattr(combined, "vertices") and hasattr(combined, "faces"):
-            # Keep the GLB's vertex normals in the intermediate OBJ.  Without
-            # this explicit flag trimesh may omit ``vn`` when its cache has not
-            # been populated; the resulting duplicated UV-corner vertices then
-            # render flat per triangle and expose triangulation seams.
-            combined.export(str(combined_obj), file_type="obj", include_normals=True)
-    except Exception:
-        combined_obj = None  # type: ignore[assignment]
-
     part_dir = mesh_cache_dir / f"glb_{digest}_parts"
     part_dir.mkdir(parents=True, exist_ok=True)
     parts: list[GlbPart] = []
@@ -425,9 +506,39 @@ def materialize_glb_texture_parts(
     for index, (name, mesh) in enumerate(geometries):
         slug = _safe_slug(name, fallback=f"part_{index:03d}")
         part_path = part_dir / f"{index:03d}_{slug}.obj"
+        tmp = part_path.with_name(
+            f"{part_path.stem}.tmp.{os.getpid()}.{threading.get_ident()}{part_path.suffix}"
+        )
         try:
-            mesh.export(str(part_path), file_type="obj", include_normals=True)
+            safe_mesh, mesh_bounds = _prepare_mitsuba_safe_mesh(mesh)
+            # OBJ exporters emit large text files in many small writes.  Doing that
+            # directly on the scene's NFS cache can turn a tiny part into a 10-20 s
+            # operation.  Export on local scratch, then stream one completed file to
+            # NFS.  A completed part also survives an interrupted materialization and
+            # can be reused before the final metadata document is published.
+            if not part_path.is_file() or part_path.stat().st_size <= 0:
+                scratch_root = Path(
+                    os.environ.get("ROBOMITUBA_GLTF_OBJ_SCRATCH")
+                    or tempfile.gettempdir()
+                ) / "robomituba-glb-obj"
+                scratch_root.mkdir(parents=True, exist_ok=True)
+                local_tmp = scratch_root / (
+                    f"{digest}_{index:04d}.{os.getpid()}.{threading.get_ident()}.obj"
+                )
+                try:
+                    safe_mesh.export(
+                        str(local_tmp), file_type="obj", include_normals=True,
+                        include_texture=True, write_texture=False,
+                    )
+                    shutil.copyfile(local_tmp, tmp)
+                    tmp.replace(part_path)
+                finally:
+                    local_tmp.unlink(missing_ok=True)
         except Exception:
+            try:
+                tmp.unlink(missing_ok=True)
+            except Exception:
+                pass
             continue
         material = getattr(getattr(mesh, "visual", None), "material", None)
         material_key = f"{index}_{getattr(material, 'name', '') or slug}"
@@ -445,7 +556,7 @@ def materialize_glb_texture_parts(
         vertex_count = int(len(getattr(mesh, "vertices", [])))
         face_count = int(len(getattr(mesh, "faces", [])))
         has_uv = _mesh_has_uv(mesh)
-        has_normal = _mesh_has_normal(mesh)
+        has_normal = _mesh_has_normal(safe_mesh)
         total_vertices += vertex_count
         total_faces += face_count
         any_uv = any_uv or has_uv
@@ -461,6 +572,8 @@ def materialize_glb_texture_parts(
             has_uv=has_uv,
             has_normal=has_normal,
             extracted_material=em,
+            bounds=mesh_bounds,
+            obj_contract=GLB_SAFE_OBJ_CONTRACT,
         ))
 
     if not parts:
@@ -471,8 +584,8 @@ def materialize_glb_texture_parts(
         source_path=str(glb_path),
         digest=digest,
         status="ok",
-        combined_obj_path=combined_obj if isinstance(combined_obj, Path) else parts[0].obj_path,
-        combined_obj_ref=_rel_or_abs(combined_obj if isinstance(combined_obj, Path) else parts[0].obj_path, repo_root),
+        combined_obj_path=None,
+        combined_obj_ref=None,
         vertex_count=total_vertices,
         triangle_count=total_faces,
         mesh_part_count=len(parts),
@@ -480,6 +593,9 @@ def materialize_glb_texture_parts(
         has_normal=any_normal,
         texture_slots=texture_slots,
         mesh_parts=parts,
+        source_mtime_ns=int(stat.st_mtime_ns),
+        source_size=int(stat.st_size),
+        obj_contract=GLB_SAFE_OBJ_CONTRACT,
     )
     try:
         meta_path.write_text(json.dumps(result.to_meta(), ensure_ascii=False, indent=2), encoding="utf-8")

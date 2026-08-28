@@ -44,7 +44,7 @@ for _m in ("robomituba_bridge", "mitsuba_converter", "navigation_dataset"):
 from mitsuba_converter.multimodal import render_modalities, RenderConfig, camera_to_world_from_lookat  # noqa: E402
 from mitsuba_converter.nir_reflectance import (  # noqa: E402
     pseudo_nir_albedo, synthesize_nir_texture, physical_material_for, nir_reflectance)
-from robomituba_bridge import AssistLightSpec, ActiveLightSpec  # noqa: E402
+from robomituba_bridge import AssistLightSpec, ActiveLightSpec, resolve_viewpoint_pose  # noqa: E402
 
 
 def _basecolor_to_pmat(scene_dir: Path, xml_path: Path) -> dict[str, str]:
@@ -114,10 +114,21 @@ def pick_viewpoints(graph: dict, k: int) -> list[dict]:
     return chosen
 
 
-def cam_for(node: dict, target: tuple) -> np.ndarray:
+def cam_for(node: dict, target: tuple | None = None, *, yaw_deg: float | None = None) -> np.ndarray:
+    """Resolve graph headings in the shared Mitsuba Y-up camera contract.
+
+    ``target`` is retained for the content-scored arbitrary-lookat mode; normal
+    graph headings must pass ``yaw_deg`` so they cannot diverge from the sweep
+    and Blender GT pose resolver.
+    """
+    if yaw_deg is not None:
+        pose = resolve_viewpoint_pose(node["position"], float(yaw_deg), eye_height_m=EYE_H)
+        return np.asarray(pose.camera_to_world_mitsuba, dtype=np.float32)
     px, py, _ = node["position"]
-    o = [float(px), EYE_H, float(py)]
-    return np.asarray(camera_to_world_from_lookat(o, list(target), [0, 1, 0]).reshape(4, 4), np.float32)
+    origin = [float(px), EYE_H, float(py)]
+    if target is None:
+        target = (origin[0], EYE_H * 0.9, origin[2] + 1.0)
+    return np.asarray(camera_to_world_from_lookat(origin, list(target), [0, 1, 0]).reshape(4, 4), np.float32)
 
 
 def select_viewpoints_by_preview(xml: Path, graph: dict, k: int, headings=(0, 60, 120, 180, 240, 300),
@@ -138,19 +149,16 @@ def select_viewpoints_by_preview(xml: Path, graph: dict, k: int, headings=(0, 60
         px, py, _ = n["position"]
         best = None
         for yaw in headings:
-            a = _m.radians(yaw)
-            o = [float(px), EYE_H, float(py)]
-            t = [o[0] + _m.sin(a), EYE_H * 0.9, o[2] + _m.cos(a)]
+            pose = resolve_viewpoint_pose(n["position"], float(yaw), eye_height_m=EYE_H)
             try:
-                img = np.asarray(render_group(xml, np.asarray(
-                    camera_to_world_from_lookat(o, t, [0, 1, 0]).reshape(4, 4), np.float32),
+                img = np.asarray(render_group(xml, np.asarray(pose.camera_to_world_mitsuba, np.float32),
                     60.0, ["rgb"], cfg, tex_cap=None)["rgb"].array)
             except Exception:
                 continue
             lit = float((img.mean(-1) > 0.02).mean())
             score = float(img.std()) * lit
             if best is None or score > best[0]:
-                best = (score, yaw, tuple(t))
+                best = (score, yaw, tuple(float(v) for v in pose.target_mitsuba))
         if best:
             scored.append((best[0], n, best[1], best[2]))
             print(f"  preview {n['node_id']}: best yaw={best[1]} score={best[0]:.4f}", flush=True)
@@ -568,9 +576,10 @@ def main() -> int:
         for spec in a.viewpoints.split(","):
             nid, _, yaw = spec.partition("@")
             n = byid[nid.strip()]; yaw = float(yaw or 0)
-            px, py, _z = n["position"]; rad = _m.radians(yaw)
+            pose = resolve_viewpoint_pose(n["position"], yaw, eye_height_m=EYE_H)
             vps.append({"node": n, "yaw": yaw,
-                        "target": (float(px) + _m.sin(rad), EYE_H * 0.9, float(py) + _m.cos(rad))})
+                        "target": pose.target_mitsuba,
+                        "pose": pose.provenance()})
     elif a.no_auto_select:
         vps = pick_viewpoints(graph, a.views)
     else:
@@ -601,7 +610,7 @@ def main() -> int:
     for _i, vp in enumerate(vps):
         vi = a.index_base + _i
         node = vp["node"]; nid = node["node_id"]
-        cam = cam_for(node, vp["target"])
+        cam = cam_for(node, vp.get("target"), yaw_deg=vp.get("yaw"))
         print(f"\n=== viewpoint {vi} {nid} pos={node['position'][:2]} ===", flush=True)
         rec = {"index": vi, "node_id": nid, "position": node["position"],
                "images": dict(prior_imgs.get(nid, {}))}

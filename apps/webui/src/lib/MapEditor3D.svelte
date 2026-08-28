@@ -69,6 +69,7 @@
 		placeholder_cached_null: number;
 		architecture_proxy: number;
 		xml_fallback_shape: number;
+		aggregate_object_proxy: number;
 		authoring_proxy_fallback: number;
 		pickable: number;
 		non_pickable: number;
@@ -79,7 +80,11 @@
 		object_id?: string;
 		shape_type: string;
 		mesh_path?: string | null;
+		mesh_ref?: string | null;
+		mesh_bytes?: number;
 		preview_mesh_path?: string | null;
+		preview_mesh_ref?: string | null;
+		preview_mesh_bytes?: number;
 		preview_mesh_faces?: number;
 		source_mesh_faces?: number;
 		preview_mesh_status?: 'ready' | 'skipped_small' | 'architecture_proxy' | 'failed' | 'unavailable' | string;
@@ -874,6 +879,51 @@
 		return mesh;
 	}
 
+	// Imported Infinigen assets are broadly typed as glass_wall (including door
+	// hardware and window frames).  Restrict the high-visibility treatment to
+	// the actual modern-office dielectric panes, rather than tinting every
+	// imported object that happened to receive that broad type.
+	function isStructuralGlassPane(obj: any): boolean {
+		const id = String(obj?.id ?? '');
+		const material = String(obj?.material ?? '');
+		return material === 'RM_ModernOffice_Glass'
+			|| /^office_glass_v\d+\.glass\.\d+$/.test(id);
+	}
+
+	function addStructuralGlassOutline(group: any, mesh: any): void {
+		if (!mesh?.geometry) return;
+		const outline = new THREE.LineSegments(
+			new THREE.EdgesGeometry(mesh.geometry),
+			new THREE.LineBasicMaterial({
+				color: 0x06b6d4,
+				transparent: true,
+				opacity: 0.98,
+				depthTest: false,
+				depthWrite: false,
+			})
+		);
+		outline.position.copy(mesh.position);
+		outline.rotation.copy(mesh.rotation);
+		outline.scale.copy(mesh.scale);
+		outline.renderOrder = 40;
+		group.add(outline);
+	}
+
+	function styleStructuralGlassPreview(obj: any, group: any, mesh: any): void {
+		if (!isStructuralGlassPane(obj)) return;
+		mesh.material = new THREE.MeshPhysicalMaterial({
+			color: 0x22d3ee,
+			transparent: true,
+			opacity: 0.30,
+			roughness: 0.04,
+			metalness: 0,
+			side: THREE.DoubleSide,
+			depthWrite: false,
+		});
+		mesh.renderOrder = 30;
+		addStructuralGlassOutline(group, mesh);
+	}
+
 	function addProxyBox(group: any, size: [number, number, number], pos: [number, number, number], color: number, materialOptions: Record<string, any> = {}) {
 		const geo = new THREE.BoxGeometry(size[0], size[1], size[2]);
 		const { physical, ...restOpts } = materialOptions;
@@ -889,14 +939,24 @@
 	function buildBuiltInPointShape(obj: any, group: any) {
 		const color = pointColor(obj.type);
 		if (obj.type === 'chair') {
-			addProxyBox(group, [0.46, 0.12, 0.42], [0, 0.32, 0], color);
-			addProxyBox(group, [0.46, 0.58, 0.10], [0, 0.60, -0.20], color);
-			for (const x of [-0.17, 0.17]) for (const z of [-0.14, 0.14]) addProxyBox(group, [0.07, 0.32, 0.07], [x, 0.16, z], color);
+			const [sx, sy, sz] = objectProxySize(obj);
+			addProxyBox(group, [sx, sy * 0.13, sz], [0, sy * 0.36, 0], color);
+			addProxyBox(group, [sx, sy * 0.58, Math.max(0.06, sz * 0.24)], [0, sy * 0.71, -sz * 0.38], color);
+			for (const x of [-sx * 0.37, sx * 0.37]) {
+				for (const z of [-sz * 0.33, sz * 0.33]) {
+					addProxyBox(group, [Math.max(0.04, sx * 0.15), sy * 0.34, Math.max(0.04, sz * 0.15)], [x, sy * 0.17, z], color);
+				}
+			}
 			return;
 		}
 		if (obj.type === 'table') {
-			addProxyBox(group, [0.76, 0.12, 0.50], [0, 0.52, 0], color);
-			for (const x of [-0.29, 0.29]) for (const z of [-0.18, 0.18]) addProxyBox(group, [0.07, 0.50, 0.07], [x, 0.25, z], color);
+			const [sx, sy, sz] = objectProxySize(obj);
+			addProxyBox(group, [sx, Math.max(0.05, sy * 0.17), sz], [0, sy * 0.91, 0], color);
+			for (const x of [-sx * 0.38, sx * 0.38]) {
+				for (const z of [-sz * 0.34, sz * 0.34]) {
+					addProxyBox(group, [Math.max(0.04, sx * 0.10), sy * 0.86, Math.max(0.04, sz * 0.10)], [x, sy * 0.43, z], color);
+				}
+			}
 			return;
 		}
 		if (obj.type === 'plant') {
@@ -909,17 +969,74 @@
 	// PR2: map of object_id (or shape_id when unmaterialized) → XML shape record.
 	// Built once per rebuildScene() so the authoring object loop can do O(1) lookups.
 	let _xmlShapeIndex = new Map<string, XmlSceneShape>();
+	let _xmlObjectFaceCounts = new Map<string, number>();
+	const _XML_OBJECT_PREVIEW_MAX_FACES = 200_000;
 	const _objMeshLoadPending = new Set<string>();
 	function rebuildXmlShapeIndex(): void {
 		_xmlShapeIndex = new Map();
+		_xmlObjectFaceCounts = new Map();
 		const shapes = xmlSceneIndex?.shapes ?? [];
 		for (const sh of shapes) {
 			// xml_role-tagged shapes (floor / shell_*) are drawn by other code paths;
 			// only authoring object shapes go into this lookup.
 			if (sh.xml_role && (sh.xml_role === 'floor' || sh.xml_role.startsWith('shell'))) continue;
 			const key = sh.object_id || sh.shape_id;
-			if (key) _xmlShapeIndex.set(key, sh as XmlSceneShape);
+			if (key) {
+				const candidate = sh as XmlSceneShape;
+				const current = _xmlShapeIndex.get(key);
+				// A GLB importer emits multiple material parts for one authoring object.
+				// The old last-write-wins map usually picked its 12-face tabletop cap,
+				// hiding the desk frame/legs. Use the most substantial previewable part.
+				const candidateFaces = Number(candidate.preview_mesh_faces ?? candidate.source_mesh_faces) || 0;
+				const currentFaces = Number(current?.preview_mesh_faces ?? current?.source_mesh_faces) || 0;
+				if (!current || candidateFaces > currentFaces) _xmlShapeIndex.set(key, candidate);
+				const faces = Number(sh.source_mesh_faces);
+				if (Number.isFinite(faces) && faces > 0) {
+					_xmlObjectFaceCounts.set(key, (_xmlObjectFaceCounts.get(key) ?? 0) + faces);
+				}
+			}
 		}
+	}
+
+	function buildAggregateObjectProxy(obj: any, sh: XmlSceneShape, faceCount: number): any {
+		const center = obj.geometry?.center;
+		if (!Array.isArray(center) || center.length < 2) return null;
+		const [sx, sy, sz] = objectProxySize(obj);
+		const baseHeight = objectBaseHeight(obj);
+		const group = new THREE.Group();
+		group.position.set(Number(center[0]) || 0, baseHeight, Number(center[1]) || 0);
+		const yaw = Number(obj.geometry?.yaw_deg ?? 0) || 0;
+		if (Math.abs(yaw) > 1e-5) group.rotation.y = (yaw * Math.PI) / 180;
+		// A semantic chair proxy remains recognisable and editable when the source
+		// asset is a multi-part, very dense GLB. Rendering a single decimated part
+		// makes a chair look like point dust and leaves only tiny hit surfaces.
+		buildBuiltInPointShape(obj, group);
+		const hullGeometry = new THREE.BoxGeometry(sx, sy, sz);
+		const hull = new THREE.Mesh(
+			hullGeometry,
+			new THREE.MeshBasicMaterial({
+				color: pointColor(obj.type), transparent: true, opacity: 0.10,
+				depthWrite: false, side: THREE.DoubleSide,
+			}),
+		);
+		hull.position.set(0, sy / 2, 0);
+		hull.userData = { id: obj.id, itemType: 'object', editor_interaction_proxy: true };
+		group.add(hull);
+		const edges = new THREE.LineSegments(
+			new THREE.EdgesGeometry(hullGeometry),
+			new THREE.LineBasicMaterial({ color: pointColor(obj.type), transparent: true, opacity: 0.55 }),
+		);
+		edges.position.copy(hull.position);
+		edges.userData = { id: obj.id, itemType: 'object', editor_interaction_proxy: true };
+		group.add(edges);
+		group.userData = {
+			id: obj.id,
+			itemType: 'object',
+			xml_shape_id: sh.shape_id,
+			editor_preview_state: 'aggregate_object_proxy',
+			editor_mesh_faces: faceCount,
+		};
+		return group;
 	}
 
 
@@ -976,9 +1093,13 @@
 	// XML scale and kick off a background fetch — the next rebuildScene() picks up
 	// the resolved geometry from cache automatically.
 	function buildObjectFromXmlShape(obj: any): any | null {
-		if (!xmlNativePreviewEnabled) return null;
 		if (isRenderOnlyLightProxy(obj)) return null;
 		const sh = _xmlShapeIndex.get(obj.id);
+		// A render-only structural-glass repair must not leave the editor showing
+		// the original opaque backing wall.  It is intentionally narrow: ordinary
+		// objects still require the user's XML-native preview toggle.
+		const forcedRenderRepair = sh?.preview_mesh_status === 'render_only_glass_repair';
+		if (!xmlNativePreviewEnabled && !forcedRenderRepair) return null;
 		if (!sh) return null;
 		const t = sh.transform ?? {};
 		const sc = Array.isArray(t.scale) ? t.scale : [1, 1, 1];
@@ -990,24 +1111,39 @@
 		if (!Array.isArray(center) || center.length < 2) return null;
 		const baseHeight = objectBaseHeight(obj);
 		const yaw = (obj.geometry?.yaw_deg ?? 0) as number;
+		const aggregateFaces = _xmlObjectFaceCounts.get(obj.id) ?? 0;
+		if (
+			obj.geometry?.type === 'point'
+			&& sh.shape_type === 'obj'
+			&& aggregateFaces > _XML_OBJECT_PREVIEW_MAX_FACES
+		) {
+			return buildAggregateObjectProxy(obj, sh, aggregateFaces);
+		}
 		const group = new THREE.Group();
 		group.position.set(Number(center[0]) || 0, baseHeight, Number(center[1]) || 0);
 		if (Math.abs(yaw) > 1e-5) group.rotation.y = (yaw * Math.PI) / 180;
 
-		const colorHint = sh.material_id ? floorMaterialColor(sh.material_id) : 0xb8b3a8;
-		const meshPath = sh.preview_mesh_path || sh.mesh_path;
-		if ((sh.editor_layer === 'architecture' || sh.preview_mesh_status === 'architecture_proxy') && !meshPath) {
+		// XML-native preview intentionally shows geometry only: no material or
+		// texture fetches are needed to inspect placement and shape.
+		const colorHint = sh.editor_layer === 'architecture' ? 0x94a3b8 : 0xa8b1bc;
+		const legacyMeshPath = sh.preview_mesh_path || sh.mesh_path;
+		const meshRef = sh.preview_mesh_ref || sh.mesh_ref || (
+			typeof legacyMeshPath === 'string' && legacyMeshPath.includes('/mesh_cache/')
+				? legacyMeshPath.split('/mesh_cache/').pop()
+				: undefined
+		);
+		const meshBytes = Number(sh.preview_mesh_bytes ?? sh.mesh_bytes);
+		if ((sh.editor_layer === 'architecture' || sh.preview_mesh_status === 'architecture_proxy') && !meshRef) {
 			const arch = buildArchitectureProxyFromXmlShape(sh, colorHint);
 			arch.position.copy(group.position);
 			arch.rotation.copy(group.rotation);
 			return arch;
 		}
-		const isMesh = sh.shape_type === 'obj' && !!meshPath;
+		const isMesh = sh.shape_type === 'obj' && !!meshRef;
 		let mesh: any;
 		let editorPreviewState = 'xml_unknown';
 		if (isMesh) {
-			const filename = (meshPath as string).split('/').pop() || meshPath as string;
-			const key = objMeshCacheKey(opticalNavProjectId, opticalNavSceneId, filename);
+			const key = objMeshCacheKey(opticalNavProjectId, opticalNavSceneId, meshRef as string);
 			const cached = getCachedObjMeshGeometry(key);
 			if (cached) {
 				editorPreviewState = 'mesh_cached';
@@ -1051,7 +1187,7 @@
 				// reactive $effect fires rebuildScene() again to swap in the real mesh.
 				if (opticalNavProjectId && opticalNavSceneId && cached === undefined && !_objMeshLoadPending.has(key)) {
 					_objMeshLoadPending.add(key);
-					void loadObjMeshGeometry(opticalNavProjectId, opticalNavSceneId, filename)
+					void loadObjMeshGeometry(opticalNavProjectId, opticalNavSceneId, meshRef as string, meshBytes)
 						.then((geo) => { if (geo) scheduleXmlNativePreviewRefresh(); })
 						.finally(() => { _objMeshLoadPending.delete(key); });
 				}
@@ -1086,9 +1222,11 @@
 			xml_role: sh.xml_role ?? null,
 			architecture_kind: sh.editor_proxy?.kind ?? null,
 			editor_preview_state: editorPreviewState,
-			editor_mesh_path: meshPath ?? null,
+			editor_mesh_ref: meshRef ?? null,
+			editor_mesh_path: legacyMeshPath ?? null,
 		};
 		if (isArchitectureMesh && String(sh.editor_proxy?.kind ?? '').toLowerCase().includes('floor')) floorTargets.push(mesh);
+		styleStructuralGlassPreview(obj, group, mesh);
 		group.add(mesh);
 		group.userData = { ...mesh.userData };
 		return group;
@@ -1118,6 +1256,20 @@
 		group.position.set(x, 0, z);
 		group.rotation.y = ((obj.geometry?.yaw_deg ?? 0) * Math.PI) / 180;
 		group.userData = { id: obj.id, itemType: 'object' };
+		// A pane is represented as an imported point object, so the usual point
+		// proxy path hides it among opaque furniture when XML-native preview is
+		// disabled. Draw a deliberately clear pane here in both preview modes.
+		if (isStructuralGlassPane(obj)) {
+			const size = Array.isArray(obj.geometry?.size_m) ? obj.geometry.size_m : [1, 2.4, 0.025];
+			const sx = Math.max(0.02, Number(size[0]) || 1);
+			const sy = Math.max(0.02, Number(size[1]) || 2.4);
+			const sz = Math.max(0.012, Number(size[2]) || 0.025);
+			const pane = new THREE.Mesh(new THREE.BoxGeometry(sx, sy, sz));
+			pane.position.y = baseHeight + sy / 2;
+			styleStructuralGlassPreview(obj, group, pane);
+			group.add(pane);
+			return group;
+		}
 		if (obj.type === 'camera') {
 			// Pyramid/cone facing +Z (forward direction)
 			const body = new THREE.Mesh(
@@ -1176,7 +1328,8 @@
 				const worldY: number = baseHeight + Number(obj.metadata?.normalized_y_min ?? 0);
 				const box = new THREE.Box3().setFromBufferAttribute(cachedGeo.attributes.position as any);
 				mesh.position.y = worldY - box.min.y;
-				group.add(mesh);
+		styleStructuralGlassPreview(obj, group, mesh);
+		group.add(mesh);
 			} else {
 				// Fallback proxy box (shown while mesh loads or if prim has no geometry)
 				const sx = Array.isArray(proxy) ? Math.max(0.16, Math.min(1.2, Number(proxy[0] ?? 0.35))) : 0.35;
@@ -1558,7 +1711,7 @@
 		const bCenter = [Number(bMin[0]) + bW / 2, 0, Number(bMin[2]) + bH / 2];
 		const bSize = [bW, 0.005, bH];
 
-		if (visibleLayers.usdBackground) {
+		if (visibleLayers.usdBackground && editorGeometry?.source === 'usd') {
 			for (const obj of editorGeometry?.objects ?? []) {
 				if (obj.category === 'floor') continue;
 				const size = boundsSize(obj.bounds);
@@ -1738,6 +1891,7 @@
 			placeholder_cached_null: 0,
 			architecture_proxy: 0,
 			xml_fallback_shape: 0,
+			aggregate_object_proxy: 0,
 			authoring_proxy_fallback: 0,
 			pickable: 0,
 			non_pickable: 0,
@@ -1790,13 +1944,15 @@
 				let mesh: any = null;
 				let builtFromXml = false;
 				if (isRenderOnlyLightProxy(obj)) continue;
-				const matchedXmlShape = xmlNativePreviewEnabled && _xmlShapeIndex.has(obj.id);
+				const xmlShape = _xmlShapeIndex.get(obj.id);
+				const forcedRenderRepair = xmlShape?.preview_mesh_status === 'render_only_glass_repair';
+				const matchedXmlShape = (xmlNativePreviewEnabled || forcedRenderRepair) && !!xmlShape;
 				if (matchedXmlShape) editorMeshStats.xml_matched++;
 				// PR2: when the XML-native preview toggle is on, draw from the actual
 				// render-side mesh first. authoringObjects without a matching XML shape
 				// (placement-only items, edits not yet synced) fall through to the
 				// existing buildWall / buildPointObject path.
-				if (xmlNativePreviewEnabled) {
+				if (xmlNativePreviewEnabled || forcedRenderRepair) {
 					mesh = buildObjectFromXmlShape(obj);
 					builtFromXml = !!mesh;
 				}
@@ -1812,6 +1968,7 @@
 				else if (previewState === 'placeholder_cached_null') editorMeshStats.placeholder_cached_null++;
 				else if (previewState === 'architecture_proxy') editorMeshStats.architecture_proxy++;
 				else if (previewState === 'xml_fallback_shape') editorMeshStats.xml_fallback_shape++;
+				else if (previewState === 'aggregate_object_proxy') editorMeshStats.aggregate_object_proxy++;
 				rootGroup.add(mesh);
 				// Glass/windows render as see-through architecture but stay clickable so the
 				// user can select a window to inspect its material. This fallback keeps them
@@ -2342,8 +2499,10 @@
 		const { halfW, halfH } = frustumHalfExtents(displayDist, args.intrinsics ?? frustumIntrinsics);
 		const yaw = (args.yawDeg * Math.PI) / 180;
 		const origin = new THREE.Vector3(args.x, args.height, args.z);
-		const fwd = new THREE.Vector3(-Math.sin(yaw), 0, -Math.cos(yaw));
-		const right = new THREE.Vector3(Math.cos(yaw), 0, -Math.sin(yaw));
+		// Match navigation_dataset's canonical heading convention:
+		// yaw=0 -> +Z, yaw=90 -> +X. Mitsuba camera local -Z is forward.
+		const fwd = new THREE.Vector3(Math.sin(yaw), 0, Math.cos(yaw));
+		const right = new THREE.Vector3(-Math.cos(yaw), 0, Math.sin(yaw));
 		const up = new THREE.Vector3(0, 1, 0);
 		const negFwd = fwd.clone().negate();
 		const center = origin.clone().addScaledVector(fwd, displayDist);
@@ -2816,12 +2975,19 @@
 		if (!projectId || !sceneId || key === loadedGeometryKey) return;
 		loadedGeometryKey = key;
 		try {
-			editorGeometryStatus = 'Loading USD proxy geometry...';
+			editorGeometryStatus = 'Loading editor geometry...';
 			onStatus?.(editorGeometryStatus);
 			const payload = await getOpticalNavEditorGeometry(projectId, sceneId);
 			editorGeometry = payload;
 			if (payload?.status === 'ready') {
-				editorGeometryStatus = payload.cached ? 'USD geometry ready (cached proxy boxes)' : 'USD geometry ready (proxy boxes)';
+				const source = String(payload?.source ?? 'usd');
+				if (source === 'xml_native') {
+					editorGeometryStatus = 'XML-native geometry ready (actual preview meshes)';
+				} else if (source === 'authoring_map') {
+					editorGeometryStatus = 'Authoring-map geometry ready';
+				} else {
+					editorGeometryStatus = payload.cached ? 'USD geometry ready (cached proxy boxes)' : 'USD geometry ready (proxy boxes)';
+				}
 			} else {
 				const reason = String(payload?.reason ?? '');
 				if (reason.includes('usd_ref missing')) {
@@ -2837,7 +3003,7 @@
 			onStatus?.(editorGeometryStatus);
 		} catch (error) {
 			editorGeometry = null;
-			editorGeometryStatus = error instanceof Error ? `USD unavailable: ${error.message}` : 'USD unavailable: fallback empty floor';
+			editorGeometryStatus = error instanceof Error ? `Editor geometry unavailable: ${error.message}` : 'Editor geometry unavailable: fallback empty floor';
 			onStatus?.(editorGeometryStatus);
 		}
 	}
@@ -3002,11 +3168,11 @@
 		if (!camera) return 0;
 		const dir = new THREE.Vector3();
 		camera.getWorldDirection(dir);
-		// Camera convention: yaw=0 → fwd=(-sin0,0,-cos0)=(0,0,-1).
-		// getWorldDirection gives orbit camera's look direction (≈+Z when looking into scene).
-		// To select the heading whose image faces the orbit camera, add 180° so orbit-yaw=0
-		// selects heading yaw=180° (fwd=+Z), whose image plane BackSide faces the orbit camera.
-		return ((Math.atan2(dir.x, dir.z) * 180 / Math.PI) + 360 + 180) % 360;
+		// Canonical heading convention: yaw=0 → +Z, yaw=90 → +X.
+		// View-aligned mode shows the rendered camera pointing in the same world
+		// direction as the editor observer. The old +180 compensated for the
+		// formerly inverted frustum geometry and must not be retained here.
+		return ((Math.atan2(dir.x, dir.z) * 180 / Math.PI) + 360) % 360;
 	}
 
 	function buildFrustumForHeading(
@@ -3028,7 +3194,7 @@
 
 		const yaw = (yawDeg * Math.PI) / 180;
 		const origin = new THREE.Vector3(nx, camY, nz);
-		const fwd = new THREE.Vector3(-Math.sin(yaw), 0, -Math.cos(yaw));
+		const fwd = new THREE.Vector3(Math.sin(yaw), 0, Math.cos(yaw));
 
 		const group = new THREE.Group();
 		group.userData = { vpId, headingId, yawDeg };
@@ -3198,10 +3364,10 @@
 				const hYaw = (hYawDeg * Math.PI) / 180;
 				const hasModality = hasHeadingModality(hdata, modalityKey);
 				const segColor = hasModality ? 0x3b82f6 : 0x94a3b8;
-				// Camera forward: fwd = (-sin(yaw), 0, -cos(yaw)) — same direction as frustum
+				// Camera forward follows the canonical graph/render heading convention.
 				const roseGeo = new THREE.BufferGeometry().setFromPoints([
 					new THREE.Vector3(nx, baseY + 0.01, nz),
-					new THREE.Vector3(nx - Math.sin(hYaw) * roseR, baseY + 0.01, nz - Math.cos(hYaw) * roseR)
+					new THREE.Vector3(nx + Math.sin(hYaw) * roseR, baseY + 0.01, nz + Math.cos(hYaw) * roseR)
 				]);
 				frustumGroup.add(new THREE.LineSegments(roseGeo, new THREE.LineBasicMaterial({ color: segColor, transparent: true, opacity: hasModality ? 0.8 : 0.4 })));
 			}
@@ -3269,8 +3435,14 @@
 	aria-label="3D map editor canvas"
 >
 	<div class="usd-status" class:warn={editorGeometry?.status !== 'ready'}>
-		<span>{editorGeometry?.status === 'ready' ? 'USD geometry ready' : 'Fallback floor'}</span>
+		<span>{editorGeometry?.status === 'ready' ? `${editorGeometry?.source === 'xml_native' ? 'XML-native' : editorGeometry?.source === 'authoring_map' ? 'Authoring map' : 'USD'} geometry ready` : 'Fallback floor'}</span>
 		<small>{editorGeometryStatus}</small>
+	</div>
+	<div class="material-legend" aria-label="Structural material legend">
+		<span class="material-legend-glass"></span>
+		<span>Structural glass partition</span>
+		<span class="material-legend-wall"></span>
+		<span>Opaque wall</span>
 	</div>
 </div>
 
@@ -3313,5 +3485,39 @@
 	.usd-status small {
 		color: inherit;
 		opacity: 0.76;
+	}
+	.material-legend {
+		position: absolute;
+		right: 16px;
+		bottom: 16px;
+		z-index: 2;
+		display: flex;
+		align-items: center;
+		gap: 6px;
+		padding: 7px 9px;
+		border: 1px solid rgba(100, 116, 139, 0.22);
+		border-radius: 9px;
+		background: rgba(255, 255, 255, 0.86);
+		backdrop-filter: blur(10px);
+		color: #334155;
+		font-size: 11px;
+		font-weight: 650;
+		pointer-events: none;
+	}
+	.material-legend-glass,
+	.material-legend-wall {
+		display: inline-block;
+		width: 12px;
+		height: 12px;
+		border-radius: 2px;
+	}
+	.material-legend-glass {
+		background: rgba(34, 211, 238, 0.32);
+		border: 2px solid #06b6d4;
+	}
+	.material-legend-wall {
+		margin-left: 4px;
+		background: #94a3b8;
+		border: 1px solid #64748b;
 	}
 </style>

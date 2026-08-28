@@ -1,0 +1,95 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Recent polar queue: passive vs active</title><style>
+:root{--bg:#0d1117;--panel:#161d27;--line:#2c3849;--fg:#e8edf4;--mut:#a5b0bf;--ok:#58dba2;--acc:#78abff}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.55 system-ui,sans-serif}main{max-width:2160px;margin:auto;padding:36px 24px 72px}h1{margin:0}h2{margin:38px 0 10px;border-top:1px solid var(--line);padding-top:24px}h3{margin:0 0 8px;color:var(--acc)}p,li{color:var(--mut)}code{background:#202a38;padding:2px 5px;border-radius:3px}article{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px;margin:18px 0}article>img{width:100%;display:block;border:1px solid var(--line);border-radius:7px;background:#080c14}table{border-collapse:collapse;width:100%;margin-top:12px;font-size:13px}th,td{border:1px solid var(--line);padding:6px 8px;text-align:left;font-variant-numeric:tabular-nums}th{color:var(--mut);background:#111824}.ok{color:var(--ok);font-size:12px}.note{padding:12px 16px;background:#141c29;border-left:3px solid var(--acc);border-radius:0 7px 7px 0}.legend{display:grid;grid-template-columns:repeat(4,minmax(170px,1fr));gap:10px}.legend div{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:10px}@media(max-width:900px){main{padding:20px 10px}.legend{grid-template-columns:1fr}article{padding:8px}}</style></head><body><main>
+<h1>Recent polar render queue — passive vs active RGB-Stokes comparison</h1>
+<p>Scene <code>infinigen_apartment_20260811</code> · generated 2026-08-26T04:03:35.301403+00:00 · direct artifacts, not UI thumbnails.</p>
+<div class="note"><strong>Conclusion:</strong> the eight completed paired poses use <code>cuda_ad_rgb_polarized</code> with the <code>opticalnav.stokes_rgb_12.v2</code> contract. Each NPZ contains <code>S0/S1/S2/S3</code> as H×W×3 tensors, so the rendered Stokes state is retained independently for R/G/B rather than as a replicated grayscale polarization product. Passive and active runs both satisfy this contract; active adds the camera-aligned polarized RGB assist.</div>
+<h2>Render sets</h2><ul>
+<li>Passive: <code>rv_20260825T055240_34fdc514f99d_64d567/perturbed</code>, ambient-room illumination.</li>
+<li>Active: <code>rv_20260825T055242_34fdc514f99d_7d2a8a/perturbed_active_polar</code>, protocol <code>rgb_stokes_12_active_polar_v1</code>.</li>
+<li>Pairing: 8 shared completed views, same scene version and heading.</li></ul>
+<h2>Visualization convention</h2><div class="legend"><div><strong>S0 RGB and R/G/B</strong><br>shared Reinhard tone map / shared intensity scale.</div><div><strong>S1, S2, S3 × R/G/B</strong><br>BWR with zero = white; each component/channel uses one common passive/active p99.5 scale.</div><div><strong>DoLP-R/G/B</strong><br>computed separately as √(S1²+S2²+S3²)/S0, then black → red over [0, 1].</div><div><strong>AoLP-R/G/B</strong><br>computed separately as ½atan2(S2,S1); rainbow over [0°, 180°), brightness and saturation modulated by that channel's DoLP.</div></div>
+<h2>Completed passive/active pairs</h2><article>
+<h3>vp_000012/h_330 <span class="ok">paired / valid</span></h3>
+<img src="images/recent_polar_queue_2026-08-25/vp_000012_h_330.webp" loading="lazy" alt="Passive and active Stokes comparison for vp_000012/h_330">
+<table><thead><tr><th>metric</th><th>passive</th><th>active</th></tr></thead><tbody>
+<tr><td>S0 mean (R/G/B)</td><td>0.0685 / 0.0611 / 0.0520</td><td>0.9840 / 0.8159 / 0.5234</td></tr>
+<tr><td>S1 mean (R/G/B)</td><td>-0.0002 / 0.0000 / 0.0000</td><td>0.0117 / 0.0104 / 0.0042</td></tr>
+<tr><td>S2 mean (R/G/B)</td><td>-0.0001 / -0.0002 / -0.0002</td><td>0.0013 / 0.0006 / -0.0013</td></tr>
+<tr><td>S3 mean (R/G/B)</td><td>-0.0000 / -0.0000 / -0.0000</td><td>0.0000 / 0.0000 / 0.0000</td></tr>
+<tr><td>DoLP mean (R/G/B)</td><td>0.0601 / 0.0699 / 0.1055</td><td>0.0249 / 0.0255 / 0.0339</td></tr>
+<tr><td>DoLP p99.5 (R/G/B)</td><td>0.3056 / 0.3551 / 0.4833</td><td>0.1128 / 0.0948 / 0.1491</td></tr>
+</tbody></table></article><article>
+<h3>vp_000048/h_330 <span class="ok">paired / valid</span></h3>
+<img src="images/recent_polar_queue_2026-08-25/vp_000048_h_330.webp" loading="lazy" alt="Passive and active Stokes comparison for vp_000048/h_330">
+<table><thead><tr><th>metric</th><th>passive</th><th>active</th></tr></thead><tbody>
+<tr><td>S0 mean (R/G/B)</td><td>0.0051 / 0.0046 / 0.0040</td><td>0.1200 / 0.1069 / 0.0932</td></tr>
+<tr><td>S1 mean (R/G/B)</td><td>-0.0001 / -0.0001 / -0.0001</td><td>0.0019 / 0.0018 / 0.0016</td></tr>
+<tr><td>S2 mean (R/G/B)</td><td>-0.0001 / -0.0001 / -0.0000</td><td>-0.0004 / -0.0003 / -0.0002</td></tr>
+<tr><td>S3 mean (R/G/B)</td><td>0.0000 / 0.0000 / 0.0000</td><td>0.0000 / 0.0000 / -0.0000</td></tr>
+<tr><td>DoLP mean (R/G/B)</td><td>0.0500 / 0.0572 / 0.0676</td><td>0.0318 / 0.0365 / 0.0433</td></tr>
+<tr><td>DoLP p99.5 (R/G/B)</td><td>0.1865 / 0.2105 / 0.2437</td><td>0.1429 / 0.1652 / 0.1968</td></tr>
+</tbody></table></article><article>
+<h3>vp_000054/h_330 <span class="ok">paired / valid</span></h3>
+<img src="images/recent_polar_queue_2026-08-25/vp_000054_h_330.webp" loading="lazy" alt="Passive and active Stokes comparison for vp_000054/h_330">
+<table><thead><tr><th>metric</th><th>passive</th><th>active</th></tr></thead><tbody>
+<tr><td>S0 mean (R/G/B)</td><td>0.0007 / 0.0005 / 0.0004</td><td>0.0047 / 0.0036 / 0.0027</td></tr>
+<tr><td>S1 mean (R/G/B)</td><td>-0.0000 / -0.0000 / -0.0000</td><td>-0.0000 / 0.0000 / 0.0000</td></tr>
+<tr><td>S2 mean (R/G/B)</td><td>-0.0000 / -0.0000 / -0.0000</td><td>0.0000 / 0.0000 / 0.0000</td></tr>
+<tr><td>S3 mean (R/G/B)</td><td>0.0000 / 0.0000 / 0.0000</td><td>0.0000 / 0.0000 / 0.0000</td></tr>
+<tr><td>DoLP mean (R/G/B)</td><td>0.4688 / 0.4915 / 0.5130</td><td>0.4696 / 0.4928 / 0.5148</td></tr>
+<tr><td>DoLP p99.5 (R/G/B)</td><td>0.9774 / 0.9774 / 0.9776</td><td>0.9841 / 0.9855 / 0.9862</td></tr>
+</tbody></table></article><article>
+<h3>vp_000055/h_330 <span class="ok">paired / valid</span></h3>
+<img src="images/recent_polar_queue_2026-08-25/vp_000055_h_330.webp" loading="lazy" alt="Passive and active Stokes comparison for vp_000055/h_330">
+<table><thead><tr><th>metric</th><th>passive</th><th>active</th></tr></thead><tbody>
+<tr><td>S0 mean (R/G/B)</td><td>0.0073 / 0.0069 / 0.0067</td><td>0.0882 / 0.0828 / 0.0786</td></tr>
+<tr><td>S1 mean (R/G/B)</td><td>-0.0002 / -0.0002 / -0.0002</td><td>-0.0011 / -0.0011 / -0.0013</td></tr>
+<tr><td>S2 mean (R/G/B)</td><td>-0.0001 / -0.0001 / -0.0001</td><td>-0.0001 / -0.0002 / -0.0002</td></tr>
+<tr><td>S3 mean (R/G/B)</td><td>0.0000 / 0.0000 / 0.0000</td><td>-0.0000 / -0.0000 / -0.0000</td></tr>
+<tr><td>DoLP mean (R/G/B)</td><td>0.0591 / 0.0632 / 0.0699</td><td>0.0406 / 0.0439 / 0.0494</td></tr>
+<tr><td>DoLP p99.5 (R/G/B)</td><td>0.3687 / 0.3642 / 0.3879</td><td>0.3458 / 0.3305 / 0.3257</td></tr>
+</tbody></table></article><article>
+<h3>vp_000087/h_330 <span class="ok">paired / valid</span></h3>
+<img src="images/recent_polar_queue_2026-08-25/vp_000087_h_330.webp" loading="lazy" alt="Passive and active Stokes comparison for vp_000087/h_330">
+<table><thead><tr><th>metric</th><th>passive</th><th>active</th></tr></thead><tbody>
+<tr><td>S0 mean (R/G/B)</td><td>0.0810 / 0.0602 / 0.0667</td><td>1.5993 / 1.1737 / 1.2706</td></tr>
+<tr><td>S1 mean (R/G/B)</td><td>0.0013 / 0.0010 / 0.0013</td><td>0.0291 / 0.0236 / 0.0306</td></tr>
+<tr><td>S2 mean (R/G/B)</td><td>-0.0005 / -0.0006 / -0.0004</td><td>-0.0026 / -0.0046 / 0.0001</td></tr>
+<tr><td>S3 mean (R/G/B)</td><td>-0.0000 / -0.0000 / -0.0000</td><td>0.0000 / 0.0000 / 0.0000</td></tr>
+<tr><td>DoLP mean (R/G/B)</td><td>0.0424 / 0.0429 / 0.0415</td><td>0.0380 / 0.0382 / 0.0373</td></tr>
+<tr><td>DoLP p99.5 (R/G/B)</td><td>0.1760 / 0.1739 / 0.1713</td><td>0.1640 / 0.1503 / 0.1579</td></tr>
+</tbody></table></article><article>
+<h3>vp_000109/h_330 <span class="ok">paired / valid</span></h3>
+<img src="images/recent_polar_queue_2026-08-25/vp_000109_h_330.webp" loading="lazy" alt="Passive and active Stokes comparison for vp_000109/h_330">
+<table><thead><tr><th>metric</th><th>passive</th><th>active</th></tr></thead><tbody>
+<tr><td>S0 mean (R/G/B)</td><td>0.0434 / 0.0428 / 0.0435</td><td>1.5379 / 1.5339 / 1.5354</td></tr>
+<tr><td>S1 mean (R/G/B)</td><td>0.0035 / 0.0034 / 0.0032</td><td>0.0430 / 0.0428 / 0.0425</td></tr>
+<tr><td>S2 mean (R/G/B)</td><td>0.0007 / 0.0008 / 0.0007</td><td>-0.0026 / -0.0026 / -0.0026</td></tr>
+<tr><td>S3 mean (R/G/B)</td><td>-0.0000 / -0.0000 / -0.0000</td><td>-0.0001 / -0.0001 / -0.0001</td></tr>
+<tr><td>DoLP mean (R/G/B)</td><td>0.0737 / 0.0769 / 0.0781</td><td>0.0812 / 0.0841 / 0.0862</td></tr>
+<tr><td>DoLP p99.5 (R/G/B)</td><td>0.5124 / 0.5254 / 0.5394</td><td>0.6244 / 0.6630 / 0.6922</td></tr>
+</tbody></table></article><article>
+<h3>vp_000146/h_330 <span class="ok">paired / valid</span></h3>
+<img src="images/recent_polar_queue_2026-08-25/vp_000146_h_330.webp" loading="lazy" alt="Passive and active Stokes comparison for vp_000146/h_330">
+<table><thead><tr><th>metric</th><th>passive</th><th>active</th></tr></thead><tbody>
+<tr><td>S0 mean (R/G/B)</td><td>0.1726 / 0.2302 / 0.2176</td><td>1.2605 / 1.9171 / 1.7099</td></tr>
+<tr><td>S1 mean (R/G/B)</td><td>0.0026 / 0.0052 / 0.0045</td><td>0.0299 / 0.0592 / 0.0507</td></tr>
+<tr><td>S2 mean (R/G/B)</td><td>0.0014 / 0.0017 / 0.0016</td><td>0.0070 / 0.0113 / 0.0101</td></tr>
+<tr><td>S3 mean (R/G/B)</td><td>-0.0000 / -0.0000 / -0.0000</td><td>0.0000 / 0.0000 / 0.0000</td></tr>
+<tr><td>DoLP mean (R/G/B)</td><td>0.0410 / 0.0434 / 0.0432</td><td>0.0454 / 0.0471 / 0.0468</td></tr>
+<tr><td>DoLP p99.5 (R/G/B)</td><td>0.1715 / 0.1603 / 0.1637</td><td>0.1597 / 0.1518 / 0.1543</td></tr>
+</tbody></table></article><article>
+<h3>vp_000172/h_330 <span class="ok">paired / valid</span></h3>
+<img src="images/recent_polar_queue_2026-08-25/vp_000172_h_330.webp" loading="lazy" alt="Passive and active Stokes comparison for vp_000172/h_330">
+<table><thead><tr><th>metric</th><th>passive</th><th>active</th></tr></thead><tbody>
+<tr><td>S0 mean (R/G/B)</td><td>0.1166 / 0.0790 / 0.0762</td><td>0.4654 / 0.2859 / 0.2678</td></tr>
+<tr><td>S1 mean (R/G/B)</td><td>0.0014 / 0.0022 / 0.0022</td><td>0.0050 / 0.0047 / 0.0044</td></tr>
+<tr><td>S2 mean (R/G/B)</td><td>-0.0002 / -0.0001 / -0.0001</td><td>-0.0017 / 0.0001 / 0.0002</td></tr>
+<tr><td>S3 mean (R/G/B)</td><td>0.0000 / 0.0000 / 0.0000</td><td>0.0000 / 0.0000 / 0.0000</td></tr>
+<tr><td>DoLP mean (R/G/B)</td><td>0.0651 / 0.0707 / 0.0730</td><td>0.0643 / 0.0690 / 0.0699</td></tr>
+<tr><td>DoLP p99.5 (R/G/B)</td><td>0.6560 / 0.7746 / 0.7863</td><td>0.5920 / 0.6777 / 0.6901</td></tr>
+</tbody></table></article>
+<h2>Newest active queue status</h2><p>The newest version <code>rv_20260825T060642_34fdc514f99d_eb2f4f</code> contains the two manual-view tasks that were not part of the completed eight-pair evidence set.</p><table><thead><tr><th>viewpoint</th><th>heading</th><th>state</th><th>job</th><th>error</th></tr></thead><tbody><tr><td>vp_000012</td><td>h_330</td><td>skipped</td><td>None</td><td>—</td></tr><tr><td>vp_000048</td><td>h_330</td><td>skipped</td><td>None</td><td>—</td></tr><tr><td>vp_000054</td><td>h_330</td><td>skipped</td><td>None</td><td>—</td></tr><tr><td>vp_000055</td><td>h_330</td><td>skipped</td><td>None</td><td>—</td></tr><tr><td>vp_000087</td><td>h_330</td><td>skipped</td><td>None</td><td>—</td></tr><tr><td>vp_000109</td><td>h_330</td><td>skipped</td><td>None</td><td>—</td></tr><tr><td>vp_000146</td><td>h_330</td><td>skipped</td><td>None</td><td>—</td></tr><tr><td>vp_000172</td><td>h_330</td><td>skipped</td><td>None</td><td>—</td></tr><tr><td>vp_manual_0012</td><td>h_330</td><td>succeeded</td><td>opticalnav-infinigen_apartment_20260811-perturbed-active-polar-vp_manual_0012-h_330-5c2501fc-resume-9471625258</td><td>—</td></tr><tr><td>vp_manual_0014</td><td>h_330</td><td>succeeded</td><td>opticalnav-infinigen_apartment_20260811-perturbed-active-polar-vp_manual_0014-h_330-5c2501fc-resume-c7f4563258</td><td>—</td></tr></tbody></table>
+<h2>Interpretation boundary</h2><p>This report verifies the output contract and demonstrates non-identical R/G/B Stokes components in actual artifacts. It does not independently prove wavelength-specific physics beyond the RGB-polarized renderer contract; that requires a controlled spectral/reference test.</p>
+</main></body></html>

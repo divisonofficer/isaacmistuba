@@ -11,6 +11,9 @@
 
 	const summary = $derived(job?.summary ?? {});
 	const archives = $derived(Array.isArray(summary.archives) ? summary.archives : []);
+	const upload = $derived(summary.upload ?? null);
+	const remoteDir = $derived(upload?.remote_dir ?? job?.remote_dir ?? '');
+	const uploadCount = $derived(Object.keys(upload?.files ?? job?.uploads ?? {}).length);
 
 	function fmtBytes(b: number | undefined): string {
 		if (!b || b < 0) return '0 B';
@@ -33,6 +36,10 @@
 	</div>
 	{#if summary.export_profile}
 		<div class="er-sub">profile: {summary.export_profile}</div>
+	{/if}
+	{#if remoteDir}
+		<div class="er-sub">☁ Google Drive: {remoteDir}</div>
+		<div class="er-sub">{uploadCount} files remote-verified</div>
 	{/if}
 	<div class="er-actions">
 		{#if archives().length}

@@ -78,6 +78,8 @@ def sample_viewpoint_nodes(
     # cell within a small radius — this lands a viewpoint right beside the door.
     snap_radius_cells = max(1, int(round(0.6 / grid.spec.resolution)))
     for seed_pt in opening_seeds or []:
+        if len(selected) >= max_nodes:
+            break
         try:
             sx, sy = float(seed_pt[0]), float(seed_pt[1])
         except (TypeError, ValueError, IndexError):
@@ -126,6 +128,8 @@ def sample_viewpoint_nodes(
                 clearance_map = np.minimum(clearance_map, d.min(axis=2))
             clearance_map = clearance_map * grid.spec.resolution
     for idx, (cell_x, cell_y) in enumerate(candidates):
+        if len(selected) >= max_nodes:
+            break
         if on_progress is not None and idx % report_every == 0:
             on_progress(idx / total)
         if clearance_map is not None:

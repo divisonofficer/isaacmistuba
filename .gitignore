@@ -1,6 +1,7 @@
 __pycache__/
 *.pyc
 *.pyo
+*.orig
 .pytest_cache/
 *.usda
 *.blend

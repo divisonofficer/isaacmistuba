@@ -18,7 +18,58 @@ The policy layer is pure-Python and unit-testable WITHOUT Blender; only
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional, Protocol, runtime_checkable
+import re
+from typing import Any, Callable, Optional, Protocol, runtime_checkable
+
+
+def map_material_slot_indices(source_names: list[str | None], imported_names: list[str | None], *,
+                              allow_source_subset: bool = False) -> dict[int, int]:
+    """Map glTF-imported slots back to the original Blender slot indices.
+
+    Blender appends a new ``.NNN`` suffix when the source materials are still
+    loaded.  Repeated variants such as ``hair``, ``hair.001`` ... therefore
+    return as ``hair.005`` ... and cannot be matched by stem alone.  The OBJ →
+    gltfpack → glTF path preserves primitive/material order, so an equal-length
+    equal-stem sequence is an unambiguous cosmetic renumbering.
+    """
+    if len(source_names) != len(imported_names) and not allow_source_subset:
+        raise ValueError("material slot count changed")
+    if len(imported_names) > len(source_names):
+        raise ValueError("material slot count increased")
+    source_by_name: dict[str, list[int]] = {}
+    for index, name in enumerate(source_names):
+        if name is not None:
+            source_by_name.setdefault(name, []).append(index)
+    mapping: dict[int, int] = {}
+    used: set[int] = set()
+    for imported_index, name in enumerate(imported_names):
+        exact = source_by_name.get(name or "", [])
+        if len(exact) == 1 and exact[0] not in used:
+            mapping[imported_index] = exact[0]
+            used.add(exact[0])
+    stem = lambda value: re.sub(r"\.\d{3}$", "", value or "")
+    unresolved = [index for index in range(len(imported_names)) if index not in mapping]
+    available = [index for index in range(len(source_names)) if index not in used]
+    for imported_index in list(unresolved):
+        candidates = [index for index in available if stem(source_names[index]) == stem(imported_names[imported_index])]
+        if len(candidates) == 1:
+            source_index = candidates[0]
+            mapping[imported_index] = source_index
+            used.add(source_index); available.remove(source_index); unresolved.remove(imported_index)
+    if unresolved:
+        # Repeated suffix families are safe only when both transports retain
+        # the same slot positions and stems at every unresolved position.
+        if (not allow_source_subset and len(unresolved) != len(available)) or any(
+            imported_index != source_index or stem(imported_names[imported_index]) != stem(source_names[source_index])
+            for imported_index, source_index in zip(unresolved, available)
+        ):
+            raise ValueError(f"material slots do not map unambiguously: source={source_names}, imported={imported_names}")
+        mapping.update(zip(unresolved, available))
+    if len(mapping) != len(imported_names) or (
+        not allow_source_subset and len(set(mapping.values())) != len(source_names)
+    ):
+        raise ValueError(f"material slots do not map bijectively: source={source_names}, imported={imported_names}")
+    return mapping
 
 
 # --------------------------------------------------------------------- types --
@@ -90,6 +141,30 @@ class RatioThreshold:
         return DecimationDecision(True, r, reason=f"{ctx.n_faces}→~{int(ctx.n_faces * r)}"
                                   + (" (optical/structural protected)" if protected else ""),
                                   policy=self.name)
+
+
+@dataclass
+class IRSemanticLodPolicy:
+    """IR-only fixed ladder: every eligible mesh is reduced to at most 30%."""
+    name = "ir_semantic_lod_v1"
+    min_faces: int = 50_000
+    floor_faces: int = 2_000
+
+    def decide(self, ctx: DecimationContext) -> DecimationDecision:
+        if ctx.n_faces < self.min_faces:
+            return DecimationDecision(False, 1.0, reason=f"n_faces {ctx.n_faces}<{self.min_faces}", policy=self.name)
+        if ctx.n_faces >= 5_000_000:
+            ratio = 0.01
+        elif ctx.n_faces >= 1_000_000:
+            ratio = 0.03
+        elif ctx.n_faces >= 250_000:
+            ratio = 0.10
+        else:
+            ratio = 0.30
+        ratio = min(0.30, max(ratio, self.floor_faces / max(ctx.n_faces, 1)))
+        return DecimationDecision(
+            True, ratio, reason=f"IR ladder {ctx.n_faces}->{int(ctx.n_faces * ratio)}", policy=self.name,
+        )
 
 
 @dataclass
@@ -166,16 +241,27 @@ def resolve_policy(name: str, **kw) -> DecimationPolicy:
             floor_faces=int(kw.get("floor_faces", 2_000)))
     if name == "semantic_contract":
         return SemanticContractPolicy(min_faces=int(kw.get("min_faces", 50_000)))
-    raise ValueError(f"unknown decimation policy: {name!r} (choices: none, ratio_threshold, semantic_contract)")
+    if name == "ir_semantic_lod_v1":
+        return IRSemanticLodPolicy(min_faces=int(kw.get("min_faces", 50_000)))
+    raise ValueError(f"unknown decimation policy: {name!r} (choices: none, ratio_threshold, semantic_contract, ir_semantic_lod_v1)")
 
 
 # --------------------------------------------------------- bpy executor ----- #
+def triangle_count(bpy_obj) -> int:
+    """Return evaluated mesh triangle count; works with lightweight unit-test fakes."""
+    mesh = bpy_obj.data
+    try:
+        mesh.calc_loop_triangles()
+        return len(mesh.loop_triangles)
+    except Exception:
+        return len(mesh.polygons)
+
 def apply_decimation(bpy_obj, decision: DecimationDecision) -> int:
     """Apply the decision to a live bpy mesh via a DECIMATE modifier (COLLAPSE) and
-    return the resulting face count. bpy-only — the caller guards on the decision so
+    return the resulting triangle count. bpy-only — the caller guards on the decision so
     this never runs when decimate=False."""
     if not decision.decimate:
-        return len(bpy_obj.data.polygons)
+        return triangle_count(bpy_obj)
     import bpy  # noqa: F401  (Blender-only)
     mod = bpy_obj.modifiers.new(name="robomituba_decimate", type="DECIMATE")
     mod.decimate_type = "COLLAPSE"
@@ -187,23 +273,91 @@ def apply_decimation(bpy_obj, decision: DecimationDecision) -> int:
         bpy.ops.object.modifier_apply(modifier=mod.name)
     finally:
         bpy.context.view_layer.objects.active = prev_active
-    return len(bpy_obj.data.polygons)
+    return triangle_count(bpy_obj)
 
 
-def decimate_object(bpy_obj, policy: DecimationPolicy, ctx: DecimationContext) -> dict:
-    """Full step: policy decides, executor applies (if bpy present). Returns a record
-    for the manifest unit. Never raises on the bpy path failing — decimation is
-    best-effort and must not abort an import."""
+def decimate_object(
+    bpy_obj,
+    policy: DecimationPolicy,
+    ctx: DecimationContext,
+    *,
+    strict: bool = False,
+    tolerance: float = 0.05,
+    fallback: Callable[[Any, int], dict] | None = None,
+) -> dict:
+    """Apply a policy and record the *actual* topology result.
+
+    Blender collapse decimation can stop above its nominal ratio on difficult
+    topology.  Retry against the measured remainder before declaring strict
+    failure; a full-resolution mesh is never accepted as a successful LOD.
+    """
     decision = policy.decide(ctx)
     before = ctx.n_faces
+    target_max_faces = min(before, int(before * min(1.0, decision.target_ratio) * (1.0 + tolerance) + 0.999999))
     after = before
     error = None
+    applied_ratios: list[float] = []
+    pass_triangle_counts: list[int] = []
     if decision.decimate:
         try:
-            after = apply_decimation(bpy_obj, decision)
+            next_ratio = float(decision.target_ratio)
+            previous = before
+            for _pass in range(3):
+                pass_decision = DecimationDecision(
+                    True, next_ratio, method=decision.method,
+                    reason=f"{decision.reason}; pass={_pass + 1}", policy=decision.policy,
+                )
+                after = apply_decimation(bpy_obj, pass_decision)
+                applied_ratios.append(round(next_ratio, 7))
+                pass_triangle_counts.append(after)
+                if after <= target_max_faces:
+                    break
+                if after >= previous:
+                    break
+                previous = after
+                next_ratio = max(1e-4, min(1.0, target_max_faces / max(after, 1)))
         except Exception as exc:  # noqa: BLE001
             error = f"{type(exc).__name__}: {exc}"
-    return {"policy": decision.policy, "decimated": bool(decision.decimate and error is None),
-            "faces_before": before, "faces_after": after,
-            "target_ratio": round(decision.target_ratio, 4), "reason": decision.reason,
-            "error": error}
+    # Blender COLLAPSE can stop far above its target on dense, disconnected
+    # procedural meshes.  The caller may supply a meshoptimizer fallback; it
+    # must return the measured triangle count, never just a process success.
+    fallback_record = None
+    fallback_unavailable = False
+    if decision.decimate and error is None and after > target_max_faces and fallback is not None:
+        try:
+            fallback_record = dict(fallback(bpy_obj, target_max_faces) or {})
+            after = int(fallback_record["triangles_after"])
+        except Exception as exc:  # noqa: BLE001
+            # A handful of procedural assets export an empty glTF after OBJ
+            # conversion (usually a disconnected/degenerate detail mesh).
+            # There is no topology for gltfpack to optimize in that case. Do
+            # not abort the whole scene in strict mode: retain the measured
+            # Blender result and record the exception so the asset remains
+            # auditable. Other fallback failures remain hard errors.
+            message = str(exc)
+            if "gltfpack import expected one mesh object, got 0" in message:
+                fallback_unavailable = True
+                fallback_record = {
+                    "status": "unavailable_empty_import",
+                    "triangles_after": int(after),
+                    "target_triangles": int(target_max_faces),
+                    "error": f"{type(exc).__name__}: {message}",
+                }
+            else:
+                error = f"fallback_error: {type(exc).__name__}: {exc}"
+    no_effect = bool(decision.decimate and error is None and after > target_max_faces and not fallback_unavailable)
+    if no_effect:
+        error = f"no_effect: requested <= {target_max_faces} triangles at ratio {decision.target_ratio:.4f}, got {after} after {len(applied_ratios)} pass(es)"
+    record = {
+        "policy": decision.policy, "measurement": "triangles",
+        "decimated": bool(decision.decimate and error is None and not fallback_unavailable),
+        "status": "kept_fallback_unavailable" if fallback_unavailable else "reduced" if decision.decimate and error is None else "no_effect" if no_effect else "error" if error else "kept",
+        "faces_before": before, "faces_after": after, "target_max_faces": target_max_faces,
+        "triangles_before": before, "triangles_after": after, "target_max_triangles": target_max_faces,
+        "target_ratio": round(decision.target_ratio, 4), "reason": decision.reason, "error": error,
+        "pass_count": len(applied_ratios), "applied_ratios": applied_ratios, "pass_triangle_counts": pass_triangle_counts,
+        "fallback": fallback_record,
+    }
+    if strict and error is not None:
+        raise RuntimeError(f"strict decimation failed for {ctx.object_id}: {error}")
+    return record

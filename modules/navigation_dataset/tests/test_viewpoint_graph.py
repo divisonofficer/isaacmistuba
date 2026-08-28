@@ -18,7 +18,7 @@ for module_path in reversed(MODULE_PATHS):
     if str(module_path) not in sys.path:
         sys.path.insert(0, str(module_path))
 
-from navigation_dataset.edge_builder import build_viewpoint_edges  # noqa: E402
+from navigation_dataset.edge_builder import build_viewpoint_edges, validate_viewpoint_edge  # noqa: E402
 from navigation_dataset.graph_episode_sampler import plan_graph_episodes, shortest_graph_path, write_graph_episodes  # noqa: E402
 from navigation_dataset.node_sampler import heading_sweep, sample_viewpoint_nodes  # noqa: E402
 from navigation_dataset.scene_annotations import GoalRegion, HazardRegion, SceneAnnotation, TraversableRegion, write_scene_annotation  # noqa: E402
@@ -31,9 +31,11 @@ from navigation_dataset.viewpoint_graph import (  # noqa: E402
     ViewpointHeading,
     ViewpointNode,
     append_edge,
+    append_manual_node,
     find_object_overlapping_nodes,
     read_viewpoint_graph,
     remove_nodes,
+    reset_node_headings,
     write_viewpoint_graph,
 )
 from navigation_dataset.traversability import build_traversability_grid, world_to_cell  # noqa: E402
@@ -135,6 +137,18 @@ class ViewpointGraphTests(unittest.TestCase):
         self.assertIsNotNone(first)
         self.assertIs(first, second)
         self.assertEqual(len(graph.edges), 1)
+
+    def test_reset_manual_node_headings_matches_graph_schema(self) -> None:
+        graph = ViewpointGraph(scene_id="s", graph_id="g", node_heading_count=24)
+        node = append_manual_node(graph, 1.0, 2.0)
+        self.assertEqual(len(node.headings), 24)
+        self.assertTrue(reset_node_headings(node, 12))
+        self.assertEqual(len(node.headings), 12)
+        self.assertEqual([h.heading_id for h in node.headings], [f"h_{yaw:03d}" for yaw in range(0, 360, 30)])
+        self.assertFalse(reset_node_headings(node, 12))
+        graph.node_heading_count = 12
+        with tempfile.TemporaryDirectory() as tmpdir:
+            write_viewpoint_graph(Path(tmpdir) / "viewpoint_graph.json", graph)
 
     def test_hazard_crossing_edge_is_flagged_but_retained(self) -> None:
         annotation = self.make_annotation()
@@ -618,6 +632,58 @@ class TestEdgeBuilderWallGate(unittest.TestCase):
         self.assertIn(("L1", "R1"), legacy)
 
 
+class TestEdgeValidationPolicy(unittest.TestCase):
+    def test_only_a_certified_portal_may_cross_a_short_floor_gap(self):
+        import numpy as np
+        from navigation_dataset.traversability import GridSpec, TraversabilityGrid
+        from navigation_dataset.walkable_surface import PortalSpec
+
+        spec = GridSpec(width=40, height=20, resolution=0.1, origin=(0.0, 0.0), scene_id="t")
+        edge_mask = np.ones((20, 40), dtype=bool)
+        edge_mask[:, 15] = False
+        # The opening is floor-disconnected, but not a body-height wall.
+        wall = np.zeros((20, 40), dtype=bool)
+        raw = TraversabilityGrid(spec=spec, traversable=edge_mask.copy(), hazard=np.zeros((20, 40), bool))
+        edge_grid = TraversabilityGrid(spec=spec, traversable=edge_mask, hazard=np.zeros((20, 40), bool))
+        left = ViewpointNode(node_id="left", position=[1.0, 1.5, 0.0], headings=heading_sweep(1))
+        right = ViewpointNode(node_id="right", position=[2.0, 1.5, 0.0], headings=heading_sweep(1))
+        portal = PortalSpec(
+            door_id="p", door_type="inferred_opening", center=(1.5, 1.5), axis=(1.0, 0.0),
+            side_a=(1.0, 1.5), side_b=(2.0, 1.5), resolved=True, source="inferred",
+        )
+        rejected = validate_viewpoint_edge(
+            edge_grid, left, right, robot_radius_m=0.0, max_edge_length_m=1.5,
+            wall_mask=wall, doorway_grid=raw, portals=[], doorway_gap_m=0.45,
+        )
+        self.assertFalse(rejected.accepted)
+        self.assertEqual(rejected.reason, "not_certified_doorway")
+        accepted = validate_viewpoint_edge(
+            edge_grid, left, right, robot_radius_m=0.0, max_edge_length_m=1.5,
+            wall_mask=wall, doorway_grid=raw, portals=[portal], doorway_gap_m=0.45,
+        )
+        self.assertTrue(accepted.accepted)
+        self.assertEqual(accepted.mode, "doorway")
+        wall[:, 15] = True
+        blocked = validate_viewpoint_edge(
+            edge_grid, left, right, robot_radius_m=0.0, max_edge_length_m=1.5,
+            wall_mask=wall, doorway_grid=raw, portals=[portal], doorway_gap_m=0.45,
+        )
+        self.assertFalse(blocked.accepted)
+        self.assertEqual(blocked.reason, "crosses_wall")
+
+    def test_opening_seeds_do_not_exceed_node_budget(self):
+        import numpy as np
+        from navigation_dataset.traversability import GridSpec, TraversabilityGrid
+
+        spec = GridSpec(width=10, height=10, resolution=0.1, origin=(0.0, 0.0), scene_id="t")
+        grid = TraversabilityGrid(spec=spec, traversable=np.ones((10, 10), bool), hazard=np.zeros((10, 10), bool))
+        nodes = sample_viewpoint_nodes(
+            grid, max_nodes=1, heading_count=1, min_node_spacing_m=0.0,
+            opening_seeds=[(0.2, 0.2), (0.7, 0.7)], seed=0,
+        )
+        self.assertEqual(len(nodes), 1)
+
+
 class TestConnectivityRepairWallGate(unittest.TestCase):
     def test_repair_bridges_through_doorway_not_wall(self):
         """A wall between two rooms with a doorway gap: repair must connect the pair
@@ -679,6 +745,31 @@ class TestConnectivityRepairWallGate(unittest.TestCase):
         )
         s, _ = _repair_connectivity(graph, grid, wall_mask=None, heading_count=1)
         self.assertTrue(graph.edges, "repair should still connect the two nodes")
+
+    def test_long_safe_route_is_split_at_edge_limit(self):
+        import numpy as np
+        from navigation_dataset.traversability import GridSpec, TraversabilityGrid
+        from navigation_dataset.graph_pipeline import _repair_connectivity
+        from navigation_dataset.viewpoint_graph import compute_connected_components
+
+        spec = GridSpec(width=70, height=10, resolution=0.1, origin=(0.0, 0.0), scene_id="t")
+        grid = TraversabilityGrid(spec=spec, traversable=np.ones((10, 70), bool), hazard=np.zeros((10, 70), bool))
+        graph = ViewpointGraph(
+            scene_id="t", graph_id="g", node_heading_count=1,
+            nodes=[
+                ViewpointNode(node_id="A", position=[0.5, 0.5, 0.0], headings=heading_sweep(1)),
+                ViewpointNode(node_id="B", position=[5.5, 0.5, 0.0], headings=heading_sweep(1)),
+            ],
+            edges=[],
+        )
+        bridge_edges, bridge_nodes = _repair_connectivity(
+            graph, grid, edge_grid=grid, safe_node_grid=grid,
+            max_edge_length_m=1.5, heading_count=1, max_nodes=12,
+        )
+        self.assertGreater(bridge_nodes, 0)
+        self.assertGreater(bridge_edges, 0)
+        self.assertEqual(len(compute_connected_components(graph)["components"]), 1)
+        self.assertTrue(all(edge.distance_m <= 1.5 + 1e-9 for edge in graph.edges))
 
 
 class TestGraphEpisodeStaleRefs(unittest.TestCase):

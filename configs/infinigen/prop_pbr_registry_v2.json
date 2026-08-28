@@ -1,0 +1,10 @@
+{
+  "schema": "robomituba.ir_prop_pbr_registry.v2",
+  "version": "hybrid_prop_pbr_v1",
+  "profiles": [
+    {"id":"generic_matte_polymer_v1","classes":["generic_prop","decor","book"],"values":{"base_color":[0.34,0.28,0.22],"roughness":0.58,"metallic":0.0}},
+    {"id":"glazed_dish_v1","classes":["dish"],"values":{"base_color":[0.72,0.68,0.58],"roughness":0.22,"metallic":0.0}},
+    {"id":"brushed_tool_metal_v1","classes":["metal_tool"],"values":{"base_color":[0.42,0.45,0.48],"roughness":0.32,"metallic":0.92}},
+    {"id":"coated_appliance_v1","classes":["appliance"],"values":{"base_color":[0.16,0.20,0.24],"roughness":0.30,"metallic":0.15}}
+  ]
+}

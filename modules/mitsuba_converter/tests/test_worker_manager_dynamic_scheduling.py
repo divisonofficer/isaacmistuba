@@ -89,6 +89,19 @@ def test_submit_caps_assigned_backlog_until_worker_terminal_event(monkeypatch):
     assert len(workers[1].stats.assigned_job_ids) == 2
 
 
+def test_submit_emits_assigned_before_worker_started(monkeypatch):
+    mgr, _workers = _manager(monkeypatch, backlog=2)
+    events = []
+    mgr.add_listener(events.append)
+
+    mgr.submit({"job_id": "prefetched"})
+
+    assert len(events) == 1
+    assert events[0]["type"] == "assigned"
+    assert events[0]["job_id"] == "prefetched"
+    assert events[0]["gpu_index"] in {0, 1}
+
+
 def test_target_gpu_routing_still_available_for_static_shards(monkeypatch):
     mgr, workers = _manager(monkeypatch, backlog=2)
 
@@ -109,6 +122,36 @@ def test_health_reports_assigned_backlog(monkeypatch):
     assert health["worker_backlog_per_gpu"] == 2
     assert [row["backlog_limit"] for row in health["workers"]] == [2, 2]
     assert sum(row["assigned_count"] for row in health["workers"]) == 2
+    assert all(row["assigned_start_age_s"] is not None for row in health["workers"])
+
+
+def test_release_assignment_clears_start_watchdog_metadata(monkeypatch):
+    mgr, workers = _manager(monkeypatch, backlog=2)
+    mgr.submit({"job_id": "assigned"})
+
+    worker = workers[0]
+    assert "assigned" in worker.stats.assigned_at
+    mgr._release_assignment(worker, "assigned")
+
+    assert "assigned" not in worker.stats.assigned_job_ids
+    assert "assigned" not in worker.stats.assigned_at
+
+
+def test_cancel_assigned_but_not_started_restarts_worker(monkeypatch):
+    mgr = WorkerManager(repo_root=Path("."), worker_count=1, gpu_indices=[0])
+    worker = _Worker(mgr, gpu_index=0)
+    worker.stats.assigned_job_ids.add("lost-before-start")
+    worker.stats.assigned_at["lost-before-start"] = time.monotonic()
+    requested: list[str] = []
+
+    monkeypatch.setattr(
+        mgr,
+        "_request_restart",
+        lambda target, *, reason: requested.append(reason),
+    )
+
+    assert worker.cancel("lost-before-start") is True
+    assert requested == ["assigned_job_cancelled"]
 
 
 def test_recycle_idle_workers_restarts_without_failing_jobs(monkeypatch):

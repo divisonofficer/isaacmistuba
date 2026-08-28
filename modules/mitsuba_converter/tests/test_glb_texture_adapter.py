@@ -5,7 +5,11 @@ from pathlib import Path
 
 import pytest
 
-from mitsuba_converter.glb_texture_adapter import materialize_glb_texture_parts
+from mitsuba_converter.glb_texture_adapter import (
+    GLB_SAFE_OBJ_CONTRACT,
+    _cached_texture_refs_valid,
+    materialize_glb_texture_parts,
+)
 from mitsuba_converter.render_daemon import _append_bsdf_xml, _select_part_render_material
 
 
@@ -28,12 +32,18 @@ def test_dtc_glb_adapter_extracts_pbr_textures(tmp_path: Path) -> None:
 
     assert result.status == "ok"
     assert result.mesh_parts
+    assert result.combined_obj_path is None
+    assert result.obj_contract == GLB_SAFE_OBJ_CONTRACT
+    assert not list((tmp_path / "mesh_cache").glob("glb_*.obj"))
+    assert not list((tmp_path / "mesh_cache").rglob("*.png"))
     assert result.texture_slots.get("base_color", 0) >= 1
     assert result.texture_slots.get("normal", 0) >= 1
     assert result.texture_slots.get("metallic_roughness", 0) >= 1
     part = result.mesh_parts[0]
     assert part.triangle_count > 0
     assert part.has_uv
+    assert part.obj_contract == GLB_SAFE_OBJ_CONTRACT
+    assert part.bounds and part.bounds["min"] and part.bounds["max"]
     assert part.extracted_material is not None
     em = part.extracted_material
     assert em["source"] == "glb_pbr"
@@ -71,3 +81,13 @@ def test_dtc_glb_extracted_material_reaches_measured_albedo_scale(tmp_path: Path
     filename = tex.find("./string[@name='filename']")
     assert filename is not None
     assert filename.get("value")
+
+
+def test_cached_texture_refs_require_existing_nonempty_files(tmp_path: Path) -> None:
+    texture = tmp_path / "texture.png"
+    texture.write_bytes(b"png")
+    material = {"base_color_texture_ref": texture.name}
+    assert _cached_texture_refs_valid(material, tmp_path)
+    texture.write_bytes(b"")
+    assert not _cached_texture_refs_valid(material, tmp_path)
+    assert _cached_texture_refs_valid({"base_color_texture_ref": "embedded://mat/base"}, tmp_path)

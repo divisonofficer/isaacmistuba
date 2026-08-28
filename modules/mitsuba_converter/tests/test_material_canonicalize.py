@@ -5,7 +5,7 @@ from mitsuba_converter.material_pipeline.canonicalize import canonicalize_slot
 def _slot(strategy, *, optical_class=None, base_tex=None, base_factor=None,
           rough_tex=None, mr_tex=None, rough_scalar=None, metallic_scalar=None,
           metallic_tex=None, metallic_factor=None, normal_tex=None, source="glb_pbr",
-          measured=None):
+          measured=None, metallic_contract=None):
     return {
         "material_id": f"m_{strategy}",
         "shape_ids": ["s0"],
@@ -13,7 +13,7 @@ def _slot(strategy, *, optical_class=None, base_tex=None, base_factor=None,
         "optical_class": optical_class,
         "measured_role": None,
         "authoring": {"base_color_factor": base_factor, "roughness": rough_scalar,
-                      "metallic": metallic_scalar},
+                      "metallic": metallic_scalar, "metallic_contract": metallic_contract},
         "extracted": {"source": source, "surface_shader_id": "x",
                       "base_color_factor": None, "base_color_texture_ref": base_tex,
                       "normal_texture_ref": normal_tex, "roughness_texture_ref": rough_tex,
@@ -32,6 +32,22 @@ def test_conductor_metallic_is_one_overriding_leaked_factor():
     assert m.canonical_bsdf == "roughconductor"
     met = m.parameters["metallic"]
     assert met.valid and met.value == 1.0 and met.source == "derived"
+
+
+def test_trusted_coverage_mixed_texture_precedes_legacy_conductor_override():
+    contract = {
+        "schema": "robomituba.metallic_contract.v2", "family": "coverage_mixed",
+        "representation": "spatial_texture", "encoding": "linear_scalar",
+        "color_space": "non_color", "source": "generated",
+        "approximation": "principled_coverage", "generator_id": "painted_metal_coverage_v1", "seed": 9,
+    }
+    material = canonicalize_slot(_slot(
+        "roughconductor", optical_class="metal", metallic_tex="metal.png",
+        metallic_scalar=1.0, metallic_contract=contract,
+    ))
+    metallic = material.parameters["metallic"]
+    assert metallic.source == "baked" and metallic.path == "metal.png"
+    assert material.extras["metallic_contract"]["family"] == "coverage_mixed"
 
 
 def test_smooth_dielectric_roughness_zero_not_half():

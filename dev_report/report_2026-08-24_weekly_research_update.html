@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>주간 연구 성과 · 2026-08-17–23</title>
+  <style>
+    :root { --bg:#10151d; --panel:#18212d; --line:#314156; --text:#eaf0f7; --muted:#aebdcb; --ok:#7ed6a2; --work:#f1c96a; --wait:#8db7ff; --bad:#ff9c9c; }
+    * { box-sizing:border-box; } body { margin:0; background:var(--bg); color:var(--text); font:16px/1.65 system-ui,sans-serif; }
+    main { max-width:1060px; margin:auto; padding:48px 24px 72px; } h1 { margin:0 0 8px; font-size:2rem; } h2 { margin-top:42px; padding-top:20px; border-top:1px solid var(--line); }
+    h3 { margin-bottom:6px; } a { color:#9fc4ff; } .meta,.note { color:var(--muted); } .card { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:18px 20px; margin:16px 0; }
+    .tag { display:inline-block; padding:2px 9px; border:1px solid var(--line); border-radius:999px; font-size:.78rem; margin-left:7px; white-space:nowrap; }
+    .tested { color:var(--ok); border-color:var(--ok); } .implemented { color:var(--work); border-color:var(--work); } .pending { color:var(--wait); border-color:var(--wait); } .limit { color:var(--bad); border-color:var(--bad); }
+    table { border-collapse:collapse; width:100%; margin:16px 0; } th,td { border:1px solid var(--line); padding:9px; text-align:left; vertical-align:top; } th { background:#202c3b; } code { background:#0c1118; padding:2px 5px; border-radius:4px; overflow-wrap:anywhere; }
+    ul { padding-left:22px; } .callout { border-left:4px solid var(--work); padding:10px 14px; background:#1a2430; margin:16px 0; }
+  </style>
+</head>
+<body><main>
+  <h1>Robomituba 주간 연구 성과</h1>
+  <p class="meta">기간: 2026-08-17–23 · 범위: OpticalNav 편광 transport 및 Infinigen inverse-rendering 데이터셋 준비 · 정본: 이 저장소의 source·test·report</p>
+
+  <div class="callout"><strong>읽는 법.</strong> 아래는 구현, 자동 테스트, 실제 GPU/scene-scale 검증을 구분한 기록이다. “물리 경로를 포함하도록 구현”은 확인되었지만, “더 나은 편광 결과”는 통제 fixture와 대표 OpticalNav 장면의 GPU 결과가 확보될 때까지 결론으로 쓰지 않는다.</div>
+
+  <h2>성과 요약</h2>
+  <table><thead><tr><th>축</th><th>이번 주 구현</th><th>확인 상태</th><th>아직 필요한 증거</th></tr></thead><tbody>
+    <tr><td>Polar transport</td><td>Stokes nested integrator의 기본을 <code>direct</code>에서 깊이 제한 <code>path</code>로 전환하고, preview 경로를 분리했다.</td><td><span class="tag implemented">구현 완료</span> <span class="tag tested">단위 테스트 통과</span></td><td>mirror/glass fixture의 direct-vs-path Stokes 수치와 대표 scene 재렌더</td></tr>
+    <tr><td>IR content</td><td>native prop의 specular/material 분포와 semantic category를 계약으로 만들고, 재현 가능한 composition을 도입했다.</td><td><span class="tag implemented">구현 완료</span> <span class="tag tested">단위 테스트 통과</span></td><td>실제 Infinigen showcase composition·registry 결과 검수</td></tr>
+    <tr><td>IR views &amp; lighting</td><td>anchor-centric multi-view, raster visibility gate, 6-condition illumination/paired capture 계획을 추가했다.</td><td><span class="tag implemented">구현 완료</span> <span class="tag tested">단위 테스트 통과</span></td><td>scene-scale render plan 및 render/GT manifest 검증</td></tr>
+  </tbody></table>
+
+  <h2>1. OpticalNav Polar transport: direct preview → physical path</h2>
+  <div class="card">
+    <h3>무엇을 바꿨나 <span class="tag implemented">구현 완료</span></h3>
+    <p><code>RenderConfig.polar_transport</code>를 도입해 기본값을 <code>physical</code>로 설정했다. 이 모드는 Stokes integrator 내부에 <code>path(max_depth=6)</code>를 사용한다. 따라서 카메라로 들어오는 Stokes 신호에 반사·투과를 포함한 다중 segment transport를 포함할 수 있다. 기존의 빠른 <code>direct(max_depth=2)</code>는 <code>preview</code> 진단 모드로만 유지한다.</p>
+    <p>이는 depth AOV를 반사에 합성하는 기능이 아니다. <strong>깊이 제한(path-depth-bounded) 경로 추적</strong>으로 편광 반사·투과 경로를 계산하는 변경이다.</p>
+    <ul>
+      <li>Stokes staging 및 scene-reuse cache key에 nested integrator와 maximum depth를 포함했다.</li>
+      <li>polar pass timing/metadata에 <code>polar_transport</code>, <code>nested_integrator</code>, <code>max_depth</code>, Stokes luminance 통계를 기록한다.</li>
+      <li>저장된 request에 transport 값이 없어도 새 기본값 <code>physical</code>을 적용하며, 미지의 mode는 거부한다.</li>
+    </ul>
+  </div>
+  <div class="card">
+    <h3>통제 검증 설계 <span class="tag tested">테스트 통과</span> <span class="tag pending">GPU 실행 대기</span></h3>
+    <p><code>apps/render_polar_transport_fixtures.py</code>는 finite-thickness dielectric glass window, glass bottle, back-silvered mirror를 생성해 preview/direct와 physical/path를 같은 카메라에서 비교한다. 각 결과는 <code>stokes_data.npz</code>의 finite ratio, invalid pixel count, S0 mean, DoLP mean으로 요약한다. thin dielectric을 쓰지 않고 유한 두께의 dielectric과 Ag conductor를 사용해 반사·투과 회귀를 겨냥한다.</p>
+    <p>이번 점검에서는 관련 Polar transport와 fixture, IR contract 테스트를 합쳐 <strong>20 passed</strong>를 확인했다. 이는 configuration/staging/fixture 정의의 회귀 방지 근거이며 GPU renderer의 물리적 개선 결과는 아니다.</p>
+  </div>
+
+  <h2>2. IR dataset: specular object distribution</h2>
+  <div class="card">
+    <h3>소품 composition 계약 <span class="tag implemented">구현 완료</span></h3>
+    <p><code>inverse_rendering_showcase_v1</code>은 audited native asset registry에서 seed로 결정론적 selection을 만든다. composition 하나는 16–24개의 소품, 최소 8개의 semantic category, factory별 최대 2개라는 제약을 만족한다.</p>
+    <table><thead><tr><th>PBR class</th><th>composition 최소 개수</th><th>목적</th></tr></thead><tbody>
+      <tr><td>polished metallic</td><td>3</td><td>금속성 highlight와 view-dependent appearance</td></tr>
+      <tr><td>glossy dielectric</td><td>4</td><td>매끄러운 dielectric 반사 특성</td></tr>
+      <tr><td>coated</td><td>3</td><td>중간 roughness의 coating 반응</td></tr>
+      <tr><td>rough textured</td><td>3</td><td>질감·roughness 다양성의 기준점</td></tr>
+    </tbody></table>
+    <p>배치는 support surface의 여유 공간·occlusion·multi-view potential을 점수화하고, 충돌하지 않는 lattice position을 선택한다. native support가 부족하면 visible neutral display bench를 명시적 scene geometry로 추가하며 manifest에 이를 남긴다.</p>
+  </div>
+
+  <h2>3. IR dataset: render diversification and camera viewpoints</h2>
+  <div class="card">
+    <h3>조명 다양성 <span class="tag implemented">구현 완료</span></h3>
+    <p>render plan은 정확히 6개의 illumination condition을 사용한다. 선택 포즈의 25%는 모든 조명 조건에서 같은 카메라 pose로 렌더하는 <em>paired capture</em>이고, 나머지는 공간 coverage를 유지하는 <em>single capture</em>로 각 condition에 분배한다. 이 방식은 조명 변화의 비교 가능성과 scene coverage를 함께 유지하며, plan에는 condition asset, recipe digest, pair ID, expected frame count를 남긴다.</p>
+  </div>
+  <div class="card">
+    <h3>카메라·가시성 계약 <span class="tag implemented">구현 완료</span></h3>
+    <ul>
+      <li>각 target anchor를 향하는 4–12개 multi-view set을 walkable graph node에서 고른다. 임의의 기존 heading sweep을 되살리지 않고 anchor 방향 yaw/pitch를 계산한다.</li>
+      <li>camera clearance ≥0.4 m, forward clearance ≥1.0 m, anchor distance 1.2–4.5 m, set 내 baseline ≥0.5 m, azimuth span ≥90°를 적용한다.</li>
+      <li>scene-scale acceptance는 조명 frame 수와 별개로 최소 50개의 독립 physical pose를 요구한다. strict anchor set이 부족하면 동일 안전 후보군에서 coverage-only supplemental pose를 추가하되 multi-view tuple로 위장하지 않는다.</li>
+      <li>160×120-equivalent raster probe는 object/material ID, depth, normal, roughness, metallic, base color를 보고, weak set을 immutable render plan 이전에 제외한다. set acceptance에는 shared object ≥8, union object ≥12, severe occlusion/near-wall 부재, target의 최소 2-view 관측을 사용한다.</li>
+    </ul>
+  </div>
+
+  <h2>검증 경계와 다음 단계</h2>
+  <table><thead><tr><th>상태</th><th>의미</th><th>다음 실행 근거</th></tr></thead><tbody>
+    <tr><td><span class="tag tested">자동 테스트 통과</span></td><td>Polar configuration/staging, fixture definition, IR composition/render-plan/readiness contract의 단위 테스트 20건 통과.</td><td>현재 checkout의 source-level contract가 회귀 없이 결합됨.</td></tr>
+    <tr><td><span class="tag pending">Polar GPU 검증 대기</span></td><td>fixture script는 준비됐지만 이번 보고서 범위에서 direct/path 결과 파일과 representative OpticalNav scene의 raw S0/S1/S2 ROI 비교는 생성·검수하지 않았다.</td><td>동일 device/variant에서 fixture를 실행하고 report JSON·PNG·raw Stokes를 보존한 뒤 scene-scale 재렌더로 확장.</td></tr>
+    <tr><td><span class="tag pending">IR dataset publish 대기</span></td><td>content/camera/lighting 계약은 준비됐지만 canonical observation↔GT join, full NIR-albedo coverage, train/val/test split과 실제 render manifest 검증은 남아 있다.</td><td>showcase composition→raster acceptance→render plan→render/GT audit 순서로 재현 가능하게 실행.</td></tr>
+  </tbody></table>
+
+  <h2>관련 정본과 재현 경로</h2>
+  <ul>
+    <li><code>modules/mitsuba_converter/src/mitsuba_converter/multimodal.py</code> — Polar transport mode, Stokes staging 및 metadata</li>
+    <li><code>apps/render_polar_transport_fixtures.py</code> — controlled mirror/glass direct-vs-path fixture</li>
+    <li><code>modules/mitsuba_converter/src/mitsuba_converter/ir_showcase.py</code> 및 <code>ir_render_plan.py</code> — composition, camera set, illumination contract</li>
+    <li><a href="report_2026-08-24_robomituba_research_status.html">2026-08-24 연구 현황 기준선</a> — 연구축과 기존 evidence boundary</li>
+    <li><a href="report_2026-08-18_infinigen_dataset_thumbnails.html">2026-08-18 Infinigen thumbnail 보고서</a> — mirror/glass geometry-aware preview 후보; physical transport 평가와는 구분</li>
+  </ul>
+</main></body></html>

@@ -1,0 +1,19 @@
+{
+  "schema": "robomituba.ir_illumination_bank.v1",
+  "contract": "illumination-diversity-paired-v1",
+  "license": "CC0-1.0",
+  "assets": {
+    "overcast_day": {"path": "assets/ir_lighting_hdri/overcast_day.hdr", "sha256": "206c67e3a1b992282821cf06662bdd69bbb4915c1c4444a66338a40d6a7d4e34", "source": "Poly Haven / kloppenheim_06_puresky_1k"},
+    "sunny_day": {"path": "assets/ir_lighting_hdri/sunny_day.hdr", "sha256": "d457bdf2fd8100e11b406200a6dde99adaf6d5613ae88780da3b3d2c5e3d5d53", "source": "Poly Haven / syferfontein_18d_clear_puresky_1k"},
+    "sunset_warm": {"path": "assets/ir_lighting_hdri/sunset_warm.hdr", "sha256": "92fe2b29b1957828fb8925a57633540bbba5bf380d9285ed553443e834249352", "source": "Poly Haven / venice_sunset_1k"},
+    "blue_hour": {"path": "assets/ir_lighting_hdri/blue_hour.hdr", "sha256": "ae4b5c0ce8ad9e69be22ab485197bec8e90a40205e76ea1a1f491c74fb554500", "source": "Poly Haven / rooftop_night_1k"}
+  },
+  "conditions": [
+    {"id": "reference_neutral_v1", "external_asset": "overcast_day", "world_strength": 0.15, "portal_strength": 1.0, "internal_energy_scale": 1.0, "internal_color": [1.0, 1.0, 1.0], "side_key": false},
+    {"id": "external_sunny_v1", "external_asset": "sunny_day", "world_strength": 0.18, "portal_strength": 1.15, "internal_energy_scale": 1.0, "internal_color": [1.0, 1.0, 1.0], "side_key": false},
+    {"id": "external_sunset_v1", "external_asset": "sunset_warm", "world_strength": 0.16, "portal_strength": 1.0, "internal_energy_scale": 1.0, "internal_color": [1.0, 1.0, 1.0], "side_key": false},
+    {"id": "external_blue_hour_v1", "external_asset": "blue_hour", "world_strength": 0.12, "portal_strength": 0.75, "internal_energy_scale": 1.0, "internal_color": [1.0, 1.0, 1.0], "side_key": false},
+    {"id": "internal_warm_dim_v1", "external_asset": "overcast_day", "world_strength": 0.15, "portal_strength": 1.0, "internal_energy_scale": 0.72, "internal_color": [1.0, 0.61, 0.31], "side_key": false},
+    {"id": "internal_cool_side_key_v1", "external_asset": "overcast_day", "world_strength": 0.15, "portal_strength": 1.0, "internal_energy_scale": 1.25, "internal_color": [0.78, 0.92, 1.0], "side_key": true, "key_energy_scale": 1.45, "opposite_energy_scale": 0.35}
+  ]
+}

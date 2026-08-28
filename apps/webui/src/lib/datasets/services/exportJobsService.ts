@@ -7,6 +7,7 @@ import {
 	submitOpticalNavExportJob,
 	getOpticalNavExportJob,
 	cancelOpticalNavExportJob,
+	resumeOpticalNavExportJob,
 } from '$lib/api';
 
 export interface ExportJobSubmitPayload {
@@ -19,8 +20,13 @@ export interface ExportJobSubmitPayload {
 	png_only?: boolean;
 	include_birdseye?: boolean;
 	include_episode_birdseye?: boolean;
-	export_profile?: 'compact_with_polar_extension' | 'single_lossless_core' | 'navigation_only' | 'legacy_full';
+	export_profile?: 'compact_with_polar_extension' | 'single_lossless_core' | 'navigation_only' | 'png_stokes_core' | 'legacy_full';
 	eval_perturbation?: boolean;
+	upload?: {
+		enabled: boolean;
+		target: 'google_drive';
+		destination_subpath?: string;
+	} | null;
 }
 
 export interface ExportCameraInventoryItem {
@@ -35,8 +41,8 @@ export interface ExportJobStatus {
 	job_id: string;
 	project_id?: string;
 	scene_id?: string;
-	export_profile?: 'compact_with_polar_extension' | 'single_lossless_core' | 'navigation_only' | 'legacy_full';
-	status: 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'unknown';
+	export_profile?: 'compact_with_polar_extension' | 'single_lossless_core' | 'navigation_only' | 'png_stokes_core' | 'legacy_full';
+	status: 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'interrupted' | 'unknown';
 	stage?: string;
 	stage_label?: string;
 	current?: number;
@@ -48,18 +54,29 @@ export interface ExportJobStatus {
 	summary?: any;
 	error?: string | null;
 	cancel_requested?: boolean;
+	resume_available?: boolean;
+	remote_dir?: string;
+	upload_rate?: string;
+	upload_eta?: string;
+	upload_transferred?: string;
+	upload_total?: string;
+	uploads?: Record<string, any>;
 	created_at?: string;
 	updated_at?: string;
 }
 
 export async function submitExportJob(projectId: string, payload: ExportJobSubmitPayload) {
-	return submitOpticalNavExportJob(projectId, payload);
+	return submitOpticalNavExportJob(projectId, payload.scene_id, payload);
 }
 
-export async function fetchExportJob(projectId: string, jobId: string): Promise<ExportJobStatus> {
-	return getOpticalNavExportJob(projectId, jobId) as Promise<ExportJobStatus>;
+export async function fetchExportJob(projectId: string, sceneId: string, jobId: string): Promise<ExportJobStatus> {
+	return getOpticalNavExportJob(projectId, sceneId, jobId) as Promise<ExportJobStatus>;
 }
 
-export async function cancelExportJob(projectId: string, jobId: string) {
-	return cancelOpticalNavExportJob(projectId, jobId);
+export async function cancelExportJob(projectId: string, sceneId: string, jobId: string) {
+	return cancelOpticalNavExportJob(projectId, sceneId, jobId);
+}
+
+export async function resumeExportJob(projectId: string, sceneId: string, jobId: string) {
+	return resumeOpticalNavExportJob(projectId, sceneId, jobId);
 }
