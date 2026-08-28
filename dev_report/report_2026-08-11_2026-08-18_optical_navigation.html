@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Optical Navigation 개발 보고서 · 2026-08-11~18</title>
+<style>
+:root{--bg:#0d1117;--panel:#151b23;--line:#293241;--fg:#e9edf2;--mut:#9ba8b7;--blue:#70a7ff;--ok:#46d39a;--warn:#f4c95d}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.65 system-ui,-apple-system,"Noto Sans KR",sans-serif}
+main{max-width:1100px;margin:auto;padding:42px 24px 80px}h1{font-size:31px;margin:0 0 6px}h2{font-size:21px;border-top:1px solid var(--line);padding-top:26px;margin-top:42px}h3{font-size:17px;color:var(--blue)}p,li{max-width:1000px}.sub,small{color:var(--mut)}code{background:#202733;padding:2px 6px;border-radius:4px}a{color:var(--blue)}
+.hero,.note,.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:18px 20px;margin:18px 0}.hero{border-left:4px solid var(--blue)}.note{border-left:4px solid var(--warn)}
+	.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:12px;margin:20px 0}.kpi{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:15px}.kpi b{display:block;font-size:20px;color:var(--blue)}.kpi span{color:var(--mut);font-size:13px}
+	.feature-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px;margin:18px 0}.feature-grid .card{margin:0}.feature-grid h3{margin:0 0 7px}.feature-grid p{margin:0;color:var(--mut);font-size:14px}
+table{border-collapse:collapse;width:100%;margin:16px 0}th,td{border:1px solid var(--line);padding:9px 11px;text-align:left;vertical-align:top}th{background:#171e27;color:var(--mut)}.done{color:var(--ok)}.pending{color:var(--warn)}ul,ol{padding-left:24px}.meta{color:var(--mut);font-size:14px}
+.comparison{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin:18px 0}.comparison figure{margin:0;background:var(--panel);border:1px solid var(--line);border-radius:10px;overflow:hidden}.comparison img{display:block;width:100%;aspect-ratio:1/1;object-fit:cover}.comparison figcaption{padding:11px 13px;color:var(--mut);font-size:13px}.comparison figcaption strong{display:block;color:var(--fg);font-size:15px;margin-bottom:3px}
+.layout-pair{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px;margin:18px 0}.layout-card{background:var(--panel);border:1px solid var(--line);border-radius:10px;overflow:hidden}.layout-card h3{margin:0;padding:13px 15px 3px}.layout-card p{margin:0;padding:0 15px 12px;color:var(--mut);font-size:13px}.layout-card svg{display:block;width:100%;height:auto;background:#101720}.layout-card .room{stroke:#9ba8b755;stroke-width:1}.layout-card .work{fill:#315d91}.layout-card .meeting{fill:#5c477e}.layout-card .support{fill:#465d50}.layout-card .hall{fill:#293241}.layout-card .glass{stroke:#5ce1e6;stroke-width:4;stroke-linecap:round}.layout-card .door{stroke:#f4c95d;stroke-width:3;stroke-linecap:round}.layout-card text{font:10px system-ui,-apple-system,"Noto Sans KR",sans-serif;fill:#e9edf2}.layout-card .legend{font-size:9px;fill:#9ba8b7}
+@media(max-width:700px){main{padding:25px 15px 55px}h1{font-size:25px}table{font-size:13px;display:block;overflow-x:auto;white-space:normal}.comparison,.layout-pair{grid-template-columns:1fr}}
+</style>
+</head>
+<body><main>
+<h1>Optical Navigation 개발 보고서</h1>
+<p class="sub">기간: 2026-08-11 ~ 2026-08-18 · 작성일: 2026-08-18 · 범위: 장면 생성·그래프·렌더링·export·산출물 관리</p>
+
+<div class="hero"><strong>요약.</strong> 이번 기간에는 OpticalNav를 viewpoint 렌더 스크립트에서 장면 생성 규칙, graph 생성, 다중 GPU 렌더 큐, modality 상태 표시, export 및 산출물 보존까지 연결된 데이터셋 제작 흐름으로 확장했다.</div>
+
+<div class="grid">
+<div class="kpi"><span>장면 생성</span><b>Modern Office</b><small>결정적 floorplan·room program</small></div>
+<div class="kpi"><span>렌더 운영</span><b>Batch / Sharding</b><small>resume 및 상태 추적 강화</small></div>
+<div class="kpi"><span>센서 경로</span><b>RGB + modality</b><small>flash·spectral·spatial PBR</small></div>
+<div class="kpi"><span>보존 정책</span><b>역참조 기반</b><small>OpticalNav out/ inventory</small></div>
+</div>
+
+<h2>1. Modern Office 장면 생성 규칙 및 wizard</h2>
+<p>관련 커밋: <code>37cd36d</code> · <em>feat(office): Modern Office OpticalNav 생성 규칙과 wizard를 추가한다</em></p>
+<ul>
+<li>결정적 floorplan 및 room program 생성 규칙을 추가했다.</li>
+<li>기본 Modern Office 스타일과 structural-glass 스타일을 분리했다.</li>
+<li>Infinigen wizard에 안전한 import/export 보조 기능과 content policy·호환성 계층을 추가했다.</li>
+<li>Structural glass 사용 여부와 graph 품질을 점검하는 audit 스크립트를 추가했다.</li>
+<li>scene metadata가 생성 규칙과 graph-build 옵션을 보존하도록 graph pipeline·scene sync·sensor sweep을 확장했다.</li>
+<li>wizard/export layout, floorplan, import 호환성, content policy, graph audit 회귀 테스트를 추가했다.</li>
+</ul>
+<div class="note">동일한 입력 설정에서 재현 가능한 office scene을 만들고, 유리 파티션이 포함된 장면을 OpticalNav graph 데이터와 함께 검증할 수 있는 기반을 마련했다.</div>
+
+<h2>1-A. Wide Glass Office v2 구현 기능</h2>
+<p><strong>목표.</strong> v2는 기존 compact Office의 확장판이 아니라, 넓은 업무 공간을 결정적으로 생성하고, structural glass·office-only population·OpticalNav graph를 하나의 검증 가능한 계약으로 연결하는 별도 생성 프로필이다. v1의 published seed contract는 변경하지 않는다.</p>
+<div class="feature-grid">
+<section class="card"><h3>1. Wide floor-plan contract</h3><p><code>modern_glass_office_v2</code>는 432–520 m² footprint에서 3–4개의 독립 work bay를 만든다. dual-spine circulation과 meeting 3·focus office 4·reception/support·break·restroom 2·storage 프로그램을 고정하고, 각 work bay는 75 m² 이하로 제한한다.</p></section>
+<section class="card"><h3>2. Provenance manifest</h3><p><code>office_layout_manifest.json</code>에 logical/effective seed, footprint, bay별 room ID·면적, room program, structural-glass digest와 population policy를 기록한다. 생성 결과와 이후 audit이 같은 layout contract를 보도록 한다.</p></section>
+<section class="card"><h3>3. Office-only population</h3><p>주거용 constraint graph를 재사용하지 않고 office 전용 asset registry와 quota를 사용한다. work bay는 desk/chair/monitor 6–10개, focus·reception은 workstation, meeting·break·restroom·storage는 용도별 최소 구성을 요구한다.</p></section>
+<section class="card"><h3>4. Door-preserving structural glass</h3><p>corridor-facing 벽 중 기존 door opening이 있는 후보에서 10개 partition을 결정적으로 선택한다. 각 partition은 문 양쪽의 두 pane으로 설치되어 총 20 panes이며, 유리 설치가 navigation barrier를 만들지 않도록 한다.</p></section>
+<section class="card"><h3>5. Candidate recovery &amp; publish</h3><p>logical seed에서 attempt별 effective seed를 파생하고, preflight → full generation → workstation layout → Blender population audit을 통과한 첫 candidate만 staging을 거쳐 <code>full/</code>로 atomic publish한다. solver configuration 실패는 무의미한 seed retry로 숨기지 않는다.</p></section>
+<section class="card"><h3>6. End-to-end quality gates</h3><p>preflight는 footprint·bay·glass·asset factory·solver 제약을 검사한다. population audit은 domestic/unassigned asset과 furniture concentration을, graph audit은 pane import·door crossing·각 work bay의 navigable viewpoint를 확인한다.</p></section>
+</div>
+<table><thead><tr><th>단계</th><th>계약 / 산출물</th><th>실패 시 처리</th></tr></thead><tbody>
+<tr><td>Preflight</td><td>400–550 m², 3–4 bays, bay ≤75 m², 10 partitions / 20 panes, factory placeholder·solver constraint</td><td>candidate 시작 전 중단</td></tr>
+<tr><td>Generation</td><td>floor plan, layout manifest, Blender structural-glass 및 workstation post-process</td><td>run-state·heartbeat·termination reason 기록</td></tr>
+<tr><td>Population audit</td><td>room quota, domestic asset 0, room 밖 asset 0, work-bay cell 분산, installed partition/pane ID</td><td>candidate 보존 후 다음 deterministic candidate 평가</td></tr>
+<tr><td>Import &amp; graph audit</td><td>OpticalNav authoring map·viewpoint graph, pane tag, door-only crossing, 모든 work bay viewpoint</td><td>import/graph 실패로 publish 완료를 주장하지 않음</td></tr>
+</tbody></table>
+<div class="note"><strong>검증 상태 구분.</strong> 위는 코드에 구현된 v2 기능과 gate다. 아래 20260823·20260824 카드는 그중 layout contract의 실제 산출물 비교이며, population audit·Blender scene·graph audit을 통과한 <code>full/</code> publish 증거와는 별개다.</div>
+
+<h2>1-B. Office layout v1 → Wide Glass Office v2 비교</h2>
+<p><strong>문제 진단.</strong> 기존 Office의 문제는 object root가 모두 <code>(0,0)</code>으로 초기화된 것이 아니라, <code>180 m²</code> floorplate의 단일 <code>open-office</code>에 office 전용 population constraint가 충분히 적용되지 않아 가구가 한 영역에 몰릴 수 있었던 것이다. 새 v2는 generation 전에 room program·work-bay·유리 파티션을 결정적으로 고정하고, Blender population audit을 통과한 후보만 <code>full/</code>로 publish하도록 바꿨다.</p>
+
+<div class="layout-pair">
+<section class="layout-card">
+<h3>Legacy · modern_hybrid_v1</h3>
+<p><code>kr_20260818_office/full</code> · 실제 publish된 15 × 12 m floorplan</p>
+<svg viewBox="0 0 520 390" role="img" aria-label="Legacy modern hybrid office floor plan">
+  <rect x="48" y="150" width="420" height="196" class="room work"/><text x="238" y="250">single open office · 105 m²</text>
+  <rect x="48" y="108" width="420" height="42" class="room hall"/><text x="220" y="133">hallway</text>
+  <rect x="48" y="40" width="112" height="68" class="room meeting"/><text x="67" y="78">meeting</text>
+  <rect x="160" y="40" width="84" height="68" class="room meeting"/><text x="170" y="78">meeting</text>
+  <rect x="244" y="40" width="56" height="68" class="room support"/><text x="249" y="78">office</text>
+  <rect x="300" y="40" width="56" height="68" class="room support"/><text x="302" y="72">break</text><text x="304" y="85">room</text>
+  <rect x="356" y="40" width="56" height="68" class="room support"/><text x="359" y="72">rest</text><text x="359" y="85">room</text>
+  <rect x="412" y="40" width="56" height="68" class="room support"/><text x="418" y="78">store</text>
+  <line x1="48" y1="108" x2="90" y2="108" class="glass"/><line x1="118" y1="108" x2="160" y2="108" class="glass"/>
+  <line x1="160" y1="108" x2="188" y2="108" class="glass"/><line x1="216" y1="108" x2="244" y2="108" class="glass"/>
+  <line x1="244" y1="108" x2="258" y2="108" class="glass"/><line x1="286" y1="108" x2="300" y2="108" class="glass"/>
+  <line x1="90" y1="108" x2="118" y2="108" class="door"/><line x1="188" y1="108" x2="216" y2="108" class="door"/><line x1="258" y1="108" x2="286" y2="108" class="door"/>
+  <text x="48" y="370" class="legend">cyan: structural glass (3) · yellow: door opening · plan extent: 180 m²</text>
+</svg>
+</section>
+<section class="layout-card">
+<h3>Candidate · v2 seed 20260823</h3>
+<p><code>kr_20260823_office/attempts/attempt_04</code> · 26 × 20 m · layout-only evidence</p>
+<svg viewBox="0 0 520 390" role="img" aria-label="Wide Glass Office v2 seed 20260823 candidate floor plan">
+  <rect x="48" y="200" width="136" height="128" class="room work"/><rect x="184" y="200" width="136" height="128" class="room work"/><rect x="320" y="200" width="144" height="128" class="room work"/>
+  <text x="83" y="268">work bay 1</text><text x="219" y="268">work bay 2</text><text x="361" y="268">work bay 3</text>
+  <text x="75" y="283">68 m²</text><text x="211" y="283">68 m²</text><text x="353" y="283">72 m²</text>
+  <rect x="48" y="176" width="416" height="24" class="room hall"/><text x="220" y="192">circulation spine</text>
+  <rect x="48" y="128" width="24" height="48" class="room hall"/><rect x="72" y="128" width="72" height="48" class="room meeting"/><rect x="144" y="128" width="56" height="48" class="room meeting"/><rect x="200" y="128" width="80" height="48" class="room support"/><rect x="280" y="128" width="64" height="48" class="room support"/><rect x="344" y="128" width="56" height="48" class="room support"/><rect x="400" y="128" width="64" height="48" class="room support"/>
+  <text x="79" y="154">meet</text><text x="150" y="154">meet</text><text x="207" y="154">reception</text><text x="292" y="154">office</text><text x="348" y="154">rest</text><text x="411" y="154">storage</text>
+  <rect x="48" y="104" width="416" height="24" class="room hall"/><text x="220" y="120">secondary spine</text>
+  <rect x="48" y="40" width="64" height="64" class="room meeting"/><rect x="112" y="40" width="56" height="64" class="room support"/><rect x="168" y="40" width="88" height="64" class="room support"/><rect x="256" y="40" width="72" height="64" class="room support"/><rect x="328" y="40" width="88" height="64" class="room support"/><rect x="416" y="40" width="48" height="64" class="room support"/>
+  <text x="56" y="76">meeting</text><text x="117" y="76">office</text><text x="193" y="76">focus / office</text><text x="267" y="76">office</text><text x="346" y="76">break room</text><text x="421" y="76">rest</text>
+  <line x1="48" y1="200" x2="104" y2="200" class="glass"/><line x1="120" y1="200" x2="184" y2="200" class="glass"/><line x1="184" y1="200" x2="240" y2="200" class="glass"/><line x1="256" y1="200" x2="320" y2="200" class="glass"/><line x1="320" y1="200" x2="376" y2="200" class="glass"/><line x1="392" y1="200" x2="464" y2="200" class="glass"/><line x1="72" y1="176" x2="96" y2="176" class="glass"/><line x1="112" y1="176" x2="136" y2="176" class="glass"/><line x1="72" y1="128" x2="72" y2="144" class="glass"/><line x1="72" y1="160" x2="72" y2="176" class="glass"/>
+  <line x1="104" y1="200" x2="120" y2="200" class="door"/><line x1="240" y1="200" x2="256" y2="200" class="door"/><line x1="376" y1="200" x2="392" y2="200" class="door"/>
+  <text x="48" y="370" class="legend">seed 20260823 · cyan: structural glass (10 / 20 panes) · yellow: work-bay door openings · 520 m²</text>
+</svg>
+</section>
+<section class="layout-card">
+<h3>Candidate · v2 seed 20260824</h3>
+<p><code>kr_20260824_office/attempts/attempt_01</code> · generation in progress; layout-only evidence</p>
+<svg viewBox="0 0 520 390" role="img" aria-label="Wide Glass Office v2 candidate floor plan">
+  <rect x="48" y="200" width="104" height="128" class="room work"/><rect x="152" y="200" width="104" height="128" class="room work"/><rect x="256" y="200" width="104" height="128" class="room work"/><rect x="360" y="200" width="104" height="128" class="room work"/>
+  <text x="71" y="268">work bay 1</text><text x="175" y="268">work bay 2</text><text x="279" y="268">work bay 3</text><text x="383" y="268">work bay 4</text>
+  <rect x="48" y="176" width="416" height="24" class="room hall"/><text x="220" y="192">circulation spine</text>
+  <rect x="48" y="128" width="24" height="48" class="room hall"/><rect x="72" y="128" width="64" height="48" class="room meeting"/><rect x="136" y="128" width="56" height="48" class="room meeting"/><rect x="192" y="128" width="56" height="48" class="room support"/><rect x="248" y="128" width="88" height="48" class="room support"/><rect x="336" y="128" width="56" height="48" class="room support"/><rect x="392" y="128" width="72" height="48" class="room support"/>
+  <text x="76" y="154">meet</text><text x="140" y="154">meet</text><text x="198" y="154">reception</text><text x="273" y="154">focus / office</text><text x="340" y="154">rest</text><text x="408" y="154">storage</text>
+  <rect x="48" y="104" width="416" height="24" class="room hall"/><text x="220" y="120">secondary spine</text>
+  <rect x="48" y="40" width="64" height="64" class="room meeting"/><rect x="112" y="40" width="56" height="64" class="room support"/><rect x="168" y="40" width="88" height="64" class="room support"/><rect x="256" y="40" width="72" height="64" class="room support"/><rect x="328" y="40" width="88" height="64" class="room support"/><rect x="416" y="40" width="48" height="64" class="room support"/>
+  <text x="56" y="76">meeting</text><text x="117" y="76">office</text><text x="193" y="76">focus / office</text><text x="267" y="76">office</text><text x="346" y="76">break room</text><text x="421" y="76">rest</text>
+  <line x1="48" y1="200" x2="96" y2="200" class="glass"/><line x1="112" y1="200" x2="152" y2="200" class="glass"/><line x1="152" y1="200" x2="192" y2="200" class="glass"/><line x1="208" y1="200" x2="256" y2="200" class="glass"/><line x1="256" y1="200" x2="304" y2="200" class="glass"/><line x1="320" y1="200" x2="360" y2="200" class="glass"/><line x1="360" y1="200" x2="400" y2="200" class="glass"/><line x1="416" y1="200" x2="464" y2="200" class="glass"/>
+  <line x1="72" y1="176" x2="96" y2="176" class="glass"/><line x1="112" y1="176" x2="136" y2="176" class="glass"/><line x1="72" y1="128" x2="72" y2="144" class="glass"/><line x1="72" y1="160" x2="72" y2="176" class="glass"/><line x1="72" y1="128" x2="96" y2="128" class="glass"/><line x1="112" y1="128" x2="136" y2="128" class="glass"/><line x1="136" y1="176" x2="160" y2="176" class="glass"/><line x1="176" y1="176" x2="192" y2="176" class="glass"/><line x1="136" y1="128" x2="160" y2="128" class="glass"/><line x1="176" y1="128" x2="192" y2="128" class="glass"/><line x1="48" y1="104" x2="72" y2="104" class="glass"/><line x1="88" y1="104" x2="112" y2="104" class="glass"/>
+  <line x1="96" y1="200" x2="112" y2="200" class="door"/><line x1="192" y1="200" x2="208" y2="200" class="door"/><line x1="304" y1="200" x2="320" y2="200" class="door"/><line x1="400" y1="200" x2="416" y2="200" class="door"/>
+  <text x="48" y="370" class="legend">seed 20260824 · cyan: structural glass (10 / 20 panes) · yellow: work-bay door openings · 468 m²</text>
+</svg>
+</section>
+</div>
+
+<table><thead><tr><th>layout contract</th><th>Legacy v1</th><th>v2 · seed 20260823</th><th>v2 · seed 20260824</th><th>개선 의도</th></tr></thead><tbody>
+<tr><td>footprint</td><td>15 × 12 m · 180 m²</td><td>26 × 20 m · 520 m²</td><td>26 × 18 m · 468 m²</td><td>동일 profile에서도 seed별 footprint variation을 보존</td></tr>
+<tr><td>업무 공간</td><td>단일 open office · 105 m²</td><td>3개 work bay · 68 / 68 / 72 m²</td><td>4개 work bay · 각 52 m²</td><td>workstation quota와 2 m × 2 m cell 분산 audit의 단위가 됨</td></tr>
+<tr><td>room program</td><td>8개 room · meeting 2 / office 1</td><td>19개 room · meeting 3 / office 4 / restroom 2 / break·storage·support</td><td>19개 room · meeting 3 / office 4 / restroom 2 / break·storage·support</td><td>주거 소품 대신 room별 office asset policy를 적용할 공간적 근거 제공</td></tr>
+<tr><td>circulation</td><td>facade bar hallway 1개</td><td>primary + secondary spine 2개</td><td>primary + secondary spine 2개</td><td>베이·meeting·focus room을 분리하면서 door-only traversability 검증</td></tr>
+<tr><td>structural glass</td><td>3 partitions · pane count 미기록</td><td>10 partitions · 정확히 20 panes</td><td>10 partitions · 정확히 20 panes</td><td>corridor-facing partition과 door opening을 metadata로 고정</td></tr>
+<tr><td>publish gate</td><td>layout 생성 후 style 적용</td><td>최대 6 candidate → population audit PASS만 <code>full/</code> atomic publish</td><td>최대 6 candidate → population audit PASS만 <code>full/</code> atomic publish</td><td>가구 집중·room 밖 배치·domestic asset을 생성 단계에서 차단</td></tr>
+</tbody></table>
+<div class="note"><strong>증거 범위.</strong> 왼쪽은 실제 <code>kr_20260818_office/full/{floor_plan,office_layout_manifest}.json</code>, 가운데는 <code>data/infinigen_generated/outputs/kr_20260823_office/attempts/attempt_04/{floor_plan,office_layout_manifest}.json</code>, 오른쪽은 <code>data/infinigen_generated/outputs/kr_20260824_office/attempts/attempt_01/{floor_plan,office_layout_manifest}.json</code>의 layout contract를 SVG로 옮긴 것이다. 두 v2 candidate는 아직 furniture population audit, Blender scene 생성, graph coverage를 통과한 <code>full/</code> publish 증거가 아니므로 asset 분산·domestic asset 0·navigation 성공을 주장하지 않는다.</div>
+
+<h2>1-C. 8월 11일 Apartment와 6월 29일 KR Apartment의 wall texture 비교</h2>
+<p>이번 기간에 추가된 중요한 scene-generation 작업은 <code>infinigen_apartment_20260811</code>의 내부 벽을 더 평탄한 단일 재질에서 벗어나게 만든 것이다. <a href="../scripts/infinigen_gen.py#L37">infinigen_gen.py의 작업 기록</a>에 따르면 2026-08-11 Infinigen 설치본에 직접 패치를 적용해, 기존 <code>Plaster + Tile</code> 중심의 wall palette에 <code>Brick</code>과 <code>Wood</code>를 추가하고 feature-wall용 <code>wall_accent</code> 선택지를 확장했다.</p>
+<div class="comparison">
+<figure><img src="assets/infinigen_dataset_thumbnails_2026-08-18/infinigen_kr_20260629/vp_000020_h_000_rgb_off.png" alt="infinigen_kr_20260629 rendered RGB sample"><figcaption><strong>infinigen_kr_20260629</strong>기존 scene의 대표 RGB 샘플. Room 4 floor, <code>vp_000020 / h_000</code>이며 주방의 넓은 plaster 벽면을 확인할 수 있다.</figcaption></figure>
+<figure><img src="assets/infinigen_dataset_thumbnails_2026-08-18/infinigen_apartment_20260811/vp_manual_0015_h_210_rgb_off.png" alt="infinigen_apartment_20260811 rendered RGB sample"><figcaption><strong>infinigen_apartment_20260811</strong>새 scene의 대표 RGB 샘플. Room 1 floor, <code>vp_manual_0015 / h_210</code>이며 육각 타일 패턴과 목재성 벽면 디테일이 나타난다.</figcaption></figure>
+</div>
+<p class="meta">두 이미지는 동일 viewpoint pair가 아닌 대표 샘플이므로 정량적인 영상 차이 비교가 아니다. wall material 차이는 scene XML·materialization metadata와 함께 판정한다.</p>
+<table><thead><tr><th>항목</th><th><code>infinigen_kr_20260629</code></th><th><code>infinigen_apartment_20260811</code></th></tr></thead><tbody>
+<tr><td>wall material 경향</td><td>bedroom·dining·hallway·kitchen·living room이 주로 <code>shader_plaster.*</code></td><td>plaster 외에 marble hex tile, ceramic rectangle tile, cobblestone square tile, wood hex tile이 확인됨</td></tr>
+<tr><td>asset/import 계약</td><td>wall source가 주로 <code>.obj</code></td><td>wall source가 <code>kr_20260811_apartment/*.wall.glb</code>이며 GLB PBR texture가 scene-local cache로 연결됨</td></tr>
+<tr><td>직접 원인</td><td colspan="2">2026-08-11 외부 Infinigen 설치본에 적용한 <code>wall</code>/<code>wall_accent</code> palette 패치. 6월 29일 <code>8cdeec2</code>의 PBR bake·렌더 소비 변경은 이 재질 정보를 texture로 전달하는 기반 작업이다.</td></tr>
+</tbody></table>
+<p><a href="report_2026-08-18_infinigen_dataset_thumbnails.html">전체 Infinigen 렌더 thumbnail 보고서 열기</a> · <a href="../scripts/infinigen_gen.py#L37">wall palette 패치 기록 보기</a></p>
+
+<h2>1-D. 공유 OpticalNav 데이터셋 통계</h2>
+<p>집계 기준은 각 scene의 최신 성공 export다. <strong>렌더 이미지</strong>는 export의 sensor index에 기록된 RGB 관측 수로, base와 optical-perturbation 조건을 모두 포함한다. <strong>렌더된 viewpoint</strong>는 12개 heading을 가진 실제 render pair에 포함된 viewpoint 수다.</p>
+<table><thead><tr><th>scene</th><th>graph viewpoint</th><th>렌더된 viewpoint</th><th>렌더 이미지</th><th>에피소드</th><th>성공 export</th></tr></thead><tbody>
+<tr><td><code>infinigen_kr_20260625</code></td><td>113</td><td>113</td><td>2,712<br><span class="meta">1,356 view-heading × base/perturbed</span></td><td>1,378<br><span class="meta">train 375 · val_seen 73 · val_unseen 930</span></td><td><code>2026-07-16</code></td></tr>
+<tr><td><code>infinigen_kr_20260629</code></td><td>117</td><td>117</td><td>2,808<br><span class="meta">1,404 view-heading × base/perturbed</span></td><td>475<br><span class="meta">train 300 · val_seen 88 · val_unseen 87</span></td><td><code>2026-08-14</code></td></tr>
+<tr><td><code>infinigen_apartment_20260811</code></td><td>172</td><td>168</td><td>4,032<br><span class="meta">2,016 view-heading × base/perturbed</span></td><td>475<br><span class="meta">train 300 · val_seen 88 · val_unseen 87</span></td><td><code>2026-08-18</code><br><span class="meta">direct export complete</span></td></tr>
+<tr><th>합계</th><th>402</th><th>398</th><th>9,552</th><th>2,328</th><th>—</th></tr>
+</tbody></table>
+<p class="meta">Apartment graph의 <code>vp_000012</code>, <code>vp_000036</code>, <code>vp_000090</code>, <code>vp_000145</code> 네 node는 graph에는 있으나 최신 export의 render pair에는 포함되지 않아 graph viewpoint와 렌더된 viewpoint 수가 4개 차이 난다. 12 heading sweep을 기준으로 한 view-heading 총계는 4,776개다.</p>
+
+<h2>2. Render daemon 및 멀티 GPU 운영</h2>
+<p>관련 커밋: <code>f31a03f</code> · <em>feat(renderer): OpticalNav daemon 다중 GPU 렌더와 UI 상태를 강화한다</em></p>
+<ul>
+<li>daemon의 batch summary, GPU sharding, resume 동작을 보강했다.</li>
+<li>flash/spectral 처리와 spatial PBR 렌더 경로를 확장했다.</li>
+<li><code>navigation_dataset</code> exporter가 새 render 상태와 modality를 전달하도록 갱신했다.</li>
+<li>Web UI의 dataset 화면, batch helper, render service, rail sensor/scene 탭에서 큐·배치·센서 상태를 표시하도록 조정했다.</li>
+<li>OptiX 7 queue launcher와 kitchen multimodal/unified harness를 새 상태 계약에 맞췄다.</li>
+<li>batch summary, sharding, spectral flash, spatial PBR, versioned artifact 회귀 테스트를 추가·갱신했다.</li>
+</ul>
+<p>장시간 viewpoint × heading 렌더에서 작업 분할과 재개 상태를 추적할 수 있고, RGB 외 modality를 UI와 export 단계에서 유지할 수 있는 구조가 되었다.</p>
+
+<h2>3. OpticalNav 산출물 정리 기준</h2>
+<p>관련 문서: <a href="../docs/out_cleanup_inventory_2026-08-18.md">out_cleanup_inventory_2026-08-18.md</a></p>
+<ul>
+<li><code>out/</code>을 OpticalNav 핵심 데이터, Infinigen import/staging, 렌더·export 결과, 실험·cache·scratch로 분류했다.</li>
+<li><code>dataset.json</code>, <code>scenes</code>, <code>episodes</code>, <code>splits</code>, <code>exports</code>, <code>render_ledger.sqlite3</code>를 핵심 보존 대상으로 식별했다.</li>
+<li><code>authoring_map → import</code>, <code>scene → authoring_map</code>, <code>dataset.json → scene</code>, <code>export manifest → source</code>, <code>ledger → batch</code> 역참조를 삭제 전 검증 계약으로 정의했다.</li>
+<li><code>.retired</code>, <code>.backup</code>, <code>.staging</code>, debug/smoke, 재생성 가능한 cache는 참조와 실행 상태 확인 후 archive/delete 후보로 분류했다.</li>
+<li>OBJ/MTL/GLB는 확장자만으로 삭제하지 않고 fallback 참조와 재현성 계약을 먼저 확인하도록 했다.</li>
+</ul>
+<p class="meta">이번 조사는 삭제를 수행하지 않은 읽기 전용 inventory다.</p>
+
+<h2>4. 기간 중 연관 작업</h2>
+<p><code>7ddb6bc</code>와 <code>2e39ad3</code>의 IR/Principled RGB-Active-NIR 파이프라인은 OpticalNav scene·import·camera pose·material pipeline을 재사용하는 인접 작업이다. 주된 목적은 IR이므로 핵심 기능 목록과 분리했지만, OpticalNav 장면 자산과 렌더 인프라의 품질·재사용성에 영향을 주는 기반 작업으로 기록한다.</p>
+
+<h2>5. 현재 상태</h2>
+<table><thead><tr><th>상태</th><th>내용</th></tr></thead><tbody>
+<tr><td class="done">커밋 완료</td><td>Modern Office 생성 규칙 및 wizard, graph/scene metadata 연동과 audit, daemon batch/sharding/resume 및 modality 상태 강화, Web UI/exporter/launcher/test 갱신</td></tr>
+<tr><td class="done">조사 완료</td><td><code>out/</code> OpticalNav 산출물 inventory 및 보존 기준</td></tr>
+<tr><td class="pending">미커밋</td><td>OpticalNav wizard/exporter, Web UI export 화면, daemon, compact bundle/custom JSON exporter, structural PBR 품질 검사 및 관련 테스트 수정</td></tr>
+</tbody></table>
+
+<h2>6. 다음 단계</h2>
+<ol>
+<li>미커밋 wizard/exporter와 daemon 변경을 테스트하고 의도별 커밋으로 분리한다.</li>
+<li>Modern Office 샘플을 생성해 floorplan seed, room program, structural-glass audit, graph 결과를 확인한다.</li>
+<li>다중 GPU queue에서 shard 재개와 batch summary가 job ledger 및 export manifest와 일치하는지 검증한다.</li>
+<li><code>out/</code> 정리는 역참조 목록과 active lock/process를 만든 뒤 archive 후보부터 이동식 보관 방식으로 처리한다.</li>
+<li>OpticalNav export의 이미지·graph·grid·episode·metadata 버전 계약을 문서화한다.</li>
+</ol>
+
+<h2>근거 및 한계</h2>
+<ul>
+<li>저장소 커밋 이력에서 기간 내 OpticalNav 직접 변경은 주로 <code>37cd36d</code>, <code>f31a03f</code>로 확인된다.</li>
+<li>작업공간의 Codex 세션 원문은 현재 실행 환경에서 직접 열람할 수 없어, 대화 맥락과 저장소 변경 이력을 기준으로 작성했다.</li>
+<li>전체 테스트 실행이나 GPU 렌더 재실행은 수행하지 않았으므로, 구현 완료와 실제 렌더 검증 완료를 구분한다.</li>
+</ul>
+<p class="meta">원본 Markdown: <a href="report_2026-08-11_2026-08-18_optical_navigation.md">report_2026-08-11_2026-08-18_optical_navigation.md</a></p>
+</main></body>
+</html>

@@ -91,7 +91,11 @@ parameters, geometry data, IDs, and validity masks use modality-first
 directories documented by `artifact_contract.json`. Light-group flash images
 are emitted only with `--qc-components`.
 
-## RGB/NIR diffuse shading
+## Legacy v2 RGB/NIR diffuse diagnostic
+
+This section documents the historical v2 output only. Existing datasets remain
+immutable and viewers label these artifacts as legacy semantics. New renders
+use the v3 transport contract in [ir_principled_dataset_v3.md](ir_principled_dataset_v3.md).
 
 Both existing renders also enable Cycles `Diffuse Direct`, `Diffuse Indirect`,
 and `Diffuse Color` passes. No third render is required. The dataset publishes:
