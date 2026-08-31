@@ -486,4 +486,34 @@
 	.translate-layout { display: flex; flex-direction: column; gap: var(--space-1, 4px); margin-top: var(--space-2, 8px); padding-top: var(--space-2, 8px); border-top: 1px solid var(--border-subtle, rgba(148,163,184,0.25)); }
 	.translate-layout-title { font-size: 12px; font-weight: 600; color: var(--muted-strong); }
 	.translate-layout-sub { font-size: 11px; color: var(--muted-strong); font-weight: 400; }
+
+	/* Keep every scene form control within the inspector column.  These rules
+	 * live with the component so they retain precedence over the older page
+	 * stylesheet when the rail is rendered as a snippet. */
+	.rail-tool-panel,
+	.rail-tool-panel :is(details, div, label, input, select, textarea, button, summary) {
+		min-width: 0;
+		max-width: 100%;
+	}
+	.geometry-grid {
+		display: grid;
+		grid-template-columns: repeat(2, minmax(0, 1fr));
+		gap: var(--space-2);
+	}
+	.action-row,
+	.emitter-bulk-row,
+	.env-radio-row,
+	.env-envmap-row {
+		flex-wrap: wrap;
+	}
+	.action-row .button,
+	.emitter-bulk-row .button {
+		max-width: 100%;
+		white-space: normal;
+	}
+
+	@media (max-width: 1080px) {
+		.geometry-grid,
+		.env-fields-grid { grid-template-columns: minmax(0, 1fr); }
+	}
 </style>

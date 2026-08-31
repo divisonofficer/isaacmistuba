@@ -124,6 +124,9 @@ export interface VisibleLayers {
 	hazards: boolean;
 	graphNodes: boolean;
 	graphEdges: boolean;
+	motionNodes: boolean;
+	motionEdges: boolean;
+	observationPlan: boolean;
 	usdBackground: boolean;
 }
 

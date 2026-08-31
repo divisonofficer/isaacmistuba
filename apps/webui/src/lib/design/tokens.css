@@ -58,11 +58,13 @@
   --space-20: 5rem;     /* 80 */
 
   /* Layout — shell measurements */
-  --layout-topbar-height:    4.25rem;  /* 68 — labeled status chip row, compact */
-  --layout-leftnav-width:    15.5rem;  /* 248 */
-  --layout-rightrail-width:  30rem;    /* 480 */
-  --layout-bottompanel-min:  16.25rem; /* 260 */
-  --layout-bottompanel-max:  20rem;    /* 320 */
+  /* The desktop control plane is intentionally dense: the canvas remains
+   * dominant while the inspector and monitor stay readable at 1440px+. */
+  --layout-topbar-height:    4rem;     /* 64 */
+  --layout-leftnav-width:    14rem;    /* 224 */
+  --layout-rightrail-width:  23rem;    /* 368 */
+  --layout-bottompanel-min:  17.25rem; /* 276 */
+  --layout-bottompanel-max:  22rem;    /* 352 */
   --layout-min-width:        1440px;
 
   /* Radius */

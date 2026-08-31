@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
+	import { Redo2, RefreshCw, Settings, Undo2 } from '@lucide/svelte';
 	import AssetThumb3D from '$lib/AssetThumb3D.svelte';
 	import MapEditor3D from '$lib/MapEditor3D.svelte';
 	import {
@@ -9,7 +10,7 @@
 	} from '$lib/opticalnavBuiltInAssets';
 	import { assetVM } from '$lib/datasets/vm/AssetVM.svelte';
 	import { sceneBottomSnippet, sceneRailSnippet } from '$lib/stores/scenePortals';
-	import { bottomPanelCollapsed, bottomPanelMode, toggleBottomPanel } from '$lib/stores/shell';
+	import { bottomPanelCollapsed, bottomPanelMode, setBottomPanelMode, toggleBottomPanel } from '$lib/stores/shell';
 	import {
 		cameraRigSensorTypeToLegacyModality,
 		legacySensorFromCameraRigSensor,
@@ -55,21 +56,20 @@
 	} from '$lib/datasets/batchHelpers';
 	import { subscribeJobStatus, type JobStatusMessage } from '$lib/stores/jobStatusWs';
 	import ExportPanel from '$lib/datasets/ExportPanel.svelte';
-	import SensorsPanel from '$lib/datasets/SensorsPanel.svelte';
 	import InspectorPanel from '$lib/datasets/InspectorPanel.svelte';
 	import AssetCatalog from '$lib/datasets/AssetCatalog.svelte';
-	import RailStatusTab from '$lib/datasets/RailStatusTab.svelte';
 	import RailExportTab from '$lib/datasets/RailExportTab.svelte';
 	import RailLightsTab from '$lib/datasets/RailLightsTab.svelte';
 	import RailPreviewTab from '$lib/datasets/RailPreviewTab.svelte';
 	import BottomPanel from '$lib/datasets/BottomPanel.svelte';
 	import RailSceneTab from '$lib/datasets/RailSceneTab.svelte';
-	import RailSensorsTab from '$lib/datasets/RailSensorsTab.svelte';
+	import SensorsInspector from '$lib/datasets/SensorsInspector.svelte';
 	import RailSyncInspectorTab from '$lib/datasets/RailSyncInspectorTab.svelte';
-	import RailPathsTab from '$lib/datasets/RailPathsTab.svelte';
+	import PathsInspector from '$lib/datasets/navigation/PathsInspector.svelte';
+	import EditorToolRail from '$lib/datasets/navigation/EditorToolRail.svelte';
+	import { resolveInspectorKind, type WorkspaceMode } from '$lib/datasets/workspaceMode';
 	import InitStatusDashboard from '$lib/datasets/InitStatusDashboard.svelte';
 	import RailSelectedTab from '$lib/datasets/RailSelectedTab.svelte';
-	import RailMaterialsTab from '$lib/datasets/RailMaterialsTab.svelte';
 	import MaterialInspector from '$lib/datasets/MaterialInspector.svelte';
 	import {
 		makeStarterAuthoringMap,
@@ -166,6 +166,7 @@
 		getOpticalNavMaterializationAudit,
 		getOpticalNavXmlSceneIndex,
 		getOpticalNavRoomShell,
+		getOpticalNavNavigationBlockerCandidates,
 		addOpticalNavGraphNode,
 		deleteOpticalNavGraphNode,
 		getOpticalNavWalkabilityOverlay,
@@ -360,7 +361,9 @@
 	let graphBatchIds = $state<string[]>([]); // all batch IDs submitted this session
 	let renderVersions = $state<any[]>([]);
 	let renderSensorProgress = $state<any[]>([]);
-	let renderVersionsLoading = $state(false);
+let renderVersionsLoading = $state(false);
+let renderCoverageRequest: Promise<void> | null = null;
+let renderCoverageUpdatedAt = 0;
 	let renderVersionGallery = $state<any>(null);
 	let renderVersionGalleryLoading = $state(false);
 	let renderVersionGalleryError = $state('');
@@ -548,7 +551,10 @@
 	});
 
 	$effect(() => {
-		if ((railTab === 'sync' || railTab === 'preview') && selectedProjectId && sceneId) {
+		// Render diagnostics stay available through the Scene inspector's Advanced
+		// disclosure. Refresh when that contextual workspace is visible rather than
+		// keeping a second rail-tab state in sync with the canvas mode.
+		if ((workspaceMode === 'map' || workspaceMode === 'objects' || workspaceMode === 'preview') && selectedProjectId && sceneId) {
 			refreshRenderSceneStats();
 		}
 	});
@@ -627,7 +633,7 @@
 	let minClearance = $state(0.1);
 	let showFootprint = $state(false);
 	// Single source of truth for map-click interaction. Only one mode at a time.
-	type PathsInteractionMode = 'select' | 'place_node' | 'paint_walkable' | 'paint_blocked' | 'paint_erase' | 'select_region' | 'add_edge' | 'inspect_edge' | 'remove_edge' | 'remove_node';
+	type PathsInteractionMode = 'select' | 'place_node' | 'paint_walkable' | 'paint_blocked' | 'paint_erase' | 'select_region' | 'add_edge' | 'inspect_edge' | 'remove_edge' | 'remove_node' | 'blueprint_pair';
 	let pathsMode = $state<PathsInteractionMode>('select');
 	// Derived flags consumed by the rest of the code (preserves call sites).
 	const addNodeMode = $derived(pathsMode === 'place_node');
@@ -639,6 +645,7 @@
 	);
 	const regionSelectMode = $derived(pathsMode === 'select_region');
 	const addEdgeMode = $derived(pathsMode === 'add_edge');
+	const blueprintPairMode = $derived(pathsMode === 'blueprint_pair');
 	const edgeInspectorMode = $derived(pathsMode === 'inspect_edge');
 	const removeEdgeMode = $derived(pathsMode === 'remove_edge');
 	const removeNodeMode = $derived(pathsMode === 'remove_node');
@@ -649,6 +656,12 @@
 	let removePassHeightM = $state(1.2);
 	let findingOverlapping = $state(false);
 	let removingNodes = $state(false);
+	// Review-first large low-obstacle scan.  A result never changes the map until
+	// the user explicitly selects candidates and presses the batch-delete button.
+	let navigationBlockerCandidates = $state<any[]>([]);
+	let selectedNavigationBlockerIds = $state<Set<string>>(new Set());
+	let navigationBlockersScanned = $state(false);
+	let navigationBlockersLoading = $state(false);
 	// Reset pending selections whenever the mode changes — avoids stale state.
 	$effect(() => {
 		pathsMode;
@@ -669,12 +682,17 @@
 	let traversableVersion = $state(0);
 	type PendingGraphEdit = {
 		client_op_id: string;
-		type: 'add_edge' | 'delete_edge';
+		type: 'add_edge' | 'delete_edge' | 'delete_node';
 		source?: string;
 		target?: string;
 		edge_id?: string;
+		node_id?: string;
+		certify_opening?: boolean;
 	};
 	let pendingGraphEdits = $state<PendingGraphEdit[]>([]);
+	let lockedGraphEdits = $state<PendingGraphEdit[]>([]);
+	let lockedNodePlacement = $state<[number, number] | null>(null);
+	let graphEditInvalidationConfirmed = $state(false);
 	let graphEditFlushTimer: ReturnType<typeof setTimeout> | null = null;
 	let graphEditIdleRefreshTimer: ReturnType<typeof setTimeout> | null = null;
 	let graphEditBatchSeq = 0;
@@ -779,24 +797,84 @@
 		const ops = pendingGraphEdits;
 		pendingGraphEdits = [];
 		const batchId = `batch_${Date.now()}_${graphEditBatchSeq++}`;
+		const confirmSupportInvalidation = graphEditInvalidationConfirmed;
 		try {
-			const res = await graphService.editGraph(selectedProjectId, sceneId, batchId, ops);
+			const res = await graphService.editGraph(
+				selectedProjectId, sceneId, batchId, ops, activeGraphScope, confirmSupportInvalidation,
+			);
+			// A pre-v4 daemon silently accepts these requests but writes them to
+			// viewpoint_graph.json. Do not report that as a successful place-graph
+			// edit: it leaves the visible v4 graph unchanged and is misleading.
+			if (activeGraphScope === 'navigation_place' && res?.graph_scope !== 'navigation_place') {
+				throw new Error('The running backend does not support Navigation Support v4 graph edits. Restart the control-plane daemon, then retry.');
+			}
 			reconcileGraphEditResults(res?.results ?? []);
+			if (res?.support_invalidated) markNavigationSupportInvalidated(res?.archived_support);
 			if (res?.edge_count != null) pushActivity('ok', 'graph:edit', `Graph edits saved (${res.edge_count} edges)`);
 			scheduleGraphIdleRefresh();
 		} catch (err) {
 			for (const op of ops) removePendingEdge(op.client_op_id);
-			pushActivity('error', 'graph:edit', errorMessage(err));
+			const payload = errorPayload(err) as any;
+			if (payload?.error === 'navigation_support_locked') {
+				lockedGraphEdits = [...lockedGraphEdits, ...ops];
+				supportEditConfirmOpen = true;
+				pushActivity('warn', 'graph:edit', 'Navigation Support is locked. Confirm the archive step to apply this topology edit.');
+			} else {
+				pushActivity('error', 'graph:edit', errorMessage(err));
+			}
 			scheduleGraphIdleRefresh();
+		} finally {
+			graphEditInvalidationConfirmed = false;
 		}
 	}
-	function enqueueGraphEdit(op: PendingGraphEdit) {
+	function enqueueGraphEditNow(op: PendingGraphEdit) {
 		pendingGraphEdits = [...pendingGraphEdits, op];
 		if (op.type === 'add_edge') optimisticAddEdge(op);
 		if (op.type === 'delete_edge' && op.edge_id && graphPayload) {
 			graphPayload = { ...graphPayload, edges: (graphPayload.edges ?? []).filter((e: any) => e.edge_id !== op.edge_id) };
 		}
 		scheduleGraphEditFlush();
+	}
+	function navigationSupportTopologyLocked(): boolean {
+		return activeGraphScope === 'navigation_place' && supportReady;
+	}
+	function enqueueGraphEdit(op: PendingGraphEdit) {
+		if (navigationSupportTopologyLocked()) {
+			lockedGraphEdits = [...lockedGraphEdits, op];
+			supportEditConfirmOpen = true;
+			return;
+		}
+		enqueueGraphEditNow(op);
+	}
+	function markNavigationSupportInvalidated(archivedSupport?: any) {
+		if (navigationSupport) {
+			navigationSupport = {
+				...navigationSupport,
+				support_graph: null,
+				observation_plan: null,
+				observation_expansions: { base_profile_digest: '', levels: [] },
+			};
+		}
+		supportAnalysis = null;
+		const archiveRef = String(archivedSupport?.archive_ref ?? '');
+		pushActivity('info', 'navigation:support-archived', archiveRef
+			? `Support plan archived at ${archiveRef}; review Blueprints and rebuild support before new episodes.`
+			: 'Support plan invalidated; review Blueprints and rebuild support before new episodes.');
+	}
+	function confirmSupportTopologyEdit() {
+		supportEditConfirmOpen = false;
+		graphEditInvalidationConfirmed = true;
+		const node = lockedNodePlacement;
+		lockedNodePlacement = null;
+		const ops = lockedGraphEdits;
+		lockedGraphEdits = [];
+		if (node) void handleAddNodeAtFloor(node[0], node[1], true);
+		for (const op of ops) enqueueGraphEditNow(op);
+	}
+	function cancelSupportTopologyEdit() {
+		supportEditConfirmOpen = false;
+		lockedNodePlacement = null;
+		lockedGraphEdits = [];
 	}
 	async function refreshTraversableMeta() {
 		if (!selectedProjectId || !sceneId) { traversableMeta = null; return; }
@@ -806,10 +884,32 @@
 		} catch (err) { traversableMeta = null; }
 	}
 	$effect(() => {
-		if (pageMode === 'paths' && showTraversableMask) refreshTraversableMeta();
+		if (workspaceMode === 'paths' && showTraversableMask) refreshTraversableMeta();
 	});
 	let edgeInspectorSource = $state('');
 	let edgeCheckResult = $state<any>(null);
+	let edgeCheckPending = $state(false);
+	const edgeCheckFlights = new Map<string, Promise<any>>();
+	let activeEdgeCheckKey = '';
+	async function checkGraphEdge(source: string, target: string, maxEdgeLengthM: number) {
+		if (!selectedProjectId || !sceneId) throw new Error('Select a project and scene first.');
+		const key = [selectedProjectId, sceneId, activeGraphScope, source, target, Number(robotRadius), maxEdgeLengthM].join('|');
+		activeEdgeCheckKey = key;
+		edgeCheckPending = true;
+		let request = edgeCheckFlights.get(key);
+		if (!request) {
+			request = graphService.checkEdge(selectedProjectId, sceneId, source, target, {
+				robotRadiusM: Number(robotRadius), maxEdgeLengthM,
+			}, activeGraphScope);
+			edgeCheckFlights.set(key, request);
+		}
+		try {
+			return await request;
+		} finally {
+			if (edgeCheckFlights.get(key) === request) edgeCheckFlights.delete(key);
+			if (activeEdgeCheckKey === key) edgeCheckPending = false;
+		}
+	}
 	function handleInspectorFirstNode(nid: string) {
 		edgeInspectorSource = nid;
 		edgeCheckResult = null;
@@ -818,24 +918,52 @@
 	async function handleInspectorSecondNode(source: string, target: string) {
 		edgeInspectorSource = '';
 		try {
-			edgeCheckResult = await graphService.checkEdge(selectedProjectId, sceneId, source, target, {
-				robotRadiusM: Number(robotRadius),
-				maxEdgeLengthM: Number(maxEdgeLength),
-			});
+			edgeCheckResult = await checkGraphEdge(
+				source, target, activeGraphScope === 'navigation_place' ? 8 : Number(maxEdgeLength),
+			);
 		} catch (err) {
 			pushActivity('error', 'edge:inspect', errorMessage(err));
 		}
+	}
+
+	async function inspectPlaceRepairGuide(guide: any) {
+		if (!selectedProjectId || !sceneId) return;
+		const source = String(guide?.main_node_id ?? '');
+		const target = String(guide?.detached_node_id ?? '');
+		const guideId = String(guide?.guide_id ?? '');
+		if (!source || !target || !guideId) return;
+		activePlaceRepairGuideId = guideId;
+		selectedSensorNodeId = target;
+		mapEditorRef?.focusOnRepairGuide?.(guideId);
+		pushActivity('info', 'place:repair-guide', `Inspecting ${source} ↔ ${target}; this amber line is not an edge until certified.`);
+		await handleInspectorSecondNode(source, target);
 	}
 	async function addEdgeAnyway() {
 		if (!edgeCheckResult?.source || !edgeCheckResult?.target) return;
 		const source = edgeCheckResult.source;
 		const target = edgeCheckResult.target;
+		if (!edgeCheckResult.would_connect) {
+			pushActivity('error', 'edge:inspect', `Not added: ${edgeCheckResult.reason ?? 'the segment is not certified safe'}`);
+			return;
+		}
 		enqueueGraphEdit({ client_op_id: nextGraphClientOpId(), type: 'add_edge', source, target });
-		pushActivity('info', 'edge:inspect', `Queued edge: ${source} ↔ ${target}`);
+		pushActivity('info', 'edge:inspect', activeGraphScope === 'navigation_place'
+			? `Queued direct place link: ${source} ↔ ${target}`
+			: `Queued edge: ${source} ↔ ${target}`);
+		edgeCheckResult = null;
+	}
+	function certifyVisibleOpening() {
+		if (!edgeCheckResult?.source || !edgeCheckResult?.target || !edgeCheckResult?.manual_opening_eligible) return;
+		const source = String(edgeCheckResult.source);
+		const target = String(edgeCheckResult.target);
+		const rawGap = Number(edgeCheckResult.raw_gap_m ?? 0).toFixed(2);
+		if (!window.confirm(`No automatic portal was found for ${source} ↔ ${target}.\n\nThe body-height wall test is clear and the raw floor gap is ${rawGap} m. Confirm this is a physically open, robot-passable threshold?\n\nThis will be saved as a user-certified portal and revalidated when Navigation Support is built.`)) return;
+		enqueueGraphEdit({ client_op_id: nextGraphClientOpId(), type: 'add_edge', source, target, certify_opening: true });
+		pushActivity('info', 'edge:certify-opening', `Queued user-certified opening: ${source} ↔ ${target}`);
 		edgeCheckResult = null;
 	}
 	// Note: mutual exclusion is now implicit because pathsMode is a single-select radio.
-	let headingCount = $state(12);
+	let headingCount = $state(24);
 	let minNodeSpacing = $state(0.5);
 	let robotRadius = $state(0.25);
 	let kNeighbors = $state(8);
@@ -917,9 +1045,27 @@
 	let planResult = $state<any>(null);
 	let graphResult = $state<any>(null);
 	let buildingGraph = $state(false);
-	let graphBuildProgress = $state<{ stage: string; progress: number; status: string } | null>(null);
+	let graphBuildProgress = $state<graphService.BuildGraphProgress | null>(null);
+	// A build request owns one short-lived progress socket, but a browser
+	// refresh must also be able to reattach to the daemon's in-memory progress
+	// record.  Keep that recovery socket separate so it never cancels the
+	// request-owned subscription.
+	let graphBuildRecoverySocket: WebSocket | null = null;
+	let graphBuildRecoveryKey = '';
 	let graphRebuildConfirmOpen = $state(false);
+	let supportEditConfirmOpen = $state(false);
 	let graphPayload = $state<any>(null);
+	let adaptiveNavigation = $state<any>(null);
+	let navigationSupport = $state<any>(null);
+	let selectedSupportObservationLevel = $state('l0_action_required');
+	let supportExpansionPreparing = $state(false);
+	let activeMotionRouteId = $state('');
+	let activeBlueprintId = $state('');
+	let activePlaceRepairGuideId = $state('');
+	let placeNodeFeedback = $state<{ tone: 'info' | 'ok' | 'error'; message: string } | null>(null);
+	let supportAnalysis = $state<any>(null);
+	let blueprintStartAnchorId = $state('');
+	let blueprintGoalAnchorId = $state('');
 	let editor3DStatus = $state('');
 	// editorGeometryPayload, editorGeometryCatalogStatus, editorGeometryRefreshToken,
 	// selectedUsdAssetId, mapAssets, mapAssetStatus, usdCandidates,
@@ -975,53 +1121,22 @@
 		hazards: true,
 		graphNodes: true,
 		graphEdges: true,
+		motionNodes: true,
+		motionEdges: true,
+		observationPlan: true,
 		usdBackground: false
 	});
 
-	type PageMode = 'map' | 'objects' | 'paths' | 'sensors' | 'lights' | 'preview' | 'export';
-	let pageMode = $state<PageMode>('map');
-	type RailTab = 'selected' | 'scene' | 'paths' | 'sensors' | 'lights' | 'preview' | 'export' | 'status' | 'sync' | 'materials';
-	let railTab = $state<RailTab>('scene');
-	let lastRailSyncedPageMode: PageMode = 'map';
-	let lastRailSelectedId = '';
-	function activateRailTab(tab: RailTab) {
-		railTab = tab;
-		if (tab === 'paths') pageMode = 'paths';
-		else if (tab === 'sensors') pageMode = 'sensors';
-		else if (tab === 'lights') pageMode = 'lights';
-		else if (tab === 'preview') pageMode = 'preview';
-		else if (tab === 'export') pageMode = 'export';
-		else if (tab === 'selected' && pageMode !== 'map' && pageMode !== 'objects') pageMode = 'map';
-	}
-	$effect(() => {
-		if (pageMode === lastRailSyncedPageMode) return;
-		lastRailSyncedPageMode = pageMode;
-		if (pageMode === 'paths') railTab = 'paths';
-		else if (pageMode === 'sensors') railTab = 'sensors';
-		else if (pageMode === 'lights') railTab = 'lights';
-		else if (pageMode === 'preview') railTab = 'preview';
-		else if (pageMode === 'export') railTab = 'export';
-		else if (railTab === 'paths') railTab = selectedAuthoringItem ? 'selected' : 'scene';
-	});
-	$effect(() => {
-		const selectedId = selectedAuthoringItem?.id ?? '';
-		if (selectedId && selectedId !== lastRailSelectedId) {
-			lastRailSelectedId = selectedId;
-			railTab = 'selected';
-		} else if (!selectedId && lastRailSelectedId) {
-			lastRailSelectedId = '';
-			if (railTab === 'selected') railTab = 'scene';
-		}
-	});
+	let workspaceMode = $state<WorkspaceMode>('map');
 	// MapEditor3D expects the legacy mode names. Map new tab names back to the
 	// behaviour the 3D editor already implements.
 	const mapEditorMode = $derived(
-		pageMode === 'map' ? 'build'
-		: pageMode === 'objects' ? 'place'
-		: pageMode === 'sensors' ? 'sensor'
-		: pageMode === 'lights' ? 'sensor'  // lights re-use sensor pointer rules (no drag-to-place)
-		: pageMode === 'preview' ? 'sensor'
-		: pageMode
+		workspaceMode === 'map' ? 'build'
+		: workspaceMode === 'objects' ? 'place'
+		: workspaceMode === 'sensors' ? 'sensor'
+		: workspaceMode === 'lights' ? 'sensor'  // lights re-use sensor pointer rules (no drag-to-place)
+		: workspaceMode === 'preview' ? 'sensor'
+		: workspaceMode
 	);
 
 	type GhostGeom = { type: 'line'; x1: number; y1: number; x2: number; y2: number; valid: boolean }
@@ -1101,6 +1216,123 @@
 	const authoringRegions = $derived(authoringMap?.regions ?? []);
 	const graphNodes = $derived(graphPayload?.nodes ?? []);
 	const graphEdges = $derived(graphPayload?.edges ?? []);
+	// Keep the editing target stable when the optional navigation sidecar fetch
+	// races a scene refresh. A loaded v4 place_graph must never silently route a
+	// click into the invisible legacy viewpoint graph.
+	const activeGraphScope = $derived(
+		navigationSupport?.profile_id === 'adaptive_navigation_support_v4'
+			|| graphPayload?.profile_id === 'adaptive_navigation_support_v4'
+			|| graphPayload?.metadata?.profile_id === 'adaptive_navigation_support_v4'
+			? 'navigation_place' as const
+			: 'legacy' as const
+	);
+	// After a place-topology edit the former v4 support graph is intentionally
+	// non-executable, but its archived render pose graph must remain visible.
+	// Normalize the render-only ViewpointGraph node id to the Motion-layer
+	// contract used by MapEditor3D. It has no action edges by design.
+	const archivedMotionNodes = $derived(
+		(navigationSupport?.archived_render_plan?.render_graph?.nodes ?? []).map((node: any) => ({
+			...node,
+			motion_node_id: String(node?.motion_node_id ?? node?.node_id ?? ''),
+		})).filter((node: any) => Boolean(node.motion_node_id))
+	);
+	const motionNodes = $derived(
+		navigationSupport?.support_graph?.nodes
+			?? (archivedMotionNodes.length ? archivedMotionNodes : undefined)
+			?? adaptiveNavigation?.motion_graph?.nodes
+			?? []
+	);
+	const motionEdges = $derived(
+		navigationSupport?.support_graph?.edges
+			?? adaptiveNavigation?.motion_graph?.edges
+			?? []
+	);
+	const observationPlanPoses = $derived(
+		navigationSupport?.observation_plan?.poses
+			?? navigationSupport?.archived_render_plan?.observation_plan?.poses
+			?? adaptiveNavigation?.observation_plan?.poses
+			?? []
+	);
+	const adaptiveRouteCount = $derived(adaptiveNavigation?.motion_graph?.routes?.length ?? 0);
+	const supportBlueprints = $derived(navigationSupport?.route_blueprints?.blueprints ?? []);
+	const placeGraphNodes = $derived(navigationSupport?.place_graph?.nodes ?? []);
+	const placeRepairGuides = $derived(navigationSupport?.place_graph?.repair_guides ?? []);
+	const approvedBlueprints = $derived(supportBlueprints.filter((item: any) => item.status === 'approved'));
+	const supportRouteCount = $derived(navigationSupport?.support_graph?.blueprint_routes?.length ?? 0);
+	// A place-graph edit intentionally invalidates the live V4 support graph, but
+	// its render plan is preserved as a read-only archive.  Treat that archive as
+	// a campaign source after a page reload so the Sensors panel does not fall
+	// back to the unrelated legacy 12-heading graph count.
+	const archivedSupportOverlayReady = $derived(Boolean(
+		navigationSupport?.archived_render_plan?.observation_plan?.summary?.polar_observation_count
+	));
+	const supportReady = $derived(Boolean(navigationSupport?.support_graph && navigationSupport?.observation_plan));
+	const supportCampaignReady = $derived(supportReady || archivedSupportOverlayReady);
+	const supportObservationExpansionLevels = $derived(
+		Array.isArray(navigationSupport?.observation_expansions?.levels)
+			? navigationSupport.observation_expansions.levels
+			: [],
+	);
+	const selectedSupportObservationExpansion = $derived(
+		supportObservationExpansionLevels.find((item: any) => item.level_id === selectedSupportObservationLevel)
+			?? supportObservationExpansionLevels[0]
+			?? null,
+	);
+	const supportRenderPlanRef = $derived(
+		String(selectedSupportObservationExpansion?.plan_ref ?? 'support_observation_plan.json'),
+	);
+	const supportRenderViewCount = $derived(Number(
+		selectedSupportObservationExpansion?.summary?.coverage_polar_observation_count
+			?? selectedSupportObservationExpansion?.summary?.polar_observation_count
+			?? navigationSupport?.observation_plan?.summary?.polar_observation_count
+			?? navigationSupport?.archived_render_plan?.observation_plan?.summary?.polar_observation_count
+			?? 0,
+	));
+	const adaptiveCoverageMissing = $derived(adaptiveNavigation?.navigation_requests?.coverage?.missing_feature_ids ?? []);
+	const detachedMotionTerminals = $derived(
+		adaptiveNavigation?.generation_diagnostics?.detached_terminal_subgraphs
+		?? adaptiveNavigation?.motion_graph?.detached_terminal_subgraphs
+		?? []
+	);
+	const adaptiveCoverageStatus = $derived(
+		adaptiveNavigation?.navigation_requests?.coverage?.status
+		?? adaptiveNavigation?.generation_diagnostics?.coverage_status
+		?? 'complete'
+	);
+	const activeMotionRoute = $derived((adaptiveNavigation?.motion_graph?.routes ?? []).find((route: any) => route.request_id === activeMotionRouteId) ?? null);
+	const activeBlueprint = $derived((supportBlueprints ?? []).find((blueprint: any) => blueprint.blueprint_id === activeBlueprintId) ?? null);
+	const activeSupportRoute = $derived((navigationSupport?.support_graph?.blueprint_routes ?? []).find((route: any) => route.blueprint_id === activeBlueprintId) ?? null);
+	const activePlaceNodeIds = $derived(activeBlueprint?.place_path_node_ids ?? []);
+	const activePlaceEdgeIds = $derived(activeBlueprint?.place_path_edge_ids ?? []);
+	const blueprintGraphRoutes = $derived(
+		supportBlueprints.filter((blueprint: any) => blueprint.status !== 'rejected')
+	);
+	const activeMotionNodeIds = $derived(activeSupportRoute?.motion_pose_ids ?? activeMotionRoute?.primary?.motion_node_ids ?? []);
+	const activeMotionEdgeIds = $derived(activeSupportRoute?.motion_edge_ids ?? activeMotionRoute?.primary?.motion_edge_ids ?? []);
+	$effect(() => {
+		const ids = (adaptiveNavigation?.motion_graph?.routes ?? []).map((route: any) => String(route.request_id));
+		if (ids.length && !ids.includes(activeMotionRouteId)) activeMotionRouteId = ids[0];
+		if (!ids.length && activeMotionRouteId) activeMotionRouteId = '';
+	});
+	$effect(() => {
+		const ids = placeGraphNodes.map((node: any) => String(node.node_id));
+		if (ids.length && !ids.includes(blueprintStartAnchorId)) blueprintStartAnchorId = ids[0];
+		if (ids.length && (!ids.includes(blueprintGoalAnchorId) || blueprintGoalAnchorId === blueprintStartAnchorId)) {
+			blueprintGoalAnchorId = ids.find((id: string) => id !== blueprintStartAnchorId) ?? ids[0];
+		}
+	});
+	$effect(() => {
+		// A review Blueprint is selectable before Stage 3; do not wait for a
+		// support route to exist before exposing its sparse place path on the map.
+		const ids = (supportBlueprints ?? []).map((blueprint: any) => String(blueprint.blueprint_id));
+		if (ids.length && !ids.includes(activeBlueprintId)) activeBlueprintId = ids[0];
+		if (!ids.length && activeBlueprintId) activeBlueprintId = '';
+	});
+	$effect(() => {
+		const ids = placeRepairGuides.map((guide: any) => String(guide.guide_id));
+		if (ids.length && !ids.includes(activePlaceRepairGuideId)) activePlaceRepairGuideId = ids[0];
+		if (!ids.length && activePlaceRepairGuideId) activePlaceRepairGuideId = '';
+	});
 	const selectedSensorNode = $derived(
 		graphNodes.find((n: any) => n.node_id === selectedSensorNodeId)
 		?? (customSensorNodes.find(n => n.id === selectedSensorNodeId)
@@ -1241,24 +1473,39 @@
 	const filteredEpisodes = $derived(
 		episodeSearch.trim() ? episodes.filter((ep: any) => ep.episode_id?.includes(episodeSearch)) : episodes
 	);
+	function episodePathCoords(episode: any): [number, number][] {
+		if (!episode) return [];
+		const isRouteMotion = (episode.navigation_mode ?? '') === 'adaptive_route_motion_v3'
+			|| episode.metadata?.motion_profile === 'adaptive_route_motion_v3';
+		// v3 path_nodes contains motion_pose_* IDs, not editable legacy
+		// viewpoint_graph IDs. Its serialized trajectory is therefore the stable
+		// map source and remains valid even if the sidecar is later rebuilt.
+		const trajectory = Array.isArray(episode.trajectory) ? episode.trajectory : [];
+		const trajectoryCoords = trajectory.flatMap((pose: unknown) => {
+			if (!Array.isArray(pose) || pose.length < 2) return [];
+			const x = Number(pose[0]);
+			const z = Number(pose[1]);
+			return Number.isFinite(x) && Number.isFinite(z) ? [[x, z] as [number, number]] : [];
+		});
+		const dedupe = (coords: [number, number][]) => coords.filter(
+			(point, index) => index === 0 || Math.hypot(point[0] - coords[index - 1][0], point[1] - coords[index - 1][1]) > 1e-7
+		);
+		if (isRouteMotion && trajectoryCoords.length) return dedupe(trajectoryCoords);
+
+		const graphCoords = (episode.path_nodes ?? []).flatMap((id: unknown) => {
+			const node = graphNodes.find((item: any) => item.node_id === id);
+			return node?.position ? [[Number(node.position[0]), Number(node.position[1])] as [number, number]] : [];
+		});
+		return graphCoords.length ? dedupe(graphCoords) : dedupe(trajectoryCoords);
+	}
 	const selectedEpisodePath = $derived.by(() => {
-		if (!selectedEpisode?.path_nodes?.length) return null;
-		const coords: [number, number][] = [];
-		for (const id of selectedEpisode.path_nodes) {
-			const n = graphNodes.find((node: any) => node.node_id === id);
-			if (n?.position) coords.push([n.position[0], n.position[1]]);
-		}
+		const coords = episodePathCoords(selectedEpisode);
 		return coords.length >= 2 ? coords : null;
 	});
 	const allEpisodePaths = $derived.by((): { coords: [number, number][]; hasHazard: boolean }[] => {
-		if (!graphNodes.length || !episodes.length) return [];
+		if (!episodes.length) return [];
 		return episodes.flatMap((ep: any) => {
-			if (!ep.path_nodes?.length) return [];
-			const coords: [number, number][] = [];
-			for (const id of ep.path_nodes) {
-				const n = graphNodes.find((node: any) => node.node_id === id);
-				if (n?.position) coords.push([n.position[0], n.position[1]]);
-			}
+			const coords = episodePathCoords(ep);
 			if (coords.length < 2) return [];
 			return [{ coords, hasHazard: Boolean(ep.hazard_collision) }];
 		});
@@ -1266,6 +1513,7 @@
 	const selectedAuthoringItem = $derived(
 		[...authoringObjects, ...authoringRegions].find((item: any) => item.id === selectedAuthoringId) ?? null
 	);
+	const inspectorKind = $derived(resolveInspectorKind(workspaceMode, Boolean(selectedAuthoringItem)));
 	const selectedAuthoringKind = $derived(
 		authoringObjects.some((item: any) => item.id === selectedAuthoringId)
 			? 'object'
@@ -2628,7 +2876,7 @@
 		selectedSensorNodeId = id;
 		sensorRenderResult = null;
 		placingSensor = false;
-		if (pageMode !== 'sensors') setPageMode('sensors');
+		if (workspaceMode !== 'sensors') setWorkspaceMode('sensors');
 		const ok = mapEditorRef?.focusOnNode?.(id);
 		if (!ok) sensorFindError = 'Viewer not ready yet — try again in a moment.';
 	}
@@ -2637,7 +2885,7 @@
 	function handleGroundPointerDown(point: { x: number; y: number }, shiftKey = false, placement: { base_height_m?: number; snap_label?: string } = {}) {
 		contextMenu = null;
 		const baseHeightM = surfaceSnapEnabled ? Number(placement?.base_height_m ?? 0) : 0;
-		if (pageMode === 'sensors' && placingSensor) {
+		if (workspaceMode === 'sensors' && placingSensor) {
 			const id = `custom_${Date.now()}`;
 			customSensorNodes = [...customSensorNodes, { id, x: point.x, z: point.y, headingDeg: 0 }];
 			selectedSensorNodeId = id;
@@ -2796,9 +3044,7 @@
 		activeHotCameraId = previewId;
 		probeError = '';
 		probeResult = null;
-		pageMode = 'preview';
-		lastRailSelectedId = selectedAuthoringItem?.id ?? lastRailSelectedId;
-		railTab = 'preview';
+		workspaceMode = 'preview';
 		pushActivity('info', 'preview:hot-camera', `${opts.source ?? 'Hot camera'} placed at x=${nextPose.x.toFixed(2)} z=${nextPose.z.toFixed(2)} yaw=${nextPose.yaw_deg.toFixed(1)}.`);
 		return nextPose;
 	}
@@ -2901,7 +3147,7 @@
 
 	async function enterSimulateMode() {
 		// Sim mode merged into 'preview' tab; only robot animation kept.
-		pageMode = 'preview';
+		workspaceMode = 'preview';
 		placementTool = 'select';
 		draftPoint = null;
 		linePreview = null;
@@ -2918,9 +3164,9 @@
 		}
 	}
 
-	function leaveSimulateMode(mode: PageMode) {
+	function leaveSimulateMode(mode: WorkspaceMode) {
 		stopRobotAnimation();
-		pageMode = mode;
+		workspaceMode = mode;
 	}
 
 	function handleContextMenu(event: MouseEvent, id: string, type: 'object' | 'region') {
@@ -2980,10 +3226,10 @@
 	// readinessState() → workflowHelpers.ts (computeWorkflowReadiness)
 	// currentReadiness $derived is declared above near line 881
 
-	const tabToMode: Record<string, PageMode> = { scene: 'map', plan: 'paths', render: 'sensors', review: 'export' };
+	const tabToMode: Record<string, WorkspaceMode> = { scene: 'map', plan: 'paths', render: 'sensors', review: 'export' };
 	async function runPrimaryAction() {
 		const readiness = currentReadiness;
-		pageMode = tabToMode[readiness.tab] ?? 'map';
+		workspaceMode = tabToMode[readiness.tab] ?? 'map';
 		if (readiness.kind === 'create_project') return createProject();
 		if (readiness.kind === 'add_scene') return addScene();
 		if (readiness.kind === 'create_overlay') {
@@ -3104,6 +3350,10 @@
 				);
 				if (mapData && isCurrentSceneRequest(sceneRequest)) setAuthoringMapPayload(mapData, false);
 			}
+			// Stage-1/2/3 navigation sidecars are durable scene state, not a
+			// transient Paths-tab view. Restore them on every browser reload, and
+			// reattach to a running graph build before its place_graph is written.
+			resumeGraphBuildProgress(sceneRequest);
 			// Secondary loads — the editor already works at this point. These four
 			// fetches are independent (same projectId/sceneId inputs, no result chained
 			// into the next), so run them in parallel to cut the unblock chain from
@@ -3116,6 +3366,7 @@
 				loadRenderReadiness(),
 				loadWorkflowStatus(),
 				loadPerturbation(),
+				restorePersistedNavigation(sceneRequest),
 			]);
 			if (!isCurrentSceneRequest(sceneRequest)) return;
 			loadingStage = 'Loading render config…';
@@ -3129,10 +3380,12 @@
 	// switching either re-loads through the SAME full path (refreshProject) instead of
 	// the old narrow inline handlers that skipped assets/episodes/renderReadiness.
 	function _resetSceneScopedState() {
+		stopGraphBuildRecoverySubscription();
 		sceneStateText = ''; cameraSpecText = ''; renderConfig = null; syncResult = null;
 		renderReadiness = null; workflowStatus = null; renderConfigError = '';
 		episodes = []; episodeTotal = 0; episodeNextCursor = null; selectedEpisode = null; selectedEpisodeId = '';
-		graphPayload = null; observationScan = null;
+		graphPayload = null; adaptiveNavigation = null; navigationSupport = null; selectedSupportObservationLevel = 'l0_action_required'; supportExpansionPreparing = false; supportAnalysis = null; blueprintStartAnchorId = ''; blueprintGoalAnchorId = ''; observationScan = null;
+		navigationBlockerCandidates = []; selectedNavigationBlockerIds = new Set(); navigationBlockersScanned = false; navigationBlockersLoading = false;
 		graphBatch = null; graphBatchId = ''; graphBatchIds = [];
 		stopBatchPolling(); _showRoomShellUserTouched = false;
 		// Force refreshProject to reload the authoring map (it skips reload when truthy).
@@ -3144,7 +3397,7 @@
 		sceneId = id;
 		_resetSceneScopedState();
 		await refreshProject();
-		if (pageMode === 'sensors') scanObservations();
+		if (workspaceMode === 'sensors') scanObservations();
 	}
 
 	async function selectProject(id: string) {
@@ -3152,7 +3405,7 @@
 		selectedProjectId = id;
 		_resetSceneScopedState();
 		await refreshProject();
-		if (pageMode === 'sensors') scanObservations();
+		if (workspaceMode === 'sensors') scanObservations();
 	}
 
 	async function createProject() {
@@ -3635,7 +3888,9 @@
 	}
 
 	function requestBuildGraph() {
-		if (hasGraph) {
+		// Only a fully materialized v4 support build is locked. A sparse place
+		// graph with review-only blueprints remains freely editable.
+		if (supportReady) {
 			graphRebuildConfirmOpen = true;
 			return;
 		}
@@ -3644,38 +3899,296 @@
 
 	function confirmGraphRebuild() {
 		graphRebuildConfirmOpen = false;
-		void buildGraph();
+		void buildGraph(true);
 	}
 
 	function cancelGraphRebuild() {
 		graphRebuildConfirmOpen = false;
 	}
 
-	async function buildGraph() {
+	async function buildGraph(confirmSupportInvalidation = false) {
 		if (!requireReady(Boolean(selectedProjectId), 'Create or select a project first.')) return;
 		if (!requireReady(hasMap, 'Build the traversable grid before building a viewpoint graph.')) return;
 		buildingGraph = true;
 		graphBuildProgress = null;
-		const data = await run(
-			() => graphService.buildGraph(selectedProjectId, sceneId, {
-				maxNodes: Number(maxNodes), headingCount: Number(headingCount),
-				minNodeSpacingM: Number(minNodeSpacing), robotRadiusM: Number(robotRadius),
-				minClearanceM: Number(minClearance), kNeighbors: Number(kNeighbors),
-				maxEdgeLengthM: Number(maxEdgeLength), resolution: Number(resolution), seed: Number(seed),
-			}, (p) => { graphBuildProgress = p; }),
-			'Viewpoint graph built.',
-			'graph:build'
-		);
-		buildingGraph = false;
-		graphBuildProgress = null;
+		let data: any;
+		try {
+			data = await run(
+				() => graphService.buildNavigationSupportPlace(selectedProjectId, sceneId, {
+					maxNodes: Number(maxNodes), headingCount: Number(headingCount),
+					minNodeSpacingM: Number(minNodeSpacing), robotRadiusM: Number(robotRadius),
+					minClearanceM: Number(minClearance), kNeighbors: Number(kNeighbors),
+					maxEdgeLengthM: Number(maxEdgeLength), resolution: Number(resolution), seed: Number(seed),
+					confirmSupportInvalidation,
+				}, (progress) => graphBuildProgress = progress),
+				'Place Graph built. Review and approve Route Blueprints before building support lanes.',
+				'navigation:place-graph'
+			);
+		} finally {
+			buildingGraph = false;
+			graphBuildProgress = null;
+		}
 		if (data) graphResult = data;
-		await refreshProject();
+		if (data) {
+			const navigation = await run(
+				() => graphService.fetchAdaptiveNavigation(selectedProjectId, sceneId),
+				undefined,
+				'navigation:load',
+				{ resource: 'graph' }
+			);
+			if (navigation) {
+				if (navigation.profile_id === 'adaptive_navigation_support_v4') {
+					navigationSupport = navigation;
+					adaptiveNavigation = null;
+					graphPayload = navigation.place_graph;
+				} else {
+					adaptiveNavigation = navigation;
+					navigationSupport = null;
+					graphPayload = navigation.anchor_graph;
+				}
+			}
+		}
+	}
+
+	async function setBlueprintStatus(blueprintId: string, status: 'proposed' | 'approved' | 'rejected') {
+		if (!selectedProjectId) return;
+		const data = await run(
+			() => graphService.setNavigationSupportBlueprintStatus(selectedProjectId, sceneId, blueprintId, status),
+			`Blueprint ${status}.`,
+			'navigation:blueprint',
+		);
+		if (data?.route_blueprints && navigationSupport) {
+			navigationSupport = { ...navigationSupport, route_blueprints: data.route_blueprints, stage: 'blueprint_review' };
+			activeBlueprintId = blueprintId;
+			supportAnalysis = null;
+		}
+	}
+
+	async function approveAllProposedBlueprints() {
+		if (!selectedProjectId || !navigationSupport) return;
+		const count = (navigationSupport.route_blueprints?.blueprints ?? [])
+			.filter((item: any) => item.status === 'proposed').length;
+		if (!count) return;
+		if (!window.confirm(`Approve all ${count} proposed route blueprints?\n\nAnalyze Support will check the 2,000-pose / 8,000-view limits before any render is submitted.`)) return;
+		const data = await run(
+			() => graphService.setAllProposedNavigationSupportBlueprints(selectedProjectId, sceneId, 'approved'),
+			`${count} Route Blueprints approved.`,
+			'navigation:blueprint-bulk',
+		);
+		if (data?.route_blueprints && navigationSupport) {
+			navigationSupport = { ...navigationSupport, route_blueprints: data.route_blueprints, stage: 'blueprint_review' };
+			supportAnalysis = null;
+		}
+	}
+
+	async function resetApprovedBlueprints() {
+		if (!selectedProjectId || !navigationSupport) return;
+		const count = (navigationSupport.route_blueprints?.blueprints ?? [])
+			.filter((item: any) => item.status === 'approved').length;
+		if (!count) return;
+		if (!window.confirm(`Move all ${count} approved route blueprints back to Proposed?\n\nNo routes are deleted and explicitly rejected routes stay rejected. Approve only the corridors you want to materialize before building support.`)) return;
+		const data = await run(
+			() => graphService.resetApprovedNavigationSupportBlueprints(selectedProjectId, sceneId),
+			`${count} Route Blueprints returned to review.`,
+			'navigation:blueprint-reset',
+		);
+		if (data?.route_blueprints && navigationSupport) {
+			navigationSupport = { ...navigationSupport, route_blueprints: data.route_blueprints, stage: 'blueprint_review' };
+			activeBlueprintId = '';
+			supportAnalysis = null;
+		}
+	}
+
+	async function createManualBlueprint() {
+		if (!requireReady(Boolean(selectedProjectId), 'Create or select a project first.')) return;
+		if (!requireReady(Boolean(blueprintStartAnchorId && blueprintGoalAnchorId && blueprintStartAnchorId !== blueprintGoalAnchorId), 'Choose distinct start and goal places.')) return;
+		const data = await run(
+			() => graphService.createNavigationSupportBlueprint(
+				selectedProjectId, sceneId, blueprintStartAnchorId, blueprintGoalAnchorId, 'manual_route', false,
+			),
+			'Manual Route Blueprint added for review.',
+			'navigation:blueprint-create',
+		);
+		if (data?.route_blueprints && navigationSupport) {
+			navigationSupport = { ...navigationSupport, route_blueprints: data.route_blueprints, stage: 'blueprint_review' };
+			activeBlueprintId = String((data.route_blueprints.blueprints ?? []).at(-1)?.blueprint_id ?? activeBlueprintId);
+			supportAnalysis = null;
+		}
+	}
+
+	function handleBlueprintPairFirstNode(nodeId: string) {
+		blueprintStartAnchorId = nodeId;
+		blueprintGoalAnchorId = '';
+		pushActivity('info', 'navigation:blueprint-pick', `Manual blueprint start: ${nodeId}. Click a goal place node…`);
+	}
+
+	async function handleBlueprintPairSecondNode(source: string, target: string) {
+		if (source === target) return;
+		blueprintStartAnchorId = source;
+		blueprintGoalAnchorId = target;
+		// The map workflow is intentionally one gesture: the second click creates
+		// a proposed (never auto-approved) route blueprint, then returns the map
+		// to normal selection so a third click cannot accidentally add another.
+		pathsMode = 'select';
+		await createManualBlueprint();
+	}
+
+	async function deleteBlueprint(blueprintId: string) {
+		if (!selectedProjectId) return;
+		const data = await run(
+			() => graphService.removeNavigationSupportBlueprint(selectedProjectId, sceneId, blueprintId),
+			'Route Blueprint removed.',
+			'navigation:blueprint-delete',
+		);
+		if (data?.route_blueprints && navigationSupport) {
+			navigationSupport = { ...navigationSupport, route_blueprints: data.route_blueprints, stage: 'blueprint_review' };
+			supportAnalysis = null;
+		}
+	}
+
+	async function analyzeSupportGraph() {
+		if (!requireReady(Boolean(selectedProjectId), 'Create or select a project first.')) return;
+		if (!requireReady(approvedBlueprints.length > 0, 'Approve at least one Route Blueprint first.')) return;
+		buildingGraph = true;
+		graphBuildProgress = null;
+		try {
+			supportAnalysis = await run(
+				() => graphService.analyzeNavigationSupportGraph(selectedProjectId, sceneId, (progress) => graphBuildProgress = progress),
+				'Support analysis completed. Review the pose and polar-view estimate before build.',
+				'navigation:support-analyze',
+			);
+		} finally {
+			buildingGraph = false;
+			graphBuildProgress = null;
+		}
+	}
+
+	async function buildSupportGraph() {
+		if (!requireReady(Boolean(selectedProjectId), 'Create or select a project first.')) return;
+		if (!requireReady(approvedBlueprints.length > 0, 'Approve at least one Route Blueprint first.')) return;
+		buildingGraph = true;
+		graphBuildProgress = null;
+		let data: any;
+		try {
+			data = await run(
+				() => graphService.buildNavigationSupportGraph(selectedProjectId, sceneId, (progress) => graphBuildProgress = progress),
+				'Navigation Support built: certified 0.25 m lanes and native-heading render plan.',
+				'navigation:support-build',
+			);
+		} finally {
+			buildingGraph = false;
+			graphBuildProgress = null;
+		}
+		if (data) graphResult = data;
 		if (data) await loadGraph();
+	}
+
+	function applyPersistedNavigation(navigation: any): boolean {
+		if (!navigation) return false;
+		if (navigation.profile_id === 'adaptive_navigation_support_v4') {
+			navigationSupport = navigation;
+			adaptiveNavigation = null;
+			graphPayload = navigation.place_graph;
+			return true;
+		}
+		if (navigation.profile_id === 'adaptive_route_motion_v3') {
+			adaptiveNavigation = navigation;
+			navigationSupport = null;
+			graphPayload = navigation.anchor_graph;
+			const routeCount = Number(navigation?.motion_graph?.routes?.length ?? 0);
+			if (routeCount > 0 && Number(episodeCount) > routeCount) episodeCount = routeCount;
+			return true;
+		}
+		return false;
+	}
+
+	async function restorePersistedNavigation(request = captureSceneRequest()): Promise<boolean> {
+		if (!request.projectId || !request.sceneId) return false;
+		try {
+			const navigation = await graphService.fetchAdaptiveNavigation(request.projectId, request.sceneId);
+			if (!isCurrentSceneRequest(request)) return false;
+			return applyPersistedNavigation(navigation);
+		} catch {
+			// No staged sidecar is normal for a newly authored / legacy scene. Do
+			// not turn that expected 404 into an editor-wide refresh failure.
+			return false;
+		}
+	}
+
+	function stopGraphBuildRecoverySubscription() {
+		const socket = graphBuildRecoverySocket;
+		graphBuildRecoverySocket = null;
+		graphBuildRecoveryKey = '';
+		if (socket && socket.readyState < WebSocket.CLOSING) {
+			try { socket.close(); } catch {}
+		}
+	}
+
+	function resumeGraphBuildProgress(request = captureSceneRequest()) {
+		if (!request.projectId || !request.sceneId) return;
+		const key = `${request.projectId}/${request.sceneId}`;
+		if (graphBuildRecoveryKey === key && graphBuildRecoverySocket) return;
+		stopGraphBuildRecoverySubscription();
+		let socket: WebSocket;
+		try {
+			socket = new WebSocket(graphBuildProgressWsUrl(request.projectId, request.sceneId));
+		} catch {
+			return;
+		}
+		graphBuildRecoverySocket = socket;
+		graphBuildRecoveryKey = key;
+		socket.onmessage = (event) => {
+			if (graphBuildRecoveryKey !== key || !isCurrentSceneRequest(request)) return;
+			let state: graphService.BuildGraphProgress | null = null;
+			try { state = JSON.parse(event.data); } catch { return; }
+			if (!state) return;
+			if (state.status === 'building') {
+				buildingGraph = true;
+				graphBuildProgress = state;
+				return;
+			}
+			if (state.status === 'done') {
+				buildingGraph = false;
+				graphBuildProgress = null;
+				stopGraphBuildRecoverySubscription();
+				void restorePersistedNavigation(request);
+				return;
+			}
+			if (state.status === 'error') {
+				buildingGraph = false;
+				graphBuildProgress = state;
+				stopGraphBuildRecoverySubscription();
+				return;
+			}
+			// The daemon sends idle immediately when there is no running build.
+			buildingGraph = false;
+			graphBuildProgress = null;
+			stopGraphBuildRecoverySubscription();
+		};
+		socket.onerror = () => {};
+		socket.onclose = () => {
+			if (graphBuildRecoverySocket === socket) {
+				graphBuildRecoverySocket = null;
+				graphBuildRecoveryKey = '';
+			}
+		};
 	}
 
 	async function loadGraph() {
 		if (!requireReady(Boolean(selectedProjectId), 'Create or select a project first.')) return;
-		if (!requireReady(hasGraph, 'Build the viewpoint graph before loading graph JSON.')) return;
+		// v4 staged sidecars take precedence, then v3, then the editable graph.
+		try {
+			const navigation = await graphService.fetchAdaptiveNavigation(selectedProjectId, sceneId);
+			if (applyPersistedNavigation(navigation)) return;
+			else {
+				adaptiveNavigation = null;
+				navigationSupport = null;
+			}
+		} catch {
+			adaptiveNavigation = null;
+			navigationSupport = null;
+		}
+		if (!requireReady(hasGraph, 'Build Navigation Support or the legacy viewpoint graph before loading graph JSON.')) return;
 		const data = await run(() => graphService.fetchGraph(selectedProjectId, sceneId), undefined, 'graph:load', { resource: 'graph' });
 		if (data) graphPayload = data;
 	}
@@ -3785,6 +4298,7 @@
 
 	async function planGraphEpisodes() {
 		if (!requireReady(Boolean(selectedProjectId), 'Create or select a project first.')) return;
+		if (!requireReady(!adaptiveNavigation && !navigationSupport, 'A staged navigation plan is active for this scene. Generate its support episodes instead.')) return;
 		if (!requireReady(hasGraph, 'Build the viewpoint graph before planning graph episodes.')) return;
 		const splitObject = Object.fromEntries(
 			splits.split(',').map((part) => {
@@ -3813,6 +4327,65 @@
 			);
 		} finally {
 			clearInterval(poll);
+			episodePlanProgress = null;
+		}
+		if (data) planResult = data;
+		await refreshProject();
+	}
+
+	async function planAdaptiveRouteMotionEpisodes() {
+		if (!requireReady(Boolean(selectedProjectId), 'Create or select a project first.')) return;
+		if (!requireReady(Boolean(adaptiveNavigation), 'Build Route Motion before generating Route Motion episodes.')) return;
+		const requested = Number(episodeCount);
+		if (!requireReady(requested <= adaptiveRouteCount,
+			`This route plan has ${adaptiveRouteCount} distinct trajectories. Rebuild with more requests instead of duplicating episodes.`)) return;
+		const splitObject = Object.fromEntries(
+			splits.split(',').map((part) => {
+				const [name, value] = part.split(':');
+				return [name.trim(), Number(value)];
+			})
+		);
+		episodePlanProgress = { status: 'running', planned: 0, target: requested };
+		let data: any;
+		try {
+			data = await run(
+				() => episodeService.planAdaptiveRouteMotionEpisodes(selectedProjectId, {
+					sceneId, numPairs: requested, splits: splitObject,
+					modalities: selectedModalities, seed: Number(seed),
+					allowIncompleteCoverage: adaptiveCoverageStatus === 'partial',
+				}),
+				'Route Motion episodes planned.',
+				'episodes:plan-adaptive-route-motion'
+			);
+		} finally {
+			episodePlanProgress = null;
+		}
+		if (data) planResult = data;
+		await refreshProject();
+	}
+
+	async function planNavigationSupportEpisodes() {
+		if (!requireReady(Boolean(selectedProjectId), 'Create or select a project first.')) return;
+		if (!requireReady(supportReady, 'Build Navigation Support before generating executable episodes.')) return;
+		const splitObject = Object.fromEntries(
+			splits.split(',').map((part) => {
+				const [name, value] = part.split(':');
+				return [name.trim(), Number(value)];
+			})
+		);
+		episodePlanProgress = { status: 'running', planned: 0, target: Number(episodeCount) };
+		let data: any;
+		try {
+			data = await run(
+				() => episodeService.planNavigationSupportEpisodes(selectedProjectId, {
+					sceneId, numPairs: Number(episodeCount), splits: splitObject,
+					modalities: selectedModalities, seed: Number(seed),
+					minForwardActions: 4, maxForwardActions: 48,
+				}),
+				'Navigation Support episodes planned from pre-rendered action states.',
+				'episodes:plan-navigation-support',
+			);
+		} finally {
 			episodePlanProgress = null;
 		}
 		if (data) planResult = data;
@@ -3953,16 +4526,42 @@
 		}
 	}
 
-	async function handleAddNodeAtFloor(x: number, z: number) {
+	async function handleAddNodeAtFloor(x: number, z: number, confirmSupportInvalidation = false) {
 		if (!selectedProjectId || !sceneId) return;
+		if (navigationSupportTopologyLocked() && !confirmSupportInvalidation) {
+			lockedNodePlacement = [x, z];
+			supportEditConfirmOpen = true;
+			return;
+		}
+		placeNodeFeedback = { tone: 'info', message: `Checking place node at (${x.toFixed(2)}, ${z.toFixed(2)})…` };
 		try {
-			const data = await graphService.addGraphNode(selectedProjectId, sceneId, x, z, Number(headingCount));
+			const data = await graphService.addGraphNode(
+				selectedProjectId, sceneId, x, z, Number(headingCount), activeGraphScope, confirmSupportInvalidation,
+			);
+			if (activeGraphScope === 'navigation_place' && data?.profile_id !== 'adaptive_navigation_support_v4') {
+				throw new Error('The running backend wrote a legacy graph node instead of a v4 place node. Restart the control-plane daemon before editing this place graph.');
+			}
 			if (data?.node_id) {
+				if (data?.support_invalidated) markNavigationSupportInvalidated(data?.archived_support);
+				placeNodeFeedback = { tone: 'ok', message: `Added ${data.node_id} at (${x.toFixed(2)}, ${z.toFixed(2)}).` };
 				pushActivity('ok', 'graph:add-node', `Added ${data.node_id} at (${x.toFixed(2)}, ${z.toFixed(2)})`);
 				await loadGraph();
+			} else {
+				placeNodeFeedback = { tone: 'error', message: 'The backend returned no node id; the placement was not saved.' };
 			}
 		} catch (err) {
-			pushActivity('error', 'graph:add-node', errorMessage(err));
+			const payload = errorPayload(err) as any;
+			const result = Array.isArray(payload?.results) ? payload.results[0] : null;
+			const reason = String(result?.reason ?? result?.error ?? payload?.error ?? errorMessage(err));
+			const message = String(result?.message ?? (
+				reason === 'outside_safe_place_domain'
+					? 'That point is outside the 0.38 m robot-safe domain. Place the node on a green cell inside the room; a doorway midpoint is not an action pose.'
+					: reason === 'too_close_to_place_node'
+						? `Too close to ${result?.nearest_node_id ?? 'an existing place node'} (${Number(result?.nearest_distance_m ?? 0).toFixed(2)} m); use a point at least 0.15 m away.`
+						: errorMessage(err)
+			));
+			placeNodeFeedback = { tone: 'error', message };
+			pushActivity('error', 'graph:add-node', message);
 		}
 	}
 	async function refreshWalkabilityOverlay() {
@@ -3975,7 +4574,7 @@
 		}
 	}
 	$effect(() => {
-		if (pageMode === 'paths' && selectedProjectId && sceneId) refreshWalkabilityOverlay();
+		if (workspaceMode === 'paths' && selectedProjectId && sceneId) refreshWalkabilityOverlay();
 	});
 	async function handlePaintStroke(points: Array<[number, number]>) {
 		if (paintMode === 'none' || !selectedProjectId || !sceneId) return;
@@ -4020,11 +4619,34 @@
 		pendingEdgeSource = nodeId;
 		pushActivity('info', 'graph:add-edge', `First node: ${nodeId}. Click target node…`);
 	}
-	function handleEdgeSecondNode(source: string, target: string) {
+	async function handleEdgeSecondNode(source: string, target: string) {
 		if (!selectedProjectId || !sceneId) return;
-		enqueueGraphEdit({ client_op_id: nextGraphClientOpId(), type: 'add_edge', source, target });
-		pushActivity('info', 'graph:add-edge', `${source} → ${target} queued`);
 		pendingEdgeSource = '';
+		// Legacy graph editing retains its historical direct-save behaviour.  V4
+		// place links must be preflighted because a missing portal annotation can
+		// require a deliberate human confirmation rather than a blind 400 after
+		// the click pair has already been discarded.
+		if (activeGraphScope !== 'navigation_place') {
+			enqueueGraphEdit({ client_op_id: nextGraphClientOpId(), type: 'add_edge', source, target });
+			pushActivity('info', 'graph:add-edge', `${source} → ${target} queued`);
+			return;
+		}
+		try {
+			const check = await checkGraphEdge(source, target, 8);
+			if (check?.would_connect) {
+				enqueueGraphEdit({ client_op_id: nextGraphClientOpId(), type: 'add_edge', source, target });
+				pushActivity('info', 'graph:add-edge', `${source} → ${target} queued`);
+				return;
+			}
+			edgeCheckResult = check;
+			if (check?.manual_opening_eligible) {
+				certifyVisibleOpening();
+				return;
+			}
+			pushActivity('error', 'graph:add-edge', `Not added: ${check?.reason ?? 'the segment is not certified safe'}`);
+		} catch (err) {
+			pushActivity('error', 'graph:add-edge', errorMessage(err));
+		}
 	}
 	// Edge-erase mode: click the two endpoints of an existing edge to delete it
 	// (works for auto + manual edges, unlike the manual-edges list which only lists
@@ -4053,6 +4675,12 @@
 		if (!selectedSensorNode || (selectedSensorNode as any).isCustom) return;
 		if (!selectedProjectId || !sceneId) return;
 		const nid = selectedSensorNode.node_id;
+		if (activeGraphScope === 'navigation_place') {
+			enqueueGraphEdit({ client_op_id: nextGraphClientOpId(), type: 'delete_node', node_id: nid });
+			pushActivity('info', 'place-graph:delete-node', `Delete queued: ${nid}; blueprints will be regenerated.`);
+			selectedSensorNodeId = '';
+			return;
+		}
 		try {
 			await graphService.deleteGraphNode(selectedProjectId, sceneId, nid);
 			pushActivity('ok', 'graph:delete-node', `Deleted ${nid}`);
@@ -4106,11 +4734,76 @@
 			findingOverlapping = false;
 		}
 	}
+	async function scanNavigationBlockers() {
+		if (!selectedProjectId || !sceneId) return;
+		navigationBlockersLoading = true;
+		try {
+			const data = await getOpticalNavNavigationBlockerCandidates(selectedProjectId, sceneId, {
+				robotHeightM: Number(removePassHeightM) || 1.2,
+			});
+			navigationBlockerCandidates = Array.isArray(data?.candidates) ? data.candidates : [];
+			selectedNavigationBlockerIds = new Set();
+			navigationBlockersScanned = true;
+			pushActivity('info', 'navigation:blockers', `${navigationBlockerCandidates.length} large navigation-blocker candidate(s) found. Review before deletion.`);
+		} catch (err) {
+			pushActivity('error', 'navigation:blockers', errorMessage(err));
+		} finally {
+			navigationBlockersLoading = false;
+		}
+	}
+
+	function toggleNavigationBlocker(objectId: string, selected: boolean) {
+		const next = new Set(selectedNavigationBlockerIds);
+		if (selected) next.add(objectId); else next.delete(objectId);
+		selectedNavigationBlockerIds = next;
+	}
+
+	function setAllNavigationBlockers(selected: boolean) {
+		selectedNavigationBlockerIds = selected
+			? new Set(navigationBlockerCandidates.map((candidate) => String(candidate.object_id)).filter(Boolean))
+			: new Set();
+	}
+
+	async function removeSelectedNavigationBlockers() {
+		if (!authoringMap || selectedNavigationBlockerIds.size === 0) return;
+		const selectedIds = new Set(selectedNavigationBlockerIds);
+		const matchedIds = new Set(
+			navigationBlockerCandidates
+				.map((candidate) => String(candidate?.object_id ?? ''))
+				.filter((objectId) => selectedIds.has(objectId) && (authoringMap.objects ?? []).some((item: any) => item?.id === objectId)),
+		);
+		if (!matchedIds.size) {
+			pushActivity('warn', 'navigation:blockers', 'Selected candidates are no longer present in the authoring map. Scan again.');
+			return;
+		}
+		pushHistory();
+		setAuthoringMapPayload({
+			...authoringMap,
+			objects: (authoringMap.objects ?? []).filter((item: any) => !matchedIds.has(String(item?.id ?? ''))),
+		});
+		if (matchedIds.has(selectedAuthoringId)) selectedAuthoringId = '';
+		const saved = await saveAuthoringMap({ updateRenderReadiness: false, deferRenderSync: true });
+		if (!saved) {
+			selectedNavigationBlockerIds = matchedIds;
+			return;
+		}
+		navigationBlockerCandidates = navigationBlockerCandidates.filter((candidate) => !matchedIds.has(String(candidate?.object_id ?? '')));
+		selectedNavigationBlockerIds = new Set();
+		pushActivity('ok', 'navigation:blockers', `Removed ${matchedIds.size} selected large blocker(s). Sync Render Scene, then rebuild grid and Place Graph.`);
+	}
 	async function removeSelectedGraphNodes() {
 		if (!selectedProjectId || !sceneId || removeSelection.size === 0) return;
 		const ids = Array.from(removeSelection);
 		removingNodes = true;
 		try {
+			if (activeGraphScope === 'navigation_place') {
+				for (const nodeId of ids) {
+					enqueueGraphEdit({ client_op_id: nextGraphClientOpId(), type: 'delete_node', node_id: nodeId });
+				}
+				removeSelection = new Set();
+				pushActivity('info', 'place-graph:remove-nodes', `Queued removal of ${ids.length} place node(s); blueprints will be regenerated.`);
+				return;
+			}
 			const res = await graphService.deleteGraphNodes(selectedProjectId, sceneId, ids);
 			pushActivity('ok', 'graph:remove-nodes', `Removed ${res?.removed_count ?? ids.length} node(s)`);
 			removeSelection = new Set();
@@ -4181,6 +4874,10 @@
 		// batch grid, refreshBatch) treats this submission consistently.
 		if (modeOverride && modeOverride !== renderMode) renderMode = modeOverride;
 		if (!requireReady(Boolean(selectedProjectId), 'Create or select a project first.')) return;
+		if ((adaptiveNavigation || navigationSupport) && (renderMode === 'graph_sweep' || renderMode === 'episode_nodes' || renderMode === 'episodes')) {
+			requireReady(false, 'A staged navigation plan is active. Submit its certified observation plan instead of a legacy graph or episode render.');
+			return;
+		}
 		if (renderMode === 'graph_sweep' && !requireReady(hasGraph, 'Build the viewpoint graph before running Sensor Sweep.')) return;
 		if (renderMode === 'episode_nodes') {
 			if (!requireReady(hasGraph, 'Build the viewpoint graph before running Episode Path Sweep.')) return;
@@ -4242,20 +4939,135 @@
 		await refreshEpisodes();
 	}
 
-	async function refreshRenderCoverage() {
-		if (!selectedProjectId || !sceneId) { renderSensorProgress = []; return; }
+	async function submitAdaptiveRouteMotionRenderPlan() {
+		if (!requireReady(Boolean(selectedProjectId), 'Create or select a project first.')) return;
+		if (!requireReady(Boolean(adaptiveNavigation?.observation_plan), 'Build Route Motion before submitting its observation plan.')) return;
+		if (!requireReady(renderSceneSynced, 'Render readiness is blocked. Sync Render Scene and resolve readiness errors.')) return;
+		const profileDigest = String(adaptiveNavigation?.motion_graph?.validation?.digest ?? '');
+		if (!requireReady(Boolean(profileDigest), 'Route Motion validation digest is missing. Rebuild the route plan before rendering.')) return;
+		let camera_spec: unknown;
 		try {
-			const data = await renderService.fetchRenderCoverage(selectedProjectId, sceneId);
-			renderSensorProgress = Array.isArray(data?.sensor_progress) ? data.sensor_progress : [];
-		} catch {
-			renderSensorProgress = [];
+			camera_spec = optionalJson(cameraSpecText);
+		} catch (err) {
+			error = `Invalid render config JSON: ${errorMessage(err)}`;
+			return;
 		}
+		const body: Record<string, unknown> = {
+			observation_plan_ref: 'observation_plan.json',
+			profile_digest: profileDigest,
+			backend,
+			camera_height_m: rigMountHeightM,
+			render_settings: renderSettingsFromRigSensor(activeRigSensorOption?.sensor),
+		};
+		applySweepSensorScope(body, camera_spec, [activeRenderModality]);
+		if (Object.keys(graphNodeHeights).length) body.node_heights = { ...graphNodeHeights };
+		graphBatch = null;
+		graphBatchId = '';
+		graphBatchIds = [];
+		sweepSubmissionInFlight = true;
+		try {
+			const data = registerGraphSweepResult(await run(
+				() => renderService.submitRouteMotionRenderPlan(selectedProjectId, sceneId, body),
+				'Route Motion observation plan submitted.',
+				'navigation:render-plan',
+			));
+			if (data?.batch_id) startBatchPolling();
+		} finally {
+			sweepSubmissionInFlight = false;
+		}
+	}
+
+	async function prepareNavigationSupportObservationExpansion() {
+		if (!requireReady(Boolean(selectedProjectId), 'Create or select a project first.')) return;
+		if (!requireReady(supportReady, 'Build Navigation Support before preparing additional native headings.')) return;
+		const expansion = selectedSupportObservationExpansion;
+		if (!expansion || expansion.level_id === 'l0_action_required') return;
+		supportExpansionPreparing = true;
+		try {
+			const data = await run(
+				() => graphService.prepareNavigationSupportExpansion(selectedProjectId, sceneId, String(expansion.level_id)),
+				`${expansion.label ?? expansion.level_id} native context plan prepared.`,
+				'navigation:support-observation-expansion',
+			);
+			if (data?.observation_expansions && navigationSupport) {
+				navigationSupport = { ...navigationSupport, observation_expansions: data.observation_expansions };
+			}
+		} finally {
+			supportExpansionPreparing = false;
+		}
+	}
+
+	async function submitNavigationSupportRenderPlan() {
+		if (!requireReady(Boolean(selectedProjectId), 'Create or select a project first.')) return;
+		if (!requireReady(Boolean(navigationSupport?.observation_plan), 'Build Navigation Support before submitting its observation plan.')) return;
+		if (!requireReady(renderSceneSynced, 'Render readiness is blocked. Sync Render Scene and resolve readiness errors.')) return;
+		const expansion = selectedSupportObservationExpansion;
+		if (!requireReady(Boolean(expansion), 'Reload Navigation Support to choose an observation coverage level.')) return;
+		if (!requireReady(expansion.level_id === 'l0_action_required' || Boolean(expansion.current), 'Prepare this native-heading expansion before rendering it.')) return;
+		const profileDigest = String(navigationSupport?.support_graph?.validation?.digest ?? '');
+		if (!requireReady(Boolean(profileDigest), 'Navigation Support validation digest is missing. Rebuild support before rendering.')) return;
+		let camera_spec: unknown;
+		try {
+			camera_spec = optionalJson(cameraSpecText);
+		} catch (err) {
+			error = `Invalid render config JSON: ${errorMessage(err)}`;
+			return;
+		}
+		const body: Record<string, unknown> = {
+			observation_plan_ref: supportRenderPlanRef,
+			profile_digest: profileDigest,
+			backend,
+			camera_height_m: rigMountHeightM,
+			render_settings: renderSettingsFromRigSensor(activeRigSensorOption?.sensor),
+			skip_existing_observations: renderMissingOnly,
+			only_missing: renderMissingOnly,
+		};
+		applySweepSensorScope(body, camera_spec, [activeRenderModality]);
+		if (Object.keys(graphNodeHeights).length) body.node_heights = { ...graphNodeHeights };
+		graphBatch = null;
+		graphBatchId = '';
+		graphBatchIds = [];
+		sweepSubmissionInFlight = true;
+		try {
+			const data = registerGraphSweepResult(await run(
+				() => renderService.submitNavigationSupportRenderPlan(selectedProjectId, sceneId, body),
+				`${expansion.label ?? 'Navigation Support'} observation plan submitted.`,
+				'navigation:support-render-plan',
+			));
+			if (data?.batch_id) startBatchPolling();
+		} finally {
+			sweepSubmissionInFlight = false;
+		}
+	}
+
+	async function refreshRenderCoverage(force = false) {
+		if (!selectedProjectId || !sceneId) { renderSensorProgress = []; return; }
+		if (renderCoverageRequest) return renderCoverageRequest;
+		if (!force && Date.now() - renderCoverageUpdatedAt < 5_000) return;
+		const projectIdAtRequest = selectedProjectId;
+		const sceneIdAtRequest = sceneId;
+		renderCoverageRequest = (async () => {
+			try {
+				const data = await renderService.fetchRenderCoverage(projectIdAtRequest, sceneIdAtRequest);
+				// Scene switches can race a slow ledger summary.  Never let the
+				// old response overwrite the newly selected scene's monitor.
+				if (selectedProjectId === projectIdAtRequest && sceneId === sceneIdAtRequest) {
+					renderSensorProgress = Array.isArray(data?.sensor_progress) ? data.sensor_progress : [];
+					renderCoverageUpdatedAt = Date.now();
+				}
+			} catch {
+				if (selectedProjectId === projectIdAtRequest && sceneId === sceneIdAtRequest) renderSensorProgress = [];
+			} finally {
+				renderCoverageRequest = null;
+			}
+		})();
+		return renderCoverageRequest;
 	}
 
 	async function refreshRenderVersions() {
 		if (!selectedProjectId || !sceneId) { renderVersions = []; renderSensorProgress = []; return; }
 		renderVersionsLoading = true;
-		void refreshRenderCoverage();
+		void refreshRenderCoverage(true);
 		try {
 			const data = await renderService.fetchRenderVersions(selectedProjectId, sceneId);
 			renderVersions = Array.isArray(data?.versions)
@@ -4304,13 +5116,20 @@
 		await refreshRenderVersions();
 	}
 
-	async function openRenderVersionGallery(version: any) {
+	async function openRenderVersionGallery(version: any, options: {
+		limit?: number;
+		cursor?: string | null;
+		variant?: string | null;
+		sensorId?: string | null;
+		state?: string | null;
+		query?: string | null;
+	} = {}) {
 		if (!selectedProjectId || !sceneId || !version?.render_version_id || renderVersionGalleryLoading) return;
 		renderVersionGalleryLoading = true;
 		renderVersionGalleryError = '';
 		try {
 			renderVersionGallery = await renderService.fetchRenderVersionGallery(
-				selectedProjectId, sceneId, String(version.render_version_id),
+				selectedProjectId, sceneId, String(version.render_version_id), { limit: 24, ...options },
 			);
 		} catch (err) {
 			renderVersionGallery = null;
@@ -4642,7 +5461,7 @@
 	// `loading`), so data loads no longer disable the whole UI. Declared here (after
 	// all its $derived inputs) to stay clear of block-scoped use-before-declaration.
 	const caps = $derived(computeCapabilities({
-		selectedProjectId, hasScene, hasMap, hasGraph, hasEpisodes,
+		selectedProjectId, hasScene, hasMap, hasGraph, hasNavigationSupport: supportReady, hasEpisodes,
 		renderSceneSynced, renderConfigReady, validationPassed,
 		actionInFlight,
 		buildingMap, buildingGraph, rebuildingEdges, renderingViewpoint,
@@ -4659,6 +5478,86 @@
 		hotCameraPose: activeHotCameraPose,
 		failedJobCount: 0,
 	}));
+
+	// The page remains the owner of services and mutable editor state.  The
+	// contextual Paths inspector receives cohesive bags instead of a long flat
+	// prop list; extracting a page controller is intentionally a later change.
+	const navigationInspectorState = $derived.by(() => ({
+		caps, hasMap, hasGraph, hasScene, loading, buildingMap, buildingGraph,
+		graphBuildProgress, graphResult, adaptiveNavigation, navigationSupport,
+		supportAnalysis, supportReady, mapResult, graphPayload, graphPayloadSummary,
+		graphNodes, graphEdges, pathsMode, paintRadiusM, pendingEdgeSource,
+		edgeInspectorSource, pendingRegionBbox, walkabilityOverlayMeta, traversableMeta,
+		showTraversableMask, showFootprint, edgeCheckResult, edgeCheckPending,
+		robotRadius, minClearance, resolution, maxNodes, minNodeSpacing, headingCount,
+		selectedSensorNode, blueprintStartAnchorId, blueprintGoalAnchorId, activeBlueprintId,
+		rebuildingEdges, removeSelectionCount: removeSelection.size, removeMarginM,
+		removePassHeightM, findingOverlapping, removingNodes, navigationBlockerCandidates,
+		selectedNavigationBlockerIds, navigationBlockersScanned, navigationBlockersLoading,
+		placeNodeFeedback, placeRepairGuides, activePlaceRepairGuideId,
+		sweepSubmissionInFlight, renderSceneSynced,
+	}));
+	const navigationEpisodeState = $derived.by(() => ({
+		filteredEpisodes, episodes, episodeSearch, episodeCount, selectedEpisodeId,
+		splitCounts, episodePlanProgress, staleEpisodeReport, validatingEpisodes,
+		episodeNodesAvailable, episodePathNodeCount, selectedRigSensorCount: selectedRigSensorIds.length || 1,
+		renderMissingOnly, headingsPerNode: graphPayload?.node_heading_count ?? 0,
+		nextCursor: episodeNextCursor, total: episodeTotal,
+	}));
+	const navigationInspectorActions = {
+		onBuildMap: buildMap,
+		onRequestBuildGraph: requestBuildGraph,
+		onSetBlueprintStartAnchorId: (id: string) => (blueprintStartAnchorId = id),
+		onSetBlueprintGoalAnchorId: (id: string) => (blueprintGoalAnchorId = id),
+		onSelectBlueprint: (id: string) => (activeBlueprintId = id),
+		onCreateManualBlueprint: createManualBlueprint,
+		onSetBlueprintStatus: setBlueprintStatus,
+		onDeleteBlueprint: deleteBlueprint,
+		onAnalyzeSupportGraph: analyzeSupportGraph,
+		onBuildSupportGraph: buildSupportGraph,
+		onRenderNavigationSupport: submitNavigationSupportRenderPlan,
+		onRebuildEdges: rebuildGraphEdges,
+		onSetPathsMode: (mode: string) => (pathsMode = mode as PathsInteractionMode),
+		onSetPaintRadius: (radius: number) => (paintRadiusM = radius),
+		onRebuildRegion: rebuildRegion,
+		onClearRegion: () => (pendingRegionBbox = null),
+		onClearWalkabilityOverlay: clearWalkabilityOverlay,
+		onRefreshTraversableMeta: refreshTraversableMeta,
+		onSetShowFootprint: (value: boolean) => (showFootprint = value),
+		onSetShowTraversableMask: (value: boolean) => (showTraversableMask = value),
+		onAddEdgeAnyway: addEdgeAnyway,
+		onCertifyVisibleOpening: certifyVisibleOpening,
+		onDismissEdgeCheck: () => (edgeCheckResult = null),
+		onDeleteGraphEdge: handleDeleteGraphEdge,
+		onDeleteGraphNode: deleteSelectedGraphNode,
+		onFindOverlapping: findOverlappingNodes,
+		onRemoveSelectedNodes: removeSelectedGraphNodes,
+		onClearRemoveSelection: clearRemoveSelection,
+		onSetRemoveMargin: (value: number) => (removeMarginM = value),
+		onSetRemovePassHeight: (value: number) => (removePassHeightM = value),
+		onScanNavigationBlockers: scanNavigationBlockers,
+		onToggleNavigationBlocker: toggleNavigationBlocker,
+		onSetAllNavigationBlockers: setAllNavigationBlockers,
+		onRemoveSelectedNavigationBlockers: removeSelectedNavigationBlockers,
+		onInspectPlaceRepairGuide: inspectPlaceRepairGuide,
+		onLoadEpisode: loadEpisode,
+		onLoadMoreEpisodes: loadMoreEpisodes,
+		onGenerateEpisodes: planGraphEpisodes,
+		onGenerateRouteMotionEpisodes: () => navigationSupport ? planNavigationSupportEpisodes() : planAdaptiveRouteMotionEpisodes(),
+		onClearEpisodes: clearEpisodes,
+		onValidateEpisodes: validateGraphEpisodes,
+		onPruneStaleEpisodes: pruneStaleEpisodes,
+		onSetEpisodeSearch: (value: string) => (episodeSearch = value),
+		onSetEpisodeCount: (value: number) => (episodeCount = value),
+		onSetRobotRadius: (value: number) => (robotRadius = value),
+		onSetMinClearance: (value: number) => (minClearance = value),
+		onSetResolution: (value: number) => (resolution = value),
+		onSetMaxNodes: (value: number) => (maxNodes = value),
+		onSetHeadingCount: (value: number) => (headingCount = value),
+		onSetMinNodeSpacing: (value: number) => (minNodeSpacing = value),
+		onRenderEpisodeNodes: () => renderEpisodes('episode_nodes'),
+		onSetRenderMissingOnly: (value: boolean) => (renderMissingOnly = value),
+	};
 
 	async function exportDataset() {
 		if (!selectedProjectId || !sceneId) return;
@@ -4760,11 +5659,30 @@
 			if (typeof s.pbrdf_band_mode === 'string') previewBandMode = s.pbrdf_band_mode;
 			if (typeof s.measured_scope === 'string') previewMeasuredScope = s.measured_scope;
 		}).catch(() => {});
+		// The menu itself is rendered at page level while the canvas, rail, and
+		// monitor own separate pointer handlers. Capture the primary pointer at
+		// document level so *any* click outside the menu dismisses it before the
+		// receiving surface handles its own action.
+		const dismissContextMenuOnOutsidePointer = (event: PointerEvent) => {
+			if (!contextMenu || event.button !== 0) return;
+			const insideMenu = event.composedPath().some((node) =>
+				node instanceof Element && node.classList.contains('context-menu')
+			);
+			if (!insideMenu) closeContextMenu();
+		};
+		const dismissContextMenuOnEscape = (event: KeyboardEvent) => {
+			if (event.key === 'Escape' && contextMenu) closeContextMenu();
+		};
+		document.addEventListener('pointerdown', dismissContextMenuOnOutsidePointer, true);
+		window.addEventListener('keydown', dismissContextMenuOnEscape);
 		return () => {
 			// Release the job-status WS subscription when the page unmounts so a
 			// route change doesn't leave the connection (and its keepalive churn)
 			// dangling.
 			stopBatchPolling();
+			stopGraphBuildRecoverySubscription();
+			document.removeEventListener('pointerdown', dismissContextMenuOnOutsidePointer, true);
+			window.removeEventListener('keydown', dismissContextMenuOnEscape);
 		};
 	});
 
@@ -4790,9 +5708,9 @@
 	});
 
 
-	async function setPageMode(mode: PageMode) {
+	async function setWorkspaceMode(mode: WorkspaceMode) {
 		if (mode !== 'preview') stopRobotAnimation();
-		pageMode = mode;
+		workspaceMode = mode;
 		placementTool = 'select';
 		draftPoint = null;
 		linePreview = null;
@@ -4831,6 +5749,101 @@
 			await refreshEpisodes();
 		}
 	}
+
+	function setRigSweepSensors(sensorIds: string[]) {
+		const validIds = new Set(rigSensorOptions.map((option: any) => String(option.sensor_id)));
+		const next = sensorIds.map((id) => String(id)).filter((id) => validIds.has(id));
+		selectedRigSensorIds = next.length ? next : (activeRigSensorId ? [activeRigSensorId] : []);
+	}
+
+	function openSensorsPreview() {
+		void setWorkspaceMode('preview');
+	}
+
+	function openSensorsMonitor() {
+		setBottomPanelMode('expanded');
+	}
+
+	const sensorInspectorState = $derived({
+		caps,
+		renderSceneSynced,
+		renderSyncMessage,
+		globalCameraRig: assetVM.globalCameraRig,
+		globalCameraRigStatus: assetVM.globalCameraRigStatus,
+		globalCameraRigError: assetVM.globalCameraRigError,
+		rigSensorOptions,
+		activeRigSensorId,
+		selectedRigSensorIds,
+		activeRigSensorOption,
+		selectedSensorNode,
+		selectedSensorNodeId,
+		selectedSensorHeightM,
+		observationScan,
+		sensorRenderResult,
+		probeResult,
+		renderingViewpoint,
+		probeRendering,
+		probeError,
+		hotCameraPose: activeHotCameraPose,
+		frustumMode,
+		ambientRadiance,
+		unifiedSpectral,
+		useLodScene,
+		renderConfig,
+		sceneStateText,
+		cameraSpecText,
+		loading,
+		selectedProjectId,
+		sceneId,
+		hasScene,
+		hasGraph,
+		graphNodeCount: graphNodes.length,
+		headingsPerNode: graphPayload?.node_heading_count ?? 0,
+		navigationSupportReady: supportCampaignReady,
+		navigationSupportReadOnly: archivedSupportOverlayReady && !supportReady,
+		legacyRenderBlocked: Boolean(adaptiveNavigation || navigationSupport),
+		navigationSupportViewCount: supportRenderViewCount,
+		navigationSupportPlanLabel: String(
+			selectedSupportObservationExpansion?.label
+				?? (archivedSupportOverlayReady ? 'Archived L0 · native action-required headings (read-only)' : 'L0 · action-required headings')
+		),
+		navigationSupportPlanReady: Boolean(selectedSupportObservationExpansion?.current),
+		navigationSupportRenderSubmitting: sweepSubmissionInFlight,
+		episodeNodesAvailable,
+		episodePathNodeCount,
+		renderVariant,
+		perturbationEnabled: Boolean(perturbation?.enabled),
+		perturbedRenderReady: Boolean(perturbation?.perturbed_render_ready),
+		perturbedRenderStale: Boolean(perturbation?.perturbed_render_stale),
+		renderMissingOnly,
+		polarSampleSweepEnabled,
+		polarSampleSweepSubmitting,
+		polarFullSweepEnabled,
+		polarFullSweepSubmitting,
+		renderSensorProgress,
+	});
+
+	const sensorInspectorActions = {
+		onLoadGlobalCameraRig: loadGlobalCameraRig,
+		onSyncRenderScene: syncRenderScene,
+		onSelectRigSensor: selectRigRenderSensor,
+		onSetRigSweepSensors: setRigSweepSensors,
+		onSetFrustumMode: (mode: string) => (frustumMode = mode as 'none' | 'view-aligned' | 'selected'),
+		onLoadRenderConfig: loadRenderConfig,
+		onSetAmbientRadiance: (value: number) => (ambientRadiance = value),
+		onSetUnifiedSpectral: (value: boolean) => (unifiedSpectral = value),
+		onSetUseLodScene: (value: boolean) => (useLodScene = value),
+		onRenderViewpoint: renderSensorViewpoint,
+		onRunProbe: renderHotCameraPreview,
+		onRenderEpisodes: (mode: 'graph_sweep' | 'episode_nodes') => { void renderEpisodes(mode); },
+		onRenderNavigationSupport: submitNavigationSupportRenderPlan,
+		onSubmitPolarSampleSweep: submitPolarSampleSweep,
+		onSubmitPolarFullSweep: submitPolarFullSweep,
+		onSetRenderVariant: (variant: 'base' | 'perturbed' | 'both') => (renderVariant = variant),
+		onSetRenderMissingOnly: (value: boolean) => (renderMissingOnly = value),
+		onOpenPreview: openSensorsPreview,
+		onOpenMonitor: openSensorsMonitor,
+	};
 </script>
 
 <svelte:head>
@@ -5119,13 +6132,13 @@
 
 	{#if selectedProjectId}
 		<section class="panel readiness-strip">
-			<button class:ready={hasScene} onclick={() => (pageMode = 'map')}>Scene {hasScene ? 'ready' : 'missing'}</button>
-			<button class:ready={hasAuthoringMap} onclick={() => (pageMode = 'map')}>Overlay {hasAuthoringMap ? 'ready' : 'missing'}</button>
-			<button class:ready={hasMap} onclick={() => (pageMode = 'paths')}>Map {hasMap ? 'ready' : 'missing'}</button>
-			<button class:ready={hasGraph} onclick={() => (pageMode = 'paths')}>Viewpoint graph {hasGraph ? 'ready' : 'missing'}</button>
-			<button class:ready={hasEpisodes} onclick={() => (pageMode = 'export')}>Episodes {hasEpisodes ? episodes.length : 'missing'}</button>
-			<button class:ready={renderSceneSynced} onclick={() => (pageMode = 'map')}>Render scene {renderSceneSynced ? 'synced' : 'pending'}</button>
-			<button class:ready={renderConfigReady} onclick={() => (pageMode = 'sensors')}>Render config {renderConfigReady ? 'ready' : 'missing'}</button>
+			<button class:ready={hasScene} onclick={() => (workspaceMode = 'map')}>Scene {hasScene ? 'ready' : 'missing'}</button>
+			<button class:ready={hasAuthoringMap} onclick={() => (workspaceMode = 'map')}>Overlay {hasAuthoringMap ? 'ready' : 'missing'}</button>
+			<button class:ready={hasMap} onclick={() => (workspaceMode = 'paths')}>Map {hasMap ? 'ready' : 'missing'}</button>
+			<button class:ready={hasGraph} onclick={() => (workspaceMode = 'paths')}>Viewpoint graph {hasGraph ? 'ready' : 'missing'}</button>
+			<button class:ready={hasEpisodes} onclick={() => (workspaceMode = 'export')}>Episodes {hasEpisodes ? episodes.length : 'missing'}</button>
+			<button class:ready={renderSceneSynced} onclick={() => (workspaceMode = 'map')}>Render scene {renderSceneSynced ? 'synced' : 'pending'}</button>
+			<button class:ready={renderConfigReady} onclick={() => (workspaceMode = 'sensors')}>Render config {renderConfigReady ? 'ready' : 'missing'}</button>
 		</section>
 	{/if}
 
@@ -5142,6 +6155,17 @@
 				perturbationEnabled={Boolean(perturbation?.enabled)}
 				{graphNodes}
 				{graphEdges}
+				{motionNodes}
+				{motionEdges}
+				detachedMotionTerminals={detachedMotionTerminals}
+				activeMotionNodeIds={activeMotionNodeIds}
+				activeMotionEdgeIds={activeMotionEdgeIds}
+				activeGraphNodeIds={activePlaceNodeIds}
+				activeGraphEdgeIds={activePlaceEdgeIds}
+				{blueprintGraphRoutes}
+				repairGuides={workspaceMode === 'paths' ? placeRepairGuides : []}
+				activeRepairGuideId={activePlaceRepairGuideId}
+				observationPlan={observationPlanPoses}
 				selectedId={selectedAuthoringId}
 				{visibleLayers}
 				{draftGhost}
@@ -5165,7 +6189,7 @@
 				onObjectSelect={(id) => {
 					const isNode = graphNodes.some((n: any) => n.node_id === id);
 					const isCustom = customSensorNodes.some(n => n.id === id);
-					if ((isNode || isCustom) && pageMode === 'sensors') {
+					if ((isNode || isCustom) && workspaceMode === 'sensors') {
 						selectedSensorNodeId = id;
 						sensorRenderResult = null;
 						placingSensor = false;
@@ -5177,47 +6201,47 @@
 				onHandleDrag={dragLineHandle}
 				onRegionResize={dragRegionHandle}
 				highlightedPath={selectedEpisodePath}
-				allEpisodePaths={pageMode === 'export' ? allEpisodePaths : []}
+				allEpisodePaths={workspaceMode === 'export' ? allEpisodePaths : []}
 				mapBounds={{ w: mapWidth, h: mapHeight }}
 				onStatus={(message) => (editor3DStatus = message)}
 				onMeshStats={(stats) => { editorMeshStats = stats; }}
-				observationScan={pageMode === 'sensors' ? observationScan : null}
-				frustumMode={pageMode === 'sensors' ? frustumMode : 'none'}
+				observationScan={workspaceMode === 'sensors' ? observationScan : null}
+				frustumMode={workspaceMode === 'sensors' ? frustumMode : 'none'}
 				frustumModality={activeRenderModality}
 				frustumSensorId={activeRigSensorId}
 				frustumIntrinsics={activeCameraFrustum}
-				hotCameraPlacement={pageMode === 'preview'}
+				hotCameraPlacement={workspaceMode === 'preview'}
 				previewCameraOverlay={hotCameraOverlays}
 				onHotCameraDrag={updateHotCameraFromDrag}
 				wallHeight={Number(authoringMap?.settings?.default_wall_height_m ?? 2.4)}
 				footprintInflationM={showFootprint ? Number(robotRadius) + Number(minClearance) : 0}
-				addNodeMode={pageMode === 'paths' && addNodeMode}
+				addNodeMode={workspaceMode === 'paths' && addNodeMode}
 				onAddNodeClick={(x, z) => handleAddNodeAtFloor(x, z)}
 				eyeHeightM={selectedSensorHeightM}
 				selectedObjectGuide={selectedObjectGuide}
-				paintMode={pageMode === 'paths' ? paintMode : 'none'}
+				paintMode={workspaceMode === 'paths' ? paintMode : 'none'}
 				paintRadiusM={paintRadiusM}
 				onPaintStroke={(points) => handlePaintStroke(points)}
-				walkabilityOverlayUrl={pageMode === 'paths' && walkabilityOverlayMeta?.has_overlay
+				walkabilityOverlayUrl={workspaceMode === 'paths' && walkabilityOverlayMeta?.has_overlay
 					? `${opticalNavWalkabilityOverlayPngUrl(selectedProjectId, sceneId)}?v=${walkabilityOverlayVersion}`
 					: null}
-				walkabilityOverlayBbox={pageMode === 'paths' && walkabilityOverlayMeta?.grid_spec ? [
+				walkabilityOverlayBbox={workspaceMode === 'paths' && walkabilityOverlayMeta?.grid_spec ? [
 					Number(walkabilityOverlayMeta.grid_spec.origin?.[0] ?? 0),
 					Number(walkabilityOverlayMeta.grid_spec.origin?.[1] ?? 0),
 					Number(walkabilityOverlayMeta.grid_spec.origin?.[0] ?? 0) + Number(walkabilityOverlayMeta.grid_spec.width ?? 0) * Number(walkabilityOverlayMeta.grid_spec.resolution ?? 1),
 					Number(walkabilityOverlayMeta.grid_spec.origin?.[1] ?? 0) + Number(walkabilityOverlayMeta.grid_spec.height ?? 0) * Number(walkabilityOverlayMeta.grid_spec.resolution ?? 1)
 				] as [number, number, number, number] : null}
-				regionSelectMode={pageMode === 'paths' && regionSelectMode}
+				regionSelectMode={workspaceMode === 'paths' && regionSelectMode}
 				onRegionSelected={(bbox) => { pendingRegionBbox = bbox; pathsMode = 'select'; }}
-				addEdgeMode={pageMode === 'paths' && (addEdgeMode || edgeInspectorMode || removeEdgeMode)}
-				onEdgeFirstNode={(nid) => edgeInspectorMode ? handleInspectorFirstNode(nid) : removeEdgeMode ? handleRemoveEdgeFirstNode(nid) : handleEdgeFirstNode(nid)}
-				onEdgeSecondNode={(src, tgt) => edgeInspectorMode ? handleInspectorSecondNode(src, tgt) : removeEdgeMode ? handleRemoveEdgeSecondNode(src, tgt) : handleEdgeSecondNode(src, tgt)}
-				removeNodeMode={pageMode === 'paths' && removeNodeMode}
+				addEdgeMode={workspaceMode === 'paths' && (addEdgeMode || edgeInspectorMode || removeEdgeMode || blueprintPairMode)}
+				onEdgeFirstNode={(nid) => blueprintPairMode ? handleBlueprintPairFirstNode(nid) : edgeInspectorMode ? handleInspectorFirstNode(nid) : removeEdgeMode ? handleRemoveEdgeFirstNode(nid) : handleEdgeFirstNode(nid)}
+				onEdgeSecondNode={(src, tgt) => blueprintPairMode ? handleBlueprintPairSecondNode(src, tgt) : edgeInspectorMode ? handleInspectorSecondNode(src, tgt) : removeEdgeMode ? handleRemoveEdgeSecondNode(src, tgt) : handleEdgeSecondNode(src, tgt)}
+				removeNodeMode={workspaceMode === 'paths' && removeNodeMode}
 				removeSelection={removeSelection}
 				onNodeToggle={toggleRemoveNode}
 				onNodesBoxSelect={addRemoveNodes}
-				addEdgeGhostColor={edgeInspectorMode ? 0xa855f7 : removeEdgeMode ? 0xef4444 : 0x22c55e}
-				addEdgeMaxLengthM={Number(maxEdgeLength)}
+				addEdgeGhostColor={blueprintPairMode ? 0x06b6d4 : edgeInspectorMode ? 0xa855f7 : removeEdgeMode ? 0xef4444 : 0x22c55e}
+				addEdgeMaxLengthM={activeGraphScope === 'navigation_place' ? 8 : Number(maxEdgeLength)}
 				roomShell={roomShell}
 				showRoomShell={showRoomShell}
 				{xmlSceneIndex}
@@ -5225,14 +6249,21 @@
 				opticalNavProjectId={selectedProjectId}
 				opticalNavSceneId={sceneId}
 				graphComponents={graphPayload?.components ?? null}
-				traversableOverlayUrl={pageMode === 'paths' && showTraversableMask && traversableMeta?.png_url ? `${traversableMeta.png_url}&v=${traversableVersion}` : null}
-				traversableOverlayBbox={pageMode === 'paths' && showTraversableMask && traversableMeta?.bbox ? traversableMeta.bbox : null}
+				traversableOverlayUrl={workspaceMode === 'paths' && showTraversableMask && traversableMeta?.png_url ? `${traversableMeta.png_url}&v=${traversableVersion}` : null}
+				traversableOverlayBbox={workspaceMode === 'paths' && showTraversableMask && traversableMeta?.bbox ? traversableMeta.bbox : null}
 				onFrustumClick={(vpId, headingId) => {
 					const modality = activeRenderModality;
 					lightboxUrl = opticalNavObservationModalityUrl(selectedProjectId, sceneId, vpId, headingId, modality, activeRigSensorId);
 					lightboxLabel = `${vpId} · ${headingId} · ${activeRigSensorId || 'legacy'} · ${modality}`;
 				}}
 			/>
+
+			{#if workspaceMode === 'paths'}
+				<EditorToolRail
+					navigationState={navigationInspectorState}
+					navigationActions={navigationInspectorActions}
+				/>
+			{/if}
 
 			<!-- Floating top bar: project badge + modes + undo/redo + view presets -->
 			<div class="map-float-top">
@@ -5242,22 +6273,22 @@
 					<div class="map-float-sep"></div>
 				{/if}
 				<div class="map-float-modes">
-					<button class:active={pageMode === 'map'} onclick={() => setPageMode('map')}>Map</button>
-					<button class:active={pageMode === 'objects'} onclick={() => setPageMode('objects')}>Objects</button>
-					<button class:active={pageMode === 'paths'} onclick={() => setPageMode('paths')}>Paths</button>
-					<button class:active={pageMode === 'sensors'} onclick={() => setPageMode('sensors')}>Sensors</button>
-					<button class:active={pageMode === 'lights'} onclick={() => setPageMode('lights')}>Lights</button>
-					<button class:active={pageMode === 'preview'} onclick={() => setPageMode('preview')}>Preview</button>
-					<button class:active={pageMode === 'export'} onclick={() => setPageMode('export')}>Export</button>
+					<button class:active={workspaceMode === 'map'} onclick={() => setWorkspaceMode('map')}>Map</button>
+					<button class:active={workspaceMode === 'objects'} onclick={() => setWorkspaceMode('objects')}>Objects</button>
+					<button class:active={workspaceMode === 'paths'} onclick={() => setWorkspaceMode('paths')}>Paths</button>
+					<button class:active={workspaceMode === 'sensors'} onclick={() => setWorkspaceMode('sensors')}>Sensors</button>
+					<button class:active={workspaceMode === 'lights'} onclick={() => setWorkspaceMode('lights')}>Lights</button>
+					<button class:active={workspaceMode === 'preview'} onclick={() => setWorkspaceMode('preview')}>Preview</button>
+					<button class:active={workspaceMode === 'export'} onclick={() => setWorkspaceMode('export')}>Export</button>
 				</div>
 				<div class="map-float-sep"></div>
-				<button class="map-float-btn" title="Undo (Ctrl+Z)" disabled={!undoStack.length} onclick={undo}>↩</button>
-				<button class="map-float-btn" title="Redo (Ctrl+Y)" disabled={!redoStack.length} onclick={redo}>↪</button>
+				<button class="map-float-btn" title="Undo (Ctrl+Z)" aria-label="Undo" disabled={!undoStack.length} onclick={undo}><Undo2 size={16} aria-hidden="true" /></button>
+				<button class="map-float-btn" title="Redo (Ctrl+Y)" aria-label="Redo" disabled={!redoStack.length} onclick={redo}><Redo2 size={16} aria-hidden="true" /></button>
 				<div class="map-float-sep"></div>
 				{#if syncRunning}
 					{@const stageIdx = renderService.syncStageIndex(syncProgress?.stage)}
 					<span class="sync-progress-chip" title={`stage: ${syncProgress?.stage ?? ''}`}>
-						⟳ {renderService.syncStageLabel(syncProgress?.stage, 'kr')}
+						<RefreshCw size={14} aria-hidden="true" /> {renderService.syncStageLabel(syncProgress?.stage, 'kr')}
 						<span class="sync-stage-dots" aria-hidden="true">
 							{#each renderService.SYNC_STAGES as _, i}
 								<span class="sync-stage-dot" class:done={stageIdx > i} class:active={stageIdx === i}></span>
@@ -5269,7 +6300,7 @@
 					<div class="map-float-sep"></div>
 				{/if}
 				<span class="map-float-hint">
-					{#if pageMode === 'preview'}
+					{#if workspaceMode === 'preview'}
 						Simulating · Esc to exit
 					{:else if placementTool === 'wall' || placementTool === 'glass_wall' || placementTool === 'mirror_wall'}
 						{draftPoint ? 'Click end point · Esc cancel' : `Placing ${placementTool.replace('_', ' ')} · click start`}
@@ -5285,7 +6316,7 @@
 			</div>
 
 			<AssetCatalog
-				{pageMode}
+				pageMode={workspaceMode}
 				{placementTool} {selectedAuthoringId}
 				{builtInBuildAssets} {builtInPlaceAssetGroups}
 					selectedUsdAssetId={assetVM.selectedUsdAssetId}
@@ -5301,49 +6332,8 @@
 					onSearchChange={(v) => (assetVM.usdCatalogSearch = v)}
 			/>
 
-			<!-- Paths mode: episode list panel -->
-			{#if pageMode === 'paths'}
-				<div class="map-float-inspector paths-panel">
-					<div class="panel-label">Episodes ({filteredEpisodes.length}/{episodeTotal})</div>
-					<input class="episode-search" type="search" placeholder="Search..." bind:value={episodeSearch} />
-					<div class="episode-list">
-						{#each filteredEpisodes as ep}
-							<div
-								class="episode-row"
-								class:selected={selectedEpisodeId === ep.episode_id}
-								role="button"
-								tabindex="0"
-								onclick={() => loadEpisode(ep.episode_id)}
-								onkeydown={(e) => e.key === 'Enter' && loadEpisode(ep.episode_id)}
-							>
-								<span class="ep-id">{ep.episode_id}</span>
-								<span class="ep-mode">{ep.navigation_mode ?? 'traj'}</span>
-								{#if ep.hazard_collision}<span class="badge-hazard">⚠</span>{/if}
-							</div>
-						{/each}
-						{#if filteredEpisodes.length === 0}
-							<div class="episode-empty">{episodes.length === 0 ? 'No episodes yet.' : 'No matches.'}</div>
-						{/if}
-					</div>
-					{#if episodeNextCursor}
-						<button class="button button-subtle" disabled={loading} onclick={loadMoreEpisodes}>Load next 100</button>
-					{/if}
-					<div class="episode-generate-bar">
-						<input type="number" min="1" bind:value={episodeCount} title="Count" />
-						<button class="button button-primary" disabled={!selectedProjectId || !hasGraph || loading} onclick={planGraphEpisodes}>
-							{#if episodePlanProgress}
-								{episodePlanProgress.status === 'indexing' ? 'Indexing…' : `Generating ${episodePlanProgress.planned ?? 0}/${episodePlanProgress.target ?? episodeCount}`}
-							{:else}+ Generate{/if}
-						</button>
-						{#if episodes.length > 0}
-							<button class="button button-subtle" onclick={clearEpisodes} title="Clear all episodes">✕</button>
-						{/if}
-					</div>
-				</div>
-			{/if}
-
-			<!-- Sensor mode: viewpoint render panel -->
-			{#if pageMode === 'sensors'}
+			<!-- Sensor mode keeps the canvas clear; all rendering controls live in the right inspector. -->
+			{#if workspaceMode === 'sensors'}
 				{#if workflowStatus && !workflowStatus.ready}
 					<section class="panel workflow-continue-card">
 						<strong>Render workflow: {workflowStatus.next_action}</strong>
@@ -5354,51 +6344,10 @@
 						<button class="button button-primary" disabled={loading} onclick={continueRenderWorkflow}>Continue</button>
 					</section>
 				{/if}
-					<SensorsPanel
-						{renderSceneSynced} renderSyncMessage={renderSyncMessage} {loading} {selectedProjectId} {hasScene} {hasGraph}
-						globalCameraRig={assetVM.globalCameraRig}
-						globalCameraRigStatus={assetVM.globalCameraRigStatus}
-						globalCameraRigError={assetVM.globalCameraRigError}
-					{rigSensorOptions} {activeRigSensorId}
-					bind:frustumMode bind:placingSensor bind:selectedSensorNodeId
-					{selectedSensorNode} {selectedCustomSensorNode}
-					{sceneId} {sceneStateText} {cameraSpecText}
-					{renderConfig} {renderConfigError}
-					{observationScan} bind:activeModalityTab
-					{sensorRenderResult} {renderingViewpoint}
-					onLoadGlobalCameraRig={loadGlobalCameraRig}
-					onSyncRenderScene={syncRenderScene}
-					onSelectRigRenderSensor={selectRigRenderSensor}
-					onLoadRenderConfig={loadRenderConfig}
-					onOptionalJson={optionalJson}
-					onRenderSensorViewpoint={renderSensorViewpoint}
-					onRenderEpisodes={() => renderEpisodes('graph_sweep')}
-					onRenderEpisodeNodes={() => renderEpisodes('episode_nodes')}
-					polarSampleSweepEnabled={polarSampleSweepEnabled}
-					polarSampleSweepSubmitting={polarSampleSweepSubmitting}
-					polarSampleSweepResult={polarSampleSweepResult}
-					onSubmitPolarSampleSweep={submitPolarSampleSweep}
-					polarFullSweepEnabled={polarFullSweepEnabled}
-					polarFullSweepSubmitting={polarFullSweepSubmitting}
-					polarFullSweepResult={polarFullSweepResult}
-					onSubmitPolarFullSweep={submitPolarFullSweep}
-					{episodeNodesAvailable}
-					{episodePathNodeCount}
-					{renderMissingOnly}
-					onSetRenderMissingOnly={(v) => (renderMissingOnly = v)}
-					headingsPerNode={graphPayload?.node_heading_count ?? 0}
-					bind:sensorFindQuery
-					{sensorFindError}
-					graphNodeCount={graphNodes.length}
-					onFindSensor={focusSensorNode}
-					onRefreshBatch={refreshBatch}
-					onRemoveCustomSensor={(id) => { customSensorNodes = customSensorNodes.filter(n => n.id !== id); }}
-					onCustomSensorHeadingChange={(id, deg) => { customSensorNodes = customSensorNodes.map(n => n.id === id ? {...n, headingDeg: deg} : n); sensorRenderResult = null; }}
-				/>
 			{/if}
 
 			<!-- Export mode panel -->
-			{#if pageMode === 'export'}
+			{#if workspaceMode === 'export'}
 				<ExportPanel
 					{caps}
 					{hasScene} {hasMap} {hasGraph} {hasEpisodes} {validationPassed}
@@ -5432,7 +6381,7 @@
 			{/if}
 
 			<!-- Floating right inspector (only when item selected in build/place mode) -->
-			{#if selectedAuthoringItem && (pageMode === 'map' || pageMode === 'objects')}
+			{#if selectedAuthoringItem && (workspaceMode === 'map' || workspaceMode === 'objects')}
 				<InspectorPanel
 					item={selectedAuthoringItem}
 					itemKind={selectedAuthoringKind}
@@ -5475,6 +6424,7 @@
 				<span>{authoringSummary.glass}glass</span>
 				{#if editor3DStatus}<span>{editor3DStatus}</span>{/if}
 				{#if graphPayloadSummary}<span>{graphPayloadSummary.node_count}nodes</span>{/if}
+				{#if archivedSupportOverlayReady}<span class="map-status-archive">{archivedMotionNodes.length} archived render poses</span>{/if}
 				<span class="map-status-sep"></span>
 				<label title="Objects"><input type="checkbox" checked={visibleLayers.objects} onchange={() => toggleLayer('objects')} /> Obj</label>
 				<label title="Walkable Area"><input type="checkbox" checked={visibleLayers.traversable} onchange={() => toggleLayer('traversable')} /> Walk</label>
@@ -5482,12 +6432,15 @@
 				<label title="Hazards"><input type="checkbox" checked={visibleLayers.hazards} onchange={() => toggleLayer('hazards')} /> Haz</label>
 				<label title="Viewpoints"><input type="checkbox" checked={visibleLayers.graphNodes} onchange={() => toggleLayer('graphNodes')} /> VP</label>
 				<label title="Path Links"><input type="checkbox" checked={visibleLayers.graphEdges} onchange={() => toggleLayer('graphEdges')} /> Links</label>
+				<label title={archivedSupportOverlayReady ? 'Read-only recovered support render poses' : '0.25m route action poses'}><input type="checkbox" checked={visibleLayers.motionNodes} onchange={() => toggleLayer('motionNodes')} /> Motion</label>
+				<label title="0.25m route action links"><input type="checkbox" checked={visibleLayers.motionEdges} onchange={() => toggleLayer('motionEdges')} /> Move links</label>
+					<label title="Gold rings identify FULL_24 panorama poses; centres are at least 0.15 m apart."><input type="checkbox" checked={visibleLayers.observationPlan} onchange={() => toggleLayer('observationPlan')} /> Obs</label>
 				{#if undoStack.length}<span class="map-status-undo">{undoStack.length} undos</span>{/if}
 			</div>
 
 			<!-- Floating ⚙ scene settings button + panel -->
 			<details class="map-float-settings">
-				<summary>⚙ Scene</summary>
+				<summary><Settings size={15} aria-hidden="true" /> Scene</summary>
 				<div class="map-settings-body">
 					{#if projectScenes.length > 0}
 						<label>
@@ -5604,67 +6557,7 @@
 				</div>
 			</details>
 
-			<!-- Floating ⊞ Paths panel (map + graph + episodes) -->
-			<details class="map-float-settings map-float-paths">
-				<summary>⊞ Paths</summary>
-				<div class="map-settings-body">
-					<!-- Status chips -->
-					<div class="path-status-chips">
-						<span class:chip-ok={hasMap} class:chip-off={!hasMap}>Map {hasMap ? 'ready' : 'missing'}</span>
-						<span class:chip-ok={hasGraph} class:chip-off={!hasGraph}>Graph {hasGraph ? 'ready' : 'missing'}</span>
-						{#if graphPayloadSummary}<span class="chip-ok">{graphPayloadSummary.node_count}n · {graphPayloadSummary.edge_count}e</span>{/if}
-					</div>
-					<!-- Grid map -->
-					<div class="panel-label">Traversable Grid</div>
-					<label><span>resolution m</span><input type="number" step="0.01" min="0.01" bind:value={resolution} /></label>
-					<button class="button button-subtle" disabled={!selectedProjectId || !hasScene || buildingMap} onclick={buildMap}>
-						{#if buildingMap}<span class="spinner-xs"></span> Building...{:else}{hasMap ? 'Rebuild Grid' : 'Build Grid'}{/if}
-					</button>
-					{#if mapResult}
-						<div class="build-result-row">
-							<span class="chip-ok">Grid ready</span>
-							{#if mapResult.cell_count}<span class="chip-dim">{mapResult.cell_count} cells</span>{/if}
-							{#if mapResult.traversable_ratio != null}<span class="chip-dim">{(mapResult.traversable_ratio * 100).toFixed(0)}% walkable</span>{/if}
-						</div>
-					{/if}
-					<!-- Viewpoint graph -->
-					<div class="panel-label mt-2">Viewpoint Graph</div>
-					<div class="geometry-grid">
-						<label><span>max nodes</span><input type="number" min="1" bind:value={maxNodes} /></label>
-						<label><span>headings</span><input type="number" min="1" bind:value={headingCount} /></label>
-						<label><span>spacing m</span><input type="number" step="0.05" min="0" bind:value={minNodeSpacing} /></label>
-						<label><span>robot r</span><input type="number" step="0.05" min="0" bind:value={robotRadius} /></label>
-					</div>
-					<button class="button button-subtle" disabled={!selectedProjectId || !hasMap || buildingGraph} onclick={requestBuildGraph}>
-						{#if buildingGraph}<span class="spinner-xs"></span>{#if graphBuildProgress} {graphBuildProgress.stage === 'edges' ? 'Edges' : 'Nodes'} {Math.round(graphBuildProgress.progress * 100)}%{:else} Building...{/if}{:else}{hasGraph ? 'Rebuild Graph' : 'Build Graph'}{/if}
-					</button>
-					{#if graphResult || graphPayloadSummary}
-						<div class="build-result-row">
-							<span class="chip-ok">Graph ready</span>
-							<span class="chip-dim">{graphPayloadSummary?.node_count ?? graphResult?.node_count ?? '?'}n</span>
-							<span class="chip-dim">{graphPayloadSummary?.edge_count ?? graphResult?.edge_count ?? '?'}e</span>
-							{#if (graphPayloadSummary?.hazard_edge_count ?? graphResult?.hazard_edge_count ?? 0) > 0}
-								<span class="chip-warn">{graphPayloadSummary?.hazard_edge_count ?? graphResult?.hazard_edge_count} hazard</span>
-							{/if}
-						</div>
-					{/if}
-					<!-- Episodes -->
-					<div class="panel-label mt-2">Episodes</div>
-					<label><span>num pairs</span><input type="number" min="1" bind:value={episodeCount} /></label>
-					<button class="button button-primary" disabled={!selectedProjectId || !hasGraph || loading} onclick={planGraphEpisodes}>
-						{#if episodePlanProgress}
-							{episodePlanProgress.status === 'indexing' ? 'Indexing…' : `Generating ${episodePlanProgress.planned ?? 0}/${episodePlanProgress.target ?? episodeCount}`}
-						{:else}Generate Episodes{/if}
-					</button>
-					{#if splitCounts.train != null}
-						<div class="path-status-chips mt-1">
-							<span class="chip-ok">train {splitCounts.train}</span>
-							<span class="chip-ok">val_seen {splitCounts.val_seen ?? 0}</span>
-							<span class="chip-ok">val_unseen {splitCounts.val_unseen ?? 0}</span>
-						</div>
-					{/if}
-				</div>
-			</details>
+			<!-- Paths workflow intentionally lives only in the contextual right inspector. -->
 
 			<!-- Map start card overlay (when empty) -->
 			{#if !hasAuthoringContent}
@@ -5687,7 +6580,7 @@
 </div>
 
 {#if lightboxUrl}
-	<div class="lightbox-overlay" role="dialog" onclick={() => { lightboxUrl = ''; lightboxLabel = ''; }}>
+	<div class="lightbox-overlay" role="dialog" tabindex="-1" onclick={() => { lightboxUrl = ''; lightboxLabel = ''; }} onkeydown={(event) => event.key === 'Escape' && (lightboxUrl = '', lightboxLabel = '')}>
 		<div class="lightbox-inner" role="presentation" onclick={(e) => e.stopPropagation()}>
 			<div class="lightbox-header">
 				<span>{lightboxLabel}</span>
@@ -5701,18 +6594,40 @@
 {#if graphRebuildConfirmOpen}
 	<div class="confirm-overlay" role="dialog" aria-modal="true" tabindex="-1">
 		<div class="confirm-dialog">
-			<div class="confirm-title">Rebuild viewpoint graph?</div>
+			<div class="confirm-title">Rebuild Sparse Place Graph?</div>
 			<p>
-				This will overwrite the current viewpoint graph using the current traversable grid settings, robot footprint, and sampling parameters.
+				This archives the completed v4 support graph and its observation plans, then replaces the sparse place graph and reviewable blueprints using the current grid and safety settings. Existing rendered observations and episodes stay unchanged, but new support episodes require a fresh Stage 3 build.
 			</p>
 			<div class="confirm-facts">
-				<span>{graphPayloadSummary?.node_count ?? currentScene?.viewpoint_graph?.node_count ?? 0} existing nodes</span>
-				<span>{graphPayloadSummary?.edge_count ?? currentScene?.viewpoint_graph?.edge_count ?? 0} existing edges</span>
+				<span>{navigationSupport?.place_graph?.nodes?.length ?? 0} places</span>
+				<span>{navigationSupport?.support_graph?.nodes?.length ?? 0} support poses</span>
+				<span>{navigationSupport?.observation_plan?.summary?.polar_observation_count ?? 0} polar views</span>
 				<span>seed {seed}</span>
 			</div>
 			<div class="confirm-actions">
 				<button class="button button-subtle" onclick={cancelGraphRebuild}>No</button>
 				<button class="button button-primary" onclick={confirmGraphRebuild}>Yes, rebuild</button>
+			</div>
+		</div>
+	</div>
+{/if}
+
+{#if supportEditConfirmOpen}
+	<div class="confirm-overlay" role="dialog" aria-modal="true" tabindex="-1">
+		<div class="confirm-dialog">
+			<div class="confirm-title">Unlock Place Graph for Editing?</div>
+			<p>
+				This Place Graph already has a completed Navigation Support graph. Continuing will archive the current support and observation plans, regenerate Blueprint review, and block new support episodes until Stage 3 is built again. Existing rendered data is not deleted.
+			</p>
+			<div class="confirm-facts">
+				<span>{navigationSupport?.place_graph?.nodes?.length ?? 0} places</span>
+				<span>{navigationSupport?.support_graph?.nodes?.length ?? 0} support poses</span>
+				<span>{navigationSupport?.observation_plan?.summary?.polar_observation_count ?? 0} polar views</span>
+				<span>{lockedNodePlacement ? '1 node edit' : `${lockedGraphEdits.length} topology edit${lockedGraphEdits.length === 1 ? '' : 's'}`}</span>
+			</div>
+			<div class="confirm-actions">
+				<button class="button button-subtle" onclick={cancelSupportTopologyEdit}>Cancel</button>
+				<button class="button button-primary" onclick={confirmSupportTopologyEdit}>Archive and edit</button>
 			</div>
 		</div>
 	</div>
@@ -5750,24 +6665,15 @@
 
 {#snippet datasetRailContent()}
 	<div class="dataset-rail">
-		<div class="rail-tabbar" aria-label="Right panel tabs">
-			{#if selectedAuthoringItem}
-				<button class:active={railTab === 'selected'} onclick={() => activateRailTab('selected')}>Selected</button>
-			{/if}
-			<button class:active={railTab === 'scene'} onclick={() => activateRailTab('scene')}>Scene</button>
-			{#if pageMode === 'paths'}
-				<button class:active={railTab === 'paths'} onclick={() => activateRailTab('paths')}>Paths</button>
-			{/if}
-			<button class:active={railTab === 'sensors'} onclick={() => activateRailTab('sensors')}>Sensors</button>
-			<button class:active={railTab === 'materials'} onclick={() => activateRailTab('materials')}>Materials</button>
-			<button class:active={railTab === 'lights'} onclick={() => activateRailTab('lights')}>Lights</button>
-			<button class:active={railTab === 'preview'} onclick={() => activateRailTab('preview')}>Preview</button>
-			<button class:active={railTab === 'export'} onclick={() => activateRailTab('export')}>Export</button>
-			<button class:active={railTab === 'sync'} onclick={() => activateRailTab('sync')}>Sync</button>
-			<button class:active={railTab === 'status'} onclick={() => activateRailTab('status')}>Status</button>
-		</div>
+		<header class="contextual-inspector-heading">
+			<div>
+				<p>Workspace inspector</p>
+				<h2>{inspectorKind === 'selected' ? 'Selected item' : inspectorKind === 'paths' ? 'Navigation Support' : inspectorKind === 'sensors' ? 'Sensors' : inspectorKind === 'lights' ? 'Lights' : inspectorKind === 'preview' ? 'Preview' : inspectorKind === 'export' ? 'Export dataset' : 'Scene'}</h2>
+			</div>
+			<span>{workspaceMode}</span>
+		</header>
 
-		{#if railTab === 'selected' && selectedAuthoringItem}
+		{#if inspectorKind === 'selected' && selectedAuthoringItem}
 			<RailSelectedTab
 				item={selectedAuthoringItem}
 				itemKind={selectedAuthoringKind}
@@ -5813,148 +6719,19 @@
 			{/if}
 		{/if}
 
-		{#if railTab === 'materials'}
-			<RailMaterialsTab projectId={selectedProjectId} {sceneId} />
-		{/if}
-
-		{#if railTab === 'paths'}
-			<RailPathsTab
-				{caps}
-				{hasMap} {hasGraph} {hasScene} {selectedProjectId} {sceneId} {loading}
-				{buildingMap} {buildingGraph} {graphBuildProgress} {graphResult} {mapResult}
-				{graphPayloadSummary} {graphPayload} graphNodes={graphNodes} graphEdges={graphEdges}
-				{pathsMode} {paintRadiusM} {pendingEdgeSource} {edgeInspectorSource}
-				{pendingRegionBbox} {walkabilityOverlayMeta} {traversableMeta}
-				{showTraversableMask} {showFootprint} {edgeCheckResult}
-				{filteredEpisodes} {episodes} {episodeSearch} {episodeCount}
-				{selectedEpisodeId} {splitCounts}
-				{robotRadius} {minClearance} {resolution}
-				{maxNodes} {headingCount} {minNodeSpacing} {selectedSensorNode}
-				onBuildMap={buildMap}
-				onRequestBuildGraph={requestBuildGraph}
-				onRebuildEdges={rebuildGraphEdges}
-				rebuildingEdges={rebuildingEdges}
-				onSetPathsMode={(m) => (pathsMode = m as PathsInteractionMode)}
-				onSetPaintRadius={(r) => (paintRadiusM = r)}
-				onRebuildRegion={rebuildRegion}
-				onClearRegion={() => (pendingRegionBbox = null)}
-				onClearWalkabilityOverlay={clearWalkabilityOverlay}
-				onRefreshTraversableMeta={refreshTraversableMeta}
-				onSetShowFootprint={(v) => (showFootprint = v)}
-				onSetShowTraversableMask={(v) => (showTraversableMask = v)}
-				onAddEdgeAnyway={addEdgeAnyway}
-				onDismissEdgeCheck={() => (edgeCheckResult = null)}
-				onDeleteGraphEdge={handleDeleteGraphEdge}
-				onDeleteGraphNode={deleteSelectedGraphNode}
-				removeSelectionCount={removeSelection.size}
-				removeMarginM={removeMarginM}
-				removePassHeightM={removePassHeightM}
-				findingOverlapping={findingOverlapping}
-				removingNodes={removingNodes}
-				onFindOverlapping={findOverlappingNodes}
-				onRemoveSelectedNodes={removeSelectedGraphNodes}
-				onClearRemoveSelection={clearRemoveSelection}
-				onSetRemoveMargin={(v) => (removeMarginM = v)}
-				onSetRemovePassHeight={(v) => (removePassHeightM = v)}
-				onLoadEpisode={loadEpisode}
-				onGenerateEpisodes={planGraphEpisodes}
-				{episodePlanProgress}
-				onClearEpisodes={clearEpisodes}
-				onValidateEpisodes={validateGraphEpisodes}
-				onPruneStaleEpisodes={pruneStaleEpisodes}
-				staleEpisodeReport={staleEpisodeReport}
-				validatingEpisodes={validatingEpisodes}
-				onSetEpisodeSearch={(v) => (episodeSearch = v)}
-				onSetEpisodeCount={(n) => (episodeCount = n)}
-				onSetRobotRadius={(v) => (robotRadius = v)}
-				onSetMinClearance={(v) => (minClearance = v)}
-				onSetResolution={(v) => (resolution = v)}
-				onSetMaxNodes={(n) => (maxNodes = n)}
-				onSetHeadingCount={(n) => (headingCount = n)}
-				onSetMinNodeSpacing={(v) => (minNodeSpacing = v)}
-				onRenderEpisodeNodes={() => renderEpisodes('episode_nodes')}
-				{episodeNodesAvailable}
-				{episodePathNodeCount}
-				selectedRigSensorCount={selectedRigSensorIds.length || 1}
-				{renderMissingOnly}
-				onSetRenderMissingOnly={(v) => (renderMissingOnly = v)}
-				headingsPerNode={graphPayload?.node_heading_count ?? 0}
-				{renderSceneSynced}
+		{#if inspectorKind === 'paths'}
+			<PathsInspector
+				navigationState={navigationInspectorState}
+				episodeState={navigationEpisodeState}
+				navigationActions={navigationInspectorActions}
 			/>
 		{/if}
 
-			{#if railTab === 'sensors'}
-				<RailSensorsTab
-					{caps}
-					{renderSceneSynced} renderSyncMessage={renderSyncMessage}
-					globalCameraRig={assetVM.globalCameraRig}
-					globalCameraRigStatus={assetVM.globalCameraRigStatus}
-					globalCameraRigError={assetVM.globalCameraRigError}
-				{rigSensorOptions} {activeRigSensorId} {selectedSensorNode} {selectedSensorNodeId}
-				{selectedCustomSensorNode} {selectedSensorHeightM}
-				{sceneStateText} {cameraSpecText} {renderConfig}
-				{observationScan} {graphBatch} {sensorRenderResult} {renderingViewpoint}
-				{placingSensor} {frustumMode} {ambientRadiance} {activeModalityTab}
-				{activeRigSensorOption} {activeCameraFrustum} {activeRenderModality}
-				hotCameraPose={activeHotCameraPose}
-				{probeRendering} {probeError}
-				{rigMountHeightM} {authoringMap}
-				{selectedProjectId} {sceneId} {loading} {hasScene} {hasGraph}
-				onLoadGlobalCameraRig={loadGlobalCameraRig}
-					onSyncRenderScene={syncRenderScene}
-				onSelectRigSensor={selectRigRenderSensor}
-				{selectedRigSensorIds}
-				onToggleRigSweepSensor={toggleRigSweepSensor}
-				onSetRigSweepSensors={(ids) => {
-					const validIds = new Set(rigSensorOptions.map((option: any) => String(option.sensor_id)));
-					const next = ids.map((id) => String(id)).filter((id) => validIds.has(id));
-					selectedRigSensorIds = next.length ? next : (activeRigSensorId ? [activeRigSensorId] : []);
-				}}
-				onSetFrustumMode={(m) => (frustumMode = m as 'none' | 'view-aligned' | 'selected')}
-				onTogglePlacingSensor={() => { placingSensor = !placingSensor; selectedSensorNodeId = ''; }}
-				onRemoveCustomSensor={(id) => { customSensorNodes = customSensorNodes.filter(n => n.id !== id); selectedSensorNodeId = ''; }}
-				onCustomSensorHeadingChange={(id, deg) => { customSensorNodes = customSensorNodes.map(n => n.id === id ? {...n, headingDeg: deg} : n); sensorRenderResult = null; }}
-				onLoadRenderConfig={loadRenderConfig}
-				onSetSensorHeight={setSelectedSensorHeight}
-				onSetAmbientRadiance={(v) => (ambientRadiance = v)}
-			{unifiedSpectral}
-			{useLodScene}
-			onSetUnifiedSpectral={(v) => (unifiedSpectral = v)}
-			onSetUseLodScene={(v) => (useLodScene = v)}
-				onClearNodeObservations={clearNodeObservations}
-				onClearAllObservations={clearAllObservations}
-				onRenderViewpoint={renderSensorViewpoint}
-				onRunProbe={renderHotCameraPreview}
-				onRenderEpisodes={() => renderEpisodes('graph_sweep')}
-				onRenderEpisodeNodes={() => renderEpisodes('episode_nodes')}
-				polarSampleSweepEnabled={polarSampleSweepEnabled}
-				polarSampleSweepSubmitting={polarSampleSweepSubmitting}
-				polarSampleSweepResult={polarSampleSweepResult}
-				onSubmitPolarSampleSweep={submitPolarSampleSweep}
-				polarFullSweepEnabled={polarFullSweepEnabled}
-				polarFullSweepSubmitting={polarFullSweepSubmitting}
-				polarFullSweepResult={polarFullSweepResult}
-				onSubmitPolarFullSweep={submitPolarFullSweep}
-				{renderVariant}
-				perturbationEnabled={Boolean(perturbation?.enabled)}
-				perturbedRenderReady={Boolean(perturbation?.perturbed_render_ready)}
-				perturbedRenderStale={Boolean(perturbation?.perturbed_render_stale)}
-				onSetRenderVariant={(v) => (renderVariant = v)}
-				onSetActiveModalityTab={(v) => (activeModalityTab = v)}
-				{episodeNodesAvailable}
-				{episodePathNodeCount}
-				{renderMissingOnly}
-				onSetRenderMissingOnly={(v) => (renderMissingOnly = v)}
-				headingsPerNode={graphPayload?.node_heading_count ?? 0}
-				bind:sensorFindQuery
-				{sensorFindError}
-				graphNodeCount={graphNodes.length}
-				onFindSensor={focusSensorNode}
-				onRefreshBatch={() => refreshBatch()}
-			/>
+		{#if inspectorKind === 'sensors'}
+			<SensorsInspector sensorState={sensorInspectorState} sensorActions={sensorInspectorActions} />
 		{/if}
 
-		{#if railTab === 'lights'}
+		{#if inspectorKind === 'lights'}
 			<RailLightsTab
 				{caps}
 				{authoringMap} {detectedEmitterIds} {detectedEmitterCount} {enabledEmitterCount}
@@ -5969,7 +6746,7 @@
 			/>
 		{/if}
 
-		{#if railTab === 'preview'}
+		{#if inspectorKind === 'preview'}
 			<RailPreviewTab
 				hotCameraPose={activeHotCameraPose}
 				{hotCameraPoses} {activeHotCameraId}
@@ -5982,7 +6759,7 @@
 			/>
 		{/if}
 
-		{#if railTab === 'export'}
+		{#if inspectorKind === 'export'}
 			<RailExportTab
 				{caps}
 				{hasScene} {hasMap} {hasGraph} {hasEpisodes} {validationPassed}
@@ -6014,8 +6791,10 @@
 			/>
 		{/if}
 
-		{#if railTab === 'sync'}
-			<RailSyncInspectorTab
+		{#if inspectorKind === 'scene'}
+			<details class="inspector-utility-disclosure">
+				<summary>Render scene diagnostics</summary>
+				<RailSyncInspectorTab
 				{renderSceneStats}
 				{renderSceneStatsLoading}
 				{sceneId}
@@ -6030,10 +6809,11 @@
 				refreshReason={caps.refreshStats.reason}
 				onRefreshStats={refreshRenderSceneStats}
 				onSetShowRoomShell={(v) => { showRoomShell = v; _showRoomShellUserTouched = true; }}
-			/>
+				/>
+			</details>
 		{/if}
 
-		{#if railTab === 'scene'}
+		{#if inspectorKind === 'scene'}
 			<RailSceneTab
 				{caps}
 				{sceneId} {projectScenes} {selectedProjectId} {hasScene}
@@ -6825,25 +7605,81 @@
 	.table tr { cursor: pointer; }
 	.dataset-rail {
 		display: grid;
-		gap: var(--space-3);
-		padding: var(--space-3);
+		gap: 0;
+		padding: 0;
 		color: var(--text);
+	}
+	.contextual-inspector-heading {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: var(--space-3);
+		min-width: 0;
+		padding: var(--space-3) var(--space-4);
+		border-bottom: 1px solid var(--panel-border);
+		background: var(--surface-1);
+	}
+	.contextual-inspector-heading div { min-width: 0; }
+	.contextual-inspector-heading p {
+		margin: 0;
+		color: var(--text-muted);
+		font-size: 10px;
+		font-weight: 800;
+		letter-spacing: .08em;
+		text-transform: uppercase;
+	}
+	.contextual-inspector-heading h2 {
+		margin: 3px 0 0;
+		overflow: hidden;
+		font-size: var(--font-size-md);
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+	.contextual-inspector-heading > span {
+		flex: 0 0 auto;
+		max-width: 7rem;
+		overflow: hidden;
+		padding: 3px 7px;
+		border-radius: var(--radius-pill);
+		background: var(--hover-bg);
+		color: var(--text-muted);
+		font-size: 10px;
+		text-overflow: ellipsis;
+		text-transform: capitalize;
+		white-space: nowrap;
+	}
+	.inspector-utility-disclosure {
+		margin: var(--space-3) var(--space-4) 0;
+		border: 1px solid var(--panel-border);
+		border-radius: var(--radius-md);
+		background: var(--surface-2);
+	}
+	.inspector-utility-disclosure > summary {
+		padding: var(--space-2) var(--space-3);
+		cursor: pointer;
+		color: var(--text-muted);
+		font-size: var(--font-size-xs);
+		font-weight: 700;
 	}
 	.rail-tabbar {
 		position: sticky;
 		top: 0;
 		z-index: 2;
 		display: flex;
-		flex-wrap: nowrap;
+		/* The inspector is a bounded workspace, not a horizontally scrollable
+		 * second canvas.  Wrap secondary tabs when a user narrows the browser or
+		 * increases zoom instead of hiding them behind a scrollbar. */
+		flex-wrap: wrap;
 		gap: 2px;
-		overflow-x: auto;
+		overflow-x: hidden;
+		overflow-y: visible;
 		padding: 0 0 1px;
 		border-bottom: 1px solid var(--panel-border);
 		background: var(--surface-1);
 	}
 	.rail-tabbar button {
-		flex: 1 0 68px;
-		min-width: 64px;
+		flex: 1 1 4.5rem;
+		min-width: 0;
 		border: 1px solid var(--panel-border);
 		border-bottom: 0;
 		border-radius: 8px 8px 0 0;
@@ -6900,6 +7736,20 @@
 	.dataset-rail .inspector-section {
 		border-top: 1px solid var(--panel-border);
 		padding-top: var(--space-2);
+	}
+	/* Native form controls and flex children otherwise retain their intrinsic
+	 * width, which can widen the entire right rail at non-100% browser zoom. */
+	.dataset-rail,
+	.dataset-rail > *,
+	.dataset-rail :is(label, input, select, textarea, button, details, summary) {
+		min-width: 0;
+		max-width: 100%;
+	}
+	.dataset-rail :is(.action-row, .emitter-bulk-row, .env-radio-row, .env-envmap-row) {
+		flex-wrap: wrap;
+	}
+	.dataset-rail :is(.action-row, .emitter-bulk-row) .button {
+		white-space: normal;
 	}
 	.dataset-rail .geometry-advanced summary {
 		cursor: pointer;
@@ -7334,6 +8184,12 @@
 	.translate-layout-sub { font-size: 11px; color: var(--muted-strong); font-weight: 400; }
 	.inline-check input[type="checkbox"] { flex: 0 0 auto; }
 	.build-result-row { display: flex; gap: 4px; flex-wrap: wrap; margin-top: 4px; align-items: center; }
+	.route-motion-progress { display: grid; gap: 4px; margin-top: 6px; padding: 6px 8px; border: 1px solid #bfdbfe; border-radius: 6px; background: #eff6ff; color: #1e3a8a; font-size: 11px; }
+	.route-motion-progress > div:first-child { display: flex; justify-content: space-between; gap: 8px; }
+	.route-motion-progress strong { font-variant-numeric: tabular-nums; }
+	.route-motion-progress small { color: #475569; }
+	.route-motion-progress-track { height: 5px; overflow: hidden; border-radius: 99px; background: #bfdbfe; }
+	.route-motion-progress-track > span { display: block; height: 100%; border-radius: inherit; background: #2563eb; transition: width 160ms ease-out; }
 	.spinner-xs {
 		display: inline-block;
 		width: 10px; height: 10px;

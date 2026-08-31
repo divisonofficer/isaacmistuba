@@ -1,5 +1,6 @@
 <script lang="ts">
 	import '../app.css';
+	import '$lib/design/material.css';
 	import { page } from '$app/stores';
 	import {
 		healthStore,
@@ -17,6 +18,31 @@
 	import { smokeRender } from '$lib/api';
 	import CurrentScenePanel from '$lib/CurrentScenePanel.svelte';
 	import { Tooltip } from '$lib/components';
+	import {
+		Activity,
+		BookOpen,
+		Camera,
+		Clapperboard,
+		ClipboardList,
+		EllipsisVertical,
+		FlaskConical,
+		House,
+		Languages,
+		Library,
+		Link2,
+		Map,
+		MonitorCog,
+		Palette,
+		PanelBottomClose,
+		PanelBottomOpen,
+		PanelRightClose,
+		PanelRightOpen,
+		Radio,
+		Route,
+		ServerCog,
+		Settings,
+		ChevronRight
+	} from '@lucide/svelte';
 	import { cmdPending, runCmd, currentSceneIdStore, currentSceneStore } from '$lib/stores/sceneCommands';
 	import {
 		commandResultToasts,
@@ -48,24 +74,24 @@
 
 	const NAV_GROUPS = [
 		{ en: '', kr: '', items: [
-			{ en: 'Operations',       kr: '운영 홈',          href: '/',               icon: '🏠' },
-			{ en: 'Current Session',  kr: '현재 세션',        href: '/current-scene',  icon: '📍' },
-			{ en: 'Jobs / Queue',     kr: '작업 / 큐',        href: '/jobs',           icon: '📋' }
+			{ en: 'Operations',       kr: '운영 홈',          href: '/',               icon: House },
+			{ en: 'Current Session',  kr: '현재 세션',        href: '/current-scene',  icon: Activity },
+			{ en: 'Jobs / Queue',     kr: '작업 / 큐',        href: '/jobs',           icon: ClipboardList }
 		]},
 		{ en: 'Navigation Dataset', kr: '내비게이션 데이터셋', items: [
-			{ en: 'Nav Scenes',       kr: '내비 씬',          href: '/nav-scenes',     icon: '🗺' },
-			{ en: 'Dataset Editor',   kr: '데이터셋 에디터',   href: '/datasets',       icon: 'DN' },
-			{ en: 'Camera Rig',       kr: '카메라 리그',      href: '/camera_rig',     icon: 'CAM' },
-			{ en: 'Asset Library',    kr: '에셋 라이브러리',  href: '/assets',         icon: '▣' }
+			{ en: 'Nav Scenes',       kr: '내비 씬',          href: '/nav-scenes',     icon: Map },
+			{ en: 'Dataset Editor',   kr: '데이터셋 에디터',   href: '/datasets',       icon: Route },
+			{ en: 'Camera Rig',       kr: '카메라 리그',      href: '/camera_rig',     icon: Camera },
+			{ en: 'Asset Library',    kr: '에셋 라이브러리',  href: '/assets',         icon: Library }
 		]},
 		{ en: 'Rendering & System', kr: '렌더링 · 시스템', items: [
-			{ en: 'Scene Registry',   kr: '장면 레지스트리',  href: '/scenes',         icon: '🎬' },
-			{ en: 'Mitsuba Live',      kr: 'Mitsuba 라이브',   href: '/mitsuba-live-viewer', icon: '◉' },
-			{ en: 'Material Library', kr: '재질 라이브러리',  href: '/materials',      icon: '🎨' },
-			{ en: 'Bridge',           kr: '연동 상태 (Bridge)', href: '/bridge',       icon: '🌉' },
-			{ en: 'System / Workers', kr: '시스템 / 워커',    href: '/system',         icon: '🖥' },
-			{ en: 'Guide',            kr: '가이드',           href: '/guide',          icon: '📘' },
-			{ en: 'Settings',         kr: '설정',             href: '/settings',       icon: '⚙' }
+			{ en: 'Scene Registry',   kr: '장면 레지스트리',  href: '/scenes',         icon: Clapperboard },
+			{ en: 'Mitsuba Live',     kr: 'Mitsuba 라이브',   href: '/mitsuba-live-viewer', icon: Radio },
+			{ en: 'Material Library', kr: '재질 라이브러리',  href: '/materials',      icon: Palette },
+			{ en: 'Bridge',           kr: '연동 상태 (Bridge)', href: '/bridge',       icon: Link2 },
+			{ en: 'System / Workers', kr: '시스템 / 워커',    href: '/system',         icon: ServerCog },
+			{ en: 'Guide',            kr: '가이드',           href: '/guide',          icon: BookOpen },
+			{ en: 'Settings',         kr: '설정',             href: '/settings',       icon: Settings }
 		]}
 	];
 
@@ -516,23 +542,25 @@
 					aria-label="More actions"
 					aria-expanded={menuOpen}
 					onclick={(e) => { e.stopPropagation(); menuOpen = !menuOpen; }}
-				>⋮</button>
+				><EllipsisVertical size={18} strokeWidth={1.8} aria-hidden="true" /></button>
 				{#if menuOpen}
 					<div class="topbar-overflow-menu" role="menu">
 						<button type="button" role="menuitem" onclick={() => { toggleLang(); menuOpen = false; }}>
-							🌐 {$lang === 'kr' ? '한국어' : 'English'}
+							<Languages size={15} aria-hidden="true" /> {$lang === 'kr' ? '한국어' : 'English'}
 						</button>
 						<button type="button" role="menuitem" onclick={() => { handleSmokeRender(); menuOpen = false; }}>
-							🧪 {$lang === 'kr' ? 'Smoke 렌더' : 'Smoke render'}
+							<FlaskConical size={15} aria-hidden="true" /> {$lang === 'kr' ? 'Smoke 렌더' : 'Smoke render'}
 						</button>
 						<button type="button" role="menuitem" onclick={() => { toggleRightRail(); menuOpen = false; }}>
-							{$rightRailCollapsed ? '◀' : '▶'} {$lang === 'kr' ? '우측 패널' : 'Right rail'}
+							{#if $rightRailCollapsed}<PanelRightOpen size={15} aria-hidden="true" />{:else}<PanelRightClose size={15} aria-hidden="true" />{/if}
+							{$lang === 'kr' ? '우측 패널' : 'Right rail'}
 						</button>
 						<button type="button" role="menuitem" onclick={() => { toggleBottomPanel(); menuOpen = false; }}>
-							{$bottomPanelCollapsed ? '▲' : '▼'} {$lang === 'kr' ? '하단 패널' : 'Bottom panel'}
+							{#if $bottomPanelCollapsed}<PanelBottomOpen size={15} aria-hidden="true" />{:else}<PanelBottomClose size={15} aria-hidden="true" />{/if}
+							{$lang === 'kr' ? '하단 패널' : 'Bottom panel'}
 						</button>
 						<a role="menuitem" href="/settings" onclick={() => { menuOpen = false; }}>
-							⚙ {$lang === 'kr' ? '설정' : 'Settings'}
+							<Settings size={15} aria-hidden="true" /> {$lang === 'kr' ? '설정' : 'Settings'}
 						</a>
 					</div>
 				{/if}
@@ -561,9 +589,10 @@
 					<div class="nav-group-label">{$lang === 'kr' ? group.kr : group.en}</div>
 				{/if}
 				{#each group.items as item}
+					{@const NavIcon = item.icon}
 					<a href={item.href} class="nav-link {isActive(item.href) ? 'nav-link-active' : ''}">
-						<span>{item.icon} {$lang === 'kr' ? item.kr : item.en}</span>
-						{#if isActive(item.href)}<span style="font-size:0.7rem;opacity:0.5">▶</span>{/if}
+						<span class="nav-link-content"><span class="nav-link-icon"><NavIcon size={16} strokeWidth={1.8} aria-hidden="true" /></span>{$lang === 'kr' ? item.kr : item.en}</span>
+						{#if isActive(item.href)}<ChevronRight size={14} strokeWidth={2} aria-hidden="true" />{/if}
 					</a>
 				{/each}
 			{/each}
@@ -629,7 +658,7 @@
 				onclick={toggleRightRail}
 				aria-expanded={!$rightRailCollapsed}
 				aria-label={$rightRailCollapsed ? 'Expand right rail' : 'Collapse right rail'}
-			>{$rightRailCollapsed ? '◀' : '▶'}</button>
+			>{#if $rightRailCollapsed}<PanelRightOpen size={16} aria-hidden="true" />{:else}<PanelRightClose size={16} aria-hidden="true" />{/if}</button>
 			{#if !$rightRailCollapsed}
 				<span class="shell-pane-label">{$lang === 'kr' ? '우측 패널' : 'Right Rail'}</span>
 			{/if}

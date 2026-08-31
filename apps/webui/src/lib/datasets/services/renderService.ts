@@ -23,12 +23,14 @@ import {
 	getOpticalNavGraphBatchLogs,
 	listOpticalNavRenderVersions,
 	getOpticalNavRenderVersionGallery,
+	type OpticalNavRenderGalleryQuery,
 	getOpticalNavRenderCoverage,
 	promoteOpticalNavRenderVersion,
 	pruneOpticalNavRenderVersion,
 	getOpticalNavGraphRun,
 	resumeOpticalNavGraphRun,
 	sweepOpticalNavViewpointGraph,
+	submitAdaptiveRouteMotionPlan,
 	renderOpticalNavEpisodes,
 } from '$lib/api';
 
@@ -85,6 +87,24 @@ export function syncStageIndex(stage: string | undefined): number {
 /** Load render readiness status for a scene. */
 export async function fetchRenderReadiness(projectId: string, sceneId: string) {
 	return getOpticalNavRenderReadiness(projectId, sceneId);
+}
+
+/** Submit only the pose-heading entries certified by a Route Motion v3 plan. */
+export async function submitRouteMotionRenderPlan(
+	projectId: string,
+	sceneId: string,
+	payload: Record<string, unknown>,
+) {
+	return submitAdaptiveRouteMotionPlan(projectId, sceneId, payload);
+}
+
+/** Submit the explicit native pose-heading allow-list from Navigation Support v4. */
+export async function submitNavigationSupportRenderPlan(
+	projectId: string,
+	sceneId: string,
+	payload: Record<string, unknown>,
+) {
+	return submitAdaptiveRouteMotionPlan(projectId, sceneId, payload);
 }
 
 export async function fetchWorkflowStatus(projectId: string, sceneId: string) {
@@ -220,8 +240,13 @@ export async function fetchBatchLogs(projectId: string, sceneId: string, batchId
 export async function fetchRenderVersions(projectId: string, sceneId: string) {
 	return listOpticalNavRenderVersions(projectId, sceneId);
 }
-export async function fetchRenderVersionGallery(projectId: string, sceneId: string, renderVersionId: string) {
-	return getOpticalNavRenderVersionGallery(projectId, sceneId, renderVersionId);
+export async function fetchRenderVersionGallery(
+	projectId: string,
+	sceneId: string,
+	renderVersionId: string,
+	options: OpticalNavRenderGalleryQuery = {},
+) {
+	return getOpticalNavRenderVersionGallery(projectId, sceneId, renderVersionId, options);
 }
 export async function fetchRenderCoverage(projectId: string, sceneId: string) {
 	return getOpticalNavRenderCoverage(projectId, sceneId);

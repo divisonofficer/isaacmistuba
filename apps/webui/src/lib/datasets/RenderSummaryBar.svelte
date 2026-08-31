@@ -1,8 +1,11 @@
 <script lang="ts">
 	import { buildRenderSummary } from '$lib/datasets/batchHelpers';
+	import { ProgressBar } from '$lib/components';
 
 	interface Props {
 		activeBatch: any;
+		progressBatch?: any;
+		canCancel?: boolean;
 		renderMode: string;
 		health: any;
 		loading: boolean;
@@ -11,11 +14,25 @@
 		onRetryFailedJobs: () => void;
 	}
 
-	let { activeBatch, renderMode, health, loading, onRefreshBatch, onCancelStaleBatchJobs, onRetryFailedJobs }: Props = $props();
-	const summary = $derived(buildRenderSummary(activeBatch, health, renderMode));
+	let { activeBatch, progressBatch = null, canCancel = true, renderMode, health, loading, onRefreshBatch, onCancelStaleBatchJobs, onRetryFailedJobs }: Props = $props();
+	const summary = $derived(buildRenderSummary(progressBatch ?? activeBatch, health, renderMode));
 	const failed = $derived(summary.counts.failed ?? 0);
 	const active = $derived((summary.counts.running ?? 0) + (summary.counts.queued ?? 0));
 	const execution = $derived(summary.execution ?? { queued: summary.counts.queued ?? 0, prefetched: 0, workerRunning: summary.counts.running ?? 0 });
+	const cacheText = $derived(
+		summary.cacheMode === 'stokes_wave_isolated'
+			? 'wave-isolated'
+			: summary.cacheMode === 'stokes_k4_batched'
+				? 'K=4 batched'
+				: `${summary.cacheHits} hit`,
+	);
+	const cacheTitle = $derived(
+		summary.cacheMode === 'stokes_wave_isolated'
+			? 'K=4 Stokes workers are intentionally recycled between waves to release OptiX texture allocations. Zero cross-wave scene-cache hits are expected; this is not an asset or texture-cache failure.'
+			: summary.cacheMode === 'stokes_k4_batched'
+				? 'Every passive K=4 strip renders four headings from one scene load. Worker residency is reported by the daemon, not inferred from this aggregate progress card.'
+				: 'Persistent scene-cache hits among the currently displayed render tasks.',
+	);
 	const gpuLabel = $derived(
 		summary.gpus.length
 			? summary.gpus.map((gpu: any) => `GPU${gpu.index} ${gpu.util_pct ?? 0}% ${gpu.mem_used_mb ?? 0}/${gpu.mem_total_mb ?? 0}MB`).join(' · ')
@@ -35,26 +52,24 @@
 			</div>
 			<div class="summary-progress">
 				<span>{summary.complete} / {summary.total} complete</span>
-				<span>{execution.workerRunning} worker running</span>
+				<span>{execution.workerRunning} {summary.logical_progress ? 'views rendering' : 'worker running'}</span>
 				{#if execution.prefetched > 0}<span>{execution.prefetched} prefetched</span>{/if}
 				<span>{execution.queued} queued</span>
 				{#if failed > 0}<span class="danger">{failed} failed</span>{/if}
 			</div>
-			<div class="progress-track">
-				<div class="progress-fill" style={`width: ${summary.percent}%`}></div>
-			</div>
+			<ProgressBar value={summary.percent} label={`${summary.percent}% complete`} />
 		</div>
 	</div>
 	<div class="summary-resources">
 		<div><span>Stage</span><strong>{summary.activeStage || 'idle'}</strong></div>
 		<div><span>Queue</span><strong>{summary.queueLength}</strong></div>
-		<div><span>Cache</span><strong>{summary.cacheHits} hit</strong></div>
+		<div title={cacheTitle}><span>Cache</span><strong>{cacheText}</strong></div>
 		<div><span>Texture</span><strong>{summary.textureProfile ? `max${summary.textureProfile}` : 'default'}</strong></div>
 		<div class="gpu-row" title={gpuLabel}><span>GPU</span><strong>{gpuLabel}</strong></div>
 	</div>
 	<div class="summary-actions">
 		<button class="button button-subtle" disabled={loading} onclick={onRefreshBatch}>Refresh</button>
-		<button class="button button-subtle" disabled={active <= 0} onclick={onCancelStaleBatchJobs}>Cancel queued/running</button>
+		<button class="button button-subtle" disabled={!canCancel || active <= 0} onclick={onCancelStaleBatchJobs}>Cancel queued/running</button>
 		<button class="button button-primary" disabled={failed <= 0 || loading} onclick={onRetryFailedJobs}>Retry failed</button>
 	</div>
 </section>
@@ -94,8 +109,6 @@
 	.summary-title { font-size: var(--font-size-sm); color: var(--text); }
 	.summary-progress { margin: var(--space-1) 0 var(--space-2); font-size: var(--font-size-xs); color: var(--muted-strong); }
 	.danger { color: var(--danger, #dc2626); font-weight: 700; }
-	.progress-track { height: 8px; border-radius: 999px; background: var(--surface-3, #e5e7eb); overflow: hidden; }
-	.progress-fill { height: 100%; background: var(--accent, #2f6fed); border-radius: inherit; }
 	.summary-resources {
 		display: grid;
 		grid-template-columns: repeat(2, minmax(0, 1fr));
