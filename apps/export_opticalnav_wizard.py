@@ -46,12 +46,50 @@ def _write_json_atomic(path: Path, payload: Mapping[str, Any]) -> None:
     tmp.replace(path)
 
 
-def _sha256(path: Path) -> str:
+def _sha256(path: Path, *, label: str | None = None) -> str:
+    """Hash a file while making multi-GiB resume preparation observable."""
+    total = path.stat().st_size
+    completed = 0
+    started_at = time.monotonic()
+    last_report_at = started_at
+    if label:
+        print(f"[checksum] {label}: 0/{total:,} bytes", flush=True)
     digest = hashlib.sha256()
     with path.open("rb") as handle:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(block)
+            completed += len(block)
+            now = time.monotonic()
+            if label and (completed == total or now - last_report_at >= 5.0):
+                elapsed = max(now - started_at, 1e-6)
+                rate_mib_s = completed / elapsed / 1048576
+                percent = 100.0 * completed / total if total else 100.0
+                print(
+                    f"[checksum] {label}: {percent:.1f}% · {completed:,}/{total:,} bytes · {rate_mib_s:.1f} MiB/s",
+                    flush=True,
+                )
+                last_report_at = now
+    if label:
+        print(f"[checksum] {label}: done", flush=True)
     return digest.hexdigest()
+
+
+def _cached_checksum(manifest_path: Path, file_path: Path) -> str | None:
+    """Return a checksum recorded for the exact current file, if available."""
+    payload = _read_json(manifest_path, {})
+    entries = payload.get("files") if isinstance(payload, Mapping) else None
+    for entry in entries or []:
+        if not isinstance(entry, Mapping):
+            continue
+        try:
+            same_file = Path(str(entry.get("path") or "")).resolve() == file_path.resolve()
+            same_size = int(entry.get("bytes")) == file_path.stat().st_size
+        except (OSError, TypeError, ValueError):
+            continue
+        checksum = entry.get("sha256")
+        if same_file and same_size and isinstance(checksum, str) and len(checksum) == 64:
+            return checksum
+    return None
 
 
 def _project_dir(project: str) -> Path:
@@ -201,7 +239,25 @@ def discover_scenes(project_dir: Path, *, scene_ids: Iterable[str] | None = None
         if not scene_dir.is_dir():
             continue
         counts = inventory.get(scene_dir.name)
-        if counts is None and not inventory:
+        # For a specifically selected scene, stable pointers are authoritative:
+        # they represent exactly the currently promotable graph views and do
+        # not double-count old resumed versions.  The unscoped picker stays
+        # ledger-only so opening it does not recursively walk every scene's
+        # NFS observation tree.
+        pointer_counts = None
+        if requested is not None:
+            pointer_counts = _pointer_summary_counts(scene_dir)
+            if pointer_counts is None:
+                pointer_counts = {
+                    "base": _sensor_counts(project_dir, scene_dir.name, "observations"),
+                    "perturbed": _sensor_counts(project_dir, scene_dir.name, "observations_perturbed"),
+                    "perturbed_active_polar": _sensor_counts(project_dir, scene_dir.name, "observations_perturbed_active_polar"),
+                }
+        if pointer_counts is not None and any(sum(values.values()) for values in pointer_counts.values()):
+            base, perturbed, active_polar = (
+                pointer_counts["base"], pointer_counts["perturbed"], pointer_counts["perturbed_active_polar"],
+            )
+        elif counts is None and not inventory:
             # Legacy projects without a ledger are uncommon. Keep that fallback
             # isolated so a modern project's menu never recursively walks NFS.
             base = _sensor_counts(project_dir, scene_dir.name, "observations")
@@ -236,6 +292,203 @@ def discover_scenes(project_dir: Path, *, scene_ids: Iterable[str] | None = None
             "exportable": bool(sum(base.values()) + sum(perturbed.values()) + sum(active_polar.values())),
         })
     return sorted(scenes, key=lambda item: item["modified_at"], reverse=True)
+
+
+_OBSERVATION_ROOT_BY_VARIANT = {
+    "base": "observations",
+    "perturbed": "observations_perturbed",
+    "perturbed_active_polar": "observations_perturbed_active_polar",
+}
+
+
+def _current_graph_view_keys(scene_dir: Path) -> set[tuple[str, str]]:
+    """Return the exact current viewpoint/heading universe for an export.
+
+    A render can be split across several resumed render versions.  Counting all
+    version directories would then mix obsolete graph revisions into an export.
+    The current graph is the durable contract for the dataset and gives the
+    precise set of pointers that must be promoted.
+    """
+    graph = _read_json(scene_dir / "viewpoint_graph.json", {})
+    if not isinstance(graph, Mapping):
+        return set()
+    keys: set[tuple[str, str]] = set()
+    for node in graph.get("nodes") or []:
+        if not isinstance(node, Mapping):
+            continue
+        node_id = str(node.get("node_id") or "")
+        if not node_id:
+            continue
+        for heading in node.get("headings") or []:
+            heading_id = str(heading.get("heading_id") or "") if isinstance(heading, Mapping) else str(heading or "")
+            if heading_id:
+                keys.add((node_id, heading_id))
+    return keys
+
+
+def _pointer_summary_counts(scene_dir: Path) -> dict[str, dict[str, int]] | None:
+    """Read a reconciliation summary when it still matches the current graph."""
+    summary = _read_json(scene_dir / "operations" / "export_current_pointer_index.json", {})
+    graph_path = scene_dir / "viewpoint_graph.json"
+    if not isinstance(summary, Mapping) or not graph_path.is_file():
+        return None
+    if int(summary.get("graph_mtime_ns") or -1) != graph_path.stat().st_mtime_ns:
+        return None
+    variants = summary.get("variants")
+    if not isinstance(variants, Mapping):
+        return None
+    result: dict[str, dict[str, int]] = {}
+    for variant in _OBSERVATION_ROOT_BY_VARIANT:
+        value = variants.get(variant)
+        sensors = value.get("sensors") if isinstance(value, Mapping) else None
+        result[variant] = {
+            str(sensor): int(count)
+            for sensor, count in (sensors or {}).items()
+            if str(sensor) and int(count) > 0
+        } if isinstance(sensors, Mapping) else {}
+    return result
+
+
+def _safe_bundle_ref(project_dir: Path, ref: str) -> Path | None:
+    """Resolve a project-relative versioned bundle without escaping the project."""
+    candidate = Path(str(ref))
+    if not ref or candidate.is_absolute():
+        return None
+    try:
+        resolved = (project_dir / candidate).resolve()
+        resolved.relative_to(project_dir.resolve())
+    except (OSError, ValueError):
+        return None
+    return resolved if (resolved / "manifest.json").is_file() else None
+
+
+def _reconcile_current_pointers(
+    project_dir: Path,
+    *,
+    scene_id: str,
+    variants: Iterable[str],
+) -> dict[str, Any]:
+    """Promote the current graph's completed versioned bundles for export.
+
+    Older resumable sweeps may be fully complete in the ledger while never
+    having one render version that contains every frame.  The regular daemon
+    promote action intentionally refuses such fragmented versions.  Exporting
+    is different: it needs one stable pointer per logical current view.  This
+    reconciliation chooses the newest valid completed bundle for each current
+    graph view and writes only those small ``current.json`` pointers.
+    """
+    scene_dir = project_dir / "scenes" / scene_id
+    expected = _current_graph_view_keys(scene_dir)
+    if not expected:
+        return {"expected": {"views": 0}, "variants": {}}
+    ledger_path = scene_dir / "operations" / "render_ledger.sqlite3"
+    if not ledger_path.is_file():
+        raise RuntimeError(f"render ledger is missing: {ledger_path}")
+
+    selected = []
+    for raw in variants:
+        variant = str(raw).strip().lower()
+        if variant not in _OBSERVATION_ROOT_BY_VARIANT:
+            raise RuntimeError(f"unsupported export variant: {variant}")
+        if variant not in selected:
+            selected.append(variant)
+
+    report: dict[str, Any] = {}
+    with sqlite3.connect(f"file:{ledger_path}?mode=ro", uri=True) as connection:
+        for variant in selected:
+            chosen: dict[tuple[str, str], tuple[str, str, str, tuple[str, ...]]] = {}
+            # Query one newest run at a time.  A global task history sort is
+            # prohibitively slow on NFS after many interrupted resumes; each
+            # run contains at most one compact plan window's task history and
+            # lets us stop as soon as all current views have a candidate.
+            run_rows = list(connection.execute(
+                """
+                SELECT run_id, scene_version_id
+                FROM sweep_runs
+                WHERE scene_id = ? AND status IN ('completed', 'ready', 'paused')
+                ORDER BY created_at DESC
+                """,
+                (scene_id,),
+            ))
+            for run_id, scene_version_id in run_rows:
+                rows = connection.execute(
+                    """
+                    SELECT node_id, heading_id, render_version_id, metadata_json
+                    FROM sweep_tasks
+                    WHERE run_id = ? AND variant = ? AND state IN ('succeeded', 'skipped')
+                    """,
+                    (run_id, variant),
+                )
+                for node_id_raw, heading_id_raw, render_version_id, metadata_raw in rows:
+                    key = (str(node_id_raw), str(heading_id_raw))
+                    if key not in expected or key in chosen:
+                        continue
+                    metadata: Any = {}
+                    try:
+                        metadata = json.loads(metadata_raw or "{}")
+                    except (TypeError, ValueError):
+                        metadata = {}
+                    sensor_ids = metadata.get("sensor_ids") if isinstance(metadata, Mapping) else None
+                    sensors = tuple(str(sensor) for sensor in sensor_ids if str(sensor)) if isinstance(sensor_ids, list) else ()
+                    source_ref = metadata.get("source_bundle_ref") if isinstance(metadata, Mapping) else None
+                    bundle = _safe_bundle_ref(project_dir, str(source_ref or ""))
+                    if bundle is None:
+                        fallback = (
+                            f"scenes/{scene_id}/observations/versions/{render_version_id}/"
+                            f"{variant}/{key[0]}/{key[1]}"
+                        )
+                        bundle = _safe_bundle_ref(project_dir, fallback)
+                    if bundle is None:
+                        continue
+                    chosen[key] = (bundle.relative_to(project_dir).as_posix(), str(render_version_id), str(scene_version_id), sensors)
+                if len(chosen) == len(expected):
+                    break
+
+            missing = sorted(expected - set(chosen))
+            if missing:
+                examples = ", ".join(f"{node}/{heading}" for node, heading in missing[:5])
+                raise RuntimeError(
+                    f"{variant} has {len(missing)}/{len(expected)} current graph views without a valid bundle "
+                    f"(examples: {examples})"
+                )
+            observation_root = _OBSERVATION_ROOT_BY_VARIANT[variant]
+            sensor_counts: dict[str, int] = {}
+            for (node_id, heading_id), (bundle_ref, render_version_id, scene_version_id, sensors) in chosen.items():
+                pointer = scene_dir / observation_root / node_id / heading_id / "current.json"
+                pointer_payload = {
+                    "schema_version": 1,
+                    "scene_id": scene_id,
+                    "variant": variant,
+                    "node_id": node_id,
+                    "heading_id": heading_id,
+                    "render_version_id": render_version_id,
+                    "scene_version_id": scene_version_id,
+                    "bundle_ref": bundle_ref,
+                    "updated_at": _utc_now(),
+                }
+                existing = _read_json(pointer, {})
+                # Reconciliation is normally invoked again on a resumable
+                # upload.  Do not turn that into 12k NFS writes when the
+                # stable target bundle has not changed.
+                stable_keys = ("scene_id", "variant", "node_id", "heading_id", "render_version_id", "scene_version_id", "bundle_ref")
+                if not isinstance(existing, Mapping) or any(existing.get(key) != pointer_payload[key] for key in stable_keys):
+                    _write_json_atomic(pointer, pointer_payload)
+                for sensor in sensors:
+                    sensor_counts[sensor] = sensor_counts.get(sensor, 0) + 1
+            report[variant] = {
+                "expected": len(expected), "promoted": len(chosen), "missing": 0,
+                "sensors": sensor_counts,
+            }
+    result: dict[str, Any] = {"expected": {"views": len(expected)}, "variants": report}
+    graph_path = scene_dir / "viewpoint_graph.json"
+    _write_json_atomic(scene_dir / "operations" / "export_current_pointer_index.json", {
+        "schema_version": 1,
+        "scene_id": scene_id,
+        "graph_mtime_ns": graph_path.stat().st_mtime_ns,
+        "updated_at": _utc_now(),
+        "variants": report,
+    })
+    return result
 
 
 def _format_scene(scene: Mapping[str, Any], index: int) -> str:
@@ -500,6 +753,7 @@ def _local_export_command(run: Mapping[str, Any], run_path: Path) -> tuple[list[
         "--versioned-root", str(_project_dir(str(run["project"]))),
         "--out", str(bundle_dir), "--image-format", "jpeg", "--jpeg-quality", "95",
         "--no-from-exr", "--keep-manifests", "--zip", "--no-legacy-bridge-jobs",
+        "--polarization-raw-format", "minimal-f16",
     ]
     camera_ids = payload.get("camera_ids")
     if isinstance(camera_ids, list) and camera_ids:
@@ -540,8 +794,11 @@ def _run_local_export(run: dict[str, Any], run_path: Path) -> tuple[dict[str, An
         "mode": "local", "scene_id": run["scene_id"], "bundle": str(bundle_dir),
         "archive": str(archive), "completed_at": _utc_now(),
     })
+    archive_checksum = _cached_checksum(file_manifest, archive)
+    if archive_checksum is None:
+        archive_checksum = _sha256(archive, label=f"hashing {archive.name}")
     _write_json_atomic(file_manifest, {
-        "files": [{"path": str(archive), "bytes": archive.stat().st_size, "sha256": _sha256(archive)}],
+        "files": [{"path": str(archive), "bytes": archive.stat().st_size, "sha256": archive_checksum}],
     })
     run["exports_root"] = str(run_path.parent)
     status = {"status": "succeeded", "stage": "local-export", "summary": {"zip_ref": str(archive.relative_to(REPO_ROOT))}}
@@ -559,6 +816,7 @@ def _upload_run(run: dict[str, Any], run_path: Path, archives: list[Path]) -> No
     extras = [path for path in (exports_root / "export_report.json", exports_root / "export_file_manifest.json") if path.is_file()]
     files = archives + extras
     records = dict(run.get("uploads") or {})
+    checksum_manifest = exports_root / "export_file_manifest.json"
     run["status"] = "uploading"
     run["remote_dir"] = remote_dir
     run["upload_started_at"] = run.get("upload_started_at") or _utc_now()
@@ -567,7 +825,17 @@ def _upload_run(run: dict[str, Any], run_path: Path, archives: list[Path]) -> No
     for local in files:
         remote_file = remote_dir + local.name
         _upload_file(local, remote_file)
-        records[local.name] = {"remote": remote_file, "bytes": local.stat().st_size, "sha256": _sha256(local), "verified": True}
+        existing = records.get(local.name)
+        checksum = (
+            str(existing.get("sha256"))
+            if isinstance(existing, Mapping)
+            and int(existing.get("bytes") or -1) == local.stat().st_size
+            and isinstance(existing.get("sha256"), str)
+            else _cached_checksum(checksum_manifest, local)
+        )
+        if checksum is None:
+            checksum = _sha256(local, label=f"hashing {local.name} for upload record")
+        records[local.name] = {"remote": remote_file, "bytes": local.stat().st_size, "sha256": checksum, "verified": True}
         run["uploads"] = records
         run["updated_at"] = _utc_now()
         _write_json_atomic(run_path, run)
@@ -668,6 +936,31 @@ def main() -> int:
         if not args.yes and not _prompt_bool("Start export?", True):
             return 0
         _write_json_atomic(run_path, run)
+
+    payload = run.get("export_payload") if isinstance(run.get("export_payload"), Mapping) else {}
+    export_variants = ["base"]
+    if bool(payload.get("eval_perturbation", False)):
+        export_variants.append("perturbed")
+    if bool(payload.get("include_active_polar", False)):
+        export_variants.append("perturbed_active_polar")
+    try:
+        reconciliation = _reconcile_current_pointers(
+            project_dir,
+            scene_id=str(run["scene_id"]),
+            variants=export_variants,
+        )
+    except RuntimeError as exc:
+        run["status"] = "blocked"
+        run["pointer_reconciliation_error"] = str(exc)
+        run["updated_at"] = _utc_now()
+        _write_json_atomic(run_path, run)
+        print(f"[error] export pointer reconciliation failed: {exc}", file=sys.stderr)
+        return 1
+    run["pointer_reconciliation"] = reconciliation
+    run["updated_at"] = _utc_now()
+    _write_json_atomic(run_path, run)
+    print("[pointers] " + json.dumps(reconciliation, ensure_ascii=False, sort_keys=True), flush=True)
+
     local_mode = str(run.get("mode") or "daemon") == "local"
     if local_mode:
         status, archives = _run_local_export(run, run_path)

@@ -39,15 +39,22 @@ Examples
 from __future__ import annotations
 
 import argparse
+import hashlib
+import io
 import json
+import os
 import shutil
 import sys
+import tempfile
+import time
 import zipfile
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
+import numpy as np
 from PIL import Image
+from tqdm import tqdm
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 for _module_path in (
@@ -56,6 +63,71 @@ for _module_path in (
 ):
     if str(_module_path) not in sys.path:
         sys.path.insert(0, str(_module_path))
+
+from mitsuba_converter.multimodal import MINIMAL_STOKES_KEYS, MINIMAL_STOKES_SCHEMA
+
+
+def _write_minimal_f16_stokes(source: Path, destination: Path) -> dict:
+    """Convert a legacy/minimal Stokes NPZ once, with an atomic destination.
+
+    The source bytes are hashed while they are loaded so the export provenance
+    identifies the exact lossy F32→F16 conversion input without a second NFS
+    read. Existing destination files are accepted only when their adjacent
+    metadata names the same source hash.
+    """
+    sidecar = destination.with_suffix(destination.suffix + ".source.json")
+    payload = source.read_bytes()
+    source_sha256 = hashlib.sha256(payload).hexdigest()
+    if destination.is_file() and sidecar.is_file():
+        try:
+            previous = json.loads(sidecar.read_text(encoding="utf-8"))
+            if previous.get("source_sha256") == source_sha256 and previous.get("schema") == MINIMAL_STOKES_SCHEMA:
+                return {**previous, "reused": True, "bytes": destination.stat().st_size}
+        except (OSError, ValueError, TypeError):
+            pass
+    with np.load(io.BytesIO(payload), allow_pickle=False) as data:
+        missing = [key for key in MINIMAL_STOKES_KEYS if key not in data.files]
+        if missing:
+            raise ValueError(f"{source} lacks Stokes arrays: {', '.join(missing)}")
+        arrays = {key: np.asarray(data[key], dtype=np.float32) for key in MINIMAL_STOKES_KEYS}
+    shape = arrays["s0"].shape
+    if len(shape) != 3 or shape[-1] != 3 or any(value.shape != shape for value in arrays.values()):
+        raise ValueError(f"{source} has invalid RGB Stokes shape")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary_name = tempfile.mkstemp(prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            np.savez_compressed(handle, **{key: value.astype(np.float16) for key, value in arrays.items()})
+        os.replace(temporary_name, destination)
+    except Exception:
+        try:
+            os.unlink(temporary_name)
+        except FileNotFoundError:
+            pass
+        raise
+    channel_metrics = {
+        key: {
+            "rmse": float(np.sqrt(np.mean((value - value.astype(np.float16).astype(np.float32)) ** 2))),
+            "max_abs_error": float(np.max(np.abs(value - value.astype(np.float16).astype(np.float32)))),
+            "nonfinite_source": int(np.count_nonzero(~np.isfinite(value))),
+        }
+        for key, value in arrays.items()
+    }
+    info = {
+        "schema": MINIMAL_STOKES_SCHEMA,
+        "source": str(source),
+        "source_sha256": source_sha256,
+        "source_bytes": len(payload),
+        "dtype": "float16",
+        "shape": list(shape),
+        "axis_order": ["height", "width", "rgb"],
+        "component_order": ["S0", "S1", "S2", "S3"],
+        "polanalyser_tensor_axis_order": ["height", "width", "rgb", "stokes"],
+        "channel_metrics": channel_metrics,
+        "lossy": True,
+    }
+    sidecar.write_text(json.dumps(info, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+    return {**info, "bytes": destination.stat().st_size, "reused": False}
 
 
 @dataclass
@@ -601,7 +673,11 @@ def main() -> int:
     ap.add_argument("--variants", default=None, help="Comma-separated variants: base,perturbed,perturbed_active_polar (default: all).")
     ap.add_argument("--no-legacy-bridge-jobs", action="store_true", help="Do not merge legacy out/bridge_jobs input with versioned observations.")
     ap.add_argument("--keep-manifests", action="store_true", help="Also write slimmed per-frame manifest.json for full provenance.")
-    ap.add_argument("--no-polarization-raw", action="store_true", help="Skip copying polarization stokes_data.npz (raw Stokes) into polarization_raw/.")
+    ap.add_argument("--no-polarization-raw", action="store_true", help="Skip exporting polarization Stokes data into polarization_raw/.")
+    ap.add_argument(
+        "--polarization-raw-format", choices=["minimal-f16", "legacy"], default="minimal-f16",
+        help="Polarization export format: compact 12-channel F16 Stokes (default) or a legacy NPZ copy.",
+    )
     ap.add_argument("--nav-dataset-root", default=None, help="OpticalNav dataset root (dataset.json + scenes/ + episodes/). Auto-detected under out/opticalnav/* if omitted.")
     ap.add_argument("--no-graph", action="store_true", help="Skip exporting the viewpoint navigation graph / grid / episodes.")
     ap.add_argument("--no-birdseye", action="store_true", help="Skip the bird's-eye grid+graph PNG.")
@@ -642,14 +718,16 @@ def main() -> int:
     exact_scene = args.scene if (args.exact_scene and args.scene) else None
     camera_ids = {item.strip() for item in (args.camera_ids or "").split(",") if item.strip()} or None
     print(f"[scan] reading manifests for {len(jobs)} bundles ...", flush=True)
-    for index, (job_dir, variant) in enumerate(jobs, 1):
-        frame_records = _build_records(job_dir, args.keep_manifests, exact_scene, variant, camera_ids)
-        if not frame_records:
-            skipped += 1
-            continue
-        records.extend(frame_records)
-        if index == 1 or index % 100 == 0 or index == len(jobs):
-            print(f"[scan] manifest {index}/{len(jobs)} · {len(records)} export records · {skipped} skipped", flush=True)
+    with tqdm(total=len(jobs), desc="scan manifests", unit="bundle", dynamic_ncols=True, file=sys.stdout) as progress:
+        for index, (job_dir, variant) in enumerate(jobs, 1):
+            frame_records = _build_records(job_dir, args.keep_manifests, exact_scene, variant, camera_ids)
+            if not frame_records:
+                skipped += 1
+            else:
+                records.extend(frame_records)
+            progress.update(1)
+            if index == 1 or index % 100 == 0 or index == len(jobs):
+                progress.set_postfix(records=len(records), skipped=skipped)
     print(f"[scan] {len(records)} frames to export ({skipped} jobs skipped: no manifest/png)")
 
     src_bytes = sum(r.src_png.stat().st_size for r in records)
@@ -688,46 +766,75 @@ def main() -> int:
 
     # Encode images in parallel.
     tasks = []
-    for r in records:
-        mod_suffix = "" if r.modality == "rgb" else f"__{r.modality}"
-        dst = images_dir / r.variant / f"{r.frame_id}__{r.camera_id}{mod_suffix}.{ext}"
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        r.record["image"] = str(dst.relative_to(out_dir))
-        if use_exr and r.modality == "rgb" and r.src_exr is not None:
-            tasks.append(("exr", str(r.src_exr), str(dst), args.image_format, args.jpeg_quality,
-                          tone["tone_exposure"], tone["tone_white"]))
-        else:
-            tasks.append(("png", str(r.src_png), str(dst), args.image_format, args.jpeg_quality, 0.0, 0.0))
+    with tqdm(total=len(records), desc="prepare images", unit="frame", dynamic_ncols=True, file=sys.stdout) as progress:
+        for r in records:
+            mod_suffix = "" if r.modality == "rgb" else f"__{r.modality}"
+            dst = images_dir / r.variant / f"{r.frame_id}__{r.camera_id}{mod_suffix}.{ext}"
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            r.record["image"] = str(dst.relative_to(out_dir))
+            if use_exr and r.modality == "rgb" and r.src_exr is not None:
+                tasks.append(("exr", str(r.src_exr), str(dst), args.image_format, args.jpeg_quality,
+                              tone["tone_exposure"], tone["tone_white"]))
+            else:
+                tasks.append(("png", str(r.src_png), str(dst), args.image_format, args.jpeg_quality, 0.0, 0.0))
+            progress.update(1)
 
     # Polarization raw: copy each camera's stokes_data.npz once (shared across the
     # camera's Stokes-representation modality rows) so downstream code can recompute
     # any representation. PNG representations are already exported as image rows above.
     polar_raw_copied = 0
+    polar_raw_reused = 0
+    polar_raw_output_bytes = 0
+    polar_raw_infos: list[dict] = []
     if not args.no_polarization_raw:
         raw_dir = out_dir / "polarization_raw"
         seen_raw: set[str] = set()
+        raw_records = []
         for r in records:
             if r.stokes_npz_src is None:
                 continue
             dst_name = f"{r.variant}/{r.frame_id}__{r.camera_id}__stokes.npz"
-            if dst_name in seen_raw:
-                continue
-            seen_raw.add(dst_name)
-            (raw_dir / r.variant).mkdir(parents=True, exist_ok=True)
-            try:
-                shutil.copy2(r.stokes_npz_src, raw_dir / dst_name)
-                polar_raw_copied += 1
-            except OSError as exc:
-                print(f"[warn] stokes copy failed {dst_name}: {exc}", file=sys.stderr)
-            if polar_raw_copied and polar_raw_copied % 100 == 0:
-                print(f"[encode] copied {polar_raw_copied} polarization Stokes files ...", flush=True)
+            if dst_name not in seen_raw:
+                seen_raw.add(dst_name)
+                raw_records.append((r.stokes_npz_src, dst_name))
+        with tqdm(total=len(raw_records), desc="F16 Stokes", unit="frame", dynamic_ncols=True, file=sys.stdout) as progress:
+            for source, dst_name in raw_records:
+                (raw_dir / Path(dst_name).parent).mkdir(parents=True, exist_ok=True)
+                destination = raw_dir / dst_name
+                try:
+                    if args.polarization_raw_format == "minimal-f16":
+                        info = _write_minimal_f16_stokes(source, destination)
+                        polar_raw_infos.append({"path": str(destination.relative_to(out_dir)), **info})
+                        polar_raw_reused += int(bool(info.get("reused")))
+                        polar_raw_output_bytes += int(info.get("bytes", 0) or 0)
+                    else:
+                        shutil.copy2(source, destination)
+                        polar_raw_output_bytes += destination.stat().st_size
+                    polar_raw_copied += 1
+                except OSError as exc:
+                    print(f"[warn] stokes copy failed {dst_name}: {exc}", file=sys.stderr)
+                except (ValueError, KeyError) as exc:
+                    print(f"[warn] stokes conversion failed {dst_name}: {exc}", file=sys.stderr)
+                progress.update(1)
+                progress.set_postfix(done=polar_raw_copied, reused=polar_raw_reused,
+                                     output=f"{polar_raw_output_bytes / 1048576:.0f}MiB")
         if polar_raw_copied:
-            print(f"[encode] copied {polar_raw_copied} polarization stokes_data.npz → polarization_raw/")
+            action = "converted" if args.polarization_raw_format == "minimal-f16" else "copied"
+            print(f"[encode] {action} {polar_raw_copied} polarization Stokes files → polarization_raw/ ({polar_raw_reused} reused)")
+        if polar_raw_infos:
+            (out_dir / "polarization_raw_manifest.json").write_text(
+                json.dumps({
+                    "schema": MINIMAL_STOKES_SCHEMA,
+                    "format": args.polarization_raw_format,
+                    "files": polar_raw_infos,
+                }, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
 
     out_bytes = 0
     errors = 0
     done = 0
-    with ProcessPoolExecutor(max_workers=max(1, args.workers)) as ex:
+    with ProcessPoolExecutor(max_workers=max(1, args.workers)) as ex, \
+         tqdm(total=len(tasks), desc="encode images", unit="image", dynamic_ncols=True, file=sys.stdout) as progress:
         futures = [ex.submit(_encode_image, t) for t in tasks]
         for fut in as_completed(futures):
             dst, nbytes, err = fut.result()
@@ -737,28 +844,31 @@ def main() -> int:
                 print(f"[warn] encode failed {Path(dst).name}: {err}", file=sys.stderr)
             else:
                 out_bytes += nbytes
-            if done == 1 or done % 100 == 0 or done == len(tasks):
-                print(f"[encode] {done}/{len(tasks)} · {errors} failed ...", flush=True)
+            progress.update(1)
+            progress.set_postfix(failed=errors, output=f"{out_bytes / 1048576:.0f}MiB")
     print(f"[encode] done: {done - errors} ok, {errors} failed")
 
     # Write index.jsonl.
     index_path = out_dir / "index.jsonl"
-    with index_path.open("w") as f:
+    with index_path.open("w") as f, tqdm(total=len(records), desc="write index", unit="record", dynamic_ncols=True, file=sys.stdout) as progress:
         for r in records:
             f.write(json.dumps(r.record, ensure_ascii=False) + "\n")
+            progress.update(1)
     print(f"[write] {index_path.relative_to(out_dir.parent)} ({len(records)} records)")
 
     # Optional per-frame slimmed manifests.
     if args.keep_manifests:
         man_dir = out_dir / "manifests"
         man_dir.mkdir(exist_ok=True)
-        for r in records:
-            if r.manifest_slim is not None:
-                variant_dir = man_dir / r.variant
-                variant_dir.mkdir(parents=True, exist_ok=True)
-                (variant_dir / f"{r.frame_id}.json").write_text(
-                    json.dumps(r.manifest_slim, ensure_ascii=False, indent=2)
-                )
+        with tqdm(total=len(records), desc="write manifests", unit="manifest", dynamic_ncols=True, file=sys.stdout) as progress:
+            for r in records:
+                if r.manifest_slim is not None:
+                    variant_dir = man_dir / r.variant
+                    variant_dir.mkdir(parents=True, exist_ok=True)
+                    (variant_dir / f"{r.frame_id}.json").write_text(
+                        json.dumps(r.manifest_slim, ensure_ascii=False, indent=2)
+                    )
+                progress.update(1)
         print(f"[write] manifests/ ({len(records)} files)")
 
     # Navigation graph + grid + episodes (the metadata the image-only export dropped).
@@ -787,6 +897,13 @@ def main() -> int:
         "image_format": args.image_format,
         "jpeg_quality": args.jpeg_quality if args.image_format != "png" else None,
         "dropped_modalities": ["exr", "raw_npz"],
+        "polarization_raw": {
+            "included": not args.no_polarization_raw,
+            "format": args.polarization_raw_format if not args.no_polarization_raw else None,
+            "schema": MINIMAL_STOKES_SCHEMA if (not args.no_polarization_raw and args.polarization_raw_format == "minimal-f16") else None,
+            "count": polar_raw_copied,
+            "reused": polar_raw_reused,
+        },
         "tonemap": (
             {
                 "source": "rgb.exr",
@@ -828,12 +945,39 @@ def main() -> int:
 
     if args.zip:
         zip_path = out_dir.with_suffix(".zip")
-        print(f"[zip] writing {zip_path} ...")
-        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
-            for p in sorted(out_dir.rglob("*")):
-                if p.is_file():
-                    zf.write(p, p.relative_to(out_dir.parent))
-        print(f"[zip] {zip_path} ({zip_path.stat().st_size / 1048576:.1f} MB)")
+        zip_files = [path for path in sorted(out_dir.rglob("*")) if path.is_file()]
+        total_files = len(zip_files)
+        total_input_bytes = sum(path.stat().st_size for path in zip_files)
+        print(
+            f"[zip] writing {zip_path} · 0/{total_files} files · "
+            f"{total_input_bytes / 1048576:.1f} MB input",
+            flush=True,
+        )
+        started_at = time.monotonic()
+        last_report_at = started_at
+        completed_bytes = 0
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf, \
+             tqdm(total=total_input_bytes, desc="zip bundle", unit="B", unit_scale=True, dynamic_ncols=True, file=sys.stdout) as progress:
+            for index, path in enumerate(zip_files, 1):
+                zf.write(path, path.relative_to(out_dir.parent))
+                written = path.stat().st_size
+                completed_bytes += written
+                progress.update(written)
+                progress.set_postfix(files=f"{index}/{total_files}", archive=f"{zip_path.stat().st_size / 1048576:.0f}MiB")
+                now = time.monotonic()
+                if index == total_files or index % 100 == 0 or now - last_report_at >= 5.0:
+                    elapsed = max(now - started_at, 1e-6)
+                    rate_mib_s = completed_bytes / elapsed / 1048576
+                    percent = 100.0 * completed_bytes / total_input_bytes if total_input_bytes else 100.0
+                    zip_mib = zip_path.stat().st_size / 1048576 if zip_path.exists() else 0.0
+                    print(
+                        f"[zip] {index}/{total_files} · {percent:.1f}% · "
+                        f"{completed_bytes / 1048576:.1f}/{total_input_bytes / 1048576:.1f} MB input · "
+                        f"{rate_mib_s:.1f} MiB/s · zip {zip_mib:.1f} MB",
+                        flush=True,
+                    )
+                    last_report_at = now
+        print(f"[zip] done: {zip_path} ({zip_path.stat().st_size / 1048576:.1f} MB)", flush=True)
 
     return 0
 

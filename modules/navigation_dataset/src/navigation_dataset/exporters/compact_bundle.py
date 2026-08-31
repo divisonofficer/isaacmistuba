@@ -17,8 +17,8 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-POLAR_STOKES_CORE_SCHEMA = "opticalnav.stokes_core.v1"
-POLAR_STOKES_CORE_KEYS = ("rgb", "s0", "s1", "s2", "s3", "mask")
+POLAR_STOKES_CORE_SCHEMA = "minimal_rgb_stokes_f16_v2"
+POLAR_STOKES_CORE_KEYS = ("s0", "s1", "s2", "s3")
 POLAR_LUMA_WEIGHTS = (0.2126, 0.7152, 0.0722)
 POLAR_PREVIEW_RECIPE = "mitsuba_converter.save_polarization_products.v1"
 
@@ -160,7 +160,7 @@ def plan_compact_bundle_files(
         if src.name == "stokes_data.npz" and src.parent.resolve() in polar_dirs:
             if profile.include_stokes_core:
                 plan.polar_core.append(
-                    PolarCorePlan(src=src, dst=str(Path(item.dst).with_name("stokes_core_v1.npz")).replace("\\", "/"))
+                    PolarCorePlan(src=src, dst=str(Path(item.dst).with_name("stokes_core_v2.npz")).replace("\\", "/"))
                 )
             else:
                 plan.omitted.append(item)
@@ -254,23 +254,22 @@ def write_polar_thumbnail(plan: PolarThumbnailPlan, root: Path, *, tile_width: i
 
 
 def write_stokes_core(src: Path, dst: Path) -> dict[str, Any]:
-    """Repack canonical Stokes inputs without lossy dtype conversion."""
+    """Write the portable 12-channel F16 Stokes core from legacy or v2 input."""
     import numpy as np  # noqa: PLC0415
 
     with np.load(src, allow_pickle=False) as source:
         missing = [key for key in POLAR_STOKES_CORE_KEYS if key not in source.files]
         if missing:
             raise ValueError(f"{src} lacks required Stokes arrays: {', '.join(missing)}")
-        arrays = {key: np.asarray(source[key]) for key in POLAR_STOKES_CORE_KEYS}
-    for key in ("rgb", "s0", "s1", "s2", "s3"):
-        if arrays[key].dtype != np.float32:
-            raise ValueError(f"{src} has non-float32 {key}: {arrays[key].dtype}")
-    if arrays["mask"].dtype != np.bool_:
-        raise ValueError(f"{src} has non-bool mask: {arrays['mask'].dtype}")
+        arrays = {key: np.asarray(source[key], dtype=np.float32) for key in POLAR_STOKES_CORE_KEYS}
+    shape = arrays["s0"].shape
+    if len(shape) != 3 or shape[-1] != 3 or any(value.shape != shape for value in arrays.values()):
+        raise ValueError(f"{src} has invalid RGB Stokes shapes")
+    converted = {key: value.astype(np.float16) for key, value in arrays.items()}
     dst.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(dst, **arrays)
+    np.savez_compressed(dst, **converted)
     with np.load(dst, allow_pickle=False) as restored:
-        for key, value in arrays.items():
+        for key, value in converted.items():
             check = np.asarray(restored[key])
             if (
                 check.dtype != value.dtype
@@ -285,8 +284,12 @@ def write_stokes_core(src: Path, dst: Path) -> dict[str, Any]:
         "bytes": dst.stat().st_size,
         "arrays": {
             key: {"dtype": str(value.dtype), "shape": list(value.shape)}
-            for key, value in arrays.items()
+            for key, value in converted.items()
         },
+        "axis_order": ["height", "width", "rgb"],
+        "component_order": ["S0", "S1", "S2", "S3"],
+        "polanalyser_tensor_axis_order": ["height", "width", "rgb", "stokes"],
+        "lossy": True,
     }
 
 
@@ -448,7 +451,7 @@ def rewrite_observation_manifest_payload(
                 original_core = original.get("stokes_npz")
                 core = source_to_exported.get(original_core) if isinstance(original_core, str) else None
                 if core:
-                    exported["stokes_core_v1"] = core
+                    exported["stokes_core_v2"] = core
             elif profile.include_stokes_core and polar_extension is not None:
                 artifact["polarization_extension"] = polar_extension
             elif profile.include_polar_thumbnails:
@@ -468,7 +471,7 @@ def rewrite_observation_manifest_payload(
             artifact_extras["derived_on_demand"] = {
                 "recipe": str(virtual.get("recipe") or POLAR_PREVIEW_RECIPE),
                 "modality": virtual.get("modality"),
-                "source": exported.get("stokes_core_v1") or None,
+                "source": exported.get("stokes_core_v2") or None,
                 "extension_required": bool(profile.include_stokes_core and profile.split_polar_extension),
             }
         artifact["artifact_paths"] = exported
@@ -524,7 +527,7 @@ def rewrite_observation_manifests(
                     original_core = original.get("stokes_npz")
                     core = source_to_exported.get(original_core) if isinstance(original_core, str) else None
                     if core:
-                        exported["stokes_core_v1"] = core
+                        exported["stokes_core_v2"] = core
                 elif profile.include_stokes_core and polar_extension is not None:
                     artifact["polarization_extension"] = polar_extension
                 elif profile.include_polar_thumbnails:
@@ -541,7 +544,7 @@ def rewrite_observation_manifests(
                 artifact_extras["derived_on_demand"] = {
                     "recipe": str(virtual.get("recipe") or POLAR_PREVIEW_RECIPE),
                     "modality": virtual.get("modality"),
-                    "source": exported.get("stokes_core_v1") or None,
+                    "source": exported.get("stokes_core_v2") or None,
                     "extension_required": bool(profile.include_stokes_core and profile.split_polar_extension),
                 }
             artifact["artifact_paths"] = exported
