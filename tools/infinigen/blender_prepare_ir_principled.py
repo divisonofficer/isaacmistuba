@@ -914,7 +914,12 @@ def main() -> int:
         if structural_manifest.get("schema") != "robomituba.ir_structural_rematerialization.v1":
             raise RuntimeError("unsupported structural rematerialization manifest")
         selection = structural_manifest.get("selection") or {}
-        if selection.get("policy") not in {"interior_structure_only_v1", "interior_structure_only_v2_role_curated", "interior_structure_only_v3_explicit_roles"}:
+        if selection.get("policy") not in {
+            "interior_structure_only_v1",
+            "interior_structure_only_v2_role_curated",
+            "interior_structure_only_v3_explicit_roles",
+            "interior_structure_only_v4_dielectric_loadbearing",
+        }:
             raise RuntimeError("structural rematerialization manifest lacks interior-only selection policy")
         for binding in structural_manifest.get("bindings") or []:
             if not bool((binding.get("eligibility") or {}).get("eligible")):

@@ -755,6 +755,17 @@ def _extended_candidate(record: dict[str, Any], staging_root: Path) -> dict[str,
             continue
         if family == "metal" and role != "wall":
             continue
+        # Interior floors in the opaque Principled IR contract are always
+        # dielectric.  TextureCan's ``metallic`` map is authoritative even
+        # when the broad asset category is tile/stone (for example decorative
+        # marble with gold inlay), so category-only filtering can otherwise
+        # admit a physically invalid reflective floor.
+        metallic = dict(record.get("metallic") or {})
+        if role == "floor" and (
+            metallic.get("mode") == "texture"
+            or float(metallic.get("value") or 0.0) > 1e-6
+        ):
+            continue
         if "wall" in title and role != "wall":
             continue
         if ("floor" in title or "flooring" in title) and role != "floor":

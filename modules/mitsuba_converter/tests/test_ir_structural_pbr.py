@@ -68,3 +68,26 @@ def test_explicit_roles_replace_keyword_inference_for_new_registry(tmp_path):
     ]}
     bindings, _ = bindings_for_scene(scene, loaded, seed=2)
     assert [(row["unit_id"], row["metallic"]) for row in bindings] == [("panel", {"mode": "texture", "map": "metallic"})]
+
+
+def test_loadbearing_structures_skip_assets_with_metallic_texture():
+    registry = {
+        "schema": REGISTRY_SCHEMA,
+        "role_policy": "explicit_approved_roles_v1",
+        "materials": [
+            {
+                "id": "bad_floor", "license": "CC0-1.0", "maps": {"base_color": "a", "roughness": "b", "normal_gl": "c", "metallic": "d"},
+                "physical_size_m": {"width": 1.0, "height": 1.0}, "approved_roles": ["floor"],
+                "metallic": {"mode": "texture", "map": "metallic"},
+            },
+            {
+                "id": "good_floor", "license": "CC0-1.0", "maps": {"base_color": "e", "roughness": "f", "normal_gl": "g"},
+                "physical_size_m": {"width": 1.0, "height": 1.0}, "approved_roles": ["floor"],
+                "metallic": {"mode": "constant", "value": 0.0},
+            },
+        ],
+    }
+    scene = {"units": [{"id": "floor", "kind": "structure", "semantic_type": "floor", "subtype": "floor",
+                         "collections": ["room_floor"], "material_slots": [{}]}]}
+    bindings, _ = bindings_for_scene(scene, registry, seed=2)
+    assert bindings[0]["material_id"] == "good_floor"

@@ -16,6 +16,39 @@ SUPPORTED_DATASET_SCHEMAS = frozenset((DATASET_SCHEMA, LEGACY_DATASET_SCHEMA))
 SUPPORTED_ARTIFACT_SCHEMAS = frozenset((ARTIFACT_SCHEMA, LEGACY_ARTIFACT_SCHEMA))
 OVERVIEW_SCHEMA = "robomituba.ir_scene_overview.v1"
 
+# Storage is intentionally independent from the dataset/PBR schema.  A compact
+# child dataset has identical pixels to its parent up to EXR half precision and
+# may omit *diagnostic* diffuse decomposition products, while keeping the
+# trainable RGB/NIR/PBR contract unchanged.
+STORAGE_PROFILE_LEGACY_FULL_FLOAT32_V1 = "legacy_full_float32_v1"
+STORAGE_PROFILE_CORE_HALF_EXR_V1 = "core_half_exr_v1"
+STORAGE_PROFILE_DIAGNOSTIC_HALF_EXR_V1 = "diagnostic_half_exr_v1"
+STORAGE_PROFILES = {
+    STORAGE_PROFILE_LEGACY_FULL_FLOAT32_V1: {
+        "exr_precision": "float32", "store_diffuse_decomposition": True,
+        "publication_tier": "legacy_full",
+    },
+    STORAGE_PROFILE_CORE_HALF_EXR_V1: {
+        "exr_precision": "float16", "store_diffuse_decomposition": False,
+        "publication_tier": "core",
+    },
+    # Stage-0/QC can retain diffuse diagnostics without imposing their cost on
+    # the full public dataset.
+    STORAGE_PROFILE_DIAGNOSTIC_HALF_EXR_V1: {
+        "exr_precision": "float16", "store_diffuse_decomposition": True,
+        "publication_tier": "diagnostic",
+    },
+}
+
+
+def storage_profile_spec(profile: object) -> dict[str, object]:
+    """Return the immutable storage policy or reject an unknown profile."""
+    key = str(profile)
+    try:
+        return {"id": key, **STORAGE_PROFILES[key]}
+    except KeyError as exc:
+        raise ValueError(f"unsupported IR dataset storage profile: {key!r}") from exc
+
 HDR_MODALITIES = {
     "rgb", "nir_active", "nir_passive", "nir_active_minus_passive",
     "diffuse_component_rgb", "diffuse_component_nir",

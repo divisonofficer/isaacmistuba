@@ -465,6 +465,10 @@ class IRDatasetController:
         # snapshots stay false so their active-NIR fingerprints and completed
         # frames remain resumable without an implicit rerender.
         request.setdefault("nir_passive", False)
+        # Persisted pre-compaction jobs keep their historical float32/full
+        # artifact contract. New submissions choose the compact core profile
+        # below; never silently change an interrupted job's fingerprint.
+        request.setdefault("storage_profile", "legacy_full_float32_v1")
         request.setdefault("paired_fraction", 0.25)
         # A lighting-expanded frame count is not a substitute for spatial
         # coverage.  New jobs must therefore have at least 100 distinct
@@ -930,6 +934,7 @@ class IRDatasetController:
             "ambient_fill_energy_scale": float(raw.get("ambient_fill_energy_scale", 1.0)),
             "illumination_diversity": bool(raw.get("illumination_diversity", False)),
             "nir_passive": bool(raw.get("nir_passive", True)),
+            "storage_profile": str(raw.get("storage_profile") or "core_half_exr_v1"),
             "paired_fraction": float(raw.get("paired_fraction", 0.20)),
             "illumination_pairing_policy": str(raw.get("illumination_pairing_policy") or "reference_subset_v2"),
             "min_unique_pose_count": int(raw.get("min_unique_pose_count", 100)),
@@ -959,6 +964,8 @@ class IRDatasetController:
         }
         if request["width"] < 1 or request["height"] < 1 or request["rgb_spp"] < 1 or request["nir_spp"] < 1 or not 1 <= request["fov"] < 179 or not 100 <= request["pose_budget"] <= 2000:
             raise ValueError("invalid render dimensions, samples, or horizontal FOV")
+        if request["storage_profile"] not in {"legacy_full_float32_v1", "core_half_exr_v1", "diagnostic_half_exr_v1"}:
+            raise ValueError("invalid storage_profile")
         if not 0.05 <= request["paired_fraction"] <= 1.0:
             raise ValueError("paired fraction must be in [0.05, 1.0]")
         if request["illumination_pairing_policy"] not in {"legacy_six_way_v1", "reference_subset_v2"}:
@@ -1617,13 +1624,50 @@ class IRDatasetController:
                 self._queue_corrected_replan(job)
             return self._payload(job)
 
-    def remove_terminal_job(self, job_id: str) -> dict[str, Any]:
-        """Remove a terminal card while retaining its diagnostic record off-queue.
+    def _unreferenced_removable_artifacts(self, job: ControllerJob) -> list[Path]:
+        """Return only failed-job work paths that no other controller job owns."""
+        candidates: list[Path] = []
+        paths = job.request.get("paths") or {}
+        for key in ("pipeline", "dataset"):
+            raw = paths.get(key)
+            if not raw:
+                continue
+            candidate = Path(str(raw)).resolve()
+            allowed_root = self.pipeline_root.resolve() if key == "pipeline" else self.work_root.resolve()
+            if candidate != allowed_root and allowed_root in candidate.parents and candidate.is_dir():
+                candidates.append(candidate)
+        removable: list[Path] = []
+        for candidate in candidates:
+            # A queued child may still rely on a parent Stage 1, even if the
+            # parent card is terminal. Preserve it until all references end.
+            in_use = False
+            for other in self._jobs.values():
+                if other.job_id == job.job_id:
+                    continue
+                references = list((other.request.get("paths") or {}).values())
+                references.append(other.request.get("legacy_dataset"))
+                for value in references:
+                    if not value:
+                        continue
+                    try:
+                        reference = Path(str(value)).resolve()
+                    except OSError:
+                        continue
+                    if reference == candidate or candidate in reference.parents:
+                        in_use = True
+                        break
+                if in_use:
+                    break
+            if not in_use:
+                removable.append(candidate)
+        return sorted(set(removable), key=lambda item: len(item.parts), reverse=True)
 
-        Generated/imported/pipeline artifacts are deliberately untouched.  This
-        only removes the durable controller snapshot and JSONL from the active
-        Jobs view; the archived snapshot is useful if an operator later needs
-        to inspect why a scene was rejected.
+    def remove_terminal_job(self, job_id: str, *, purge_artifacts: bool = True) -> dict[str, Any]:
+        """Remove a terminal card, retaining logs while reclaiming unused work.
+
+        Only controller-owned ``.pipeline`` and unpublished work-dataset
+        subtrees are eligible. Source Infinigen outputs, OpticalNav scenes,
+        and immutable published datasets are never deleted here.
         """
         with self._lock:
             job = self._jobs.get(job_id)
@@ -1631,10 +1675,12 @@ class IRDatasetController:
                 raise KeyError(job_id)
             if job.status not in TERMINAL or job_id in self._running:
                 raise ValueError("only a non-running terminal job can be removed")
+            purge_paths = self._unreferenced_removable_artifacts(job) if purge_artifacts else []
             archive = self.control_root.parent / "removed"
             archive.mkdir(parents=True, exist_ok=True)
             payload = job.payload()
             payload["removed_at"] = _utc()
+            payload["purged_artifacts"] = [str(path) for path in purge_paths]
             _atomic_json(archive / f"{job_id}.json", payload)
             log = self._log_path(job)
             if log.is_file():
@@ -1645,7 +1691,11 @@ class IRDatasetController:
             self._jobs.pop(job_id, None)
             self._queue = [ident for ident in self._queue if ident != job_id]
             self._stage_progress_cache.pop(job_id, None)
-            return {"job_id": job_id, "removed": True, "archive": str(archive / f"{job_id}.json")}
+            for path in purge_paths:
+                if path.exists():
+                    shutil.rmtree(path)
+            return {"job_id": job_id, "removed": True, "archive": str(archive / f"{job_id}.json"),
+                    "purged_artifacts": [str(path) for path in purge_paths]}
 
     def set_job_visibility(self, job_id: str, *, hidden: bool) -> dict[str, Any]:
         """Hide/unhide a terminal job without removing its durable history."""
@@ -1686,11 +1736,16 @@ class IRDatasetController:
                 for key in (
                     "width", "height", "fov", "rgb_spp", "nir_spp",
                     "flash_energy_scale", "ambient_fill_energy_scale",
-                    "illumination_diversity", "paired_fraction", "pose_budget",
+                    "illumination_diversity", "nir_passive", "paired_fraction",
+                    "illumination_pairing_policy", "min_unique_pose_count", "pose_budget",
                     "camera_policy", "adaptive_pose_budget", "sparse_negative_fraction",
                     "max_headings_per_node", "graph_max_nodes", "graph_heading_count",
                     "graph_min_node_spacing", "graph_robot_radius", "material_mix_profile",
-                    "ir_material_profile",
+                    "ir_material_profile", "placement_profile", "structural_rematerialize",
+                    "hybrid_prop_pbr", "prop_pbr_target", "prop_pbr_seed",
+                    "filter_small_high_poly", "small_high_poly_max_extent_m",
+                    "small_high_poly_min_triangles", "structural_pbr_registry",
+                    "structural_pbr_registry_root", "material_variant_id", "material_seed",
                 )
                 if key in parent.request
             }
@@ -2099,6 +2154,7 @@ class IRDatasetController:
                 manifest = _read_json(Path(p["structural_rematerialization"]))
                 valid = (manifest.get("schema") == "robomituba.ir_structural_rematerialization.v1"
                          and bool(manifest.get("bindings"))
+                         and manifest.get("compiler_version") == "structural-rematerialize-v4-dielectric-loadbearing"
                          and str(manifest.get("child_scene_id")) == str(r.get("scene_id")))
                 return "verified" if valid else "stale"
             except (KeyError, OSError, ValueError, json.JSONDecodeError): return "missing"
@@ -2714,6 +2770,13 @@ class IRDatasetController:
             "--ambient-fill-energy-scale", str(r["ambient_fill_energy_scale"]),
             "--overview-proxy-dir", p["overview_proxy"],
         ]
+        # Full datasets use the requested policy. Stage-0 keeps compact
+        # diagnostic diffuse products so decomposition QC remains available
+        # without charging every production frame for them.
+        storage_profile = str(r.get("storage_profile") or "legacy_full_float32_v1")
+        if stage == "qc_render" and storage_profile == "core_half_exr_v1":
+            storage_profile = "diagnostic_half_exr_v1"
+        common += ["--storage-profile", storage_profile]
         if r.get("nir_passive"):
             common.append("--nir-passive")
         else:
@@ -3239,6 +3302,11 @@ class IRDatasetController:
             supported_structural_policies = {
                 "interior_structure_only_v2_role_curated",
                 "interior_structure_only_v3_explicit_roles",
+                # v4 tightens the eligible asset set for load-bearing
+                # surfaces: floor/ceiling/column cannot select a metallic
+                # texture.  It retains the same interior-only provenance
+                # contract, so a v4 prepared child is valid for Stage 0.
+                "interior_structure_only_v4_dielectric_loadbearing",
             }
             policy = (override.get("selection") or {}).get("policy") if isinstance(override, dict) else None
             if policy not in supported_structural_policies:

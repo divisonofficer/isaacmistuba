@@ -755,6 +755,34 @@ def test_prepared_accepts_supported_structural_rematerialization_policies(tmp_pa
     controller._assert_prepared_v2(job)
 
 
+def test_remove_terminal_job_reclaims_only_unreferenced_work_artifacts(tmp_path: Path) -> None:
+    controller = _controller(tmp_path)
+    pipeline = controller.pipeline_root / "failed"; dataset = controller.work_root / "failed"
+    pipeline.mkdir(parents=True); dataset.mkdir(parents=True)
+    (pipeline / "partial.txt").write_text("partial")
+    (dataset / "partial.txt").write_text("partial")
+    failed = ControllerJob(job_id="failed", status="failed", request={
+        "dataset_name": "failed", "paths": {"pipeline": str(pipeline), "dataset": str(dataset)},
+    })
+    with controller._lock:
+        controller._jobs[failed.job_id] = failed
+        controller._save(failed, "failed")
+    result = controller.remove_terminal_job(failed.job_id)
+    assert result["removed"] and not pipeline.exists() and not dataset.exists()
+
+
+def test_remove_terminal_job_keeps_artifacts_referenced_by_child(tmp_path: Path) -> None:
+    controller = _controller(tmp_path)
+    pipeline = controller.pipeline_root / "parent"; pipeline.mkdir(parents=True)
+    failed = ControllerJob(job_id="parent", status="failed", request={"paths": {"pipeline": str(pipeline)}})
+    child = ControllerJob(job_id="child", status="queued", request={"legacy_dataset": str(pipeline)})
+    with controller._lock:
+        controller._jobs.update({failed.job_id: failed, child.job_id: child})
+        controller._save(failed, "failed")
+    result = controller.remove_terminal_job(failed.job_id)
+    assert result["purged_artifacts"] == [] and pipeline.exists()
+
+
 def test_stale_prepared_stage_is_rebuilt_only_via_archive_flag(tmp_path: Path) -> None:
     controller = _controller(tmp_path)
     geometry = tmp_path / "geometry"

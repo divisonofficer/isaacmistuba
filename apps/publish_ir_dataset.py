@@ -16,14 +16,15 @@ from mitsuba_converter.ir_dataset_publish import publish_dataset  # noqa: E402
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--dataset", type=Path, required=True, help="completed dataset below out/ir_dataset")
+    parser.add_argument("--dataset", type=Path, required=True,
+                        help="completed dataset below out/ir_dataset or /bean/ir_dataset_work")
     parser.add_argument("--name", help="destination directory name; defaults to source basename")
     parser.add_argument("--destination-root", type=Path, default=Path("/bean/ir_dataset"))
     args = parser.parse_args()
     source = args.dataset.resolve()
-    allowed = (REPO_ROOT / "out" / "ir_dataset").resolve()
-    if allowed != source and allowed not in source.parents:
-        parser.error(f"--dataset must be inside {allowed}")
+    allowed_roots = ((REPO_ROOT / "out" / "ir_dataset").resolve(), Path("/bean/ir_dataset_work").resolve())
+    if not any(root == source or root in source.parents for root in allowed_roots):
+        parser.error("--dataset must be inside " + " or ".join(map(str, allowed_roots)))
 
     last_stage = None
 

@@ -846,49 +846,20 @@ def _bake_coverage_adaptive(obj, out_png, base_res, max_res, max_unbaked_ratio):
             "referenced_unbaked_texels",
         }:
             if rebuilt_uv:
-                break
-            rebuilt_uv = True
-            rebuilt = _ensure_uv(obj, force=True)
-            validation["uv_rebuild_attempted"] = True
-            validation["uv_rebuild_succeeded"] = bool(rebuilt)
-            if not rebuilt:
-                break
-            # Validate the rebuilt layer at the same resolution before escalating;
-            # this keeps a repair of a small mesh cheap and deterministic.
-            baked = bool(_bake_coverage(obj, out_png, resolution))
-            repaired = (
-                _coverage_validation(obj, out_png, max_unbaked_ratio=max_unbaked_ratio)
-                if baked else {"attempted": True, "passed": False, "reason": "bake_failed"}
-            )
-            repaired["resolution"] = [resolution, resolution]
-            repaired["uv_rebuild_attempted"] = True
-            repaired["uv_rebuild_succeeded"] = True
-            attempts.append(repaired)
-            if repaired.get("passed"):
-                result = dict(repaired)
-                result["adaptive_attempts"] = attempts
-                result["uv_rebuild_attempted"] = True
-                return resolution, result
-            print(
-                "[bake] coverage repaired-UV retry "
-                f"{obj.name}: res={resolution} reason={repaired.get('reason')} "
-                f"unbaked={repaired.get('referenced_unbaked_ratio', 'n/a')} "
-                f"slot_max={repaired.get('max_material_slot_unbaked_ratio', 'n/a')}",
-                file=sys.stderr,
-            )
-            if repaired.get("reason") in {
-                "degenerate_uv_triangles",
-                "overlapping_uv_triangles",
-                "referenced_unbaked_texels",
-            }:
-                # Smart Project can intentionally retain stacked islands for
-                # coincident generated components.  That is not a valid shared
-                # atlas contract, so rebuild as one unique tile per polygon
-                # instead of accepting the overlap or silently downgrading a
-                # linked PBR channel to a scalar factor.
+                if resolution < int(max_res):
+                    # Give the rebuilt, normally packed UV the same complete
+                    # resolution ladder before replacing it.  This is the
+                    # common successful path for dense generated props.
+                    continue
+                # The repaired Smart UV already had every normal adaptive
+                # resolution available to it.  Only now use a per-face atlas
+                # as the final escape hatch.  Switching after its first 512px
+                # attempt is counterproductive for dense generated props:
+                # their Smart UV islands commonly become valid at 1K/2K while
+                # a 48K-face atlas still has sub-texel tiles at 4K.
                 face_atlas_ok = _face_atlas_uv(obj)
-                repaired["face_atlas_uv_attempted"] = True
-                repaired["face_atlas_uv_succeeded"] = bool(face_atlas_ok)
+                validation["face_atlas_uv_attempted"] = True
+                validation["face_atlas_uv_succeeded"] = bool(face_atlas_ok)
                 if not face_atlas_ok:
                     break
                 face_base_resolution = min(
@@ -930,6 +901,35 @@ def _bake_coverage_adaptive(obj, out_png, base_res, max_res, max_unbaked_ratio):
                     if face_repaired.get("reason") == "bake_failed":
                         break
                 break
+            rebuilt_uv = True
+            rebuilt = _ensure_uv(obj, force=True)
+            validation["uv_rebuild_attempted"] = True
+            validation["uv_rebuild_succeeded"] = bool(rebuilt)
+            if not rebuilt:
+                break
+            # Validate the rebuilt layer at the same resolution before escalating;
+            # this keeps a repair of a small mesh cheap and deterministic.
+            baked = bool(_bake_coverage(obj, out_png, resolution))
+            repaired = (
+                _coverage_validation(obj, out_png, max_unbaked_ratio=max_unbaked_ratio)
+                if baked else {"attempted": True, "passed": False, "reason": "bake_failed"}
+            )
+            repaired["resolution"] = [resolution, resolution]
+            repaired["uv_rebuild_attempted"] = True
+            repaired["uv_rebuild_succeeded"] = True
+            attempts.append(repaired)
+            if repaired.get("passed"):
+                result = dict(repaired)
+                result["adaptive_attempts"] = attempts
+                result["uv_rebuild_attempted"] = True
+                return resolution, result
+            print(
+                "[bake] coverage repaired-UV retry "
+                f"{obj.name}: res={resolution} reason={repaired.get('reason')} "
+                f"unbaked={repaired.get('referenced_unbaked_ratio', 'n/a')} "
+                f"slot_max={repaired.get('max_material_slot_unbaked_ratio', 'n/a')}",
+                file=sys.stderr,
+            )
     result = dict(attempts[-1]) if attempts else {
         "attempted": True, "passed": False, "reason": "no_resolution_attempted",
     }
@@ -2732,6 +2732,10 @@ def main():
     filter_small_high_poly = "--filter-small-high-poly" in args
     small_high_poly_max_extent = float(args[args.index("--small-high-poly-max-extent-m") + 1]) if "--small-high-poly-max-extent-m" in args else 0.5
     small_high_poly_min_triangles = int(args[args.index("--small-high-poly-min-triangles") + 1]) if "--small-high-poly-min-triangles" in args else 100_000
+    resume_after_blender_name = (
+        args[args.index("--resume-after-blender-name") + 1]
+        if "--resume-after-blender-name" in args else None
+    )
     decimation_policy = None
     _DecCtx = _decimate_object = None
     try:
@@ -2835,6 +2839,13 @@ def main():
     if only_degenerate:
         mesh_objs = [o for o in mesh_objs if o.data.uv_layers and _uv_is_degenerate(o.data)]
     total_renderable = len(mesh_objs)
+    if resume_after_blender_name is not None:
+        # A filter can be enabled after an interrupted unfiltered export.  The
+        # old manifest is an alphabetical prefix, whereas a numeric ``--skip``
+        # would now point at different objects because filtered decorations are
+        # absent.  Continue strictly after its last committed source name; the
+        # merge below retains that already-exported prefix unchanged.
+        mesh_objs = [o for o in mesh_objs if o.name > resume_after_blender_name]
     manifest["prefilter_renderable_unit_count"] = total_renderable + len(filtered_small_high_poly)
     manifest["renderable_unit_count"] = total_renderable
     if skip:
@@ -2848,7 +2859,7 @@ def main():
     manifest_path = os.path.join(out_dir, "scene_manifest.json")
     existing_manifest = None
     existing_oid_by_name = {}
-    partial_export = bool(only_substrs or only_degenerate or skip or limit)
+    partial_export = bool(only_substrs or only_degenerate or skip or limit or resume_after_blender_name)
     if partial_export and os.path.exists(manifest_path) and not merge:
         raise RuntimeError("partial export refuses to overwrite a full manifest; pass --merge")
     if merge and os.path.exists(manifest_path):
@@ -3664,6 +3675,11 @@ def main():
         for _key in ("prefilter_renderable_unit_count", "renderable_unit_count"):
             if _key in manifest:
                 existing_manifest[_key] = manifest[_key]
+        if resume_after_blender_name is not None:
+            # The retained prefix can contain an already-baked decoration that
+            # the newly enabled filter would omit.  Report the actual merged
+            # output count, not just this invocation's filtered source count.
+            existing_manifest["renderable_unit_count"] = len(existing_manifest["units"])
         existing_manifest.setdefault("materials", {}).update(manifest["materials"])
         final_manifest = existing_manifest
         n_replaced = len(manifest["units"])

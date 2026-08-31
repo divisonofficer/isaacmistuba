@@ -45,12 +45,17 @@ from mitsuba_converter.ir_render_plan import (  # noqa: E402
     PLAN_SCHEMA,
     stable_digest as render_plan_digest,
 )
+from mitsuba_converter.ir_dataset_contract import (  # noqa: E402
+    STORAGE_PROFILE_CORE_HALF_EXR_V1,
+    STORAGE_PROFILE_LEGACY_FULL_FLOAT32_V1,
+    storage_profile_spec,
+)
 
 
 BLENDER_LAUNCHER = REPO_ROOT / "tools" / "infinigen" / "run_bundled_blender.py"
 WORKER_SCRIPT = REPO_ROOT / "tools" / "infinigen" / "blender_render_ir_principled_worker.py"
 QUEUE_SCHEMA = "robomituba.ir_principled_rolling_queue.v1"
-QUEUE_COMPILER_VERSION = "ir-principled-rolling-render-v14-diffuse-transport-v3"
+QUEUE_COMPILER_VERSION = "ir-principled-rolling-render-v15-core-half-exr-v1"
 DATASET_SCHEMA = "robomituba.ir_principled_dataset.v3"
 OVERVIEW_SCHEMA = "robomituba.ir_scene_overview.v1"
 OVERVIEW_COMPILER_VERSION = "ir-scene-overview-v2"
@@ -63,17 +68,22 @@ COMPATIBLE_PREVIOUS_WORKER_SHA256 = frozenset({
     # explicit lets legacy queues resume without changing their fingerprint.
     "9a524bb3336dad895abfcfab4398064c9a300a202efad05477eba6d524a8dfc4",
 })
-REQUIRED_MODALITIES = {
+CORE_REQUIRED_MODALITIES = {
     "rgb", "nir_active", "base_color_rgb", "base_color_nir", "roughness", "metallic", "metallic_family_id",
     "metal_coverage_mask", "exposed_metal_mask",
     "normal_geometry_world", "normal_shading_world", "depth", "range", "object_id", "material_id",
     "gt_defined_mask", "source_valid_mask", "replacement_mask", "fallback_mask", "remediated_pbr_mask",
     "train_pbr_valid_mask", "pbr_provenance_class", "primary_eval_valid_mask",
+}
+DIFFUSE_DIAGNOSTIC_MODALITIES = {
     "diffuse_transport_rgb", "diffuse_transport_nir",
     "diffuse_component_rgb", "diffuse_component_nir",
     "diffuse_reflectance_rgb", "diffuse_reflectance_nir",
     "diffuse_transport_valid_rgb", "diffuse_transport_valid_nir",
 }
+# Kept as a public compatibility symbol for existing tools/tests.  New code
+# must select the set through the storage profile below.
+REQUIRED_MODALITIES = CORE_REQUIRED_MODALITIES | DIFFUSE_DIAGNOSTIC_MODALITIES
 PASSIVE_NIR_MODALITIES = {"nir_passive", "nir_active_minus_passive"}
 # These fields describe publication/readiness, not the render identity.  They
 # are written only after every indexed frame has both passive-NIR sidecars and
@@ -152,6 +162,11 @@ def _args() -> argparse.Namespace:
     parser.add_argument("--max-frames", type=int)
     parser.add_argument("--retry-limit", type=int, default=3)
     parser.add_argument("--qc-components", action="store_true")
+    parser.add_argument("--storage-profile", choices=(
+        STORAGE_PROFILE_LEGACY_FULL_FLOAT32_V1,
+        STORAGE_PROFILE_CORE_HALF_EXR_V1,
+        "diagnostic_half_exr_v1",
+    ), help="immutable raster-storage policy; new full datasets default to core half EXR")
     nir_group = parser.add_mutually_exclusive_group()
     nir_group.add_argument("--nir-passive", dest="nir_passive", action="store_true",
                            help="render flash-off passive NIR and active-minus-passive sidecar (default for new datasets)")
@@ -176,6 +191,27 @@ def _args() -> argparse.Namespace:
     parser.add_argument("--adopt-existing-rows", action="store_true",
                         help="re-attest exact existing frame rows using strict row/task checks when a legacy config was lost")
     return parser.parse_args()
+
+
+def _required_modalities(storage_profile: str) -> set[str]:
+    spec = storage_profile_spec(storage_profile)
+    return set(CORE_REQUIRED_MODALITIES) | (
+        set(DIFFUSE_DIAGNOSTIC_MODALITIES) if spec["store_diffuse_decomposition"] else set()
+    )
+
+
+def _exr_write_parameters(storage_profile: str) -> list[int]:
+    """OpenCV parameters used for queue-generated EXR sidecars.
+
+    Blender writes the primary files at the requested bit depth.  This helper
+    covers derived active-minus-passive and any repaired diagnostic EXRs.
+    """
+    spec = storage_profile_spec(storage_profile)
+    precision = cv2.IMWRITE_EXR_TYPE_HALF if spec["exr_precision"] == "float16" else cv2.IMWRITE_EXR_TYPE_FLOAT
+    parameters = [cv2.IMWRITE_EXR_TYPE, precision]
+    if hasattr(cv2, "IMWRITE_EXR_COMPRESSION_ZIP"):
+        parameters += [cv2.IMWRITE_EXR_COMPRESSION, cv2.IMWRITE_EXR_COMPRESSION_ZIP]
+    return parameters
 
 
 def _utc_now() -> str:
@@ -372,6 +408,10 @@ def _task(node: dict, yaw: float, lighting: dict | None, args: argparse.Namespac
 
 def _artifact_contract(args: argparse.Namespace, material_contract: dict, fingerprint: str, frame_plan: dict | None,
                        overview: dict | None = None, *, passive_ready: bool = False) -> dict:
+    storage = storage_profile_spec(args.storage_profile)
+    exr_precision = str(storage["exr_precision"])
+    rgb_encoding = f"scene_linear_rgb_{exr_precision}"
+    nir_encoding = f"synthetic_nir_linear_{exr_precision}_rgb_replicated"
     contract = {
         "schema": "robomituba.ir_principled_artifact_contract.v3",
         "dataset_schema": DATASET_SCHEMA,
@@ -380,6 +420,7 @@ def _artifact_contract(args: argparse.Namespace, material_contract: dict, finger
         "overview": {"schema": OVERVIEW_SCHEMA, "compiler_version": OVERVIEW_COMPILER_VERSION,
                      "path": "scene_overview.json"},
         "renderer": {"name": "Blender Cycles", "version": "4.2", "device": args.device},
+        "storage_profile": storage,
         "exposure_ev": {"rgb": 0.0, "nir_active": 0.0},
         "material_contract": material_contract["contract_version"],
         "render_plan": ({"render_plan_id": frame_plan["render_plan_id"],
@@ -389,10 +430,10 @@ def _artifact_contract(args: argparse.Namespace, material_contract: dict, finger
                          "actual_pose_count": frame_plan.get("actual_pose_count"),
                          "illumination": frame_plan.get("illumination")} if frame_plan else None),
         "observations": {
-            "rgb": {"path": "rgb/{frame_id}.exr", "encoding": "scene_linear_rgb_float32"},
+            "rgb": {"path": "rgb/{frame_id}.exr", "encoding": rgb_encoding},
             "nir_active": {
                 "path": "nir_active/{frame_id}.exr",
-                "encoding": "synthetic_nir_linear_float32_rgb_replicated",
+                "encoding": nir_encoding,
                 "formula": args.nir_formula,
             },
         },
@@ -405,12 +446,6 @@ def _artifact_contract(args: argparse.Namespace, material_contract: dict, finger
             "normal_shading_world": "xyz_signed_to_unorm16",
             "depth": "camera_z_millimeters_u16", "range": "ray_range_millimeters_u16",
             "object_id": "uint16", "material_id": "uint16",
-            "diffuse_transport_rgb": "scene_linear_rgb_float32",
-            "diffuse_transport_nir": "scene_linear_rgb_float32_replicated",
-            "diffuse_component_rgb": "scene_linear_rgb_float32",
-            "diffuse_component_nir": "scene_linear_rgb_float32_replicated",
-            "diffuse_reflectance_rgb": "linear_unorm16",
-            "diffuse_reflectance_nir": "linear_unorm16_replicated",
         },
         "masks": {
             "gt_defined_mask": "binary_u8", "source_valid_mask": "binary_u8",
@@ -419,10 +454,9 @@ def _artifact_contract(args: argparse.Namespace, material_contract: dict, finger
             "metal_coverage_mask": "binary_u8 conductor-family membership",
             "exposed_metal_mask": "binary_u8 effective exposed conductor coverage",
             "primary_eval_valid_mask": "source_valid AND NOT replacement",
-            "diffuse_transport_valid_rgb": "finite surface AND max(diffuse_reflectance_rgb) > 1e-4",
-            "diffuse_transport_valid_nir": "finite surface AND max(diffuse_reflectance_nir) > 1e-4",
         },
         "diffuse_decomposition": {
+            "stored": bool(storage["store_diffuse_decomposition"]),
             "contract": "cycles_color_separated_diffuse_transport_v2",
             "transport": "Cycles Diffuse Direct + Diffuse Indirect",
             "reflectance": "Cycles Diffuse Color",
@@ -445,6 +479,19 @@ def _artifact_contract(args: argparse.Namespace, material_contract: dict, finger
             "ambient_fill_rig": material_contract.get("ambient_fill_rig"),
         },
     }
+    if storage["store_diffuse_decomposition"]:
+        contract["ground_truth"].update({
+            "diffuse_transport_rgb": f"scene_linear_rgb_{exr_precision}",
+            "diffuse_transport_nir": f"scene_linear_rgb_{exr_precision}_replicated",
+            "diffuse_component_rgb": f"scene_linear_rgb_{exr_precision}",
+            "diffuse_component_nir": f"scene_linear_rgb_{exr_precision}_replicated",
+            "diffuse_reflectance_rgb": "linear_unorm16",
+            "diffuse_reflectance_nir": "linear_unorm16_replicated",
+        })
+        contract["masks"].update({
+            "diffuse_transport_valid_rgb": "finite surface AND max(diffuse_reflectance_rgb) > 1e-4",
+            "diffuse_transport_valid_nir": "finite surface AND max(diffuse_reflectance_nir) > 1e-4",
+        })
     if getattr(args, "nir_passive", False):
         contract["nir_passive"] = {
             "requested": True,
@@ -455,13 +502,13 @@ def _artifact_contract(args: argparse.Namespace, material_contract: dict, finger
         contract["exposure_ev"].update({"nir_passive": 0.0, "nir_active_minus_passive": 0.0})
         contract["observations"]["nir_passive"] = {
             "path": "nir_passive/{frame_id}.exr",
-            "encoding": "synthetic_nir_linear_float32_rgb_replicated",
+            "encoding": nir_encoding,
             "flash": "disabled",
             "formula": args.nir_formula,
         }
         contract["observations"]["nir_active_minus_passive"] = {
             "path": "nir_active_minus_passive/{frame_id}.exr",
-            "encoding": "scene_linear_float32_rgb_difference",
+            "encoding": f"scene_linear_{exr_precision}_rgb_difference",
             "definition": "nir_active - nir_passive",
         }
     if overview and (overview.get("traversability") or {}).get("path"):
@@ -603,7 +650,8 @@ def _lighting_group_progress(tasks: list[dict], completed: set[str]) -> dict[str
     return groups
 
 
-def _row_complete(out: Path, frame_id: str, fingerprint: str, *, require_passive: bool = False) -> bool:
+def _row_complete(out: Path, frame_id: str, fingerprint: str, *, require_passive: bool = False,
+                  storage_profile: str = STORAGE_PROFILE_LEGACY_FULL_FLOAT32_V1) -> bool:
     path = out / "frames" / f"{frame_id}.json"
     if not path.is_file():
         return False
@@ -614,7 +662,7 @@ def _row_complete(out: Path, frame_id: str, fingerprint: str, *, require_passive
     if row.get("dataset_fingerprint") != fingerprint:
         return False
     paths = row.get("paths") or {}
-    required = set(REQUIRED_MODALITIES)
+    required = _required_modalities(storage_profile)
     # A new passive-NIR queue must not adopt an older active-only row as
     # complete.  The row flag is retained for legacy resumes, while the
     # explicit queue requirement covers the transition case before the
@@ -626,7 +674,7 @@ def _row_complete(out: Path, frame_id: str, fingerprint: str, *, require_passive
     return all((out / paths[name]).is_file() for name in required)
 
 
-def _derive_nir_difference(out: Path, row: dict) -> dict:
+def _derive_nir_difference(out: Path, row: dict, *, storage_profile: str) -> dict:
     """Create the exact linear active-minus-passive NIR sidecar.
 
     Blender writes both captures as scene-linear float EXR. OpenCV preserves
@@ -646,7 +694,7 @@ def _derive_nir_difference(out: Path, row: dict) -> dict:
         raise RuntimeError(f"active/passive NIR shape mismatch: {active.shape} vs {passive.shape}")
     difference = active[..., :3].astype(np.float32) - passive[..., :3].astype(np.float32)
     target = out / "nir_active_minus_passive" / Path(active_rel).name
-    _atomic_image(target, difference)
+    _atomic_image(target, difference, _exr_write_parameters(storage_profile))
     row["paths"]["nir_active_minus_passive"] = str(target.relative_to(out))
     scalar = np.mean(difference, axis=2)
     finite = np.isfinite(scalar)
@@ -681,7 +729,8 @@ def _passive_sidecars_complete(out: Path, frame_ids: set[str], *, fingerprint: s
     return True
 
 
-def _activate_nir_passive_contract(out: Path, *, fingerprint: str, frame_ids: set[str]) -> None:
+def _activate_nir_passive_contract(out: Path, *, fingerprint: str, frame_ids: set[str],
+                                   storage_profile: str) -> None:
     """Publish the dataset-level passive contract after an atomic completeness gate.
 
     Frame sidecars are useful while a queue is still running, but exposing the
@@ -716,15 +765,19 @@ def _activate_nir_passive_contract(out: Path, *, fingerprint: str, frame_ids: se
         "nir_active_minus_passive": 0.0,
     })
     observations = contract.setdefault("observations", {})
+    encoding = ("synthetic_nir_linear_float16_rgb_replicated"
+                if storage_profile_spec(storage_profile)["exr_precision"] == "float16"
+                else "synthetic_nir_linear_float32_rgb_replicated")
     observations["nir_passive"] = {
         "path": "nir_passive/{frame_id}.exr",
-        "encoding": "synthetic_nir_linear_float32_rgb_replicated",
+        "encoding": encoding,
         "flash": "disabled",
         "formula": config.get("nir_formula", "primary"),
     }
     observations["nir_active_minus_passive"] = {
         "path": "nir_active_minus_passive/{frame_id}.exr",
-        "encoding": "scene_linear_float32_rgb_difference",
+        "encoding": ("scene_linear_float16_rgb_difference" if "float16" in encoding
+                     else "scene_linear_float32_rgb_difference"),
         "definition": "nir_active - nir_passive",
     }
     _atomic_json(contract_path, contract)
@@ -807,7 +860,7 @@ def _sanitize_diffuse_arrays(
     return transport, component, pixel_valid, invalid_count
 
 
-def _derive_camera_depth(out: Path, row: dict) -> dict:
+def _derive_camera_depth(out: Path, row: dict, *, storage_profile: str) -> dict:
     mask_repairs = _canonicalize_binary_masks(out, row)
     range_path = out / row["paths"]["range"]
     ranges_mm = cv2.imread(str(range_path), cv2.IMREAD_UNCHANGED)
@@ -892,7 +945,8 @@ def _derive_camera_depth(out: Path, row: dict) -> dict:
         }
     row["lighting_qc"] = lighting_qc
     decomposition_qc = {}
-    for modality in ("rgb", "nir"):
+    if storage_profile_spec(storage_profile)["store_diffuse_decomposition"]:
+      for modality in ("rgb", "nir"):
         transport_path = out / row["paths"][f"diffuse_transport_{modality}"]
         component_path = out / row["paths"][f"diffuse_component_{modality}"]
         reflectance_path = out / row["paths"][f"diffuse_reflectance_{modality}"]
@@ -913,8 +967,8 @@ def _derive_camera_depth(out: Path, row: dict) -> dict:
             transport, component, reflectance, pixel_valid,
         )
         if invalid_count:
-            _atomic_image(transport_path, transport)
-            _atomic_image(component_path, component)
+            _atomic_image(transport_path, transport, _exr_write_parameters(storage_profile))
+            _atomic_image(component_path, component, _exr_write_parameters(storage_profile))
             _atomic_image(valid_path, np.where(pixel_valid, 255, 0).astype(np.uint8), [cv2.IMWRITE_PNG_COMPRESSION, 3])
         channel_valid = pixel_valid[..., None] & (reflectance > 2.0 / 65535.0)
         reconstructed = transport * reflectance
@@ -968,6 +1022,10 @@ class BlenderWorker:
         ]
         if self.args.qc_components:
             command.append("--qc-components")
+        storage = storage_profile_spec(self.args.storage_profile)
+        command += ["--exr-color-depth", "16" if storage["exr_precision"] == "float16" else "32"]
+        if storage["store_diffuse_decomposition"]:
+            command.append("--write-diffuse-decomposition")
         if getattr(self.args, "nir_passive", False):
             command.append("--nir-passive")
         if getattr(self.args, "allow_legacy_passive_backfill_aovs", False):
@@ -1102,8 +1160,10 @@ def _adopt_compatible_frames(out: Path, *, tasks: list[dict], new_fingerprint: s
         previous_plan = previous_config.get("render_plan") or {}
         if str(previous_plan.get("render_plan_digest") or "") != str(old_plan.get("render_plan_digest") or ""):
             return set()
-    required_modalities = set(REQUIRED_MODALITIES)
-    if bool(current_config.get("nir_passive_enabled")):
+    required_modalities = _required_modalities(str(current_config.get(
+        "storage_profile", STORAGE_PROFILE_LEGACY_FULL_FLOAT32_V1,
+    )))
+    if bool(current_config.get("nir_passive_enabled") or current_config.get("nir_passive_requested")):
         required_modalities |= PASSIVE_NIR_MODALITIES
     manifest_path = out / "plan_adoption_manifest.json"
     manifest = {
@@ -1237,6 +1297,21 @@ def main() -> int:
     args.scene_dir = args.scene_dir.resolve()
     args.prepared_scene_dir = args.prepared_scene_dir.resolve()
     args.out = args.out.resolve()
+    previous_storage_config = None
+    storage_config_path = args.out / "dataset_config.json"
+    if storage_config_path.is_file():
+        try:
+            previous_storage_config = json.loads(storage_config_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, json.JSONDecodeError):
+            previous_storage_config = None
+    # Existing roots retain their exact legacy storage identity.  A brand-new
+    # output defaults to compact core data: half EXR observations and no
+    # diffuse decomposition sidecars in the full dataset.
+    if args.storage_profile is None:
+        args.storage_profile = str((previous_storage_config or {}).get(
+            "storage_profile", STORAGE_PROFILE_LEGACY_FULL_FLOAT32_V1 if previous_storage_config else STORAGE_PROFILE_CORE_HALF_EXR_V1,
+        ))
+    storage_profile_spec(args.storage_profile)
     if args.nir_passive is None:
         args.nir_passive = not (args.out / "dataset_config.json").is_file()
     if args.overview_proxy_dir:
@@ -1293,6 +1368,7 @@ def main() -> int:
         "device": args.device, "render_seed": args.render_seed,
         "exposure_ev": {"rgb": 0.0, "nir_active": 0.0},
         "qc_components": bool(args.qc_components),
+        "storage_profile": args.storage_profile,
         "nir_formula": args.nir_formula,
         "flash_energy_scale": args.flash_energy_scale,
         "ambient_fill_energy_scale": args.ambient_fill_energy_scale,
@@ -1363,6 +1439,7 @@ def main() -> int:
     )
     completed = {task["frame_id"] for task in tasks if _row_complete(
         args.out, task["frame_id"], fingerprint, require_passive=bool(args.nir_passive),
+        storage_profile=args.storage_profile,
     )}
     pending = [task for task in tasks if task["frame_id"] not in completed]
     state = {
@@ -1387,6 +1464,7 @@ def main() -> int:
             _activate_nir_passive_contract(
                 args.out, fingerprint=fingerprint,
                 frame_ids={task["frame_id"] for task in tasks},
+                storage_profile=args.storage_profile,
             )
         return 0
 
@@ -1464,9 +1542,9 @@ def main() -> int:
                 worker_failed = False
                 try:
                     event = worker.render(task)
-                    row = _derive_camera_depth(args.out, event["row"])
+                    row = _derive_camera_depth(args.out, event["row"], storage_profile=args.storage_profile)
                     if args.nir_passive:
-                        row = _derive_nir_difference(args.out, row)
+                        row = _derive_nir_difference(args.out, row, storage_profile=args.storage_profile)
                     with lock:
                         completed.add(frame_id)
                         state["completed"] = sorted(completed)
@@ -1574,6 +1652,7 @@ def main() -> int:
         _activate_nir_passive_contract(
             args.out, fingerprint=fingerprint,
             frame_ids={task["frame_id"] for task in tasks},
+            storage_profile=args.storage_profile,
         )
     print(f"[ir-principled-queue] complete frames={len(rows)} -> {args.out}", flush=True)
     return 0

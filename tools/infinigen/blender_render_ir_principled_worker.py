@@ -81,6 +81,10 @@ def _args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=20260812)
     parser.add_argument("--device", choices=("OPTIX", "CUDA"), default="OPTIX")
     parser.add_argument("--qc-components", action="store_true")
+    parser.add_argument("--exr-color-depth", choices=("16", "32"), default="32",
+                        help="storage precision for all scene-linear EXR artifacts")
+    parser.add_argument("--write-diffuse-decomposition", action="store_true",
+                        help="emit auxiliary diffuse transport/component/reflectance artifacts")
     parser.add_argument("--nir-formula", choices=("primary", "luminance_matched_v1"), default="primary")
     parser.add_argument("--flash-energy-scale", type=float, default=1.0)
     parser.add_argument("--ambient-fill-energy-scale", type=float, default=1.0)
@@ -112,7 +116,7 @@ def _configure_cycles(scene, args: argparse.Namespace) -> list[str]:
     scene.render.film_transparent = False
     scene.render.image_settings.file_format = "OPEN_EXR"
     scene.render.image_settings.color_mode = "RGB"
-    scene.render.image_settings.color_depth = "32"
+    scene.render.image_settings.color_depth = args.exr_color_depth
     scene.view_settings.view_transform = "Raw"
     scene.view_settings.look = "None"
     scene.view_settings.exposure = 0.0
@@ -358,7 +362,7 @@ def _binary_mask(tree, source):
     return threshold.outputs[0]
 
 
-def _setup_diffuse_decomposition(tree, layers, staging: Path, frame_id: str, modality: str) -> None:
+def _setup_diffuse_decomposition(tree, layers, staging: Path, frame_id: str, modality: str, *, exr_depth: str) -> None:
     # Blender 4.2 exposes the Cycles identifiers on compositor sockets
     # (DiffDir/DiffInd/DiffCol), while the UI labels them Diffuse Direct etc.
     direct = layers.outputs.get("DiffDir") or layers.outputs.get("Diffuse Direct")
@@ -384,7 +388,7 @@ def _setup_diffuse_decomposition(tree, layers, staging: Path, frame_id: str, mod
     transport_stem, component_stem = _DIFFUSE_EXR_STEMS[modality]
     reflectance_stem, valid_stem = _DIFFUSE_PNG_STEMS[modality]
     transport_out = _file_node(
-        tree, staging / transport_stem, frame_id, mode="RGB", depth="32", file_format="OPEN_EXR",
+        tree, staging / transport_stem, frame_id, mode="RGB", depth=exr_depth, file_format="OPEN_EXR",
     )
     tree.links.new(transport.outputs[0], transport_out.inputs[0])
     reflectance_out = _file_node(
@@ -398,7 +402,7 @@ def _setup_diffuse_decomposition(tree, layers, staging: Path, frame_id: str, mod
     tree.links.new(reflectance, component.inputs[1])
     tree.links.new(transport.outputs[0], component.inputs[2])
     component_out = _file_node(
-        tree, staging / component_stem, frame_id, mode="RGB", depth="32", file_format="OPEN_EXR",
+        tree, staging / component_stem, frame_id, mode="RGB", depth=exr_depth, file_format="OPEN_EXR",
     )
     tree.links.new(component.outputs[0], component_out.inputs[0])
 
@@ -421,7 +425,7 @@ def _setup_diffuse_decomposition(tree, layers, staging: Path, frame_id: str, mod
     tree.links.new(valid.outputs[0], valid_out.inputs[0])
 
 
-def _light_group_output(tree, layers, staging: Path, frame_id: str, *, socket_names, stem: str) -> None:
+def _light_group_output(tree, layers, staging: Path, frame_id: str, *, socket_names, stem: str, exr_depth: str) -> None:
     source = None
     for socket_name in socket_names:
         source = layers.outputs.get(socket_name)
@@ -429,23 +433,25 @@ def _light_group_output(tree, layers, staging: Path, frame_id: str, *, socket_na
             break
     if source is None:
         raise RuntimeError(f"render layer lacks required Light Group socket: {socket_names}")
-    output = _file_node(tree, staging / stem, frame_id, mode="RGB", depth="32", file_format="OPEN_EXR")
+    output = _file_node(tree, staging / stem, frame_id, mode="RGB", depth=exr_depth, file_format="OPEN_EXR")
     tree.links.new(source, output.inputs[0])
 
 
-def _setup_rgb_compositor(scene, staging: Path, frame_id: str, *, qc_components: bool) -> None:
+def _setup_rgb_compositor(scene, staging: Path, frame_id: str, *, qc_components: bool,
+                          write_diffuse_decomposition: bool, exr_depth: str) -> None:
     scene.use_nodes = True
     tree = scene.node_tree
     tree.nodes.clear()
     layers = tree.nodes.new("CompositorNodeRLayers")
-    rgb = _file_node(tree, staging / "rgb", frame_id, mode="RGB", depth="32", file_format="OPEN_EXR")
+    rgb = _file_node(tree, staging / "rgb", frame_id, mode="RGB", depth=exr_depth, file_format="OPEN_EXR")
     tree.links.new(layers.outputs["Image"], rgb.inputs[0])
-    _setup_diffuse_decomposition(tree, layers, staging, frame_id, "rgb")
+    if write_diffuse_decomposition:
+        _setup_diffuse_decomposition(tree, layers, staging, frame_id, "rgb", exr_depth=exr_depth)
     if qc_components:
         _light_group_output(
             tree, layers, staging, frame_id,
             socket_names=("Combined_DATASET_AMBIENT_FILL", "DATASET_AMBIENT_FILL"),
-            stem="qc_rgb_ambient_fill",
+            stem="qc_rgb_ambient_fill", exr_depth=exr_depth,
         )
     def _constant(value: float):
         node = tree.nodes.new("CompositorNodeValue")
@@ -508,7 +514,8 @@ def _setup_rgb_compositor(scene, staging: Path, frame_id: str, *, qc_components:
         tree.links.new(encoded, output.inputs[0])
 
 
-def _setup_nir_compositor(scene, staging: Path, frame_id: str, *, qc_components: bool) -> None:
+def _setup_nir_compositor(scene, staging: Path, frame_id: str, *, qc_components: bool,
+                          write_diffuse_decomposition: bool, exr_depth: str) -> None:
     scene.use_nodes = True
     tree = scene.node_tree
     tree.nodes.clear()
@@ -522,14 +529,15 @@ def _setup_nir_compositor(scene, staging: Path, frame_id: str, *, qc_components:
     for channel in range(3):
         tree.links.new(bw.outputs[0], combine.inputs[channel])
     combine.inputs[3].default_value = 1.0
-    active = _file_node(tree, staging / "nir_active", frame_id, mode="RGB", depth="32", file_format="OPEN_EXR")
+    active = _file_node(tree, staging / "nir_active", frame_id, mode="RGB", depth=exr_depth, file_format="OPEN_EXR")
     tree.links.new(combine.outputs[0], active.inputs[0])
-    _setup_diffuse_decomposition(tree, layers, staging, frame_id, "nir")
+    if write_diffuse_decomposition:
+        _setup_diffuse_decomposition(tree, layers, staging, frame_id, "nir", exr_depth=exr_depth)
     if qc_components:
         _light_group_output(
             tree, layers, staging, frame_id,
             socket_names=("Combined_DATASET_AMBIENT_FILL", "DATASET_AMBIENT_FILL"),
-            stem="qc_nir_ambient_fill",
+            stem="qc_nir_ambient_fill", exr_depth=exr_depth,
         )
         flash_socket = layers.outputs.get("Combined_NIR_FLASH") or layers.outputs.get("NIR_FLASH")
         if flash_socket is not None:
@@ -539,11 +547,11 @@ def _setup_nir_compositor(scene, staging: Path, frame_id: str, *, qc_components:
             for channel in range(3):
                 tree.links.new(flash_bw.outputs[0], flash_rgb.inputs[channel])
             flash_rgb.inputs[3].default_value = 1.0
-            flash = _file_node(tree, staging / "qc_nir_flash", frame_id, mode="RGB", depth="32", file_format="OPEN_EXR")
+            flash = _file_node(tree, staging / "qc_nir_flash", frame_id, mode="RGB", depth=exr_depth, file_format="OPEN_EXR")
             tree.links.new(flash_rgb.outputs[0], flash.inputs[0])
 
 
-def _setup_nir_passive_compositor(scene, staging: Path, frame_id: str) -> None:
+def _setup_nir_passive_compositor(scene, staging: Path, frame_id: str, *, exr_depth: str) -> None:
     """Write the flash-off NIR observation using the same evaluated scene.
 
     Passive NIR deliberately has no independent material or GT path.  It is
@@ -561,7 +569,7 @@ def _setup_nir_passive_compositor(scene, staging: Path, frame_id: str) -> None:
     for channel in range(3):
         tree.links.new(bw.outputs[0], combine.inputs[channel])
     combine.inputs[3].default_value = 1.0
-    output = _file_node(tree, staging / "nir_passive", frame_id, mode="RGB", depth="32", file_format="OPEN_EXR")
+    output = _file_node(tree, staging / "nir_passive", frame_id, mode="RGB", depth=exr_depth, file_format="OPEN_EXR")
     tree.links.new(combine.outputs[0], output.inputs[0])
 
 
@@ -627,12 +635,12 @@ def _publish(staging: Path, out: Path, frame_id: str, task: dict, timings: dict,
         passive_stems = ("nir_passive",) if passive_enabled else ()
         exr_stems = {
             "rgb", "nir_active", *passive_stems,
-            *(stem for stems in _DIFFUSE_EXR_STEMS.values() for stem in stems),
+            *((stem for stems in _DIFFUSE_EXR_STEMS.values() for stem in stems) if args.write_diffuse_decomposition else ()),
         }
         stems = [
             "rgb", "nir_active", *passive_stems, *_GT_SPECS.keys(),
-            *(stem for stems in _DIFFUSE_EXR_STEMS.values() for stem in stems),
-            *(stem for stems in _DIFFUSE_PNG_STEMS.values() for stem in stems),
+            *((stem for stems in _DIFFUSE_EXR_STEMS.values() for stem in stems) if args.write_diffuse_decomposition else ()),
+            *((stem for stems in _DIFFUSE_PNG_STEMS.values() for stem in stems) if args.write_diffuse_decomposition else ()),
         ]
     for stem in stems:
         suffix = ".exr" if stem in exr_stems else ".png"
@@ -739,7 +747,9 @@ def _render_task(scene, args, lighting_state, task: dict) -> dict:
             )
             _set_environment(scene, nir=False, recipe=(task.get("lighting") or {}).get("runtime_recipe") or (task.get("lighting") or {}).get("recipe"))
             _place_flash(camera, enabled=False, energy_scale=args.flash_energy_scale)
-            _setup_rgb_compositor(scene, staging, frame_id, qc_components=args.qc_components)
+            _setup_rgb_compositor(scene, staging, frame_id, qc_components=args.qc_components,
+                                  write_diffuse_decomposition=args.write_diffuse_decomposition,
+                                  exr_depth=args.exr_color_depth)
             scene.cycles.samples = int(args.rgb_spp)
             scene.cycles.seed = int(args.seed)
             started = time.perf_counter()
@@ -756,7 +766,7 @@ def _render_task(scene, args, lighting_state, task: dict) -> dict:
         _set_environment(scene, nir=True, recipe=(task.get("lighting") or {}).get("runtime_recipe") or (task.get("lighting") or {}).get("recipe"))
         if passive_enabled:
             _place_flash(camera, enabled=False, energy_scale=args.flash_energy_scale)
-            _setup_nir_passive_compositor(scene, staging, frame_id)
+            _setup_nir_passive_compositor(scene, staging, frame_id, exr_depth=args.exr_color_depth)
             scene.cycles.samples = int(args.nir_spp)
             scene.cycles.seed = int(args.seed) + 1
             started = time.perf_counter()
@@ -768,7 +778,9 @@ def _render_task(scene, args, lighting_state, task: dict) -> dict:
                             width=args.width, height=args.height)
 
         _place_flash(camera, enabled=True, energy_scale=args.flash_energy_scale)
-        _setup_nir_compositor(scene, staging, frame_id, qc_components=args.qc_components)
+        _setup_nir_compositor(scene, staging, frame_id, qc_components=args.qc_components,
+                              write_diffuse_decomposition=args.write_diffuse_decomposition,
+                              exr_depth=args.exr_color_depth)
         scene.cycles.samples = int(args.nir_spp)
         # Reuse the passive seed for common-random-number cancellation: the
         # active-minus-passive image should expose the flash contribution, not

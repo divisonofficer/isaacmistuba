@@ -31,6 +31,8 @@ from .ir_dataset_contract import (
     MASK_MODALITIES,
     NORMAL_MODALITIES,
     SCALAR_MODALITIES,
+    STORAGE_PROFILE_LEGACY_FULL_FLOAT32_V1,
+    storage_profile_spec,
     _read_json,
     _safe_artifact_path,
 )
@@ -91,8 +93,12 @@ def _validate_image_bytes(data: bytes, modality: str, expected_shape: tuple[int,
         raise ValueError(f"{modality} shape {value.shape[:2]} != {expected_shape}")
     if np.issubdtype(value.dtype, np.floating) and not np.isfinite(value).all():
         raise ValueError(f"{modality} contains non-finite values")
-    if modality in HDR_MODALITIES and value.dtype != np.float32:
-        raise ValueError(f"{modality} must be float32 EXR, got {value.dtype}")
+    # OpenCV intentionally expands both HALF and FLOAT OpenEXR on decode.
+    # Header precision is declared by the immutable artifact contract below;
+    # here we validate the decoded linear raster rather than accidentally
+    # rejecting valid half EXR as float32.
+    if modality in HDR_MODALITIES and not np.issubdtype(value.dtype, np.floating):
+        raise ValueError(f"{modality} must decode as floating-point EXR, got {value.dtype}")
     if modality in LINEAR_RGB_MODALITIES | SCALAR_MODALITIES | NORMAL_MODALITIES | DISTANCE_MODALITIES | ID_MODALITIES:
         if value.dtype != np.uint16:
             raise ValueError(f"{modality} must be uint16 PNG, got {value.dtype}")
@@ -122,6 +128,15 @@ def validate_publish_source(source: Path) -> dict[str, Any]:
         raise ValueError(f"unsupported artifact schema: {contract.get('schema')!r}")
     if ((config.get("schema") == DATASET_SCHEMA) != (contract.get("schema") == ARTIFACT_SCHEMA)):
         raise ValueError("dataset/artifact contract major versions differ")
+    storage = storage_profile_spec((contract.get("storage_profile") or {}).get(
+        "id", config.get("storage_profile", STORAGE_PROFILE_LEGACY_FULL_FLOAT32_V1),
+    ))
+    config_profile = config.get("storage_profile")
+    if config_profile is not None and str(config_profile) != str(storage["id"]):
+        raise ValueError("dataset/artifact storage profile mismatch")
+    diffuse_contract = contract.get("diffuse_decomposition") or {}
+    if bool(diffuse_contract.get("stored", True)) != bool(storage["store_diffuse_decomposition"]):
+        raise ValueError("diffuse decomposition storage contract mismatch")
     if queue_state.get("schema") != "robomituba.ir_principled_rolling_queue.v1":
         raise ValueError(f"unsupported rolling queue schema: {queue_state.get('schema')!r}")
     if qc.get("schema") != "robomituba.ir_principled_qc_summary.v1":

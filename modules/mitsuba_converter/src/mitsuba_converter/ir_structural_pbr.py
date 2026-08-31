@@ -139,6 +139,24 @@ def curated_for_role(record: dict[str, Any], role: str) -> bool:
     return any(token in identifier for token in ROLE_TOKENS.get(role, ()))
 
 
+def dielectric_loadbearing_compatible(record: dict[str, Any], role: str) -> bool:
+    """Reject non-dielectric maps for load-bearing interior structure.
+
+    TextureCan assets sometimes carry an auxiliary metallic map even when the
+    human review approved the asset for a floor or ceiling.  Wiring that map
+    into a large structural surface creates an implausible mirror-like floor
+    and then makes the quality gate fail.  Floors, ceilings and columns are
+    deliberately opaque dielectrics in the IR structural contract.  Decorative
+    wall/panel metal remains possible through the explicit review policy.
+    """
+    if role not in {"floor", "ceiling", "column"}:
+        return True
+    metallic = record.get("metallic") or {"mode": "constant", "value": 0.0}
+    if str(metallic.get("mode") or "constant") != "constant":
+        return False
+    return abs(float(metallic.get("value") or 0.0)) <= 1e-6
+
+
 def bindings_for_scene(stage1_manifest: dict[str, Any], registry: dict[str, Any], *, seed: int) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     rng = random.Random(int(seed))
     records = list(registry["materials"])
@@ -150,7 +168,12 @@ def bindings_for_scene(stage1_manifest: dict[str, Any], registry: dict[str, Any]
                              **eligibility})
             continue
         role = str(eligibility["subtype"])
-        choices = [record for record in records if compatible(record, unit) and curated_for_role(record, role)]
+        choices = [
+            record for record in records
+            if compatible(record, unit)
+            and curated_for_role(record, role)
+            and dielectric_loadbearing_compatible(record, role)
+        ]
         if not choices:
             raise ValueError(f"structural registry has no approved material for {role}")
         for slot, _material in enumerate(unit.get("material_slots") or unit.get("materials") or [None]):
@@ -178,14 +201,14 @@ def build_manifest(*, stage1_manifest: dict[str, Any], stage1_path: Path, regist
     bindings, excluded = bindings_for_scene(stage1_manifest, registry, seed=material_seed)
     geometry_digest = sha256(stage1_path)
     payload = {
-        "schema": MANIFEST_SCHEMA, "compiler_version": "structural-rematerialize-v3-explicit-role-aware",
+        "schema": MANIFEST_SCHEMA, "compiler_version": "structural-rematerialize-v4-dielectric-loadbearing",
         "child_scene_id": child_scene_id, "parent_scene_id": parent_scene_id,
         "parent_dataset_fingerprint": parent_dataset_fingerprint,
         "geometry_digest": geometry_digest, "material_variant_id": material_variant_id,
         "material_seed": int(material_seed), "registry_digest": canonical_digest(registry),
         "registry_path": str(registry_path), "bindings": bindings,
         "selection": {
-            "policy": ("interior_structure_only_v3_explicit_roles"
+            "policy": ("interior_structure_only_v4_dielectric_loadbearing"
                        if registry.get("role_policy") == "explicit_approved_roles_v1"
                        else "interior_structure_only_v2_role_curated"),
             "eligible_unit_count": len({row["unit_id"] for row in bindings}),
