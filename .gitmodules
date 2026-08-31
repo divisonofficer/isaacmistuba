@@ -1,0 +1,4 @@
+[submodule "modules/hssd_blender_ir"]
+	path = modules/hssd_blender_ir
+	url = /jarvis/project/hssd_blender_ir.git
+	branch = main
