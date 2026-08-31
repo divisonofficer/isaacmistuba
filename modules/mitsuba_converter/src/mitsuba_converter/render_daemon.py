@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import base64
-from collections import OrderedDict, deque
+import copy
+from collections import deque
 import concurrent.futures
 from dataclasses import dataclass, fields
 from datetime import datetime, timezone, timedelta
@@ -89,6 +90,7 @@ from .material_overrides_store import (
     save_overrides as _save_material_overrides,
 )
 from .material_pipeline import canonicalize_materials, extract_material_slots
+from .gallery_preview_service import GalleryPreviewService
 from .multimodal import (
     RenderConfig,
     SUPPORTED_MODALITIES,
@@ -156,18 +158,17 @@ def _is_render_queue_proxy_path(method: str, path: str) -> bool:
     if not path.startswith("/api/opticalnav/projects/"):
         return False
     parts = [part for part in path[len("/api/opticalnav/projects/"):].strip("/").split("/") if part]
-    # v3 makes scene the ownership boundary.  The backend-only 8765 process
-    # owns authoring/editor requests, while the 8766 GPU queue owns the durable
-    # render ledger and its progress.  Do not let the old global-route shape
-    # below accidentally leave scene-local status requests on 8765's empty
-    # in-memory worker state.
+    # The backend-only 8765 process owns authoring/editor requests and reads
+    # the shared scene ledger for aggregate coverage.  Queue-control routes
+    # remain on 8766, but coverage must stay local so it can combine all
+    # render queues (for example the 8766 primary and 8767 recovery queues).
     if len(parts) >= 4 and parts[1] == "scenes":
         scene_route = parts[3:]
         if scene_route in (["graph", "sweep"], ["graph", "polar-sample-plan"]):
             return method == "POST"
         if len(scene_route) >= 1 and scene_route[0] in {
             "graph-render-batches", "render-batches", "render-runs",
-            "render-tasks", "render-coverage",
+            "render-tasks",
         }:
             return method in {"GET", "POST"}
         if scene_route == ["episodes", "render"]:
@@ -175,11 +176,12 @@ def _is_render_queue_proxy_path(method: str, path: str) -> bool:
     if len(parts) >= 2 and parts[1] in {"graph-render-batches", "render-batches"}:
         return method in {"GET", "POST"}
     if len(parts) >= 4 and parts[1] == "scenes" and parts[3] == "render-versions":
-        # Render-version listing/promote/prune is durable render-queue state.
-        # Everything else under scenes/{id}/ (authoring-map, annotation,
-        # editor-geometry, prim-mesh, optical-perturbation, ...) is plain
-        # scene-description I/O that MUST stay local so scene loading and node
-        # authoring keep working when no GPU render queue is running.
+        # Gallery browsing is read-only scene-local I/O plus bounded CPU
+        # Stokes materialization. Keep it on the backend-only 8765 process so
+        # a page of image requests cannot contend with the 8766 GPU queue.
+        # Render-version listing/promote/prune still belongs to the queue.
+        if len(parts) >= 6 and parts[5] == "gallery":
+            return False
         return method in {"GET", "POST"}
     if len(parts) >= 2 and parts[1] == "graph-render-runs":
         # Durable run status / resume live in the render queue.
@@ -347,6 +349,119 @@ def _interleaved_gpu_shard_assignments(item_count: int, gpu_indices: list[int]) 
     return assignments
 
 
+def _snapshot_render_request_payload(request: RenderRequest) -> dict[str, Any]:
+    """Return a detached request payload safe to nest in a leader's extras.
+
+    The normal bridge serializer intentionally retains its ``extras`` mapping
+    by reference.  A heading-batch leader is also one of its children, so a
+    live child payload nested in that same mapping would form a JSON cycle.
+    """
+    return copy.deepcopy(render_request_to_payload(request))
+
+
+_RESUME_BATCH_ROUTING_KEYS = (
+    "run_id",
+    "scene_version_id",
+    "render_version_id",
+    "scene_variant_key",
+    "render_variant",
+    "submission_group_id",
+    "variant_sequence_index",
+    "variant_sequence_total",
+    "previous_variant_batch_id",
+    "polar_sample_selection_manifest_ref",
+    "task_key",
+    "logical_task_key",
+    "plan_ordinal",
+    "task_plan_persisted",
+    "phase",
+    "phase_index",
+    "opticalnav_project_id",
+    "opticalnav_scene_id",
+    "render_profile_id",
+)
+
+
+def _rewrite_resume_batch_child_routing(
+    request_payload: Mapping[str, Any],
+    *,
+    routing: Mapping[str, Any],
+    parent_task_key: str,
+) -> dict[str, Any]:
+    """Stamp immutable resume routing onto every detached K-heading child.
+
+    A K=2..4 request stores detached child payloads under its outer request's
+    ``extras``. A normal submission binds both layers together, but a resume
+    recreates the outer request from an old durable blob. Updating only that
+    outer blob would render children into the superseded version directory
+    while recording success against the new version.
+    """
+    updated = dict(request_payload)
+    extras = dict(updated.get("extras") or {})
+    child_routing = {
+        key: routing[key]
+        for key in _RESUME_BATCH_ROUTING_KEYS
+        if key in routing
+    }
+    for payload_key in (
+        "stokes_heading_batch_request_payloads",
+        "active_stokes_heading_batch_request_payloads",
+    ):
+        raw_children = extras.get(payload_key)
+        if not isinstance(raw_children, list):
+            continue
+        children: list[Any] = []
+        for index, raw_child in enumerate(raw_children):
+            if not isinstance(raw_child, Mapping):
+                children.append(raw_child)
+                continue
+            child = dict(raw_child)
+            child_extras = dict(child.get("extras") or {})
+            # Preserve each child's own viewpoint/heading keys. The outer task
+            # identifies only the batch leader.
+            child_extras.update(child_routing)
+            child_extras["stokes_heading_batch_parent_task_key"] = parent_task_key
+            child_extras["stokes_heading_batch_child_index"] = index
+            child["extras"] = child_extras
+            children.append(child)
+        extras[payload_key] = children
+    updated["extras"] = extras
+    return updated
+
+
+def _stokes_batch_window_policy(
+    sweep_requests: Sequence[Any],
+    *,
+    gpu_indices: Sequence[int],
+    default_window: int,
+) -> tuple[int, bool]:
+    """Choose the K-heading submission policy for the current worker mode.
+
+    Legacy strips stage a pose-specific XML. A persistent OptiX worker can
+    then hold the previous strip's texture allocation while compiling the next
+    one, so 24 GiB GPUs require a one-strip wave and worker recycle. Resident
+    strips instead keep a fixed K-slot scene per worker and mutate only sensor
+    transforms; no second scene compilation overlaps the resident allocation.
+
+    This is a scheduler policy only: it leaves the canonical render profile
+    and its image/Stokes data unchanged. Active camera-local polar captures
+    are K=1 and deliberately do not use this path.
+    """
+    ambient_stokes_batch = any(
+        str((getattr(getattr(item, "request", item), "extras", {}) or {}).get("stokes_heading_batch_execution") or "")
+        == "ambient_stokes_heading_batch_v1"
+        for item in sweep_requests
+    )
+    if not ambient_stokes_batch:
+        return max(1, int(default_window)), False
+    resident = str(os.environ.get("ROBOMITUBA_RESIDENT_STOKES_HEADING_BATCH", "1")).strip().lower() not in {
+        "0", "false", "no", "off",
+    }
+    if resident:
+        return max(1, int(default_window)), False
+    return min(max(1, int(default_window)), max(1, len(gpu_indices))), True
+
+
 def _bind_graph_sweep_task_record(
     sweep_request: Any,
     task_payload: dict[str, Any],
@@ -370,7 +485,7 @@ def _bind_graph_sweep_task_record(
     """Attach one durable graph-sweep task to its actual phase request."""
     request = sweep_request.request
     task_payload.setdefault("polar_sample_selection_manifest_ref", selection_manifest_ref)
-    request.extras.update({
+    task_extras = {
         "run_id": run_id,
         "scene_version_id": scene_version_id_value,
         "render_version_id": render_version_id,
@@ -396,7 +511,63 @@ def _bind_graph_sweep_task_record(
         # its immutable ID on each request avoids copying the same JSON blob
         # thousands of times into the task/request ledger during a full sweep.
         **({"source_bundle_ref": task_payload["source_bundle_ref"]} if task_payload.get("source_bundle_ref") else {}),
-    })
+    }
+    request.extras.update(task_extras)
+
+    # K-heading jobs render the detached child payloads below, not the leader
+    # request passed to this function.  The snapshots are intentionally made
+    # before task binding to avoid a self-referential ``extras`` payload, which
+    # meant they formerly missed render_version_id and fell back to the legacy
+    # bridge_jobs output root.  Stamp only the immutable routing metadata onto
+    # each child after binding.  Preserve each child's own job/scene identity,
+    # and overwrite its pose key from the canonical batch view list so every
+    # split Stokes output lands in its own versioned bundle.
+    for payload_key in (
+        "stokes_heading_batch_request_payloads",
+        "active_stokes_heading_batch_request_payloads",
+    ):
+        raw_payloads = request.extras.get(payload_key)
+        if not isinstance(raw_payloads, list):
+            continue
+        bound_payloads: list[Any] = []
+        for index, raw_child in enumerate(raw_payloads):
+            if not isinstance(raw_child, Mapping):
+                bound_payloads.append(raw_child)
+                continue
+            child = dict(raw_child)
+            child_extras = dict(child.get("extras") or {})
+            child_extras.update(task_extras)
+            child_extras["stokes_heading_batch_parent_task_key"] = task_id
+            child_extras["stokes_heading_batch_child_index"] = index
+            child["extras"] = child_extras
+            bound_payloads.append(child)
+        request.extras[payload_key] = bound_payloads
+
+    # The matching view list belongs to the ambient and active batch protocol
+    # alike.  It is the authoritative source of each child observation path.
+    view_keys = request.extras.get("stokes_heading_batch_view_keys")
+    if isinstance(view_keys, list):
+        for payload_key in (
+            "stokes_heading_batch_request_payloads",
+            "active_stokes_heading_batch_request_payloads",
+        ):
+            bound_payloads = request.extras.get(payload_key)
+            if not isinstance(bound_payloads, list):
+                continue
+            for index, child in enumerate(bound_payloads):
+                if not isinstance(child, Mapping) or index >= len(view_keys):
+                    continue
+                view_key = view_keys[index]
+                if not isinstance(view_key, Mapping):
+                    continue
+                child_extras = dict(child.get("extras") or {})
+                node_id = _maybe_str(view_key.get("node_id"))
+                heading_id = _maybe_str(view_key.get("heading_id"))
+                if node_id:
+                    child_extras["opticalnav_vp_id"] = node_id
+                if heading_id:
+                    child_extras["opticalnav_heading_id"] = heading_id
+                child["extras"] = child_extras
     return id(request), {
         "task_key": task_id,
         "run_id": run_id,
@@ -5737,17 +5908,11 @@ class RenderDaemon:
         self._jobs: dict[str, _QueuedJob] = {}
         self._scene_cache_stats: dict[str, dict[str, Any]] = {}
         self._path_size_cache: dict[str, dict[str, Any]] = {}
-        # Preview derivatives for ``core_preview_v1`` are intentionally never
-        # written back into immutable observation directories.  Keep a small
-        # byte-LRU instead; cache keys include the raw source digest so a new
-        # render version cannot leak a stale visualization into the viewer.
-        self._stokes_preview_cache: OrderedDict[tuple[str, str], bytes] = OrderedDict()
-        self._stokes_preview_cache_bytes = 0
-        self._stokes_preview_cache_limit_bytes = max(
-            8 * 1024 * 1024,
-            int(float(os.environ.get("ROBOMITUBA_STOKES_PREVIEW_CACHE_MB", "128")) * 1024 * 1024),
-        )
-        self._stokes_preview_cache_lock = threading.Lock()
+        # 8765 owns gallery read/preview work.  This is intentionally a
+        # bounded CPU executor, separate from the persistent 8766 GPU worker
+        # manager; preview requests never acquire a render worker or mutate an
+        # immutable observation directory.
+        self._gallery_preview_service = GalleryPreviewService()
         self._telemetry_cache: dict[str, Any] = {"path": None, "mtime_ns": None, "rows": []}
         # Per-scene project-summary cache. _opticalnav_project_summary is called on
         # every project/scene mutation AND once per project on the project list, and
@@ -5929,22 +6094,51 @@ class RenderDaemon:
         payload: Mapping[str, Any],
     ) -> tuple[HTTPStatus, dict[str, Any]]:
         from navigation_dataset.graph_edit_log import edge_record as _erec, graph_size as _gsz, node_record as _nrec
+        from navigation_dataset.edge_builder import user_certifiable_opening
         from navigation_dataset.graph_pipeline import validate_scene_graph_edge
         from navigation_dataset.viewpoint_graph import (
             append_edge,
+            append_manual_node,
             find_edge_by_endpoints,
             read_viewpoint_graph,
             remove_edge,
+            remove_node,
             write_viewpoint_graph,
         )
 
         scene_dir = project_dir / "scenes" / scene_id
-        graph_path = scene_dir / "viewpoint_graph.json"
+        graph_scope = str(payload.get("graph_scope") or "legacy")
+        place_scope = graph_scope == "navigation_place"
+        if graph_scope not in {"legacy", "navigation_place"}:
+            return HTTPStatus.BAD_REQUEST, {"error": f"unknown graph_scope: {graph_scope}"}
+        if place_scope:
+            from navigation_dataset.navigation_support import PLACE_GRAPH_FILE
+            graph_path = scene_dir / PLACE_GRAPH_FILE
+        else:
+            graph_path = scene_dir / "viewpoint_graph.json"
         if not graph_path.exists():
-            return HTTPStatus.NOT_FOUND, {"error": "viewpoint_graph.json not found"}
+            return HTTPStatus.NOT_FOUND, {
+                "error": "place_graph.json not found; Build Place Graph first."
+                if place_scope else "viewpoint_graph.json not found"
+            }
         raw_ops = payload.get("ops")
         if not isinstance(raw_ops, list) or not raw_ops:
             return HTTPStatus.BAD_REQUEST, {"error": "graph edits require a non-empty ops list"}
+        support_lock = None
+        if place_scope:
+            from navigation_dataset.navigation_support import support_lock_summary
+
+            support_lock = support_lock_summary(scene_dir)
+            if support_lock and not self._coerce_bool(payload.get("confirm_support_invalidation"), False):
+                return HTTPStatus.CONFLICT, {
+                    "error": "navigation_support_locked",
+                    "message": (
+                        "Navigation Support is complete. Confirm that this topology edit should archive "
+                        "the current support/render plan and return the workflow to Blueprint review."
+                    ),
+                    "requires_confirmation": True,
+                    "support_lock": support_lock,
+                }
         client_batch_id = _maybe_str(payload.get("client_batch_id"))
 
         with self._opticalnav_graph_edit_lock(project_dir, scene_id):
@@ -5971,9 +6165,129 @@ class RenderDaemon:
                     results.append({"client_op_id": client_op_id, "ok": True, "duplicate_client_op": True})
                     continue
 
+                if op_type == "add_node":
+                    try:
+                        x = float(raw["x"])
+                        y = float(raw["y"])
+                    except (KeyError, TypeError, ValueError):
+                        results.append({"client_op_id": client_op_id, "ok": False, "type": op_type, "error": "x/y must be numeric"})
+                        continue
+                    if place_scope:
+                        # V4 place nodes must lie on the same clearance-eroded
+                        # domain used to create Navigation Support.  The legacy
+                        # editor deliberately retains its more permissive policy.
+                        from navigation_dataset.navigation_support import MOTION_GRID_FILE
+                        from navigation_dataset.traversability import load_traversability_grid, world_to_cell
+                        try:
+                            # v4 owns a distinct action-domain grid.  The old
+                            # filename (motion_grid.npy) belonged to v3 and
+                            # made every otherwise-safe v4 node insertion fail
+                            # with HTTP 400 / motion_grid_missing.
+                            motion_grid = load_traversability_grid(scene_dir / MOTION_GRID_FILE)
+                            cell_x, cell_y = world_to_cell(motion_grid.spec, x, y)
+                            if not (
+                                0 <= cell_x < motion_grid.spec.width
+                                and 0 <= cell_y < motion_grid.spec.height
+                                and bool(motion_grid.traversable[cell_y, cell_x])
+                            ):
+                                results.append({
+                                    "client_op_id": client_op_id, "ok": False, "type": op_type,
+                                    "error": "node_rejected", "reason": "outside_safe_place_domain",
+                                    "message": "Place node rejected: that point is outside the v4 robot-safe domain. "
+                                    "Choose a green traversable cell or correct the walkability map first.",
+                                    "position": [x, y],
+                                })
+                                continue
+                        except FileNotFoundError:
+                            results.append({
+                                "client_op_id": client_op_id, "ok": False, "type": op_type,
+                                "error": "motion_grid_missing",
+                                "message": "The v4 safe placement grid is missing. Build Place Graph once before adding a place node.",
+                            })
+                            continue
+                        # A dense action graph belongs to Stage 3, not the
+                        # editable sparse place graph.  Keep hand-placed
+                        # anchors at least 15 cm apart (or the configured
+                        # sparse spacing when it is larger), except for the
+                        # build-time portal threshold seeds which are tagged
+                        # explicitly and never created by this endpoint.
+                        # This is a de-duplication floor, not the builder's
+                        # coverage spacing: editors must still be able to add
+                        # a deliberate room-interior node near a doorway.
+                        minimum_spacing_m = 0.15
+                        nearest_node = None
+                        nearest_distance = float("inf")
+                        for candidate in getattr(graph, "nodes", []) or []:
+                            position = getattr(candidate, "position", None) or ()
+                            if len(position) < 2:
+                                continue
+                            distance = math.hypot(float(position[0]) - x, float(position[1]) - y)
+                            if distance < nearest_distance:
+                                nearest_node, nearest_distance = candidate, distance
+                        if nearest_node is not None and nearest_distance < minimum_spacing_m - 1e-9:
+                            results.append({
+                                "client_op_id": client_op_id, "ok": False, "type": op_type,
+                                "error": "node_rejected", "reason": "too_close_to_place_node",
+                                "message": (
+                                    f"Place node rejected: {nearest_distance:.2f} m from {nearest_node.node_id}; "
+                                    "v4 place nodes must be at least 0.15 m apart."
+                                ),
+                                "position": [x, y],
+                                "nearest_node_id": nearest_node.node_id,
+                                "nearest_distance_m": round(nearest_distance, 4),
+                                "minimum_spacing_m": minimum_spacing_m,
+                            })
+                            continue
+                    before = _gsz(graph)
+                    node = append_manual_node(graph, x, y, heading_count=graph.node_heading_count)
+                    changed = True
+                    if client_op_id:
+                        new_applied_ids.append(client_op_id)
+                        applied_set.add(client_op_id)
+                    results.append({
+                        "client_op_id": client_op_id, "ok": True, "type": op_type,
+                        "node_id": node.node_id, "position": node.position,
+                        "heading_count": len(node.headings),
+                        "minimum_spacing_m": minimum_spacing_m if place_scope else None,
+                    })
+                    log_events.append({
+                        "operation": "add_node", "graph_scope": graph_scope,
+                        "graph_id": getattr(graph, "graph_id", None),
+                        "client_batch_id": client_batch_id, "client_op_id": client_op_id,
+                        "revision_before": revision_before, "before": before, "after": _gsz(graph),
+                        "params": {"x": x, "y": y, "heading_count": graph.node_heading_count},
+                        "added_node": {"id": node.node_id, "position": [x, y], "headings": len(node.headings)},
+                    })
+                    continue
+
+                if op_type == "delete_node":
+                    node_id = str(raw.get("node_id") or "")
+                    if not node_id:
+                        results.append({"client_op_id": client_op_id, "ok": False, "type": op_type, "error": "node_id required"})
+                        continue
+                    before = _gsz(graph)
+                    rec = _nrec(graph, node_id)
+                    if not remove_node(graph, node_id):
+                        results.append({"client_op_id": client_op_id, "ok": False, "type": op_type, "node_id": node_id, "error": f"node_id not found: {node_id}"})
+                        continue
+                    changed = True
+                    if client_op_id:
+                        new_applied_ids.append(client_op_id)
+                        applied_set.add(client_op_id)
+                    results.append({"client_op_id": client_op_id, "ok": True, "type": op_type, "node_id": node_id, "deleted": True})
+                    log_events.append({
+                        "operation": "delete_node", "graph_scope": graph_scope,
+                        "graph_id": getattr(graph, "graph_id", None),
+                        "client_batch_id": client_batch_id, "client_op_id": client_op_id,
+                        "revision_before": revision_before, "before": before, "after": _gsz(graph),
+                        "params": {"node_id": node_id}, "deleted_nodes": [rec] if rec else [],
+                    })
+                    continue
+
                 if op_type == "add_edge":
                     source = str(raw.get("source") or "")
                     target = str(raw.get("target") or "")
+                    certify_opening = bool(raw.get("certify_opening", False))
                     if not source or not target or source == target:
                         results.append({"client_op_id": client_op_id, "ok": False, "type": op_type, "error": "source/target node ids required and must differ"})
                         continue
@@ -5995,32 +6309,97 @@ class RenderDaemon:
                             except (TypeError, ValueError):
                                 return default
 
+                        # Sparse place links express global topology.  They do
+                        # not themselves become robot actions: Navigation
+                        # Support later expands a certified place corridor into
+                        # 0.25 m transitions.  A user-approved, clear direct
+                        # connection must therefore not be rejected merely
+                        # because the automatic spanner already has a longer
+                        # alternative or because it exceeds one action step.
+                        # Keep the explicit 8 m ceiling so a mistaken click
+                        # cannot create a scene-wide shortcut; wall/body-height
+                        # validation remains mandatory.
+                        configured_manual_limit = (
+                            (meta.get("navigation_support_config") or {}).get("manual_place_edge_max_length_m", 8.0)
+                            if place_scope else None
+                        )
+                        try:
+                            manual_place_limit = min(8.0, max(1.5, float(configured_manual_limit)))
+                        except (TypeError, ValueError):
+                            manual_place_limit = 8.0
+                        effective_max_edge_length_m = (
+                            max(float(_meta_float("max_edge_length_m", 1.5) or 1.5), manual_place_limit)
+                            if place_scope else float(_meta_float("max_edge_length_m", 1.5) or 1.5)
+                        )
+                        doorway_gap_m = float(_meta_float(
+                            "doorway_gap_m", 0.75 if place_scope else 0.45,
+                        ) or (0.75 if place_scope else 0.45))
+                        try:
+                            manual_opening_max_gap_m = float((meta.get("navigation_support_config") or {}).get(
+                                "manual_opening_max_gap_m", 1.0,
+                            ))
+                        except (TypeError, ValueError):
+                            manual_opening_max_gap_m = 1.0
+                        resolution_m = float(_meta_float("grid_resolution_m", 0.05) or 0.05)
                         validation, validation_diagnostics = validate_scene_graph_edge(
                             scene_id,
                             scene_dir,
                             graph,
                             source,
                             target,
-                            resolution=float(_meta_float("grid_resolution_m", 0.05) or 0.05),
+                            resolution=resolution_m,
                             robot_radius_m=float(_meta_float("robot_radius_m", 0.25) or 0.25),
                             min_clearance_m=_meta_float("min_clearance_m", None),
-                            max_edge_length_m=float(_meta_float("max_edge_length_m", 1.5) or 1.5),
+                            max_edge_length_m=effective_max_edge_length_m,
+                            doorway_gap_m=doorway_gap_m,
+                        )
+                        manual_opening_eligible = place_scope and user_certifiable_opening(
+                            validation,
+                            resolution_m=resolution_m,
+                            max_raw_gap_m=manual_opening_max_gap_m,
                         )
                         if not validation.accepted:
-                            results.append({
-                                "client_op_id": client_op_id,
-                                "ok": False,
-                                "type": op_type,
-                                "source": source,
-                                "target": target,
-                                "error": "edge_rejected",
-                                "reason": validation.reason,
-                                "distance_m": round(validation.distance_m, 4),
-                                "wall_run_cells": validation.wall_run_cells,
-                                "gap_run_cells": validation.gap_run_cells,
-                                "generation_diagnostics": validation_diagnostics,
-                            })
-                            continue
+                            if certify_opening and manual_opening_eligible:
+                                # This remains a bounded exception, not an
+                                # "add edge anyway" bypass: the body-height
+                                # wall test and raw floor-gap cap have already
+                                # passed, and the user has confirmed that this
+                                # visible threshold is open.  Mark it as an
+                                # open portal so V4 restores the same narrow
+                                # centre line when materialising support.
+                                automatic_reason = validation.reason
+                                manual_portal_id = "manual_opening_" + "__".join(sorted((source, target)))
+                                validation = type(validation)(
+                                    True, "manual_opening", "user_certified_opening",
+                                    validation.distance_m, validation.wall_run_cells,
+                                    validation.gap_run_cells, validation.hazard_crossing,
+                                    manual_portal_id, validation.raw_gap_run_cells,
+                                )
+                            else:
+                                results.append({
+                                    "client_op_id": client_op_id,
+                                    "ok": False,
+                                    "type": op_type,
+                                    "source": source,
+                                    "target": target,
+                                    "error": "edge_rejected",
+                                    "reason": validation.reason,
+                                    "message": (
+                                        f"Direct topology link rejected: {validation.reason} "
+                                        f"(doorway threshold allowance {doorway_gap_m:.2f} m). "
+                                        "It must remain collision-free at robot body height."
+                                    ),
+                                    "distance_m": round(validation.distance_m, 4),
+                                    "wall_run_cells": validation.wall_run_cells,
+                                    "gap_run_cells": validation.gap_run_cells,
+                                    "raw_gap_run_cells": validation.raw_gap_run_cells,
+                                    "raw_gap_m": round(validation.raw_gap_run_cells * resolution_m, 4),
+                                    "doorway_gap_m": doorway_gap_m,
+                                    "manual_opening_eligible": manual_opening_eligible,
+                                    "manual_opening_max_gap_m": manual_opening_max_gap_m,
+                                    "generation_diagnostics": validation_diagnostics,
+                                })
+                                continue
                         distance_m = validation.distance_m
                     edge = append_edge(graph, source, target, distance_m=distance_m, weight=weight)
                     if edge is None:
@@ -6030,14 +6409,39 @@ class RenderDaemon:
                     if is_new:
                         edge.extras = {
                             **(edge.extras or {}),
+                            # Keep manual topology edits distinguishable from
+                            # generated place edges. The v4 rail deliberately
+                            # lists only the active graph's manual edges.
+                            "manual": True,
+                            "graph_scope": graph_scope,
+                            "topology_direct": bool(place_scope),
+                            "manual_max_edge_length_m": effective_max_edge_length_m,
                             "edge_validation": {
                                 "mode": validation.mode,
                                 "reason": validation.reason,
                                 "wall_run_cells": validation.wall_run_cells,
                                 "gap_run_cells": validation.gap_run_cells,
+                                "doorway_gap_m": doorway_gap_m,
                                 "portal_id": validation.portal_id,
+                                "raw_gap_run_cells": validation.raw_gap_run_cells,
                             },
                         }
+                        if validation.mode == "manual_opening":
+                            edge.extras.update({
+                                "portal": validation.portal_id,
+                                "portal_source": "user_certified",
+                                "portal_type": "manual_opening",
+                                "portal_state": "open",
+                                "open": True,
+                                "manual_opening": {
+                                    "certified": True,
+                                    "automatic_reason": automatic_reason,
+                                    "raw_gap_run_cells": validation.raw_gap_run_cells,
+                                    "raw_gap_m": round(validation.raw_gap_run_cells * resolution_m, 6),
+                                    "max_raw_gap_m": manual_opening_max_gap_m,
+                                    "confirmed_via": "place_graph_editor",
+                                },
+                            })
                     changed = changed or is_new
                     if client_op_id:
                         new_applied_ids.append(client_op_id)
@@ -6051,6 +6455,7 @@ class RenderDaemon:
                         "target": edge.target,
                         "distance_m": edge.distance_m,
                         "duplicate_edge": not is_new,
+                        "manual_opening": bool((edge.extras or {}).get("manual_opening")),
                     })
                     log_events.append({
                         "operation": "add_edge",
@@ -6060,7 +6465,7 @@ class RenderDaemon:
                         "revision_before": revision_before,
                         "before": before,
                         "after": _gsz(graph),
-                        "params": {"source": source, "target": target, "distance_m": raw.get("distance_m"), "weight": raw.get("weight")},
+                        "params": {"source": source, "target": target, "distance_m": raw.get("distance_m"), "weight": raw.get("weight"), "certify_opening": certify_opening},
                         "added_edge": {
                             "id": edge.edge_id,
                             "source": edge.source,
@@ -6104,9 +6509,35 @@ class RenderDaemon:
 
                 results.append({"client_op_id": client_op_id, "ok": False, "type": op_type or None, "error": f"unsupported op type: {op_type or 'missing'}"})
 
+            route_blueprints = None
             if changed or new_applied_ids:
                 _rev_before, revision_after = self._bump_viewpoint_graph_revision(graph, new_applied_ids)
-                write_viewpoint_graph(graph_path, graph)
+                if place_scope:
+                    # Topology edits intentionally return the workflow to stage 2:
+                    # regenerate review candidates and invalidate every derived
+                    # action/render sidecar.  A stale approved route must never
+                    # survive an edited place graph.
+                    from navigation_dataset.navigation_support import (
+                        BLUEPRINTS_FILE, DEFAULT_CONFIG, OBSERVATION_PLAN_FILE,
+                        RENDER_GRAPH_FILE, SUPPORT_GRAPH_FILE, propose_route_blueprints,
+                        archive_navigation_support, write_place_graph, write_route_blueprints,
+                    )
+                    from navigation_dataset.scene_annotations import read_scene_annotation
+
+                    config = dict(meta.get("navigation_support_config") or DEFAULT_CONFIG)
+                    archived_support = archive_navigation_support(
+                        scene_dir,
+                        reason="place_graph_edit",
+                    )
+                    write_place_graph(scene_dir, graph, config=config)
+                    annotation_path = scene_dir / "scene_annotation.json"
+                    annotation = read_scene_annotation(annotation_path) if annotation_path.is_file() else None
+                    route_blueprints = propose_route_blueprints(graph, annotation=annotation, config=config)
+                    write_route_blueprints(scene_dir / BLUEPRINTS_FILE, route_blueprints)
+                    for name in (SUPPORT_GRAPH_FILE, OBSERVATION_PLAN_FILE, RENDER_GRAPH_FILE):
+                        (scene_dir / name).unlink(missing_ok=True)
+                else:
+                    write_viewpoint_graph(graph_path, graph)
             else:
                 revision_after = revision_before
 
@@ -6114,18 +6545,25 @@ class RenderDaemon:
                 event["revision_after"] = revision_after
                 _log_graph_edit(handler, project_dir, scene_id, event)
 
-            rejected_only = (not changed and any(item.get("error") == "edge_rejected" for item in results))
+            rejected_only = (not changed and any(item.get("error") in {"edge_rejected", "node_rejected"} for item in results))
             status = HTTPStatus.BAD_REQUEST if rejected_only else HTTPStatus.OK
             body = {
                 "ok": status == HTTPStatus.OK,
+                "graph_scope": graph_scope,
                 "graph_id": getattr(graph, "graph_id", None),
                 "revision": revision_after,
                 "node_count": len(getattr(graph, "nodes", []) or []),
                 "edge_count": len(getattr(graph, "edges", []) or []),
                 "results": results,
             }
+            if route_blueprints is not None:
+                body["profile_id"] = "adaptive_navigation_support_v4"
+                body["route_blueprints"] = route_blueprints
+                body["support_invalidated"] = True
+                if archived_support is not None:
+                    body["archived_support"] = archived_support
             if rejected_only:
-                body["error"] = "edge_rejected"
+                body["error"] = next(item.get("error") for item in results if item.get("error") in {"edge_rejected", "node_rejected"})
             return status, body
 
     # ── Phase R: render worker subprocess wiring ────────────────────────
@@ -7662,6 +8100,8 @@ class RenderDaemon:
         if self._server_thread is not None:
             self._server_thread.join(timeout=5.0)
             self._server_thread = None
+
+        self._gallery_preview_service.shutdown()
 
         flush_timeout_s = max(
             0.0,
@@ -9649,7 +10089,7 @@ class RenderDaemon:
                 "scene_id": scene_id,
                 "profile": profile.name,
                 "stokes_schema": POLAR_STOKES_CORE_SCHEMA,
-                "canonical_arrays": ["rgb", "s0", "s1", "s2", "s3", "mask"],
+                "canonical_arrays": ["s0", "s1", "s2", "s3"],
                 "derived_channels": {
                     "luma_weights": list(POLAR_LUMA_WEIGHTS),
                     "preview_recipe": POLAR_PREVIEW_RECIPE,
@@ -10035,7 +10475,7 @@ class RenderDaemon:
             "compression": "stored",
             "polarization": {
                 "stokes_schema": POLAR_STOKES_CORE_SCHEMA if profile.include_stokes_core else None,
-                "canonical_arrays": ["rgb", "s0", "s1", "s2", "s3", "mask"] if profile.include_stokes_core else None,
+                "canonical_arrays": ["s0", "s1", "s2", "s3"] if profile.include_stokes_core else None,
                 "legacy_stokes": profile.include_legacy_stokes,
                 "legacy_visualization_staging": {
                     "generated_count": legacy_visualization_count,
@@ -11000,6 +11440,7 @@ class RenderDaemon:
                 "task_key",
                 "phase",
                 "phase_index",
+                "texture_profile_override",
             ):
                 if key in render_request.extras:
                     status_extras[key] = render_request.extras[key]
@@ -11464,6 +11905,87 @@ class RenderDaemon:
         return rows
 
     @staticmethod
+    def _opticalnav_hidden_editor_scene(scene_id: str) -> bool:
+        """Return whether a scene belongs to the excluded single-room IR set.
+
+        Those workspaces share the OpticalNav root because they reuse parts of
+        the import pipeline, but they are not navigable multi-room scenes for
+        the OpticalNav editor.  Keep the check name-only so project discovery
+        never needs to open an IR workspace.
+        """
+        normalized = str(scene_id).strip().lower().replace("-", "_")
+        return "single_room" in normalized or "singleroom" in normalized
+
+    @classmethod
+    def _opticalnav_infinigen_editor_workspace_candidates(cls, project_dir: Path) -> list[Path]:
+        """Return the bounded set of multi-room Infinigen workspace names.
+
+        A scene imported for authoring has an annotation/map/XML before it has
+        generated episodes, therefore it intentionally has no
+        ``scenes/<id>/dataset.json`` yet.  The v3 catalog alone cannot expose
+        such a scene.  Only inspect immediate apartment/office directories;
+        do not recurse into observations, meshes, episodes, or IR single-room
+        workspaces.
+        """
+        scene_root = project_dir / "scenes"
+        try:
+            entries = [entry for entry in scene_root.iterdir() if entry.is_dir()]
+        except OSError:
+            return []
+        result: list[Path] = []
+        for entry in entries:
+            scene_id = entry.name
+            lowered = scene_id.lower()
+            if (
+                not lowered.startswith("infinigen_")
+                or cls._opticalnav_hidden_editor_scene(scene_id)
+                or ("apartment" not in lowered and "office" not in lowered)
+            ):
+                continue
+            result.append(entry)
+        return sorted(result, key=lambda path: path.name)
+
+    @classmethod
+    def _opticalnav_v3_catalog_scenes(
+        cls,
+        dataset: Mapping[str, Any],
+        *,
+        workspace_dirs: Iterable[Path],
+    ) -> list[dict[str, Any]]:
+        """Merge registered v3 datasets with ready editor-only workspaces.
+
+        Registered rows retain their scene-local episode counts.  Discovered
+        rows deliberately report zero episodes and an explicit status rather
+        than synthesising a scene dataset, so opening a scene remains a
+        read-only catalog operation.
+        """
+        rows_by_id: dict[str, dict[str, Any]] = {}
+        for entry in dataset.get("scenes") or []:
+            if not isinstance(entry, Mapping):
+                continue
+            scene_id = _maybe_str(entry.get("scene_id"))
+            if not scene_id or cls._opticalnav_hidden_editor_scene(scene_id):
+                continue
+            rows_by_id[scene_id] = dict(entry)
+        for scene_dir in workspace_dirs:
+            scene_id = scene_dir.name
+            if scene_id in rows_by_id:
+                continue
+            rows_by_id[scene_id] = {
+                "scene_id": scene_id,
+                "dataset_ref": None,
+                "episode_count": 0,
+                "split_counts": {},
+                "episode_digest": "",
+                "status": "workspace_unregistered",
+                "updated_at": "",
+                "authoring_map_ref": f"scenes/{scene_id}/authoring_map.json",
+                "annotation_ref": f"scenes/{scene_id}/scene_annotation.json",
+                "catalog_source": "editor_workspace",
+            }
+        return [rows_by_id[scene_id] for scene_id in sorted(rows_by_id)]
+
+    @staticmethod
     def _opticalnav_manifest_split_counts(dataset: Mapping[str, Any]) -> dict[str, int]:
         splits = dataset.get("splits")
         if isinstance(splits, Mapping):
@@ -11474,19 +11996,40 @@ class RenderDaemon:
         return {}
 
     def _opticalnav_project_summary(self, project_dir: Path) -> dict[str, Any]:
-        """Serve a compact catalog without scanning any scene workspace.
+        """Serve a compact catalog without parsing any scene workspace.
 
         Project selection is on the hot startup path.  Before v3 migration,
         the old implementation parsed every graph/annotation, counted every
         root episode, and scheduled validation for each `/projects` refresh.
         That made a UI catalog request proportional to every dataset in the
-        project.  Both v2 and v3 now use the root manifest as a small catalog;
-        all data-plane work is reached through an explicit scene id.
+        project.  The v3 manifest remains the source of episode counts, with
+        a bounded one-level discovery pass for ready Infinigen apartment and
+        office workspaces that have not produced an episode manifest yet.
         """
         dataset_path = project_dir / "dataset.json"
-        # Legacy catalogs also include the immediate ``scenes/`` names, so a
-        # fresh import invalidates the compact cache without walking any scene.
-        signature = (self._stat_sig(dataset_path), self._stat_sig(project_dir / "scenes"))
+        workspace_candidates = self._opticalnav_infinigen_editor_workspace_candidates(project_dir)
+        # ``scenes/`` changes when a workspace is imported.  The selected
+        # workspace directory signature also catches its map/annotation being
+        # materialised after the directory itself was created, without
+        # fingerprinting its large children.
+        workspace_signature = tuple(
+            (
+                path.name,
+                self._stat_sig(path),
+                # Directory mtimes are not reliably updated by the NAS/CIFS
+                # mount used in development.  Fingerprint the two tiny marker
+                # files themselves so a just-finished import appears without a
+                # daemon restart or a manual hard refresh.
+                self._stat_sig(path / "authoring_map.json"),
+                self._stat_sig(path / "scene_annotation.json"),
+            )
+            for path in workspace_candidates
+        )
+        signature = (
+            self._stat_sig(dataset_path),
+            self._stat_sig(project_dir / "scenes"),
+            workspace_signature,
+        )
         cache_key = str(project_dir.resolve())
         with self._scene_summary_lock:
             cache = getattr(self, "_opticalnav_catalog_cache", {})
@@ -11497,7 +12040,20 @@ class RenderDaemon:
         if not isinstance(dataset, Mapping):
             dataset = {}
         if dataset.get("layout_version") == "opticalnav_project_catalog_v3":
-            scene_entries = [dict(entry) for entry in dataset.get("scenes") or [] if isinstance(entry, Mapping)]
+            # A direct import is selectable once it has either authoring
+            # input.  These two lightweight stats are deliberately separate
+            # from candidate enumeration: an initially empty directory stays
+            # in the cache fingerprint, so adding its map later invalidates a
+            # previously cached catalog response.
+            workspace_dirs = [
+                path for path in workspace_candidates
+                if (path / "authoring_map.json").is_file()
+                or (path / "scene_annotation.json").is_file()
+            ]
+            scene_entries = self._opticalnav_v3_catalog_scenes(
+                dataset,
+                workspace_dirs=workspace_dirs,
+            )
             split_counts: dict[str, int] = {}
             for entry in scene_entries:
                 for split, count in dict(entry.get("split_counts") or {}).items():
@@ -13774,6 +14330,15 @@ class RenderDaemon:
         "stokes_s1_rgb": "s1_rgb_preview.png",
         "stokes_s2_rgb": "s2_rgb_preview.png",
         "stokes_s3_rgb": "s3_rgb_preview.png",
+        "stokes_s1_r_bwr": "s1_r_bwr_colorbar.png",
+        "stokes_s1_g_bwr": "s1_g_bwr_colorbar.png",
+        "stokes_s1_b_bwr": "s1_b_bwr_colorbar.png",
+        "stokes_s2_r_bwr": "s2_r_bwr_colorbar.png",
+        "stokes_s2_g_bwr": "s2_g_bwr_colorbar.png",
+        "stokes_s2_b_bwr": "s2_b_bwr_colorbar.png",
+        "stokes_s3_r_bwr": "s3_r_bwr_colorbar.png",
+        "stokes_s3_g_bwr": "s3_g_bwr_colorbar.png",
+        "stokes_s3_b_bwr": "s3_b_bwr_colorbar.png",
     }
 
     def _opticalnav_scan_observations(self, project_dir: Path, scene_id: str) -> dict[str, Any]:
@@ -14646,62 +15211,36 @@ class RenderDaemon:
     def _stokes_preview_png_from_npz(self, *, npz_path: Path, modality: str) -> bytes | None:
         """Return a legacy visualization generated from Stokes raw data.
 
-        The cache is in-memory only.  Generation uses the renderer's own
-        visualization writer inside a temporary directory so previews opened
-        in the UI and regenerated by a ``legacy_full`` export share one recipe.
+        The cache and bounded materialization executor are local to the
+        control-plane process. Generation uses the renderer's own visualization
+        writer inside a temporary directory so previews opened in the UI and
+        regenerated by a ``legacy_full`` export share one recipe.
         """
-        if not npz_path.is_file():
+        if not npz_path.is_file() or modality not in self._OPTICALNAV_OBS_PNG_FILENAMES:
             return None
-        filename = self._OPTICALNAV_OBS_PNG_FILENAMES.get(modality)
-        if not filename:
-            return None
-        try:
-            digest = hashlib.sha256(npz_path.read_bytes()).hexdigest()
-        except OSError:
-            return None
-        key = (digest, modality)
-        with self._stokes_preview_cache_lock:
-            cached = self._stokes_preview_cache.pop(key, None)
-            if cached is not None:
-                self._stokes_preview_cache[key] = cached
-                return cached
-        requested = {
-            "polar_rgb_preview" if modality == "polar_rgb_preview" else modality
-        }
-        if modality.startswith("stokes_") and modality.endswith("_rgb"):
-            # ``save_polarization_products`` always writes component previews
-            # in full policy, so any normal requested set is sufficient.
-            requested = {"polar_rgb_preview"}
-        try:
-            with tempfile.TemporaryDirectory(prefix="robomituba-stokes-preview-") as temp:
-                outputs = materialize_stokes_visualizations(npz_path, temp, requested)
-                output_key = {
-                    "polar_rgb_preview": "rgb_preview",
-                    "stokes_s0_rgb": "s0_rgb_preview",
-                    "stokes_s1_rgb": "s1_rgb_preview",
-                    "stokes_s2_rgb": "s2_rgb_preview",
-                    "stokes_s3_rgb": "s3_rgb_preview",
-                }.get(modality, modality)
-                rendered = Path(outputs[output_key]).read_bytes()
-        except (OSError, KeyError, ValueError, TypeError):
-            return None
-        with self._stokes_preview_cache_lock:
-            self._stokes_preview_cache[key] = rendered
-            self._stokes_preview_cache_bytes += len(rendered)
-            while self._stokes_preview_cache and self._stokes_preview_cache_bytes > self._stokes_preview_cache_limit_bytes:
-                _old_key, old = self._stokes_preview_cache.popitem(last=False)
-                self._stokes_preview_cache_bytes -= len(old)
-        return rendered
+        return self._gallery_preview_service.png_bytes(npz_path=npz_path, modality=modality)
 
     def _opticalnav_render_version_gallery(
-        self, project_dir: Path, scene_id: str, render_version_id: str,
+        self,
+        project_dir: Path,
+        scene_id: str,
+        render_version_id: str,
+        *,
+        limit: int = 24,
+        cursor: str | None = None,
+        variant: str | None = None,
+        sensor_id: str | None = None,
+        state: str | None = None,
+        query: str | None = None,
     ) -> dict[str, Any]:
-        """Return the completed/pending captures belonging to one render version group.
+        """Return one bounded page of captures for an immutable version group.
 
         A Polar Sample submission creates two immutable versions under one
         ``submission_group_id``.  Selecting either row intentionally returns
         both versions, so QA can compare passive and active-polar frames in
-        one place.  Ordinary versions simply return their own run.
+        one place.  The old implementation expanded every task and sensor in
+        the group, which made a 315-view QA pass create hundreds of DOM cards
+        and forced the server to materialize the full sweep ledger.
         """
         ledger = RenderLedger(project_dir, scene_id=scene_id)
         versions = ledger.list_versions(scene_id=scene_id)
@@ -14723,102 +15262,143 @@ class RenderDaemon:
             int((item.get("metadata") or {}).get("variant_sequence_index") or 0),
             str(item.get("created_at") or ""),
         ))
-        captures: list[dict[str, Any]] = []
         version_payloads: list[dict[str, Any]] = []
+        run_ids: list[str] = []
+        variant_by_run: dict[str, str] = {}
+        sequence_by_run: dict[str, int] = {}
         for version in grouped:
             source_version_id = str(version.get("render_version_id") or "")
             run_id = str(version.get("run_id") or "")
-            run = ledger.run_payload(run_id) if run_id else None
-            tasks = list((run or {}).get("tasks") or [])
+            metadata = dict(version.get("metadata") or {})
+            version_variant = str(metadata.get("scene_variant_key") or metadata.get("variant") or "base")
+            if run_id:
+                run_ids.append(run_id)
+                variant_by_run[run_id] = version_variant
+                sequence_by_run[run_id] = int(metadata.get("variant_sequence_index") or 0)
             version_payloads.append({
                 "render_version_id": source_version_id,
                 "run_id": run_id,
-                "variant": str((version.get("metadata") or {}).get("scene_variant_key") or (version.get("metadata") or {}).get("variant") or "base"),
+                "variant": version_variant,
                 "status": version.get("status"),
-                "task_count": len(tasks),
+                "plan_total": int(metadata.get("plan_total") or 0),
             })
-            for task in tasks:
-                metadata = dict(task.get("metadata") or {})
-                variant = str(task.get("variant") or metadata.get("scene_variant_key") or "base")
-                node_id = str(task.get("node_id") or "")
-                heading_id = str(task.get("heading_id") or "")
-                bundle_version_id = source_version_id
-                source_ref = str(metadata.get("source_bundle_ref") or "")
-                if source_ref:
-                    try:
-                        source_bundle = (project_dir / source_ref).resolve()
-                        source_bundle.relative_to(project_dir.resolve())
-                        parts = source_bundle.relative_to(project_dir).parts
-                        # scenes/<scene>/observations/versions/<version>/<variant>/<node>/<heading>
-                        if len(parts) >= 5 and parts[:4] == ("scenes", scene_id, "observations", "versions"):
-                            bundle_version_id = parts[4]
-                    except (OSError, ValueError):
-                        pass
-                bundle = versioned_bundle_dir(
-                    project_dir, scene_id=scene_id, render_version_id=bundle_version_id,
-                    variant=variant, node_id=node_id, heading_id=heading_id,
+        page = ledger.gallery_task_page(
+            run_ids=run_ids,
+            limit=limit,
+            cursor=cursor,
+            variant=variant,
+            sensor_id=sensor_id,
+            state=state,
+            query=query,
+        )
+        captures: list[dict[str, Any]] = []
+        for task in page["tasks"]:
+            metadata = dict(task.get("metadata") or {})
+            run_id = str(task.get("run_id") or "")
+            task_variant = str(task.get("variant") or metadata.get("scene_variant_key") or variant_by_run.get(run_id) or "base")
+            node_id = str(task.get("node_id") or "")
+            heading_id = str(task.get("heading_id") or "")
+            bundle_version_id = str(task.get("render_version_id") or "")
+            bundle_variant = task_variant
+            bundle_node_id = node_id
+            bundle_heading_id = heading_id
+            source_ref = str(metadata.get("source_bundle_ref") or "")
+            if source_ref:
+                try:
+                    project_root = project_dir.resolve()
+                    source_bundle = (project_root / source_ref).resolve()
+                    # Source-bundle reuse is a trusted ledger reference only
+                    # after containment and the full version/variant/view path
+                    # have been verified.  ``Path.relative_to`` must use two
+                    # resolved paths; mixing absolute/relative paths silently
+                    # discarded this override and made skipped tasks look as
+                    # though their Stokes NPZ was absent.
+                    parts = source_bundle.relative_to(project_root).parts
+                    if len(parts) >= 8 and parts[:4] == ("scenes", scene_id, "observations", "versions"):
+                        bundle_version_id = parts[4]
+                        bundle_variant = parts[5]
+                        bundle_node_id = parts[6]
+                        bundle_heading_id = parts[7]
+                except (OSError, ValueError):
+                    pass
+            requested_sensor_ids = [str(item) for item in (metadata.get("sensor_ids") or []) if str(item)]
+            chosen_sensor_id = str(sensor_id or (requested_sensor_ids[0] if requested_sensor_ids else ""))
+            bundle = versioned_bundle_dir(
+                project_dir, scene_id=scene_id, render_version_id=bundle_version_id,
+                variant=bundle_variant, node_id=bundle_node_id, heading_id=bundle_heading_id,
+            )
+            sensor_dir = bundle
+            if chosen_sensor_id:
+                sensor_dir = bundle / "sensors" / chosen_sensor_id
+                if not sensor_dir.is_dir():
+                    sensor_dir = bundle / "cameras" / chosen_sensor_id
+            has_stokes_data = (sensor_dir / "stokes_data.npz").is_file()
+            modality = "polar_rgb_preview" if has_stokes_data else "rgb"
+            params = {
+                "heading": bundle_heading_id,
+                "variant": bundle_variant,
+                "render_version_id": bundle_version_id,
+            }
+            if chosen_sensor_id:
+                params["sensor_id"] = chosen_sensor_id
+            def product_url(product: str) -> str:
+                return (
+                    f"/api/opticalnav/projects/{quote(project_dir.name, safe='')}/scenes/{quote(scene_id, safe='')}"
+                    f"/observations/{quote(bundle_node_id, safe='')}/{product}?{urlencode(params)}"
                 )
-                sensor_ids = [str(item) for item in (metadata.get("sensor_ids") or []) if str(item)]
-                sensors_root = bundle / "sensors"
-                cameras_root = bundle / "cameras"
-                discovered_ids: set[str] = set(sensor_ids)
-                for root in (sensors_root, cameras_root):
-                    if root.is_dir():
-                        discovered_ids.update(path.name for path in root.iterdir() if path.is_dir())
-                sensor_ids = sorted(discovered_ids)
-                # A task without a sensor directory is still useful: display
-                # its queue/failure state rather than hiding it from the QA set.
-                for sensor_id in sensor_ids or [""]:
-                    sensor_dir = sensors_root / sensor_id if sensor_id and (sensors_root / sensor_id).is_dir() else cameras_root / sensor_id if sensor_id else bundle
-                    modality = "polar_rgb_preview" if (sensor_dir / "polar_rgb_preview.png").is_file() else "rgb"
-                    image_exists = (sensor_dir / self._OPTICALNAV_OBS_PNG_FILENAMES[modality]).is_file()
-                    params = {
-                        "heading": heading_id,
-                        "variant": variant,
-                        "render_version_id": bundle_version_id,
-                    }
-                    if sensor_id:
-                        params["sensor_id"] = sensor_id
-                    image_url = (
-                        f"/api/opticalnav/projects/{quote(project_dir.name, safe='')}/scenes/{quote(scene_id, safe='')}"
-                        f"/observations/{quote(node_id, safe='')}/{modality}?{urlencode(params)}"
+            products = (
+                {
+                    product: product_url(product)
+                    for product in (
+                        "polar_rgb_preview", "stokes_s0_rgb",
+                        "stokes_s1_r_bwr", "stokes_s1_g_bwr", "stokes_s1_b_bwr",
+                        "stokes_s2_r_bwr", "stokes_s2_g_bwr", "stokes_s2_b_bwr",
+                        "stokes_s3_r_bwr", "stokes_s3_g_bwr", "stokes_s3_b_bwr",
+                        "dop", "aolp",
                     )
-                    has_stokes_data = (sensor_dir / "stokes_data.npz").is_file()
-                    stokes_image_urls = {
-                        component: (
-                            f"/api/opticalnav/projects/{quote(project_dir.name, safe='')}/scenes/{quote(scene_id, safe='')}"
-                            f"/observations/{quote(node_id, safe='')}/stokes_{component}_rgb?"
-                            f"{urlencode(params)}"
-                        )
-                        for component in ("s0", "s1", "s2", "s3")
-                    } if has_stokes_data else None
-                    captures.append({
-                        "task_key": task.get("task_key"),
-                        "render_version_id": source_version_id,
-                        "bundle_render_version_id": bundle_version_id,
-                        "variant": variant,
-                        "node_id": node_id,
-                        "heading_id": heading_id,
-                        "sensor_id": sensor_id or None,
-                        "state": task.get("state") or "planned",
-                        "ordinal": int(task.get("ordinal") or 0),
-                        # S0 is the default gallery image for polarized data.
-                        # The other components are exposed as a selectable set
-                        # of RGB previews rather than hiding behind NPZ files.
-                        "image_url": stokes_image_urls["s0"] if stokes_image_urls else image_url if image_exists else None,
-                        "modality": modality,
-                        "has_stokes_data": has_stokes_data,
-                        "stokes_image_urls": stokes_image_urls,
-                        "error": task.get("error"),
-                    })
-        captures.sort(key=lambda item: (item["variant"], item["ordinal"], item["sensor_id"] or ""))
+                }
+                if has_stokes_data else {}
+            )
+            image_exists = (sensor_dir / self._OPTICALNAV_OBS_PNG_FILENAMES[modality]).is_file()
+            captures.append({
+                "task_key": task.get("task_key"),
+                "render_version_id": task.get("render_version_id"),
+                "bundle_render_version_id": bundle_version_id,
+                "bundle_variant": bundle_variant,
+                "variant": task_variant,
+                "node_id": node_id,
+                "heading_id": heading_id,
+                "sensor_id": chosen_sensor_id or None,
+                "sensor_ids": requested_sensor_ids,
+                "state": task.get("state") or "planned",
+                "ordinal": int(task.get("ordinal") or 0),
+                "image_url": products.get("polar_rgb_preview") if products else product_url(modality) if image_exists else None,
+                "modality": modality,
+                "has_stokes_data": has_stokes_data,
+                "product_urls": products,
+                "error": task.get("error"),
+                "gallery_rank": int(task.get("gallery_rank") or sequence_by_run.get(run_id, 0)),
+            })
         return {
             "scene_id": scene_id,
             "selected_render_version_id": render_version_id,
             "submission_group_id": group_id or None,
             "versions": version_payloads,
             "captures": captures,
-            "capture_count": len(captures),
+            "capture_count": int(page["total"]),
+            "state_counts": page["state_counts"],
+            "page": {
+                "limit": max(1, min(int(limit or 24), 96)),
+                "cursor": cursor,
+                "next_cursor": page["next_cursor"],
+                "returned": len(captures),
+            },
+            "filters": {
+                "variant": variant or None,
+                "sensor_id": sensor_id or None,
+                "state": state or None,
+                "query": query or None,
+            },
         }
 
     def _opticalnav_observation_rgb_png(
@@ -15321,13 +15901,15 @@ class RenderDaemon:
             raise ValueError(f"source run belongs to {source_scene_id!r}, not {scene_id!r}")
         plan: list[dict[str, Any]] = []
         task_records: list[dict[str, Any]] = []
-        reusable_by_logical = ledger.find_complete_tasks(
-            scene_version_id_value=source_scene_version_id,
-            logical_task_keys=[
-                str(task.get("logical_task_key") or (task.get("metadata") or {}).get("logical_task_key") or "")
-                for task in tasks
-            ],
-        )
+        # A resume is intentionally scoped to the source run's own completed
+        # immutable bundles.  A logical viewpoint key alone is not a rendering
+        # identity: it can match an older run with a different Stokes basis,
+        # camera convention, or sampling contract.  Reusing such a bundle
+        # would silently mix non-canonical polar data into a new version.
+        #
+        # Cross-run reuse remains an explicit submission-time policy where the
+        # caller provides a full render identity.  It is never implicit during
+        # a resume operation.
         # Fetch request payloads in bounded batches before planning.  Calling
         # ``get_request_blob`` inside the loop opened one SQLite/NFS connection
         # per unfinished frame, which made large resume requests appear frozen.
@@ -15389,21 +15971,6 @@ class RenderDaemon:
                         "resume_render_settings_overrides": render_settings_overrides,
                     } if render_settings_overrides else {}),
                 })
-            elif reusable_by_logical.get(logical_key):
-                reusable = reusable_by_logical[logical_key]
-                reusable_metadata = dict(reusable.get("metadata") or {})
-                reusable_ref = str(reusable_metadata.get("source_bundle_ref") or "")
-                reusable_bundle = (project_dir / reusable_ref).resolve() if reusable_ref else versioned_bundle_dir(
-                    project_dir, scene_id=scene_id,
-                    render_version_id=str(reusable.get("render_version_id") or ""),
-                    variant=task_payload["variant"], node_id=task_payload["node_id"],
-                    heading_id=task_payload["heading_id"],
-                )
-                if (reusable_bundle / "manifest.json").exists():
-                    metadata.update({
-                        "source_bundle_ref": reusable_bundle.relative_to(project_dir).as_posix(),
-                        "source_task_key": str(reusable.get("task_key") or ""),
-                    })
             # The usual resume case is an inherited completed task.  Avoid
             # opening/decompressing its request blob at all: a 2,000-frame
             # sweep otherwise performs 2,000 needless NAS SQLite reads before
@@ -15442,6 +16009,11 @@ class RenderDaemon:
                     "opticalnav_heading_id": task_payload["heading_id"],
                 })
                 request_payload["extras"] = extras
+                request_payload = _rewrite_resume_batch_child_routing(
+                    request_payload,
+                    routing=extras,
+                    parent_task_key=new_task_key,
+                )
                 if render_settings_overrides:
                     request_payload = _apply_resume_render_settings_overrides(
                         request_payload, render_settings_overrides,
@@ -16171,7 +16743,21 @@ class RenderDaemon:
         if len(parts) == 6 and parts[1] == "scenes" and parts[3] == "render-versions" and parts[5] == "gallery":
             scene_id = parts[2]
             try:
-                payload = self._opticalnav_render_version_gallery(project_dir, scene_id, parts[4])
+                gallery_limit = int((query.get("limit") or ["24"])[0])
+            except (TypeError, ValueError):
+                gallery_limit = 24
+            try:
+                payload = self._opticalnav_render_version_gallery(
+                    project_dir,
+                    scene_id,
+                    parts[4],
+                    limit=gallery_limit,
+                    cursor=_maybe_str((query.get("cursor") or [None])[0]),
+                    variant=_maybe_str((query.get("variant") or [None])[0]),
+                    sensor_id=_maybe_str((query.get("sensor_id") or [None])[0]),
+                    state=_maybe_str((query.get("state") or [None])[0]),
+                    query=_maybe_str((query.get("q") or [None])[0]),
+                )
             except KeyError:
                 self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": f"Unknown render_version_id: {parts[4]}"})
                 return True
@@ -16479,6 +17065,161 @@ class RenderDaemon:
                 })
             except Exception as exc:
                 self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            return True
+        if len(parts) == 5 and parts[1] == "scenes" and parts[3] == "navigation" and parts[4] == "blocker-candidates":
+            # Review-only list of removable oversized low furniture.  This is
+            # deliberately based on the authoring map rather than a previously
+            # built graph, so it can be used *before* the first place-graph build.
+            from navigation_dataset.navigation_blockers import navigation_blocker_candidates
+
+            scene_dir = project_dir / "scenes" / parts[2]
+            map_path = scene_dir / "authoring_map.json"
+            if not map_path.is_file():
+                self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": "authoring_map.json not found"})
+                return True
+
+            def _candidate_float(name: str, default: float) -> float:
+                try:
+                    return float((query.get(name) or [str(default)])[0])
+                except (TypeError, ValueError):
+                    return default
+
+            robot_height_m = _candidate_float("robot_height_m", 1.2)
+            min_area_m2 = _candidate_float("min_footprint_area_m2", 2.0)
+            min_extent_m = _candidate_float("min_extent_m", 2.0)
+            try:
+                authoring = _read_json(map_path)
+                candidates = navigation_blocker_candidates(
+                    authoring.get("objects") or [],
+                    robot_height_m=robot_height_m,
+                    min_footprint_area_m2=min_area_m2,
+                    min_extent_m=min_extent_m,
+                )
+                self._send_json(handler, HTTPStatus.OK, {
+                    "scene_id": parts[2],
+                    "candidates": candidates,
+                    "count": len(candidates),
+                    "criteria": {
+                        "robot_height_m": robot_height_m,
+                        "min_footprint_area_m2": min_area_m2,
+                        "min_extent_m": min_extent_m,
+                        "mode": "review_only",
+                    },
+                })
+            except Exception as exc:
+                self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            return True
+        if len(parts) == 5 and parts[1] == "scenes" and parts[3] == "navigation" and parts[4] == "blueprints":
+            from navigation_dataset.navigation_support import BLUEPRINTS_FILE, PLACE_GRAPH_FILE, read_route_blueprints
+            from navigation_dataset.viewpoint_graph import read_viewpoint_graph
+
+            scene_dir = project_dir / "scenes" / parts[2]
+            place_path = scene_dir / PLACE_GRAPH_FILE
+            blueprint_path = scene_dir / BLUEPRINTS_FILE
+            if not place_path.is_file():
+                self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": "Build Place Graph first."})
+                return True
+            try:
+                place_graph = read_viewpoint_graph(place_path)
+                blueprints = read_route_blueprints(blueprint_path) if blueprint_path.is_file() else None
+                self._send_json(handler, HTTPStatus.OK, {
+                    "profile_id": "adaptive_navigation_support_v4",
+                    "place_graph_id": place_graph.graph_id,
+                    "route_blueprints": blueprints,
+                })
+            except Exception as exc:
+                self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            return True
+        if len(parts) == 4 and parts[1] == "scenes" and parts[3] == "navigation":
+            scene_dir = project_dir / "scenes" / parts[2]
+            # v4 owns a separate group of sidecars.  It takes precedence when a
+            # place graph exists, including the review period before support is
+            # built, so the UI can show exactly which stage remains.
+            from navigation_dataset.navigation_support import (
+                BLUEPRINTS_FILE, OBSERVATION_PLAN_FILE, PLACE_GRAPH_FILE,
+                SUPPORT_GRAPH_FILE, latest_support_render_archive,
+                list_support_observation_expansions,
+            )
+            place_path = scene_dir / PLACE_GRAPH_FILE
+            if place_path.is_file():
+                try:
+                    from navigation_dataset.viewpoint_graph import (
+                        compute_connected_components,
+                        disconnected_component_repair_guides,
+                        read_viewpoint_graph,
+                    )
+                    place_graph = read_viewpoint_graph(place_path)
+                    place_payload = _read_json(place_path)
+                    place_components = compute_connected_components(place_graph)
+                    place_payload["components"] = place_components["node_to_component"]
+                    place_payload["component_summary"] = [
+                        {"index": component["index"], "size": component["size"]}
+                        for component in place_components["components"]
+                    ]
+                    place_payload["repair_guides"] = disconnected_component_repair_guides(place_graph)
+                    payload = {
+                        "profile_id": "adaptive_navigation_support_v4",
+                        "place_graph": place_payload,
+                        "route_blueprints": _read_json(scene_dir / BLUEPRINTS_FILE)
+                        if (scene_dir / BLUEPRINTS_FILE).is_file() else None,
+                        "support_graph": _read_json(scene_dir / SUPPORT_GRAPH_FILE)
+                        if (scene_dir / SUPPORT_GRAPH_FILE).is_file() else None,
+                        "observation_plan": _read_json(scene_dir / OBSERVATION_PLAN_FILE)
+                        if (scene_dir / OBSERVATION_PLAN_FILE).is_file() else None,
+                    }
+                    payload["observation_expansions"] = list_support_observation_expansions(
+                        scene_dir,
+                        base_plan=payload["observation_plan"],
+                    )
+                    # A topology edit invalidates the active support graph but
+                    # must not hide its immutable render contract.  The client
+                    # receives this only as a read-only pose overlay; episodes
+                    # and support rendering continue to require a fresh Stage 3
+                    # build whose digest matches the current place graph.
+                    if payload["support_graph"] is None or payload["observation_plan"] is None:
+                        payload["archived_render_plan"] = latest_support_render_archive(scene_dir)
+                    payload["stage"] = (
+                        "support_ready" if payload["support_graph"] and payload["observation_plan"]
+                        else ("blueprint_review" if payload["route_blueprints"] else "place_graph")
+                    )
+                    payload["generation_diagnostics"] = dict(
+                        (payload["support_graph"] or {}).get("generation_diagnostics") or {}
+                    )
+                except Exception as exc:
+                    self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                    return True
+                self._send_json(handler, HTTPStatus.OK, payload)
+                return True
+            names = ("anchor_graph.json", "navigation_requests.json", "motion_graph.json", "observation_plan.json")
+            files = {name: scene_dir / name for name in names}
+            if not all(path.is_file() for path in files.values()):
+                self._send_json(handler, HTTPStatus.NOT_FOUND, {
+                    "error": "adaptive_route_motion_v3 sidecars not built",
+                    "missing": [name for name, value in files.items() if not value.is_file()],
+                })
+                return True
+            try:
+                motion_graph = _read_json(files["motion_graph.json"])
+                observation_plan = _read_json(files["observation_plan.json"])
+                if str(motion_graph.get("profile_id") or "") != "adaptive_route_motion_v3":
+                    self._send_json(handler, HTTPStatus.CONFLICT, {
+                        "error": "adaptive_route_motion_rebuild_required",
+                        "message": "This scene has an obsolete Route Motion sidecar; rebuild adaptive_route_motion_v3.",
+                        "found_profile_id": motion_graph.get("profile_id"),
+                    })
+                    return True
+                payload = {
+                    "profile_id": "adaptive_route_motion_v3",
+                    "anchor_graph": _read_json(files["anchor_graph.json"]),
+                    "navigation_requests": _read_json(files["navigation_requests.json"]),
+                    "motion_graph": motion_graph,
+                    "observation_plan": observation_plan,
+                    "generation_diagnostics": dict(motion_graph.get("generation_diagnostics") or {}),
+                }
+            except Exception as exc:
+                self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return True
+            self._send_json(handler, HTTPStatus.OK, payload)
             return True
         if len(parts) == 4 and parts[1] == "scenes" and parts[3] == "graph":
             graph_path = project_dir / "scenes" / parts[2] / "viewpoint_graph.json"
@@ -17704,6 +18445,555 @@ class RenderDaemon:
                 **graph_summary(nodes, edges, heading_count=heading_count),
             })
             return True
+        if len(parts) == 6 and parts[1] == "scenes" and parts[3] == "navigation" and parts[4] == "place-graph" and parts[5] == "build":
+            # Stage 1 of Navigation Support v4.  This is intentionally sparse
+            # topology authoring: no action graph, observations, render tasks or
+            # legacy graph files are changed here.
+            from navigation_dataset.graph_pipeline import build_viewpoint_graph_core
+            from navigation_dataset.navigation_support import (
+                BLUEPRINTS_FILE, DEFAULT_CONFIG as _support_defaults,
+                MOTION_GRID_FILE, OBSERVATION_PLAN_FILE, RENDER_GRAPH_FILE,
+                SUPPORT_GRAPH_FILE, archive_navigation_support, propose_route_blueprints,
+                support_lock_summary,
+                write_place_graph, write_route_blueprints,
+            )
+            from navigation_dataset.scene_annotations import read_scene_annotation
+            from navigation_dataset.traversability import save_traversability_grid
+
+            scene_id = parts[2]
+            scene_dir = project_dir / "scenes" / scene_id
+            if not scene_dir.is_dir():
+                self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": f"Unknown scene_id: {scene_id}"})
+                return True
+            support_lock = support_lock_summary(scene_dir)
+            if support_lock and not self._coerce_bool(payload.get("confirm_support_invalidation"), False):
+                self._send_json(handler, HTTPStatus.CONFLICT, {
+                    "error": "navigation_support_locked",
+                    "message": (
+                        "Navigation Support is complete. Confirm that this rebuild should archive the "
+                        "current support/render plan and return the workflow to Blueprint review."
+                    ),
+                    "requires_confirmation": True,
+                    "support_lock": support_lock,
+                })
+                return True
+            progress_key = f"{project_dir}/{scene_id}"
+            archived_support = None
+
+            def _set_progress(stage: str, fraction: float, detail: Mapping[str, Any] | None = None) -> None:
+                state: dict[str, Any] = {
+                    "stage": stage,
+                    "progress": round(min(1.0, max(0.0, float(fraction))), 3),
+                    "status": "building",
+                    "operation": "adaptive_navigation_support_v4",
+                }
+                if detail:
+                    state["detail"] = dict(detail)
+                with self._graph_build_lock:
+                    self._graph_build_progress[progress_key] = state
+                with self._graph_build_sub_lock:
+                    subscribers = list(self._graph_build_subscribers.get(progress_key, set()))
+                for subscriber in subscribers:
+                    try:
+                        subscriber.send_json(state)
+                    except Exception:
+                        pass
+
+            def _finish_progress(state: Mapping[str, Any]) -> None:
+                with self._graph_build_lock:
+                    self._graph_build_progress.pop(progress_key, None)
+                with self._graph_build_sub_lock:
+                    subscribers = list(self._graph_build_subscribers.pop(progress_key, set()))
+                for subscriber in subscribers:
+                    try:
+                        subscriber.send_json(state)
+                    except Exception:
+                        pass
+
+            _set_progress("place_grid", 0.0)
+            try:
+                config = {**_support_defaults}
+                for key in _support_defaults:
+                    if key in payload and payload[key] is not None:
+                        config[key] = payload[key]
+                if payload.get("max_nodes") is not None:
+                    config["max_place_nodes"] = int(payload["max_nodes"])
+                # A place graph is deliberately 12-heading.  24 headings are
+                # created only as native action states in Stage 3.
+                safety_margin = float(payload.get("min_clearance_m", config["safety_margin_m"]))
+                config["safety_margin_m"] = safety_margin
+                graph_clearance_margin = safety_margin + float(config["geometry_epsilon_m"])
+                result = build_viewpoint_graph_core(
+                    scene_id,
+                    scene_dir,
+                    graph_id=f"{scene_id}_place_{_utc_now().strftime('%Y%m%dT%H%M%S%f')}",
+                    resolution=float(payload.get("resolution", 0.05)),
+                    robot_radius_m=float(payload.get("robot_radius_m", 0.25)),
+                    robot_height_m=float(payload.get("robot_height_m", 1.2)),
+                    heading_count=12,
+                    min_node_spacing_m=float(payload.get("min_node_spacing_m", payload.get("min_node_spacing", 0.5))),
+                    min_clearance_m=graph_clearance_margin,
+                    camera_margin_m=float(payload.get("camera_margin_m", 0.10)),
+                    doorway_gap_m=float(payload.get("doorway_gap_m", config["doorway_gap_m"])),
+                    max_nodes=int(config["max_place_nodes"]),
+                    k_neighbors=int(payload.get("k_neighbors", 8)),
+                    max_edge_length_m=float(payload.get("max_edge_length_m", 1.5)),
+                    seed=int(payload.get("seed", 0)),
+                    persist_grid=False,
+                    existing_graph=None,
+                    # Stage 1 is an authoring map, not an episode source. Keep
+                    # every robot-safe but disconnected room visible so the user
+                    # can add a doorway/direct place link instead of wondering
+                    # why half the apartment vanished from the place graph.
+                    retain_sealed_components=True,
+                    metadata_extra={"profile_id": "adaptive_navigation_support_v4", "built_at": _utc_now_iso()},
+                    on_progress=lambda stage, fraction: _set_progress(
+                        f"place_{stage}", 0.03 + 0.82 * float(fraction),
+                    ),
+                )
+                annotation_path = scene_dir / "scene_annotation.json"
+                annotation = read_scene_annotation(annotation_path) if annotation_path.is_file() else None
+                _set_progress("blueprint_catalogue", 0.88, {"place_node_count": len(result.graph.nodes)})
+                blueprints = propose_route_blueprints(result.graph, annotation=annotation, config=config)
+                archived_support = archive_navigation_support(
+                    scene_dir,
+                    reason="place_graph_rebuild",
+                )
+                place_path = write_place_graph(scene_dir, result.graph, config=config)
+                grid_path = save_traversability_grid(scene_dir / MOTION_GRID_FILE, result.motion_grid)
+                blueprint_path = write_route_blueprints(scene_dir / BLUEPRINTS_FILE, blueprints)
+                # A new topology invalidates only v4's derived support files.
+                # v3 and legacy graph/episode/render outputs remain untouched.
+                for name in (SUPPORT_GRAPH_FILE, OBSERVATION_PLAN_FILE, RENDER_GRAPH_FILE):
+                    (scene_dir / name).unlink(missing_ok=True)
+            except Exception as exc:
+                _finish_progress({
+                    "stage": "error", "progress": 0.0, "status": "error",
+                    "operation": "adaptive_navigation_support_v4", "error": str(exc),
+                })
+                self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return True
+            _finish_progress({
+                "stage": "done", "progress": 1.0, "status": "done",
+                "operation": "adaptive_navigation_support_v4",
+            })
+            self._send_json(handler, HTTPStatus.OK, {
+                "scene_id": scene_id,
+                "profile_id": "adaptive_navigation_support_v4",
+                "stage": "blueprint_review",
+                "place_graph_ref": place_path.relative_to(project_dir).as_posix(),
+                "motion_grid_ref": grid_path.relative_to(project_dir).as_posix(),
+                "route_blueprints_ref": blueprint_path.relative_to(project_dir).as_posix(),
+                "place_node_count": len(result.graph.nodes),
+                "place_edge_count": len(result.graph.edges),
+                "heading_count": 12,
+                "proposed_blueprint_count": len(blueprints.get("blueprints") or []),
+                **({"archived_support": archived_support} if archived_support is not None else {}),
+            })
+            return True
+        if len(parts) == 5 and parts[1] == "scenes" and parts[3] == "navigation" and parts[4] == "blueprints":
+            from navigation_dataset.navigation_support import (
+                BLUEPRINTS_FILE, PLACE_GRAPH_FILE, add_route_blueprint,
+                read_route_blueprints, update_route_blueprint, write_route_blueprints,
+            )
+            from navigation_dataset.viewpoint_graph import read_viewpoint_graph
+
+            scene_id = parts[2]
+            scene_dir = project_dir / "scenes" / scene_id
+            try:
+                graph = read_viewpoint_graph(scene_dir / PLACE_GRAPH_FILE)
+                blueprints = read_route_blueprints(scene_dir / BLUEPRINTS_FILE)
+                action = str(payload.get("action") or "create")
+                if action == "create":
+                    blueprints = add_route_blueprint(
+                        blueprints, graph,
+                        start_anchor_id=str(payload["start_anchor_id"]),
+                        goal_anchor_id=str(payload["goal_anchor_id"]),
+                        scenario=str(payload.get("scenario") or "goal_only"),
+                        approved=self._coerce_bool(payload.get("approved"), False),
+                    )
+                elif action == "status":
+                    blueprints = update_route_blueprint(
+                        blueprints, str(payload["blueprint_id"]), status=str(payload["status"]),
+                    )
+                elif action == "status_all":
+                    status = str(payload.get("status") or "")
+                    if status not in {"proposed", "approved", "rejected"}:
+                        raise ValueError("blueprint status must be proposed, approved, or rejected")
+                    source_status = str(payload.get("from_status") or "proposed")
+                    if source_status not in {"proposed", "approved", "rejected"}:
+                        raise ValueError("blueprint source status must be proposed, approved, or rejected")
+                    # One atomic sidecar write for a deliberate review action.
+                    # The default preserves the original bulk-approve contract
+                    # (proposed -> approved).  The explicit source status also
+                    # gives the UI a reversible escape hatch when an overly
+                    # broad bulk approval makes a support build too large or
+                    # exposes a stale place-graph link.
+                    for row in list(blueprints.get("blueprints") or []):
+                        if str(row.get("status") or "proposed") != source_status:
+                            continue
+                        blueprints = update_route_blueprint(
+                            blueprints, str(row["blueprint_id"]), status=status,
+                        )
+                else:
+                    raise ValueError("blueprint action must be create, status, or status_all")
+                blueprint_path = write_route_blueprints(scene_dir / BLUEPRINTS_FILE, blueprints)
+            except FileNotFoundError:
+                self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": "Build Place Graph first."})
+                return True
+            except (KeyError, ValueError) as exc:
+                self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return True
+            self._send_json(handler, HTTPStatus.OK, {
+                "scene_id": scene_id,
+                "profile_id": "adaptive_navigation_support_v4",
+                "route_blueprints_ref": blueprint_path.relative_to(project_dir).as_posix(),
+                "route_blueprints": blueprints,
+            })
+            return True
+        if len(parts) == 6 and parts[1] == "scenes" and parts[3] == "navigation" and parts[4] == "support" and parts[5] == "observation-expansion":
+            # This is intentionally independent of support build: it only adds
+            # native heading allow-list entries around the already certified
+            # ACTION_NATIVE poses.  The support graph, episodes and baseline L0
+            # observation plan remain untouched.
+            from navigation_dataset.navigation_support import (
+                OBSERVATION_PLAN_FILE, build_support_observation_expansion,
+                list_support_observation_expansions, read_support_observation_plan,
+                write_support_observation_expansion,
+            )
+
+            scene_id = parts[2]
+            scene_dir = project_dir / "scenes" / scene_id
+            base_path = scene_dir / OBSERVATION_PLAN_FILE
+            level_id = str(payload.get("level_id") or "")
+            try:
+                if not base_path.is_file():
+                    raise FileNotFoundError("Build Navigation Support before preparing an observation expansion.")
+                base_plan = read_support_observation_plan(base_path)
+                expansion = build_support_observation_expansion(base_plan, level_id=level_id)
+                path = write_support_observation_expansion(scene_dir, expansion)
+                catalogue = list_support_observation_expansions(scene_dir, base_plan=base_plan)
+            except FileNotFoundError as exc:
+                self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": str(exc)})
+                return True
+            except (OSError, ValueError) as exc:
+                self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return True
+            self._send_json(handler, HTTPStatus.OK, {
+                "scene_id": scene_id,
+                "profile_id": "adaptive_navigation_support_v4",
+                "observation_expansion_ref": path.relative_to(project_dir).as_posix(),
+                "coverage_level_id": expansion["coverage_level_id"],
+                "profile_digest": expansion["profile_digest"],
+                "coverage_digest": expansion["coverage_digest"],
+                "summary": expansion["summary"],
+                "observation_expansions": catalogue,
+            })
+            return True
+        if len(parts) == 6 and parts[1] == "scenes" and parts[3] == "navigation" and parts[4] == "support" and parts[5] in {"analyze", "build"}:
+            from navigation_dataset.navigation_support import (
+                BLUEPRINTS_FILE, DEFAULT_CONFIG as _support_defaults, MOTION_GRID_FILE,
+                PLACE_GRAPH_FILE, analyze_navigation_support, build_navigation_support,
+                read_route_blueprints, write_navigation_support,
+            )
+            from navigation_dataset.scene_annotations import read_scene_annotation
+            from navigation_dataset.traversability import load_traversability_grid
+            from navigation_dataset.viewpoint_graph import read_viewpoint_graph
+
+            scene_id = parts[2]
+            scene_dir = project_dir / "scenes" / scene_id
+            progress_key = f"{project_dir}/{scene_id}"
+
+            def _set_progress(stage: str, fraction: float, detail: Mapping[str, Any] | None = None) -> None:
+                state: dict[str, Any] = {
+                    "stage": stage, "progress": round(min(1.0, max(0.0, float(fraction))), 3),
+                    "status": "building", "operation": "adaptive_navigation_support_v4",
+                }
+                if detail:
+                    state["detail"] = dict(detail)
+                with self._graph_build_lock:
+                    self._graph_build_progress[progress_key] = state
+                with self._graph_build_sub_lock:
+                    subscribers = list(self._graph_build_subscribers.get(progress_key, set()))
+                for subscriber in subscribers:
+                    try:
+                        subscriber.send_json(state)
+                    except Exception:
+                        pass
+
+            def _finish_progress(state: Mapping[str, Any]) -> None:
+                with self._graph_build_lock:
+                    self._graph_build_progress.pop(progress_key, None)
+                with self._graph_build_sub_lock:
+                    subscribers = list(self._graph_build_subscribers.pop(progress_key, set()))
+                for subscriber in subscribers:
+                    try:
+                        subscriber.send_json(state)
+                    except Exception:
+                        pass
+
+            _set_progress("support_prepare", 0.0)
+            try:
+                config = {**_support_defaults}
+                for key in _support_defaults:
+                    if key in payload and payload[key] is not None:
+                        config[key] = payload[key]
+                place_graph = read_viewpoint_graph(scene_dir / PLACE_GRAPH_FILE)
+                blueprints = read_route_blueprints(scene_dir / BLUEPRINTS_FILE)
+                grid = load_traversability_grid(scene_dir / MOTION_GRID_FILE)
+                annotation_path = scene_dir / "scene_annotation.json"
+                annotation = read_scene_annotation(annotation_path) if annotation_path.is_file() else None
+                builder = analyze_navigation_support if parts[5] == "analyze" else build_navigation_support
+                artifacts = builder(
+                    place_graph,
+                    blueprints,
+                    annotation=annotation,
+                    motion_grid=grid,
+                    config=config,
+                    on_progress=lambda stage, fraction, detail: _set_progress(
+                        stage, 0.03 + 0.93 * float(fraction), detail,
+                    ),
+                )
+                paths = write_navigation_support(scene_dir, artifacts) if parts[5] == "build" else {}
+            except FileNotFoundError:
+                _finish_progress({"stage": "error", "progress": 0.0, "status": "error", "error": "Build Place Graph first."})
+                self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": "Build Place Graph first."})
+                return True
+            except Exception as exc:
+                # Analysis is non-mutating.  A fixed 15-degree / 0.25 m action
+                # lattice can reject a place edge, and an opaque edge ID alone
+                # gives the reviewer no way to choose which approval to undo.
+                # Keep an actual Build strict, but make Analyze identify every
+                # approved blueprint that references the first blocked link.
+                if parts[5] == "analyze":
+                    error = str(exc)
+                    blocker: dict[str, Any] = {
+                        "ok": False,
+                        "error": error,
+                        "kind": "support_analysis_failed",
+                        "blocked_blueprint_ids": [],
+                    }
+                    prefix = "support_corridor_unreachable:"
+                    if error.startswith(prefix):
+                        edge_id = error[len(prefix):]
+                        blueprint_ids = sorted(
+                            str(row.get("blueprint_id"))
+                            for row in blueprints.get("blueprints") or []
+                            if str(row.get("status") or "proposed") == "approved"
+                            and edge_id in {str(value) for value in row.get("place_path_edge_ids") or []}
+                        )
+                        blocker.update({
+                            "kind": "support_corridor_unreachable",
+                            "place_edge_id": edge_id,
+                            "blocked_blueprint_ids": blueprint_ids,
+                            "message": (
+                                "The 0.25 m action lattice cannot materialize this approved place link. "
+                                "Repair that corridor, or return the listed blueprints to Proposed/Reject them."
+                            ),
+                        })
+                    elif error.startswith("blueprint_support_unreachable:"):
+                        fragments = error.split(":", 2)
+                        blueprint_id = fragments[1] if len(fragments) > 1 else ""
+                        blocker.update({
+                            "kind": "blueprint_support_unreachable",
+                            "blocked_blueprint_ids": [blueprint_id] if blueprint_id else [],
+                            "message": "This approved blueprint is not represented by the active support backbone.",
+                        })
+                    _finish_progress({
+                        "stage": "blocked", "progress": 1.0, "status": "done",
+                        "operation": "adaptive_navigation_support_v4", "detail": blocker,
+                    })
+                    self._send_json(handler, HTTPStatus.OK, {
+                        "scene_id": scene_id,
+                        "profile_id": "adaptive_navigation_support_v4",
+                        "mode": "analyze",
+                        "ok": False,
+                        "analysis": blocker,
+                    })
+                    return True
+                _finish_progress({
+                    "stage": "error", "progress": 0.0, "status": "error",
+                    "operation": "adaptive_navigation_support_v4", "error": str(exc),
+                })
+                self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return True
+            _finish_progress({
+                "stage": "done", "progress": 1.0, "status": "done",
+                "operation": "adaptive_navigation_support_v4",
+            })
+            support = artifacts["support_graph"]
+            plan = artifacts["observation_plan"]
+            self._send_json(handler, HTTPStatus.OK, {
+                "scene_id": scene_id,
+                "profile_id": "adaptive_navigation_support_v4",
+                "mode": parts[5],
+                "profile_digest": support["profile_digest"],
+                "support_graph_ref": paths.get("support_graph", scene_dir / "navigation_support_graph.json").relative_to(project_dir).as_posix() if paths else None,
+                "observation_plan_ref": paths.get("observation_plan", scene_dir / "support_observation_plan.json").relative_to(project_dir).as_posix() if paths else None,
+                "generation_diagnostics": artifacts["generation_diagnostics"],
+                "validation": support["validation"],
+                "summary": plan["summary"],
+            })
+            return True
+        if len(parts) == 5 and parts[1] == "scenes" and parts[3] == "navigation" and parts[4] == "build":
+            # Adaptive Route Motion v3 intentionally writes new sidecars.  It does
+            # not rewrite viewpoint_graph.json, manual graph edits, episodes, or
+            # observations from the legacy full-sweep workflow.
+            from navigation_dataset.graph_pipeline import build_viewpoint_graph_core
+            from navigation_dataset.route_motion import (
+                DEFAULT_CONFIG as _route_motion_defaults,
+                build_adaptive_route_motion,
+                motion_render_graph_from_plan,
+                write_adaptive_route_motion,
+            )
+            from navigation_dataset.scene_annotations import read_scene_annotation
+            from navigation_dataset.viewpoint_graph import write_viewpoint_graph
+
+            scene_id = parts[2]
+            scene_dir = project_dir / "scenes" / scene_id
+            if not scene_dir.is_dir():
+                self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": f"Unknown scene_id: {scene_id}"})
+                return True
+            progress_key = f"{project_dir}/{scene_id}"
+
+            def _set_progress(stage: str, fraction: float, detail: Mapping[str, Any] | None = None) -> None:
+                state: dict[str, Any] = {
+                    "stage": stage,
+                    "progress": round(min(1.0, max(0.0, float(fraction))), 3),
+                    "status": "building",
+                    "operation": "adaptive_route_motion_v3",
+                }
+                if detail:
+                    state["detail"] = dict(detail)
+                with self._graph_build_lock:
+                    self._graph_build_progress[progress_key] = state
+                with self._graph_build_sub_lock:
+                    subscribers = list(self._graph_build_subscribers.get(progress_key, set()))
+                stale: list[_GraphBuildSubscriber] = []
+                for subscriber in subscribers:
+                    try:
+                        subscriber.send_json(state)
+                    except Exception:
+                        stale.append(subscriber)
+                if stale:
+                    with self._graph_build_sub_lock:
+                        bucket = self._graph_build_subscribers.get(progress_key, set())
+                        for subscriber in stale:
+                            bucket.discard(subscriber)
+
+            def _finish_progress(state: Mapping[str, Any]) -> None:
+                with self._graph_build_lock:
+                    self._graph_build_progress.pop(progress_key, None)
+                with self._graph_build_sub_lock:
+                    subscribers = list(self._graph_build_subscribers.pop(progress_key, set()))
+                for subscriber in subscribers:
+                    try:
+                        subscriber.send_json(state)
+                    except Exception:
+                        pass
+
+            _set_progress("anchor_grid", 0.0)
+            try:
+                config = {**_route_motion_defaults}
+                for key in _route_motion_defaults:
+                    if key in payload and payload[key] is not None:
+                        config[key] = payload[key]
+                # Graph-pipeline interprets ``min_clearance_m`` as the safety
+                # margin *in addition to* robot radius.  v2 also reserves the
+                # geometry discretisation epsilon, so the default 0.25 robot
+                # requires 0.25 + 0.10 + 0.03 = 0.38 m at every action pose.
+                safety_margin = float(payload.get("min_clearance_m", config["safety_margin_m"]))
+                config["safety_margin_m"] = safety_margin
+                graph_clearance_margin = safety_margin + float(config["geometry_epsilon_m"])
+                # The v3 default is a fresh, 24-heading anchor graph.  It lives in
+                # anchor_graph.json, so old/manual viewpoint_graph.json is kept as
+                # a legacy artifact rather than silently migrated.
+                result = build_viewpoint_graph_core(
+                    scene_id,
+                    scene_dir,
+                    graph_id=f"{scene_id}_anchor_{_utc_now().strftime('%Y%m%dT%H%M%S%f')}",
+                    resolution=float(payload.get("resolution", 0.05)),
+                    robot_radius_m=float(payload.get("robot_radius_m", 0.25)),
+                    robot_height_m=float(payload.get("robot_height_m", 1.2)),
+                    heading_count=24,
+                    min_node_spacing_m=float(payload.get("min_node_spacing_m", 0.5)),
+                    min_clearance_m=graph_clearance_margin,
+                    camera_margin_m=float(payload.get("camera_margin_m", 0.10)),
+                    doorway_gap_m=float(payload.get("doorway_gap_m", 0.45)),
+                    max_nodes=int(config["max_anchor_nodes"]),
+                    k_neighbors=int(payload.get("k_neighbors", 8)),
+                    max_edge_length_m=float(payload.get("max_edge_length_m", 1.5)),
+                    seed=int(payload.get("seed", 0)),
+                    # A navigation sidecar build must not replace the editor grid
+                    # or retain legacy manual nodes/edges as automatic data.
+                    persist_grid=False,
+                    existing_graph=None,
+                    metadata_extra={"profile_id": str(config["profile_id"]), "built_at": _utc_now_iso()},
+                    on_progress=lambda stage, fraction: _set_progress(
+                        f"anchor_{stage}",
+                        0.04 + 0.34 * float(fraction),
+                    ),
+                )
+                annotation_path = scene_dir / "scene_annotation.json"
+                annotation = read_scene_annotation(annotation_path) if annotation_path.is_file() else None
+                _set_progress("route_motion", 0.40, {"anchor_node_count": len(result.graph.nodes)})
+                artifacts = build_adaptive_route_motion(
+                    result.graph,
+                    annotation=annotation,
+                    config=config,
+                    motion_grid=result.motion_grid,
+                    on_progress=lambda stage, fraction, detail: _set_progress(
+                        stage,
+                        0.40 + 0.55 * float(fraction),
+                        detail,
+                    ),
+                )
+                _set_progress("sidecars", 0.96)
+                paths = write_adaptive_route_motion(scene_dir, artifacts)
+                render_graph_path = write_viewpoint_graph(
+                    scene_dir / "motion_render_graph.json",
+                    motion_render_graph_from_plan(artifacts["observation_plan"]),
+                )
+                workflow_path = scene_dir / "workflow_state.json"
+                workflow_state = _read_json_mapping(workflow_path) or {}
+                workflow_state["navigation"] = {
+                    "profile_id": str(config["profile_id"]),
+                    "profile_digest": artifacts["observation_plan"]["profile_digest"],
+                    "built_at": _utc_now_iso(),
+                    "motion_graph_ref": paths["motion_graph"].name,
+                    "observation_plan_ref": paths["observation_plan"].name,
+                }
+                workflow_path.write_text(json.dumps(workflow_state, ensure_ascii=False, indent=2), encoding="utf-8")
+            except Exception as exc:
+                _finish_progress({
+                    "stage": "error",
+                    "progress": 0.0,
+                    "status": "error",
+                    "operation": "adaptive_route_motion_v3",
+                    "error": str(exc),
+                })
+                self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return True
+            diagnostics = dict(artifacts["generation_diagnostics"])
+            _finish_progress({
+                "stage": "done",
+                "progress": 1.0,
+                "status": "done",
+                "operation": "adaptive_route_motion_v3",
+            })
+            self._send_json(handler, HTTPStatus.OK, {
+                "scene_id": scene_id,
+                "profile_id": str(artifacts["observation_plan"]["profile_id"]),
+                "profile_digest": artifacts["observation_plan"]["profile_digest"],
+                "anchor_graph_ref": paths["anchor_graph"].relative_to(project_dir).as_posix(),
+                "navigation_requests_ref": paths["navigation_requests"].relative_to(project_dir).as_posix(),
+                "motion_graph_ref": paths["motion_graph"].relative_to(project_dir).as_posix(),
+                "observation_plan_ref": paths["observation_plan"].relative_to(project_dir).as_posix(),
+                "motion_render_graph_ref": render_graph_path.relative_to(project_dir).as_posix(),
+                "generation_diagnostics": diagnostics,
+                "gpu_time_estimate_hours_per_polar_camera_variant": diagnostics["observation"]["gpu_time_estimate_hours_per_polar_camera_variant"],
+            })
+            return True
         if len(parts) == 5 and parts[1] == "scenes" and parts[3] == "graph" and parts[4] == "rebuild-edges":
             # Re-run edge building over the CURRENT node set (auto + manual nodes
             # preserved, NOT resampled). Delegates to graph_pipeline.rebuild_viewpoint_edges
@@ -17786,12 +19076,39 @@ class RenderDaemon:
         if len(parts) == 5 and parts[1] == "scenes" and parts[3] == "graph" and parts[4] == "sweep":
             self._handle_opticalnav_graph_sweep(handler, project_dir, parts[2], payload)
             return True
+        if len(parts) == 5 and parts[1] == "scenes" and parts[3] == "render-plan" and parts[4] == "submit":
+            self._handle_opticalnav_render_plan_submit(handler, project_dir, parts[2], payload)
+            return True
         if len(parts) == 5 and parts[1] == "scenes" and parts[3] == "graph" and parts[4] == "polar-sample-plan":
             self._handle_opticalnav_polar_sample_plan(handler, project_dir, parts[2], payload)
             return True
         if len(parts) == 5 and parts[1] == "scenes" and parts[3] == "graph" and parts[4] == "nodes":
             from navigation_dataset.viewpoint_graph import read_viewpoint_graph, write_viewpoint_graph, append_manual_node
             scene_id = parts[2]
+            if str(payload.get("graph_scope") or "") == "navigation_place":
+                status, response = self._apply_opticalnav_graph_edits(handler, project_dir, scene_id, {
+                    "graph_scope": "navigation_place",
+                    "client_batch_id": payload.get("client_batch_id"),
+                    "ops": [{
+                        "type": "add_node", "client_op_id": payload.get("client_op_id"),
+                        "x": payload.get("x"), "y": payload.get("y"),
+                    }],
+                })
+                if status != HTTPStatus.OK:
+                    self._send_json(handler, status, response)
+                    return True
+                result = next((item for item in response.get("results", []) if item.get("ok")), None)
+                if result is None:
+                    self._send_json(handler, HTTPStatus.BAD_REQUEST, response)
+                    return True
+                self._send_json(handler, HTTPStatus.OK, {
+                    "node_id": result.get("node_id"), "position": result.get("position"),
+                    "headings": result.get("heading_count"), "heading_count": 12,
+                    "graph_scope": "navigation_place",
+                    "profile_id": "adaptive_navigation_support_v4",
+                    "support_invalidated": bool(response.get("support_invalidated")),
+                })
+                return True
             graph_path = project_dir / "scenes" / scene_id / "viewpoint_graph.json"
             if not graph_path.exists():
                 self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": "viewpoint_graph.json not found"})
@@ -18007,12 +19324,24 @@ class RenderDaemon:
         if len(parts) == 5 and parts[1] == "scenes" and parts[3] == "graph" and parts[4] == "edge-check":
             # POST .../graph/edge-check  body: {source, target, robot_radius_m?, max_edge_length_m?}
             from navigation_dataset.viewpoint_graph import read_viewpoint_graph, find_node
+            from navigation_dataset.edge_builder import user_certifiable_opening
             from navigation_dataset.graph_pipeline import validate_scene_graph_edge
             scene_id = parts[2]
             scene_dir = project_dir / "scenes" / scene_id
-            graph_path = scene_dir / "viewpoint_graph.json"
+            graph_scope = str(payload.get("graph_scope") or "legacy")
+            if graph_scope == "navigation_place":
+                from navigation_dataset.navigation_support import PLACE_GRAPH_FILE
+                graph_path = scene_dir / PLACE_GRAPH_FILE
+            elif graph_scope == "legacy":
+                graph_path = scene_dir / "viewpoint_graph.json"
+            else:
+                self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": f"unknown graph_scope: {graph_scope}"})
+                return True
             if not graph_path.exists():
-                self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": "viewpoint_graph.json not found"})
+                self._send_json(handler, HTTPStatus.NOT_FOUND, {
+                    "error": "place_graph.json not found; Build Place Graph first."
+                    if graph_scope == "navigation_place" else "viewpoint_graph.json not found"
+                })
                 return True
             source_id = str(payload.get("source") or "")
             target_id = str(payload.get("target") or "")
@@ -18029,20 +19358,47 @@ class RenderDaemon:
                 meta = dict(graph.metadata or {})
                 robot_radius_m = float(payload.get("robot_radius_m", meta.get("robot_radius_m", 0.25)))
                 max_edge_length_m = float(payload.get("max_edge_length_m", meta.get("max_edge_length_m", 1.5)))
+                if graph_scope == "navigation_place":
+                    configured_limit = (meta.get("navigation_support_config") or {}).get(
+                        "manual_place_edge_max_length_m", 8.0
+                    )
+                    try:
+                        manual_place_limit = min(8.0, max(1.5, float(configured_limit)))
+                    except (TypeError, ValueError):
+                        manual_place_limit = 8.0
+                    max_edge_length_m = max(max_edge_length_m, manual_place_limit)
                 raw_margin = meta.get("min_clearance_m")
                 try:
                     min_clearance_m = float(raw_margin) if raw_margin is not None else None
                 except (TypeError, ValueError):
                     min_clearance_m = None
+                try:
+                    doorway_gap_m = float(meta.get(
+                        "doorway_gap_m", 0.75 if graph_scope == "navigation_place" else 0.45,
+                    ))
+                except (TypeError, ValueError):
+                    doorway_gap_m = 0.75 if graph_scope == "navigation_place" else 0.45
                 validation, diagnostics = validate_scene_graph_edge(
                     scene_id, scene_dir, graph, source_id, target_id,
                     resolution=float(meta.get("grid_resolution_m", 0.05) or 0.05),
                     robot_radius_m=robot_radius_m,
                     min_clearance_m=min_clearance_m,
                     max_edge_length_m=max_edge_length_m,
+                    doorway_gap_m=doorway_gap_m,
+                )
+                try:
+                    manual_opening_max_gap_m = float((meta.get("navigation_support_config") or {}).get(
+                        "manual_opening_max_gap_m", 1.0,
+                    ))
+                except (TypeError, ValueError):
+                    manual_opening_max_gap_m = 1.0
+                resolution_m = float(meta.get("grid_resolution_m", 0.05) or 0.05)
+                manual_opening_eligible = graph_scope == "navigation_place" and user_certifiable_opening(
+                    validation, resolution_m=resolution_m, max_raw_gap_m=manual_opening_max_gap_m,
                 )
                 self._send_json(handler, HTTPStatus.OK, {
                     "ok": True,
+                    "graph_scope": graph_scope,
                     "source": source_id,
                     "target": target_id,
                     "would_connect": validation.accepted,
@@ -18050,9 +19406,15 @@ class RenderDaemon:
                     "mode": validation.mode,
                     "distance_m": round(validation.distance_m, 4),
                     "max_edge_length_m": max_edge_length_m,
+                    "topology_direct_link": graph_scope == "navigation_place",
                     "within_max_edge_length": validation.distance_m <= max_edge_length_m,
                     "wall_run_cells": validation.wall_run_cells,
                     "gap_run_cells": validation.gap_run_cells,
+                    "raw_gap_run_cells": validation.raw_gap_run_cells,
+                    "raw_gap_m": round(validation.raw_gap_run_cells * resolution_m, 4),
+                    "doorway_gap_m": doorway_gap_m,
+                    "manual_opening_eligible": manual_opening_eligible,
+                    "manual_opening_max_gap_m": manual_opening_max_gap_m,
                     "hazard_crossing": validation.hazard_crossing,
                     "portal_id": validation.portal_id,
                     "generation_diagnostics": diagnostics,
@@ -18063,9 +19425,20 @@ class RenderDaemon:
         if len(parts) == 5 and parts[1] == "scenes" and parts[3] == "graph" and parts[4] == "edges":
             # POST .../graph/edges  body: {source, target, distance_m?, weight?}
             scene_id = parts[2]
-            graph_path = project_dir / "scenes" / scene_id / "viewpoint_graph.json"
+            graph_scope = str(payload.get("graph_scope") or "legacy")
+            if graph_scope == "navigation_place":
+                from navigation_dataset.navigation_support import PLACE_GRAPH_FILE
+                graph_path = project_dir / "scenes" / scene_id / PLACE_GRAPH_FILE
+            elif graph_scope == "legacy":
+                graph_path = project_dir / "scenes" / scene_id / "viewpoint_graph.json"
+            else:
+                self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": f"unknown graph_scope: {graph_scope}"})
+                return True
             if not graph_path.exists():
-                self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": "viewpoint_graph.json not found"})
+                self._send_json(handler, HTTPStatus.NOT_FOUND, {
+                    "error": "place_graph.json not found; Build Place Graph first."
+                    if graph_scope == "navigation_place" else "viewpoint_graph.json not found"
+                })
                 return True
             source = str(payload.get("source") or "")
             target = str(payload.get("target") or "")
@@ -18073,12 +19446,14 @@ class RenderDaemon:
                 self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": "source/target node ids required and must differ"})
                 return True
             status, response = self._apply_opticalnav_graph_edits(handler, project_dir, scene_id, {
+                "graph_scope": payload.get("graph_scope"),
                 "ops": [{
                     "type": "add_edge",
                     "source": source,
                     "target": target,
                     **({"distance_m": payload.get("distance_m")} if payload.get("distance_m") is not None else {}),
                     **({"weight": payload.get("weight")} if payload.get("weight") is not None else {}),
+                    **({"certify_opening": True} if payload.get("certify_opening") is True else {}),
                 }]
             })
             if status != HTTPStatus.OK:
@@ -18093,6 +19468,8 @@ class RenderDaemon:
                 "edge_id": result.get("edge_id"),
                 "source": result.get("source"),
                 "target": result.get("target"),
+                "graph_scope": graph_scope,
+                "profile_id": "adaptive_navigation_support_v4" if graph_scope == "navigation_place" else None,
                 "distance_m": result.get("distance_m"),
                 "revision": response.get("revision"),
             })
@@ -18136,6 +19513,140 @@ class RenderDaemon:
                 "summary": result.summary,
                 "sync": result.sync,
                 "project": self._opticalnav_project_summary(project_dir),
+            })
+            return True
+        if len(parts) == 5 and parts[1] == "scenes" and parts[3] == "episodes" and parts[4] == "plan" and str(payload.get("mode") or "") == "adaptive_navigation_support_v4":
+            from navigation_dataset.navigation_support import (
+                OBSERVATION_PLAN_FILE, SUPPORT_GRAPH_FILE, plan_support_episodes,
+                write_support_episodes,
+            )
+            from navigation_dataset.rollout import split_counts_from_spec
+            from navigation_dataset.scene_dataset import write_episode_index, write_project_catalog, write_scene_dataset
+
+            scene_id = parts[2]
+            try:
+                scene_dir = project_dir / "scenes" / scene_id
+                scene_paths = self._opticalnav_scene_paths(project_dir, scene_id)
+                sidecars = {
+                    SUPPORT_GRAPH_FILE: scene_dir / SUPPORT_GRAPH_FILE,
+                    OBSERVATION_PLAN_FILE: scene_dir / OBSERVATION_PLAN_FILE,
+                }
+                missing_sidecars = [name for name, path in sidecars.items() if not path.is_file()]
+                if missing_sidecars:
+                    raise FileNotFoundError("Navigation Support sidecars are missing: " + ", ".join(missing_sidecars))
+                split_spec = payload.get("splits", {"train": int(payload.get("num_pairs", 10))})
+                if isinstance(split_spec, str):
+                    split_counts = split_counts_from_spec(split_spec)
+                elif isinstance(split_spec, Mapping):
+                    split_counts = {str(key): int(value) for key, value in split_spec.items()}
+                else:
+                    raise ValueError("splits must be an object or 'train:60,val_seen:10' string.")
+                requested = int(payload.get("num_pairs", sum(split_counts.values())))
+                modalities = [str(item) for item in payload.get("modalities", ["rgb"])]
+                support_graph = _read_json(sidecars[SUPPORT_GRAPH_FILE])
+                observation_plan = _read_json(sidecars[OBSERVATION_PLAN_FILE])
+                validation_digest = str((support_graph.get("validation") or {}).get("digest") or "")
+                if (
+                    str(support_graph.get("profile_id") or "") != "adaptive_navigation_support_v4"
+                    or not validation_digest
+                    or validation_digest != str(support_graph.get("profile_digest") or "")
+                    or validation_digest != str(observation_plan.get("profile_digest") or "")
+                    or validation_digest != str(observation_plan.get("validation_digest") or "")
+                ):
+                    raise ValueError("adaptive_navigation_support_v4 sidecar validation digest mismatch; rebuild Navigation Support")
+                episodes = plan_support_episodes(
+                    support_graph=support_graph,
+                    observation_plan=observation_plan,
+                    num_pairs=requested,
+                    split_counts=split_counts,
+                    modalities=modalities,
+                    seed=int(payload.get("seed", 0)),
+                    min_forward_actions=int(payload.get("min_forward_actions", 4)),
+                    max_forward_actions=int(payload.get("max_forward_actions", 48)),
+                )
+                written = write_support_episodes(scene_paths, episodes)
+                write_episode_index(scene_paths)
+                write_scene_dataset(scene_paths)
+                write_project_catalog(project_dir)
+            except Exception as exc:
+                self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return True
+            self._send_json(handler, HTTPStatus.OK, {
+                "scene_id": scene_id,
+                "profile_id": "adaptive_navigation_support_v4",
+                "planned_count": len(written),
+                "episode_ids": [episode.episode_id for episode in episodes],
+                "episodes": [path.relative_to(project_dir).as_posix() for path in written],
+                "support_graph_ref": sidecars[SUPPORT_GRAPH_FILE].relative_to(project_dir).as_posix(),
+                "observation_plan_ref": sidecars[OBSERVATION_PLAN_FILE].relative_to(project_dir).as_posix(),
+            })
+            return True
+        if len(parts) == 5 and parts[1] == "scenes" and parts[3] == "episodes" and parts[4] == "plan" and str(payload.get("mode") or "") == "adaptive_route_motion_v3":
+            from navigation_dataset.route_motion import plan_motion_route_episodes, write_scene_motion_route_episodes
+            from navigation_dataset.rollout import split_counts_from_spec
+            from navigation_dataset.scene_dataset import write_episode_index, write_project_catalog, write_scene_dataset
+
+            scene_id = parts[2]
+            try:
+                scene_dir = project_dir / "scenes" / scene_id
+                scene_paths = self._opticalnav_scene_paths(project_dir, scene_id)
+                sidecars = {
+                    name: scene_dir / name
+                    for name in ("motion_graph.json", "observation_plan.json", "navigation_requests.json")
+                }
+                missing_sidecars = [name for name, path in sidecars.items() if not path.is_file()]
+                if missing_sidecars:
+                    raise FileNotFoundError(
+                        "adaptive Route Motion sidecars are missing: " + ", ".join(missing_sidecars)
+                    )
+                split_spec = payload.get("splits", {"train": int(payload.get("num_pairs", 10))})
+                if isinstance(split_spec, str):
+                    split_counts = split_counts_from_spec(split_spec)
+                elif isinstance(split_spec, Mapping):
+                    split_counts = {str(key): int(value) for key, value in split_spec.items()}
+                else:
+                    raise ValueError("splits must be an object or 'train:60,val_seen:10' string.")
+                requested = int(payload.get("num_pairs", sum(split_counts.values())))
+                modalities = [str(item) for item in payload.get("modalities", ["rgb"])]
+                motion_graph = _read_json(sidecars["motion_graph.json"])
+                observation_plan = _read_json(sidecars["observation_plan.json"])
+                validation_digest = str((motion_graph.get("validation") or {}).get("digest") or "")
+                if (
+                    str(motion_graph.get("profile_id") or "") != "adaptive_route_motion_v3"
+                    or not validation_digest
+                    or validation_digest != str(motion_graph.get("profile_digest") or "")
+                    or validation_digest != str(observation_plan.get("profile_digest") or "")
+                    or validation_digest != str(observation_plan.get("validation_digest") or "")
+                ):
+                    raise ValueError("adaptive_route_motion_v3 sidecar validation digest mismatch; rebuild route motion")
+                navigation_requests = _read_json(sidecars["navigation_requests.json"])
+                episodes = plan_motion_route_episodes(
+                    motion_graph=motion_graph,
+                    observation_plan=observation_plan,
+                    navigation_requests=navigation_requests,
+                    num_pairs=requested,
+                    split_counts=split_counts,
+                    modalities=modalities,
+                    seed=int(payload.get("seed", 0)),
+                    allow_incomplete_coverage=bool(payload.get("allow_incomplete_coverage", False)),
+                )
+                written = write_scene_motion_route_episodes(scene_paths, episodes)
+                write_episode_index(scene_paths)
+                write_scene_dataset(scene_paths)
+                write_project_catalog(project_dir)
+            except Exception as exc:
+                self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return True
+            self._send_json(handler, HTTPStatus.OK, {
+                "scene_id": scene_id,
+                "profile_id": "adaptive_route_motion_v3",
+                "planned_count": len(written),
+                "coverage_status": str((motion_graph.get("generation_diagnostics") or {}).get("coverage_status") or "complete"),
+                "missing_feature_ids": list(((navigation_requests.get("coverage") or {}).get("missing_feature_ids") or [])),
+                "episode_ids": [episode.episode_id for episode in episodes],
+                "episodes": [path.relative_to(project_dir).as_posix() for path in written],
+                "motion_graph_ref": sidecars["motion_graph.json"].relative_to(project_dir).as_posix(),
+                "observation_plan_ref": sidecars["observation_plan.json"].relative_to(project_dir).as_posix(),
             })
             return True
         if len(parts) == 5 and parts[1] == "scenes" and parts[3] == "episodes" and parts[4] == "plan" and str(payload.get("mode") or "trajectory") != "viewpoint_graph":
@@ -18221,6 +19732,23 @@ class RenderDaemon:
             from navigation_dataset.viewpoint_graph import read_viewpoint_graph
 
             scene_id = parts[2]
+            _motion_graph_path = project_dir / "scenes" / scene_id / "motion_graph.json"
+            _motion_graph = _read_json_mapping(_motion_graph_path) if _motion_graph_path.is_file() else None
+            _support_graph_path = project_dir / "scenes" / scene_id / "navigation_support_graph.json"
+            _support_graph = _read_json_mapping(_support_graph_path) if _support_graph_path.is_file() else None
+            _active_navigation_profile = str(
+                (_support_graph or _motion_graph or {}).get("profile_id") or ""
+            )
+            if (
+                not self._coerce_bool(payload.get("allow_legacy_override"), False)
+                and _active_navigation_profile in {"adaptive_route_motion_v3", "adaptive_navigation_support_v4"}
+            ):
+                self._send_json(handler, HTTPStatus.CONFLICT, {
+                    "error": "legacy_episode_generation_blocked",
+                    "message": f"A validated {_active_navigation_profile} plan exists; generate its staged episodes instead.",
+                    "profile_id": _active_navigation_profile,
+                })
+                return True
             try:
                 from navigation_dataset.optical_perturbation import disabled_edges_for_scene
                 scene_dir = project_dir / "scenes" / scene_id
@@ -19020,6 +20548,33 @@ class RenderDaemon:
         if len(parts) >= 2 and parts[1] == "export-jobs":
             self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": "scene_scope_required"})
             return True
+        if len(parts) == 6 and parts[1] == "scenes" and parts[3] == "navigation" and parts[4] == "blueprints":
+            from navigation_dataset.navigation_support import (
+                BLUEPRINTS_FILE, delete_route_blueprint, read_route_blueprints,
+                write_route_blueprints,
+            )
+
+            scene_id, blueprint_id = parts[2], parts[5]
+            blueprint_path = project_dir / "scenes" / scene_id / BLUEPRINTS_FILE
+            try:
+                blueprints = delete_route_blueprint(read_route_blueprints(blueprint_path), blueprint_id)
+                write_route_blueprints(blueprint_path, blueprints)
+            except FileNotFoundError:
+                self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": "Route Blueprints not found."})
+                return True
+            except KeyError as exc:
+                self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": str(exc)})
+                return True
+            except ValueError as exc:
+                self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return True
+            self._send_json(handler, HTTPStatus.OK, {
+                "ok": True,
+                "profile_id": "adaptive_navigation_support_v4",
+                "removed": blueprint_id,
+                "route_blueprints": blueprints,
+            })
+            return True
         if len(parts) == 5 and parts[1] == "scenes" and parts[3] == "observations" and parts[4] == "":
             # DELETE .../scenes/{scene_id}/observations/ — never happens (trailing slash guard)
             pass
@@ -19305,11 +20860,160 @@ class RenderDaemon:
             "expected_capture_count": 20,
         })
 
+    def _handle_opticalnav_render_plan_submit(
+        self, handler: BaseHTTPRequestHandler, project_dir: Path, scene_id: str, payload: Mapping[str, Any]
+    ) -> None:
+        """Submit only explicit v3 or v4 observation-plan pose/headings.
+
+        The actual queue path remains ``graph/sweep``: a render-only 24-heading
+        graph plus a strict view allow-list gives this new profile the same durable
+        task ledger, retry and render-version behaviour as legacy sweeps.
+        """
+        from navigation_dataset.viewpoint_graph import write_viewpoint_graph
+
+        scene_dir = project_dir / "scenes" / scene_id
+        raw_ref = str(payload.get("observation_plan_ref") or "observation_plan.json")
+        try:
+            plan_path = (scene_dir / raw_ref).resolve()
+            plan_path.relative_to(scene_dir.resolve())
+        except (OSError, ValueError):
+            self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": "observation_plan_ref must stay inside the scene directory"})
+            return
+        if not plan_path.is_file():
+            self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": f"observation plan not found: {raw_ref}"})
+            return
+        try:
+            raw_plan = _read_json_mapping(plan_path) or {}
+            profile_id = str(raw_plan.get("profile_id") or "")
+            if profile_id == "adaptive_navigation_support_v4":
+                from navigation_dataset.navigation_support import (
+                    read_support_observation_plan, support_render_graph,
+                )
+
+                plan = read_support_observation_plan(plan_path)
+                raw_support_ref = str(plan.get("support_graph_ref") or "navigation_support_graph.json")
+                try:
+                    support_graph_path = (scene_dir / raw_support_ref).resolve()
+                    support_graph_path.relative_to(scene_dir.resolve())
+                except (OSError, ValueError):
+                    raise ValueError("support_graph_ref must stay inside the scene directory")
+                support_graph = _read_json_mapping(support_graph_path) if support_graph_path.is_file() else None
+                validation_digest = str(((support_graph or {}).get("validation") or {}).get("digest") or "")
+                if (
+                    str((support_graph or {}).get("profile_id") or "") != profile_id
+                    or not validation_digest
+                    or validation_digest != str(plan.get("profile_digest") or "")
+                    or validation_digest != str(plan.get("validation_digest") or "")
+                    or validation_digest != str((support_graph or {}).get("profile_digest") or "")
+                ):
+                    raise ValueError("adaptive_navigation_support_v4 validation digest mismatch; rebuild before render submission")
+                # Expansion plans must not overwrite the baseline render graph:
+                # queued work can begin after the next level has been prepared.
+                # A digest-qualified immutable graph ref preserves the exact
+                # pose/heading contract of every durable batch.
+                coverage_digest = str(plan.get("coverage_digest") or "")
+                render_graph_name = (
+                    f"support_render_graph_{coverage_digest[:16]}.json"
+                    if coverage_digest else "support_render_graph.json"
+                )
+                render_graph_path = write_viewpoint_graph(
+                    scene_dir / render_graph_name,
+                    support_render_graph(plan),
+                )
+            else:
+                from navigation_dataset.route_motion import motion_render_graph_from_plan, read_observation_plan
+
+                plan = read_observation_plan(plan_path)
+                profile_id = "adaptive_route_motion_v3"
+                motion_graph_path = scene_dir / "motion_graph.json"
+                motion_graph = _read_json_mapping(motion_graph_path) if motion_graph_path.is_file() else None
+                validation_digest = str(((motion_graph or {}).get("validation") or {}).get("digest") or "")
+                if (
+                    str(plan.get("profile_id") or "") != profile_id
+                    or str((motion_graph or {}).get("profile_id") or "") != profile_id
+                    or not validation_digest
+                    or validation_digest != str(plan.get("profile_digest") or "")
+                    or validation_digest != str(plan.get("validation_digest") or "")
+                    or validation_digest != str((motion_graph or {}).get("profile_digest") or "")
+                ):
+                    raise ValueError("adaptive_route_motion_v3 validation digest mismatch; rebuild before render submission")
+                render_graph_path = write_viewpoint_graph(
+                    scene_dir / "motion_render_graph.json",
+                    motion_render_graph_from_plan(plan),
+                )
+            if str(plan.get("scene_id") or "") != scene_id:
+                raise ValueError("observation plan scene_id does not match request")
+            expected_digest = _maybe_str(payload.get("profile_digest"))
+            if expected_digest and expected_digest != str(plan.get("profile_digest") or ""):
+                raise ValueError("observation plan profile_digest does not match request")
+        except Exception as exc:
+            self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            return
+        delegated = dict(payload)
+        delegated.pop("observation_plan_ref", None)
+        delegated["graph_ref"] = render_graph_path.name
+        delegated["view_keys"] = [
+            {"node_id": entry["motion_node_id"], "heading_id": entry["heading_id"]}
+            for entry in plan.get("render_entries") or []
+            if isinstance(entry, Mapping)
+        ]
+        # This makes the partial-observation contract durable per child task.
+        # A TRACK_4 result must never be interpreted as an implicit panorama.
+        delegated["view_metadata_by_key"] = {
+            f"{entry['motion_node_id']}/{entry['heading_id']}": {
+                key: entry[key]
+                for key in (
+                    "tier", "available_heading_ids", "lazy_heading_ids",
+                    "polar_batch_key", "polar_batch_index", "polar_batch_size", "projection",
+                    "native_resolution", "canonical", "action_heading_ids",
+                    "base_tier", "observation_role", "coverage_level_id",
+                )
+                if key in entry
+            }
+            for entry in plan.get("render_entries") or []
+            if isinstance(entry, Mapping)
+            and _maybe_str(entry.get("motion_node_id"))
+            and _maybe_str(entry.get("heading_id"))
+        }
+        # Isolate this profile in the scene-version key; otherwise identical scene
+        # XML could source-reuse a legacy all-heading sweep by mistake.
+        delegated["graph_revision"] = f"{profile_id}:{plan.get('coverage_digest') or plan.get('profile_digest', '')}"
+        delegated["render_plan_ref"] = plan_path.relative_to(project_dir).as_posix()
+        delegated["profile_id"] = profile_id
+        # A polar-only support plan would otherwise resolve ``auto`` to the
+        # legacy per-view phase and bypass its explicit K=2..4 batch affinity.
+        # Support plans own a native polar observation contract, so always
+        # materialize the polar phase before the batch scheduler sees it.
+        delegated.setdefault("sweep_execution_policy", "modality_phases")
+        delegated.setdefault("backend", "daemon")
+        if str(delegated.get("backend") or "daemon").lower() != "daemon":
+            self._send_json(handler, HTTPStatus.BAD_REQUEST, {
+                "error": f"{profile_id} requires backend='daemon' so render-plan tasks are durable and resumable"
+            })
+            return
+        self._handle_opticalnav_graph_sweep(handler, project_dir, scene_id, delegated)
+
     def _handle_opticalnav_graph_sweep(self, handler: BaseHTTPRequestHandler, project_dir: Path, scene_id: str, payload: Mapping[str, Any]) -> None:
         from navigation_dataset.sensor_sweep import build_sweep_render_requests, build_custom_position_render_requests, render_viewpoint_sweep_direct
         from navigation_dataset.viewpoint_graph import read_viewpoint_graph
 
         custom_positions = list(payload.get("custom_positions") or [])
+        scene_dir = project_dir / "scenes" / scene_id
+        active_motion = _read_json_mapping(scene_dir / "motion_graph.json") if (scene_dir / "motion_graph.json").is_file() else None
+        active_support = _read_json_mapping(scene_dir / "navigation_support_graph.json") if (scene_dir / "navigation_support_graph.json").is_file() else None
+        active_navigation_profile = str((active_support or active_motion or {}).get("profile_id") or "")
+        requested_graph = str(payload.get("graph_ref") or "viewpoint_graph.json")
+        if (
+            active_navigation_profile in {"adaptive_route_motion_v3", "adaptive_navigation_support_v4"}
+            and requested_graph == "viewpoint_graph.json"
+            and str(payload.get("profile_id") or "") != active_navigation_profile
+            and not self._coerce_bool(payload.get("allow_legacy_override"), False)
+        ):
+            self._send_json(handler, HTTPStatus.CONFLICT, {
+                "error": "legacy_render_blocked",
+                "message": f"A validated {active_navigation_profile} plan exists; submit its render plan instead.",
+            })
+            return
         modalities = [str(item) for item in payload.get("modalities", ["rgb", "depth", "active_nir_intensity", "hazard_mask"])]
         backend = str(payload.get("backend") or "daemon")
         scene_state_payload = payload.get("scene_state")
@@ -19344,8 +21048,38 @@ class RenderDaemon:
                 if node_id and heading_id:
                     selected.setdefault(node_id, []).append(heading_id)
             heading_ids_by_node = selected or None
+        view_metadata_raw = payload.get("view_metadata_by_key")
+        view_metadata_by_key = (
+            {
+                str(key): dict(value)
+                for key, value in view_metadata_raw.items()
+                if isinstance(value, Mapping)
+            }
+            if isinstance(view_metadata_raw, Mapping)
+            else None
+        )
         render_settings_raw = payload.get("render_settings")
         render_settings = dict(render_settings_raw) if isinstance(render_settings_raw, dict) else {}
+        # The texture cap is a worker-process environment setting, rather than a
+        # RenderConfig attribute.  Keep it top-level so the strict render-settings
+        # parser never sees it, but make it explicit and bounded at submission
+        # time.  This is required for memory-safe K-heading strips: a max512 K=4
+        # render is a different immutable profile from a max1024 K=1 render.
+        texture_profile_override: int | None = None
+        texture_profile_raw = payload.get("texture_profile_override")
+        if texture_profile_raw is not None:
+            try:
+                texture_profile_override = int(texture_profile_raw)
+            except (TypeError, ValueError):
+                self._send_json(handler, HTTPStatus.BAD_REQUEST, {
+                    "error": "texture_profile_override must be an integer in [64, 4096]",
+                })
+                return
+            if not 64 <= texture_profile_override <= 4096:
+                self._send_json(handler, HTTPStatus.BAD_REQUEST, {
+                    "error": "texture_profile_override must be an integer in [64, 4096]",
+                })
+                return
         # Mesh LOD render option: selects the decimated scene xml, so it is NOT a
         # RenderConfig field — pop it here before render_settings reaches the strict
         # render_config_from_payload field check (mirrors the `variant` pattern).
@@ -19354,6 +21088,13 @@ class RenderDaemon:
             payload.get("skip_existing_observations")
             or payload.get("only_missing")
             or payload.get("resume_missing_only")
+        )
+        # An explicit renderer/basis migration needs fresh source pixels even
+        # if a prior render version has the same logical pose-heading task.
+        # This is intentionally independent of ``only_missing``: callers may
+        # request a full rerender without changing the source scene digest.
+        reuse_existing_observations = self._coerce_bool(
+            payload.get("reuse_existing_observations"), True,
         )
         sweep_execution_policy = str(payload.get("sweep_execution_policy") or "auto").strip().lower()
         if sweep_execution_policy not in {"auto", "per_view", "modality_phases"}:
@@ -19377,8 +21118,26 @@ class RenderDaemon:
                            or "base").lower()
         if _variant_key not in {"base", "perturbed", "perturbed_active_polar"}:
             _variant_key = "base"
+        # A camera-aligned active polar source changes the complete scene, not
+        # just the child sensor.  The 2026-08-30 max512 K=1/K=4 parity audit
+        # found RGB/S0 errors of 0.77–3.50× S0 p99 even with 6 m separation.
+        # Do not let a direct API caller bypass the safe L3 submitter and
+        # silently create non-canonical active observations.
+        active_batch_policy = str(render_settings.get("active_polar_batch_policy", "k1") or "k1").strip().lower()
+        if _variant_key == "perturbed_active_polar" and active_batch_policy != "k1":
+            self._send_json(handler, HTTPStatus.BAD_REQUEST, {
+                "error": "active_spatial_batch_unsupported",
+                "message": (
+                    "Camera-aligned active polarization must use K=1. "
+                    "Spatial K>1 batching failed the certified K=1 parity check."
+                ),
+                "requested_policy": active_batch_policy,
+            })
+            return
         submission_group_id = _maybe_str(payload.get("submission_group_id"))
         selection_manifest_ref = _maybe_str(payload.get("polar_sample_selection_manifest_ref"))
+        render_plan_ref = _maybe_str(payload.get("render_plan_ref"))
+        motion_profile_id = _maybe_str(payload.get("profile_id"))
         previous_variant_batch_id = _maybe_str(payload.get("previous_variant_batch_id"))
         try:
             variant_sequence_index = int(payload.get("variant_sequence_index", 0) or 0)
@@ -19472,13 +21231,16 @@ class RenderDaemon:
             graph_revision=str(payload.get("graph_revision") or ""),
         )
         _render_version_id = new_render_version_id(_scene_digest)
+        render_settings_for_profile = dict(render_settings)
+        if texture_profile_override is not None:
+            render_settings_for_profile["texture_profile_override"] = texture_profile_override
         _render_profile_id, _render_profile = _render_profile_identity(
             scene_variant_key=_variant_key,
             sensor_ids=sensor_ids,
             camera_specs_payload=camera_specs_payload,
             sensor_specs_payload=sensor_specs_payload,
             modalities=modalities,
-            render_settings=render_settings,
+            render_settings=render_settings_for_profile,
             active_lights=active_lights_payload,
         )
         # Always rebuild canonical scene_state — never inherit stale job_id from caller.
@@ -19596,6 +21358,8 @@ class RenderDaemon:
                 "variant_sequence_total": variant_sequence_total,
                 "previous_variant_batch_id": previous_variant_batch_id,
                 "polar_sample_selection_manifest_ref": selection_manifest_ref,
+                "render_plan_ref": render_plan_ref,
+                "motion_profile_id": motion_profile_id,
                 "render_profile_id": _render_profile_id,
                 "render_profile": _render_profile,
                 "modalities": modalities,
@@ -19622,9 +21386,22 @@ class RenderDaemon:
             })
             return
 
-        graph_path = project_dir / "scenes" / scene_id / "viewpoint_graph.json"
+        scene_dir = project_dir / "scenes" / scene_id
+        graph_ref = _maybe_str(payload.get("graph_ref"))
+        if graph_ref:
+            try:
+                graph_path = (scene_dir / graph_ref).resolve()
+                graph_path.relative_to(scene_dir.resolve())
+            except (OSError, ValueError):
+                self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": "graph_ref must stay inside the scene directory"})
+                return
+            if graph_path.suffix != ".json":
+                self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": "graph_ref must name a JSON graph"})
+                return
+        else:
+            graph_path = scene_dir / "viewpoint_graph.json"
         if not graph_path.exists():
-            self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": "viewpoint_graph.json not found"})
+            self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": f"graph not found: {graph_path.name}"})
             return
         precondition = self._opticalnav_render_precondition_payload(project_dir, [scene_id], payload, mode="graph_sweep")
         if precondition is not None:
@@ -19689,6 +21466,8 @@ class RenderDaemon:
                 "variant_sequence_total": variant_sequence_total,
                 "previous_variant_batch_id": previous_variant_batch_id,
                 "polar_sample_selection_manifest_ref": selection_manifest_ref,
+                "render_plan_ref": render_plan_ref,
+                "motion_profile_id": motion_profile_id,
                 "render_profile_id": _render_profile_id,
                 "render_profile": _render_profile,
             },
@@ -19726,6 +21505,8 @@ class RenderDaemon:
             "variant_sequence_total": variant_sequence_total,
             "previous_variant_batch_id": previous_variant_batch_id,
             "polar_sample_selection_manifest_ref": selection_manifest_ref,
+            "render_plan_ref": render_plan_ref,
+            "motion_profile_id": motion_profile_id,
             "render_profile_id": _render_profile_id,
             "render_profile": _render_profile,
             "plan_total": 0,
@@ -19737,6 +21518,7 @@ class RenderDaemon:
             "phase_count": 0,
             "status": "building",
             "skip_existing_observations": skip_existing_observations,
+            "reuse_existing_observations": reuse_existing_observations,
             "jobs": [],
             "counts": {"queued": 0, "running": 0, "completed": 0, "failed": 0, "cancelled": 0, "unknown": 0},
             "progress": {"completed": 0, "failed": 0, "total": 0, "fraction": 0.0},
@@ -19764,9 +21546,11 @@ class RenderDaemon:
                 modalities=modalities,
                 node_ids_filter=node_ids_filter,
                 heading_ids_by_node=heading_ids_by_node,
+                view_metadata_by_key=view_metadata_by_key,
                 camera_height_m=camera_height_m,
                 render_settings=render_settings,
                 node_heights=node_heights,
+                texture_profile_override=texture_profile_override,
                 variant=str(payload.get("variant") or self.variant),
                 scene_variant_key=_variant_key,
                 submission_group_id=submission_group_id,
@@ -19774,8 +21558,11 @@ class RenderDaemon:
                 variant_sequence_total=variant_sequence_total,
                 previous_variant_batch_id=previous_variant_batch_id,
                 selection_manifest_ref=selection_manifest_ref,
+                render_plan_ref=render_plan_ref,
+                motion_profile_id=motion_profile_id,
                 sweep_execution_policy=sweep_execution_policy,
                 skip_existing_observations=skip_existing_observations,
+                reuse_existing_observations=reuse_existing_observations,
                 active_lights=active_lights_payload,
             ),
             daemon=True,
@@ -19820,11 +21607,20 @@ class RenderDaemon:
                 status = str(payload.get("status") or "").lower()
                 counts = payload.get("state_counts") if isinstance(payload.get("state_counts"), Mapping) else {}
                 total = int(payload.get("task_count") or 0)
+                metadata = payload.get("metadata") if isinstance(payload.get("metadata"), Mapping) else {}
+                try:
+                    expected_total = int(metadata.get("plan_total") or 0)
+                except (TypeError, ValueError):
+                    expected_total = 0
+                fully_materialized = expected_total <= 0 or total >= expected_total
                 done = sum(
                     int(counts.get(state) or 0)
                     for state in ("succeeded", "skipped", "failed", "partial", "blocked", "cancelled")
                 )
-                if status == "completed" or (total > 0 and done >= total and status not in {"building", "submitting"}):
+                if fully_materialized and (
+                    status == "completed"
+                    or (total > 0 and done >= total and status not in {"building", "submitting"})
+                ):
                     return payload
                 if status in failure_states:
                     raise RuntimeError(
@@ -19922,9 +21718,11 @@ class RenderDaemon:
         modalities: list,
         node_ids_filter: "list[str] | None",
         heading_ids_by_node: "dict[str, list[str]] | None",
+        view_metadata_by_key: "dict[str, dict[str, Any]] | None",
         camera_height_m: float,
         render_settings: dict,
         node_heights: "dict | None",
+        texture_profile_override: int | None,
         variant: str,
         scene_variant_key: str = "base",
         submission_group_id: str | None = None,
@@ -19932,8 +21730,11 @@ class RenderDaemon:
         variant_sequence_total: int = 1,
         previous_variant_batch_id: str | None = None,
         selection_manifest_ref: str | None = None,
+        render_plan_ref: str | None = None,
+        motion_profile_id: str | None = None,
         sweep_execution_policy: str = "auto",
         skip_existing_observations: bool = False,
+        reuse_existing_observations: bool = True,
         active_lights: "list[dict] | None" = None,
     ) -> None:
         """Background thread: read graph, build RenderRequests, submit all jobs."""
@@ -19942,6 +21743,25 @@ class RenderDaemon:
         from robomituba_bridge import AssistLightSpec
         ledger = RenderLedger(project_dir, scene_id=scene_id)
         try:
+            # These two controls are queue-scheduler policy, not renderer
+            # controls.  Keep them in the render-profile identity at submit
+            # time, but remove them before the strict RenderConfig parser sees
+            # the per-camera request settings in a worker.
+            request_render_settings = dict(render_settings)
+            active_spatial_batch_policy = str(
+                request_render_settings.pop("active_polar_batch_policy", "k1") or "k1"
+            ).strip().lower()
+            if active_spatial_batch_policy not in {"k1", "spatial_candidate"}:
+                raise ValueError(
+                    "active_polar_batch_policy must be 'k1' or 'spatial_candidate'"
+                )
+            try:
+                active_spatial_min_separation_m = max(
+                    0.1,
+                    float(request_render_settings.pop("active_polar_batch_min_separation_m", 6.0)),
+                )
+            except (TypeError, ValueError):
+                active_spatial_min_separation_m = 6.0
             # Keep the ordering guarantee in the daemon as well as the UI: a
             # direct/retried client cannot enqueue perturbed work before the
             # previous variant batch is terminal.
@@ -19978,15 +21798,223 @@ class RenderDaemon:
                 job_id_mode="per_heading",
                 node_ids=node_ids_filter,
                 heading_ids_by_node=heading_ids_by_node,
+                view_metadata_by_key=view_metadata_by_key,
                 camera_height_m=camera_height_m,
-                render_settings=render_settings,
+                render_settings=request_render_settings,
                 node_heights=node_heights,
                 active_lights=active_lights,
             )
+            # Set the process-level texture contract before batch payloads are
+            # serialized below.  In particular, K-heading follower payloads
+            # must carry the same cap as their leader for auditability even
+            # though the worker applies the cap once to the whole strip.
+            if texture_profile_override is not None:
+                for sweep_request in sweep_requests:
+                    sweep_request.request.extras["texture_profile_override"] = texture_profile_override
             phases = split_sweep_requests_by_modality_phase(
                 sweep_requests,
                 sweep_execution_policy=sweep_execution_policy,
             )
+            # Apply the camera-aligned active-polar protocol before serializing
+            # a K-heading cohort.  Serializing first would silently leave the
+            # follower payloads passive while only the leader receives the light.
+            if scene_variant_key == "perturbed_active_polar":
+                for phase in phases:
+                    for sweep_request in phase.requests:
+                        request = sweep_request.request
+                        request.assist_light = AssistLightSpec(
+                            mode="camera_aligned_rect", distance_m=0.12,
+                            size_world=[2.2, 1.6], spectrum_mode="rgb_white",
+                            polarized=True, polarizer_angle_deg=0.0,
+                            extras={"radiance": 18.0, "protocol": "rgb_stokes_12_active_polar_v1"},
+                        )
+                        request.extras.update({
+                            "polar_active": True,
+                            "polar_pilot": True,
+                            "polar_color_mode": "rgb_stokes_12",
+                        })
+
+            # The v3/v4 observation planner emits batch keys only for headings
+            # of the same polar camera pose. Passive headings share one native
+            # Stokes strip render; active headings retain their camera-aligned
+            # emitter and run as a K-sized cohort of independently staged views.
+            if (
+                render_plan_ref
+                and motion_profile_id in {"adaptive_route_motion_v3", "adaptive_navigation_support_v4"}
+                and scene_variant_key in {"base", "perturbed", "perturbed_active_polar"}
+            ):
+                polar_modalities = {
+                    "polar_rgb_preview", "s1", "s2", "s1_over_s0", "s2_over_s0", "dop", "aolp",
+                }
+
+                def _batch_eligible(sweep_request: Any) -> bool:
+                    request = sweep_request.request
+                    batch_key = str((request.extras or {}).get("polar_batch_key") or "")
+                    requested = set(str(item) for item in request.modalities)
+                    return bool(
+                        batch_key
+                        and 2 <= int((request.extras or {}).get("polar_batch_size") or 0) <= 4
+                        and requested
+                        and requested <= polar_modalities
+                        and len(request.camera_specs) == 1
+                        and not request.sensor_specs
+                        and not request.active_lights
+                        and (
+                            (scene_variant_key in {"base", "perturbed"} and request.assist_light is None)
+                            or (
+                                scene_variant_key == "perturbed_active_polar"
+                                and request.assist_light is not None
+                                and request.assist_light.mode == "camera_aligned_rect"
+                                and request.assist_light.polarized
+                            )
+                        )
+                    )
+
+                def _camera_origin(sweep_request: Any) -> np.ndarray:
+                    matrix = np.asarray(
+                        sweep_request.request.camera_specs[0].camera_to_world,
+                        dtype=np.float64,
+                    ).reshape(4, 4)
+                    return matrix[:3, 3].copy()
+
+                def _active_spatial_groups(candidates: list[Any]) -> tuple[list[list[Any]], list[Any]]:
+                    """Partition active views into distance-separated K<=4 groups.
+
+                    A camera-aligned emitter belongs to the individual camera,
+                    not the common pose as in the passive heading batch.  Pick
+                    the furthest compatible candidates first to avoid a nearby
+                    tail consuming all distant locations.  A later K=1 parity
+                    pilot is still required before this policy is used for a
+                    production dataset.
+                    """
+                    pending = sorted(
+                        candidates,
+                        key=lambda item: (str(item.node_id), str(item.heading_id), str(item.request.job_id)),
+                    )
+                    grouped: list[list[Any]] = []
+                    singletons: list[Any] = []
+                    while pending:
+                        group = [pending.pop(0)]
+                        origins = [_camera_origin(group[0])]
+                        while pending and len(group) < 4:
+                            compatible: list[tuple[float, int]] = []
+                            for index, candidate in enumerate(pending):
+                                candidate_origin = _camera_origin(candidate)
+                                min_distance = min(float(np.linalg.norm(candidate_origin - origin)) for origin in origins)
+                                if min_distance >= active_spatial_min_separation_m:
+                                    compatible.append((min_distance, index))
+                            if not compatible:
+                                break
+                            _, chosen_index = max(compatible, key=lambda item: (item[0], -item[1]))
+                            chosen = pending.pop(chosen_index)
+                            group.append(chosen)
+                            origins.append(_camera_origin(chosen))
+                        if len(group) >= 2:
+                            grouped.append(group)
+                        else:
+                            singletons.extend(group)
+                    return grouped, singletons
+
+                for phase in phases:
+                    if phase.phase != "polar":
+                        continue
+                    if scene_variant_key == "perturbed_active_polar":
+                        # Active views are K=1 by default.  Each view owns a
+                        # camera-aligned polarized emitter, so batching merely
+                        # by the request's heading key would make all emitters
+                        # contribute to every child sensor.  The candidate
+                        # mode is intentionally explicit and records a
+                        # certificate for a K=1 Stokes parity gate.
+                        if active_spatial_batch_policy != "spatial_candidate":
+                            continue
+                        eligible = [item for item in phase.requests if _batch_eligible(item)]
+                        passthrough = [item for item in phase.requests if not _batch_eligible(item)]
+                        spatial_groups, singletons = _active_spatial_groups(eligible)
+                        collapsed: list[Any] = [*passthrough, *singletons]
+                        for spatial_index, members in enumerate(spatial_groups):
+                            leader = members[0]
+                            origins = [_camera_origin(member) for member in members]
+                            pairwise_distances = [
+                                round(float(np.linalg.norm(origins[left] - origins[right])), 6)
+                                for left in range(len(origins))
+                                for right in range(left + 1, len(origins))
+                            ]
+                            batch_key = f"active_spatial:{spatial_index:05d}"
+                            certificate = {
+                                "policy": "active_spatial_separation_candidate_v1",
+                                "batch_policy": active_spatial_batch_policy,
+                                "minimum_required_separation_m": active_spatial_min_separation_m,
+                                "pairwise_camera_separation_m": pairwise_distances,
+                                "requires_k1_parity_validation": True,
+                            }
+                            batch_views = [
+                                {"node_id": member.node_id, "heading_id": member.heading_id, "job_id": member.request.job_id}
+                                for member in members
+                            ]
+                            leader.request.extras.update({
+                                "stokes_heading_batch_key": batch_key,
+                                "stokes_heading_batch_size": len(members),
+                                "stokes_heading_batch_view_keys": batch_views,
+                                "stokes_heading_batch_execution": "active_stokes_heading_spatial_batch_v1",
+                                "active_stokes_spatial_batch_certificate": certificate,
+                                # ``render_request_to_payload`` intentionally
+                                # exposes ``extras`` by reference for the normal
+                                # request-persistence path.  A batch leader is
+                                # itself one of ``members``; storing that live
+                                # payload inside its own extras would therefore
+                                # make ``extras → batch payload → extras``
+                                # circular as soon as this update completes.
+                                # Snapshot each child before attaching the
+                                # collection to the leader so later task metadata
+                                # mutations cannot alter it either.
+                                "active_stokes_heading_batch_request_payloads": [
+                                    _snapshot_render_request_payload(member.request)
+                                    for member in members
+                                ],
+                            })
+                            collapsed.append(leader)
+                        phase.requests = collapsed
+                        continue
+                    grouped: dict[str, list[Any]] = {}
+                    passthrough: list[Any] = []
+                    for sweep_request in phase.requests:
+                        if _batch_eligible(sweep_request):
+                            grouped.setdefault(str(sweep_request.request.extras["polar_batch_key"]), []).append(sweep_request)
+                        else:
+                            passthrough.append(sweep_request)
+                    collapsed: list[Any] = list(passthrough)
+                    for batch_key, members in sorted(grouped.items()):
+                        expected = int(members[0].request.extras.get("polar_batch_size") or 0)
+                        common_camera = members[0].request.camera_specs[0].camera_id
+                        compatible = (
+                            len(members) == expected
+                            and all(member.request.camera_specs[0].camera_id == common_camera for member in members)
+                            and all(member.request.modalities == members[0].request.modalities for member in members)
+                        )
+                        if not compatible:
+                            collapsed.extend(members)
+                            continue
+                        leader = members[0]
+                        batch_views = [
+                            {"node_id": member.node_id, "heading_id": member.heading_id, "job_id": member.request.job_id}
+                            for member in members
+                        ]
+                        leader.request.extras.update({
+                            "stokes_heading_batch_key": batch_key,
+                            "stokes_heading_batch_size": len(members),
+                            "stokes_heading_batch_view_keys": batch_views,
+                            "stokes_heading_batch_execution": "ambient_stokes_heading_batch_v1",
+                        })
+                        # See the active-batch equivalent above.  In the
+                        # passive case the leader is also a child, so these must
+                        # be detached snapshots rather than payloads retaining
+                        # a reference to ``leader.request.extras``.
+                        leader.request.extras["stokes_heading_batch_request_payloads"] = [
+                            _snapshot_render_request_payload(member.request)
+                            for member in members
+                        ]
+                        collapsed.append(leader)
+                    phase.requests = collapsed
             # Persist the complete plan before submitting the first worker job.
             # This is the durable cursor that allows a later resume to include
             # tasks that were never accepted by the in-memory queue.
@@ -20009,18 +22037,8 @@ class RenderDaemon:
                     # were created atomically under the bridge contract.
                     logical_job_id = str(request.job_id)
                     request.extras["logical_job_id"] = logical_job_id
-                    if scene_variant_key == "perturbed_active_polar":
-                        request.assist_light = AssistLightSpec(
-                            mode="camera_aligned_rect", distance_m=0.12,
-                            size_world=[2.2, 1.6], spectrum_mode="rgb_white",
-                            polarized=True, polarizer_angle_deg=0.0,
-                            extras={"radiance": 18.0, "protocol": "rgb_stokes_12_active_polar_v1"},
-                        )
-                        request.extras.update({
-                            "polar_active": True,
-                            "polar_pilot": True,
-                            "polar_color_mode": "rgb_stokes_12",
-                        })
+                    if texture_profile_override is not None:
+                        request.extras["texture_profile_override"] = texture_profile_override
                     task_payload = {
                         "run_id": run_id,
                         "scene_id": scene_id,
@@ -20035,10 +22053,17 @@ class RenderDaemon:
                         "variant_sequence_total": variant_sequence_total,
                         "previous_variant_batch_id": previous_variant_batch_id,
                         "polar_sample_selection_manifest_ref": selection_manifest_ref,
+                        "render_plan_ref": render_plan_ref,
+                        "motion_profile_id": motion_profile_id,
                         "phase": phase.phase,
                         "phase_index": phase.phase_index,
                         "node_id": sweep_request.node_id,
                         "heading_id": sweep_request.heading_id,
+                        "stokes_heading_batch_key": request.extras.get("stokes_heading_batch_key"),
+                        "stokes_heading_batch_size": int(request.extras.get("stokes_heading_batch_size") or 1),
+                        "stokes_heading_batch_execution": request.extras.get("stokes_heading_batch_execution"),
+                        "stokes_heading_batch_view_keys": list(request.extras.get("stokes_heading_batch_view_keys") or []),
+                        "active_stokes_spatial_batch_certificate": request.extras.get("active_stokes_spatial_batch_certificate"),
                         "sensor_ids": list(sweep_request.sensor_ids or []),
                         "modalities_by_sensor": dict(sweep_request.modalities_by_sensor or {}),
                     }
@@ -20049,12 +22074,49 @@ class RenderDaemon:
                     preplans.append((sweep_request, task_payload, logical_key, task_id, plan_ordinal))
                     plan_ordinal += 1
 
-            existing_by_logical = ledger.find_complete_tasks(
-                scene_version_id_value=scene_version_id_value,
-                logical_task_keys=logical_keys,
-            )
+            # A renderer/basis revision sometimes requires a clean render even
+            # when an older version has a byte-complete bundle for the same
+            # logical view.  Keep the normal resume optimisation as the
+            # default, but let an explicit rerender bypass *both* lookup paths
+            # below.  Merely setting ``skip_existing_observations=false`` is
+            # not sufficient: the identity lookup happens before phase
+            # admission and would otherwise install ``source_bundle_ref``.
+            existing_by_logical: dict[str, dict[str, Any]] = {}
+            existing_by_identity: dict[str, dict[str, Any]] = {}
+            if reuse_existing_observations:
+                existing_by_logical = ledger.find_complete_tasks(
+                    scene_version_id_value=scene_version_id_value,
+                    logical_task_keys=logical_keys,
+                )
+            # A predecessor batch id enforces variant ordering, but a resumed
+            # predecessor has a new id while producing the exact same image.
+            # Keep the legacy logical lookup first, then fall back to a
+            # sequence-agnostic render identity so missing-only never rerenders
+            # a completed frame solely because its chain was resumed.
+            def _reuse_identity(task: Mapping[str, Any]) -> dict[str, Any]:
+                return {
+                    "variant": str(task.get("variant") or ""),
+                    "render_variant": str(task.get("render_variant") or ""),
+                    "phase": str(task.get("phase") or ""),
+                    "phase_index": int(task.get("phase_index") or 0),
+                    "node_id": str(task.get("node_id") or ""),
+                    "heading_id": str(task.get("heading_id") or ""),
+                    "sensor_ids": list(task.get("sensor_ids") or []),
+                    "modalities_by_sensor": dict(task.get("modalities_by_sensor") or {}),
+                }
+
+            def _reuse_identity_key(identity: Mapping[str, Any]) -> str:
+                return json.dumps(dict(identity), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+            if reuse_existing_observations:
+                existing_by_identity = ledger.find_complete_tasks_by_render_identity(
+                    scene_version_id_value=scene_version_id_value,
+                    identities=[_reuse_identity(task_payload) for _, task_payload, _, _, _ in preplans],
+                )
             for sweep_request, task_payload, logical_key, task_id, ordinal in preplans:
-                existing = existing_by_logical.get(logical_key)
+                existing = existing_by_logical.get(logical_key) or existing_by_identity.get(
+                    _reuse_identity_key(_reuse_identity(task_payload))
+                )
                 if existing:
                     prior_bundle = versioned_bundle_dir(
                         project_dir, scene_id=scene_id, render_version_id=str(existing.get("render_version_id") or ""),
@@ -20085,6 +22147,30 @@ class RenderDaemon:
                 task_keys[request_key] = task_id
                 task_records[request_key] = task_record
             requested_plan_count = plan_ordinal
+            # The normal windowed-admission path keeps a huge sweep from
+            # spending minutes writing SQLite before any GPU starts.  For a
+            # moderately sized explicit render plan, however, the complete
+            # immutable task list is small enough to make durable immediately.
+            # This is important for K=4 support sweeps: restarting the daemon
+            # between admission windows must not silently turn a 2,454-view
+            # plan into only its first materialized window on resume.
+            #
+            # Request blobs are included because resume reconstructs a task
+            # from the ledger, not from the transient submission thread.  The
+            # cap deliberately leaves very large legacy sweeps on the existing
+            # bounded path.
+            try:
+                durable_plan_prefill_limit = int(
+                    os.environ.get("ROBOMITUBA_SWEEP_DURABLE_PLAN_PREFILL_MAX", "1024") or "1024"
+                )
+            except (TypeError, ValueError):
+                durable_plan_prefill_limit = 1024
+            durable_plan_prefilled = (
+                durable_plan_prefill_limit > 0
+                and requested_plan_count <= durable_plan_prefill_limit
+            )
+            if durable_plan_prefilled:
+                ledger.put_tasks_batch(list(task_records.values()))
             # Do not pre-insert an entire sweep into the NFS-backed ledger.
             #
             # ``WorkerManager.submit()`` deliberately blocks once every GPU has
@@ -20103,6 +22189,9 @@ class RenderDaemon:
                 "phase_order": [phase.phase for phase in phases],
                 "plan_total": requested_plan_count,
                 "plan_window": plan_window,
+                "durable_plan_prefilled": durable_plan_prefilled,
+                "durable_plan_prefill_limit": durable_plan_prefill_limit,
+                "reuse_existing_observations": bool(reuse_existing_observations),
                 "scene_variant_key": scene_variant_key,
                 "render_variant": variant,
                 "submission_group_id": submission_group_id,
@@ -20110,6 +22199,8 @@ class RenderDaemon:
                 "variant_sequence_total": variant_sequence_total,
                 "previous_variant_batch_id": previous_variant_batch_id,
                 "polar_sample_selection_manifest_ref": selection_manifest_ref,
+                "render_plan_ref": render_plan_ref,
+                "motion_profile_id": motion_profile_id,
             })
             # A separately submitted perturbed sweep is a scene-variant
             # boundary too. If the previous base sweep tripped the worker
@@ -20141,6 +22232,7 @@ class RenderDaemon:
             submitted_phase_job_ids: list[str] = []
             phase_order = [phase.phase for phase in phases]
             phase_recycle_events: list[dict[str, Any]] = []
+            stokes_strip_recycle_events: list[dict[str, Any]] = []
             if sweep_start_recovery.get("degraded_reset") or sweep_start_recovery.get("started"):
                 phase_recycle_events.append({
                     "after_phase": None,
@@ -20170,6 +22262,8 @@ class RenderDaemon:
                     "variant_sequence_index": variant_sequence_index,
                     "variant_sequence_total": variant_sequence_total,
                     "previous_variant_batch_id": previous_variant_batch_id,
+                    "render_plan_ref": render_plan_ref,
+                    "motion_profile_id": motion_profile_id,
                     "plan_total": requested_count,
                     "modalities": modalities,
                     "sensor_scope": sensor_scope,
@@ -20179,6 +22273,7 @@ class RenderDaemon:
                     "phase_count": len(phases),
                     "active_phase": active_phase,
                     "phase_recycle_events": phase_recycle_events,
+                    "stokes_strip_recycle_events": stokes_strip_recycle_events,
                     "scheduling_policy": "interleaved_gpu_shards" if _static_gpu_shards_enabled() else _dynamic_gpu_scheduling_policy(),
                     "gpu_indices": _render_gpu_indices_from_env(),
                     "static_gpu_shards": _static_gpu_shards_enabled(),
@@ -20283,17 +22378,32 @@ class RenderDaemon:
                 # their final state now. All non-skipped rows are persisted in
                 # bounded windows immediately before submit below.
                 if phase_skips:
-                    ledger.put_tasks_batch(phase_skips)
+                    if durable_plan_prefilled:
+                        ledger.update_tasks_batch(
+                            [
+                                {"task_key": record["task_key"], "state": "skipped"}
+                                for record in phase_skips
+                            ],
+                            run_id=run_id,
+                            event_type="source_reused",
+                        )
+                    else:
+                        ledger.put_tasks_batch(phase_skips)
 
                 shard_assignments = _interleaved_gpu_shard_assignments(len(phase_requests), gpu_indices)
+                submission_window, recycle_stokes_workers = _stokes_batch_window_policy(
+                    phase_requests,
+                    gpu_indices=gpu_indices,
+                    default_window=plan_window,
+                )
                 submitted_phase_job_ids = []
                 _write_batch("submitting", active_phase=phase.phase)
-                for start in range(0, len(phase_requests), plan_window):
+                for start in range(0, len(phase_requests), submission_window):
                     if _cancelled_by_operator():
                         _write_batch("cancelled", active_phase=None)
                         return
-                    request_window = phase_requests[start:start + plan_window]
-                    shard_window = shard_assignments[start:start + plan_window]
+                    request_window = phase_requests[start:start + submission_window]
+                    shard_window = shard_assignments[start:start + submission_window]
                     # The durable plan may be large, but the in-memory worker
                     # queue must remain small.  A plan window alone only bounds
                     # SQLite writes; without this gate the submission thread can
@@ -20317,6 +22427,7 @@ class RenderDaemon:
                         for sweep_request in request_window
                         if not sweep_request.request.extras.get("source_bundle_ref")
                     ])
+                    window_job_ids: list[str] = []
                     for sweep_request, shard in zip(request_window, shard_window):
                         if sweep_request.request.extras.get("source_bundle_ref"):
                             skipped_existing += 1
@@ -20347,6 +22458,7 @@ class RenderDaemon:
                         # creates the task row and records the running state when it
                         # actually consumes this in-memory job.
                         submitted_phase_job_ids.append(accepted.job_id)
+                        window_job_ids.append(accepted.job_id)
                         jobs.append({
                             "job_id": accepted.job_id,
                             "scene_id": scene_id,
@@ -20369,12 +22481,54 @@ class RenderDaemon:
                             "polar_sample_selection_manifest_ref": selection_manifest_ref,
                             "phase_sensor_ids": list(sweep_request.sensor_ids or []),
                             "modalities_by_sensor": dict(sweep_request.modalities_by_sensor or {}),
+                            "stokes_heading_batch_key": sweep_request.request.extras.get("stokes_heading_batch_key"),
+                            "stokes_heading_batch_size": int(sweep_request.request.extras.get("stokes_heading_batch_size") or 1),
+                            "stokes_heading_batch_view_keys": list(sweep_request.request.extras.get("stokes_heading_batch_view_keys") or []),
                             "status_url": accepted.status_url,
                             **runtime_overrides,
                             **({"target_gpu_index": shard["target_gpu_index"]} if _static_gpu_shards_enabled() else {}),
                         })
                         if len(jobs) % 128 == 0:
                             _write_batch("submitting", active_phase=phase.phase)
+                    if recycle_stokes_workers and window_job_ids:
+                        # A 512px K=4 strip leaves a scene-local OptiX texture
+                        # allocation behind in the persistent worker.  Do not let
+                        # the next pose overlap it while compiling: drain exactly
+                        # one strip per worker, then replace idle workers before
+                        # submitting the next wave.  This preserves the 512px
+                        # profile rather than trading image fidelity for memory.
+                        _write_batch("waiting_stokes_batch_wave", active_phase=phase.phase)
+                        window_counts = self._wait_for_render_jobs_terminal(window_job_ids)
+                        if _cancelled_by_operator():
+                            _write_batch("cancelled", active_phase=None)
+                            return
+                        if int(window_counts.get("failed", 0)) or int(window_counts.get("cancelled", 0)):
+                            raise RuntimeError(
+                                "ambient Stokes K-heading batch wave did not complete: "
+                                f"{window_counts}"
+                            )
+                        self._flush_render_persistence(run_id=run_id)
+                        strip_recycle = self._recycle_render_workers_if_available(
+                            reason="ambient_stokes_heading_batch_wave",
+                            recover_degraded=True,
+                        )
+                        stokes_strip_recycle_events.append({
+                            "phase": phase.phase,
+                            "wave_start": start,
+                            "job_ids": list(window_job_ids),
+                            "job_status_counts": window_counts,
+                            "worker_recycle": strip_recycle,
+                            "at": _utc_now_iso(),
+                        })
+                        if strip_recycle.get("degraded"):
+                            raise RuntimeError(
+                                "worker manager remains degraded after an ambient Stokes batch wave"
+                            )
+                        if strip_recycle.get("skipped_busy"):
+                            raise RuntimeError(
+                                "worker recycle timed out after an ambient Stokes batch wave"
+                            )
+                        _write_batch("recycled_stokes_batch_wave", active_phase=phase.phase)
                 _write_batch("ready", active_phase=phase.phase)
 
             _write_batch("ready", active_phase=None)
@@ -20417,6 +22571,30 @@ class RenderDaemon:
         if not paths:
             self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": "No episodes matched render request."})
             return
+        motion_path = project_dir / "scenes" / scene_id / "motion_graph.json"
+        active_motion = _read_json_mapping(motion_path) if motion_path.is_file() else None
+        support_path = project_dir / "scenes" / scene_id / "navigation_support_graph.json"
+        active_support = _read_json_mapping(support_path) if support_path.is_file() else None
+        active_navigation_profile = str((active_support or active_motion or {}).get("profile_id") or "")
+        if (
+            active_navigation_profile in {"adaptive_route_motion_v3", "adaptive_navigation_support_v4"}
+            and not self._coerce_bool(payload.get("allow_legacy_override"), False)
+        ):
+            legacy_episode_ids = []
+            for path in paths:
+                try:
+                    episode = read_episode(path)
+                except Exception:
+                    continue
+                if episode.navigation_mode == "viewpoint_graph":
+                    legacy_episode_ids.append(episode.episode_id)
+            if legacy_episode_ids:
+                self._send_json(handler, HTTPStatus.CONFLICT, {
+                    "error": "legacy_episode_render_blocked",
+                    "message": f"A validated {active_navigation_profile} plan exists; submit its observation plan instead.",
+                    "episode_ids": legacy_episode_ids,
+                })
+                return
         scene_ids = []
         for path in paths:
             try:
@@ -20804,7 +22982,14 @@ class RenderDaemon:
             })
             return
         self._send_bytes(
-            handler, HTTPStatus.OK, index.read_bytes(), content_type="text/html; charset=utf-8",
+            handler,
+            HTTPStatus.OK,
+            index.read_bytes(),
+            content_type="text/html; charset=utf-8",
+            # The HTML document selects the hashed Svelte assets.  It must be
+            # revalidated on a normal browser refresh, otherwise a user can
+            # keep an old bundle even after a new static build is deployed.
+            extra_headers={"Cache-Control": "no-cache"},
         )
 
     def _handle_post(self, handler: BaseHTTPRequestHandler) -> None:
@@ -22053,12 +24238,35 @@ class RenderDaemon:
                     # Legacy path: drive the render inline. Daemon thread
                     # blocks here for the full render, picking up the next
                     # job only when this one is done.
-                    bundle = self.render_fn(
-                        job.render_request,
-                        repo_root=self.repo_root,
-                        variant=job.variant,
-                        progress_callback=lambda stage, payload=None: self._update_progress(job_id, stage, payload),
-                    )
+                    batch_payloads = job.render_request.extras.get("stokes_heading_batch_request_payloads")
+                    active_batch_payloads = job.render_request.extras.get("active_stokes_heading_batch_request_payloads")
+                    if isinstance(active_batch_payloads, list) and len(active_batch_payloads) >= 2:
+                        from .observation_bridge import render_timestep_bundle_active_stokes_heading_batch
+                        batch_requests = [render_request_from_payload(dict(item)) for item in active_batch_payloads if isinstance(item, Mapping)]
+                        bundles = render_timestep_bundle_active_stokes_heading_batch(
+                            batch_requests,
+                            repo_root=self.repo_root,
+                            variant=job.variant,
+                            progress_callback=lambda stage, payload=None: self._update_progress(job_id, stage, payload),
+                        )
+                        bundle = bundles[0]
+                    elif isinstance(batch_payloads, list) and len(batch_payloads) >= 2:
+                        from .observation_bridge import render_timestep_bundle_stokes_heading_batch
+                        batch_requests = [render_request_from_payload(dict(item)) for item in batch_payloads if isinstance(item, Mapping)]
+                        bundles = render_timestep_bundle_stokes_heading_batch(
+                            batch_requests,
+                            repo_root=self.repo_root,
+                            variant=job.variant,
+                            progress_callback=lambda stage, payload=None: self._update_progress(job_id, stage, payload),
+                        )
+                        bundle = bundles[0]
+                    else:
+                        bundle = self.render_fn(
+                            job.render_request,
+                            repo_root=self.repo_root,
+                            variant=job.variant,
+                            progress_callback=lambda stage, payload=None: self._update_progress(job_id, stage, payload),
+                        )
                     manifest_path = f"{bundle.bundle_root}/manifest.json"
                     self._mark_succeeded(job_id, manifest_path=manifest_path)
                 else:
@@ -22087,18 +24295,31 @@ class RenderDaemon:
         texture_profile_override = job.status.extras.get("texture_profile_override")
         if texture_profile_override is not None:
             env_overrides["ROBOMITUBA_TEXTURE_MAX_RESOLUTION"] = str(texture_profile_override)
+        batch_payloads = job.render_request.extras.get("stokes_heading_batch_request_payloads")
+        active_batch_payloads = job.render_request.extras.get("active_stokes_heading_batch_request_payloads")
+        is_active_stokes_heading_batch = isinstance(active_batch_payloads, list) and len(active_batch_payloads) >= 2
+        is_stokes_heading_batch = isinstance(batch_payloads, list) and len(batch_payloads) >= 2
         spec: dict[str, Any] = {
-            "request_payload": request_payload,
             "repo_root": str(self.repo_root),
             "variant": job.variant,
             "disable_cuda": str(os.environ.get("ROBOMITUBA_FULL_RENDER_DISABLE_CUDA", "0")).strip().lower()
             in {"1", "true", "yes", "on"},
         }
+        if is_active_stokes_heading_batch:
+            spec["request_payloads"] = active_batch_payloads
+        elif is_stokes_heading_batch:
+            spec["request_payloads"] = batch_payloads
+        else:
+            spec["request_payload"] = request_payload
         if env_overrides:
             spec["env_overrides"] = env_overrides
         payload = {
             "job_id": job_id,
-            "kind": "render_job",
+            "kind": (
+                "active_stokes_heading_batch" if is_active_stokes_heading_batch
+                else "stokes_heading_batch" if is_stokes_heading_batch
+                else "render_job"
+            ),
             "spec": spec,
         }
         worker_gpu_index = job.runtime_overrides.get("worker_gpu_index")
@@ -22113,7 +24334,7 @@ class RenderDaemon:
         target_suffix = f" target_gpu={target_gpu}" if target_gpu is not None else ""
         print(
             f"[daemon] render_queue: enqueue (subprocess) job_id={job_id} "
-            f"variant={job.variant}{target_suffix}",
+            f"variant={job.variant}{' active_stokes_batch' if is_active_stokes_heading_batch else ' stokes_batch' if is_stokes_heading_batch else ''}{target_suffix}",
             file=sys.stderr, flush=True,
         )
 
@@ -24589,6 +26810,7 @@ class RenderDaemon:
             "load_scene_total_s": sum(float(record.get("load_scene_s", 0.0) or 0.0) for record in pass_records),
             "render_total_s": sum(float(record.get("render_s", 0.0) or 0.0) for record in pass_records),
             "stokes_npz_write_total_s": sum(float(record.get("stokes_npz_write_s", 0.0) or 0.0) for record in pass_records),
+            "stokes_npz_total_bytes": sum(int(record.get("stokes_npz_bytes", 0) or 0) for record in pass_records),
             "preview_write_total_s": sum(float(record.get("preview_write_s", 0.0) or 0.0) for record in pass_records),
             "polar_postprocess_total_s": sum(float(record.get("polar_postprocess_s", 0.0) or 0.0) for record in pass_records),
             "manifest_publish_s": float(timing_payload.get("manifest_publish_s", timing_payload.get("manifest_s", 0.0)) or 0.0),

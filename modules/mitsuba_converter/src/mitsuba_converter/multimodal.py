@@ -86,10 +86,105 @@ MODALITY_DEFINITIONS = {
 _PARSED_SCENE_CACHE: dict[tuple[str, int, int], ET.Element] = {}
 _SCENE_TEMPLATE_CACHE: dict[tuple[tuple[str, int, int], str, tuple[Any, ...]], ET.Element] = {}
 _RESIDENT_SCENE_CACHE: "OrderedDict[tuple[str, int, int, str], Any]" = OrderedDict()
+# ``ParameterMap`` instances belong to the same loaded Mitsuba scene as the
+# entry above.  Keeping this sidecar lets the resident K-heading hot path avoid
+# a full ``mi.traverse(scene)`` on every strip.
+_RESIDENT_BATCH_BINDINGS: dict[tuple[str, int, int, str], tuple[Any, tuple[str, ...]]] = {}
 _STAGED_SCENE_SIGNATURE_CACHE: dict[str, tuple[Any, ...]] = {}
 _SCENE_CACHE_LOCK = threading.Lock()
 _RESIDENT_SCENE_CACHE_LIMIT: int = int(os.environ.get("ROBOMITUBA_SCENE_CACHE_LIMIT", "32"))
+_POLAR_RESIDENT_SCENE_CACHE_LIMIT: int = int(
+    os.environ.get("ROBOMITUBA_POLAR_RESIDENT_SCENE_CACHE_LIMIT", "1")
+)
 _last_source_scene_dir: str = ""
+
+
+def _resident_stokes_heading_batches_enabled() -> bool:
+    """Whether passive K=2..4 Stokes strips retain one scene per worker.
+
+    A resident batch scene has fixed sensor slots and only updates their
+    transforms between strips.  It avoids the otherwise dominant repeated
+    ``mi.load_file`` cost while preserving the max512 memory envelope.
+    """
+    return str(os.environ.get("ROBOMITUBA_RESIDENT_STOKES_HEADING_BATCH", "1")).strip().lower() not in {
+        "0", "false", "no", "off",
+    }
+
+# ``stokes_data.npz`` is a learning/delivery artifact, not a rendering
+# interchange file.  Keep its contract deliberately small: the four RGB
+# Stokes vectors are the complete physical signal, while RGB previews and all
+# scalar polar products are deterministic derivations.  The individual arrays
+# are also the least-surprising representation for polanalyser users (who can
+# stack them with ``np.stack([s0, s1, s2, s3], axis=-1)``).
+MINIMAL_STOKES_SCHEMA = "minimal_rgb_stokes_f16_v2"
+MINIMAL_STOKES_KEYS = ("s0", "s1", "s2", "s3")
+
+
+def load_stokes_rgb_channels(stokes_npz: str | Path) -> dict[str, np.ndarray]:
+    """Load either legacy or minimal Stokes NPZ data as float32 arrays.
+
+    The returned mapping always contains ``rgb``, ``s0`` ... ``s3``. Minimal
+    v2 products intentionally omit a redundant raw RGB raster; S0 is the
+    radiometric RGB representation used for regeneration in that case.  A
+    historical S0/S1-only diagnostic NPZ is normalized by zero-filling S2/S3
+    so old gallery entries remain browseable without mutating their bundles.
+    """
+    source = Path(stokes_npz)
+    with np.load(source, allow_pickle=False) as data:
+        # A short-lived legacy gallery format wrote only S0/S1.  It is not a
+        # complete learning artifact, but it is still safe to browse: retain
+        # its measured S0/S1 and make the absent linear components explicitly
+        # zero.  Missing S0 or S1 remains a corrupt Stokes artifact because
+        # RGB previews, DoLP and AoLP then have no reliable baseline.
+        if "s0" not in data.files or "s1" not in data.files:
+            missing = [key for key in ("s0", "s1") if key not in data.files]
+            raise ValueError(f"{source} lacks required Stokes arrays: {', '.join(missing)}")
+        channels = {
+            "s0": np.asarray(data["s0"], dtype=np.float32),
+            "s1": np.asarray(data["s1"], dtype=np.float32),
+        }
+        for key in ("s2", "s3"):
+            channels[key] = np.asarray(data[key], dtype=np.float32) if key in data.files else np.zeros_like(channels["s0"])
+        rgb = np.asarray(data["rgb"], dtype=np.float32) if "rgb" in data.files else channels["s0"]
+    shape = channels["s0"].shape
+    if len(shape) != 3 or shape[-1] != 3 or any(value.shape != shape for value in channels.values()):
+        raise ValueError(f"{source} has invalid RGB Stokes shapes")
+    return {"rgb": rgb, **channels}
+
+
+def stokes_rgb_tensor_for_polanalyser(stokes_npz: str | Path) -> np.ndarray:
+    """Return the Polanalyser-friendly ``(H, W, RGB, S0..S3)`` tensor."""
+    arrays = load_stokes_rgb_channels(stokes_npz)
+    return np.stack([arrays[key] for key in MINIMAL_STOKES_KEYS], axis=-1)
+
+
+def _save_minimal_stokes_npz(path: Path, *, s0: np.ndarray, s1: np.ndarray, s2: np.ndarray, s3: np.ndarray) -> tuple[float, int]:
+    """Atomically publish the compact F16 Stokes payload.
+
+    Conversion occurs after rendering has completed, so no CUDA work is held
+    while Deflate writes to a potentially slow NFS mount. A temporary sibling
+    also prevents a reader from ever observing a partial NPZ.
+    """
+    started = time.perf_counter()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            np.savez_compressed(
+                handle,
+                s0=np.asarray(s0, dtype=np.float16),
+                s1=np.asarray(s1, dtype=np.float16),
+                s2=np.asarray(s2, dtype=np.float16),
+                s3=np.asarray(s3, dtype=np.float16),
+            )
+        os.replace(temporary_name, path)
+    except Exception:
+        try:
+            os.unlink(temporary_name)
+        except FileNotFoundError:
+            pass
+        raise
+    return time.perf_counter() - started, path.stat().st_size
 
 # RGB radiance tonemapping (extended Reinhard). Render-time uses these fixed
 # defaults so every frame in a sweep shares the same exposure (consistent for
@@ -2356,10 +2451,12 @@ def _append_camera_assist_light(
     assist_light: AssistLightSpec,
     *,
     polarized: bool,
+    id_suffix: str = "",
 ) -> None:
     default_radiance = 18.0 if polarized else 14.0
     radiance = float(assist_light.extras.get("radiance", default_radiance))
-    light_shape = ET.SubElement(root, "shape", {"type": "rectangle", "id": "camera_assist_light"})
+    suffix = str(id_suffix or "")
+    light_shape = ET.SubElement(root, "shape", {"type": "rectangle", "id": f"camera_assist_light{suffix}"})
     transform = ET.SubElement(light_shape, "transform", {"name": "to_world"})
     ET.SubElement(
         transform,
@@ -2381,7 +2478,7 @@ def _append_camera_assist_light(
     if not polarized:
         return
 
-    polar_shape = ET.SubElement(root, "shape", {"type": "rectangle", "id": "camera_assist_polarizer"})
+    polar_shape = ET.SubElement(root, "shape", {"type": "rectangle", "id": f"camera_assist_polarizer{suffix}"})
     polar_transform = ET.SubElement(polar_shape, "transform", {"name": "to_world"})
     ET.SubElement(
         polar_transform,
@@ -2672,7 +2769,14 @@ def _stage_stokes_scene(
     max_measured_bsdfs: int = 3,
     active_lights: Sequence["ActiveLightSpec"] = (),
     base_pose: Any = None,
+    stokes_reference_axis: Sequence[float] | None = None,
 ) -> Path:
+    reference_axis: tuple[float, float, float] | None = None
+    if stokes_reference_axis is not None:
+        axis = np.asarray(stokes_reference_axis, dtype=np.float64).reshape(-1)
+        if axis.shape != (3,) or not np.all(np.isfinite(axis)) or float(np.linalg.norm(axis)) == 0.0:
+            raise ValueError("stokes_reference_axis must be a finite, non-zero 3-vector")
+        reference_axis = tuple(float(value) for value in axis)
     stage_signature = (
         "stokes",
         _scene_cache_key(scene_path),
@@ -2685,6 +2789,7 @@ def _stage_stokes_scene(
             int(max_measured_bsdfs),
             _MEASURED_SCOPE_STAGE_VERSION,
             _material_policy_signature(scene_path),
+            reference_axis,
         ),
         _scene_override_signature(scene_override),
         _assist_light_signature(assist_light),
@@ -2702,6 +2807,17 @@ def _stage_stokes_scene(
             integrator.remove(child)
         if samples_per_pass is not None and samples_per_pass > 0:
             ET.SubElement(integrator, "integer", {"name": "samples_per_pass", "value": str(samples_per_pass)})
+        if reference_axis is not None:
+            ET.SubElement(
+                integrator,
+                "vector",
+                {
+                    "name": "reference_axis",
+                    "x": str(reference_axis[0]),
+                    "y": str(reference_axis[1]),
+                    "z": str(reference_axis[2]),
+                },
+            )
         nested = ET.SubElement(integrator, "integrator", {"type": nested_integrator_type})
         if nested_max_depth is not None and nested_max_depth > 0:
             ET.SubElement(nested, "integer", {"name": "max_depth", "value": str(nested_max_depth)})
@@ -2723,6 +2839,7 @@ def _stage_stokes_scene(
             int(max_measured_bsdfs),
             _MEASURED_SCOPE_STAGE_VERSION,
             _material_policy_signature(scene_path),
+            reference_axis,
         ),
         builder=_build_template,
     )
@@ -2750,12 +2867,21 @@ def _stage_base_stokes_scene(
     *,
     samples_per_pass: int | None,
     scene_override: SceneOverrideSpec | None = None,
+    assist_light: AssistLightSpec | None = None,
+    camera_fov_deg: float | None = None,
+    camera_width: int | None = None,
+    camera_height: int | None = None,
     nested_integrator_type: str = "direct",
     nested_max_depth: int | None = None,
     measured_scope: str = "analytic_only",
     max_measured_bsdfs: int = 3,
+    stokes_reference_axis: Sequence[float] | None = None,
 ) -> Path:
     """Stage a camera-free Stokes scene shared across polar viewpoints."""
+    reference_axis: tuple[float, float, float] | None = None
+    if stokes_reference_axis is not None:
+        from .polar_heading_batch import _normalized_reference_axis
+        reference_axis = _normalized_reference_axis(stokes_reference_axis)
     sig = (
         "base_stokes",
         _scene_cache_key(scene_path),
@@ -2767,8 +2893,19 @@ def _stage_base_stokes_scene(
             int(max_measured_bsdfs),
             _MEASURED_SCOPE_STAGE_VERSION,
             _material_policy_signature(scene_path),
+            reference_axis,
         ),
         _scene_override_signature(scene_override),
+        _assist_light_signature(assist_light),
+        # A camera-aligned active polar scene keeps the source sensor and
+        # emitter transforms live. They are updated through ``mi.traverse``
+        # for every heading, so the resident scene is shared without baking a
+        # pose-specific XML file per view.
+        (
+            round(float(camera_fov_deg), 6) if camera_fov_deg is not None else None,
+            int(camera_width or 0),
+            int(camera_height or 0),
+        ),
         _texture_cache_signature(),
     )
     out_scene = _shared_base_scene_path(scene_path, sig)
@@ -2785,6 +2922,17 @@ def _stage_base_stokes_scene(
             integrator.remove(child)
         if samples_per_pass is not None and samples_per_pass > 0:
             ET.SubElement(integrator, "integer", {"name": "samples_per_pass", "value": str(samples_per_pass)})
+        if reference_axis is not None:
+            ET.SubElement(
+                integrator,
+                "vector",
+                {
+                    "name": "reference_axis",
+                    "x": str(reference_axis[0]),
+                    "y": str(reference_axis[1]),
+                    "z": str(reference_axis[2]),
+                },
+            )
         nested = ET.SubElement(integrator, "integrator", {"type": nested_integrator_type})
         if nested_max_depth is not None and nested_max_depth > 0:
             ET.SubElement(nested, "integer", {"name": "max_depth", "value": str(nested_max_depth)})
@@ -2806,10 +2954,28 @@ def _stage_base_stokes_scene(
             int(max_measured_bsdfs),
             _MEASURED_SCOPE_STAGE_VERSION,
             _material_policy_signature(scene_path),
+            reference_axis,
         ),
         builder=_build_template,
     )
     _apply_scene_override(root, scene_override, mode="polar")
+    if assist_light is not None:
+        if camera_fov_deg is None or camera_width is None or camera_height is None:
+            raise ValueError("camera-aligned base Stokes staging requires fov and resolution")
+        _update_sensor(
+            root,
+            camera_to_world=np.eye(4, dtype=np.float32),
+            fov_deg=float(camera_fov_deg),
+            spp=1,
+            width=int(camera_width),
+            height=int(camera_height),
+        )
+        _append_camera_assist_light(
+            root,
+            np.eye(4, dtype=np.float32),
+            assist_light,
+            polarized=assist_light.polarized,
+        )
     out_scene.parent.mkdir(parents=True, exist_ok=True)
     tmp = out_scene.with_name(f"{out_scene.stem}.tmp.{os.getpid()}.{threading.get_ident()}.xml")
     _write_scene(root, tmp)
@@ -2822,6 +2988,12 @@ def _stage_base_stokes_scene(
             pass
         if not out_scene.exists():
             raise
+    # ``_write_scene`` initially targets a temporary filename.  Material-policy
+    # injection can leave a texture introduced after that first cap pass (for
+    # example a TextureCan structural map) at its source resolution.  Run the
+    # cap against the published path before enforcing the audit so the worker
+    # never rejects a scene solely because it has a late-added bitmap.
+    _write_scene(root, out_scene)
     _write_texture_audit(root, out_scene=out_scene, fail_on_gt_profile=True)
     return out_scene
 
@@ -3019,6 +3191,61 @@ class _ViewpointSensorSpec:
 def _shared_base_scene_path(source_scene: Path, base_sig: tuple) -> Path:
     sig_hash = hashlib.sha1(str(base_sig).encode()).hexdigest()[:16]
     return source_scene.parent / ".staged_mitsuba" / "base" / f"{sig_hash}.xml"
+
+
+def _resident_stokes_heading_batch_scene_path(
+    base_scene: Path,
+    *,
+    batch_size: int,
+    width: int,
+    height: int,
+    fov_deg: float,
+    stokes_reference_axis: Sequence[float],
+) -> Path:
+    """Return a stable K-slot batch XML path suitable for resident caching."""
+    signature = (
+        "resident_stokes_heading_batch_v2",
+        _scene_cache_key(base_scene),
+        int(batch_size),
+        int(width),
+        int(height),
+        round(float(fov_deg), 6),
+        tuple(round(float(value), 9) for value in stokes_reference_axis),
+    )
+    digest = hashlib.sha1(repr(signature).encode("utf-8")).hexdigest()[:16]
+    return base_scene.parent.parent / "stokes_heading_batches" / f"{digest}.xml"
+
+
+def _stage_resident_stokes_heading_batch_scene(
+    base_scene: Path,
+    *,
+    batch_size: int,
+    width: int,
+    height: int,
+    fov_deg: float,
+    stokes_reference_axis: Sequence[float],
+) -> Path:
+    """Create the immutable K-slot scene whose sensors are updated at runtime."""
+    from .polar_heading_batch import stage_resident_ambient_stokes_heading_batch
+
+    output = _resident_stokes_heading_batch_scene_path(
+        base_scene,
+        batch_size=batch_size,
+        width=width,
+        height=height,
+        fov_deg=fov_deg,
+        stokes_reference_axis=stokes_reference_axis,
+    )
+    stage_resident_ambient_stokes_heading_batch(
+        base_scene,
+        output,
+        batch_size=batch_size,
+        width=width,
+        height=height,
+        fov_deg=fov_deg,
+        stokes_reference_axis=stokes_reference_axis,
+    )
+    return output
 
 
 def _stage_base_path_scene(
@@ -3282,18 +3509,49 @@ def _resident_scene_cache_has(scene_path: Path, *, variant: str) -> bool:
         return cache_key in _RESIDENT_SCENE_CACHE
 
 
-def _load_resident_scene(scene_path: Path, *, variant: str) -> tuple[Any, float, bool]:
+def _load_resident_scene(
+    scene_path: Path,
+    *,
+    variant: str,
+    cache_limit: int | None = None,
+) -> tuple[Any, float, bool]:
     mi = _import_mitsuba()
     from .mitsuba_runtime import ensure_mitsuba_variant
 
     variant = ensure_mitsuba_variant(variant)
     cache_key = _resident_scene_cache_key(scene_path, variant=variant)
 
+    effective_cache_limit = max(1, int(cache_limit or _RESIDENT_SCENE_CACHE_LIMIT))
+    evicted_scene: Any | None = None
+    evicted_binding: Any | None = None
     with _SCENE_CACHE_LOCK:
         cached_scene = _RESIDENT_SCENE_CACHE.get(cache_key)
         if cached_scene is not None:
             _RESIDENT_SCENE_CACHE.move_to_end(cache_key)
             return cached_scene, 0.0, True
+        # A K=2 tail and the normal K=4 strip use different fixed-slot XMLs.
+        # On a 24 GiB card, loading the new scene *before* evicting the old
+        # one transiently holds two complete OptiX texture scenes and crashes
+        # in cuda_tex.cpp. Reserve the cache slot first, drop its ParamMap
+        # sidecar too, and return allocator-only scratch before mi.load_file.
+        while len(_RESIDENT_SCENE_CACHE) >= effective_cache_limit:
+            evicted_key, evicted_scene = _RESIDENT_SCENE_CACHE.popitem(last=False)
+            evicted_binding = _RESIDENT_BATCH_BINDINGS.pop(evicted_key, None)
+
+    if evicted_scene is not None or evicted_binding is not None:
+        try:
+            import gc
+            import drjit as dr  # type: ignore
+
+            # Drop both Python references before asking Dr.Jit to release its
+            # now-unreferenced device allocations.
+            evicted_scene = None
+            evicted_binding = None
+            gc.collect()
+            dr.sync_thread()
+            dr.flush_malloc_cache()
+        except Exception:
+            pass
 
     load_start = time.perf_counter()
     scene = mi.load_file(str(scene_path))
@@ -3302,8 +3560,6 @@ def _load_resident_scene(scene_path: Path, *, variant: str) -> tuple[Any, float,
     with _SCENE_CACHE_LOCK:
         _RESIDENT_SCENE_CACHE[cache_key] = scene
         _RESIDENT_SCENE_CACHE.move_to_end(cache_key)
-        while len(_RESIDENT_SCENE_CACHE) > _RESIDENT_SCENE_CACHE_LIMIT:
-            _RESIDENT_SCENE_CACHE.popitem(last=False)
     return scene, load_s, False
 
 
@@ -3312,6 +3568,7 @@ def _clear_scene_caches() -> None:
         _PARSED_SCENE_CACHE.clear()
         _SCENE_TEMPLATE_CACHE.clear()
         _RESIDENT_SCENE_CACHE.clear()
+        _RESIDENT_BATCH_BINDINGS.clear()
         _STAGED_SCENE_SIGNATURE_CACHE.clear()
 
 
@@ -3322,11 +3579,17 @@ def _render_scene(
     spp: int,
     on_loaded: Callable[[], None] | None = None,
     viewpoint: "_ViewpointSensorSpec | None" = None,
+    scene_viewpoint: "_ViewpointSensorSpec | None" = None,
+    dynamic_assist_light: AssistLightSpec | None = None,
     seed: int | None = None,
+    scene_parameter_updater: Callable[[Any], None] | None = None,
+    resident_cache_limit: int | None = None,
 ) -> tuple[np.ndarray, dict[str, float]]:
     mi = _import_mitsuba()
     start = time.perf_counter()
-    scene, load_s, cache_hit = _load_resident_scene(scene_path, variant=variant)
+    scene, load_s, cache_hit = _load_resident_scene(
+        scene_path, variant=variant, cache_limit=resident_cache_limit
+    )
     # variant is now active; safe to call mi.ScalarTransform4f etc.
 
     sensor = None
@@ -3349,6 +3612,45 @@ def _render_scene(
                 "sample_count": 1,
             },
         })
+    if scene_viewpoint is not None:
+        # Keep the scene's own sensor active instead of constructing a
+        # temporary sensor. This is essential for the legacy OptiX-7 Stokes
+        # plugin, whose reference frame is the scene sensor. It also lets a
+        # camera-aligned active emitter move with the same pose while retaining
+        # one resident scene across all headings.
+        params = mi.traverse(scene)
+
+        def _assign_transform(key: str, transform: Any) -> None:
+            """Assign an active-variant transform without relying on pybind casts."""
+            expected_type = type(params[key])
+            if not isinstance(transform, expected_type):
+                transform = expected_type(transform)
+            params[key] = transform
+
+        origin, target, up = camera_to_world_to_lookat(scene_viewpoint.camera_to_world)
+        _assign_transform(
+            "sensor.to_world",
+            mi.ScalarTransform4f.look_at(
+                origin=list(origin), target=list(target), up=list(up)
+            ),
+        )
+        if dynamic_assist_light is not None:
+            light_matrix = _camera_aligned_rectangle_matrix(
+                scene_viewpoint.camera_to_world,
+                distance_m=dynamic_assist_light.distance_m,
+                size_world=dynamic_assist_light.size_world,
+            )
+            _assign_transform("camera_assist_light.to_world", mi.ScalarTransform4f(light_matrix))
+            polarizer_matrix = _camera_aligned_rectangle_matrix(
+                scene_viewpoint.camera_to_world,
+                distance_m=dynamic_assist_light.distance_m + 0.01,
+                size_world=dynamic_assist_light.size_world,
+                roll_deg=dynamic_assist_light.polarizer_angle_deg,
+            )
+            _assign_transform("camera_assist_polarizer.to_world", mi.ScalarTransform4f(polarizer_matrix))
+        params.update()
+    if scene_parameter_updater is not None:
+        scene_parameter_updater(scene)
     sensor_build_s = time.perf_counter() - sensor_build_start
 
     if on_loaded is not None:
@@ -3360,6 +3662,33 @@ def _render_scene(
             sampler_spp = int(sensor.sampler().sample_count())
         except Exception:
             sampler_spp = None
+
+    # A resident K-heading Stokes scene deliberately retains its full OptiX
+    # scene (geometry, textures, and acceleration structures) in VRAM.  The
+    # frame-local Dr.Jit allocator cache must *not* accumulate between strips:
+    # on a 24 GiB card the cached scratch blocks can otherwise make the next
+    # ``cuda_tex`` allocation fail even though the retained scene is healthy.
+    #
+    # Do this before the next render as well as after the previous image has
+    # been copied.  A worker can have survived an earlier job with cached
+    # allocations before it receives its first resident strip.
+    resident_allocator_prepare_s = 0.0
+    if resident_cache_limit is not None:
+        prepare_start = time.perf_counter()
+        try:
+            import gc
+            import drjit as dr  # type: ignore
+
+            gc.collect()
+            # Pending kernels can still own temporary allocations.  Synchronize
+            # before flushing so the allocator can actually return those blocks.
+            dr.sync_thread()
+            dr.flush_malloc_cache()
+        except Exception:
+            # This is memory hygiene only; minimal test doubles and Dr.Jit
+            # builds without allocator control remain functionally correct.
+            pass
+        resident_allocator_prepare_s = time.perf_counter() - prepare_start
 
     render_start = time.perf_counter()
     render_kwargs: dict[str, Any] = {"spp": spp}
@@ -3384,6 +3713,31 @@ def _render_scene(
         # for minimal/non-Dr.Jit test environments.
         pass
     image = np.array(image_tensor, dtype=np.float32)
+    # A resident K-heading Stokes scene deliberately retains its full OptiX
+    # scene (geometry, textures, and acceleration structures) in VRAM.  The
+    # rendered film tensor is different: once copied into ``image`` it is
+    # dead, but Dr.Jit's allocator may otherwise retain its temporary CUDA
+    # blocks between strips.  On a 24 GiB card this can turn a healthy ~22 GiB
+    # resident scene into a later ``cuda_tex.cpp`` OOM.  Keep the scene cache
+    # intact while releasing only unused allocator-cache blocks on the
+    # explicit resident path.
+    resident_allocator_flush_s = 0.0
+    if resident_cache_limit is not None:
+        flush_start = time.perf_counter()
+        try:
+            import gc
+            import drjit as dr  # type: ignore
+
+            dr.sync_thread()
+            del image_tensor
+            gc.collect()
+            dr.flush_malloc_cache()
+        except Exception:
+            # This is a memory-hygiene optimization.  Rendering remains
+            # correct on minimal test doubles and on Dr.Jit builds that do
+            # not expose allocator-cache control.
+            pass
+        resident_allocator_flush_s = time.perf_counter() - flush_start
     render_s = time.perf_counter() - render_start
     total_s = time.perf_counter() - start
     return image, {
@@ -3394,8 +3748,99 @@ def _render_scene(
         "requested_spp": int(spp),
         "sensor_sampler_spp": sampler_spp,
         "render_s": render_s,
+        "resident_allocator_prepare_s": resident_allocator_prepare_s,
+        "resident_allocator_flush_s": resident_allocator_flush_s,
         "total_s": total_s,
     }
+
+
+def _render_resident_stokes_heading_batch_scene(
+    scene_path: Path,
+    *,
+    camera_to_worlds: Sequence[np.ndarray],
+    variant: str,
+    spp: int,
+) -> tuple[np.ndarray, dict[str, float]]:
+    """Render a stable K-slot Stokes scene after updating its sensor poses.
+
+    The batch XML's path and contents stay fixed.  Consequently
+    :func:`_load_resident_scene` returns the same Mitsuba scene object after
+    its initial load, retaining geometry, textures and OptiX acceleration data
+    in the worker's VRAM.
+    """
+    from .polar_heading_batch import normalize_camera_to_world
+
+    # RenderRequest persists camera matrices in the historical column-major
+    # flat layout. Resident slot updates consume ordinary row-major matrices;
+    # normalize here as a second guard even when callers have already done it.
+    poses = [normalize_camera_to_world(item).astype(np.float32) for item in camera_to_worlds]
+    if len(poses) < 2 or len(poses) > 4:
+        raise ValueError("resident Stokes heading batches require 2 to 4 poses")
+
+    slot_binding_cache_hit = False
+
+    def _update_sensor_slots(scene: Any) -> None:
+        nonlocal slot_binding_cache_hit
+        mi = _import_mitsuba()
+        cache_key = _resident_scene_cache_key(scene_path, variant=variant)
+        with _SCENE_CACHE_LOCK:
+            binding = _RESIDENT_BATCH_BINDINGS.get(cache_key)
+        if binding is None:
+            params = mi.traverse(scene)
+            parameter_names = [str(key) for key in params.keys()]
+            keys: list[str] = []
+            missing: list[str] = []
+            for index in range(len(poses)):
+                suffix = f".slot_{index}.to_world"
+                matches = [key for key in parameter_names if key.endswith(suffix)]
+                if len(matches) == 1:
+                    keys.append(matches[0])
+                else:
+                    missing.append(suffix)
+            if missing:
+                available = [
+                    key for key in parameter_names
+                    if "sensor" in key.lower() or "slot_" in key.lower()
+                ][:32]
+                raise RuntimeError(
+                    "resident Stokes batch scene does not expose the expected sensor transforms: "
+                    f"missing={missing}; available={available}"
+                )
+            binding = (params, tuple(keys))
+            with _SCENE_CACHE_LOCK:
+                _RESIDENT_BATCH_BINDINGS[cache_key] = binding
+        else:
+            slot_binding_cache_hit = True
+        params, keys = binding
+        for key, pose in zip(keys, poses):
+            origin, target, up = camera_to_world_to_lookat(pose)
+            transform = mi.ScalarTransform4f.look_at(
+                origin=list(origin), target=list(target), up=list(up),
+            )
+            # Batch child transforms are exposed through the parent sensor and
+            # Mitsuba reports them as the active variant's ``Transform4f``.
+            # A scalar look-at transform is usually implicitly castable, but
+            # the OptiX7 CUDA-AD binding rejects that conversion for some
+            # XML-loaded batch scenes. Construct the exact parameter class so
+            # the resident hot path is independent of that pybind overload.
+            expected_transform_type = type(params[key])
+            if not isinstance(transform, expected_transform_type):
+                transform = expected_transform_type(transform)
+            params[key] = transform
+        params.update()
+
+    image, timing = _render_scene(
+        scene_path,
+        variant=variant,
+        spp=spp,
+        scene_parameter_updater=_update_sensor_slots,
+        # A polar worker has scene affinity: retaining a second full OptiX
+        # scene buys nothing but makes its VRAM ceiling unpredictable.
+        resident_cache_limit=_POLAR_RESIDENT_SCENE_CACHE_LIMIT,
+    )
+    timing["resident_slot_binding_cache_hit"] = slot_binding_cache_hit
+    timing["resident_scene_cache_limit"] = _POLAR_RESIDENT_SCENE_CACHE_LIMIT
+    return image, timing
 
 
 def _polar_adaptive_noise_score(reference: np.ndarray, estimate: np.ndarray) -> float:
@@ -4136,25 +4581,9 @@ def save_polarization_products(
     finite_ratio = float(np.mean(finite_mask))
 
     stokes_npz = out_dir / "stokes_data.npz"
-    npz_started = time.perf_counter()
-    np.savez_compressed(
-        stokes_npz,
-        rgb=rgb,
-        s0=s0,
-        s1=s1,
-        s2=s2,
-        s3=s3,
-        s0_l=s0_l,
-        s1_l=s1_l,
-        s2_l=s2_l,
-        s3_l=s3_l,
-        s1_over_s0=s1_n,
-        s2_over_s0=s2_n,
-        dop=dop,
-        aolp=aolp,
-        mask=mask,
+    stokes_npz_write_s, stokes_npz_bytes = _save_minimal_stokes_npz(
+        stokes_npz, s0=s0, s1=s1, s2=s2, s3=s3
     )
-    stokes_npz_write_s = time.perf_counter() - npz_started
 
     def bwr_map(field: np.ndarray, scale: float) -> np.ndarray:
         safe_field = np.where(np.isfinite(field), field, 0.0)
@@ -4227,6 +4656,16 @@ def save_polarization_products(
     s1_scale = max(float(np.quantile(np.abs(s1_l[mask]), 0.99)) if np.any(mask) else 1.0, 1e-6)
     s2_scale = max(float(np.quantile(np.abs(s2_l[mask]), 0.99)) if np.any(mask) else 1.0, 1e-6)
 
+    # Gallery inspection needs the actual RGB-channel Stokes fields, rather
+    # than the older luminance-composited signed preview.  These are generated
+    # on demand from the immutable NPZ under ``core_preview_v1`` and therefore
+    # do not multiply dataset storage.  Each BWR image declares its own p99
+    # scale in the embedded colorbar; it is a raw Sᵢ channel diagnostic, not
+    # the normalized Sᵢ/S0 product below.
+    channel_stokes_bwr_keys: set[str] = set()
+    component_channels = (("s1", s1), ("s2", s2), ("s3", s3))
+    rgb_channels = (("r", 0), ("g", 1), ("b", 2))
+
     outputs: dict[str, str] = {"stokes_npz": str(stokes_npz)}
     # Keep an immediately browsable RGB representation for every Stokes
     # component.  The immutable gallery also synthesizes these from legacy
@@ -4269,6 +4708,26 @@ def save_polarization_products(
         s2_rgb = _despeckle_dark_preview_pixels(bwr_map(s2_l, s2_scale), iterations=3)
         append_colorbar(s2_rgb, bar, ticks, "S2", s2_path, title_mode="signed")
         outputs["s2"] = str(s2_path)
+    for component_name, component in component_channels:
+        for channel_name, channel_index in rgb_channels:
+            key = f"stokes_{component_name}_{channel_name}_bwr"
+            channel_stokes_bwr_keys.add(key)
+            if visualization_policy != "full_v1" or key not in requested_modalities:
+                continue
+            field = component[:, :, channel_index]
+            finite = np.isfinite(field) & mask
+            scale = max(
+                float(np.quantile(np.abs(field[finite]), 0.99)) if np.any(finite) else 1.0,
+                1e-6,
+            )
+            bar, ticks = bwr_bar(scale, field.shape[0])
+            path = out_dir / f"{component_name}_{channel_name}_bwr_colorbar.png"
+            preview = _despeckle_dark_preview_pixels(bwr_map(field, scale), iterations=3)
+            append_colorbar(
+                preview, bar, ticks, f"{component_name.upper()} · {channel_name.upper()}", path,
+                title_mode="signed",
+            )
+            outputs[key] = str(path)
     if visualization_policy == "full_v1" and "dop" in requested_modalities:
         bar, ticks = dop_bar(dop.shape[0])
         dop_path = out_dir / "dop_red_black_colorbar.png"
@@ -4299,6 +4758,7 @@ def save_polarization_products(
     preview_write_s = time.perf_counter() - preview_started
     derived_on_demand = sorted(
         {"rgb_preview", "s0_rgb_preview", "s1_rgb_preview", "s2_rgb_preview", "s3_rgb_preview"}
+        | channel_stokes_bwr_keys
         | ({"s1", "s2", "dop", "aolp", "s1_over_s0", "s2_over_s0"}
            if visualization_policy in {"core_preview_v1", "raw_stokes_aolp_v1"} else set())
         - set(outputs)
@@ -4325,10 +4785,22 @@ def save_polarization_products(
         },
         "dop_range": [0.0, 1.0],
         "aolp_range_degrees": [0.0, 180.0],
+        "channel_stokes_bwr_products": sorted(channel_stokes_bwr_keys),
         "visualization_policy": visualization_policy,
         "stokes_preview_recipe": "stokes_preview_v1",
+        "stokes_schema": MINIMAL_STOKES_SCHEMA,
+        "stokes_dtype": "float16",
+        "stokes_shape": list(s0.shape),
+        "stokes_axis_order": ["height", "width", "rgb"],
+        "stokes_component_order": ["S0", "S1", "S2", "S3"],
+        "polanalyser_tensor_axis_order": ["height", "width", "rgb", "stokes"],
+        "rgb_source": "s0",
+        "derived_precision": "float32",
+        "aolp_derivation": "0.5*atan2(luminance(S2), luminance(S1)) mod pi",
+        "dolp_derivation": "sqrt(luminance(S1)^2+luminance(S2)^2)/max(luminance(S0),1e-8)",
         "derived_on_demand": derived_on_demand,
         "stokes_npz_write_s": stokes_npz_write_s,
+        "stokes_npz_bytes": stokes_npz_bytes,
         "preview_write_s": preview_write_s,
         "polar_postprocess_s": time.perf_counter() - write_started,
         "outputs": outputs,
@@ -4367,12 +4839,8 @@ def materialize_stokes_visualizations(
     source = Path(stokes_npz)
     target = Path(out_dir)
     target.mkdir(parents=True, exist_ok=True)
-    with np.load(source, allow_pickle=False) as data:
-        required = ("rgb", "s0", "s1", "s2", "s3")
-        missing = [key for key in required if key not in data.files]
-        if missing:
-            raise ValueError(f"{source} lacks Stokes arrays: {', '.join(missing)}")
-        image = np.concatenate([np.asarray(data[key], dtype=np.float32) for key in required], axis=2)
+    arrays = load_stokes_rgb_channels(source)
+    image = np.concatenate([arrays[key] for key in ("rgb", *MINIMAL_STOKES_KEYS)], axis=2)
     summary, _arrays = save_polarization_products(
         image,
         target,
@@ -5205,6 +5673,7 @@ def render_modalities(
     if _last_source_scene_dir and _last_source_scene_dir != current_dir:
         with _SCENE_CACHE_LOCK:
             _RESIDENT_SCENE_CACHE.clear()
+            _RESIDENT_BATCH_BINDINGS.clear()
     _last_source_scene_dir = current_dir
 
     results: dict[str, ModalityResult] = {}
@@ -5272,6 +5741,8 @@ def render_modalities(
         spp: int,
         variant_override: str | None = None,
         viewpoint: "_ViewpointSensorSpec | None" = None,
+        scene_viewpoint: "_ViewpointSensorSpec | None" = None,
+        dynamic_assist_light: AssistLightSpec | None = None,
         seed: int | None = None,
     ) -> tuple[np.ndarray, dict[str, float]]:
         _pass_index[0] += 1
@@ -5346,7 +5817,17 @@ def render_modalities(
         try:
             image, timing = _render_scene(
                 scene_path, variant=v, spp=spp, on_loaded=_on_loaded,
-                viewpoint=viewpoint, seed=seed,
+                viewpoint=viewpoint, scene_viewpoint=scene_viewpoint,
+                dynamic_assist_light=dynamic_assist_light, seed=seed,
+                # K=1 camera-aligned polar views keep one full scene resident
+                # just like K=4 passive strips.  Do not let unrelated generic
+                # scenes accumulate in this worker, and release only unused
+                # Dr.Jit temporary allocations after each view.
+                resident_cache_limit=(
+                    _POLAR_RESIDENT_SCENE_CACHE_LIMIT
+                    if scene_viewpoint is not None and dynamic_assist_light is not None
+                    else None
+                ),
             )
         except Exception as exc:
             if not v.startswith("cuda_"):
@@ -5366,7 +5847,8 @@ def render_modalities(
             })
             image, timing = _render_scene(
                 scene_path, variant=fallback, spp=spp, on_loaded=_on_loaded,
-                viewpoint=viewpoint, seed=seed,
+                viewpoint=viewpoint, scene_viewpoint=scene_viewpoint,
+                dynamic_assist_light=dynamic_assist_light, seed=seed,
             )
         _cb("saving_output", {
             "pass": pass_name,
@@ -5380,6 +5862,8 @@ def render_modalities(
         *,
         variant_override: str | None,
         viewpoint: "_ViewpointSensorSpec | None",
+        scene_viewpoint: "_ViewpointSensorSpec | None" = None,
+        dynamic_assist_light: AssistLightSpec | None = None,
     ) -> tuple[np.ndarray, dict[str, Any]]:
         """Progressively render physical Stokes data without discarding samples.
 
@@ -5394,6 +5878,8 @@ def render_modalities(
             return _render_pass(
                 scene_path, pass_name="polar", spp=config.polar_spp,
                 variant_override=variant_override, viewpoint=viewpoint,
+                scene_viewpoint=scene_viewpoint,
+                dynamic_assist_light=dynamic_assist_light,
             )
         minimum = int(configured_min)
         maximum = min(int(configured_max), int(config.polar_spp))
@@ -5411,7 +5897,10 @@ def render_modalities(
         def _take(spp: int, seed: int) -> tuple[np.ndarray, dict[str, Any]]:
             image, timing = _render_pass(
                 scene_path, pass_name="polar", spp=spp,
-                variant_override=variant_override, viewpoint=viewpoint, seed=seed,
+                variant_override=variant_override, viewpoint=viewpoint,
+                scene_viewpoint=scene_viewpoint,
+                dynamic_assist_light=dynamic_assist_light,
+                seed=seed,
             )
             batches.append((image, spp, timing))
             return image, timing
@@ -6301,6 +6790,12 @@ def render_modalities(
 
     polarization_material_mode = "not_requested"
     if _needs_polar(requested_set):
+        # Keep K=1 and K=4 products in one global, gravity-aligned Stokes
+        # frame. The camera is slightly pitched, so its local image-up rotates
+        # with yaw and cannot serve as a shared K=4 batch reference axis.
+        from .polar_heading_batch import shared_stokes_reference_axis
+
+        stokes_reference_axis = shared_stokes_reference_axis([camera_to_world])
         _polar_active_lights = [l for l in active_lights if "polar" in (l.modalities or [])]
         # Physical Stokes GT must include reflected/transmitted background paths.
         # Keep direct only as an explicit fast diagnostic preview.
@@ -6310,21 +6805,28 @@ def render_modalities(
             else "rig_active_light" if _polar_active_lights
             else "ambient_room"
         )
-        # Camera-aligned assist lights AND pose-baked rig active lights (Stage B)
-        # are part of the scene geometry, so they must stay camera/base-baked.
-        # Plain ambient-room polarization can share one resident Stokes scene
-        # across all headings and only swap the sensor.
-        use_base_polar_scene = _use_scene_reuse and assist_light is None and not _polar_active_lights
-        polar_viewpoint = _viewpoint if use_base_polar_scene else None
+        # A rig-mounted active light remains pose-baked. A camera-aligned
+        # rectangle, however, has a fixed topology: retain it once in a base
+        # Stokes scene and update its two transforms together with the scene
+        # sensor. This avoids reparsing the complete XML for every heading.
+        use_base_polar_scene = _use_scene_reuse and not _polar_active_lights
+        use_dynamic_camera_assist = use_base_polar_scene and assist_light is not None
+        polar_viewpoint = _viewpoint if use_base_polar_scene and not use_dynamic_camera_assist else None
+        polar_scene_viewpoint = _viewpoint if use_dynamic_camera_assist else None
         if use_base_polar_scene:
             scene_polar = _stage_base_stokes_scene(
                 source_scene,
                 samples_per_pass=config.samples_per_pass,
                 scene_override=scene_override,
+                assist_light=assist_light if use_dynamic_camera_assist else None,
+                camera_fov_deg=fov_deg if use_dynamic_camera_assist else None,
+                camera_width=config.width if use_dynamic_camera_assist else None,
+                camera_height=config.height if use_dynamic_camera_assist else None,
                 nested_integrator_type=polar_nested,
                 nested_max_depth=polar_max_depth,
                 measured_scope=measured_scope,
                 max_measured_bsdfs=max_measured_bsdfs,
+                stokes_reference_axis=stokes_reference_axis,
             )
         else:
             scene_polar = _stage_stokes_scene(
@@ -6344,6 +6846,7 @@ def render_modalities(
                 max_measured_bsdfs=max_measured_bsdfs,
                 active_lights=_polar_active_lights,
                 base_pose=base_pose,
+                stokes_reference_axis=stokes_reference_axis,
             )
         staged_scenes["polar"] = str(scene_polar)
         _cb("staging_scene", {"pass": "polar"})
@@ -6353,9 +6856,12 @@ def render_modalities(
             scene_polar,
             variant_override=_polar_variant(variant, color_mode=config.polar_color_mode),
             viewpoint=polar_viewpoint,
+            scene_viewpoint=polar_scene_viewpoint,
+            dynamic_assist_light=assist_light if use_dynamic_camera_assist else None,
         )
         timing["spp"] = int(timing.get("adaptive_spp_used", config.polar_spp))
         timing["dynamic_sensor"] = bool(use_base_polar_scene)
+        timing["dynamic_camera_assist"] = bool(use_dynamic_camera_assist)
         summary, arrays = save_polarization_products(
             image,
             workspace,
@@ -6363,10 +6869,11 @@ def render_modalities(
             visualization_policy=config.polar_visualization_policy,
         )
         summary.update({
-            "schema": "opticalnav.stokes_rgb_12.v2",
+            "schema": "opticalnav.stokes_rgb_12.minimal_f16.v2",
             "polar_color_mode": config.polar_color_mode,
             "stokes_channel_order": ["S0_RGB", "S1_RGB", "S2_RGB", "S3_RGB"],
-            "stokes_basis": "camera_image_x_y",
+            "stokes_basis": "world_gravity_y_v1",
+            "stokes_reference_axis": list(stokes_reference_axis),
         })
         quality_summary = _polar_quality_summary(summary, config)
         polarization_material_mode = "shared_material_policy"
@@ -6375,6 +6882,16 @@ def render_modalities(
             "task": "polar",
             "scene": str(scene_polar),
             "spp": config.polar_spp,
+            # This path is deliberately K=1 for camera-local polarized
+            # illumination.  It remains resident, but never co-renders two
+            # active emitters in a spatial strip.
+            "batch_size": 1,
+            "batch_mode": (
+                "active_stokes_heading_k1_resident_v1"
+                if use_dynamic_camera_assist
+                else "stokes_k1_v1"
+            ),
+            "resident_scene": bool(use_base_polar_scene),
             # Persist both the caller's requested value and the dynamic
             # sensor's local sampler value. The AD integrator's ``prepare``
             # call overrides that sampler with requested_spp; retaining both
@@ -6388,6 +6905,7 @@ def render_modalities(
             "stokes_schema": summary["schema"],
             "stokes_channel_order": summary["stokes_channel_order"],
             "stokes_basis": summary["stokes_basis"],
+            "stokes_reference_axis": summary["stokes_reference_axis"],
             "nested_integrator": polar_nested,
             "max_depth": polar_max_depth,
             "load_scene_s": timing["load_scene_s"],
@@ -6395,12 +6913,16 @@ def render_modalities(
             "render_s": timing["render_s"],
             "total_s": timing["total_s"],
             "stokes_npz_write_s": summary["stokes_npz_write_s"],
+            "stokes_npz_bytes": summary["stokes_npz_bytes"],
             "preview_write_s": summary["preview_write_s"],
             "polar_postprocess_s": summary["polar_postprocess_s"],
             "material_mode": polarization_material_mode,
             "material_policy": "shared_with_rgb",
             **quality_summary,
             "dynamic_sensor": bool(use_base_polar_scene),
+            "dynamic_camera_assist": bool(use_dynamic_camera_assist),
+            "resident_allocator_prepare_s": timing.get("resident_allocator_prepare_s", 0.0),
+            "resident_allocator_flush_s": timing.get("resident_allocator_flush_s", 0.0),
             "illumination_tag": polar_illumination_tag,
             "stokes_shape": list(image.shape),
             "polarization": summary,
@@ -6435,6 +6957,7 @@ def render_modalities(
             "max_depth": polar_max_depth,
             "total_s": timing["total_s"],
             "stokes_npz_write_s": summary["stokes_npz_write_s"],
+            "stokes_npz_bytes": summary["stokes_npz_bytes"],
             "preview_write_s": summary["preview_write_s"],
             "polar_postprocess_s": summary["polar_postprocess_s"],
             "material_mode": polarization_material_mode,
@@ -6678,6 +7201,300 @@ def render_modalities(
         results=results,
         pass_records=pass_records,
     )
+
+
+def render_ambient_stokes_heading_batch(
+    scene_xml: str | Path,
+    camera_to_worlds: Sequence[np.ndarray | Sequence[float]],
+    fov_deg: float,
+    modalities: Sequence[str],
+    *,
+    out_dirs: Sequence[str | Path],
+    config: RenderConfig | None = None,
+    scene_override: SceneOverrideSpec | None = None,
+    assist_lights: Sequence[AssistLightSpec] | None = None,
+    batch_mode: str = "ambient_stokes_heading_batch_v1",
+    variant: str = "auto",
+    progress_callback: Callable[[str, Mapping[str, Any] | None], None] | None = None,
+) -> list[MultimodalRenderResult]:
+    """Render 2–4 Stokes views in one native-perspective batch.
+
+    This is deliberately narrower than :func:`render_modalities`: it is the
+    production K=4 fast path for a single polar camera.  By default the scene
+    is passive.  Supplying one ``assist_lights`` entry per camera stages every
+    camera-local emitter in the shared batch scene; callers must first certify
+    that the selected spatially separated views have negligible cross-light
+    influence.  Each returned item is an ordinary per-heading result; only the
+    renderer's temporary batch film is shared. Passive batches use a stable
+    K-slot scene when resident reuse is enabled, so consecutive strips update
+    only sensor transforms instead of reloading geometry and textures.
+    """
+    from .mitsuba_runtime import resolve_variant
+    from .polar_heading_batch import (
+        normalize_camera_to_world,
+        shared_stokes_reference_axis,
+        split_stokes_heading_batch,
+        stage_ambient_stokes_heading_batch,
+    )
+
+    config = config or RenderConfig()
+    requested = _resolve_modalities(modalities)
+    requested_set = set(requested)
+    if not requested or not _needs_polar(requested_set) or any(item not in {
+        "polar_rgb_preview", "dop", "aolp", "s1", "s2", "s1_over_s0", "s2_over_s0",
+    } for item in requested):
+        raise ValueError("Stokes heading batches support polar camera modalities only")
+    if len(camera_to_worlds) < 2 or len(camera_to_worlds) > 4:
+        raise ValueError("Stokes heading batches require 2 to 4 headings")
+    if len(out_dirs) != len(camera_to_worlds):
+        raise ValueError("out_dirs must contain one destination per heading")
+    if assist_lights is not None and len(assist_lights) != len(camera_to_worlds):
+        raise ValueError("assist_lights must contain one camera-aligned light per batch view")
+    if config.polar_adaptive_spp_min is not None or config.polar_adaptive_spp_max is not None:
+        raise ValueError("Stokes heading batches require fixed polar SPP")
+    source_scene = Path(scene_xml).resolve()
+    # Camera poses arriving from a durable RenderRequest may still use its
+    # legacy column-major-flat storage. Normalize before both reference-frame
+    # certification and resident ParamMap updates.
+    poses = [normalize_camera_to_world(item).astype(np.float32) for item in camera_to_worlds]
+    # A K-heading strip has one outer Stokes integrator.  Make its basis
+    # explicit and certify that this yaw-only rig really shares the same up
+    # axis before the first expensive scene load.
+    stokes_reference_axis = shared_stokes_reference_axis(poses)
+    polar_nested, polar_max_depth = _polar_transport_integrator(config)
+    base_scene = _stage_base_stokes_scene(
+        source_scene,
+        samples_per_pass=config.samples_per_pass,
+        scene_override=scene_override,
+        nested_integrator_type=polar_nested,
+        nested_max_depth=polar_max_depth,
+        measured_scope=_resolve_measured_scope(config),
+        max_measured_bsdfs=_resolve_max_measured_bsdfs(config),
+        stokes_reference_axis=stokes_reference_axis,
+    )
+    destinations = [Path(item).resolve() for item in out_dirs]
+    for destination in destinations:
+        destination.mkdir(parents=True, exist_ok=True)
+    if progress_callback is not None:
+        progress_callback("staging_scene", {"pass": "polar", "batch_size": len(poses), "mode": batch_mode})
+    selected_variant = resolve_variant(
+        _polar_variant(variant, color_mode=config.polar_color_mode),
+        kind="rgb_polarized",
+        allow_cpu=True,
+    )
+    use_resident_batch_scene = assist_lights is None and _resident_stokes_heading_batches_enabled()
+    if use_resident_batch_scene:
+        batch_scene = _stage_resident_stokes_heading_batch_scene(
+            base_scene,
+            batch_size=len(poses),
+            width=int(config.width),
+            height=int(config.height),
+            fov_deg=float(fov_deg),
+            stokes_reference_axis=stokes_reference_axis,
+        )
+        if progress_callback is not None:
+            progress_callback("rendering", {
+                "pass": "polar", "batch_size": len(poses), "variant": selected_variant,
+                "mode": batch_mode, "resident_scene": True,
+            })
+        image, timing = _render_resident_stokes_heading_batch_scene(
+            batch_scene,
+            camera_to_worlds=poses,
+            variant=selected_variant,
+            spp=int(config.polar_spp),
+        )
+    else:
+        with tempfile.TemporaryDirectory(prefix="robomituba_stokes_heading_batch_") as tmpdir:
+            batch_scene = Path(tmpdir) / "stokes_heading_batch.xml"
+            batch_source = base_scene
+            if assist_lights is not None:
+                active_source = Path(tmpdir) / "stokes_heading_batch_active.xml"
+                root = ET.parse(base_scene).getroot()
+                for light_index, (pose, light) in enumerate(zip(poses, assist_lights)):
+                    _append_camera_assist_light(
+                        root,
+                        pose,
+                        light,
+                        polarized=light.polarized,
+                        id_suffix=f"_{light_index:02d}",
+                    )
+                ET.ElementTree(root).write(active_source, encoding="utf-8", xml_declaration=True)
+                batch_source = active_source
+            stage_ambient_stokes_heading_batch(
+                batch_source,
+                batch_scene,
+                camera_to_worlds=poses,
+                width=int(config.width),
+                height=int(config.height),
+                fov_deg=float(fov_deg),
+                stokes_reference_axis=stokes_reference_axis,
+            )
+            if progress_callback is not None:
+                progress_callback("rendering", {
+                    "pass": "polar", "batch_size": len(poses), "variant": selected_variant,
+                    "mode": batch_mode, "resident_scene": False,
+                })
+            image, timing = _render_scene(
+                batch_scene,
+                variant=selected_variant,
+                spp=int(config.polar_spp),
+            )
+    strips = split_stokes_heading_batch(
+        image,
+        batch_size=len(poses),
+        width=int(config.width),
+        height=int(config.height),
+    )
+    common_timing = dict(timing)
+    common_timing.update({
+        "spp": int(config.polar_spp),
+        "effective_spp": int(config.polar_spp),
+        "batch_size": len(poses),
+        "batch_render_s": float(timing.get("render_s", 0.0)),
+        "batch_total_s": float(timing.get("total_s", 0.0)),
+        "batch_mode": batch_mode,
+        "resident_batch_scene": bool(use_resident_batch_scene),
+        "resident_batch_scene_ref": str(batch_scene) if use_resident_batch_scene else None,
+        "stokes_reference_axis": list(stokes_reference_axis),
+        "stokes_basis": "world_gravity_y_v1",
+        "scene": str(base_scene),
+    })
+    outputs: list[MultimodalRenderResult] = []
+    array_names = {
+        "polar_rgb_preview": "rgb",
+        "dop": "dop",
+        "aolp": "aolp_deg",
+        "s1": "s1_l",
+        "s2": "s2_l",
+        "s1_over_s0": "s1_over_s0",
+        "s2_over_s0": "s2_over_s0",
+    }
+    for batch_index, (pose, destination, strip) in enumerate(zip(poses, destinations, strips)):
+        if progress_callback is not None:
+            progress_callback("saving_output", {
+                "pass": "polar", "batch_size": len(poses), "batch_index": batch_index,
+                "mode": batch_mode,
+            })
+        summary, arrays = save_polarization_products(
+            strip,
+            destination,
+            requested_set,
+            visualization_policy=config.polar_visualization_policy,
+        )
+        summary.update({
+            "schema": "opticalnav.stokes_rgb_12.minimal_f16.v2",
+            "polar_color_mode": config.polar_color_mode,
+            "stokes_channel_order": ["S0_RGB", "S1_RGB", "S2_RGB", "S3_RGB"],
+            "stokes_basis": "world_gravity_y_v1",
+            "stokes_reference_axis": list(stokes_reference_axis),
+        })
+        quality_summary = _polar_quality_summary(summary, config)
+        item_timing = {
+            **common_timing,
+            "batch_index": batch_index,
+            "render_s": float(timing.get("render_s", 0.0)) / len(poses),
+            "total_s": float(timing.get("total_s", 0.0)) / len(poses),
+            "stokes_npz_write_s": summary["stokes_npz_write_s"],
+            "stokes_npz_bytes": summary["stokes_npz_bytes"],
+            "preview_write_s": summary["preview_write_s"],
+            "polar_postprocess_s": summary["polar_postprocess_s"],
+        }
+        base_metadata = _branch_metadata(
+            illumination_tag="active_camera_aligned" if assist_lights is not None else "ambient_room",
+            scene_override=scene_override,
+            extra={
+                "material_mode": "shared_material_policy",
+                "material_policy": "shared_with_rgb",
+                "polar_transport": config.polar_transport,
+                "polar_color_mode": config.polar_color_mode,
+                "stokes_schema": summary["schema"],
+                "stokes_channel_order": summary["stokes_channel_order"],
+                "stokes_basis": summary["stokes_basis"],
+                "nested_integrator": polar_nested,
+                "max_depth": polar_max_depth,
+                "polar_visualization_policy": config.polar_visualization_policy,
+                "stokes_preview_recipe": summary["stokes_preview_recipe"],
+                "derived_on_demand": list(summary["derived_on_demand"]),
+                "stokes_heading_batch": {
+                    "batch_size": len(poses),
+                    "batch_index": batch_index,
+                    "mode": batch_mode,
+                    "camera_aligned_light": assist_lights is not None,
+                },
+                **quality_summary,
+            },
+        )
+
+        def _artifacts(modality: str) -> dict[str, Any]:
+            artifacts: dict[str, Any] = {"stokes_npz": summary["outputs"]["stokes_npz"]}
+            output_name = "rgb_preview" if modality == "polar_rgb_preview" else modality
+            output = summary["outputs"].get(output_name)
+            if output:
+                artifacts["png"] = output
+            elif modality != "polar_rgb_preview":
+                artifacts["derived_on_demand"] = {
+                    "source": summary["outputs"]["stokes_npz"],
+                    "recipe": summary["stokes_preview_recipe"],
+                    "modality": modality,
+                }
+            return artifacts
+
+        results: dict[str, ModalityResult] = {}
+        for modality in requested:
+            result_metadata = dict(base_metadata)
+            if modality == "dop":
+                result_metadata["range"] = [0.0, 1.0]
+            elif modality == "aolp":
+                result_metadata["range_degrees"] = [0.0, 180.0]
+            elif modality in {"s1_over_s0", "s2_over_s0"}:
+                result_metadata["range"] = [-1.0, 1.0]
+            elif modality == "s1":
+                result_metadata["scale_abs_p995"] = summary["s1_scale_abs_p995"]
+            elif modality == "s2":
+                result_metadata["scale_abs_p995"] = summary["s2_scale_abs_p995"]
+            array_name = array_names[modality]
+            results[modality] = ModalityResult(
+                name=modality,
+                array=arrays[array_name],
+                raw_channels={"mask": arrays["mask"], array_name: arrays[array_name]},
+                metadata=result_metadata,
+                timing=dict(item_timing),
+                artifacts=_artifacts(modality),
+            )
+        outputs.append(MultimodalRenderResult(
+            scene={
+                "source_scene": str(source_scene),
+                "workspace": str(destination),
+                "temporary_workspace": False,
+                "staged_scenes": {"polar": str(base_scene)},
+                "polarization_material_mode": "shared_material_policy",
+                "stokes_heading_batch": {
+                    "batch_size": len(poses),
+                    "batch_index": batch_index,
+                    "mode": batch_mode,
+                    "camera_aligned_light": assist_lights is not None,
+                },
+                "start_time": now_iso(),
+            },
+            camera={
+                "camera_to_world": pose.tolist(),
+                "fov_deg": float(fov_deg),
+                "convention": "cam-to-world, local -Z forward, local +Y up",
+            },
+            config=config,
+            definitions=dict(MODALITY_DEFINITIONS),
+            results=results,
+            pass_records={
+                "polarization": {
+                    **item_timing,
+                    "task": "polar",
+                    "mode": batch_mode,
+                    "stokes_shape": list(strip.shape),
+                    "polarization": summary,
+                },
+            },
+        ))
+    return outputs
 
 
 def render_rgb(*args, **kwargs) -> MultimodalRenderResult:

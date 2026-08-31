@@ -154,6 +154,25 @@ def test_cancel_assigned_but_not_started_restarts_worker(monkeypatch):
     assert requested == ["assigned_job_cancelled"]
 
 
+def test_progress_promotes_assigned_job_when_started_record_was_lost():
+    """A valid per-job progress event proves stdin dispatch was not stranded."""
+    mgr = WorkerManager(repo_root=Path("."), worker_count=1, gpu_indices=[0])
+    worker = _Worker(mgr, gpu_index=0)
+    worker.stats.assigned_job_ids.add("loading-scene")
+    worker.stats.assigned_at["loading-scene"] = time.monotonic()
+    events = []
+    mgr.add_listener(events.append)
+
+    worker._handle_event({
+        "job_id": "loading-scene", "type": "progress", "stage": "loading_scene", "ts": 123.0,
+    })
+
+    assert worker.stats.in_flight_job_id == "loading-scene"
+    assert [event["type"] for event in events] == ["started", "progress"]
+    assert events[0]["inferred_from_progress"] is True
+    assert events[0]["job_id"] == "loading-scene"
+
+
 def test_recycle_idle_workers_restarts_without_failing_jobs(monkeypatch):
     mgr, workers = _manager(monkeypatch, backlog=2)
 

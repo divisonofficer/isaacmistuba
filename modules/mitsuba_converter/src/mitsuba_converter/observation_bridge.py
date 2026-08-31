@@ -29,7 +29,14 @@ from robomituba_bridge import (
     load_ouster_metadata,
 )
 
-from .multimodal import MODALITY_DEFINITIONS, MultimodalRenderResult, RenderConfig, camera_to_world_from_lookat, render_modalities
+from .multimodal import (
+    MODALITY_DEFINITIONS,
+    MultimodalRenderResult,
+    RenderConfig,
+    camera_to_world_from_lookat,
+    render_ambient_stokes_heading_batch,
+    render_modalities,
+)
 from .multimodal import _camera_basis, _compute_target_union_bounds, _project_bounds_to_image_bbox
 from .versioned_artifacts import versioned_bundle_dir
 
@@ -855,6 +862,262 @@ def render_timestep_bundle_split_lighting(
     bundle_manifest.extras["manifest_s"] = manifest_s
     write_manifest(bundle_manifest, repo_root=root)
     return bundle_manifest
+
+
+def render_timestep_bundle_active_stokes_heading_cohort(
+    render_requests: list[RenderRequest],
+    *,
+    repo_root: str | Path,
+    variant: str = "auto",
+    progress_callback: Callable[[str, Mapping[str, Any] | None], None] | None = None,
+) -> list[ObservationBundleManifest]:
+    """Render a K=2..4 *camera-aligned active* polar cohort correctly.
+
+    Unlike the passive heading fast path, the active protocol places both the
+    area emitter and its polarizer in the camera's local frame.  A Mitsuba
+    ``batch`` sensor shares one world between all child sensors, which would
+    make every strip see every other heading's emitter.  This cohort therefore
+    keeps one durable K-sized worker task but renders each child with its own
+    camera-aligned scene.  The resulting artifacts are exactly the ordinary
+    K=1 active-polar artifacts; the cohort only changes scheduling, progress,
+    and retry granularity.
+    """
+    if len(render_requests) < 2 or len(render_requests) > 4:
+        raise ValueError("active Stokes heading cohorts require 2 to 4 requests")
+
+    root = Path(repo_root).resolve()
+    first = render_requests[0]
+    scene_ref = first.scene_state.mitsuba_scene_ref
+    camera_id: str | None = None
+    expected_modalities: set[str] | None = None
+    for request in render_requests:
+        validate_render_request(request)
+        if request.scene_state.mitsuba_scene_ref != scene_ref:
+            raise ValueError("active Stokes heading cohorts must use the same scene XML")
+        if request.sensor_specs or len(request.camera_specs) != 1:
+            raise ValueError("active Stokes heading cohorts require exactly one camera and no non-camera sensors")
+        if request.active_lights:
+            raise ValueError("active Stokes heading cohorts support camera-aligned assist lights only")
+        camera = request.camera_specs[0]
+        modalities = _camera_modalities(request, camera)
+        if not modalities or any(modality not in POLAR_MODALITIES for modality in modalities):
+            raise ValueError("active Stokes heading cohorts require polar-only camera modalities")
+        assist_light = _camera_assist_light(request, camera, modalities)
+        if assist_light is None or assist_light.mode != "camera_aligned_rect" or not assist_light.polarized:
+            raise ValueError("active Stokes heading cohorts require a polarized camera-aligned assist light")
+        if camera_id is None:
+            camera_id = camera.camera_id
+        elif camera.camera_id != camera_id:
+            raise ValueError("active Stokes heading cohorts must target the same polar camera")
+        requested_modalities = set(modalities)
+        if expected_modalities is None:
+            expected_modalities = requested_modalities
+        elif requested_modalities != expected_modalities:
+            raise ValueError("active Stokes heading cohorts must share polar modalities")
+
+    manifests: list[ObservationBundleManifest] = []
+    cohort_size = len(render_requests)
+    for cohort_index, request in enumerate(render_requests):
+        if progress_callback is not None:
+            progress_callback("active_polar_heading", {
+                "batch_size": cohort_size,
+                "batch_index": cohort_index,
+                "camera_id": camera_id,
+                "mode": "active_stokes_heading_cohort_v1",
+            })
+        bundle_manifest = render_timestep_bundle_split_lighting(
+            request,
+            repo_root=root,
+            variant=variant,
+            progress_callback=progress_callback,
+        )
+        bundle_manifest.extras["stokes_heading_cohort"] = {
+            "batch_index": cohort_index,
+            "batch_size": cohort_size,
+            "camera_id": camera_id,
+            "execution_mode": "active_stokes_heading_cohort_v1",
+            "camera_aligned_light": True,
+        }
+        write_manifest(bundle_manifest, repo_root=root)
+        manifests.append(bundle_manifest)
+    return manifests
+
+
+def render_timestep_bundle_stokes_heading_batch(
+    render_requests: list[RenderRequest],
+    *,
+    repo_root: str | Path,
+    variant: str = "auto",
+    camera_aligned_active: bool = False,
+    progress_callback: Callable[[str, Mapping[str, Any] | None], None] | None = None,
+) -> list[ObservationBundleManifest]:
+    """Write ordinary bundles from one K=2..4 Stokes render.
+
+    The function is intentionally all-or-nothing at the batch boundary: a
+    caller must retry the whole group after an exception rather than treating a
+    partially written strip as four completed observations.  The default is a
+    single passive polar camera.  ``camera_aligned_active`` is intentionally
+    opt-in: the caller must have created a spatial non-interference certificate
+    before exposing several active emitters to one batch scene.
+    """
+    if len(render_requests) < 2 or len(render_requests) > 4:
+        raise ValueError("Stokes heading bundle batches require 2 to 4 requests")
+    root = Path(repo_root).resolve()
+    first = render_requests[0]
+    scene_ref = first.scene_state.mitsuba_scene_ref
+    source_scene = resolve_repo_path(root, scene_ref)
+    camera_specs: list[CameraSpec] = []
+    camera_modalities: list[list[str]] = []
+    camera_configs: list[RenderConfig] = []
+    layouts: list[Any] = []
+    for request in render_requests:
+        validate_render_request(request)
+        if request.scene_state.mitsuba_scene_ref != scene_ref:
+            raise ValueError("all Stokes heading batch requests must use the same scene XML")
+        if request.sensor_specs or len(request.camera_specs) != 1:
+            raise ValueError("Stokes heading batch requires exactly one camera and no non-camera sensors")
+        if request.active_lights:
+            raise ValueError("Stokes heading batch supports ambient/passive polar observations only")
+        camera = request.camera_specs[0]
+        modalities = _camera_modalities(request, camera)
+        if not modalities or any(modality not in POLAR_MODALITIES for modality in modalities):
+            raise ValueError("Stokes heading batch requires polar-only camera modalities")
+        assist_light = _camera_assist_light(request, camera, modalities)
+        if camera_aligned_active:
+            if assist_light is None or assist_light.mode != "camera_aligned_rect" or not assist_light.polarized:
+                raise ValueError("active Stokes heading batch requires a polarized camera-aligned assist light")
+        elif assist_light is not None:
+            raise ValueError("Stokes heading batch does not support camera-aligned active polarization")
+        base_config = render_config_from_payload(
+            _camera_render_settings_payload(request.render_settings, camera, modalities)
+        )
+        config = _camera_config(base_config, camera)
+        camera_specs.append(camera)
+        camera_modalities.append(modalities)
+        camera_configs.append(config)
+        layouts.append(_observation_layout_for_request(request, root))
+    if any(camera.camera_id != camera_specs[0].camera_id for camera in camera_specs):
+        raise ValueError("Stokes heading batch requests must target the same polar camera")
+    if any(abs(float(camera.fov_deg) - float(camera_specs[0].fov_deg)) > 1e-6 for camera in camera_specs):
+        raise ValueError("Stokes heading batch requests must share camera intrinsics")
+    if any(config != camera_configs[0] for config in camera_configs[1:]):
+        raise ValueError("Stokes heading batch requests must share render settings")
+    if any(set(modalities) != set(camera_modalities[0]) for modalities in camera_modalities[1:]):
+        raise ValueError("Stokes heading batch requests must share polar modalities")
+    if any(request.scene_override != first.scene_override for request in render_requests[1:]):
+        raise ValueError("Stokes heading batch requests must share scene overrides")
+
+    batch_mode = "active_stokes_heading_spatial_batch_v1" if camera_aligned_active else "ambient_stokes_heading_batch_v1"
+    if progress_callback is not None:
+        progress_callback("polar_batch", {
+            "batch_size": len(render_requests),
+            "camera_id": camera_specs[0].camera_id,
+            "mode": batch_mode,
+        })
+    results = render_ambient_stokes_heading_batch(
+        source_scene,
+        [np.asarray(camera.camera_to_world, dtype=np.float32).reshape(4, 4) for camera in camera_specs],
+        float(camera_specs[0].fov_deg),
+        camera_modalities[0],
+        out_dirs=[layout.cameras_dir / camera.camera_id for layout, camera in zip(layouts, camera_specs)],
+        config=camera_configs[0],
+        scene_override=first.scene_override,
+        assist_lights=(
+            [_camera_assist_light(request, camera, modalities) for request, camera, modalities in zip(render_requests, camera_specs, camera_modalities)]
+            if camera_aligned_active else None
+        ),
+        batch_mode=batch_mode,
+        variant=variant,
+        progress_callback=progress_callback,
+    )
+    manifests: list[ObservationBundleManifest] = []
+    for batch_index, (request, camera, modalities, layout, result) in enumerate(
+        zip(render_requests, camera_specs, camera_modalities, layouts, results)
+    ):
+        artifacts = [
+            _artifact_manifest_from_result(root, camera, modality, result.results[modality])
+            for modality in modalities
+            if modality in result.results
+        ]
+        timing_log_path = layout.logs_dir / "render_timing.json"
+        timing_log = {
+            "request_id": request.request_id,
+            "job_id": request.job_id,
+            "frame_id": request.frame_id,
+            "timestamp": request.timestamp,
+            "branch_policy": batch_mode,
+            "batch_index": batch_index,
+            "batch_size": len(render_requests),
+            "cameras": {camera.camera_id: result.pass_records},
+        }
+        timing_log_path.write_text(json.dumps(timing_log, indent=2), encoding="utf-8")
+        artifacts, merged_modalities = _merge_existing_versioned_artifacts(
+            layout, artifacts, list(request.modalities)
+        )
+        batch_metadata: dict[str, Any] = {
+            "batch_index": batch_index,
+            "batch_size": len(render_requests),
+            "camera_id": camera.camera_id,
+        }
+        if camera_aligned_active:
+            batch_metadata.update({
+                "mode": batch_mode,
+                "camera_aligned_light": True,
+                "spatial_noninterference_required": True,
+            })
+        bundle_manifest = ObservationBundleManifest(
+            job_id=request.job_id,
+            scene_id=request.scene_state.scene_id,
+            frame_id=request.frame_id,
+            timestamp=request.timestamp,
+            scene_state=request.scene_state,
+            robot_state=request.robot_state,
+            requested_modalities=merged_modalities,
+            camera_specs=list(request.camera_specs),
+            sensor_specs=[],
+            artifacts=artifacts,
+            bundle_root=to_repo_relative_posix(root, layout.frame_dir),
+            status="complete",
+            action_ref=request.action_ref,
+            prev_observation_ref=request.prev_observation_ref,
+            next_observation_ref=request.next_observation_ref,
+            extras={
+                **request.extras,
+                "timing_log_ref": to_repo_relative_posix(root, timing_log_path),
+                "scene_version": request.scene_state.scene_version,
+                "scene_version_id": request.extras.get("scene_version_id") if isinstance(request.extras, Mapping) else None,
+                "render_version_id": request.extras.get("render_version_id") if isinstance(request.extras, Mapping) else None,
+                "run_id": request.extras.get("run_id") if isinstance(request.extras, Mapping) else None,
+                "branch_policy": batch_mode,
+                "stokes_heading_batch": batch_metadata,
+            },
+        )
+        write_manifest(bundle_manifest, repo_root=root)
+        manifests.append(bundle_manifest)
+    return manifests
+
+
+def render_timestep_bundle_active_stokes_heading_batch(
+    render_requests: list[RenderRequest],
+    *,
+    repo_root: str | Path,
+    variant: str = "auto",
+    progress_callback: Callable[[str, Mapping[str, Any] | None], None] | None = None,
+) -> list[ObservationBundleManifest]:
+    """Render a certified spatial K=2..4 active-polar Stokes batch.
+
+    The batch includes one camera-aligned emitter/polarizer per strip.  It is
+    only safe for the spatially separated groups produced by the daemon's
+    active-batch scheduler; same-pose heading groups must use the cohort
+    fallback instead.
+    """
+    return render_timestep_bundle_stokes_heading_batch(
+        render_requests,
+        repo_root=repo_root,
+        variant=variant,
+        camera_aligned_active=True,
+        progress_callback=progress_callback,
+    )
 
 
 def make_reflective_island_demo_request(

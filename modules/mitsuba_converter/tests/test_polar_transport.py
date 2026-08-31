@@ -58,3 +58,25 @@ def test_physical_stokes_stage_uses_path_and_path_depth(tmp_path) -> None:
     nested = outer.find("./integrator")
     assert nested is not None and nested.attrib["type"] == "path"
     assert nested.find("./integer[@name='max_depth']").attrib["value"] == "9"
+
+
+def test_stokes_stage_can_opt_into_a_world_reference_axis(tmp_path) -> None:
+    source = tmp_path / "source.xml"
+    source.write_text(
+        "<scene version='3.0.0'><integrator type='direct'/>"
+        "<sensor type='perspective'><sampler type='independent'/>"
+        "<film type='hdrfilm'/></sensor></scene>",
+        encoding="utf-8",
+    )
+    staged = _stage_stokes_scene(
+        source, tmp_path / "batch_stokes.xml",
+        camera_to_world=np.eye(4), fov_deg=65.0, spp=4, width=16, height=12,
+        samples_per_pass=None, nested_integrator_type="path", nested_max_depth=9,
+        stokes_reference_axis=(0.0, 1.0, 0.0),
+    )
+
+    outer = ET.parse(staged).getroot().find("./integrator")
+    assert outer is not None
+    axis = outer.find("./vector[@name='reference_axis']")
+    assert axis is not None
+    assert axis.attrib == {"name": "reference_axis", "x": "0.0", "y": "1.0", "z": "0.0"}
