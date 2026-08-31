@@ -30,9 +30,13 @@ PERTURBATION_VERSION = "opticalnav-optical-perturbation-v0.1"
 PERTURBATION_FILENAME = "optical_perturbation.json"
 
 # Mirror geometry sampling (flush sub-segments mounted on a wall face).
-_MIRROR_WIDTH_M = (0.6, 1.5)
-_MIRROR_BASE_HEIGHT_M = (0.8, 1.2)
-_MIRROR_HEIGHT_M = (0.8, 1.6)
+# Keep auto mirrors useful as optical-navigation perturbations: a near-1m²
+# mirror is too small to yield reliable reflection evidence at navigation
+# camera distance.  Lower mounting offsets allow the taller variants to stay
+# below a typical 2.7m interior ceiling.
+_MIRROR_WIDTH_M = (0.4, 2.2)
+_MIRROR_BASE_HEIGHT_M = (0.45, 0.7)
+_MIRROR_HEIGHT_M = (1.5, 2.0)
 _MIRROR_THICKNESS_M = 0.04
 _WALL_CORNER_INSET_M = 0.35        # keep mirrors away from corners
 _MIRROR_GAP_M = 0.5                # min gap between mirrors on the same wall
@@ -40,7 +44,7 @@ _OPENING_CLEARANCE_M = 0.8         # keep mirrors away from doors/windows
 _MIRROR_PASSAGE_CLEARANCE_M = 0.15 # reject a mirror only when a nav edge actually passes through it
                                    # (a doorway/threshold crossing) — interior edges run >0.3m off the
                                    # wall (node camera-margin) so parallel edges don't trip it
-_MIRROR_PER_METER = 0.22           # ~1 mirror per 4.5 m of wall (× density)
+_MIRROR_PER_METER = 0.07           # ~1 mirror per 14 m of physical wall (× density)
 _MIN_ROOM_AREA_M2 = 2.0            # ignore tiny regions (goal/start corners)
 
 # Glass-wall sampling (partial partitions across passages).
@@ -151,6 +155,21 @@ def _near_opening(x: float, y: float, openings) -> bool:
     return any(math.hypot(x - ox, y - oy) < _OPENING_CLEARANCE_M for ox, oy in openings)
 
 
+def _mirror_near_opening(start: tuple, end: tuple, openings) -> bool:
+    """True when any part of a mirror, not merely its center, overlaps an opening."""
+    dx, dy = end[0] - start[0], end[1] - start[1]
+    length_sq = dx * dx + dy * dy
+    for ox, oy in openings:
+        if length_sq <= 1e-12:
+            px, py = start
+        else:
+            t = min(1.0, max(0.0, ((ox - start[0]) * dx + (oy - start[1]) * dy) / length_sq))
+            px, py = start[0] + t * dx, start[1] + t * dy
+        if math.hypot(ox - px, oy - py) < _OPENING_CLEARANCE_M:
+            return True
+    return False
+
+
 def _edge_crosses_footprint(a: tuple[float, float], b: tuple[float, float], fp,
                             step: float = _GLASS_CROSS_STEP_M) -> bool:
     """True if the segment a→b passes through footprint ``fp`` (grid-free sampling)."""
@@ -220,14 +239,64 @@ def _rect_segments(rects: list[tuple[str, float, float, float, float]]) -> list[
     return segs
 
 
-def _wall_segments_from_floor_meshes(scene_dir: Path) -> list[tuple[str, tuple, tuple]]:
-    """Real wall segments = the boundary polygon of each room's FLOOR mesh, in authoring
-    XY (handles diagonal / non-rectangular rooms). Returns [] if meshes/trimesh are
-    unavailable so the caller can fall back to room-rectangle edges."""
+def _merge_collinear_wall_segments(
+    segments: list[tuple[str, tuple[float, float], tuple[float, float]]],
+) -> list[tuple[str, tuple[float, float], tuple[float, float]]]:
+    """Merge touching coplanar wall-face fragments, including duplicate room shells."""
+    merged: list[tuple[str, tuple[float, float], tuple[float, float]]] = []
+    pending = list(segments)
+    while pending:
+        rid, p, q = pending.pop()
+        dx, dy = q[0] - p[0], q[1] - p[1]
+        length = math.hypot(dx, dy)
+        if length < 1e-6:
+            continue
+        ux, uy = dx / length, dy / length
+        changed = True
+        while changed:
+            changed = False
+            for index, (_other_rid, a, b) in enumerate(pending):
+                odx, ody = b[0] - a[0], b[1] - a[1]
+                other_length = math.hypot(odx, ody)
+                if other_length < 1e-6:
+                    continue
+                # Same supporting line (orientation may be opposite), within
+                # the source wall thickness / OBJ float noise.
+                if abs((dx * odx + dy * ody) / (length * other_length)) < 0.995:
+                    continue
+                if max(abs((a[0] - p[0]) * uy - (a[1] - p[1]) * ux),
+                       abs((b[0] - p[0]) * uy - (b[1] - p[1]) * ux)) > 0.08:
+                    continue
+                values = [0.0, length,
+                          (a[0] - p[0]) * ux + (a[1] - p[1]) * uy,
+                          (b[0] - p[0]) * ux + (b[1] - p[1]) * uy]
+                values.sort()
+                if values[2] - values[1] > 0.12:
+                    continue
+                lo, hi = values[0], values[-1]
+                p, q = (p[0] + ux * lo, p[1] + uy * lo), (p[0] + ux * hi, p[1] + uy * hi)
+                dx, dy = q[0] - p[0], q[1] - p[1]
+                length = math.hypot(dx, dy)
+                pending.pop(index)
+                changed = True
+                break
+        merged.append((rid, p, q))
+    return merged
+
+
+def _wall_segments_from_wall_meshes(scene_dir: Path) -> list[tuple[str, tuple, tuple]]:
+    """Return only physical wall runs that exist at mirror/robot body height.
+
+    Floor boundaries are not reliable wall evidence: connected Infinigen rooms can
+    have separate floor meshes but no partition between them.  Extracting the
+    projected edges of wall faces that span the 0.45–1.2m height band preserves
+    door openings (lintels are above the band) and rejects open room boundaries.
+    """
     try:
         import numpy as np
         from .graph_pipeline import _infinigen_inputs
-        from .walkable_surface import _load_unit_faces
+        from .walkable_surface import _project_to_authoring_xy, _structure_units
+        import trimesh
     except Exception:
         return []
     inputs = _infinigen_inputs(Path(scene_dir))
@@ -238,18 +307,41 @@ def _wall_segments_from_floor_meshes(scene_dir: Path) -> list[tuple[str, tuple, 
         manifest = json.loads((import_root / "scene_manifest.json").read_text(encoding="utf-8"))
     except Exception:
         return []
-    segments: list[tuple[str, tuple, tuple]] = []
-    for u in manifest.get("units") or []:
-        bn = str(u.get("blender_name") or "")
-        if u.get("subtype") != "floor" and not bn.endswith(".floor"):
+    _floors, walls = _structure_units(manifest)
+    segments: list[tuple[str, tuple[float, float], tuple[float, float]]] = []
+    for u in walls:
+        rel = u.get("mesh_obj")
+        if not rel:
             continue
-        xy, faces = _load_unit_faces(import_root, u, origin_offset)
-        if len(xy) == 0 or len(faces) == 0:
+        try:
+            mesh = trimesh.load(str(import_root / rel), process=False, force="mesh")
+        except Exception:
             continue
-        rid = bn.split(".")[0] or "room"
-        for a, b in _boundary_polylines(np.asarray(xy), np.asarray(faces)):
-            segments.append((rid, (float(a[0]), float(a[1])), (float(b[0]), float(b[1]))))
-    return segments
+        verts = np.asarray(getattr(mesh, "vertices", np.zeros((0, 3))), dtype=np.float64)
+        faces = np.asarray(getattr(mesh, "faces", np.zeros((0, 3))), dtype=np.int64)
+        if len(verts) == 0 or len(faces) == 0:
+            continue
+        xy = _project_to_authoring_xy(
+            verts, u.get("world_bbox_min"), u.get("world_bbox_max"), origin_offset,
+        )
+        heights = verts[:, 1] - float(verts[:, 1].min())
+        rid = str(u.get("blender_name") or "room").split(".")[0] or "room"
+        seen: set[tuple[tuple[float, float], tuple[float, float]]] = set()
+        for tri in faces:
+            a, b, c = (int(tri[0]), int(tri[1]), int(tri[2]))
+            if max(heights[a], heights[b], heights[c]) < 0.45 or min(heights[a], heights[b], heights[c]) > 1.2:
+                continue
+            for i, j in ((a, b), (b, c), (c, a)):
+                p, q = tuple(map(float, xy[i])), tuple(map(float, xy[j]))
+                if math.dist(p, q) < 0.05:
+                    continue
+                key = tuple(sorted(((round(p[0], 4), round(p[1], 4)),
+                                    (round(q[0], 4), round(q[1], 4)))))
+                if key in seen:
+                    continue
+                seen.add(key)
+                segments.append((rid, p, q))
+    return _merge_collinear_wall_segments(segments)
 
 
 def _boundary_polylines(verts_xy, faces) -> list[tuple]:
@@ -314,31 +406,76 @@ def place_mirrors(wall_segments: list[tuple[str, tuple, tuple]], openings: list[
     a navigation edge (a passage/doorway), so mirrors never seal a walkable route."""
     mirrors: list[JsonDict] = []
     seq = 0
-    for rid, (x0, y0), (x1, y1) in wall_segments:
-        seglen = math.hypot(x1 - x0, y1 - y0)
-        usable = seglen - 2 * _WALL_CORNER_INSET_M
-        if usable < _MIRROR_WIDTH_M[0]:
+    by_room: dict[str, list[tuple[tuple, tuple]]] = {}
+    for rid, start, end in wall_segments:
+        by_room.setdefault(rid, []).append((start, end))
+    for rid, room_segments in by_room.items():
+        if density <= 0.0:
             continue
-        ux, uy = (x1 - x0) / seglen, (y1 - y0) / seglen   # unit direction along the wall
-        target = max(0, int(round(usable * _MIRROR_PER_METER * max(0.0, density))))
-        cursor = _WALL_CORNER_INSET_M
+        usable_total = sum(max(0.0, math.dist(start, end) - 2 * _WALL_CORNER_INSET_M)
+                           for start, end in room_segments)
+        # Give every eligible room a chance to contribute reflection evidence,
+        # then scale additional mirrors by that room's total usable wall length.
+        # Unlike per-segment rounding, this cannot multiply a large room's
+        # budget just because its shell was exported in many fragments.
+        target = max(1, int(round(usable_total * _MIRROR_PER_METER * density)))
+        candidates = list(room_segments)
+        rng.shuffle(candidates)
         placed = 0
-        while placed < target and cursor < seglen - _WALL_CORNER_INSET_M - _MIRROR_WIDTH_M[0]:
-            w = min(rng.uniform(*_MIRROR_WIDTH_M), seglen - _WALL_CORNER_INSET_M - cursor)
-            if w < _MIRROR_WIDTH_M[0]:
+        for (x0, y0), (x1, y1) in candidates:
+            if placed >= target:
                 break
-            t0, t1 = cursor, cursor + w
-            start = (x0 + ux * t0, y0 + uy * t0)
-            end = (x0 + ux * t1, y0 + uy * t1)
-            mx, my = (start[0] + end[0]) / 2.0, (start[1] + end[1]) / 2.0
-            if not _near_opening(mx, my, openings) and not _blocks_a_passage(start, end, edges):
-                seq += 1
-                mirrors.append(_mirror_object(
-                    f"mirror_auto_{seq:03d}", list(start), list(end),
-                    rng.uniform(*_MIRROR_BASE_HEIGHT_M), rng.uniform(*_MIRROR_HEIGHT_M), rid))
-                placed += 1
-            cursor = t1 + _MIRROR_GAP_M + rng.uniform(0.0, 1.0)
+            seglen = math.hypot(x1 - x0, y1 - y0)
+            usable = seglen - 2 * _WALL_CORNER_INSET_M
+            if usable < _MIRROR_WIDTH_M[0]:
+                continue
+            ux, uy = (x1 - x0) / seglen, (y1 - y0) / seglen   # unit direction along the wall
+            cursor = _WALL_CORNER_INSET_M
+            while placed < target and cursor < seglen - _WALL_CORNER_INSET_M - _MIRROR_WIDTH_M[0]:
+                w = min(rng.uniform(*_MIRROR_WIDTH_M), seglen - _WALL_CORNER_INSET_M - cursor)
+                if w < _MIRROR_WIDTH_M[0]:
+                    break
+                t0, t1 = cursor, cursor + w
+                start = (x0 + ux * t0, y0 + uy * t0)
+                end = (x0 + ux * t1, y0 + uy * t1)
+                if (not _mirror_near_opening(start, end, openings)
+                        and not _blocks_a_passage(start, end, edges)
+                        and not _near_existing_mirror(start, end, mirrors)):
+                    seq += 1
+                    mirrors.append(_mirror_object(
+                        f"mirror_auto_{seq:03d}", list(start), list(end),
+                        rng.uniform(*_MIRROR_BASE_HEIGHT_M), rng.uniform(*_MIRROR_HEIGHT_M), rid))
+                    placed += 1
+                cursor = t1 + _MIRROR_GAP_M + rng.uniform(0.0, 1.0)
     return mirrors
+
+
+def _near_existing_mirror(start: tuple, end: tuple, mirrors: list[JsonDict]) -> bool:
+    """Reject duplicate/adjacent candidates from overlapping room-wall shells."""
+    dx, dy = end[0] - start[0], end[1] - start[1]
+    length = math.hypot(dx, dy)
+    if length < 1e-6:
+        return True
+    ux, uy = dx / length, dy / length
+    for mirror in mirrors:
+        geom = mirror.get("geometry") or {}
+        a, b = geom.get("start"), geom.get("end")
+        if not (isinstance(a, list) and isinstance(b, list) and len(a) >= 2 and len(b) >= 2):
+            continue
+        adx, ady = float(b[0]) - float(a[0]), float(b[1]) - float(a[1])
+        other_length = math.hypot(adx, ady)
+        if other_length < 1e-6 or abs((dx * adx + dy * ady) / (length * other_length)) < 0.995:
+            continue
+        # Same wall plane within mesh thickness/noise.
+        if max(abs((float(a[0]) - start[0]) * uy - (float(a[1]) - start[1]) * ux),
+               abs((float(b[0]) - start[0]) * uy - (float(b[1]) - start[1]) * ux)) > 0.10:
+            continue
+        lo, hi = 0.0, length
+        other_lo = (float(a[0]) - start[0]) * ux + (float(a[1]) - start[1]) * uy
+        other_hi = (float(b[0]) - start[0]) * ux + (float(b[1]) - start[1]) * uy
+        if max(lo, min(other_lo, other_hi)) <= min(hi, max(other_lo, other_hi)) + _MIRROR_GAP_M:
+            return True
+    return False
 
 
 def _blocks_a_passage(start: tuple, end: tuple, edges: list[tuple[tuple, tuple]]) -> bool:
@@ -493,10 +630,10 @@ def build_optical_perturbation(scene_dir: Path, *, seed: int = 0, enabled: bool 
     graph = json.loads(graph_path.read_text(encoding="utf-8")) if graph_path.is_file() else {"nodes": [], "edges": []}
 
     rng = random.Random(int(seed))
-    # Real wall segments from the floor-mesh boundary (diagonal-aware); fall back to
-    # room-rectangle edges if meshes/trimesh aren't available.
-    wall_segments = _wall_segments_from_floor_meshes(scene_dir)
-    wall_source = "floor_mesh_boundary"
+    # Physical wall geometry at body height, not floor boundaries: adjacent/open
+    # rooms often have distinct floor meshes but no partition between them.
+    wall_segments = _wall_segments_from_wall_meshes(scene_dir)
+    wall_source = "wall_mesh_body_band"
     if not wall_segments:
         wall_segments = _rect_segments(_room_rects(authoring_map))
         wall_source = "room_rect_fallback"

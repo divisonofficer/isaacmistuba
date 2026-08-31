@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import math
 import sys
 import unittest
 
@@ -14,6 +15,7 @@ import random  # noqa: E402
 from navigation_dataset.optical_perturbation import (  # noqa: E402
     _num_components,
     _rect_segments,
+    _mirror_near_opening,
     disabled_edge_ids,
     place_glass_walls,
     place_mirrors,
@@ -54,13 +56,16 @@ class TestOpticalPerturbation(unittest.TestCase):
             g = m["geometry"]
             # mounted (off the floor) and not full-height (not floor-to-ceiling)
             self.assertGreater(g["base_height_m"], 0.0)
-            self.assertLess(g["height_m"], 2.0)
+            self.assertGreaterEqual(g["height_m"], 1.5)
+            self.assertLessEqual(g["height_m"], 2.0)
             # flush on a wall face: start/end share one coordinate that sits on a room edge
             sx, sy = g["start"]
             ex, ey = g["end"]
             on_x_edge = abs(sx - ex) < 1e-6 and abs(sx - round(sx)) < 1e-6 and round(sx) in (0, 5)
             on_y_edge = abs(sy - ey) < 1e-6 and abs(sy - round(sy)) < 1e-6 and round(sy) in (0, 4)
             self.assertTrue(on_x_edge or on_y_edge, f"mirror not flush on a wall: {g}")
+        widths = [math.dist(m["geometry"]["start"], m["geometry"]["end"]) for m in mirrors]
+        self.assertGreater(max(widths), 1.5, "auto placement should include wide mirror variants")
 
     def test_mirrors_follow_a_diagonal_wall(self):
         # a single diagonal wall segment (45°). Mirrors must lie ON the diagonal,
@@ -82,6 +87,23 @@ class TestOpticalPerturbation(unittest.TestCase):
             if abs(g["start"][1]) < 1e-6 and abs(g["end"][1]) < 1e-6:  # on south wall
                 mid_x = (g["start"][0] + g["end"][0]) / 2.0
                 self.assertGreater(abs(mid_x - 3.0), 0.5, "mirror placed on top of the door")
+
+    def test_opening_clearance_checks_the_entire_mirror_span(self):
+        # A long mirror can have a harmless-looking center while one end covers
+        # a doorway. The clearance must be measured against the line segment.
+        self.assertTrue(_mirror_near_opening((0.0, 0.0), (2.0, 0.0), [(1.9, 0.0)]))
+        self.assertFalse(_mirror_near_opening((0.0, 0.0), (2.0, 0.0), [(3.0, 0.0)]))
+
+    def test_mirrors_are_distributed_by_room_and_fit_narrow_walls(self):
+        mirrors = place_mirrors([
+            ("small", (0.0, 0.0), (1.2, 0.0)),
+            ("large", (0.0, 3.0), (6.0, 3.0)),
+        ], [], [], rng=random.Random(17), density=1.0)
+        rooms = {m["metadata"]["snapped_to_wall"] for m in mirrors}
+        self.assertIn("small", rooms)
+        self.assertIn("large", rooms)
+        small = next(m for m in mirrors if m["metadata"]["snapped_to_wall"] == "small")
+        self.assertGreaterEqual(math.dist(small["geometry"]["start"], small["geometry"]["end"]), 0.4)
 
     def test_mirrors_do_not_block_a_passage(self):
         # wall along y=0; a nav edge crosses it at x=3 (a doorway/passage). No mirror

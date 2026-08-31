@@ -16,6 +16,8 @@ from dataclasses import dataclass, field, replace
 import json
 import math
 from pathlib import Path
+from collections import OrderedDict
+from threading import RLock
 from typing import Any, Callable
 
 import numpy as np
@@ -48,6 +50,12 @@ class GraphBuildResult:
     grid: TraversabilityGrid
     graph: ViewpointGraph
     surface: WalkableSurface | None
+    # Action-state builders need the same robot+camera clearance mask used while
+    # sampling graph nodes.  Keeping it in the in-memory result avoids silently
+    # falling back to the editor's un-eroded grid when a caller derives a
+    # low-level motion graph immediately after an anchor build.  It is not
+    # persisted as a new public artifact.
+    motion_grid: TraversabilityGrid | None = None
     summary: dict[str, Any] = field(default_factory=dict)
 
 
@@ -76,6 +84,76 @@ class _GraphGrids:
     portals: list[Any]
     opening_seeds: list[Any]
     diagnostics: dict[str, Any] = field(default_factory=dict)
+
+
+# ``edge-check`` is a read-only, interactive operation.  Reconstructing a
+# mesh-backed WalkableSurface for every click used to re-read every OBJ and
+# re-run rasterisation/EDT/portal inference, even though the final operation is
+# only a line traversal over an already-derived grid.  Keep a deliberately
+# small process-local cache: the key below includes all scene inputs that can
+# change the derived grid, and graph edits themselves do not invalidate it.
+# A control-plane restart simply starts with an empty cache, which is safe.
+_EDGE_CHECK_GRID_CACHE: "OrderedDict[tuple[Any, ...], _GraphGrids]" = OrderedDict()
+_EDGE_CHECK_GRID_CACHE_LOCK = RLock()
+_EDGE_CHECK_GRID_CACHE_MAX_ITEMS = 4
+
+
+def _edge_check_file_stamp(path: Path) -> tuple[str, int, int] | tuple[str, None, None]:
+    """Return a cheap, deterministic invalidation stamp for one dependency."""
+    try:
+        stat = path.stat()
+    except OSError:
+        return (str(path), None, None)
+    return (str(path), int(stat.st_mtime_ns), int(stat.st_size))
+
+
+def _edge_check_grid_cache_key(
+    scene_id: str,
+    scene_dir: Path,
+    *,
+    resolution: float,
+    robot_radius_m: float,
+    robot_height_m: float,
+    min_clearance_m: float | None,
+    camera_margin_m: float,
+    low_profile_max_height_m: float,
+    wall_inflate_m: float,
+    max_nodes: int,
+    max_edge_length_m: float,
+    doorway_gap_m: float,
+) -> tuple[Any, ...]:
+    """Fingerprint inputs used by :func:`_prepare_graph_grids` for edge checks.
+
+    Imported scene geometry is immutable behind ``scene_manifest.json``.  The
+    manifest's timestamp/size is therefore the geometry revision marker; the
+    scene-local authoring/annotation/overlay files are stamped independently.
+    This avoids a full OBJ stat walk on every UI click while still invalidating
+    immediately after Save/Sync/Rebuild Grid or an overlay edit.
+    """
+    inf = _infinigen_inputs(scene_dir)
+    import_manifest = (inf[0] / "scene_manifest.json") if inf is not None else None
+    files = (
+        scene_dir / "authoring_map.json",
+        scene_dir / "scene_annotation.json",
+        scene_dir / "render_scene_overlays.json",
+        scene_dir / "walkability_overlay.npy",
+        scene_dir / "traversable_grid.npy",
+        import_manifest if import_manifest is not None else scene_dir / "__no_import_manifest__",
+    )
+    return (
+        str(scene_id),
+        *( _edge_check_file_stamp(path) for path in files ),
+        round(float(resolution), 8),
+        round(float(robot_radius_m), 8),
+        round(float(robot_height_m), 8),
+        None if min_clearance_m is None else round(float(min_clearance_m), 8),
+        round(float(camera_margin_m), 8),
+        round(float(low_profile_max_height_m), 8),
+        round(float(wall_inflate_m), 8),
+        int(max_nodes),
+        round(float(max_edge_length_m), 8),
+        round(float(doorway_gap_m), 8),
+    )
 
 
 def _read_json(path: Path) -> Any:
@@ -202,6 +280,7 @@ def _inferred_portals(
                 key=lambda item: item,
             )
             chosen: tuple[tuple[float, float], tuple[float, float], float] | None = None
+            chosen_score: tuple[int, float, float, int, int] | None = None
             for _distance_m, by, bx in order[:2048]:
                 ay, ax = int(nearest[0, by, bx]), int(nearest[1, by, bx])
                 if ax == bx and ay == by:
@@ -217,8 +296,28 @@ def _inferred_portals(
                 if span > float(max_edge_length_m):
                     rejected += 1
                     continue
-                chosen = (pa, pb, span)
-                break
+                # Prefer threshold anchors that are directly expressible as a
+                # 24-heading / 0.25 m action chain.  The previous nearest-pair
+                # rule often selected a 0.85 m span even when a 0.90 or 1.00 m
+                # safe pair existed a few grid cells farther into the rooms.
+                # Keep a safe non-representable fallback for legacy graph
+                # connectivity, but give v2 a deterministic action-compatible
+                # portal whenever geometry permits one.
+                count = max(1, int(round(span / 0.25)))
+                action_step = span / count
+                yaw = (math.degrees(math.atan2(-(float(pb[0]) - float(pa[0])), float(pb[1]) - float(pa[1]))) + 360.0) % 360.0
+                aligned = math.isclose(yaw / 15.0, round(yaw / 15.0), abs_tol=1e-6)
+                representable = aligned and 0.225 - 1e-9 <= action_step <= 0.275 + 1e-9
+                score = (
+                    0 if representable else 1,
+                    abs(action_step - 0.25),
+                    _distance_m,
+                    by,
+                    bx,
+                )
+                if chosen_score is None or score < chosen_score:
+                    chosen = (pa, pb, span)
+                    chosen_score = score
             if chosen is None:
                 continue
             pa, pb, span = chosen
@@ -325,6 +424,105 @@ def _bfs_path_cells(full_grid: TraversabilityGrid, start_cell, goal_cell, max_st
                 prev[(nx, ny)] = (x, y)
                 q.append((nx, ny, dpt + 1))
     return None
+
+
+def _separate_bridge_nodes(
+    graph: ViewpointGraph,
+    safe_grid: TraversabilityGrid,
+    *,
+    edge_is_safe: Callable[[ViewpointNode, ViewpointNode], bool],
+    clearance_map: "np.ndarray | None" = None,
+    min_spacing_m: float = 0.15,
+) -> tuple[int, int]:
+    """Move automatic bridge nodes away from regular placement nodes.
+
+    Connectivity repair follows a grid path and used to blindly materialise every
+    selected stepping-stone cell.  A regular Poisson/coverage node can already be
+    one or two cells away from that cell, leaving a visually noisy 5--11 cm pair.
+    That is not a useful second place node, and it makes manual placement harder.
+
+    Keep the bridge's topology, but first try nearby safe grid cells which preserve
+    every incident normal edge and are at least ``min_spacing_m`` from *all* other
+    nodes.  We deliberately move only automatic ``bridge`` nodes: authored portal
+    anchors and a user's manual placement retain their exact coordinates.
+    """
+    spec = safe_grid.spec
+    min_spacing = max(0.15, float(min_spacing_m))
+    min_spacing_sq = (min_spacing - 1e-9) ** 2
+    moved = 0
+
+    def _distance_sq(a: ViewpointNode, x: float, y: float) -> float:
+        return (float(a.position[0]) - x) ** 2 + (float(a.position[1]) - y) ** 2
+
+    # Two passes allow a bridge--bridge pair to settle deterministically without
+    # ever moving a non-bridge node.  A 0.40 m search window is enough to replace a
+    # one- or two-cell collision while remaining safely inside a local corridor.
+    for _pass in range(2):
+        changed = False
+        node_by_id = {node.node_id: node for node in graph.nodes}
+        bridges = sorted(
+            (node for node in graph.nodes if "bridge" in node.tags),
+            key=lambda node: node.node_id,
+        )
+        for bridge in bridges:
+            others = [node for node in graph.nodes if node.node_id != bridge.node_id]
+            if not any(_distance_sq(node, float(bridge.position[0]), float(bridge.position[1])) < min_spacing_sq
+                       for node in others):
+                continue
+            incident = [
+                edge for edge in graph.edges
+                if edge.source == bridge.node_id or edge.target == bridge.node_id
+            ]
+            neighbour_ids = sorted({
+                edge.target if edge.source == bridge.node_id else edge.source
+                for edge in incident
+            })
+            neighbours = [node_by_id[node_id] for node_id in neighbour_ids if node_id in node_by_id]
+            cx, cy = world_to_cell(spec, float(bridge.position[0]), float(bridge.position[1]))
+            radius_cells = max(1, int(math.ceil(0.40 / spec.resolution)))
+            candidates: list[tuple[float, int, int, float, float]] = []
+            for yy in range(cy - radius_cells, cy + radius_cells + 1):
+                for xx in range(cx - radius_cells, cx + radius_cells + 1):
+                    if not (0 <= yy < spec.height and 0 <= xx < spec.width and bool(safe_grid.traversable[yy, xx])):
+                        continue
+                    wx, wy = cell_to_world(spec, xx, yy)
+                    if any(_distance_sq(node, float(wx), float(wy)) < min_spacing_sq for node in others):
+                        continue
+                    candidates.append((
+                        (float(wx) - float(bridge.position[0])) ** 2 + (float(wy) - float(bridge.position[1])) ** 2,
+                        int(yy), int(xx), float(wx), float(wy),
+                    ))
+            candidates.sort()
+            for _distance, yy, xx, wx, wy in candidates:
+                candidate = ViewpointNode(
+                    node_id=bridge.node_id,
+                    position=[wx, wy, 0.0],
+                    clearance_m=bridge.clearance_m,
+                    tags=bridge.tags,
+                    headings=bridge.headings,
+                    extras=bridge.extras,
+                )
+                if not all(edge_is_safe(candidate, neighbour) for neighbour in neighbours):
+                    continue
+                bridge.position = [wx, wy, 0.0]
+                if clearance_map is not None and 0 <= yy < clearance_map.shape[0] and 0 <= xx < clearance_map.shape[1]:
+                    bridge.clearance_m = float(clearance_map[yy, xx])
+                bridge.extras = {**(bridge.extras or {}), "cell": [xx, yy], "spacing_adjusted": True}
+                moved += 1
+                changed = True
+                break
+        if not changed:
+            break
+
+    unresolved = 0
+    for bridge in (node for node in graph.nodes if "bridge" in node.tags):
+        if any(
+            _distance_sq(node, float(bridge.position[0]), float(bridge.position[1])) < min_spacing_sq
+            for node in graph.nodes
+            if node.node_id != bridge.node_id
+        ):
+            unresolved += 1
+    return moved, unresolved
 
 
 def _repair_connectivity(
@@ -546,6 +744,23 @@ def _repair_connectivity(
             break
         if not made:
             break  # remaining fragments are genuinely sealed
+    moved, unresolved = _separate_bridge_nodes(
+        graph,
+        safe_grid,
+        edge_is_safe=_normal_edge_ok,
+        clearance_map=clearance_map,
+        min_spacing_m=0.15,
+    )
+    graph.metadata["connectivity_repair_spacing"] = {
+        "minimum_bridge_node_spacing_m": 0.15,
+        "bridge_nodes_adjusted": moved,
+        "bridge_spacing_unresolved": unresolved,
+    }
+    if unresolved:
+        raise ValueError(
+            "connectivity repair could not place automatic bridge nodes at least "
+            "0.15 m from another place node"
+        )
     return straight, stones
 
 
@@ -672,13 +887,19 @@ def _fill_safe_node_coverage(
     return nodes, {"coverage_nodes": int(added), "coverage_components_uncovered": int(still_uncovered)}
 
 
-def _drop_sealed_automatic_components(graph: ViewpointGraph) -> list[dict[str, Any]]:
-    """Remove auto-only components that have no certified safe route to the graph.
+def _drop_sealed_automatic_components(
+    graph: ViewpointGraph,
+    *,
+    remove: bool = True,
+) -> list[dict[str, Any]]:
+    """Describe auto-only components that have no certified safe route to the graph.
 
     A mesh import can expose a visually walkable island that is disconnected after
-    body-radius clearance and authoring-domain masking.  Keeping one random node on
-    that island produces an unreachable episode start.  We never remove a user node
-    (or its legacy component); auto-only sealed islands are omitted and recorded.
+    body-radius clearance and authoring-domain masking.  Legacy graph production
+    omits such islands because they cannot safely seed an episode.  The v4 *place
+    graph* instead keeps and labels them: the editor must show the user the room
+    that needs a doorway/map/manual-topology repair rather than silently making it
+    disappear.  We never remove a user node (or its legacy component).
     """
     components = compute_connected_components(graph).get("components", [])
     if len(components) <= 1:
@@ -697,11 +918,18 @@ def _drop_sealed_automatic_components(graph: ViewpointGraph) -> list[dict[str, A
             round(sum(float(position[axis]) for position in positions) / len(positions), 3)
             for axis in (0, 1)
         ]
-        remove_ids.update(node_ids)
+        if remove:
+            remove_ids.update(node_ids)
+        else:
+            for node_id in node_ids:
+                node = nodes[node_id]
+                if "sealed_component" not in node.tags:
+                    node.tags.append("sealed_component")
+                node.extras = {**(node.extras or {}), "sealed_component": True}
         diagnostics.append({
             "size": len(node_ids),
             "centroid": centroid,
-            "reason": "sealed_no_safe_route",
+            "reason": "sealed_no_safe_route" if remove else "sealed_requires_editor_connection",
         })
     if remove_ids:
         graph.nodes = [node for node in graph.nodes if node.node_id not in remove_ids]
@@ -1021,10 +1249,12 @@ def validate_scene_graph_edge(
     target = find_node(graph, target_id)
     if source is None or target is None:
         return EdgeValidation(False, "rejected", "unknown_endpoint", 0.0, 0, 0, False), {}
-    grids = _prepare_graph_grids(
-        scene_id,
-        scene_path,
-        overlay_objects=_load_overlay_objects(scene_path),
+    max_nodes = max(1, len(graph.nodes))
+    # Callers that provide an in-memory overlay may not have persisted it yet;
+    # it cannot safely share the on-disk cache key.
+    cacheable = walkability_overlay is None
+    cache_key = _edge_check_grid_cache_key(
+        scene_id, scene_path,
         resolution=resolution,
         robot_radius_m=robot_radius_m,
         robot_height_m=robot_height_m,
@@ -1032,11 +1262,46 @@ def validate_scene_graph_edge(
         camera_margin_m=camera_margin_m,
         low_profile_max_height_m=low_profile_max_height_m,
         wall_inflate_m=wall_inflate_m,
-        walkability_overlay=walkability_overlay,
-        max_nodes=max(1, len(graph.nodes)),
+        max_nodes=max_nodes,
         max_edge_length_m=max_edge_length_m,
         doorway_gap_m=doorway_gap_m,
     )
+    # Serialise a cache miss: several rapid UI clicks otherwise all build the
+    # same 400+ OBJ surface concurrently, which both makes the checks slow and
+    # starves graph-edit requests. The cached grids are immutable in this path.
+    def _build_grids() -> _GraphGrids:
+        return _prepare_graph_grids(
+            scene_id,
+            scene_path,
+            overlay_objects=_load_overlay_objects(scene_path),
+            resolution=resolution,
+            robot_radius_m=robot_radius_m,
+            robot_height_m=robot_height_m,
+            min_clearance_m=min_clearance_m,
+            camera_margin_m=camera_margin_m,
+            low_profile_max_height_m=low_profile_max_height_m,
+            wall_inflate_m=wall_inflate_m,
+            walkability_overlay=walkability_overlay,
+            max_nodes=max_nodes,
+            max_edge_length_m=max_edge_length_m,
+            doorway_gap_m=doorway_gap_m,
+        )
+    if not cacheable:
+        grids = _build_grids()
+        cache_hit = False
+    else:
+        with _EDGE_CHECK_GRID_CACHE_LOCK:
+            grids = _EDGE_CHECK_GRID_CACHE.get(cache_key)
+            if grids is not None:
+                _EDGE_CHECK_GRID_CACHE.move_to_end(cache_key)
+                cache_hit = True
+            else:
+                cache_hit = False
+                grids = _build_grids()
+                _EDGE_CHECK_GRID_CACHE[cache_key] = grids
+                _EDGE_CHECK_GRID_CACHE.move_to_end(cache_key)
+                while len(_EDGE_CHECK_GRID_CACHE) > _EDGE_CHECK_GRID_CACHE_MAX_ITEMS:
+                    _EDGE_CHECK_GRID_CACHE.popitem(last=False)
     validation = validate_viewpoint_edge(
         grids.edge_grid,
         source,
@@ -1048,7 +1313,9 @@ def validate_scene_graph_edge(
         portals=grids.portals,
         doorway_gap_m=doorway_gap_m,
     )
-    return validation, grids.diagnostics
+    diagnostics = dict(grids.diagnostics)
+    diagnostics["edge_check_grid_cache"] = "hit" if cache_hit else "miss"
+    return validation, diagnostics
 
 
 def build_viewpoint_graph_core(
@@ -1075,6 +1342,7 @@ def build_viewpoint_graph_core(
     persist_grid: bool = True,
     walkability_overlay: "np.ndarray | None" = None,
     existing_graph: ViewpointGraph | None = None,
+    retain_sealed_components: bool = False,
     scene_variant_id: Any = None,
     on_progress: Callable[[str, float], None] | None = None,
     metadata_extra: dict | None = None,
@@ -1221,6 +1489,7 @@ def build_viewpoint_graph_core(
             "min_clearance_m": float(min_clearance_m) if min_clearance_m is not None else None,
             "min_node_spacing_m": float(min_node_spacing_m),
             "max_edge_length_m": float(max_edge_length_m),
+            "doorway_gap_m": float(doorway_gap_m),
             "k_neighbors": int(k_neighbors),
             "seed": int(seed),
             "grid_resolution_m": float(resolution),
@@ -1253,9 +1522,14 @@ def build_viewpoint_graph_core(
         )
         bridge_edges += extra_edges
         bridge_nodes += extra_nodes
-    sealed_components = _drop_sealed_automatic_components(graph) if surface is not None else []
+    sealed_components = _drop_sealed_automatic_components(
+        graph,
+        remove=not retain_sealed_components,
+    ) if surface is not None else []
     if sealed_components:
-        grids.diagnostics["sealed_components_removed"] = sealed_components
+        grids.diagnostics[
+            "sealed_components_retained" if retain_sealed_components else "sealed_components_removed"
+        ] = sealed_components
 
     summary = graph_summary(graph.nodes, graph.edges, heading_count=heading_count)
     summary["bridge_edges"] = bridge_edges
@@ -1289,7 +1563,13 @@ def build_viewpoint_graph_core(
     if surface is not None:
         summary["walkable_surface"] = surface.stats
     _progress("edges", 1.0)
-    return GraphBuildResult(grid=grid, graph=graph, surface=surface, summary=summary)
+    return GraphBuildResult(
+        grid=grid,
+        graph=graph,
+        surface=surface,
+        motion_grid=node_grid,
+        summary=summary,
+    )
 
 
 def rebuild_viewpoint_edges(
@@ -1433,4 +1713,10 @@ def rebuild_viewpoint_edges(
     if grids.surface is not None:
         summary["walkable_surface"] = grids.surface.stats
     _progress("edges", 1.0)
-    return GraphBuildResult(grid=grids.grid, graph=graph, surface=grids.surface, summary=summary)
+    return GraphBuildResult(
+        grid=grids.grid,
+        graph=graph,
+        surface=grids.surface,
+        motion_grid=grids.node_grid,
+        summary=summary,
+    )

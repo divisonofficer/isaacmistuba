@@ -176,9 +176,19 @@ def validate_episode(episode: EpisodeManifest) -> None:
         raise ValueError("actions must end with stop.")
     if not episode.timesteps:
         raise ValueError("timesteps must not be empty.")
-    if episode.navigation_mode not in {"trajectory", "viewpoint_graph"}:
-        raise ValueError("navigation_mode must be 'trajectory' or 'viewpoint_graph'.")
-    if episode.navigation_mode == "viewpoint_graph":
+    graph_navigation_modes = {
+        "viewpoint_graph",
+        "adaptive_route_motion_v2",
+        "adaptive_route_motion_v3",
+        "adaptive_navigation_support_v4",
+    }
+    if episode.navigation_mode not in {"trajectory", *graph_navigation_modes}:
+        raise ValueError(
+            "navigation_mode must be 'trajectory', 'viewpoint_graph', "
+            "'adaptive_route_motion_v2', 'adaptive_route_motion_v3', or "
+            "'adaptive_navigation_support_v4'."
+        )
+    if episode.navigation_mode in graph_navigation_modes:
         if not episode.graph_id:
             raise ValueError("graph_id is required for viewpoint_graph episodes.")
         if not episode.start_node or not episode.goal_node:

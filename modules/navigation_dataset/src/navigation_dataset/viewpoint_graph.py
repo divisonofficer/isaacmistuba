@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 import json
+import math
 import os
 from pathlib import Path, PurePosixPath
 import threading
@@ -438,6 +439,67 @@ def compute_connected_components(graph: ViewpointGraph) -> dict[str, Any]:
         "node_to_component": node_to_component,
         "components": components,
     }
+
+
+def disconnected_component_repair_guides(graph: ViewpointGraph) -> list[JsonDict]:
+    """Return review-only closest-boundary pairs for disconnected components.
+
+    These are *not* proposed edges.  Their sole purpose is to make a retained
+    safe island actionable in the editor: the pair points at the most likely
+    doorway, blocking object, or missing authoring-domain bridge to inspect.
+    The normal edge validator remains the authority for any later manual link.
+    """
+    components = compute_connected_components(graph).get("components", [])
+    if len(components) <= 1:
+        return []
+    nodes = {node.node_id: node for node in graph.nodes}
+    main_ids = [str(node_id) for node_id in components[0].get("node_ids", []) if node_id in nodes]
+    if not main_ids:
+        return []
+
+    guides: list[JsonDict] = []
+    for component in components[1:]:
+        component_index = int(component.get("index", len(guides) + 1))
+        detached_ids = [str(node_id) for node_id in component.get("node_ids", []) if node_id in nodes]
+        if not detached_ids:
+            continue
+        # Graphs are intentionally sparse (<=300 nodes), so the exact Cartesian
+        # scan is small and gives a deterministic, readily explainable boundary
+        # pair.  Sort keys make ties stable across JSON round-trips.
+        best: tuple[float, str, str] | None = None
+        for main_id in main_ids:
+            main = nodes[main_id]
+            for detached_id in detached_ids:
+                detached = nodes[detached_id]
+                dx = float(main.position[0]) - float(detached.position[0])
+                dy = float(main.position[1]) - float(detached.position[1])
+                candidate = (dx * dx + dy * dy, main_id, detached_id)
+                if best is None or candidate < best:
+                    best = candidate
+        if best is None:
+            continue
+        distance_sq, main_id, detached_id = best
+        main = nodes[main_id]
+        detached = nodes[detached_id]
+        main_position = [round(float(main.position[0]), 4), round(float(main.position[1]), 4)]
+        detached_position = [round(float(detached.position[0]), 4), round(float(detached.position[1]), 4)]
+        guides.append({
+            "guide_id": f"repair_component_{component_index:03d}",
+            "component_index": component_index,
+            "component_size": len(detached_ids),
+            "main_node_id": main_id,
+            "detached_node_id": detached_id,
+            "main_position": main_position,
+            "detached_position": detached_position,
+            "midpoint": [
+                round((main_position[0] + detached_position[0]) / 2.0, 4),
+                round((main_position[1] + detached_position[1]) / 2.0, 4),
+            ],
+            "straight_line_distance_m": round(math.sqrt(distance_sq), 4),
+            "status": "uncertified_boundary_pair",
+            "instruction": "Inspect this boundary; add a place link only if edge validation certifies a real opening.",
+        })
+    return guides
 
 
 def remove_edge(graph: ViewpointGraph, edge_id: str) -> bool:

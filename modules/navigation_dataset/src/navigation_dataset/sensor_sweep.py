@@ -315,6 +315,7 @@ def build_sweep_render_requests(
     job_id_mode: str = "per_heading",
     node_ids: list[str] | None = None,
     heading_ids_by_node: Mapping[str, Sequence[str]] | None = None,
+    view_metadata_by_key: Mapping[str, Mapping[str, Any]] | None = None,
     camera_height_m: float = 1.0,
     render_settings: dict | None = None,
     node_heights: dict | None = None,
@@ -348,6 +349,17 @@ def build_sweep_render_requests(
     heading_id_sets = {
         str(node_id): {str(heading_id) for heading_id in heading_ids}
         for node_id, heading_ids in (heading_ids_by_node or {}).items()
+    }
+    # ``heading_ids_by_node`` defines which views exist.  This companion map
+    # carries the *observation contract* for those views (tier, available
+    # headings, and K-heading batch affinity).  Keeping it on the ordinary
+    # per-heading RenderRequest lets the durable ledger/resume machinery stay
+    # unchanged while preventing a partial TRACK_4 observation from being
+    # interpreted as a full panorama downstream.
+    metadata_by_key = {
+        str(key): dict(value)
+        for key, value in (view_metadata_by_key or {}).items()
+        if isinstance(value, Mapping)
     }
     requests: list[SweepRenderRequest] = []
     for node in graph.nodes:
@@ -416,6 +428,7 @@ def build_sweep_render_requests(
                     "sensor_ids": sensor_ids_list,
                     "sensor_count": len(sensor_ids_list),
                     "modalities_by_sensor": modalities_by_sensor,
+                    **metadata_by_key.get(f"{node.node_id}/{heading.heading_id}", {}),
                 },
             )
             requests.append(
