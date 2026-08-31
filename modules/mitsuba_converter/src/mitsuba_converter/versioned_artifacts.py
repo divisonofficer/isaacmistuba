@@ -1540,6 +1540,39 @@ class RenderLedger:
         if not expected_views:
             return []
 
+        # A browser-local throughput sample is useful after the second monitor
+        # refresh, but it is empty after a page reload and can also miss a
+        # K=4 completion burst.  The durable attempt timestamps give the
+        # coverage endpoint an immediate, conservative fallback for every
+        # active variant.  Only real successful attempts participate: reused
+        # source bundles must not make a newly admitted successor appear fast.
+        elapsed_seconds_by_variant: dict[str, float] = {}
+        if selected_runs:
+            placeholders = ", ".join("?" for _ in selected_runs)
+            with self.connection() as conn:
+                timing_rows = conn.execute(
+                    f"""SELECT t.variant, MIN(a.started_at) AS first_started_at
+                           FROM render_attempts a
+                           JOIN sweep_tasks t ON t.task_key = a.task_key
+                          WHERE t.run_id IN ({placeholders})
+                            AND a.state = 'succeeded'
+                            AND a.started_at IS NOT NULL
+                          GROUP BY t.variant""",
+                    sorted(selected_runs),
+                ).fetchall()
+            now = datetime.now(timezone.utc)
+            for row in timing_rows:
+                raw_started_at = str(row["first_started_at"] or "")
+                try:
+                    started_at = datetime.fromisoformat(raw_started_at.replace("Z", "+00:00"))
+                    if started_at.tzinfo is None:
+                        started_at = started_at.replace(tzinfo=timezone.utc)
+                    elapsed_seconds = (now - started_at.astimezone(timezone.utc)).total_seconds()
+                except (TypeError, ValueError):
+                    continue
+                if elapsed_seconds > 0:
+                    elapsed_seconds_by_variant[str(row["variant"] or "")] = elapsed_seconds
+
         state_rank = {"queued": 0, "failed": 1, "running": 2, "completed": 3}
         state_by_view: dict[tuple[str, str, str, str], str] = {}
         for row, metadata in task_metadata:
@@ -1593,7 +1626,7 @@ class RenderLedger:
                     if state in counts:
                         counts[state] += 1
                 total = len(expected_views)
-                result.append({
+                payload: dict[str, Any] = {
                     "scene_id": str(scene_id),
                     "campaign_id": campaign_id,
                     "coverage_source": "render_plan",
@@ -1606,7 +1639,15 @@ class RenderLedger:
                     "failed": counts["failed"],
                     "total": total,
                     "fraction": counts["completed"] / max(1, total),
-                })
+                }
+                elapsed_seconds = elapsed_seconds_by_variant.get(variant)
+                if elapsed_seconds and counts["completed"] > 0 and counts["completed"] < total:
+                    views_per_second = counts["completed"] / elapsed_seconds
+                    if views_per_second > 0:
+                        payload["observed_views_per_second"] = views_per_second
+                        payload["eta_seconds"] = (total - counts["completed"]) / views_per_second
+                        payload["eta_source"] = "durable_run_average"
+                result.append(payload)
         return result
 
     def _safe_render_plan_ref(self, value: Any) -> str | None:
