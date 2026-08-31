@@ -332,7 +332,7 @@ def parse_seed(seed: int) -> AptPreset:
 
 def build_command(preset: AptPreset, *, out: Path, stage: str, fast: bool,
                   floor_plan_json: Path | None, extra_overrides: list[str],
-                  placement_profile: str = "legacy_clutter_v1") -> list[str]:
+                  placement_profile: str = "collision_aware_clutter_v1") -> list[str]:
     """stage: 'layout' (no objects, fast wall/cutter check) | 'full' (object solve)."""
     if stage == "layout":
         configs = ["no_objects.gin", "overhead.gin"]
@@ -421,7 +421,7 @@ def main() -> int:
     ap.add_argument("--anchor-richness", choices=("minimal", "balanced", "rich", "storage"), default="balanced")
     ap.add_argument("--surface-clutter", choices=("low", "balanced", "rich", "storage"), default="balanced")
     ap.add_argument("--placement-profile", choices=("legacy_clutter_v1", "upstream_residential_v1", "collision_aware_clutter_v1"),
-                    default="legacy_clutter_v1")
+                    default="collision_aware_clutter_v1")
     ap.add_argument("--office-style", choices=MODERN_OFFICE_STYLES, default="modern_basic_v1",
                     help="Modern Office visual/structural preset (office archetype only).")
     ap.add_argument("--office-max-attempts", type=int, default=1,
