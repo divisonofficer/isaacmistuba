@@ -7,9 +7,39 @@ export type PrimaryNavigationAction = {
 	disabled: boolean;
 };
 
+/**
+ * ``support/analyze`` is deliberately non-persistent, so the inspector keeps
+ * the response in page state.  The current daemon returns ``summary`` at the
+ * top level, while an older compatible daemon can put it under ``analysis``.
+ * Both are a completed dry run.  A structured ``ok: false`` response is the
+ * one case that must *not* unlock the destructive/materialising Build step.
+ */
+export function hasSuccessfulSupportAnalysis(analysis: any): boolean {
+	if (!analysis || analysis.ok === false) return false;
+	return Boolean(
+		analysis.summary
+		|| analysis.analysis?.summary
+		// The mode marker is part of the HTTP contract and lets a newer WebUI
+		// interoperate with an older daemon that did not include the estimate
+		// summary in its response.
+		|| analysis.mode === 'analyze',
+	);
+}
+
+export function supportAnalysisSummary(analysis: any): any | null {
+	if (!hasSuccessfulSupportAnalysis(analysis)) return null;
+	return analysis?.summary ?? analysis?.analysis?.summary ?? null;
+}
+
 /** Keep the sole sticky action deterministic and easy to test. */
 export function primaryNavigationAction(state: any): PrimaryNavigationAction {
-	if (!state.hasMap) {
+	// A v4 place graph is built from the navigation motion grid and persists
+	// with its own immutable digest. The broader workflow status can mark the
+	// legacy grid stale after an annotation-only edit, but that must not make an
+	// already reviewable Place Graph/Blueprint collection regress to “Build
+	// grid” and hide the Analyze → Build Support sequence.
+	const supportHasPlaceGraph = Boolean(state.navigationSupport?.place_graph?.nodes?.length);
+	if (!state.hasMap && !supportHasPlaceGraph) {
 		return { id: 'build-grid', label: 'Build grid', description: state.caps?.buildMap?.reason || 'Build the traversable grid first.', disabled: !state.caps?.buildMap?.enabled };
 	}
 	if (!state.navigationSupport) {
@@ -19,7 +49,7 @@ export function primaryNavigationAction(state: any): PrimaryNavigationAction {
 	if (!approved) {
 		return { id: 'analyze-support', label: 'Analyze support', description: 'Approve at least one route blueprint before support can be built.', disabled: true };
 	}
-	if (!state.supportAnalysis?.summary) {
+	if (!hasSuccessfulSupportAnalysis(state.supportAnalysis)) {
 		return { id: 'analyze-support', label: 'Analyze support', description: 'Estimate native poses and coverage for approved routes.', disabled: Boolean(state.loading || state.buildingGraph) };
 	}
 	if (!state.supportReady) {

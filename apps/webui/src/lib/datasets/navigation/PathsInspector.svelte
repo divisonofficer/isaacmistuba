@@ -3,7 +3,7 @@
 	import { Check, ChevronDown, CircleCheck, CircleX, CircleDotDashed, FileStack, Link2, MapPin, Route, ScanLine, Search, Settings2, Trash2 } from '@lucide/svelte';
 	import { InspectorSection, MetricCard, ProgressBar, SegmentedControl } from '$lib/components';
 	import { navigationSupportProgressLabel } from '$lib/datasets/services/graphService';
-	import { filterBlueprints, primaryNavigationAction, type NavigationInspectorTab } from './navigationPresentation';
+	import { filterBlueprints, primaryNavigationAction, supportAnalysisSummary, type NavigationInspectorTab } from './navigationPresentation';
 	import type { EpisodeState, NavigationActions, NavigationState } from './types';
 
 	interface Props {
@@ -31,6 +31,7 @@
 	const approvedCount = $derived(blueprints.filter((item: any) => item.status === 'approved').length);
 	const repairGuides = $derived(navigationState.placeRepairGuides ?? []);
 	const supportReady = $derived(Boolean(navigationState.supportReady));
+	const analysisSummary = $derived(supportAnalysisSummary(navigationState.supportAnalysis));
 	const primary = $derived(primaryNavigationAction({ ...navigationState, supportReady }));
 
 	function runPrimary() {
@@ -231,8 +232,8 @@
 
 	{#if tab === 'support'}
 		<InspectorSection title="Coverage workflow">
-			<div class="metric-grid"><MetricCard label="Approved routes" value={approvedCount} tone={approvedCount ? 'success' : 'warning'} /><MetricCard label="Support poses" value={navigationState.supportAnalysis?.summary?.support_pose_count ?? navigationState.navigationSupport?.observation_plan?.summary?.support_pose_count ?? '—'} /><MetricCard label="Native views" value={navigationState.supportAnalysis?.summary?.polar_observation_count ?? navigationState.navigationSupport?.observation_plan?.summary?.polar_observation_count ?? '—'} /></div>
-			{#if navigationState.supportAnalysis?.summary}<p class="help">Analysis estimates {navigationState.supportAnalysis.summary.polar_batch_count ?? '—'} K=4 polar batches before building the immutable support plan.</p>{:else}<p class="help">Approve a route, then analyze its pose and native-view coverage.</p>{/if}
+			<div class="metric-grid"><MetricCard label="Approved routes" value={approvedCount} tone={approvedCount ? 'success' : 'warning'} /><MetricCard label="Support poses" value={analysisSummary?.support_pose_count ?? navigationState.navigationSupport?.observation_plan?.summary?.support_pose_count ?? '—'} /><MetricCard label="Native views" value={analysisSummary?.polar_observation_count ?? navigationState.navigationSupport?.observation_plan?.summary?.polar_observation_count ?? '—'} /></div>
+			{#if analysisSummary}<p class="help">Analysis estimates {analysisSummary.polar_batch_count ?? '—'} K=4 polar batches before building the immutable support plan.</p>{:else if navigationState.supportAnalysis?.ok === false}<p class="help warn">{navigationState.supportAnalysis?.analysis?.message ?? navigationState.supportAnalysis?.analysis?.error ?? 'Analysis found a blocked corridor. Repair or unapprove the listed route before building.'}</p>{:else}<p class="help">Approve a route, then analyze its pose and native-view coverage.</p>{/if}
 			{#if supportReady}<div class="inline-summary"><Check size={15} /> Navigation Support is built and ready to render.</div>{/if}
 		</InspectorSection>
 	{/if}
