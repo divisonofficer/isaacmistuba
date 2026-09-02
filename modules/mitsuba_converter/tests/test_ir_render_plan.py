@@ -296,3 +296,131 @@ def test_camera_key_is_unchanged_for_graph_poses() -> None:
     assert _camera_key(poses[0]) == (
         str(poses[0]["viewpoint_id"]), round(float(poses[0]["heading_deg"]) % 360.0, 6), "",
     )
+
+
+def _free_poses(count: int = 60, anchors: int = 6) -> dict:
+    """A 6-DoF sampler payload, shaped as the sampler emits it."""
+    poses = []
+    for index in range(count):
+        anchor = f"obj:a{index % anchors}"
+        orbit = f"orbit:{anchor}:00"
+        poses.append({
+            "pose_id": f"{anchor}|orbit|00|{index:03d}", "viewpoint_id": orbit,
+            "orbit_id": orbit, "anchor_id": anchor, "capture_kind": "orbit",
+            "sequence_index": index, "heading_deg": (index * 17.0) % 360.0,
+            "position_xy": [math.cos(index) * 2.0, math.sin(index) * 2.0],
+            "eye_mitsuba": [0.0, 1.2, 0.0], "target_mitsuba": [1.0, 0.5, 0.0],
+            "up_mitsuba": [0.0, 1.0, 0.0], "roll_deg": 0.0,
+            "elevation_deg": -20.0, "anchor_distance_m": 1.4,
+        })
+    return {"schema": "robomituba.ir_camera_6dof_poses.v1",
+            "sampler_version": "object-orbit-6dof-v1", "poses": poses,
+            "free_pose_digest": "deadbeef", "source_authoring_map_digest": "cafe",
+            "anchor_count": anchors, "orbit_count": anchors, "tuple_count": 0,
+            "radius_range_m": [1.0, 2.0], "camera_elevation_range_deg": [-30.0, 55.0],
+            "orbits": [], "tuples": []}
+
+
+def _bank(conditions: int = 6) -> dict:
+    ids = ["reference_neutral_v1"] + [f"variation_{index}_v1" for index in range(conditions - 1)]
+    return {
+        "schema": "robomituba.ir_illumination_bank.v2",
+        "contract": "illumination-fixture-diversity-v2",
+        "manifest_digest": "bank-digest",
+        "assets": {"overcast_day": {"path": "a.exr", "sha256": "0" * 64}},
+        "conditions": [
+            {"id": name, "external_asset": "overcast_day", "internal_energy_scale": 1.0,
+             "fixtures": {"policy": "group_mask_v1", "subset_salt": name,
+                          "groups": {"ceiling": {"on_probability": 1.0}}}}
+            for name in ids
+        ],
+    }
+
+
+def test_free_pose_plan_declares_its_own_universe() -> None:
+    plan = build_render_plan({"nodes": [], "edges": []}, requested_pose_count=60, seed=7,
+                             scene_id="room", free_poses=_free_poses(),
+                             illumination=_bank(),
+                             illumination_pairing_policy="variation_subset_v3")
+    assert plan["schema"] == "robomituba.ir_principled_render_plan.v5"
+    assert plan["pose_universe"] == "object_orbit_6dof_v1"
+    assert plan["sampler_version"] == "object-orbit-6dof-v1"
+    # The graph is not the pose universe, so provenance points at the sampler.
+    assert plan["free_poses"]["free_pose_digest"] == "deadbeef"
+    assert plan["free_poses"]["source_authoring_map_digest"] == "cafe"
+
+
+def test_variation_subset_renders_every_base_pose_and_a_full_lighting_stack() -> None:
+    """The rule: N base poses once, M of them under every variation."""
+    plan = build_render_plan({"nodes": [], "edges": []}, requested_pose_count=60, seed=7,
+                             scene_id="room", free_poses=_free_poses(60),
+                             illumination=_bank(6), variation_pose_count=10,
+                             illumination_pairing_policy="variation_subset_v3")
+    groups = {group["lighting"]["id"]: group["poses"] for group in plan["groups"]}
+    assert len(groups["reference_neutral_v1"]) == 60
+    variations = [name for name in groups if name != "reference_neutral_v1"]
+    assert len(variations) == 5
+    for name in variations:
+        assert len(groups[name]) == 10
+
+    # Every variation condition covers the *same* ten poses, so lighting is
+    # isolated for a fixed camera rather than confounded with viewpoint.
+    stacks = [{pose["pose_id"] for pose in groups[name]} for name in variations]
+    assert all(stack == stacks[0] for stack in stacks)
+    assert stacks[0] <= {pose["pose_id"] for pose in groups["reference_neutral_v1"]}
+
+    assert plan["illumination"]["expected_frame_count"] == 60 + 10 * 5
+    assert plan["illumination"]["variation_pose_count"] == 10
+    assert plan["illumination"]["variation_condition_count"] == 5
+
+
+def test_variation_subset_shares_one_pair_id_across_conditions() -> None:
+    plan = build_render_plan({"nodes": [], "edges": []}, requested_pose_count=60, seed=7,
+                             scene_id="room", free_poses=_free_poses(),
+                             illumination=_bank(), variation_pose_count=10,
+                             illumination_pairing_policy="variation_subset_v3")
+    by_pose: dict[str, set[str]] = {}
+    for group in plan["groups"]:
+        for pose in group["poses"]:
+            by_pose.setdefault(pose["pose_id"], set()).add(pose["pair_id"])
+    assert all(len(ids) == 1 for ids in by_pose.values())
+    assert all(next(iter(ids)).startswith("room:") for ids in by_pose.values())
+
+
+def test_variation_subset_spreads_the_lighting_stack_over_anchors() -> None:
+    """Ten frames of one object teach less about lighting than ten objects."""
+    plan = build_render_plan({"nodes": [], "edges": []}, requested_pose_count=60, seed=7,
+                             scene_id="room", free_poses=_free_poses(60, anchors=6),
+                             illumination=_bank(), variation_pose_count=6,
+                             illumination_pairing_policy="variation_subset_v3")
+    varied = [pose for group in plan["groups"]
+              if group["lighting"]["id"] != "reference_neutral_v1" for pose in group["poses"]]
+    assert len({pose["anchor_id"] for pose in varied}) == 6
+
+
+def test_variation_subset_enforces_the_base_pose_band() -> None:
+    with pytest.raises(ValueError, match="50-100 base poses"):
+        build_render_plan({"nodes": [], "edges": []}, requested_pose_count=20, seed=7,
+                          scene_id="room", free_poses=_free_poses(20), illumination=_bank(),
+                          illumination_pairing_policy="variation_subset_v3")
+
+
+def test_variation_subset_cannot_be_starved_of_conditions() -> None:
+    """Five variations is the floor, and the bank rule already guarantees it.
+
+    A v2 bank must carry 6-12 conditions and exactly one reference, so fewer
+    than five variations is rejected before the policy is reached.  The policy
+    keeps its own check as a guard, but this is the reachable failure.
+    """
+    with pytest.raises(ValueError, match="6-12 conditions"):
+        build_render_plan({"nodes": [], "edges": []}, requested_pose_count=60, seed=7,
+                          scene_id="room", free_poses=_free_poses(), illumination=_bank(5),
+                          illumination_pairing_policy="variation_subset_v3")
+
+
+def test_free_poses_are_keyed_by_pose_id_not_viewpoint() -> None:
+    """Orbit members share a viewpoint id; the legacy key would collapse them."""
+    first, second = _free_poses(2, anchors=1)["poses"]
+    second["heading_deg"] = first["heading_deg"]
+    assert first["viewpoint_id"] == second["viewpoint_id"]
+    assert _camera_key(first) != _camera_key(second)

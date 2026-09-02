@@ -32,7 +32,10 @@ STRUCTURAL_TOKENS = ("wall", "floor", "ceiling", "door", "window", "exterior", "
 #: Objects mounted at or above this are ceiling fixtures, not things to inspect.
 CEILING_FIXTURE_HEIGHT_M = 2.2
 MIN_EXTENT_M = 0.15
-MAX_EXTENT_M = 2.5
+#: Anything larger cannot be framed from a 1-2 m standoff without
+#: dominating the shot, and the working distance is the constraint we
+#: may not relax -- active NIR irradiance falls as 1/r^2.
+MAX_EXTENT_M = 1.2
 #: Minimum planar separation between two admitted anchors, so a shelf of bottles
 #: does not consume the whole budget.
 MIN_ANCHOR_SPACING_M = 0.8
@@ -63,8 +66,14 @@ def _category(record: Mapping[str, Any]) -> str:
     return factory.removesuffix("Factory").split("_")[0].lower()
 
 
-def _geometry(record: Mapping[str, Any]) -> tuple[float, float, float, float, float] | None:
-    """Return ``(x, z_planar, half_x, half_y_planar, centre_height)`` or None."""
+def _geometry(record: Mapping[str, Any]) -> tuple[float, float, float, float, float, float] | None:
+    """Return ``(x, z_planar, half_x, half_y_planar, centre_height, vertical_extent)``.
+
+    The vertical extent is carried separately from ``centre_height``: the camera
+    sampler needs the object's real height to frame it, and substituting the
+    planar extent for it made flat props (a book, chopsticks on a table) look
+    several times taller than they are.
+    """
     geometry = record.get("geometry") or {}
     centre = geometry.get("center")
     size = geometry.get("size_m") or []
@@ -78,7 +87,7 @@ def _geometry(record: Mapping[str, Any]) -> tuple[float, float, float, float, fl
         return None
     if not all(math.isfinite(v) for v in (x, planar_y, ex, vertical, ey, base)):
         return None
-    return x, planar_y, ex / 2.0, ey / 2.0, base + vertical / 2.0
+    return x, planar_y, ex / 2.0, ey / 2.0, base + vertical / 2.0, vertical
 
 
 def _is_structural(record: Mapping[str, Any]) -> bool:
@@ -97,9 +106,11 @@ def candidate_anchors(authoring_map: Mapping[str, Any]) -> list[dict[str, Any]]:
         parsed = _geometry(record)
         if parsed is None:
             continue
-        x, y, hx, hy, height = parsed
+        x, y, hx, hy, height, vertical = parsed
         extent = max(hx, hy) * 2.0
-        if extent > MAX_EXTENT_M or height >= CEILING_FIXTURE_HEIGHT_M:
+        # A tall thin object overflows the frame just as surely as a wide
+        # one, so the size band is judged on every axis.
+        if max(extent, vertical) > MAX_EXTENT_M or height >= CEILING_FIXTURE_HEIGHT_M:
             continue
         pbr = ((record.get("metadata") or {}).get("pbr") or {}).get("channels") or {}
         out.append({
@@ -109,6 +120,7 @@ def candidate_anchors(authoring_map: Mapping[str, Any]) -> list[dict[str, Any]]:
             "center_xy": [x, y],
             "half_extent_xy": [hx, hy],
             "height_m": round(height, 6),
+            "vertical_extent_m": round(vertical, 6),
             "extent_m": round(extent, 6),
             "pbr_channels": sorted(pbr),
         })
@@ -142,6 +154,7 @@ def _cluster(small: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
             "half_extent_xy": [max(hx / 2.0, CLUSTER_MIN_EXTENT_M / 2.0),
                                max(hy / 2.0, CLUSTER_MIN_EXTENT_M / 2.0)],
             "height_m": round(sum(m["height_m"] for m in members) / len(members), 6),
+            "vertical_extent_m": round(max(m["vertical_extent_m"] for m in members), 6),
             "extent_m": round(max(hx, hy), 6),
             "pbr_channels": sorted({c for m in members for c in m["pbr_channels"]}),
             "member_object_ids": [m["object_id"] for m in members],
@@ -183,6 +196,7 @@ def build_object_anchors(
             **row, "anchor_id": anchor_id,
             # Mitsuba world is Y-up: (x, height, authoring_y).
             "center_mitsuba": [row["center_xy"][0], row["height_m"], row["center_xy"][1]],
+            "vertical_extent_m": row["vertical_extent_m"],
             "target_height_m": row["height_m"],
         })
         factory_counts[factory] = factory_counts.get(factory, 0) + 1

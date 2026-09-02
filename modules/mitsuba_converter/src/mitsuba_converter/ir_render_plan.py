@@ -19,6 +19,15 @@ ILLUMINATION_PLAN_SCHEMA = "robomituba.ir_principled_render_plan.v3"
 ILLUMINATION_REFERENCE_PLAN_SCHEMA = "robomituba.ir_principled_render_plan.v4"
 CONTENT_SAMPLER_VERSION = "content-aware-fps-v2"
 LIGHTING_PRESET_VERSION = "indoor-capture-groups-v1"
+FREE_POSE_PLAN_SCHEMA = "robomituba.ir_principled_render_plan.v5"
+POSE_UNIVERSE_FREE = "object_orbit_6dof_v1"
+#: Base poses rendered once each.  Below 50 a scene does not cover its objects;
+#: above 100 the lighting subset stops being the interesting part of the budget.
+BASE_POSE_RANGE = (50, 100)
+#: Poses re-rendered under every variation condition.  Small on purpose: the
+#: cross product is what costs GPU time, and lighting is a per-pose control.
+DEFAULT_VARIATION_POSE_COUNT = 10
+MIN_VARIATION_CONDITIONS = 5
 ILLUMINATION_BANK_SCHEMA_V2 = "robomituba.ir_illumination_bank.v2"
 MAX_ILLUMINATION_CONDITIONS = 12
 FIXTURE_SAMPLER_VERSION = "fixture-subset-hash-v1"
@@ -65,9 +74,20 @@ def _distance(a: dict[str, Any], b: dict[str, Any], spatial_scale: float) -> flo
     return spatial + 0.35 * delta
 
 
-def _camera_key(item: dict[str, Any]) -> tuple[str, float, str]:
-    """Distinguish two anchor sets that intentionally share one graph node."""
-    return (str(item["viewpoint_id"]), round(float(item["heading_deg"]) % 360.0, 6), str(item.get("anchor_id") or ""))
+def _camera_key(item: dict[str, Any]) -> tuple[str, float, str] | tuple[str, str]:
+    """Identity of a pose for de-duplication.
+
+    A free 6-DoF pose carries an explicit ``pose_id``; two of them can share a
+    viewpoint (an orbit id) and round to the same heading while being entirely
+    different cameras, so the legacy triple would collapse them.  Graph poses
+    never carry ``pose_id``, so their key -- and every published digest built on
+    it -- is untouched.
+    """
+    pose_id = item.get("pose_id")
+    if pose_id:
+        return ("pose", str(pose_id))
+    return (str(item["viewpoint_id"]), float(item["heading_deg"]) % 360.0,
+            str(item.get("anchor_id") or ""))
 
 
 def _fps(candidates: list[dict[str, Any]], count: int, rng: random.Random, spatial_scale: float) -> list[dict[str, Any]]:
@@ -165,6 +185,40 @@ def _content_select(candidates: list[dict[str, Any]], visibility: dict[str, Any]
     return selected, metadata
 
 
+def _illumination_recipe(condition: dict[str, Any], illumination: dict[str, Any], *,
+                         scene_id: str, seed: int, side_axis, center, version: str) -> dict[str, Any]:
+    """Build one lighting recipe and close its digest over the whole spec."""
+    external_id = str(condition["external_asset"])
+    asset = dict((illumination.get("assets") or {}).get(external_id) or {})
+    recipe = {
+        "id": str(condition["id"]), "label": str(condition["id"]),
+        "version": version,
+        # Carries the *specification*, never a resolved fixture list:
+        # view_plan runs before principled_prepare, so the plan cannot
+        # know which fixtures a scene has.  recipe_digest closes over
+        # this, so the sampled subset stays reproducible.
+        **({"fixtures": {**dict(condition["fixtures"]),
+                         "sampler_version": FIXTURE_SAMPLER_VERSION,
+                         "subset_seed": int(seed),
+                         "nir_band_effect": {"color": "luminance_collapsed",
+                                             "on_off": "shared"}},
+            "scene_id": str(scene_id)}
+           if condition.get("fixtures") else {}),
+        "native_energy_scale": float(condition.get("internal_energy_scale", 1.0)),
+        "ambient_fill_scale": 1.0,
+        "rgb_color_multiplier": list(condition.get("internal_color") or (1.0, 1.0, 1.0)),
+        "side_key": bool(condition.get("side_key", False)),
+        "key_energy_scale": float(condition.get("key_energy_scale", 1.45)),
+        "opposite_energy_scale": float(condition.get("opposite_energy_scale", 0.35)),
+        "side_axis_xy": side_axis, "side_center_xy": center,
+        "external": {"asset_id": external_id, "path": asset.get("path"), "sha256": asset.get("sha256"),
+                     "world_strength": float(condition.get("world_strength", 0.0)),
+                     "portal_strength": float(condition.get("portal_strength", 0.0))},
+    }
+    recipe["recipe_digest"] = stable_digest(recipe)
+    return recipe
+
+
 def build_render_plan(graph: dict[str, Any], *, requested_pose_count: int, seed: int, scene_id: str,
                       visibility: dict[str, Any] | None = None, adaptive_budget: bool = False,
                       max_headings_per_node: int = 6, sparse_fraction: float = 0.15,
@@ -172,12 +226,26 @@ def build_render_plan(graph: dict[str, Any], *, requested_pose_count: int, seed:
                       paired_fraction: float = 0.25, camera_sets: dict[str, Any] | None = None,
                       showcase_provenance: dict[str, Any] | None = None,
                       min_unique_pose_count: int = 1,
+                      free_poses: dict[str, Any] | None = None,
+                      variation_pose_count: int = DEFAULT_VARIATION_POSE_COUNT,
                       illumination_pairing_policy: str = "legacy_six_way_v1") -> dict[str, Any]:
     """Select unique node-heading poses in balanced lighting capture groups."""
     if requested_pose_count < 1:
         raise ValueError("requested_pose_count must be positive")
     candidates: list[dict[str, Any]] = []
-    if camera_sets is not None:
+    if free_poses is not None:
+        # The 6-DoF sampler has already enforced standoff, framing and free
+        # space.  Every pose it emitted is kept as a candidate; `position_xy`
+        # and `heading_deg` are derived fields it fills in so the existing
+        # spread and selection helpers work unchanged.
+        for pose in free_poses.get("poses") or []:
+            if not isinstance(pose, dict) or not pose.get("pose_id"):
+                continue
+            candidate = dict(pose)
+            candidate["heading_deg"] = float(candidate.get("heading_deg") or 0.0)
+            candidate["position_xy"] = [float(v) for v in candidate["position_xy"]]
+            candidates.append(candidate)
+    elif camera_sets is not None:
         # Showcase cameras are already assembled from walkable nodes and look
         # at their local anchor.  Do not resurrect OpticalNav's heading sweep.
         for pose in camera_sets.get("poses") or []:
@@ -195,11 +263,12 @@ def build_render_plan(graph: dict[str, Any], *, requested_pose_count: int, seed:
             position_xy = _position(node)
             for heading in node.get("headings") or []:
                 candidates.append({"viewpoint_id": node_id, "heading_deg": float(heading.get("yaw_deg", 0.0)), "position_xy": list(position_xy)})
-    candidates.sort(key=lambda item: (item["viewpoint_id"], item["heading_deg"], str(item.get("anchor_id") or "")))
+    candidates.sort(key=lambda item: (str(item.get("pose_id") or ""), item["viewpoint_id"],
+                                      item["heading_deg"], str(item.get("anchor_id") or "")))
     if not candidates:
         raise ValueError("viewpoint graph has no node-heading candidates")
     room_cap, room_size_class = _adaptive_cap(candidates)
-    target = int(requested_pose_count) if camera_sets is not None else (
+    target = int(requested_pose_count) if (camera_sets is not None or free_poses is not None) else (
         min(int(requested_pose_count), room_cap) if adaptive_budget else int(requested_pose_count)
     )
     actual = min(target, len(candidates))
@@ -208,9 +277,10 @@ def build_render_plan(graph: dict[str, Any], *, requested_pose_count: int, seed:
     span = max(math.hypot(x - center[0], y - center[1]) for x, y in points) * 2.0
     rng = random.Random(int(seed))
     selection_meta = None
-    if camera_sets is not None:
-        # build_camera_sets has already applied the anchor-set cardinality,
-        # clearance and baseline invariants.  Preserve each selected pose.
+    if free_poses is not None or camera_sets is not None:
+        # Both universes have already applied their own selection invariants
+        # (anchor-set cardinality and baseline; standoff and framing).
+        # Preserve each selected pose.
         remaining = list(candidates)
     elif visibility is not None:
         selected_all, selection_meta = _content_select(candidates, visibility, actual, rng, span,
@@ -235,11 +305,70 @@ def build_render_plan(graph: dict[str, Any], *, requested_pose_count: int, seed:
                     f"illumination bank v2 requires 6-{MAX_ILLUMINATION_CONDITIONS} conditions")
         elif len(conditions) != 6:
             raise ValueError("illumination diversity requires six conditions")
-        if illumination_pairing_policy not in {"legacy_six_way_v1", "reference_subset_v2"}:
+        if illumination_pairing_policy not in {"legacy_six_way_v1", "reference_subset_v2",
+                                               "variation_subset_v3"}:
             raise ValueError(f"unsupported illumination pairing policy: {illumination_pairing_policy}")
         fraction = max(0.0, min(1.0, float(paired_fraction)))
         paired_count = min(actual, max(1, round(actual * fraction)))
-        if illumination_pairing_policy == "reference_subset_v2":
+        if illumination_pairing_policy == "variation_subset_v3":
+            # Every base pose once under the reference, and a small subset under
+            # *every* variation.  reference_subset_v2 instead partitions the
+            # base poses across the variations, so no pose is ever seen under
+            # two lightings and lighting cannot be isolated for a fixed camera.
+            reference_indices = [index for index, condition in enumerate(conditions)
+                                 if str(condition.get("id") or "") == "reference_neutral_v1"]
+            if len(reference_indices) != 1:
+                raise ValueError("variation_subset_v3 requires exactly one reference_neutral_v1 condition")
+            reference_index = reference_indices[0]
+            variation_indices = [index for index in range(len(conditions)) if index != reference_index]
+            if len(variation_indices) < MIN_VARIATION_CONDITIONS:
+                raise ValueError(
+                    f"variation_subset_v3 requires at least {MIN_VARIATION_CONDITIONS} variation "
+                    f"conditions, got {len(variation_indices)}")
+            base_poses = _fps(remaining, actual, rng, span) if len(remaining) > actual else list(remaining)
+            actual = len(base_poses)
+            if not BASE_POSE_RANGE[0] <= actual <= BASE_POSE_RANGE[1]:
+                raise ValueError(
+                    f"variation_subset_v3 expects {BASE_POSE_RANGE[0]}-{BASE_POSE_RANGE[1]} base "
+                    f"poses, got {actual}")
+            wanted = max(1, min(int(variation_pose_count), actual))
+            # Spread the lighting subset over distinct anchors first: ten frames
+            # of one object under five lightings teaches less about lighting than
+            # ten different objects would, and the anchors carry the scene's
+            # material variety.
+            by_anchor: dict[str, list[dict[str, Any]]] = {}
+            for pose in base_poses:
+                by_anchor.setdefault(str(pose.get("anchor_id") or ""), []).append(pose)
+            leaders = _fps([poses[0] for poses in by_anchor.values()],
+                           min(wanted, len(by_anchor)), rng, span)
+            chosen = {_camera_key(pose) for pose in leaders}
+            if len(chosen) < wanted:
+                rest = [pose for pose in base_poses if _camera_key(pose) not in chosen]
+                chosen |= {_camera_key(pose) for pose in _fps(rest, wanted - len(chosen), rng, span)}
+            variation_poses = [pose for pose in base_poses if _camera_key(pose) in chosen]
+
+            def lit_pose(pose: dict[str, Any], member_index: int) -> dict[str, Any]:
+                # One pair_id per *pose*, shared across its lighting conditions,
+                # so a consumer can pull the whole lighting stack for one camera.
+                pair_id = f"{scene_id}:{pose['pose_id']}"
+                return {**pose, "capture_kind": str(pose.get("capture_kind") or "orbit"),
+                        "lighting_pair_id": pair_id, "pair_id": pair_id,
+                        "pair_member_index": member_index}
+
+            for index, condition in enumerate(conditions):
+                recipe = _illumination_recipe(condition, illumination, scene_id=scene_id, seed=seed,
+                                              side_axis=side_axis, center=center,
+                                              version="illumination-variation-subset-v3")
+                poses = ([lit_pose(pose, 0) for pose in base_poses] if index == reference_index
+                         else [lit_pose(pose, 1 + variation_indices.index(index))
+                               for pose in variation_poses])
+                groups.append({"lighting": recipe,
+                               "capture_group_id": f"{scene_id}:{recipe['id']}", "poses": poses})
+            paired_count = len(variation_poses)
+            # Every base pose is rendered under the reference, so none is
+            # "single" in the legacy sense of belonging to one condition only.
+            singles = []
+        elif illumination_pairing_policy == "reference_subset_v2":
             reference_indices = [index for index, condition in enumerate(conditions)
                                  if str(condition.get("id") or "") == "reference_neutral_v1"]
             if len(reference_indices) != 1:
@@ -265,34 +394,9 @@ def build_render_plan(graph: dict[str, Any], *, requested_pose_count: int, seed:
                         "pair_member_index": member_index}
 
             for index, condition in enumerate(conditions):
-                external_id = str(condition["external_asset"])
-                asset = dict((illumination.get("assets") or {}).get(external_id) or {})
-                recipe = {
-                    "id": str(condition["id"]), "label": str(condition["id"]),
-                    "version": "illumination-reference-subset-v2",
-                    # Carries the *specification*, never a resolved fixture list:
-                    # view_plan runs before principled_prepare, so the plan cannot
-                    # know which fixtures a scene has.  recipe_digest closes over
-                    # this, so the sampled subset stays reproducible.
-                    **({"fixtures": {**dict(condition["fixtures"]),
-                                     "sampler_version": FIXTURE_SAMPLER_VERSION,
-                                     "subset_seed": int(seed),
-                                     "nir_band_effect": {"color": "luminance_collapsed",
-                                                         "on_off": "shared"}},
-                        "scene_id": str(scene_id)}
-                       if condition.get("fixtures") else {}),
-                    "native_energy_scale": float(condition.get("internal_energy_scale", 1.0)),
-                    "ambient_fill_scale": 1.0,
-                    "rgb_color_multiplier": list(condition.get("internal_color") or (1.0, 1.0, 1.0)),
-                    "side_key": bool(condition.get("side_key", False)),
-                    "key_energy_scale": float(condition.get("key_energy_scale", 1.45)),
-                    "opposite_energy_scale": float(condition.get("opposite_energy_scale", 0.35)),
-                    "side_axis_xy": side_axis, "side_center_xy": center,
-                    "external": {"asset_id": external_id, "path": asset.get("path"), "sha256": asset.get("sha256"),
-                                 "world_strength": float(condition.get("world_strength", 0.0)),
-                                 "portal_strength": float(condition.get("portal_strength", 0.0))},
-                }
-                recipe["recipe_digest"] = stable_digest(recipe)
+                recipe = _illumination_recipe(condition, illumination, scene_id=scene_id, seed=seed,
+                                              side_axis=side_axis, center=center,
+                                              version="illumination-reference-subset-v2")
                 poses = ([paired_pose(pose, 0) for pose in base_poses] if index == reference_index
                          else [paired_pose(pose, 1) for pose in variation_groups[index]])
                 groups.append({"lighting": recipe,
@@ -369,10 +473,12 @@ def build_render_plan(graph: dict[str, Any], *, requested_pose_count: int, seed:
     if len(unique_selected) < int(min_unique_pose_count):
         raise ValueError(f"independent camera pose minimum not met: {len(unique_selected)} < {int(min_unique_pose_count)} (lighting ignored)")
     plan_core = {
-        "schema": ((ILLUMINATION_REFERENCE_PLAN_SCHEMA if illumination_pairing_policy == "reference_subset_v2"
-                    else ILLUMINATION_PLAN_SCHEMA) if illumination else
-                   (CONTENT_PLAN_SCHEMA if (visibility is not None or camera_sets is not None) else PLAN_SCHEMA)),
-        "sampler_version": "anchor-centric-walkable-v1" if camera_sets is not None else (CONTENT_SAMPLER_VERSION if visibility is not None else SAMPLER_VERSION), "scene_id": scene_id,
+        "schema": (FREE_POSE_PLAN_SCHEMA if free_poses is not None else
+                   ((ILLUMINATION_REFERENCE_PLAN_SCHEMA if illumination_pairing_policy == "reference_subset_v2"
+                     else ILLUMINATION_PLAN_SCHEMA) if illumination else
+                    (CONTENT_PLAN_SCHEMA if (visibility is not None or camera_sets is not None) else PLAN_SCHEMA))),
+        "sampler_version": (str(free_poses.get("sampler_version") or "") if free_poses is not None else
+                            ("anchor-centric-walkable-v1" if camera_sets is not None else (CONTENT_SAMPLER_VERSION if visibility is not None else SAMPLER_VERSION))), "scene_id": scene_id,
         "source_graph_digest": stable_digest(graph),
         "sampling_seed": int(seed), "requested_pose_count": int(requested_pose_count), "actual_pose_count": actual,
         "candidate_pose_count": len(candidates), "clamped": actual != int(requested_pose_count),
@@ -383,16 +489,37 @@ def build_render_plan(graph: dict[str, Any], *, requested_pose_count: int, seed:
         "lighting_preset_version": LIGHTING_PRESET_VERSION, "lighting_group_count": len(groups),
         "scene_center_xy": center, "side_key_axis_xy": side_axis, "groups": groups,
     }
+    if free_poses is not None:
+        # The graph is not the pose universe here, so record what is: the
+        # authoring map the anchors came from and the sampler's own digest.
+        plan_core["pose_universe"] = POSE_UNIVERSE_FREE
+        plan_core["free_poses"] = {
+            "free_pose_digest": free_poses.get("free_pose_digest"),
+            "source_authoring_map_digest": free_poses.get("source_authoring_map_digest"),
+            "sampler_version": free_poses.get("sampler_version"),
+            "anchor_count": free_poses.get("anchor_count"),
+            "orbit_count": free_poses.get("orbit_count"),
+            "tuple_count": free_poses.get("tuple_count"),
+            "radius_range_m": free_poses.get("radius_range_m"),
+            "camera_elevation_range_deg": free_poses.get("camera_elevation_range_deg"),
+            "orbits": free_poses.get("orbits"),
+            "tuples": free_poses.get("tuples"),
+        }
     if illumination:
         variation_counts = {group["lighting"]["id"]: len(group["poses"]) for group in groups}
         plan_core["illumination"] = {"contract": illumination.get("contract"), "manifest_digest": illumination.get("manifest_digest"),
                                       "pairing_policy": illumination_pairing_policy,
                                       "paired_fraction": float(paired_fraction), "paired_pose_count": paired_count,
                                       "single_pose_count": len(singles), "condition_count": len(conditions),
-                                      "reference_condition_id": "reference_neutral_v1" if illumination_pairing_policy == "reference_subset_v2" else None,
-                                      "base_pose_count": actual if illumination_pairing_policy == "reference_subset_v2" else None,
+                                      "reference_condition_id": ("reference_neutral_v1" if illumination_pairing_policy in {"reference_subset_v2", "variation_subset_v3"} else None),
+                                      "base_pose_count": (actual if illumination_pairing_policy in {"reference_subset_v2", "variation_subset_v3"} else None),
                                       "condition_pose_counts": variation_counts,
                                       "expected_frame_count": sum(variation_counts.values())}
+        if illumination_pairing_policy == "variation_subset_v3":
+            # Added only under the new policy: any key present here lands in
+            # render_plan_digest, and every published plan must keep its bytes.
+            plan_core["illumination"]["variation_pose_count"] = paired_count
+            plan_core["illumination"]["variation_condition_count"] = len(conditions) - 1
     if visibility is not None:
         selected_keys = {(pose["viewpoint_id"], pose["heading_deg"]) for group in groups for pose in group["poses"]}
         reserve_pool = [item for item in candidates if (item["viewpoint_id"], item["heading_deg"]) not in selected_keys
@@ -421,6 +548,8 @@ def write_render_plan(path: Path, graph_path: Path, *, requested_pose_count: int
                       camera_sets_path: Path | None = None,
                       showcase_provenance: dict[str, Any] | None = None,
                       min_unique_pose_count: int = 1,
+                      free_poses: dict[str, Any] | None = None,
+                      variation_pose_count: int = DEFAULT_VARIATION_POSE_COUNT,
                       illumination_pairing_policy: str = "legacy_six_way_v1") -> dict[str, Any]:
     graph = json.loads(graph_path.read_text(encoding="utf-8"))
     visibility = json.loads(visibility_path.read_text(encoding="utf-8")) if visibility_path else None

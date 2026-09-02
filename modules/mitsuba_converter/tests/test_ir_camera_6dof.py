@@ -28,11 +28,14 @@ def _prop(oid, x, y, *, base=0.0, height=0.5, extent=0.4, depth=None):
                          "base_height_m": base}}
 
 
-def _anchor(aid, x, y_up, z, *, half=0.2, object_id=None):
+def _anchor(aid, x, y_up, z, *, half=0.2, tall=None, object_id=None):
     return {"anchor_id": aid, "object_id": object_id or aid,
             "center_mitsuba": [x, y_up, z], "center_xy": [x, z],
-            "half_extent_xy": [half, half], "height_m": half * 2,
-            "target_height_m": y_up}
+            "half_extent_xy": [half, half],
+            # The object's real vertical size; `height_m` is its centre height
+            # above the floor, which is a different quantity entirely.
+            "vertical_extent_m": half * 2 if tall is None else tall,
+            "height_m": y_up, "target_height_m": y_up}
 
 
 def _map(objects):
@@ -124,9 +127,9 @@ def test_line_of_sight_is_blocked_by_a_tall_slab():
 
 def test_framing_rejects_anchors_that_are_too_small_or_too_large():
     objects = [_floor(width=20.0, depth=20.0)]
-    tiny = build_free_camera_poses([_anchor("obj:tiny", 0.0, 0.5, 0.0, half=0.005)],
+    tiny = build_free_camera_poses([_anchor("obj:tiny", 0.0, 0.5, 0.0, half=0.005, tall=0.01)],
                                    _map(objects), scene_id="s", seed=3)
-    huge = build_free_camera_poses([_anchor("obj:huge", 0.0, 0.5, 0.0, half=4.0)],
+    huge = build_free_camera_poses([_anchor("obj:huge", 0.0, 0.5, 0.0, half=4.0, tall=4.0)],
                                    _map(objects), scene_id="s", seed=3)
     assert tiny["actual_pose_count"] == 0
     assert huge["actual_pose_count"] == 0

@@ -57,10 +57,18 @@ ORBIT_ARC_SPAN_DEG = (70.0, 160.0)
 ORBIT_STEPS = (6, 14)
 #: Resolution of the per-anchor ring scan that finds which azimuths exist.
 AZIMUTH_SCAN_STEPS = 72
+#: Orbits per anchor.  Each commits to one radius and elevation, so a second
+#: pass is how one anchor offers more than a single vantage -- and it is the
+#: cheapest way to keep a scene's base-pose supply above the plan's floor.
+ORBITS_PER_ANCHOR = 2
 SPARSE_TUPLE_SIZE = (4, 8)
 MIN_BASELINE_M = 0.5
 MIN_AZIMUTH_SPAN_DEG = 90.0
-FRAME_FILL_RANGE = (0.04, 0.70)
+#: Fraction of frame *area* the anchor's box may cover.  The old 0.70 ceiling
+#: admitted poses where the object filled the shot and read as standing on
+#: top of it.  At 2 m and a 50 deg FOV, 0.30 is about a 1.0 m wide object --
+#: past that it is the standoff, not the framing, that would have to give.
+FRAME_FILL_RANGE = (0.04, 0.30)
 MAX_ANCHOR_OFFCENTER = 0.62
 LOS_RAY_MIN_CLEAR = 3
 
@@ -189,7 +197,10 @@ def _framing(eye, target, anchor, *, fov_deg, width, height):
     tan_x = math.tan(math.radians(fov_deg) / 2.0)
     tan_y = tan_x * float(height) / float(width)
     hx, hy = anchor["half_extent_xy"]
-    hz = max(hx, hy)
+    # The anchor's own vertical extent.  Falling back to the planar extent, as
+    # this once did, scored a flat prop at several times its real frame area
+    # and let visibly-too-close poses through the fill gate.
+    hz = float(anchor.get("vertical_extent_m") or max(hx, hy) * 2.0) / 2.0
     xs, ys = [], []
     for sx in (-1, 1):
         for sy in (-1, 1):
@@ -215,6 +226,49 @@ def _azimuth_span(values: Sequence[float]) -> float:
     gaps = [(ordered[i + 1] - ordered[i]) for i in range(len(ordered) - 1)]
     gaps.append(360.0 - ordered[-1] + ordered[0])
     return 360.0 - max(gaps)
+
+
+def _longest_arc(ring: Sequence[tuple[float, dict[str, Any]]],
+                 rng: random.Random) -> list[dict[str, Any]]:
+    """Pick a short contiguous arc out of the viable azimuths, or nothing.
+
+    An orbit with a hole in it is not a small-baseline sequence, so a run that
+    cannot be filled contiguously is discarded rather than stitched.
+    """
+    if not ring:
+        return []
+    step_deg = 360.0 / AZIMUTH_SCAN_STEPS
+    indices = [round(a / step_deg) for a, _ in ring]
+    best: list[int] = []
+    current = [0]
+    for k in range(1, len(indices)):
+        if indices[k] == indices[k - 1] + 1:
+            current.append(k)
+        else:
+            best = max(best, current, key=len)
+            current = [k]
+    best = max(best, current, key=len)
+    # The ring wraps, so a run ending at 355 deg continues at 0 deg.
+    if len(indices) > 1 and indices[0] == 0 and indices[-1] == AZIMUTH_SCAN_STEPS - 1:
+        head = [k for k in range(len(indices)) if indices[k] == k]
+        tail: list[int] = []
+        for k in range(len(indices) - 1, 0, -1):
+            if indices[k] != indices[k - 1] + 1:
+                break
+            tail.insert(0, k)
+        if len(tail) + len(head) > len(best):
+            best = tail + head
+    if len(best) < ORBIT_STEPS[0] or (len(best) - 1) * step_deg < ORBIT_ARC_SPAN_DEG[0]:
+        return []
+    # An orbit is a short arc, not a lap: spreading members over a whole viable
+    # ring would put ~1.7 m between adjacent frames.
+    want_span = rng.uniform(*ORBIT_ARC_SPAN_DEG)
+    arc_width = max(ORBIT_STEPS[0], min(len(best), int(want_span / step_deg) + 1))
+    offset = rng.randint(0, len(best) - arc_width)
+    window = best[offset:offset + arc_width]
+    keep = min(len(window), ORBIT_STEPS[1])
+    picked = [window[round(i * (len(window) - 1) / (keep - 1))] for i in range(keep)]
+    return [ring[k][1] for k in dict.fromkeys(picked)]
 
 
 def build_free_camera_poses(anchors, authoring_map, *, scene_id, seed, pose_budget=120,
@@ -250,9 +304,44 @@ def build_free_camera_poses(anchors, authoring_map, *, scene_id, seed, pose_budg
         hi = min(hi, CAMERA_ELEVATION_RANGE_DEG[1])
         return (lo, hi) if hi > lo else None
 
+    def framing_distance(anchor, rng):
+        """Standoff that frames this anchor, clamped to the working band.
+
+        Drawing the distance blind and letting the fill gate judge it after the
+        fact threw away whole orbits: an orbit commits to one distance, so a
+        single too-close draw killed every member.  Solving for it instead means
+        a large object is met from the far end of the band and a small one from
+        the near end, which is what "1-2 m" was always meant to express.
+
+        The result is then nudged to a distance that actually admits an
+        elevation: something mounted well above eye level can only be looked up
+        at from far enough back, and framing alone does not know that.
+        """
+        tan_x = math.tan(math.radians(fov_deg) / 2.0)
+        tan_y = tan_x * float(height) / float(width)
+        hx, hy = anchor["half_extent_xy"]
+        hz = float(anchor.get("vertical_extent_m") or max(hx, hy) * 2.0) / 2.0
+        # Solve against the bounding sphere, not the axis-aligned span.  The box
+        # is generally seen cornerwise, and its near face is closer than its
+        # centre, so a span-based estimate under-predicted the projected area by
+        # two to three times and put the camera far too close.  A sphere over-
+        # estimates slightly, which errs toward standing back.
+        radius = math.sqrt(hx * hx + hy * hy + hz * hz)
+        target = rng.uniform(0.08, 0.22)
+        ideal = radius + radius / math.sqrt(max(target * tan_x * tan_y, 1e-9))
+        ideal = max(RADIUS_RANGE_M[0], min(RADIUS_RANGE_M[1], ideal))
+        if elevation_window(anchor, ideal) is not None:
+            return ideal
+        steps = 12
+        for step in range(steps + 1):
+            probe = RADIUS_RANGE_M[0] + (RADIUS_RANGE_M[1] - RADIUS_RANGE_M[0]) * step / steps
+            if elevation_window(anchor, probe) is not None:
+                return probe
+        return ideal
+
     def candidate(anchor, azimuth_deg, rng, *, fixed_elevation=None, fixed_distance=None):
         theta = math.radians(azimuth_deg)
-        distance = (rng.uniform(*RADIUS_RANGE_M) if fixed_distance is None else fixed_distance)
+        distance = (framing_distance(anchor, rng) if fixed_distance is None else fixed_distance)
         window = elevation_window(anchor, distance)
         if window is None:
             note("no_elevation"); return None
@@ -332,72 +421,44 @@ def build_free_camera_poses(anchors, authoring_map, *, scene_id, seed, pose_budg
             if pose is not None:
                 viable.append((360.0 * step / AZIMUTH_SCAN_STEPS, pose))
 
-        # An orbit holds its radius and eye height and varies only azimuth --
+        # An orbit holds its radius and elevation and varies only azimuth --
         # that is what keeps adjacent frames a small baseline apart.  Letting
         # every member redraw them produced a 1.6 m jump between neighbours.
-        orbit_rng = _rng(seed, scene_id, aid, "orbit")
-        orbit_distance = orbit_rng.uniform(*RADIUS_RANGE_M)
-        orbit_window = elevation_window(anchor, orbit_distance)
-        orbit_elevation = (orbit_rng.uniform(*orbit_window) if orbit_window
-                           else CAMERA_ELEVATION_RANGE_DEG[0])
-        ring: list[tuple[float, dict[str, Any]]] = []
-        for step in range(AZIMUTH_SCAN_STEPS):
-            azimuth = 360.0 * step / AZIMUTH_SCAN_STEPS
-            pose = candidate(anchor, azimuth, orbit_rng,
-                             fixed_elevation=orbit_elevation, fixed_distance=orbit_distance)
-            if pose is not None:
-                ring.append((azimuth, pose))
+        # Each orbit therefore contributes exactly one vantage, so an anchor
+        # needs more than one of them to carry its share of the pose budget.
+        for orbit_index in range(ORBITS_PER_ANCHOR):
+            orbit_rng = _rng(seed, scene_id, aid, f"orbit{orbit_index}")
+            orbit_distance = framing_distance(anchor, orbit_rng)
+            orbit_window = elevation_window(anchor, orbit_distance)
+            if orbit_window is None:
+                note("orbit_no_elevation")
+                continue
+            # Split the feasible elevation band between orbits so the second is
+            # a different vantage rather than a near-duplicate of the first.
+            low, high = orbit_window
+            slot = (high - low) / ORBITS_PER_ANCHOR
+            orbit_elevation = orbit_rng.uniform(low + slot * orbit_index,
+                                                low + slot * (orbit_index + 1))
+            ring: list[tuple[float, dict[str, Any]]] = []
+            for step in range(AZIMUTH_SCAN_STEPS):
+                azimuth = 360.0 * step / AZIMUTH_SCAN_STEPS
+                pose = candidate(anchor, azimuth, orbit_rng,
+                                 fixed_elevation=orbit_elevation, fixed_distance=orbit_distance)
+                if pose is not None:
+                    ring.append((azimuth, pose))
 
-        run: list[dict[str, Any]] = []
-        if ring:
-            indices = [round(a / (360.0 / AZIMUTH_SCAN_STEPS)) for a, _ in ring]
-            best: list[int] = []
-            current = [0]
-            for k in range(1, len(indices)):
-                if indices[k] == indices[k - 1] + 1:
-                    current.append(k)
-                else:
-                    best = max(best, current, key=len)
-                    current = [k]
-            best = max(best, current, key=len)
-            # The ring wraps, so a run ending at 355 deg continues at 0 deg.
-            if len(indices) > 1 and indices[0] == 0 and indices[-1] == AZIMUTH_SCAN_STEPS - 1:
-                head = [k for k in range(len(indices)) if indices[k] == k]
-                tail = []
-                for k in range(len(indices) - 1, 0, -1):
-                    if indices[k] != indices[k - 1] + 1:
-                        break
-                    tail.insert(0, k)
-                if len(tail) + len(head) > len(best):
-                    best = tail + head
-            step_deg = 360.0 / AZIMUTH_SCAN_STEPS
-            span = (len(best) - 1) * step_deg
-            if len(best) >= ORBIT_STEPS[0] and span >= ORBIT_ARC_SPAN_DEG[0]:
-                # An orbit is a short arc, not a lap.  Spreading the members
-                # over a whole viable ring would put ~1.7 m between adjacent
-                # frames, which is not a small-baseline sequence.
-                want_span = orbit_rng.uniform(*ORBIT_ARC_SPAN_DEG)
-                # NB: not named `width` -- that shadows the image-width
-                # parameter this closure reads, and framed every anchor
-                # after the first against a 22px-wide image.
-                arc_width = max(ORBIT_STEPS[0], min(len(best), int(want_span / step_deg) + 1))
-                start = orbit_rng.randint(0, len(best) - arc_width)
-                window = best[start:start + arc_width]
-                keep = min(len(window), ORBIT_STEPS[1])
-                picked = [window[round(i * (len(window) - 1) / (keep - 1))] for i in range(keep)]
-                run = [ring[k][1] for k in dict.fromkeys(picked)]
-
-        if run:
-            orbit_id = f"orbit:{aid}:00"
+            run = _longest_arc(ring, orbit_rng)
+            if not run:
+                note("orbit_too_short")
+                continue
+            orbit_id = f"orbit:{aid}:{orbit_index:02d}"
             for ordinal, pose in enumerate(run):
                 poses.append({**pose, "capture_kind": "orbit", "orbit_id": orbit_id,
                               "sequence_index": ordinal, "viewpoint_id": orbit_id,
-                              "pose_id": f"{aid}|orbit|00|{ordinal:03d}"})
+                              "pose_id": f"{aid}|orbit|{orbit_index:02d}|{ordinal:03d}"})
             orbits.append({"orbit_id": orbit_id, "anchor_id": aid, "member_count": len(run),
                            "arc_span_deg": round(
                                _azimuth_span([p["azimuth_deg"] for p in run]), 3)})
-        else:
-            note("orbit_too_short")
 
         # Sparse tuples draw from the same scan, greedily spread for baseline.
         trng = _rng(seed, scene_id, aid, "tuple")

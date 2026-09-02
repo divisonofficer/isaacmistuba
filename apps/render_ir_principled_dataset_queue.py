@@ -72,6 +72,12 @@ COMPATIBLE_PREVIOUS_WORKER_SHA256 = frozenset({
     # published Stage 2 does, so the render equations and every written product
     # are unchanged for existing datasets and their frames stay adoptable.
     "67151eed8cd9580fbdf030c7eb43ec25ce767ce78d1f40e3408ba38ecc041eac",
+    # Worker before GT_MetallicSourceBinary was made optional in the compositor
+    # and publisher as well as the view layer.  It was only ever exempted in
+    # _view_layer_setup, so rendering any prepared blend without that socket --
+    # which is every published Stage 2 -- failed outright.  No frame was ever
+    # produced under that worker, so nothing it wrote can differ.
+    "cfc94bc6d063998ffe3bb2b97415ff0e72cab171dede466b1cf125090fe8933d",
     # Worker immediately before the opt-in denoiser.  With --denoise absent the
     # Cycles settings are byte-identical to this build, so every existing
     # dataset renders the same products and keeps its frames adoptable.

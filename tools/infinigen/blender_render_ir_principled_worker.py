@@ -556,6 +556,14 @@ def _setup_rgb_compositor(scene, staging: Path, frame_id: str, *, qc_components:
                 # Provenance is unknown for legacy prepared material graphs;
                 # encode the documented zero/unknown class.
                 source = _constant(0.0)
+            elif source_name == "GT_MetallicSourceBinary":
+                # Only a Stage 2 built with the continuous-metalness policy
+                # carries the pre-augmentation metallic.  Unlike the masks
+                # above there is no honest default: a zero image would assert
+                # that nothing was metal before augmentation, which is a false
+                # label rather than a missing one.  Omit the modality instead
+                # -- it is optional and outside CORE_REQUIRED_MODALITIES.
+                continue
             else:
                 raise RuntimeError(f"render layer lacks required pass socket: {source_name}")
         output = _file_node(tree, staging / stem, frame_id, mode=mode, depth=depth, file_format="PNG")
@@ -737,6 +745,12 @@ def _publish(staging: Path, out: Path, frame_id: str, task: dict, timings: dict,
         # compositor input, so materialize the documented zero/unknown image
         # here using the already-rendered RGB dimensions.  This keeps the
         # artifact contract complete without changing any core PBR channel.
+        if stem == "metallic_source_binary":
+            # Skipped by the compositor when the prepared blend has no such
+            # socket; there is nothing to collect and nothing to fabricate.
+            matches = sorted(source_dir.glob(f"{frame_id}*{suffix}")) if source_dir.is_dir() else []
+            if not matches:
+                continue
         if stem in {"remediated_pbr_mask", "pbr_provenance_class"}:
             matches = sorted(source_dir.glob(f"{frame_id}*{suffix}")) if source_dir.is_dir() else []
             if not matches:
