@@ -127,14 +127,20 @@ def default_policy() -> dict[str, Any]:
         "node_graph_version": NODE_GRAPH_VERSION,
         "exposed_threshold": 0.7,
         "noise_scale_m": 6.0,
+        # ``bare_probability`` is the share of slots left *uncoated*, keeping a
+        # genuine pure-metal tail.  Measured on 34.7 M InteriorVerse pixels, real
+        # PBR interiors retain 1.6% of metal-bearing pixels at metalness >= 0.98
+        # (18.8% among strongly metallic ones); coating every slot erases a
+        # population that actually exists.  Polished cutlery and chrome hardware
+        # are bare far more often than a painted appliance shell.
         "classes": {
-            "metal_tool":       {"coat_centre": 0.06, "coat_spread": 0.05, "metallic_floor": 0.80},
-            "cookware":         {"coat_centre": 0.12, "coat_spread": 0.08, "metallic_floor": 0.70},
-            "metal_hardware":   {"coat_centre": 0.15, "coat_spread": 0.10, "metallic_floor": 0.65},
-            "generic_metal":    {"coat_centre": 0.22, "coat_spread": 0.12, "metallic_floor": 0.55},
-            "decor_metal":      {"coat_centre": 0.32, "coat_spread": 0.15, "metallic_floor": 0.40},
-            "structural_metal": {"coat_centre": 0.45, "coat_spread": 0.18, "metallic_floor": 0.25},
-            "appliance_shell":  {"coat_centre": 0.55, "coat_spread": 0.18, "metallic_floor": 0.20},
+            "metal_tool":       {"coat_centre": 0.06, "coat_spread": 0.05, "metallic_floor": 0.80, "bare_probability": 0.55},
+            "cookware":         {"coat_centre": 0.12, "coat_spread": 0.08, "metallic_floor": 0.70, "bare_probability": 0.35},
+            "metal_hardware":   {"coat_centre": 0.15, "coat_spread": 0.10, "metallic_floor": 0.65, "bare_probability": 0.40},
+            "generic_metal":    {"coat_centre": 0.22, "coat_spread": 0.12, "metallic_floor": 0.55, "bare_probability": 0.15},
+            "decor_metal":      {"coat_centre": 0.32, "coat_spread": 0.15, "metallic_floor": 0.40, "bare_probability": 0.10},
+            "structural_metal": {"coat_centre": 0.45, "coat_spread": 0.18, "metallic_floor": 0.25, "bare_probability": 0.05},
+            "appliance_shell":  {"coat_centre": 0.55, "coat_spread": 0.18, "metallic_floor": 0.20, "bare_probability": 0.03},
         },
         # Sampled per material slot; the spread across slots is what breaks a
         # global metallic-from-roughness law.  The ranges are calibrated against
@@ -187,7 +193,7 @@ def sample_coefficients(
     # A per-slot offset of the coat centre, so two slots of the same class do
     # not share one metallic level.
     centre_offset = (rng.random() * 2.0 - 1.0) * spread
-    return {
+    coefficients = {
         "composition_class": composition,
         "coat_centre": round(min(0.95, max(0.0, centre + centre_offset)), 6),
         "coat_spread": round(spread, 6),
@@ -198,7 +204,17 @@ def sample_coefficients(
         "roughness_gain": round(_draw("roughness_gain_range"), 6),
         "roughness_reference": float(policy["roughness_reference"]),
         "albedo_reference": float(policy["albedo_reference"]),
+        "bare": 0.0,
     }
+    # A bare slot is expressed purely through the coefficients -- no coat, no
+    # couplings, a floor at full metal -- so the shader graph needs no extra
+    # branch and the authored coverage texture still gates where metal is.
+    if rng.random() < float(spec.get("bare_probability", 0.0)):
+        coefficients.update({
+            "coat_centre": 0.0, "roughness_coupling": 0.0, "albedo_coupling": 0.0,
+            "noise_coupling": 0.0, "metallic_floor": 1.0, "bare": 1.0,
+        })
+    return coefficients
 
 
 def _as_array(value: Any) -> np.ndarray:

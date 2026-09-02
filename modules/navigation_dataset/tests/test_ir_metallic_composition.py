@@ -191,11 +191,21 @@ def test_no_leak_even_when_every_slot_shares_one_composition_class() -> None:
     assert report["min_conditional_std"] >= 0.04, report["conditional_std"]
 
 
-def test_augmentation_actually_defeats_the_binary_distribution() -> None:
-    """Today 96.4 % of metallic GT pixels sit at 0 or 1; that is the problem."""
+def test_augmentation_matches_the_measured_reference_distribution() -> None:
+    """Break the binary distribution, but keep the pure-metal tail that is real.
+
+    96.4 % of Infinigen metallic GT pixels sit at 0 or 1, which is the problem.
+    Coating *everything* over-corrects it though: measured over 34.7 M
+    InteriorVerse pixels, genuine PBR interiors keep 1.6 % of metal-bearing
+    pixels at metalness >= 0.98, rising to 18.8 % among strongly metallic ones.
+    Polished cutlery and chrome really are bare. So the target is a broad
+    intermediate mass *with* a surviving tail, not a tail of zero.
+    """
     metallic, _ = _corpus()
     intermediate = float(((metallic > 0.02) & (metallic < 0.98)).mean())
-    assert intermediate > 0.80, intermediate
+    bare = float((metallic >= 0.98).mean())
+    assert intermediate > 0.60, intermediate
+    assert 0.01 <= bare <= 0.35, bare
 
 
 def test_roughness_rises_monotonically_with_coat() -> None:
