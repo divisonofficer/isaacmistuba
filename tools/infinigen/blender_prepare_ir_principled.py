@@ -48,7 +48,11 @@ from navigation_dataset.ir_principled import (  # noqa: E402
     normalize_legacy_metallic_scalar,
     pbr_for_slot,
     validate_metallic_contract,
+    wrap_continuous_metallic_contract,
+    CONTINUOUS_METALLIC_FAMILY,
+    SEMANTIC_SURROGATES,
 )
+from navigation_dataset import ir_metallic_composition  # noqa: E402
 from render_visibility_contract import (  # noqa: E402
     hide_untracked_render_meshes,
     visible_untracked_mesh_names,
@@ -63,6 +67,9 @@ _AOV_TYPES = {
     "GT_MetallicFamilyID": "VALUE",
     "GT_MetalCoverage": "VALUE",
     "GT_ExposedMetal": "VALUE",
+    # Written only when the metallic augmentation is active; a label-level
+    # ablation reads it instead of demanding a second render.
+    "GT_MetallicSourceBinary": "VALUE",
     "GT_GeometryNormalWorld": "COLOR",
     "GT_ShadingNormalWorld": "COLOR",
     "GT_MaterialID": "VALUE",
@@ -219,6 +226,15 @@ def _args() -> argparse.Namespace:
     parser.add_argument("--luminance-bias", type=float, required=True)
     parser.add_argument("--luminance-corpus-digest", required=True)
     parser.add_argument("--illumination-manifest", type=Path)
+    parser.add_argument(
+        "--metallic-augmentation-policy", type=Path,
+        help=("opt-in continuous-metalness policy (configs/ir_materials/*.json). "
+              "Absent means no augmentation and a byte-identical contract."),
+    )
+    parser.add_argument(
+        "--metallic-augmentation-seed", type=int, default=0,
+        help="dataset seed mixed into every per-material augmentation draw",
+    )
     parser.add_argument("--structural-material-manifest", type=Path,
                         help="optional canonical external-PBR bindings for a rematerialized child scene")
     parser.add_argument("--prop-material-manifest", type=Path,
@@ -396,7 +412,12 @@ def _pseudo_nir_socket(tree, rgb_socket):
     return combine.outputs[0]
 
 
-def _matched_luminance_socket(tree, rgb_socket, *, scale: float, bias: float):
+def _luminance_socket(tree, rgb_socket):
+    """Rec.709 luminance of a linear RGB socket.
+
+    Factored out of ``_matched_luminance_socket`` so the NIR branch and the
+    metallic augmentation share one implementation of the same convention.
+    """
     separate = tree.nodes.new("ShaderNodeSeparateColor")
     separate.mode = "RGB"
     tree.links.new(rgb_socket, separate.inputs[0])
@@ -415,6 +436,11 @@ def _matched_luminance_socket(tree, rgb_socket, *, scale: float, bias: float):
     add_rgb.operation = "ADD"
     tree.links.new(add_rg.outputs[0], add_rgb.inputs[0])
     tree.links.new(weighted[2], add_rgb.inputs[1])
+    return add_rgb
+
+
+def _matched_luminance_socket(tree, rgb_socket, *, scale: float, bias: float):
+    add_rgb = _luminance_socket(tree, rgb_socket)
     affine = tree.nodes.new("ShaderNodeMath")
     affine.operation = "MULTIPLY_ADD"
     affine.inputs[1].default_value = float(scale)
@@ -466,10 +492,138 @@ def _prop_pbr_socket(tree, binding: dict, channel: str):
     return _value_constant(tree, float(values.get(channel, default))), "curated_profile_constant"
 
 
+def _augmented_metallic_socket(
+    tree, *, base_metallic, roughness, base_color_rgb, source_family: str,
+    unit: dict, slot: int, source_material: str, semantic_class: str,
+    policy: dict, policy_digest: str, dataset_seed: int, scene_id: str,
+):
+    """Build the continuous-metalness subgraph and its provenance record.
+
+    Infinigen metalness is effectively binary, so a network trained on it learns
+    to detect metal rather than estimate metalness.  This replaces the authored
+    scalar with a dielectric-coat-over-conductor field whose coat coverage is
+    driven by the four agreed signals -- the authored conductor family, the
+    roughness, the composition class and the albedo -- with a spatial residual
+    that keeps metalness from being a function of roughness alone.
+
+    Only the metallic socket is rewritten.  Roughness and base colour are read
+    as *inputs* and deliberately left untouched: a physically complete coating
+    would also roughen and tint the surface, but roughness is the primary
+    research target of this dataset, and perturbing its ground truth to justify
+    a metallic augmentation would confound the very measurement the dataset
+    exists to make.  The record states this so the choice is legible downstream.
+
+    Returns ``(socket, record)``, or ``(base_metallic, None)`` when the slot is
+    not conductor-bearing -- a trusted dielectric is never promoted into metal.
+    """
+    if str(source_family) not in ir_metallic_composition.CONDUCTOR_FAMILIES:
+        return base_metallic, None
+
+    composition = ir_metallic_composition.composition_class(
+        unit=unit, source_material=source_material,
+        semantic_class=semantic_class, source_family=source_family,
+    )
+    material_seed = ir_metallic_composition.material_seed(
+        policy_digest=policy_digest, scene_id=scene_id, unit_id=str(unit.get("id")),
+        slot=int(slot), source_material=source_material, semantic_class=semantic_class,
+    )
+    coefficients = ir_metallic_composition.sample_coefficients(
+        policy=policy, composition=composition["class"], seed=material_seed,
+    )
+
+    # Albedo luminance, shared with the NIR branch's convention.
+    luminance = _luminance_socket(tree, base_color_rgb).outputs[0]
+
+    # A spatial residual in object space, statistically independent of roughness.
+    # This is what stops the label from being recoverable from the roughness map.
+    coords = tree.nodes.new("ShaderNodeTexCoord")
+    noise = tree.nodes.new("ShaderNodeTexNoise")
+    noise.name = "IR_MetalAug_Residual"
+    noise.noise_dimensions = "4D"
+    noise.inputs["Scale"].default_value = float(policy.get("noise_scale_m", 6.0))
+    noise.inputs["Detail"].default_value = 2.0
+    noise.inputs["Roughness"].default_value = 0.5
+    # The 4th dimension is the per-slot seed, so two materials sharing a
+    # location still get independent residuals.
+    noise.inputs["W"].default_value = float(material_seed % 100003) / 1000.0
+    tree.links.new(coords.outputs["Object"], noise.inputs["Vector"])
+
+    def _term(source, *, factor: float, offset: float, name: str):
+        """factor * (source - offset), as one MULTIPLY_ADD node."""
+        subtract = tree.nodes.new("ShaderNodeMath")
+        subtract.operation = "SUBTRACT"
+        subtract.name = f"IR_MetalAug_{name}_delta"
+        tree.links.new(source, subtract.inputs[0])
+        subtract.inputs[1].default_value = float(offset)
+        scale = tree.nodes.new("ShaderNodeMath")
+        scale.operation = "MULTIPLY"
+        scale.name = f"IR_MetalAug_{name}"
+        tree.links.new(subtract.outputs[0], scale.inputs[0])
+        scale.inputs[1].default_value = float(factor)
+        return scale.outputs[0]
+
+    # coat = centre + a_r*(R - r0) + a_y*(y0 - Y) + a_n*(N - 0.5)
+    terms = [
+        _term(roughness, factor=coefficients["roughness_coupling"],
+              offset=coefficients["roughness_reference"], name="rough"),
+        _term(luminance, factor=-coefficients["albedo_coupling"],
+              offset=coefficients["albedo_reference"], name="albedo"),
+        _term(noise.outputs["Fac"], factor=coefficients["noise_coupling"],
+              offset=0.5, name="residual"),
+    ]
+    accumulator = _value_constant(tree, coefficients["coat_centre"])
+    for index, term in enumerate(terms):
+        add = tree.nodes.new("ShaderNodeMath")
+        add.operation = "ADD"
+        add.name = f"IR_MetalAug_sum_{index}"
+        tree.links.new(accumulator, add.inputs[0])
+        tree.links.new(term, add.inputs[1])
+        accumulator = add.outputs[0]
+
+    # metallic = clamp(1 - coat), floored so a trusted conductor stays metal.
+    complement = tree.nodes.new("ShaderNodeMath")
+    complement.operation = "SUBTRACT"
+    complement.name = "IR_MetalAug_complement"
+    complement.inputs[0].default_value = 1.0
+    tree.links.new(accumulator, complement.inputs[1])
+    floored = tree.nodes.new("ShaderNodeMath")
+    floored.operation = "MAXIMUM"
+    floored.name = "IR_MetalAug_floor"
+    floored.use_clamp = True
+    tree.links.new(complement.outputs[0], floored.inputs[0])
+    floored.inputs[1].default_value = float(coefficients["metallic_floor"])
+
+    # Authored coverage stays the authority on *where* metal is: multiplying by
+    # the source socket preserves a coverage texture's geometry exactly, and is
+    # a no-op for a scalar conductor at 1.0.
+    gated = tree.nodes.new("ShaderNodeMath")
+    gated.operation = "MULTIPLY"
+    gated.name = "IR_MetalAug_coverage_gate"
+    gated.use_clamp = True
+    tree.links.new(floored.outputs[0], gated.inputs[0])
+    tree.links.new(base_metallic, gated.inputs[1])
+
+    record = ir_metallic_composition.augmentation_record(
+        policy=policy, policy_digest=policy_digest, coefficients=coefficients,
+        composition=composition, seed=int(dataset_seed), slot_seed=material_seed,
+        source_family=str(source_family),
+        source_representation="spatial_texture" if source_family == "coverage_mixed" else "scalar",
+        semantic_class=str(semantic_class), source_material=str(source_material),
+    )
+    record["modified_channels"] = ["metallic"]
+    record["unmodified_channels_note"] = (
+        "roughness and base_color are read as inputs and left authored; "
+        "roughness is the primary research target and must not be perturbed"
+    )
+    return gated.outputs[0], record
+
+
 def _make_material(
     *, stage1_dir: Path, unit: dict, slot: int, source_material: str,
     semantic_class: str, material_id: int, luminance_scale: float, luminance_bias: float,
     structural_binding: dict | None = None, prop_binding: dict | None = None, scene_id: str = "",
+    metallic_augmentation_policy: dict | None = None, metallic_augmentation_digest: str = "",
+    dataset_seed: int = 0,
 ) -> tuple[object, dict]:
     decision = material_normalization_record(unit, source_material, semantic_class, slot=slot)
     material = bpy.data.materials.new(f"IRPBR::{unit['id']}::{slot:03d}")
@@ -543,6 +697,33 @@ def _make_material(
         rough_source = f"surrogate_max_{SURROGATE_MIN_ROUGHNESS:g}"
         metallic_source = "surrogate_zero"
 
+    # The v2 contract is resolved here rather than after the AOVs because its
+    # family is what decides whether this slot may be augmented at all.  It is
+    # computed exactly once and reused for the AOV block below.
+    metallic_contract = _effective_metallic_contract(
+        unit=unit, slot=slot, source_material=source_material,
+        semantic_class=semantic_class, metallic_source=metallic_source,
+        structural_binding=structural_binding, prop_binding=prop_binding,
+        legacy_fractional_normalization=legacy_fractional_normalization,
+    )
+    source_metallic_socket = effective_metallic
+    metallic_augmentation = None
+    if metallic_augmentation_policy is not None and semantic_class not in SEMANTIC_SURROGATES:
+        effective_metallic, metallic_augmentation = _augmented_metallic_socket(
+            tree, base_metallic=effective_metallic, roughness=effective_roughness,
+            base_color_rgb=effective_base_color_rgb,
+            source_family=str(metallic_contract.get("family") or ""),
+            unit=unit, slot=slot, source_material=source_material,
+            semantic_class=semantic_class, policy=metallic_augmentation_policy,
+            policy_digest=metallic_augmentation_digest, dataset_seed=dataset_seed,
+            scene_id=scene_id,
+        )
+        if metallic_augmentation is not None:
+            metallic_contract = wrap_continuous_metallic_contract(
+                metallic_contract, metallic_augmentation,
+            )
+            metallic_source = f"metallic_composition::{metallic_source}"
+
     band = tree.nodes.new("ShaderNodeValue")
     band.name = "IR_Band"
     band.label = "0=RGB, 1=NIR"
@@ -604,16 +785,33 @@ def _make_material(
     _aov(tree, "GT_BaseColorNIR", effective_base_color_nir, kind="COLOR")
     _aov(tree, "GT_Roughness", effective_roughness, kind="VALUE")
     _aov(tree, "GT_Metallic", effective_metallic, kind="VALUE")
-    metallic_contract = _effective_metallic_contract(
-        unit=unit, slot=slot, source_material=source_material,
-        semantic_class=semantic_class, metallic_source=metallic_source,
-        structural_binding=structural_binding, prop_binding=prop_binding,
-        legacy_fractional_normalization=legacy_fractional_normalization,
-    )
     family = str(metallic_contract["family"])
     family_id = METALLIC_FAMILY_IDS[family]
-    family_membership = _value_constant(tree, float(family in {"conductor", "coverage_mixed"}))
-    exposed_metal = effective_metallic if family == "coverage_mixed" else family_membership
+    # An augmented slot keeps the conductor identity of the family it came from,
+    # so metal_coverage_mask stays the same binary membership mask it always was.
+    membership_family = (
+        str((metallic_contract.get("augmentation") or {}).get("source_family") or family)
+        if family == CONTINUOUS_METALLIC_FAMILY else family
+    )
+    family_membership = _value_constant(
+        tree, float(membership_family in {"conductor", "coverage_mixed"}),
+    )
+    if family == CONTINUOUS_METALLIC_FAMILY:
+        # exposed_metal_mask is documented as *effective exposed conductor
+        # coverage* and its encoding is a binary mask, so a continuous metalness
+        # is thresholded here rather than leaked through as a float.
+        threshold = tree.nodes.new("ShaderNodeMath")
+        threshold.operation = "GREATER_THAN"
+        threshold.name = "IR_MetalAug_exposed"
+        tree.links.new(effective_metallic, threshold.inputs[0])
+        threshold.inputs[1].default_value = float(
+            (metallic_augmentation or {}).get("parameters", {}).get("exposed_threshold", 0.7)
+        )
+        exposed_metal = threshold.outputs[0]
+        # The pre-augmentation binary, so a label ablation needs no second render.
+        _aov(tree, "GT_MetallicSourceBinary", source_metallic_socket, kind="VALUE")
+    else:
+        exposed_metal = effective_metallic if family == "coverage_mixed" else family_membership
     _aov(tree, "GT_MetallicFamilyID", _value_constant(tree, float(family_id)), kind="VALUE")
     _aov(tree, "GT_MetalCoverage", family_membership, kind="VALUE")
     _aov(tree, "GT_ExposedMetal", exposed_metal, kind="VALUE")
@@ -904,6 +1102,21 @@ def main() -> int:
     stage1_dir = args.stage1_dir.resolve()
     manifest, units, digest_paths = _unit_states(stage1_dir)
     semantic = _semantic_index(args.semantic_regions.resolve() if args.semantic_regions else None)
+    # Continuous metalness is strictly opt-in.  With the flag absent the policy
+    # stays None, no augmentation node is built, and the emitted contract has no
+    # extra key -- so material_contract_digest, and every dataset fingerprint
+    # derived from it, is unchanged.
+    metallic_policy = None
+    metallic_policy_digest = ""
+    if args.metallic_augmentation_policy:
+        policy_path = args.metallic_augmentation_policy.resolve()
+        metallic_policy = json.loads(policy_path.read_text(encoding="utf-8"))
+        if metallic_policy.get("schema") != ir_metallic_composition.POLICY_SCHEMA:
+            raise RuntimeError(
+                f"unsupported metallic composition policy: {metallic_policy.get('schema')}"
+            )
+        metallic_policy_digest = ir_metallic_composition.stable_digest(metallic_policy)
+        digest_paths.append(policy_path)
     structural_manifest = None
     structural_bindings = {}
     prop_manifest = None
@@ -985,6 +1198,9 @@ def main() -> int:
                 structural_binding=binding,
                 prop_binding=prop_binding,
                 scene_id=str((structural_manifest or {}).get("child_scene_id") or manifest.get("scene_id") or ""),
+                metallic_augmentation_policy=metallic_policy,
+                metallic_augmentation_digest=metallic_policy_digest,
+                dataset_seed=int(args.metallic_augmentation_seed),
             )
             prop_row = prop_audit.get((str(unit["id"]), slot))
             if prop_row is not None:
@@ -1108,6 +1324,15 @@ def main() -> int:
         "external_portal_rig": external_portals,
         "illumination_manifest": (json.loads(args.illumination_manifest.read_text(encoding="utf-8")) if args.illumination_manifest and args.illumination_manifest.is_file() else None),
         "illumination_manifest_sha256": (_sha256(args.illumination_manifest) if args.illumination_manifest and args.illumination_manifest.is_file() else None),
+        **({"metallic_augmentation": {
+            "policy_id": str(metallic_policy.get("policy_id")),
+            "policy_schema": str(metallic_policy.get("policy_schema") or metallic_policy.get("schema")),
+            "policy_sha256": _sha256(args.metallic_augmentation_policy.resolve()),
+            "policy_digest": metallic_policy_digest,
+            "dataset_seed": int(args.metallic_augmentation_seed),
+            "node_graph_version": ir_metallic_composition.NODE_GRAPH_VERSION,
+            "modified_channels": ["metallic"],
+        }} if metallic_policy is not None else {}),
         "counts": dict(counts),
         "render_visibility_contract": {
             "policy": "stage1_authority_or_hidden_v1",
