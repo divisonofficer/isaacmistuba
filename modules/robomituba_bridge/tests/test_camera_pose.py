@@ -14,6 +14,7 @@ from robomituba_bridge.camera_pose import (  # noqa: E402
     matrix_to_legacy_flat,
     mitsuba_camera_to_blender,
     pose_from_mitsuba_camera_to_world,
+    resolve_lookat_pose,
     resolve_viewpoint_pose,
 )
 
@@ -118,5 +119,64 @@ class CameraPoseTests(unittest.TestCase):
         self.assertAlmostEqual(forward[2], 1.0, places=7)
 
 
+class LookAtPoseTests(unittest.TestCase):
+    """The 6-DoF contract that replaces the graph's fixed-pitch heading sweep."""
+
+    @staticmethod
+    def _pitch_deg(pose) -> float:
+        """Elevation of the view ray; Mitsuba is Y-up."""
+        rise = pose.target_mitsuba[1] - pose.origin_mitsuba[1]
+        span = math.dist(pose.origin_mitsuba, pose.target_mitsuba)
+        return math.degrees(math.asin(max(-1.0, min(1.0, rise / span))))
+
+    def _assert_orthonormal(self, matrix) -> None:
+        cols = [[matrix[r][c] for r in range(3)] for c in range(3)]
+        for index, u in enumerate(cols):
+            self.assertAlmostEqual(sum(v * v for v in u), 1.0, places=9)
+            for v in cols[index + 1:]:
+                self.assertAlmostEqual(sum(a * b for a, b in zip(u, v)), 0.0, places=9)
+
+    def test_pitch_is_expressible_in_both_directions(self) -> None:
+        """resolve_viewpoint_pose could not do this.
+
+        It places the target one metre ahead on a unit forward ray, so pitch
+        was a near-constant and every frame looked out at roughly eye level.
+        """
+        down = resolve_lookat_pose((0.0, 1.6, 0.0), (1.5, 0.1, 0.0))
+        up = resolve_lookat_pose((0.0, 0.6, 0.0), (1.5, 2.4, 0.0))
+        self.assertLess(self._pitch_deg(down), -30.0)
+        self.assertGreater(self._pitch_deg(up), 30.0)
+
+    def test_agrees_with_the_graph_path_on_a_shared_pose(self) -> None:
+        """Both resolvers must speak one convention, not two similar ones."""
+        graph = resolve_viewpoint_pose(
+            (1.0, 2.0), 37.0, eye_height_m=1.2, target_height_m=1.1,
+        )
+        lookat = resolve_lookat_pose(graph.origin_mitsuba, graph.target_mitsuba)
+        for row_a, row_b in zip(graph.camera_to_world_blender, lookat.camera_to_world_blender):
+            for a, b in zip(row_a, row_b):
+                self.assertAlmostEqual(a, b, places=9)
+
+    def test_survives_a_straight_down_view(self) -> None:
+        """Looking along the up axis makes the usual cross product degenerate."""
+        pose = resolve_lookat_pose((0.0, 1.8, 0.0), (0.0, 0.0, 0.0))
+        self.assertAlmostEqual(self._pitch_deg(pose), -90.0, places=6)
+        self._assert_orthonormal(pose.camera_to_world_blender)
+
+    def test_roll_keeps_the_basis_orthonormal(self) -> None:
+        pose = resolve_lookat_pose((0.0, 1.4, 0.0), (1.2, 0.3, 0.4), roll_deg=15.0)
+        self._assert_orthonormal(pose.camera_to_world_blender)
+
+    def test_registration_offset_translates_without_rotating(self) -> None:
+        plain = resolve_lookat_pose((0.0, 1.4, 0.0), (1.2, 0.3, 0.4))
+        shifted = resolve_lookat_pose((0.0, 1.4, 0.0), (1.2, 0.3, 0.4),
+                                      origin_offset=(0.25, -0.5, 0.75))
+        for row_a, row_b in zip(plain.camera_to_world_blender, shifted.camera_to_world_blender):
+            for a, b in zip(row_a[:3], row_b[:3]):
+                self.assertAlmostEqual(a, b, places=9)
+        self.assertNotEqual(shifted.camera_to_world_blender, plain.camera_to_world_blender)
+
+
 if __name__ == "__main__":
+
     unittest.main()
