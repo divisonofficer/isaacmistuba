@@ -72,6 +72,10 @@ COMPATIBLE_PREVIOUS_WORKER_SHA256 = frozenset({
     # published Stage 2 does, so the render equations and every written product
     # are unchanged for existing datasets and their frames stay adoptable.
     "67151eed8cd9580fbdf030c7eb43ec25ce767ce78d1f40e3408ba38ecc041eac",
+    # Worker immediately before the opt-in denoiser.  With --denoise absent the
+    # Cycles settings are byte-identical to this build, so every existing
+    # dataset renders the same products and keeps its frames adoptable.
+    "899e5edd01e9c1e4117054e31abf3ba9a9438312b85ccf8e33550610a871a038",
 })
 CORE_REQUIRED_MODALITIES = {
     "rgb", "nir_active", "base_color_rgb", "base_color_nir", "roughness", "metallic", "metallic_family_id",
@@ -174,6 +178,8 @@ def _args() -> argparse.Namespace:
     parser.add_argument("--max-frames", type=int)
     parser.add_argument("--retry-limit", type=int, default=3)
     parser.add_argument("--qc-components", action="store_true")
+    parser.add_argument("--denoise", action="store_true",
+                        help="OpenImageDenoise the beauty passes; changes the dataset fingerprint")
     parser.add_argument("--storage-profile", choices=(
         STORAGE_PROFILE_LEGACY_FULL_FLOAT32_V1,
         STORAGE_PROFILE_CORE_HALF_EXR_V1,
@@ -1029,6 +1035,7 @@ class BlenderWorker:
             "--width", str(self.args.width), "--height", str(self.args.height),
             "--fov", str(self.args.fov), "--rgb-spp", str(self.args.rgb_spp),
             "--nir-spp", str(self.args.nir_spp), "--max-bounces", str(self.args.max_bounces),
+            *(("--denoise",) if getattr(self.args, "denoise", False) else ()),
             "--seed", str(self.args.render_seed), "--device", self.args.device,
             "--nir-formula", self.args.nir_formula,
             "--flash-energy-scale", str(self.args.flash_energy_scale),
@@ -1420,6 +1427,7 @@ def main() -> int:
         "device": args.device, "render_seed": args.render_seed,
         "exposure_ev": {"rgb": 0.0, "nir_active": 0.0},
         "qc_components": bool(args.qc_components),
+        **({"denoise": True} if args.denoise else {}),
         "storage_profile": args.storage_profile,
         "nir_formula": args.nir_formula,
         "flash_energy_scale": args.flash_energy_scale,

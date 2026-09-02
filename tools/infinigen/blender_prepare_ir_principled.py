@@ -300,7 +300,7 @@ def _value_for_slot(channel: dict, slot: int, default):
     return value
 
 
-def _image_socket(tree, path: Path, *, color: bool):
+def _image_socket(tree, path: Path, *, color: bool, box_projection: bool = False):
     if not path.is_file():
         return None
     image = bpy.data.images.load(str(path.resolve()), check_existing=True)
@@ -309,6 +309,15 @@ def _image_socket(tree, path: Path, *, color: bool):
     node.image = image
     node.interpolation = "Linear"
     node.extension = "REPEAT"
+    if box_projection:
+        # FLAT projection samples only X and Y of the incoming vector.  Fed
+        # object-space coordinates that is correct for a floor or ceiling, which
+        # lie in the XY plane, but a wall shell is a box: its vertical faces span
+        # X-Z or Y-Z, so Y (or X) is constant across the wall's height and the
+        # texture smears vertically.  BOX picks the axis pair per face from the
+        # normal, which is what makes a tiled material tile on every surface.
+        node.projection = "BOX"
+        node.projection_blend = 0.2
     return node.outputs.get("Color") or node.outputs[0]
 
 
@@ -324,7 +333,9 @@ def _external_pbr_socket(tree, binding: dict, channel: str):
     if key is None:
         raise ValueError(f"unsupported external PBR channel: {channel}")
     path = Path(str((binding.get("resolved_maps") or {}).get(key) or ""))
-    socket = _image_socket(tree, path, color=channel == "base_color")
+    # Structural overlays are metre-repeat tiles applied to room shells, so they
+    # always want box projection -- see the note in ``_image_socket``.
+    socket = _image_socket(tree, path, color=channel == "base_color", box_projection=True)
     if socket is None:
         raise FileNotFoundError(f"external PBR map missing: {binding.get('material_id')} {channel}")
     texture = socket.node

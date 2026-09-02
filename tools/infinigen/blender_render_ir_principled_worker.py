@@ -83,6 +83,8 @@ def _args() -> argparse.Namespace:
     parser.add_argument("--fov", type=float, required=True)
     parser.add_argument("--rgb-spp", type=int, required=True)
     parser.add_argument("--nir-spp", type=int, required=True)
+    parser.add_argument("--denoise", action="store_true",
+                        help="OpenImageDenoise the beauty passes; PBR AOVs stay exact")
     parser.add_argument("--max-bounces", type=int, default=8)
     parser.add_argument("--seed", type=int, default=20260812)
     parser.add_argument("--device", choices=("OPTIX", "CUDA"), default="OPTIX")
@@ -113,7 +115,17 @@ def _emit(payload: dict) -> None:
 def _configure_cycles(scene, args: argparse.Namespace) -> list[str]:
     scene.render.engine = "CYCLES"
     scene.cycles.device = "GPU"
-    scene.cycles.use_denoising = False
+    # Denoising is opt-in and off by default: it is a filter, so turning it on
+    # silently changes every rendered product.  When requested it applies to the
+    # Monte-Carlo beauty passes, which are the only noisy ones -- the PBR AOVs
+    # are per-pixel material constants and must stay exact.
+    scene.cycles.use_denoising = bool(getattr(args, "denoise", False))
+    if scene.cycles.use_denoising:
+        scene.cycles.denoiser = "OPENIMAGEDENOISE"
+        scene.cycles.denoising_input_passes = "RGB_ALBEDO_NORMAL"
+        scene.cycles.denoising_prefilter = "ACCURATE"
+        if hasattr(scene.cycles, "denoising_use_gpu"):
+            scene.cycles.denoising_use_gpu = True
     scene.cycles.max_bounces = int(args.max_bounces)
     scene.cycles.use_adaptive_sampling = False
     scene.render.resolution_x = int(args.width)
