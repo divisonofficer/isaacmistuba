@@ -55,6 +55,12 @@ was uncontrolled.
 - **Two orbits per anchor**, each committing to one radius and elevation and
   varying only azimuth, splitting the feasible elevation band between them.
   One orbit per anchor did not supply the 50-pose floor.
+- **Field of view 60 deg.** Framing is held constant across FOV because the
+  sampler solves standoff for a fill target, so FOV only matters once the
+  1-2 m clamp binds -- which is precisely what happens in a small room at a
+  narrow FOV. Pose yield at 40/50/60/70 deg: bathroom 14/28/**56**/56, living
+  room 90/95/**92**/90, apartment 352/339/**329**/314. Below 60 the smallest
+  rooms cannot reach the 50-pose floor.
 - Capture kinds are `orbit` (ordered arc, 0.07-0.33 m between neighbours) and
   `sparse_tuple` (wide baseline, >= 90 deg azimuth span).
 

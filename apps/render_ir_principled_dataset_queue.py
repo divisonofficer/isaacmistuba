@@ -37,9 +37,10 @@ from navigation_dataset.ir_principled import (  # noqa: E402
     MATERIAL_CONTRACT_SCHEMA, MATERIAL_CONTRACT_VERSION, STAGE2_COMPILER_VERSION, stable_json_digest,
     validate_metallic_contract,
 )
-from robomituba_bridge.camera_pose import resolve_viewpoint_pose  # noqa: E402
+from robomituba_bridge.camera_pose import resolve_lookat_pose, resolve_viewpoint_pose  # noqa: E402
 from mitsuba_converter.ir_render_plan import (  # noqa: E402
     CONTENT_PLAN_SCHEMA,
+    FREE_POSE_PLAN_SCHEMA,
     ILLUMINATION_PLAN_SCHEMA,
     ILLUMINATION_REFERENCE_PLAN_SCHEMA,
     PLAN_SCHEMA,
@@ -397,6 +398,95 @@ def _plan_specs(graph: dict, plan: dict) -> list[tuple[str, float, dict]]:
     if not result:
         raise ValueError("frame plan contains no poses")
     return result
+
+
+def _free_plan_specs(plan: dict) -> list[tuple[dict, dict]]:
+    """Pose/lighting pairs for a v5 free-pose plan.
+
+    Kept separate from :func:`_plan_specs` so v1-v4 plans take a byte-identical
+    path.  A free pose is its own record rather than a graph node id, and it is
+    keyed by ``pose_id``: orbit members share a viewpoint id and can round to
+    the same heading, so the legacy triple would call them duplicates.
+    """
+    if plan.get("schema") != FREE_POSE_PLAN_SCHEMA:
+        raise ValueError("frame plan schema is not a free-pose plan")
+    result: list[tuple[dict, dict]] = []
+    seen: set[tuple[str, str]] = set()
+    for group in plan.get("groups") or []:
+        lighting = dict(group.get("lighting") or {})
+        if not lighting.get("id") or not lighting.get("recipe_digest"):
+            raise ValueError("frame plan group lacks canonical lighting recipe")
+        capture_group_id = str(group.get("capture_group_id") or "")
+        if not capture_group_id:
+            raise ValueError("frame plan group lacks capture_group_id")
+        for pose in group.get("poses") or []:
+            pose_id = str(pose.get("pose_id") or "")
+            if not pose_id:
+                raise ValueError("free-pose plan has a pose without pose_id")
+            key = (pose_id, str(lighting["id"]))
+            if key in seen:
+                raise ValueError("frame plan has a duplicate pose/lighting pair")
+            seen.add(key)
+            result.append((dict(pose), {
+                "id": lighting["id"], "recipe": lighting,
+                "recipe_digest": lighting["recipe_digest"],
+                "capture_group_id": capture_group_id,
+                "render_plan_id": plan["render_plan_id"],
+                "render_plan_digest": plan["render_plan_digest"],
+                "capture_kind": pose.get("capture_kind", "orbit"),
+                "pair_id": pose.get("pair_id"),
+                "pair_member_index": pose.get("pair_member_index"),
+                "anchor_id": str(pose.get("anchor_id") or "") or None,
+                "camera_set_ids": list(pose.get("camera_set_ids") or []),
+            }))
+    if not result:
+        raise ValueError("free-pose plan has no poses")
+    return result
+
+
+def _free_task(pose: dict, lighting: dict, args: argparse.Namespace, offset, fingerprint: str,
+               pbr_gt_contract_digest: str, external_lighting_available: bool) -> dict:
+    """Build a worker task from an explicit eye/target pair.
+
+    The worker needs no change: it already drives its camera from
+    ``camera_to_world_blender``.
+    """
+    resolved = resolve_lookat_pose(
+        pose["eye_mitsuba"], pose["target_mitsuba"],
+        up=tuple(pose.get("up_mitsuba") or (0.0, 1.0, 0.0)),
+        roll_deg=float(pose.get("roll_deg") or 0.0), origin_offset=offset,
+    )
+    # Hashed so the id is filesystem-safe and short, and prefixed so it can
+    # never collide with the legacy ``{node}__h_###`` scheme.
+    frame_id = "p_" + hashlib.sha256(str(pose["pose_id"]).encode("utf-8")).hexdigest()[:12]
+    frame_id += f"__l_{lighting['id']}"
+    task = {
+        "frame_id": frame_id,
+        # The capture set, not the pose: downstream consumers group by this and
+        # a viewer shows an orbit or tuple as one unit.  pose_id carries the
+        # per-frame identity alongside it.
+        "viewpoint_id": str(pose.get("viewpoint_id") or pose["pose_id"]),
+        "pose_id": str(pose["pose_id"]),
+        "heading_deg": float(pose.get("heading_deg") or 0.0),
+        "camera_to_world_blender": [list(row) for row in resolved.camera_to_world_blender],
+        "camera": resolved.provenance(), "dataset_fingerprint": fingerprint,
+        "pbr_gt_contract_digest": pbr_gt_contract_digest,
+        "external_lighting_available": bool(external_lighting_available),
+        "width": args.width, "height": args.height, "fov_deg": args.fov,
+        "anchor_id": lighting.get("anchor_id"),
+        "capture_kind": str(lighting.get("capture_kind") or "orbit"),
+        "pair_id": lighting.get("pair_id"),
+        "pair_member_index": lighting.get("pair_member_index"),
+        "camera_set_ids": list(lighting.get("camera_set_ids") or []),
+        "sequence_index": pose.get("sequence_index"),
+        "lighting": dict(lighting),
+    }
+    runtime_recipe = dict(lighting["recipe"])
+    center = list(runtime_recipe.get("side_center_xy") or (0.0, 0.0))
+    runtime_recipe["side_center_xy"] = [float(center[0]) + float(offset[0]),
+                                        float(center[1]) + float(offset[1])]
+    task["lighting"]["runtime_recipe"] = runtime_recipe
+    return task
 
 
 def _task(node: dict, yaw: float, lighting: dict | None, args: argparse.Namespace, offset, fingerprint: str, pbr_gt_contract_digest: str, external_lighting_available: bool) -> dict:
@@ -1420,18 +1510,32 @@ def main() -> int:
     overview_proxy = _load_overview_proxy(args.overview_proxy_dir)
     nodes = {str(node["node_id"]): node for node in graph["nodes"]}
     frame_plan = None
+    free_specs: list[tuple[dict, dict]] | None = None
     if args.frame_plan:
         frame_plan = json.loads(args.frame_plan.read_text(encoding="utf-8"))
-        specs = _plan_specs(graph, frame_plan)
+        if frame_plan.get("schema") == FREE_POSE_PLAN_SCHEMA:
+            # v5 has no graph universe; poses carry their own eye/target.
+            free_specs = _free_plan_specs(frame_plan)
+            specs = []
+        else:
+            specs = _plan_specs(graph, frame_plan)
     else:
         specs = _frame_specs(graph, args.viewpoints, args.shuffle_seed)
     if args.max_frames is not None:
         specs = specs[:args.max_frames]
+        if free_specs is not None:
+            free_specs = free_specs[:args.max_frames]
     config = {
         "schema": DATASET_SCHEMA, "queue_compiler_version": QUEUE_COMPILER_VERSION,
         "worker_sha256": _sha256(WORKER_SCRIPT),
         "material_contract_digest": _sha256(contract_path),
-        "prepared_blend_sha256": _sha256(blend), "graph_sha256": _sha256(graph_path),
+        "prepared_blend_sha256": _sha256(blend),
+        # v5 binds to the authoring map its anchors came from; the graph is not
+        # its pose universe.  Kept inside the branch so every existing
+        # dataset_config keeps its exact key set and stays adoptable.
+        **({"authoring_map_sha256": _sha256(args.scene_dir / "authoring_map.json"),
+            "free_pose_digest": (frame_plan.get("free_poses") or {}).get("free_pose_digest")}
+           if free_specs is not None else {"graph_sha256": _sha256(graph_path)}),
         "width": args.width, "height": args.height, "fov": args.fov,
         "eye_height": args.eye_height, "target_height": args.target_height,
         "rgb_spp": args.rgb_spp, "nir_spp": args.nir_spp, "max_bounces": args.max_bounces,
@@ -1448,7 +1552,7 @@ def main() -> int:
                               "source_geometry_digest": overview_proxy["source_geometry_digest"],
                               "triangle_target": overview_proxy.get("triangle_target"),
                               "triangle_cap": overview_proxy.get("triangle_cap")} if overview_proxy else None),
-        "frame_specs": specs,
+        "frame_specs": (free_specs if free_specs is not None else specs),
         "render_plan": ({"render_plan_id": frame_plan["render_plan_id"], "render_plan_digest": frame_plan["render_plan_digest"],
                          "content_digest": render_plan_digest(frame_plan), "illumination": frame_plan.get("illumination")} if frame_plan else None),
     }
@@ -1496,7 +1600,11 @@ def main() -> int:
         ],
     })
     external_lighting_available = bool((contract.get("external_portal_rig") or {}).get("available"))
-    tasks = [_task(nodes[node_id], yaw, lighting, args, offset, fingerprint, pbr_gt_contract_digest, external_lighting_available) for node_id, yaw, lighting in specs]
+    if free_specs is not None:
+        tasks = [_free_task(pose, lighting, args, offset, fingerprint, pbr_gt_contract_digest,
+                            external_lighting_available) for pose, lighting in free_specs]
+    else:
+        tasks = [_task(nodes[node_id], yaw, lighting, args, offset, fingerprint, pbr_gt_contract_digest, external_lighting_available) for node_id, yaw, lighting in specs]
     overview = _write_scene_overview(args.out, graph, tasks, args, fingerprint, graph_path)
     artifact_contract = _artifact_contract(args, contract, fingerprint, frame_plan, overview,
                                            passive_ready=False)

@@ -325,6 +325,13 @@ def build_render_plan(graph: dict[str, Any], *, requested_pose_count: int, seed:
                 raise ValueError(
                     f"variation_subset_v3 requires at least {MIN_VARIATION_CONDITIONS} variation "
                     f"conditions, got {len(variation_indices)}")
+            if free_poses is None:
+                # Reached when a job asks for this policy but the camera policy
+                # was not the free universe; graph poses have no pose_id and
+                # would otherwise fail with a bare KeyError much later.
+                raise ValueError(
+                    "variation_subset_v3 requires the free 6-DoF pose universe "
+                    f"({POSE_UNIVERSE_FREE}); got graph or camera-set poses")
             base_poses = _fps(remaining, actual, rng, span) if len(remaining) > actual else list(remaining)
             actual = len(base_poses)
             if not BASE_POSE_RANGE[0] <= actual <= BASE_POSE_RANGE[1]:
@@ -548,10 +555,14 @@ def write_render_plan(path: Path, graph_path: Path, *, requested_pose_count: int
                       camera_sets_path: Path | None = None,
                       showcase_provenance: dict[str, Any] | None = None,
                       min_unique_pose_count: int = 1,
-                      free_poses: dict[str, Any] | None = None,
+                      free_poses_path: Path | None = None,
                       variation_pose_count: int = DEFAULT_VARIATION_POSE_COUNT,
                       illumination_pairing_policy: str = "legacy_six_way_v1") -> dict[str, Any]:
-    graph = json.loads(graph_path.read_text(encoding="utf-8"))
+    # A free-pose plan has no graph universe, but the file may still exist for
+    # traversability previews, so an absent one is not an error here.
+    graph = (json.loads(graph_path.read_text(encoding="utf-8"))
+             if graph_path is not None and graph_path.is_file() else {"nodes": [], "edges": []})
+    free_poses = json.loads(free_poses_path.read_text(encoding="utf-8")) if free_poses_path else None
     visibility = json.loads(visibility_path.read_text(encoding="utf-8")) if visibility_path else None
     camera_sets = json.loads(camera_sets_path.read_text(encoding="utf-8")) if camera_sets_path else None
     # A showcase raster probe is a broader durable report whose selected
@@ -565,6 +576,7 @@ def write_render_plan(path: Path, graph_path: Path, *, requested_pose_count: int
                              illumination=illumination, paired_fraction=paired_fraction,
                              camera_sets=camera_sets, showcase_provenance=showcase_provenance,
                              min_unique_pose_count=min_unique_pose_count,
+                             free_poses=free_poses, variation_pose_count=variation_pose_count,
                              illumination_pairing_policy=illumination_pairing_policy)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")

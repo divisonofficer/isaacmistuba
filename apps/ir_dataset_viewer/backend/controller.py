@@ -48,7 +48,9 @@ IR_GRAPH_DEFAULTS = {
     "graph_min_node_spacing": 0.25,
     "graph_robot_radius": 0.30,
 }
-STAGES = ("generate", "showcase_composition", "import", "scene_content_audit", "navigation_compile", "material_extract", "material_canonicalize", "showcase_raster_probe", "showcase_acceptance", "view_probe", "lighting_asset_audit", "view_plan", "scene_quality_gate", "geometry", "structural_rematerialize", "structural_quality_audit", "prop_pbr_remediate", "overview_proxy", "principled_prepare", "material_mix_audit", "qc_render", "qc_verify", "full_render", "nir_passive_backfill", "full_verify", "dataset_utility_audit", "publish")
+FREE_CAMERA_POLICY = "object_orbit_6dof_v1"
+FREE_PAIRING_POLICY = "variation_subset_v3"
+STAGES = ("generate", "showcase_composition", "import", "scene_content_audit", "navigation_compile", "material_extract", "material_canonicalize", "showcase_raster_probe", "showcase_acceptance", "view_probe", "object_anchors", "camera_6dof_sample", "lighting_asset_audit", "view_plan", "scene_quality_gate", "geometry", "structural_rematerialize", "structural_quality_audit", "prop_pbr_remediate", "overview_proxy", "principled_prepare", "material_mix_audit", "qc_render", "qc_verify", "full_render", "nir_passive_backfill", "full_verify", "dataset_utility_audit", "publish")
 TERMINAL = {"succeeded", "failed", "cancelled", "interrupted"}
 GPU_STAGES = frozenset({"qc_render", "full_render", "nir_passive_backfill"})
 INFINIGEN_GENERATE_STAGES = frozenset({"generate"})
@@ -510,6 +512,8 @@ class IRDatasetController:
             paths.setdefault("render_plan", str(Path(pipeline) / "render_plan.json"))
             paths.setdefault("qc_render_plan", str(Path(pipeline) / "qc_render_plan.json"))
             paths.setdefault("candidate_visibility", str(Path(pipeline) / "candidate_visibility.json"))
+            paths.setdefault("object_anchors", str(Path(pipeline) / "object_anchors.json"))
+            paths.setdefault("free_camera_poses", str(Path(pipeline) / "free_camera_poses.json"))
             paths.setdefault("content_audit", str(Path(pipeline) / "scene_content_audit.json"))
             paths.setdefault("overview_proxy", str(Path(pipeline) / "overview_proxy"))
             paths.setdefault("illumination_audit", str(Path(pipeline) / "illumination_asset_audit.json"))
@@ -600,7 +604,13 @@ class IRDatasetController:
         if job.request.get("source_mode") == "nir_passive_backfill":
             return ["nir_passive_backfill"]
         if job.request.get("source_mode") == "augmentation":
-            stages = ["lighting_asset_audit", "view_plan"]
+            # The 6-DoF universe is derived from the authoring map, not from
+            # Stage 1, so it re-derives cheaply on top of a reused geometry
+            # bake -- which is the whole point of augmenting rather than
+            # regenerating a scene.
+            stages = (["object_anchors", "camera_6dof_sample"]
+                      if job.request.get("camera_policy") == FREE_CAMERA_POLICY else [])
+            stages += ["lighting_asset_audit", "view_plan"]
             if job.request.get("structural_rematerialize"):
                 stages += ["structural_rematerialize", "structural_quality_audit"]
             if job.request.get("hybrid_prop_pbr"):
@@ -622,6 +632,15 @@ class IRDatasetController:
             stages = [stage for stage in stages if stage != "lighting_asset_audit"]
         if job.request.get("pipeline_revision") != "ir-content-aware-v2":
             stages = [stage for stage in stages if stage not in {"scene_content_audit", "view_probe", "scene_quality_gate", "material_mix_audit", "dataset_utility_audit"}]
+        if job.request.get("camera_policy") == FREE_CAMERA_POLICY:
+            # The graph is no longer the pose universe: view_probe walks
+            # graph.nodes[*].headings, which a free-pose plan does not have.
+            # navigation_compile stays -- its traversability grid still backs
+            # the overview preview and the OpticalNav export tree.
+            stages = [stage for stage in stages if stage != "view_probe"]
+        else:
+            stages = [stage for stage in stages
+                      if stage not in {"object_anchors", "camera_6dof_sample"}]
         if job.request.get("ir_composition_profile") != SHOWCASE_PROFILE:
             stages = [stage for stage in stages if stage not in {"showcase_composition", "showcase_raster_probe", "showcase_acceptance"}]
         if job.request.get("content_profile") != "research_balanced" or job.request.get("source_mode") != "generate":
@@ -944,6 +963,8 @@ class IRDatasetController:
             "min_unique_pose_count": int(raw.get("min_unique_pose_count", 100)),
             "pose_budget": int(raw.get("pose_budget", 400)),
             "camera_policy": str(raw.get("camera_policy") or "content_aware_v2"),
+            "illumination_bank_version": str(raw.get("illumination_bank_version") or "v1"),
+            "variation_pose_count": int(raw.get("variation_pose_count") or 10),
             "content_profile": str(raw.get("content_profile") or "balanced"),
             "placement_profile": str(raw.get("placement_profile") or "legacy_clutter_v1"),
             "ir_composition_profile": str(raw.get("ir_composition_profile") or ""),
@@ -972,11 +993,21 @@ class IRDatasetController:
             raise ValueError("invalid storage_profile")
         if not 0.05 <= request["paired_fraction"] <= 1.0:
             raise ValueError("paired fraction must be in [0.05, 1.0]")
-        if request["illumination_pairing_policy"] not in {"legacy_six_way_v1", "reference_subset_v2"}:
+        if request["illumination_pairing_policy"] not in {"legacy_six_way_v1", "reference_subset_v2", FREE_PAIRING_POLICY}:
             raise ValueError("invalid illumination pairing policy")
         if not 1 <= request["min_unique_pose_count"] <= request["pose_budget"]:
             raise ValueError("min_unique_pose_count must be between 1 and pose_budget")
-        if request["camera_policy"] not in {"content_aware_v2", "coverage_v1"} or request["content_profile"] not in {"balanced", "anchor_rich", "structural", "research_balanced"}:
+        if request["illumination_bank_version"] not in {"v1", "v2"}:
+            raise ValueError("illumination_bank_version must be v1 or v2")
+        if request["camera_policy"] == FREE_CAMERA_POLICY:
+            # The 6-DoF universe carries its own lighting contract; pairing a
+            # v1 bank with it would silently drop the per-fixture variation
+            # that is half the point of the new rule.
+            if request["illumination_bank_version"] != "v2":
+                raise ValueError(f"{FREE_CAMERA_POLICY} requires illumination_bank_version v2")
+            if request.get("illumination_pairing_policy") != FREE_PAIRING_POLICY:
+                raise ValueError(f"{FREE_CAMERA_POLICY} requires {FREE_PAIRING_POLICY}")
+        if request["camera_policy"] not in {"content_aware_v2", "coverage_v1", FREE_CAMERA_POLICY} or request["content_profile"] not in {"balanced", "anchor_rich", "structural", "research_balanced"}:
             raise ValueError("invalid camera or content policy")
         if request["placement_profile"] not in {"legacy_clutter_v1", "upstream_residential_v1", "collision_aware_clutter_v1"}:
             raise ValueError("invalid Infinigen placement profile")
@@ -1102,7 +1133,12 @@ class IRDatasetController:
                 raise FileNotFoundError(f"legacy dataset source graph is unavailable: {scene_id}")
             request.update({"legacy_dataset_name": legacy_name, "legacy_dataset": str(legacy), "room_type": str(raw.get("room_type") or "generic"),
                             "scene_id": self._safe_name(scene_id, "scene_id"), "illumination_diversity": True,
-                            "camera_policy": "coverage_v1"})
+                            # Augmentation has no visibility probe, so coverage
+                            # is the fallback -- but the free 6-DoF universe
+                            # brings its own poses and must not be overwritten.
+                            "camera_policy": (FREE_CAMERA_POLICY
+                                              if str(raw.get("camera_policy") or "") == FREE_CAMERA_POLICY
+                                              else "coverage_v1")})
         pipeline = self.pipeline_root / dataset_name
         if pipeline.exists():
             raise FileExistsError("pipeline artifact directory already exists; retry its original job instead")
@@ -1112,6 +1148,8 @@ class IRDatasetController:
             "prepared": str(attempt_root / "principled_stage2"), "qc": str(attempt_root / "qc_stage0"),
             "render_plan": str(attempt_root / "render_plan.json"), "qc_render_plan": str(attempt_root / "qc_render_plan.json"),
             "candidate_visibility": str(attempt_root / "candidate_visibility.json"),
+            "object_anchors": str(attempt_root / "object_anchors.json"),
+            "free_camera_poses": str(attempt_root / "free_camera_poses.json"),
             "showcase_blend": str(attempt_root / "showcase" / "composition_c00.blend"),
             "showcase_composition": str(attempt_root / "showcase" / "composition_c00.json"),
             "showcase_raster_probe": str(attempt_root / "showcase_raster_probe.json"),
@@ -1880,6 +1918,8 @@ class IRDatasetController:
             "render_plan": str(upgrade_root / "render_plan.json"),
             "qc_render_plan": str(upgrade_root / "qc_render_plan.json"),
             "candidate_visibility": str(upgrade_root / "candidate_visibility.json"),
+            "object_anchors": str(upgrade_root / "object_anchors.json"),
+            "free_camera_poses": str(upgrade_root / "free_camera_poses.json"),
             "scene_quality": str(upgrade_root / "scene_content_quality.json"),
             "material_mix": str(upgrade_root / "material_mix_quality.json"),
             "dataset": str(self.work_root / child_name),
@@ -2076,6 +2116,22 @@ class IRDatasetController:
                 authoring = _read_json(scene / "authoring_map.json")
                 from mitsuba_converter.ir_render_plan import stable_digest
                 return "verified" if audit.get("status") == "passed" and audit.get("source_authoring_map_digest") == stable_digest(authoring) else "stale"
+            except (KeyError, OSError, ValueError, json.JSONDecodeError): return "missing"
+        if stage == "object_anchors":
+            try:
+                anchors = _read_json(Path(p["object_anchors"]))
+                return "verified" if anchors.get("anchor_digest") and anchors.get("anchors") else "stale"
+            except (KeyError, OSError, ValueError, json.JSONDecodeError): return "missing"
+        if stage == "camera_6dof_sample":
+            try:
+                free = _read_json(Path(p["free_camera_poses"]))
+                anchors = _read_json(Path(p["object_anchors"]))
+                authoring = _read_json(scene / "authoring_map.json")
+                from mitsuba_converter.ir_render_plan import stable_digest
+                valid = (free.get("free_pose_digest")
+                         and free.get("anchor_digest") == anchors.get("anchor_digest")
+                         and free.get("source_authoring_map_digest") == stable_digest(authoring))
+                return "verified" if valid else "stale"
             except (KeyError, OSError, ValueError, json.JSONDecodeError): return "missing"
         if stage == "view_probe":
             try:
@@ -2288,6 +2344,13 @@ class IRDatasetController:
         self._save(job, "recovery_queued", rerun_from=start, insert_stages=insert_stages)
         self._wake.set()
 
+    def _illumination_bank(self, job: ControllerJob) -> dict:
+        """v1 stays the default so no existing job changes bank."""
+        if str(job.request.get("illumination_bank_version") or "v1") != "v2":
+            return load_bank(self.repo_root)
+        return load_bank(self.repo_root,
+                         self.repo_root / "configs" / "ir_lighting" / "illumination_diversity_v2.json")
+
     def _build_view_plan(self, job: ControllerJob) -> None:
         path = Path(job.request["paths"]["render_plan"])
         graph = self.scene_root / job.request["scene_id"] / "viewpoint_graph.json"
@@ -2311,15 +2374,19 @@ class IRDatasetController:
             }
         else:
             provenance = None
+        free = job.request.get("camera_policy") == FREE_CAMERA_POLICY
         plan = write_render_plan(path, graph, requested_pose_count=int(job.request["pose_budget"]),
                                  seed=int(job.request.get("effective_scene_seed") or job.request.get("seed") or 20260812),
                                  scene_id=str(job.request["scene_id"]),
                                  visibility_path=Path(job.request["paths"]["candidate_visibility"])
                                  if job.request.get("camera_policy") == "content_aware_v2" else None,
+                                 free_poses_path=(Path(job.request["paths"]["free_camera_poses"])
+                                                  if free else None),
+                                 variation_pose_count=int(job.request.get("variation_pose_count") or 10),
                                  adaptive_budget=bool(job.request.get("adaptive_pose_budget")),
                                  max_headings_per_node=int(job.request.get("max_headings_per_node", 6)),
                                  sparse_fraction=float(job.request.get("sparse_negative_fraction", 0.15)),
-                                 illumination=(load_bank(self.repo_root) if job.request.get("illumination_diversity") else None),
+                                 illumination=(self._illumination_bank(job) if job.request.get("illumination_diversity") else None),
                                  paired_fraction=float(job.request.get("paired_fraction", 0.25)),
                                  illumination_pairing_policy=str(job.request.get("illumination_pairing_policy") or "legacy_six_way_v1"),
                                  min_unique_pose_count=int(job.request.get("min_unique_pose_count", 100)),
@@ -2351,8 +2418,21 @@ class IRDatasetController:
             actual_poses = int(plan.get("unique_pose_count") or plan.get("actual_pose_count") or 0)
             paired_poses = int(illumination_plan.get("paired_pose_count") or 0)
             pairing_policy = str(illumination_plan.get("pairing_policy") or "legacy_six_way_v1")
-            requested_pair_fraction = (1.0 if pairing_policy == "reference_subset_v2"
-                                       else float(job.request.get("paired_fraction", 0.25)))
+            if pairing_policy == FREE_PAIRING_POLICY:
+                # This policy sets the lighting subset as an explicit count, not
+                # a fraction of the base poses: the cost of the cross product is
+                # what is being bounded, and it does not scale with how many
+                # vantages a room happens to afford.  A fraction gate rejected a
+                # correct plan for having *more* base poses.
+                wanted = min(int(job.request.get("variation_pose_count") or 10), actual_poses)
+                if paired_poses != wanted:
+                    raise QualityGateError(
+                        "lighting variation subset size mismatch: "
+                        f"{paired_poses} != {wanted}")
+                requested_pair_fraction = 0.0
+            else:
+                requested_pair_fraction = (1.0 if pairing_policy == "reference_subset_v2"
+                                           else float(job.request.get("paired_fraction", 0.25)))
             if actual_poses and paired_poses / actual_poses + 1e-9 < requested_pair_fraction:
                 raise QualityGateError(
                     "paired lighting coverage below requested minimum: "
@@ -2679,6 +2759,20 @@ class IRDatasetController:
                     "--room-type", str(r.get("room_type") or "generic"), "--profile", str(r.get("content_profile") or "balanced"),
                     "--source-blend", str(self._source_blend_path(source)), "--registry-root", str(self.pipeline_root),
                     "--registry-root", str(self.bean_root)]
+        if stage == "object_anchors":
+            return ["python3", "apps/build_ir_object_anchors.py",
+                    "--scene-dir", str(self.scene_root / r["scene_id"]),
+                    "--out", p["object_anchors"],
+                    "--seed", str(int(r.get("effective_scene_seed") or r.get("seed") or 20260812))]
+        if stage == "camera_6dof_sample":
+            return ["python3", "apps/sample_ir_camera_6dof.py",
+                    "--scene-dir", str(self.scene_root / r["scene_id"]),
+                    "--anchors", p["object_anchors"], "--out", p["free_camera_poses"],
+                    "--scene-id", str(r["scene_id"]),
+                    "--seed", str(int(r.get("effective_scene_seed") or r.get("seed") or 20260812)),
+                    "--fov", str(float(r.get("fov") or 60.0)),
+                    "--width", str(int(r.get("width") or 684)),
+                    "--height", str(int(r.get("height") or 512))]
         if stage == "view_probe":
             return ["python3", "apps/probe_ir_candidate_visibility.py", "--graph",
                     str(self.scene_root / r["scene_id"] / "viewpoint_graph.json"), "--authoring-map",
