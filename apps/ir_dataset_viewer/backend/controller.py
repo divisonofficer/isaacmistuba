@@ -2252,6 +2252,11 @@ class IRDatasetController:
                     contract.get("schema") == "robomituba.ir_principled_material_contract.v4"
                     and contract.get("contract_version") == "blender42-principled-metallic-roughness-v4"
                     and contract.get("compiler_version") == STAGE2_COMPILER_VERSION
+                    # A v2 lighting bank needs the addressable fixture rig.  A
+                    # Stage 2 built without it renders nothing, so it must read
+                    # stale here rather than be reused.
+                    and (bool((contract.get("ambient_fill_rig") or {}).get("indoor_fixture_rig"))
+                         if str(r.get("illumination_bank_version") or "v1") == "v2" else True)
                     # A Stage 2 built with the continuous-metalness policy emits
                     # v3 records.  Accept them only when the contract itself
                     # declares the policy, so an undeclared v3 still reads stale.
@@ -2846,7 +2851,15 @@ class IRDatasetController:
             if Path(p["prepared"]).exists():
                 cmd.append("--rebuild-stale")
             if r.get("illumination_diversity"):
-                cmd += ["--illumination-manifest", str(self.repo_root / "configs" / "ir_lighting" / "illumination_diversity_v1.json")]
+                bank = ("illumination_diversity_v2.json"
+                        if str(r.get("illumination_bank_version") or "v1") == "v2"
+                        else "illumination_diversity_v1.json")
+                cmd += ["--illumination-manifest", str(self.repo_root / "configs" / "ir_lighting" / bank)]
+                if str(r.get("illumination_bank_version") or "v1") == "v2":
+                    # A v2 recipe drives fixtures individually, which the worker
+                    # refuses to fake: without this the blend has no addressable
+                    # rig and every frame fails at _set_lighting.
+                    cmd += ["--fixture-policy", "addressable_v2"]
             if r.get("metallic_augmentation"):
                 cmd += [
                     "--metallic-augmentation-policy",
@@ -3102,14 +3115,39 @@ class IRDatasetController:
         required = {"rgb", "nir_active", "base_color_rgb", "roughness", "metallic", "normal_geometry_world", "normal_shading_world"}
         if not rows or not required <= set(rows[0].get("paths") or {}): raise RuntimeError("QC gate failed: required modalities absent")
         if job.request.get("illumination_diversity"):
+            pairing_policy = str(job.request.get("illumination_pairing_policy") or "legacy_six_way_v1")
             pairs: dict[str, list[dict[str, Any]]] = {}
             for row in rows:
                 pair_id = row.get("pair_id")
-                if row.get("capture_kind") == "paired" and pair_id:
+                if not pair_id:
+                    continue
+                # v5 keeps its real capture kind (orbit / sparse_tuple) because
+                # that describes the camera, not the lighting; a pair_id is
+                # present only on the poses that actually carry a stack.
+                if pairing_policy == FREE_PAIRING_POLICY or row.get("capture_kind") == "paired":
                     pairs.setdefault(str(pair_id), []).append(row)
-            pairing_policy = str(job.request.get("illumination_pairing_policy") or "legacy_six_way_v1")
-            expected_pair_members = 2 if pairing_policy == "reference_subset_v2" else 6
-            if not pairs or any(len(group) != expected_pair_members for group in pairs.values()):
+            expected_pair_members = (2 if pairing_policy == "reference_subset_v2" else 6)
+            if pairing_policy == FREE_PAIRING_POLICY:
+                # The reference plus every variation condition.
+                expected_pair_members = 1 + int(
+                    ((_read_json(Path(job.request["paths"]["render_plan"])).get("illumination")
+                      or {}).get("variation_condition_count")) or 5)
+            if qc and pairing_policy == FREE_PAIRING_POLICY:
+                # The QC pass renders a truncated slice of the frame list, so a
+                # six-member lighting stack is routinely cut in half.  Demand
+                # that a complete stack exists -- the invariant below is what QC
+                # is actually for -- and leave whole-dataset completeness to
+                # full_verify, where the frame list is not truncated.
+                complete = {key: group for key, group in pairs.items()
+                            if len(group) == expected_pair_members}
+                if not complete:
+                    raise RuntimeError(
+                        f"QC gate failed: no complete illumination stack for {pairing_policy} "
+                        f"(expected {expected_pair_members} members; largest seen "
+                        f"{max((len(g) for g in pairs.values()), default=0)})"
+                    )
+                pairs = complete
+            elif not pairs or any(len(group) != expected_pair_members for group in pairs.values()):
                 raise RuntimeError(
                     f"QC gate failed: incomplete illumination pair for {pairing_policy} "
                     f"(expected {expected_pair_members} members)"

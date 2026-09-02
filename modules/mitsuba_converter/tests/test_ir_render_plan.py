@@ -374,17 +374,30 @@ def test_variation_subset_renders_every_base_pose_and_a_full_lighting_stack() ->
     assert plan["illumination"]["variation_condition_count"] == 5
 
 
-def test_variation_subset_shares_one_pair_id_across_conditions() -> None:
+def test_only_the_variation_subset_carries_a_pair_id() -> None:
+    """A pose seen under one lighting is not paired with anything.
+
+    Tagging every base pose would advertise a lighting stack of size one.
+    """
     plan = build_render_plan({"nodes": [], "edges": []}, requested_pose_count=60, seed=7,
                              scene_id="room", free_poses=_free_poses(),
                              illumination=_bank(), variation_pose_count=10,
                              illumination_pairing_policy="variation_subset_v3")
     by_pose: dict[str, set[str]] = {}
+    appearances: dict[str, int] = {}
     for group in plan["groups"]:
         for pose in group["poses"]:
-            by_pose.setdefault(pose["pose_id"], set()).add(pose["pair_id"])
+            appearances[pose["pose_id"]] = appearances.get(pose["pose_id"], 0) + 1
+            if pose.get("pair_id"):
+                by_pose.setdefault(pose["pose_id"], set()).add(pose["pair_id"])
+
+    # Exactly the ten poses that appear under every condition are paired, and
+    # each of them uses one pair_id across its whole stack.
+    assert len(by_pose) == 10
     assert all(len(ids) == 1 for ids in by_pose.values())
     assert all(next(iter(ids)).startswith("room:") for ids in by_pose.values())
+    assert all(appearances[pose_id] == 6 for pose_id in by_pose)
+    assert all(appearances[pose_id] == 1 for pose_id in appearances if pose_id not in by_pose)
 
 
 def test_variation_subset_spreads_the_lighting_stack_over_anchors() -> None:

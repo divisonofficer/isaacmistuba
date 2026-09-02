@@ -355,11 +355,16 @@ def build_render_plan(graph: dict[str, Any], *, requested_pose_count: int, seed:
             variation_poses = [pose for pose in base_poses if _camera_key(pose) in chosen]
 
             def lit_pose(pose: dict[str, Any], member_index: int) -> dict[str, Any]:
+                lit = {**pose, "capture_kind": str(pose.get("capture_kind") or "orbit")}
+                if _camera_key(pose) not in chosen:
+                    # A pose rendered under the reference alone is not paired
+                    # with anything; giving it a pair_id would advertise a
+                    # lighting stack that has exactly one member.
+                    return lit
                 # One pair_id per *pose*, shared across its lighting conditions,
                 # so a consumer can pull the whole lighting stack for one camera.
                 pair_id = f"{scene_id}:{pose['pose_id']}"
-                return {**pose, "capture_kind": str(pose.get("capture_kind") or "orbit"),
-                        "lighting_pair_id": pair_id, "pair_id": pair_id,
+                return {**lit, "lighting_pair_id": pair_id, "pair_id": pair_id,
                         "pair_member_index": member_index}
 
             for index, condition in enumerate(conditions):
