@@ -126,8 +126,14 @@ def _distance(a: Sequence[float], b: Sequence[float]) -> float:
 
 
 def _yaw_to(a: Sequence[float], b: Sequence[float]) -> float:
-    # This matches sensor_sweep._mat4_from_xy_yaw / graph_episode_sampler._edge_heading.
-    return (math.degrees(math.atan2(-(float(b[0]) - float(a[0])), float(b[1]) - float(a[1]))) + 360.0) % 360.0
+    """Return the canonical camera yaw which faces ``b`` from ``a``.
+
+    ``resolve_viewpoint_pose`` defines camera forward in authoring-floor
+    coordinates as ``(sin(yaw), cos(yaw))``.  Keeping this helper in that same
+    convention is essential: a sign flip on X makes east/west motion render
+    with a 180-degree reversed camera heading.
+    """
+    return (math.degrees(math.atan2(float(b[0]) - float(a[0]), float(b[1]) - float(a[1]))) + 360.0) % 360.0
 
 
 def _heading_id(yaw_deg: float, heading_count: int = 24) -> str:
@@ -419,6 +425,16 @@ def _interpolate_polyline(points: Sequence[tuple[float, float]], segments: int) 
     return output
 
 
+def _edge_portal_id(edge: ViewpointEdge) -> str:
+    """Return the portal id a place edge crosses, or "" when it crosses none.
+
+    The id is the ``portal`` extra written by the place-graph builder; every
+    other portal predicate in this module reads the same key.
+    """
+    portal_id = (edge.extras or {}).get("portal")
+    return str(portal_id) if portal_id else ""
+
+
 def _portal_is_open(edge: ViewpointEdge) -> bool:
     extras = dict(edge.extras or {})
     if not extras.get("portal"):
@@ -577,6 +593,7 @@ def _action_grid_path(
     *,
     guide: Sequence[tuple[float, float]],
     exact_start: bool = False,
+    exact_goal: bool = False,
 ) -> list[tuple[float, float]] | None:
     """Find legal 0.25m action chords near a certified anchor route.
 
@@ -627,7 +644,7 @@ def _action_grid_path(
     # a disconnected lattice phase.  Existing v3 callers retain the raster
     # centre behaviour by default.
     start_point = tuple(start_point) if exact_start else cell_to_world(grid.spec, *start)
-    goal_point = cell_to_world(grid.spec, *goal)
+    goal_point = tuple(goal_point) if exact_goal else cell_to_world(grid.spec, *goal)
     if not (allowed(start_point, endpoint=True) and allowed(goal_point, endpoint=True)):
         return None
 
@@ -637,7 +654,10 @@ def _action_grid_path(
     # End within one forward primitive; all actual transitions remain fixed
     # length and collision-checked. The selected route is still labelled with
     # the original anchor feature for coverage accounting.
-    goal_radius_m = float(config["forward_step_m"])
+    # An anchor patch must land on the caller's exact pose, not merely within
+    # one action of it: it exists to reconcile two lattice phases, and a
+    # relaxed landing would leave the very gap it is meant to close.
+    goal_radius_m = 1e-7 if exact_goal else float(config["forward_step_m"])
 
     # A place edge can already be one exact forward primitive (most notably a
     # 25 cm portal threshold).  The relaxed terminal radius below exists only
@@ -2085,9 +2105,20 @@ def _v3_portal_aware_grid(graph: ViewpointGraph, grid: TraversabilityGrid) -> tu
     restored: list[str] = []
     for edge in graph.edges:
         extras = dict(edge.extras or {})
-        portal_id = str(extras.get("portal") or "")
         validation = extras.get("edge_validation") or {}
-        if not portal_id or not _portal_is_open(edge) or not isinstance(validation, Mapping):
+        if not isinstance(validation, Mapping):
+            continue
+        # The first v4 editor recorded an inferred doorway only inside the
+        # accepted edge-validation record, never as a ``portal`` extra. That
+        # certificate is immutable, so honour it as a portal of its own rather
+        # than requiring the edge to be recertified.
+        legacy_doorway = (
+            str(validation.get("mode") or "") == "doorway"
+            and str(validation.get("reason") or "") == "certified_doorway"
+            and bool(validation.get("portal_id"))
+        )
+        portal_id = str(extras.get("portal") or (validation.get("portal_id") if legacy_doorway else "") or "")
+        if not portal_id or not (_portal_is_open(edge) or legacy_doorway):
             continue
         if validation.get("wall_run_cells") not in (None, 0):
             continue
@@ -2101,7 +2132,7 @@ def _v3_portal_aware_grid(graph: ViewpointGraph, grid: TraversabilityGrid) -> tu
         # One physical grid cell is enough to absorb a legal action-lattice
         # phase offset while still being much narrower than the 0.38 m robot
         # clearance that was used to certify the endpoint nodes.
-        padding_cells = 1 if is_user_certified else 0
+        padding_cells = 1 if (is_user_certified or legacy_doorway) else 0
         for source, target in zip(_edge_points(graph, edge), _edge_points(graph, edge)[1:]):
             count = max(1, int(math.ceil(_distance(source, target) / (float(grid.spec.resolution) / 3.0))))
             for index in range(count + 1):

@@ -67,6 +67,7 @@
 	import RailSyncInspectorTab from '$lib/datasets/RailSyncInspectorTab.svelte';
 	import PathsInspector from '$lib/datasets/navigation/PathsInspector.svelte';
 	import EditorToolRail from '$lib/datasets/navigation/EditorToolRail.svelte';
+	import { hasSuccessfulSupportAnalysis } from '$lib/datasets/navigation/navigationPresentation';
 	import { resolveInspectorKind, type WorkspaceMode } from '$lib/datasets/workspaceMode';
 	import InitStatusDashboard from '$lib/datasets/InitStatusDashboard.svelte';
 	import RailSelectedTab from '$lib/datasets/RailSelectedTab.svelte';
@@ -361,9 +362,16 @@
 	let graphBatchIds = $state<string[]>([]); // all batch IDs submitted this session
 	let renderVersions = $state<any[]>([]);
 	let renderSensorProgress = $state<any[]>([]);
-let renderVersionsLoading = $state(false);
-let renderCoverageRequest: Promise<void> | null = null;
-let renderCoverageUpdatedAt = 0;
+	let renderVersionsLoading = $state(false);
+	// Kept separate from renderVersionsLoading: version metadata is inexpensive,
+	// while a durable plan coverage read can take several seconds on the shared
+	// ledger. This makes that wait visible and lets the manual Refresh await it.
+	let renderCoverageLoading = $state(false);
+	let renderCoverageRequest: Promise<void> | null = null;
+	// Reactive because the monitor displays this independently of completed-view
+	// count. A K=4 strip commits four views together, so a fresh ledger read can
+	// be useful even when the next strip has not completed yet.
+	let renderCoverageUpdatedAt = $state(0);
 	let renderVersionGallery = $state<any>(null);
 	let renderVersionGalleryLoading = $state(false);
 	let renderVersionGalleryError = $state('');
@@ -689,7 +697,19 @@ let renderCoverageUpdatedAt = 0;
 		node_id?: string;
 		certify_opening?: boolean;
 	};
+	type EdgeReviewCandidate = {
+		candidate_id: string;
+		source: string;
+		target: string;
+		status: 'checking' | 'ready' | 'opening_confirmation' | 'blocked' | 'submitting';
+		check?: any;
+		client_op_id?: string;
+	};
 	let pendingGraphEdits = $state<PendingGraphEdit[]>([]);
+	// A v4 edge is never silently force-added.  The queue makes every pair
+	// observable while its collision check runs and gives the editor an in-rail
+	// confirmation surface instead of a blocking browser `confirm()` dialog.
+	let edgeReviewQueue = $state<EdgeReviewCandidate[]>([]);
 	let lockedGraphEdits = $state<PendingGraphEdit[]>([]);
 	let lockedNodePlacement = $state<[number, number] | null>(null);
 	let graphEditInvalidationConfirmed = $state(false);
@@ -770,6 +790,12 @@ let renderCoverageUpdatedAt = 0;
 				edges = edges.filter((e: any) => e.edge_id !== result.edge_id);
 			}
 		}
+		const terminalClientIds = new Set(
+			(results ?? []).map((result: any) => String(result?.client_op_id ?? '')).filter(Boolean),
+		);
+		if (terminalClientIds.size) {
+			edgeReviewQueue = edgeReviewQueue.filter((candidate) => !candidate.client_op_id || !terminalClientIds.has(candidate.client_op_id));
+		}
 		graphPayload = { ...graphPayload, edges };
 	}
 	function scheduleGraphIdleRefresh() {
@@ -814,13 +840,20 @@ let renderCoverageUpdatedAt = 0;
 			scheduleGraphIdleRefresh();
 		} catch (err) {
 			for (const op of ops) removePendingEdge(op.client_op_id);
+			const failedClientIds = new Set(ops.map((op) => op.client_op_id));
+			const failureReason = errorMessage(err);
+			edgeReviewQueue = edgeReviewQueue.map((candidate) => (
+				candidate.client_op_id && failedClientIds.has(candidate.client_op_id)
+					? { ...candidate, status: 'blocked', check: { ...(candidate.check ?? {}), reason: failureReason } }
+					: candidate
+			));
 			const payload = errorPayload(err) as any;
 			if (payload?.error === 'navigation_support_locked') {
 				lockedGraphEdits = [...lockedGraphEdits, ...ops];
 				supportEditConfirmOpen = true;
 				pushActivity('warn', 'graph:edit', 'Navigation Support is locked. Confirm the archive step to apply this topology edit.');
 			} else {
-				pushActivity('error', 'graph:edit', errorMessage(err));
+				pushActivity('error', 'graph:edit', failureReason);
 			}
 			scheduleGraphIdleRefresh();
 		} finally {
@@ -856,6 +889,7 @@ let renderCoverageUpdatedAt = 0;
 			};
 		}
 		supportAnalysis = null;
+		supportAnalysisStale = false;
 		const archiveRef = String(archivedSupport?.archive_ref ?? '');
 		pushActivity('info', 'navigation:support-archived', archiveRef
 			? `Support plan archived at ${archiveRef}; review Blueprints and rebuild support before new episodes.`
@@ -891,15 +925,37 @@ let renderCoverageUpdatedAt = 0;
 	let edgeCheckPending = $state(false);
 	const edgeCheckFlights = new Map<string, Promise<any>>();
 	let activeEdgeCheckKey = '';
+	function activePlaceGraphSafetyConfig(): any {
+		const metadata = graphPayload?.metadata ?? navigationSupport?.place_graph?.metadata ?? {};
+		return metadata?.navigation_support_config ?? metadata ?? {};
+	}
+	function activePlaceGraphRobotRadius(): number {
+		// Editing an existing place graph must use the radius that built its
+		// persisted motion grid. A changed form value is only a pending rebuild
+		// configuration; using it for an immediate edge check would certify an
+		// edge against a different safety domain.
+		const configured = activePlaceGraphSafetyConfig()?.robot_radius_m;
+		const radius = Number(configured);
+		return Number.isFinite(radius) && radius > 0 ? radius : Number(robotRadius);
+	}
+	function activePlaceGraphSafetyMargin(): number {
+		const config = activePlaceGraphSafetyConfig();
+		const configured = Number(config?.safety_margin_m);
+		if (Number.isFinite(configured) && configured >= 0) return configured;
+		// Older place graphs only recorded the graph pipeline's combined margin.
+		const combined = Number(config?.min_clearance_m);
+		return Number.isFinite(combined) && combined >= 0.03 ? combined - 0.03 : Number(minClearance);
+	}
 	async function checkGraphEdge(source: string, target: string, maxEdgeLengthM: number) {
 		if (!selectedProjectId || !sceneId) throw new Error('Select a project and scene first.');
-		const key = [selectedProjectId, sceneId, activeGraphScope, source, target, Number(robotRadius), maxEdgeLengthM].join('|');
+		const safetyRadius = activeGraphScope === 'navigation_place' ? activePlaceGraphRobotRadius() : Number(robotRadius);
+		const key = [selectedProjectId, sceneId, activeGraphScope, source, target, safetyRadius, maxEdgeLengthM].join('|');
 		activeEdgeCheckKey = key;
 		edgeCheckPending = true;
 		let request = edgeCheckFlights.get(key);
 		if (!request) {
 			request = graphService.checkEdge(selectedProjectId, sceneId, source, target, {
-				robotRadiusM: Number(robotRadius), maxEdgeLengthM,
+				robotRadiusM: safetyRadius, maxEdgeLengthM,
 			}, activeGraphScope);
 			edgeCheckFlights.set(key, request);
 		}
@@ -914,6 +970,44 @@ let renderCoverageUpdatedAt = 0;
 		edgeInspectorSource = nid;
 		edgeCheckResult = null;
 		pushActivity('info', 'edge:inspect', `Pick second node to diagnose…`);
+	}
+	function updateEdgeReviewCandidate(candidateId: string, patch: Partial<EdgeReviewCandidate>) {
+		edgeReviewQueue = edgeReviewQueue.map((candidate) => candidate.candidate_id === candidateId ? { ...candidate, ...patch } : candidate);
+	}
+	function removeEdgeReviewCandidate(candidateId: string) {
+		edgeReviewQueue = edgeReviewQueue.filter((candidate) => candidate.candidate_id !== candidateId);
+	}
+	function queueEdgeReview(source: string, target: string, check?: any) {
+		const candidateId = nextGraphClientOpId();
+		const status: EdgeReviewCandidate['status'] = check?.would_connect
+			? 'ready'
+			: check?.manual_opening_eligible
+				? 'opening_confirmation'
+				: check ? 'blocked' : 'checking';
+		edgeReviewQueue = [...edgeReviewQueue, { candidate_id: candidateId, source, target, status, check }];
+		return candidateId;
+	}
+	async function confirmEdgeReviewCandidate(candidateId: string) {
+		const candidate = edgeReviewQueue.find((item) => item.candidate_id === candidateId);
+		if (!candidate || candidate.status === 'checking' || candidate.status === 'blocked' || candidate.status === 'submitting') return;
+		const clientOpId = nextGraphClientOpId();
+		updateEdgeReviewCandidate(candidateId, { status: 'submitting', client_op_id: clientOpId });
+		enqueueGraphEdit({
+			client_op_id: clientOpId,
+			type: 'add_edge',
+			source: candidate.source,
+			target: candidate.target,
+			certify_opening: candidate.status === 'opening_confirmation',
+		});
+		pushActivity('info', 'graph:add-edge', candidate.status === 'opening_confirmation'
+			? `Queued user-certified opening: ${candidate.source} ↔ ${candidate.target}`
+			: `Queued direct place link: ${candidate.source} ↔ ${candidate.target}`);
+	}
+	function queueOpeningCertificationFromInspection() {
+		if (!edgeCheckResult?.source || !edgeCheckResult?.target || !edgeCheckResult?.manual_opening_eligible) return;
+		queueEdgeReview(String(edgeCheckResult.source), String(edgeCheckResult.target), edgeCheckResult);
+		pushActivity('info', 'edge:certify-opening', `Opening confirmation queued: ${edgeCheckResult.source} ↔ ${edgeCheckResult.target}`);
+		edgeCheckResult = null;
 	}
 	async function handleInspectorSecondNode(source: string, target: string) {
 		edgeInspectorSource = '';
@@ -952,20 +1046,12 @@ let renderCoverageUpdatedAt = 0;
 			: `Queued edge: ${source} ↔ ${target}`);
 		edgeCheckResult = null;
 	}
-	function certifyVisibleOpening() {
-		if (!edgeCheckResult?.source || !edgeCheckResult?.target || !edgeCheckResult?.manual_opening_eligible) return;
-		const source = String(edgeCheckResult.source);
-		const target = String(edgeCheckResult.target);
-		const rawGap = Number(edgeCheckResult.raw_gap_m ?? 0).toFixed(2);
-		if (!window.confirm(`No automatic portal was found for ${source} ↔ ${target}.\n\nThe body-height wall test is clear and the raw floor gap is ${rawGap} m. Confirm this is a physically open, robot-passable threshold?\n\nThis will be saved as a user-certified portal and revalidated when Navigation Support is built.`)) return;
-		enqueueGraphEdit({ client_op_id: nextGraphClientOpId(), type: 'add_edge', source, target, certify_opening: true });
-		pushActivity('info', 'edge:certify-opening', `Queued user-certified opening: ${source} ↔ ${target}`);
-		edgeCheckResult = null;
-	}
 	// Note: mutual exclusion is now implicit because pathsMode is a single-select radio.
 	let headingCount = $state(24);
 	let minNodeSpacing = $state(0.5);
-	let robotRadius = $state(0.25);
+	// v4's default wall/collision radius. It combines with the independent
+	// 0.10 m extra buffer and 0.03 m raster epsilon when a Place Graph is built.
+	let robotRadius = $state(0.15);
 	let kNeighbors = $state(8);
 	let maxEdgeLength = $state(1.5);
 	let selectedModalities = $state(['rgb', 'depth', 'active_nir_intensity', 'hazard_mask']);
@@ -1045,6 +1131,7 @@ let renderCoverageUpdatedAt = 0;
 	let planResult = $state<any>(null);
 	let graphResult = $state<any>(null);
 	let buildingGraph = $state(false);
+	let regeneratingBlueprints = $state(false);
 	let graphBuildProgress = $state<graphService.BuildGraphProgress | null>(null);
 	// A build request owns one short-lived progress socket, but a browser
 	// refresh must also be able to reattach to the daemon's in-memory progress
@@ -1057,13 +1144,41 @@ let renderCoverageUpdatedAt = 0;
 	let graphPayload = $state<any>(null);
 	let adaptiveNavigation = $state<any>(null);
 	let navigationSupport = $state<any>(null);
-	let selectedSupportObservationLevel = $state('l0_action_required');
+	let selectedSupportObservationLevel = $state('sv1_episode_headings');
 	let supportExpansionPreparing = $state(false);
 	let activeMotionRouteId = $state('');
 	let activeBlueprintId = $state('');
 	let activePlaceRepairGuideId = $state('');
 	let placeNodeFeedback = $state<{ tone: 'info' | 'ok' | 'error'; message: string } | null>(null);
 	let supportAnalysis = $state<any>(null);
+	// The WebUI opts into the reviewed candidate for interactive testing. Bare
+	// API callers remain on production_v1 unless they send this explicit id.
+	let supportAlgorithm = $state<graphService.NavigationSupportAlgorithm>('global_executable_network_v2');
+	// Lateral band: one side lane on each side of a blueprint's straight
+	// runs, so an episode can step off the certified centre line. Defaults
+	// mirror navigation_support.DEFAULT_CONFIG.
+	let supportLateralBand = $state(true);
+	let supportLateralSwitchInterval = $state(3);
+	// A finished support graph is one executable network, so episodes are
+	// sampled freely across it by default; the narrower blueprint scopes stay
+	// available for corridor-specific datasets.
+	let episodeRouteScope = $state<episodeService.NavigationSupportRouteScope>('global');
+	// Minimum physical episode length in meters. Distance is the sum of each
+	// traversed move_forward transition's own distance_m, not an estimate
+	// from forward-action count, so this is an exact guarantee.
+	let episodeMinDistanceM = $state(5);
+	// The support graph is dense only along approved corridors, so a pair whose
+	// direct route was never materialised gets answered with a long way round.
+	// Reject an episode walking more than this multiple of the free-space
+	// shortest path; 0 disables the check.
+	let episodeMaxDetourRatio = $state(1.5);
+	// Place Graph rebuilds carry manual nodes/edits forward by default; this
+	// opts into a genuine reset that discards them instead.
+	let buildGraphFromScratch = $state(false);
+	// Blueprint review is deliberately batchable. Keep the last diagnostic on
+	// screen after a status edit and only require one explicit re-analysis at
+	// the end; rebuilding a place graph still clears it completely.
+	let supportAnalysisStale = $state(false);
 	let blueprintStartAnchorId = $state('');
 	let blueprintGoalAnchorId = $state('');
 	let editor3DStatus = $state('');
@@ -1151,6 +1266,10 @@ let renderCoverageUpdatedAt = 0;
 	let robotPos = $state<{ x: number; y: number } | null>(null);
 	let robotAnimTimer: ReturnType<typeof setInterval> | null = null;
 	let batchPollTimer: ReturnType<typeof setInterval> | null = null;
+	// The durable render-plan ledger outlives a graph-batch summary.  Keep its
+	// coverage polling independent so successor variants (passive/active polar)
+	// continue to advance after the first graph batch reaches `completed`.
+	let renderCoveragePollTimer: ReturnType<typeof setInterval> | null = null;
 	let batchRefreshDebounceTimer: ReturnType<typeof setTimeout> | null = null;
 	let observationScanDebounceTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -1236,22 +1355,55 @@ let renderCoverageUpdatedAt = 0;
 			motion_node_id: String(node?.motion_node_id ?? node?.node_id ?? ''),
 		})).filter((node: any) => Boolean(node.motion_node_id))
 	);
+
+	// New support builds expose their globally normalised executable graph
+	// directly. Keep the old compact topology only as a read-only fallback for
+	// artifacts created before the Build-stage normalisation contract existed.
+	const supportTopology = $derived(navigationSupport?.support_graph?.topology ?? null);
+	const globalSupportNormalization = $derived(
+		navigationSupport?.support_graph?.global_normalization ?? null
+	);
+	const useSupportTopology = $derived(
+		!globalSupportNormalization
+			&& Array.isArray(supportTopology?.nodes)
+			&& supportTopology.nodes.length > 0
+	);
 	const motionNodes = $derived(
-		navigationSupport?.support_graph?.nodes
-			?? (archivedMotionNodes.length ? archivedMotionNodes : undefined)
-			?? adaptiveNavigation?.motion_graph?.nodes
-			?? []
+		useSupportTopology
+			? supportTopology.nodes
+			: navigationSupport?.support_graph?.nodes
+				?? (archivedMotionNodes.length ? archivedMotionNodes : undefined)
+				?? adaptiveNavigation?.motion_graph?.nodes
+				?? []
 	);
 	const motionEdges = $derived(
-		navigationSupport?.support_graph?.edges
-			?? adaptiveNavigation?.motion_graph?.edges
-			?? []
+		useSupportTopology
+			? (supportTopology.edges ?? [])
+			: navigationSupport?.support_graph?.edges
+				?? adaptiveNavigation?.motion_graph?.edges
+				?? []
 	);
+	const topologyObservationPlanPoses = $derived.by(() => {
+		if (!useSupportTopology) return [];
+		const rawPlans = new Map(
+			(navigationSupport?.observation_plan?.poses ?? []).map((pose: any) => [String(pose.motion_node_id), pose])
+		);
+		return (supportTopology?.nodes ?? []).map((node: any) => {
+			const members = Array.isArray(node?.member_motion_pose_ids) ? node.member_motion_pose_ids : [];
+			const plans = members.map((id: any) => rawPlans.get(String(id))).filter(Boolean);
+			const representative = plans.find((pose: any) => pose.tier === 'FULL_24' || pose.tier === 'PANORAMA_12') ?? plans[0];
+			return representative
+				? { ...representative, motion_node_id: String(node.motion_node_id), raw_motion_pose_ids: members }
+				: { motion_node_id: String(node.motion_node_id), raw_motion_pose_ids: members };
+		});
+	});
 	const observationPlanPoses = $derived(
-		navigationSupport?.observation_plan?.poses
-			?? navigationSupport?.archived_render_plan?.observation_plan?.poses
-			?? adaptiveNavigation?.observation_plan?.poses
-			?? []
+		useSupportTopology
+			? topologyObservationPlanPoses
+			: navigationSupport?.observation_plan?.poses
+				?? navigationSupport?.archived_render_plan?.observation_plan?.poses
+				?? adaptiveNavigation?.observation_plan?.poses
+				?? []
 	);
 	const adaptiveRouteCount = $derived(adaptiveNavigation?.motion_graph?.routes?.length ?? 0);
 	const supportBlueprints = $derived(navigationSupport?.route_blueprints?.blueprints ?? []);
@@ -1278,11 +1430,14 @@ let renderCoverageUpdatedAt = 0;
 			?? supportObservationExpansionLevels[0]
 			?? null,
 	);
-	const supportRenderPlanRef = $derived(
-		String(selectedSupportObservationExpansion?.plan_ref ?? 'support_observation_plan.json'),
+	// The rung sidecar selects a subset of L0; the executable plan submitted is
+	// always L0 itself, with the rung supplying which views to render.
+	const supportRenderPlanRef = 'support_observation_plan.json';
+	const supportSweepCoverageRef = $derived(
+		String(selectedSupportObservationExpansion?.plan_ref ?? ''),
 	);
 	const supportRenderViewCount = $derived(Number(
-		selectedSupportObservationExpansion?.summary?.coverage_polar_observation_count
+		selectedSupportObservationExpansion?.summary?.selected_view_count
 			?? selectedSupportObservationExpansion?.summary?.polar_observation_count
 			?? navigationSupport?.observation_plan?.summary?.polar_observation_count
 			?? navigationSupport?.archived_render_plan?.observation_plan?.summary?.polar_observation_count
@@ -1307,8 +1462,16 @@ let renderCoverageUpdatedAt = 0;
 	const blueprintGraphRoutes = $derived(
 		supportBlueprints.filter((blueprint: any) => blueprint.status !== 'rejected')
 	);
-	const activeMotionNodeIds = $derived(activeSupportRoute?.motion_pose_ids ?? activeMotionRoute?.primary?.motion_node_ids ?? []);
-	const activeMotionEdgeIds = $derived(activeSupportRoute?.motion_edge_ids ?? activeMotionRoute?.primary?.motion_edge_ids ?? []);
+	const activeMotionNodeIds = $derived(
+		activeSupportRoute
+			? Array.from(new Set((activeSupportRoute.motion_pose_ids ?? []).map((id: any) => supportTopology?.raw_pose_to_topology_id?.[String(id)] ?? String(id))))
+			: activeMotionRoute?.primary?.motion_node_ids ?? []
+	);
+	const activeMotionEdgeIds = $derived(
+		activeSupportRoute
+			? Array.from(new Set((activeSupportRoute.motion_edge_ids ?? []).map((id: any) => supportTopology?.raw_motion_edge_to_topology_edge_id?.[String(id)] ?? String(id))))
+			: activeMotionRoute?.primary?.motion_edge_ids ?? []
+	);
 	$effect(() => {
 		const ids = (adaptiveNavigation?.motion_graph?.routes ?? []).map((route: any) => String(route.request_id));
 		if (ids.length && !ids.includes(activeMotionRouteId)) activeMotionRouteId = ids[0];
@@ -2881,6 +3044,37 @@ let renderCoverageUpdatedAt = 0;
 		if (!ok) sensorFindError = 'Viewer not ready yet — try again in a moment.';
 	}
 
+	// Paths uses the same canonical viewpoint resolver as Sensors, but must not
+	// redirect the operator into the Sensors workspace. A bare number therefore
+	// has the expected behaviour: 57 -> vp_000057 -> canvas focus.
+	function focusPathNode(query: string): string {
+		const id = resolveSensorNodeId(query);
+		if (!id) return `No place node matches "${query.trim()}".`;
+		selectedSensorNodeId = id;
+		if (workspaceMode !== 'paths') setWorkspaceMode('paths');
+		const focused = mapEditorRef?.focusOnNode?.(id);
+		if (!focused) return `${id} selected; the canvas is still initializing.`;
+		pushActivity('info', 'navigation:find-node', `Focused ${id}.`);
+		return `Focused ${id}.`;
+	}
+
+	function inspectSupportBlocker(group: any): void {
+		const source = String(group?.source ?? '');
+		const target = String(group?.target ?? '');
+		if (!source || !target) {
+			pushActivity('warn', 'navigation:support-blocker', 'This blocker has no resolvable route or place-edge endpoints.');
+			return;
+		}
+		if (workspaceMode !== 'paths') setWorkspaceMode('paths');
+		selectedSensorNodeId = source;
+		const focused = mapEditorRef?.focusOnNode?.(source);
+		const description = group?.blueprint_id
+			? `Inspect approved route ${group.blueprint_id}: ${source} → ${target}.`
+			: `Inspect ${group?.place_edge_id ?? 'place edge'}: ${source} ↔ ${target}.`;
+		pushActivity('warn', 'navigation:support-blocker', description, group);
+		if (!focused) pushActivity('warn', 'navigation:support-blocker', `${source} selected; canvas focus will be available when the editor is ready.`);
+	}
+
 	// World-coordinate handlers (used by MapEditor3D callbacks)
 	function handleGroundPointerDown(point: { x: number; y: number }, shiftKey = false, placement: { base_height_m?: number; snap_label?: string } = {}) {
 		contextMenu = null;
@@ -3384,7 +3578,7 @@ let renderCoverageUpdatedAt = 0;
 		sceneStateText = ''; cameraSpecText = ''; renderConfig = null; syncResult = null;
 		renderReadiness = null; workflowStatus = null; renderConfigError = '';
 		episodes = []; episodeTotal = 0; episodeNextCursor = null; selectedEpisode = null; selectedEpisodeId = '';
-		graphPayload = null; adaptiveNavigation = null; navigationSupport = null; selectedSupportObservationLevel = 'l0_action_required'; supportExpansionPreparing = false; supportAnalysis = null; blueprintStartAnchorId = ''; blueprintGoalAnchorId = ''; observationScan = null;
+		graphPayload = null; adaptiveNavigation = null; navigationSupport = null; selectedSupportObservationLevel = 'sv1_episode_headings'; supportExpansionPreparing = false; supportAnalysis = null; supportAnalysisStale = false; blueprintStartAnchorId = ''; blueprintGoalAnchorId = ''; edgeReviewQueue = []; observationScan = null;
 		navigationBlockerCandidates = []; selectedNavigationBlockerIds = new Set(); navigationBlockersScanned = false; navigationBlockersLoading = false;
 		graphBatch = null; graphBatchId = ''; graphBatchIds = [];
 		stopBatchPolling(); _showRoomShellUserTouched = false;
@@ -3920,6 +4114,7 @@ let renderCoverageUpdatedAt = 0;
 					minClearanceM: Number(minClearance), kNeighbors: Number(kNeighbors),
 					maxEdgeLengthM: Number(maxEdgeLength), resolution: Number(resolution), seed: Number(seed),
 					confirmSupportInvalidation,
+					fromScratch: buildGraphFromScratch,
 				}, (progress) => graphBuildProgress = progress),
 				'Place Graph built. Review and approve Route Blueprints before building support lanes.',
 				'navigation:place-graph'
@@ -3950,6 +4145,37 @@ let renderCoverageUpdatedAt = 0;
 		}
 	}
 
+	async function regenerateBlueprintCatalog() {
+		if (!requireReady(Boolean(selectedProjectId), 'Create or select a project first.')) return;
+		if (!requireReady(Boolean(navigationSupport?.place_graph), 'Build the Place Graph before regenerating route blueprints.')) return;
+		regeneratingBlueprints = true;
+		try {
+			const data = await run(
+				() => graphService.regenerateNavigationSupportBlueprintCatalog(
+					selectedProjectId,
+					sceneId,
+					Boolean(navigationSupport?.support_graph && navigationSupport?.observation_plan),
+				),
+				'Fresh Blueprint catalogue created. The prior review set was archived.',
+				'navigation:blueprint-regenerate',
+			);
+			if (data?.route_blueprints && navigationSupport) {
+				navigationSupport = {
+					...navigationSupport,
+					route_blueprints: data.route_blueprints,
+					support_graph: null,
+					observation_plan: null,
+					stage: 'blueprint_review',
+				};
+				activeBlueprintId = String(data.route_blueprints.blueprints?.[0]?.blueprint_id ?? '');
+				supportAnalysis = null;
+				supportAnalysisStale = false;
+			}
+		} finally {
+			regeneratingBlueprints = false;
+		}
+	}
+
 	async function setBlueprintStatus(blueprintId: string, status: 'proposed' | 'approved' | 'rejected') {
 		if (!selectedProjectId) return;
 		const data = await run(
@@ -3960,7 +4186,7 @@ let renderCoverageUpdatedAt = 0;
 		if (data?.route_blueprints && navigationSupport) {
 			navigationSupport = { ...navigationSupport, route_blueprints: data.route_blueprints, stage: 'blueprint_review' };
 			activeBlueprintId = blueprintId;
-			supportAnalysis = null;
+			supportAnalysisStale = Boolean(supportAnalysis);
 		}
 	}
 
@@ -3977,7 +4203,7 @@ let renderCoverageUpdatedAt = 0;
 		);
 		if (data?.route_blueprints && navigationSupport) {
 			navigationSupport = { ...navigationSupport, route_blueprints: data.route_blueprints, stage: 'blueprint_review' };
-			supportAnalysis = null;
+			supportAnalysisStale = Boolean(supportAnalysis);
 		}
 	}
 
@@ -3995,7 +4221,7 @@ let renderCoverageUpdatedAt = 0;
 		if (data?.route_blueprints && navigationSupport) {
 			navigationSupport = { ...navigationSupport, route_blueprints: data.route_blueprints, stage: 'blueprint_review' };
 			activeBlueprintId = '';
-			supportAnalysis = null;
+			supportAnalysisStale = Boolean(supportAnalysis);
 		}
 	}
 
@@ -4013,6 +4239,7 @@ let renderCoverageUpdatedAt = 0;
 			navigationSupport = { ...navigationSupport, route_blueprints: data.route_blueprints, stage: 'blueprint_review' };
 			activeBlueprintId = String((data.route_blueprints.blueprints ?? []).at(-1)?.blueprint_id ?? activeBlueprintId);
 			supportAnalysis = null;
+			supportAnalysisStale = false;
 		}
 	}
 
@@ -4043,7 +4270,49 @@ let renderCoverageUpdatedAt = 0;
 		if (data?.route_blueprints && navigationSupport) {
 			navigationSupport = { ...navigationSupport, route_blueprints: data.route_blueprints, stage: 'blueprint_review' };
 			supportAnalysis = null;
+			supportAnalysisStale = false;
 		}
+	}
+
+	function setSupportAlgorithm(value: string) {
+		if (value !== 'production_v1' && value !== 'global_executable_network_v2') return;
+		if (supportAlgorithm === value) return;
+		supportAlgorithm = value;
+		// A dry run is valid only for the algorithm that produced it.
+		supportAnalysis = null;
+		supportAnalysisStale = false;
+	}
+
+	function setSupportLateralBand(value: boolean) {
+		if (supportLateralBand === value) return;
+		supportLateralBand = value;
+		supportAnalysis = null;
+		supportAnalysisStale = false;
+	}
+
+	function setSupportLateralSwitchInterval(value: number) {
+		const next = Math.max(1, Math.round(value));
+		if (supportLateralSwitchInterval === next) return;
+		supportLateralSwitchInterval = next;
+		supportAnalysis = null;
+		supportAnalysisStale = false;
+	}
+
+	function setEpisodeRouteScope(value: string) {
+		if (value !== 'blueprint' && value !== 'blueprint_band' && value !== 'global') return;
+		episodeRouteScope = value;
+	}
+
+	function setEpisodeMinDistanceM(value: number) {
+		episodeMinDistanceM = Math.max(0, value);
+	}
+
+	function setEpisodeMaxDetourRatio(value: number) {
+		episodeMaxDetourRatio = Math.max(0, value);
+	}
+
+	function setBuildGraphFromScratch(value: boolean) {
+		buildGraphFromScratch = value;
 	}
 
 	async function analyzeSupportGraph() {
@@ -4052,11 +4321,25 @@ let renderCoverageUpdatedAt = 0;
 		buildingGraph = true;
 		graphBuildProgress = null;
 		try {
-			supportAnalysis = await run(
-				() => graphService.analyzeNavigationSupportGraph(selectedProjectId, sceneId, (progress) => graphBuildProgress = progress),
-				'Support analysis completed. Review the pose and polar-view estimate before build.',
+			const analysis = await run(
+				() => graphService.analyzeNavigationSupportGraph(
+					selectedProjectId, sceneId, (progress) => graphBuildProgress = progress, supportAlgorithm,
+					{ lateralBandEnabled: supportLateralBand, lateralSwitchIntervalSteps: supportLateralSwitchInterval },
+				),
+				undefined,
 				'navigation:support-analyze',
 			);
+			supportAnalysis = analysis ?? null;
+			supportAnalysisStale = false;
+			if (analysis?.ok === false) {
+				const blocker = analysis?.analysis ?? analysis;
+				const message = String(blocker?.message ?? blocker?.error ?? 'Support analysis found a blocked approved route.');
+				error = `Support analysis blocked: ${message}`;
+				pushActivity('warn', 'navigation:support-analyze', error, blocker);
+			} else if (analysis) {
+				info = 'Support analysis completed. Review the pose and polar-view estimate before build.';
+				pushActivity('ok', 'navigation:support-analyze', info, analysis);
+			}
 		} finally {
 			buildingGraph = false;
 			graphBuildProgress = null;
@@ -4066,12 +4349,21 @@ let renderCoverageUpdatedAt = 0;
 	async function buildSupportGraph() {
 		if (!requireReady(Boolean(selectedProjectId), 'Create or select a project first.')) return;
 		if (!requireReady(approvedBlueprints.length > 0, 'Approve at least one Route Blueprint first.')) return;
+		if (!requireReady(!supportAnalysisStale, 'Review edits are staged. Re-analyze Support once before building Navigation Support.')) return;
+		if (!requireReady(hasSuccessfulSupportAnalysis(supportAnalysis), 'Run Analyze support successfully for the current approved routes before building Navigation Support.')) return;
+		if (!requireReady(
+			String(supportAnalysis?.support_algorithm ?? 'production_v1') === supportAlgorithm,
+			'Algorithm changed. Re-run Analyze support before building.',
+		)) return;
 		buildingGraph = true;
 		graphBuildProgress = null;
 		let data: any;
 		try {
 			data = await run(
-				() => graphService.buildNavigationSupportGraph(selectedProjectId, sceneId, (progress) => graphBuildProgress = progress),
+				() => graphService.buildNavigationSupportGraph(
+					selectedProjectId, sceneId, (progress) => graphBuildProgress = progress, supportAlgorithm,
+					{ lateralBandEnabled: supportLateralBand, lateralSwitchIntervalSteps: supportLateralSwitchInterval },
+				),
 				'Navigation Support built: certified 0.25 m lanes and native-heading render plan.',
 				'navigation:support-build',
 			);
@@ -4079,8 +4371,43 @@ let renderCoverageUpdatedAt = 0;
 			buildingGraph = false;
 			graphBuildProgress = null;
 		}
-		if (data) graphResult = data;
-		if (data) await loadGraph();
+		if (data) {
+			graphResult = data;
+			// The dry-run is consumed only after its corresponding support plan
+			// has been durably materialised. This returns the primary action to
+			// Render rather than repeatedly offering the same Build step.
+			supportAnalysis = null;
+			supportAnalysisStale = false;
+			await loadGraph();
+		}
+	}
+
+	async function returnBlockedBlueprintsToReview(blueprintIds: string[]) {
+		if (!selectedProjectId || !navigationSupport) return;
+		const requested = new Set((blueprintIds ?? []).map(String).filter(Boolean));
+		const ids = (navigationSupport.route_blueprints?.blueprints ?? [])
+			.filter((item: any) => requested.has(String(item?.blueprint_id)) && String(item?.status) === 'approved')
+			.map((item: any) => String(item.blueprint_id));
+		if (!ids.length) return;
+		const data = await run(async () => {
+			let latest: any = null;
+			// Keep this compatible with already-running daemons: the established
+			// single-blueprint status endpoint performs one durable sidecar update
+			// per route and avoids requiring a daemon restart for blocker recovery.
+			for (const blueprintId of ids) {
+				latest = await graphService.setNavigationSupportBlueprintStatus(
+					selectedProjectId, sceneId, blueprintId, 'proposed',
+				);
+			}
+			return latest;
+		}, undefined, 'navigation:support-blocker');
+		if (data?.route_blueprints) {
+			navigationSupport = { ...navigationSupport, route_blueprints: data.route_blueprints, stage: 'blueprint_review' };
+			activeBlueprintId = ids[0];
+			supportAnalysisStale = Boolean(supportAnalysis);
+			info = `${ids.length} blocking route${ids.length === 1 ? '' : 's'} returned to Proposed for review.`;
+			pushActivity('ok', 'navigation:support-blocker', info, { blueprint_ids: ids });
+		}
 	}
 
 	function applyPersistedNavigation(navigation: any): boolean {
@@ -4231,7 +4558,7 @@ let renderCoverageUpdatedAt = 0;
 		return (observationScan?.viewpoints?.[nodeId]?.completed ?? 0) > 0;
 	}
 
-	async function planEpisodes() {
+	async function planEpisodes(writeMode: episodeService.EpisodeWriteMode = "append") {
 		if (!requireReady(Boolean(selectedProjectId), 'Create or select a project first.')) return;
 		if (!requireReady(hasMap, 'Build the traversable grid before planning v0.1 episodes.')) return;
 		const splitObject = Object.fromEntries(
@@ -4244,7 +4571,7 @@ let renderCoverageUpdatedAt = 0;
 			() => episodeService.planEpisodes(selectedProjectId, {
 				sceneId, numPairs: Number(episodeCount), splits: splitObject,
 				instructionTypes: instructionTypes.split(',').map((s) => s.trim()).filter(Boolean),
-				modalities: selectedModalities, seed: Number(seed),
+				modalities: selectedModalities, seed: Number(seed), writeMode,
 			}),
 			'Episodes planned.',
 			'episodes:plan-v0.1'
@@ -4296,7 +4623,7 @@ let renderCoverageUpdatedAt = 0;
 		}
 	}
 
-	async function planGraphEpisodes() {
+	async function planGraphEpisodes(writeMode: episodeService.EpisodeWriteMode = "append") {
 		if (!requireReady(Boolean(selectedProjectId), 'Create or select a project first.')) return;
 		if (!requireReady(!adaptiveNavigation && !navigationSupport, 'A staged navigation plan is active for this scene. Generate its support episodes instead.')) return;
 		if (!requireReady(hasGraph, 'Build the viewpoint graph before planning graph episodes.')) return;
@@ -4320,7 +4647,7 @@ let renderCoverageUpdatedAt = 0;
 				() => episodeService.planGraphEpisodes(selectedProjectId, {
 					sceneId, numPairs: Number(episodeCount), splits: splitObject,
 					scenarios: graphScenarios.split(',').map((s) => s.trim()).filter(Boolean),
-					modalities: selectedModalities, seed: Number(seed),
+					modalities: selectedModalities, seed: Number(seed), writeMode,
 				}),
 				'Graph episodes planned.',
 				'episodes:plan-graph'
@@ -4333,12 +4660,10 @@ let renderCoverageUpdatedAt = 0;
 		await refreshProject();
 	}
 
-	async function planAdaptiveRouteMotionEpisodes() {
+	async function planAdaptiveRouteMotionEpisodes(writeMode: episodeService.EpisodeWriteMode = "append") {
 		if (!requireReady(Boolean(selectedProjectId), 'Create or select a project first.')) return;
 		if (!requireReady(Boolean(adaptiveNavigation), 'Build Route Motion before generating Route Motion episodes.')) return;
 		const requested = Number(episodeCount);
-		if (!requireReady(requested <= adaptiveRouteCount,
-			`This route plan has ${adaptiveRouteCount} distinct trajectories. Rebuild with more requests instead of duplicating episodes.`)) return;
 		const splitObject = Object.fromEntries(
 			splits.split(',').map((part) => {
 				const [name, value] = part.split(':');
@@ -4351,7 +4676,7 @@ let renderCoverageUpdatedAt = 0;
 			data = await run(
 				() => episodeService.planAdaptiveRouteMotionEpisodes(selectedProjectId, {
 					sceneId, numPairs: requested, splits: splitObject,
-					modalities: selectedModalities, seed: Number(seed),
+					modalities: selectedModalities, seed: Number(seed), writeMode,
 					allowIncompleteCoverage: adaptiveCoverageStatus === 'partial',
 				}),
 				'Route Motion episodes planned.',
@@ -4364,7 +4689,7 @@ let renderCoverageUpdatedAt = 0;
 		await refreshProject();
 	}
 
-	async function planNavigationSupportEpisodes() {
+	async function planNavigationSupportEpisodes(writeMode: episodeService.EpisodeWriteMode = "append") {
 		if (!requireReady(Boolean(selectedProjectId), 'Create or select a project first.')) return;
 		if (!requireReady(supportReady, 'Build Navigation Support before generating executable episodes.')) return;
 		const splitObject = Object.fromEntries(
@@ -4379,8 +4704,13 @@ let renderCoverageUpdatedAt = 0;
 			data = await run(
 				() => episodeService.planNavigationSupportEpisodes(selectedProjectId, {
 					sceneId, numPairs: Number(episodeCount), splits: splitObject,
-					modalities: selectedModalities, seed: Number(seed),
+					modalities: selectedModalities, seed: Number(seed), writeMode,
 					minForwardActions: 4, maxForwardActions: 48,
+					routeScope: episodeRouteScope,
+					minDistanceM: episodeMinDistanceM > 0 ? episodeMinDistanceM : undefined,
+					maxDetourRatio: episodeMaxDetourRatio > 0 ? episodeMaxDetourRatio : undefined,
+				}, (planned, target) => {
+					episodePlanProgress = { status: 'running', planned, target };
 				}),
 				'Navigation Support episodes planned from pre-rendered action states.',
 				'episodes:plan-navigation-support',
@@ -4530,6 +4860,10 @@ let renderCoverageUpdatedAt = 0;
 		if (!selectedProjectId || !sceneId) return;
 		if (navigationSupportTopologyLocked() && !confirmSupportInvalidation) {
 			lockedNodePlacement = [x, z];
+			placeNodeFeedback = {
+				tone: 'info',
+				message: 'Navigation Support is already built. Confirm “Archive and edit” to preserve the current render plan and add this place node.'
+			};
 			supportEditConfirmOpen = true;
 			return;
 		}
@@ -4631,20 +4965,19 @@ let renderCoverageUpdatedAt = 0;
 			pushActivity('info', 'graph:add-edge', `${source} → ${target} queued`);
 			return;
 		}
+		const candidateId = queueEdgeReview(source, target);
+		pushActivity('info', 'graph:add-edge', `Checking direct place link: ${source} ↔ ${target}`);
 		try {
 			const check = await checkGraphEdge(source, target, 8);
-			if (check?.would_connect) {
-				enqueueGraphEdit({ client_op_id: nextGraphClientOpId(), type: 'add_edge', source, target });
-				pushActivity('info', 'graph:add-edge', `${source} → ${target} queued`);
-				return;
+			updateEdgeReviewCandidate(candidateId, {
+				status: check?.would_connect ? 'ready' : check?.manual_opening_eligible ? 'opening_confirmation' : 'blocked',
+				check,
+			});
+			if (!check?.would_connect && !check?.manual_opening_eligible) {
+				pushActivity('warn', 'graph:add-edge', `Review required: ${check?.reason ?? 'the segment is not certified safe'}`);
 			}
-			edgeCheckResult = check;
-			if (check?.manual_opening_eligible) {
-				certifyVisibleOpening();
-				return;
-			}
-			pushActivity('error', 'graph:add-edge', `Not added: ${check?.reason ?? 'the segment is not certified safe'}`);
 		} catch (err) {
+			updateEdgeReviewCandidate(candidateId, { status: 'blocked', check: { reason: errorMessage(err) } });
 			pushActivity('error', 'graph:add-edge', errorMessage(err));
 		}
 	}
@@ -4977,16 +5310,22 @@ let renderCoverageUpdatedAt = 0;
 		}
 	}
 
-	async function prepareNavigationSupportObservationExpansion() {
+	function setSupportObservationLevel(levelId: string) {
+		if (!levelId) return;
+		selectedSupportObservationLevel = levelId;
+	}
+
+	async function prepareNavigationSupportObservationExpansion(levelId?: string) {
+		if (levelId) selectedSupportObservationLevel = levelId;
 		if (!requireReady(Boolean(selectedProjectId), 'Create or select a project first.')) return;
 		if (!requireReady(supportReady, 'Build Navigation Support before preparing additional native headings.')) return;
 		const expansion = selectedSupportObservationExpansion;
-		if (!expansion || expansion.level_id === 'l0_action_required') return;
+		if (!expansion) return;
 		supportExpansionPreparing = true;
 		try {
 			const data = await run(
 				() => graphService.prepareNavigationSupportExpansion(selectedProjectId, sceneId, String(expansion.level_id)),
-				`${expansion.label ?? expansion.level_id} native context plan prepared.`,
+				`${expansion.label ?? expansion.level_id} sweep coverage prepared.`,
 				'navigation:support-observation-expansion',
 			);
 			if (data?.observation_expansions && navigationSupport) {
@@ -5003,7 +5342,7 @@ let renderCoverageUpdatedAt = 0;
 		if (!requireReady(renderSceneSynced, 'Render readiness is blocked. Sync Render Scene and resolve readiness errors.')) return;
 		const expansion = selectedSupportObservationExpansion;
 		if (!requireReady(Boolean(expansion), 'Reload Navigation Support to choose an observation coverage level.')) return;
-		if (!requireReady(expansion.level_id === 'l0_action_required' || Boolean(expansion.current), 'Prepare this native-heading expansion before rendering it.')) return;
+		if (!requireReady(Boolean(expansion.current), 'Prepare this sweep coverage level for the current support build before rendering it.')) return;
 		const profileDigest = String(navigationSupport?.support_graph?.validation?.digest ?? '');
 		if (!requireReady(Boolean(profileDigest), 'Navigation Support validation digest is missing. Rebuild support before rendering.')) return;
 		let camera_spec: unknown;
@@ -5015,6 +5354,7 @@ let renderCoverageUpdatedAt = 0;
 		}
 		const body: Record<string, unknown> = {
 			observation_plan_ref: supportRenderPlanRef,
+			sweep_coverage_ref: supportSweepCoverageRef,
 			profile_digest: profileDigest,
 			backend,
 			camera_height_m: rigMountHeightM,
@@ -5040,12 +5380,41 @@ let renderCoverageUpdatedAt = 0;
 		}
 	}
 
+	function hasPendingRenderCoverage(items: any[] = renderSensorProgress) {
+		return items.some((item: any) => {
+			const total = Math.max(0, Number(item?.total) || 0);
+			if (!total) return false;
+			const completed = Math.max(0, Number(item?.completed) || 0);
+			const failed = Math.max(0, Number(item?.failed) || 0);
+			return completed + failed < total;
+		});
+	}
+
+	function stopRenderCoveragePolling() {
+		if (renderCoveragePollTimer !== null) {
+			clearInterval(renderCoveragePollTimer);
+			renderCoveragePollTimer = null;
+		}
+	}
+
+	function startRenderCoveragePolling(projectId = selectedProjectId, targetSceneId = sceneId) {
+		if (!projectId || !targetSceneId || renderCoveragePollTimer !== null) return;
+		renderCoveragePollTimer = setInterval(() => {
+			if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return;
+			// Do not let an old interval issue a request for a scene the user has
+			// already left. The response guard below remains the final safeguard.
+			if (selectedProjectId !== projectId || sceneId !== targetSceneId) return;
+			void refreshRenderCoverage(true).catch(() => {});
+		}, 10_000);
+	}
+
 	async function refreshRenderCoverage(force = false) {
 		if (!selectedProjectId || !sceneId) { renderSensorProgress = []; return; }
 		if (renderCoverageRequest) return renderCoverageRequest;
 		if (!force && Date.now() - renderCoverageUpdatedAt < 5_000) return;
 		const projectIdAtRequest = selectedProjectId;
 		const sceneIdAtRequest = sceneId;
+		renderCoverageLoading = true;
 		renderCoverageRequest = (async () => {
 			try {
 				const data = await renderService.fetchRenderCoverage(projectIdAtRequest, sceneIdAtRequest);
@@ -5054,11 +5423,23 @@ let renderCoverageUpdatedAt = 0;
 				if (selectedProjectId === projectIdAtRequest && sceneId === sceneIdAtRequest) {
 					renderSensorProgress = Array.isArray(data?.sensor_progress) ? data.sensor_progress : [];
 					renderCoverageUpdatedAt = Date.now();
+					if (hasPendingRenderCoverage(renderSensorProgress)) {
+						startRenderCoveragePolling(projectIdAtRequest, sceneIdAtRequest);
+					} else {
+						stopRenderCoveragePolling();
+					}
 				}
 			} catch {
-				if (selectedProjectId === projectIdAtRequest && sceneId === sceneIdAtRequest) renderSensorProgress = [];
+				if (selectedProjectId === projectIdAtRequest && sceneId === sceneIdAtRequest) {
+					// Preserve the last durable answer. The ledger is occasionally busy
+					// while a K=4 strip commits; clearing this array made a healthy render
+					// look like a reset until a full page reload happened to succeed.
+					// Retry on the independent, bounded coverage cadence instead.
+					startRenderCoveragePolling(projectIdAtRequest, sceneIdAtRequest);
+				}
 			} finally {
 				renderCoverageRequest = null;
+				renderCoverageLoading = false;
 			}
 		})();
 		return renderCoverageRequest;
@@ -5080,7 +5461,17 @@ let renderCoverageUpdatedAt = 0;
 		}
 	}
 	$effect(() => {
-		if (selectedProjectId && sceneId) void refreshRenderVersions();
+		const projectIdAtEffect = selectedProjectId;
+		const sceneIdAtEffect = sceneId;
+		stopRenderCoveragePolling();
+		if (!projectIdAtEffect || !sceneIdAtEffect) return;
+		renderCoverageUpdatedAt = 0;
+		void refreshRenderVersions();
+		// Start immediately rather than waiting for a graph-batch refresh. A
+		// restored page may have no live graph batch even while successor render
+		// versions are actively consuming the durable plan.
+		startRenderCoveragePolling(projectIdAtEffect, sceneIdAtEffect);
+		return () => stopRenderCoveragePolling();
 	});
 
 	async function resumeActiveGraphRun(runIdOverride = '') {
@@ -5200,6 +5591,15 @@ let renderCoverageUpdatedAt = 0;
 	}
 
 	async function refreshBatch(options: RunOptions = {}) {
+		// Coverage is a durable render-plan summary, not a property of the
+		// currently displayed graph batch. Refresh it even when no graph batch was
+		// restored (or when the original batch is already terminal). Manual
+		// Refresh bypasses the short anti-churn cache; background polling does not.
+		// The monitor's Refresh button must finish with the latest durable
+		// coverage, even when there is no live graph-batch summary to refresh.
+		// Previously this was fire-and-forget, so the button appeared inert until
+		// a complete page reload happened to refetch the same data.
+		await refreshRenderCoverage(!options.background);
 		if (!selectedProjectId) return;
 		if (isGraphSweepRenderMode(renderMode)) {
 			if (!graphBatchIds.length) return;
@@ -5483,23 +5883,35 @@ let renderCoverageUpdatedAt = 0;
 	// contextual Paths inspector receives cohesive bags instead of a long flat
 	// prop list; extracting a page controller is intentionally a later change.
 	const navigationInspectorState = $derived.by(() => ({
-		caps, hasMap, hasGraph, hasScene, loading, buildingMap, buildingGraph,
+		caps, hasMap, hasGraph, hasScene, loading, buildingMap, buildingGraph, regeneratingBlueprints,
 		graphBuildProgress, graphResult, adaptiveNavigation, navigationSupport,
-		supportAnalysis, supportReady, mapResult, graphPayload, graphPayloadSummary,
+		supportAnalysis, supportAnalysisStale, supportAlgorithm, supportLateralBand, supportLateralSwitchInterval,
+		supportCoverageLevel: selectedSupportObservationExpansion,
+		supportCoverageLevels: supportObservationExpansionLevels,
+		supportCoverageLevelId: selectedSupportObservationLevel,
+		supportCoveragePreparing: supportExpansionPreparing,
+		buildGraphFromScratch,
+		supportReady, mapResult, graphPayload, graphPayloadSummary,
 		graphNodes, graphEdges, pathsMode, paintRadiusM, pendingEdgeSource,
 		edgeInspectorSource, pendingRegionBbox, walkabilityOverlayMeta, traversableMeta,
 		showTraversableMask, showFootprint, edgeCheckResult, edgeCheckPending,
 		robotRadius, minClearance, resolution, maxNodes, minNodeSpacing, headingCount,
+		activePlaceGraphRobotRadius: activePlaceGraphRobotRadius(),
+		activePlaceGraphSafetyMargin: activePlaceGraphSafetyMargin(),
+		clearanceRebuildRequired: Boolean(hasGraph) && (
+			Math.abs(activePlaceGraphRobotRadius() - Number(robotRadius)) > 1e-6
+			|| Math.abs(activePlaceGraphSafetyMargin() - Number(minClearance)) > 1e-6
+		),
 		selectedSensorNode, blueprintStartAnchorId, blueprintGoalAnchorId, activeBlueprintId,
 		rebuildingEdges, removeSelectionCount: removeSelection.size, removeMarginM,
 		removePassHeightM, findingOverlapping, removingNodes, navigationBlockerCandidates,
 		selectedNavigationBlockerIds, navigationBlockersScanned, navigationBlockersLoading,
-		placeNodeFeedback, placeRepairGuides, activePlaceRepairGuideId,
+		placeNodeFeedback, placeRepairGuides, activePlaceRepairGuideId, edgeReviewQueue,
 		sweepSubmissionInFlight, renderSceneSynced,
 	}));
 	const navigationEpisodeState = $derived.by(() => ({
 		filteredEpisodes, episodes, episodeSearch, episodeCount, selectedEpisodeId,
-		splitCounts, episodePlanProgress, staleEpisodeReport, validatingEpisodes,
+		splitCounts, episodePlanProgress, staleEpisodeReport, validatingEpisodes, episodeRouteScope, episodeMinDistanceM, episodeMaxDetourRatio,
 		episodeNodesAvailable, episodePathNodeCount, selectedRigSensorCount: selectedRigSensorIds.length || 1,
 		renderMissingOnly, headingsPerNode: graphPayload?.node_heading_count ?? 0,
 		nextCursor: episodeNextCursor, total: episodeTotal,
@@ -5507,14 +5919,27 @@ let renderCoverageUpdatedAt = 0;
 	const navigationInspectorActions = {
 		onBuildMap: buildMap,
 		onRequestBuildGraph: requestBuildGraph,
+		onRegenerateBlueprintCatalog: regenerateBlueprintCatalog,
 		onSetBlueprintStartAnchorId: (id: string) => (blueprintStartAnchorId = id),
 		onSetBlueprintGoalAnchorId: (id: string) => (blueprintGoalAnchorId = id),
 		onSelectBlueprint: (id: string) => (activeBlueprintId = id),
 		onCreateManualBlueprint: createManualBlueprint,
 		onSetBlueprintStatus: setBlueprintStatus,
+		onReturnBlockedBlueprintsToReview: returnBlockedBlueprintsToReview,
+		onFindGraphNode: focusPathNode,
+		onInspectSupportBlocker: inspectSupportBlocker,
 		onDeleteBlueprint: deleteBlueprint,
 		onAnalyzeSupportGraph: analyzeSupportGraph,
 		onBuildSupportGraph: buildSupportGraph,
+		onSetSupportAlgorithm: setSupportAlgorithm,
+		onSetSupportCoverageLevel: setSupportObservationLevel,
+		onPrepareSupportCoverageLevel: (levelId?: string) => prepareNavigationSupportObservationExpansion(levelId),
+		onSetSupportLateralBand: setSupportLateralBand,
+		onSetSupportLateralSwitchInterval: setSupportLateralSwitchInterval,
+		onSetEpisodeRouteScope: setEpisodeRouteScope,
+		onSetEpisodeMinDistanceM: setEpisodeMinDistanceM,
+		onSetEpisodeMaxDetourRatio: setEpisodeMaxDetourRatio,
+		onSetBuildGraphFromScratch: setBuildGraphFromScratch,
 		onRenderNavigationSupport: submitNavigationSupportRenderPlan,
 		onRebuildEdges: rebuildGraphEdges,
 		onSetPathsMode: (mode: string) => (pathsMode = mode as PathsInteractionMode),
@@ -5526,7 +5951,9 @@ let renderCoverageUpdatedAt = 0;
 		onSetShowFootprint: (value: boolean) => (showFootprint = value),
 		onSetShowTraversableMask: (value: boolean) => (showTraversableMask = value),
 		onAddEdgeAnyway: addEdgeAnyway,
-		onCertifyVisibleOpening: certifyVisibleOpening,
+		onQueueOpeningCertification: queueOpeningCertificationFromInspection,
+		onConfirmEdgeReview: confirmEdgeReviewCandidate,
+		onCancelEdgeReview: removeEdgeReviewCandidate,
 		onDismissEdgeCheck: () => (edgeCheckResult = null),
 		onDeleteGraphEdge: handleDeleteGraphEdge,
 		onDeleteGraphNode: deleteSelectedGraphNode,
@@ -5543,7 +5970,7 @@ let renderCoverageUpdatedAt = 0;
 		onLoadEpisode: loadEpisode,
 		onLoadMoreEpisodes: loadMoreEpisodes,
 		onGenerateEpisodes: planGraphEpisodes,
-		onGenerateRouteMotionEpisodes: () => navigationSupport ? planNavigationSupportEpisodes() : planAdaptiveRouteMotionEpisodes(),
+		onGenerateRouteMotionEpisodes: (writeMode: episodeService.EpisodeWriteMode) => navigationSupport ? planNavigationSupportEpisodes(writeMode) : planAdaptiveRouteMotionEpisodes(writeMode),
 		onClearEpisodes: clearEpisodes,
 		onValidateEpisodes: validateGraphEpisodes,
 		onPruneStaleEpisodes: pruneStaleEpisodes,
@@ -5680,6 +6107,7 @@ let renderCoverageUpdatedAt = 0;
 			// route change doesn't leave the connection (and its keepalive churn)
 			// dangling.
 			stopBatchPolling();
+			stopRenderCoveragePolling();
 			stopGraphBuildRecoverySubscription();
 			document.removeEventListener('pointerdown', dismissContextMenuOnOutsidePointer, true);
 			window.removeEventListener('keydown', dismissContextMenuOnEscape);
@@ -6424,7 +6852,10 @@ let renderCoverageUpdatedAt = 0;
 				<span>{authoringSummary.glass}glass</span>
 				{#if editor3DStatus}<span>{editor3DStatus}</span>{/if}
 				{#if graphPayloadSummary}<span>{graphPayloadSummary.node_count}nodes</span>{/if}
-				{#if archivedSupportOverlayReady}<span class="map-status-archive">{archivedMotionNodes.length} archived render poses</span>{/if}
+				{#if globalSupportNormalization}<span class="map-status-archive">{globalSupportNormalization.normalized_pose_count} global support nodes · {globalSupportNormalization.cross_blueprint_stitch_pair_count} stitches</span>
+					{:else if useSupportTopology}<span class="map-status-archive">{supportTopology.topology_node_count} legacy compact support nodes</span>
+					{:else if archivedSupportOverlayReady}<span class="map-status-archive">{archivedMotionNodes.length} archived render poses</span>
+					{/if}
 				<span class="map-status-sep"></span>
 				<label title="Objects"><input type="checkbox" checked={visibleLayers.objects} onchange={() => toggleLayer('objects')} /> Obj</label>
 				<label title="Walkable Area"><input type="checkbox" checked={visibleLayers.traversable} onchange={() => toggleLayer('traversable')} /> Walk</label>
@@ -6432,8 +6863,8 @@ let renderCoverageUpdatedAt = 0;
 				<label title="Hazards"><input type="checkbox" checked={visibleLayers.hazards} onchange={() => toggleLayer('hazards')} /> Haz</label>
 				<label title="Viewpoints"><input type="checkbox" checked={visibleLayers.graphNodes} onchange={() => toggleLayer('graphNodes')} /> VP</label>
 				<label title="Path Links"><input type="checkbox" checked={visibleLayers.graphEdges} onchange={() => toggleLayer('graphEdges')} /> Links</label>
-				<label title={archivedSupportOverlayReady ? 'Read-only recovered support render poses' : '0.25m route action poses'}><input type="checkbox" checked={visibleLayers.motionNodes} onchange={() => toggleLayer('motionNodes')} /> Motion</label>
-				<label title="0.25m route action links"><input type="checkbox" checked={visibleLayers.motionEdges} onchange={() => toggleLayer('motionEdges')} /> Move links</label>
+				<label title={globalSupportNormalization ? 'Globally normalised executable support poses; every hard merge preserves the 0.25 m action contract' : useSupportTopology ? 'Legacy compact support topology; raw 0.25m action poses remain preserved for rollout' : archivedSupportOverlayReady ? 'Read-only recovered support render poses' : '0.25m route action poses'}><input type="checkbox" checked={visibleLayers.motionNodes} onchange={() => toggleLayer('motionNodes')} /> Motion</label>
+				<label title={globalSupportNormalization ? 'Executable 0.25m action edges, including certified cross-blueprint stitches' : 'Legacy compact L0 adjacency + collision-safe L1 display relations'}><input type="checkbox" checked={visibleLayers.motionEdges} onchange={() => toggleLayer('motionEdges')} /> Support graph</label>
 					<label title="Gold rings identify FULL_24 panorama poses; centres are at least 0.15 m apart."><input type="checkbox" checked={visibleLayers.observationPlan} onchange={() => toggleLayer('observationPlan')} /> Obs</label>
 				{#if undoStack.length}<span class="map-status-undo">{undoStack.length} undos</span>{/if}
 			</div>
@@ -6869,7 +7300,7 @@ let renderCoverageUpdatedAt = 0;
 		onCancelJob={cancelBatchJob}
 		onRefreshSelectedJobLog={() => refreshSelectedBatchJobLog()}
 		{renderVersions} {renderVersionsLoading}
-		{renderSensorProgress} {observationScan}
+		{renderSensorProgress} {renderCoverageLoading} {renderCoverageUpdatedAt} {observationScan}
 		expectedRenderViews={graphNodes.length * Number(graphPayload?.node_heading_count ?? headingCount ?? 0)}
 		onRefreshVersions={refreshRenderVersions}
 		{renderVersionGallery} {renderVersionGalleryLoading} {renderVersionGalleryError}

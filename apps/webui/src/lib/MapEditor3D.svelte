@@ -1126,7 +1126,13 @@
 		// A render-only structural-glass repair must not leave the editor showing
 		// the original opaque backing wall.  It is intentionally narrow: ordinary
 		// objects still require the user's XML-native preview toggle.
-		const forcedRenderRepair = sh?.preview_mesh_status === 'render_only_glass_repair';
+		// Both backing-wall aperture repairs and their thin-pane replacements are
+		// render-authoritative geometry. Falling back to the source GLB would show
+		// a stale opaque wall or a thick pane in the editor.
+		const forcedRenderRepair = [
+			'render_only_glass_repair',
+			'render_only_thin_glass_panes'
+		].includes(String(sh?.preview_mesh_status ?? ''));
 		if (!xmlNativePreviewEnabled && !forcedRenderRepair) return null;
 		if (!sh) return null;
 		const t = sh.transform ?? {};
@@ -1957,17 +1963,25 @@
 				const target = motionById.get(String(edge.target));
 				if (!source || !target) continue;
 				const active = activeEdges.has(String(edge.motion_edge_id));
+				const l1Topology = edge.layer === 'L1' || edge.edge_type === 'proximity_topology';
+				const globalStitch = edge.edge_type === 'cross_blueprint_stitch' || edge.lane === 'global_stitch';
+				const lateralBand = edge.lane === 'lateral_band';
 				const line = new THREE.Line(
 					new THREE.BufferGeometry().setFromPoints([
 						new THREE.Vector3(source.position?.[0] ?? 0, 0.115, source.position?.[1] ?? 0),
 						new THREE.Vector3(target.position?.[0] ?? 0, 0.115, target.position?.[1] ?? 0)
 					]),
 					new THREE.LineBasicMaterial({
-					color: edge.edge_type === 'portal_bridge' ? 0x0ea5e9 : active ? blueprintActiveColor : 0x22c55e,
+						color: globalStitch ? 0xf97316 : lateralBand ? 0x14b8a6 : l1Topology ? 0x8b5cf6 : edge.edge_type === 'portal_bridge' ? 0x0ea5e9 : active ? blueprintActiveColor : 0x16a34a,
 						transparent: true,
-						opacity: active ? 0.94 : edge.edge_type === 'portal_bridge' ? 0.50 : hasActiveRoute ? 0.10 : 0.62,
+						// Editor links are an annotation layer: leave them legible over
+						// opaque USD geometry instead of letting depth-testing hide them.
+						opacity: globalStitch ? 1 : l1Topology ? (hasActiveRoute ? 0.22 : 0.52) : active ? 1 : edge.edge_type === 'portal_bridge' ? 0.78 : hasActiveRoute ? 0.32 : 0.88,
+						depthTest: false,
+						depthWrite: false,
 					})
 				);
+				line.renderOrder = globalStitch ? 996 : active ? 994 : 991;
 				line.userData = { id: edge.motion_edge_id, itemType: 'motion_edge' };
 				rootGroup.add(line);
 			}
@@ -1978,15 +1992,16 @@
 			const blueprintActiveColor = 0x06b6d4;
 			const activeEdges = new Set(activeGraphEdgeIds.map(String));
 			const hasActiveRoute = activeEdges.size > 0;
-			// Blueprint paths are review intent, not executable support edges. Draw
-			// all of them above the topology in distinct dashed colours so reviewers
-			// can judge coverage before approving a large batch.
-			const blueprintPalette = [0x06b6d4, 0xec4899, 0x84cc16, 0xf97316, 0x8b5cf6, 0x14b8a6, 0xeab308, 0xef4444];
+			// Blueprint paths are review intent, not executable support edges. Their
+			// colour is deliberately semantic rather than per-route: green means the
+			// route was approved for support construction; amber is still proposed.
+			// This remains comprehensible even when many blueprints overlap.
 			const topologyById = new Map(graphEdges.map((edge: any) => [String(edge.edge_id), edge]));
-			for (let routeIndex = 0; routeIndex < blueprintGraphRoutes.length; routeIndex += 1) {
-				const blueprint = blueprintGraphRoutes[routeIndex];
+			for (const blueprint of blueprintGraphRoutes) {
 				const edgeIds = Array.isArray(blueprint?.place_path_edge_ids) ? blueprint.place_path_edge_ids : [];
-				const color = blueprintPalette[routeIndex % blueprintPalette.length];
+				const status = String(blueprint?.status ?? 'proposed');
+				const approved = status === 'approved';
+				const color = approved ? 0x16a34a : 0xf59e0b;
 				for (const edgeId of edgeIds) {
 					const edge: any = topologyById.get(String(edgeId));
 					if (!edge) continue;
@@ -1996,18 +2011,21 @@
 					const selected = activeEdges.has(String(edge.edge_id));
 					const line = new THREE.Line(
 						new THREE.BufferGeometry().setFromPoints([
-							new THREE.Vector3(source.position?.[0] ?? 0, 0.135, source.position?.[1] ?? 0),
-							new THREE.Vector3(target.position?.[0] ?? 0, 0.135, target.position?.[1] ?? 0),
+							new THREE.Vector3(source.position?.[0] ?? 0, selected ? 0.215 : approved ? 0.185 : 0.16, source.position?.[1] ?? 0),
+							new THREE.Vector3(target.position?.[0] ?? 0, selected ? 0.215 : approved ? 0.185 : 0.16, target.position?.[1] ?? 0),
 						]),
 						new THREE.LineDashedMaterial({
 							color: selected ? blueprintActiveColor : color,
-							dashSize: selected ? 0.16 : 0.10,
-							gapSize: 0.06,
+							dashSize: selected ? 0.18 : approved ? 0.15 : 0.10,
+							gapSize: approved ? 0.045 : 0.075,
 							transparent: true,
-							opacity: selected ? 0.98 : 0.60,
+							opacity: selected ? 1 : approved ? 0.96 : 0.84,
+							depthTest: false,
+							depthWrite: false,
 						}),
 					);
 					line.computeLineDistances();
+					line.renderOrder = selected ? 996 : approved ? 994 : 993;
 					line.userData = { id: String(blueprint?.blueprint_id ?? edgeId), itemType: 'blueprint_review_route' };
 					rootGroup.add(line);
 				}
@@ -2025,11 +2043,17 @@
 				const line = new THREE.Line(
 					new THREE.BufferGeometry().setFromPoints(pts),
 					new THREE.LineBasicMaterial({
-						color: active ? blueprintActiveColor : edge.hazard_crossing ? 0xf97316 : isManual ? 0xa855f7 : 0x6366f1,
-						transparent: true, opacity: active ? 0.98 : hasActiveRoute ? 0.10 : isManual ? 0.9 : 0.55,
-						linewidth: active || isManual ? 2 : 1,
+						color: active ? blueprintActiveColor : edge.hazard_crossing ? 0xea580c : isManual ? 0x9333ea : 0x2563eb,
+						transparent: true,
+						opacity: active ? 1 : hasActiveRoute ? 0.34 : isManual ? 0.98 : 0.88,
+						// WebGL does not honour linewidth on most drivers. Render this
+						// annotation layer above the scene instead, which makes sparse
+						// topology reliably visible without a costly tube mesh per edge.
+						depthTest: false,
+						depthWrite: false,
 					})
 				);
+				line.renderOrder = active ? 995 : isManual ? 992 : 990;
 				line.userData = { id: edge.edge_id, itemType: 'edge', manual: isManual };
 				rootGroup.add(line);
 			}
@@ -2081,7 +2105,10 @@
 				let builtFromXml = false;
 				if (isRenderOnlyLightProxy(obj)) continue;
 				const xmlShape = _xmlShapeIndex.get(obj.id);
-				const forcedRenderRepair = xmlShape?.preview_mesh_status === 'render_only_glass_repair';
+				const forcedRenderRepair = [
+					'render_only_glass_repair',
+					'render_only_thin_glass_panes'
+				].includes(String(xmlShape?.preview_mesh_status ?? ''));
 				const matchedXmlShape = (xmlNativePreviewEnabled || forcedRenderRepair) && !!xmlShape;
 				if (matchedXmlShape) editorMeshStats.xml_matched++;
 				// PR2: when the XML-native preview toggle is on, draw from the actual
@@ -2187,9 +2214,14 @@
 				const plan = planById.get(String(node.motion_node_id));
 				if (visibleLayers.motionNodes) {
 					const active = activeNodes.has(String(node.motion_node_id));
+					const hardMerged = node.merge_kind === 'hard' || (node.source_motion_pose_ids?.length ?? 0) > 1;
 					const sphere = new THREE.Mesh(
-						new THREE.SphereGeometry(active ? 0.052 : 0.028, 8, 8),
-						new THREE.MeshBasicMaterial({ color: active ? blueprintActiveColor : 0xa855f7, transparent: hasActiveRoute, opacity: active ? 1 : 0.16 })
+						new THREE.SphereGeometry(active ? 0.052 : hardMerged ? 0.042 : 0.028, 8, 8),
+						new THREE.MeshBasicMaterial({
+							color: active ? blueprintActiveColor : hardMerged ? 0xf97316 : 0xa855f7,
+							transparent: hasActiveRoute && !hardMerged,
+							opacity: active || hardMerged ? 1 : hasActiveRoute ? 0.16 : 0.62,
+						})
 					);
 					sphere.position.set(node.position?.[0] ?? 0, 0.13, node.position?.[1] ?? 0);
 					sphere.userData = { id: node.motion_node_id, itemType: 'motion_node' };
@@ -2882,6 +2914,9 @@
 				return;
 			}
 			if (addNodeMode) {
+				// A canvas marker makes the floor click itself observable while the
+				// parent verifies the safe-cell constraint and persists the node.
+				_showNodePlacementMarker(pt.x, pt.y);
 				onAddNodeClick?.(pt.x, pt.y);
 				return;
 			}
@@ -3086,6 +3121,36 @@
 		ring.userData = { itemType: 'paint_cursor' };
 		hoverGroup.add(ring);
 		paintCursorMesh = ring;
+	}
+
+	let nodePlacementMarker: any = null;
+	let nodePlacementMarkerTimer: ReturnType<typeof setTimeout> | null = null;
+	function _showNodePlacementMarker(x: number, z: number) {
+		if (!hoverGroup) return;
+		if (nodePlacementMarker) {
+			hoverGroup.remove(nodePlacementMarker);
+			(nodePlacementMarker.geometry as any)?.dispose?.();
+			(nodePlacementMarker.material as any)?.dispose?.();
+		}
+		if (nodePlacementMarkerTimer) clearTimeout(nodePlacementMarkerTimer);
+		const marker = new THREE.Mesh(
+			new THREE.RingGeometry(0.09, 0.13, 28),
+			new THREE.MeshBasicMaterial({ color: 0x2563eb, transparent: true, opacity: 0.96, side: THREE.DoubleSide, depthTest: false, depthWrite: false })
+		);
+		marker.rotation.x = -Math.PI / 2;
+		marker.position.set(x, 0.24, z);
+		marker.renderOrder = 998;
+		marker.userData = { itemType: 'node_placement_pending' };
+		hoverGroup.add(marker);
+		nodePlacementMarker = marker;
+		nodePlacementMarkerTimer = setTimeout(() => {
+			if (nodePlacementMarker !== marker) return;
+			hoverGroup?.remove(marker);
+			marker.geometry.dispose();
+			(marker.material as any)?.dispose?.();
+			nodePlacementMarker = null;
+			nodePlacementMarkerTimer = null;
+		}, 1400);
 	}
 
 	function _updateRegionPreview() {
@@ -3673,6 +3738,7 @@
 <!-- svelte-ignore a11y_no_noninteractive_element_interactions, a11y_no_noninteractive_tabindex -->
 <div
 	class="map3d-host"
+	class:placing-node={addNodeMode}
 	bind:this={host}
 	onpointerdown={onPointerDown}
 	onpointermove={onPointerMove}
@@ -3704,6 +3770,9 @@
 		position: absolute;
 		inset: 0;
 		cursor: crosshair;
+	}
+	.map3d-host.placing-node, .map3d-host.placing-node :global(canvas) {
+		cursor: copy;
 	}
 	.map3d-host :global(canvas) {
 		display: block;

@@ -128,14 +128,23 @@
 					 The selected scene's render-readiness response is therefore the
 					 authoritative fallback when this compact row has no sync field. -->
 				{@const _readinessSynced = Boolean(effectiveRenderReadiness?.ok)}
-				{@const _renderSynced = _ss.render_scene === 'synced' || (!_ss.render_scene && _readinessSynced)}
+				{@const _baseSynced = _ss.render_scene === 'synced' || (!_ss.render_scene && _readinessSynced)}
+				<!-- Perturbation is rendered from its own XML, produced by the same
+					 sync. Reporting "synced" while that variant is missing is what let
+					 a scene sit with mirrors configured and no perturbed scene to
+					 render them from. -->
+				{@const _perturbedMissing = Boolean(perturbation?.enabled) && !perturbation?.perturbed_render_ready}
+				{@const _renderSynced = _baseSynced && !_perturbedMissing}
 				{@const _isSyncing = _rs === 'syncing'}
 				<div class="sync-card">
 					<div class="panel-label">Sync</div>
 					<div class:ready={_renderSynced}>
-						Render {_renderSynced ? 'synced' : (_ss.render_scene ?? 'pending')}
+						Render {_renderSynced ? 'synced' : (_baseSynced && _perturbedMissing ? 'base only' : (_ss.render_scene ?? 'pending'))}
 						{#if _rs && _rs !== _ss.render_scene}<span class="sync-sub"> · {_rs}</span>{/if}
 					</div>
+					{#if _baseSynced && _perturbedMissing && !_isSyncing}
+						<div class="sync-stale">⚠ Optical perturbation is enabled but its render scene is missing{perturbation?.perturbed_render_stale ? ' (stale)' : ''}. Sync to build it, or the perturbed / both variants stay unavailable.</div>
+					{/if}
 					<!-- While the daemon is actively syncing, the `message` field carries the
 						 live progress text and supersedes any older "deferred / stale" rationale
 						 the annotation may have been left with. Show stale flags only when sync

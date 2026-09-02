@@ -10,6 +10,7 @@ import {
 	buildNavigationSupportPlaceGraph,
 	getNavigationSupport,
 	getNavigationSupportBlueprints,
+	regenerateNavigationSupportBlueprints,
 	editNavigationSupportBlueprints,
 	deleteNavigationSupportBlueprint,
 	analyzeNavigationSupport,
@@ -30,6 +31,8 @@ import {
 	regenerateOpticalNavGraphRegion,
 } from '$lib/api';
 
+export type NavigationSupportAlgorithm = 'production_v1' | 'global_executable_network_v2';
+
 export interface BuildGraphParams {
 	maxNodes: number;
 	headingCount: number;
@@ -42,6 +45,8 @@ export interface BuildGraphParams {
 	seed: number;
 	/** Required only when replacing an already materialized V4 support graph. */
 	confirmSupportInvalidation?: boolean;
+	/** Discard every manually added node/edge and edit-history hint instead of carrying them into the new sample. */
+	fromScratch?: boolean;
 }
 
 export interface BuildGraphProgress {
@@ -236,6 +241,7 @@ export async function buildNavigationSupportPlace(
 			resolution: params.resolution,
 			seed: params.seed,
 			confirm_support_invalidation: Boolean(params.confirmSupportInvalidation),
+			from_scratch: Boolean(params.fromScratch),
 		}),
 	);
 }
@@ -246,6 +252,17 @@ export async function fetchNavigationSupport(projectId: string, sceneId: string)
 
 export async function fetchNavigationSupportBlueprints(projectId: string, sceneId: string) {
 	return getNavigationSupportBlueprints(projectId, sceneId);
+}
+
+/** Create a fresh proposal catalogue without rebuilding the repaired Place Graph. */
+export async function regenerateNavigationSupportBlueprintCatalog(
+	projectId: string,
+	sceneId: string,
+	confirmSupportInvalidation = false,
+) {
+	return regenerateNavigationSupportBlueprints(projectId, sceneId, {
+		confirm_support_invalidation: confirmSupportInvalidation,
+	});
 }
 
 export async function setNavigationSupportBlueprintStatus(
@@ -280,21 +297,42 @@ export async function removeNavigationSupportBlueprint(projectId: string, sceneI
 	return deleteNavigationSupportBlueprint(projectId, sceneId, blueprintId);
 }
 
+/** Lateral-band knobs for Stage 3, layered on top of the selected algorithm. */
+export interface NavigationSupportOptions {
+	lateralBandEnabled?: boolean;
+	lateralSwitchIntervalSteps?: number;
+}
+
+function navigationSupportPayload(algorithm: NavigationSupportAlgorithm, options?: NavigationSupportOptions) {
+	const payload: Record<string, unknown> = { support_algorithm: algorithm };
+	if (options?.lateralBandEnabled !== undefined) payload.lateral_band_enabled = options.lateralBandEnabled;
+	if (options?.lateralSwitchIntervalSteps !== undefined) payload.lateral_switch_interval_steps = options.lateralSwitchIntervalSteps;
+	return payload;
+}
+
 /** Stage 3 dry-run: reports pose/view/batch cost without writing sidecars. */
 export async function analyzeNavigationSupportGraph(
-	projectId: string, sceneId: string, onProgress: (p: BuildGraphProgress) => void,
+	projectId: string,
+	sceneId: string,
+	onProgress: (p: BuildGraphProgress) => void,
+	algorithm: NavigationSupportAlgorithm = 'production_v1',
+	options?: NavigationSupportOptions,
 ) {
 	return withNavigationProgress(projectId, sceneId, onProgress, () =>
-		analyzeNavigationSupport(projectId, sceneId, {}),
+		analyzeNavigationSupport(projectId, sceneId, navigationSupportPayload(algorithm, options)),
 	);
 }
 
 /** Stage 3 write: collision-certified lanes, action states, and render allow-list. */
 export async function buildNavigationSupportGraph(
-	projectId: string, sceneId: string, onProgress: (p: BuildGraphProgress) => void,
+	projectId: string,
+	sceneId: string,
+	onProgress: (p: BuildGraphProgress) => void,
+	algorithm: NavigationSupportAlgorithm = 'production_v1',
+	options?: NavigationSupportOptions,
 ) {
 	return withNavigationProgress(projectId, sceneId, onProgress, () =>
-		buildNavigationSupport(projectId, sceneId, {}),
+		buildNavigationSupport(projectId, sceneId, navigationSupportPayload(algorithm, options)),
 	);
 }
 
