@@ -1230,6 +1230,10 @@ def _adopt_compatible_frames(out: Path, *, tasks: list[dict], new_fingerprint: s
 
 def _qc_summary(out: Path, rows: list[dict]) -> dict:
     mask_counts = Counter()
+    # Evidence that metalness is not a deterministic function of roughness.
+    joint = {"histogram": np.zeros((16, 16), dtype=np.int64), "n": 0,
+             "sum_m": 0.0, "sum_r": 0.0, "sum_mm": 0.0, "sum_rr": 0.0,
+             "sum_mr": 0.0, "intermediate": 0}
     histograms = {name: np.zeros(32, dtype=np.int64) for name in ("roughness_original", "roughness_replacement", "roughness_all", "metallic_original", "metallic_replacement", "metallic_all")}
     for row in rows:
         paths = row.get("paths") or {}
@@ -1254,6 +1258,21 @@ def _qc_summary(out: Path, rows: list[dict]) -> dict:
         for value, prefix in ((rough, "roughness"), (metal, "metallic")):
             for mask, suffix in ((defined & original, "original"), (defined & replacement, "replacement"), (defined, "all")):
                 histograms[f"{prefix}_{suffix}"] += np.histogram(value[mask], bins=32, range=(0.0, 1.0))[0]
+        # Joint statistics over metal-bearing pixels only.  On a coverage-texture
+        # edge the authored value is a coverage fraction rather than a metalness,
+        # and pooling those with real metal manufactures a roughness correlation
+        # that does not exist on the pixels the label actually describes.
+        metal_bearing = defined & (metal > 0.5)
+        if bool(metal_bearing.any()):
+            mv, rv = metal[metal_bearing], rough[metal_bearing]
+            joint["histogram"] += np.histogram2d(
+                rv, mv, bins=(16, 16), range=((0.0, 1.0), (0.0, 1.0)),
+            )[0].astype(np.int64)
+            joint["n"] += int(mv.size)
+            joint["sum_m"] += float(mv.sum()); joint["sum_r"] += float(rv.sum())
+            joint["sum_mm"] += float((mv * mv).sum()); joint["sum_rr"] += float((rv * rv).sum())
+            joint["sum_mr"] += float((mv * rv).sum())
+            joint["intermediate"] += int(((mv > 0.02) & (mv < 0.98)).sum())
     fallback_ratio = mask_counts["fallback"] / max(mask_counts["defined"], 1)
     replacement_ratio = mask_counts["replacement"] / max(mask_counts["defined"], 1)
     replacement_fallback_ratio = mask_counts["replacement_fallback"] / max(mask_counts["defined"], 1)
@@ -1265,8 +1284,27 @@ def _qc_summary(out: Path, rows: list[dict]) -> dict:
         for key, source in (("nir_mean", "mean"), ("nir_p95", "p95"), ("nir_saturation_ratio", "saturation_ratio_gt_1"), ("flash_contribution_ratio", "flash_contribution_ratio")):
             if qc.get(source) is not None:
                 group[key].append(float(qc[source]))
+    metallic_roughness: dict = {"metal_bearing_pixel_count": int(joint["n"]),
+                                "metal_threshold": 0.5}
+    if joint["n"] > 1:
+        n = float(joint["n"])
+        mean_m, mean_r = joint["sum_m"] / n, joint["sum_r"] / n
+        var_m = max(0.0, joint["sum_mm"] / n - mean_m ** 2)
+        var_r = max(0.0, joint["sum_rr"] / n - mean_r ** 2)
+        cov = joint["sum_mr"] / n - mean_m * mean_r
+        pearson = cov / math.sqrt(var_m * var_r) if var_m > 1e-12 and var_r > 1e-12 else None
+        metallic_roughness.update({
+            "metallic_mean": mean_m, "roughness_mean": mean_r,
+            "metallic_std": math.sqrt(var_m), "roughness_std": math.sqrt(var_r),
+            "pearson": pearson,
+            "r_squared": (pearson * pearson) if pearson is not None else None,
+            "intermediate_fraction": joint["intermediate"] / n,
+            "joint_histogram_16x16_roughness_by_metallic": joint["histogram"].tolist(),
+        })
+
     summary = {
         "schema": "robomituba.ir_principled_qc_summary.v1", "generated_at": _utc_now(),
+        "metallic_roughness": metallic_roughness,
         "frame_count": len(rows), "pixel_counts": dict(mask_counts),
         "replacement_pixel_ratio": replacement_ratio,
         "replacement_fallback_pixel_ratio": replacement_fallback_ratio,

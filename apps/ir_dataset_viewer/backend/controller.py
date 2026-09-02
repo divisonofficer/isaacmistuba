@@ -461,6 +461,8 @@ class IRDatasetController:
         """Supply v1 controller snapshots with immutable render-plan defaults."""
         request.setdefault("pose_budget", 400)
         request.setdefault("illumination_diversity", False)
+        request.setdefault("metallic_augmentation", False)
+        request.setdefault("metallic_augmentation_seed", 0)
         # New jobs opt into the paired NIR observation contract.  Legacy
         # snapshots stay false so their active-NIR fingerprints and completed
         # frames remain resumable without an implicit rerender.
@@ -933,6 +935,8 @@ class IRDatasetController:
             "nir_spp": int(raw.get("nir_spp", 2000)), "flash_energy_scale": float(raw.get("flash_energy_scale", 1.0)),
             "ambient_fill_energy_scale": float(raw.get("ambient_fill_energy_scale", 1.0)),
             "illumination_diversity": bool(raw.get("illumination_diversity", False)),
+            "metallic_augmentation": bool(raw.get("metallic_augmentation", False)),
+            "metallic_augmentation_seed": int(raw.get("metallic_augmentation_seed", 0) or 0),
             "nir_passive": bool(raw.get("nir_passive", True)),
             "storage_profile": str(raw.get("storage_profile") or "core_half_exr_v1"),
             "paired_fraction": float(raw.get("paired_fraction", 0.20)),
@@ -2192,8 +2196,17 @@ class IRDatasetController:
                     contract.get("schema") == "robomituba.ir_principled_material_contract.v4"
                     and contract.get("contract_version") == "blender42-principled-metallic-roughness-v4"
                     and contract.get("compiler_version") == STAGE2_COMPILER_VERSION
-                    and all((record.get("metallic_contract") or {}).get("schema") == "robomituba.metallic_contract.v2"
-                            for record in (contract.get("materials") or []))
+                    # A Stage 2 built with the continuous-metalness policy emits
+                    # v3 records.  Accept them only when the contract itself
+                    # declares the policy, so an undeclared v3 still reads stale.
+                    and all(
+                        (record.get("metallic_contract") or {}).get("schema") in (
+                            {"robomituba.metallic_contract.v2", "robomituba.metallic_contract.v3"}
+                            if contract.get("metallic_augmentation")
+                            else {"robomituba.metallic_contract.v2"}
+                        )
+                        for record in (contract.get("materials") or [])
+                    )
                 )
                 return "verified" if valid else "stale"
             except (OSError, ValueError, json.JSONDecodeError):
@@ -2740,6 +2753,13 @@ class IRDatasetController:
                 cmd.append("--rebuild-stale")
             if r.get("illumination_diversity"):
                 cmd += ["--illumination-manifest", str(self.repo_root / "configs" / "ir_lighting" / "illumination_diversity_v1.json")]
+            if r.get("metallic_augmentation"):
+                cmd += [
+                    "--metallic-augmentation-policy",
+                    str(self.repo_root / "configs" / "ir_materials" / "metallic_composition_v1.json"),
+                    "--metallic-augmentation-seed",
+                    str(int(r.get("metallic_augmentation_seed") or r.get("effective_scene_seed") or r.get("seed") or 0)),
+                ]
             if r.get("structural_rematerialize"):
                 cmd += ["--structural-material-manifest", p["structural_rematerialization"]]
             if r.get("hybrid_prop_pbr"):
@@ -3090,10 +3110,20 @@ class IRDatasetController:
         coverage_mixed_pixels = coverage_mixed_intermediate = 0
         coverage_component_sizes: list[int] = []
         structural_ids: set[int] = set()
+        prepared_contract: dict[str, Any] = {}
+        if job and job.request.get("paths", {}).get("prepared"):
+            try:
+                prepared_contract = _read_json(
+                    Path(job.request["paths"]["prepared"]) / "principled_material_contract.json"
+                ) or {}
+            except Exception:
+                prepared_contract = {}
         if job and job.request.get("structural_rematerialize"):
-            contract = _read_json(Path(job.request["paths"]["prepared"]) / "principled_material_contract.json")
-            structural_ids = {int(record["material_id"]) for record in (contract.get("materials") or [])
+            structural_ids = {int(record["material_id"]) for record in (prepared_contract.get("materials") or [])
                               if record.get("structural_rematerialization") and record.get("material_id") is not None}
+        # A Stage 2 built with the continuous-metalness policy invalidates the
+        # binary premise of the gates below, so it selects a third mode.
+        metallic_augmentation = prepared_contract.get("metallic_augmentation") or {}
         structural_valid = structural_high = native_high = 0
         for row in rows:
             paths = row["paths"]
@@ -3215,7 +3245,14 @@ class IRDatasetController:
         # Keep the findings in the report, but do not block the showcase
         # pipeline on this sampling-sensitive heuristic.
         showcase_diagnostic = bool(job and job.request.get("ir_composition_profile") == SHOWCASE_PROFILE)
-        if not structural_ids and not showcase_diagnostic:
+        # The high-metal coverage band and the near-binary ratio both assume a
+        # binary metalness distribution.  Under the continuous policy they no
+        # longer describe a defect -- an augmented dataset is *supposed* to sit
+        # between 0 and 1 -- so keep every statistic in the report but stop them
+        # from blocking the render.  Without this an augmented dataset fails its
+        # own quality gate by construction.
+        continuous_metallic_diagnostic = bool(metallic_augmentation)
+        if not structural_ids and not showcase_diagnostic and not continuous_metallic_diagnostic:
             failures.extend(diagnostic_findings)
         failures.extend(physical_failures)
         material_interior = []
@@ -3240,6 +3277,32 @@ class IRDatasetController:
                     "roughness_delta": sample["exposed_roughness_sum"] / exposed_count - sample["covered_roughness_sum"] / covered_count,
                 },
             })
+        # In exchange for relaxing the binary gates, the continuous policy gets a
+        # gate of its own: if the augmentation silently did nothing, the interior
+        # metal pixels stay pinned at 0/1 and the dataset is worthless for the
+        # experiment it was built for.  That must fail loudly, not pass quietly.
+        continuous_metallic_report: dict[str, Any] = {}
+        if continuous_metallic_diagnostic:
+            conductor_interior = [
+                sample for mid, sample in interior_samples.items()
+                if sample["pixels"] and (sample["metallic_sum"] / max(1, sample["pixels"])) > 0.02
+            ]
+            interior_total = sum(int(sample["pixels"]) for sample in conductor_interior)
+            interior_intermediate = sum(int(sample["intermediate_pixels"]) for sample in conductor_interior)
+            intermediate_fraction = interior_intermediate / interior_total if interior_total else 0.0
+            continuous_metallic_report = {
+                "policy_id": metallic_augmentation.get("policy_id"),
+                "policy_sha256": metallic_augmentation.get("policy_sha256"),
+                "dataset_seed": metallic_augmentation.get("dataset_seed"),
+                "modified_channels": metallic_augmentation.get("modified_channels"),
+                "conductor_interior_pixels": interior_total,
+                "intermediate_fraction": intermediate_fraction,
+                "minimum_intermediate_fraction": 0.30,
+                "relaxed_binary_findings": diagnostic_findings,
+            }
+            if interior_total and intermediate_fraction < 0.30:
+                failures.append("continuous_metallic_collapsed_to_binary")
+
         report = {"schema": "robomituba.ir_material_visibility_qc.v1", "profile": METAL_PROFILE,
                   "high_metallic_threshold": threshold, "status": "failed" if failures else "passed",
                   "valid_pixel_count": total_valid, "high_metallic_pixel_count": total_high,
@@ -3248,6 +3311,8 @@ class IRDatasetController:
                   "high_metal_material_instance_count": len(material_counts),
                   "conductor_roughness_histogram_5_bins": roughness_bins,
                   "material_interior": material_interior,
+                  **({"continuous_metallic": continuous_metallic_report}
+                     if continuous_metallic_report else {}),
                   "coverage_mixed": {"pixels": coverage_mixed_pixels,
                                       "intermediate_ratio": mixed_intermediate_ratio,
                                       "connected_component_sizes": sorted(coverage_component_sizes, reverse=True)[:100]},

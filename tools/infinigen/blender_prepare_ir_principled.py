@@ -1116,7 +1116,11 @@ def main() -> int:
                 f"unsupported metallic composition policy: {metallic_policy.get('schema')}"
             )
         metallic_policy_digest = ir_metallic_composition.stable_digest(metallic_policy)
-        digest_paths.append(policy_path)
+        # Deliberately NOT appended to digest_paths: the wrapper reconstructs
+        # that list independently, so adding a file here silently defeats its
+        # reuse check.  The policy is bound to the contract through
+        # metallic_augmentation.policy_sha256 instead, and the contract's own
+        # sha256 is already part of the dataset fingerprint.
     structural_manifest = None
     structural_bindings = {}
     prop_manifest = None

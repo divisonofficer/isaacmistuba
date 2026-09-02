@@ -1317,3 +1317,107 @@ def test_legacy_duplicate_pipeline_is_blocked_before_ir_artifacts(tmp_path: Path
     controller._assert_pipeline_owner(owner)
     with pytest.raises(RuntimeError, match="generated scene is preserved"):
         controller._assert_pipeline_owner(duplicate)
+
+
+def _metal_qc_fixture(root: Path, *, metallic_u16: int) -> dict:
+    """Write a minimal single-material QC frame and return its paths."""
+    paths = {
+        "metallic": "metallic.png", "gt_defined_mask": "defined.png",
+        "replacement_mask": "replacement.png", "fallback_mask": "fallback.png",
+        "material_id": "material_id.png", "roughness": "roughness.png",
+        "base_color_rgb": "base.png", "normal_shading_world": "normal.png",
+        "metallic_family_id": "family.png", "exposed_metal_mask": "exposed.png",
+    }
+    shape = (6, 6)
+    assert cv2.imwrite(str(root / paths["metallic"]), np.full(shape, metallic_u16, np.uint16))
+    assert cv2.imwrite(str(root / paths["gt_defined_mask"]), np.full(shape, 255, np.uint8))
+    for key in ("replacement_mask", "fallback_mask", "exposed_metal_mask"):
+        assert cv2.imwrite(str(root / paths[key]), np.zeros(shape, np.uint8))
+    assert cv2.imwrite(str(root / paths["material_id"]), np.ones(shape, np.uint16))
+    assert cv2.imwrite(str(root / paths["roughness"]), np.full(shape, 20000, np.uint16))
+    assert cv2.imwrite(str(root / paths["base_color_rgb"]), np.full((*shape, 3), 32768, np.uint16))
+    assert cv2.imwrite(str(root / paths["normal_shading_world"]), np.full((*shape, 3), 32768, np.uint16))
+    assert cv2.imwrite(str(root / paths["metallic_family_id"]), np.full(shape, 3, np.uint8))
+    return paths
+
+
+def _augmented_job(tmp_path: Path, *, declare: bool) -> ControllerJob:
+    prepared = tmp_path / "prepared"
+    prepared.mkdir(parents=True, exist_ok=True)
+    contract = {"materials": []}
+    if declare:
+        contract["metallic_augmentation"] = {
+            "policy_id": "metallic_composition_v1", "policy_sha256": "d" * 64, "dataset_seed": 7,
+            "modified_channels": ["metallic"],
+        }
+    _atomic_json(prepared / "principled_material_contract.json", contract)
+    return ControllerJob(job_id="aug", request={"paths": {"prepared": str(prepared)}})
+
+
+def test_continuous_metallic_relaxes_the_binary_gates_but_still_reports_them(tmp_path: Path) -> None:
+    """The binary coverage/near-binary gates assume a distribution v3 abandons.
+
+    An augmented dataset is *supposed* to sit between 0 and 1, so those findings
+    must stop blocking the render while remaining visible in the report.
+    """
+    controller = _controller(tmp_path)
+    root = tmp_path / "qc"
+    root.mkdir()
+    # Mid-range metalness everywhere: exactly what the binary gates dislike.
+    paths = _metal_qc_fixture(root, metallic_u16=39000)
+    rows = [{"frame_id": "f", "paths": paths}]
+
+    undeclared = controller._material_visibility_qc(
+        root, rows, job=_augmented_job(tmp_path / "a", declare=False),
+    )
+    assert undeclared["status"] == "failed"
+    assert undeclared["diagnostic_findings"]
+
+    declared = controller._material_visibility_qc(
+        root, rows, job=_augmented_job(tmp_path / "b", declare=True),
+    )
+    assert declared["status"] == "passed"
+    # The statistics are retained, not silently dropped.
+    assert declared["diagnostic_findings"] == undeclared["diagnostic_findings"]
+    assert declared["continuous_metallic"]["relaxed_binary_findings"] == undeclared["diagnostic_findings"]
+    assert declared["continuous_metallic"]["policy_id"] == "metallic_composition_v1"
+    assert declared["continuous_metallic"]["intermediate_fraction"] == 1.0
+
+
+def test_continuous_metallic_fails_loudly_when_the_augmentation_did_nothing(tmp_path: Path) -> None:
+    """A silently no-op augmentation leaves metalness pinned at 0/1.
+
+    That dataset is worthless for the experiment it was built for, so the gate
+    that replaces the relaxed binary checks must reject it.
+    """
+    controller = _controller(tmp_path)
+    root = tmp_path / "qc"
+    root.mkdir()
+    paths = _metal_qc_fixture(root, metallic_u16=65535)  # still fully binary
+    report = controller._material_visibility_qc(
+        root, [{"frame_id": "f", "paths": paths}],
+        job=_augmented_job(tmp_path / "c", declare=True),
+    )
+    assert report["status"] == "failed"
+    assert "continuous_metallic_collapsed_to_binary" in report["failures"]
+    assert report["continuous_metallic"]["intermediate_fraction"] == 0.0
+
+
+def test_prepare_stage_passes_the_metallic_policy_only_when_requested(tmp_path: Path) -> None:
+    controller = _controller(tmp_path)
+    job = ControllerJob(job_id="cmd", request={
+        "scene_id": "s",
+        "paths": {"geometry": "g", "prepared": "p"},
+        "metallic_augmentation": False,
+    })
+    off = controller._command(job, "principled_prepare")
+    assert "--metallic-augmentation-policy" not in off
+
+    job.request["metallic_augmentation"] = True
+    job.request["metallic_augmentation_seed"] = 4242
+    on = controller._command(job, "principled_prepare")
+    assert "--metallic-augmentation-policy" in on
+    assert on[on.index("--metallic-augmentation-policy") + 1].endswith(
+        "configs/ir_materials/metallic_composition_v1.json"
+    )
+    assert on[on.index("--metallic-augmentation-seed") + 1] == "4242"

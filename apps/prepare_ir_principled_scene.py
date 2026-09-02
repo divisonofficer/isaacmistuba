@@ -45,6 +45,11 @@ def _args() -> argparse.Namespace:
     parser.add_argument("--ambient-fill-max-size", type=float, default=2.2)
     parser.add_argument("--ambient-fill-ceiling-gap", type=float, default=0.10)
     parser.add_argument("--illumination-manifest", type=Path)
+    parser.add_argument(
+        "--metallic-augmentation-policy", type=Path,
+        help="opt-in continuous-metalness policy; absent keeps the contract byte-identical",
+    )
+    parser.add_argument("--metallic-augmentation-seed", type=int, default=0)
     parser.add_argument("--structural-material-manifest", type=Path,
                         help="immutable external-PBR overlay for an independent rematerialized scene")
     parser.add_argument("--prop-material-manifest", type=Path,
@@ -174,6 +179,10 @@ def main() -> int:
     illumination_sha = _sha256(args.illumination_manifest.resolve()) if args.illumination_manifest else None
     structural_sha = _sha256(args.structural_material_manifest.resolve()) if args.structural_material_manifest else None
     prop_sha = _sha256(args.prop_material_manifest.resolve()) if args.prop_material_manifest else None
+    metallic_policy_sha = (
+        _sha256(args.metallic_augmentation_policy.resolve())
+        if args.metallic_augmentation_policy else None
+    )
     if out.exists() and not args.force:
         try:
             contract = _validate_output(out)
@@ -197,6 +206,11 @@ def main() -> int:
                 and contract.get("illumination_manifest_sha256") == illumination_sha
                 and contract.get("structural_rematerialization_sha256") == structural_sha
                 and contract.get("prop_pbr_remediation_sha256") == prop_sha
+                # Absent on both sides when the augmentation is off, so an
+                # un-augmented Stage 2 still reuses exactly as before.
+                and (contract.get("metallic_augmentation") or {}).get("policy_sha256") == metallic_policy_sha
+                and (contract.get("metallic_augmentation") or {}).get("dataset_seed")
+                    == (int(args.metallic_augmentation_seed) if args.metallic_augmentation_policy else None)
             ):
                 print(f"[ir-principled] reuse verified Stage 2: {out}")
                 return 0
@@ -236,6 +250,11 @@ def main() -> int:
         ]
         if args.illumination_manifest:
             command.extend(("--illumination-manifest", str(args.illumination_manifest.resolve())))
+        if args.metallic_augmentation_policy:
+            command.extend((
+                "--metallic-augmentation-policy", str(args.metallic_augmentation_policy.resolve()),
+                "--metallic-augmentation-seed", str(int(args.metallic_augmentation_seed)),
+            ))
         if args.structural_material_manifest:
             command.extend(("--structural-material-manifest", str(args.structural_material_manifest.resolve())))
         if args.prop_material_manifest:
