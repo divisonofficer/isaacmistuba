@@ -52,7 +52,7 @@ from navigation_dataset.ir_principled import (  # noqa: E402
     CONTINUOUS_METALLIC_FAMILY,
     SEMANTIC_SURROGATES,
 )
-from navigation_dataset import ir_metallic_composition  # noqa: E402
+from navigation_dataset import ir_indoor_fixtures, ir_metallic_composition  # noqa: E402
 from render_visibility_contract import (  # noqa: E402
     hide_untracked_render_meshes,
     visible_untracked_mesh_names,
@@ -234,6 +234,12 @@ def _args() -> argparse.Namespace:
     parser.add_argument(
         "--metallic-augmentation-seed", type=int, default=0,
         help="dataset seed mixed into every per-material augmentation draw",
+    )
+    parser.add_argument(
+        "--fixture-policy", choices=("legacy_disable_v1", "addressable_v2"),
+        default="legacy_disable_v1",
+        help=("addressable_v2 tags indoor lights as individually switchable fixtures; "
+              "the default deletes them exactly as before and emits no extra contract key"),
     )
     parser.add_argument("--structural-material-manifest", type=Path,
                         help="optional canonical external-PBR bindings for a rematerialized child scene")
@@ -1007,17 +1013,25 @@ def _ceiling_height(room: dict) -> tuple[float, str]:
 
 def _install_ambient_fill(args: argparse.Namespace) -> dict:
     rooms = _room_bounds(args.room_manifest.resolve() if args.room_manifest else None)
+    addressable = str(getattr(args, "fixture_policy", "legacy_disable_v1")) == "addressable_v2"
     source_audit = []
+    fixtures: list[dict] = []
     for obj in list(bpy.data.objects):
         if obj.type != "LIGHT" or obj.name == "__ir_nir_flash" or obj.name.startswith("__ir_ambient_fill_"):
             continue
         point = obj.matrix_world.translation
-        in_room = any(
-            room["bounds_xy"][0] <= point.x <= room["bounds_xy"][2]
-            and room["bounds_xy"][1] <= point.y <= room["bounds_xy"][3]
-            and point.z > 1.5
-            for room in rooms
+        # A ceiling fixture is tested against the room bounds widened by a
+        # margin: traversable bounds are inset from the room's real extent, and
+        # a ceiling light legitimately hangs over floor nobody can stand on.
+        margin = (ir_indoor_fixtures.CEILING_ROOM_MARGIN_M
+                  if point.z > ir_indoor_fixtures.CEILING_MIN_HEIGHT_M else 0.0)
+        room_id = next(
+            (str(room["room_id"]) for room in rooms
+             if room["bounds_xy"][0] - margin <= point.x <= room["bounds_xy"][2] + margin
+             and room["bounds_xy"][1] - margin <= point.y <= room["bounds_xy"][3] + margin),
+            "",
         )
+        in_room = bool(room_id) and point.z > 1.5
         preserve = obj.data.type == "AREA" and in_room
         source_audit.append({
             "object": obj.name, "type": obj.data.type, "energy_before": float(obj.data.energy),
@@ -1025,9 +1039,47 @@ def _install_ambient_fill(args: argparse.Namespace) -> dict:
             "valid_room_ceiling_area": bool(preserve),
             "policy": "preserved" if preserve else "disabled_variance_source",
         })
-        if not preserve:
-            obj.hide_render = True
-            obj.data.energy = 0.0
+        if not addressable:
+            if not preserve:
+                obj.hide_render = True
+                obj.data.energy = 0.0
+            continue
+
+        # Addressable policy: classify by height and room membership rather than
+        # by lamp type, so a POINT lamp at ceiling height stays a ceiling light
+        # instead of being deleted for having the wrong datablock.
+        group = ir_indoor_fixtures.classify_fixture(
+            blender_type=str(obj.data.type),
+            position_z_m=float(point.z),
+            in_traversable_room=bool(room_id),
+            spot_size_deg=(math.degrees(float(obj.data.spot_size))
+                           if obj.data.type == "SPOT" else None),
+        )
+        base_energy = float(obj.data.energy)
+        base_color = [float(v) for v in obj.data.color]
+        fid = ir_indoor_fixtures.fixture_id(group=group, room_id=room_id, object_name=obj.name)
+        obj.data["ir_fixture_id"] = fid
+        obj.data["ir_fixture_group"] = group
+        obj.data["ir_fixture_room_id"] = room_id
+        obj.data["ir_base_energy_w"] = base_energy
+        obj.data["ir_base_color"] = base_color
+        # A POINT lamp rendered at zero radius throws fireflies once it is
+        # actually switched on, so give it a small physical size.
+        if obj.data.type == "POINT" and float(getattr(obj.data, "shadow_soft_size", 0.0)) < 1e-4:
+            obj.data.shadow_soft_size = 0.05
+        # Every addressable fixture starts off.  A condition turns it on
+        # explicitly, so a run that requests no fixture spec reproduces the
+        # legacy single-softbox lighting exactly.
+        obj.hide_render = True
+        obj.data.energy = 0.0
+        obj.lightgroup = f"DATASET_FIXTURE_{group.upper()}"
+        fixtures.append({
+            "fixture_id": fid, "object": obj.name, "group": group, "room_id": room_id,
+            "blender_type": str(obj.data.type), "base_energy_w": base_energy,
+            "base_color_linear_rgb": base_color,
+            "world_position": [float(value) for value in point],
+            "legacy_v1_action": "preserved" if preserve else "disabled_variance_source",
+        })
 
     panels = []
     for room in rooms:
@@ -1059,6 +1111,20 @@ def _install_ambient_fill(args: argparse.Namespace) -> dict:
             obj.location = (x, y, panel_z)
             obj.rotation_euler = (0.0, 0.0, 0.0)  # Blender AREA emits along local -Z.
             obj.lightgroup = "DATASET_AMBIENT_FILL"
+            if addressable:
+                fid = ir_indoor_fixtures.fixture_id(
+                    group="ambient_fill", room_id=str(room["room_id"]), object_name=name)
+                data["ir_fixture_id"] = fid
+                data["ir_fixture_group"] = "ambient_fill"
+                data["ir_fixture_room_id"] = str(room["room_id"])
+                data["ir_base_color"] = [1.0, 0.93, 0.82]
+                fixtures.append({
+                    "fixture_id": fid, "object": name, "group": "ambient_fill",
+                    "room_id": str(room["room_id"]), "blender_type": "AREA",
+                    "base_energy_w": float(args.ambient_fill_energy),
+                    "base_color_linear_rgb": [1.0, 0.93, 0.82],
+                    "world_position": [x, y, panel_z], "legacy_v1_action": "synthetic",
+                })
             panels.append({
                 "object": name, "room_id": room["room_id"], "position": [x, y, panel_z],
                 "size_m": [side_x, side_y], "energy_w": float(args.ambient_fill_energy),
@@ -1073,6 +1139,20 @@ def _install_ambient_fill(args: argparse.Namespace) -> dict:
         "ceiling_gap_m": float(args.ambient_fill_ceiling_gap),
         "light_group": "DATASET_AMBIENT_FILL",
         "rooms": rooms, "panels": panels, "source_lights": source_audit,
+        **({"indoor_fixture_rig": {
+            "schema": ir_indoor_fixtures.FIXTURE_RIG_SCHEMA,
+            "policy": "addressable_indoor_fixture_v2",
+            "classifier_version": ir_indoor_fixtures.CLASSIFIER_VERSION,
+            "legacy_equivalent_policy": "preserve_valid_room_ceiling_area_disable_other_light_objects",
+            "switchable_groups": list(ir_indoor_fixtures.SWITCHABLE_GROUPS),
+            "portal_authority": "external_hdri_recipe_only",
+            "color_temperature_model": ir_indoor_fixtures.COLOR_TEMPERATURE_MODEL,
+            "default_state": "all_addressable_fixtures_off",
+            "group_counts": {g: sum(1 for f in fixtures if f["group"] == g)
+                             for g in sorted({f["group"] for f in fixtures})},
+            "fixtures": sorted(fixtures, key=lambda row: row["fixture_id"]),
+            "rig_digest": ir_indoor_fixtures.rig_digest(fixtures),
+        }} if addressable else {}),
     }
 
 
@@ -1271,6 +1351,11 @@ def main() -> int:
     scene["ir_pseudo_nir_formula"] = PSEUDO_NIR_FORMULA_ID
     scene["ir_prepared_at"] = _utc_now()
     scene["ir_stage1_scene_id"] = str(manifest.get("scene_id") or "")
+    # The worker refuses a per-fixture recipe unless the blend it loaded carries
+    # this, so a v2 condition can never be applied to a v1-prepared scene.
+    rig = (ambient_fill or {}).get("indoor_fixture_rig") or {}
+    if rig:
+        scene["ir_indoor_fixture_rig_digest"] = str(rig.get("rig_digest") or "")
 
     counts = Counter()
     for record in records:

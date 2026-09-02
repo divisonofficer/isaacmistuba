@@ -33,6 +33,14 @@ FIXTURE_GROUPS = ("ceiling", "lamp", "accent", "ambient_fill", "portal", "exteri
 SWITCHABLE_GROUPS = ("ceiling", "lamp", "accent", "ambient_fill")
 
 CEILING_MIN_HEIGHT_M = 1.5
+#: Room membership is tested against *traversable* bounds, which are inset from
+#: the room's real extent by the robot radius and wall clearance.  A ceiling
+#: light hangs above floor nobody can stand on, so testing it against the
+#: traversable footprint drops genuine fixtures near walls and corners -- one of
+#: two identical 2.66 m lamps in the measured bathroom was excluded that way.
+#: Fixtures at or above ceiling height get this margin; floor-level ones do not,
+#: because there the inset is the point.
+CEILING_ROOM_MARGIN_M = 0.9
 LAMP_MIN_HEIGHT_M = 0.3
 ACCENT_SPOT_MAX_ANGLE_DEG = 45.0
 
@@ -140,6 +148,7 @@ def rig_digest(fixtures: Sequence[Mapping[str, Any]]) -> str:
 __all__ = [
     "ACCENT_SPOT_MAX_ANGLE_DEG",
     "CEILING_MIN_HEIGHT_M",
+    "CEILING_ROOM_MARGIN_M",
     "CLASSIFIER_VERSION",
     "COLOR_TEMPERATURE_MODEL",
     "FIXTURE_GROUPS",

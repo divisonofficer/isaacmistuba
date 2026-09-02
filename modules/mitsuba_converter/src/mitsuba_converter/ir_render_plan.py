@@ -19,6 +19,9 @@ ILLUMINATION_PLAN_SCHEMA = "robomituba.ir_principled_render_plan.v3"
 ILLUMINATION_REFERENCE_PLAN_SCHEMA = "robomituba.ir_principled_render_plan.v4"
 CONTENT_SAMPLER_VERSION = "content-aware-fps-v2"
 LIGHTING_PRESET_VERSION = "indoor-capture-groups-v1"
+ILLUMINATION_BANK_SCHEMA_V2 = "robomituba.ir_illumination_bank.v2"
+MAX_ILLUMINATION_CONDITIONS = 12
+FIXTURE_SAMPLER_VERSION = "fixture-subset-hash-v1"
 LIGHTING_PRESETS = (
     {"id": "balanced_day_v1", "label": "Balanced day", "native_energy_scale": 1.0,
      "ambient_fill_scale": 1.0, "rgb_color_multiplier": [1.0, 1.0, 1.0], "side_key": False},
@@ -224,7 +227,13 @@ def build_render_plan(graph: dict[str, Any], *, requested_pose_count: int, seed:
     groups = []
     if illumination:
         conditions = list(illumination.get("conditions") or [])
-        if len(conditions) != 6:
+        # v1 keeps its exact-six rule so no published plan digest can move; the
+        # v2 bank enumerates per-fixture conditions more finely.
+        if str(illumination.get("schema") or "") == ILLUMINATION_BANK_SCHEMA_V2:
+            if not 6 <= len(conditions) <= MAX_ILLUMINATION_CONDITIONS:
+                raise ValueError(
+                    f"illumination bank v2 requires 6-{MAX_ILLUMINATION_CONDITIONS} conditions")
+        elif len(conditions) != 6:
             raise ValueError("illumination diversity requires six conditions")
         if illumination_pairing_policy not in {"legacy_six_way_v1", "reference_subset_v2"}:
             raise ValueError(f"unsupported illumination pairing policy: {illumination_pairing_policy}")
@@ -261,6 +270,17 @@ def build_render_plan(graph: dict[str, Any], *, requested_pose_count: int, seed:
                 recipe = {
                     "id": str(condition["id"]), "label": str(condition["id"]),
                     "version": "illumination-reference-subset-v2",
+                    # Carries the *specification*, never a resolved fixture list:
+                    # view_plan runs before principled_prepare, so the plan cannot
+                    # know which fixtures a scene has.  recipe_digest closes over
+                    # this, so the sampled subset stays reproducible.
+                    **({"fixtures": {**dict(condition["fixtures"]),
+                                     "sampler_version": FIXTURE_SAMPLER_VERSION,
+                                     "subset_seed": int(seed),
+                                     "nir_band_effect": {"color": "luminance_collapsed",
+                                                         "on_off": "shared"}},
+                        "scene_id": str(scene_id)}
+                       if condition.get("fixtures") else {}),
                     "native_energy_scale": float(condition.get("internal_energy_scale", 1.0)),
                     "ambient_fill_scale": 1.0,
                     "rgb_color_multiplier": list(condition.get("internal_color") or (1.0, 1.0, 1.0)),
@@ -301,6 +321,17 @@ def build_render_plan(graph: dict[str, Any], *, requested_pose_count: int, seed:
                 recipe = {
                     "id": str(condition["id"]), "label": str(condition["id"]),
                     "version": "illumination-diversity-paired-v1",
+                    # Carries the *specification*, never a resolved fixture list:
+                    # view_plan runs before principled_prepare, so the plan cannot
+                    # know which fixtures a scene has.  recipe_digest closes over
+                    # this, so the sampled subset stays reproducible.
+                    **({"fixtures": {**dict(condition["fixtures"]),
+                                     "sampler_version": FIXTURE_SAMPLER_VERSION,
+                                     "subset_seed": int(seed),
+                                     "nir_band_effect": {"color": "luminance_collapsed",
+                                                         "on_off": "shared"}},
+                        "scene_id": str(scene_id)}
+                       if condition.get("fixtures") else {}),
                     "native_energy_scale": float(condition.get("internal_energy_scale", 1.0)),
                     "ambient_fill_scale": 1.0,
                     "rgb_color_multiplier": list(condition.get("internal_color") or (1.0, 1.0, 1.0)),

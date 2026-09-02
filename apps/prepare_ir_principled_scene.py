@@ -50,6 +50,10 @@ def _args() -> argparse.Namespace:
         help="opt-in continuous-metalness policy; absent keeps the contract byte-identical",
     )
     parser.add_argument("--metallic-augmentation-seed", type=int, default=0)
+    parser.add_argument(
+        "--fixture-policy", choices=("legacy_disable_v1", "addressable_v2"),
+        default="legacy_disable_v1",
+        help="addressable_v2 keeps indoor lights as individually switchable fixtures")
     parser.add_argument("--structural-material-manifest", type=Path,
                         help="immutable external-PBR overlay for an independent rematerialized scene")
     parser.add_argument("--prop-material-manifest", type=Path,
@@ -209,6 +213,7 @@ def main() -> int:
                 # Absent on both sides when the augmentation is off, so an
                 # un-augmented Stage 2 still reuses exactly as before.
                 and (contract.get("metallic_augmentation") or {}).get("policy_sha256") == metallic_policy_sha
+                and bool((contract.get("ambient_fill_rig") or {}).get("indoor_fixture_rig"))                     == (args.fixture_policy == "addressable_v2")
                 and (contract.get("metallic_augmentation") or {}).get("dataset_seed")
                     == (int(args.metallic_augmentation_seed) if args.metallic_augmentation_policy else None)
             ):
@@ -255,6 +260,8 @@ def main() -> int:
                 "--metallic-augmentation-policy", str(args.metallic_augmentation_policy.resolve()),
                 "--metallic-augmentation-seed", str(int(args.metallic_augmentation_seed)),
             ))
+        if args.fixture_policy != "legacy_disable_v1":
+            command.extend(("--fixture-policy", str(args.fixture_policy)))
         if args.structural_material_manifest:
             command.extend(("--structural-material-manifest", str(args.structural_material_manifest.resolve())))
         if args.prop_material_manifest:

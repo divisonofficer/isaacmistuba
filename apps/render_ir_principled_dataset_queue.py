@@ -76,6 +76,11 @@ COMPATIBLE_PREVIOUS_WORKER_SHA256 = frozenset({
     # Cycles settings are byte-identical to this build, so every existing
     # dataset renders the same products and keeps its frames adoptable.
     "899e5edd01e9c1e4117054e31abf3ba9a9438312b85ccf8e33550610a871a038",
+    # Worker immediately before per-fixture lighting.  Without a 'fixtures'
+    # block in the recipe the resolver is skipped entirely and the only new
+    # statement restores hide_render to the value it already had, so every
+    # existing dataset renders identically and keeps its frames adoptable.
+    "79cc640ce8b7c5aa58c85b67329214a19c260b4f396631f6303c60231ea4b738",
 })
 CORE_REQUIRED_MODALITIES = {
     "rgb", "nir_active", "base_color_rgb", "base_color_nir", "roughness", "metallic", "metallic_family_id",

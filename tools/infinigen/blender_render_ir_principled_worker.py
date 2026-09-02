@@ -22,7 +22,15 @@ from mathutils import Matrix  # type: ignore
 _SCRIPT_DIR = Path(__file__).resolve().parent
 if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
+import ir_fixture_contract  # noqa: E402
 from ir_worker_aov_contract import required_aov_sources  # noqa: E402
+
+# The fixture classifier and its colour-temperature conversion live with the
+# other renderer-independent contracts; the worker only needs blackbody here.
+_NAV_SRC = _SCRIPT_DIR.parents[1] / "modules" / "navigation_dataset" / "src"
+if str(_NAV_SRC) not in sys.path:
+    sys.path.insert(0, str(_NAV_SRC))
+from navigation_dataset import ir_indoor_fixtures  # noqa: E402
 
 
 _REC709 = (0.2126, 0.7152, 0.0722)
@@ -226,6 +234,18 @@ def _lighting_state(scene):
                 "energy": float(obj.data.energy),
                 "ambient_fill": bool(obj.data.get("ir_ambient_fill", False)),
                 "location": tuple(float(v) for v in obj.matrix_world.translation),
+                # Fixture identity must be captured here: the snapshot is taken
+                # once at worker start and is the only baseline a task sees.
+                "fixture_id": str(obj.data.get("ir_fixture_id") or ""),
+                "fixture_group": str(obj.data.get("ir_fixture_group") or ""),
+                "room_id": str(obj.data.get("ir_fixture_room_id") or ""),
+                "base_energy_w": float(obj.data.get("ir_base_energy_w", obj.data.energy)),
+                # Captured so every task can restore it.  _set_lighting never
+                # touched hide_render before; once a condition starts switching
+                # fixtures off, an unrestored flag would darken every later
+                # frame this resident worker renders.
+                "hide_render": bool(obj.hide_render),
+                "external_portal": bool(obj.data.get("ir_external_portal", False)),
             }
     world = []
     if scene.world and scene.world.use_nodes and scene.world.node_tree:
@@ -244,9 +264,58 @@ def _set_lighting(scene, state, *, nir: bool, ambient_fill_energy_scale: float, 
     side_axis = recipe.get("side_axis_xy") or (1.0, 0.0)
     side_center = recipe.get("side_center_xy") or (0.0, 0.0)
     side_key = bool(recipe.get("side_key", False))
+
+    # Per-fixture switching, when the condition asks for it.  Resolution is a
+    # pure hash of the spec plus the rig identity, so the plan can carry the
+    # specification without knowing which fixtures a scene has.
+    spec = recipe.get("fixtures")
+    resolved: dict[str, dict] = {}
+    if spec:
+        rig_digest = str(bpy.context.scene.get("ir_indoor_fixture_rig_digest") or "")
+        # Portals are installed after the fixture pass and are never switchable
+        # here -- _set_environment owns their energy -- so they carry no fixture
+        # id by design and must not count as an untagged light.
+        missing = [n for n, r in lights.items()
+                   if not r.get("fixture_id") and not r.get("external_portal")]
+        if not rig_digest or missing:
+            raise RuntimeError(
+                "lighting recipe requests per-fixture control but the prepared blend has no "
+                f"addressable fixture rig (digest={rig_digest!r}, untagged lights={len(missing)}); "
+                "re-prepare with --fixture-policy addressable_v2"
+            )
+        resolved = ir_fixture_contract.resolve_fixture_subset(
+            [dict(record, fixture_id=record["fixture_id"], group=record["fixture_group"],
+                  room_id=record["room_id"]) for record in lights.values()],
+            spec,
+            scene_id=str(recipe.get("scene_id") or bpy.context.scene.get("ir_stage1_scene_id") or ""),
+            condition_id=str(recipe.get("id") or ""),
+            rig_digest=rig_digest,
+            blackbody=ir_indoor_fixtures.blackbody_linear_rgb,
+        )["fixtures"]
+
     for name, record in lights.items():
         obj = bpy.data.objects.get(name)
         if obj is None or obj.type != "LIGHT":
+            continue
+        # Restore the prepared visibility first: absolute values are always
+        # re-derived from the baseline, never compounded across tasks.
+        obj.hide_render = bool(record.get("hide_render", obj.hide_render))
+        fixture = resolved.get(str(record.get("fixture_id") or ""))
+        if fixture is not None:
+            base_rgb = fixture.get("color_linear_rgb") or record["color"]
+            color = tuple(float(base_rgb[index]) * color_multiplier[index] for index in range(3))
+            if fixture["on"]:
+                obj.hide_render = False
+                obj.data.energy = (float(record.get("base_energy_w", record["energy"]))
+                                   * float(fixture["energy_scale"]) * native_scale)
+            else:
+                obj.hide_render = True
+                obj.data.energy = 0.0
+            if nir:
+                y = _luminance(color)
+                obj.data.color = (y, y, y)
+            else:
+                obj.data.color = color[:3]
             continue
         color = tuple(record["color"][index] * color_multiplier[index] for index in range(3))
         energy = record["energy"] * native_scale
@@ -642,7 +711,7 @@ def _pass_stats(scene) -> dict:
 
 
 def _publish(staging: Path, out: Path, frame_id: str, task: dict, timings: dict, qc: dict,
-             *, width: int, height: int) -> dict:
+             *, width: int, height: int, write_diffuse_decomposition: bool) -> dict:
     passive_only = str(task.get("render_mode") or "") == "nir_passive_only"
     passive_enabled = bool(task.get("nir_passive") or (not passive_only and task.get("nir_passive_enabled")))
     paths = {}
@@ -653,12 +722,12 @@ def _publish(staging: Path, out: Path, frame_id: str, task: dict, timings: dict,
         passive_stems = ("nir_passive",) if passive_enabled else ()
         exr_stems = {
             "rgb", "nir_active", *passive_stems,
-            *((stem for stems in _DIFFUSE_EXR_STEMS.values() for stem in stems) if args.write_diffuse_decomposition else ()),
+            *((stem for stems in _DIFFUSE_EXR_STEMS.values() for stem in stems) if write_diffuse_decomposition else ()),
         }
         stems = [
             "rgb", "nir_active", *passive_stems, *_GT_SPECS.keys(),
-            *((stem for stems in _DIFFUSE_EXR_STEMS.values() for stem in stems) if args.write_diffuse_decomposition else ()),
-            *((stem for stems in _DIFFUSE_PNG_STEMS.values() for stem in stems) if args.write_diffuse_decomposition else ()),
+            *((stem for stems in _DIFFUSE_EXR_STEMS.values() for stem in stems) if write_diffuse_decomposition else ()),
+            *((stem for stems in _DIFFUSE_PNG_STEMS.values() for stem in stems) if write_diffuse_decomposition else ()),
         ]
     for stem in stems:
         suffix = ".exr" if stem in exr_stems else ".png"
@@ -793,7 +862,8 @@ def _render_task(scene, args, lighting_state, task: dict) -> dict:
         if passive_only:
             qc = _pass_stats(scene)
             return _publish(staging, args.out, frame_id, task, timings, qc,
-                            width=args.width, height=args.height)
+                            width=args.width, height=args.height,
+                            write_diffuse_decomposition=args.write_diffuse_decomposition)
 
         _place_flash(camera, enabled=True, energy_scale=args.flash_energy_scale)
         _setup_nir_compositor(scene, staging, frame_id, qc_components=args.qc_components,
@@ -809,7 +879,8 @@ def _render_task(scene, args, lighting_state, task: dict) -> dict:
         timings["nir_active"] = time.perf_counter() - started
         qc = _pass_stats(scene)
         row = _publish(staging, args.out, frame_id, task, timings, qc,
-                       width=args.width, height=args.height)
+                       width=args.width, height=args.height,
+                       write_diffuse_decomposition=args.write_diffuse_decomposition)
         return row
     finally:
         if staging.exists():
