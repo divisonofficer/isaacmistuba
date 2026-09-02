@@ -786,13 +786,25 @@ def _make_material(
     _aov(tree, "GT_Roughness", effective_roughness, kind="VALUE")
     _aov(tree, "GT_Metallic", effective_metallic, kind="VALUE")
     family = str(metallic_contract["family"])
-    family_id = METALLIC_FAMILY_IDS[family]
     # An augmented slot keeps the conductor identity of the family it came from,
     # so metal_coverage_mask stays the same binary membership mask it always was.
     membership_family = (
         str((metallic_contract.get("augmentation") or {}).get("source_family") or family)
         if family == CONTINUOUS_METALLIC_FAMILY else family
     )
+    # The AOV reports the *physical* family, never continuous_composite.
+    #
+    # GT_MetallicFamilyID is declared categorical_uint8 but is rendered as a
+    # filtered value pass, so a silhouette between two materials interpolates
+    # between their ids.  With ids 0..2 that already fabricated a spurious 1;
+    # emitting 3 here widened the span so every boundary manufactured both 1 and
+    # 2, measured at 0.41% of defined pixels on a QC render.  An augmented
+    # conductor is still a conductor, so reporting the source family keeps the
+    # rendered range at 0..2 and adds no new ambiguity.  That a slot was
+    # augmented is carried per-dataset by the contract's metallic_augmentation
+    # block and per-pixel by GT_MetallicSourceBinary; family id 3 remains the
+    # contract-level identity only.
+    family_id = METALLIC_FAMILY_IDS[membership_family]
     family_membership = _value_constant(
         tree, float(membership_family in {"conductor", "coverage_mixed"}),
     )
@@ -1287,7 +1299,11 @@ def main() -> int:
             "base_color_nir": "effective Principled Base Color selected NIR branch",
             "roughness": "effective Principled Roughness input",
             "metallic": "raw effective Principled Metallic input (linear Non-Color; no GT-only correction)",
-            "metallic_family_id": "0 dielectric; 1 conductor; 2 coverage_mixed",
+            "metallic_family_id": ("0 dielectric; 1 conductor; 2 coverage_mixed. An augmented "
+                                   "(continuous_composite) slot reports the source family it was "
+                                   "derived from, so this pass never carries family id 3; the "
+                                   "augmentation is declared per-dataset in metallic_augmentation "
+                                   "and per-pixel by metallic_source_binary."),
             "metal_coverage_mask": "membership in a conductor or coverage-mixed material family",
             "exposed_metal_mask": "effective exposed conductor coverage; equals effective metallic for coverage_mixed",
             "normal_geometry_world": "Geometry.True Normal in world space",

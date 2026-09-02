@@ -453,7 +453,9 @@ def _artifact_contract(args: argparse.Namespace, material_contract: dict, finger
             "base_color_rgb": "linear_unorm16", "base_color_nir": "linear_unorm16",
             "roughness": "perceptual_roughness_unorm16",
             "metallic": "raw_effective_principled_metallic_linear_unorm16",
-            "metallic_family_id": "uint8 categorical: 0 dielectric, 1 conductor, 2 coverage_mixed",
+            "metallic_family_id": ("uint8 categorical: 0 dielectric, 1 conductor, 2 coverage_mixed; "
+                                   "an augmented slot reports its source family, so id 3 never "
+                                   "appears here"),
             "normal_geometry_world": "xyz_signed_to_unorm16",
             "normal_shading_world": "xyz_signed_to_unorm16",
             "depth": "camera_z_millimeters_u16", "range": "ray_range_millimeters_u16",
