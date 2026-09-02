@@ -73,13 +73,18 @@ def _validate_output(directory: Path) -> dict:
         "base_color_rgb", "base_color_nir", "roughness", "metallic",
         "normal_geometry_world", "normal_shading_world",
     }
+    # See the queue's matching gate: v3 is accepted only when the prepared
+    # contract declares the augmentation policy it was compiled with.
+    allow_continuous_metallic = bool(contract.get("metallic_augmentation"))
     for record in contract["materials"]:
         effective = record.get("effective_inputs")
         if not isinstance(effective, dict) or set(effective) != required_effective:
             raise RuntimeError("Principled Stage 2 material lacks the effective-input audit")
         if not all(isinstance(effective[name], dict) and effective[name].get("route") for name in required_effective):
             raise RuntimeError("Principled Stage 2 material has an invalid effective-input audit")
-        valid, failures = validate_metallic_contract(record.get("metallic_contract"))
+        valid, failures = validate_metallic_contract(
+            record.get("metallic_contract"), allow_v3=allow_continuous_metallic,
+        )
         if not valid:
             raise RuntimeError(
                 f"Principled Stage 2 material {record.get('material_id')} has invalid MetallicContractV2: "

@@ -147,3 +147,111 @@ def test_ceiling_softbox_policy_scales_to_four_panels_for_large_rooms():
     specs = ceiling_softbox_specs([0.0, 0.0, 12.0, 10.0])
     assert len(specs) == 4
     assert all(0.8 <= value <= 2.2 for spec in specs for value in spec["size_m"])
+
+
+def _v2_contract(family: str = "conductor", **extra):
+    return {
+        "schema": "robomituba.metallic_contract.v2",
+        "family": family,
+        "representation": "spatial_texture" if family == "coverage_mixed" else "scalar",
+        "encoding": "linear_scalar",
+        "color_space": "non_color",
+        "source": "original",
+        "approximation": "principled_coverage" if family == "coverage_mixed" else "none",
+        "generator_id": "legacy_pure_conductor_v1",
+        "seed": 0,
+        "legacy_inferred": False,
+        **extra,
+    }
+
+
+def _augmentation(**extra):
+    return {
+        "policy_id": "metallic_composition_v1",
+        "policy_digest": "d" * 64,
+        "node_graph_version": "metallic_aug_nodes_v1",
+        "seed": 7,
+        "material_seed": 1234567,
+        "source_family": "conductor",
+        "source_representation": "scalar",
+        "semantic_class": "none",
+        "composition_class": "metal_hardware",
+        "composition_evidence": ["faucet"],
+        "source_material": "sink_faucet_chrome",
+        "parameters": {"coat_centre": 0.15, "exposed_threshold": 0.7},
+        **extra,
+    }
+
+
+def test_v2_metallic_contract_still_validates_and_v3_is_refused_by_default() -> None:
+    """Three production call sites validate published contracts with no kwargs.
+
+    Defaulting ``allow_v3`` on would silently widen the acceptance surface of
+    every existing dataset, so the default must keep refusing v3.
+    """
+    from navigation_dataset.ir_principled import validate_metallic_contract as validate
+
+    assert validate(_v2_contract()) == (True, [])
+    assert validate(_v2_contract("coverage_mixed")) == (True, [])
+    assert validate(_v2_contract("dielectric", approximation="none")) == (True, [])
+
+    v3 = {"schema": "robomituba.metallic_contract.v3"}
+    assert validate(v3) == (False, ["invalid_schema"])
+    # v2 payloads are unaffected by the opt-in flag.
+    assert validate(_v2_contract(), allow_v3=True) == (True, [])
+
+
+def test_v3_continuous_contract_requires_full_augmentation_provenance() -> None:
+    from navigation_dataset.ir_principled import (
+        validate_metallic_contract as validate, wrap_continuous_metallic_contract,
+    )
+
+    contract = wrap_continuous_metallic_contract(_v2_contract(), _augmentation())
+    assert validate(contract, allow_v3=True) == (True, [])
+
+    for key in ("policy_id", "material_seed", "source_family", "parameters", "composition_class"):
+        broken = wrap_continuous_metallic_contract(
+            _v2_contract(), {k: v for k, v in _augmentation().items() if k != key},
+        )
+        valid, failures = validate(broken, allow_v3=True)
+        assert not valid and f"missing_augmentation_{key}" in failures, key
+
+    missing_source = dict(contract)
+    missing_source.pop("source_contract")
+    valid, failures = validate(missing_source, allow_v3=True)
+    assert not valid and "missing_source_contract" in failures
+
+
+def test_wrapping_retains_the_v2_payload_verbatim() -> None:
+    """The binary label must stay recoverable for a label-level ablation.
+
+    Generated conductors (``rich_metal``) carry extra keys the wrapper never
+    knows about; keeping the whole v2 dict rather than rebuilding it preserves
+    them, and preserves the authored contract a rebuild would have to guess.
+    """
+    from navigation_dataset.ir_principled import wrap_continuous_metallic_contract
+
+    authored = _v2_contract(profile="brushed", parameter_digest="a" * 64)
+    contract = wrap_continuous_metallic_contract(authored, _augmentation())
+    assert contract["source_contract"] == authored
+    assert contract["source_contract"]["profile"] == "brushed"
+    assert contract["source_contract"]["parameter_digest"] == "a" * 64
+    assert contract["generator_id"] == "metallic_composition_v1::legacy_pure_conductor_v1"
+    assert contract["seed"] == 1234567
+
+
+def test_a_dielectric_is_never_promoted_by_the_wrapper() -> None:
+    from navigation_dataset.ir_principled import wrap_continuous_metallic_contract
+
+    dielectric = _v2_contract("dielectric")
+    assert wrap_continuous_metallic_contract(dielectric, _augmentation()) == dielectric
+
+
+def test_metallic_family_ids_are_append_only() -> None:
+    """0/1/2 are baked into a published categorical uint8 AOV."""
+    from navigation_dataset.ir_principled import METALLIC_FAMILY_IDS
+
+    assert METALLIC_FAMILY_IDS["dielectric"] == 0
+    assert METALLIC_FAMILY_IDS["conductor"] == 1
+    assert METALLIC_FAMILY_IDS["coverage_mixed"] == 2
+    assert METALLIC_FAMILY_IDS["continuous_composite"] == 3

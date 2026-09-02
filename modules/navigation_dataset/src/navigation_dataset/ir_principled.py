@@ -17,9 +17,28 @@ import numpy as np
 MATERIAL_CONTRACT_SCHEMA = "robomituba.ir_principled_material_contract.v4"
 MATERIAL_CONTRACT_VERSION = "blender42-principled-metallic-roughness-v4"
 STAGE2_COMPILER_VERSION = "ir-principled-stage2-v12-render-visibility-contract"
-METALLIC_CONTRACT_SCHEMA = "robomituba.metallic_contract.v2"
+METALLIC_CONTRACT_SCHEMA_V2 = "robomituba.metallic_contract.v2"
+METALLIC_CONTRACT_SCHEMA_V3 = "robomituba.metallic_contract.v3"
+#: v2 remains the default written and the only schema accepted without opt-in.
+METALLIC_CONTRACT_SCHEMA = METALLIC_CONTRACT_SCHEMA_V2
 METALLIC_CONTRACT_FAMILIES = ("dielectric", "conductor", "coverage_mixed")
-METALLIC_FAMILY_IDS = {"dielectric": 0, "conductor": 1, "coverage_mixed": 2}
+#: v3 adds one family for augmented, continuously-valued metalness.
+CONTINUOUS_METALLIC_FAMILY = "continuous_composite"
+CONTINUOUS_METALLIC_REPRESENTATION = "continuous_spatial_field"
+CONTINUOUS_METALLIC_APPROXIMATION = "disney_metallic_composition_v1"
+METALLIC_CONTRACT_FAMILIES_V3 = (*METALLIC_CONTRACT_FAMILIES, CONTINUOUS_METALLIC_FAMILY)
+#: Append-only.  These ids are baked into the published ``metallic_family_id``
+#: categorical uint8 AOV, so renumbering 0/1/2 would silently corrupt the labels
+#: of every existing dataset with no error anywhere.
+METALLIC_FAMILY_IDS = {"dielectric": 0, "conductor": 1, "coverage_mixed": 2,
+                       CONTINUOUS_METALLIC_FAMILY: 3}
+#: Provenance keys a v3 ``augmentation`` block must carry for the augmented
+#: label to be reproducible from the dataset fingerprint alone.
+CONTINUOUS_METALLIC_AUGMENTATION_KEYS = (
+    "policy_id", "policy_digest", "node_graph_version", "seed", "material_seed",
+    "source_family", "source_representation", "semantic_class", "composition_class",
+    "parameters",
+)
 PSEUDO_NIR_FORMULA_ID = "pseudo_max_complement_bt601_v1"
 PSEUDO_NIR_WEIGHTS = np.asarray((0.229, 0.587, 0.114), dtype=np.float32)
 LUMINANCE_WEIGHTS = np.asarray((0.2126, 0.7152, 0.0722), dtype=np.float32)
@@ -211,12 +230,80 @@ def pbr_for_slot(unit: Mapping[str, Any], slot: int | None = None) -> Mapping[st
     return value if isinstance(value, Mapping) else {}
 
 
-def validate_metallic_contract(value: Mapping[str, Any] | None) -> tuple[bool, list[str]]:
-    """Validate the strict, renderer-independent MetallicContractV2 payload."""
+def _validate_continuous_metallic_contract(value: Mapping[str, Any]) -> list[str]:
+    """Validate the v3 continuous-composite payload.
+
+    A continuous metalness is only legitimate when it can be reproduced: the
+    policy that generated it, the per-slot seed, the authored family it was
+    derived from and the coefficients all have to be on the record, and the
+    untouched v2 payload has to be retained so the binary label remains
+    recoverable for an ablation.
+    """
+    failures: list[str] = []
+    family = str(value.get("family") or "")
+    if family != CONTINUOUS_METALLIC_FAMILY:
+        # v3 may still carry an ordinary v2 family verbatim; only the augmented
+        # family gets the extra requirements below.
+        if family not in METALLIC_CONTRACT_FAMILIES_V3:
+            failures.append("invalid_family")
+        return failures
+    if value.get("representation") != CONTINUOUS_METALLIC_REPRESENTATION:
+        failures.append("invalid_representation")
+    if value.get("approximation") != CONTINUOUS_METALLIC_APPROXIMATION:
+        failures.append("invalid_continuous_approximation")
+    if value.get("encoding") != "linear_scalar":
+        failures.append("invalid_encoding")
+    if value.get("color_space") != "non_color":
+        failures.append("metallic_not_non_color")
+    if not str(value.get("generator_id") or ""):
+        failures.append("missing_generator_id")
+    if not isinstance(value.get("seed"), int):
+        failures.append("invalid_seed")
+
+    source = value.get("source_contract")
+    if not isinstance(source, Mapping):
+        failures.append("missing_source_contract")
+    else:
+        valid, source_failures = validate_metallic_contract(source)
+        if not valid:
+            failures.extend(f"source_contract:{failure}" for failure in source_failures)
+
+    augmentation = value.get("augmentation")
+    if not isinstance(augmentation, Mapping):
+        failures.append("missing_augmentation")
+        return failures
+    for key in CONTINUOUS_METALLIC_AUGMENTATION_KEYS:
+        if key not in augmentation:
+            failures.append(f"missing_augmentation_{key}")
+    if augmentation and not isinstance(augmentation.get("material_seed"), int):
+        failures.append("invalid_augmentation_material_seed")
+    if str(augmentation.get("source_family") or "") not in METALLIC_CONTRACT_FAMILIES:
+        failures.append("invalid_augmentation_source_family")
+    if not isinstance(augmentation.get("parameters"), Mapping):
+        failures.append("invalid_augmentation_parameters")
+    return failures
+
+
+def validate_metallic_contract(
+    value: Mapping[str, Any] | None, *, allow_v3: bool = False,
+) -> tuple[bool, list[str]]:
+    """Validate a renderer-independent metallic contract payload.
+
+    ``allow_v3`` defaults to False on purpose.  Stage-2 preparation, the render
+    queue and the controller all call this with no keyword against contracts
+    that were written long before the augmentation existed; defaulting the flag
+    on would silently widen the acceptance surface of every published dataset.
+    Only a job that explicitly requested augmentation passes ``allow_v3=True``.
+    """
     if not isinstance(value, Mapping):
         return False, ["missing_metallic_contract"]
+    schema = value.get("schema")
+    if schema == METALLIC_CONTRACT_SCHEMA_V3:
+        if not allow_v3:
+            return False, ["invalid_schema"]
+        return (lambda f: (not f, f))(_validate_continuous_metallic_contract(value))
     failures = []
-    if value.get("schema") != METALLIC_CONTRACT_SCHEMA:
+    if schema != METALLIC_CONTRACT_SCHEMA_V2:
         failures.append("invalid_schema")
     family = str(value.get("family") or "")
     if family not in METALLIC_CONTRACT_FAMILIES:
@@ -237,6 +324,42 @@ def validate_metallic_contract(value: Mapping[str, Any] | None) -> tuple[bool, l
     if not isinstance(value.get("seed"), int):
         failures.append("invalid_seed")
     return not failures, failures
+
+
+def wrap_continuous_metallic_contract(
+    contract: Mapping[str, Any], augmentation: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Promote a resolved v2 contract to v3, retaining the v2 payload verbatim.
+
+    This is deliberately a wrapper applied once at the call site rather than a
+    branch inside ``_effective_metallic_contract``.  That function has three
+    return paths, and the *authored* one returns ``dict(authored)`` before any
+    family inference runs -- which is exactly the path taken by the generated
+    ``rich_metal`` conductors, i.e. the highest-value augmentation targets.
+    Wrapping from outside covers every path and, because the v2 payload is kept
+    whole under ``source_contract``, preserves generator-specific extra keys
+    (``profile``, ``projection``, ``parameter_digest``) that a rebuild would drop.
+
+    A dielectric is returned untouched: the authored binary family is a trusted
+    prior, so a non-conductor slot is never promoted into metal.
+    """
+    family = str(contract.get("family") or "")
+    if family not in {"conductor", "coverage_mixed"}:
+        return dict(contract)
+    return {
+        "schema": METALLIC_CONTRACT_SCHEMA_V3,
+        "family": CONTINUOUS_METALLIC_FAMILY,
+        "representation": CONTINUOUS_METALLIC_REPRESENTATION,
+        "approximation": CONTINUOUS_METALLIC_APPROXIMATION,
+        "encoding": contract.get("encoding", "linear_scalar"),
+        "color_space": contract.get("color_space", "non_color"),
+        "source": contract.get("source", "original"),
+        "generator_id": f"{augmentation.get('policy_id')}::{contract.get('generator_id')}",
+        "seed": int(augmentation.get("material_seed", contract.get("seed", 0))),
+        "legacy_inferred": bool(contract.get("legacy_inferred", False)),
+        "source_contract": dict(contract),
+        "augmentation": dict(augmentation),
+    }
 
 
 def metallic_contract_for_slot(unit: Mapping[str, Any], slot: int | None = None) -> Mapping[str, Any] | None:

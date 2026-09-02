@@ -117,9 +117,16 @@ def _validate_prepared_contract(contract: dict) -> None:
         raise RuntimeError("prepared Stage 2 lacks the v2 texture-accurate PBR GT audit")
     if any(set((record.get("effective_inputs") or {})) != _REQUIRED_EFFECTIVE_INPUTS for record in records):
         raise RuntimeError("prepared Stage 2 lacks the v2 texture-accurate PBR GT audit")
+    # A continuous-metallic contract is accepted only when the prepared scene
+    # itself declares the augmentation policy it was built with.  A contract
+    # without that block can never validate v3, so published datasets keep the
+    # exact acceptance surface they were verified under.
+    allow_continuous_metallic = bool(contract.get("metallic_augmentation"))
     invalid = []
     for record in records:
-        valid, failures = validate_metallic_contract(record.get("metallic_contract"))
+        valid, failures = validate_metallic_contract(
+            record.get("metallic_contract"), allow_v3=allow_continuous_metallic,
+        )
         if not valid:
             invalid.append(f"{record.get('material_id', '?')}:{','.join(failures)}")
     if invalid:
