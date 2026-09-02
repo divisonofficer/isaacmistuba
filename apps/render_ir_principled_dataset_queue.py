@@ -67,6 +67,11 @@ COMPATIBLE_PREVIOUS_WORKER_SHA256 = frozenset({
     # Worker immediately before the passive-NIR extension.  Keeping this
     # explicit lets legacy queues resume without changing their fingerprint.
     "9a524bb3336dad895abfcfab4398064c9a300a202efad05477eba6d524a8dfc4",
+    # Worker immediately before GT_MetallicSourceBinary was routed.  That AOV is
+    # emitted only when the prepared blend actually carries the socket, which no
+    # published Stage 2 does, so the render equations and every written product
+    # are unchanged for existing datasets and their frames stay adoptable.
+    "67151eed8cd9580fbdf030c7eb43ec25ce767ce78d1f40e3408ba38ecc041eac",
 })
 CORE_REQUIRED_MODALITIES = {
     "rgb", "nir_active", "base_color_rgb", "base_color_nir", "roughness", "metallic", "metallic_family_id",

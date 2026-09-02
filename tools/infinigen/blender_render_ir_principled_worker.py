@@ -36,6 +36,9 @@ _GT_SPECS = {
     "metallic_family_id": ("GT_MetallicFamilyID", "BW", "8", "categorical_uint8"),
     "metal_coverage_mask": ("GT_MetalCoverage", "BW", "8", "binary_mask_u8"),
     "exposed_metal_mask": ("GT_ExposedMetal", "BW", "8", "binary_mask_u8"),
+    # Present only on a Stage 2 built with the continuous-metalness policy: the
+    # pre-augmentation binary, so a label-level ablation needs no second render.
+    "metallic_source_binary": ("GT_MetallicSourceBinary", "BW", "16", "unorm16"),
     "normal_geometry_world": ("GT_GeometryNormalWorld", "RGB", "16", "xyz_signed_to_unorm16"),
     "normal_shading_world": ("GT_ShadingNormalWorld", "RGB", "16", "xyz_signed_to_unorm16"),
     # Cycles' Z pass is camera-to-surface ray distance.  The parent derives
@@ -55,7 +58,10 @@ _GT_SPECS = {
 # Older v3 prepared blends predate the optional remediation/provenance AOVs.
 # They remain valid for the core PBR contract; the renderer synthesizes these
 # optional channels below rather than rejecting an otherwise usable scene.
-_OPTIONAL_AOV_SOURCES = frozenset({"GT_Remediated", "GT_PBRProvenance"})
+# GT_MetallicSourceBinary joins these because an un-augmented Stage 2 -- every
+# published one -- legitimately has no such socket.  It must never become a core
+# required modality or existing datasets fail their completeness check.
+_OPTIONAL_AOV_SOURCES = frozenset({"GT_Remediated", "GT_PBRProvenance", "GT_MetallicSourceBinary"})
 _DIFFUSE_EXR_STEMS = {
     "rgb": ("diffuse_transport_rgb", "diffuse_component_rgb"),
     "nir": ("diffuse_transport_nir", "diffuse_component_nir"),
