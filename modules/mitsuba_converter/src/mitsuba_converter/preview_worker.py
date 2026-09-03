@@ -61,8 +61,9 @@ import sys
 import threading
 import time
 import traceback
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 _HEARTBEAT_INTERVAL_S = 5.0
@@ -818,14 +819,76 @@ def _dispatch_render_job(job_id: str, spec: dict[str, Any]) -> None:
     })
 
 
+class _SavePipeline:
+    """One-deep pipeline that overlaps a batch's host-side tail with the next
+    batch's GPU render.
+
+    At K=12 a batch cycle is ~32 s of GPU render followed by ~7 s during which
+    the GPU is idle while the host saves products and writes manifests. Handing
+    that tail to a background thread lets the worker return to its stdin loop
+    immediately, so the next render starts while the previous batch drains.
+
+    Depth is deliberately one: a second pending tail would let saves fall
+    arbitrarily far behind the renders and grow host memory without bound. The
+    ``completed`` event for a batch is emitted by the thread that finishes it,
+    never before its files exist, so a crash mid-tail leaves the batch unmarked
+    and the ledger retries it -- the same outcome as a crash mid-render.
+    """
+
+    def __init__(self) -> None:
+        self._pending: Future[None] | None = None
+        self._pool: ThreadPoolExecutor | None = None
+        self._lock = threading.Lock()
+
+    @property
+    def enabled(self) -> bool:
+        return _env_flag("ROBOMITUBA_POLAR_SAVE_PIPELINE", "0")
+
+    def _ensure_pool(self) -> ThreadPoolExecutor:
+        if self._pool is None:
+            self._pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="polar-tail")
+        return self._pool
+
+    def drain(self, timeout: float | None = None) -> None:
+        """Block until the outstanding tail (if any) has finished."""
+        with self._lock:
+            pending = self._pending
+        if pending is None:
+            return
+        try:
+            pending.result(timeout=timeout)
+        except Exception:
+            # The tail reports its own failure through _emit_failed; re-raising
+            # here would misattribute it to whichever job is running now.
+            pass
+        with self._lock:
+            if self._pending is pending:
+                self._pending = None
+
+    def submit(self, fn: Callable[[], None]) -> None:
+        """Run ``fn`` in the background after the previous tail has drained."""
+        self.drain()
+        future = self._ensure_pool().submit(fn)
+        with self._lock:
+            self._pending = future
+
+
+_SAVE_PIPELINE = _SavePipeline()
+
+
 def _dispatch_stokes_heading_batch(job_id: str, spec: dict[str, Any]) -> None:
     """Execute one passive K=2..4 Stokes batch and fan out bundle manifests."""
     from .observation_bridge import render_timestep_bundle_stokes_heading_batch
     from robomituba_bridge import render_request_from_payload
 
     payloads = spec.get("request_payloads")
-    if not isinstance(payloads, list) or not 2 <= len(payloads) <= 4 or not all(isinstance(item, dict) for item in payloads):
-        _emit_failed(job_id, "bad_request", "stokes_heading_batch requires 2..4 request payloads")
+    from .polar_heading_batch import MIN_STOKES_HEADING_BATCH_SLOTS, max_stokes_heading_batch_slots
+    max_slots = max_stokes_heading_batch_slots()
+    if (not isinstance(payloads, list)
+            or not MIN_STOKES_HEADING_BATCH_SLOTS <= len(payloads) <= max_slots
+            or not all(isinstance(item, dict) for item in payloads)):
+        _emit_failed(job_id, "bad_request",
+                     f"stokes_heading_batch requires {MIN_STOKES_HEADING_BATCH_SLOTS}..{max_slots} request payloads")
         return
     repo_root_str = spec.get("repo_root")
     variant = str(spec.get("variant") or "")
@@ -850,6 +913,7 @@ def _dispatch_stokes_heading_batch(job_id: str, spec: dict[str, Any]) -> None:
             _emit(event)
 
         previous_env: dict[str, str | None] = {}
+        pipelined = _SAVE_PIPELINE.enabled
         try:
             env_overrides = spec.get("env_overrides")
             if isinstance(env_overrides, dict):
@@ -861,11 +925,12 @@ def _dispatch_stokes_heading_batch(job_id: str, spec: dict[str, Any]) -> None:
             if bool(spec.get("disable_cuda")) or _env_flag(ENV_FULL_RENDER_DISABLE_CUDA):
                 previous_env.setdefault("ROBOMITUBA_DISABLE_CUDA", os.environ.get("ROBOMITUBA_DISABLE_CUDA"))
                 os.environ["ROBOMITUBA_DISABLE_CUDA"] = "1"
-            manifests = render_timestep_bundle_stokes_heading_batch(
+            rendered = render_timestep_bundle_stokes_heading_batch(
                 requests,
                 repo_root=Path(str(repo_root_str)),
                 variant=variant,
                 progress_callback=_progress,
+                defer=pipelined,
             )
         except Exception as exc:
             elapsed_ms = int((time.perf_counter() - t_start) * 1000.0)
@@ -879,15 +944,33 @@ def _dispatch_stokes_heading_batch(job_id: str, spec: dict[str, Any]) -> None:
                 else:
                     os.environ[key] = previous
 
-    elapsed_ms = int((time.perf_counter() - t_start) * 1000.0)
-    manifest_paths = [f"{item.bundle_root}/manifest.json" for item in manifests]
-    _emit({
-        "job_id": job_id,
-        "type": "completed",
-        "manifest_path": manifest_paths[0],
-        "manifest_paths": manifest_paths,
-        "elapsed_ms": elapsed_ms,
-    })
+    def _publish(manifests: list[Any]) -> None:
+        elapsed_ms = int((time.perf_counter() - t_start) * 1000.0)
+        manifest_paths = [f"{item.bundle_root}/manifest.json" for item in manifests]
+        _emit({
+            "job_id": job_id,
+            "type": "completed",
+            "manifest_path": manifest_paths[0],
+            "manifest_paths": manifest_paths,
+            "elapsed_ms": elapsed_ms,
+        })
+
+    if not pipelined:
+        _publish(rendered)
+        return
+
+    def _finish_in_background() -> None:
+        try:
+            _publish(rendered())
+        except Exception as exc:
+            elapsed_ms = int((time.perf_counter() - t_start) * 1000.0)
+            tb_tail = "\n".join(traceback.format_exc().splitlines()[-12:])
+            _emit_failed(
+                job_id, "render_exception",
+                f"{type(exc).__name__}: {exc}\n{tb_tail}", elapsed_ms=elapsed_ms,
+            )
+
+    _SAVE_PIPELINE.submit(_finish_in_background)
 
 
 def _dispatch_active_stokes_heading_cohort(job_id: str, spec: dict[str, Any]) -> None:
@@ -896,8 +979,13 @@ def _dispatch_active_stokes_heading_cohort(job_id: str, spec: dict[str, Any]) ->
     from robomituba_bridge import render_request_from_payload
 
     payloads = spec.get("request_payloads")
-    if not isinstance(payloads, list) or not 2 <= len(payloads) <= 4 or not all(isinstance(item, dict) for item in payloads):
-        _emit_failed(job_id, "bad_request", "active_stokes_heading_cohort requires 2..4 request payloads")
+    from .polar_heading_batch import MIN_STOKES_HEADING_BATCH_SLOTS, max_stokes_heading_batch_slots
+    max_slots = max_stokes_heading_batch_slots()
+    if (not isinstance(payloads, list)
+            or not MIN_STOKES_HEADING_BATCH_SLOTS <= len(payloads) <= max_slots
+            or not all(isinstance(item, dict) for item in payloads)):
+        _emit_failed(job_id, "bad_request",
+                     f"active_stokes_heading_cohort requires {MIN_STOKES_HEADING_BATCH_SLOTS}..{max_slots} request payloads")
         return
     repo_root_str = spec.get("repo_root")
     variant = str(spec.get("variant") or "")
@@ -968,8 +1056,13 @@ def _dispatch_active_stokes_heading_batch(job_id: str, spec: dict[str, Any]) -> 
     from robomituba_bridge import render_request_from_payload
 
     payloads = spec.get("request_payloads")
-    if not isinstance(payloads, list) or not 2 <= len(payloads) <= 4 or not all(isinstance(item, dict) for item in payloads):
-        _emit_failed(job_id, "bad_request", "active_stokes_heading_batch requires 2..4 request payloads")
+    from .polar_heading_batch import MIN_STOKES_HEADING_BATCH_SLOTS, max_stokes_heading_batch_slots
+    max_slots = max_stokes_heading_batch_slots()
+    if (not isinstance(payloads, list)
+            or not MIN_STOKES_HEADING_BATCH_SLOTS <= len(payloads) <= max_slots
+            or not all(isinstance(item, dict) for item in payloads)):
+        _emit_failed(job_id, "bad_request",
+                     f"active_stokes_heading_batch requires {MIN_STOKES_HEADING_BATCH_SLOTS}..{max_slots} request payloads")
         return
     repo_root_str = spec.get("repo_root")
     variant = str(spec.get("variant") or "")
@@ -1141,6 +1234,9 @@ def main(argv: list[str] | None = None) -> int:
                 continue
             _dispatch(request)
     finally:
+        # A tail still draining here has rendered but not yet published; give it
+        # a bounded chance to finish rather than dropping a completed batch.
+        _SAVE_PIPELINE.drain(timeout=300.0)
         stop_event.set()
 
     return 0

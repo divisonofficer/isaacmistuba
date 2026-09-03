@@ -9,6 +9,7 @@ import os
 import re
 import sys
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import tempfile
 import threading
@@ -86,17 +87,56 @@ MODALITY_DEFINITIONS = {
 _PARSED_SCENE_CACHE: dict[tuple[str, int, int], ET.Element] = {}
 _SCENE_TEMPLATE_CACHE: dict[tuple[tuple[str, int, int], str, tuple[Any, ...]], ET.Element] = {}
 _RESIDENT_SCENE_CACHE: "OrderedDict[tuple[str, int, int, str], Any]" = OrderedDict()
-# ``ParameterMap`` instances belong to the same loaded Mitsuba scene as the
-# entry above.  Keeping this sidecar lets the resident K-heading hot path avoid
-# a full ``mi.traverse(scene)`` on every strip.
-_RESIDENT_BATCH_BINDINGS: dict[tuple[str, int, int, str], tuple[Any, tuple[str, ...]]] = {}
+# Resolved ``slot_N.to_world`` parameter *names* for the scene cached above.
+# Only the names are cached: a ParameterMap captured here would go stale the
+# moment dr.freeze replays the scene (it swaps the underlying JIT variables),
+# and writing through the stale map crashed the worker with
+# CUDA_ERROR_ILLEGAL_ADDRESS. Names are pose-independent, so re-traversing per
+# strip is both cheap and safe.
+_RESIDENT_BATCH_BINDINGS: dict[tuple[str, int, int, str], tuple[str, ...]] = {}
+# One ``dr.freeze``-wrapped render callable per resident scene cache entry,
+# keyed a second level by spp (freeze bakes spp into the traced closure).
+# See ``_drjit_freeze_enabled`` for why this stays opt-in.
+_RESIDENT_FROZEN_RENDER_CACHE: dict[tuple[str, int, int, str], dict[int, Any]] = {}
 _STAGED_SCENE_SIGNATURE_CACHE: dict[str, tuple[Any, ...]] = {}
 _SCENE_CACHE_LOCK = threading.Lock()
 _RESIDENT_SCENE_CACHE_LIMIT: int = int(os.environ.get("ROBOMITUBA_SCENE_CACHE_LIMIT", "32"))
 _POLAR_RESIDENT_SCENE_CACHE_LIMIT: int = int(
     os.environ.get("ROBOMITUBA_POLAR_RESIDENT_SCENE_CACHE_LIMIT", "1")
 )
+# Every resident Stokes heading batch is staged at this one slot count so the
+# whole sweep shares a single resident scene -- and therefore a single
+# dr.freeze recording -- instead of thrashing between per-K scene shapes.
+#
+# The count also sets the batch film width (slots * width), and the render
+# wavefront scales with it: K=4 at 512x384x1024spp exhausted a 32 GB card
+# (CUDA_ERROR_OUT_OF_MEMORY, killing the worker and cascading every job it
+# held). Keep this at the largest value that leaves GPU headroom for the
+# resident scene on the target device.
+_RESIDENT_STOKES_HEADING_BATCH_SLOTS: int = int(
+    os.environ.get("ROBOMITUBA_RESIDENT_STOKES_BATCH_SLOTS", "4")
+)
+_RENDER_DRJIT_FREEZE_ENV = "ROBOMITUBA_RENDER_DRJIT_FREEZE"
+# Last stage ("record"/"replay") printed per resident scene, so the worker
+# console shows one line per transition instead of one per frame.
+_FROZEN_RENDER_LOG_STATE: dict[tuple[str, int, int, str], str] = {}
 _last_source_scene_dir: str = ""
+
+
+def _drjit_freeze_enabled() -> bool:
+    """Opt-in Dr.Jit function freezing for resident-scene renders.
+
+    Freezing replays a recorded CUDA kernel graph instead of re-tracing on
+    every call, which only pays off when the scene/sensor structure stays
+    fixed across calls -- the resident heading-batch and camera-aligned polar
+    hot paths that keep one scene object resident and mutate it only through
+    ``mi.traverse()``. Only Device 1's OptiX 8 build exposes ``dr.freeze``
+    reliably; Device 2's OptiX 7 build segfaults when it is exercised. Detect
+    that from the outside instead of hardcoding it: launchers set this
+    per-device (``run_render_queue_local.sh`` on, ``run_render_queue_optix7.sh``
+    off).
+    """
+    return os.environ.get(_RENDER_DRJIT_FREEZE_ENV, "0").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _resident_stokes_heading_batches_enabled() -> bool:
@@ -238,6 +278,10 @@ class RenderConfig:
     polar_color_mode: str = "rgb_stokes_12"
     # ``physical`` is the dataset-quality default: it traces reflected and
     # transmitted background transport through the nested path integrator.
+    # ``physical_volpath`` is an opt-in control for scenes with a small
+    # polarized emitter / polarizer topology. It is deliberately not the
+    # default: the extra medium transport is useful for validating that setup,
+    # but is materially more expensive for production sweeps.
     # ``preview`` retains the inexpensive direct-light diagnostic path.
     polar_transport: str = "physical"
     path_max_depth: int = 6
@@ -306,8 +350,10 @@ class RenderConfig:
 
     def __post_init__(self) -> None:
         self.polar_transport = str(self.polar_transport or "physical").strip().lower()
-        if self.polar_transport not in {"physical", "preview"}:
-            raise ValueError("polar_transport must be one of: physical, preview")
+        if self.polar_transport not in {"physical", "physical_volpath", "preview"}:
+            raise ValueError(
+                "polar_transport must be one of: physical, physical_volpath, preview"
+            )
         self.polar_color_mode = str(self.polar_color_mode or "rgb_stokes_12").strip().lower()
         if self.polar_color_mode not in {"rgb_stokes_12", "legacy_auto"}:
             raise ValueError("polar_color_mode must be one of: rgb_stokes_12, legacy_auto")
@@ -364,6 +410,8 @@ def _polar_transport_integrator(config: "RenderConfig") -> tuple[str, int]:
     """Resolve the nested Stokes integrator from the public transport mode."""
     if config.polar_transport == "physical":
         return "path", int(config.path_max_depth)
+    if config.polar_transport == "physical_volpath":
+        return "volpath", int(config.path_max_depth)
     return "direct", int(config.direct_max_depth)
 
 
@@ -911,6 +959,10 @@ def _substitute_measured_bsdfs_with_diffuse(root: ET.Element, *, reflectance: st
 _MEASURED_SCOPES = {"analytic_only", "analytic_priority", "budgeted_measured", "measured_full"}
 _PRIORITY_MEASURED_ROLES = {"forced", "target", "anchor"}
 _MEASURED_SCOPE_STAGE_VERSION = "measured-scope-v3"
+# Dynamic active-polar scenes update the source sensor through ``mi.traverse``.
+# Give staged sensors a stable XML id and version their shared scene path so an
+# old, anonymous base scene cannot be reused after that contract changed.
+_DYNAMIC_SCENE_SENSOR_BINDING_STAGE_VERSION = "dynamic-sensor-binding-v3"
 
 
 def _resolve_measured_scope(config: "RenderConfig | None") -> str:
@@ -2508,6 +2560,11 @@ def _update_sensor(
     sensor = root.find("./sensor")
     if sensor is None:
         raise RuntimeError("Scene has no sensor")
+    # An unnamed XML sensor is exposed by Mitsuba as ``perspective.to_world``
+    # (rather than ``sensor.to_world``). Dynamic active-polar rendering must
+    # update it after loading, so all newly staged scenes receive a stable
+    # parameter name. Preserve explicit source ids such as ``polar_cam``.
+    sensor.attrib.setdefault("id", "sensor")
 
     sampler = sensor.find("./sampler")
     if sampler is None:
@@ -2799,6 +2856,16 @@ def _stage_stokes_scene(
         return out_scene
 
     def _build_template(root: ET.Element) -> None:
+        # The authored render_scene.xml this stages from never sets a sensor
+        # id, so an unnamed sensor is exposed through an unstable
+        # memory-address-keyed parameter (e.g. ``object_<addr>.to_world``,
+        # not ``perspective.to_world`` as _scene_sensor_transform_parameter_key
+        # otherwise assumes) whenever a resident stokes scene is driven purely
+        # through mi.traverse(). Give it the same stable id _update_sensor
+        # already stamps on other staged copies.
+        sensor = root.find("./sensor")
+        if sensor is not None:
+            sensor.attrib.setdefault("id", "sensor")
         integrator = root.find("./integrator")
         if integrator is None:
             raise RuntimeError("Scene has no integrator node")
@@ -2892,6 +2959,7 @@ def _stage_base_stokes_scene(
             str(measured_scope),
             int(max_measured_bsdfs),
             _MEASURED_SCOPE_STAGE_VERSION,
+            _DYNAMIC_SCENE_SENSOR_BINDING_STAGE_VERSION,
             _material_policy_signature(scene_path),
             reference_axis,
         ),
@@ -2914,6 +2982,16 @@ def _stage_base_stokes_scene(
         return out_scene
 
     def _build_template(root: ET.Element) -> None:
+        # The authored render_scene.xml this stages from never sets a sensor
+        # id, so an unnamed sensor is exposed through an unstable
+        # memory-address-keyed parameter (e.g. ``object_<addr>.to_world``,
+        # not ``perspective.to_world`` as _scene_sensor_transform_parameter_key
+        # otherwise assumes) whenever a resident stokes scene is driven purely
+        # through mi.traverse(). Give it the same stable id _update_sensor
+        # already stamps on other staged copies.
+        sensor = root.find("./sensor")
+        if sensor is not None:
+            sensor.attrib.setdefault("id", "sensor")
         integrator = root.find("./integrator")
         if integrator is None:
             raise RuntimeError("Scene has no integrator node")
@@ -2953,15 +3031,18 @@ def _stage_base_stokes_scene(
             str(measured_scope),
             int(max_measured_bsdfs),
             _MEASURED_SCOPE_STAGE_VERSION,
+            _DYNAMIC_SCENE_SENSOR_BINDING_STAGE_VERSION,
             _material_policy_signature(scene_path),
             reference_axis,
         ),
         builder=_build_template,
     )
     _apply_scene_override(root, scene_override, mode="polar")
-    if assist_light is not None:
-        if camera_fov_deg is None or camera_width is None or camera_height is None:
-            raise ValueError("camera-aligned base Stokes staging requires fov and resolution")
+    if camera_fov_deg is not None and camera_width is not None and camera_height is not None:
+        # This scene's own sensor is the one that renders (its pose is driven
+        # through mi.traverse), so stamp the requesting camera's intrinsics on
+        # it. Without this the render silently falls back to whatever film and
+        # fov the authored scene XML happens to carry.
         _update_sensor(
             root,
             camera_to_world=np.eye(4, dtype=np.float32),
@@ -2970,6 +3051,9 @@ def _stage_base_stokes_scene(
             width=int(camera_width),
             height=int(camera_height),
         )
+    if assist_light is not None:
+        if camera_fov_deg is None or camera_width is None or camera_height is None:
+            raise ValueError("camera-aligned base Stokes staging requires fov and resolution")
         _append_camera_assist_light(
             root,
             np.eye(4, dtype=np.float32),
@@ -3204,7 +3288,7 @@ def _resident_stokes_heading_batch_scene_path(
 ) -> Path:
     """Return a stable K-slot batch XML path suitable for resident caching."""
     signature = (
-        "resident_stokes_heading_batch_v2",
+        "resident_stokes_heading_batch_v4",
         _scene_cache_key(base_scene),
         int(batch_size),
         int(width),
@@ -3524,6 +3608,7 @@ def _load_resident_scene(
     effective_cache_limit = max(1, int(cache_limit or _RESIDENT_SCENE_CACHE_LIMIT))
     evicted_scene: Any | None = None
     evicted_binding: Any | None = None
+    evicted_frozen: Any | None = None
     with _SCENE_CACHE_LOCK:
         cached_scene = _RESIDENT_SCENE_CACHE.get(cache_key)
         if cached_scene is not None:
@@ -3537,8 +3622,9 @@ def _load_resident_scene(
         while len(_RESIDENT_SCENE_CACHE) >= effective_cache_limit:
             evicted_key, evicted_scene = _RESIDENT_SCENE_CACHE.popitem(last=False)
             evicted_binding = _RESIDENT_BATCH_BINDINGS.pop(evicted_key, None)
+            evicted_frozen = _RESIDENT_FROZEN_RENDER_CACHE.pop(evicted_key, None)
 
-    if evicted_scene is not None or evicted_binding is not None:
+    if evicted_scene is not None or evicted_binding is not None or evicted_frozen is not None:
         try:
             import gc
             import drjit as dr  # type: ignore
@@ -3547,6 +3633,7 @@ def _load_resident_scene(
             # now-unreferenced device allocations.
             evicted_scene = None
             evicted_binding = None
+            evicted_frozen = None
             gc.collect()
             dr.sync_thread()
             dr.flush_malloc_cache()
@@ -3569,7 +3656,78 @@ def _clear_scene_caches() -> None:
         _SCENE_TEMPLATE_CACHE.clear()
         _RESIDENT_SCENE_CACHE.clear()
         _RESIDENT_BATCH_BINDINGS.clear()
+        _RESIDENT_FROZEN_RENDER_CACHE.clear()
         _STAGED_SCENE_SIGNATURE_CACHE.clear()
+
+
+def _get_or_build_frozen_render(cache_key: tuple[str, int, int, str], spp: int) -> Any:
+    """Return (building once per resident scene + spp) a ``dr.freeze``-wrapped renderer.
+
+    Caller must guarantee the target scene stays resident and is only mutated
+    through ``mi.traverse()`` between calls -- see ``_drjit_freeze_enabled``.
+    """
+    mi = _import_mitsuba()
+    import drjit as dr  # type: ignore
+
+    with _SCENE_CACHE_LOCK:
+        per_scene = _RESIDENT_FROZEN_RENDER_CACHE.get(cache_key)
+        cached = per_scene.get(spp) if per_scene else None
+    if cached is not None:
+        return cached
+
+    frozen = dr.freeze(
+        lambda active_scene: mi.render(active_scene, spp=spp),
+        backend=dr.JitBackend.CUDA,
+    )
+    with _SCENE_CACHE_LOCK:
+        _RESIDENT_FROZEN_RENDER_CACHE.setdefault(cache_key, {})[spp] = frozen
+    return frozen
+
+
+def _scene_sensor_transform_parameter_key(scene: Any, params: Any) -> str:
+    """Return the writable ``to_world`` parameter for the scene sensor.
+
+    Historically generated Infinigen XMLs often leave the top-level sensor
+    anonymous. Mitsuba exposes that parameter as ``perspective.to_world``;
+    newer staged XMLs name it ``sensor.to_world``. Resolving both forms here
+    lets pending durable tasks use their old staged scene while new stages use
+    the stable name. Explicitly named sensors are supported through the sensor
+    object's id as well.
+    """
+    parameter_names = {str(key) for key in params.keys()}
+    for candidate in (
+        "sensor.to_world",
+        "perspective.to_world",
+        "orthographic.to_world",
+        "thinlens.to_world",
+        "telecentric.to_world",
+    ):
+        if candidate in parameter_names:
+            return candidate
+
+    try:
+        sensors = list(scene.sensors())
+    except Exception:
+        sensors = []
+    for sensor in sensors:
+        identifier = getattr(sensor, "id", None)
+        try:
+            identifier = identifier() if callable(identifier) else identifier
+        except Exception:
+            identifier = None
+        if isinstance(identifier, str) and identifier:
+            candidate = f"{identifier}.to_world"
+            if candidate in parameter_names:
+                return candidate
+
+    available = [
+        key for key in sorted(parameter_names)
+        if key.endswith(".to_world") and ("sensor" in key.lower() or "perspective" in key.lower())
+    ][:16]
+    raise KeyError(
+        "scene sensor transform is not exposed through a known parameter; "
+        f"expected sensor/perspective to_world, available={available}"
+    )
 
 
 def _render_scene(
@@ -3629,7 +3787,7 @@ def _render_scene(
 
         origin, target, up = camera_to_world_to_lookat(scene_viewpoint.camera_to_world)
         _assign_transform(
-            "sensor.to_world",
+            _scene_sensor_transform_parameter_key(scene, params),
             mi.ScalarTransform4f.look_at(
                 origin=list(origin), target=list(target), up=list(up)
             ),
@@ -3697,10 +3855,90 @@ def _render_scene(
     # sequence with itself and incorrectly declare every frame converged.
     if seed is not None:
         render_kwargs["seed"] = int(seed)
-    if sensor is not None:
-        image_tensor = mi.render(scene, sensor=sensor, **render_kwargs)
-    else:
-        image_tensor = mi.render(scene, **render_kwargs)
+    frozen_stage: str | None = None
+    frozen_render_active = False
+    # Freezing only pays off, and only stays safe, on the resident hot paths
+    # that keep the same scene object and mutate it purely through
+    # mi.traverse() (scene_viewpoint above, and the heading-batch slot update
+    # in _render_resident_stokes_heading_batch_scene) -- never on a fresh
+    # per-call sensor object (the ``viewpoint`` branch) or a varying seed,
+    # either of which would defeat kernel-graph reuse. See
+    # _drjit_freeze_enabled for the OptiX 8 vs. OptiX 7 opt-in split.
+    if (
+        sensor is None
+        and seed is None
+        # ``resident_cache_limit`` only narrows the eviction ceiling for the
+        # camera-aligned active-light path -- it is None for the (equally
+        # resident, still traverse-only-mutated) passive K=1 ambient polar
+        # path, which would otherwise be silently excluded from freezing.
+        # The real signal is which updater actually touches the scene:
+        # scene_viewpoint (camera-aligned polar) or scene_parameter_updater
+        # (heading-batch slots) both only call mi.traverse() on the existing
+        # scene object; the one-shot non-resident temp batch scene at the
+        # bottom of render_ambient_stokes_heading_batch() passes neither and
+        # is correctly excluded here.
+        and (scene_viewpoint is not None or scene_parameter_updater is not None)
+        and variant.startswith("cuda_")
+        and _drjit_freeze_enabled()
+    ):
+        scene_cache_key: tuple[str, int, int, str] | None = None
+        try:
+            # ``variant`` is already the concrete resolved variant at this
+            # call layer (every caller resolves "auto" before reaching
+            # _render_scene), so it keys the same resident scene cache entry
+            # _load_resident_scene just populated/reused above.
+            scene_cache_key = _resident_scene_cache_key(scene_path, variant=variant)
+            if not cache_hit:
+                # ``scene_cache_key`` is (path, mtime, size, variant): stable
+                # across a scene *file* being evicted and reloaded, even
+                # though eviction/reload produces a brand-new live mi.Scene
+                # object. A frozen callable recorded against the old object
+                # is invalid for the new one -- reusing it silently corrupts
+                # state until a later call fails deep inside dr.freeze's
+                # record(). Drop any stale entry so this call rebuilds fresh
+                # against the object _load_resident_scene just returned.
+                with _SCENE_CACHE_LOCK:
+                    _RESIDENT_FROZEN_RENDER_CACHE.pop(scene_cache_key, None)
+            frozen_render = _get_or_build_frozen_render(scene_cache_key, spp)
+            previous_recordings = int(frozen_render.n_recordings)
+            image_tensor = frozen_render(scene)
+            frozen_stage = "record" if int(frozen_render.n_recordings) > previous_recordings else "replay"
+            frozen_render_active = True
+            # Log every *record*, not just stage transitions: a scene stuck
+            # re-recording each frame otherwise looks identical to one that
+            # recorded once, which is the difference between freeze paying off
+            # and freeze costing a full trace per frame.
+            if frozen_stage == "record" or _FROZEN_RENDER_LOG_STATE.get(scene_cache_key) != frozen_stage:
+                _FROZEN_RENDER_LOG_STATE[scene_cache_key] = frozen_stage
+                print(
+                    f"[drjit-freeze] {scene_path.name} variant={variant} spp={spp} "
+                    f"stage={frozen_stage} n_recordings={int(frozen_render.n_recordings)}",
+                    file=sys.stderr, flush=True,
+                )
+        except Exception as exc:
+            frozen_render_active = False
+            # A frozen callable that errors once is not safe to keep calling:
+            # dr.freeze's internal recording state is left inconsistent, so a
+            # future call would pay a doomed record attempt every time on top
+            # of the classic mi.render() fallback -- silently double-costing
+            # every remaining frame against this scene. Drop it so the next
+            # call gets a clean dr.freeze() wrapper instead of retrying the
+            # same broken one forever.
+            if scene_cache_key is not None:
+                with _SCENE_CACHE_LOCK:
+                    _RESIDENT_FROZEN_RENDER_CACHE.pop(scene_cache_key, None)
+            if _FROZEN_RENDER_LOG_STATE.get(scene_cache_key) != "failed":
+                _FROZEN_RENDER_LOG_STATE[scene_cache_key] = "failed"
+                print(
+                    f"[drjit-freeze] {scene_path.name} variant={variant} spp={spp} "
+                    f"FAILED, falling back to classic mi.render(): {exc!r}",
+                    file=sys.stderr, flush=True,
+                )
+    if not frozen_render_active:
+        if sensor is not None:
+            image_tensor = mi.render(scene, sensor=sensor, **render_kwargs)
+        else:
+            image_tensor = mi.render(scene, **render_kwargs)
     # ``mi.render`` can return a lazily scheduled Dr.Jit tensor.  Force
     # completion before timing it; without this a later NumPy conversion or
     # product write can accidentally absorb the CUDA work.
@@ -3750,6 +3988,8 @@ def _render_scene(
         "render_s": render_s,
         "resident_allocator_prepare_s": resident_allocator_prepare_s,
         "resident_allocator_flush_s": resident_allocator_flush_s,
+        "drjit_freeze_active": frozen_render_active,
+        "drjit_freeze_stage": frozen_stage,
         "total_s": total_s,
     }
 
@@ -3760,6 +4000,7 @@ def _render_resident_stokes_heading_batch_scene(
     camera_to_worlds: Sequence[np.ndarray],
     variant: str,
     spp: int,
+    on_loaded: Callable[[], None] | None = None,
 ) -> tuple[np.ndarray, dict[str, float]]:
     """Render a stable K-slot Stokes scene after updating its sensor poses.
 
@@ -3774,8 +4015,12 @@ def _render_resident_stokes_heading_batch_scene(
     # flat layout. Resident slot updates consume ordinary row-major matrices;
     # normalize here as a second guard even when callers have already done it.
     poses = [normalize_camera_to_world(item).astype(np.float32) for item in camera_to_worlds]
-    if len(poses) < 2 or len(poses) > 4:
-        raise ValueError("resident Stokes heading batches require 2 to 4 poses")
+    from .polar_heading_batch import MIN_STOKES_HEADING_BATCH_SLOTS, max_stokes_heading_batch_slots
+    if not MIN_STOKES_HEADING_BATCH_SLOTS <= len(poses) <= max_stokes_heading_batch_slots():
+        raise ValueError(
+            f"resident Stokes heading batches require {MIN_STOKES_HEADING_BATCH_SLOTS} to "
+            f"{max_stokes_heading_batch_slots()} poses, got {len(poses)}"
+        )
 
     slot_binding_cache_hit = False
 
@@ -3783,35 +4028,55 @@ def _render_resident_stokes_heading_batch_scene(
         nonlocal slot_binding_cache_hit
         mi = _import_mitsuba()
         cache_key = _resident_scene_cache_key(scene_path, variant=variant)
+        # Re-traverse on every strip and cache only the resolved *key names*.
+        #
+        # Caching the ParameterMap itself was the intended optimisation, but it
+        # is unsafe once dr.freeze replays this scene: a frozen replay swaps the
+        # scene's underlying JIT variables, so a ParameterMap captured before
+        # the replay addresses variables that no longer belong to the live
+        # scene. Writing slot transforms through it corrupted the CUDA context
+        # and killed the worker with CUDA_ERROR_ILLEGAL_ADDRESS. A fresh
+        # mi.traverse() is negligible next to a 1024spp strip render.
+        params = mi.traverse(scene)
         with _SCENE_CACHE_LOCK:
-            binding = _RESIDENT_BATCH_BINDINGS.get(cache_key)
-        if binding is None:
-            params = mi.traverse(scene)
+            cached_keys = _RESIDENT_BATCH_BINDINGS.get(cache_key)
+        if cached_keys is not None and len(cached_keys) == len(poses):
+            slot_binding_cache_hit = True
+            keys = list(cached_keys)
+        else:
             parameter_names = [str(key) for key in params.keys()]
             keys: list[str] = []
             missing: list[str] = []
             for index in range(len(poses)):
-                suffix = f".slot_{index}.to_world"
-                matches = [key for key in parameter_names if key.endswith(suffix)]
+                # Upstream BatchSensor::traverse() keys children by their id
+                # ("heading_NN" as staged here, "sensorN" when unnamed). The
+                # ".slot_N" form is what this project's older patched 3.7.x
+                # renderer exposed; accept both so one renderer build can be
+                # swapped for the other without restaging every batch scene.
+                suffixes = (
+                    f".heading_{index:02d}.to_world",
+                    f".slot_{index}.to_world",
+                    f".sensor{index}.to_world",
+                )
+                matches = [
+                    key for key in parameter_names
+                    if any(key.endswith(suffix) for suffix in suffixes)
+                ]
                 if len(matches) == 1:
                     keys.append(matches[0])
                 else:
-                    missing.append(suffix)
+                    missing.append(suffixes[0])
             if missing:
                 available = [
                     key for key in parameter_names
-                    if "sensor" in key.lower() or "slot_" in key.lower()
+                    if "sensor" in key.lower() or "slot_" in key.lower() or "heading_" in key.lower()
                 ][:32]
                 raise RuntimeError(
                     "resident Stokes batch scene does not expose the expected sensor transforms: "
                     f"missing={missing}; available={available}"
                 )
-            binding = (params, tuple(keys))
             with _SCENE_CACHE_LOCK:
-                _RESIDENT_BATCH_BINDINGS[cache_key] = binding
-        else:
-            slot_binding_cache_hit = True
-        params, keys = binding
+                _RESIDENT_BATCH_BINDINGS[cache_key] = tuple(keys)
         for key, pose in zip(keys, poses):
             origin, target, up = camera_to_world_to_lookat(pose)
             transform = mi.ScalarTransform4f.look_at(
@@ -3833,6 +4098,7 @@ def _render_resident_stokes_heading_batch_scene(
         scene_path,
         variant=variant,
         spp=spp,
+        on_loaded=on_loaded,
         scene_parameter_updater=_update_sensor_slots,
         # A polar worker has scene affinity: retaining a second full OptiX
         # scene buys nothing but makes its VRAM ceiling unpredictable.
@@ -4824,6 +5090,71 @@ def save_polarization_products(
     return summary, arrays
 
 
+def polar_save_worker_count(batch_size: int) -> int:
+    """Threads to use when saving a K-view Stokes strip.
+
+    Measured on the RTX 5090 host at K=12 (512x384, full_v1 policy): 7.5 s
+    serial, 2.9 s at 4 threads, 2.5 s at 8. The curve is flat past ~4 because
+    the residual is GIL-bound Python between the numpy calls, so the default
+    stops there rather than oversubscribing cores the render worker also uses.
+    """
+    try:
+        configured = int(os.environ.get("ROBOMITUBA_POLAR_SAVE_WORKERS", "4"))
+    except (TypeError, ValueError):
+        configured = 4
+    if configured < 1:
+        configured = 1
+    return max(1, min(configured, int(batch_size)))
+
+
+def _save_polarization_products_batch(
+    strips: Sequence[np.ndarray],
+    destinations: Sequence[Path],
+    requested_modalities: set[str],
+    *,
+    visualization_policy: str = "full_v1",
+    progress_callback: Callable[[str, dict[str, Any]], None] | None = None,
+    progress_extra: dict[str, Any] | None = None,
+) -> list[tuple[dict[str, Any], dict[str, np.ndarray]]]:
+    """Save every view of a Stokes strip, in parallel, preserving order.
+
+    Each ``(strip, destination)`` pair is independent -- separate host arrays
+    writing to separate directories -- so the only shared state is the progress
+    callback, which is serialized behind a lock.
+    """
+    count = len(strips)
+    extra = dict(progress_extra or {})
+    if progress_callback is not None:
+        progress_callback("saving_output", {**extra, "batch_index": 0})
+
+    def _save(index: int) -> tuple[dict[str, Any], dict[str, np.ndarray]]:
+        return save_polarization_products(
+            strips[index],
+            destinations[index],
+            requested_modalities,
+            visualization_policy=visualization_policy,
+        )
+
+    workers = polar_save_worker_count(count)
+    if workers <= 1 or count <= 1:
+        return [_save(index) for index in range(count)]
+
+    lock = threading.Lock()
+    done = 0
+
+    def _save_and_report(index: int) -> tuple[dict[str, Any], dict[str, np.ndarray]]:
+        result = _save(index)
+        if progress_callback is not None:
+            nonlocal done
+            with lock:
+                done += 1
+                progress_callback("saving_output", {**extra, "batch_index": done - 1})
+        return result
+
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="polar-save") as pool:
+        return list(pool.map(_save_and_report, range(count)))
+
+
 def materialize_stokes_visualizations(
     stokes_npz: str | Path,
     out_dir: str | Path,
@@ -5613,6 +5944,23 @@ def _polar_variant(base_variant: str, *, color_mode: str = "rgb_stokes_12") -> s
     if color_mode == "rgb_stokes_12":
         # Do not negotiate this from ``auto``: a spectral carrier has different
         # semantics and would silently violate the 12-channel RGB contract.
+        #
+        # Prefer the non-AD rgb-polarized variant: this render never needs
+        # gradients, and the AD variant spends most of its wall time building
+        # a differentiable graph on one CPU core while the GPU sits at ~2%.
+        #
+        # An earlier attempt to switch was reverted because K>=2 resident
+        # heading batches failed with "missing .slot_1.to_world" -- that was
+        # not a variant incompatibility but the batch slot bug (identical
+        # identity placeholders collapsing the child sensors, plus BatchSensor
+        # lacking MI_TRAVERSE_CB), both since fixed. Re-verified on a real K=4
+        # batch scene afterwards: 4 slots exposed, no segfault, and dr.freeze
+        # settles into replay at 0.67 s per 4-view batch (vs ~100 s+ per view
+        # on the AD variant), with slot pose updates correctly applied.
+        from .mitsuba_runtime import available_variants
+
+        if "cuda_rgb_polarized" in available_variants():
+            return "cuda_rgb_polarized"
         return "cuda_ad_rgb_polarized"
     if not base_variant or base_variant in {"auto", "default"}:
         return "auto"
@@ -6811,17 +7159,36 @@ def render_modalities(
         # sensor. This avoids reparsing the complete XML for every heading.
         use_base_polar_scene = _use_scene_reuse and not _polar_active_lights
         use_dynamic_camera_assist = use_base_polar_scene and assist_light is not None
-        polar_viewpoint = _viewpoint if use_base_polar_scene and not use_dynamic_camera_assist else None
-        polar_scene_viewpoint = _viewpoint if use_dynamic_camera_assist else None
+        # Any resident base-Stokes scene (ambient or camera-aligned active
+        # light, base or scene_override-perturbed) always stages an explicit
+        # ``stokes_reference_axis`` a few lines below, so the C++
+        # StokesIntegrator's reference frame comes from that static
+        # world-space property (stokes.cpp: m_has_reference_axis), never from
+        # `m_sensor->world_transform()`. That means whichever sensor object
+        # renders a given call is physically interchangeable here, so every
+        # use_base_polar_scene case can reuse the scene's own sensor via
+        # mi.traverse() (scene_viewpoint) instead of constructing a fresh one
+        # (viewpoint) each call -- which is also what lets _render_scene's
+        # dr.freeze path engage for ambient/perturbed K=1 polar, not just the
+        # active-light case.
+        polar_viewpoint = _viewpoint if not use_base_polar_scene else None
+        polar_scene_viewpoint = _viewpoint if use_base_polar_scene else None
         if use_base_polar_scene:
             scene_polar = _stage_base_stokes_scene(
                 source_scene,
                 samples_per_pass=config.samples_per_pass,
                 scene_override=scene_override,
                 assist_light=assist_light if use_dynamic_camera_assist else None,
-                camera_fov_deg=fov_deg if use_dynamic_camera_assist else None,
-                camera_width=config.width if use_dynamic_camera_assist else None,
-                camera_height=config.height if use_dynamic_camera_assist else None,
+                # The staged scene's own sensor is what actually renders on the
+                # use_base_polar_scene path (its transform is driven through
+                # mi.traverse), so it must carry the *camera's* intrinsics.
+                # Passing these only for the camera-aligned active-light case
+                # silently made ambient/perturbed views inherit the authored
+                # render_scene.xml film instead -- e.g. 640x480 @ fov 60 for a
+                # polar_cam declared as 512x384 @ fov 90.
+                camera_fov_deg=float(fov_deg),
+                camera_width=int(config.width),
+                camera_height=int(config.height),
                 nested_integrator_type=polar_nested,
                 nested_max_depth=polar_max_depth,
                 measured_scope=measured_scope,
@@ -6923,6 +7290,11 @@ def render_modalities(
             "dynamic_camera_assist": bool(use_dynamic_camera_assist),
             "resident_allocator_prepare_s": timing.get("resident_allocator_prepare_s", 0.0),
             "resident_allocator_flush_s": timing.get("resident_allocator_flush_s", 0.0),
+            # This record enumerates its keys, so freeze state has to be listed
+            # explicitly -- without it a durable timing log cannot distinguish
+            # "freeze re-recorded every frame" from "freeze never engaged".
+            "drjit_freeze_active": timing.get("drjit_freeze_active"),
+            "drjit_freeze_stage": timing.get("drjit_freeze_stage"),
             "illumination_tag": polar_illumination_tag,
             "stokes_shape": list(image.shape),
             "polarization": summary,
@@ -7216,8 +7588,16 @@ def render_ambient_stokes_heading_batch(
     batch_mode: str = "ambient_stokes_heading_batch_v1",
     variant: str = "auto",
     progress_callback: Callable[[str, Mapping[str, Any] | None], None] | None = None,
-) -> list[MultimodalRenderResult]:
+    defer: bool = False,
+) -> list[MultimodalRenderResult] | Callable[[], list[MultimodalRenderResult]]:
     """Render 2–4 Stokes views in one native-perspective batch.
+
+    With ``defer=True`` the GPU render still runs synchronously, but the
+    host-side tail (save + result assembly) is returned as a zero-argument
+    callable instead of being executed. The caller owns exactly one such
+    callable at a time and must invoke it — the batch is not complete until it
+    returns. This exists so a worker can start the next batch's render while
+    the previous batch's ~7 s of CPU work drains on another thread.
 
     This is deliberately narrower than :func:`render_modalities`: it is the
     production K=4 fast path for a single polar camera.  By default the scene
@@ -7231,6 +7611,8 @@ def render_ambient_stokes_heading_batch(
     """
     from .mitsuba_runtime import resolve_variant
     from .polar_heading_batch import (
+        MIN_STOKES_HEADING_BATCH_SLOTS,
+        max_stokes_heading_batch_slots,
         normalize_camera_to_world,
         shared_stokes_reference_axis,
         split_stokes_heading_batch,
@@ -7244,8 +7626,11 @@ def render_ambient_stokes_heading_batch(
         "polar_rgb_preview", "dop", "aolp", "s1", "s2", "s1_over_s0", "s2_over_s0",
     } for item in requested):
         raise ValueError("Stokes heading batches support polar camera modalities only")
-    if len(camera_to_worlds) < 2 or len(camera_to_worlds) > 4:
-        raise ValueError("Stokes heading batches require 2 to 4 headings")
+    if not MIN_STOKES_HEADING_BATCH_SLOTS <= len(camera_to_worlds) <= max_stokes_heading_batch_slots():
+        raise ValueError(
+            f"Stokes heading batches require {MIN_STOKES_HEADING_BATCH_SLOTS} to "
+            f"{max_stokes_heading_batch_slots()} headings, got {len(camera_to_worlds)}"
+        )
     if len(out_dirs) != len(camera_to_worlds):
         raise ValueError("out_dirs must contain one destination per heading")
     if assist_lights is not None and len(assist_lights) != len(camera_to_worlds):
@@ -7284,25 +7669,86 @@ def render_ambient_stokes_heading_batch(
     )
     use_resident_batch_scene = assist_lights is None and _resident_stokes_heading_batches_enabled()
     if use_resident_batch_scene:
+        # Always stage the *same* K-slot shape, padding a short tail batch up to
+        # the maximum. A K=2 strip would otherwise be a different XML file than
+        # a K=3/K=4 strip, and because only one polar scene stays resident
+        # (_POLAR_RESIDENT_SCENE_CACHE_LIMIT) the two shapes evict each other
+        # every time the batch size changes. That eviction also discards the
+        # dr.freeze recording bound to the evicted scene, so each new batch
+        # paid a fresh ~100s record instead of a fast replay. One shape means
+        # one resident scene and one recording reused across every batch; the
+        # padded slots render duplicate pixels that are dropped right below,
+        # which is far cheaper than re-recording.
+        #
+        # A request may ask for more headings than one resident strip holds
+        # (the slot count is capped by GPU memory, not by the planner), so the
+        # poses are rendered in fixed-size chunks against that one scene and
+        # the resulting strips are concatenated back into the requested order.
+        resident_slots = max(2, int(_RESIDENT_STOKES_HEADING_BATCH_SLOTS))
+        pose_chunks = [
+            list(poses[start:start + resident_slots])
+            for start in range(0, len(poses), resident_slots)
+        ]
         batch_scene = _stage_resident_stokes_heading_batch_scene(
             base_scene,
-            batch_size=len(poses),
+            batch_size=resident_slots,
             width=int(config.width),
             height=int(config.height),
             fov_deg=float(fov_deg),
             stokes_reference_axis=stokes_reference_axis,
         )
+        # A first cold load of a heavy scene can take many minutes. Report the
+        # GPU-load phase separately from ray tracing so the monitor does not
+        # look stalled while textures and the OptiX BVH are still being built.
+        batch_progress_ctx = {
+            "pass": "polar", "batch_size": len(poses), "variant": selected_variant,
+            "mode": batch_mode, "resident_scene": True, "resident_slots": resident_slots,
+        }
+        scene_cached = _resident_scene_cache_has(batch_scene, variant=selected_variant)
         if progress_callback is not None:
-            progress_callback("rendering", {
-                "pass": "polar", "batch_size": len(poses), "variant": selected_variant,
-                "mode": batch_mode, "resident_scene": True,
+            progress_callback("loading_scene", {
+                **batch_progress_ctx,
+                "sub_step": "cached" if scene_cached else "uploading_textures",
+                "cached": scene_cached,
+                **({} if scene_cached else _count_scene_assets(batch_scene)),
             })
-        image, timing = _render_resident_stokes_heading_batch_scene(
-            batch_scene,
-            camera_to_worlds=poses,
-            variant=selected_variant,
-            spp=int(config.polar_spp),
-        )
+
+        def _on_batch_loaded() -> None:
+            if progress_callback is not None:
+                progress_callback("rendering", batch_progress_ctx)
+
+        chunk_strips: list[np.ndarray] = []
+        timing: dict[str, Any] = {}
+        padded_total = 0
+        for chunk_index, chunk in enumerate(pose_chunks):
+            padded_chunk = list(chunk)
+            while len(padded_chunk) < resident_slots:
+                # Duplicate the tail so the film keeps the staged slot count;
+                # the extra strip is discarded right after the split below.
+                padded_chunk.append(chunk[-1])
+            padded_total += len(padded_chunk) - len(chunk)
+            chunk_image, chunk_timing = _render_resident_stokes_heading_batch_scene(
+                batch_scene,
+                camera_to_worlds=padded_chunk,
+                variant=selected_variant,
+                spp=int(config.polar_spp),
+                on_loaded=_on_batch_loaded if chunk_index == 0 else None,
+            )
+            strips = split_stokes_heading_batch(
+                chunk_image, batch_size=len(padded_chunk),
+                width=int(config.width), height=int(config.height),
+            )
+            chunk_strips.extend(strips[: len(chunk)])
+            for key, value in chunk_timing.items():
+                # Sum the per-chunk costs; keep scalars from the last chunk.
+                if key.endswith("_s") and isinstance(value, (int, float)):
+                    timing[key] = float(timing.get(key, 0.0)) + float(value)
+                else:
+                    timing[key] = value
+        image = np.concatenate(chunk_strips, axis=1)
+        timing["resident_slots"] = resident_slots
+        timing["resident_chunks"] = len(pose_chunks)
+        timing["resident_padded_slots"] = padded_total
     else:
         with tempfile.TemporaryDirectory(prefix="robomituba_stokes_heading_batch_") as tmpdir:
             batch_scene = Path(tmpdir) / "stokes_heading_batch.xml"
@@ -7339,162 +7785,176 @@ def render_ambient_stokes_heading_batch(
                 variant=selected_variant,
                 spp=int(config.polar_spp),
             )
-    strips = split_stokes_heading_batch(
-        image,
-        batch_size=len(poses),
-        width=int(config.width),
-        height=int(config.height),
-    )
-    common_timing = dict(timing)
-    common_timing.update({
-        "spp": int(config.polar_spp),
-        "effective_spp": int(config.polar_spp),
-        "batch_size": len(poses),
-        "batch_render_s": float(timing.get("render_s", 0.0)),
-        "batch_total_s": float(timing.get("total_s", 0.0)),
-        "batch_mode": batch_mode,
-        "resident_batch_scene": bool(use_resident_batch_scene),
-        "resident_batch_scene_ref": str(batch_scene) if use_resident_batch_scene else None,
-        "stokes_reference_axis": list(stokes_reference_axis),
-        "stokes_basis": "world_gravity_y_v1",
-        "scene": str(base_scene),
-    })
-    outputs: list[MultimodalRenderResult] = []
-    array_names = {
-        "polar_rgb_preview": "rgb",
-        "dop": "dop",
-        "aolp": "aolp_deg",
-        "s1": "s1_l",
-        "s2": "s2_l",
-        "s1_over_s0": "s1_over_s0",
-        "s2_over_s0": "s2_over_s0",
-    }
-    for batch_index, (pose, destination, strip) in enumerate(zip(poses, destinations, strips)):
-        if progress_callback is not None:
-            progress_callback("saving_output", {
-                "pass": "polar", "batch_size": len(poses), "batch_index": batch_index,
-                "mode": batch_mode,
-            })
-        summary, arrays = save_polarization_products(
-            strip,
-            destination,
+    # Everything below is host-side: splitting the film, saving products and
+    # assembling manifests-ready results. It is hoisted into a closure so a
+    # caller that wants to overlap it with the *next* batch's GPU render can
+    # take the callable instead of the result (see ``defer``). The default
+    # path calls it immediately, so behaviour is unchanged.
+    def _finish() -> list[MultimodalRenderResult]:
+        strips = split_stokes_heading_batch(
+            image,
+            batch_size=len(poses),
+            width=int(config.width),
+            height=int(config.height),
+        )
+        common_timing = dict(timing)
+        common_timing.update({
+            "spp": int(config.polar_spp),
+            "effective_spp": int(config.polar_spp),
+            "batch_size": len(poses),
+            "batch_render_s": float(timing.get("render_s", 0.0)),
+            "batch_total_s": float(timing.get("total_s", 0.0)),
+            "batch_mode": batch_mode,
+            "resident_batch_scene": bool(use_resident_batch_scene),
+            "resident_batch_scene_ref": str(batch_scene) if use_resident_batch_scene else None,
+            "stokes_reference_axis": list(stokes_reference_axis),
+            "stokes_basis": "world_gravity_y_v1",
+            "scene": str(base_scene),
+        })
+        outputs: list[MultimodalRenderResult] = []
+        array_names = {
+            "polar_rgb_preview": "rgb",
+            "dop": "dop",
+            "aolp": "aolp_deg",
+            "s1": "s1_l",
+            "s2": "s2_l",
+            "s1_over_s0": "s1_over_s0",
+            "s2_over_s0": "s2_over_s0",
+        }
+        # Saving is pure host-side work (the strips are already numpy) while the GPU
+        # sits idle waiting for the next batch, so at K=12 the serial loop below was
+        # the second-largest term in the batch cycle. numpy, PIL and zlib all drop
+        # the GIL, so a thread pool converts it to wall time / ~3. Only the save
+        # itself is parallel -- result assembly stays serial and ordered so the
+        # emitted outputs are byte-identical to the serial path.
+        saved = _save_polarization_products_batch(
+            strips,
+            destinations,
             requested_set,
             visualization_policy=config.polar_visualization_policy,
+            progress_callback=progress_callback,
+            progress_extra={"pass": "polar", "batch_size": len(poses), "mode": batch_mode},
         )
-        summary.update({
-            "schema": "opticalnav.stokes_rgb_12.minimal_f16.v2",
-            "polar_color_mode": config.polar_color_mode,
-            "stokes_channel_order": ["S0_RGB", "S1_RGB", "S2_RGB", "S3_RGB"],
-            "stokes_basis": "world_gravity_y_v1",
-            "stokes_reference_axis": list(stokes_reference_axis),
-        })
-        quality_summary = _polar_quality_summary(summary, config)
-        item_timing = {
-            **common_timing,
-            "batch_index": batch_index,
-            "render_s": float(timing.get("render_s", 0.0)) / len(poses),
-            "total_s": float(timing.get("total_s", 0.0)) / len(poses),
-            "stokes_npz_write_s": summary["stokes_npz_write_s"],
-            "stokes_npz_bytes": summary["stokes_npz_bytes"],
-            "preview_write_s": summary["preview_write_s"],
-            "polar_postprocess_s": summary["polar_postprocess_s"],
-        }
-        base_metadata = _branch_metadata(
-            illumination_tag="active_camera_aligned" if assist_lights is not None else "ambient_room",
-            scene_override=scene_override,
-            extra={
-                "material_mode": "shared_material_policy",
-                "material_policy": "shared_with_rgb",
-                "polar_transport": config.polar_transport,
+        for batch_index, (pose, destination, strip) in enumerate(zip(poses, destinations, strips)):
+            summary, arrays = saved[batch_index]
+            summary.update({
+                "schema": "opticalnav.stokes_rgb_12.minimal_f16.v2",
                 "polar_color_mode": config.polar_color_mode,
-                "stokes_schema": summary["schema"],
-                "stokes_channel_order": summary["stokes_channel_order"],
-                "stokes_basis": summary["stokes_basis"],
-                "nested_integrator": polar_nested,
-                "max_depth": polar_max_depth,
-                "polar_visualization_policy": config.polar_visualization_policy,
-                "stokes_preview_recipe": summary["stokes_preview_recipe"],
-                "derived_on_demand": list(summary["derived_on_demand"]),
-                "stokes_heading_batch": {
-                    "batch_size": len(poses),
-                    "batch_index": batch_index,
-                    "mode": batch_mode,
-                    "camera_aligned_light": assist_lights is not None,
+                "stokes_channel_order": ["S0_RGB", "S1_RGB", "S2_RGB", "S3_RGB"],
+                "stokes_basis": "world_gravity_y_v1",
+                "stokes_reference_axis": list(stokes_reference_axis),
+            })
+            quality_summary = _polar_quality_summary(summary, config)
+            item_timing = {
+                **common_timing,
+                "batch_index": batch_index,
+                "render_s": float(timing.get("render_s", 0.0)) / len(poses),
+                "total_s": float(timing.get("total_s", 0.0)) / len(poses),
+                "stokes_npz_write_s": summary["stokes_npz_write_s"],
+                "stokes_npz_bytes": summary["stokes_npz_bytes"],
+                "preview_write_s": summary["preview_write_s"],
+                "polar_postprocess_s": summary["polar_postprocess_s"],
+            }
+            base_metadata = _branch_metadata(
+                illumination_tag="active_camera_aligned" if assist_lights is not None else "ambient_room",
+                scene_override=scene_override,
+                extra={
+                    "material_mode": "shared_material_policy",
+                    "material_policy": "shared_with_rgb",
+                    "polar_transport": config.polar_transport,
+                    "polar_color_mode": config.polar_color_mode,
+                    "stokes_schema": summary["schema"],
+                    "stokes_channel_order": summary["stokes_channel_order"],
+                    "stokes_basis": summary["stokes_basis"],
+                    "nested_integrator": polar_nested,
+                    "max_depth": polar_max_depth,
+                    "polar_visualization_policy": config.polar_visualization_policy,
+                    "stokes_preview_recipe": summary["stokes_preview_recipe"],
+                    "derived_on_demand": list(summary["derived_on_demand"]),
+                    "stokes_heading_batch": {
+                        "batch_size": len(poses),
+                        "batch_index": batch_index,
+                        "mode": batch_mode,
+                        "camera_aligned_light": assist_lights is not None,
+                    },
+                    **quality_summary,
                 },
-                **quality_summary,
-            },
-        )
-
-        def _artifacts(modality: str) -> dict[str, Any]:
-            artifacts: dict[str, Any] = {"stokes_npz": summary["outputs"]["stokes_npz"]}
-            output_name = "rgb_preview" if modality == "polar_rgb_preview" else modality
-            output = summary["outputs"].get(output_name)
-            if output:
-                artifacts["png"] = output
-            elif modality != "polar_rgb_preview":
-                artifacts["derived_on_demand"] = {
-                    "source": summary["outputs"]["stokes_npz"],
-                    "recipe": summary["stokes_preview_recipe"],
-                    "modality": modality,
-                }
-            return artifacts
-
-        results: dict[str, ModalityResult] = {}
-        for modality in requested:
-            result_metadata = dict(base_metadata)
-            if modality == "dop":
-                result_metadata["range"] = [0.0, 1.0]
-            elif modality == "aolp":
-                result_metadata["range_degrees"] = [0.0, 180.0]
-            elif modality in {"s1_over_s0", "s2_over_s0"}:
-                result_metadata["range"] = [-1.0, 1.0]
-            elif modality == "s1":
-                result_metadata["scale_abs_p995"] = summary["s1_scale_abs_p995"]
-            elif modality == "s2":
-                result_metadata["scale_abs_p995"] = summary["s2_scale_abs_p995"]
-            array_name = array_names[modality]
-            results[modality] = ModalityResult(
-                name=modality,
-                array=arrays[array_name],
-                raw_channels={"mask": arrays["mask"], array_name: arrays[array_name]},
-                metadata=result_metadata,
-                timing=dict(item_timing),
-                artifacts=_artifacts(modality),
             )
-        outputs.append(MultimodalRenderResult(
-            scene={
-                "source_scene": str(source_scene),
-                "workspace": str(destination),
-                "temporary_workspace": False,
-                "staged_scenes": {"polar": str(base_scene)},
-                "polarization_material_mode": "shared_material_policy",
-                "stokes_heading_batch": {
-                    "batch_size": len(poses),
-                    "batch_index": batch_index,
-                    "mode": batch_mode,
-                    "camera_aligned_light": assist_lights is not None,
+
+            def _artifacts(modality: str) -> dict[str, Any]:
+                artifacts: dict[str, Any] = {"stokes_npz": summary["outputs"]["stokes_npz"]}
+                output_name = "rgb_preview" if modality == "polar_rgb_preview" else modality
+                output = summary["outputs"].get(output_name)
+                if output:
+                    artifacts["png"] = output
+                elif modality != "polar_rgb_preview":
+                    artifacts["derived_on_demand"] = {
+                        "source": summary["outputs"]["stokes_npz"],
+                        "recipe": summary["stokes_preview_recipe"],
+                        "modality": modality,
+                    }
+                return artifacts
+
+            results: dict[str, ModalityResult] = {}
+            for modality in requested:
+                result_metadata = dict(base_metadata)
+                if modality == "dop":
+                    result_metadata["range"] = [0.0, 1.0]
+                elif modality == "aolp":
+                    result_metadata["range_degrees"] = [0.0, 180.0]
+                elif modality in {"s1_over_s0", "s2_over_s0"}:
+                    result_metadata["range"] = [-1.0, 1.0]
+                elif modality == "s1":
+                    result_metadata["scale_abs_p995"] = summary["s1_scale_abs_p995"]
+                elif modality == "s2":
+                    result_metadata["scale_abs_p995"] = summary["s2_scale_abs_p995"]
+                array_name = array_names[modality]
+                results[modality] = ModalityResult(
+                    name=modality,
+                    array=arrays[array_name],
+                    raw_channels={"mask": arrays["mask"], array_name: arrays[array_name]},
+                    metadata=result_metadata,
+                    timing=dict(item_timing),
+                    artifacts=_artifacts(modality),
+                )
+            outputs.append(MultimodalRenderResult(
+                scene={
+                    "source_scene": str(source_scene),
+                    "workspace": str(destination),
+                    "temporary_workspace": False,
+                    "staged_scenes": {"polar": str(base_scene)},
+                    "polarization_material_mode": "shared_material_policy",
+                    "stokes_heading_batch": {
+                        "batch_size": len(poses),
+                        "batch_index": batch_index,
+                        "mode": batch_mode,
+                        "camera_aligned_light": assist_lights is not None,
+                    },
+                    "start_time": now_iso(),
                 },
-                "start_time": now_iso(),
-            },
-            camera={
-                "camera_to_world": pose.tolist(),
-                "fov_deg": float(fov_deg),
-                "convention": "cam-to-world, local -Z forward, local +Y up",
-            },
-            config=config,
-            definitions=dict(MODALITY_DEFINITIONS),
-            results=results,
-            pass_records={
-                "polarization": {
-                    **item_timing,
-                    "task": "polar",
-                    "mode": batch_mode,
-                    "stokes_shape": list(strip.shape),
-                    "polarization": summary,
+                camera={
+                    "camera_to_world": pose.tolist(),
+                    "fov_deg": float(fov_deg),
+                    "convention": "cam-to-world, local -Z forward, local +Y up",
                 },
-            },
-        ))
-    return outputs
+                config=config,
+                definitions=dict(MODALITY_DEFINITIONS),
+                results=results,
+                pass_records={
+                    "polarization": {
+                        **item_timing,
+                        "task": "polar",
+                        "mode": batch_mode,
+                        "stokes_shape": list(strip.shape),
+                        "polarization": summary,
+                    },
+                },
+            ))
+        return outputs
+
+    if defer:
+        return _finish
+    return _finish()
 
 
 def render_rgb(*args, **kwargs) -> MultimodalRenderResult:

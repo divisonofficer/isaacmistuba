@@ -265,7 +265,12 @@ def _camera_assist_light(render_request: RenderRequest, camera_spec: CameraSpec,
         # area-emitter + polarizer construction to polar cameras only.  This
         # keeps RGB cameras passive in a mixed rig capture.
         request_extras = render_request.extras if isinstance(render_request.extras, Mapping) else {}
-        if bool(request_extras.get("polar_active")) and any(item in POLAR_MODALITIES for item in camera_modalities):
+        # Graph sweeps stamp ``polar_active`` explicitly.  Direct debug
+        # submissions often only carry the durable scene variant, however;
+        # accepting that equivalent marker prevents a valid compact-polar
+        # AssistLightSpec from being silently dropped for rig cameras.
+        active_polar_variant = str(request_extras.get("scene_variant_key") or "").strip().lower() == "perturbed_active_polar"
+        if (bool(request_extras.get("polar_active")) or active_polar_variant) and any(item in POLAR_MODALITIES for item in camera_modalities):
             return render_request.assist_light
         return None
     return render_request.assist_light
@@ -774,7 +779,13 @@ def render_timestep_bundle_split_lighting(
         if branch_modalities["polar"]:
             if progress_callback is not None:
                 progress_callback("polar", {"camera_id": camera_spec.camera_id, "modalities": branch_modalities["polar"]})
-            polar_config = replace(camera_config, samples_per_pass=None)
+            # ``samples_per_pass`` must reach the polar branch: the K-slot
+            # Stokes batch film is width*K x height at polar_spp, and with an
+            # unbounded wavefront Dr.Jit materialises every sample's path
+            # state at once (measured ~29 GB on a 2048x384 @1024spp batch).
+            # The staged stokes integrator honours the property, splitting the
+            # render into polar_spp/samples_per_pass identical passes.
+            polar_config = camera_config
             branch_results["polar"] = render_modalities(
                 scene_path,
                 camera_to_world,
@@ -882,7 +893,8 @@ def render_timestep_bundle_active_stokes_heading_cohort(
     K=1 active-polar artifacts; the cohort only changes scheduling, progress,
     and retry granularity.
     """
-    if len(render_requests) < 2 or len(render_requests) > 4:
+    from .polar_heading_batch import MIN_STOKES_HEADING_BATCH_SLOTS, max_stokes_heading_batch_slots
+    if not MIN_STOKES_HEADING_BATCH_SLOTS <= len(render_requests) <= max_stokes_heading_batch_slots():
         raise ValueError("active Stokes heading cohorts require 2 to 4 requests")
 
     root = Path(repo_root).resolve()
@@ -950,8 +962,14 @@ def render_timestep_bundle_stokes_heading_batch(
     variant: str = "auto",
     camera_aligned_active: bool = False,
     progress_callback: Callable[[str, Mapping[str, Any] | None], None] | None = None,
-) -> list[ObservationBundleManifest]:
+    defer: bool = False,
+) -> list[ObservationBundleManifest] | Callable[[], list[ObservationBundleManifest]]:
     """Write ordinary bundles from one K=2..4 Stokes render.
+
+    ``defer=True`` runs the GPU render synchronously and returns a callable that
+    performs the host-side remainder (save, result assembly, manifest writes).
+    Nothing is published until that callable runs, so a caller that defers owns
+    the obligation to invoke it exactly once.
 
     The function is intentionally all-or-nothing at the batch boundary: a
     caller must retry the whole group after an exception rather than treating a
@@ -960,7 +978,8 @@ def render_timestep_bundle_stokes_heading_batch(
     opt-in: the caller must have created a spatial non-interference certificate
     before exposing several active emitters to one batch scene.
     """
-    if len(render_requests) < 2 or len(render_requests) > 4:
+    from .polar_heading_batch import MIN_STOKES_HEADING_BATCH_SLOTS, max_stokes_heading_batch_slots
+    if not MIN_STOKES_HEADING_BATCH_SLOTS <= len(render_requests) <= max_stokes_heading_batch_slots():
         raise ValueError("Stokes heading bundle batches require 2 to 4 requests")
     root = Path(repo_root).resolve()
     first = render_requests[0]
@@ -1014,7 +1033,7 @@ def render_timestep_bundle_stokes_heading_batch(
             "camera_id": camera_specs[0].camera_id,
             "mode": batch_mode,
         })
-    results = render_ambient_stokes_heading_batch(
+    rendered = render_ambient_stokes_heading_batch(
         source_scene,
         [np.asarray(camera.camera_to_world, dtype=np.float32).reshape(4, 4) for camera in camera_specs],
         float(camera_specs[0].fov_deg),
@@ -1029,72 +1048,84 @@ def render_timestep_bundle_stokes_heading_batch(
         batch_mode=batch_mode,
         variant=variant,
         progress_callback=progress_callback,
+        defer=defer,
     )
-    manifests: list[ObservationBundleManifest] = []
-    for batch_index, (request, camera, modalities, layout, result) in enumerate(
-        zip(render_requests, camera_specs, camera_modalities, layouts, results)
-    ):
-        artifacts = [
-            _artifact_manifest_from_result(root, camera, modality, result.results[modality])
-            for modality in modalities
-            if modality in result.results
-        ]
-        timing_log_path = layout.logs_dir / "render_timing.json"
-        timing_log = {
-            "request_id": request.request_id,
-            "job_id": request.job_id,
-            "frame_id": request.frame_id,
-            "timestamp": request.timestamp,
-            "branch_policy": batch_mode,
-            "batch_index": batch_index,
-            "batch_size": len(render_requests),
-            "cameras": {camera.camera_id: result.pass_records},
-        }
-        timing_log_path.write_text(json.dumps(timing_log, indent=2), encoding="utf-8")
-        artifacts, merged_modalities = _merge_existing_versioned_artifacts(
-            layout, artifacts, list(request.modalities)
-        )
-        batch_metadata: dict[str, Any] = {
-            "batch_index": batch_index,
-            "batch_size": len(render_requests),
-            "camera_id": camera.camera_id,
-        }
-        if camera_aligned_active:
-            batch_metadata.update({
-                "mode": batch_mode,
-                "camera_aligned_light": True,
-                "spatial_noninterference_required": True,
-            })
-        bundle_manifest = ObservationBundleManifest(
-            job_id=request.job_id,
-            scene_id=request.scene_state.scene_id,
-            frame_id=request.frame_id,
-            timestamp=request.timestamp,
-            scene_state=request.scene_state,
-            robot_state=request.robot_state,
-            requested_modalities=merged_modalities,
-            camera_specs=list(request.camera_specs),
-            sensor_specs=[],
-            artifacts=artifacts,
-            bundle_root=to_repo_relative_posix(root, layout.frame_dir),
-            status="complete",
-            action_ref=request.action_ref,
-            prev_observation_ref=request.prev_observation_ref,
-            next_observation_ref=request.next_observation_ref,
-            extras={
-                **request.extras,
-                "timing_log_ref": to_repo_relative_posix(root, timing_log_path),
-                "scene_version": request.scene_state.scene_version,
-                "scene_version_id": request.extras.get("scene_version_id") if isinstance(request.extras, Mapping) else None,
-                "render_version_id": request.extras.get("render_version_id") if isinstance(request.extras, Mapping) else None,
-                "run_id": request.extras.get("run_id") if isinstance(request.extras, Mapping) else None,
+    # Manifest assembly is host-side work that does not touch the GPU, so it
+    # is hoisted into a closure alongside the renderer's own deferred tail.
+    # ``defer`` hands both back to the caller as one callable.
+    def _finish(rendered: list[Any]) -> list[ObservationBundleManifest]:
+        results = rendered
+        manifests: list[ObservationBundleManifest] = []
+        for batch_index, (request, camera, modalities, layout, result) in enumerate(
+            zip(render_requests, camera_specs, camera_modalities, layouts, results)
+        ):
+            artifacts = [
+                _artifact_manifest_from_result(root, camera, modality, result.results[modality])
+                for modality in modalities
+                if modality in result.results
+            ]
+            timing_log_path = layout.logs_dir / "render_timing.json"
+            timing_log = {
+                "request_id": request.request_id,
+                "job_id": request.job_id,
+                "frame_id": request.frame_id,
+                "timestamp": request.timestamp,
                 "branch_policy": batch_mode,
-                "stokes_heading_batch": batch_metadata,
-            },
-        )
-        write_manifest(bundle_manifest, repo_root=root)
-        manifests.append(bundle_manifest)
-    return manifests
+                "batch_index": batch_index,
+                "batch_size": len(render_requests),
+                "cameras": {camera.camera_id: result.pass_records},
+            }
+            timing_log_path.write_text(json.dumps(timing_log, indent=2), encoding="utf-8")
+            artifacts, merged_modalities = _merge_existing_versioned_artifacts(
+                layout, artifacts, list(request.modalities)
+            )
+            batch_metadata: dict[str, Any] = {
+                "batch_index": batch_index,
+                "batch_size": len(render_requests),
+                "camera_id": camera.camera_id,
+            }
+            if camera_aligned_active:
+                batch_metadata.update({
+                    "mode": batch_mode,
+                    "camera_aligned_light": True,
+                    "spatial_noninterference_required": True,
+                })
+            bundle_manifest = ObservationBundleManifest(
+                job_id=request.job_id,
+                scene_id=request.scene_state.scene_id,
+                frame_id=request.frame_id,
+                timestamp=request.timestamp,
+                scene_state=request.scene_state,
+                robot_state=request.robot_state,
+                requested_modalities=merged_modalities,
+                camera_specs=list(request.camera_specs),
+                sensor_specs=[],
+                artifacts=artifacts,
+                bundle_root=to_repo_relative_posix(root, layout.frame_dir),
+                status="complete",
+                action_ref=request.action_ref,
+                prev_observation_ref=request.prev_observation_ref,
+                next_observation_ref=request.next_observation_ref,
+                extras={
+                    **request.extras,
+                    "timing_log_ref": to_repo_relative_posix(root, timing_log_path),
+                    "scene_version": request.scene_state.scene_version,
+                    "scene_version_id": request.extras.get("scene_version_id") if isinstance(request.extras, Mapping) else None,
+                    "render_version_id": request.extras.get("render_version_id") if isinstance(request.extras, Mapping) else None,
+                    "run_id": request.extras.get("run_id") if isinstance(request.extras, Mapping) else None,
+                    "branch_policy": batch_mode,
+                    "stokes_heading_batch": batch_metadata,
+                },
+            )
+            write_manifest(bundle_manifest, repo_root=root)
+            manifests.append(bundle_manifest)
+        return manifests
+
+    if defer:
+        # ``rendered`` is the renderer's own deferred tail; chaining them keeps
+        # the whole host-side remainder behind a single callable.
+        return lambda: _finish(rendered())
+    return _finish(rendered)
 
 
 def render_timestep_bundle_active_stokes_heading_batch(

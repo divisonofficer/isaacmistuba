@@ -42,6 +42,8 @@
 		onRefreshSelectedJobLog: () => void;
 		renderVersions?: any[];
 		renderSensorProgress?: any[];
+		renderCoverageLoading?: boolean;
+		renderCoverageUpdatedAt?: number;
 		observationScan?: any;
 		expectedRenderViews?: number;
 		renderVersionsLoading?: boolean;
@@ -67,7 +69,7 @@
 		renderVersions = [], renderVersionsLoading = false, onRefreshVersions = () => {},
 		renderVersionGallery = null, renderVersionGalleryLoading = false, renderVersionGalleryError = '',
 		onOpenRenderVersionGallery = () => {}, onCloseRenderVersionGallery = () => {},
-		renderSensorProgress = [], observationScan = null, expectedRenderViews = 0,
+		renderSensorProgress = [], renderCoverageLoading = false, renderCoverageUpdatedAt = 0, observationScan = null, expectedRenderViews = 0,
 		onResumeRun = () => {}, onPromoteVersion = () => {}, onPruneVersion = () => {},
 	}: Props = $props();
 
@@ -169,6 +171,43 @@
 	});
 
 	const health = $derived($healthStore);
+	const renderCoverageUpdatedLabel = $derived.by(() => {
+		if (!renderCoverageUpdatedAt) return '';
+		return new Date(renderCoverageUpdatedAt).toLocaleTimeString([], {
+			hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
+		});
+	});
+	// The plan-level card summarises many jobs, but the worker only runs one at
+	// a time; take its live stage/profile so the header reflects reality rather
+	// than a guess derived from aggregate counts.
+	const liveJob = $derived(
+		(activeBatch?.jobs ?? []).find((job: any) => String(job?.status?.status ?? job?.status ?? '') === 'running') ?? null,
+	);
+	const liveJobStage = $derived(String(liveJob?.status?.progress_stage ?? '').trim());
+	// A polar batch job carries its live render shape in progress_context (the
+	// renderer publishes it there per pass); the flat extras keys are only set
+	// for other job kinds. Read both so this card reports the batch actually
+	// running instead of falling back to "default" / "0 hit".
+	const liveProgressContext = $derived(liveJob?.status?.extras?.progress_context ?? {});
+	const liveTextureProfile = $derived(
+		liveJob?.status?.extras?.texture_profile
+			?? liveJob?.status?.extras?.texture_audit?.texture_profile
+			?? liveProgressContext?.texture_profile
+			?? null,
+	);
+	const liveBatchSlots = $derived(
+		Number(
+			liveJob?.status?.extras?.stokes_heading_batch_size
+				?? liveProgressContext?.resident_slots
+				?? liveProgressContext?.batch_size
+				?? 0,
+		),
+	);
+	const liveCacheMode = $derived(
+		liveBatchSlots >= 2
+			? `stokes_k${liveBatchSlots}_batched`
+			: (liveJob?.status?.extras?.cache_mode ?? null),
+	);
 	const renderPlanProgress = $derived.by(() => {
 		const planned = (renderSensorProgress ?? []).filter((item: any) => item?.coverage_source === 'render_plan');
 		if (!planned.length) return null;
@@ -184,13 +223,16 @@
 			logical_progress: true,
 			summary_label: 'Navigation Support render plan',
 			batch_id: campaignId,
-			active_stage: running > 0 ? 'rendering polarization' : queued > 0 ? 'waiting for scheduled wave' : 'complete',
+			// Report the stage the worker is actually in. Deriving it from the
+			// running/queued counts alone claimed "rendering polarization" for
+			// the whole job, including the many minutes a cold scene spends
+			// uploading textures and building its OptiX BVH.
+			active_stage: liveJobStage || (running > 0 ? 'rendering' : queued > 0 ? 'waiting for scheduled wave' : 'complete'),
 			queue_length: queued,
-			texture_profile: 'max512',
-			// Aggregate progress is deliberately independent of the worker's
-			// resident-vs-wave scheduling policy.  This confirms K=4 logical
-			// batching without falsely claiming that workers were recycled.
-			cache_mode: 'stokes_k4_batched',
+			// RenderSummaryBar renders this as `max${textureProfile}`, so pass
+			// the bare number (a 'max512' string rendered as "maxmax512").
+			texture_profile: liveTextureProfile,
+			cache_mode: liveCacheMode,
 			counts: { completed, running, queued, failed, cancelled: 0, unknown: 0 },
 			execution_counts: { worker_running: running, prefetched: 0, queued },
 			progress: { completed, failed, total, fraction: (completed + failed) / Math.max(1, total) },
@@ -461,7 +503,9 @@
 				<button class:active={activeTab === 'logs'} onclick={() => activeTab = 'logs'}>Logs</button>
 			</nav>
 			<div class="monitor-actions">
-				<button class="button button-subtle" disabled={actionInFlight} onclick={onRefreshBatch}>Refresh</button>
+				<button class="button button-subtle" disabled={actionInFlight || renderCoverageLoading} onclick={onRefreshBatch}>
+					{renderCoverageLoading ? 'Refreshing…' : 'Refresh'}
+				</button>
 				<button class="button button-subtle" disabled={!hasActiveJobs} onclick={onCancelStaleBatchJobs}>Cancel queued</button>
 				<button class="button button-primary" disabled={failedJobs.length === 0 || actionInFlight} onclick={retryFailedJobs}>Retry failed ({failedJobs.length})</button>
 				<div class="size-controls" aria-label="Panel size">
@@ -489,7 +533,16 @@
 						<section class="camera-coverage" aria-label="Camera render coverage">
 							<div class="camera-coverage-head">
 								<strong>Camera coverage</strong>
-								<small>completed viewpoint × heading renders</small>
+								<small>
+									completed viewpoint × heading renders
+									{#if renderCoverageLoading}
+										 · updating…
+									{:else if renderCoverageUpdatedLabel}
+										 · checked {renderCoverageUpdatedLabel}
+									{:else}
+										 · waiting for first ledger read
+									{/if}
+								</small>
 							</div>
 							<div class="coverage-table">
 								<div class="coverage-header">Camera</div>

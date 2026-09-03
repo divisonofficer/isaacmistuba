@@ -21434,6 +21434,7 @@ class RenderDaemon:
         try:
             raw_plan = _read_json_mapping(plan_path) or {}
             profile_id = str(raw_plan.get("profile_id") or "")
+            coverage_plan_path = plan_path
             if profile_id == "adaptive_navigation_support_v4":
                 from navigation_dataset.navigation_support import (
                     read_support_observation_plan, support_render_graph,
@@ -21486,6 +21487,13 @@ class RenderDaemon:
                     if not plan["render_entries"]:
                         raise ValueError("sweep coverage selection matched no view in the observation plan")
                     sweep_level_id = str(sweep.get("level_id") or "")
+                    # The submitted contract is this rung, not the full L0 plan.
+                    # ``render_plan_ref`` is what the coverage monitor later reads
+                    # back to size its progress denominator, so pointing it at the
+                    # unnarrowed L0 file makes the UI report the whole action set
+                    # (e.g. 21785 views) as the total for a rung that only
+                    # submitted a few thousand.
+                    coverage_plan_path = sweep_path
                 coverage_digest = str(plan.get("coverage_digest") or "") or sweep_level_id
                 render_graph_name = (
                     f"support_render_graph_{coverage_digest[:16]}.json"
@@ -21553,7 +21561,7 @@ class RenderDaemon:
         # Isolate this profile in the scene-version key; otherwise identical scene
         # XML could source-reuse a legacy all-heading sweep by mistake.
         delegated["graph_revision"] = f"{profile_id}:{plan.get('coverage_digest') or plan.get('profile_digest', '')}"
-        delegated["render_plan_ref"] = plan_path.relative_to(project_dir).as_posix()
+        delegated["render_plan_ref"] = coverage_plan_path.relative_to(project_dir).as_posix()
         delegated["profile_id"] = profile_id
         # A polar-only support plan would otherwise resolve ``auto`` to the
         # legacy per-view phase and bypass its explicit K=2..4 batch affinity.
@@ -22634,45 +22642,91 @@ class RenderDaemon:
                             collapsed.append(leader)
                         phase.requests = collapsed
                         continue
-                    grouped: dict[str, list[Any]] = {}
+                    # Pack passive headings into full strips *across* viewpoints.
+                    #
+                    # The planner emits ``polar_batch_key`` per pose, so a
+                    # coverage rung that selects only some of a pose's headings
+                    # (SV1 takes just the headings its episodes traverse) left
+                    # most groups short of ``polar_batch_size`` and every one of
+                    # them fell back to K=1 -- the majority of the sweep paid a
+                    # full single-view render each. A passive strip carries no
+                    # per-camera emitter and every view shares the same
+                    # world-gravity Stokes reference axis, so which poses ride
+                    # in one strip is a scheduling choice, not a physical one.
+                    # Group only by what must actually match (camera + modality
+                    # set), then chunk to the planner's strip width.
+                    compat_groups: dict[tuple[str, tuple[str, ...]], list[Any]] = {}
                     passthrough: list[Any] = []
                     for sweep_request in phase.requests:
-                        if _batch_eligible(sweep_request):
-                            grouped.setdefault(str(sweep_request.request.extras["polar_batch_key"]), []).append(sweep_request)
-                        else:
+                        if not _batch_eligible(sweep_request):
                             passthrough.append(sweep_request)
-                    collapsed: list[Any] = list(passthrough)
-                    for batch_key, members in sorted(grouped.items()):
-                        expected = int(members[0].request.extras.get("polar_batch_size") or 0)
-                        common_camera = members[0].request.camera_specs[0].camera_id
-                        compatible = (
-                            len(members) == expected
-                            and all(member.request.camera_specs[0].camera_id == common_camera for member in members)
-                            and all(member.request.modalities == members[0].request.modalities for member in members)
-                        )
-                        if not compatible:
-                            collapsed.extend(members)
                             continue
-                        leader = members[0]
-                        batch_views = [
-                            {"node_id": member.node_id, "heading_id": member.heading_id, "job_id": member.request.job_id}
-                            for member in members
+                        request = sweep_request.request
+                        compat_groups.setdefault(
+                            (
+                                str(request.camera_specs[0].camera_id),
+                                tuple(str(item) for item in request.modalities),
+                            ),
+                            [],
+                        ).append(sweep_request)
+                    collapsed: list[Any] = list(passthrough)
+                    batch_ordinal = 0
+                    for compat_key, eligible in sorted(compat_groups.items(), key=lambda item: item[0]):
+                        eligible.sort(key=lambda item: (str(item.node_id), str(item.heading_id)))
+                        widths = {
+                            int(member.request.extras.get("polar_batch_size") or 0)
+                            for member in eligible
+                        }
+                        strip_width = min(w for w in widths if w >= 2) if any(w >= 2 for w in widths) else 0
+                        # The planner's polar_batch_size describes the pose's own
+                        # heading group; now that strips are packed across
+                        # viewpoints the real limit is how many sub-sensors the
+                        # renderer keeps resident, which is bounded by GPU memory
+                        # rather than by the plan. Honour the same knob the
+                        # renderer uses so one setting sizes the strip end to end
+                        # (a mismatch just pads the film with discarded copies).
+                        try:
+                            resident_slots_env = int(
+                                os.environ.get("ROBOMITUBA_RESIDENT_STOKES_BATCH_SLOTS", "0")
+                            )
+                        except (TypeError, ValueError):
+                            resident_slots_env = 0
+                        if resident_slots_env >= 2:
+                            strip_width = resident_slots_env
+                        if strip_width < 2:
+                            collapsed.extend(eligible)
+                            continue
+                        chunks = [
+                            eligible[start:start + strip_width]
+                            for start in range(0, len(eligible), strip_width)
                         ]
-                        leader.request.extras.update({
-                            "stokes_heading_batch_key": batch_key,
-                            "stokes_heading_batch_size": len(members),
-                            "stokes_heading_batch_view_keys": batch_views,
-                            "stokes_heading_batch_execution": "ambient_stokes_heading_batch_v1",
-                        })
-                        # See the active-batch equivalent above.  In the
-                        # passive case the leader is also a child, so these must
-                        # be detached snapshots rather than payloads retaining
-                        # a reference to ``leader.request.extras``.
-                        leader.request.extras["stokes_heading_batch_request_payloads"] = [
-                            _snapshot_render_request_payload(member.request)
-                            for member in members
-                        ]
-                        collapsed.append(leader)
+                        for members in chunks:
+                            if len(members) < 2:
+                                # A lone tail view cannot form a strip.
+                                collapsed.extend(members)
+                                continue
+                            batch_key = f"packed:{compat_key[0]}:{batch_ordinal:05d}"
+                            batch_ordinal += 1
+                            leader = members[0]
+                            batch_views = [
+                                {"node_id": member.node_id, "heading_id": member.heading_id, "job_id": member.request.job_id}
+                                for member in members
+                            ]
+                            leader.request.extras.update({
+                                "stokes_heading_batch_key": batch_key,
+                                "stokes_heading_batch_size": len(members),
+                                "stokes_heading_batch_view_keys": batch_views,
+                                "stokes_heading_batch_execution": "ambient_stokes_heading_batch_v1",
+                            })
+                            # See the active-batch equivalent above.  In the
+                            # passive case the leader is also a child, so these
+                            # must be detached snapshots rather than payloads
+                            # retaining a reference to ``leader.request.extras``.
+                            leader.request.extras["stokes_heading_batch_request_payloads"] = [
+                                _snapshot_render_request_payload(member.request)
+                                for member in members
+                            ]
+                            collapsed.append(leader)
                     phase.requests = collapsed
             # Persist the complete plan before submitting the first worker job.
             # This is the durable cursor that allows a later resume to include

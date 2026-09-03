@@ -19,18 +19,23 @@
 	const failed = $derived(summary.counts.failed ?? 0);
 	const active = $derived((summary.counts.running ?? 0) + (summary.counts.queued ?? 0));
 	const execution = $derived(summary.execution ?? { queued: summary.counts.queued ?? 0, prefetched: 0, workerRunning: summary.counts.running ?? 0 });
+	// The batched label carries its slot count, which is a runtime setting
+	// (GPU memory bounds it), so read K out of the mode instead of hardcoding 4.
+	const batchedSlots = $derived(
+		/^stokes_k(\d+)_batched$/.exec(String(summary.cacheMode ?? ''))?.[1] ?? '',
+	);
 	const cacheText = $derived(
 		summary.cacheMode === 'stokes_wave_isolated'
 			? 'wave-isolated'
-			: summary.cacheMode === 'stokes_k4_batched'
-				? 'K=4 batched'
+			: batchedSlots
+				? `K=${batchedSlots} batched`
 				: `${summary.cacheHits} hit`,
 	);
 	const cacheTitle = $derived(
 		summary.cacheMode === 'stokes_wave_isolated'
-			? 'K=4 Stokes workers are intentionally recycled between waves to release OptiX texture allocations. Zero cross-wave scene-cache hits are expected; this is not an asset or texture-cache failure.'
-			: summary.cacheMode === 'stokes_k4_batched'
-				? 'Every passive K=4 strip renders four headings from one scene load. Worker residency is reported by the daemon, not inferred from this aggregate progress card.'
+			? 'Stokes workers are intentionally recycled between waves to release OptiX texture allocations. Zero cross-wave scene-cache hits are expected; this is not an asset or texture-cache failure.'
+			: batchedSlots
+				? `Every passive strip renders ${batchedSlots} headings from one scene load. Worker residency is reported by the daemon, not inferred from this aggregate progress card.`
 				: 'Persistent scene-cache hits among the currently displayed render tasks.',
 	);
 	const gpuLabel = $derived(

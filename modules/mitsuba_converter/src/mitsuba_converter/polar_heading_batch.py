@@ -30,6 +30,23 @@ import numpy as np
 # sensor. A common world frame can be, and is also used by K=1 renders.
 CANONICAL_STOKES_REFERENCE_AXIS = (0.0, 1.0, 0.0)
 
+# Widest Stokes heading strip the pipeline will accept. This used to be a hard
+# 4 in every layer, dating from when a strip could only hold one pose's heading
+# group. Strips are now packed across viewpoints and the real limit is GPU
+# memory (the batch film is slots * width), so the bound is configurable and
+# every layer must agree on it -- a scheduler that packs 12 into a strip the
+# worker rejects fails the whole batch.
+MIN_STOKES_HEADING_BATCH_SLOTS = 2
+
+
+def max_stokes_heading_batch_slots() -> int:
+    """Return the configured maximum strip width (never below the legacy 4)."""
+    try:
+        configured = int(os.environ.get("ROBOMITUBA_RESIDENT_STOKES_BATCH_SLOTS", "4"))
+    except (TypeError, ValueError):
+        configured = 4
+    return max(4, configured)
+
 
 def normalize_camera_to_world(matrix: Sequence[float] | np.ndarray) -> np.ndarray:
     """Return column-translation 4x4 storage from either supported input form."""
@@ -176,6 +193,11 @@ def stage_ambient_stokes_heading_batch(
     for index, pose in enumerate(poses):
         child = copy.deepcopy(child_template)
         child.attrib["name"] = f"heading_{index:02d}"
+        # BatchSensor::traverse() keys its children by their *id* (falling back
+        # to "sensorN" for unnamed ones), not by the XML "name" attribute, so
+        # the resident updater can only address these slots if each child
+        # carries a stable id.
+        child.attrib["id"] = f"heading_{index:02d}"
         _set_sensor_transform(child, pose)
         fov = child.find("./float[@name='fov']")
         if fov is None:
@@ -218,8 +240,11 @@ def stage_resident_ambient_stokes_heading_batch(
     rewriting it would change its cache key and force a new ``mi.load_file``.
     """
     slots = int(batch_size)
-    if slots < 2 or slots > 4:
-        raise ValueError("resident Stokes heading batches require 2 to 4 slots")
+    if slots < MIN_STOKES_HEADING_BATCH_SLOTS or slots > max_stokes_heading_batch_slots():
+        raise ValueError(
+            f"resident Stokes heading batches require {MIN_STOKES_HEADING_BATCH_SLOTS} to "
+            f"{max_stokes_heading_batch_slots()} slots, got {slots}"
+        )
     if width <= 0 or height <= 0:
         raise ValueError("batch film width and height must be positive")
     output = Path(output_scene)
@@ -231,10 +256,21 @@ def stage_resident_ambient_stokes_heading_batch(
     # mtime and therefore cannot invalidate another worker's resident cache.
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary = output.with_name(f".{output.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    # Each placeholder pose must be *distinct*: Mitsuba collapses structurally
+    # identical child sensors into one shared instance, so K identity slots
+    # would load as a single sensor and ``BatchSensor::traverse`` would then
+    # publish only ``slot_0``, breaking the resident updater. The updater
+    # overwrites every slot before each render, so these values never reach a
+    # rendered frame.
+    placeholder_poses = []
+    for index in range(slots):
+        pose = np.eye(4, dtype=np.float64)
+        pose[2, 3] = float(index)
+        placeholder_poses.append(pose)
     count = stage_ambient_stokes_heading_batch(
         source_scene,
         temporary,
-        camera_to_worlds=[np.eye(4, dtype=np.float64) for _ in range(slots)],
+        camera_to_worlds=placeholder_poses,
         width=width,
         height=height,
         fov_deg=fov_deg,
