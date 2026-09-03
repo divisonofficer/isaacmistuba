@@ -11,8 +11,10 @@ Three outcomes, decided per scene:
                is dead weight -- delete it.
   requeue      no re-render yet, but the Stage 1 geometry bake survives, so the
                scene can be re-rendered cheaply -- keep it and queue it.
-  discard      no re-render and no Stage 1 bake.  Nothing here is reusable and
-               the scene has to be generated again from scratch -- delete it.
+  protected    no Stage 1 bake either, but the render carries far more smooth
+               surface than the corpus average, so it survives on content alone.
+  discard      no re-render, no Stage 1 bake, and nothing worth keeping in the
+               pixels -- delete it.
 
 Stage 1 bakes are never touched.  They are the expensive artifact and the whole
 reason a scene can be re-rendered at all; ``--prune-pipeline`` removes the
@@ -35,9 +37,12 @@ WORK = Path("/bean/ir_dataset_work")
 PIPELINE = WORK / ".pipeline"
 
 SUPERSEDED, REQUEUE, DISCARD = "superseded", "requeue", "discard"
+PROTECTED = "protected"
 #: A scene with this much smooth surface is where a controlled NIR highlight can
-#: actually appear.  Discarding one is a real loss even when nothing about it is
-#: reusable, so those are called out rather than listed quietly among the rest.
+#: actually appear.  Across the measured corpus most scenes sit under 5%, so the
+#: handful above this carry nearly all of the cue the dataset exists to provide.
+#: Having no Stage 1 bake makes such a scene expensive to replace, not worthless
+#: -- so it is kept as a survival candidate rather than deleted.
 RICH_SPECULAR = 10.0
 CONFIRM = {"예", "yes", "y"}
 
@@ -92,23 +97,45 @@ def dataset_roots() -> dict[str, Path]:
     return found
 
 
-def classify(plan: dict, roots: dict[str, Path], stats: dict, *, sizes: bool) -> list[dict]:
+def classify(plan: dict, roots: dict[str, Path], stats: dict, *, sizes: bool,
+             protect_specular: float = RICH_SPECULAR) -> list[dict]:
     """Assign every named dataset an outcome and the reason for it."""
-    superseded = set(plan.get("superseded_by_rerender") or [])
+    raw = plan.get("superseded_by_rerender") or {}
+    # A list means "trust me"; a mapping of old -> replacement lets the script
+    # check the replacement actually rendered.  Retiring an original because a
+    # replacement was *queued* loses both if that queue run fails.
+    superseded = raw if isinstance(raw, dict) else {name: None for name in raw}
     rows = []
     for name, path in roots.items():
         source = stage1_source(name)
+        specular = round(stats.get(name, {}).get("specular_share", -0.01) * 100, 1)
         if name in superseded:
-            outcome, reason = SUPERSEDED, "a newer re-render of this scene already exists"
+            replacement = superseded[name]
+            done = frame_count(roots[replacement]) if replacement in roots else 0
+            if replacement is not None and done <= 0:
+                outcome = REQUEUE
+                reason = (f"replacement {replacement} has not rendered yet "
+                          "-- retiring this now would lose both")
+            else:
+                outcome = SUPERSEDED
+                reason = ("a newer re-render of this scene already exists"
+                          + (f" ({replacement}, {done:,} frames)" if replacement else ""))
         elif source:
             outcome = REQUEUE
             reason = ("Stage 1 bake survives, so it can be re-rendered cheaply"
                       + ("" if source == name else f" (bake under {source})"))
+        elif specular >= protect_specular:
+            # Nothing here can be re-rendered, but almost nothing else in the
+            # corpus carries this much smooth surface.  Replacing it means
+            # generating the scene again, so it survives on its content alone.
+            outcome = PROTECTED
+            reason = (f"no Stage 1 bake, but {specular:.1f}% smooth surface -- too much of the "
+                      "cue to throw away when replacing it means regenerating the scene")
         else:
             outcome, reason = DISCARD, "no re-render and no Stage 1 bake; nothing here is reusable"
         rows.append({"scene": name, "path": str(path), "outcome": outcome, "reason": reason,
                      "stage1_source": source, "frames": frame_count(path), "bytes": 0,
-                     "specular": round(stats.get(name, {}).get("specular_share", -0.01) * 100, 1)})
+                     "specular": specular})
     if sizes:
         # du on this storage takes seconds per dataset and is pure I/O wait, so
         # it is worth running the whole inventory concurrently.
@@ -139,30 +166,34 @@ def main() -> int:
                              "surface each dataset carries")
     parser.add_argument("--no-size", action="store_true",
                         help="skip the disk measurement, which is slow on network storage")
+    parser.add_argument("--protect-specular", type=float, default=RICH_SPECULAR,
+                        help="keep an otherwise-discardable dataset whose smooth surface "
+                             f"reaches this percentage (default {RICH_SPECULAR:g}; "
+                             "0 disables the protection)")
     args = parser.parse_args()
 
     plan = json.loads(args.plan.read_text(encoding="utf-8"))
     stats = {}
     if args.stats and args.stats.is_file():
         stats = json.loads(args.stats.read_text(encoding="utf-8"))
-    rows = classify(plan, dataset_roots(), stats, sizes=not args.no_size)
+    rows = classify(plan, dataset_roots(), stats, sizes=not args.no_size,
+                    protect_specular=args.protect_specular if args.protect_specular > 0 else 1e9)
     wanted = set(args.outcome or (SUPERSEDED, DISCARD))
     targets = [r for r in rows if r["outcome"] in wanted]
 
-    for outcome in (SUPERSEDED, REQUEUE, DISCARD):
+    VERB = {REQUEUE: "keep and queue", PROTECTED: "keep as a survival candidate"}
+    for outcome in (SUPERSEDED, REQUEUE, PROTECTED, DISCARD):
         group = [r for r in rows if r["outcome"] == outcome]
         if not group:
             continue
         total = sum(r["bytes"] for r in group)
-        verb = "keep and queue" if outcome == REQUEUE else "DELETE"
-        print(f"\n=== {outcome}  ({verb})  {len(group)} datasets, "
+        print(f"\n=== {outcome}  ({VERB.get(outcome, 'DELETE')})  {len(group)} datasets, "
               f"{sum(r['frames'] for r in group):,} frames, {total/1e9:.1f} GB")
         print(f"    reason: {group[0]['reason']}")
         for r in sorted(group, key=lambda x: -x["specular"]):
-            mark = "  <-- rich specular" if (outcome == DISCARD and r["specular"] >= RICH_SPECULAR) else ""
             spec = f"spec {r['specular']:5.1f}%" if r["specular"] >= 0 else "spec     ?"
             print(f"      {r['bytes']/1e9:7.2f} GB  {r['frames']:6,d} frames  "
-                  f"{spec}  {r['scene']}{mark}")
+                  f"{spec}  {r['scene']}")
 
     if not targets:
         print("\nnothing selected for deletion.")
@@ -172,13 +203,18 @@ def main() -> int:
     print(f"selected for deletion: {len(targets)} datasets, "
           f"{sum(r['frames'] for r in targets):,} frames, {freed/1e9:.1f} GB")
     print("Stage 1 bakes are not touched.")
-    rich = [r for r in targets if r["outcome"] == DISCARD and r["specular"] >= RICH_SPECULAR]
+    protected = [r for r in rows if r["outcome"] == PROTECTED]
+    if protected:
+        print(f"{len(protected)} datasets are held back on smooth-surface content alone "
+              f"(>= {args.protect_specular:g}%);")
+        print("pass --protect-specular 0 to include them.")
+    rich = [r for r in targets if r["specular"] >= RICH_SPECULAR]
     if rich:
-        print(f"\n  WARNING: {len(rich)} of these carry >= {RICH_SPECULAR:.0f}% smooth surface,")
-        print("  which is the cue this dataset exists to capture.  They have no Stage 1")
-        print("  bake, so deleting them means regenerating the scene, not re-rendering it:")
+        print(f"\n  WARNING: {len(rich)} selected datasets still carry >= {RICH_SPECULAR:.0f}% "
+              "smooth surface,")
+        print("  which is the cue this dataset exists to capture:")
         for r in sorted(rich, key=lambda x: -x["specular"]):
-            print(f"      spec {r['specular']:5.1f}%  {r['scene']}")
+            print(f"      spec {r['specular']:5.1f}%  {r['outcome']:10} {r['scene']}")
 
     if not args.delete:
         print("\ndry run -- nothing was deleted.  Re-run with --delete to act on this.")
