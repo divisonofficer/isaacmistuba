@@ -697,13 +697,24 @@ def _write_scene_overview(out: Path, graph: dict, tasks: list[dict], args: argpa
                       "up": list(camera.get("up_mitsuba") or [0.0, 1.0, 0.0]),
                       "fov_deg": float(args.fov), "aspect": float(args.width) / float(args.height),
                       "lighting_id": lighting_id})
-    points = np.asarray([node["origin"] for node in graph_nodes] or [[-1.0, 0.0, -1.0], [1.0, 1.0, 1.0]], dtype=np.float32)
+    # A v5 dataset has no viewpoint graph: the camera universe is the 6-DoF
+    # object orbit, and the queue leaves `nodes` empty.  Claiming a graph is
+    # available anyway published a digest of an empty file, which the publisher
+    # then compared against `config["graph_sha256"]` -- a key the v5 branch
+    # deliberately replaces with `authoring_map_sha256` -- and every v5 dataset
+    # failed its own publish gate after rendering every frame.  Say what is
+    # true, and fall back to the pose origins for bounds so the viewer still
+    # frames the scene.
+    graph_available = bool(graph_nodes)
+    origins = [node["origin"] for node in graph_nodes] or [pose["origin"] for pose in poses]
+    points = np.asarray(origins or [[-1.0, 0.0, -1.0], [1.0, 1.0, 1.0]], dtype=np.float32)
     mins, maxs = points.min(axis=0), points.max(axis=0)
     margin = max(0.5, float(np.max(maxs[[0, 2]] - mins[[0, 2]]) * 0.08))
     payload: dict[str, Any] = {
         "schema": OVERVIEW_SCHEMA, "compiler_version": OVERVIEW_COMPILER_VERSION,
         "dataset_fingerprint": fingerprint, "coordinate_system": "mitsuba_y_up",
-        "graph_digest": _sha256(graph_path), "graph_available": True,
+        "graph_digest": _sha256(graph_path) if graph_available else None,
+        "graph_available": graph_available,
         "traversability_available": False,
         "bounds": {"min": [float(mins[0] - margin), float(mins[1]), float(mins[2] - margin)],
                    "max": [float(maxs[0] + margin), float(maxs[1]), float(maxs[2] + margin)]},
