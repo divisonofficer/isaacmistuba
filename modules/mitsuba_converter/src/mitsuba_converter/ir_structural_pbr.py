@@ -13,6 +13,8 @@ import random
 from pathlib import Path
 from typing import Any
 
+from .ir_structural_finish import choose_for_role, finish_report
+
 REGISTRY_SCHEMA = "robomituba.ir_external_structural_pbr_registry.v1"
 MANIFEST_SCHEMA = "robomituba.ir_structural_rematerialization.v1"
 INTERIOR_SUBTYPES = frozenset({"wall", "floor", "ceiling", "column", "panel"})
@@ -157,8 +159,19 @@ def dielectric_loadbearing_compatible(record: dict[str, Any], role: str) -> bool
     return abs(float(metallic.get("value") or 0.0)) <= 1e-6
 
 
-def bindings_for_scene(stage1_manifest: dict[str, Any], registry: dict[str, Any], *, seed: int) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+def bindings_for_scene(stage1_manifest: dict[str, Any], registry: dict[str, Any], *, seed: int,
+                       finish_policy: dict[str, Any] | None = None,
+                       roughness_index: dict[str, float] | None = None,
+                       ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Bind a registry material to every structural slot.
+
+    Without ``finish_policy`` the draw is the uniform one this has always made,
+    so an existing manifest reproduces byte for byte.  With it, each role draws
+    from its own roughness band -- see ir_structural_finish for why the uniform
+    draw left the corpus split between rooms of chalk and rooms of polish.
+    """
     rng = random.Random(int(seed))
+    roughness = roughness_index or {}
     records = list(registry["materials"])
     bindings, excluded = [], []
     for unit in stage1_manifest.get("units") or []:
@@ -177,7 +190,11 @@ def bindings_for_scene(stage1_manifest: dict[str, Any], registry: dict[str, Any]
         if not choices:
             raise ValueError(f"structural registry has no approved material for {role}")
         for slot, _material in enumerate(unit.get("material_slots") or unit.get("materials") or [None]):
-            record = choices[rng.randrange(len(choices))]
+            if finish_policy is not None:
+                record = choose_for_role(choices, role, rng,
+                                         policy=finish_policy, roughness=roughness)
+            else:
+                record = choices[rng.randrange(len(choices))]
             metallic = record.get("metallic")
             if not isinstance(metallic, dict):
                 metallic = {"mode": "constant", "value": 0.0}
@@ -197,8 +214,12 @@ def bindings_for_scene(stage1_manifest: dict[str, Any], registry: dict[str, Any]
 
 def build_manifest(*, stage1_manifest: dict[str, Any], stage1_path: Path, registry: dict[str, Any],
                    registry_path: Path, child_scene_id: str, parent_scene_id: str, parent_dataset_fingerprint: str | None,
-                   material_variant_id: str, material_seed: int) -> dict[str, Any]:
-    bindings, excluded = bindings_for_scene(stage1_manifest, registry, seed=material_seed)
+                   material_variant_id: str, material_seed: int,
+                   finish_policy: dict[str, Any] | None = None,
+                   roughness_index: dict[str, float] | None = None) -> dict[str, Any]:
+    bindings, excluded = bindings_for_scene(stage1_manifest, registry, seed=material_seed,
+                                            finish_policy=finish_policy,
+                                            roughness_index=roughness_index)
     geometry_digest = sha256(stage1_path)
     payload = {
         "schema": MANIFEST_SCHEMA, "compiler_version": "structural-rematerialize-v4-dielectric-loadbearing",
@@ -217,5 +238,9 @@ def build_manifest(*, stage1_manifest: dict[str, Any], stage1_path: Path, regist
             "excluded_units": excluded,
         },
     }
+    if finish_policy is not None:
+        # Only present when a finish policy was applied, so every manifest built
+        # without one keeps its exact key set and its digest.
+        payload["structural_finish"] = finish_report(bindings, roughness_index or {}, finish_policy)
     payload["digest"] = canonical_digest(payload)
     return payload
