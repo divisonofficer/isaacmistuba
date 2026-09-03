@@ -549,7 +549,8 @@ class IRDatasetController:
         if (not request.get("illumination_diversity")
                 or job.status == "succeeded"
                 or request.get("source_mode") == "nir_passive_backfill"
-                or request.get("illumination_pairing_policy") == "reference_subset_v2"
+                or request.get("illumination_pairing_policy") in {"reference_subset_v2",
+                                                                  FREE_PAIRING_POLICY}
                 or job.stage in {"qc_render", "full_render"}):
             return
         paths = request.get("paths") or {}
@@ -964,6 +965,11 @@ class IRDatasetController:
             "pose_budget": int(raw.get("pose_budget", 400)),
             "camera_policy": str(raw.get("camera_policy") or "content_aware_v2"),
             "illumination_bank_version": str(raw.get("illumination_bank_version") or "v1"),
+            # OpenImageDenoise on the beauty passes.  Off by default so no
+            # existing dataset's fingerprint moves; the queue records it in
+            # dataset_config, so a denoised and a raw render never adopt each
+            # other's frames.
+            "denoise": bool(raw.get("denoise", False)),
             "variation_pose_count": int(raw.get("variation_pose_count") or 10),
             "content_profile": str(raw.get("content_profile") or "balanced"),
             "placement_profile": str(raw.get("placement_profile") or "legacy_clutter_v1"),
@@ -2904,6 +2910,10 @@ class IRDatasetController:
         if stage == "qc_render" and storage_profile == "core_half_exr_v1":
             storage_profile = "diagnostic_half_exr_v1"
         common += ["--storage-profile", storage_profile]
+        if r.get("denoise"):
+            # Beauty passes only -- the PBR and geometry AOVs are per-pixel
+            # constants and are written exactly either way.
+            common.append("--denoise")
         if r.get("nir_passive"):
             common.append("--nir-passive")
         else:
