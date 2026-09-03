@@ -3498,8 +3498,16 @@ class IRDatasetController:
         records = contract.get("materials") or []
         if not records or any(set((record.get("effective_inputs") or {})) != required for record in records):
             raise RuntimeError("prepared scene lacks the required effective-input audit")
-        if any((record.get("metallic_contract") or {}).get("schema") != "robomituba.metallic_contract.v2" for record in records):
-            raise RuntimeError("prepared scene lacks valid per-material MetallicContractV2 provenance")
+        # A Stage 2 built with the continuous-metalness policy emits v3 records,
+        # which carry the v2 payload they were derived from.  Accept them only
+        # when the contract itself declares the policy, so an undeclared v3 is
+        # still a defect rather than a silent widening.
+        allowed_metallic = {"robomituba.metallic_contract.v2"}
+        if contract.get("metallic_augmentation"):
+            allowed_metallic.add("robomituba.metallic_contract.v3")
+        if any((record.get("metallic_contract") or {}).get("schema") not in allowed_metallic
+               for record in records):
+            raise RuntimeError("prepared scene lacks valid per-material metallic contract provenance")
         override = contract.get("structural_rematerialization")
         if job.request.get("structural_rematerialize"):
             # v3 keeps the same interior-only safety boundary as v2, but
