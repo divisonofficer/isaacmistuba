@@ -283,10 +283,14 @@ def restart_daemon_for_clean_memory() -> None:
             cwd=str(REPO_ROOT), stdout=logf, stderr=subprocess.STDOUT,
             start_new_session=True, env=daemon_env,
         )
+    # Probe a constant-time endpoint. /api/render-jobs enumerates every job
+    # directory under out/bridge_jobs (2,400+ of them, on a CIFS mount), which
+    # takes minutes -- the daemon was up and serving in 17 ms while this probe
+    # timed out and killed the chain at the first variant handoff.
     deadline = _time.time() + 120
     while _time.time() < deadline:
         try:
-            with urlopen(f"{DAEMON_URL}/api/render-jobs", timeout=10) as resp:
+            with urlopen(f"{DAEMON_URL}/api/health", timeout=10) as resp:
                 if resp.status == 200:
                     print("[sv1-chain] daemon back up and responding", flush=True)
                     return

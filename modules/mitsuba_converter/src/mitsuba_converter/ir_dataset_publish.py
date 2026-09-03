@@ -190,7 +190,15 @@ def validate_publish_source(source: Path) -> dict[str, Any]:
         overview = _read_json(overview_path)
         if overview.get("schema") != "robomituba.ir_scene_overview.v1" or overview.get("dataset_fingerprint") != fingerprint:
             raise ValueError("scene overview schema or fingerprint mismatch")
-        if overview.get("graph_available") and overview.get("graph_digest") != config.get("graph_sha256"):
+        # The binding exists to catch an overview built against a different
+        # viewpoint graph than the dataset was rendered from.  A v5 dataset
+        # declares `authoring_map_sha256` instead of `graph_sha256`: its camera
+        # universe is the 6-DoF object orbit, and the graph the overview still
+        # carries for the viewer is not what the frames came from.  Comparing a
+        # real digest against a key the config does not have made every v5
+        # dataset fail this gate after rendering every frame.
+        declared_graph = config.get("graph_sha256")
+        if declared_graph and overview.get("graph_available") and overview.get("graph_digest") != declared_graph:
             raise ValueError("scene overview graph binding mismatch")
         proxy = overview.get("proxy_mesh") or {}
         declared_proxy = overview_contract.get("proxy_mesh_path")
