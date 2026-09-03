@@ -162,3 +162,17 @@ def test_suitability_outranks_the_smooth_budget() -> None:
     picked = {choose_for_role(choices, "wall", random.Random(n),
                               policy=policy, roughness=rough)["id"] for n in range(40)}
     assert picked == {"matte_tile"}
+
+
+def test_repeat_ceiling_holds_without_any_policy() -> None:
+    """The stretched wall is a defect, so it is checked whatever the finish is."""
+    from mitsuba_converter.ir_structural_finish import repeat_fits
+    coarse = {"id": "c", "surface_family": "wood",
+              "physical_size_m": {"width": 2.4, "height": 2.4}}
+    fine = {"id": "f", "surface_family": "wood",
+            "physical_size_m": {"width": 1.2, "height": 1.2}}
+    assert repeat_fits(coarse, "wall") is False
+    assert repeat_fits(coarse, "floor") is True    # seen obliquely, it reads fine
+    assert repeat_fits(fine, "wall") is True
+    # A role the ceiling does not name is left alone.
+    assert repeat_fits(coarse, "soffit") is True

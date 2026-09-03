@@ -13,7 +13,7 @@ import random
 from pathlib import Path
 from typing import Any
 
-from .ir_structural_finish import choose_for_role, finish_report
+from .ir_structural_finish import choose_for_role, finish_report, repeat_fits
 
 REGISTRY_SCHEMA = "robomituba.ir_external_structural_pbr_registry.v1"
 MANIFEST_SCHEMA = "robomituba.ir_structural_rematerialization.v1"
@@ -162,13 +162,19 @@ def dielectric_loadbearing_compatible(record: dict[str, Any], role: str) -> bool
 def bindings_for_scene(stage1_manifest: dict[str, Any], registry: dict[str, Any], *, seed: int,
                        finish_policy: dict[str, Any] | None = None,
                        roughness_index: dict[str, float] | None = None,
+                       allow_coarse_repeat: bool = False,
                        ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Bind a registry material to every structural slot.
 
-    Without ``finish_policy`` the draw is the uniform one this has always made,
-    so an existing manifest reproduces byte for byte.  With it, each role draws
-    from its own roughness band -- see ir_structural_finish for why the uniform
-    draw left the corpus split between rooms of chalk and rooms of polish.
+    Without ``finish_policy`` the draw stays uniform over the approved set, as
+    it has always been; with it, each role also draws against a smooth budget --
+    see ir_structural_finish for why the uniform draw left the corpus split
+    between rooms of chalk and rooms of polish.
+
+    The repeat ceiling applies either way.  A wall wearing a 2.4 m texture reads
+    as one plank across the room whatever else is going on, and the uniform draw
+    did that to 8.8% of wall slots.  ``allow_coarse_repeat`` exists only to
+    reproduce a manifest built before the ceiling existed.
     """
     rng = random.Random(int(seed))
     roughness = roughness_index or {}
@@ -187,6 +193,12 @@ def bindings_for_scene(stage1_manifest: dict[str, Any], registry: dict[str, Any]
             and curated_for_role(record, role)
             and dielectric_loadbearing_compatible(record, role)
         ]
+        if not allow_coarse_repeat:
+            # Never leaves a role with nothing: a ceiling on a registry of only
+            # coarse materials keeps them rather than failing the render.
+            fine = [record for record in choices if repeat_fits(record, role)]
+            if fine:
+                choices = fine
         if not choices:
             raise ValueError(f"structural registry has no approved material for {role}")
         for slot, _material in enumerate(unit.get("material_slots") or unit.get("materials") or [None]):

@@ -91,3 +91,29 @@ def test_loadbearing_structures_skip_assets_with_metallic_texture():
                          "collections": ["room_floor"], "material_slots": [{}]}]}
     bindings, _ = bindings_for_scene(scene, registry, seed=2)
     assert bindings[0]["material_id"] == "good_floor"
+
+
+def _tiny_scene():
+    return {"units": [{"id": "u", "blender_name": "room.wall", "subtype": "wall",
+                       "material_slots": [None]}]}
+
+
+def test_a_coarse_texture_never_lands_on_a_wall() -> None:
+    """8.8% of wall slots drew a 2.0-2.4 m texture before this held."""
+    from mitsuba_converter.ir_structural_finish import repeat_fits
+    from mitsuba_converter.ir_structural_pbr import bindings_for_scene
+    from pathlib import Path
+    import json
+    registry_path = Path("/bean/ir_pbr_assets/texturecan_structural_extended_v1/registry.lock.json")
+    if not registry_path.is_file():
+        import pytest
+        pytest.skip("structural registry is not available on this host")
+    registry = json.loads(registry_path.read_text())
+    by_id = {m["id"]: m for m in registry["materials"]}
+    stage1 = json.loads((Path("/bean/ir_dataset_work/.pipeline")
+                         / "infinigen_bedroom_20260810_v2" / "ir_geometry" / "stage1"
+                         / "scene_manifest.json").read_text())
+    for seed in range(25):
+        bindings, _ = bindings_for_scene(stage1, registry, seed=seed)
+        for b in bindings:
+            assert repeat_fits(by_id[b["material_id"]], b["role"]), (seed, b["role"], b["material_id"])
