@@ -164,7 +164,7 @@ def _parse_args(argv):
                     default="legacy_clutter_v1")
     ap.add_argument(
         "--ir-material-profile",
-        choices=("standard", "principled_rich_v1"),
+        choices=("standard", "principled_rich_v1", "principled_rich_v2"),
         default="standard",
         help="Opt-in IR material generator profile. The default leaves Infinigen material pools unchanged.",
     )

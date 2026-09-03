@@ -37,6 +37,8 @@ from navigation_dataset.ir_principled import (  # noqa: E402
     MATERIAL_CONTRACT_VERSION,
     METALLIC_CONTRACT_SCHEMA,
     METALLIC_FAMILY_IDS,
+    COATED_CONDUCTOR_FAMILY,
+    CONDUCTOR_BEARING_FAMILIES,
     STAGE2_COMPILER_VERSION,
     PSEUDO_NIR_FORMULA_ID,
     SURROGATE_MIN_ROUGHNESS,
@@ -53,6 +55,13 @@ from navigation_dataset.ir_principled import (  # noqa: E402
     SEMANTIC_SURROGATES,
 )
 from navigation_dataset import ir_indoor_fixtures, ir_metallic_composition  # noqa: E402
+
+#: A curated profile below this is a dielectric that happens to carry a trace of
+#: specular, not a conductor.  The registry's two metal-bearing profiles sit at
+#: 0.92 and 0.15 and its two dielectric ones at exactly 0.0, so any cut in
+#: between separates them; 0.02 matches the threshold the QC already uses to
+#: call a pixel metal-bearing.
+_COATED_CONDUCTOR_MIN = 0.02
 from render_visibility_contract import (  # noqa: E402
     hide_untracked_render_meshes,
     visible_untracked_mesh_names,
@@ -140,7 +149,15 @@ def _effective_metallic_contract(
         family, value, source = "dielectric", 0.0, "remediated"
     elif prop_binding:
         value = float((((prop_binding.get("profile") or {}).get("values") or {}).get("metallic", 0.0)))
-        family, source = ("conductor" if value >= 1.0 - 1e-6 else "dielectric"), "remediated"
+        # A curated profile is authored, not guessed, so its fractional level is
+        # a real material property rather than the legacy Stage-1 ambiguity that
+        # the uniform-fractional rule below exists to reject.  Reading anything
+        # under 1.0 as dielectric is what put 0.92 pans and 0.15 appliance
+        # shells behind a "not metal" label.
+        family = ("conductor" if value >= 1.0 - 1e-6
+                  else COATED_CONDUCTOR_FAMILY if value > _COATED_CONDUCTOR_MIN
+                  else "dielectric")
+        source = "remediated"
     elif metallic_source == "texture":
         # A legacy authored metallic texture is retained as spatial coverage,
         # never collapsed to a guessed scalar. Stage-0's near-binary audit is
@@ -161,6 +178,7 @@ def _effective_metallic_contract(
         "legacy_uniform_fractional_snap_v1" if legacy_fractional_normalization
         else "legacy_authored_coverage_v1" if family == "coverage_mixed"
         else "legacy_pure_conductor_v1" if family == "conductor"
+        else "curated_profile_coated_conductor_v1" if family == COATED_CONDUCTOR_FAMILY
         else "legacy_dielectric_v1"
     )
     result = {
@@ -843,7 +861,7 @@ def _make_material(
     # contract-level identity only.
     family_id = METALLIC_FAMILY_IDS[membership_family]
     family_membership = _value_constant(
-        tree, float(membership_family in {"conductor", "coverage_mixed"}),
+        tree, float(membership_family in CONDUCTOR_BEARING_FAMILIES),
     )
     if family == CONTINUOUS_METALLIC_FAMILY:
         # exposed_metal_mask is documented as *effective exposed conductor
@@ -860,7 +878,12 @@ def _make_material(
         # The pre-augmentation binary, so a label ablation needs no second render.
         _aov(tree, "GT_MetallicSourceBinary", source_metallic_socket, kind="VALUE")
     else:
-        exposed_metal = effective_metallic if family == "coverage_mixed" else family_membership
+        # A coated conductor's authored level *is* its exposed fraction -- a
+        # 0.15 appliance shell is not fully exposed metal -- so it leaks the
+        # effective value the way a coverage texture does.
+        exposed_metal = (effective_metallic
+                         if family in {"coverage_mixed", COATED_CONDUCTOR_FAMILY}
+                         else family_membership)
     _aov(tree, "GT_MetallicFamilyID", _value_constant(tree, float(family_id)), kind="VALUE")
     _aov(tree, "GT_MetalCoverage", family_membership, kind="VALUE")
     _aov(tree, "GT_ExposedMetal", exposed_metal, kind="VALUE")
@@ -1415,7 +1438,9 @@ def main() -> int:
             "base_color_nir": "effective Principled Base Color selected NIR branch",
             "roughness": "effective Principled Roughness input",
             "metallic": "raw effective Principled Metallic input (linear Non-Color; no GT-only correction)",
-            "metallic_family_id": ("0 dielectric; 1 conductor; 2 coverage_mixed. An augmented "
+            "metallic_family_id": ("0 dielectric; 1 conductor; 2 coverage_mixed; 4 coated_conductor "
+                                   "(a curated prop finished at a fractional level; id 3 is the "
+                                   "contract-level continuous_composite and is never rendered). An augmented "
                                    "(continuous_composite) slot reports the source family it was "
                                    "derived from, so this pass never carries family id 3; the "
                                    "augmentation is declared per-dataset in metallic_augmentation "

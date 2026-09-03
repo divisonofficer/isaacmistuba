@@ -17,7 +17,7 @@
   let surfaceClutter = $state<'low' | 'balanced' | 'rich' | 'storage'>('rich');
   let cameraPolicy = $state<'content_aware_v2' | 'coverage_v1'>('content_aware_v2');
   let contentProfile = $state<'balanced' | 'anchor_rich' | 'structural' | 'research_balanced'>('research_balanced'); let adaptivePoseBudget = $state(true);
-  let irMaterialProfile = $state<'standard' | 'principled_rich_v1'>('principled_rich_v1');
+  let irMaterialProfile = $state<'standard' | 'principled_rich_v1' | 'principled_rich_v2'>('principled_rich_v2');
   let width = $state(684); let height = $state(512); let fov = $state(60); let rgbSpp = $state(4000); let nirSpp = $state(2000);
   let nirPassive = $state(true);
   // 160 leaves content-aware sampling room to satisfy the strict 100-pose
@@ -354,7 +354,7 @@
         {#if illuminationDiversity}<div class="field-note">Reference-subset lighting pairs<small>Reference neutral은 base pose {poseBudget}개를 모두 렌더합니다. 나머지 5개 조명은 base pose를 겹치지 않게 약 {variationPoseEstimate}개씩 나눠 렌더하므로, 모든 variation frame에 정확히 대응하는 reference frame이 있습니다. 예상 총 {illuminationFrameEstimate} frames.</small></div>{/if}
         <label>Camera policy<select bind:value={cameraPolicy}><option value="content_aware_v2">Content-aware v2</option><option value="coverage_v1">Coverage v1</option></select></label>
           <label>Content profile<select bind:value={contentProfile}><option value="research_balanced">Research balanced</option><option value="balanced">balanced</option><option value="anchor_rich">anchor rich</option><option value="structural">structural</option></select><small>family_home + rich anchors/clutter를 최소로 적용합니다. 밀도·pose·metal GT gate 미달 시 최대 4 variation을 자동 재생성합니다.</small></label>
-          <label>IR material profile<select bind:value={irMaterialProfile}><option value="principled_rich_v1">Principled rich v1</option><option value="standard">Standard Infinigen</option></select><small>principled_rich_v1은 새 Infinigen 생성에서만 metal-capable pool에 conductor/near-binary coverage material을 추가합니다. 기본 Infinigen 분포는 변경하지 않습니다.</small></label>
+          <label>IR material profile<select bind:value={irMaterialProfile}><option value="principled_rich_v2">Principled rich v2</option><option value="principled_rich_v1">Principled rich v1</option><option value="standard">Standard Infinigen</option></select><small>v1은 metal-capable pool에 conductor/near-binary coverage material을 추가합니다. v2는 거기에 더해 cutlery와 cookware를 전용 pool로 분리합니다 &mdash; 지금까지 fork/knife/spoon/pan은 컵과 같은 pool에서 뽑아 금속 확률이 20.7%였고, 실측에서 fork가 유리로 8번, knife가 반투명 플라스틱으로 5번 나왔습니다. 두 프로파일 모두 기본 Infinigen 분포는 변경하지 않습니다.</small></label>
           {#if contentProfile === 'research_balanced'}<div class="material-contract"><b>MetallicContractV2 · physically constrained</b><small>dielectric=0 · conductor=1 · coverage-mixed는 shared near-binary mask · Non-Color linear metallic · high-metal coverage 3–12% · 서로 다른 visible metal material ≥2 · 단일 material 독점 ≤50%</small></div>{/if}
         {#if sourceMode !== 'augmentation'}
           <section class:enabled={structuralRematerialize} class="structural-override-card">

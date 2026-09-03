@@ -188,7 +188,7 @@ export type ControllerRequest = {
   pose_budget: number;
   min_unique_pose_count?: number;
   camera_policy?: 'content_aware_v2' | 'coverage_v1'; content_profile?: 'balanced' | 'anchor_rich' | 'structural' | 'research_balanced'; ir_composition_profile?: 'inverse_rendering_showcase_v1';
-  ir_material_profile?: 'standard' | 'principled_rich_v1'; material_mix_profile?: 'physically_constrained_metal_v1'; max_quality_variations?: number; max_showcase_composition_attempts?: number;
+  ir_material_profile?: 'standard' | 'principled_rich_v1' | 'principled_rich_v2'; material_mix_profile?: 'physically_constrained_metal_v1'; max_quality_variations?: number; max_showcase_composition_attempts?: number;
   adaptive_pose_budget?: boolean; sparse_negative_fraction?: number; max_headings_per_node?: number;
   graph_max_nodes: number; graph_heading_count: number; graph_min_node_spacing: number; graph_robot_radius: number;
   archetype?: string; room_type?: string; density?: string; generation_stage?: string; seed?: string; existing_output?: string;

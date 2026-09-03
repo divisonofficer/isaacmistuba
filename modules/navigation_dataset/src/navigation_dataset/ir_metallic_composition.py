@@ -54,7 +54,12 @@ COMPOSITION_RULE_VERSION = "composition-token-v1"
 #: Families the Stage-2 MetallicContractV2 can report, and how this model reads
 #: them.  Only conductor-bearing slots are ever augmented; a dielectric stays a
 #: dielectric so a painted wall can never be relabelled as metal.
-CONDUCTOR_FAMILIES = frozenset({"conductor", "coverage_mixed"})
+#:
+#: ``coated_conductor`` is a curated prop finished at a fractional level (a pan
+#: at 0.92).  It belongs here: the field multiplies by the authored value, so
+#: that level becomes the ceiling and the coat varies beneath it, exactly as a
+#: coverage texture bounds where metal is.
+CONDUCTOR_FAMILIES = frozenset({"conductor", "coverage_mixed", "coated_conductor"})
 
 COMPOSITION_CLASSES = (
     "metal_hardware",     # faucets, handles, hinges, rails -- bare or lightly coated

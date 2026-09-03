@@ -1027,7 +1027,8 @@ class IRDatasetController:
             raise ValueError("invalid Infinigen placement profile")
         if request["ir_composition_profile"] not in {"", SHOWCASE_PROFILE}:
             raise ValueError("invalid IR composition profile")
-        if request["ir_material_profile"] not in {"standard", "principled_rich_v1"}:
+        if request["ir_material_profile"] not in {"standard", "principled_rich_v1",
+                                                  "principled_rich_v2"}:
             raise ValueError("invalid IR material profile")
         if request["material_mix_profile"] != METAL_PROFILE or not 1 <= request["max_quality_variations"] <= 5 or not 1 <= request["max_showcase_composition_attempts"] <= 3:
             raise ValueError("invalid material-mix profile or quality variation limit")
@@ -3374,7 +3375,9 @@ class IRDatasetController:
                 entry["covered_base_sum"] += float(bv[covered_interior].sum())
                 entry["exposed_roughness_sum"] += float(rv[exposed_interior].sum())
                 entry["covered_roughness_sum"] += float(rv[covered_interior].sum())
-            mixed = valid & (family_id == 2)
+            # 2 is coverage_mixed and 4 is coated_conductor; both carry a
+            # continuous authored metalness, so both belong to this statistic.
+            mixed = valid & np.isin(family_id, (2, 4))
             coverage_mixed_pixels += int(mixed.sum())
             coverage_mixed_intermediate += int((mixed & (value > 0.02) & (value < 0.98)).sum())
             if mixed.any():

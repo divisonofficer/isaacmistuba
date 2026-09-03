@@ -21,7 +21,16 @@ METALLIC_CONTRACT_SCHEMA_V2 = "robomituba.metallic_contract.v2"
 METALLIC_CONTRACT_SCHEMA_V3 = "robomituba.metallic_contract.v3"
 #: v2 remains the default written and the only schema accepted without opt-in.
 METALLIC_CONTRACT_SCHEMA = METALLIC_CONTRACT_SCHEMA_V2
-METALLIC_CONTRACT_FAMILIES = ("dielectric", "conductor", "coverage_mixed")
+#: A conductor finished at a curated fractional level.  The prop PBR registry
+#: gives a pan 0.92 and an appliance shell 0.15, and those values render and
+#: land in ``GT_Metallic`` -- but the family test was ``value >= 1 - 1e-6``, so
+#: both were labelled ``dielectric``.  Every knife and pot in the corpus
+#: therefore carried a metalness of 0.92 under a label saying "not metal", and
+#: was skipped by the augmentation, which reads the family.  This is the family
+#: those slots always belonged to.
+COATED_CONDUCTOR_FAMILY = "coated_conductor"
+METALLIC_CONTRACT_FAMILIES = ("dielectric", "conductor", "coverage_mixed",
+                              COATED_CONDUCTOR_FAMILY)
 #: v3 adds one family for augmented, continuously-valued metalness.
 CONTINUOUS_METALLIC_FAMILY = "continuous_composite"
 CONTINUOUS_METALLIC_REPRESENTATION = "continuous_spatial_field"
@@ -30,8 +39,13 @@ METALLIC_CONTRACT_FAMILIES_V3 = (*METALLIC_CONTRACT_FAMILIES, CONTINUOUS_METALLI
 #: Append-only.  These ids are baked into the published ``metallic_family_id``
 #: categorical uint8 AOV, so renumbering 0/1/2 would silently corrupt the labels
 #: of every existing dataset with no error anywhere.
+#: 3 was taken by ``continuous_composite`` before ``coated_conductor`` existed,
+#: so the rendered ids are {0, 1, 2, 4} with a hole at 3.  Closing the hole
+#: would mean renumbering, which is exactly what append-only forbids.
 METALLIC_FAMILY_IDS = {"dielectric": 0, "conductor": 1, "coverage_mixed": 2,
-                       CONTINUOUS_METALLIC_FAMILY: 3}
+                       CONTINUOUS_METALLIC_FAMILY: 3, COATED_CONDUCTOR_FAMILY: 4}
+#: Families whose slots carry conductor and may therefore be augmented.
+CONDUCTOR_BEARING_FAMILIES = frozenset({"conductor", "coverage_mixed", COATED_CONDUCTOR_FAMILY})
 #: Provenance keys a v3 ``augmentation`` block must carry for the augmented
 #: label to be reproducible from the dataset fingerprint alone.
 CONTINUOUS_METALLIC_AUGMENTATION_KEYS = (
@@ -371,7 +385,7 @@ def wrap_continuous_metallic_contract(
     prior, so a non-conductor slot is never promoted into metal.
     """
     family = str(contract.get("family") or "")
-    if family not in {"conductor", "coverage_mixed"}:
+    if family not in CONDUCTOR_BEARING_FAMILIES:
         return dict(contract)
     return {
         "schema": METALLIC_CONTRACT_SCHEMA_V3,
