@@ -962,7 +962,7 @@ class IRDatasetController:
             "metallic_augmentation": bool(raw.get("metallic_augmentation", False)),
             "metallic_augmentation_seed": int(raw.get("metallic_augmentation_seed", 0) or 0),
             "nir_passive": bool(raw.get("nir_passive", True)),
-            "storage_profile": str(raw.get("storage_profile") or "core_half_exr_v1"),
+            "storage_profile": str(raw.get("storage_profile") or "core_half_exr_v2"),
             "paired_fraction": float(raw.get("paired_fraction", 0.20)),
             "illumination_pairing_policy": str(raw.get("illumination_pairing_policy") or "reference_subset_v2"),
             "min_unique_pose_count": int(raw.get("min_unique_pose_count", 100)),
@@ -997,9 +997,13 @@ class IRDatasetController:
             "small_high_poly_max_extent_m": float(raw.get("small_high_poly_max_extent_m", 0.5)),
             "small_high_poly_min_triangles": int(raw.get("small_high_poly_min_triangles", 100000)),
         }
+        # core_half_exr_v1 omitted pre-albedo diffuse diagnostics.  Preserve it
+        # only for existing immutable jobs; every new submission is upgraded.
+        if request["storage_profile"] == "core_half_exr_v1":
+            request["storage_profile"] = "core_half_exr_v2"
         if request["width"] < 1 or request["height"] < 1 or request["rgb_spp"] < 1 or request["nir_spp"] < 1 or not 1 <= request["fov"] < 179 or not 100 <= request["pose_budget"] <= 2000:
             raise ValueError("invalid render dimensions, samples, or horizontal FOV")
-        if request["storage_profile"] not in {"legacy_full_float32_v1", "core_half_exr_v1", "diagnostic_half_exr_v1"}:
+        if request["storage_profile"] not in {"legacy_full_float32_v1", "core_half_exr_v1", "core_half_exr_v2", "diagnostic_half_exr_v1"}:
             raise ValueError("invalid storage_profile")
         if not 0.05 <= request["paired_fraction"] <= 1.0:
             raise ValueError("paired fraction must be in [0.05, 1.0]")
@@ -2705,6 +2709,11 @@ class IRDatasetController:
                    "--ir-material-profile", str(r.get("ir_material_profile") or "standard"),
                    "--scene-id", r["scene_id"], "--no-import", "--yes"]
             if r["archetype"] == "single_room": cmd += ["--room-type", r["room_type"]]
+            # Office v2 owns a durable candidate run-state.  A controller
+            # timeout deliberately preserves it, so its recovery command
+            # must explicitly reopen that same state instead of failing with
+            # "incomplete state" before the solver can continue.
+            elif r["archetype"] == "office": cmd += ["--resume"]
             return cmd
         if stage == "showcase_composition":
             source_blend = self._source_blend_path(native_source)
@@ -3277,6 +3286,19 @@ class IRDatasetController:
         # A Stage 2 built with the continuous-metalness policy invalidates the
         # binary premise of the gates below, so it selects a third mode.
         metallic_augmentation = prepared_contract.get("metallic_augmentation") or {}
+        # The composition policy draws a per-slot ``bare`` Bernoulli whose rate
+        # is calibrated against measurement (18.8% of strongly metallic
+        # InteriorVerse pixels sit at metalness >= 0.98).  A bare slot is
+        # deliberately left at its conductor floor, so it is binary because the
+        # policy said so -- not because the augmentation failed.  The collapse
+        # gate below must not count those pixels, or a scene fails for
+        # containing a polished pan.
+        bare_metal_ids: set[int] = set()
+        for record in prepared_contract.get("materials") or []:
+            contract = record.get("metallic_contract") or {}
+            parameters = ((contract.get("augmentation") or {}).get("parameters") or {})
+            if float(parameters.get("bare") or 0.0) >= 0.5 and record.get("material_id") is not None:
+                bare_metal_ids.add(int(record["material_id"]))
         structural_valid = structural_high = native_high = 0
         for row in rows:
             paths = row["paths"]
@@ -3439,7 +3461,10 @@ class IRDatasetController:
             conductor_interior = [
                 sample for mid, sample in interior_samples.items()
                 if sample["pixels"] and (sample["metallic_sum"] / max(1, sample["pixels"])) > 0.02
+                and int(mid) not in bare_metal_ids
             ]
+            bare_interior = sum(int(sample["pixels"]) for mid, sample in interior_samples.items()
+                                if int(mid) in bare_metal_ids)
             interior_total = sum(int(sample["pixels"]) for sample in conductor_interior)
             interior_intermediate = sum(int(sample["intermediate_pixels"]) for sample in conductor_interior)
             intermediate_fraction = interior_intermediate / interior_total if interior_total else 0.0
@@ -3449,6 +3474,8 @@ class IRDatasetController:
                 "dataset_seed": metallic_augmentation.get("dataset_seed"),
                 "modified_channels": metallic_augmentation.get("modified_channels"),
                 "conductor_interior_pixels": interior_total,
+                "bare_interior_pixels": bare_interior,
+                "bare_material_ids": sorted(bare_metal_ids),
                 "intermediate_fraction": intermediate_fraction,
                 "minimum_intermediate_fraction": 0.30,
                 "relaxed_binary_findings": diagnostic_findings,
