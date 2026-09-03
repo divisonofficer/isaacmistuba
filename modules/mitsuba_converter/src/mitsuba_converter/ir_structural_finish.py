@@ -49,6 +49,27 @@ DEFAULT_SMOOTH_RATE: dict[str, float] = {
     "panel": 0.30,
     "ceiling": 0.0,
 }
+#: Which surface families belong on which role.  Approval in the registry says
+#: a material *can* go somewhere; this says it *should*.  Selecting on the
+#: smooth budget alone put a wood texture on a bedroom wall, which reads as
+#: planks running the length of the room -- smooth, and wrong.
+DEFAULT_FAMILIES: dict[str, tuple[str, ...]] = {
+    "floor": ("wood", "tile", "fabric", "concrete", "marble"),
+    "wall": ("concrete", "tile", "marble", "brick", "rock", "metal"),
+    "ceiling": ("concrete", "tile"),
+    "column": ("concrete", "tile", "marble", "brick", "rock"),
+    "panel": ("metal", "tile", "wood"),
+}
+#: Largest texture repeat a role may wear, in metres.  A wall is read close up
+#: and from the side, so a 2.4 m repeat puts one plank across the whole surface;
+#: a floor is seen obliquely and takes a coarser repeat without looking odd.
+DEFAULT_MAX_REPEAT_M: dict[str, float] = {
+    "floor": 2.4,
+    "wall": 1.5,
+    "ceiling": 2.0,
+    "column": 1.5,
+    "panel": 2.0,
+}
 #: A material counts as smooth when this much of its roughness map is at or
 #: below SMOOTH_ROUGHNESS.  The registry splits cleanly around it: 13 materials
 #: are over half smooth and 82 have almost none, so the exact value barely
@@ -71,6 +92,8 @@ def load_policy(path: Path | None) -> dict[str, Any]:
     if path is None:
         return {"schema": POLICY_SCHEMA, "version": POLICY_VERSION,
                 "smooth_rate": dict(DEFAULT_SMOOTH_RATE),
+                "families": {k: list(v) for k, v in DEFAULT_FAMILIES.items()},
+                "max_repeat_m": dict(DEFAULT_MAX_REPEAT_M),
                 "material_smooth_fraction": MATERIAL_SMOOTH_FRACTION,
                 "shell_smooth_target": list(SHELL_SMOOTH_TARGET),
                 "smooth_roughness": SMOOTH_ROUGHNESS}
@@ -130,6 +153,25 @@ def smooth_rate_for(policy: Mapping[str, Any], role: str) -> float | None:
     return None if rate is None else float(rate)
 
 
+def suitable(record: Mapping[str, Any], role: str, policy: Mapping[str, Any]) -> bool:
+    """Does this material belong on this surface, beyond being approved for it?
+
+    Two things the registry's approval does not capture: whether the family
+    reads correctly there, and whether its repeat is fine enough to be seen
+    from that distance.
+    """
+    families = (policy.get("families") or {}).get(role)
+    if families and str(record.get("surface_family") or "") not in set(families):
+        return False
+    limit = (policy.get("max_repeat_m") or {}).get(role)
+    if limit is not None:
+        size = record.get("physical_size_m") or {}
+        extent = max(float(size.get("width") or 0.0), float(size.get("height") or 0.0))
+        if extent > float(limit) + 1e-9:
+            return False
+    return True
+
+
 def choose_for_role(choices: Sequence[Mapping[str, Any]], role: str, rng: random.Random,
                     *, policy: Mapping[str, Any], roughness: Mapping[str, float]) -> Mapping[str, Any]:
     """Pick a material for one structural slot against the role's smooth budget.
@@ -146,11 +188,15 @@ def choose_for_role(choices: Sequence[Mapping[str, Any]], role: str, rng: random
     rate = smooth_rate_for(policy, role)
     if rate is None:
         return choices[rng.randrange(len(choices))]
+    # Suitability first: a finish budget must not be able to buy a smooth
+    # surface by putting the wrong material on it.  If nothing suits, the
+    # approved set stands rather than the render failing.
+    pool_all = [c for c in choices if suitable(c, role, policy)] or list(choices)
     cut = float(policy.get("material_smooth_fraction", MATERIAL_SMOOTH_FRACTION))
-    smooth = [c for c in choices if roughness.get(str(c.get("id")), 0.0) >= cut]
-    matte = [c for c in choices if roughness.get(str(c.get("id")), 0.0) < cut]
+    smooth = [c for c in pool_all if roughness.get(str(c.get("id")), 0.0) >= cut]
+    matte = [c for c in pool_all if roughness.get(str(c.get("id")), 0.0) < cut]
     pool = smooth if (rng.random() < rate and smooth) else (matte or smooth)
-    return pool[rng.randrange(len(pool))] if pool else choices[rng.randrange(len(choices))]
+    return pool[rng.randrange(len(pool))] if pool else pool_all[rng.randrange(len(pool_all))]
 
 
 def shell_smooth_fraction(bindings: Iterable[Mapping[str, Any]],
@@ -198,7 +244,8 @@ def finish_report(bindings: Sequence[Mapping[str, Any]], roughness: Mapping[str,
 
 
 __all__ = [
-    "DEFAULT_SMOOTH_RATE", "MATERIAL_SMOOTH_FRACTION", "POLICY_SCHEMA", "POLICY_VERSION",
+    "DEFAULT_FAMILIES", "DEFAULT_MAX_REPEAT_M", "DEFAULT_SMOOTH_RATE",
+    "MATERIAL_SMOOTH_FRACTION", "POLICY_SCHEMA", "POLICY_VERSION", "suitable",
     "SHELL_SMOOTH_TARGET", "SMOOTH_ROUGHNESS", "choose_for_role", "finish_report",
     "load_policy", "measure_roughness", "roughness_index", "shell_smooth_fraction",
     "smooth_rate_for", "stable_digest",

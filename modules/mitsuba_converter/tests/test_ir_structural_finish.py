@@ -120,3 +120,45 @@ def test_policy_rejects_a_rate_that_is_not_a_probability(tmp_path: Path) -> None
     bad.write_text(json.dumps({"schema": POLICY_SCHEMA, "smooth_rate": {"floor": 1.4}}))
     with pytest.raises(ValueError, match="probability"):
         load_policy(bad)
+
+
+def test_a_wall_does_not_get_a_coarse_wood_texture() -> None:
+    """The defect a render A/B exposed: smooth bought at the cost of sense.
+
+    Wood is the coarsest family the registry stocks, and a 2 m repeat on a wall
+    reads as planks running the length of the room.
+    """
+    from mitsuba_converter.ir_structural_finish import suitable
+    policy = load_policy(REPO / "configs" / "ir_materials" / "structural_finish_v1.json")
+    wood = {"id": "wood", "surface_family": "wood",
+            "physical_size_m": {"width": 2.0, "height": 2.0}}
+    tile = {"id": "tile", "surface_family": "tile",
+            "physical_size_m": {"width": 1.2, "height": 1.2}}
+    assert suitable(wood, "floor", policy) is True
+    assert suitable(wood, "wall", policy) is False
+    assert suitable(tile, "wall", policy) is True
+
+
+def test_a_repeat_too_coarse_for_the_role_is_rejected() -> None:
+    from mitsuba_converter.ir_structural_finish import suitable
+    policy = load_policy(REPO / "configs" / "ir_materials" / "structural_finish_v1.json")
+    coarse = {"id": "c", "surface_family": "tile",
+              "physical_size_m": {"width": 2.0, "height": 2.0}}
+    fine = {"id": "f", "surface_family": "tile",
+            "physical_size_m": {"width": 1.2, "height": 1.2}}
+    assert suitable(coarse, "wall", policy) is False   # over the 1.5 m wall limit
+    assert suitable(coarse, "floor", policy) is True   # a floor takes it
+    assert suitable(fine, "wall", policy) is True
+
+
+def test_suitability_outranks_the_smooth_budget() -> None:
+    """A smooth but unsuitable material must not win the draw."""
+    policy = load_policy(REPO / "configs" / "ir_materials" / "structural_finish_v1.json")
+    choices = [{"id": "smooth_wood", "surface_family": "wood",
+                "physical_size_m": {"width": 2.4, "height": 2.4}},
+               {"id": "matte_tile", "surface_family": "tile",
+                "physical_size_m": {"width": 1.2, "height": 1.2}}]
+    rough = {"smooth_wood": 0.90, "matte_tile": 0.0}
+    picked = {choose_for_role(choices, "wall", random.Random(n),
+                              policy=policy, roughness=rough)["id"] for n in range(40)}
+    assert picked == {"matte_tile"}
