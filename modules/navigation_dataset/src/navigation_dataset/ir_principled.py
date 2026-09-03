@@ -39,8 +39,19 @@ CONTINUOUS_METALLIC_AUGMENTATION_KEYS = (
     "source_family", "source_representation", "semantic_class", "composition_class",
     "parameters",
 )
-PSEUDO_NIR_FORMULA_ID = "pseudo_max_complement_bt601_v1"
-PSEUDO_NIR_WEIGHTS = np.asarray((0.229, 0.587, 0.114), dtype=np.float32)
+PSEUDO_NIR_FORMULA_ID = "pseudo_monotone_gamma_bt601_v2"
+#: Rec. 601 luma.  The v1 weights read (0.229, 0.587, 0.114) and summed to
+#: 0.930, so even a white surface could not reach an albedo of 1.
+PSEUDO_NIR_WEIGHTS = np.asarray((0.299, 0.587, 0.114), dtype=np.float32)
+#: Below 1 this compresses contrast toward the reference, which is the
+#: direction NIR goes for indoor dielectrics: dark visible materials are
+#: relatively brighter at 850 nm, light ones relatively less so.
+PSEUDO_NIR_GAMMA = 0.75
+#: The luminance the mapping holds fixed.  A bare gamma lift raises the overall
+#: level as well, which is not justifiable and is what buried the flash term;
+#: anchoring at a typical indoor albedo keeps NIR scale-matched to the visible
+#: band instead of pushing the whole range up.
+PSEUDO_NIR_REFERENCE_ALBEDO = 0.5
 LUMINANCE_WEIGHTS = np.asarray((0.2126, 0.7152, 0.0722), dtype=np.float32)
 
 DEFAULT_BASE_COLOR = (0.5, 0.5, 0.5, 1.0)
@@ -88,11 +99,27 @@ def normalize_legacy_metallic_scalar(value: float, *, threshold: float = 0.5) ->
 
 
 def pseudo_nir_albedo(rgb_linear: np.ndarray) -> np.ndarray:
-    """Apply the dataset's deterministic pseudo-NIR convention to linear RGB."""
+    """Stand-in 850 nm reflectance for a visible base colour.
+
+    Monotone in visible luminance and bounded in [0, 1], so a dark surface
+    never comes out brighter than a light one, and scale-matched to the visible
+    band by holding PSEUDO_NIR_REFERENCE_ALBEDO fixed.
+
+    v1 computed ``max(c, 1-c)`` per channel.  That bottoms out at 0.5 and
+    returns 1.0 at both ends, so it is V-shaped rather than monotone: black
+    surfaces became the brightest thing in the NIR image and mid-greys the
+    darkest, no NIR albedo could fall below 0.5, and the mapping had no inverse
+    for a network to learn through.  Measured over nine rendered scenes it put
+    NIR albedo at 1.6-3.0x the visible, which is what buried the active flash
+    term the dataset exists to capture.
+    """
     rgb = np.clip(np.asarray(rgb_linear, dtype=np.float32), 0.0, 1.0)
     if rgb.shape[-1:] != (3,):
         raise ValueError(f"expected RGB in the last dimension, got {rgb.shape}")
-    return (np.maximum(rgb, 1.0 - rgb) @ PSEUDO_NIR_WEIGHTS).astype(np.float32)
+    luma = rgb @ PSEUDO_NIR_WEIGHTS
+    reference = np.float32(PSEUDO_NIR_REFERENCE_ALBEDO)
+    lifted = (luma / reference) ** np.float32(PSEUDO_NIR_GAMMA) * reference
+    return np.clip(lifted, 0.0, 1.0).astype(np.float32)
 
 
 def matched_luminance_coefficients(rgb_linear: np.ndarray) -> dict[str, float]:
@@ -444,11 +471,16 @@ def formula_contract() -> dict[str, Any]:
     return {
         "id": PSEUDO_NIR_FORMULA_ID,
         "input": "linear_rgb",
-        "expression": "dot(max(rgb, 1-rgb), [0.229, 0.587, 0.114])",
+        "expression": "(dot(rgb, [0.299, 0.587, 0.114]) / 0.5) ** 0.75 * 0.5",
         "weights": PSEUDO_NIR_WEIGHTS.astype(float).tolist(),
+        "gamma": float(PSEUDO_NIR_GAMMA),
+        "reference_albedo": float(PSEUDO_NIR_REFERENCE_ALBEDO),
+        "monotone": True,
         "implementation_digest": stable_json_digest({
             "id": PSEUDO_NIR_FORMULA_ID,
             "weights": PSEUDO_NIR_WEIGHTS.astype(float).tolist(),
-            "operation": "dot(max(rgb, 1-rgb), weights)",
+            "gamma": float(PSEUDO_NIR_GAMMA),
+            "reference_albedo": float(PSEUDO_NIR_REFERENCE_ALBEDO),
+            "operation": "(dot(rgb, weights) / reference) ** gamma * reference",
         }),
     }

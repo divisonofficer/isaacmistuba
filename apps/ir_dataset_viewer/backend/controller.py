@@ -42,6 +42,10 @@ DENSITIES = {"model_house", "normal_lived_in", "family_home", "storage_heavy"}
 # navigation_dataset.ir_principled.STAGE2_COMPILER_VERSION.  The controller is
 # intentionally importable without the navigation package on PYTHONPATH.
 STAGE2_COMPILER_VERSION = "ir-principled-stage2-v12-render-visibility-contract"
+# Likewise navigation_dataset.ir_principled.PSEUDO_NIR_FORMULA_ID.  The albedo
+# is compiled into the blend, so a Stage 2 built against an older formula has
+# to read stale even when everything else about it still matches.
+PSEUDO_NIR_FORMULA_ID = "pseudo_monotone_gamma_bt601_v2"
 IR_GRAPH_DEFAULTS = {
     "graph_max_nodes": 70,
     "graph_heading_count": 24,
@@ -2258,6 +2262,13 @@ class IRDatasetController:
                     contract.get("schema") == "robomituba.ir_principled_material_contract.v4"
                     and contract.get("contract_version") == "blender42-principled-metallic-roughness-v4"
                     and contract.get("compiler_version") == STAGE2_COMPILER_VERSION
+                    # The pseudo-NIR albedo is compiled into the blend, so a
+                    # Stage 2 built against the old formula would keep rendering
+                    # it while looking fresh.  Invalidate on the formula itself
+                    # rather than bumping the compiler version, which would
+                    # discard every Stage 2 for an unrelated reason.
+                    and ((contract.get("pseudo_nir") or {}).get("id")
+                         == PSEUDO_NIR_FORMULA_ID)
                     # A v2 lighting bank needs the addressable fixture rig.  A
                     # Stage 2 built without it renders nothing, so it must read
                     # stale here rather than be reused.

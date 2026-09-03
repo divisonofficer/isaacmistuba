@@ -396,36 +396,56 @@ def _channel_socket(tree, stage1_dir: Path, unit: dict, channel_name: str, slot:
 
 
 def _pseudo_nir_socket(tree, rgb_socket):
+    """Stand-in 850 nm albedo: a monotone gamma lift of visible luma.
+
+    Must stay identical to ``ir_principled.pseudo_nir_albedo`` -- the Python
+    side writes the contract this graph is checked against.
+
+    The previous graph took ``max(c, 1-c)`` per channel, which is V-shaped: it
+    could not go below 0.5, returned 1.0 at both black and white, and so had no
+    inverse for a network to learn through.  Measured over nine scenes it put
+    NIR albedo at 1.6-3.0x the visible and buried the active flash term.
+    """
     separate = tree.nodes.new("ShaderNodeSeparateColor")
     separate.mode = "RGB"
     tree.links.new(rgb_socket, separate.inputs[0])
     weighted = []
-    for index, weight in enumerate((0.229, 0.587, 0.114)):
-        invert = tree.nodes.new("ShaderNodeMath")
-        invert.operation = "SUBTRACT"
-        invert.inputs[0].default_value = 1.0
-        tree.links.new(separate.outputs[index], invert.inputs[1])
-        maximum = tree.nodes.new("ShaderNodeMath")
-        maximum.operation = "MAXIMUM"
-        tree.links.new(separate.outputs[index], maximum.inputs[0])
-        tree.links.new(invert.outputs[0], maximum.inputs[1])
+    # Rec. 601 luma.  The previous weights summed to 0.930, so not even white
+    # could reach an albedo of 1.
+    for index, weight in enumerate((0.299, 0.587, 0.114)):
         multiply = tree.nodes.new("ShaderNodeMath")
         multiply.operation = "MULTIPLY"
         multiply.inputs[1].default_value = weight
-        tree.links.new(maximum.outputs[0], multiply.inputs[0])
+        tree.links.new(separate.outputs[index], multiply.inputs[0])
         weighted.append(multiply.outputs[0])
     add_rg = tree.nodes.new("ShaderNodeMath")
     add_rg.operation = "ADD"
     tree.links.new(weighted[0], add_rg.inputs[0])
     tree.links.new(weighted[1], add_rg.inputs[1])
-    add_rgb = tree.nodes.new("ShaderNodeMath")
-    add_rgb.operation = "ADD"
-    tree.links.new(add_rg.outputs[0], add_rgb.inputs[0])
-    tree.links.new(weighted[2], add_rgb.inputs[1])
+    luma = tree.nodes.new("ShaderNodeMath")
+    luma.operation = "ADD"
+    tree.links.new(add_rg.outputs[0], luma.inputs[0])
+    tree.links.new(weighted[2], luma.inputs[1])
+    # (luma / reference) ** gamma * reference, clamped -- the reference is a
+    # fixed point, so contrast compresses toward it instead of the whole range
+    # being pushed up.
+    normalized = tree.nodes.new("ShaderNodeMath")
+    normalized.operation = "DIVIDE"
+    normalized.inputs[1].default_value = 0.5
+    tree.links.new(luma.outputs[0], normalized.inputs[0])
+    powered = tree.nodes.new("ShaderNodeMath")
+    powered.operation = "POWER"
+    powered.inputs[1].default_value = 0.75
+    tree.links.new(normalized.outputs[0], powered.inputs[0])
+    scaled = tree.nodes.new("ShaderNodeMath")
+    scaled.operation = "MULTIPLY"
+    scaled.inputs[1].default_value = 0.5
+    scaled.use_clamp = True
+    tree.links.new(powered.outputs[0], scaled.inputs[0])
     combine = tree.nodes.new("ShaderNodeCombineColor")
     combine.mode = "RGB"
     for input_socket in combine.inputs[:3]:
-        tree.links.new(add_rgb.outputs[0], input_socket)
+        tree.links.new(scaled.outputs[0], input_socket)
     return combine.outputs[0]
 
 

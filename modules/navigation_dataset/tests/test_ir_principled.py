@@ -33,14 +33,39 @@ def _unit(**channels):
     }
 
 
-def test_pseudo_nir_uses_fixed_linear_max_complement_formula():
+def test_pseudo_nir_is_a_monotone_scale_matched_lift():
     rgb = np.asarray([[[0.0, 0.5, 1.0], [0.2, 0.3, 0.4]]], dtype=np.float32)
-    actual = pseudo_nir_albedo(rgb)
-    expected = np.maximum(rgb, 1.0 - rgb) @ np.asarray([0.229, 0.587, 0.114], np.float32)
-    np.testing.assert_allclose(actual, expected, rtol=0.0, atol=1e-7)
+    luma = rgb @ np.asarray([0.299, 0.587, 0.114], np.float32)
+    expected = np.clip((luma / 0.5) ** 0.75 * 0.5, 0.0, 1.0)
+    np.testing.assert_allclose(pseudo_nir_albedo(rgb), expected, rtol=0.0, atol=1e-6)
     contract = formula_contract()
-    assert contract["id"] == "pseudo_max_complement_bt601_v1"
+    assert contract["id"] == "pseudo_monotone_gamma_bt601_v2"
+    assert contract["monotone"] is True
     assert len(contract["implementation_digest"]) == 64
+
+
+def test_pseudo_nir_never_ranks_a_dark_surface_above_a_light_one():
+    """The v1 defect: max(c, 1-c) is V-shaped, so black outshone mid-grey.
+
+    A non-monotone albedo has no inverse, which is fatal for a network meant to
+    recover material from the NIR band.
+    """
+    ramp = np.linspace(0.0, 1.0, 128, dtype=np.float32).reshape(-1, 1).repeat(3, 1)
+    values = pseudo_nir_albedo(ramp)
+    assert np.all(np.diff(values) >= -1e-7)
+    assert values[0] < values[len(values) // 2] < values[-1]
+
+
+def test_pseudo_nir_holds_the_reference_albedo_fixed():
+    """Scale matching: the lift changes contrast, not the overall level.
+
+    An unanchored lift is what put NIR albedo at 1.6-3.0x the visible and left
+    the active flash term with nothing to stand out against.
+    """
+    mid = np.full((1, 1, 3), 0.5, dtype=np.float32)
+    np.testing.assert_allclose(pseudo_nir_albedo(mid), 0.5, atol=1e-6)
+    dark = pseudo_nir_albedo(np.full((1, 1, 3), 0.1, dtype=np.float32))
+    assert 0.1 < float(dark) < 0.5      # lifted, but still below the reference
 
 
 def test_absent_authored_normal_is_valid_but_missing_pbr_parameter_is_not():
