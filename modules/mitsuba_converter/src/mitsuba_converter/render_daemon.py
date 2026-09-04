@@ -22501,6 +22501,66 @@ class RenderDaemon:
                             "polar_color_mode": "rgb_stokes_12",
                         })
 
+            # Drop views a prior render version of this same scene version has
+            # already produced, per view, before the K-strip packing below.
+            #
+            # The ledger records one task row per *batch leader*, so a K=12 run
+            # of 3,151 views leaves only 263 rows. The reuse lookups further
+            # down key on those rows' node/heading, which makes the other 2,888
+            # completed views invisible to resume -- a cumulative coverage rung
+            # (SV2 over SV1) then re-rendered ~70% of frames it already had.
+            # The per-view bundle directory is the authoritative record, so
+            # consult it directly. Filtering here rather than after packing also
+            # lets the packer fill strips with genuinely missing views instead
+            # of grouping around already-rendered ones.
+            if skip_existing_observations and reuse_existing_observations:
+                versions_root = (
+                    project_dir / "scenes" / scene_id / "observations" / "versions"
+                )
+                # A render version id is rv_<stamp>_<scene_digest[:12]>_<nonce>,
+                # so sibling versions of this same scene version are identifiable
+                # by name without opening each one's metadata.
+                _rv_parts = str(render_version_id).split("_")
+                digest_tag = _rv_parts[2] if len(_rv_parts) >= 4 else ""
+                prior_version_dirs = []
+                if digest_tag and versions_root.is_dir():
+                    prior_version_dirs = [
+                        entry for entry in versions_root.iterdir()
+                        if entry.is_dir()
+                        and f"_{digest_tag}_" in entry.name
+                        and entry.name != render_version_id
+                    ]
+                if prior_version_dirs:
+                    rendered_views: set[tuple[str, str]] = set()
+                    for version_dir in prior_version_dirs:
+                        variant_dir = version_dir / scene_variant_key
+                        if not variant_dir.is_dir():
+                            continue
+                        for node_dir in variant_dir.iterdir():
+                            if not node_dir.is_dir():
+                                continue
+                            for heading_dir in node_dir.iterdir():
+                                if (heading_dir / "manifest.json").is_file():
+                                    rendered_views.add((node_dir.name, heading_dir.name))
+                    if rendered_views:
+                        dropped = 0
+                        for phase in phases:
+                            kept = []
+                            for sweep_request in phase.requests:
+                                key = (str(sweep_request.node_id), str(sweep_request.heading_id))
+                                if key in rendered_views:
+                                    dropped += 1
+                                else:
+                                    kept.append(sweep_request)
+                            phase.requests = kept
+                        if dropped:
+                            print(
+                                f"[daemon] render_plan: reusing {dropped} views already rendered "
+                                f"under {len(prior_version_dirs)} prior render version(s) of "
+                                f"scene version {digest_tag}",
+                                file=sys.stderr, flush=True,
+                            )
+
             # The v3/v4 observation planner emits batch keys only for headings
             # of the same polar camera pose. Passive headings share one native
             # Stokes strip render; active headings retain their camera-aligned
@@ -22515,12 +22575,24 @@ class RenderDaemon:
                 }
 
                 def _batch_eligible(sweep_request: Any) -> bool:
+                    # A cumulative coverage rung (SV2+) resubmitted with
+                    # only_missing=True can leave a pose's own local heading
+                    # group down to a single new view once SV1 already covers
+                    # the rest -- polar_batch_size=1. The old 2..4 gate here
+                    # rejected those into ungrouped K=1 passthrough before the
+                    # cross-viewpoint chunking below ever got a chance to
+                    # re-pack them with other poses' leftover singles, which
+                    # is exactly the case that chunking was built to handle
+                    # (measured: 9.6s/view ungrouped vs ~2.7-3.5s/view packed).
+                    # Upper bound matches the same runtime cap the chunking
+                    # honours via ROBOMITUBA_RESIDENT_STOKES_BATCH_SLOTS.
+                    from .polar_heading_batch import max_stokes_heading_batch_slots
                     request = sweep_request.request
                     batch_key = str((request.extras or {}).get("polar_batch_key") or "")
                     requested = set(str(item) for item in request.modalities)
                     return bool(
                         batch_key
-                        and 2 <= int((request.extras or {}).get("polar_batch_size") or 0) <= 4
+                        and 1 <= int((request.extras or {}).get("polar_batch_size") or 0) <= max_stokes_heading_batch_slots()
                         and requested
                         and requested <= polar_modalities
                         and len(request.camera_specs) == 1
