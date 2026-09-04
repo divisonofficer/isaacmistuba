@@ -22513,6 +22513,7 @@ class RenderDaemon:
             # consult it directly. Filtering here rather than after packing also
             # lets the packer fill strips with genuinely missing views instead
             # of grouping around already-rendered ones.
+            reused_by_phase: dict[int, list[Any]] = {}
             if skip_existing_observations and reuse_existing_observations:
                 versions_root = (
                     project_dir / "scenes" / scene_id / "observations" / "versions"
@@ -22531,7 +22532,7 @@ class RenderDaemon:
                         and entry.name != render_version_id
                     ]
                 if prior_version_dirs:
-                    rendered_views: set[tuple[str, str]] = set()
+                    rendered_views: dict[tuple[str, str], str] = {}
                     for version_dir in prior_version_dirs:
                         variant_dir = version_dir / scene_variant_key
                         if not variant_dir.is_dir():
@@ -22541,21 +22542,34 @@ class RenderDaemon:
                                 continue
                             for heading_dir in node_dir.iterdir():
                                 if (heading_dir / "manifest.json").is_file():
-                                    rendered_views.add((node_dir.name, heading_dir.name))
+                                    rendered_views[(node_dir.name, heading_dir.name)] = (
+                                        heading_dir.relative_to(project_dir).as_posix()
+                                    )
                     if rendered_views:
-                        dropped = 0
                         for phase in phases:
                             kept = []
                             for sweep_request in phase.requests:
                                 key = (str(sweep_request.node_id), str(sweep_request.heading_id))
-                                if key in rendered_views:
-                                    dropped += 1
-                                else:
+                                bundle = rendered_views.get(key)
+                                if bundle is None:
                                     kept.append(sweep_request)
+                                    continue
+                                # Hold these out of packing so strips fill with
+                                # genuinely missing views, but keep them in the
+                                # plan: they are re-appended after packing so
+                                # the skip pass below records a ``skipped`` task
+                                # row for each. Dropping them outright rendered
+                                # the right pixels but left coverage reporting a
+                                # complete variant as permanently incomplete,
+                                # and left a later resume unable to tell
+                                # "already done" from "never planned".
+                                sweep_request.request.extras["source_bundle_ref"] = bundle
+                                reused_by_phase.setdefault(id(phase), []).append(sweep_request)
                             phase.requests = kept
-                        if dropped:
+                        reused_total = sum(len(items) for items in reused_by_phase.values())
+                        if reused_total:
                             print(
-                                f"[daemon] render_plan: reusing {dropped} views already rendered "
+                                f"[daemon] render_plan: reusing {reused_total} views already rendered "
                                 f"under {len(prior_version_dirs)} prior render version(s) of "
                                 f"scene version {digest_tag}",
                                 file=sys.stderr, flush=True,
@@ -22800,6 +22814,15 @@ class RenderDaemon:
                             ]
                             collapsed.append(leader)
                     phase.requests = collapsed
+
+            # Packing is done; return the reused views to the plan so each gets
+            # a durable ``skipped`` task row from the skip pass further down.
+            if reused_by_phase:
+                for phase in phases:
+                    reused = reused_by_phase.get(id(phase))
+                    if reused:
+                        phase.requests = list(phase.requests) + reused
+
             # Persist the complete plan before submitting the first worker job.
             # This is the durable cursor that allows a later resume to include
             # tasks that were never accepted by the in-memory queue.
@@ -23144,9 +23167,17 @@ class RenderDaemon:
                             record = task_records.get(id(sweep_request.request))
                             if record is not None:
                                 record["state"] = "skipped"
+                                # Coverage counts a skipped task as completed
+                                # only when its metadata carries the bundle it
+                                # reused, so carry the ref across from the
+                                # request. Without this a reused view lands in
+                                # the ledger as skipped-but-unaccounted and a
+                                # finished variant reports as incomplete.
+                                _reused_ref = sweep_request.request.extras.get("source_bundle_ref")
                                 record["metadata"] = {
                                     **dict(record.get("metadata") or {}),
                                     "skip_reason": "complete_scene_version_task" if existing_versioned else "existing_observation",
+                                    **({"source_bundle_ref": str(_reused_ref)} if _reused_ref else {}),
                                 }
                                 phase_skips.append(record)
                         else:
@@ -23162,9 +23193,11 @@ class RenderDaemon:
                             record = task_records.get(id(sweep_request.request))
                             if record is not None:
                                 record["state"] = "skipped"
+                                _reused_ref = sweep_request.request.extras.get("source_bundle_ref")
                                 record["metadata"] = {
                                     **dict(record.get("metadata") or {}),
                                     "skip_reason": "complete_scene_version_task",
+                                    **({"source_bundle_ref": str(_reused_ref)} if _reused_ref else {}),
                                 }
                                 phase_skips.append(record)
                         else:
