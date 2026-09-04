@@ -83,3 +83,62 @@ def test_versioned_export_repackages_legacy_stokes_as_minimal_f16(tmp_path: Path
     manifest = json.loads((out / "polarization_raw_manifest.json").read_text())
     assert manifest["schema"] == "minimal_rgb_stokes_f16_v2"
     assert manifest["files"][0]["source_sha256"]
+
+
+def _polar_bundle(tmp_path: Path, monkeypatch) -> Path:
+    """One polar observation: declared derived products plus an s0 sibling."""
+    monkeypatch.setattr(exporter, "REPO_ROOT", tmp_path)
+    camera = tmp_path / "cameras" / "polar_cam"
+    camera.mkdir(parents=True)
+    for name in ("polar_rgb_preview.png", "dop_red_black_colorbar.png", "s0_rgb_preview.png"):
+        Image.new("RGB", (2, 2)).save(camera / name)
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    (bundle / "manifest.json").write_text(json.dumps({
+        "frame_id": "support_pose_1-h_000",
+        "scene_id": "scene",
+        "artifacts": [
+            {
+                "camera_id": "polar_cam", "modality": modality,
+                "artifact_paths": {
+                    "png": (camera / filename).relative_to(tmp_path).as_posix(),
+                    "stokes_npz": "cameras/polar_cam/stokes_data.npz",
+                },
+            }
+            for modality, filename in (
+                ("polar_rgb_preview", "polar_rgb_preview.png"),
+                ("dop", "dop_red_black_colorbar.png"),
+            )
+        ],
+        "camera_specs": [{"camera_id": "polar_cam", "resolution": [2, 2]}],
+    }))
+    return bundle
+
+
+def test_modality_filter_keeps_only_requested_products(tmp_path: Path, monkeypatch) -> None:
+    bundle = _polar_bundle(tmp_path, monkeypatch)
+
+    everything = exporter._build_records(bundle, False, "scene", "base", None, None)
+    assert {record.modality for record in everything} == {"polar_rgb_preview", "dop"}
+
+    filtered = exporter._build_records(bundle, False, "scene", "base", None, {"dop"})
+    assert [record.modality for record in filtered] == ["dop"]
+
+
+def test_s0_modality_admits_the_undeclared_stokes_preview(tmp_path: Path, monkeypatch) -> None:
+    bundle = _polar_bundle(tmp_path, monkeypatch)
+
+    records = exporter._build_records(bundle, False, "scene", "base", None, {"s0"})
+
+    assert [record.modality for record in records] == ["s0"]
+    record = records[0]
+    assert record.src_png.name == "s0_rgb_preview.png"
+    # The Stokes payload must survive the substitution: it is the lossless core.
+    assert record.record["image"].endswith("__polar_cam__s0.{ext}")
+
+
+def test_requesting_an_absent_preview_yields_no_record(tmp_path: Path, monkeypatch) -> None:
+    bundle = _polar_bundle(tmp_path, monkeypatch)
+    (tmp_path / "cameras" / "polar_cam" / "s3_rgb_preview.png").unlink(missing_ok=True)
+
+    assert exporter._build_records(bundle, False, "scene", "base", None, {"s3"}) == []

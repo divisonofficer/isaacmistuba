@@ -48,7 +48,7 @@ import sys
 import tempfile
 import time
 import zipfile
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, as_completed, wait
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -128,6 +128,20 @@ def _write_minimal_f16_stokes(source: Path, destination: Path) -> dict:
     }
     sidecar.write_text(json.dumps(info, ensure_ascii=False, sort_keys=True), encoding="utf-8")
     return {**info, "bytes": destination.stat().st_size, "reused": False}
+
+
+def _write_stokes_worker(task: tuple[str, str, str]) -> tuple[str, dict | None, str | None]:
+    """Convert/copy one Stokes payload in a separate CPU process."""
+    source_raw, destination_raw, raw_format = task
+    source = Path(source_raw)
+    destination = Path(destination_raw)
+    try:
+        if raw_format == "minimal-f16":
+            return str(destination), _write_minimal_f16_stokes(source, destination), None
+        shutil.copy2(source, destination)
+        return str(destination), {"bytes": destination.stat().st_size, "reused": False}, None
+    except (OSError, ValueError, KeyError) as exc:
+        return str(destination), None, f"{type(exc).__name__}: {exc}"
 
 
 @dataclass
@@ -224,12 +238,50 @@ def _camera_spec(manifest: dict, camera_id: str) -> dict:
     return {}
 
 
+#: Stokes component previews a polarized render writes next to its declared
+#: artifacts.  ``s0`` is the unpolarized total-intensity RGB image, which is the
+#: natural navigation image for a polar-only rig, but the observation manifest
+#: only declares the derived/tonemapped products.  Expose them as first-class
+#: modalities so an export can request the physical component directly.
+_UNDECLARED_STOKES_PREVIEWS = {"s0": "s0_rgb_preview.png", "s3": "s3_rgb_preview.png"}
+
+
+def _manifest_artifacts(manifest: dict, modalities: set[str] | None) -> list[dict]:
+    """Return manifest artifacts, plus requested Stokes previews it omits."""
+    artifacts = list(manifest.get("artifacts", []) or [])
+    if modalities is None:
+        return artifacts
+    declared = {artifact.get("modality", "rgb") for artifact in artifacts}
+    for modality in sorted(modalities & set(_UNDECLARED_STOKES_PREVIEWS) - declared):
+        filename = _UNDECLARED_STOKES_PREVIEWS[modality]
+        for artifact in artifacts:
+            paths = artifact.get("artifact_paths") or {}
+            png_rel = paths.get("png")
+            if not isinstance(png_rel, str) or not png_rel:
+                continue
+            candidate = (REPO_ROOT / png_rel).resolve().parent / filename
+            if not candidate.is_file():
+                continue
+            synthesized = dict(artifact)
+            synthesized["modality"] = modality
+            synthesized["definition"] = f"Stokes {modality.upper()} RGB preview written beside the declared artifacts."
+            synthesized["artifact_paths"] = {
+                **{key: value for key, value in paths.items() if key != "png"},
+                "png": candidate.relative_to(REPO_ROOT).as_posix(),
+            }
+            synthesized.pop("timing", None)
+            artifacts.append(synthesized)
+            break
+    return artifacts
+
+
 def _build_records(
     job_dir: Path,
     keep_manifests: bool,
     exact_scene: str | None = None,
     variant: str = "base",
     camera_ids: set[str] | None = None,
+    modalities: set[str] | None = None,
 ) -> list[FrameRecord]:
     loaded = ((job_dir, json.loads((job_dir / "manifest.json").read_text(encoding="utf-8")))
               if (job_dir / "manifest.json").is_file() else _load_manifest(job_dir))
@@ -247,10 +299,12 @@ def _build_records(
     extras = manifest.get("extras") or {}
 
     records: list[FrameRecord] = []
-    for artifact in manifest.get("artifacts", []) or []:
+    for artifact in _manifest_artifacts(manifest, modalities):
         camera_id = artifact.get("camera_id")
         png_rel = (artifact.get("artifact_paths") or {}).get("png")
         if not camera_id or not png_rel or (camera_ids is not None and camera_id not in camera_ids):
+            continue
+        if modalities is not None and artifact.get("modality", "rgb") not in modalities:
             continue
         src_png = (REPO_ROOT / png_rel).resolve()
         if not src_png.is_file():
@@ -670,6 +724,15 @@ def main() -> int:
     ap.add_argument("--tone-pixel-stride", type=int, default=4, help="Pass-1 pixel subsample stride.")
     ap.add_argument("--include-probe", action="store_true", help="Also export probe_* jobs (default: grid vp only).")
     ap.add_argument("--camera-ids", default=None, help="Comma-separated camera IDs to export (default: all).")
+    ap.add_argument(
+        "--modalities",
+        default=None,
+        help=(
+            "Comma-separated artifact modalities to export as images (default: all declared). "
+            "'s0'/'s3' additionally admit the Stokes component previews a polarized render "
+            "writes beside its declared artifacts."
+        ),
+    )
     ap.add_argument("--variants", default=None, help="Comma-separated variants: base,perturbed,perturbed_active_polar (default: all).")
     ap.add_argument("--no-legacy-bridge-jobs", action="store_true", help="Do not merge legacy out/bridge_jobs input with versioned observations.")
     ap.add_argument("--keep-manifests", action="store_true", help="Also write slimmed per-frame manifest.json for full provenance.")
@@ -684,6 +747,10 @@ def main() -> int:
     ap.add_argument("--include-dense-nav-graph", action="store_true", help="Also copy the large cell-level nav_graph.json (tens of MB).")
     ap.add_argument("--birdseye-scale", type=int, default=2, help="Upscale factor for the bird's-eye PNG (default 2).")
     ap.add_argument("--workers", type=int, default=8)
+    ap.add_argument(
+        "--stokes-workers", type=int, default=0,
+        help="Parallel F16 Stokes conversion processes (0: min(12, CPU count); use 1 for serial).",
+    )
     ap.add_argument("--limit", type=int, default=0, help="Process only the first N jobs (debug).")
     ap.add_argument("--zip", action="store_true", help="Produce a single <out>.zip after export.")
     ap.add_argument("--dry-run", action="store_true", help="Scan and report sizes without writing images.")
@@ -717,10 +784,11 @@ def main() -> int:
     skipped = 0
     exact_scene = args.scene if (args.exact_scene and args.scene) else None
     camera_ids = {item.strip() for item in (args.camera_ids or "").split(",") if item.strip()} or None
+    modalities = {item.strip() for item in (args.modalities or "").split(",") if item.strip()} or None
     print(f"[scan] reading manifests for {len(jobs)} bundles ...", flush=True)
     with tqdm(total=len(jobs), desc="scan manifests", unit="bundle", dynamic_ncols=True, file=sys.stdout) as progress:
         for index, (job_dir, variant) in enumerate(jobs, 1):
-            frame_records = _build_records(job_dir, args.keep_manifests, exact_scene, variant, camera_ids)
+            frame_records = _build_records(job_dir, args.keep_manifests, exact_scene, variant, camera_ids, modalities)
             if not frame_records:
                 skipped += 1
             else:
@@ -797,27 +865,41 @@ def main() -> int:
             if dst_name not in seen_raw:
                 seen_raw.add(dst_name)
                 raw_records.append((r.stokes_npz_src, dst_name))
-        with tqdm(total=len(raw_records), desc="F16 Stokes", unit="frame", dynamic_ncols=True, file=sys.stdout) as progress:
-            for source, dst_name in raw_records:
-                (raw_dir / Path(dst_name).parent).mkdir(parents=True, exist_ok=True)
-                destination = raw_dir / dst_name
-                try:
-                    if args.polarization_raw_format == "minimal-f16":
-                        info = _write_minimal_f16_stokes(source, destination)
+        stokes_workers = args.stokes_workers or min(12, os.cpu_count() or 1)
+        if stokes_workers < 1:
+            ap.error("--stokes-workers must be at least 1")
+        stokes_tasks = []
+        for source, dst_name in raw_records:
+            destination = raw_dir / dst_name
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            stokes_tasks.append((str(source), str(destination), args.polarization_raw_format))
+        # Keep only a small number of large NPZ conversions in flight. Each
+        # task reads F32 Stokes, holds it during F16+deflate, and can otherwise
+        # consume many GiB if all 12k futures are submitted at once.
+        in_flight_limit = max(stokes_workers * 2, 1)
+        print(f"[encode] F16 Stokes: {len(stokes_tasks)} files using {stokes_workers} CPU processes", flush=True)
+        with ProcessPoolExecutor(max_workers=stokes_workers) as executor, \
+             tqdm(total=len(stokes_tasks), desc="F16 Stokes", unit="frame", dynamic_ncols=True, file=sys.stdout) as progress:
+            pending = set()
+            task_index = 0
+            while task_index < len(stokes_tasks) or pending:
+                while task_index < len(stokes_tasks) and len(pending) < in_flight_limit:
+                    pending.add(executor.submit(_write_stokes_worker, stokes_tasks[task_index]))
+                    task_index += 1
+                completed, pending = wait(pending, return_when=FIRST_COMPLETED)
+                for future in completed:
+                    destination_raw, info, error = future.result()
+                    if error:
+                        print(f"[warn] stokes conversion failed {Path(destination_raw).name}: {error}", file=sys.stderr)
+                    elif info is not None:
+                        destination = Path(destination_raw)
                         polar_raw_infos.append({"path": str(destination.relative_to(out_dir)), **info})
                         polar_raw_reused += int(bool(info.get("reused")))
                         polar_raw_output_bytes += int(info.get("bytes", 0) or 0)
-                    else:
-                        shutil.copy2(source, destination)
-                        polar_raw_output_bytes += destination.stat().st_size
-                    polar_raw_copied += 1
-                except OSError as exc:
-                    print(f"[warn] stokes copy failed {dst_name}: {exc}", file=sys.stderr)
-                except (ValueError, KeyError) as exc:
-                    print(f"[warn] stokes conversion failed {dst_name}: {exc}", file=sys.stderr)
-                progress.update(1)
-                progress.set_postfix(done=polar_raw_copied, reused=polar_raw_reused,
-                                     output=f"{polar_raw_output_bytes / 1048576:.0f}MiB")
+                        polar_raw_copied += 1
+                    progress.update(1)
+                    progress.set_postfix(done=polar_raw_copied, reused=polar_raw_reused,
+                                         output=f"{polar_raw_output_bytes / 1048576:.0f}MiB")
         if polar_raw_copied:
             action = "converted" if args.polarization_raw_format == "minimal-f16" else "copied"
             print(f"[encode] {action} {polar_raw_copied} polarization Stokes files → polarization_raw/ ({polar_raw_reused} reused)")
