@@ -535,6 +535,18 @@ def build_walkable_surface(
     # gaps in walkable, then keep only the filled cells that are NOT wall — so genuine
     # openings (wall cut, no wall in the gap) connect, while solid walls keep rooms
     # apart. This makes connectivity independent of door objects.
+    #
+    # Wall occupancy at robot body height. Computed BEFORE the opening bridge:
+    # the bridge must distinguish a real doorway (wall above the lintel and below
+    # the sill, but nothing at body height) from a solid wall. The full-height
+    # ``wall_mask`` cannot make that distinction -- a doorway's own threshold and
+    # lintel project onto the very cells the opening occupies -- so gating the
+    # bridge with it sealed every doorway that had no door object.
+    wall_band_mask = _wall_body_band_mask(
+        import_root, walls, origin_offset, spec,
+        z_lo=WALL_BAND_Z_LO_M, z_hi=max(WALL_BAND_Z_LO_M + 0.1, float(robot_height_m)),
+    )
+
     n_bridged = 0
     if opening_bridge_m > 0 and wall_mask.any():
         r = max(1, int(round(float(opening_bridge_m) / resolution)))
@@ -544,7 +556,7 @@ def build_walkable_surface(
         # closed gap at an EXTERIOR opening (window/door cut in the perimeter wall)
         # can't leak walkable cells outside the building.
         interior = ndimage.binary_fill_holes(floor_mask | wall_mask)
-        bridge = closed & ~walkable & ~wall_mask & interior
+        bridge = closed & ~walkable & ~wall_band_mask & interior
         n_bridged = int(bridge.sum())
         if n_bridged:
             walkable = walkable | bridge
@@ -566,14 +578,6 @@ def build_walkable_surface(
         spec=spec,
         traversable=island,
         hazard=np.zeros((height, width), dtype=bool),
-    )
-
-    # --- wall occupancy at robot body height (for connectivity repair) ------ #
-    # Drop floor sills (below WALL_BAND_Z_LO) and door lintels (above robot height)
-    # so door openings read as gaps; repair uses this to avoid bridging through walls.
-    wall_band_mask = _wall_body_band_mask(
-        import_root, walls, origin_offset, spec,
-        z_lo=WALL_BAND_Z_LO_M, z_hi=max(WALL_BAND_Z_LO_M + 0.1, float(robot_height_m)),
     )
 
     stats = {
