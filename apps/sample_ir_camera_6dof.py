@@ -27,7 +27,7 @@ def main() -> int:
 # scenes barely move.  Framing stays constant across FOV because the
 # sampler solves standoff for a fill target -- until the 1-2 m clamp
 # binds, which is exactly what happens in a tight room at a narrow FOV.
-    parser.add_argument("--fov", type=float, default=60.0)
+    parser.add_argument("--fov", type=float, default=44.98)
     parser.add_argument("--width", type=int, default=684)
     parser.add_argument("--height", type=int, default=512)
     args = parser.parse_args()

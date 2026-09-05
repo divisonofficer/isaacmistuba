@@ -18,7 +18,7 @@
   let cameraPolicy = $state<'content_aware_v2' | 'coverage_v1'>('content_aware_v2');
   let contentProfile = $state<'balanced' | 'anchor_rich' | 'structural' | 'research_balanced'>('research_balanced'); let adaptivePoseBudget = $state(true);
   let irMaterialProfile = $state<'standard' | 'principled_rich_v1' | 'principled_rich_v2'>('principled_rich_v2');
-  let width = $state(684); let height = $state(512); let fov = $state(60); let rgbSpp = $state(4000); let nirSpp = $state(2000);
+  let width = $state(720); let height = $state(540); let fov = $state(44.98); let rgbSpp = $state(4000); let nirSpp = $state(2000);
   let nirPassive = $state(true);
   // 160 leaves content-aware sampling room to satisfy the strict 100-pose
   // floor without restoring the former graph-wide 1,000+ frame renders.

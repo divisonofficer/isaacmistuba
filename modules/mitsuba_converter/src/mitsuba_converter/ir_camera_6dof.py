@@ -64,11 +64,29 @@ ORBITS_PER_ANCHOR = 2
 SPARSE_TUPLE_SIZE = (4, 8)
 MIN_BASELINE_M = 0.5
 MIN_AZIMUTH_SPAN_DEG = 90.0
-#: Fraction of frame *area* the anchor's box may cover.  The old 0.70 ceiling
-#: admitted poses where the object filled the shot and read as standing on
-#: top of it.  At 2 m and a 50 deg FOV, 0.30 is about a 1.0 m wide object --
-#: past that it is the standoff, not the framing, that would have to give.
+#: Fraction of frame *area* the anchor's box may cover, quoted at
+#: :data:`FRAME_FILL_REFERENCE_FOV_DEG`.  The old 0.70 ceiling admitted poses
+#: where the object filled the shot and read as standing on top of it.  At 2 m
+#: and a 50 deg FOV, 0.30 is about a 1.0 m wide object -- past that it is the
+#: standoff, not the framing, that would have to give.
 FRAME_FILL_RANGE = (0.04, 0.30)
+#: The FOV those numbers describe.  Area fraction goes as the square of angular
+#: size over field of view, so the same physical framing reads as a different
+#: fraction through a different lens: moving to the JAI FS-1600's real 44.98 deg
+#: horizontal field (1/2.9" sensor, 6 mm lens) nearly doubles it.  Applying the
+#: 60 deg numbers unchanged there demanded a standoff past the 2 m ceiling and
+#: cut the pose yield from 393 to 155 across ten scenes -- a framing rule
+#: rewritten as a distance rule by accident.  Scale instead of retuning.
+FRAME_FILL_REFERENCE_FOV_DEG = 60.0
+
+
+def frame_fill_range(fov_deg: float) -> tuple[float, float]:
+    """:data:`FRAME_FILL_RANGE` expressed for an actual horizontal FOV."""
+    reference = math.tan(math.radians(FRAME_FILL_REFERENCE_FOV_DEG) / 2.0)
+    actual = math.tan(math.radians(float(fov_deg)) / 2.0)
+    scale = (reference / actual) ** 2 if actual > 0 else 1.0
+    low, high = FRAME_FILL_RANGE
+    return (min(low * scale, 0.95), min(high * scale, 0.95))
 MAX_ANCHOR_OFFCENTER = 0.62
 LOS_RAY_MIN_CLEAR = 3
 
@@ -272,7 +290,7 @@ def _longest_arc(ring: Sequence[tuple[float, dict[str, Any]]],
 
 
 def build_free_camera_poses(anchors, authoring_map, *, scene_id, seed, pose_budget=120,
-                            fov_deg=60.0, width=684, height=512):
+                            fov_deg=44.98, width=720, height=540):
     bounds = room_bounds(authoring_map)
     occluders = _occluders(authoring_map)
     orbits, tuples, poses = [], [], []
@@ -389,7 +407,8 @@ def build_free_camera_poses(anchors, authoring_map, *, scene_id, seed, pose_budg
         if framed is None:
             note("behind_camera"); return None
         fill, offcenter = framed
-        if not FRAME_FILL_RANGE[0] <= fill <= FRAME_FILL_RANGE[1]:
+        fill_low, fill_high = frame_fill_range(fov_deg)
+        if not fill_low <= fill <= fill_high:
             note("frame_fill"); return None
         if offcenter > MAX_ANCHOR_OFFCENTER:
             note("offcenter"); return None

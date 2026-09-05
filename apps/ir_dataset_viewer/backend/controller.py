@@ -954,8 +954,14 @@ class IRDatasetController:
             "source_mode": mode, "dataset_name": dataset_name,
             "gpu_indices": list(self.gpu_pool), "requested_gpu_indices": gpu_indices,
             "pipeline_revision": "ir-content-aware-v2", "import_profile": "ir-bootstrap-v1",
-            "width": int(raw.get("width", 684)), "height": int(raw.get("height", 512)),
-            "fov": float(raw.get("fov", 60.0)), "rgb_spp": int(raw.get("rgb_spp", 4000)),
+            # 720x540 at a 60 degree horizontal fov: the worker renders with
+            # sensor_fit=HORIZONTAL, so `fov` is already the horizontal angle.
+            # Existing datasets keep whatever their own request recorded.
+            "width": int(raw.get("width", 720)), "height": int(raw.get("height", 540)),
+            # JAI FS-1600, 1/2.9" sensor (1440x1080 at 3.45 um = 4.968 x 3.726 mm)
+            # behind a 6 mm lens: 44.98 deg horizontal, 34.50 vertical. The render
+            # aspect 720x540 already matches the sensor 4:3 exactly.
+            "fov": float(raw.get("fov", 44.98)), "rgb_spp": int(raw.get("rgb_spp", 4000)),
             "nir_spp": int(raw.get("nir_spp", 2000)), "flash_energy_scale": float(raw.get("flash_energy_scale", 1.0)),
             "ambient_fill_energy_scale": float(raw.get("ambient_fill_energy_scale", 1.0)),
             "illumination_diversity": bool(raw.get("illumination_diversity", False)),
@@ -2562,8 +2568,38 @@ class IRDatasetController:
         # pose gates strict, while using a 2.5/m² floor to avoid wasting a
         # full Infinigen variation on that numerical boundary.
         if per_m2 < 2.5: failures.append("nonstructural_density_below_2_5_per_m2")
-        if median < 2.0: failures.append("visible_object_median_below_2")
-        if sparse > 0.150001: failures.append("sparse_pose_fraction_above_15pct")
+        # A v5 plan's poses carry no `utility`/`probe` block: the 6-DoF sampler
+        # never runs the fan probe the graph pipeline did, because a free pose
+        # only exists if it already framed an anchor's bounding box, cleared
+        # five line-of-sight rays and passed the height-aware occupancy test.
+        # Reading visible_object_count off those poses yields 0 for every one of
+        # them, so this gate failed every generate-mode v5 job on every
+        # variation until the attempt limit ran out -- and it would have failed
+        # all sixteen r13 scenes too, which rendered 2020 frames and passed
+        # human QA, had augmentation mode not skipped this stage.
+        #
+        # Gate on what the sampler does record instead. The anchor floor of 2 is
+        # the minimum any accepted scene reached (closet, 112 poses over 2
+        # anchors) and the fill band is the sampler's own FRAME_FILL_RANGE.
+        free_pose_universe = bool(plan.get("pose_universe"))
+        if free_pose_universe:
+            anchors = {str(pose.get("anchor_id") or "") for pose in poses}
+            anchors.discard("")
+            fills = sorted(float(pose.get("frame_fill_fraction") or 0.0) for pose in poses)
+            fill_median = fills[len(fills) // 2] if fills else 0.0
+            # The band is quoted at a reference FOV and scales with the lens --
+            # area fraction goes as the square of angular size over field of
+            # view. Hardcoding the 60 deg numbers here rejected scenes the
+            # sampler had just accepted through the JAI FS-1600's real 44.98 deg
+            # field, where the same framing reads as 0.078-0.583.
+            from mitsuba_converter.ir_camera_6dof import frame_fill_range
+            fill_low, fill_high = frame_fill_range(float(job.request.get("fov") or 44.98))
+            if len(anchors) < 2: failures.append("free_pose_anchor_count_below_2")
+            if not fill_low <= fill_median <= fill_high:
+                failures.append("free_pose_frame_fill_outside_band")
+        else:
+            if median < 2.0: failures.append("visible_object_median_below_2")
+            if sparse > 0.150001: failures.append("sparse_pose_fraction_above_15pct")
         report = {"schema": "robomituba.ir_scene_content_quality.v1", "profile": "research_balanced",
                   "status": "failed" if failures else "passed", "attempt": int(job.request.get("variation_id") or 0),
                   "logical_seed": job.request.get("logical_seed"), "effective_seed": job.request.get("effective_scene_seed"),
@@ -2802,9 +2838,9 @@ class IRDatasetController:
                     "--anchors", p["object_anchors"], "--out", p["free_camera_poses"],
                     "--scene-id", str(r["scene_id"]),
                     "--seed", str(int(r.get("effective_scene_seed") or r.get("seed") or 20260812)),
-                    "--fov", str(float(r.get("fov") or 60.0)),
-                    "--width", str(int(r.get("width") or 684)),
-                    "--height", str(int(r.get("height") or 512))]
+                    "--fov", str(float(r.get("fov") or 44.98)),
+                    "--width", str(int(r.get("width") or 720)),
+                    "--height", str(int(r.get("height") or 540))]
         if stage == "view_probe":
             return ["python3", "apps/probe_ir_candidate_visibility.py", "--graph",
                     str(self.scene_root / r["scene_id"] / "viewpoint_graph.json"), "--authoring-map",
