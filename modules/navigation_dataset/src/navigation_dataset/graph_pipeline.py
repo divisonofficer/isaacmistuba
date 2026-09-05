@@ -1109,7 +1109,16 @@ def _prepare_graph_grids(
         domain_grid = TraversabilityGrid(spec=grid.spec, traversable=domain_mask, hazard=grid.hazard)
         # Pre-erode once via the fast EDT clearance map (bypassing the O(obstacles)
         # inflate_traversable_grid that is too slow on mesh grids), with two masks:
-        #   - edge_mask: physical robot fit (robot_radius). Edges may hug walls.
+        #   - edge_mask: the domain the v4 support builder actually threads an
+        #     action lane through, which is the node domain (motion_grid is
+        #     node_grid). Certifying place edges at the looser robot-fit
+        #     clearance instead used to hand the support build corridors it
+        #     could not materialize, surfacing later as an unownable
+        #     "support_corridor_unreachable" card the reviewer could only
+        #     resolve by unapproving routes. A doorway too narrow to carry a
+        #     margin-respecting lane now simply yields no place edge, and the
+        #     room behind it is reported as sealed rather than silently
+        #     promised and then failed.
         #   - node_mask: robot_radius + camera_margin so rendered viewpoints aren't
         #     buried in geometry. Re-islanded so nodes only land in robot-REACHABLE
         #     space — pockets reachable only through sub-robot-width gaps (which the
@@ -1133,7 +1142,8 @@ def _prepare_graph_grids(
         else:
             wall_halo = np.zeros_like(grid.traversable)
         node_mask = (surface.clearance_m >= node_clr) & ~wall_halo & domain_mask
-        edge_mask = (surface.clearance_m >= edge_clr) & domain_mask
+        # One clearance contract for nodes, edges and support corridors.
+        edge_mask = node_mask
         comp_labels, n_comp = ndimage.label(domain_mask)
         excluded_components = 0
         for ci in range(1, int(n_comp) + 1):
