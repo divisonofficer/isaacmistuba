@@ -1324,7 +1324,18 @@ def _normalize_global_support_graph(
     raw_poses = {pose_id: deepcopy(pose) for pose_id, pose in poses.items()}
     raw_edges = [deepcopy(edge) for _, edge in sorted(edges.items())]
     merge_radius = float(config.get("hard_merge_radius_m", config["min_pose_spacing_m"]))
-    action_min = float(config["forward_step_m"]) - float(config["forward_tolerance_m"])
+    # Normalization used a full forward step as its lower bound while
+    # validate_navigation_support accepts any chord from min_link_distance_m
+    # upward ("short links close gaps that a fixed-step lattice cannot
+    # express"). Two layers of the same builder disagreed, so a pose pair that
+    # survived the hard merge but sat closer than one action -- which is
+    # exactly the band between hard_merge_radius_m and a forward step -- aborted
+    # the build instead of producing the short link validation would have
+    # accepted. Take the same lower bound as validation.
+    action_min = min(
+        float(config["forward_step_m"]) - float(config["forward_tolerance_m"]),
+        float(config["min_link_distance_m"]),
+    )
     action_max = float(config["forward_step_m"]) + float(config["forward_tolerance_m"])
 
     incident_portals: dict[str, set[str]] = defaultdict(set)
