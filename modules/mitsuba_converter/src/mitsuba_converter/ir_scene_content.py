@@ -59,6 +59,58 @@ def _room_footprint(authoring_map: dict[str, Any]) -> dict[str, Any] | None:
     return {"bounds_xy_m": [x0, y0, x1, y1], "area_m2": (x1 - x0) * (y1 - y0), "method": "region_union_aabb"}
 
 
+#: Least of the two axes the props may span, as a share of the floor slab.
+#: A room whose objects all sit in one strip cannot be orbited: the camera
+#: sampler needs a 1-2 m standoff and finds the ring falls outside the floor.
+#: Measured on the generated rooms, a 7.7 x 6.0 m open office put all forty of
+#: its props in a 0.9 m band (coverage 0.15) and yielded 28 poses against a
+#: 50-pose floor, while two meeting rooms at 0.11 and 0.19 yielded none at all.
+#: Every scene that reached the floor scored 0.79 or better, and only 14 of 384
+#: scenes in the repository fall below 0.55, so this rejects a narrow, genuinely
+#: unusable class rather than trimming the distribution.
+MIN_OBJECT_SPREAD_FRACTION = 0.5
+
+
+def _object_spread(authoring_map: dict[str, Any]) -> dict[str, Any] | None:
+    """How much of the floor slab the props actually span, on its worse axis.
+
+    Against the floor rather than the navigation regions: regions are inset by
+    a robot radius, which would flatter a scene whose props hug the walls -- the
+    exact case this measures.
+    """
+    slabs = []
+    for record in authoring_map.get("objects") or []:
+        name = str(record.get("id") or "").lower()
+        kind = str(record.get("type") or record.get("kind") or "").lower()
+        if not (name.endswith(".floor") or "floor" in kind):
+            continue
+        geometry = record.get("geometry") or {}
+        size = geometry.get("size_m") or []
+        if len(size) >= 3:
+            try:
+                slabs.append((float(size[0]), float(size[2])))
+            except (TypeError, ValueError):
+                continue
+    # Measure the objects a camera would actually orbit, not every prop. Room-
+    # spanning furniture reaches both walls in any scene and pins the ratio near
+    # 1.0 whatever the small props do -- the first attempt measured that and
+    # scored a room with all forty of its anchorables in one strip at 1.07.
+    from .ir_object_anchors import candidate_anchors
+    xs = [c["center_xy"][0] for c in candidate_anchors(authoring_map)]
+    ys = [c["center_xy"][1] for c in candidate_anchors(authoring_map)]
+    if not slabs or len(xs) < 5:
+        return None
+    floor_w = max(s[0] for s in slabs)
+    floor_d = max(s[1] for s in slabs)
+    if floor_w <= 0 or floor_d <= 0:
+        return None
+    span_x, span_y = max(xs) - min(xs), max(ys) - min(ys)
+    return {"object_span_m": [round(span_x, 4), round(span_y, 4)],
+            "floor_span_m": [round(floor_w, 4), round(floor_d, 4)],
+            "coverage_fraction": round(min(span_x / floor_w, span_y / floor_d), 4),
+            "minimum_coverage_fraction": MIN_OBJECT_SPREAD_FRACTION}
+
+
 def audit_scene_content(authoring_map: dict[str, Any], *, room_type: str, profile: str = "balanced",
                         source_scene_digest: str | None = None) -> dict[str, Any]:
     categories = [_category(obj) for obj in authoring_map.get("objects") or []]
@@ -91,6 +143,9 @@ def audit_scene_content(authoring_map: dict[str, Any], *, room_type: str, profil
     if forbidden_is_material:
         failures.append("forbidden_room_content")
     footprint = _room_footprint(authoring_map)
+    spread = _object_spread(authoring_map)
+    if spread is not None and spread["coverage_fraction"] < MIN_OBJECT_SPREAD_FRACTION:
+        failures.append("object_placement_collapsed_to_strip")
     core = {"schema": SCHEMA, "room_type": room_type, "profile": profile, "status": "failed" if failures else "passed",
             "object_count": len(categories), "nonstructural_object_count": len(meaningful), "category_counts": counts,
             "required_groups": [sorted(group) for group in program["required"]], "missing_required_groups": missing,
@@ -104,7 +159,7 @@ def audit_scene_content(authoring_map: dict[str, Any], *, room_type: str, profil
             "failures": failures,
             "warnings": ((["partial_room_program"] if missing and not failures else [])
                          + (["minor_forbidden_room_content"] if forbidden and not forbidden_is_material else [])),
-            "room_footprint": footprint}
+            "room_footprint": footprint, "object_spread": spread}
     if source_scene_digest:
         core["source_scene_digest"] = source_scene_digest
     return {**core, "source_authoring_map_digest": _digest(authoring_map), "audit_digest": _digest(core)}

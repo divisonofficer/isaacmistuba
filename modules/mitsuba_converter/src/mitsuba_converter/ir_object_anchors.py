@@ -36,9 +36,24 @@ MIN_EXTENT_M = 0.15
 #: dominating the shot, and the working distance is the constraint we
 #: may not relax -- active NIR irradiance falls as 1/r^2.
 MAX_EXTENT_M = 1.2
-#: Minimum planar separation between two admitted anchors, so a shelf of bottles
-#: does not consume the whole budget.
+#: Preferred planar separation between two admitted anchors, so a shelf of
+#: bottles does not consume the whole budget.
 MIN_ANCHOR_SPACING_M = 0.8
+#: Infinigen does not spread props evenly through a room: in a measured 39.8 m²
+#: open office, 1036 of 1128 candidate pairs sat closer than 0.8 m and the
+#: median separation was 0.365 m, because the props are packed onto a few
+#: surfaces rather than distributed. A fixed 0.8 m floor then admitted 2 anchors
+#: out of 43 candidates and the scene could not reach its pose budget.
+#:
+#: Relax the separation in steps until the scene yields enough anchors. Spread
+#: is still preferred -- an evenly furnished room never leaves the first rung --
+#: and the spacing actually used is recorded so a sparse selection is legible
+#: rather than silent.
+ANCHOR_SPACING_LADDER_M = (0.8, 0.6, 0.45, 0.35, 0.25)
+#: Below this the remaining candidates are neighbours on one surface, and a
+#: camera orbiting either sees the same thing.
+ANCHOR_RELAX_TARGET = 12
+
 MAX_PER_FACTORY = 3
 #: Small props are grouped into one composite anchor: a 0.1 m bottle alone fills
 #: too little of the frame at a metre to be worth a capture set.
@@ -178,17 +193,34 @@ def build_object_anchors(
         size_fit = 1.0 - abs(math.log(max(row["extent_m"], 1e-3) / 0.6))
         return (-(richness + size_fit + rng.random() * 0.05), str(row["object_id"]))
 
-    selected: list[dict[str, Any]] = []
-    factory_counts: dict[str, int] = {}
-    for row in sorted(pool, key=score):
-        if len(selected) >= max_anchors:
+    ordered = sorted(pool, key=score)
+
+    def admit(spacing: float) -> list[Mapping[str, Any]]:
+        keep: list[Mapping[str, Any]] = []
+        counts: dict[str, int] = {}
+        for candidate in ordered:
+            if len(keep) >= max_anchors:
+                break
+            factory = candidate["factory"] or candidate["category"]
+            if counts.get(factory, 0) >= MAX_PER_FACTORY:
+                continue
+            if any(math.dist(candidate["center_xy"], other["center_xy"]) < spacing
+                   for other in keep):
+                continue
+            counts[factory] = counts.get(factory, 0) + 1
+            keep.append(candidate)
+        return keep
+
+    spacing_used = ANCHOR_SPACING_LADDER_M[0]
+    admitted = admit(spacing_used)
+    for spacing in ANCHOR_SPACING_LADDER_M[1:]:
+        if len(admitted) >= min(ANCHOR_RELAX_TARGET, max_anchors):
             break
-        factory = row["factory"] or row["category"]
-        if factory_counts.get(factory, 0) >= MAX_PER_FACTORY:
-            continue
-        if any(math.dist(row["center_xy"], other["center_xy"]) < MIN_ANCHOR_SPACING_M
-               for other in selected):
-            continue
+        spacing_used = spacing
+        admitted = admit(spacing)
+
+    selected: list[dict[str, Any]] = []
+    for row in admitted:
         anchor_id = "obj:" + "".join(
             ch if ch.isalnum() or ch in "._-" else "_" for ch in row["object_id"]
         )[:64]
@@ -199,12 +231,13 @@ def build_object_anchors(
             "vertical_extent_m": row["vertical_extent_m"],
             "target_height_m": row["height_m"],
         })
-        factory_counts[factory] = factory_counts.get(factory, 0) + 1
 
     core = {
         "schema": SCHEMA, "anchor_version": ANCHOR_VERSION,
         "source_authoring_map_digest": stable_digest(authoring_map),
         "sampling_seed": int(seed), "requested_anchor_count": int(max_anchors),
+        "anchor_spacing_m": round(float(spacing_used), 3),
+        "anchor_spacing_relaxed": bool(spacing_used < ANCHOR_SPACING_LADDER_M[0]),
         "candidate_count": len(pool), "anchor_count": len(selected),
         "anchors": selected,
     }
