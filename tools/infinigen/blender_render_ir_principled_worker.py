@@ -225,6 +225,12 @@ def _luminance(color) -> float:
     return sum(float(color[i]) * _REC709[i] for i in range(3))
 
 
+#: Filled by ``_set_lighting`` and read by ``_publish``; the two are always one
+#: frame apart in the same process, so a module-level record needs no plumbing
+#: through every render call.
+_LAST_RESOLVED_FIXTURES: dict = {}
+
+
 def _lighting_state(scene):
     lights = {}
     for obj in bpy.data.objects:
@@ -270,6 +276,8 @@ def _set_lighting(scene, state, *, nir: bool, ambient_fill_energy_scale: float, 
     # specification without knowing which fixtures a scene has.
     spec = recipe.get("fixtures")
     resolved: dict[str, dict] = {}
+    if not spec:
+        _LAST_RESOLVED_FIXTURES.clear()
     if spec:
         rig_digest = str(bpy.context.scene.get("ir_indoor_fixture_rig_digest") or "")
         # Portals are installed after the fixture pass and are never switchable
@@ -291,7 +299,20 @@ def _set_lighting(scene, state, *, nir: bool, ambient_fill_energy_scale: float, 
             condition_id=str(recipe.get("id") or ""),
             rig_digest=rig_digest,
             blackbody=ir_indoor_fixtures.blackbody_linear_rgb,
-        )["fixtures"]
+        )
+        resolved = resolution["fixtures"]
+        # What the condition actually did to this scene's fixtures, so a lamp
+        # that stayed on across every condition is visible in the record rather
+        # than having to be inferred from pixels.
+        _LAST_RESOLVED_FIXTURES.clear()
+        _LAST_RESOLVED_FIXTURES.update({
+            "rig_digest": rig_digest,
+            "on": sorted(fid for fid, f in resolved.items() if f.get("on")),
+            "off": sorted(fid for fid, f in resolved.items() if not f.get("on")),
+            "forced_on": sorted(resolution.get("forced_on_fixture_ids") or []),
+            "kelvin": {fid: f["kelvin"] for fid, f in sorted(resolved.items())
+                       if f.get("kelvin") is not None},
+        })
 
     for name, record in lights.items():
         obj = bpy.data.objects.get(name)
@@ -817,6 +838,8 @@ def _publish(staging: Path, out: Path, frame_id: str, task: dict, timings: dict,
         row.pop("nir_passive_backfill", None)
     if task.get("lighting"):
         row["lighting"] = {key: value for key, value in task["lighting"].items() if key != "runtime_recipe"}
+        if _LAST_RESOLVED_FIXTURES:
+            row["lighting"]["resolved_fixtures"] = json.loads(json.dumps(_LAST_RESOLVED_FIXTURES))
     frame_path = out / "frames" / f"{frame_id}.json"
     frame_path.parent.mkdir(parents=True, exist_ok=True)
     temp = frame_path.with_suffix(".json.tmp")

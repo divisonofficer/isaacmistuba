@@ -64,6 +64,10 @@ OVERVIEW_COMPILER_VERSION = "ir-scene-overview-v2"
 # render equations and frame plan did not change, so completed frames from this
 # worker remain valid.  No other worker transition is accepted implicitly.
 COMPATIBLE_PREVIOUS_WORKER_SHA256 = frozenset({
+    # Worker before per-frame resolved_fixtures provenance. That record is
+    # written from a resolution the worker already performed, so no light,
+    # energy or colour changes and every existing frame stays adoptable.
+    "b01d9ddb98d3357b1e2d3885d4db4f67336dd40914a6601b934f3d2e63da77fe",
     "ffc32d5ce1c97a2ef2772ae0f426c64fa6e181db775d0bea2fa066a753c1267e",
     # Worker immediately before the passive-NIR extension.  Keeping this
     # explicit lets legacy queues resume without changing their fingerprint.

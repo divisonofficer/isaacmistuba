@@ -1063,11 +1063,11 @@ def _install_ambient_fill(args: argparse.Namespace) -> dict:
         if obj.type != "LIGHT" or obj.name == "__ir_nir_flash" or obj.name.startswith("__ir_ambient_fill_"):
             continue
         point = obj.matrix_world.translation
-        # A ceiling fixture is tested against the room bounds widened by a
-        # margin: traversable bounds are inset from the room's real extent, and
-        # a ceiling light legitimately hangs over floor nobody can stand on.
-        margin = (ir_indoor_fixtures.CEILING_ROOM_MARGIN_M
-                  if point.z > ir_indoor_fixtures.CEILING_MIN_HEIGHT_M else 0.0)
+        # Room bounds are widened by a margin at every height: traversable
+        # bounds are inset by the robot radius and the furniture footprint, and
+        # both a ceiling light over unwalkable floor and a table lamp standing
+        # on the furniture that caused the inset are legitimately indoors.
+        margin = ir_indoor_fixtures.ROOM_MARGIN_M
         room_id = next(
             (str(room["room_id"]) for room in rooms
              if room["bounds_xy"][0] - margin <= point.x <= room["bounds_xy"][2] + margin

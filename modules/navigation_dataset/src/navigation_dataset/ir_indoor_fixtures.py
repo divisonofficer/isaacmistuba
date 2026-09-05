@@ -21,7 +21,7 @@ import math
 from typing import Any, Mapping, Sequence
 
 FIXTURE_RIG_SCHEMA = "robomituba.ir_indoor_fixture_rig.v1"
-CLASSIFIER_VERSION = "fixture-group-geometric-v1"
+CLASSIFIER_VERSION = "fixture-group-geometric-v2"
 COLOR_TEMPERATURE_MODEL = "planckian_cie1931_rec709_maxnorm_v1"
 
 #: ``exterior`` keeps the legacy disable: a light outside every traversable room
@@ -34,13 +34,28 @@ SWITCHABLE_GROUPS = ("ceiling", "lamp", "accent", "ambient_fill")
 
 CEILING_MIN_HEIGHT_M = 1.5
 #: Room membership is tested against *traversable* bounds, which are inset from
-#: the room's real extent by the robot radius and wall clearance.  A ceiling
-#: light hangs above floor nobody can stand on, so testing it against the
-#: traversable footprint drops genuine fixtures near walls and corners -- one of
-#: two identical 2.66 m lamps in the measured bathroom was excluded that way.
-#: Fixtures at or above ceiling height get this margin; floor-level ones do not,
-#: because there the inset is the point.
-CEILING_ROOM_MARGIN_M = 0.9
+#: the room's real extent by the robot radius, wall clearance and the furniture
+#: footprint.  Testing a fixture against that footprint drops genuine ones near
+#: walls and corners -- one of two identical 2.66 m lamps in the measured
+#: bathroom was excluded that way.
+#:
+#: This margin used to apply only at ceiling height, on the reasoning that lower
+#: down "the inset is the point".  That is backwards for a table lamp: the inset
+#: exists because furniture is there, and a table lamp stands on the furniture,
+#: so a zero margin excluded them by construction.  Across sixteen scenes only 2
+#: of 92 lights were classified `lamp` and 47 became `exterior`, which is not
+#: switchable -- so the lamp a camera is pointed at never changed between
+#: lighting conditions.
+#:
+#: 1.0 m is read off the measured distribution rather than chosen: the nine real
+#: table lamps (all at 1.15-1.48 m height) sit 0.00-0.95 m outside the
+#: traversable bounds, and the next light of any kind is at 1.28 m and below
+#: 0.83 m height. The value sits in that gap. It captures all nine and changes
+#: nothing at ceiling height, where 0.9 and 1.0 both admit 43 of 44.
+ROOM_MARGIN_M = 1.0
+#: Retained so an older caller keeps working; the margin no longer depends on
+#: height.
+CEILING_ROOM_MARGIN_M = ROOM_MARGIN_M
 LAMP_MIN_HEIGHT_M = 0.3
 ACCENT_SPOT_MAX_ANGLE_DEG = 45.0
 
@@ -149,6 +164,7 @@ __all__ = [
     "ACCENT_SPOT_MAX_ANGLE_DEG",
     "CEILING_MIN_HEIGHT_M",
     "CEILING_ROOM_MARGIN_M",
+    "ROOM_MARGIN_M",
     "CLASSIFIER_VERSION",
     "COLOR_TEMPERATURE_MODEL",
     "FIXTURE_GROUPS",
