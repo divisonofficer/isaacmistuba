@@ -166,6 +166,26 @@ def _showcase_import_name(effective_scene_seed: str, variation_id: int, composit
     return f"irshowcase_{effective_scene_seed}_v{int(variation_id):02d}_c{int(composition_attempt):02d}"
 
 
+#: Written when the pool is deliberately narrowed so the narrowing survives a
+#: relaunch.  The environment variable alone made the restriction a property of
+#: one shell: sharing this machine with two other render drivers, a restart
+#: without the variable silently reverted to all eight devices and leased into
+#: their pool with nothing to stop it.  A split held by whoever remembers to
+#: export a variable is not held at all.
+GPU_POOL_LOCK_NAME = "gpu_pool.lock.json"
+
+
+def _gpu_pool_lock(work_root: Path) -> list[int] | None:
+    """Persisted pool restriction, or None when the machine is ours alone."""
+    path = Path(work_root) / GPU_POOL_LOCK_NAME
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+    values = sorted({int(v) for v in payload.get("gpu_indices") or []})
+    return values if values and values[0] >= 0 else None
+
+
 def _gpu_pool_env(name: str = "ROBOMITUBA_IR_GPU_INDICES", default: str = "0,1,2,3,4,5,6,7") -> list[int]:
     try:
         values = sorted({int(part.strip()) for part in os.environ.get(name, default).split(",") if part.strip()})
@@ -279,7 +299,14 @@ class IRDatasetController:
         # tokens which can affect it; terminal jobs then cost only a handful of
         # stat calls per status request instead of megabytes of JSON parsing.
         self._stage_progress_cache: dict[str, tuple[tuple[tuple[str, int, int], ...], dict[str, dict[str, Any]]]] = {}
+        # The lock file narrows the pool and is never allowed to widen it: an
+        # explicit environment setting still wins when it asks for less.
         self.gpu_pool = _gpu_pool_env()
+        locked = _gpu_pool_lock(self.work_root)
+        if locked is not None:
+            kept = [gpu for gpu in self.gpu_pool if gpu in locked]
+            if kept:
+                self.gpu_pool = kept
         self.bootstrap_concurrency = _positive_env("ROBOMITUBA_BLENDER_BOOTSTRAP_CONCURRENCY", 4)
         self.bake_concurrency = _positive_env("ROBOMITUBA_BLENDER_BAKE_CONCURRENCY", 2)
         self.prepare_concurrency = _positive_env("ROBOMITUBA_BLENDER_PREPARE_CONCURRENCY", 2)
@@ -1110,7 +1137,16 @@ class IRDatasetController:
             if not raw.get("prop_pbr_seed"):
                 request["prop_pbr_seed"] = int(effective_seed)
             request["scene_id_base"] = request["scene_id"]
-            if archetype == "single_room" and request["content_profile"] == "research_balanced" and not request["ir_composition_profile"]:
+            # The showcase profile composes its own camera sets from synthetic
+            # props, which is a different camera universe from the 6-DoF object
+            # orbit and mutually exclusive with it: a v5 plan carries free poses,
+            # so showcase_acceptance finds no camera sets and fails every time.
+            # Auto-enabling it for every research_balanced single room meant each
+            # 6-DoF generation burned all five variations -- roughly 25 minutes
+            # apiece -- on a profile it could never satisfy.
+            if (archetype == "single_room" and request["content_profile"] == "research_balanced"
+                    and not request["ir_composition_profile"]
+                    and str(request.get("camera_policy") or "") != FREE_CAMERA_POLICY):
                 request["ir_composition_profile"] = SHOWCASE_PROFILE
                 # Initial source + at most four regenerated variations.
                 if "max_quality_variations" not in raw:
@@ -1526,6 +1562,19 @@ class IRDatasetController:
                 job.external_adopted = False
                 job.status = job.stage = "cancelled"; job.finished_at = _utc()
             elif job.status == "running" and job.job_id not in self._running:
+                # `_running` is in-memory, so after a controller restart every
+                # job that survived reads "running" with no handle here. This
+                # branch used to mark such a job cancelled and never touch its
+                # process: the subprocess kept going, kept its resource slot,
+                # and the queue behind it sat in "queued" with no error anywhere
+                # -- it looked idle rather than blocked. The pid is persisted,
+                # so signal its group the way the live path does. Children are
+                # started with start_new_session, so the group is the subtree.
+                if self._pid_alive(job.pid):
+                    try:
+                        os.killpg(int(job.pid), signal.SIGTERM)
+                    except (ProcessLookupError, PermissionError, ValueError):
+                        pass
                 job.status = job.stage = "cancelled"; job.resource_state = "cancelled"; job.finished_at = _utc()
             elif job.status == "running": job.cancel.set()
             if job.status == "cancelled":
@@ -2213,7 +2262,20 @@ class IRDatasetController:
                     probe = _read_json(Path(p["showcase_raster_probe"]))
                     valid = (valid and plan.get("camera_sets", {}).get("camera_set_digest")
                              == (probe.get("camera_sets") or {}).get("camera_set_digest"))
-                if r.get("pipeline_revision") == "ir-content-aware-v2" and r.get("source_mode") != "augmentation":
+                # A v5 plan's camera universe is the 6-DoF object orbit, so the
+                # pipeline skips view_probe and never writes candidate_visibility.
+                # Requiring it here made the plan read stale the instant it was
+                # written: view_plan re-ran forever, once a minute, and no
+                # generate-mode job ever reached the Stage-1 bake.  The free-pose
+                # sampler's own digest is what binds this plan to its inputs.
+                free_pose_universe = bool(plan.get("pose_universe")) or str(
+                    plan.get("schema") or "").endswith(".v5")
+                if free_pose_universe:
+                    free = _read_json(Path(p["free_camera_poses"]))
+                    valid = (valid
+                             and (plan.get("free_poses") or {}).get("free_pose_digest")
+                             == free.get("free_pose_digest"))
+                elif r.get("pipeline_revision") == "ir-content-aware-v2" and r.get("source_mode") != "augmentation":
                     probe = _read_json(Path(p["candidate_visibility"]))
                     valid = valid and plan.get("source_visibility_digest") == probe.get("probe_digest")
                 return "verified" if valid else "stale"
@@ -2661,6 +2723,13 @@ class IRDatasetController:
             "prepared": str(attempt / "principled_stage2"), "qc": str(attempt / "qc_stage0"),
             "render_plan": str(attempt / "render_plan.json"), "qc_render_plan": str(attempt / "qc_render_plan.json"),
             "candidate_visibility": str(attempt / "candidate_visibility.json"), "content_audit": str(attempt / "scene_content_audit.json"),
+            # The 6-DoF artifacts were missing here, so a job that reached its
+            # second variation lost them and died with KeyError: 'object_anchors'
+            # at the first stage that needed one. Every free-pose job therefore
+            # got exactly one attempt, whatever its variation limit said.
+            "object_anchors": str(attempt / "object_anchors.json"),
+            "free_camera_poses": str(attempt / "free_camera_poses.json"),
+            "prop_pbr_remediation": str(attempt / "prop_pbr_remediation.json"),
             "showcase_blend": str(attempt / "showcase" / "composition_c00.blend"),
             "showcase_composition": str(attempt / "showcase" / "composition_c00.json"),
             "showcase_raster_probe": str(attempt / "showcase_raster_probe.json"),

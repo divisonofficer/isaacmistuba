@@ -189,6 +189,9 @@ def test_submit_resolves_deferred_seed_and_builds_safe_commands(tmp_path: Path) 
         assert current.request["pipeline_revision"] == "ir-content-aware-v2"
         assert current.request["import_profile"] == "ir-bootstrap-v1"
         assert current.request["nir_passive"] is True
+        assert current.request["storage_profile"] == "core_half_exr_v2"
+        render_command = controller._command(current, "full_render")
+        assert render_command[render_command.index("--storage-profile") + 1] == "core_half_exr_v2"
         assert "--nir-passive" in controller._command(current, "full_render")
         assert "scene_content_audit" in controller._pipeline(current)
         assert "view_probe" in controller._pipeline(current)
@@ -1421,3 +1424,47 @@ def test_prepare_stage_passes_the_metallic_policy_only_when_requested(tmp_path: 
         "configs/ir_materials/metallic_composition_v1.json"
     )
     assert on[on.index("--metallic-augmentation-seed") + 1] == "4242"
+
+
+def test_variation_retry_rebuilds_every_attempt_path() -> None:
+    """A second variation must address the same artifacts as the first.
+
+    Two separate literals build the per-attempt ``paths`` dict: one when the job
+    is normalized, one when ``_next_quality_variation`` moves to the next
+    variation. They drifted twice -- ``object_anchors``/``free_camera_poses``
+    went missing, so every free-pose job died with KeyError on its second
+    attempt and effectively had a variation limit of one, and then
+    ``prop_pbr_remediation`` went missing the same way. Compare the two literals
+    directly rather than waiting for the next stage to trip over the gap.
+    """
+    import re
+    source = (Path(__file__).resolve().parents[1] / "backend" / "controller.py").read_text()
+    first = source[source.index('attempt_root = pipeline / "attempts"'):][:3000]
+    retry = source[source.index("def _next_quality_variation"):][:6000]
+    first_keys = set(re.findall(r'"([a-z_0-9]+)":\s*str\(attempt_root', first))
+    retry_keys = set(re.findall(r'"([a-z_0-9]+)":\s*str\(attempt\s*/', retry))
+    retry_keys |= {"attempt_root"} if '"attempt_root": str(attempt)' in retry else set()
+    assert first_keys, "path literal not found; the regex needs updating"
+    assert not first_keys - retry_keys, f"variation retry drops: {sorted(first_keys - retry_keys)}"
+
+
+def test_cancel_signals_a_running_job_the_controller_has_no_handle_for() -> None:
+    """A restart empties `_running`; cancel must still stop the subprocess.
+
+    Jobs persist as "running" across a controller restart while `_running` does
+    not, so cancelling one afterwards took the branch that marked it cancelled
+    and never signalled anything. The Infinigen tree kept going and kept its
+    resource slot, and every queued job behind it stalled with no error to show
+    for it. The pid is persisted, so there is no reason not to signal it.
+    """
+    import re
+    source = (Path(__file__).resolve().parents[1] / "backend" / "controller.py").read_text()
+    start = source.index("def cancel_job")
+    branch = source[start:source.index("def retry(", start)]
+    orphan = branch[branch.index('job.job_id not in self._running'):]
+    orphan = orphan[:orphan.index('elif job.status == "running":')]
+    assert "_pid_alive" in orphan and "killpg" in orphan, (
+        "cancel_job leaves a handle-less running job's process group alive")
+    # The signal has to precede the status change, or a later reader sees a
+    # cancelled job whose process is still holding a slot.
+    assert orphan.index("killpg") < orphan.index('job.status = job.stage = "cancelled"')
