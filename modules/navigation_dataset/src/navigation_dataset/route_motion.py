@@ -450,6 +450,13 @@ def _portal_is_open(edge: ViewpointEdge) -> bool:
     # wall-free / short raw-floor-gap certificate on the place edge.
     if source == "inferred" and portal_type == "inferred_opening":
         return True
+    # A bridged opening is the strongest geometric evidence of the three: the
+    # opening bridge only fills cells the body-height wall band says carry no
+    # wall, so the gap is certified wall-free at robot height by construction.
+    # It has no closed-state ambiguity for the same reason a declared door mesh
+    # does -- there is no door leaf, only an absence of wall.
+    if source == "bridged_opening" and portal_type == "opening":
+        return True
     manual = extras.get("manual_opening")
     return (
         source == "user_certified"
