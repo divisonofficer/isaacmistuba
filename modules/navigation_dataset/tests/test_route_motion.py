@@ -12,6 +12,7 @@ from navigation_dataset.route_motion import (
     _build_observation_plan,
     _grid_segment_safe,
     _merged_config,
+    _yaw_to,
     _world_segment_safe,
     build_adaptive_route_motion,
     build_anchor_spanner,
@@ -385,9 +386,26 @@ def test_clearance_grid_action_search_turns_without_short_chord_or_wall_crossing
     for source, target in zip(path, path[1:]):
         distance = math.dist(source, target)
         assert 0.225 <= distance <= 0.275
-        yaw_deg = math.degrees(math.atan2(-(target[0] - source[0]), target[1] - source[1])) % 360.0
+        yaw_deg = _yaw_to(source, target)
         assert math.isclose(yaw_deg / 15.0, round(yaw_deg / 15.0), abs_tol=1e-6)
         assert _grid_segment_safe(grid, world_to_cell(spec, *source), world_to_cell(spec, *target))
+
+
+@pytest.mark.parametrize(
+    ("target", "expected_yaw"),
+    [
+        ((0.0, 1.0), 0.0),
+        ((1.0, 0.0), 90.0),
+        ((0.0, -1.0), 180.0),
+        ((-1.0, 0.0), 270.0),
+    ],
+)
+def test_motion_heading_matches_canonical_camera_forward(target: tuple[float, float], expected_yaw: float):
+    """A route heading must point in the same direction as the rendered camera."""
+    yaw = _yaw_to((0.0, 0.0), target)
+    assert math.isclose(yaw, expected_yaw, abs_tol=1e-9)
+    assert math.isclose(math.sin(math.radians(yaw)), target[0], abs_tol=1e-9)
+    assert math.isclose(math.cos(math.radians(yaw)), target[1], abs_tol=1e-9)
 
 
 def test_action_grid_path_keeps_an_exact_single_forward_primitive():

@@ -305,7 +305,10 @@ def _inferred_portals(
                 # portal whenever geometry permits one.
                 count = max(1, int(round(span / 0.25)))
                 action_step = span / count
-                yaw = (math.degrees(math.atan2(-(float(pb[0]) - float(pa[0])), float(pb[1]) - float(pa[1]))) + 360.0) % 360.0
+                # Canonical camera forward is (sin(yaw), cos(yaw)) in the
+                # authoring X/Y floor frame; retain only portal links that can
+                # be represented by the same 15-degree action convention.
+                yaw = (math.degrees(math.atan2(float(pb[0]) - float(pa[0]), float(pb[1]) - float(pa[1]))) + 360.0) % 360.0
                 aligned = math.isclose(yaw / 15.0, round(yaw / 15.0), abs_tol=1e-6)
                 representable = aligned and 0.225 - 1e-9 <= action_step <= 0.275 + 1e-9
                 score = (
