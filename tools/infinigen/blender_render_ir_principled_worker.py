@@ -291,7 +291,7 @@ def _set_lighting(scene, state, *, nir: bool, ambient_fill_energy_scale: float, 
                 f"addressable fixture rig (digest={rig_digest!r}, untagged lights={len(missing)}); "
                 "re-prepare with --fixture-policy addressable_v2"
             )
-        resolved = ir_fixture_contract.resolve_fixture_subset(
+        resolution = ir_fixture_contract.resolve_fixture_subset(
             [dict(record, fixture_id=record["fixture_id"], group=record["fixture_group"],
                   room_id=record["room_id"]) for record in lights.values()],
             spec,
