@@ -18,7 +18,7 @@ import math
 from pathlib import Path
 from collections import OrderedDict
 from threading import RLock
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 import numpy as np
 
@@ -1355,6 +1355,7 @@ def build_viewpoint_graph_core(
     persist_grid: bool = True,
     walkability_overlay: "np.ndarray | None" = None,
     existing_graph: ViewpointGraph | None = None,
+    topology_hints: Mapping[str, Any] | None = None,
     retain_sealed_components: bool = False,
     scene_variant_id: Any = None,
     on_progress: Callable[[str, float], None] | None = None,
@@ -1437,6 +1438,54 @@ def build_viewpoint_graph_core(
             **coverage_diagnostics,
         })
 
+    # Apply only conservative, scene-local human topology hints.  They never
+    # mark an unsafe point as traversable and they do not change the clearance
+    # grid.  Their purpose is to stop the sampler re-introducing a second row
+    # beside a manually curated corridor spine, or a node the operator already
+    # removed before placing a better door-centre anchor.
+    history_hint_summary: dict[str, Any] = {"applied": False, "auto_nodes_suppressed": 0}
+    if isinstance(topology_hints, Mapping):
+        def _hint_points(key: str) -> list[tuple[float, float]]:
+            values = topology_hints.get(key) or []
+            result: list[tuple[float, float]] = []
+            for value in values:
+                if isinstance(value, (list, tuple)) and len(value) >= 2:
+                    try:
+                        result.append((float(value[0]), float(value[1])))
+                    except (TypeError, ValueError):
+                        continue
+            return result
+
+        manual_points = _hint_points("manual_node_positions")
+        removed_auto_points = _hint_points("removed_auto_node_positions")
+        try:
+            manual_radius = max(0.0, float(topology_hints.get("manual_node_exclusion_m", 0.42)))
+        except (TypeError, ValueError):
+            manual_radius = 0.42
+        try:
+            removed_radius = max(0.0, float(topology_hints.get("removed_auto_node_exclusion_m", 0.28)))
+        except (TypeError, ValueError):
+            removed_radius = 0.28
+
+        def _suppressed(node: ViewpointNode) -> bool:
+            point = (float(node.position[0]), float(node.position[1]))
+            return any(math.dist(point, hint) <= manual_radius for hint in manual_points) or any(
+                math.dist(point, hint) <= removed_radius for hint in removed_auto_points
+            )
+
+        before_hint_filter = len(nodes)
+        nodes = [node for node in nodes if not _suppressed(node)]
+        history_hint_summary = {
+            "applied": bool(manual_points or removed_auto_points),
+            "history_event_count": int(topology_hints.get("history_event_count", 0) or 0),
+            "manual_anchor_count": len(manual_points),
+            "removed_auto_sample_count": len(removed_auto_points),
+            "manual_node_exclusion_m": manual_radius,
+            "removed_auto_node_exclusion_m": removed_radius,
+            "auto_nodes_suppressed": before_hint_filter - len(nodes),
+        }
+        grids.diagnostics["topology_edit_hints"] = history_hint_summary
+
     # Backfill clearance + tag portal nodes (nearest sampled node to each portal side).
     if surface is not None:
         for n in nodes:
@@ -1513,6 +1562,97 @@ def build_viewpoint_graph_core(
             **(metadata_extra or {}),
         },
     )
+
+    # Preserve live manual connectivity across a topology rebuild only after
+    # it passes the *new* mesh/clearance contract. Manual nodes are valuable
+    # authoring intent (door centres and corridor spines), but a stale manual
+    # edge is not a safety certificate: copying it verbatim used to recreate
+    # long wall-crossing links after a Grid/Place Graph rebuild.
+    manual_edge_summary = {
+        "carried": 0,
+        "merged_with_generated": 0,
+        "skipped_missing_endpoint": 0,
+        "skipped_revalidation": 0,
+        "rejected": [],
+    }
+    if existing_graph is not None:
+        by_pair: dict[frozenset[str], Any] = {
+            frozenset((str(edge.source), str(edge.target))): edge
+            for edge in graph.edges
+        }
+        node_ids = {str(node.node_id) for node in graph.nodes}
+        for old_edge in existing_graph.edges:
+            extras = dict(old_edge.extras or {})
+            is_manual = bool(extras.get("manual")) or str(old_edge.edge_id).startswith("edge_manual")
+            if not is_manual:
+                continue
+            if str(old_edge.source) not in node_ids or str(old_edge.target) not in node_ids:
+                manual_edge_summary["skipped_missing_endpoint"] += 1
+                continue
+            source = next((node for node in graph.nodes if str(node.node_id) == str(old_edge.source)), None)
+            target = next((node for node in graph.nodes if str(node.node_id) == str(old_edge.target)), None)
+            if source is None or target is None:
+                manual_edge_summary["skipped_missing_endpoint"] += 1
+                continue
+            validation = validate_viewpoint_edge(
+                edge_grid,
+                source,
+                target,
+                robot_radius_m=edge_radius,
+                max_edge_length_m=max_edge_length_m,
+                wall_mask=(surface.wall_band_mask if surface is not None else None),
+                doorway_grid=domain_grid,
+                portals=portals,
+                doorway_gap_m=doorway_gap_m,
+            )
+            if not validation.accepted:
+                manual_edge_summary["skipped_revalidation"] += 1
+                manual_edge_summary["rejected"].append({
+                    "edge_id": str(old_edge.edge_id),
+                    "source": str(old_edge.source),
+                    "target": str(old_edge.target),
+                    "reason": str(validation.reason),
+                })
+                continue
+            key = frozenset((str(old_edge.source), str(old_edge.target)))
+            generated = by_pair.get(key)
+            if generated is None:
+                # Keep the original ID for history/blueprint reconciliation,
+                # but stamp the fact that this topology build recertified it.
+                old_edge.extras = {
+                    **extras,
+                    "manual": True,
+                    "revalidated_on_place_graph_build": {
+                        "reason": str(validation.reason),
+                        "mode": str(validation.mode),
+                        "distance_m": float(validation.distance_m),
+                    },
+                }
+                old_edge.collision_free = True
+                graph.edges.append(old_edge)
+                by_pair[key] = old_edge
+                manual_edge_summary["carried"] += 1
+            else:
+                # The generated edge is already certified under this rebuild's
+                # grid. Retain user provenance without overwriting its fresh
+                # edge_validation/portal metadata with stale values.
+                manual_provenance = {
+                    key: value for key, value in extras.items()
+                    if key not in {"edge_validation", "portal", "portal_source", "portal_type", "portal_state", "open"}
+                }
+                generated.extras = {
+                    **dict(generated.extras or {}),
+                    **manual_provenance,
+                    "manual": True,
+                    "manual_edge_id": str(old_edge.edge_id),
+                    "revalidated_on_place_graph_build": {
+                        "reason": str(validation.reason),
+                        "mode": str(validation.mode),
+                        "distance_m": float(validation.distance_m),
+                    },
+                }
+                manual_edge_summary["merged_with_generated"] += 1
+        graph.metadata["manual_topology_carry_forward"] = manual_edge_summary
 
     # ---- forced portal bridge edges + connectivity repair ----------------- #
     portal_edges, bridge_edges, bridge_nodes = _connect_portals_and_repair(
@@ -1655,11 +1795,11 @@ def rebuild_viewpoint_edges(
     )
     graph.edges = new_edges
 
-    # Re-append legacy manual edges unchanged, but report which ones no longer
-    # satisfy the new policy.  The chosen rollout deliberately avoids silently
-    # mutating a user's existing graph; new manual additions go through the same
-    # validator before they can claim ``collision_free``.
-    legacy_manual_audit = {"total": 0, "policy_valid": 0, "rejected": []}
+    # Re-append manual edges only when the current rebuild grid certifies them.
+    # A failed legacy edge is recorded for review but is deliberately not kept
+    # as ``collision_free``: keeping a wall-crossing link merely because it was
+    # once hand drawn defeats the entire rebuild contract.
+    legacy_manual_audit = {"total": 0, "policy_valid": 0, "rejected": [], "skipped": 0}
     if preserve_manual_edges:
         have = {(e.source, e.target) for e in graph.edges}
         have |= {(e.target, e.source) for e in graph.edges}
@@ -1671,6 +1811,9 @@ def rebuild_viewpoint_edges(
                 source, target = nodes_by_id.get(e.source), nodes_by_id.get(e.target)
                 if source is None or target is None:
                     validation_reason = "unknown_endpoint"
+                    legacy_manual_audit["rejected"].append({"edge_id": e.edge_id, "reason": validation_reason})
+                    legacy_manual_audit["skipped"] += 1
+                    continue
                 else:
                     validation = validate_viewpoint_edge(
                         grids.edge_grid, source, target,
@@ -1684,8 +1827,20 @@ def rebuild_viewpoint_edges(
                     validation_reason = validation.reason
                     if validation.accepted:
                         legacy_manual_audit["policy_valid"] += 1
-                if validation_reason != "ok" and validation_reason != "certified_doorway":
+                if not validation.accepted:
                     legacy_manual_audit["rejected"].append({"edge_id": e.edge_id, "reason": validation_reason})
+                    legacy_manual_audit["skipped"] += 1
+                    continue
+                e.extras = {
+                    **dict(e.extras or {}),
+                    "manual": True,
+                    "revalidated_on_edge_rebuild": {
+                        "reason": str(validation.reason),
+                        "mode": str(validation.mode),
+                        "distance_m": float(validation.distance_m),
+                    },
+                }
+                e.collision_free = True
                 graph.edges.append(e)
                 have.add((e.source, e.target))
                 have.add((e.target, e.source))
