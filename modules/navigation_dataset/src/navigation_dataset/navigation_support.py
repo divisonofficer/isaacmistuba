@@ -328,6 +328,14 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # This remains smaller than a support patch and every emitted chord is
     # still checked against the 0.28 m-eroded motion grid.
     "action_corridor_radius_m": 0.75,
+    # A place corridor can be certified at place level yet be too tight for the
+    # action lattice once the grid is eroded by robot_radius + safety_margin.
+    # "error" (default) aborts the build and reports the corridor for review.
+    # "relief" retries that corridor against the same grid dilated back by
+    # ``corridor_relief_radius_m`` -- i.e. the physically-fits-but-no-margin
+    # domain -- and records every edge that needed it.
+    "unmaterializable_corridor_policy": "error",
+    "corridor_relief_radius_m": 0.1,
     "min_pose_spacing_m": 0.15,
     # Build first normalizes all approved-corridor samples into one executable
     # support network.  A hard merge is allowed only when every surviving L0
@@ -765,9 +773,14 @@ def _config(values: Mapping[str, Any] | None = None) -> dict[str, Any]:
         "directness_slack_m", "heading_render_seconds", "action_corridor_radius_m",
         "hard_merge_radius_m", "global_stitch_min_distance_m", "global_stitch_target_distance_m",
         "global_stitch_max_distance_m", "global_stitch_heading_tolerance_deg",
-        "min_link_distance_m",
+        "min_link_distance_m", "corridor_relief_radius_m",
     ):
         cfg[name] = float(cfg[name])
+    cfg["unmaterializable_corridor_policy"] = str(cfg["unmaterializable_corridor_policy"])
+    if cfg["unmaterializable_corridor_policy"] not in {"error", "relief"}:
+        raise ValueError("unmaterializable_corridor_policy must be error or relief")
+    if cfg["corridor_relief_radius_m"] < 0.0:
+        raise ValueError("corridor_relief_radius_m must be >= 0")
     cfg["effective_clearance_m"] = round(
         cfg["robot_radius_m"] + cfg["safety_margin_m"] + cfg["geometry_epsilon_m"], 4
     )
@@ -1833,6 +1846,52 @@ def build_navigation_support(
         if on_progress: on_progress(stage, max(0.0, min(1.0, progress)), detail)
 
     effective_grid, restored_portals = _v3_portal_aware_grid(place_graph, motion_grid)
+    # Relief domain for ``unmaterializable_corridor_policy == "relief"``.  The
+    # motion grid is eroded by robot_radius + safety_margin; dilating it back by
+    # ``corridor_relief_radius_m`` recovers the corridor the robot physically
+    # fits through with a reduced margin.  Built once, lazily, and used only as
+    # a retry for a corridor the strict domain cannot materialize.
+    relaxed_corridor_edge_ids: list[str] = []
+    _relief_grid_cache: list[TraversabilityGrid | None] = []
+
+    def relief_grid() -> "TraversabilityGrid | None":
+        if _relief_grid_cache:
+            return _relief_grid_cache[0]
+        grid: TraversabilityGrid | None = None
+        if cfg["unmaterializable_corridor_policy"] == "relief" and cfg["corridor_relief_radius_m"] > 0.0:
+            try:
+                import numpy as _np
+                from scipy import ndimage as _ndimage
+
+                iterations = max(1, int(round(
+                    cfg["corridor_relief_radius_m"] / float(effective_grid.spec.resolution)
+                )))
+                dilated = _ndimage.binary_dilation(
+                    _np.asarray(effective_grid.traversable, dtype=bool), iterations=iterations,
+                )
+                grid = TraversabilityGrid(
+                    spec=effective_grid.spec, traversable=dilated, hazard=effective_grid.hazard,
+                )
+            except Exception:
+                grid = None
+        _relief_grid_cache.append(grid)
+        return grid
+
+    def corridor_path(start, goal, params, *, guide, edge_id, **kwargs):
+        """Strict action path, with an optional reduced-margin retry."""
+        path = _action_grid_path(effective_grid, start, goal, params, guide=guide, **kwargs)
+        if path is not None and len(path) >= 2:
+            return path
+        grid = relief_grid()
+        if grid is None:
+            return path
+        relaxed = _action_grid_path(grid, start, goal, params, guide=guide, **kwargs)
+        if relaxed is not None and len(relaxed) >= 2:
+            if str(edge_id) not in relaxed_corridor_edge_ids:
+                relaxed_corridor_edge_ids.append(str(edge_id))
+            return relaxed
+        return path
+
     rows = [dict(item) for item in blueprints.get("blueprints") or [] if isinstance(item, Mapping)]
     required_edges, trunk_meta = _major_trunk_edges(place_graph, rows, annotation, cfg)
     edge_by_id = {str(edge.edge_id): edge for edge in place_graph.edges if edge.collision_free}
@@ -1948,15 +2007,15 @@ def build_navigation_support(
                 if str(edge.target) == parent_id:
                     raw_guide.reverse()
                 guide = [parent_point, *raw_guide[1:]]
-                path = _action_grid_path(
-                    effective_grid, parent_point, guide[-1],
+                path = corridor_path(
+                    parent_point, guide[-1],
                     {
                         "forward_step_m": cfg["forward_step_m"],
                         "forward_tolerance_m": cfg["forward_tolerance_m"],
                         "heading_count": 24,
                         "action_corridor_radius_m": cfg["action_corridor_radius_m"],
                     },
-                    guide=guide, exact_start=True,
+                    guide=guide, edge_id=edge.edge_id, exact_start=True,
                 )
                 if path is None or len(path) < 2:
                     raise ValueError(f"support_corridor_unreachable:{edge.edge_id}")
@@ -1999,23 +2058,23 @@ def build_navigation_support(
         # phases with an action-only anchor patch. This keeps the connector in
         # the canonical topology rather than letting every Blueprint invent a
         # private near-coincident ribbon.
-        cycle_path = _action_grid_path(
-            effective_grid, source_point, target_point,
+        cycle_path = corridor_path(
+            source_point, target_point,
             {
                 "forward_step_m": cfg["forward_step_m"],
                 "forward_tolerance_m": cfg["forward_tolerance_m"],
                 "heading_count": 24,
                 "action_corridor_radius_m": cfg["action_corridor_radius_m"],
             },
-            guide=guide, exact_start=True,
+            guide=guide, edge_id=edge_id, exact_start=True,
         )
         if cycle_path is None or len(cycle_path) < 2:
             unmaterialized_canonical_cycle_edge_ids.append(edge_id)
             continue
         patch_path: list[tuple[float, float]] | None = None
         if _distance(cycle_path[-1], target_point) > 1e-7:
-            patch_path = _action_grid_path(
-                effective_grid, cycle_path[-1], target_point,
+            patch_path = corridor_path(
+                cycle_path[-1], target_point,
                 {
                     "forward_step_m": cfg["forward_step_m"],
                     "forward_tolerance_m": cfg["forward_tolerance_m"],
@@ -2025,7 +2084,8 @@ def build_navigation_support(
                         cfg["junction_patch_radius_m"],
                     ),
                 },
-                guide=[cycle_path[-1], target_point], exact_start=True, exact_goal=True,
+                guide=[cycle_path[-1], target_point], edge_id=edge_id,
+                exact_start=True, exact_goal=True,
             )
             if patch_path is None or len(patch_path) < 2:
                 unmaterialized_canonical_cycle_edge_ids.append(edge_id)
@@ -2745,6 +2805,10 @@ def build_navigation_support(
                 "global_executable_stitching",
             ],
         }
+    # Corridors materialized on the reduced-margin relief domain are recorded on
+    # the graph itself so validation, the daemon response and any later reader
+    # can see exactly which lanes carry less than the configured safety margin.
+    support_graph["relaxed_corridor_place_edge_ids"] = sorted(relaxed_corridor_edge_ids)
     validation = validate_navigation_support(support_graph, motion_grid=effective_grid)
     support_graph["validation"] = {**validation, "digest": digest}
     observation_plan = {
@@ -2762,6 +2826,9 @@ def build_navigation_support(
         "canonical_centerline_edge_count": len(canonical_centerline_edges),
         "canonical_cycle_edge_count": len(canonical_cycle_edge_ids),
         "unmaterialized_canonical_cycle_edge_count": len(unmaterialized_canonical_cycle_edge_ids),
+        "relaxed_corridor_edge_count": len(relaxed_corridor_edge_ids),
+        "relaxed_corridor_place_edge_ids": sorted(relaxed_corridor_edge_ids),
+        "unmaterializable_corridor_policy": cfg["unmaterializable_corridor_policy"],
         "narrow_corridor_edge_count": len(narrow_edges),
         "local_ribbon_place_edge_count": len(set(route_local_edge_ids)),
         "reused_canonical_blueprint_count": len(reused_canonical_blueprint_ids),
@@ -3061,6 +3128,10 @@ def validate_navigation_support(graph: Mapping[str, Any], *, motion_grid: Traver
     states = {str(item.get("motion_state_id")): item for item in graph.get("states") or [] if isinstance(item, Mapping)}
     if not poses or not edges or not states: raise ValueError("support graph is empty")
     support_config = dict(graph.get("config") or {})
+    relaxed_place_edge_ids = {
+        str(value) for value in graph.get("relaxed_corridor_place_edge_ids") or [] if str(value)
+    }
+    relaxed_forward_edge_ids: list[str] = []
     # The persisted v4 support graph keeps its executable action contract at
     # the top level. Retain the nested lookup as a forward-compatible fallback
     # for an early experimental artifact.
@@ -3076,7 +3147,14 @@ def validate_navigation_support(graph: Mapping[str, Any], *, motion_grid: Traver
         link_min = float(graph.get("min_link_distance_m") or support_config.get("min_link_distance_m") or 0.10)
         if not (link_min - 1e-9 <= distance <= forward_step_m + forward_tolerance_m + 1e-9):
             raise ValueError(f"support_non_normalized_forward:{edge_id}:{distance:.5f}")
-        if motion_grid is not None and not _world_segment_safe(motion_grid, tuple(source["position"][:2]), tuple(target["position"][:2])): raise ValueError(f"support_unsafe_forward:{edge_id}")
+        if motion_grid is not None and not _world_segment_safe(motion_grid, tuple(source["position"][:2]), tuple(target["position"][:2])):
+            # A lane deliberately materialized on the reduced-margin relief
+            # domain is not a validation failure: it fails the strict grid by
+            # construction. Count it instead of aborting, so the reduced margin
+            # stays visible rather than silently passing as a full-margin lane.
+            if not (set(str(value) for value in edge.get("place_edge_ids") or []) & relaxed_place_edge_ids):
+                raise ValueError(f"support_unsafe_forward:{edge_id}")
+            relaxed_forward_edge_ids.append(edge_id)
         if str(edge.get("edge_type") or "") == "portal_bridge":
             if not edge.get("portal_ids") or not bool((edge.get("safety_certificate") or {}).get("portal_open")):
                 raise ValueError(f"support_uncertified_portal:{edge_id}")
@@ -3194,6 +3272,11 @@ def validate_navigation_support(graph: Mapping[str, Any], *, motion_grid: Traver
         "state_count": len(states),
         "transition_count": len(graph.get("transitions") or []),
         "strong_component_count": strong_component_count,
+        # Forward lanes that clear the robot body but not the configured safety
+        # margin, because their place corridor was materialized under the
+        # "relief" policy. Empty on every strict build.
+        "reduced_margin_forward_edge_count": len(relaxed_forward_edge_ids),
+        "reduced_margin_place_edge_ids": sorted(relaxed_place_edge_ids),
     }
 
 
