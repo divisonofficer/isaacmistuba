@@ -85,6 +85,24 @@ MATERIAL_SMOOTH_FRACTION = 0.10
 #: hall of mirrors.
 SHELL_SMOOTH_TARGET = (0.05, 0.60)
 SMOOTH_ROUGHNESS = 0.30
+#: A wall whose metallic map is a high constant is a mirror slab: the whole
+#: surface reads metallic=1 with no spatial structure, and roughness alongside
+#: it is flat too.  Two of the 23 scenes in the first fixed batch drew one --
+#: "Radially Polished Metal" and "Radially Brushed Gold" -- each metallic 1.0
+#: with standard deviation 0.0000 and roughness pinned at 0.298 +/- 0.006.
+#: Across a room shell that is a large block of frame with nothing to learn in
+#: two of the four recovered channels, which is the same defect the showcase
+#: pedestals had.
+#:
+#: Flatness alone is not the test.  A painted wall is flat in both maps and is
+#: exactly right; what makes this one wrong is that it is flat *and* fully
+#: metallic. Spatially varying metal is kept deliberately -- it is the
+#: continuous metallic signal the dataset exists to teach.
+MIRROR_SLAB_METALLIC_MEAN = 0.5
+MIRROR_SLAB_METALLIC_STD = 0.02
+#: Roles where a mirror slab is rejected.  A panel is small and decorative, so
+#: a sheet of polished metal there is both plausible and a minor share of frame.
+MIRROR_SLAB_ROLES = ("wall", "ceiling", "column")
 
 
 def stable_digest(value: Any) -> str:
@@ -139,6 +157,49 @@ def measure_roughness(path: Path, *, smooth: float = SMOOTH_ROUGHNESS) -> float 
     return float((np.asarray(array) <= smooth).mean())
 
 
+def measure_metallic(record: Mapping[str, Any], root: Path) -> tuple[float, float] | None:
+    """(mean, std) of a material's metallic route, or None if unreadable.
+
+    A constant route has zero spread by definition; a texture route is read
+    from its map.  Both are reported the same way so callers do not have to
+    care which route a material took.
+    """
+    metallic = record.get("metallic") or {}
+    mode = str(metallic.get("mode") or "constant")
+    if mode != "texture":
+        return (float(metallic.get("value") or 0.0), 0.0)
+    key = str(metallic.get("map") or "metallic")
+    relative = (record.get("maps") or {}).get(key)
+    if not relative:
+        return None
+    try:
+        import cv2  # noqa: PLC0415
+        import numpy as np  # noqa: PLC0415
+    except ImportError:
+        return None
+    image = cv2.imread(str(root / relative), cv2.IMREAD_UNCHANGED)
+    if image is None:
+        return None
+    array = image.astype("float32") / (65535.0 if image.dtype.itemsize == 2 else 255.0)
+    if array.ndim == 3:
+        array = array.mean(2)
+    array = np.asarray(array)
+    return (float(array.mean()), float(array.std()))
+
+
+def mirror_slab_ids(registry: Mapping[str, Any], root: Path) -> list[str]:
+    """Material ids that are uniformly, fully metallic -- see MIRROR_SLAB_*."""
+    rejected = []
+    for record in registry.get("materials") or []:
+        stats = measure_metallic(record, root)
+        if stats is None:
+            continue
+        mean, std = stats
+        if mean >= MIRROR_SLAB_METALLIC_MEAN and std <= MIRROR_SLAB_METALLIC_STD:
+            rejected.append(str(record["id"]))
+    return sorted(rejected)
+
+
 def roughness_index(registry: Mapping[str, Any], root: Path,
                     *, smooth: float = SMOOTH_ROUGHNESS) -> dict[str, float]:
     """Smooth-pixel fraction per material id, for every map that can be read."""
@@ -184,6 +245,12 @@ def suitable(record: Mapping[str, Any], role: str, policy: Mapping[str, Any]) ->
     families = (policy.get("families") or {}).get(role)
     if families and str(record.get("surface_family") or "") not in set(families):
         return False
+    # Keyed on the measured map rather than surface_family, because the family
+    # labels do not survive contact with the data: the registry files a red
+    # terrazzo under "tile", a concrete under "metal" and a brick under "tile".
+    if role in tuple(policy.get("mirror_slab_roles") or MIRROR_SLAB_ROLES):
+        if str(record.get("id") or "") in set(policy.get("mirror_slab_ids") or ()):
+            return False
     return repeat_fits(record, role, policy.get("max_repeat_m"))
 
 

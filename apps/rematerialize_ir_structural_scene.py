@@ -10,7 +10,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "modules" / "mitsuba_converter" / "src"))
 from mitsuba_converter.ir_structural_pbr import build_manifest, load_registry, validate_registry_files  # noqa: E402
-from mitsuba_converter.ir_structural_finish import load_policy, roughness_index  # noqa: E402
+from mitsuba_converter.ir_structural_finish import load_policy, mirror_slab_ids, roughness_index  # noqa: E402
 
 
 def main() -> int:
@@ -39,6 +39,11 @@ def main() -> int:
         finish_policy = load_policy(a.structural_finish_policy.resolve())
         roughness = roughness_index(registry, a.registry_root.resolve(),
                                     smooth=float(finish_policy.get("smooth_roughness", 0.30)))
+        # Uniformly, fully metallic materials are kept off the room shell.  The
+        # ids are measured here rather than named in the policy file so the rule
+        # follows the registry instead of going stale against it.
+        finish_policy = dict(finish_policy)
+        finish_policy["mirror_slab_ids"] = mirror_slab_ids(registry, a.registry_root.resolve())
     result = build_manifest(stage1_manifest=json.loads(stage1.read_text()), stage1_path=stage1,
         registry=registry, registry_path=a.registry.resolve(), child_scene_id=a.child_scene_id,
         parent_scene_id=a.parent_scene_id, parent_dataset_fingerprint=a.parent_dataset_fingerprint,
