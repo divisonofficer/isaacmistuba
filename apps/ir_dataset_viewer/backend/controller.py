@@ -186,6 +186,11 @@ def _gpu_pool_lock(work_root: Path) -> list[int] | None:
     return values if values and values[0] >= 0 else None
 
 
+def _stable_seed(text: str) -> int:
+    """A per-scene seed that survives restarts and never collides by accident."""
+    return int(hashlib.sha256(str(text).encode("utf-8")).hexdigest()[:8], 16)
+
+
 def _gpu_pool_env(name: str = "ROBOMITUBA_IR_GPU_INDICES", default: str = "0,1,2,3,4,5,6,7") -> list[int]:
     try:
         values = sorted({int(part.strip()) for part in os.environ.get(name, default).split(",") if part.strip()})
@@ -1075,7 +1080,17 @@ class IRDatasetController:
             request.update({"structural_pbr_registry": str(registry.resolve()),
                             "structural_pbr_registry_root": str(registry_root.resolve()),
                             "material_variant_id": self._safe_name(raw.get("material_variant_id") or "variant", "material_variant_id"),
-                            "material_seed": int(raw.get("material_seed") or 0),
+                            # Derived per scene, not a shared constant.  The
+                            # structural draw seeds one RNG with this value and
+                            # a room has only about three shell slots, so at 0
+                            # every scene walked the identical stream: of 203
+                            # rematerialized scenes, 169 wore one of exactly two
+                            # concrete textures on every wall.  Re-running the
+                            # draw over 25 scenes shows the size of it -- seed 0
+                            # yields 2 distinct wall materials, a per-scene seed
+                            # yields 27 over 30 slots.
+                            "material_seed": int(raw.get("material_seed")
+                                                 or _stable_seed(request.get("scene_id") or dataset_name)),
                             "parent_scene_id": str(raw.get("parent_scene_id") or "")})
         if not 0.0 < request["prop_pbr_target"] <= 1.0:
             raise ValueError("prop PBR train-valid target must be in (0, 1]")

@@ -2058,6 +2058,7 @@ def _gltfpack_simplify_object(obj, target_max_triangles):
     binary = _gltfpack_binary()
     source_mesh = obj.data
     source_materials = list(source_mesh.materials)
+    _source_used_indices = {int(poly.material_index) for poly in source_mesh.polygons}
     source_material_names = [material.name if material else None for material in source_materials]
     source_triangles = _mesh_triangle_count(source_mesh)
     if source_triangles <= target_max_triangles:
@@ -2161,13 +2162,35 @@ def _gltfpack_simplify_object(obj, target_max_triangles):
                 raise RuntimeError(
                     f"gltfpack did not reduce topology ({source_triangles}->{triangles_after} triangles)"
                 )
+            # gltfpack takes a ratio, not a count, and does not have to honour
+            # it. Asked for 61% of a dining table's 35840 triangles it returned
+            # 856 -- 2.4%, a twenty-five-fold overshoot that erased the legs and
+            # left the rim of the top floating with the cutlery above it. Keep
+            # the caller's mesh instead: it is over the LOD target, which costs
+            # memory, where this costs the object.
+            _floor = int(target_max_triangles) * 0.2
+            if triangles_after < _floor:
+                raise RuntimeError(
+                    f"gltfpack collapsed the mesh ({source_triangles}->{triangles_after} triangles, "
+                    f"target {int(target_max_triangles)}, floor {_floor:.0f})"
+                )
+            # And it can drop a material slot's geometry entirely, which the
+            # decimation record then reported as preserved because this asserted
+            # so without looking.
+            _kept = {int(poly.material_index) for poly in candidate_mesh.polygons}
+            _slots_preserved = _source_used_indices <= _kept
+            if not _slots_preserved:
+                raise RuntimeError(
+                    f"gltfpack dropped material slots {sorted(_source_used_indices - _kept)} "
+                    f"(source used {sorted(_source_used_indices)}, kept {sorted(_kept)})"
+                )
             obj.data = candidate_mesh
             return {
                 "backend": "meshoptimizer_gltfpack", "binary": binary,
                 "source_triangles": source_triangles, "target_max_triangles": int(target_max_triangles),
                 "triangles_after": triangles_after, "ratio_requested": ratio,
                 "command": command[1:], "uv_preserved": bool(candidate_mesh.uv_layers),
-                "material_slots_preserved": True,
+                "material_slots_preserved": _slots_preserved,
             }
         finally:
             for imported in imported_objects:
@@ -3084,9 +3107,31 @@ def main():
                 decimation_record.get("material_slot_transport_repaired")
             )
             _validation["material_slot_transport_repaired"] = _slot_transport_repaired
+            # A slot that had geometry before and none after means that part of
+            # the object is gone. A dining table came back as the rim of its top
+            # and nothing else: 69596 triangles down to 856 against a 21923
+            # target, its wooden legs -- material slot 1 -- absent entirely. Both
+            # facts were recorded here and neither was consulted, so the unit
+            # passed and rendered as a floating frame with the cutlery that had
+            # been resting on it hanging in the air.
+            _used_slots_preserved = set(_pre_used_material_indices) <= set(_post_indices)
+            _validation["used_material_slots_preserved"] = _used_slots_preserved
+            # gltfpack is asked for a ratio, not a count, and can overshoot far
+            # past it. Requesting 61% of 35840 triangles returned 856 -- 2.4%,
+            # a twenty-five-fold overshoot. Judge the result against the target
+            # that was asked for rather than trusting the backend to honour it.
+            _after = float(decimation_record.get("triangles_after") or 0.0)
+            _before = float(decimation_record.get("triangles_before") or 0.0)
+            _target = float(decimation_record.get("target_max_triangles") or 0.0)
+            _collapse_floor = _target * 0.2
+            _collapsed = bool(_target and _after and _after < _collapse_floor and _after < _before)
+            _validation["decimation_collapse_floor"] = _collapse_floor
+            _validation["decimation_collapsed"] = _collapsed
             _validation["passed"] = all((
                 _validation["uv_valid"],
                 (_validation["material_slots_preserved"] or _slot_transport_repaired),
+                _used_slots_preserved,
+                not _collapsed,
                 _validation["primitive_material_indices_valid"], _validation["transform_preserved"],
                 _validation["aabb_finite"],
             ))

@@ -85,15 +85,34 @@ _FAMILY_ALIASES = {
 # finishes.  The extended profile retains controlled visual diversity without
 # admitting photographed props, exterior paving, or damaged/weathered scans.
 # Quotas are asset counts (not per-role tokens) and sum to 100.
+#: Per-family caps for the extended profile. The first set summed to exactly
+#: 100 with tile taking 44 of it, and after the wall repeat ceiling that left
+#: 54 wall candidates of which 39 were tile -- every room came out in square
+#: tiles. The staged pool holds 497 assets (tile 163, metal 86, fabric 78,
+#: wood 71, concrete 45, rock 28, brick 15, marble 11), so the scarce families
+#: are taken whole and tile is capped near where it stops dominating.
 EXTENDED_FAMILY_QUOTAS = {
-    "tile": 44, "wood": 16, "concrete": 15, "brick": 8,
-    "metal": 6, "fabric": 6, "marble": 5,
+    "tile": 40, "concrete": 45, "wood": 30, "fabric": 20,
+    "metal": 15, "brick": 15, "marble": 11, "rock": 10,
 }
+#: Matched against the whole asset text, so a term here rejects an asset whose
+#: *description* merely mentions it. That cost more than it saved: of 497
+#: accepted assets, 312 were excluded, and the four commonest reasons were
+#: "worn" (122), "damaged" (71), "broken" (61) and "crack" (59) -- terms that
+#: describe an ordinary interior wall. They took out "Red Brick Wall Texture
+#: Covered by Cement", "Concrete Plaster Wall Texture", "White Bathroom Tile
+#: Texture" and "Blue Office Carpet Texture", and cut brick from 23 assets to 3.
+#: A worn wall is what rooms look like; the dataset wants that variety, not a
+#: showroom. "coat" went with them as a substring that caught "Coating" and
+#: "Chevron ... Coat" more often than a garment.
+#:
+#: What remains is genuinely outdoor or non-architectural. Those are still the
+#: wrong surface for an interior wall however the sentence is phrased.
 _EXTENDED_EXCLUSION_TERMS = (
-    "rust", "oxidized", "corroded", "crack", "damaged", "broken", "worn", "moss",
+    "rust", "oxidized", "corroded", "moss",
     "bark", "fence", "cobblestone", "pavement", "puddle", "road", "asphalt",
     "treadplate", "tread plate", "chain", "fur", " hair ", "leather", "camouflage",
-    "coat", "medieval", "wallpaper", "carbon fibre", "carbon fiber", "foil",
+    "medieval", "carbon fibre", "carbon fiber", "foil",
     "shipping container", "cargo container", "steel cable", "wireframe", "perforated",
     "grille", "mesh", "tree trunk", "tree bark", "office building facade",
 )
@@ -101,6 +120,7 @@ _EXTENDED_POSITIVE_TERMS = (
     "plaster", "concrete", "ceramic", "porcelain", "terracotta", "tile", "wood",
     "plank", "carpet", "rug", "marble", "terrazzo", "galvanized", "brushed",
     "aluminium", "aluminum", "indoor", "bathroom", "office",
+    "wallpaper", "paint", "painted", "stucco", "drywall",
 )
 
 
@@ -798,15 +818,25 @@ def _extended_scale(record: dict[str, Any]) -> float:
     if family == "wood":
         return 2.4 if any(token in title for token in ("plank", "long", "flooring")) else 2.0
     if family == "brick":
-        return 2.0
+        # The wall ceiling is 1.5 m and treats repeat size as feature size,
+        # which is right for planks and wrong for masonry: a 2.0 m brick tile
+        # holds about thirty bricks, not one. At 2.0 every brick asset was
+        # excluded from walls -- nine of them -- and the wall pool came out 68
+        # tiles of 83. 1.5 m is still a realistic course width.
+        return 1.5
     if family == "marble":
         return 1.5
     if family == "metal":
         return 1.5
     if family == "concrete":
-        return 1.2 if any(token in title for token in ("plate", "slab", "waffle", "tile")) else 2.0
+        # Plaster and poured concrete have no feature that sets a scale, so the
+        # repeat is a free choice; 2.0 only cost them their place on walls.
+        return 1.2 if any(token in title for token in ("plate", "slab", "waffle", "tile")) else 1.5
     if family == "tile":
         return 0.6 if any(token in title for token in ("small", "mosaic", "hexagonal", "terracotta")) else 1.2
+    if family == "rock":
+        # Slate and stone cladding read at roughly a brick's scale indoors.
+        return 1.5
     raise ValueError(f"unsupported extended family: {family}")
 
 

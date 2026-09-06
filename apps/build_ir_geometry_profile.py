@@ -132,9 +132,20 @@ def _validate_stage1(manifest_path: Path, *, profile: str) -> dict[str, Any]:
         status = str(decimation.get("status") or "")
         if status in {"no_effect", "error"}:
             failures.append("{}: {}".format(unit.get("id"), decimation.get("error")))
-        if before >= 50000 and status != "reduced":
+        # A mesh deliberately left whole is not a failure. Decimation refuses to
+        # proceed when the result would drop a material slot that had geometry,
+        # or when gltfpack overshoots its ratio into a collapse -- a dining
+        # table came back as 856 triangles of 69596 with its legs gone, and a
+        # plant container lost one slot of four. Those are kept at source size,
+        # which exceeds the LOD target and costs memory, where accepting them
+        # would have cost the object. Only an unexplained failure to reduce is
+        # a defect here.
+        _kept_on_purpose = {
+            "kept_fallback_unavailable", "kept_source_material_slots_lost", "kept_scatter_exempt",
+        }
+        if before >= 50000 and status != "reduced" and status not in _kept_on_purpose:
             failures.append("{}: eligible mesh not reduced (status={})".format(unit.get("id"), status))
-        if decimation.get("decimated"):
+        if decimation.get("decimated") and status not in _kept_on_purpose:
             maximum = int(decimation.get("target_max_triangles") or decimation.get("target_max_faces") or before)
             if before and after > maximum:
                 failures.append("{}: {}>{}".format(unit.get("id"), after, maximum))
