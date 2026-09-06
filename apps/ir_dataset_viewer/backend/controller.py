@@ -1080,17 +1080,10 @@ class IRDatasetController:
             request.update({"structural_pbr_registry": str(registry.resolve()),
                             "structural_pbr_registry_root": str(registry_root.resolve()),
                             "material_variant_id": self._safe_name(raw.get("material_variant_id") or "variant", "material_variant_id"),
-                            # Derived per scene, not a shared constant.  The
-                            # structural draw seeds one RNG with this value and
-                            # a room has only about three shell slots, so at 0
-                            # every scene walked the identical stream: of 203
-                            # rematerialized scenes, 169 wore one of exactly two
-                            # concrete textures on every wall.  Re-running the
-                            # draw over 25 scenes shows the size of it -- seed 0
-                            # yields 2 distinct wall materials, a per-scene seed
-                            # yields 27 over 30 slots.
-                            "material_seed": int(raw.get("material_seed")
-                                                 or _stable_seed(request.get("scene_id") or dataset_name)),
+                            # Filled in from the scene id below, once that is
+                            # resolved.  Left at the old default of 0 here so a
+                            # caller can still pin it explicitly.
+                            "material_seed": int(raw.get("material_seed") or 0),
                             "parent_scene_id": str(raw.get("parent_scene_id") or "")})
         if not 0.0 < request["prop_pbr_target"] <= 1.0:
             raise ValueError("prop PBR train-valid target must be in (0, 1]")
@@ -1211,6 +1204,21 @@ class IRDatasetController:
                             "camera_policy": (FREE_CAMERA_POLICY
                                               if str(raw.get("camera_policy") or "") == FREE_CAMERA_POLICY
                                               else "coverage_v1")})
+        # Seed the structural draw from the scene, which is the thing whose
+        # materials these are.  It seeds one RNG and a room has only about
+        # three shell slots, so the old default of 0 had every scene walk the
+        # identical stream: of 203 rematerialized scenes, 169 wore one of
+        # exactly two concrete textures on every wall.  Re-running the draw
+        # over 25 scenes measures it -- seed 0 gives 2 distinct wall materials,
+        # a per-scene seed gives 27 over 30 slots.
+        #
+        # It has to happen here rather than beside the registry validation,
+        # because scene_id is not resolved until the mode blocks above.  Keying
+        # on the scene rather than the dataset also means a room keeps its
+        # materials when it is re-rendered into a later batch, so two batches
+        # of the same scene stay comparable.
+        if request.get("structural_pbr_registry") and not int(raw.get("material_seed") or 0):
+            request["material_seed"] = _stable_seed(request["scene_id"])
         pipeline = self.pipeline_root / dataset_name
         if pipeline.exists():
             raise FileExistsError("pipeline artifact directory already exists; retry its original job instead")
