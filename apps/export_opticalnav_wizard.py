@@ -1066,6 +1066,7 @@ def _choose_payload(scene: Mapping[str, Any], non_interactive: bool, args: argpa
         "include_episode_birdseye": False, "eval_perturbation": perturbed,
         "include_active_polar": perturbed,
         "export_profile": profile,
+        "coverage_levels": [item.strip() for item in (args.coverage_levels or "").split(",") if item.strip()] or None,
     }
 
 
@@ -1153,6 +1154,9 @@ def _local_export_command(run: Mapping[str, Any], run_path: Path) -> tuple[list[
     modalities = payload.get("modalities")
     if isinstance(modalities, list) and modalities:
         command.extend(["--modalities", ",".join(str(modality) for modality in modalities)])
+    levels = payload.get("coverage_levels")
+    if isinstance(levels, list) and levels:
+        command.extend(["--coverage-levels", ",".join(str(level) for level in levels)])
     if not payload.get("include_polarization_raw", False):
         command.append("--no-polarization-raw")
     if not payload.get("include_birdseye", True):

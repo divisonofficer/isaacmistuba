@@ -45,6 +45,7 @@ import json
 import os
 import shutil
 import sys
+from typing import Sequence
 import tempfile
 import time
 import zipfile
@@ -171,7 +172,30 @@ def _find_jobs(bridge_dir: Path, scene: str | None, include_probe: bool) -> list
     return jobs
 
 
-def _find_versioned_bundles(optical_root: Path, scene: str | None) -> list[tuple[Path, str]]:
+def _coverage_view_filter(scene_dir: Path, level_ids: Sequence[str]) -> set[tuple[str, str]] | None:
+    """Union of (node, heading) views named by sweep coverage levels.
+
+    A coverage rung is a subset of the certified L0 plan. Without this filter
+    the export universe falls back to the whole plan, which pulls in frames
+    outside the rungs actually rendered and leaves the variants with differing
+    view counts, so base/perturbed pairs no longer line up.
+    """
+    views: set[tuple[str, str]] = set()
+    for level_id in level_ids:
+        path = scene_dir / f"support_sweep_coverage_{level_id}.json"
+        if not path.is_file():
+            raise SystemExit(f"coverage level sidecar not found: {path}")
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        for entry in payload.get("render_entries") or []:
+            views.add((str(entry.get("motion_node_id")), str(entry.get("heading_id"))))
+    return views or None
+
+
+def _find_versioned_bundles(
+    optical_root: Path,
+    scene: str | None,
+    coverage_levels: Sequence[str] = (),
+) -> list[tuple[Path, str]]:
     """Resolve active current.json pointers without scanning old render versions."""
     bundles: list[tuple[Path, str]] = []
     if not optical_root.is_dir():
@@ -189,10 +213,14 @@ def _find_versioned_bundles(optical_root: Path, scene: str | None) -> list[tuple
         scenes_dir = project_dir / "scenes"
         scene_dirs = [candidate for candidate in scenes_dir.iterdir() if candidate.is_dir() and (not scene or scene in candidate.name)]
         for scene_dir in scene_dirs:
+            allowed = _coverage_view_filter(scene_dir, coverage_levels) if coverage_levels else None
             for pointer in scene_dir.glob("observations*/**/current.json"):
                 try:
-                    observation_root = pointer.relative_to(scene_dir).parts[0]
+                    parts = pointer.relative_to(scene_dir).parts
+                    observation_root = parts[0]
                 except ValueError:
+                    continue
+                if allowed is not None and (parts[-3], parts[-2]) not in allowed:
                     continue
                 pointers.append((pointer, project_dir, scene_dir.name, observation_root))
     print(f"[discover] reading {len(pointers)} active pointers ...", flush=True)
@@ -712,6 +740,9 @@ def main() -> int:
     ap.add_argument("--exact-scene", action="store_true", help="Treat --scene as an exact scene_id (drops sibling scenes like '..._chairtest' that the substring filter would otherwise include).")
     ap.add_argument("--bridge-jobs-dir", default=str(REPO_ROOT / "out" / "bridge_jobs"), help="Legacy bridge jobs (compatibility input).")
     ap.add_argument("--versioned-root", default=str(REPO_ROOT / "out" / "opticalnav"), help="Versioned OpticalNav artifact root (preferred).")
+    ap.add_argument("--coverage-levels", default="",
+                    help="Comma-separated sweep coverage level ids; their union restricts the exported views "
+                         "(each names a scene-local support_sweep_coverage_<level>.json).")
     ap.add_argument("--out", required=True, help="Output dataset directory.")
     ap.add_argument("--image-format", choices=["jpeg", "webp", "png"], default="jpeg")
     ap.add_argument("--jpeg-quality", type=int, default=95, help="Quality for jpeg/webp (1-100).")
@@ -760,7 +791,8 @@ def main() -> int:
     out_dir = Path(args.out).resolve()
     ext = {"jpeg": "jpg", "webp": "webp", "png": "png"}[args.image_format]
 
-    jobs = _find_versioned_bundles(Path(args.versioned_root).resolve(), args.scene)
+    coverage_levels = [item.strip() for item in (args.coverage_levels or "").split(",") if item.strip()]
+    jobs = _find_versioned_bundles(Path(args.versioned_root).resolve(), args.scene, coverage_levels)
     # Legacy jobs remain an explicit compatibility input; active versioned
     # pointers are preferred and therefore scanned first.
     if not args.no_legacy_bridge_jobs:
