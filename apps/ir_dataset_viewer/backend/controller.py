@@ -2850,6 +2850,15 @@ class IRDatasetController:
                     "--child-scene-id", str(r["scene_id"]),
                     "--parent-scene-id", str(r.get("parent_scene_id") or r["scene_id"]),
                     "--material-variant-id", str(r["material_variant_id"]),
+                    # Without a finish policy the draw is uniform over the
+                    # approved set, which leaves the shell -- 62% of an average
+                    # frame -- either wholly matte or wholly polished, and a
+                    # matte shell carries no specular cue for active NIR to
+                    # recover.  Over the 25 scenes queued next it moves the
+                    # median smooth fraction from 0.01 to 0.21 and puts 16 of
+                    # them inside the 0.05-0.60 band rather than 5.
+                    "--structural-finish-policy",
+                    str(self.repo_root / "configs" / "ir_materials" / "structural_finish_v1.json"),
                     "--material-seed", str(r["material_seed"])]
         if stage == "prop_pbr_remediate":
             return ["python3", "apps/build_prop_pbr_remediation.py",
