@@ -161,6 +161,40 @@ def scene_done(scene_dir: Path, expected_frames: int | None = None) -> bool:
     return _rendered_frames(scene_dir) >= expected_frames
 
 
+#: The cross-session allocation every job on this box writes to. This work
+#: root's own lock narrows further within it; this one says which devices are
+#: this session's to use at all.
+MACHINE_POOL_LOCK = Path("/bean/ir_dataset_work/gpu_pool.lock.json")
+
+
+def machine_pool(path: Path, holder: str) -> set[int] | None:
+    """GPUs the machine-wide lock assigns to `holder`, or None if it cannot say.
+
+    There were three files named gpu_pool.lock.json on this box with different
+    schemas -- one per work root plus this one -- and no job read any but its
+    own. Every "I have updated the lock" was true and invisible to everybody
+    else, so the actual coordination was carried by the conversation between
+    sessions while each of us believed a file was doing it. It never caused a
+    collision, which is the part that should worry anyone: an unread file and a
+    working protocol are indistinguishable right up until the conversation stops.
+
+    Returns None rather than an empty set when the file is missing, unreadable
+    or has no row for `holder`. Narrowing to nothing on a schema this code does
+    not recognise would let another job's format change silently halt this one,
+    which is a worse failure than the overlap it would prevent -- the lock is
+    advisory and a human is always in the loop. It logs loudly instead.
+    """
+    if not path.is_file():
+        log(f"machine pool lock {path} absent; not narrowing")
+        return None
+    try:
+        holders = json.loads(path.read_text(encoding="utf-8"))["all_holders"]
+        return {int(value) for value in holders[holder]}
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        log(f"machine pool lock {path} unusable for holder {holder!r} ({error}); not narrowing")
+        return None
+
+
 def eligible_gpus(requested: list[int], lock_path: Path) -> list[int]:
     """Narrow a GPU request to the pool this work root is allowed to use.
 
@@ -465,6 +499,10 @@ def main() -> int:
                              "composer version, NIR model or lighting profile than this run asks "
                              "for; without it such scenes are reported and skipped")
     parser.add_argument("--dry-run", action="store_true", help="list the plan and exit")
+    parser.add_argument("--holder", default=None,
+                        help="this session's row in the machine-wide pool lock's `all_holders`; "
+                             "without it that lock is not consulted")
+    parser.add_argument("--machine-pool-lock", type=Path, default=MACHINE_POOL_LOCK)
     args = parser.parse_args()
 
     if "-" in args.seeds and "," not in args.seeds:
@@ -474,6 +512,14 @@ def main() -> int:
         seeds = [int(v) for v in args.seeds.split(",") if v.strip()]
     gpus = eligible_gpus([int(v) for v in args.gpus.split(",") if v.strip()],
                          args.gpu_pool_lock or (args.out_root / "gpu_pool.lock.json"))
+    if args.holder:
+        machine = machine_pool(args.machine_pool_lock, args.holder)
+        if machine is not None:
+            kept = [g for g in gpus if g in machine]
+            if kept != gpus:
+                log(f"machine pool lock narrows {gpus} to {kept} "
+                    f"(holder {args.holder} in {args.machine_pool_lock})")
+            gpus = kept
     if not seeds or not gpus:
         parser.error("need at least one seed, and at least one GPU the pool lock allows")
 
