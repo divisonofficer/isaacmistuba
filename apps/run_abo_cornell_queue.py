@@ -48,7 +48,7 @@ from hssd_blender_ir.box_lighting import PROFILE as BOX_LIGHTING_PROFILE  # noqa
 
 #: Kept in step with `build_abo_cornell_scene.COMPOSER_VERSION`; a scene whose
 #: manifest declares a different one was built by different code.
-COMPOSER_VERSION = "abo-cornell-v2"
+COMPOSER_VERSION = "abo-cornell-v3"
 COMPOSER = REPO_ROOT / "apps" / "build_abo_cornell_scene.py"
 BLENDER_LAUNCHER = REPO_ROOT / "tools" / "infinigen" / "run_bundled_blender.py"
 #: Blender exits 0 even when the script it was handed raises, so a crashed
@@ -184,6 +184,44 @@ def eligible_gpus(requested: list[int], lock_path: Path) -> list[int]:
     if narrowed != requested:
         log(f"gpu pool lock narrows {requested} to {narrowed} ({lock_path})")
     return narrowed
+
+
+def gpu_claimants(gpu: int, *, exclude: set[int] | None = None) -> list[tuple[int, str]]:
+    """Every live process bound to this GPU, whoever started it.
+
+    Not `nvidia-smi --query-compute-apps`. That lists processes holding a CUDA
+    *context*, which is a narrower thing than holding the device: a Blender bake
+    binds its GPU for the whole run but only creates a context once it reaches
+    the Cycles step, so during its CPU phases it is absent from that query while
+    still fully intending to come back. Reading the count as "one app, so it is
+    mine" put a render onto a device another job was mid-way through using --
+    the query was accurate and the inference from it was wrong.
+
+    It is also robust to the pid-namespace split: nvidia-smi reports host pids
+    that match nothing in `ps` here, so a pid-to-owner comparison finds no owner
+    for any process and reads exactly like an idle device. `environ` is on this
+    side of that boundary.
+    """
+    exclude = exclude or set()
+    needle = f"CUDA_VISIBLE_DEVICES={gpu}"
+    found: list[tuple[int, str]] = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        if pid in exclude:
+            continue
+        try:
+            # A process can exit between the listdir and either read; both files
+            # vanish together, so one guard covers the race.
+            if needle not in (entry / "environ").read_bytes().decode(
+                    "utf-8", "replace").split("\0"):
+                continue
+            command = (entry / "cmdline").read_bytes().decode("utf-8", "replace")
+        except (OSError, ValueError):
+            continue
+        found.append((pid, command.replace("\0", " ").strip()[:100]))
+    return sorted(found)
 
 
 def _render_running_for(scene_dir: Path) -> bool:
@@ -438,6 +476,13 @@ def main() -> int:
                          args.gpu_pool_lock or (args.out_root / "gpu_pool.lock.json"))
     if not seeds or not gpus:
         parser.error("need at least one seed, and at least one GPU the pool lock allows")
+
+    # Report, do not refuse: the pool lock is what grants a device, and sharing
+    # one is sometimes deliberate. What is never wanted is discovering it later
+    # as an unexplained slowdown.
+    for gpu in gpus:
+        for pid, command in gpu_claimants(gpu, exclude={os.getpid()}):
+            log(f"gpu {gpu} already claimed by pid {pid}: {command}")
 
     # The renderer walks every variant per pose but only writes the non-baseline
     # ones for important poses, so the frame count is not poses x variants. This
