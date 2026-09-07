@@ -18,22 +18,31 @@ measured, with no loss that matters:
 Each frame gets a `channels.json` recording the format, dtype, scale and offset
 per channel, so the encoding is reversible without consulting this file.
 
-It also flags, and deliberately does not repair, the AOV layer-summing defect:
-per-material AOVs accumulate along the ray path rather than stopping at the
-first hit, so a pixel seen through a lamp shade carries the sum of every
-surface behind it. `GT_MRExplicitMask` is a per-material constant of 1.0 and so
-counts the layers exactly, which is what makes the defect detectable. Dividing
-by that count is tempting and wrong: it yields the mean over the layers, and
-the mean of a shade's roughness and the vase behind it is neither surface's
-ground truth. The affected pixels are written out as `aov_valid` instead, and
-the count as `gt_layer_count`, so a consumer can exclude them.
+It also flags, and deliberately does not repair, pixels whose per-material AOVs
+are a blend of more than one surface. Two things produce them: transmission,
+where a pixel seen through glass accumulates the surface behind it, and partial
+coverage, where a pixel straddling a silhouette edge carries a fraction of each
+side. Both make that pixel's roughness, metallic and base colour a mixture that
+is neither surface's ground truth, and averaging is not a repair -- the mean of
+a shade's roughness and the vase behind it describes nothing. They are written
+out as `aov_valid` so a consumer can exclude them.
+
+The renderer emits `layer_count` for exactly this. It is not an integer count:
+the values run continuously (1.506, 2.463) because coverage is fractional, so
+it is thresholded rather than rounded. An earlier version of this file read the
+count off `mr_explicit_mask`, which the renderer now clamps to 1.0 -- so the
+detector found a maximum of 1.0 in every frame and reported every frame clean.
+It was not measuring less than it should have; it was measuring a constant, and
+a check that cannot fail reads exactly like a corpus that has no defect.
 """
 from __future__ import annotations
 
 import argparse
+import collections
 import json
 import os
 import shutil
+import struct
 import sys
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
@@ -51,6 +60,11 @@ HDR_CHANNELS = frozenset({
     "diffuse_transport_rgb", "diffuse_transport_nir",
     "diffuse_component_rgb", "diffuse_component_nir",
     "depth", "range",
+    # Exceeds 1.0 wherever a pixel blends surfaces, which is its entire purpose.
+    # Left out of this set it fell through to the bounded default and was
+    # clipped to 1.0 -- the packer destroying the one channel that records
+    # which pixels it was warning about.
+    "layer_count",
     # Not bounded [0,1] and its fractional values are real -- a pixel spanning
     # two materials carries their blend, which an integer PNG would destroy.
     "material_id",
@@ -62,8 +76,57 @@ FLAG_CHANNELS = frozenset({
 })
 #: Signed and bounded to [-1, 1]; stored as (v + 1) / 2.
 SIGNED_CHANNELS = frozenset({"normal", "normal_tangent"})
-#: The mask that doubles as a layer counter, per the module docstring.
-LAYER_COUNT_CHANNEL = "mr_explicit_mask"
+#: Preferred blend indicator, and the legacy channel to fall back on for
+#: frames rendered before the renderer emitted one. The fallback is only
+#: meaningful while that mask was still unclamped; a clamped one yields no
+#: detections, which `blend_source` records so the difference is visible in the
+#: frame record rather than inferred from a suspiciously clean result.
+LAYER_COUNT_CHANNEL = "layer_count"
+LEGACY_LAYER_COUNT_CHANNEL = "mr_explicit_mask"
+#: A clean first hit reads 1.0; the tolerance is for float round-trip only.
+LAYER_EPSILON = 1e-3
+
+
+def exr_pixel_types(path: Path) -> set[str]:
+    """Pixel type of every channel in an EXR, read from its header.
+
+    Needed because "is this already half?" cannot be answered from the decoded
+    array -- OpenCV hands back float32 whatever the file held. Searching the
+    header bytes for b"half" or b"float" does not work either: EXR names its
+    attribute *types* in the same header, so every file contains b"float" from
+    `screenWindowWidth` alone and that probe reports FLOAT for everything,
+    including files it just wrote as half. The channel list is the only place
+    the answer actually lives, as an int32 per channel.
+    """
+    with path.open("rb") as handle:
+        head = handle.read(65536)
+    if head[:4] != b"\x76\x2f\x31\x01":
+        return set()
+    types: set[str] = set()
+    names = {0: "UINT", 1: "HALF", 2: "FLOAT"}
+    offset = 8
+    try:
+        while True:
+            end = head.index(b"\0", offset)
+            attribute = head[offset:end].decode(); offset = end + 1
+            if not attribute:
+                break
+            offset = head.index(b"\0", offset) + 1          # attribute type
+            size = struct.unpack("<i", head[offset:offset + 4])[0]; offset += 4
+            value = head[offset:offset + size]; offset += size
+            if attribute != "channels":
+                continue
+            cursor = 0
+            while cursor < len(value) - 1:
+                end = value.index(b"\0", cursor)
+                if end == cursor:
+                    break
+                cursor = end + 1
+                types.add(names[struct.unpack("<i", value[cursor:cursor + 4])[0]])
+                cursor += 16                                  # type + flags + sampling
+    except (ValueError, KeyError, struct.error):
+        return set()
+    return types
 
 
 def _is_grey(image: np.ndarray) -> bool:
@@ -72,15 +135,29 @@ def _is_grey(image: np.ndarray) -> bool:
             and np.array_equal(image[..., 1], image[..., 2]))
 
 
-def _encode(channel: str, image: np.ndarray, out_dir: Path) -> dict[str, Any]:
-    """Write one channel in the format its content calls for."""
-    if _is_grey(image):
+def _encode(channel: str, image: np.ndarray, out_dir: Path,
+            source: Path | None = None) -> dict[str, Any]:
+    """Write one channel in the format its content calls for.
+
+    An HDR channel already stored as half, with no duplicate components to
+    drop, is copied rather than re-encoded. The renderer's compact format now
+    writes half EXR itself, so re-encoding those channels changed nothing about
+    their precision and cost about 80 KB a frame in compression noise --
+    measured, the pack step made a frame 0.07% *larger*. What remains worth
+    doing is the component collapse on depth, material_id and layer_count.
+    """
+    collapsed = _is_grey(image)
+    if collapsed:
         image = image[..., :1]
     if channel in HDR_CHANNELS:
         target = out_dir / f"{channel}.exr"
+        if source is not None and not collapsed and exr_pixel_types(source) == {"HALF"}:
+            shutil.copy2(source, target)
+            return {"file": target.name, "format": "exr_half", "channels": int(image.shape[2]),
+                    "scale": 1.0, "offset": 0.0, "reencoded": False}
         cv2.imwrite(str(target), image, [cv2.IMWRITE_EXR_TYPE, cv2.IMWRITE_EXR_TYPE_HALF])
         return {"file": target.name, "format": "exr_half", "channels": int(image.shape[2]),
-                "scale": 1.0, "offset": 0.0}
+                "scale": 1.0, "offset": 0.0, "reencoded": True}
     if channel in SIGNED_CHANNELS:
         target = out_dir / f"{channel}.png"
         cv2.imwrite(str(target), (np.clip(image * 0.5 + 0.5, 0, 1) * 65535).astype(np.uint16))
@@ -107,47 +184,48 @@ def pack_frame(args: tuple[str, bool]) -> dict[str, Any]:
     packed.mkdir(exist_ok=True)
 
     images: dict[str, np.ndarray] = {}
+    paths: dict[str, Path] = {}
     for source in sources:
         channel = source.name[len(name) + 1:-len("0001.exr")]
+        paths[channel] = source
         image = cv2.imread(str(source), cv2.IMREAD_UNCHANGED | cv2.IMREAD_ANYDEPTH)
         if image is None:
             return {"frame": name, "error": f"unreadable {source.name}"}
         images[channel] = image.astype(np.float32)
 
     record: dict[str, Any] = {"schema": SCHEMA, "frame": name, "channels": {}}
-    layers = images.get(LAYER_COUNT_CHANNEL)
+    source_channel = (LAYER_COUNT_CHANNEL if LAYER_COUNT_CHANNEL in images
+                      else LEGACY_LAYER_COUNT_CHANNEL)
+    layers = images.get(source_channel)
     if layers is not None:
         count = layers[..., 0] if layers.ndim == 3 else layers
-        # A first hit reads exactly 1. Anything above is a summed pixel, and
-        # rounding is safe because the constant being summed is exactly 1.0.
-        count = np.rint(count).astype(np.float32)
-        contaminated = count > 1.5
-        record["aov_layer_summing"] = {
-            "affected_fraction": float(contaminated.mean()),
+        # Not rounded. The values are continuous because pixel coverage is
+        # fractional, so 1.506 is a real half-and-half pixel rather than a 2
+        # that needs recovering, and rounding it either way asserts something
+        # the renderer did not say.
+        blended = count > 1.0 + LAYER_EPSILON
+        record["aov_surface_blend"] = {
+            "blend_source": source_channel,
+            "affected_fraction": float(blended.mean()),
             "max_layers": float(count.max()),
             "repaired": False,
-            "note": "per-material AOVs sum along the ray path; dividing by the "
-                    "count yields the mean over layers, not the first hit, so "
-                    "the pixels are flagged rather than corrected",
+            "note": "pixels whose per-material AOVs mix more than one surface, "
+                    "through transmission or partial coverage; averaging them "
+                    "yields neither surface's ground truth, so they are flagged",
         }
-        # Written directly rather than through _encode: these are derived, so
-        # their names are not channel names and the format is not up for
-        # negotiation -- the count must survive as a number, the flag as a bit.
-        cv2.imwrite(str(packed / "gt_layer_count.exr"), count[..., None],
-                    [cv2.IMWRITE_EXR_TYPE, cv2.IMWRITE_EXR_TYPE_HALF])
-        record["channels"]["gt_layer_count"] = {
-            "file": "gt_layer_count.exr", "format": "exr_half", "channels": 1,
-            "scale": 1.0, "offset": 0.0,
-            "note": "surfaces summed into this pixel's per-material AOVs; 1 is a clean first hit"}
+        # Derived, so written directly rather than through `_encode`: their
+        # names are not channel names and the format is not negotiable -- the
+        # flag must stay a bit, and it is the only one of the two that is new,
+        # since the renderer now writes `layer_count` itself.
         cv2.imwrite(str(packed / "aov_valid.png"),
-                    ((~contaminated).astype(np.uint8) * 255))
+                    ((~blended).astype(np.uint8) * 255))
         record["channels"]["aov_valid"] = {
             "file": "aov_valid.png", "format": "png8", "channels": 1,
             "scale": 1.0, "offset": 0.0,
-            "note": "0 where the per-material AOVs are a sum over layers"}
+            "note": f"0 where the per-material AOVs mix surfaces, per {source_channel}"}
 
     for channel, image in images.items():
-        record["channels"][channel] = _encode(channel, image, packed)
+        record["channels"][channel] = _encode(channel, image, packed, paths.get(channel))
 
     (packed / "channels.json").write_text(json.dumps(record, indent=1), encoding="utf-8")
     before = sum(s.stat().st_size for s in sources)
@@ -156,7 +234,8 @@ def pack_frame(args: tuple[str, bool]) -> dict[str, Any]:
         for source in sources:
             source.unlink()
     return {"frame": name, "before": before, "after": after,
-            "affected": record.get("aov_layer_summing", {}).get("affected_fraction", 0.0)}
+            "affected": record.get("aov_surface_blend", {}).get("affected_fraction", 0.0),
+            "blend_source": record.get("aov_surface_blend", {}).get("blend_source")}
 
 
 def main() -> int:
@@ -189,8 +268,13 @@ def main() -> int:
     print(f"[pack] packed={len(ok)} failed={len(failed)}")
     print(f"[pack] {before / 2**30:.2f} GB -> {after / 2**30:.2f} GB "
           f"({100 * after / max(before, 1):.0f}%, saves {100 - 100 * after / max(before, 1):.0f}%)")
-    print(f"[pack] frames carrying summed AOV pixels: {len(touched)}"
+    print(f"[pack] frames with surface-blended AOV pixels: {len(touched)}"
           + (f" (worst {max(r['affected'] for r in touched):.2%})" if touched else ""))
+    # Zero detections is the answer a broken detector gives, so say which
+    # channel produced it rather than leaving a clean result unattributed.
+    sources = collections.Counter(r["blend_source"] for r in ok)
+    print(f"[pack] blend detected from: "
+          + ", ".join(f"{name or 'no channel'}={n}" for name, n in sources.most_common()))
     for r in failed[:5]:
         print(f"   FAILED {r['frame']}: {r['error']}")
     return 0 if not failed else 1
