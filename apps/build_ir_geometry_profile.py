@@ -92,6 +92,7 @@ def _validate_stage1(manifest_path: Path, *, profile: str) -> dict[str, Any]:
     structural_exclusion = dict(payload.get("ir_face_exclusion") or {})
     removed_structural_triangles = int(structural_exclusion.get("removed_triangle_count") or 0)
     decimated: list[dict[str, Any]] = []
+    refused: list[dict[str, Any]] = []
     triangles_before_total = 0
     triangles_after_total = 0
     for unit in units:
@@ -143,6 +144,23 @@ def _validate_stage1(manifest_path: Path, *, profile: str) -> dict[str, Any]:
         _kept_on_purpose = {
             "kept_fallback_unavailable", "kept_source_material_slots_lost", "kept_scatter_exempt",
         }
+        if status in _kept_on_purpose:
+            # Report what the gate declined to do, not only what it did. The
+            # aggregate this profile already published -- unit count, triangles
+            # before and after, retained ratio -- stayed plausible while a
+            # dining table was being reduced to 1.2% of itself, because a
+            # summary of what happened cannot show what was prevented. These
+            # entries are the record that a refusal occurred and why, and they
+            # are what makes the next collapse visible without rendering it.
+            refused.append({
+                "object_id": unit.get("id"), "status": status,
+                "triangles_before": before, "triangles_kept": after,
+                "target_max_triangles": int(decimation.get("target_max_triangles")
+                                            or decimation.get("target_max_faces") or 0),
+                "lost_material_slots": (decimation.get("fallback") or {}).get("lost_material_slots"),
+                "reason": (decimation.get("fallback") or {}).get("error")
+                          or (decimation.get("fallback") or {}).get("status"),
+            })
         if before >= 50000 and status != "reduced" and status not in _kept_on_purpose:
             failures.append("{}: eligible mesh not reduced (status={})".format(unit.get("id"), status))
         if decimation.get("decimated") and status not in _kept_on_purpose:
@@ -171,6 +189,10 @@ def _validate_stage1(manifest_path: Path, *, profile: str) -> dict[str, Any]:
         "triangles_after_total": triangles_after_total,
         "retained_triangle_ratio": (triangles_after_total / triangles_before_total) if triangles_before_total else 1.0,
         "decimated_units": decimated,
+        "refused_unit_count": len(refused),
+        "refused_units": refused,
+        "triangles_kept_by_refusal": sum(int(r["triangles_before"]) - int(r["triangles_kept"])
+                                         for r in refused),
         "structural_exclusion": structural_exclusion,
         "manifest_sha256": _sha256(manifest_path),
     }
