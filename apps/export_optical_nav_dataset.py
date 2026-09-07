@@ -595,8 +595,20 @@ def _export_nav_graph(
         scene_entry: dict = {"source": str(root)}
 
         # Viewpoint graph (nodes + edges).
+        #
+        # The dataset manifest is not a reliable index here: v4 scenes never
+        # declare viewpoint_graph_ref and have no viewpoint_graph.json at all,
+        # they carry place_graph.json instead. Relying on the ref alone shipped
+        # bundles whose graph/ directory was simply absent, reported only as a
+        # "[graph] 0 nodes, 0 edges" line that is easy to read past. Fall back
+        # to the scene's own graph files, newest schema first.
         vgraph: dict = {}
         vg_ref = art.get("viewpoint_graph_ref")
+        if not (vg_ref and (root / vg_ref).is_file()):
+            for candidate in ("place_graph.json", "viewpoint_graph.json"):
+                if (root / "scenes" / scene_id / candidate).is_file():
+                    vg_ref = f"scenes/{scene_id}/{candidate}"
+                    break
         if vg_ref and (root / vg_ref).is_file():
             vgraph = json.loads((root / vg_ref).read_text())
             graph_dir.mkdir(parents=True, exist_ok=True)
@@ -606,6 +618,18 @@ def _export_nav_graph(
             scene_entry["node_count"] = len(vgraph.get("nodes", []) or [])
             scene_entry["edge_count"] = len(vgraph.get("edges", []) or [])
             scene_entry["node_heading_count"] = vgraph.get("node_heading_count")
+
+        # The v4 support graph is the executable action lattice episodes are
+        # sampled from; a consumer cannot replay an episode without it.
+        support_ref = Path("scenes") / scene_id / "navigation_support_graph.json"
+        if (root / support_ref).is_file():
+            graph_dir.mkdir(parents=True, exist_ok=True)
+            support_dst = graph_dir / f"{scene_id}__navigation_support_graph.json"
+            support_dst.write_bytes((root / support_ref).read_bytes())
+            support_payload = json.loads(support_dst.read_text())
+            scene_entry["navigation_support_graph"] = str(support_dst.relative_to(out_dir))
+            scene_entry["support_pose_count"] = len(support_payload.get("poses") or [])
+            scene_entry["support_edge_count"] = len(support_payload.get("edges") or [])
 
         # Traversable grid (+ legend/spec sidecar).
         grid_spec: dict = {}
