@@ -1208,12 +1208,71 @@ def _run_local_export(run: dict[str, Any], run_path: Path) -> tuple[dict[str, An
     return status, [archive]
 
 
+def _split_archive(archive: Path, part_bytes: int) -> list[Path]:
+    """Cut a large archive into fixed-size parts next to it.
+
+    Upload progress is recorded per file, so a single multi-dozen-GiB archive
+    is all-or-nothing: an interrupted transfer restarts from zero, which on a
+    slow link throws away hours. Parts are recorded individually, so a resume
+    re-sends at most one part. Concatenating the parts in order reproduces the
+    archive byte for byte -- no unzip-aware tooling is required to rebuild it.
+    """
+    parts_dir = archive.parent / (archive.name + ".parts")
+    total = archive.stat().st_size
+    expected = (total + part_bytes - 1) // part_bytes
+    existing = sorted(parts_dir.glob(f"{archive.name}.part*")) if parts_dir.is_dir() else []
+    if len(existing) == expected and sum(item.stat().st_size for item in existing) == total:
+        print(f"[split] reusing {expected} existing parts for {archive.name}", flush=True)
+        return existing
+    parts_dir.mkdir(parents=True, exist_ok=True)
+    for stale in existing:
+        stale.unlink()
+    parts: list[Path] = []
+    with archive.open("rb") as handle:
+        for index in range(expected):
+            part = parts_dir / f"{archive.name}.part{index:03d}"
+            remaining = part_bytes
+            with part.open("wb") as out:
+                while remaining > 0:
+                    chunk = handle.read(min(1 << 24, remaining))
+                    if not chunk:
+                        break
+                    out.write(chunk)
+                    remaining -= len(chunk)
+            parts.append(part)
+            print(f"[split] {part.name} ({part.stat().st_size:,} bytes) - {index + 1}/{expected}", flush=True)
+    return parts
+
+
+def _write_parts_manifest(archive: Path, parts: list[Path], archive_sha: str | None) -> Path:
+    manifest = archive.parent / (archive.name + ".parts.json")
+    _write_json_atomic(manifest, {
+        "archive": archive.name,
+        "archive_bytes": archive.stat().st_size,
+        "archive_sha256": archive_sha,
+        "part_count": len(parts),
+        "reassemble": f"cat {archive.name}.part* > {archive.name}",
+        "parts": [{"name": part.name, "bytes": part.stat().st_size} for part in parts],
+    })
+    return manifest
+
+
 def _upload_run(run: dict[str, Any], run_path: Path, archives: list[Path]) -> None:
     remote_root = str(run["remote_root"]).rstrip("/") + "/"
     remote_dir = remote_root + f"{run['scene_id']}/{run['run_id']}/"
     exports_root = Path(run["exports_root"])
     extras = [path for path in (exports_root / "export_report.json", exports_root / "export_file_manifest.json") if path.is_file()]
-    files = archives + extras
+    split_bytes = int(run.get("split_size_bytes") or 0)
+    uploadable: list[Path] = []
+    for archive in archives:
+        if split_bytes > 0 and archive.stat().st_size > split_bytes:
+            parts = _split_archive(archive, split_bytes)
+            uploadable.extend(parts)
+            uploadable.append(_write_parts_manifest(
+                archive, parts, _cached_checksum(exports_root / "export_file_manifest.json", archive)))
+        else:
+            uploadable.append(archive)
+    files = uploadable + extras
     records = dict(run.get("uploads") or {})
     checksum_manifest = exports_root / "export_file_manifest.json"
     run["status"] = "uploading"
@@ -1286,6 +1345,9 @@ def _args() -> argparse.Namespace:
     parser.add_argument("--include-incomplete", action="store_true")
     parser.add_argument("--raw", action="store_true")
     parser.add_argument("--yes", action="store_true", help="Skip final interactive confirmation.")
+    parser.add_argument("--split-size-gib", type=float, default=8.0,
+                        help="Split archives larger than this into parts so an interrupted upload resumes "
+                             "per part instead of restarting the whole archive. 0 disables splitting.")
     return parser.parse_args()
 
 
@@ -1352,6 +1414,7 @@ def main() -> int:
             "run_id": run_id, "project": args.project, "scene_id": selected["scene_id"],
             "daemon_url": args.daemon_url.rstrip("/"), "mode": "local" if args.local else "daemon", "remote_root": remote_root,
             "export_payload": payload, "daemon_job_id": None, "uploads": {}, "status": "planned",
+            "split_size_bytes": int(args.split_size_gib * (1 << 30)) if args.split_size_gib > 0 else 0,
             # Persisted so a resumed run reconciles the same view universe it
             # was planned against, even if the scene gains coverage later.
             "coverage_levels": coverage_levels,
