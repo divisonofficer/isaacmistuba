@@ -108,6 +108,14 @@ def _index_one(path_text: str) -> dict[str, Any]:
     low = np.full(3, np.inf)
     high = np.full(3, -np.inf)
     triangles = 0
+    # Counted alongside triangles because faces alone are not an identity for a
+    # mesh. A peer's pipeline gated on triangle counts at every stage and passed
+    # while two runs of it split the same mesh into 293,820 and 290,428
+    # vertices -- identical faces, re-split UV seams, a different interpolated
+    # surface and therefore different baked pixels. The pair (faces, vertices)
+    # is the identity; either number alone is a projection of it, and every
+    # projection has a null space.
+    vertices = 0
     stack = [(int(index), np.eye(4)) for index in roots]
     visited = 0
     while stack:
@@ -131,6 +139,7 @@ def _index_one(path_text: str) -> dict[str, Any]:
                 placed = (world @ corners.T).T[:, :3]
                 low = np.minimum(low, placed.min(axis=0))
                 high = np.maximum(high, placed.max(axis=0))
+                vertices += int(accessor["count"])
                 if "indices" in primitive:
                     triangles += accessors[primitive["indices"]]["count"] // 3
         for child in node.get("children", []):
@@ -159,6 +168,7 @@ def _index_one(path_text: str) -> dict[str, Any]:
         "bounds_lo": [round(float(v), 4) for v in low],
         "bounds_hi": [round(float(v), 4) for v in high],
         "triangles": int(triangles),
+        "vertices": int(vertices),
         "material_count": len(gltf.get("materials") or []),
         "textured_slots": textured,
         "emissive_materials": emissive_materials,
