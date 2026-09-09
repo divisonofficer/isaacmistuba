@@ -140,6 +140,40 @@ def _rendered_frames(scene_dir: Path) -> int:
     return len([d for d in (scene_dir / "render").glob("shard_*/*") if d.is_dir()])
 
 
+def scene_intact(scene_dir: Path) -> tuple[bool, str]:
+    """Do this scene's manifest paths still resolve?
+
+    Frame count answers "did the render finish". It does not answer "is the
+    scene still buildable", and since the bundles moved into a shared
+    `_asset_cache` those are different questions with the same evidence: delete
+    the cache and every rendered frame is still on disk, so every scene reads
+    complete, and a rerun of this queue would find nothing to do and exit 0
+    while the whole corpus had stopped resolving.
+
+    That is the shape a peer hit from the other side -- a work list scoped from
+    an artefact another process later deleted, which did not fail but silently
+    emptied, because doing nothing and succeeding look identical from outside.
+    Worth stating plainly about the cache: its name promises it is disposable
+    and it is not. It is regenerable, but only by recomposing every scene that
+    points into it.
+    """
+    manifest = scene_dir / "scene_manifest.json"
+    if not manifest.is_file():
+        return False, "no scene_manifest.json"
+    try:
+        payload = json.loads(manifest.read_text(encoding="utf-8"))
+    except ValueError as error:
+        return False, f"unparseable manifest ({error})"
+    stage = (payload.get("stage") or {}).get("bundle")
+    if not stage or not Path(stage).is_file():
+        return False, "stage bundle missing"
+    missing = [i["source_id"] for i in payload.get("instances") or []
+               if not Path(i.get("bundle", "")).is_file()]
+    if missing:
+        return False, f"{len(missing)} instance bundles missing (e.g. {missing[:3]})"
+    return True, ""
+
+
 def scene_done(scene_dir: Path, expected_frames: int | None = None) -> bool:
     """A scene counts as finished only once its own planned frame count is met.
 
@@ -604,13 +638,34 @@ def main() -> int:
 
     done = [s for s in seeds if scene_done(args.out_root / f"{args.prefix}_{s:04d}")]
     failed = sorted(s for s, ok in results.items() if not ok)
-    log(f"complete={len(done)}/{len(seeds)} failed={failed}")
+
+    # Completeness and integrity are separate questions and only one of them is
+    # answered by counting frames. A scene whose bundles have gone still counts
+    # every frame it ever rendered, so without this a run over a broken corpus
+    # reports complete=N/N and exits 0.
+    broken = []
+    for seed in seeds:
+        scene_dir = args.out_root / f"{args.prefix}_{seed:04d}"
+        if not (scene_dir / "scene_manifest.json").is_file():
+            continue
+        ok, why = scene_intact(scene_dir)
+        if not ok:
+            broken.append((seed, why))
+    if broken:
+        log(f"BROKEN {len(broken)} scenes have a manifest whose paths no longer resolve:")
+        for seed, why in broken[:8]:
+            log(f"    {args.prefix}_{seed:04d}: {why}")
+        log("    these count as complete by frame count and are not buildable; "
+            "the shared asset cache is the usual cause")
+
+    log(f"complete={len(done)}/{len(seeds)} failed={failed} broken={len(broken)}")
     summary = {"seeds": seeds, "complete": done, "failed": failed,
+               "broken": [{"seed": seed, "why": why} for seed, why in broken],
                "frames_per_scene": expected_frames,
                "settings": {k: (str(v) if isinstance(v, Path) else v)
                             for k, v in vars(args).items()}}
     (args.out_root / "queue_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
-    return 0 if not failed else 1
+    return 0 if not failed and not broken else 1
 
 
 if __name__ == "__main__":

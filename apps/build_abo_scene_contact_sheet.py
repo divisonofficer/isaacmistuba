@@ -42,6 +42,11 @@ STRIP = (
 )
 BASELINE = "B0_warm_all"
 EXPOSURE = 1.0
+#: The closed-box curriculum, in the order the renderer walks it. Shown as RGB
+#: for the same pose so a scene's lighting spread can be judged against itself
+#: rather than against a neighbour's.
+VARIANTS = ("B0_warm_all", "B1_warm_partial", "B2_neutral_all",
+            "B3_cool_all", "B4_dim_warm", "B5_bright_mixed")
 
 
 def _read(frame_dir: Path, channel: str) -> np.ndarray | None:
@@ -80,6 +85,63 @@ def _encode(image: np.ndarray, treatment: str, width: int) -> str:
     return "data:image/jpeg;base64," + base64.b64encode(buffer.tobytes()).decode()
 
 
+def spread_views(record, count):
+    """`count` baseline poses chosen to show the scene, not one object.
+
+    Reviewing a scene from a single frame reviews the frame. The first sheet
+    showed each scene's highest-scoring important pose, and because that score
+    rewards specular observability -- which peaks on glancing views of glossy
+    surfaces, often from inside the furniture -- the pick was systematically the
+    scene's most awkward framing rather than a typical one.
+
+    So this rotates over distinct target objects and takes each target's
+    best-covered pose. The targets sit in different places, so choosing one
+    apiece spreads the viewpoints without needing to reason about camera
+    geometry. Only when the targets are exhausted does it take a second pose
+    from each.
+    """
+    baseline = [f for f in record.get("frames", [])
+                if f.get("lighting_variant") == BASELINE]
+    by_target = {}
+    for frame in baseline:
+        by_target.setdefault(frame.get("target_source_id") or "?", []).append(frame)
+    for frames in by_target.values():
+        frames.sort(key=lambda f: (f.get("coverage") or {}).get("object_fraction", 0.0),
+                    reverse=True)
+    chosen = []
+    depth = 0
+    while len(chosen) < count:
+        added = False
+        for target in sorted(by_target):
+            if depth < len(by_target[target]):
+                chosen.append(by_target[target][depth])
+                added = True
+                if len(chosen) == count:
+                    break
+        if not added:
+            break
+        depth += 1
+    return chosen
+
+
+def variant_frames(scene: Path, pose_index: int) -> list[dict[str, Any]]:
+    """Every lighting variant of one pose, in curriculum order.
+
+    Only important poses carry the full sweep, so this returns what exists
+    rather than asserting six: a scene whose chosen pose is not important shows
+    its baseline alone, which is the truth about that pose.
+    """
+    found: dict[str, Path] = {}
+    for shard in sorted((scene / "render").glob("shard_*")):
+        for frame_dir in shard.iterdir():
+            if not frame_dir.is_dir():
+                continue
+            for variant in VARIANTS:
+                if frame_dir.name.endswith(f"_p{pose_index:03d}_{variant}"):
+                    found[variant] = frame_dir
+    return [{"variant": v, "dir": found[v]} for v in VARIANTS if v in found]
+
+
 def pick_frame(scene: Path) -> tuple[Path, dict[str, Any]] | None:
     """The scene's best important pose under baseline lighting.
 
@@ -113,9 +175,21 @@ def main() -> int:
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--width", type=int, default=210)
     parser.add_argument("--limit", type=int, default=0)
+    parser.add_argument("--views", type=int, default=0,
+                        help="RGB renders from this many viewpoints per scene, one per target "
+                             "object where possible, so a review judges the scene rather than "
+                             "one frame's framing")
+    parser.add_argument("--variants", action=argparse.BooleanOptionalAction, default=True,
+                        help="include the lighting sweep row")
+    parser.add_argument("--seeds", default=None,
+                        help="restrict to a seed range, e.g. 100-149, matched against the "
+                             "four-digit suffix of the scene directory")
     args = parser.parse_args()
 
     scenes = sorted(p for p in args.root.glob("abo_cornell_*") if p.is_dir())
+    if args.seeds:
+        low, high = (int(v) for v in args.seeds.split("-", 1))
+        scenes = [p for p in scenes if low <= int(p.name.rsplit("_", 1)[1]) <= high]
     if args.limit:
         scenes = scenes[:args.limit]
     rows, skipped = [], []
@@ -133,6 +207,24 @@ def main() -> int:
                 strip.append({"label": label, "uri": None})
                 continue
             strip.append({"label": label, "uri": _encode(image, treatment, args.width)})
+        views = []
+        for chosen in spread_views(frame["_manifest"], args.views):
+            shard_dir = next((shard / chosen["frame"]
+                              for shard in sorted((scene / "render").glob("shard_*"))
+                              if (shard / chosen["frame"]).is_dir()), None)
+            image = _read(shard_dir, "rgb") if shard_dir else None
+            views.append({
+                "label": "p%03d %s" % (chosen["pose_index"],
+                                       (chosen.get("target_source_id") or "?")[-4:]),
+                "uri": None if image is None else _encode(image, "hdr", args.width),
+            })
+
+        lighting = []
+        for entry in (variant_frames(scene, frame["pose_index"]) if args.variants else []):
+            image = _read(entry["dir"], "rgb")
+            lighting.append({"label": entry["variant"].split("_", 1)[1].replace("_", " "),
+                             "uri": None if image is None
+                             else _encode(image, "hdr", args.width)})
         record = frame["_manifest"]
         scene_manifest = json.loads((scene / "scene_manifest.json").read_text(encoding="utf-8"))
         rows.append({
@@ -146,6 +238,9 @@ def main() -> int:
             "distance_m": frame.get("target_distance_m"),
             "missing": missing,
             "strip": strip,
+            "lighting": lighting,
+            "views": views,
+            "pose_index": frame["pose_index"],
         })
         print(f"[sheet] {scene.name} {frame['frame']}"
               + (f" MISSING {missing}" if missing else ""), flush=True)

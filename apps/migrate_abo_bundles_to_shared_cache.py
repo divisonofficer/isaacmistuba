@@ -47,12 +47,32 @@ SCHEMA = "robomituba.abo_bundle_migration.v1"
 STAGE = "stage"
 
 
+#: Written by `publish` into the cache copy and absent from the per-scene copy
+#: it replaces. It is migration bookkeeping, not part of the bundle, so it
+#: must not take part in deciding whether the two are the same bundle.
+RECORD = "bundle.json"
+
+
 def _tree(root: Path) -> list[Path]:
-    return sorted(p.relative_to(root) for p in root.rglob("*") if p.is_file())
+    return sorted(p.relative_to(root) for p in root.rglob("*")
+                  if p.is_file() and p.name != RECORD)
 
 
 def identical(left: Path, right: Path) -> tuple[bool, str]:
-    """Every file present in both, same size, same bytes."""
+    """Every file present in both, same bytes -- the record file excepted.
+
+    The first apply removed nothing. `publish` writes `bundle.json` into the
+    cache copy, so a published bundle had six files against the per-scene
+    five and every comparison failed on the file list alone.
+
+    The dry run had not caught it because it compares against the donor
+    directory, which carries no record yet. So the preview and the apply were
+    asking different questions, and the preview's 2,097 removable copies
+    described an operation the apply does not perform -- a preview that is
+    honest about quantity and wrong about what it is previewing. Excluding
+    the record makes both ask whether the bundle content is the same, which
+    is what either one meant.
+    """
     a, b = _tree(left), _tree(right)
     if a != b:
         only = sorted(set(a) ^ set(b))[:3]
@@ -104,6 +124,30 @@ def scan(root: Path) -> tuple[dict[str, list[tuple[Path, dict]]], list[str]]:
                 continue
             assets[f"{asset_id}-{digest[:16]}"].append((scene, record))
     return assets, problems
+
+
+def reap_staging(cache: Path, apply: bool) -> int:
+    """Remove staging directories whose owning process is gone.
+
+    Staging names carry the pid that created them so two concurrent runs cannot
+    collide, which means an interrupted run's directory is never reclaimed by
+    the next one -- it has a different pid and simply builds beside it. Observed
+    after a run was killed on a timeout: one orphan, invisible to every
+    subsequent attempt. The pid is what makes them safe to leave alone while a
+    peer is running and safe to remove once it is not.
+    """
+    staging = cache / ".staging"
+    if not staging.is_dir():
+        return 0
+    reaped = 0
+    for entry in staging.iterdir():
+        suffix = entry.name.rsplit(".", 1)[-1]
+        if suffix.isdigit() and Path(f"/proc/{suffix}").exists():
+            continue                      # a live run owns this one
+        reaped += 1
+        if apply:
+            shutil.rmtree(entry, ignore_errors=True)
+    return reaped
 
 
 def publish(cache: Path, key: str, record: dict, apply: bool) -> tuple[Path, str]:
@@ -183,6 +227,11 @@ def main() -> int:
     args = parser.parse_args()
     cache = args.cache or (args.root / "_asset_cache")
 
+    orphans = reap_staging(cache, args.apply)
+    if orphans:
+        print(f"[migrate] {orphans} orphaned staging directories "
+              f"{'removed' if args.apply else 'found (rerun with --apply to clear)'}")
+
     assets, problems = scan(args.root)
     if problems:
         print(f"[migrate] {len(problems)} scenes/assets skipped:")
@@ -202,11 +251,14 @@ def main() -> int:
     moves: dict[Path, dict[str, Path]] = defaultdict(dict)
     compare_against: dict[str, Path] = {}
     published_count = 0
+    published_bytes = 0
     for key, uses in sorted(assets.items()):
         _, record = uses[0]
         target, how = publish(cache, key, record, args.apply)
         if how in ("published", "would publish"):
             published_count += 1
+            origin = target if target.is_dir() else Path(record["gltf"]).parent
+            published_bytes += sum(f.stat().st_size for f in origin.rglob("*") if f.is_file())
         asset_id = key.rsplit("-", 1)[0]
         # What a removal will be checked against. On a real run that is the
         # published bundle; on a dry run nothing has been published, so it is
@@ -247,15 +299,24 @@ def main() -> int:
                 shutil.rmtree(local)
         print(f"[migrate] {scene.name}: {changed} entries repointed", flush=True)
 
+    # Gross and net are different numbers and only one of them is the saving.
+    # A donor's copy is removed like any other, but its bytes did not vanish --
+    # they moved into the cache. Reporting only what was deleted made a run that
+    # freed 6.0 GB locally while writing 5.2 GB of cache look like a 6 GB win.
     print(f"[migrate] {repointed} manifest entries repointed, {removed} local copies "
-          f"{'removed' if args.apply else 'removable'}, {freed / 2**30:.1f} GB")
+          f"{'removed' if args.apply else 'removable'}")
+    print(f"[migrate] {freed / 2**30:.1f} GB of per-scene copies "
+          f"{'removed' if args.apply else 'removable'}, "
+          f"{published_bytes / 2**30:.1f} GB now held once in the cache, "
+          f"net {(freed - published_bytes) / 2**30:+.1f} GB")
     if args.record:
         args.record.write_text(json.dumps({
             "schema": SCHEMA, "root": str(args.root), "cache": str(cache),
             "applied": args.apply, "scenes": len(scenes),
             "bundle_instances": instances, "distinct_assets": len(assets),
             "published": published_count, "local_copies_removed": removed,
-            "bytes_freed": freed, "skipped": problems,
+            "bytes_removed": freed, "bytes_published": published_bytes,
+            "bytes_net": freed - published_bytes, "skipped": problems,
         }, indent=1), encoding="utf-8")
         print(f"[migrate] record -> {args.record}")
     return 0
