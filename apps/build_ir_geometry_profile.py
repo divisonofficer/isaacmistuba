@@ -95,6 +95,9 @@ def _validate_stage1(manifest_path: Path, *, profile: str) -> dict[str, Any]:
     refused: list[dict[str, Any]] = []
     triangles_before_total = 0
     triangles_after_total = 0
+    vertices_before_total = 0
+    vertices_after_total = 0
+    unchanged_faces_changed_vertices = []
     for unit in units:
         pbr = dict(unit.get("pbr") or {})
         if pbr.get("status") != "ok" or pbr.get("appearance_authoritative") is False:
@@ -130,6 +133,22 @@ def _validate_stage1(manifest_path: Path, *, profile: str) -> dict[str, Any]:
         after = int(decimation.get("triangles_after") or decimation.get("faces_after") or 0)
         triangles_before_total += before
         triangles_after_total += after
+        # Faces alone is not an identity for a mesh, so this records the pair.
+        # Two results can carry the same triangles while splitting vertices
+        # differently at UV seams and normal boundaries; that changes the
+        # interpolated surface and therefore every atlas baked against it, and
+        # it was invisible to every check here because they all counted faces,
+        # which by construction do not change. Either number alone is a
+        # projection, and each has a different null space.
+        verts_before = int(decimation.get("vertices_before") or 0)
+        verts_after = int(decimation.get("vertices_after") or 0)
+        vertices_before_total += verts_before
+        vertices_after_total += verts_after
+        if verts_before and verts_after and after and after == before and verts_after != verts_before:
+            unchanged_faces_changed_vertices.append({
+                "object_id": unit.get("id"), "triangles": before,
+                "vertices_before": verts_before, "vertices_after": verts_after,
+            })
         status = str(decimation.get("status") or "")
         if status in {"no_effect", "error"}:
             failures.append("{}: {}".format(unit.get("id"), decimation.get("error")))
@@ -194,6 +213,19 @@ def _validate_stage1(manifest_path: Path, *, profile: str) -> dict[str, Any]:
         "triangles_kept_by_refusal": sum(int(r["triangles_before"]) - int(r["triangles_kept"])
                                          for r in refused),
         "structural_exclusion": structural_exclusion,
+        # The vertex half of the identity. Published even when it is unremarkable,
+        # because a quantity nothing records is a quantity that can drift for a
+        # week: an unrecorded vertex count is exactly how a mesh can be rebuilt
+        # with the same faces, a different vertex split, and a clean report from
+        # every gate. ``face_stable_vertex_changed_units`` lists the units where
+        # triangles held and vertices did not -- the case a triangle count cannot
+        # express -- and is informational rather than fatal, since a legitimate
+        # re-split at a seam looks identical to a defective one from here.
+        "vertices_before_total": vertices_before_total,
+        "vertices_after_total": vertices_after_total,
+        "retained_vertex_ratio": (vertices_after_total / vertices_before_total) if vertices_before_total else 1.0,
+        "face_stable_vertex_changed_units": unchanged_faces_changed_vertices,
+        "face_stable_vertex_changed_count": len(unchanged_faces_changed_vertices),
         "manifest_sha256": _sha256(manifest_path),
     }
 

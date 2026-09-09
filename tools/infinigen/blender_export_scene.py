@@ -1836,11 +1836,29 @@ def _mesh_triangle_count(mesh):
     return len(mesh.loop_triangles)
 
 
+def _mesh_counts(mesh):
+    """Triangles, vertices and loops together.
+
+    Triangle count alone is not an identity for a mesh. Two meshes can carry the
+    same faces while differing in how vertices are split at UV seams and normal
+    boundaries, which changes the interpolated surface and therefore anything
+    baked against it -- and every gate here counted only triangles, so that
+    difference was invisible to all of them. Record the tuple; compare the tuple.
+    """
+    mesh.calc_loop_triangles()
+    return {
+        "triangles": len(mesh.loop_triangles),
+        "vertices": len(mesh.vertices),
+        "loops": len(mesh.loops),
+    }
+
+
 def _gltfpack_simplify_material_partitions(obj, target_max_triangles):
     """Preserve every used material slot by simplifying one primitive set at a time."""
     import bmesh
 
     source_mesh = obj.data
+    _counts_before = _mesh_counts(source_mesh)
     used_slots = sorted({int(poly.material_index) for poly in source_mesh.polygons})
     # Some generated assets retain polygon indices for a material slot whose
     # datablock was dropped during authoring/export.  A strict partition pass
@@ -2035,11 +2053,16 @@ def _gltfpack_simplify_material_partitions(obj, target_max_triangles):
             f"({triangles_after}>{int(target_max_triangles)})"
         )
     obj.data = candidate_mesh
+    _counts_after = _mesh_counts(candidate_mesh)
     return {
         "backend": "meshoptimizer_gltfpack_material_partitions",
         "source_triangles": total,
         "target_max_triangles": int(target_max_triangles),
         "triangles_after": triangles_after,
+        "counts_before": _counts_before,
+        "counts_after": _counts_after,
+        "vertices_before": _counts_before["vertices"],
+        "vertices_after": _counts_after["vertices"],
         "used_material_slots": used_slots,
         "material_slots_preserved": resulting_slots == set(used_slots),
         "material_slot_transport_repaired": resulting_slots != set(used_slots),
@@ -2060,9 +2083,13 @@ def _gltfpack_simplify_object(obj, target_max_triangles):
     source_materials = list(source_mesh.materials)
     _source_used_indices = {int(poly.material_index) for poly in source_mesh.polygons}
     source_material_names = [material.name if material else None for material in source_materials]
-    source_triangles = _mesh_triangle_count(source_mesh)
+    _counts_before = _mesh_counts(source_mesh)
+    source_triangles = _counts_before["triangles"]
     if source_triangles <= target_max_triangles:
-        return {"backend": "meshoptimizer_gltfpack", "triangles_after": source_triangles, "skipped": True}
+        return {"backend": "meshoptimizer_gltfpack", "triangles_after": source_triangles,
+                "counts_before": _counts_before, "counts_after": dict(_counts_before),
+                "vertices_before": _counts_before["vertices"],
+                "vertices_after": _counts_before["vertices"], "skipped": True}
     source_matrix = obj.matrix_world.copy()
     source_had_uv = bool(source_mesh.uv_layers)
     imported_objects = []
@@ -2185,10 +2212,14 @@ def _gltfpack_simplify_object(obj, target_max_triangles):
                     f"(source used {sorted(_source_used_indices)}, kept {sorted(_kept)})"
                 )
             obj.data = candidate_mesh
+            _counts_after = _mesh_counts(candidate_mesh)
             return {
                 "backend": "meshoptimizer_gltfpack", "binary": binary,
                 "source_triangles": source_triangles, "target_max_triangles": int(target_max_triangles),
                 "triangles_after": triangles_after, "ratio_requested": ratio,
+                "counts_before": _counts_before, "counts_after": _counts_after,
+                "vertices_before": _counts_before["vertices"],
+                "vertices_after": _counts_after["vertices"],
                 "command": command[1:], "uv_preserved": bool(candidate_mesh.uv_layers),
                 "material_slots_preserved": _slots_preserved,
             }
