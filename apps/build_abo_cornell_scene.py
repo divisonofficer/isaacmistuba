@@ -1112,7 +1112,19 @@ def build_manifest(scene_id: str, layout: dict[str, Any], stage_glb: Path,
             return cache[key]
 
         print(f"[abo-cornell] convert asset={key} -> shared cache", flush=True)
-        staging = asset_cache / ".staging" / f"{key}-{digest[:16]}.{os.getpid()}"
+        # The leaf directory name is not cosmetic: `rewrite_glb` derives each
+        # material's join key from it (`material_marker(out.name, index)`), and
+        # that key is written into the glTF at conversion time. Building into a
+        # directory called `<id>-<sha>.<pid>` therefore stamped the pid into
+        # every material name, and `prepare` refused every scene that touched a
+        # freshly converted asset because those names could not be joined to the
+        # manifest audit. Fifty scenes, all of them.
+        #
+        # So the pid disambiguates a level up and the leaf keeps the asset id.
+        # The final directory is still named for the content hash -- renaming
+        # afterwards is safe precisely because the names are already inside the
+        # file by then.
+        staging = asset_cache / ".staging" / str(os.getpid()) / key
         if staging.exists():
             shutil.rmtree(staging)
         record = rewrite_glb(source=source, out=staging, basisu=basisu)
@@ -1132,6 +1144,13 @@ def build_manifest(scene_id: str, layout: dict[str, Any], stage_glb: Path,
             if not record_path.is_file():
                 raise
             record = json.loads(record_path.read_text(encoding="utf-8"))
+        # The pid directory exists only to keep two composes apart; once its
+        # bundle has been renamed out it is an empty directory that nothing will
+        # ever revisit, because the next run has a different pid.
+        try:
+            staging.parent.rmdir()
+        except OSError:
+            pass                      # another convert of ours is still using it
         cache[key] = record
         return record
 
