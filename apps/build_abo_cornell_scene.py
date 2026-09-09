@@ -47,7 +47,9 @@ import csv
 import hashlib
 import json
 import math
+import os
 import random
+import shutil
 import struct
 import sys
 from pathlib import Path
@@ -74,13 +76,17 @@ from hssd_blender_ir.material_naming import material_marker  # noqa: E402
 from hssd_blender_ir.pbr import classify_material  # noqa: E402
 
 SCHEMA = "robomituba.abo_cornell_scene.v1"
+#: v3: both accent walls draw from one wider pool and are required to differ;
+#: the prop size cap rises to 0.75 of the near frame width. Neither changes
+#: what a scene *is*, but scenes composed under v2 draw from smaller pools and
+#: are not comparable on material or asset diversity.
 #: v2: structural finishes are drawn from the union of a role's preferred
 #: categories rather than the first non-empty one, and the texel gate is
 #: evaluated at the distance walls are actually seen from. Under v1 those two
 #: together left every wall and ceiling in the dataset a choice of two
 #: materials. Scenes composed under v1 are not comparable and the queue's
 #: policy check will flag them.
-COMPOSER_VERSION = "abo-cornell-v2"
+COMPOSER_VERSION = "abo-cornell-v3"
 
 #: The camera band this dataset is composed for.  `pose_gates` rejects a frame
 #: whose median depth is under 0.8 m; the far end is where a prop of the
@@ -97,7 +103,12 @@ DEFAULT_FRAME_WIDTH_PX = 720
 #: A prop may occupy this much of the frame width at the near end.  Past it
 #: `pose_gates.MAX_DOMINANT_MATERIAL` starts rejecting the pose for being one
 #: material wall-to-wall, which is the same judgement from the other side.
-PROP_FRAME_FRACTION = 0.60
+#: v3 raises this from 0.60. At 0.60 the prop pool was 380 assets and 100
+#: scenes placed 1,600 props from it, so 234 assets appeared four times or
+#: more; 0.75 gives 529. The cap is a framing limit, not a physical one -- a
+#: 0.50 m prop is 75% of the frame at the near standoff and half of it at the
+#: far end, and the pose gates reject a frame one material fills regardless.
+PROP_FRAME_FRACTION = 0.75
 #: Below this a prop is a cable adapter reading as a smudge, not a subject --
 #: an unfiltered draw picked a 0.04 m MULTIPORT_HUB.  At 1.0 m and 45 deg a
 #: 0.12 m object still spans ~104 px.
@@ -125,6 +136,10 @@ MIN_SUPPORT_AREA_M2 = 0.06
 MIN_SUPPORT_SIDE_M = 0.25
 #: Gap between props sharing a surface, so they read as separate objects.
 PROP_GAP_M = 0.04
+#: Categories an accent wall may draw from -- everything that reads as a
+#: departure from the concrete/brick/tile a main wall wears. 38 materials in
+#: the current registry against the 11 the v2 west accent could reach.
+ACCENT_CATEGORIES = ("fabric", "wood", "marble", "rock", "metal")
 #: Structural roles the box exposes to the TextureCan registry.
 BOX_ROLES = ("floor", "ceiling", "wall_north", "wall_south", "wall_east", "wall_west")
 
@@ -856,8 +871,25 @@ def choose_finishes(registry: dict[str, Any], seed: int, *, accent_walls: bool,
     if accent_walls:
         # The classic Cornell pair: two facing walls differ so colour bleeding
         # is visible in the interreflection the box exists to produce.
-        finishes["wall_east"] = draw("accent_east", ("fabric", "wood", "marble"))
-        finishes["wall_west"] = draw("accent_west", ("marble", "rock", "fabric"))
+        #
+        # v3 draws both accents from one pool and then requires them to differ,
+        # rather than giving each its own narrow preference list. Under v2 the
+        # west accent's list was marble + rock + fabric, which is 11 materials
+        # in this registry -- across 100 scenes it produced 11 distinct walls
+        # against 50 for the main wall, with one material appearing 13 times.
+        # Distinctness is what the accent is for, so it is enforced rather than
+        # left to two lists happening not to overlap.
+        pool = ACCENT_CATEGORIES
+        east = draw("accent_east", pool)
+        west = draw("accent_west", pool)
+        if west["id"] == east["id"] or west["id"] == wall_default["id"]:
+            rng = _rng(seed, "accent_west_retry")
+            options = [record for category in pool for record in by_category.get(category, [])
+                       if record["id"] not in {east["id"], wall_default["id"]}]
+            if options:
+                west = rng.choice(sorted(options, key=lambda r: r["id"]))
+        finishes["wall_east"] = east
+        finishes["wall_west"] = west
     return finishes
 
 
@@ -1040,7 +1072,8 @@ def write_semantics_csv(path: Path, placements: Sequence[dict[str, Any]]) -> int
 
 def build_manifest(scene_id: str, layout: dict[str, Any], stage_glb: Path,
                    out_dir: Path, *, basisu: Path, nir_classes: dict[str, Any] | None,
-                   stage_finishes: dict[str, dict[str, Any]]) -> dict[str, Any]:
+                   stage_finishes: dict[str, dict[str, Any]],
+                   asset_cache: Path | None = None) -> dict[str, Any]:
     """Convert every asset once and assemble the HSSD-shaped scene manifest.
 
     `nir_classes` of None leaves `nir_priors` empty, which is how the prepare
@@ -1048,13 +1081,61 @@ def build_manifest(scene_id: str, layout: dict[str, Any], stage_glb: Path,
     """
     cache: dict[str, dict[str, Any]] = {}
 
-    def bundle(key: str, source: Path) -> dict[str, Any]:
-        if key not in cache:
+    def bundle(key: str, source: Path, *, shared: bool = True) -> dict[str, Any]:
+        """Convert one asset, reusing a shared bundle when the source matches.
+
+        The cache used to be keyed by scene, so an ABO asset appearing in ten
+        scenes was decoded and re-encoded ten times into ten directories holding
+        byte-identical output. Measured over 150 scenes: 2,141 bundle instances
+        for 693 distinct assets, about 39 GB of duplicate bytes, and the
+        duplicate work to produce them.
+
+        `shared=False` is for the stage, which is generated per scene and is
+        genuinely different every time -- content-addressing it would spend a
+        hash to prove that. It stays beside the scene it belongs to.
+        """
+        if key in cache:
+            return cache[key]
+        if not shared or asset_cache is None:
             print(f"[abo-cornell] convert asset={key}", flush=True)
             cache[key] = rewrite_glb(source=source, out=out_dir / "assets" / key, basisu=basisu)
-        return cache[key]
+            return cache[key]
 
-    stage_bundle = bundle("stage", stage_glb)
+        # Keyed on the source's content, not its id: an id is a promise that the
+        # bytes behind it never change, and this week has been a run of names
+        # promising identities they did not have.
+        digest = sha256(source)
+        published = asset_cache / f"{key}-{digest[:16]}"
+        record_path = published / "bundle.json"
+        if record_path.is_file():
+            cache[key] = json.loads(record_path.read_text(encoding="utf-8"))
+            return cache[key]
+
+        print(f"[abo-cornell] convert asset={key} -> shared cache", flush=True)
+        staging = asset_cache / ".staging" / f"{key}-{digest[:16]}.{os.getpid()}"
+        if staging.exists():
+            shutil.rmtree(staging)
+        record = rewrite_glb(source=source, out=staging, basisu=basisu)
+        # Paths inside the record must name where the bundle ends up, not where
+        # it was built, since the manifest hands them to Blender verbatim.
+        record = json.loads(json.dumps(record).replace(str(staging), str(published)))
+        record_staged = staging / "bundle.json"
+        record_staged.write_text(json.dumps(record, indent=1), encoding="utf-8")
+        published.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.rename(staging, published)
+        except OSError:
+            # Another compose published the same content first. bundle.json is
+            # written before the rename, so anything that arrived here is whole;
+            # theirs is as good as ours and ours is the one that gets discarded.
+            shutil.rmtree(staging, ignore_errors=True)
+            if not record_path.is_file():
+                raise
+            record = json.loads(record_path.read_text(encoding="utf-8"))
+        cache[key] = record
+        return record
+
+    stage_bundle = bundle("stage", stage_glb, shared=False)
 
     product_type_by_asset = {item["record"]["id"]: item["record"]["product_type"]
                              for item in layout["placements"]}
@@ -1186,12 +1267,21 @@ def main() -> int:
                              "Off by default: the pipeline's own derived_pseudo_nir is the "
                              "agreed model for this dataset. The prior is better grounded but "
                              "attenuates within-texture detail to its class alpha (ceramic 0.15 "
-                             "keeps 15% of the visible relative contrast), so it is opt-in.")
+                             "keeps 15%% of the visible relative contrast), so it is opt-in.")
     parser.add_argument("--nir-classes", type=Path, default=DEFAULT_NIR_CLASSES,
                         help="class_band_reflectance_v1.json consulted by --nir-class-prior")
     parser.add_argument("--basisu", type=Path, default=Path("basisu"),
                         help="only used for KTX2 sources; ABO ships PNG/JPEG and never invokes it")
+    parser.add_argument("--asset-cache", type=Path, default=None,
+                        help="directory holding converted asset bundles keyed by source content, "
+                             "shared across scenes. Defaults to `_asset_cache` beside the scene "
+                             "directory; pass an explicit path to relocate it, or --no-asset-cache "
+                             "to keep every bundle inside its own scene as before.")
+    parser.add_argument("--no-asset-cache", dest="asset_cache", action="store_const", const=None,
+                        help="disable the shared cache (the pre-2026-09-09 behaviour)")
     args = parser.parse_args()
+    if args.asset_cache is None and "--no-asset-cache" not in sys.argv:
+        args.asset_cache = args.out.parent / "_asset_cache"
 
     index = json.loads(args.index.read_text(encoding="utf-8"))
     if not index.get("support_pass"):
@@ -1237,6 +1327,7 @@ def main() -> int:
 
     nir_classes = load_nir_classes(args.nir_classes) if args.nir_class_prior else None
     manifest = build_manifest(scene_id, layout, stage_glb, out_dir, basisu=args.basisu,
+                              asset_cache=args.asset_cache,
                               nir_classes=nir_classes, stage_finishes=finishes)
     manifest["structural_finish"] = finish_report
     manifest["camera_limits"] = limits

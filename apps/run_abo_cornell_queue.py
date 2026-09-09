@@ -350,7 +350,8 @@ def build_one(seed: int, gpu: int, args: argparse.Namespace, expected_frames: in
                    "--out", str(scene_dir), "--scene-id", scene_id, "--seed", str(seed),
                    "--hosts", str(args.hosts), "--props", str(args.props),
                    "--luminaires", str(args.luminaires),
-                   "--hfov-deg", str(args.hfov_deg), "--frame-width-px", str(args.width)]
+                   "--hfov-deg", str(args.hfov_deg), "--frame-width-px", str(args.width),
+                   "--asset-cache", str(args.asset_cache or (args.out_root / "_asset_cache"))]
         if args.accent_walls:
             command.append("--accent-walls")
         if args.nir_class_prior:
@@ -499,6 +500,11 @@ def main() -> int:
                              "composer version, NIR model or lighting profile than this run asks "
                              "for; without it such scenes are reported and skipped")
     parser.add_argument("--dry-run", action="store_true", help="list the plan and exit")
+    parser.add_argument("--asset-cache", type=Path, default=None,
+                        help="shared bundle cache for the composer, keyed by source content. "
+                             "Defaults to `_asset_cache` under --out-root, which is what makes an "
+                             "asset used by ten scenes get converted and stored once rather than "
+                             "ten times.")
     parser.add_argument("--holder", default=None,
                         help="this session's row in the machine-wide pool lock's `all_holders`; "
                              "without it that lock is not consulted")
