@@ -29,6 +29,7 @@ every pose, plus the other five for the important ones.
 from __future__ import annotations
 
 import argparse
+import datetime
 import hashlib
 import json
 import os
@@ -695,7 +696,11 @@ def main() -> int:
             "any failure below may be that rather than the scene")
 
     log(f"complete={len(done)}/{len(seeds)} failed={failed} broken={len(broken)}")
-    summary = {"seeds": seeds, "complete": done, "failed": failed,
+    # A result with no time on it decays into a claim about the present. This
+    # run's numbers describe the corpus as it was when the run ended, and the
+    # next run will move them.
+    summary = {"finished_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+               "seeds": seeds, "complete": done, "failed": failed,
                "tools_at_start": tools_at_start, "tools_at_end": tools_at_end,
                "tools_changed_during_run": drifted,
                "broken": [{"seed": seed, "why": why} for seed, why in broken],
