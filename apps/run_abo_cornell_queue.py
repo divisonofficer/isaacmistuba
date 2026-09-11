@@ -29,6 +29,7 @@ every pose, plus the other five for the important ones.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -138,6 +139,30 @@ def _run(command: list[str], *, log_path: Path, env: dict[str, str] | None = Non
 
 def _rendered_frames(scene_dir: Path) -> int:
     return len([d for d in (scene_dir / "render").glob("shard_*/*") if d.is_dir()])
+
+
+def tool_fingerprint() -> dict[str, str]:
+    """Content hash of every script this queue executes.
+
+    These live in a submodule several sessions share and edit in place, and a
+    render launches whatever is on disk at that moment. A batch of this one died
+    fifty scenes deep with
+
+        NameError: name '_write_manifest' is not defined
+
+    because a peer was midway through adding that function when our renders read
+    the file; their finished version landed hours later and the traceback points
+    at a file that by then is perfectly correct, which makes it close to
+    undiagnosable after the fact.
+
+    Hashing does not prevent it -- nothing short of running from a private copy
+    would, and that would pin the library these scripts import but not the
+    library itself. What it does is turn an impossible traceback into a named
+    event: the run records what it started with and says so when it changes.
+    """
+    return {path.name: hashlib.sha256(path.read_bytes()).hexdigest()[:12]
+            for path in (COMPOSER, BUILD_SCENE, PREPARE, RENDER)
+            if path.is_file()}
 
 
 def scene_intact(scene_dir: Path) -> tuple[bool, str]:
@@ -626,6 +651,9 @@ def main() -> int:
         f"poses={args.pose_count} important={args.important_count} "
         f"nir={'class_prior' if args.nir_class_prior else 'pseudo'} "
         f"format={args.channel_format} hosts={args.hosts} props={args.props}")
+    tools_at_start = tool_fingerprint()
+    log("tools " + " ".join(f"{name}={digest}" for name, digest in sorted(tools_at_start.items())))
+
     for sig in (signal.SIGINT, signal.SIGTERM):
         signal.signal(sig, _reap)
     results: dict[int, bool] = {}
@@ -658,8 +686,18 @@ def main() -> int:
         log("    these count as complete by frame count and are not buildable; "
             "the shared asset cache is the usual cause")
 
+    tools_at_end = tool_fingerprint()
+    drifted = sorted(name for name in set(tools_at_start) | set(tools_at_end)
+                     if tools_at_start.get(name) != tools_at_end.get(name))
+    if drifted:
+        log(f"TOOLS CHANGED DURING THIS RUN: {', '.join(drifted)}")
+        log("    a shared script was edited while these renders were reading it; "
+            "any failure below may be that rather than the scene")
+
     log(f"complete={len(done)}/{len(seeds)} failed={failed} broken={len(broken)}")
     summary = {"seeds": seeds, "complete": done, "failed": failed,
+               "tools_at_start": tools_at_start, "tools_at_end": tools_at_end,
+               "tools_changed_during_run": drifted,
                "broken": [{"seed": seed, "why": why} for seed, why in broken],
                "frames_per_scene": expected_frames,
                "settings": {k: (str(v) if isinstance(v, Path) else v)
