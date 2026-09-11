@@ -1456,6 +1456,10 @@ def main() -> int:
         print(f"[error] export pointer reconciliation failed: {exc}", file=sys.stderr)
         return 1
     run["pointer_reconciliation"] = reconciliation
+    # A retry that succeeds must not leave the previous attempt's error behind:
+    # a resumed run is written in place, so a stale key here reads as a failure
+    # on a run whose status is "succeeded".
+    run.pop("pointer_reconciliation_error", None)
     run["updated_at"] = _utc_now()
     _write_json_atomic(run_path, run)
     print(

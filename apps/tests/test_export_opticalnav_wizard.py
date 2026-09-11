@@ -118,6 +118,7 @@ def test_default_payload_uses_png_stokes_core_and_png_only() -> None:
         "include_incomplete": False,
         "raw": False,
         "profile": "png_stokes_core",
+        "coverage_levels": None,
     })()
     payload = wizard._choose_payload(
         {"scene_id": "scene", "camera_ids": ["rgb", "polar"]},
@@ -141,6 +142,7 @@ def test_raw_payload_requests_legacy_full_with_exr() -> None:
         "include_incomplete": False,
         "raw": True,
         "profile": "png_stokes_core",
+        "coverage_levels": None,
     })()
     payload = wizard._choose_payload(
         {"scene_id": "scene", "camera_ids": ["rgb", "polar"]},
