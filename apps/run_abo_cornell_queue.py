@@ -501,27 +501,64 @@ def _render_once(scene_dir: Path, gpu: int, args: argparse.Namespace,
 
 
 def worker(gpu: int, seeds: list[int], claims: Path, args: argparse.Namespace,
-           expected_frames: int, results: dict[int, bool]) -> None:
-    for seed in seeds:
-        scene_dir = args.out_root / f"{args.prefix}_{seed:04d}"
-        # Completeness is checked *after* policy, not before. A finished scene
-        # built under an older composer is not done, it is stale -- and asking
-        # "is it complete" first short-circuits the question that decides
-        # whether it should exist at all.
-        if stale_reason(scene_dir, args) is None and scene_done(scene_dir):
-            continue
-        claim = claims / f"{seed:04d}"
-        try:
-            claim.mkdir()  # atomic: only one worker wins
-        except FileExistsError:
-            continue
+           expected_frames: int, results: dict[int, bool],
+           attempts: dict[int, int]) -> None:
+    """Take whatever is claimable, repeatedly, until nothing is.
+
+    This used to iterate `seeds` once. A scene that failed released its claim so
+    "a later pass" could retry it, but there is no later pass -- only workers
+    that happen to be behind it in the same list. Seed 150 failed first in a
+    batch of fifty, nothing was behind it, and it finished the run as the single
+    unbuilt scene while four other casualties of the same minute were all picked
+    up by workers further back. The bias is at both ends and invisible in the
+    middle, which is why it took a kill script landing on the first seed to show
+    it.
+
+    Re-scanning instead means no worker has a position, so a released claim is
+    simply available to whoever looks next. It also lets a worker started later
+    -- on a device handed over mid-run -- join without restarting anything.
+
+    `attempts` caps the retries, because a scene that fails for its own reasons
+    would otherwise be handed round the workers forever.
+    """
+    while True:
+        seed = None
+        # Fewest attempts first, so a seed that has just failed goes behind
+        # everything untried rather than being re-taken on the next scan. A
+        # transient failure -- a peer's kill script, a moment of NFS contention
+        # -- is likelier to succeed after the other work than immediately after
+        # itself, and an immediate retry also blocks the queue while it burns
+        # its attempts.
+        for candidate in sorted(seeds, key=lambda x: (attempts.get(x, 0), x)):
+            if attempts.get(candidate, 0) >= args.max_attempts:
+                continue
+            scene_dir = args.out_root / f"{args.prefix}_{candidate:04d}"
+            # Completeness is checked *after* policy, not before. A finished
+            # scene built under an older composer is not done, it is stale --
+            # and asking "is it complete" first short-circuits the question that
+            # decides whether it should exist at all.
+            if stale_reason(scene_dir, args) is None and scene_done(scene_dir):
+                continue
+            claim = claims / f"{candidate:04d}"
+            try:
+                claim.mkdir()  # atomic: only one worker wins
+            except FileExistsError:
+                continue
+            seed = candidate
+            break
+        if seed is None:
+            return
+
         # Stamp the owner so a later instance can tell "in progress elsewhere"
         # from "abandoned", instead of assuming nothing is running.
         (claim / "owner").write_text(f"{os.getpid()}\n", encoding="utf-8")
+        attempts[seed] = attempts.get(seed, 0) + 1
         results[seed] = build_one(seed, gpu, args, expected_frames)
         if not results[seed]:
-            # Release so a later pass retries; --resume keeps what was rendered.
             shutil.rmtree(claim, ignore_errors=True)
+            if attempts[seed] >= args.max_attempts:
+                log(f"[gpu {gpu}] {args.prefix}_{seed:04d} giving up after "
+                    f"{attempts[seed]} attempts")
 
 
 def main() -> int:
@@ -560,6 +597,10 @@ def main() -> int:
                              "composer version, NIR model or lighting profile than this run asks "
                              "for; without it such scenes are reported and skipped")
     parser.add_argument("--dry-run", action="store_true", help="list the plan and exit")
+    parser.add_argument("--max-attempts", type=int, default=2,
+                        help="how many times one seed may be taken before it is left alone. "
+                             "Workers re-scan rather than walking the list once, so without a "
+                             "cap a scene that fails for its own reasons circulates forever.")
     parser.add_argument("--asset-cache", type=Path, default=None,
                         help="shared bundle cache for the composer, keyed by source content. "
                              "Defaults to `_asset_cache` under --out-root, which is what makes an "
@@ -658,7 +699,9 @@ def main() -> int:
     for sig in (signal.SIGINT, signal.SIGTERM):
         signal.signal(sig, _reap)
     results: dict[int, bool] = {}
-    threads = [threading.Thread(target=worker, args=(gpu, seeds, claims, args, expected_frames, results))
+    attempts: dict[int, int] = {}
+    threads = [threading.Thread(target=worker,
+                                args=(gpu, seeds, claims, args, expected_frames, results, attempts))
                for gpu in gpus]
     for thread in threads:
         thread.start()
