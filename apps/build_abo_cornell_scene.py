@@ -1070,6 +1070,65 @@ def write_semantics_csv(path: Path, placements: Sequence[dict[str, Any]]) -> int
     return len(rows)
 
 
+def _alpha_evidence(bundle: Path, material_index: int) -> dict[str, Any]:
+    """What the material's alpha actually is, not just what it declares.
+
+    `alphaMode: BLEND` says alpha should be honoured; it does not say any of it
+    is below 1. Measured across this corpus, 58 materials declare BLEND or MASK
+    and 21 of them are effectively opaque, so acting on the declaration alone
+    would discard a third of them for nothing.
+
+    The prepare stage decides `pbr_training_valid = training_valid and not
+    glass`, and its glass test is a name containing "glass" or a
+    KHR_materials_transmission factor. ABO uses neither -- zero materials here
+    carry the extension -- so 154 transmissive surfaces were rendering with a
+    metallic-roughness target that cannot describe them. These two fields are
+    what lets that test see them, and they are optional: a consumer written
+    before this must treat their absence as "not measured", not as "opaque".
+    """
+    if not bundle.is_file():
+        return {}
+    try:
+        document = json.loads(bundle.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    materials = document.get("materials") or []
+    if material_index >= len(materials):
+        return {}
+    pbr = (materials[material_index].get("pbrMetallicRoughness") or {})
+    factor = float((pbr.get("baseColorFactor") or [1.0, 1.0, 1.0, 1.0])[3])
+    evidence: dict[str, Any] = {"base_color_factor_alpha": factor}
+
+    index = (pbr.get("baseColorTexture") or {}).get("index")
+    textures = document.get("textures") or []
+    images = document.get("images") or []
+    if index is None or index >= len(textures):
+        return evidence
+    source = textures[index].get("source")
+    if source is None or source >= len(images):
+        return evidence
+    uri = images[source].get("uri")
+    if not uri:
+        return evidence
+    path = bundle.parent / uri
+    if not path.is_file():
+        return evidence
+    try:
+        image = Image.open(path)
+        if image.mode not in ("RGBA", "LA", "PA"):
+            # No alpha channel at all is evidence of opacity, and different
+            # from having one we could not read.
+            evidence["base_color_texture_alpha_fraction"] = 0.0
+            return evidence
+        alpha = np.asarray(image.convert("RGBA"))[..., 3].astype(np.float32) / 255.0
+    except OSError:
+        return evidence
+    evidence["base_color_texture_alpha_fraction"] = float((alpha < 0.95).mean())
+    return evidence
+
+
+
+
 def build_manifest(scene_id: str, layout: dict[str, Any], stage_glb: Path,
                    out_dir: Path, *, basisu: Path, nir_classes: dict[str, Any] | None,
                    stage_finishes: dict[str, dict[str, Any]],
@@ -1220,63 +1279,6 @@ def build_manifest(scene_id: str, layout: dict[str, Any], stage_glb: Path,
                 prior["asset_id"] = asset_id
                 prior["material_index"] = index
                 nir_priors[material_marker(asset_id, index)] = prior
-
-def _alpha_evidence(bundle: Path, material_index: int) -> dict[str, Any]:
-    """What the material's alpha actually is, not just what it declares.
-
-    `alphaMode: BLEND` says alpha should be honoured; it does not say any of it
-    is below 1. Measured across this corpus, 58 materials declare BLEND or MASK
-    and 21 of them are effectively opaque, so acting on the declaration alone
-    would discard a third of them for nothing.
-
-    The prepare stage decides `pbr_training_valid = training_valid and not
-    glass`, and its glass test is a name containing "glass" or a
-    KHR_materials_transmission factor. ABO uses neither -- zero materials here
-    carry the extension -- so 154 transmissive surfaces were rendering with a
-    metallic-roughness target that cannot describe them. These two fields are
-    what lets that test see them, and they are optional: a consumer written
-    before this must treat their absence as "not measured", not as "opaque".
-    """
-    if not bundle.is_file():
-        return {}
-    try:
-        document = json.loads(bundle.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
-    materials = document.get("materials") or []
-    if material_index >= len(materials):
-        return {}
-    pbr = (materials[material_index].get("pbrMetallicRoughness") or {})
-    factor = float((pbr.get("baseColorFactor") or [1.0, 1.0, 1.0, 1.0])[3])
-    evidence: dict[str, Any] = {"base_color_factor_alpha": factor}
-
-    index = (pbr.get("baseColorTexture") or {}).get("index")
-    textures = document.get("textures") or []
-    images = document.get("images") or []
-    if index is None or index >= len(textures):
-        return evidence
-    source = textures[index].get("source")
-    if source is None or source >= len(images):
-        return evidence
-    uri = images[source].get("uri")
-    if not uri:
-        return evidence
-    path = bundle.parent / uri
-    if not path.is_file():
-        return evidence
-    try:
-        image = Image.open(path)
-        if image.mode not in ("RGBA", "LA", "PA"):
-            # No alpha channel at all is evidence of opacity, and different
-            # from having one we could not read.
-            evidence["base_color_texture_alpha_fraction"] = 0.0
-            return evidence
-        alpha = np.asarray(image.convert("RGBA"))[..., 3].astype(np.float32) / 255.0
-    except OSError:
-        return evidence
-    evidence["base_color_texture_alpha_fraction"] = float((alpha < 0.95).mean())
-    return evidence
-
 
     material_audit: list[dict[str, Any]] = []
     for asset_id, record in cache.items():
