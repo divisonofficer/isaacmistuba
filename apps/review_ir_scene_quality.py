@@ -108,7 +108,19 @@ def review(dataset: Path, stats_root: Path | None, overrides: dict[str, dict[str
     stats = stats_for(fp, dataset, stats_root)
     density = str(stats.get("density_class") or "unknown")
     rationale: list[str] = []
-    if density == "dense" and pose_count >= 50 and ratio >= 0.20:
+    # "we measured this scene and it is thin" and "we never measured this
+    # scene" used to leave by the same door, as tier D with
+    # deprecation_candidate set. They are not the same claim, and the second is
+    # not a claim about the data at all: 166 of 168 unreviewed datasets reached
+    # it purely because no statistics sidecar existed, several of them carrying
+    # 60-100 physical poses. archive_ir_review_tier.py moves datasets by tier,
+    # so an absent measurement became a decision to archive.
+    measured = density != "unknown"
+    if not measured:
+        tier, deprecated = "D", False
+        rationale.append("NOT MEASURED: no density classification available for this dataset; "
+                         "tier D is provisional and is not a judgement about the scene")
+    elif density == "dense" and pose_count >= 50 and ratio >= 0.20:
         tier, deprecated = "A", False
         rationale.append("dense scene with >=50 physical poses and >=20% paired lighting coverage")
     elif density == "dense":
@@ -119,7 +131,7 @@ def review(dataset: Path, stats_root: Path | None, overrides: dict[str, dict[str
         rationale.append("paired lighting exists but scene is not classified dense")
     else:
         tier, deprecated = "D", True
-        rationale.append("sparse/unknown scene or no same-pose lighting variation")
+        rationale.append("sparse scene or no same-pose lighting variation")
     if pose_count < 50: rationale.append(f"physical poses={pose_count} (<50)")
     if ratio < 0.20: rationale.append(f"paired pose ratio={ratio:.3f} (<0.20)")
     if density == "unknown": rationale.append("density classification is unknown")
@@ -129,6 +141,9 @@ def review(dataset: Path, stats_root: Path | None, overrides: dict[str, dict[str
         "density_class": density, "physical_pose_count": pose_count, "paired_pose_count": paired_count,
         "paired_pose_ratio": round(ratio, 6), "lighting_condition_count": lighting_count,
         "deprecation_candidate": deprecated, "requires_visual_qa": tier in {"A", "B"},
+        "density_measured": measured,
+        "density_basis": str(stats.get("density_basis") or ("unmeasured" if not measured else "unknown")),
+        "pose_visibility_class": str(stats.get("pose_visibility_class") or "unknown"),
         "rationale": rationale,
         "binding": {"dataset_fingerprint": fp, "sources": [
             {"path": str(config_path.resolve()), "sha256": sha256(config_path)},

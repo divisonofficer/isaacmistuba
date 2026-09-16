@@ -26,24 +26,53 @@ def _summary(values: list[float]) -> dict[str, float | None]:
             "p10": round(percentile(.1), 6), "p90": round(percentile(.9), 6)}
 
 
-def _classify(objects_per_m2: float | None, visible_median: float | None) -> str:
-    if objects_per_m2 is None:
-        return "unknown"
-    # Backfilled legacy scenes can have a graph snapshot whose node IDs no
-    # longer match the rendered plan.  Their source inventory and footprint
-    # are still authoritative, so retain a density class from objects/m² and
-    # let the caller expose visibility as unavailable in provenance.
-    if visible_median is None:
+def _classify(objects_per_m2: float | None, visible_median: float | None) -> tuple[str, str]:
+    """Classify how furnished the SCENE is, and say what the answer rests on.
+
+    Density is a property of the room; how many objects a given pose happens to
+    see is a property of the pose set. Combining them made the two inseparable
+    and the result wrong in both directions:
+
+      * ``objects_per_m2 or visible_median`` let one weak term veto a strong
+        one, so a closet holding 42 objects in 2.45 m² -- 17.2 per m² -- was
+        classified sparse because its poses looked at walls.
+      * ``visible_median`` falls as a pose sweep widens, so the same scene came
+        out dense at 53 poses and sparse at 200. Density anti-correlated with
+        coverage, which is backwards.
+
+    So visibility no longer decides density. It stays in the record as
+    ``selected_visible_object_count`` and gets its own class, and this returns
+    the class alongside the basis it was reached from, because a reader cannot
+    otherwise tell a measured class from a fallback one.
+    """
+    if objects_per_m2 is not None:
         if objects_per_m2 < 1.0:
-            return "sparse"
+            return "sparse", "objects_per_m2"
         if objects_per_m2 < 3.0:
-            return "moderate"
-        return "dense"
-    if objects_per_m2 < 1.0 or visible_median < 2.0:
-        return "sparse"
-    if objects_per_m2 < 3.0 or visible_median < 5.0:
-        return "moderate"
-    return "dense"
+            return "moderate", "objects_per_m2"
+        return "dense", "objects_per_m2"
+    # No footprint. Visibility is a weaker proxy -- it answers "how much did
+    # these poses see" rather than "how furnished is the room" -- but it is a
+    # measurement, and returning "unknown" when a measurement exists is what
+    # sent 166 of 168 datasets to a deprecation tier for lack of a sidecar.
+    if visible_median is not None:
+        if visible_median < 2.0:
+            return "sparse", "visible_median_fallback"
+        if visible_median < 5.0:
+            return "moderate", "visible_median_fallback"
+        return "dense", "visible_median_fallback"
+    return "unknown", "no_measurement"
+
+
+def _visibility_class(visible_median: float | None) -> str:
+    """How much the selected poses actually see. Not density -- coverage."""
+    if visible_median is None:
+        return "unknown"
+    if visible_median < 2.0:
+        return "narrow"
+    if visible_median < 5.0:
+        return "mixed"
+    return "wide"
 
 
 def build_scene_statistics(*, content_audit: dict[str, Any], visibility: dict[str, Any], render_plan: dict[str, Any],
@@ -65,7 +94,8 @@ def build_scene_statistics(*, content_audit: dict[str, Any], visibility: dict[st
     nonstructural = int(content_audit.get("nonstructural_object_count") or 0)
     per_m2 = round(nonstructural / area, 6) if area else None
     visible_stats, fraction_stats = _summary(visible), _summary(fractions)
-    density_class = _classify(per_m2, visible_stats["median"])
+    density_class, density_basis = _classify(per_m2, visible_stats["median"])
+    visibility_class = _visibility_class(visible_stats["median"])
     material_mix = material_mix or {}
     material_visibility = material_visibility or {}
     core = {
@@ -79,7 +109,9 @@ def build_scene_statistics(*, content_audit: dict[str, Any], visibility: dict[st
         "selected_sparse_pose_fraction": round(classes["sparse_negative"] / len(selected), 6) if selected else None,
         "selected_visible_object_count": visible_stats,
         "selected_nonstructural_fraction": fraction_stats,
-        "density_class": density_class, "unknown_reason": None if density_class != "unknown" else "missing_area_or_visibility",
+        "density_class": density_class, "density_basis": density_basis,
+        "pose_visibility_class": visibility_class,
+        "unknown_reason": None if density_class != "unknown" else "no_room_footprint_and_no_pose_visibility",
         "render_plan_digest": render_plan.get("render_plan_digest"), "visibility_digest": visibility.get("probe_digest"),
         "material_mix_profile": material_mix.get("profile"),
         "high_metallic_material_count": material_mix.get("high_metallic_constant_count"),
