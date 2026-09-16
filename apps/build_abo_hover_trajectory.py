@@ -168,8 +168,16 @@ def candidate_chains(picks: list[dict], count: int, tries: int = 4):
             yield [start]
         return
     for start in picks:
-        rest = sorted((b for b in picks if b is not start),
-                      key=lambda b: math.dist(start["centre"], b["centre"]))
+        # Distance alone pairs a 0.56 m subject with the 0.18 m thing nearest
+        # it, and at a fixed 1 m the second object then fills 21% of frame
+        # width against the first's 68%. The radius is the user's spec and not
+        # the place to absorb that, so the size ratio is paid for here: a
+        # partner twice the distance away is worth it if it frames comparably.
+        def pairing_cost(other):
+            ratio = max(max(start["size"]), max(other["size"])) / \
+                    max(1e-6, min(max(start["size"]), max(other["size"])))
+            return math.dist(start["centre"], other["centre"]) * (1.0 + 0.6 * (ratio - 1.0))
+        rest = sorted((b for b in picks if b is not start), key=pairing_cost)
         for partner in rest[:tries]:
             chain = [start, partner]
             while len(chain) < count:
