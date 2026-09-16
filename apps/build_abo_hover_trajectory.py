@@ -268,12 +268,51 @@ def plan_arc(targets: list[dict], blockers: list[dict], room: dict, *, frames: i
     return None
 
 
-def choose_targets(boxes: list[dict], instances: list[dict], count: int) -> list[dict]:
-    """Props that are neither hosts, luminaires, nor buried in another prop."""
-    for box, instance in zip(boxes, instances):
+def join_boxes(boxes: list[dict], instances: list[dict], tolerance: float = 1e-3) -> list[dict]:
+    """Attach each instance's identity to the box that was measured for it.
+
+    By origin, not by name and not by list order. A root node is called
+    whatever the source glTF called it -- abo_cornell_0150 mixes "RootNode"
+    with "root" in one scene -- and order only lines up when every instance
+    happens to produce exactly one root in import sequence. Matching on the
+    name gave 16 boxes for 20 instances there; matching on order would have
+    paired the survivors with the wrong products and said nothing.
+
+    Boxes with no instance are the room: floor, walls, ceiling. They stay in
+    the list as occluders and are simply never targets.
+    """
+    by_origin = {}
+    for box in boxes:
+        origin = box.get("origin")
+        if origin is not None:
+            by_origin[tuple(round(v, 4) for v in origin)] = box
+    joined, missed = [], []
+    for instance in instances:
+        matrix = instance["blender_matrix"]
+        want = tuple(round(matrix[axis][3], 4) for axis in range(3))
+        box = by_origin.get(want)
+        if box is None:
+            best = min(boxes, key=lambda b: math.dist(b.get("origin") or (1e9,) * 3, want),
+                       default=None)
+            if best is None or math.dist(best.get("origin") or (1e9,) * 3, want) > tolerance:
+                missed.append(instance.get("source_id"))
+                continue
+            box = best
         box["source_id"] = instance.get("source_id")
         box["instance_id"] = instance.get("instance_id")
         box["role"] = instance.get("abo_role")
+        joined.append(box)
+    if missed:
+        # Loud, because the alternative is a corpus whose labels are silently
+        # off by however many instances failed to join.
+        print(f"[hover] {len(missed)} instances have no measured box: "
+              f"{', '.join(str(m) for m in missed[:6])}")
+    return joined
+
+
+def choose_targets(boxes: list[dict], instances: list[dict], count: int) -> list[dict]:
+    """Props that are neither hosts, luminaires, nor buried in another prop."""
+    join_boxes(boxes, instances)
     props = [b for b in boxes if b.get("role") == "prop"]
     out = []
     for box in sorted(props, key=lambda b: -max(b["size"])):
@@ -324,9 +363,13 @@ def main() -> int:
     room = manifest["room"]
     instances = manifest["instances"]
     measured = json.loads(args.bboxes.read_text(encoding="utf-8"))
-    boxes = [b for b in measured if b["name"].startswith("RootNode")]
-    if len(boxes) != len(instances):
-        parser.error(f"{len(boxes)} measured boxes vs {len(instances)} instances: "
+    if measured and "origin" not in measured[0]:
+        parser.error("this bbox dump predates the origin field; re-run "
+                     "apps/dump_abo_scene_bboxes.py against the prepared blend")
+    boxes = measured
+    joined = join_boxes(boxes, instances)
+    if not joined:
+        parser.error(f"none of {len(instances)} instances matched a measured box: "
                      "the dump is from a different scene")
 
     targets = choose_targets(boxes, instances, max(1, args.targets) * max(1, args.chain))

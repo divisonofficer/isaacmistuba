@@ -63,6 +63,13 @@ def main() -> int:
         low, high = measured
         rows.append({
             "name": obj.name,
+            # The object's own origin, which is what scene_manifest's
+            # blender_matrix records for the instance. It is the only thing
+            # here that identifies WHICH instance this box belongs to: root
+            # node names are whatever the source glTF called them, and this
+            # corpus mixes "RootNode" with "root" in the same scene, so
+            # neither the name nor the list order is a join key.
+            "origin": [round(v, 6) for v in obj.matrix_world.translation],
             "lo": [round(v, 4) for v in low],
             "hi": [round(v, 4) for v in high],
             "centre": [round((low[i] + high[i]) / 2.0, 4) for i in range(3)],
