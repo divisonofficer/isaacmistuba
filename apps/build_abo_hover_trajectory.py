@@ -316,6 +316,14 @@ def main() -> int:
         available = [t for t in targets if id(t) not in used]
         chain = plan = None
         for candidate in candidate_chains(available, args.chain):
+            # The chain's own members are not occluders of each other. One
+            # does stand in front of the other -- on the first chain here the
+            # starting object was in front of the finishing one for frames
+            # 26-30 -- and that is footage, not a defect: the subject is still
+            # in frame, nothing is buried in the camera, and a take that walks
+            # between two objects on one table is going to see both. Rejecting
+            # on it took the facings rejected from 0-20 up to 25-29 and would
+            # have thrown away takes to enforce a rule nobody wanted.
             attempt = plan_arc(candidate, [b for b in boxes if b not in candidate], room,
                                frames=args.frames, radius=args.radius,
                                azimuth_span_deg=args.azimuth_span_deg,
