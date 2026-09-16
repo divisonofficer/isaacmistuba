@@ -30,11 +30,14 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "modules" / "hssd_blender_ir" / "src"))
 from hssd_blender_ir import hover_path  # noqa: E402
 
-SCHEMA = "abo_hover_trajectory/2"
+SCHEMA = "abo_hover_trajectory/3"
 
 RADIUS_M = 1.0
 AZIMUTH_SPAN_DEG = 60.0     # the total sweep, -30..+30, as the HSSD mode names it
 ELEVATION_DEG = 55.0
+# pace() takes an amount, not an angle; this is the factor the HSSD mode uses to
+# turn one handheld knob into both the aim wander and the uneven pacing.
+PACING_PER_DEG = 0.045
 WALL_CLEARANCE_M = 0.25
 FLOOR_CLEARANCE_M = 0.30
 CEILING_CLEARANCE_M = 0.30
@@ -88,7 +91,8 @@ def _inside_room(position, room) -> bool:
 
 def plan_arc(target: dict, blockers: list[dict], room: dict, *, frames: int,
              radius: float, azimuth_span_deg: float, elevation_deg: float,
-             facing_candidates: int) -> dict[str, Any] | None:
+             facing_candidates: int, handheld_deg: float, shape: str,
+             seed: int) -> dict[str, Any] | None:
     """One unobstructed arc around `target`, or None if no facing gives one.
 
     All or nothing, deliberately. A blocked sample dropped from the middle of
@@ -99,24 +103,34 @@ def plan_arc(target: dict, blockers: list[dict], room: dict, *, frames: int,
     band = (FLOOR_CLEARANCE_M, room["height_m"] - CEILING_CLEARANCE_M)
     lowest, highest = hover_path.elevation_band_deg(centroid[2], radius, band=band,
                                                     requested=elevation_deg)
-    samples = hover_path.arc(frames, azimuth_span_deg, lowest, highest)
+    samples = hover_path.arc(frames, azimuth_span_deg, lowest, highest,
+                             pacing=handheld_deg * PACING_PER_DEG, seed=seed, shape=shape)
+    hands = [hover_path.handheld(index, frames, handheld_deg, seed)
+             for index in range(frames)]
 
     rejected = 0
     for index in range(facing_candidates):
         facing = 2.0 * math.pi * index / facing_candidates
-        positions = [hover_path.camera_position(centroid, radius, facing,
-                                                s["azimuth_deg"], s["elevation_deg"])
-                     for s in samples]
+        positions = [hover_path.camera_position(centroid, radius * hand["radius_scale"],
+                                                facing, s["azimuth_deg"], s["elevation_deg"])
+                     for s, hand in zip(samples, hands)]
         if not all(_inside_room(p, room) for p in positions):
             rejected += 1
             continue
+        # Cast at the object, never along the wandered aim. Testing where the
+        # camera happens to be pointing lets the hand walk the ray off the
+        # target and report an occlusion that is really just a hand.
         if any(_segment_hits_box(p, centroid, box) for p in positions for box in blockers):
             rejected += 1
             continue
+        aims = [hover_path.aim_point(p, centroid, hand["yaw_deg"], hand["pitch_deg"])
+                for p, hand in zip(positions, hands)]
         return {"facing_rad": facing, "samples": samples, "positions": positions,
+                "aims": aims, "hands": hands,
                 "elevation_from_deg": lowest, "elevation_to_deg": highest,
                 "facings_rejected": rejected,
-                "angular_steps_deg": hover_path.angular_steps_deg(samples)}
+                "angular_steps_deg": hover_path.angular_steps_deg(samples),
+                "turn_angles_deg": hover_path.turn_angles_deg(samples)}
     return None
 
 
@@ -156,6 +170,14 @@ def main() -> int:
     parser.add_argument("--elevation-deg", type=float, default=ELEVATION_DEG)
     parser.add_argument("--targets", type=int, default=1)
     parser.add_argument("--facing-candidates", type=int, default=36)
+    parser.add_argument("--hover-handheld-deg", type=float, default=hover_path.HANDHELD_DEG,
+                        help="how far the aim may wander, in degrees, plus the roll and "
+                             "uneven pacing that come with it; 0 gives a rigid orbit")
+    parser.add_argument("--hover-shape", choices=["quartic", "corner"], default="quartic",
+                        help="quartic bends the path; corner is the original two-segment L, "
+                             "kept reachable for frames already rendered against it")
+    parser.add_argument("--seed", type=int, default=0,
+                        help="picks the hand; the same seed always gives the same camera")
     args = parser.parse_args()
 
     manifest = json.loads((args.scene / "scene_manifest.json").read_text(encoding="utf-8"))
@@ -177,19 +199,36 @@ def main() -> int:
                         frames=args.frames, radius=args.radius,
                         azimuth_span_deg=args.azimuth_span_deg,
                         elevation_deg=args.elevation_deg,
-                        facing_candidates=args.facing_candidates)
+                        facing_candidates=args.facing_candidates,
+                        handheld_deg=args.hover_handheld_deg,
+                        shape=args.hover_shape, seed=args.seed)
         if plan is None:
             print(f"[hover] {target['source_id']}: no unobstructed facing, skipped")
             continue
-        for order, (sample, position) in enumerate(zip(plan["samples"], plan["positions"])):
+        for order, (sample, position, aim, hand) in enumerate(
+                zip(plan["samples"], plan["positions"], plan["aims"], plan["hands"])):
             poses.append({
                 "position": list(position),
-                "target": list(target["centre"]),
+                # `target` is where the camera looks, which the hand has moved
+                # off the object; `object_centroid` is the object. A consumer
+                # reconstructing the rig needs the first, one measuring the
+                # subject needs the second, and they are no longer one point.
+                "target": list(aim),
+                "object_centroid": [round(v, 6) for v in target["centre"]],
                 "pose_mode": "hover_trajectory",
                 "trajectory_order": order,
                 "trajectory_segment": sample["segment"],
-                "hover_azimuth_deg": sample["azimuth_deg"],
-                "hover_elevation_deg": sample["elevation_deg"],
+                "sequence_index": order, "sequence_length": args.frames,
+                "hover_segment": sample["segment"],
+                "hover_shape": args.hover_shape,
+                "hover_azimuth_deg": round(sample["azimuth_deg"], 4),
+                "hover_elevation_deg": round(sample["elevation_deg"], 4),
+                "hover_radius_m": round(args.radius * hand["radius_scale"], 4),
+                # Read back by the renderer's dataset loop. Roll is the one
+                # degree of freedom a look-at target cannot carry, so it has to
+                # travel as its own field or it does not travel at all.
+                "handheld_roll_deg": round(hand["roll_deg"], 4),
+                "handheld_deg": args.hover_handheld_deg,
                 "target_distance_m": args.radius,
                 "target_source_id": target["source_id"],
                 "target_instance_id": target["instance_id"],
@@ -209,6 +248,10 @@ def main() -> int:
             "frames": args.frames,
             "sweep_frames": sum(1 for s in plan["samples"] if s["segment"] == "azimuth"),
             "angular_step_deg": [round(min(steps), 3), round(max(steps), 3)],
+            "max_turn_deg": round(max(plan["turn_angles_deg"]), 3) if plan["turn_angles_deg"] else 0.0,
+            "shape": args.hover_shape, "handheld_deg": args.hover_handheld_deg, "seed": args.seed,
+            "roll_deg": [round(min(h["roll_deg"] for h in plan["hands"]), 3),
+                         round(max(h["roll_deg"] for h in plan["hands"]), 3)],
         })
 
     if not poses:
@@ -225,8 +268,11 @@ def main() -> int:
     for s in summaries:
         print(f"    {s['source_id']}  centre z={s['target'][2]:.2f}  size={s['size_m']}")
         print(f"      elevation {s['elevation_from_deg']:.1f}..{s['elevation_to_deg']:.1f}deg"
-              f" (asked {s['elevation_requested_deg']:.0f})   sweep {s['sweep_frames']}"
-              f"/{s['frames']} frames   step {s['angular_step_deg'][0]}-{s['angular_step_deg'][1]}deg")
+              f" (asked {s['elevation_requested_deg']:.0f})   {s['shape']}"
+              f"   step {s['angular_step_deg'][0]}-{s['angular_step_deg'][1]}deg"
+              f"   max turn {s['max_turn_deg']}deg")
+        print(f"      hand {s['handheld_deg']:.1f}deg seed {s['seed']}"
+              f"   roll {s['roll_deg'][0]}..{s['roll_deg'][1]}deg")
         print(f"      facings rejected before one cleared: {s['facings_rejected']}"
               f"   burial {s['burial_fraction']*100:.0f}%")
     return 0
