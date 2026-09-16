@@ -44,6 +44,11 @@ CEILING_CLEARANCE_M = 0.30
 # Above this, two props are sharing a position rather than merely touching,
 # and neither is a sensible thing to point a camera at and call identifiable.
 BURIAL_FRACTION = 0.50
+# With one target the camera sits on a sphere around it and cannot reach
+# anything else. Chaining moves the centre it orbits, so the camera now
+# translates through the room and can end up inside a lamp -- a line-of-sight
+# test never sees that, because the ray it casts starts there.
+CAMERA_CLEARANCE_M = 0.12
 
 
 def _aabb_overlap_fraction(a: dict, b: dict) -> float:
@@ -82,6 +87,13 @@ def _segment_hits_box(origin, end, box) -> bool:
     return True
 
 
+def _box_clearance(position, box) -> float:
+    """Distance from a point to a box; 0 when the point is inside it."""
+    return math.sqrt(sum(max(box["lo"][axis] - position[axis], 0.0,
+                             position[axis] - box["hi"][axis]) ** 2
+                         for axis in range(3)))
+
+
 def _inside_room(position, room) -> bool:
     half_width = room["width_m"] / 2.0 - WALL_CLEARANCE_M
     half_depth = room["depth_m"] / 2.0 - WALL_CLEARANCE_M
@@ -89,44 +101,111 @@ def _inside_room(position, room) -> bool:
             and FLOOR_CLEARANCE_M <= position[2] <= room["height_m"] - CEILING_CLEARANCE_M)
 
 
-def plan_arc(target: dict, blockers: list[dict], room: dict, *, frames: int,
+def _smoothstep(t: float) -> float:
+    t = min(1.0, max(0.0, t))
+    return t * t * (3.0 - 2.0 * t)
+
+
+def centroid_at(targets: list[dict], t: float, window: float) -> tuple[list[float], int]:
+    """Where the camera is looking at fraction `t` of the take, and whose it is.
+
+    With one target this is that target, forever. With several the aim slides
+    from one to the next over a window in the middle of each leg, so the take
+    is a camera walking from object to object rather than a cut between two
+    orbits. The camera keeps its radius from THIS point, not from the object it
+    started on, which is what makes the move read as carrying the framing
+    across rather than drifting away from one thing and back onto another.
+
+    Returns the interpolated centre and the index of whichever target the aim
+    is closer to, which is the one the occlusion gate and the record use.
+    """
+    if len(targets) == 1:
+        return list(targets[0]["centre"]), 0
+    legs = len(targets) - 1
+    scaled = min(0.999999, max(0.0, t)) * legs
+    leg = int(scaled)
+    local = scaled - leg
+    start, end = targets[leg]["centre"], targets[leg + 1]["centre"]
+    # Dwell, hand over, dwell. `window` is the fraction of a leg spent moving.
+    edge = (1.0 - window) / 2.0
+    blend = _smoothstep((local - edge) / window) if window > 0 else (0.0 if local < 0.5 else 1.0)
+    centre = [a + (b - a) * blend for a, b in zip(start, end)]
+    return centre, (leg if blend < 0.5 else leg + 1)
+
+
+def chain_targets(picks: list[dict], count: int) -> list[dict]:
+    """A start plus its nearest unused neighbours, so the walk stays local."""
+    if not picks:
+        return []
+    chain = [picks[0]]
+    used = {id(picks[0])}
+    while len(chain) < count:
+        here = chain[-1]["centre"]
+        rest = [b for b in picks if id(b) not in used]
+        if not rest:
+            break
+        nearest = min(rest, key=lambda b: math.dist(here, b["centre"]))
+        chain.append(nearest)
+        used.add(id(nearest))
+    return chain
+
+
+def plan_arc(targets: list[dict], blockers: list[dict], room: dict, *, frames: int,
              radius: float, azimuth_span_deg: float, elevation_deg: float,
              facing_candidates: int, handheld_deg: float, shape: str,
-             seed: int) -> dict[str, Any] | None:
-    """One unobstructed arc around `target`, or None if no facing gives one.
+             seed: int, handoff_window: float) -> dict[str, Any] | None:
+    """One unobstructed take across `targets`, or None if no facing gives one.
 
-    All or nothing, deliberately. A blocked sample dropped from the middle of
-    an arc leaves a video with a hole in it, which is worse than a scene that
-    reports it could not be shot.
+    All or nothing, deliberately. A blocked sample dropped from the middle of a
+    take leaves a video with a hole in it, which is worse than a scene that
+    reports it could not be shot. With several targets that gate gets harder,
+    because every sample has to clear against whichever object it is on.
     """
-    centroid = target["centre"]
-    band = (FLOOR_CLEARANCE_M, room["height_m"] - CEILING_CLEARANCE_M)
-    lowest, highest = hover_path.elevation_band_deg(centroid[2], radius, band=band,
-                                                    requested=elevation_deg)
+    lowest = highest = None
+    for target in targets:
+        low, high = hover_path.elevation_band_deg(
+            target["centre"][2], radius,
+            band=(FLOOR_CLEARANCE_M, room["height_m"] - CEILING_CLEARANCE_M),
+            requested=elevation_deg)
+        # The take is one move, so it has to fit inside what EVERY object it
+        # visits allows. Taking the first object's band would put the camera
+        # through the floor over a lower one later in the same shot.
+        lowest = low if lowest is None else max(lowest, low)
+        highest = high if highest is None else min(highest, high)
+    highest = max(lowest, highest)
+
     samples = hover_path.arc(frames, azimuth_span_deg, lowest, highest,
                              pacing=handheld_deg * PACING_PER_DEG, seed=seed, shape=shape)
     hands = [hover_path.handheld(index, frames, handheld_deg, seed)
              for index in range(frames)]
+    span = [centroid_at(targets, index / max(1, frames - 1), handoff_window)
+            for index in range(frames)]
 
     rejected = 0
     for index in range(facing_candidates):
         facing = 2.0 * math.pi * index / facing_candidates
-        positions = [hover_path.camera_position(centroid, radius * hand["radius_scale"],
+        positions = [hover_path.camera_position(centre, radius * hand["radius_scale"],
                                                 facing, s["azimuth_deg"], s["elevation_deg"])
-                     for s, hand in zip(samples, hands)]
+                     for s, hand, (centre, _) in zip(samples, hands, span)]
         if not all(_inside_room(p, room) for p in positions):
+            rejected += 1
+            continue
+        if any(_box_clearance(p, box) < CAMERA_CLEARANCE_M
+               for p in positions for box in blockers):
             rejected += 1
             continue
         # Cast at the object, never along the wandered aim. Testing where the
         # camera happens to be pointing lets the hand walk the ray off the
         # target and report an occlusion that is really just a hand.
-        if any(_segment_hits_box(p, centroid, box) for p in positions for box in blockers):
+        if any(_segment_hits_box(p, centre, box)
+               for p, (centre, owner) in zip(positions, span)
+               for box in blockers if box is not targets[owner]):
             rejected += 1
             continue
-        aims = [hover_path.aim_point(p, centroid, hand["yaw_deg"], hand["pitch_deg"])
-                for p, hand in zip(positions, hands)]
+        aims = [hover_path.aim_point(p, centre, hand["yaw_deg"], hand["pitch_deg"])
+                for p, hand, (centre, _) in zip(positions, hands, span)]
         return {"facing_rad": facing, "samples": samples, "positions": positions,
-                "aims": aims, "hands": hands,
+                "aims": aims, "hands": hands, "span": span,
                 "elevation_from_deg": lowest, "elevation_to_deg": highest,
                 "facings_rejected": rejected,
                 "angular_steps_deg": hover_path.angular_steps_deg(samples),
@@ -168,7 +247,13 @@ def main() -> int:
     parser.add_argument("--azimuth-span-deg", type=float, default=AZIMUTH_SPAN_DEG,
                         help="the TOTAL sweep, as the HSSD hover mode names it")
     parser.add_argument("--elevation-deg", type=float, default=ELEVATION_DEG)
-    parser.add_argument("--targets", type=int, default=1)
+    parser.add_argument("--targets", type=int, default=1,
+                        help="how many separate takes to write")
+    parser.add_argument("--chain", type=int, default=1,
+                        help="objects visited within ONE take; the aim hands over from each "
+                             "to its nearest unused neighbour without cutting")
+    parser.add_argument("--handoff-window", type=float, default=0.40,
+                        help="fraction of each leg spent moving the aim; the rest dwells")
     parser.add_argument("--facing-candidates", type=int, default=36)
     parser.add_argument("--hover-handheld-deg", type=float, default=hover_path.HANDHELD_DEG,
                         help="how far the aim may wander, in degrees, plus the roll and "
@@ -189,32 +274,44 @@ def main() -> int:
         parser.error(f"{len(boxes)} measured boxes vs {len(instances)} instances: "
                      "the dump is from a different scene")
 
-    targets = choose_targets(boxes, instances, args.targets)
+    targets = choose_targets(boxes, instances, max(1, args.targets) * max(1, args.chain))
     if not targets:
         parser.error("every prop in this scene is buried inside another one")
 
     poses, summaries = [], []
-    for target in targets:
-        plan = plan_arc(target, [b for b in boxes if b is not target], room,
+    shot = 0
+    while shot < max(1, args.targets):
+        chain = chain_targets([t for t in targets if not t.get("used")], args.chain)
+        if not chain:
+            break
+        for t in chain:
+            t["used"] = True
+        shot += 1
+        plan = plan_arc(chain, [b for b in boxes if b not in chain], room,
                         frames=args.frames, radius=args.radius,
                         azimuth_span_deg=args.azimuth_span_deg,
                         elevation_deg=args.elevation_deg,
                         facing_candidates=args.facing_candidates,
                         handheld_deg=args.hover_handheld_deg,
-                        shape=args.hover_shape, seed=args.seed)
+                        shape=args.hover_shape, seed=args.seed + shot - 1,
+                        handoff_window=args.handoff_window)
         if plan is None:
-            print(f"[hover] {target['source_id']}: no unobstructed facing, skipped")
+            print(f"[hover] {' -> '.join(t['source_id'] for t in chain)}: "
+                  "no unobstructed facing, skipped")
             continue
-        for order, (sample, position, aim, hand) in enumerate(
-                zip(plan["samples"], plan["positions"], plan["aims"], plan["hands"])):
+        for order, (sample, position, aim, hand, (centre, owner)) in enumerate(
+                zip(plan["samples"], plan["positions"], plan["aims"],
+                    plan["hands"], plan["span"])):
+            target = chain[owner]
             poses.append({
                 "position": list(position),
                 # `target` is where the camera looks, which the hand has moved
-                # off the object; `object_centroid` is the object. A consumer
-                # reconstructing the rig needs the first, one measuring the
-                # subject needs the second, and they are no longer one point.
+                # off the object; `object_centroid` is what it is looking at,
+                # and with a chain that point MOVES -- it slides from one
+                # object to the next rather than cutting. `object_source_id`
+                # says whose it is closest to at this frame.
                 "target": list(aim),
-                "object_centroid": [round(v, 6) for v in target["centre"]],
+                "object_centroid": [round(v, 6) for v in centre],
                 "pose_mode": "hover_trajectory",
                 "trajectory_order": order,
                 "trajectory_segment": sample["segment"],
@@ -224,11 +321,9 @@ def main() -> int:
                 "hover_azimuth_deg": round(sample["azimuth_deg"], 4),
                 "hover_elevation_deg": round(sample["elevation_deg"], 4),
                 "hover_radius_m": round(args.radius * hand["radius_scale"], 4),
-                # Read back by the renderer's dataset loop. Roll is the one
-                # degree of freedom a look-at target cannot carry, so it has to
-                # travel as its own field or it does not travel at all.
                 "handheld_roll_deg": round(hand["roll_deg"], 4),
                 "handheld_deg": args.hover_handheld_deg,
+                "chain_index": owner, "chain_length": len(chain),
                 "target_distance_m": args.radius,
                 "target_source_id": target["source_id"],
                 "target_instance_id": target["instance_id"],
@@ -236,20 +331,26 @@ def main() -> int:
                 "coverage": {}, "pose_qc": {}, "specular": {},
             })
         steps = plan["angular_steps_deg"]
+        moves = [math.dist(plan["positions"][i], plan["positions"][i + 1])
+                 for i in range(len(plan["positions"]) - 1)]
         summaries.append({
-            "source_id": target["source_id"], "instance_id": target["instance_id"],
-            "target": target["centre"], "size_m": target["size"],
-            "burial_fraction": round(target["burial_fraction"], 4),
+            "source_id": " -> ".join(t["source_id"] for t in chain),
+            "chain": [t["source_id"] for t in chain],
+            "instance_id": chain[0]["instance_id"],
+            "target": chain[0]["centre"], "size_m": chain[0]["size"],
+            "burial_fraction": round(chain[0]["burial_fraction"], 4),
             "radius_m": args.radius, "facing_rad": plan["facing_rad"],
             "facings_rejected": plan["facings_rejected"],
             "elevation_requested_deg": args.elevation_deg,
             "elevation_from_deg": plan["elevation_from_deg"],
             "elevation_to_deg": plan["elevation_to_deg"],
             "frames": args.frames,
-            "sweep_frames": sum(1 for s in plan["samples"] if s["segment"] == "azimuth"),
+            "handoff_window": args.handoff_window,
             "angular_step_deg": [round(min(steps), 3), round(max(steps), 3)],
+            "move_cm": [round(100 * min(moves), 2), round(100 * max(moves), 2)],
             "max_turn_deg": round(max(plan["turn_angles_deg"]), 3) if plan["turn_angles_deg"] else 0.0,
-            "shape": args.hover_shape, "handheld_deg": args.hover_handheld_deg, "seed": args.seed,
+            "shape": args.hover_shape, "handheld_deg": args.hover_handheld_deg,
+            "seed": args.seed + shot - 1,
             "roll_deg": [round(min(h["roll_deg"] for h in plan["hands"]), 3),
                          round(max(h["roll_deg"] for h in plan["hands"]), 3)],
         })
@@ -266,7 +367,7 @@ def main() -> int:
                                    indent=2), encoding="utf-8")
     print(f"[hover] {len(summaries)} trajectories, {len(poses)} poses -> {args.out}")
     for s in summaries:
-        print(f"    {s['source_id']}  centre z={s['target'][2]:.2f}  size={s['size_m']}")
+        print(f"    {s['source_id']}   move {s['move_cm'][0]}-{s['move_cm'][1]}cm/frame")
         print(f"      elevation {s['elevation_from_deg']:.1f}..{s['elevation_to_deg']:.1f}deg"
               f" (asked {s['elevation_requested_deg']:.0f})   {s['shape']}"
               f"   step {s['angular_step_deg'][0]}-{s['angular_step_deg'][1]}deg"
