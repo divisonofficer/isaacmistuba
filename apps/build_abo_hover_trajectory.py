@@ -67,8 +67,25 @@ def _aabb_overlap_fraction(a: dict, b: dict) -> float:
     return inter / min(volumes)
 
 
+def _contains(point, box) -> bool:
+    return all(box["lo"][axis] <= point[axis] <= box["hi"][axis] for axis in range(3))
+
+
 def _segment_hits_box(origin, end, box) -> bool:
-    """Slab test: does the camera-to-object segment pass through this box."""
+    """Slab test: does the camera-to-object segment pass through this box.
+
+    A box that CONTAINS the segment's end is never an occluder of it: the ray
+    stops inside, so nothing in that box stands between the camera and the
+    target. Without this the test rejects on the target's own host. ABO props
+    sit embedded in their table's bounding box -- measured on abo_cornell_0900,
+    a table whose box tops out at 0.865 m holding props centred at 0.80 -- so
+    the aim point is inside the table's box and every ray to it "hits" the
+    table. That read as total occlusion from all 36 facings on three of five
+    chains, which is a check reporting a scene is unshootable because of the
+    furniture the subject is standing on.
+    """
+    if _contains(end, box):
+        return False
     near, far = 0.0, 1.0
     for axis in range(3):
         direction = end[axis] - origin[axis]
@@ -133,21 +150,36 @@ def centroid_at(targets: list[dict], t: float, window: float) -> tuple[list[floa
     return centre, (leg if blend < 0.5 else leg + 1)
 
 
-def chain_targets(picks: list[dict], count: int) -> list[dict]:
-    """A start plus its nearest unused neighbours, so the walk stays local."""
+def candidate_chains(picks: list[dict], count: int, tries: int = 4):
+    """Chains to try, nearest neighbour first, in the order worth attempting.
+
+    Nearest is the right first guess and a poor only guess. The nearest object
+    to a good subject is often a small one wedged among clutter, and a chain is
+    rejected if ANY frame of it is blocked -- so pairing greedily by distance
+    throws away takes that a slightly farther partner would have allowed. On
+    abo_cornell_0900, nearest-only shot 1 take of 5; the four it lost were all
+    small partners (0.18-0.26 m) surrounded on the table, rejected at 27-31 of
+    36 facings while a 0.49 m partner cleared 28.
+    """
     if not picks:
-        return []
-    chain = [picks[0]]
-    used = {id(picks[0])}
-    while len(chain) < count:
-        here = chain[-1]["centre"]
-        rest = [b for b in picks if id(b) not in used]
-        if not rest:
-            break
-        nearest = min(rest, key=lambda b: math.dist(here, b["centre"]))
-        chain.append(nearest)
-        used.add(id(nearest))
-    return chain
+        return
+    if count <= 1:
+        for start in picks:
+            yield [start]
+        return
+    for start in picks:
+        rest = sorted((b for b in picks if b is not start),
+                      key=lambda b: math.dist(start["centre"], b["centre"]))
+        for partner in rest[:tries]:
+            chain = [start, partner]
+            while len(chain) < count:
+                used = {id(c) for c in chain}
+                more = [b for b in picks if id(b) not in used]
+                if not more:
+                    break
+                chain.append(min(more, key=lambda b: math.dist(chain[-1]["centre"], b["centre"])))
+            if len(chain) == count:
+                yield chain
 
 
 def plan_arc(targets: list[dict], blockers: list[dict], room: dict, *, frames: int,
@@ -279,26 +311,29 @@ def main() -> int:
         parser.error("every prop in this scene is buried inside another one")
 
     poses, summaries = [], []
-    shot = 0
-    while shot < max(1, args.targets):
-        chain = chain_targets([t for t in targets if not t.get("used")], args.chain)
-        if not chain:
-            break
-        for t in chain:
-            t["used"] = True
-        shot += 1
-        plan = plan_arc(chain, [b for b in boxes if b not in chain], room,
-                        frames=args.frames, radius=args.radius,
-                        azimuth_span_deg=args.azimuth_span_deg,
-                        elevation_deg=args.elevation_deg,
-                        facing_candidates=args.facing_candidates,
-                        handheld_deg=args.hover_handheld_deg,
-                        shape=args.hover_shape, seed=args.seed + shot - 1,
-                        handoff_window=args.handoff_window)
+    used: set[int] = set()
+    for _ in range(max(1, args.targets)):
+        available = [t for t in targets if id(t) not in used]
+        chain = plan = None
+        for candidate in candidate_chains(available, args.chain):
+            attempt = plan_arc(candidate, [b for b in boxes if b not in candidate], room,
+                               frames=args.frames, radius=args.radius,
+                               azimuth_span_deg=args.azimuth_span_deg,
+                               elevation_deg=args.elevation_deg,
+                               facing_candidates=args.facing_candidates,
+                               handheld_deg=args.hover_handheld_deg,
+                               shape=args.hover_shape, seed=args.seed + len(summaries),
+                               handoff_window=args.handoff_window)
+            if attempt is not None:
+                chain, plan = candidate, attempt
+                break
         if plan is None:
-            print(f"[hover] {' -> '.join(t['source_id'] for t in chain)}: "
-                  "no unobstructed facing, skipped")
-            continue
+            # Nothing left that can be shot, rather than one pairing that could
+            # not be. Objects are consumed on success only: a chain rejected for
+            # occlusion must not take its members out of the pool, or one bad
+            # partner costs a good subject its take.
+            break
+        used.update(id(t) for t in chain)
         for order, (sample, position, aim, hand, (centre, owner)) in enumerate(
                 zip(plan["samples"], plan["positions"], plan["aims"],
                     plan["hands"], plan["span"])):
@@ -316,6 +351,7 @@ def main() -> int:
                 "trajectory_order": order,
                 "trajectory_segment": sample["segment"],
                 "sequence_index": order, "sequence_length": args.frames,
+                "take_index": len(summaries),
                 "hover_segment": sample["segment"],
                 "hover_shape": args.hover_shape,
                 "hover_azimuth_deg": round(sample["azimuth_deg"], 4),
@@ -350,7 +386,7 @@ def main() -> int:
             "move_cm": [round(100 * min(moves), 2), round(100 * max(moves), 2)],
             "max_turn_deg": round(max(plan["turn_angles_deg"]), 3) if plan["turn_angles_deg"] else 0.0,
             "shape": args.hover_shape, "handheld_deg": args.hover_handheld_deg,
-            "seed": args.seed + shot - 1,
+            "seed": args.seed + len(summaries),
             "roll_deg": [round(min(h["roll_deg"] for h in plan["hands"]), 3),
                          round(max(h["roll_deg"] for h in plan["hands"]), 3)],
         })
