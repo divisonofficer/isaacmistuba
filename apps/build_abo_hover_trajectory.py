@@ -268,36 +268,48 @@ def plan_arc(targets: list[dict], blockers: list[dict], room: dict, *, frames: i
     return None
 
 
-def join_boxes(boxes: list[dict], instances: list[dict], tolerance: float = 1e-3) -> list[dict]:
+def join_boxes(boxes: list[dict], instances: list[dict], pad: float = 0.02) -> list[dict]:
     """Attach each instance's identity to the box that was measured for it.
 
-    By origin, not by name and not by list order. A root node is called
-    whatever the source glTF called it -- abo_cornell_0150 mixes "RootNode"
-    with "root" in one scene -- and order only lines up when every instance
-    happens to produce exactly one root in import sequence. Matching on the
-    name gave 16 boxes for 20 instances there; matching on order would have
-    paired the survivors with the wrong products and said nothing.
+    Not by name and not by list order. A root node is called whatever the
+    source glTF called it -- abo_cornell_0150 mixes "RootNode" with "root" in
+    one scene -- and order only lines up when every instance produces exactly
+    one root in import sequence. Matching on the name gave 16 boxes for 20
+    instances there; matching on order would have paired the survivors with the
+    wrong products and said nothing.
 
-    Boxes with no instance are the room: floor, walls, ceiling. They stay in
-    the list as occluders and are simply never targets.
+    Nor by an exact origin match, which was the first fix and was still wrong.
+    scene_manifest records where the composer PUT an instance; build and
+    prepare then settle it onto whatever it sits on, so on 0150 three props
+    agree with the manifest in x and y to the millimetre and sit 8 to 152 mm
+    higher in z. The instance origin is a point ON the object either way, so
+    containment is the rule that survives both: the box that holds it, and the
+    smallest one when several do.
     """
-    by_origin = {}
-    for box in boxes:
-        origin = box.get("origin")
-        if origin is not None:
-            by_origin[tuple(round(v, 4) for v in origin)] = box
-    joined, missed = [], []
+    def holds(box, point):
+        return all(box["lo"][axis] - pad <= point[axis] <= box["hi"][axis] + pad
+                   for axis in range(3))
+
+    def volume(box):
+        return max(1e-9, box["size"][0] * box["size"][1] * box["size"][2])
+
+    taken, joined, missed = set(), [], []
     for instance in instances:
         matrix = instance["blender_matrix"]
-        want = tuple(round(matrix[axis][3], 4) for axis in range(3))
-        box = by_origin.get(want)
-        if box is None:
-            best = min(boxes, key=lambda b: math.dist(b.get("origin") or (1e9,) * 3, want),
-                       default=None)
-            if best is None or math.dist(best.get("origin") or (1e9,) * 3, want) > tolerance:
-                missed.append(instance.get("source_id"))
-                continue
-            box = best
+        origin = tuple(matrix[axis][3] for axis in range(3))
+        # A settled object moved in z only, so fall back to the column it is in
+        # rather than to raw distance -- the nearest box in 3-space to a lifted
+        # prop can easily be its neighbour on the same shelf.
+        candidates = [b for b in boxes if id(b) not in taken and holds(b, origin)]
+        if not candidates:
+            candidates = [b for b in boxes if id(b) not in taken
+                          and b.get("origin") is not None
+                          and math.dist(b["origin"][:2], origin[:2]) <= pad]
+        if not candidates:
+            missed.append(instance.get("source_id"))
+            continue
+        box = min(candidates, key=volume)
+        taken.add(id(box))
         box["source_id"] = instance.get("source_id")
         box["instance_id"] = instance.get("instance_id")
         box["role"] = instance.get("abo_role")
