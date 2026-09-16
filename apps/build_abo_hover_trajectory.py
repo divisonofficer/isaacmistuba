@@ -244,8 +244,23 @@ def plan_arc(targets: list[dict], blockers: list[dict], room: dict, *, frames: i
             continue
         aims = [hover_path.aim_point(p, centre, hand["yaw_deg"], hand["pitch_deg"])
                 for p, hand, (centre, _) in zip(positions, hands, span)]
+        # The gate is pass/fail per sample and cannot see a trend: a take that
+        # walks steadily into a corner passes every frame and still ends with a
+        # wall filling part of it. Recorded per take so the worst frame is
+        # visible without re-deriving it -- a peer's user found exactly that on
+        # HSSD by reading the table, where clearance fell 1.34 m to 0.334 m
+        # across one shot with every sample clearing.
+        half = (room["width_m"] / 2.0, room["depth_m"] / 2.0)
+        wall = [min(half[0] - abs(p[0]), half[1] - abs(p[1]),
+                    p[2], room["height_m"] - p[2]) for p in positions]
+        near = [min(_box_clearance(p, box) for box in blockers) for p in positions]
         return {"facing_rad": facing, "samples": samples, "positions": positions,
                 "aims": aims, "hands": hands, "span": span,
+                "wall_clearance_m": [round(min(wall), 3), round(max(wall), 3)],
+                "object_clearance_m": [round(min(near), 3), round(max(near), 3)],
+                "wall_clearance_trend": round(
+                    (sum(wall[len(wall)//2:]) / max(1, len(wall) - len(wall)//2))
+                    / max(1e-6, sum(wall[:len(wall)//2]) / max(1, len(wall)//2)), 3),
                 "elevation_from_deg": lowest, "elevation_to_deg": highest,
                 "facings_rejected": rejected,
                 "angular_steps_deg": hover_path.angular_steps_deg(samples),
@@ -405,6 +420,12 @@ def main() -> int:
             "seed": args.seed + len(summaries),
             "roll_deg": [round(min(h["roll_deg"] for h in plan["hands"]), 3),
                          round(max(h["roll_deg"] for h in plan["hands"]), 3)],
+            "wall_clearance_m": plan["wall_clearance_m"],
+            "object_clearance_m": plan["object_clearance_m"],
+            # Second half's mean clearance over the first half's. Below about
+            # 0.7 the take is walking into something over its length, which no
+            # per-sample gate reports.
+            "wall_clearance_trend": plan["wall_clearance_trend"],
         })
 
     if not poses:
@@ -428,6 +449,9 @@ def main() -> int:
               f"   roll {s['roll_deg'][0]}..{s['roll_deg'][1]}deg")
         print(f"      facings rejected before one cleared: {s['facings_rejected']}"
               f"   burial {s['burial_fraction']*100:.0f}%")
+        print(f"      clearance wall {s['wall_clearance_m'][0]}-{s['wall_clearance_m'][1]}m"
+              f" (trend {s['wall_clearance_trend']})"
+              f"   object {s['object_clearance_m'][0]}-{s['object_clearance_m'][1]}m")
     return 0
 
 

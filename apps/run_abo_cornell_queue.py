@@ -52,6 +52,8 @@ from hssd_blender_ir.box_lighting import PROFILE as BOX_LIGHTING_PROFILE  # noqa
 #: manifest declares a different one was built by different code.
 COMPOSER_VERSION = "abo-cornell-v3"
 COMPOSER = REPO_ROOT / "apps" / "build_abo_cornell_scene.py"
+BBOX_DUMP = REPO_ROOT / "apps" / "dump_abo_scene_bboxes.py"
+HOVER = REPO_ROOT / "apps" / "build_abo_hover_trajectory.py"
 BLENDER_LAUNCHER = REPO_ROOT / "tools" / "infinigen" / "run_bundled_blender.py"
 #: Blender exits 0 even when the script it was handed raises, so a crashed
 #: stage looks exactly like a finished one -- four scenes "succeeded" in five
@@ -456,6 +458,9 @@ def build_one(seed: int, gpu: int, args: argparse.Namespace, expected_frames: in
             log(f"[gpu {gpu}] {scene_id} FAILED at prepare")
             return False
 
+    if args.hover:
+        return _build_hover(scene_id, scene_dir, gpu, args, logs)
+
     # What this particular scene can supply, rather than what was asked for.
     targets = len(json.loads((scene_dir / "object_selection.json")
                              .read_text(encoding="utf-8"))["objects"])
@@ -472,6 +477,65 @@ def build_one(seed: int, gpu: int, args: argparse.Namespace, expected_frames: in
         log(f"[gpu {gpu}] {scene_id} FAILED at render (status {status}, see {logs})")
         return False
     return True
+
+
+def _build_hover(scene_id: str, scene_dir: Path, gpu: int, args: argparse.Namespace,
+                 logs: Path) -> bool:
+    """Measure, plan, shoot. Three steps the closeup path does not have.
+
+    The aim point is a measured world bounding-box centre, not the instance
+    transform: an ABO glTF origin sits on the object's base, which is the host
+    table's surface, so aiming at the transform frames the tabletop. That
+    measurement has to come out of the prepared blend, so it is its own Blender
+    pass and its own artifact next to the scene.
+    """
+    boxes = scene_dir / "scene_bboxes.json"
+    if not boxes.is_file():
+        log(f"[gpu {gpu}] {scene_id} measure bounding boxes")
+        if _run([sys.executable, str(BLENDER_LAUNCHER), *BLENDER_PREAMBLE,
+                 str(scene_dir / "ir_scene.blend"), "--python", str(BBOX_DUMP), "--",
+                 str(boxes)], log_path=logs) != 0:
+            log(f"[gpu {gpu}] {scene_id} FAILED at bounding boxes")
+            return False
+
+    selection = scene_dir / "hover_poses.json"
+    if not selection.is_file():
+        log(f"[gpu {gpu}] {scene_id} plan {args.hover_takes} takes "
+            f"x {args.hover_frames} frames, chain {args.hover_chain}")
+        if _run([sys.executable, str(HOVER), "--scene", str(scene_dir),
+                 "--bboxes", str(boxes), "--out", str(selection),
+                 "--frames", str(args.hover_frames), "--targets", str(args.hover_takes),
+                 "--chain", str(args.hover_chain), "--radius", str(args.hover_radius),
+                 "--hover-handheld-deg", str(args.hover_handheld_deg),
+                 "--seed", str(args.seed_base)], log_path=logs) != 0:
+            # A scene with nothing shootable is a real answer, not a failure to
+            # retry: every prop buried, or every facing blocked. It is recorded
+            # by the absent selection file and skipped rather than reattempted.
+            log(f"[gpu {gpu}] {scene_id} SKIPPED: nothing shootable")
+            return False
+
+    planned = len(json.loads(selection.read_text(encoding="utf-8"))["all"])
+    log(f"[gpu {gpu}] {scene_id} render {planned} frames")
+    status = _render_hover(scene_dir, gpu, args, selection, logs)
+    if status != 0:
+        log(f"[gpu {gpu}] {scene_id} FAILED at render (status {status}, see {logs})")
+        return False
+    return True
+
+
+def _render_hover(scene_dir: Path, gpu: int, args: argparse.Namespace,
+                  selection: Path, logs: Path) -> int:
+    return _run([sys.executable, str(BLENDER_LAUNCHER), *BLENDER_PREAMBLE,
+                 str(scene_dir / "ir_scene.blend"), "--python", str(RENDER), "--",
+                 "--out", str(scene_dir / "render"),
+                 "--width", str(args.width), "--height", str(args.height),
+                 "--hfov-deg", str(args.hfov_deg),
+                 "--spp", str(args.spp), "--nir-spp", str(args.nir_spp),
+                 "--max-bounces", str(args.max_bounces), "--dataset",
+                 "--pose-selection-file", str(selection),
+                 "--channel-format", args.channel_format,
+                 "--include-active", "--resume"],
+                log_path=logs, env={"CUDA_VISIBLE_DEVICES": str(gpu)})
 
 
 def _render(scene_dir: Path, gpu: int, args: argparse.Namespace,
@@ -599,6 +663,19 @@ def main() -> int:
     parser.add_argument("--max-bounces", type=int, default=DEFAULT_BOUNCES)
     parser.add_argument("--pose-count", type=int, default=DEFAULT_POSE_COUNT)
     parser.add_argument("--important-count", type=int, default=DEFAULT_IMPORTANT_COUNT)
+    parser.add_argument("--hover", action="store_true",
+                        help="shoot continuous camera takes instead of a closeup pose set")
+    parser.add_argument("--hover-takes", type=int, default=5,
+                        help="takes per scene")
+    parser.add_argument("--hover-frames", type=int, default=20,
+                        help="frames per take")
+    parser.add_argument("--hover-chain", type=int, default=2,
+                        help="objects the aim walks across within one take")
+    parser.add_argument("--hover-radius", type=float, default=1.0,
+                        help="metres from whatever the camera is currently looking at")
+    parser.add_argument("--hover-handheld-deg", type=float, default=4.0)
+    parser.add_argument("--seed-base", type=int, default=0,
+                        help="picks the hand; the same seed always gives the same camera")
     parser.add_argument("--channel-format", choices=["legacy", "compact"], default="compact",
                         help="compact stores each channel in the smallest form its content "
                              "allows, measured 2.3-3x smaller than the 32-bit EXR the renderer "
