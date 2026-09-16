@@ -72,3 +72,37 @@ def test_dense_and_paired_is_tier_A(tmp_path, monkeypatch):
     monkeypatch.setattr(R, "stats_for", lambda fp, ds, root: {"density_class": "dense"})
     out = R.review(d, None, {})
     assert out["review_tier"] == "A" and out["deprecation_candidate"] is False
+
+
+def test_generation_path_lifts_a_tier_and_never_lowers_one(tmp_path, monkeypatch):
+    d = _dataset(tmp_path, poses=80, paired=4)          # paired ratio 0.05, below the Tier A bar
+    monkeypatch.setattr(R, "stats_for", lambda fp, ds, root: {
+        "density_class": "dense", "placement_profile": "upstream_residential_v1"})
+    out = R.review(d, None, {})
+    assert out["review_tier"] == "A" and out["generation_path"] == "native"
+
+    # the same dataset from a constrained profile stays where it was
+    monkeypatch.setattr(R, "stats_for", lambda fp, ds, root: {
+        "density_class": "dense", "placement_profile": "legacy_clutter_v1"})
+    assert R.review(d, None, {})["review_tier"] == "B"
+
+    # and an unrecorded provenance is not a penalty
+    monkeypatch.setattr(R, "stats_for", lambda fp, ds, root: {"density_class": "dense"})
+    out = R.review(d, None, {})
+    assert out["review_tier"] == "B" and out["generation_path"] == "unrecorded"
+
+
+def test_native_floor_plan_counts_even_without_a_placement_profile(tmp_path, monkeypatch):
+    d = _dataset(tmp_path, poses=60, paired=3)
+    monkeypatch.setattr(R, "stats_for", lambda fp, ds, root: {
+        "density_class": "dense", "floor_plan_mode": "native_solver"})
+    out = R.review(d, None, {})
+    assert out["generation_path"] == "native" and out["review_tier"] == "A"
+
+
+def test_native_cannot_rescue_a_sparse_scene(tmp_path, monkeypatch):
+    d = _dataset(tmp_path, poses=80, paired=0)
+    monkeypatch.setattr(R, "stats_for", lambda fp, ds, root: {
+        "density_class": "sparse", "placement_profile": "upstream_residential_v1"})
+    out = R.review(d, None, {})
+    assert out["review_tier"] == "D" and out["deprecation_candidate"] is True

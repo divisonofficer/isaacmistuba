@@ -16,6 +16,13 @@ from pathlib import Path
 from typing import Any
 
 SCHEMA = "robomituba.ir_scene_review.v1"
+#: Generation paths, best first. ``upstream_residential_v1`` and the
+#: ``native_solver`` floor plan are Infinigen's own indoor logic with the
+#: repository's extra placement constraints released and object counts raised;
+#: scenes built that way spread objects through the room instead of banking
+#: them against one wall, which is what the earlier clutter profiles did.
+GENERATION_RANK = {"upstream_residential_v1": "native", "collision_aware_clutter_v1": "constrained",
+                   "legacy_clutter_v1": "constrained"}
 COMPILER = "ir-scene-review-v1"
 OVERRIDES_SCHEMA = "robomituba.ir_scene_review_overrides.v1"
 DEFAULT_OVERRIDES = Path("/bean/ir_dataset_work/.catalog_scene_review_overrides.json")
@@ -107,6 +114,15 @@ def review(dataset: Path, stats_root: Path | None, overrides: dict[str, dict[str
     lighting_count = len({item for values in physical.values() for item in values})
     stats = stats_for(fp, dataset, stats_root)
     density = str(stats.get("density_class") or "unknown")
+    # How the scene was generated, when the scene records it. 227 of 233
+    # datasets predate kr_preset carrying placement_profile, so this is read as
+    # "not recorded" far more often than not -- and an unrecorded provenance is
+    # not a bad one. It can lift a tier and can never lower one, for the same
+    # reason an absent density measurement no longer deprecates a dataset.
+    profile = str(stats.get("placement_profile") or "")
+    floor_plan = str(stats.get("floor_plan_mode") or "")
+    generation = GENERATION_RANK.get(profile) or ("native" if floor_plan == "native_solver" else "")
+    generation = generation or "unrecorded"
     rationale: list[str] = []
     # "we measured this scene and it is thin" and "we never measured this
     # scene" used to leave by the same door, as tier D with
@@ -123,6 +139,14 @@ def review(dataset: Path, stats_root: Path | None, overrides: dict[str, dict[str
     elif density == "dense" and pose_count >= 50 and ratio >= 0.20:
         tier, deprecated = "A", False
         rationale.append("dense scene with >=50 physical poses and >=20% paired lighting coverage")
+    elif density == "dense" and generation == "native" and pose_count >= 50:
+        # Infinigen's own indoor solver distributes objects through the room
+        # rather than against a wall, which is the property this corpus is
+        # short of. It is worth a tier over a constrained-placement scene that
+        # missed the paired-lighting bar, and only over that.
+        tier, deprecated = "A", False
+        rationale.append("dense scene from Infinigen's native indoor generation with >=50 physical "
+                         f"poses (paired ratio {ratio:.3f} below the usual Tier A bar)")
     elif density == "dense":
         tier, deprecated = "B", False
         rationale.append("dense scene but physical pose or paired-lighting coverage is below Tier A")
@@ -142,6 +166,8 @@ def review(dataset: Path, stats_root: Path | None, overrides: dict[str, dict[str
         "paired_pose_ratio": round(ratio, 6), "lighting_condition_count": lighting_count,
         "deprecation_candidate": deprecated, "requires_visual_qa": tier in {"A", "B"},
         "density_measured": measured,
+        "generation_path": generation, "placement_profile": profile or None,
+        "floor_plan_mode": floor_plan or None,
         "density_basis": str(stats.get("density_basis") or ("unmeasured" if not measured else "unknown")),
         "pose_visibility_class": str(stats.get("pose_visibility_class") or "unknown"),
         "rationale": rationale,
