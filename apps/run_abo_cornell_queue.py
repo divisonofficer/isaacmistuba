@@ -66,7 +66,23 @@ RENDER = HSSD_TOOLS / "blender_render_hssd_ir_sample.py"
 #: Matches `run_v2_render_queue.sh` / `run_tod_dataset_queue.sh`, so a frame
 #: from this dataset differs from an HSSD v2 frame by scene content alone.
 DEFAULT_WIDTH, DEFAULT_HEIGHT, DEFAULT_HFOV = 720, 540, 44.98
-DEFAULT_SPP, DEFAULT_NIR_SPP, DEFAULT_BOUNCES = 512, 1536, 8
+# NIR at 768 rather than 1536, measured against a 4096-sample reference on
+# abo_cornell_0900 rather than chosen: 1.49x faster end to end, and the cost is
+# confined to one place. Both NIR channels and the bright and mid bands of the
+# difference channel degrade by 4-14% relative, because denoising is on by
+# default and absorbs most of the sampling noise. The exception is the dark
+# quarter of active-minus-passive, which goes 29.4% -> 40.2% relative error, a
+# 1.37x that is close to the sqrt(2) sampling theory predicts -- that band is
+# the one place the denoiser cannot help, because the difference of two noisy
+# estimates has no signal left to guide it.
+#
+# So this does not degrade anything that was trustworthy; it degrades further
+# the one band that was already at 29% at 1536. A consumer that uses the dark
+# end of active-minus-passive needs to mask it, at either setting. The corpus
+# rendered before this change is at 1536 and says so: render/manifest.json
+# carries spp {"rgb": ..., "nir": ...}, so the two generations are separable
+# without a side note.
+DEFAULT_SPP, DEFAULT_NIR_SPP, DEFAULT_BOUNCES = 512, 768, 8
 #: box_lighting supplies six variants; only the baseline is rendered for every
 #: pose, the rest for the important ones.
 VARIANT_COUNT = 6
