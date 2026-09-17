@@ -11,11 +11,35 @@ def _area(plan):
     return (n[2] - n[0]) * (n[3] - n[1]), (n[2] - n[0]), (n[3] - n[1])
 
 
-def test_area_varies_far_more_than_the_three_authored_anchors():
+def test_area_varies_instead_of_taking_one_of_three_values():
     areas = {_area(F.build_single_room_plan(s, "office"))[0] for s in range(200)}
     assert len(areas) > 20, f"only {len(areas)} distinct areas; sampling is not happening"
-    anchors = [w * d for w, d in F.SINGLE_ROOM_PROFILES["office"]["sizes"]]
-    assert max(areas) > max(anchors) * 2.5
+
+
+def test_an_ordinary_room_stays_an_ordinary_room():
+    # A single room is not an apartment. 136-175 m2 is right for a multi-room
+    # flat and absurd for one office, and an earlier version of this sampler
+    # scaled offices to 60 m2 because its multiplier did not know what it was
+    # scaling.
+    for rt in ("office", "meeting-room", "break-room", "living-room", "kitchen",
+               "bedroom", "dining-room"):
+        areas = [_area(F.build_single_room_plan(s, rt))[0] for s in range(150)]
+        assert max(areas) <= F.SINGLE_ROOM_AREA_CAP_M2 + 2.0, f"{rt} reaches {max(areas):.1f} m2"
+        assert min(areas) >= 9.0, f"{rt} drops to {min(areas):.1f} m2"
+
+
+def test_a_small_room_is_not_inflated_into_a_hall():
+    # A flat 30 m2 ceiling gave a 30 m2 bathroom and a 19 m2 closet; the ceiling
+    # has to come from each type's own authored sizes.
+    for rt, limit in (("bathroom", 20.0), ("closet", 16.0), ("restroom", 20.0), ("utility", 22.0)):
+        worst = max(_area(F.build_single_room_plan(s, rt))[0] for s in range(150))
+        assert worst <= limit, f"{rt} reaches {worst:.1f} m2, over {limit}"
+
+
+def test_types_that_are_large_in_life_stay_large():
+    for rt in ("warehouse", "open-office"):
+        areas = [_area(F.build_single_room_plan(s, rt))[0] for s in range(120)]
+        assert max(areas) > F.SINGLE_ROOM_AREA_CAP_M2 * 1.5, f"{rt} capped at {max(areas):.1f}"
 
 
 def test_no_room_is_smaller_than_its_smallest_anchor():
