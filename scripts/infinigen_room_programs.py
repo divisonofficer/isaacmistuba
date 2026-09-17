@@ -338,10 +338,14 @@ def room_content_program(room_type: str, anchor_richness: str = "balanced",
     #
     # The guard was added because a second count constraint can span Infinigen's
     # greedy placement stages and trip its non-overlap assertion before solve.
-    # That claim is recorded in the comment below but was never re-tested, so
-    # this makes the guard switchable rather than deleting it: opt in, watch it
-    # fail or not, and decide from the result.
-    force_program = os.environ.get("ROBOMITUBA_FORCE_ROOM_PROGRAM", "") == "1"
+    # That was real -- two such errors appear the moment it is lifted -- but the
+    # cause was a factory left unscoped to one placement stage, not the count
+    # constraints themselves, and both are fixed above. The programmes run by
+    # default now. Set ROBOMITUBA_FORCE_ROOM_PROGRAM=0 to restore the skip
+    # without editing code: only office has been checked end to end at the time
+    # this default flipped, and a room type whose programme still spans a stage
+    # would fail at solve rather than degrade quietly.
+    force_program = os.environ.get("ROBOMITUBA_FORCE_ROOM_PROGRAM", "1") != "0"
     custom_program = (
         not force_program
         and (room_type in {"office", "factory-office", "open-office", "meeting-room",
