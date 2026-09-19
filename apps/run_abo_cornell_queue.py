@@ -379,7 +379,8 @@ def policy_of(args: argparse.Namespace) -> dict[str, str]:
             # Taking the lid off swaps the whole variant table -- sky instead of
             # fixtures -- so an open scene and a closed one are not the same
             # corpus and must not resume into each other.
-            "lighting_profile": (OPEN_LIGHTING_PROFILE if args.open_ceiling
+            "lighting_profile": (OPEN_LIGHTING_PROFILE
+                                 if (args.open_ceiling or args.open_walls)
                                  else BOX_LIGHTING_PROFILE)}
 
 
@@ -410,6 +411,10 @@ def stale_reason(scene_dir: Path, args: argparse.Namespace) -> str | None:
     got_blocks = len(declared.get("wall_massing") or [])
     if got_blocks != want_blocks:
         return f"wall_massing={got_blocks} but this run wants {want_blocks}"
+    want_open = int(getattr(args, "open_walls", 0) or 0)
+    got_open = len(declared.get("open_walls") or [])
+    if got_open != want_open:
+        return f"open_walls={got_open} but this run wants {want_open}"
     return None
 
 
@@ -447,6 +452,8 @@ def build_one(seed: int, gpu: int, args: argparse.Namespace, expected_frames: in
             command += ["--wall-massing", str(args.wall_massing)]
         if args.open_ceiling:
             command.append("--open-ceiling")
+        if args.open_walls:
+            command += ["--open-walls", str(args.open_walls)]
         if args.nir_class_prior:
             command.append("--nir-class-prior")
         if _run(command, log_path=logs) != 0:
@@ -674,6 +681,8 @@ def main() -> int:
                         help="blocks to stand against the walls, so the shell is not a smooth box")
     parser.add_argument("--open-ceiling", action="store_true",
                         help="omit the ceiling and light the room from an HDRI sky")
+    parser.add_argument("--open-walls", type=int, default=0, choices=(0, 1, 2),
+                        help="omit this many walls, so low sun and a view out reach the room")
     parser.add_argument("--nir-class-prior", action="store_true", default=False)
     parser.add_argument("--width", type=int, default=DEFAULT_WIDTH)
     parser.add_argument("--height", type=int, default=DEFAULT_HEIGHT)

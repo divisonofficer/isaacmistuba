@@ -69,7 +69,8 @@ sys.path.insert(0, str(REPO_ROOT / "apps"))
 
 from build_abo_object_index import read_gltf_json  # noqa: E402
 from hssd_blender_ir.box_lighting import (PROFILE as BOX_LIGHTING_PROFILE,  # noqa: E402
-                                          OPEN_ENVIRONMENTS, OPEN_PROFILE as OPEN_LIGHTING_PROFILE)
+                                          OPEN_ENVIRONMENTS, WALL_AZIMUTH_DEG,
+                                          OPEN_PROFILE as OPEN_LIGHTING_PROFILE)
 from hssd_blender_ir.compiler import SCHEMA as HSSD_SCENE_SCHEMA, _summary  # noqa: E402
 from hssd_blender_ir.gltf import rewrite_glb, sha256  # noqa: E402
 from hssd_blender_ir.lighting import FIXTURE_PLACEMENT, LIGHTING_SUPER_CATEGORY  # noqa: E402
@@ -667,7 +668,8 @@ def _quad(origin: Sequence[float], edge_u: Sequence[float], edge_v: Sequence[flo
     return positions, normals, uvs, indices
 
 
-def wall_massing(room: dict[str, float], count: int, rng) -> list[dict[str, Any]]:
+def wall_massing(room: dict[str, float], count: int, rng,
+                 skip: Sequence[str] = ()) -> list[dict[str, Any]]:
     """Blocks standing against the walls, so the shell is not four flat planes.
 
     An outdoor box with a lid taken off is still a room until the walls stop
@@ -683,7 +685,12 @@ def wall_massing(room: dict[str, float], count: int, rng) -> list[dict[str, Any]
     """
     width, depth, height = room["width_m"], room["depth_m"], room["height_m"]
     half_w, half_d = width / 2.0, depth / 2.0
-    walls = ("north", "south", "east", "west")
+    # A wall that has been taken out gets no blocks: they would stand in the
+    # gap and shadow the room from the one direction the gap exists to admit.
+    walls = tuple(w for w in ("north", "south", "east", "west")
+                  if f"wall_{w}" not in set(skip))
+    if not walls:
+        return []
     out = []
     for index in range(count):
         wall = walls[index % len(walls)]
@@ -708,6 +715,25 @@ def wall_massing(room: dict[str, float], count: int, rng) -> list[dict[str, Any]
     return out
 
 
+def _open_walls(count: int, rng) -> tuple[str, ...]:
+    """Which walls to leave out, drawn per scene.
+
+    Opposite walls are never both taken: a room open on two facing sides is a
+    corridor with no back, and the hover path would frame the subject against
+    sky from most of its arc. Two openings therefore meet at a corner.
+    """
+    if count <= 0:
+        return ()
+    walls = ["wall_north", "wall_south", "wall_east", "wall_west"]
+    opposite = {"wall_north": "wall_south", "wall_south": "wall_north",
+                "wall_east": "wall_west", "wall_west": "wall_east"}
+    first = rng.choice(walls)
+    if count == 1:
+        return (first,)
+    second = rng.choice([w for w in walls if w != first and w != opposite[first]])
+    return tuple(sorted((first, second)))
+
+
 def _box_faces(origin, size):
     """The five faces of a wall block that face into the room.
 
@@ -729,7 +755,8 @@ def _box_faces(origin, size):
 def build_stage_glb(room: dict[str, float], finishes: dict[str, dict[str, Any]],
                     registry_root: Path, out_glb: Path, work_dir: Path,
                     massing: list[dict[str, Any]] | None = None,
-                    open_ceiling: bool = False) -> dict[str, Any]:
+                    open_ceiling: bool = False,
+                    open_walls: Sequence[str] = ()) -> dict[str, Any]:
     """Write the Cornell box as a GLB with embedded TextureCan PBR per face.
 
     Images must be embedded: `rewrite_glb` rejects a glTF whose image is not in
@@ -833,6 +860,16 @@ def build_stage_glb(room: dict[str, float], finishes: dict[str, dict[str, Any]],
         # layer_count counts surfaces crossed, and a pane the sky shines
         # through would be counted as one.
         faces.pop("ceiling", None)
+    for wall in open_walls:
+        # A wall comes out for the same reason the lid does, and buys something
+        # the lid cannot: the suns in the sky bank sit at 3.3-18.5 deg, far
+        # below the cone an open ceiling leaves, so only a gap in a WALL lets
+        # direct light reach the subject. What the camera sees through the gap
+        # is world background, which carries no PBR ground truth -- the
+        # renderer's `_mark_background_invalid` folds it into
+        # GT_PBRInvalidMask off the depth pass, so those pixels are labelled
+        # unsupervised rather than labelled zero.
+        faces.pop(wall, None)
 
     for role, spec in faces.items():
         finish = finishes[role]
@@ -1456,6 +1493,8 @@ def main() -> int:
                              "so the shell reads as neighbouring buildings rather than four "
                              "flat planes and the indirect light picks up a different colour "
                              "off each")
+    parser.add_argument("--open-walls", type=int, default=0, choices=(0, 1, 2),
+                        help="omit this many walls, so low sun and a view out reach the room")
     parser.add_argument("--open-ceiling", action="store_true",
                         help="leave the lid off for an exterior. The hover arc starts level "
                              "with the object and climbs, so the camera never looks up into "
@@ -1516,21 +1555,31 @@ def main() -> int:
     wall_texel_floor = args.frame_width_px / frame_width_m(wall_distance, args.hfov_deg)
     print(f"[abo-cornell] wall texel floor {wall_texel_floor:.0f} px/m at {wall_distance:.2f} m "
           f"(prop-distance floor would be {limits['min_texel_px_per_m']:.0f})", flush=True)
-    blocks = wall_massing(room, args.wall_massing, _rng(args.seed, "massing")) \
-        if args.wall_massing else []
+    # Which walls come out is drawn per scene, and drawn before the massing so
+    # the blocks can avoid them.
+    open_walls = _open_walls(args.open_walls, _rng(args.seed, "open_walls"))
+    if open_walls:
+        print(f"[abo-cornell] open walls {', '.join(open_walls)}", flush=True)
+    blocks = wall_massing(room, args.wall_massing, _rng(args.seed, "massing"),
+                          skip=open_walls) if args.wall_massing else []
     finishes = choose_finishes(registry, args.seed, accent_walls=args.accent_walls,
                                massing=blocks,
                                registry_root=registry_root,
                                min_texel_px_per_m=wall_texel_floor)
     stage_glb = out_dir / "stage" / "cornell_box.glb"
     finish_report = build_stage_glb(room, finishes, registry_root, stage_glb, out_dir,
-                                    massing=blocks, open_ceiling=args.open_ceiling)
+                                    massing=blocks, open_ceiling=args.open_ceiling,
+                                    open_walls=open_walls)
     if blocks:
         print(f"[abo-cornell] massing {len(blocks)} blocks, "
               f"{len({finishes[b['role']]['id'] for b in blocks})} distinct finishes"
               + (" · open ceiling" if args.open_ceiling else ""), flush=True)
+    # Name a wall that was actually built: wall_north may have been taken out.
+    a_wall = next((role for role in BOX_ROLES
+                   if role.startswith("wall_") and role in finish_report), None)
     print(f"[abo-cornell] stage {stage_glb.name} "
-          f"floor={finish_report['floor']['material_id']} wall={finish_report['wall_north']['material_id']}",
+          f"floor={finish_report['floor']['material_id']} "
+          f"{a_wall}={finish_report[a_wall]['material_id'] if a_wall else 'none'}",
           flush=True)
 
     nir_classes = load_nir_classes(args.nir_classes) if args.nir_class_prior else None
@@ -1541,14 +1590,20 @@ def main() -> int:
     manifest["camera_limits"] = limits
     if blocks:
         manifest["wall_massing"] = blocks
-    if args.open_ceiling:
-        # With the lid off there are no bounces from above and the fixtures the
-        # closed-box curriculum relies on are not what lights the room: the sky
-        # is. That is a different variant table, and it needs the sky bank.
+    if args.open_ceiling or open_walls:
+        # An opening of any kind means the sky, not the fixtures, is what lights
+        # the room -- so the closed-box curriculum is the wrong variant table
+        # and the sky bank is needed. A wall counts for this exactly as the
+        # ceiling does.
         missing = [name for name in OPEN_ENVIRONMENTS if not (HDRI_DIR / f"{name}.hdr").is_file()]
         if missing:
             raise SystemExit(f"--open-ceiling needs the sky bank; missing {missing} under {HDRI_DIR}")
-        manifest["open_ceiling"] = True
+        manifest["open_ceiling"] = bool(args.open_ceiling)
+        if open_walls:
+            manifest["open_walls"] = list(open_walls)
+            # Which way the gap faces decides where the sun has to be put, so
+            # it travels with the scene rather than being re-derived downstream.
+            manifest["open_wall_azimuth_deg"] = WALL_AZIMUTH_DEG[open_walls[0]]
         manifest["lighting_profile"] = OPEN_LIGHTING_PROFILE
         manifest["environment_hdri_dir"] = str(HDRI_DIR)
     digest_inputs: dict[str, Any] = {
@@ -1564,6 +1619,8 @@ def main() -> int:
         digest_inputs["massing"] = blocks
     if args.open_ceiling:
         digest_inputs["open_ceiling"] = True
+    if open_walls:
+        digest_inputs["open_walls"] = list(open_walls)
     manifest["composition_digest"] = stable_digest(digest_inputs)
 
     lamp_count = write_semantics_csv(out_dir / "abo_semantics.csv", layout["placements"])
