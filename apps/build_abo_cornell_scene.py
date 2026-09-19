@@ -68,7 +68,8 @@ for _source in ("modules/hssd_blender_ir/src", "modules/mitsuba_converter/src",
 sys.path.insert(0, str(REPO_ROOT / "apps"))
 
 from build_abo_object_index import read_gltf_json  # noqa: E402
-from hssd_blender_ir.box_lighting import PROFILE as BOX_LIGHTING_PROFILE  # noqa: E402
+from hssd_blender_ir.box_lighting import (PROFILE as BOX_LIGHTING_PROFILE,  # noqa: E402
+                                          OPEN_ENVIRONMENTS, OPEN_PROFILE as OPEN_LIGHTING_PROFILE)
 from hssd_blender_ir.compiler import SCHEMA as HSSD_SCENE_SCHEMA, _summary  # noqa: E402
 from hssd_blender_ir.gltf import rewrite_glb, sha256  # noqa: E402
 from hssd_blender_ir.lighting import FIXTURE_PLACEMENT, LIGHTING_SUPER_CATEGORY  # noqa: E402
@@ -76,6 +77,11 @@ from hssd_blender_ir.material_naming import material_marker  # noqa: E402
 from hssd_blender_ir.pbr import classify_material  # noqa: E402
 
 SCHEMA = "robomituba.abo_cornell_scene.v1"
+
+#: Poly Haven CC0 skies, checksummed in
+#: `configs/ir_lighting/illumination_diversity_v2.json`. Only an open ceiling
+#: uses them; a closed box never reads this path.
+HDRI_DIR = REPO_ROOT / "assets" / "ir_lighting_hdri"
 #: v3: both accent walls draw from one wider pool and are required to differ;
 #: the prop size cap rises to 0.75 of the near frame width. Neither changes
 #: what a scene *is*, but scenes composed under v2 draw from smaller pools and
@@ -661,8 +667,69 @@ def _quad(origin: Sequence[float], edge_u: Sequence[float], edge_v: Sequence[flo
     return positions, normals, uvs, indices
 
 
+def wall_massing(room: dict[str, float], count: int, rng) -> list[dict[str, Any]]:
+    """Blocks standing against the walls, so the shell is not four flat planes.
+
+    An outdoor box with a lid taken off is still a room until the walls stop
+    being smooth. Massing them like neighbouring buildings gives the object
+    something to sit among, and -- the point of it -- gives the indirect light
+    somewhere to pick up a colour, because each block carries its own finish.
+    Four walls of one material bounce one colour; eight blocks of eight
+    materials bounce eight, which is the thing a real exterior does and a
+    Cornell box does not.
+
+    Sized against the room rather than in absolute metres so a 4 m box and a
+    7 m box both read as buildings rather than as furniture.
+    """
+    width, depth, height = room["width_m"], room["depth_m"], room["height_m"]
+    half_w, half_d = width / 2.0, depth / 2.0
+    walls = ("north", "south", "east", "west")
+    out = []
+    for index in range(count):
+        wall = walls[index % len(walls)]
+        # Wide enough to read as a mass, shallow enough to leave the room usable.
+        w = rng.uniform(0.18, 0.42) * (width if wall in ("north", "south") else depth)
+        d = rng.uniform(0.10, 0.28) * min(width, depth)
+        h = rng.uniform(0.35, 0.95) * height
+        if wall == "north":
+            u = rng.uniform(-half_w, half_w - w)
+            origin, size = (u, 0.0, -half_d), (w, h, d)
+        elif wall == "south":
+            u = rng.uniform(-half_w, half_w - w)
+            origin, size = (u, 0.0, half_d - d), (w, h, d)
+        elif wall == "east":
+            v = rng.uniform(-half_d, half_d - w)
+            origin, size = (half_w - d, 0.0, v), (d, h, w)
+        else:
+            v = rng.uniform(-half_d, half_d - w)
+            origin, size = (-half_w, 0.0, v), (d, h, w)
+        out.append({"role": f"massing_{index:02d}", "wall": wall,
+                    "origin": origin, "size": size})
+    return out
+
+
+def _box_faces(origin, size):
+    """The five faces of a wall block that face into the room.
+
+    The sixth is against the wall and is left out rather than drawn and hidden:
+    a coincident pair of surfaces is z-fighting waiting to happen, and the
+    normal AOV is ground truth here.
+    """
+    x, y, z = origin
+    w, h, d = size
+    return {
+        "top":   ((x, y + h, z), (w, 0, 0), (0, 0, d), w, d),
+        "front": ((x, y, z + d), (w, 0, 0), (0, h, 0), w, h),
+        "back":  ((x + w, y, z), (-w, 0, 0), (0, h, 0), w, h),
+        "left":  ((x, y, z), (0, 0, d), (0, h, 0), d, h),
+        "right": ((x + w, y, z + d), (0, 0, -d), (0, h, 0), d, h),
+    }
+
+
 def build_stage_glb(room: dict[str, float], finishes: dict[str, dict[str, Any]],
-                    registry_root: Path, out_glb: Path, work_dir: Path) -> dict[str, Any]:
+                    registry_root: Path, out_glb: Path, work_dir: Path,
+                    massing: list[dict[str, Any]] | None = None,
+                    open_ceiling: bool = False) -> dict[str, Any]:
     """Write the Cornell box as a GLB with embedded TextureCan PBR per face.
 
     Images must be embedded: `rewrite_glb` rejects a glTF whose image is not in
@@ -761,6 +828,12 @@ def build_stage_glb(room: dict[str, float], finishes: dict[str, dict[str, Any]],
         return material_cache[material_id]
 
     finish_report: dict[str, Any] = {}
+    if open_ceiling:
+        # Taken out rather than made transparent or emissive: the renderer's
+        # layer_count counts surfaces crossed, and a pane the sky shines
+        # through would be counted as one.
+        faces.pop("ceiling", None)
+
     for role, spec in faces.items():
         finish = finishes[role]
         physical = finish["physical_size_m"]
@@ -782,6 +855,29 @@ def build_stage_glb(room: dict[str, float], finishes: dict[str, dict[str, Any]],
         finish_report[role] = {"material_id": finish["id"], "category": finish.get("category"),
                                "repeat_u": round(span_u / physical["width"], 3),
                                "repeat_v": round(span_v / physical["height"], 3)}
+
+    for block in massing or []:
+        finish = finishes[block["role"]]
+        physical = finish["physical_size_m"]
+        material_index = add_material(finish)
+        for face, (origin, edge_u, edge_v, span_u, span_v) in _box_faces(
+                block["origin"], block["size"]).items():
+            positions, normals, uvs, indices = _quad(
+                origin, edge_u, edge_v, span_u / physical["width"],
+                span_v / physical["height"])
+            meshes.append({"name": f"{block['role']}_{face}", "primitives": [{
+                "attributes": {
+                    "POSITION": add_accessor(positions, 5126, "VEC3", target=34962, bounds=True),
+                    "NORMAL": add_accessor(normals, 5126, "VEC3", target=34962),
+                    "TEXCOORD_0": add_accessor(uvs, 5126, "VEC2", target=34962),
+                },
+                "indices": add_accessor(indices.reshape(-1, 1), 5123, "SCALAR", target=34963),
+                "material": material_index,
+            }]})
+            nodes.append({"name": f"{block['role']}_{face}", "mesh": len(meshes) - 1})
+        finish_report[block["role"]] = {
+            "material_id": finish["id"], "category": finish.get("category"),
+            "wall": block["wall"], "size_m": [round(v, 3) for v in block["size"]]}
 
     while len(blob) % 4:
         blob.append(0)
@@ -821,6 +917,7 @@ def _texel_density(record: dict[str, Any], registry_root: Path) -> float:
 
 
 def choose_finishes(registry: dict[str, Any], seed: int, *, accent_walls: bool,
+                    massing: list[dict[str, Any]] | None = None,
                     registry_root: Path, min_texel_px_per_m: float) -> dict[str, dict[str, Any]]:
     """Draw one TextureCan material per box face, at or above screen resolution.
 
@@ -865,6 +962,19 @@ def choose_finishes(registry: dict[str, Any], seed: int, *, accent_walls: bool,
         "floor": draw("floor", ("wood", "tile", "concrete")),
         "ceiling": draw("ceiling", ("concrete", "plaster", "tile")),
     }
+    # Every block gets its own draw, keyed on its own role, and they are
+    # required to differ from each other. Blocks that all landed on the same
+    # material would be a more complicated wall rather than a row of
+    # neighbouring buildings, and the whole reason for the massing is that the
+    # indirect light picks up a different colour off each one.
+    used: set[str] = set()
+    for block in massing or []:
+        for attempt in range(8):
+            pick = draw(f"{block['role']}#{attempt}", ("concrete", "brick", "tile", "metal"))
+            if pick["id"] not in used:
+                break
+        used.add(pick["id"])
+        finishes[block["role"]] = pick
     wall_default = draw("wall", ("concrete", "brick", "tile"))
     for role in ("wall_north", "wall_south", "wall_east", "wall_west"):
         finishes[role] = wall_default
@@ -1341,6 +1451,15 @@ def main() -> int:
     parser.add_argument("--hfov-deg", type=float, default=DEFAULT_HFOV_DEG,
                         help="camera horizontal FOV; default is the JAI FS-1600 with a 6 mm lens")
     parser.add_argument("--frame-width-px", type=int, default=DEFAULT_FRAME_WIDTH_PX)
+    parser.add_argument("--wall-massing", type=int, default=0,
+                        help="blocks standing against the walls, each with its own finish, "
+                             "so the shell reads as neighbouring buildings rather than four "
+                             "flat planes and the indirect light picks up a different colour "
+                             "off each")
+    parser.add_argument("--open-ceiling", action="store_true",
+                        help="leave the lid off for an exterior. The hover arc starts level "
+                             "with the object and climbs, so the camera never looks up into "
+                             "the gap; what it buys is sky as the only light from above")
     parser.add_argument("--accent-walls", action="store_true",
                         help="give two facing walls contrasting finishes (classic Cornell bleed)")
     parser.add_argument("--nir-class-prior", action=argparse.BooleanOptionalAction, default=False,
@@ -1397,11 +1516,19 @@ def main() -> int:
     wall_texel_floor = args.frame_width_px / frame_width_m(wall_distance, args.hfov_deg)
     print(f"[abo-cornell] wall texel floor {wall_texel_floor:.0f} px/m at {wall_distance:.2f} m "
           f"(prop-distance floor would be {limits['min_texel_px_per_m']:.0f})", flush=True)
+    blocks = wall_massing(room, args.wall_massing, _rng(args.seed, "massing")) \
+        if args.wall_massing else []
     finishes = choose_finishes(registry, args.seed, accent_walls=args.accent_walls,
+                               massing=blocks,
                                registry_root=registry_root,
                                min_texel_px_per_m=wall_texel_floor)
     stage_glb = out_dir / "stage" / "cornell_box.glb"
-    finish_report = build_stage_glb(room, finishes, registry_root, stage_glb, out_dir)
+    finish_report = build_stage_glb(room, finishes, registry_root, stage_glb, out_dir,
+                                    massing=blocks, open_ceiling=args.open_ceiling)
+    if blocks:
+        print(f"[abo-cornell] massing {len(blocks)} blocks, "
+              f"{len({finishes[b['role']]['id'] for b in blocks})} distinct finishes"
+              + (" · open ceiling" if args.open_ceiling else ""), flush=True)
     print(f"[abo-cornell] stage {stage_glb.name} "
           f"floor={finish_report['floor']['material_id']} wall={finish_report['wall_north']['material_id']}",
           flush=True)
@@ -1412,11 +1539,32 @@ def main() -> int:
                               nir_classes=nir_classes, stage_finishes=finishes)
     manifest["structural_finish"] = finish_report
     manifest["camera_limits"] = limits
-    manifest["composition_digest"] = stable_digest({
+    if blocks:
+        manifest["wall_massing"] = blocks
+    if args.open_ceiling:
+        # With the lid off there are no bounces from above and the fixtures the
+        # closed-box curriculum relies on are not what lights the room: the sky
+        # is. That is a different variant table, and it needs the sky bank.
+        missing = [name for name in OPEN_ENVIRONMENTS if not (HDRI_DIR / f"{name}.hdr").is_file()]
+        if missing:
+            raise SystemExit(f"--open-ceiling needs the sky bank; missing {missing} under {HDRI_DIR}")
+        manifest["open_ceiling"] = True
+        manifest["lighting_profile"] = OPEN_LIGHTING_PROFILE
+        manifest["environment_hdri_dir"] = str(HDRI_DIR)
+    digest_inputs: dict[str, Any] = {
         "version": COMPOSER_VERSION, "seed": args.seed, "room": room,
         "instances": [(i["source_id"], i["blender_matrix"]) for i in manifest["instances"]],
         "finishes": finish_report,
-    })
+    }
+    # The structural keys join the digest only when they are used. A scene with
+    # a closed, unmassed box hashes to what it hashed to before they existed,
+    # so the 200 scenes already composed stay comparable with the ones composed
+    # after this.
+    if blocks:
+        digest_inputs["massing"] = blocks
+    if args.open_ceiling:
+        digest_inputs["open_ceiling"] = True
+    manifest["composition_digest"] = stable_digest(digest_inputs)
 
     lamp_count = write_semantics_csv(out_dir / "abo_semantics.csv", layout["placements"])
     (out_dir / "scene_manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")

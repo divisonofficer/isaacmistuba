@@ -46,7 +46,8 @@ from typing import Any
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "modules" / "hssd_blender_ir" / "src"))
 
-from hssd_blender_ir.box_lighting import PROFILE as BOX_LIGHTING_PROFILE  # noqa: E402
+from hssd_blender_ir.box_lighting import (PROFILE as BOX_LIGHTING_PROFILE,  # noqa: E402
+                                          OPEN_PROFILE as OPEN_LIGHTING_PROFILE)
 
 #: Kept in step with `build_abo_cornell_scene.COMPOSER_VERSION`; a scene whose
 #: manifest declares a different one was built by different code.
@@ -375,7 +376,11 @@ def policy_of(args: argparse.Namespace) -> dict[str, str]:
     """What a scene composed under the current settings should declare."""
     return {"composer_version": COMPOSER_VERSION,
             "nir_model": "class_band_prior_v1" if args.nir_class_prior else "derived_pseudo_nir",
-            "lighting_profile": BOX_LIGHTING_PROFILE}
+            # Taking the lid off swaps the whole variant table -- sky instead of
+            # fixtures -- so an open scene and a closed one are not the same
+            # corpus and must not resume into each other.
+            "lighting_profile": (OPEN_LIGHTING_PROFILE if args.open_ceiling
+                                 else BOX_LIGHTING_PROFILE)}
 
 
 def stale_reason(scene_dir: Path, args: argparse.Namespace) -> str | None:
@@ -399,6 +404,12 @@ def stale_reason(scene_dir: Path, args: argparse.Namespace) -> str | None:
         got = declared.get(key)
         if got != want:
             return f"{key}={got!r} but this run wants {want!r}"
+    # Massing is a count, and a manifest written before it existed has none --
+    # which is what a run asking for none wants, so the two agree at zero.
+    want_blocks = int(getattr(args, "wall_massing", 0) or 0)
+    got_blocks = len(declared.get("wall_massing") or [])
+    if got_blocks != want_blocks:
+        return f"wall_massing={got_blocks} but this run wants {want_blocks}"
     return None
 
 
@@ -432,6 +443,10 @@ def build_one(seed: int, gpu: int, args: argparse.Namespace, expected_frames: in
                    "--asset-cache", str(args.asset_cache or (args.out_root / "_asset_cache"))]
         if args.accent_walls:
             command.append("--accent-walls")
+        if args.wall_massing:
+            command += ["--wall-massing", str(args.wall_massing)]
+        if args.open_ceiling:
+            command.append("--open-ceiling")
         if args.nir_class_prior:
             command.append("--nir-class-prior")
         if _run(command, log_path=logs) != 0:
@@ -506,6 +521,7 @@ def _build_hover(scene_id: str, scene_dir: Path, gpu: int, args: argparse.Namesp
                  "--bboxes", str(boxes), "--out", str(selection),
                  "--frames", str(args.hover_frames), "--targets", str(args.hover_takes),
                  "--chain", str(args.hover_chain), "--radius", str(args.hover_radius),
+                 "--azimuth-span-deg", str(args.hover_azimuth_span_deg),
                  "--hover-handheld-deg", str(args.hover_handheld_deg),
                  "--seed", str(args.seed_base)], log_path=logs) != 0:
             # A scene with nothing shootable is a real answer, not a failure to
@@ -654,6 +670,10 @@ def main() -> int:
     parser.add_argument("--props", type=int, default=6)
     parser.add_argument("--luminaires", type=int, default=1)
     parser.add_argument("--accent-walls", action="store_true", default=True)
+    parser.add_argument("--wall-massing", type=int, default=0,
+                        help="blocks to stand against the walls, so the shell is not a smooth box")
+    parser.add_argument("--open-ceiling", action="store_true",
+                        help="omit the ceiling and light the room from an HDRI sky")
     parser.add_argument("--nir-class-prior", action="store_true", default=False)
     parser.add_argument("--width", type=int, default=DEFAULT_WIDTH)
     parser.add_argument("--height", type=int, default=DEFAULT_HEIGHT)
@@ -671,6 +691,12 @@ def main() -> int:
                         help="frames per take")
     parser.add_argument("--hover-chain", type=int, default=2,
                         help="objects the aim walks across within one take")
+    parser.add_argument("--hover-azimuth-span-deg", type=float, default=120.0,
+                        help="TOTAL sweep. 120 is +-60: the camera travels 2.52 m per take "
+                             "against 1.56 m at 60, at the cost of 8.3-22.2 cm between "
+                             "frames instead of 4.9-10.7. Scenes 0000-0003 of "
+                             "abo_cornell_video_v1 were planned at 60 and keep it, because "
+                             "a scene's pose selection is written once and reused.")
     parser.add_argument("--hover-radius", type=float, default=1.0,
                         help="metres from whatever the camera is currently looking at")
     parser.add_argument("--hover-handheld-deg", type=float, default=4.0)
