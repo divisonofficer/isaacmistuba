@@ -415,6 +415,24 @@ def stale_reason(scene_dir: Path, args: argparse.Namespace) -> str | None:
     got_open = len(declared.get("open_walls") or [])
     if got_open != want_open:
         return f"open_walls={got_open} but this run wants {want_open}"
+    # A marble hall and a parking deck differ in nothing a frame count can see,
+    # so the type has to be compared directly or a resume would fill one corpus
+    # with both. Absent on both sides is a match: that is every untyped scene.
+    want_type = getattr(args, "environment_type", None)
+    if declared.get("environment_type") != want_type:
+        return f"environment_type={declared.get('environment_type')!r} but this run wants {want_type!r}"
+    # Which registry a scene drew its walls and floor from is part of what it
+    # is: the environment pool is metal, marble and stone where the interior
+    # one is tile, wood and concrete. A resume across the two would mix them.
+    want_registry = str(args.registry) if args.registry is not None else None
+    got_registry = declared.get("structural_registry")
+    # A manifest written before the composer recorded this cannot say which
+    # pool it drew from -- but every one of them predates --registry existing,
+    # so all of them used the composer default. Treating the silence as a
+    # mismatch would flag the whole existing corpus stale and rebuild 200
+    # scenes to land exactly where they already are.
+    if want_registry is not None and got_registry is not None and got_registry != want_registry:
+        return f"structural_registry={got_registry!r} but this run wants {want_registry!r}"
     return None
 
 
@@ -448,6 +466,10 @@ def build_one(seed: int, gpu: int, args: argparse.Namespace, expected_frames: in
                    "--asset-cache", str(args.asset_cache or (args.out_root / "_asset_cache"))]
         if args.accent_walls:
             command.append("--accent-walls")
+        if args.registry is not None:
+            command += ["--registry", str(args.registry)]
+        if args.environment_type:
+            command += ["--environment-type", args.environment_type]
         if args.wall_massing:
             command += ["--wall-massing", str(args.wall_massing)]
         if args.open_ceiling:
@@ -677,6 +699,13 @@ def main() -> int:
     parser.add_argument("--props", type=int, default=6)
     parser.add_argument("--luminaires", type=int, default=1)
     parser.add_argument("--accent-walls", action="store_true", default=True)
+    parser.add_argument("--environment-type", default=None,
+                        help="marble_hall | parking_tower | concrete_building | outdoor_street; "
+                             "pins material families and shell openings to one real space")
+    parser.add_argument("--registry", type=Path, default=None,
+                        help="structural PBR registry; default is the composer's interior one. "
+                             "The environment corpus needs texturecan_environment_v1, whose "
+                             "metal/marble/stone the interior registry does not carry.")
     parser.add_argument("--wall-massing", type=int, default=0,
                         help="blocks to stand against the walls, so the shell is not a smooth box")
     parser.add_argument("--open-ceiling", action="store_true",

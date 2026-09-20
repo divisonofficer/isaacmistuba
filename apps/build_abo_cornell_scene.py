@@ -83,6 +83,46 @@ SCHEMA = "robomituba.abo_cornell_scene.v1"
 #: `configs/ir_lighting/illumination_diversity_v2.json`. Only an open ceiling
 #: uses them; a closed box never reads this path.
 HDRI_DIR = REPO_ROOT / "assets" / "ir_lighting_hdri"
+
+#: The real spaces this corpus is meant to cover, each pinned to the material
+#: families it is actually made of and to whether its shell is open.
+#:
+#: Without this the composer draws every role from the whole pool, and the pool
+#: is not uniform: metal holds 11 of the 96 wall-role materials and marble 8, so
+#: an untyped draw produces metal-leaning rooms most of the time and four
+#: distinct environments almost never. A "type" here is exactly two things --
+#: which families each role may draw from, and what is left out of the shell.
+#:
+#: The grass/plant environment that was fifth is absent on purpose: ABO has no
+#: plant geometry. Its 182 PLANTER entries are empty pots and its single
+#: ARTIFICIAL_PLANT is a hanging ceramic planter with a rope, so the type would
+#: have been a dirt floor with nothing standing on it.
+ENVIRONMENT_TYPES: dict[str, dict[str, Any]] = {
+    "marble_hall": {
+        "palette": {"floor": ("marble", "tile"), "wall": ("marble",),
+                    "ceiling": ("concrete", "tile"), "massing": ("marble", "concrete", "tile"),
+                    "accent": ("marble", "rock")},
+        "open_ceiling": False, "open_walls": 0,
+    },
+    "parking_tower": {
+        "palette": {"floor": ("metal", "concrete"), "wall": ("metal",),
+                    "ceiling": ("metal", "concrete"), "massing": ("metal", "concrete"),
+                    "accent": ("metal", "concrete")},
+        "open_ceiling": False, "open_walls": 0,
+    },
+    "concrete_building": {
+        "palette": {"floor": ("wood", "fabric"), "wall": ("concrete",),
+                    "ceiling": ("concrete",), "massing": ("concrete", "brick"),
+                    "accent": ("concrete", "brick", "wood")},
+        "open_ceiling": False, "open_walls": 0,
+    },
+    "outdoor_street": {
+        "palette": {"floor": ("rock", "tile", "concrete"), "wall": ("concrete", "brick", "rock"),
+                    "ceiling": ("concrete",), "massing": ("concrete", "brick", "metal", "tile"),
+                    "accent": ("concrete", "rock", "brick")},
+        "open_ceiling": True, "open_walls": 1,
+    },
+}
 #: v3: both accent walls draw from one wider pool and are required to differ;
 #: the prop size cap rises to 0.75 of the near frame width. Neither changes
 #: what a scene *is*, but scenes composed under v2 draw from smaller pools and
@@ -955,7 +995,8 @@ def _texel_density(record: dict[str, Any], registry_root: Path) -> float:
 
 def choose_finishes(registry: dict[str, Any], seed: int, *, accent_walls: bool,
                     massing: list[dict[str, Any]] | None = None,
-                    registry_root: Path, min_texel_px_per_m: float) -> dict[str, dict[str, Any]]:
+                    registry_root: Path, min_texel_px_per_m: float,
+                    palette: dict[str, tuple[str, ...]] | None = None) -> dict[str, dict[str, Any]]:
     """Draw one TextureCan material per box face, at or above screen resolution.
 
     A surface whose texture carries fewer texels per metre than the sensor
@@ -980,6 +1021,22 @@ def choose_finishes(registry: dict[str, Any], seed: int, *, accent_walls: bool,
     for record in materials:
         by_category.setdefault(record.get("category", "other"), []).append(record)
 
+    if palette is not None:
+        # A named environment must not quietly become a different one. `draw`
+        # falls back to the whole pool when a preference list matches nothing,
+        # which is right for an untyped box and wrong here: a marble hall with
+        # no marble left would render as a metal room under the name of a
+        # marble hall, and the manifest would still say marble_hall.
+        empty = sorted(role for role, families in palette.items()
+                       if not any(by_category.get(family) for family in families))
+        if empty:
+            raise ValueError(
+                f"environment palette has nothing for {empty} at {min_texel_px_per_m:.0f} px/m; "
+                f"available categories: {sorted(by_category)}")
+
+    def prefer_for(role: str, default: tuple[str, ...]) -> tuple[str, ...]:
+        return tuple(palette[role]) if palette and role in palette else default
+
     def draw(role: str, prefer: Iterable[str]) -> dict[str, Any]:
         """Draw from every preferred category at once, not the first that has
         anything in it.
@@ -996,8 +1053,8 @@ def choose_finishes(registry: dict[str, Any], seed: int, *, accent_walls: bool,
         return rng.choice(sorted(pool or materials, key=lambda r: r["id"]))
 
     finishes = {
-        "floor": draw("floor", ("wood", "tile", "concrete")),
-        "ceiling": draw("ceiling", ("concrete", "plaster", "tile")),
+        "floor": draw("floor", prefer_for("floor", ("wood", "tile", "concrete"))),
+        "ceiling": draw("ceiling", prefer_for("ceiling", ("concrete", "plaster", "tile"))),
     }
     # Every block gets its own draw, keyed on its own role, and they are
     # required to differ from each other. Blocks that all landed on the same
@@ -1007,12 +1064,13 @@ def choose_finishes(registry: dict[str, Any], seed: int, *, accent_walls: bool,
     used: set[str] = set()
     for block in massing or []:
         for attempt in range(8):
-            pick = draw(f"{block['role']}#{attempt}", ("concrete", "brick", "tile", "metal"))
+            pick = draw(f"{block['role']}#{attempt}",
+                        prefer_for("massing", ("concrete", "brick", "tile", "metal")))
             if pick["id"] not in used:
                 break
         used.add(pick["id"])
         finishes[block["role"]] = pick
-    wall_default = draw("wall", ("concrete", "brick", "tile"))
+    wall_default = draw("wall", prefer_for("wall", ("concrete", "brick", "tile")))
     for role in ("wall_north", "wall_south", "wall_east", "wall_west"):
         finishes[role] = wall_default
     if accent_walls:
@@ -1026,7 +1084,7 @@ def choose_finishes(registry: dict[str, Any], seed: int, *, accent_walls: bool,
         # against 50 for the main wall, with one material appearing 13 times.
         # Distinctness is what the accent is for, so it is enforced rather than
         # left to two lists happening not to overlap.
-        pool = ACCENT_CATEGORIES
+        pool = prefer_for("accent", ACCENT_CATEGORIES)
         east = draw("accent_east", pool)
         west = draw("accent_west", pool)
         if west["id"] == east["id"] or west["id"] == wall_default["id"]:
@@ -1493,6 +1551,9 @@ def main() -> int:
                              "so the shell reads as neighbouring buildings rather than four "
                              "flat planes and the indirect light picks up a different colour "
                              "off each")
+    parser.add_argument("--environment-type", choices=sorted(ENVIRONMENT_TYPES), default=None,
+                        help="pin the material families and the shell openings to one real "
+                             "space; --open-ceiling/--open-walls still override it")
     parser.add_argument("--open-walls", type=int, default=0, choices=(0, 1, 2),
                         help="omit this many walls, so low sun and a view out reach the room")
     parser.add_argument("--open-ceiling", action="store_true",
@@ -1557,6 +1618,17 @@ def main() -> int:
           f"(prop-distance floor would be {limits['min_texel_px_per_m']:.0f})", flush=True)
     # Which walls come out is drawn per scene, and drawn before the massing so
     # the blocks can avoid them.
+    # A type supplies the openings unless the caller named them itself, so
+    # --environment-type outdoor_street is one flag rather than three that have
+    # to agree with each other.
+    preset = ENVIRONMENT_TYPES.get(args.environment_type) if args.environment_type else None
+    if preset is not None:
+        if not args.open_ceiling:
+            args.open_ceiling = bool(preset["open_ceiling"])
+        if not args.open_walls:
+            args.open_walls = int(preset["open_walls"])
+        print(f"[abo-cornell] environment {args.environment_type} "
+              f"(open_ceiling={args.open_ceiling} open_walls={args.open_walls})", flush=True)
     open_walls = _open_walls(args.open_walls, _rng(args.seed, "open_walls"))
     if open_walls:
         print(f"[abo-cornell] open walls {', '.join(open_walls)}", flush=True)
@@ -1565,7 +1637,8 @@ def main() -> int:
     finishes = choose_finishes(registry, args.seed, accent_walls=args.accent_walls,
                                massing=blocks,
                                registry_root=registry_root,
-                               min_texel_px_per_m=wall_texel_floor)
+                               min_texel_px_per_m=wall_texel_floor,
+                               palette=preset["palette"] if preset else None)
     stage_glb = out_dir / "stage" / "cornell_box.glb"
     finish_report = build_stage_glb(room, finishes, registry_root, stage_glb, out_dir,
                                     massing=blocks, open_ceiling=args.open_ceiling,
@@ -1587,6 +1660,11 @@ def main() -> int:
                               asset_cache=args.asset_cache,
                               nir_classes=nir_classes, stage_finishes=finishes)
     manifest["structural_finish"] = finish_report
+    # Which pool the shell was drawn from, so a resume can tell an environment
+    # scene from an interior one without opening the finishes.
+    manifest["structural_registry"] = str(args.registry)
+    if args.environment_type:
+        manifest["environment_type"] = args.environment_type
     manifest["camera_limits"] = limits
     if blocks:
         manifest["wall_massing"] = blocks
@@ -1621,6 +1699,8 @@ def main() -> int:
         digest_inputs["open_ceiling"] = True
     if open_walls:
         digest_inputs["open_walls"] = list(open_walls)
+    if args.environment_type:
+        digest_inputs["environment_type"] = args.environment_type
     manifest["composition_digest"] = stable_digest(digest_inputs)
 
     lamp_count = write_semantics_csv(out_dir / "abo_semantics.csv", layout["placements"])
