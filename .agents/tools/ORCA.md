@@ -20,6 +20,7 @@ Fleet Run: `run_08a9cc052de7` (coordinator terminal = DIRECTOR_MARK10).
 | SONNET_WORKER_1 | term_f71b4ccd-fb32-48ff-b139-7c4bc0cd72d8 | Orca |
 | SONNET_WORKER_2 | term_edb95088-642f-4b9f-bb99-a94d6c5cff8b | Orca |
 | SONNET_GPU_MANAGER | term_dd4ba567-79a7-4168-b75f-0735c0293e9b | Orca |
+| RESEARCHER (Codex gpt-6-astra) | term_65853e59-37d5-463e-bcde-b3cdb18d840b | Orca |
 | PC_OPTICALNAV_RENDER, PC_WORKER_1 | none | Device 1, Remote Control only |
 
 All VS Code copies were closed 2026-09-21 05:30Z; every local agent now runs in an Orca

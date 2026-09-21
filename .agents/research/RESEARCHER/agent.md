@@ -10,7 +10,7 @@ status: spawning
 # RESEARCHER (codename)
 
 - **Project:** both (OpticalNav and Scene_Scale_InverseRendering)
-- **Agent:** Codex, model gpt-6-astra, in an Orca terminal titled RESEARCHER
+- **Agent:** Codex, model gpt-6-astra, Orca terminal term_65853e59-37d5-463e-bcde-b3cdb18d840b (spawned 2026-09-21 05:55Z)
 - **Tier:** research (peer of the orchesters, no run ownership)
 - **Reports to:** PROJECT_DIRECTOR (DIRECTOR_MARK10, Orca handle term_ba01190f-6c2d-4466-8937-de69e62bc846)
 - **Directs:** nobody
