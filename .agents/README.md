@@ -52,6 +52,9 @@ PROJECT_DIRECTOR                         (Device 2) — user intent, fleet board
 - **Shared trees.** `modules/hssd_blender_ir` and the shared checkout are live
   dependencies re-imported per job. Edit in a private worktree; tell the owner
   before changing anything on the closed path.
+- **Signed records.** Anything written to disk with an author field (reclaim records,
+  lock rows, reports) carries the ROLE name from this tree, never the derived peer name
+  (`robomituba-XX`), which rolls on every rename and cannot be traced back later.
 - **Addressing.** A session cannot rename itself. Report both the role name and
   the `ListAgents` name (`robomituba-XX [ref]`) so peers can reach you.
 - **Escalation.** An orchester that needs deep research or a large engineering

@@ -5,7 +5,9 @@ bound_sessions:
     ref: 2391414
     address: uds:/tmp/cc-socks/2391414.sock
     since: 2026-09-21
-    status: active     # revived by the user 04:57Z from session 2e50bd36 (formerly listed as robomituba-a0)
+    status: active     # revived by the user 04:57Z from session 2e50bd36; earlier peer names of this
+                       # same transcript: robomituba-d2 → robomituba-ed → robomituba-6d → robomituba-a0.
+                       # /bean reclaim records signed robomituba-d2 / -ed are this session's.
 codex_sessions: []
 last_reviewed_by: DIRECTOR_MARK10 [c3cb4e]
 last_reviewed: 2026-09-21
