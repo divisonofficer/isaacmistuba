@@ -69,6 +69,10 @@ PROJECT_DIRECTOR                         (Device 2) — user intent, fleet board
   RTX 3090, OptiX 7) are separate hosts with separate builds. A PC_* agent
   is not reachable by local process tools from Device 2.
 
+## Session policy (2026-09-21)
+- Every local Claude session runs inside an Orca terminal (`tools/orca_adopt.sh`) with Remote
+  Control on. Both launchers start sessions through `claude remote-control`, never plain `claude`.
+
 ## Tooling policy (2026-09-21)
 
 - **ponytail** and **codebase-memory-mcp**: allowed in every session. codebase-memory's
