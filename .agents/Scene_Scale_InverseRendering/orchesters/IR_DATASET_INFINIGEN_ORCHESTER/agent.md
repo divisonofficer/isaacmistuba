@@ -23,8 +23,15 @@ status: adopted (remit confirmed by the session 2026-09-21 05:05Z)
 ## Remit (confirmed)
 - The Infinigen-sourced IR corpus end to end: generation, import, Stage-1/2, render, review tooling.
   Not HSSD, not ABO, not v13 training. Reuses `hover_path.py` arithmetic from hssd_blender_ir, never edits it.
-- Uncommitted Infinigen script changes (8 files, +107/−8, mtime 2026-09-09) and 5 untracked
-  test/cleanup tools: ownership still to be stated file by file (asked in roll-call).
+- Of the uncommitted Infinigen changes only ONE hunk is this session's: `vertex_count()` in
+  `tools/infinigen/mesh_decimation.py`. The other 7 modified files (import_infinigen_scene.py,
+  run_infinigen_import.sh, its test, infinigen_gen/_generate_indoors_safe/_modern_office_style/
+  _wizard.py) and 6 untracked files (2 room tests, 3 cleanup tools, 1 dev_report html) are NOT
+  this session's. Owner unknown; treat as a separate orphan.
+- This session's earlier incarnation was `robomituba-d2`: the 09-07 and 09-09 reclaim records
+  and the :8780 viewer server are its own work, not orphaned by a third party.
+- Owns `apps/render_ir_principled_dataset_queue.py` storage_profile change + test_nir_passive fixtures
+  (from one stash pop). Suite green at d77d7cc (175 passing) 2026-09-21.
 
 ## Known facts
 - Work-room placement programmes (office, meeting, break room, restroom, warehouse) never ran before

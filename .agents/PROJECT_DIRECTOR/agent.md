@@ -61,7 +61,8 @@ last_reviewed: 2026-09-21
 6. RESOLVED by user 05:17Z: GPUs 1,6 went to the ABO takes=8 top-up. Infinigen apartment hover render still has no GPUs; next free slot is GPUs 1,6 after ~10:00Z.
 7. Infinigen: delete 62 superseded dataset versions (41 scenes)? And the 229 GB /bean duplicate: is a published dataset a fixed snapshot or a live copy? The work copy has 20.9 GB passive NIR the published one lacks, so a blind dedupe loses a channel. Director recommends: snapshot semantics, then migrate the passive NIR into the published copy before deleting the work copy.
 8. `.agents/` is untracked in git and world-writable (inherited NAS mode 777). Commit it? Tighten mode?
-4. 341 stale `.import.lock`, /bean tier-D 34 GB cleanup.
+4. Infinigen scripts orphan: 7 modified + 6 untracked files are NOT the Infinigen orchester's (only one mesh_decimation hunk is). Owner unknown, mtime 2026-09-09. Assign or drop?
+5. 341 stale `.import.lock`, /bean tier-D 34 GB cleanup.
 
 ## Template for a new agent.md
 ```

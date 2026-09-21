@@ -102,6 +102,10 @@ has reviewed or adopted the work. You inherit it.
    Do not edit that file or those fixtures. Once that orchester reports the suite green, do 3(a)-(c)
    for the viewer diff only. Until then: item 4 only (who is connected to :8780, why /api/datasets stalls).
 
+6. 2026-09-21 06:30Z — IR_DATASET_INFINIGEN_ORCHESTER reports the suite green at d77d7cc (175 passing).
+   Item 5's wait is over: do 3(a)-(c) for the viewer diff now, then item 4. Verify green yourself
+   first (`python3 -m pytest apps/ir_dataset_viewer/tests`); if not green, stop and mail me.
+
 ## Resources
 - No GPU claim. The viewer's render queue can request up to 3 GPUs per dataset via the daemon;
   do not enable that path without a lock claim agreed with the director.
