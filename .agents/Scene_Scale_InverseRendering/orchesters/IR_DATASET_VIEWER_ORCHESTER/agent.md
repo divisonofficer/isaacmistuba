@@ -14,7 +14,13 @@ bound_sessions:
   #   address: <uds socket>
   #   since: <date>
   #   status: active
-codex_sessions: []
+codex_sessions:
+  - id: 01a0c1d2-bab0-74f3-a89b-2a73de593205
+    model: gpt-5.6-terra
+    since: 2026-09-21
+    status: failed      # codex exec (workspace-write): bwrap pivot_root not permitted in this
+                        # container, zero commands ran. Needs a host where bwrap works or a
+                        # user decision on sandbox mode. Prompt: director scratchpad codex_viewer/prompt.md
 last_reviewed_by: DIRECTOR_MARK10 [c3cb4e]
 last_reviewed: 2026-09-21
 status: VACANT — spawn a session with this file as its first read
