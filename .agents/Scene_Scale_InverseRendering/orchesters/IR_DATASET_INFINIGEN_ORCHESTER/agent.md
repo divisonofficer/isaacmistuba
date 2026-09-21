@@ -44,10 +44,15 @@ status: adopted (remit confirmed by the session 2026-09-21 05:05Z)
 - The :8780 viewer backend, pid 2997224, was started by THIS transcript on 2026-09-06 04:38:24
   (/proc environ CLAUDE_CODE_SESSION_ID=2e50bd36…, log /bean/ir_dataset_work/controller_backend.log).
   This session owns that process; its restart is coordinated with IR_DATASET_VIEWER_ORCHESTER.
-- The same window edited backend/controller.py via heredocs and ran `git stash pop`; the
-  storage_profile change in apps/render_ir_principled_dataset_queue.py was dirty and known at the
-  restart. Awaiting this session's transcript check on (a) storage_profile authorship, (b) whether
-  the stash pop restored the +754 viewer diff.
+- Confirmed by the session 2026-09-21: the server is its own. The +754 viewer diff and the
+  storage_profile edit in apps/render_ir_principled_dataset_queue.py arrived together from one
+  `git stash pop` (stash@{0} on 287d699 still exists and lists exactly those files). Authorship of
+  the edits inside the stash is not determinable; the tree is holding them, nobody wrote them here.
+- ASSIGNED: this session unbreaks the three `test_nir_passive.py` failures and owns the queue
+  file's storage_profile change going forward (commit it once green, with the fixtures). Tell
+  IR_DATASET_VIEWER_ORCHESTER (Codex) before touching anything under apps/ir_dataset_viewer/tests.
+- Lesson recorded at its request: a pid mismatch proves a different process, not a different
+  owner; check /proc/<pid>/environ CLAUDE_CODE_SESSION_ID before saying "not mine".
 
 ## Shared with OpticalNav
 - `apps/import_infinigen_scene.py` and `apps/run_infinigen_import.sh` are also on the OpticalNav

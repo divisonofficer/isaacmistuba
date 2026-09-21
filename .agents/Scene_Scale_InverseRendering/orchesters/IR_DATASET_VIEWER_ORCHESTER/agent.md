@@ -96,6 +96,12 @@ has reviewed or adopted the work. You inherit it.
    to :8780 (`ss` is not installed; use `lsof -i :8780` or /proc/net/tcp), and whether
    `/api/datasets` times out because of NFS scanning or a hung process.
 
+5. 2026-09-21 05:20Z — SUPERSEDES the queue-file part of 2 and 3(d): the storage_profile change in
+   `apps/render_ir_principled_dataset_queue.py` and the three `test_nir_passive.py` failures are now
+   owned by IR_DATASET_INFINIGEN_ORCHESTER (it owns the :8780 server; both came from one stash pop).
+   Do not edit that file or those fixtures. Once that orchester reports the suite green, do 3(a)-(c)
+   for the viewer diff only. Until then: item 4 only (who is connected to :8780, why /api/datasets stalls).
+
 ## Resources
 - No GPU claim. The viewer's render queue can request up to 3 GPUs per dataset via the daemon;
   do not enable that path without a lock claim agreed with the director.
