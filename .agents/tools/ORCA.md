@@ -15,8 +15,8 @@ Fleet Run: `run_08a9cc052de7` (coordinator terminal = DIRECTOR_MARK10).
 | IR_DATASET_ABO_ORCHESTER | term_47fb8002-265a-44bd-abec-dd43cb2f5287 | Orca |
 | IR_DATASET_INFINIGEN_ORCHESTER | term_eb71a360-90a0-44fa-abca-9c10170183b0 | Orca |
 | IR_DATASET_VIEWER_ORCHESTER (Codex) | term_9a444085-4438-4b38-b901-bd3cb58f840b | Orca |
-| OPTICALNAV_ORCHESTER | term_7185dd48-3d3e-4ecf-83ac-a0ee68cbfb68 | Orca |
-| OPTICALNAV_NAVIGATION_ORCHESTER | term_30ceba37-049e-4eae-af55-d7a0d00338bd | Orca |
+| OPTICALNAV_ORCHESTER | term_538be2b3-8f43-4c7e-b256-daaeda1f01ed | Orca, worktree OpticalNav |
+| OPTICALNAV_NAVIGATION_ORCHESTER | term_38731d3a-1277-4474-ace8-c07f9b5759e7 | Orca, worktree OpticalNav |
 | SONNET_WORKER_1 | term_f71b4ccd-fb32-48ff-b139-7c4bc0cd72d8 | Orca |
 | SONNET_WORKER_2 | term_edb95088-642f-4b9f-bb99-a94d6c5cff8b | Orca |
 | SONNET_GPU_MANAGER | term_dd4ba567-79a7-4168-b75f-0735c0293e9b | Orca |
@@ -25,6 +25,13 @@ Fleet Run: `run_08a9cc052de7` (coordinator terminal = DIRECTOR_MARK10).
 
 All VS Code copies were closed 2026-09-21 05:30Z; every local agent now runs in an Orca
 terminal resumed from its previous session id, so context carried over.
+
+## Worktrees
+Orca has three worktree entries on the same checkout: `robomituba` (root), `IR_DATASET`, and
+`OpticalNav`. IR agents, the director, shared workers and RESEARCHER sit in the root/IR_DATASET
+entries; the two OpticalNav orchesters sit in `OpticalNav` (moved 2026-09-21 06:10Z). A terminal
+cannot be moved between worktrees: close it and recreate with
+`orca-ide terminal create --worktree id:<worktree id> --command "claude remote-control --name NAME --session-id SID"`.
 
 ## Sending mail to an agent in an Orca terminal
 ```
