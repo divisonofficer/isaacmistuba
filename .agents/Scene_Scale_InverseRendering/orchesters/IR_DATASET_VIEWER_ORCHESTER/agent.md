@@ -21,9 +21,13 @@ codex_sessions:
     status: failed      # codex exec (workspace-write): bwrap pivot_root not permitted in this
                         # container, zero commands ran. Needs a host where bwrap works or a
                         # user decision on sandbox mode. Prompt: director scratchpad codex_viewer/prompt.md
+  - id: codex-exec-2026-09-21
+    model: gpt-5.6-terra
+    since: 2026-09-21
+    status: active
 last_reviewed_by: DIRECTOR_MARK10 [c3cb4e]
 last_reviewed: 2026-09-21
-status: VACANT — spawn a session with this file as its first read
+status: adopted
 ---
 # IR_DATASET_VIEWER_ORCHESTER
 
