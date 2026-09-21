@@ -44,12 +44,12 @@ last_reviewed: 2026-09-21
 | IR_DATASET_HSSD_ORCHESTER | 49/100 scenes, ETA ~3 d | 0,2,3 (lock row renamed) | SONNET_WORKER_1, SONNET_WORKER_2 |
 | OPTICALNAV_ORCHESTER | idle, waiting on Device 1 renders of 20267404, 20272904 | none (daemon :8765 idle) | SONNET_WORKER_1 |
 | OPTICALNAV_NAVIGATION_ORCHESTER | idle, 2 user decisions pending | none | none |
-| IR_DATASET_VIEWER_ORCHESTER | VACANT, awaiting spawn | none | none |
+| IR_DATASET_VIEWER_ORCHESTER | Codex (gpt-5.6-terra), run 1 done: verified, nothing committed, 3 tests blocked on orphaned queue-script change; directive 2-4 pending resume | none | none |
 | PC_OPTICALNAV_RENDER | 20272904 perturbed_active_polar 12%, ETA 09:05Z | Device 1 GPU 0 | — |
 | PC_WORKER_1 | queue complete, free (user-assigned only) | Device 1 | — |
 
 ## Open items for the user
-1. Orphaned ir_dataset_viewer work: role file prepared at Scene_Scale_InverseRendering/orchesters/IR_DATASET_VIEWER_ORCHESTER/agent.md (VACANT). User to spawn a session that reads it first.
+1. Orphaned ir_dataset_viewer work: adopted by Codex. User resumes the thread when directed; director writes directives into the role file.
 2. HSSD: ~98 GB v3 blends deletion, blocked until render_hover_v1 stops reading them.
 3. Navigation: verify 20273004 graph regen result (in-room node count pre-dates wall restore), and whether to commit 4 tool files.
 5. `.agents/` is untracked in git and world-writable (inherited NAS mode 777). Commit it? Tighten mode?

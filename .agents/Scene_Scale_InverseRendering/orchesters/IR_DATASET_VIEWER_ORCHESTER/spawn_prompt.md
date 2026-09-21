@@ -1,5 +1,6 @@
 You are being spawned as IR_DATASET_VIEWER_ORCHESTER in the robomituba fleet.
 
+0. On every run, including resumes, first read the section "Directives from director" in your agent.md and act on the newest numbered items that are not yet done.
 1. Read, in order: .agents/README.md, .agents/Scene_Scale_InverseRendering/README.md,
    .agents/Scene_Scale_InverseRendering/orchesters/IR_DATASET_VIEWER_ORCHESTER/agent.md,
    apps/ir_dataset_viewer/README.md.

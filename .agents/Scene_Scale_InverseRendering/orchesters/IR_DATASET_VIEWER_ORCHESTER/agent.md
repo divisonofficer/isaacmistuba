@@ -32,7 +32,7 @@ status: adopted
 # IR_DATASET_VIEWER_ORCHESTER
 
 - **Project:** Scene_Scale_InverseRendering (IR)
-- **Session:** VACANT. On adoption, fill `bound_sessions` above and tell DIRECTOR_MARK10 your ListAgents name and ref.
+- **Session:** Codex thread 01a0c1d2-bab0-74f3-a89b-2a73de593205 (gpt-5.6-terra), adopted 2026-09-21. Resumed by the user with `codex exec resume`.
 - **Tier:** orchester
 - **Reports to:** PROJECT_DIRECTOR (DIRECTOR_MARK10 [c3cb4e])
 - **Directs:** may request a shared worker (SONNET_WORKER_1/2) for read-only checks; both are currently loaded
@@ -76,6 +76,23 @@ has reviewed or adopted the work. You inherit it.
 6. Commit only `apps/ir_dataset_viewer/` paths. The shared checkout has 160+ other modified
    files from other sessions; `git add -A` or `git commit -a` stages peers' work.
 7. Report to the director: what was committed, what was dropped, whether :8780 was restarted.
+
+## Directives from director (read at the start of every run; newest last)
+1. 2026-09-21 03:10Z — Run 1 outcome accepted: rescue verified, check+build pass, 118/121 tests,
+   nothing committed. Correct call.
+2. The 3 failures in `tests/test_nir_passive.py` come from an UNCOMMITTED change to
+   `apps/render_ir_principled_dataset_queue.py` (+10/−6, mtime 2026-09-06 04:37, same era as the
+   viewer work, no other session claims it). Treat it as part of the same orphan. Your scope now
+   includes that file and its fixtures. Do: read its diff, decide whether the `storage_profile`
+   default change (CORE_HALF_EXR_V1 → V2) is intended, update the three test fixtures to pass
+   `storage_profile` explicitly (do not weaken the tests), rerun the full viewer suite.
+3. If the suite is green: commit in this order, each its own commit, viewer paths and that one
+   queue file only: (a) backend/catalog.py + test_catalog.py, (b) the two new .svelte components,
+   (c) App.svelte + other src changes + style.css, (d) render_ir_principled_dataset_queue.py + fixture
+   updates. Append the hashes to your report.
+4. Do not restart :8780 yet. Instead record in the report: which pids/sessions have connections
+   to :8780 (`ss` is not installed; use `lsof -i :8780` or /proc/net/tcp), and whether
+   `/api/datasets` times out because of NFS scanning or a hung process.
 
 ## Resources
 - No GPU claim. The viewer's render queue can request up to 3 GPUs per dataset via the daemon;
