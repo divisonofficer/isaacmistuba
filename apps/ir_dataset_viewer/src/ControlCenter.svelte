@@ -5,7 +5,7 @@
     type ControllerJob, type ControllerRequest, type ControllerStatus, type GPU, type RecoveryPlan
   } from './api';
 
-  let { onBrowse }: { onBrowse: () => void } = $props();
+  let { onBrowse, openJobs = false }: { onBrowse: () => void; openJobs?: boolean } = $props();
   let tab = $state<'create' | 'jobs'>('create');
   let status = $state<ControllerStatus>({ jobs: [], queue: [], gpu_inventory: [] });
   let outputs = $state<{ relative_path: string; scene_blend: string }[]>([]);
@@ -83,6 +83,7 @@
   const variationPoseEstimate = $derived(Math.round(poseBudget / 5));
   const illuminationFrameEstimate = $derived(illuminationDiversity ? poseBudget * 2 : poseBudget);
 
+  $effect(() => { if (openJobs) tab = 'jobs'; });
   onMount(() => { void poll(); });
   onDestroy(() => {
     disposed = true;
@@ -319,7 +320,7 @@
 </script>
 
 <section class="control-center">
-  <header class="control-header"><div><h2>IR Dataset Control Center</h2><p>독립 pipeline queue · bake/render는 할당 GPU 단위로 조정됩니다.</p></div><button onclick={refresh}>Refresh</button></header>
+  <header class="control-header"><div><h2>Control center</h2><p>독립 pipeline queue · bake/render는 할당 GPU 단위로 조정됩니다.</p></div><button onclick={refresh}>Refresh</button></header>
   {#if error}<div class="control-error">{error}<button onclick={() => error = ''}>×</button></div>{/if}
   <nav class="control-tabs"><button class:active={tab === 'create'} onclick={() => tab = 'create'}>Create job</button><button class:active={tab === 'jobs'} onclick={() => tab = 'jobs'}>Jobs ({status.jobs.length})</button><button onclick={onBrowse}>Browse datasets</button>{#if status.hidden_job_count}<button class="secondary" onclick={toggleHiddenJobs}>{showHiddenJobs ? 'Hide archived' : `Show archived (${status.hidden_job_count})`}</button>{/if}</nav>
 

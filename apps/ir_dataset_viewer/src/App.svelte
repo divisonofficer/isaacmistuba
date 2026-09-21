@@ -2,9 +2,11 @@
   import { onMount } from 'svelte';
   import ImagePanel, { type ViewTransform } from './ImagePanel.svelte';
   import Overview2D from './Overview2D.svelte';
+  import MiniMap from './MiniMap.svelte';
   import Overview3D from './Overview3D.svelte';
   import ControlCenter from './ControlCenter.svelte';
   import SceneCatalog from './SceneCatalog.svelte';
+  import MiniJobStatus from './MiniJobStatus.svelte';
   import {
     cancelPublishJob, getBrowse, getDataset, getFrame, getPixels, getPublishJob, listDatasets, invalidateDatasetSessionCache,
     previewUrl, publishDataset, getOverview, overviewTraversabilityUrl, overviewMeshUrl, type DatasetSummary, type DisplayControls, type FrameCompact,
@@ -33,6 +35,16 @@
   let metadataOpen = $state(false);
   let cursor = $state<{ x: number; y: number } | null>(null);
   let pixelData = $state<PixelResponse | null>(null);
+  let pixelPanelOpen = $state(false);
+  let modalitiesExpanded = $state(false);
+  let headingPointerId = $state<number | null>(null);
+  let headingDragStartX = $state(0);
+  let headingDragStartDeg = $state(0);
+  let headingDragMoved = $state(false);
+  let displayHeadingDeg = $state(0);
+  let headingRaf = $state<number | null>(null);
+  let headingAnimating = $state(false);
+  let headingWheelTimer: ReturnType<typeof setTimeout> | null = null;
   let transform = $state<ViewTransform>({ zoom: 1, offsetX: 0, offsetY: 0 });
   let controls = $state<DisplayControls>({ ev: 0, minimum: 0, maximum: 10, overlay: '', overlayOpacity: 0.45 });
   let publishName = $state('');
@@ -40,6 +52,9 @@
   let publishTimer: ReturnType<typeof setInterval> | null = null;
   let workspace = $state<'browse' | 'scenes' | 'control'>('browse');
   let sceneCatalogRefreshNonce = $state(0);
+  let sceneCatalogScrollY = 0;
+  let controlOpenJobs = $state(false);
+  let browseOpenedFromCatalog = $state(false);
   let viewMode = $state<'frame' | 'bird' | '3d'>('frame');
   let overview = $state<SceneOverview | null>(null);
   let overviewLoading = $state(false);
@@ -57,6 +72,7 @@
   let idlePrefetchTimer: ReturnType<typeof setTimeout> | null = null;
   let prefetchEpoch = 0;
   let controlsDragging = $state(false);
+  let toolbarOpen = $state(true);
   let prefetchTrigger = $state(0);
   let frameTransitionStarted = 0;
   let viewerMetrics = $state({ bootstrap_ms: 0, preview_first_ms: 0, preview_full_ms: 0,
@@ -70,6 +86,11 @@
   // catalog-level modality_groups.  The frame endpoint is authoritative for
   // the artifacts that actually exist, so its `available` map is folded into
   // the selector once the first frame is loaded.
+  // A wider, more navigable overview than the previous 3px/degree ruler.
+  // This is the only scale used for both tick placement and pointer dragging.
+  const headingPixelsPerDegree = 1.5;
+  const compassTurns = Array.from({ length: 13 }, (_, index) => index);
+  const compassAnchorTurn = 6;
   const modalityGroupDefinitions = [
     { id: 'observation', label: 'Observation', modalities: ['rgb', 'nir_active', 'nir_passive', 'nir_active_minus_passive'] },
     { id: 'pbr', label: 'PBR', modalities: ['base_color_rgb', 'base_color_nir', 'roughness', 'metallic'] },
@@ -115,9 +136,30 @@
   const selectedViewpoint = $derived(viewpoints.find((item) => item.viewpoint_id === selectedViewpointId) ?? null);
   const frames = $derived(selectedViewpoint?.frames ?? []);
   const headingGroups = $derived(selectedViewpoint?.headings ?? []);
-  const selectedHeading = $derived(headingGroups.find((item) => item.heading_key === selectedHeadingKey) ?? headingGroups[0] ?? null);
   const lightingIds = $derived(Array.from(new Set(frames.map((item) => item.lighting_id || 'legacy'))).sort());
+  // Keep the filter for choosing a compatible frame, but the camera compass is a
+  // physical-pose navigator and must expose every heading captured under any lighting.
   const visibleHeadingGroups = $derived(headingGroups.filter((group) => frameLightingFilter === 'all' || group.frames.some((item) => (item.lighting_id || 'legacy') === frameLightingFilter)));
+  const compassHeadingGroups = $derived.by(() => {
+    // `headings` is normally complete, but some legacy payloads only group the
+    // current-light frames. Fold raw frames in so the compass is always the
+    // union of physical headings across every lighting capture.
+    const result = new Map<string, HeadingGroup>();
+    for (const group of headingGroups) result.set(group.heading_key, { ...group, frames: [...group.frames] });
+    for (const frame of frames) {
+      // API `heading_key` is the stable physical-pose group identifier. It is
+      // not guaranteed to be identical to a compact frame's `pose_key`.
+      // Prefer membership in an existing API group so selecting this frame
+      // cannot create a duplicate heading and fall back to the first one.
+      const member = [...result.values()].find((group) => group.frames.some((item) => item.frame_id === frame.frame_id));
+      const key = member?.heading_key ?? frame.pose_key ?? `heading:${frame.heading_deg.toFixed(6)}`;
+      const existing = result.get(key);
+      if (existing) { if (!existing.frames.some((item) => item.frame_id === frame.frame_id)) existing.frames.push(frame); }
+      else result.set(key, { heading_key: key, heading_deg: frame.heading_deg, anchor_id: frame.anchor_id, frames: [frame] });
+    }
+    return [...result.values()].sort((a, b) => a.heading_deg - b.heading_deg);
+  });
+  const selectedHeading = $derived(compassHeadingGroups.find((item) => item.heading_key === selectedHeadingKey) ?? compassHeadingGroups[0] ?? null);
   const headingFrames = $derived(selectedHeading?.frames.filter((item) => frameLightingFilter === 'all' || (item.lighting_id || 'legacy') === frameLightingFilter) ?? frames);
   const lightingHeadingGroups = $derived(
     lightingIds.map((lightingId) => ({
@@ -130,6 +172,18 @@
   );
   const selectedLightingGroup = $derived(lightingHeadingGroups.find((group) => group.lightingId === selectedLightingId) ?? lightingHeadingGroups[0] ?? null);
   const selectedFrame = $derived(frames.find((item) => item.frame_id === selectedFrameId) ?? null);
+  // v5 object-orbit captures retain one viewpoint per target object; moving
+  // this rail therefore selects a new camera origin around that anchor rather
+  // than merely rotating a camera in place.
+  const objectOrbitMode = $derived(Boolean(
+    selectedFrame?.capture_kind === 'orbit'
+    || selectedFrame?.camera_pose_source === 'object_orbit_6dof'
+    || selectedViewpointId.startsWith('orbit:')
+  ));
+  const orbitAnchorId = $derived(selectedHeading?.anchor_id ?? selectedFrame?.anchor_id ?? '');
+  const orbitTargetLabel = $derived(orbitAnchorId
+    .replace(/^obj:/, '')
+    .replace(/\.spawn_asset_/, ' · '));
   const filteredViewpoints = $derived(viewpoints.filter((item) => item.viewpoint_id.toLowerCase().includes(search.toLowerCase())));
   const frameAvailableModalities = $derived(
     Array.from(new Set([
@@ -146,6 +200,7 @@
   const maskModalities = $derived(datasetModalities.filter((name) => name.endsWith('_mask') || name.includes('valid')));
   const comparisonPinned = $derived(pinned.filter((name) => name !== modality));
   const structuralOverride = $derived(datasetDetail?.contract?.structural_rematerialization ?? frameDetail?.frame?.structural_rematerialization ?? null);
+  const selectedHeadingIndex = $derived(Math.max(0, compassHeadingGroups.findIndex((group) => group.heading_key === selectedHeadingKey)));
 
   onMount(() => {
     window.addEventListener('keydown', onKey);
@@ -153,7 +208,7 @@
     return () => {
       window.removeEventListener('keydown', onKey);
       if (publishTimer) clearInterval(publishTimer);
-      datasetAbort?.abort(); frameAbort?.abort(); pixelAbort?.abort(); invalidatePrefetch();
+      datasetAbort?.abort(); frameAbort?.abort(); pixelAbort?.abort(); invalidatePrefetch(); cancelHeadingAnimation(); if (headingWheelTimer) clearTimeout(headingWheelTimer);
     };
   });
 
@@ -194,6 +249,28 @@
       datasetDetail = null; viewpoints = []; selectedViewpointId = ''; selectedFrameId = '';
       history.replaceState(null, '', `${location.pathname}?view=${viewMode}`);
     }
+  }
+
+  function openControlJobs() {
+    controlOpenJobs = true;
+    workspace = 'control';
+    requestAnimationFrame(() => window.scrollTo({ top: 0, behavior: 'instant' as ScrollBehavior }));
+  }
+
+  function openSceneCatalog() {
+    workspace = 'scenes';
+    // SceneCatalog remains mounted, so this restores its exact DOM/filter
+    // state. Restore its scroll on the next paint after it becomes visible.
+    requestAnimationFrame(() => window.scrollTo({ top: sceneCatalogScrollY, behavior: 'instant' as ScrollBehavior }));
+  }
+
+  function browseSceneFromCatalog(datasetId: string) {
+    sceneCatalogScrollY = window.scrollY;
+    browseOpenedFromCatalog = true;
+    workspace = 'browse';
+    // Never expose the frame inspector at the catalog's previous bottom scroll.
+    requestAnimationFrame(() => window.scrollTo({ top: 0, behavior: 'instant' as ScrollBehavior }));
+    void selectDataset(datasetId);
   }
 
   function refreshWorkspace() {
@@ -281,11 +358,16 @@
 
   async function selectHeading(key: string) {
     selectedHeadingKey = key;
-    const group = headingGroups.find((item) => item.heading_key === key);
+    const group = compassHeadingGroups.find((item) => item.heading_key === key);
     const candidates = group?.frames.filter((item) => frameLightingFilter === 'all' || (item.lighting_id || 'legacy') === frameLightingFilter) ?? [];
     selectedLightingId = candidates[0]?.lighting_id ?? group?.frames?.[0]?.lighting_id ?? '';
     const first = candidates[0] ?? group?.frames?.[0];
-    if (first) selectFrame(first.frame_id);
+    if (first) selectFrame(first.frame_id, group?.heading_key);
+  }
+
+  function selectHeadingIndex(index: number) {
+    const group = compassHeadingGroups[index];
+    if (group) void selectHeading(group.heading_key);
   }
 
   async function selectLighting(id: string) {
@@ -319,7 +401,13 @@
     syncUrl();
   }
 
-  function selectFrame(id: string) {
+  function headingKeyForFrame(frame: FrameCompact, groups = compassHeadingGroups): string {
+    return groups.find((group) => group.frames.some((item) => item.frame_id === frame.frame_id))?.heading_key
+      ?? frame.pose_key
+      ?? `heading:${frame.heading_deg.toFixed(6)}`;
+  }
+
+  function selectFrame(id: string, headingKey?: string) {
     frameAbort?.abort(); pixelAbort?.abort(); invalidatePrefetch();
     frameTransitionStarted = performance.now();
     viewerMetrics.preview_first_ms = 0; viewerMetrics.preview_full_ms = 0;
@@ -327,7 +415,7 @@
     frameDetail = null;
     const frame = frames.find((item) => item.frame_id === id);
     if (frame) {
-      selectedHeadingKey = frame.pose_key || selectedHeadingKey;
+      selectedHeadingKey = headingKey ?? headingKeyForFrame(frame);
       selectedLightingId = frame.lighting_id || 'legacy';
     }
     syncUrl();
@@ -421,7 +509,6 @@
     const elapsed = performance.now() - frameTransitionStarted;
     if (stage === 'fallback' && !viewerMetrics.preview_first_ms) viewerMetrics.preview_first_ms = elapsed;
     if (stage === 'full') viewerMetrics.preview_full_ms = elapsed;
-    console.debug('[ir-viewer] preview', { stage, ms: elapsed, frame: selectedFrameId });
   }
 
   function syncUrl() {
@@ -449,15 +536,41 @@
     const priority = profile === 'primary' ? 'interactive' : profile === 'comparison' ? 'comparison' : 'prefetch';
     return selectedDatasetId && selectedFrameId ? previewUrl(selectedDatasetId, selectedFrameId, name, previewControls, profile, priority) : '';
   }
-  async function setViewMode(next: 'frame' | 'bird' | '3d') {
-    viewMode = next; syncUrl();
-    if (next !== 'frame' && selectedDatasetId && !overview) {
-      overviewLoading = true;
-      try { overview = await getOverview(selectedDatasetId); } catch (cause) { error = cause instanceof Error ? cause.message : String(cause); }
-      finally { overviewLoading = false; }
-    }
+  async function ensureOverview() {
+    const id = selectedDatasetId;
+    if (!id || overviewLoading || overview?.dataset_id === id) return;
+    overviewLoading = true;
+    try {
+      const next = await getOverview(id);
+      if (selectedDatasetId === id) overview = next;
+    } catch (cause) {
+      if (selectedDatasetId === id) error = cause instanceof Error ? cause.message : String(cause);
+    } finally { if (selectedDatasetId === id) overviewLoading = false; }
   }
-  function selectOverviewPose(pose: OverviewPose) { void selectFrame(pose.frame_id); viewMode = 'frame'; syncUrl(); }
+  async function setViewMode(next: 'frame' | 'bird' | '3d') { viewMode = next; syncUrl(); await ensureOverview(); }
+  function selectMiniMapPose(pose: OverviewPose) {
+    const view = viewpoints.find((item) => item.viewpoint_id === pose.viewpoint_id);
+    // Use the target viewpoint's frame list directly: reactive derived `frames`
+    // may still describe the previous sidebar row within this event turn.
+    const frame = view?.frames.find((item) => item.frame_id === pose.frame_id);
+    if (view) selectedViewpointId = view.viewpoint_id;
+    const targetHeadingKey = frame && view
+      ? view.headings?.find((group) => group.frames.some((item) => item.frame_id === frame.frame_id))?.heading_key ?? frame.pose_key
+      : undefined;
+    selectedHeadingKey = targetHeadingKey ?? selectedHeadingKey;
+    selectedLightingId = frame?.lighting_id || pose.lighting_id || 'legacy';
+    selectFrame(pose.frame_id, targetHeadingKey);
+  }
+  function selectOverviewPose(pose: OverviewPose) { selectMiniMapPose(pose); viewMode = 'frame'; syncUrl(); }
+
+  $effect(() => {
+    if (selectedDatasetId) void ensureOverview();
+  });
+
+  $effect(() => {
+    const heading = selectedHeading?.heading_deg;
+    if (heading !== undefined && headingPointerId === null && !headingAnimating) displayHeadingDeg = equivalentHeading(heading, displayHeadingDeg);
+  });
 
   $effect(() => {
     controls.ev; controls.minimum; controls.maximum; controls.overlay; controls.overlayOpacity;
@@ -474,6 +587,7 @@
 
   async function probe(x: number, y: number) {
     cursor = { x, y };
+    pixelPanelOpen = true;
     const extras = ['object_id', 'material_id', 'source_valid_mask', 'replacement_mask', 'fallback_mask', 'primary_eval_valid_mask'];
     const names = [...new Set([modality, ...pinned, ...extras])].filter((name) => datasetModalities.includes(name));
     pixelAbort?.abort(); const controller = new AbortController(); pixelAbort = controller;
@@ -484,6 +598,104 @@
       if ((cause as DOMException)?.name !== 'AbortError') error = cause instanceof Error ? cause.message : String(cause);
     }
   }
+
+  function normalizeHeading(degrees: number): number { return ((degrees % 360) + 360) % 360; }
+  // Place a canonical capture angle on the same unwrapped turn as `around`.
+  // Rendering uses this continuous value; only frame lookup uses its 0–360 form.
+  function equivalentHeading(canonical: number, around: number): number { return canonical + Math.round((around - canonical) / 360) * 360; }
+  function nearestHeading(degrees: number): HeadingGroup | null {
+    if (compassHeadingGroups.length === 0) return null;
+    const normalized = normalizeHeading(degrees);
+    return compassHeadingGroups.reduce((best, group) => {
+      const distance = Math.abs((((group.heading_deg - normalized) + 540) % 360) - 180);
+      const bestDistance = Math.abs((((best.heading_deg - normalized) + 540) % 360) - 180);
+      return distance < bestDistance ? group : best;
+    });
+  }
+  function cancelHeadingAnimation() { if (headingRaf !== null) cancelAnimationFrame(headingRaf); headingRaf = null; headingAnimating = false; }
+  function animateHeading(target: number, ms = 600) {
+    if (headingPointerId !== null) return;
+    cancelHeadingAnimation();
+    headingAnimating = true;
+    const from = displayHeadingDeg;
+    const destination = equivalentHeading(normalizeHeading(target), from);
+    const delta = ((destination - from + 540) % 360) - 180;
+    const started = performance.now();
+    const step = (now: number) => {
+      const t = Math.min((now - started) / ms, 1);
+      const eased = 1 - Math.pow(1 - t, 3);
+      displayHeadingDeg = from + delta * eased;
+      if (t < 1) headingRaf = requestAnimationFrame(step);
+      else {
+        headingRaf = null;
+        const near = nearestHeading(destination);
+        if (near) { displayHeadingDeg = equivalentHeading(near.heading_deg, displayHeadingDeg); void selectHeading(near.heading_key); }
+        headingAnimating = false;
+      }
+    };
+    headingRaf = requestAnimationFrame(step);
+  }
+  function headingAngle(event: PointerEvent): number {
+    const rect = (event.currentTarget as HTMLElement).getBoundingClientRect();
+    return Math.max(0, Math.min(359.999, ((rect.right - event.clientX) / Math.max(rect.width, 1)) * 360));
+  }
+  function magneticHeading(angle: number): number {
+    const nearest = nearestHeading(angle);
+    if (!nearest) return normalizeHeading(angle);
+    const distance = Math.abs((((nearest.heading_deg - angle) + 540) % 360) - 180);
+    const snapped = equivalentHeading(nearest.heading_deg, angle);
+    return distance <= 8 ? snapped : angle;
+  }
+  function selectHeadingFromPointer(event: PointerEvent) {
+    if (compassHeadingGroups.length === 0) return;
+    // The ruler is drawn at `headingPixelsPerDegree` CSS pixels per degree. Use that same physical
+    // scale for drag input instead of mapping the whole rail width to 360°.
+    // Leftward drag increases the angle, matching the reversed scroll direction.
+    const delta = (event.clientX - headingDragStartX) / headingPixelsPerDegree;
+    displayHeadingDeg = magneticHeading(headingDragStartDeg - delta);
+  }
+  function isMagnetized(group: HeadingGroup): boolean {
+    if (headingPointerId === null) return false;
+    return Math.abs((((group.heading_deg - displayHeadingDeg) + 540) % 360) - 180) < .01;
+  }
+  function wheelHeading(event: WheelEvent) {
+    event.preventDefault();
+    if (headingPointerId !== null || compassHeadingGroups.length === 0) return;
+    cancelHeadingAnimation();
+    // One notch is deliberately small; the 8° magnetic range makes discrete
+    // capture headings easy to land on without starting frame work per event.
+    displayHeadingDeg = magneticHeading(normalizeHeading(displayHeadingDeg + event.deltaY * .12));
+    if (headingWheelTimer) clearTimeout(headingWheelTimer);
+    headingWheelTimer = setTimeout(() => {
+      const near = nearestHeading(displayHeadingDeg);
+      if (near) { displayHeadingDeg = equivalentHeading(near.heading_deg, displayHeadingDeg); void selectHeading(near.heading_key); }
+      headingWheelTimer = null;
+    }, 110);
+  }
+  function startHeadingDrag(event: PointerEvent) {
+    // The scrubber owns the pointer from here on, even when the drag starts
+    // over a captured-heading marker.
+    event.preventDefault();
+    cancelHeadingAnimation(); headingPointerId = event.pointerId; headingDragStartX = event.clientX; headingDragStartDeg = displayHeadingDeg; headingDragMoved = false;
+    (event.currentTarget as HTMLElement).setPointerCapture(event.pointerId);
+  }
+  function moveHeadingDrag(event: PointerEvent) {
+    if (headingPointerId !== event.pointerId) return;
+    if (Math.abs(event.clientX - headingDragStartX) > 2) headingDragMoved = true;
+    if (headingDragMoved) selectHeadingFromPointer(event);
+  }
+  function endHeadingDrag(event: PointerEvent) {
+    if (headingPointerId !== event.pointerId) return;
+    if ((event.currentTarget as HTMLElement).hasPointerCapture(event.pointerId)) (event.currentTarget as HTMLElement).releasePointerCapture(event.pointerId);
+    const target = headingDragMoved ? displayHeadingDeg : headingAngle(event), wasDrag = headingDragMoved; headingPointerId = null;
+    // A blank-area click only focuses the scrubber; it must not reinterpret
+    // screen x as an absolute angle and jump the current heading to zero.
+    if (!wasDrag) { displayHeadingDeg = headingDragStartDeg; return; }
+    const near = nearestHeading(target); if (near) { displayHeadingDeg = equivalentHeading(near.heading_deg, displayHeadingDeg); void selectHeading(near.heading_key); }
+  }
+  function rulerPosition(degrees: number, turn: number): string { return String((turn * 360 + degrees) * headingPixelsPerDegree) + 'px'; }
+  function compassTrackOffset(heading: number): string { return `translateX(calc(50% - ${(compassAnchorTurn * 360 + heading) * headingPixelsPerDegree}px))`; }
+  function compassLabel(index: number): string { return ['N', '', '', 'NE', '', '', 'E', '', '', 'SE', '', '', 'S', '', '', 'SW', '', '', 'W', '', '', 'NW', '', ''][index] ?? ''; }
 
   function stepFrame(delta: number) {
     const index = frames.findIndex((item) => item.frame_id === selectedFrameId);
@@ -539,8 +751,9 @@
   <div><strong>IR Dataset Control Center</strong><span>Principled v2 · inspect and orchestrate</span></div>
   <div class="top-actions">
     {#if busy}<span class="status working">Loading</span>{/if}
-    <button class:active={workspace === 'browse'} onclick={() => workspace = 'browse'}>Browse</button>
-    <button class:active={workspace === 'scenes'} onclick={() => workspace = 'scenes'}>Scenes</button>
+    {#if workspace === 'browse' && browseOpenedFromCatalog}<button class="catalog-back" onclick={openSceneCatalog}>‹ Scene catalog</button>{/if}
+    <button class:active={workspace === 'browse'} onclick={() => { browseOpenedFromCatalog = false; workspace = 'browse'; }}>Browse</button>
+    <button class:active={workspace === 'scenes'} onclick={openSceneCatalog}>Scenes</button>
     <button class:active={workspace === 'control'} onclick={() => workspace = 'control'}>Control center</button>
     <button onclick={refreshWorkspace}>Refresh</button>
   </div>
@@ -548,17 +761,21 @@
 
 {#if error}<div class="error-banner">{error}<button onclick={() => error = ''}>×</button></div>{/if}
 
+<MiniJobStatus onOpenJobs={openControlJobs} />
+
 <!-- Keep the Scene catalog mounted while any workspace is open. Its own
      explicit Refresh is the only normal revalidation path. -->
 <section hidden={workspace !== 'scenes'}>
   <SceneCatalog active={workspace === 'scenes'} refreshNonce={sceneCatalogRefreshNonce}
-    onBrowse={(id) => { workspace = 'browse'; void selectDataset(id); }} />
+    onBrowse={browseSceneFromCatalog} />
 </section>
 
 {#if workspace === 'control'}
-  <ControlCenter onBrowse={() => workspace = 'browse'} />
-{:else}
-<main class="shell" hidden={workspace !== 'browse'}>
+  <ControlCenter onBrowse={() => workspace = 'browse'} openJobs={controlOpenJobs} />
+{:else if workspace === 'browse'}
+<!-- Frame-only UI is mounted only in Browse: fixed controls must never bleed
+     through the catalog or control-center workspace. -->
+<main class="shell">
   <aside class="sidebar">
     <label>Dataset<select value={selectedDatasetId} onchange={(event) => selectDataset(event.currentTarget.value)}>
       {#each datasets as item}<option value={item.dataset_id}>{item.name} · {item.frame_count}</option>{/each}
@@ -571,6 +788,15 @@
       <div class="qc-row"><span>Fallback</span><b>{(Number(selectedDataset.qc?.fallback_pixel_ratio ?? 0) * 100).toFixed(3)}%</b></div>
       <div class="qc-row"><span>Replacement</span><b>{(Number(selectedDataset.qc?.replacement_pixel_ratio ?? 0) * 100).toFixed(2)}%</b></div>
     {/if}
+    <section class="minimap-card" aria-label="Bird-eye viewpoint minimap">
+      <header><span>Bird-eye minimap</span><b>{selectedViewpointId || '—'}</b></header>
+      <div class="minimap-grid">
+        {#if overviewLoading}<span class="minimap-loading">Loading map…</span>
+        {:else if overview}<MiniMap {overview} {selectedFrameId} traversabilityUrl={overview.traversability_available ? overviewTraversabilityUrl(selectedDatasetId) : ""} onSelect={selectMiniMapPose} />
+        {:else}<span class="minimap-loading">Map unavailable</span>{/if}
+      </div>
+    </section>
+
     <label>Find viewpoint<input placeholder="vp_000002" bind:value={search} /></label>
     <div class="view-list">
       {#each filteredViewpoints as view}
@@ -608,92 +834,134 @@
         {:else}<div class="empty">Overview unavailable.</div>{/if}
       </section>
     {:else}
-    <div class="framebar">
-        <button onclick={() => stepFrame(-1)}>←</button>
-      <div class="navigator-mode" aria-label="Frame grouping mode">
-        <button class:active={headingNavigationMode === 'heading'} onclick={() => setHeadingNavigationMode('heading')}>Group by heading</button>
-        <button class:active={headingNavigationMode === 'lighting'} onclick={() => setHeadingNavigationMode('lighting')}>Group by lighting</button>
-      </div>
-      {#if headingNavigationMode === 'heading'}
-        <div class="headings" aria-label="Physical camera headings">
-          {#each visibleHeadingGroups as group}<button class:active={group.heading_key === selectedHeadingKey} onclick={() => selectHeading(group.heading_key)} title={group.anchor_id ? `anchor ${group.anchor_id}` : ''}>{group.heading_deg}°{#if group.anchor_id} · {group.anchor_id.slice(0, 8)}{/if}<small>{group.frames.length} lighting</small></button>{/each}
-        </div>
-      {:else}
-        <div class="headings lighting-groups" aria-label="Lighting condition groups">
-          {#each lightingHeadingGroups as group}<button class:active={group.lightingId === selectedLightingId} onclick={() => selectLightingGroup(group.lightingId)}><b>{group.lightingId.replace(/_v1$/, '').replaceAll('_', ' ')}</b><small>{group.headings.length} headings · {group.frames.length} frames</small></button>{/each}
-        </div>
-      {/if}
-      <button onclick={() => stepFrame(1)}>→</button>
-    </div>
-    <div class="lighting-filterbar">
-      <span>Physical headings <b>{headingGroups.length}</b></span>
-      <span>Lighting captures <b>{lightingIds.length || 1}</b></span>
-      <label>Show lighting
-        <select value={frameLightingFilter} onchange={(event) => setFrameLightingFilter(event.currentTarget.value)}>
-          <option value="all">All conditions</option>
-          {#each lightingIds as lighting}<option value={lighting}>{lighting.replace(/_v1$/, '').replaceAll('_', ' ')}</option>{/each}
-        </select>
-      </label>
-    </div>
-    {#if headingNavigationMode === 'lighting' && selectedLightingGroup}
-      <div class="lightingbar"><span>Headings <small>({selectedLightingGroup.lightingId.replace(/_v1$/, '').replaceAll('_', ' ')})</small></span>{#each selectedLightingGroup.headings as group}<button class:active={group.heading_key === selectedHeadingKey} onclick={() => { frameLightingFilter = selectedLightingGroup.lightingId; selectHeading(group.heading_key); }}>{group.heading_deg}°<small>{group.frames.length} frame</small></button>{/each}</div>
-    {:else if selectedHeading}
-      <div class="lightingbar"><span>Lighting condition <small>(heading fixed)</small></span>{#each selectedHeading.frames as frame}<button class:active={(frame.lighting_id || 'legacy') === selectedLightingId} onclick={() => selectLighting(frame.lighting_id || 'legacy')} title={frame.frame_id}>{(frame.lighting_id || 'legacy').replace(/_v1$/, '').replaceAll('_', ' ')}</button>{/each}</div>
-    {/if}
-
-    <div class="toolbar">
-      <span class="frame-title">{selectedFrameId || 'No frame'}</span>
-      <label>EV <input type="range" min="-8" max="8" step="0.25" bind:value={controls.ev} onpointerdown={beginControlDrag} onpointerup={endControlDrag} onpointercancel={endControlDrag} /><output>{Number(controls.ev).toFixed(2)}</output></label>
-      <label>Depth max <input type="number" min="0.1" step="0.5" bind:value={controls.maximum} /></label>
-      <label>Overlay <select bind:value={controls.overlay}><option value="">None</option>{#each maskModalities as name}<option value={name}>{name}</option>{/each}</select></label>
-      <label>Opacity <input type="range" min="0" max="1" step="0.05" bind:value={controls.overlayOpacity} onpointerdown={beginControlDrag} onpointerup={endControlDrag} onpointercancel={endControlDrag} /></label>
-      <button onclick={resetView}>Reset view (0)</button>
-      <button onclick={() => { metadataOpen = !metadataOpen; if (metadataOpen) { void ensureDatasetDetail(); void ensureFrameDetail(); } }}>Metadata</button>
-    </div>
-
-    <nav class="modalities">
-      {#each groups as group}
-        <div><span>{group.label}</span>{#each group.modalities as name}
-          <button class:active={name === modality} onclick={() => setModality(name)} title={name}>{modalityLabel(name)}</button>
-          <button class="pin" class:pinned={pinned.includes(name)} title="Toggle comparison" onclick={() => togglePinned(name)}>+</button>
-        {/each}</div>
-      {/each}
-      {#if groups.length === 0 && datasetModalities.length === 0}
-        <span class="modalities-empty">No modality metadata yet; select a frame to load available artifacts.</span>
-      {/if}
-    </nav>
-    {#if frameDetail?.legacy_diffuse_warning}
-      <p class="legacy-warning">{frameDetail.legacy_diffuse_warning}</p>
-    {/if}
-
-    {#if selectedDataset && selectedFrameId}
-      <div class="primary-view">
-        <ImagePanel title={modalityLabel(modality)} url={imageUrl(modality, 'primary')} fallbackUrl={imageUrl(modality, 'comparison')} width={imageWidth} height={imageHeight} eager
-          available={artifactAvailable(modality)} {transform} {cursor}
-          onTransform={(value) => transform = value} onProbe={probe} onPreviewLoaded={recordPreview} />
-        <aside class="pixel-panel">
-          <h3>Raw pixel</h3>
-          {#if pixelData}
-            <div class="coords">x {pixelData.x} · y {pixelData.y}</div>
-            {#each Object.entries(pixelData.values) as [name, item]}
-              <div class="pixel-row"><span title={name}>{modalityLabel(name)}</span><b>{item.available ? valueText(item.value) : '—'}</b><small>{item.unit ?? ''}</small></div>
-            {/each}
-          {:else}<p>Click an image to inspect exact source values.</p>{/if}
-        </aside>
-      </div>
-      <section class="compare-section">
-        <header><h2>Synced comparison</h2><span>{comparisonPinned.length}/5 additional modalities</span></header>
-        <div class="compare-grid">
-          {#each comparisonPinned as name}
-            <ImagePanel title={modalityLabel(name)} url={imageUrl(name, 'comparison')} width={imageWidth} height={imageHeight}
-              available={artifactAvailable(name)} {transform} {cursor}
-              onTransform={(value) => transform = value} onProbe={probe} />
+      <nav class="modalities canvas-modalities" aria-label="Render modalities">
+        <div class="modality-groups">
+          {#each groups as group}
+            {#if modalitiesExpanded || group.id === 'observation' || group.id === 'pbr'}
+              <section class="modality-group"><span>{group.label}</span><div class="modality-options">{#each group.modalities as name}
+                <span class="modality-choice"><button class:active={name === modality} onclick={() => setModality(name)} title={name}>{modalityLabel(name)}</button><button class="pin" class:pinned={pinned.includes(name)} title={`${pinned.includes(name) ? 'Remove' : 'Add'} ${modalityLabel(name)} comparison`} onclick={() => togglePinned(name)}>+</button></span>
+              {/each}</div></section>
+            {/if}
           {/each}
         </div>
-      </section>
-    {:else if busy && !selectedDataset}<div class="empty">Loading dataset catalog…</div>
-    {:else if !selectedDataset}<div class="empty">No compatible Principled v2 dataset found.</div>
-    {:else if !selectedFrameId}<div class="empty">This dataset has no selectable frame.</div>{/if}
+        {#if groups.some((group) => group.id !== 'observation' && group.id !== 'pbr')}
+          <button class="modality-more" onclick={() => modalitiesExpanded = !modalitiesExpanded} aria-expanded={modalitiesExpanded}><span>{modalitiesExpanded ? '⌃' : '⌄'}</span>{modalitiesExpanded ? 'Geometry · ID · Mask · Diffuse 접기' : 'Geometry · ID · Mask · Diffuse 더 보기'}</button>
+        {/if}
+        {#if groups.length === 0 && datasetModalities.length === 0}
+          <span class="modalities-empty">No modality metadata yet; select a frame to load available artifacts.</span>
+        {/if}
+      </nav>
+      {#if frameDetail?.legacy_diffuse_warning}
+        <p class="legacy-warning">{frameDetail.legacy_diffuse_warning}</p>
+      {/if}
+
+      {#if selectedDataset && selectedFrameId}
+        <section class="canvas-layout">
+          <div class="canvas-column">
+            <section class="sync-strip">
+              <header><b>Synced</b><span>{comparisonPinned.length}/5 pinned modalities</span></header>
+              <div class="sync-cards">
+                {#each comparisonPinned as name}
+                  <button class:active={name === modality} onclick={() => setModality(name)} title={modalityLabel(name)}>
+                    <img src={imageUrl(name, 'comparison')} alt={modalityLabel(name)} />
+                    <span>{modalityLabel(name)}</span>
+                  </button>
+                {/each}
+                {#if comparisonPinned.length === 0}<p>Pin modalities above to compare them with this pose.</p>{/if}
+              </div>
+            </section>
+
+            <section class="canvas-main" class:dual={Boolean(comparisonPinned[0])}>
+              <ImagePanel title={modalityLabel(modality)} url={imageUrl(modality, 'primary')} fallbackUrl={imageUrl(modality, 'comparison')} width={imageWidth} height={imageHeight} eager
+                available={artifactAvailable(modality)} {transform} {cursor}
+                onTransform={(value) => transform = value} onProbe={probe} onPreviewLoaded={recordPreview} />
+              {#if comparisonPinned[0]}
+                {@const secondary = comparisonPinned[0]}
+                <div class="secondary-main-panel">
+                  <ImagePanel title={modalityLabel(secondary)} url={imageUrl(secondary, 'comparison')} width={imageWidth} height={imageHeight}
+                    available={artifactAvailable(secondary)} {transform} {cursor}
+                    onTransform={(value) => transform = value} onProbe={probe} />
+                </div>
+              {/if}
+            </section>
+
+            <details class="comparison-details">
+              <summary>Detailed synced comparison <span>{comparisonPinned.length} modalities</span></summary>
+              <div class="compare-grid">
+                {#each comparisonPinned as name}
+                  <ImagePanel title={modalityLabel(name)} url={imageUrl(name, 'comparison')} width={imageWidth} height={imageHeight}
+                    available={artifactAvailable(name)} {transform} {cursor}
+                    onTransform={(value) => transform = value} onProbe={probe} />
+                {/each}
+              </div>
+            </details>
+          </div>
+
+          <aside class="selection-rail" aria-label="Camera and lighting selection">
+            <section class="heading-rail" class:object-orbit={objectOrbitMode}>
+              <header><div><span>{objectOrbitMode ? 'Object orbit' : 'Camera heading'}</span>{#if objectOrbitMode}<small class="orbit-target" title={orbitAnchorId}>around {orbitTargetLabel}</small>{/if}</div><b>{selectedHeading?.heading_deg ?? '—'}°</b></header>
+              <div class="compass-scrubber" class:dragging={headingPointerId !== null} role="group" aria-label={objectOrbitMode ? 'Object orbit scrubber' : 'Camera heading scrubber'} onpointerdown={startHeadingDrag} onpointermove={moveHeadingDrag} onpointerup={endHeadingDrag} onpointercancel={endHeadingDrag} onwheel={wheelHeading}>
+                <div class="compass-track" style:transform={compassTrackOffset(displayHeadingDeg)}>
+                  {#each compassTurns as turn}
+                    {#each Array.from({ length: 24 }) as _, index}<span class:major={index % 3 === 0} style:left={rulerPosition(index * 15, turn)}>{compassLabel(index)}</span>{/each}
+                    {#each compassHeadingGroups as group}<button class="heading-marker" class:active={group.heading_key === selectedHeadingKey} class:magnetized={isMagnetized(group)} style:left={rulerPosition(group.heading_deg, turn)} onclick={(event) => { event.stopPropagation(); animateHeading(group.heading_deg); }} title={`${objectOrbitMode ? 'Orbit angle' : 'Heading'} ${group.heading_deg}°`}>{group.heading_deg}°</button>{/each}
+                  {/each}
+                </div>
+                <i aria-hidden="true"></i>
+              </div>
+            </section>
+
+            <section class="rail-card lighting-rail">
+              <header><div><b>Lighting variations</b><small>{headingNavigationMode === 'heading' ? 'same pose' : 'selected lighting'}</small></div><label>Filter <select value={frameLightingFilter} onchange={(event) => setFrameLightingFilter(event.currentTarget.value)}><option value="all">All</option>{#each lightingIds as lighting}<option value={lighting}>{lighting.replace(/_v1$/, '').replaceAll('_', ' ')}</option>{/each}</select></label></header>
+              <div class="lighting-card-list">
+                {#if headingNavigationMode === 'lighting' && selectedLightingGroup}
+                  {#each selectedLightingGroup.headings as group}
+                    {@const cardFrame = group.frames[0]}
+                    <button class:active={group.heading_key === selectedHeadingKey} onclick={() => { frameLightingFilter = selectedLightingGroup.lightingId; selectHeading(group.heading_key); }}>
+                      <img src={previewUrl(selectedDatasetId, cardFrame.frame_id, 'rgb', previewControls, 'comparison', 'comparison')} alt={String(group.heading_deg) + ' degree preview'} />
+                      <span>{objectOrbitMode ? `Orbit ${group.heading_deg}°` : `${group.heading_deg}°`}</span><small>{selectedLightingGroup.lightingId.replace(/_v1$/, '').replaceAll('_', ' ')}</small>
+                    </button>
+                  {/each}
+                {:else if selectedHeading}
+                  {#each selectedHeading.frames as frame}
+                    <button class:active={(frame.lighting_id || 'legacy') === selectedLightingId} onclick={() => selectLighting(frame.lighting_id || 'legacy')}>
+                      <img src={previewUrl(selectedDatasetId, frame.frame_id, 'rgb', previewControls, 'comparison', 'comparison')} alt={(frame.lighting_id || 'legacy') + ' preview'} />
+                      <span>{(frame.lighting_id || 'legacy').replace(/_v1$/, '').replaceAll('_', ' ')}</span><small>rgb</small>
+                    </button>
+                  {/each}
+                {/if}
+              </div>
+            </section>
+
+            <details class="rail-pixel" bind:open={pixelPanelOpen}>
+              <summary>Raw pixel inspection</summary>
+              {#if pixelData}
+                <div class="coords">x {pixelData.x} · y {pixelData.y}</div>
+                {#each Object.entries(pixelData.values) as [name, item]}
+                  <div class="pixel-row"><span title={name}>{modalityLabel(name)}</span><b>{item.available ? valueText(item.value) : '—'}</b><small>{item.unit ?? ''}</small></div>
+                {/each}
+              {:else}<p>Click the preview to inspect exact source values.</p>{/if}
+            </details>
+          </aside>
+        </section>
+
+        {#if toolbarOpen}
+          <div class="toolbar canvas-toolbar">
+            <span class="frame-title">{selectedFrameId || 'No frame'}</span>
+            <label>EV <input type="range" min="-8" max="8" step="0.25" bind:value={controls.ev} onpointerdown={beginControlDrag} onpointerup={endControlDrag} onpointercancel={endControlDrag} /><output>{Number(controls.ev).toFixed(2)}</output></label>
+            <label>Depth max <input type="number" min="0.1" step="0.5" bind:value={controls.maximum} /></label>
+            <label>Overlay <select bind:value={controls.overlay}><option value="">None</option>{#each maskModalities as name}<option value={name}>{name}</option>{/each}</select></label>
+            <label>Opacity <input type="range" min="0" max="1" step="0.05" bind:value={controls.overlayOpacity} onpointerdown={beginControlDrag} onpointerup={endControlDrag} onpointercancel={endControlDrag} /></label>
+            <button onclick={resetView}>Reset view (0)</button>
+            <button onclick={() => { metadataOpen = !metadataOpen; if (metadataOpen) { void ensureDatasetDetail(); void ensureFrameDetail(); } }}>Metadata</button>
+            <button class="toolbar-close" title="Hide controls" onclick={() => toolbarOpen = false}>×</button>
+          </div>
+        {:else}
+          <button class="toolbar-reopen" onclick={() => toolbarOpen = true}>⌃ Controls</button>
+        {/if}
+      {:else if busy && !selectedDataset}<div class="empty">Loading dataset catalog…</div>
+      {:else if !selectedDataset}<div class="empty">No compatible Principled v2 dataset found.</div>
+      {:else if !selectedFrameId}<div class="empty">This dataset has no selectable frame.</div>{/if}
     {/if}
   </section>
 
