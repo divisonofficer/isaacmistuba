@@ -38,7 +38,8 @@ cannot be moved between worktrees: close it and recreate with
 orca-ide orchestration send --run run_08a9cc052de7 --to <terminal handle> \
   --type status --subject "<one line>" --body "<text>" --json
 ```
-Terminal-handle mailboxes are not durable across terminal close. A recipient reads with
+Terminal-handle mailboxes are not durable across terminal close, and an empty mailbox reads
+exactly like a dead one; confirmed bidirectional 2026-09-21 06:40Z (DIRECTOR ↔ INFINIGEN). A recipient reads with
 `orca-ide orchestration check --terminal <own handle> --json`; Claude sessions do not read
 Orca mail on their own, so pair the first Orca message with a cross-session ping, or ask the
 agent to check at its natural checkpoints.

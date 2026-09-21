@@ -62,7 +62,8 @@ last_reviewed: 2026-09-21
 7. Infinigen: delete 62 superseded dataset versions (41 scenes)? And the 229 GB /bean duplicate: is a published dataset a fixed snapshot or a live copy? The work copy has 20.9 GB passive NIR the published one lacks, so a blind dedupe loses a channel. Director recommends: snapshot semantics, then migrate the passive NIR into the published copy before deleting the work copy.
 8. `.agents/` is untracked in git and world-writable (inherited NAS mode 777). Commit it? Tighten mode?
 4. Infinigen scripts orphan: 7 modified + 6 untracked files are NOT the Infinigen orchester's (only one mesh_decimation hunk is). Owner unknown, mtime 2026-09-09. Assign or drop?
-5. 341 stale `.import.lock`, /bean tier-D 34 GB cleanup.
+5. Infinigen: run the statistics backfill (rewrites 111 sidecars under the corrected density rule) before any tier-based archive? Director recommends yes, with a pre-backfill copy of the 111 sidecars: without it 103 of 104 tier-D datasets are unmeasured, and the archiver moves data by tier.
+6. 341 stale `.import.lock`, /bean tier-D 34 GB cleanup.
 
 ## Template for a new agent.md
 ```

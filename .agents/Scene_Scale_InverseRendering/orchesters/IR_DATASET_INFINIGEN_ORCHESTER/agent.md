@@ -42,6 +42,11 @@ status: adopted (remit confirmed by the session 2026-09-21 05:05Z)
   3 takes/room), free-pose format, no renderer change. Not rendered; all 8 GPUs claimed.
 
 ## Pending user decisions (recorded in /bean/ir_dataset_work/.control/)
+- Review-tier assignment, dry run over 142 datasets: A 30 / B 2 / C 6 / D 104. 103 of the D's are
+  "not measured" (no statistics sidecar), not judged sparse, and carry deprecation_candidate=false
+  since d63a93f; one is a measured D. archive_ir_review_tier.py moves data by tier, so nothing runs
+  until the statistics backfill question is answered: it would rewrite 111 existing sidecars under the
+  corrected density rule and resolve ~91 of the 103. Nothing written yet.
 - 62 superseded dataset versions across 41 scenes: delete?
 - 229 GB duplicated between /bean/ir_dataset and /bean/ir_dataset_work. NOT a clean duplicate: the
   work copy holds 20.9 GB of passive NIR the published copy lacks. Deleting on name+fingerprint match
