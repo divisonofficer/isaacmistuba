@@ -24,9 +24,13 @@ last_reviewed: 2026-09-21
 - Own memory-IR v13 training (volume pose-query PBR, worktree scene_ir_ff_v13) and its evals.
 - Decide corpus mix; consumes HSSD render_hover_v1 (.done scenes) and ABO corpora.
 - Current: epoch 7/20 on GPUs 4,5,7 (bf16 held-out eval finished; GPU 5 back to training only).
-- Consumes: HSSD render_hover_v1 (42 pinned .done scenes), abo_cornell_v1, abo_cornell_video_v1
-  (manifest v3). abo_cornell_env_v1 (ABO orchester's current 50-scene corpus) not yet consumed;
-  name relation being confirmed with ABO orchester.
+- Consumes: HSSD render_hover_v1 (42 pinned .done scenes) and abo_cornell_video_v1 (manifest v3),
+  plus an ABO set it recorded as "abo_cornell_v1", which does not exist on disk; confirm the path the
+  run actually read (probably abo_cornell_v2) and correct the name in the manifests.
+- Not yet consumed: abo_cornell_env_v1 (/bean/ir_dataset/abo_cornell_env_v1, 50 scenes, ~3,400 frames
+  when done). New data, no overlap with abo_cornell_video_v1; frame-id prefixes differ
+  (hssd_abo_env_ vs hssd_abo_cornell_) so both merge into one index. Discriminate on manifest key
+  `environment_type`, not composer_version (unchanged on purpose).
 - Manifests v3 pinned to 42 done HSSD scenes until HSSD orchester reports completion.
 
 ## Resources

@@ -12,5 +12,8 @@ environments) and train memory-IR models on them (scene_ir_ff, memory_ir).
 
 Workers: SONNET_WORKER_1 and SONNET_WORKER_2 from `../shared_workers/`.
 
+ABO corpora on /bean/ir_dataset: abo_cornell_v2, abo_cornell_video_v1, abo_cornell_env_v1;
+`abo_v1` is an object index, not a corpus; `abo_cornell_v1` does not exist.
+
 Dependency chain: HSSD/ABO .done scenes → v3 manifests → v13 training. Corpus
 orchesters must notify IR_PIPELINE_ORCHESTER before removing any .done scene.
