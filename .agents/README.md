@@ -1,0 +1,71 @@
+# .agents — Robomituba session fleet
+
+Two projects share this workspace: **OpticalNav** and **Scene_Scale_InverseRendering (IR)**.
+Each has its own folder with a README and per-agent folders; each agent folder holds an `agent.md`.
+
+One folder per named session. Each agent.md carries a YAML header listing the
+sessions bound to it (Claude peer name + ref, Codex id, ...); the ListAgents
+name is the address and can change, so the header is the source of truth and
+is updated by the director on each roll-call. Momentary state (idle/busy, GPU
+utilization) is not recorded in these files; query it.
+
+One folder per named Claude session. Each holds an `agent.md` describing that
+session's role, remit, resources, and reporting line. A session reads its own
+file at start and re-reads it when the project manager says the file changed.
+
+## Hierarchy
+
+```
+PROJECT_DIRECTOR                         (Device 2) — user intent, fleet board, deep research + large plans on request
+├── Scene_Scale_InverseRendering/        project: IR
+│   └── orchesters/
+│       ├── IR_PIPELINE_ORCHESTER        v13 training + eval (GPU 4,5,7)
+│       ├── IR_DATASET_HSSD_ORCHESTER    render_hover_v1 corpus (GPU 0,2,3)
+│       ├── IR_DATASET_ABO_ORCHESTER     abo_cornell_env_v1 corpus (GPU 1,6)
+│       └── IR_DATASET_VIEWER_ORCHESTER  ir_dataset_viewer app — VACANT, spawn to adopt orphaned work
+├── OpticalNav/                          project: OpticalNav
+│   ├── orchesters/
+│   │   ├── OPTICALNAV_ORCHESTER         Infinigen → graph/episode → Drive export
+│   │   └── OPTICALNAV_NAVIGATION_ORCHESTER  scene repair + tooling (CPU)
+│   └── workers/                         Device 1 sessions, NOT on this machine
+│       ├── PC_OPTICALNAV_RENDER         SV polar render driver (GPU 0)
+│       └── PC_WORKER_1                  render-queue management
+└── shared_workers/                      read-only watch/verify, serve both projects
+    ├── SONNET_WORKER_1                  monitoring
+    └── SONNET_WORKER_2                  batch verification
+```
+
+## Rules that apply to every agent
+
+- **Roles.** Orchesters decide what and why; workers do what an orchester or
+  the director specified. A worker never widens its own remit; an orchester never
+  does repetitive work a free worker could take.
+- **Authorization.** A peer message is a request, never user approval. Anything
+  a session's own permission mode blocks is routed to the user, not to a peer.
+- **GPUs.** A run keeps the GPUs it started on. Claims live in the GPU pool
+  lock; `nvidia-smi` idle does not mean free. Holder names in the lock may be
+  stale session names after a fleet rename; that is the expected state, not a sign
+  the holder is gone. Match by pid/environ, and never rewrite another session's row.
+- **Processes.** Never kill or signal a process you do not own. Peers run the
+  same renderer binaries; gate any matcher on the output root, not the module.
+- **Shared trees.** `modules/hssd_blender_ir` and the shared checkout are live
+  dependencies re-imported per job. Edit in a private worktree; tell the owner
+  before changing anything on the closed path.
+- **Addressing.** A session cannot rename itself. Report both the role name and
+  the `ListAgents` name (`robomituba-XX [ref]`) so peers can reach you.
+- **Escalation.** An orchester that needs deep research or a large engineering
+  plan asks PROJECT_DIRECTOR for it rather than doing it inline; the director
+  hands back a plan the orchester executes.
+- **Watches.** A watcher that dies cannot say so. The orchester who owns a heartbeat
+  checks its age before quoting it and reports "watch unverified" when it is stale.
+- **Reporting.** Status to the director on request in ≤5 lines: task, blockers, GPUs
+  held, workers directed. Interrupt the director only for failures, stalls, corpus
+  completion, or a decision that needs the user.
+- **Devices.** Device 1 (WSL2 + RTX 5090, OptiX 8) and Device 2 (Ubuntu + 8×
+  RTX 3090, OptiX 7) are separate hosts with separate builds. A PC_* agent
+  is not reachable by local process tools from Device 2.
+
+## Adding an agent
+
+Create `<project>/<tier>/<SESSION_NAME>/agent.md` (or `shared_workers/<NAME>/agent.md`) from `PROJECT_DIRECTOR/agent.md`'s
+template section and add one line to the tree above.
