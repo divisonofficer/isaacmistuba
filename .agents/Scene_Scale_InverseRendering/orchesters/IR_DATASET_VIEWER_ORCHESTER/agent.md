@@ -106,6 +106,11 @@ has reviewed or adopted the work. You inherit it.
    Item 5's wait is over: do 3(a)-(c) for the viewer diff now, then item 4. Verify green yourself
    first (`python3 -m pytest apps/ir_dataset_viewer/tests`); if not green, stop and mail me.
 
+7. 2026-09-21 06:55Z — Directive 6 done: c32b015 / cfb8aa0 / 6a84c30, report 02024e1, 121 tests
+   + check + build green, :8780 not restarted (no clients; cold /api/datasets 7 s is the NFS catalog
+   scan). Accepted. Next: none until the director assigns; the :8780 restart is the Infinigen
+   orchester's call as server owner.
+
 ## Resources
 - No GPU claim. The viewer's render queue can request up to 3 GPUs per dataset via the daemon;
   do not enable that path without a lock claim agreed with the director.

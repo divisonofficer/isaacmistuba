@@ -49,12 +49,12 @@ last_reviewed: 2026-09-21
 | OPTICALNAV_NAVIGATION_ORCHESTER | idle, 2 user decisions pending | none | none |
 | IR_DATASET_INFINIGEN_ORCHESTER | apartment hover takes built, unrendered (no GPUs); 2 cleanup decisions pending | none | none |
 | IR_DATASET_INFINIGEN_ORCHESTER | apartment hover takes ready, blocked on GPUs; corpus dedup needs a contract answer from director | none | none |
-| IR_DATASET_VIEWER_ORCHESTER | Codex (gpt-5.6-terra), run 1 done: verified, nothing committed, 3 tests blocked on orphaned queue-script change; directive 2-4 pending resume | none | none |
+| IR_DATASET_VIEWER_ORCHESTER | Codex: orphaned viewer work COMMITTED 06:55Z (c32b015, cfb8aa0, 6a84c30; report 02024e1); 121 tests, check, build pass; :8780 healthy (cold /api/datasets 7 s = NFS scan, not hung) | none | none |
 | PC_OPTICALNAV_RENDER | 20272904 perturbed_active_polar 12%, ETA 09:05Z | Device 1 GPU 0 | — |
 | PC_WORKER_1 | queue complete, free (user-assigned only) | Device 1 | — |
 
 ## Open items for the user
-1. Orphaned ir_dataset_viewer work: adopted by Codex. User resumes the thread when directed; director writes directives into the role file.
+1. RESOLVED: orphaned ir_dataset_viewer work committed by the Codex viewer thread (c32b015, cfb8aa0, 6a84c30). Remaining: whether to restart :8780 (pid 2997224, stale code, healthy) so it serves the committed code — owner is IR_DATASET_INFINIGEN_ORCHESTER.
 2. HSSD: ~98 GB v3 blends deletion, blocked until render_hover_v1 stops reading them.
 3. Navigation: verify 20273004 graph regen result (in-room node count pre-dates wall restore), and whether to commit 4 tool files.
 5. RESOLVED by user: GPUs 4,5,7 swapped to v14a at v13 epoch 8. v13's ep7 numbers are the baseline.
