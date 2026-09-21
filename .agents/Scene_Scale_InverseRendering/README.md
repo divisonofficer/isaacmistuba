@@ -8,6 +8,7 @@ environments) and train memory-IR models on them (scene_ir_ff, memory_ir).
 | IR_PIPELINE_ORCHESTER | v13 training + eval; corpus consumer | 4,5,7 |
 | IR_DATASET_HSSD_ORCHESTER | render_hover_v1 corpus, hssd_blender_ir tree | 0,2,3 |
 | IR_DATASET_ABO_ORCHESTER | abo_cornell_env_v1 corpus | 1,6 |
+| IR_DATASET_INFINIGEN_ORCHESTER | Infinigen-sourced IR corpus: generate, import, stage, render, review tooling | none |
 | IR_DATASET_VIEWER_ORCHESTER | apps/ir_dataset_viewer (Codex thread) | none |
 | IR_DATASET_INFINIGEN_ORCHESTER | Infinigen IR corpora, scripts/infinigen_*, import tooling | none |
 

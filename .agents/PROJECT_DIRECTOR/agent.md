@@ -46,6 +46,7 @@ last_reviewed: 2026-09-21
 | OPTICALNAV_ORCHESTER | idle, waiting on Device 1 renders of 20267404, 20272904 | none (daemon :8765 idle) | SONNET_WORKER_1 |
 | OPTICALNAV_NAVIGATION_ORCHESTER | idle, 2 user decisions pending | none | none |
 | IR_DATASET_INFINIGEN_ORCHESTER | apartment hover takes built, unrendered (no GPUs); 2 cleanup decisions pending | none | none |
+| IR_DATASET_INFINIGEN_ORCHESTER | apartment hover takes ready, blocked on GPUs; corpus dedup needs a contract answer from director | none | none |
 | IR_DATASET_VIEWER_ORCHESTER | Codex (gpt-5.6-terra), run 1 done: verified, nothing committed, 3 tests blocked on orphaned queue-script change; directive 2-4 pending resume | none | none |
 | PC_OPTICALNAV_RENDER | 20272904 perturbed_active_polar 12%, ETA 09:05Z | Device 1 GPU 0 | — |
 | PC_WORKER_1 | queue complete, free (user-assigned only) | Device 1 | — |
