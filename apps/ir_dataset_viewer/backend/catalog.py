@@ -773,11 +773,16 @@ class DatasetCatalog:
             lighting = row.get("lighting") or {}
             lighting_id = str(lighting.get("id") or "legacy")
             anchor_id = str(row.get("anchor_id") or lighting.get("anchor_id") or "")
+            camera = row.get("camera") or {}
+            capture_kind = str(row.get("capture_kind") or lighting.get("capture_kind") or "")
+            camera_pose_source = str(camera.get("pose_source") or "")
             heading = float(row.get("heading_deg") or 0.0)
             pose_key = f"{heading % 360.0:.6f}|{anchor_id}"
             grouped[viewpoint].append({
                 "frame_id": row["frame_id"], "heading_deg": heading,
                 "lighting_id": lighting_id, "anchor_id": anchor_id or None,
+                "capture_kind": capture_kind or None,
+                "camera_pose_source": camera_pose_source or None,
                 "pose_key": pose_key, "available": _declared_modalities(paths),
             })
         viewpoints = []

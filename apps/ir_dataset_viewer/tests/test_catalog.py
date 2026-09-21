@@ -100,6 +100,22 @@ def test_catalog_deduplicates_by_fingerprint_and_prefers_bean(tmp_path: Path) ->
     assert viewpoints[0]["frames"][0]["frame_id"] == "vp_000001__h_000"
 
 
+def test_browse_compact_frames_expose_object_orbit_metadata(tmp_path: Path) -> None:
+    root = tmp_path / "datasets"; dataset = _fixture(root)
+    row = json.loads((dataset / "index.jsonl").read_text(encoding="utf-8"))
+    row.update({"viewpoint_id": "orbit:obj:Cabinet_01", "capture_kind": "orbit"})
+    row["camera"] = {"pose_source": "object_orbit_6dof"}
+    row["lighting"] = {"id": "reference_neutral_v1", "anchor_id": "obj:Cabinet_01", "capture_kind": "orbit"}
+    (dataset / "index.jsonl").write_text(json.dumps(row) + "\n", encoding="utf-8")
+
+    catalog = DatasetCatalog([("out", root)], ttl_s=0)
+    dataset_id = catalog.list_payload(force=True)["datasets"][0]["dataset_id"]
+    frame = catalog.browse_payload(dataset_id)["viewpoints"][0]["frames"][0]
+    assert frame["capture_kind"] == "orbit"
+    assert frame["camera_pose_source"] == "object_orbit_6dof"
+    assert frame["anchor_id"] == "obj:Cabinet_01"
+
+
 def test_catalog_accepts_v3_and_keeps_v2_legacy_semantics_visible(tmp_path: Path) -> None:
     v3 = _fixture(tmp_path, "v3", "3" * 64, version=3)
     v2 = _fixture(tmp_path, "v2", "2" * 64, version=2)
