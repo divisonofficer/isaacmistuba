@@ -71,7 +71,9 @@ PROJECT_DIRECTOR                         (Device 2) — user intent, fleet board
 
 ## Session policy (2026-09-21)
 - Every local Claude session runs inside an Orca terminal (`tools/orca_adopt.sh`) with Remote
-  Control on. Both launchers start sessions through `claude remote-control`, never plain `claude`.
+  Control on. `~/.claude/settings.json` sets `remoteControlAtStartup: true`, so every new
+  session on this host starts with it; a session started before that flag runs `/rc` once.
+  Both launchers also go through `claude remote-control` so the flag is not the only guard.
 
 ## Tooling policy (2026-09-21)
 
