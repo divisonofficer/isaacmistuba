@@ -91,7 +91,8 @@ for any that are down. It reattaches to the last known session id from
 `--list` shows state, `--dry-run` shows what would launch, `--once NAME` limits to one agent.
 Run it by hand or from cron; it never stops or restarts a live session.
 Caveats: `claude remote-control` asks for a spawn mode interactively, so the script passes
-`--spawn=same-dir`. `--name` names the Remote Control environment; the peer name other
+`--spawn=session` (classic single-session mode, which is how the fleet's sessions appear on
+claude.ai; same-dir/worktree modes create a spawn environment instead). `--name` names the Remote Control environment; the peer name other
 sessions message stays derived (`robomituba-XX`) until that session runs `/rename <NAME>`,
 so the first message to a relaunched agent should ask it to rename itself.
 

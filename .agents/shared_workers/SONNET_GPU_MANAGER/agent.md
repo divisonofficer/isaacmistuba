@@ -7,9 +7,9 @@ bound_sessions:
     since: 2026-09-21
     status: ended
   - kind: claude-peer
-    name: robomituba-97   # relaunched by ensure_sessions.sh 03:42Z; fresh transcript, no task yet;
-    ref: 2314939          # needs /rename SONNET_GPU_MANAGER typed by the user in that session
-    address: uds:/tmp/cc-socks/2314939.sock
+    name: robomituba-51   # relaunched 04:45Z with --spawn=session; fresh transcript, no task yet;
+    ref: 2345689          # needs /rename SONNET_GPU_MANAGER typed by the user in that session
+    address: uds:/tmp/cc-socks/2345689.sock
     since: 2026-09-21
     status: active-unassigned
 codex_sessions: []

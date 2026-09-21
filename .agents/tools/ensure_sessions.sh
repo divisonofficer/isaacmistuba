@@ -104,10 +104,10 @@ launch() {
   local name="$1" sid tmux_name cmd
   sid="$(known_session_id "$name")"
   tmux_name="agent_${name}"
-  cmd="cd $FLEET_ROOT && claude remote-control --spawn=same-dir --name $name"
+  cmd="cd $FLEET_ROOT && claude remote-control --spawn=session --name $name"
   [ -n "$sid" ] && cmd="$cmd --session-id $sid"
   # If reattach by id is refused (expired, moved), fall back to a fresh session.
-  cmd="$cmd || (echo 'reattach failed, starting fresh' && cd $FLEET_ROOT && claude remote-control --spawn=same-dir --name $name)"
+  cmd="$cmd || (echo 'reattach failed, starting fresh' && cd $FLEET_ROOT && claude remote-control --spawn=session --name $name)"
   if tmux has-session -t "$tmux_name" 2>/dev/null; then
     echo "  tmux $tmux_name exists but no live session registered; leaving it (inspect manually)"
     return
