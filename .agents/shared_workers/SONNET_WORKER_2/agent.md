@@ -24,5 +24,10 @@ last_reviewed: 2026-09-21
 - HSSD .done corpus (49 scenes): sweep running; re-run at corpus completion.
 - Scripts live in session scratchpad, not the repo.
 
+## Tooling
+- ponytail, codebase-memory-mcp: allowed.
+- headroom: allowed in trial mode under the README's conditions (learn off, no repo writes,
+  localhost proxy, one-week report to the director).
+
 ## Does not
 - Edit files, kill processes, or touch .done/.coat/.claim.

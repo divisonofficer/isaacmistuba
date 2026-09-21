@@ -25,5 +25,10 @@ last_reviewed: 2026-09-21
 - Tail, poll, re-verify, report on change. Interrupt only on failure, stall, or completion.
 - Before taking a watch, confirm with SONNET_WORKER_2 it is not already taken.
 
+## Tooling
+- ponytail, codebase-memory-mcp: allowed.
+- headroom: allowed in trial mode under the README's conditions (learn off, no repo writes,
+  localhost proxy, one-week report to the director).
+
 ## Does not
 - Edit files, kill processes, or touch .done/.coat/.claim. File edits need the user.

@@ -65,6 +65,21 @@ PROJECT_DIRECTOR                         (Device 2) — user intent, fleet board
   RTX 3090, OptiX 7) are separate hosts with separate builds. A PC_* agent
   is not reachable by local process tools from Device 2.
 
+## Tooling policy (2026-09-21)
+
+- **ponytail** and **codebase-memory-mcp**: allowed in every session. codebase-memory's
+  indexer leaks `db.stage` copies into `/root/.cache`; clean anything older than 60 min.
+- **headroom**: shared_workers only, in trial mode. Conditions:
+  1. `headroom learn` disabled; it must never write CLAUDE.md, AGENTS.md, or any file in
+     this repo. Verify the hook's write set before enabling and after every update.
+  2. Its proxy binds localhost only and is started by that session; no shared or
+     fleet-wide proxy.
+  3. The worker reports to the director after one week: token savings, any hook
+     interference with Bash tool calls, any file the hook touched.
+- Orchesters and the director do not install headroom until that report is in.
+- Installs are each session's own user-approved action; the director sets policy,
+  it does not install on a peer's behalf.
+
 ## Adding an agent
 
 Create `<project>/<tier>/<SESSION_NAME>/agent.md` (or `shared_workers/<NAME>/agent.md`) from `PROJECT_DIRECTOR/agent.md`'s
