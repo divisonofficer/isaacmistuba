@@ -25,6 +25,7 @@ codex_sessions:
     model: gpt-5.6-terra
     since: 2026-09-21
     status: active
+ensure_session: false   # Codex thread, not a Claude session; ensure_sessions.sh skips it
 last_reviewed_by: DIRECTOR_MARK10 [c3cb4e]
 last_reviewed: 2026-09-21
 status: adopted

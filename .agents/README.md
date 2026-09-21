@@ -80,6 +80,17 @@ PROJECT_DIRECTOR                         (Device 2) — user intent, fleet board
 - Installs are each session's own user-approved action; the director sets policy,
   it does not install on a peer's behalf.
 
+## Keeping sessions alive
+
+`tools/ensure_sessions.sh` walks every agent.md (skipping `PC_*` folders and files with
+`ensure_session: false`), checks `~/.claude/sessions/` for a live process registered under
+the agent's name (`claude_session_name:` in the frontmatter overrides the folder name),
+and starts `claude remote-control --name <NAME>` in a detached tmux session `agent_<NAME>`
+for any that are down. It reattaches to the last known session id from
+`tools/session_map.json` (machine-local, gitignored) so context survives a restart.
+`--list` shows state, `--dry-run` shows what would launch, `--once NAME` limits to one agent.
+Run it by hand or from cron; it never stops or restarts a live session.
+
 ## Adding an agent
 
 Create `<project>/<tier>/<SESSION_NAME>/agent.md` (or `shared_workers/<NAME>/agent.md`) from `PROJECT_DIRECTOR/agent.md`'s

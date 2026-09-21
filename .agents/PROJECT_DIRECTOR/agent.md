@@ -9,6 +9,7 @@ bound_sessions:
     since: 2026-09-21
     status: active
 codex_sessions: []      # e.g. - {id: <codex session id>, since: <date>, status: active}
+claude_session_name: DIRECTOR_MARK10   # ensure_sessions.sh launches/reattaches under this name
 last_reviewed_by: DIRECTOR_MARK10 [c3cb4e]
 last_reviewed: 2026-09-21
 ---
