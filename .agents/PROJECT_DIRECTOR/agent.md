@@ -41,8 +41,8 @@ last_reviewed: 2026-09-21
 | Agent | State | GPUs | Workers |
 |---|---|---|---|
 | IR_PIPELINE_ORCHESTER | v13 epoch 8/20; v14 (memory-only NVS decoder, 3 arms) implemented, waiting for GPUs | 4,5,7 (lock: robomituba-12) | SONNET_WORKER_1 watch |
-| IR_DATASET_ABO_ORCHESTER | outdoor_street 38-49 in flight, ETA ~6h; wall-massing analysis closed (leave it) | 1,6 (lock holder name stale: robomituba-b4) | SONNET_WORKER_2 |
-| IR_DATASET_HSSD_ORCHESTER | 49/100 scenes, ETA ~3 d | 0,2,3 (lock row renamed) | SONNET_WORKER_1, SONNET_WORKER_2 |
+| IR_DATASET_ABO_ORCHESTER | abo_cornell_env_v1 COMPLETE 04:36Z: 50 scenes / 3,480 frames (marble 960 / parking 860 / concrete 760 / street 900), verified 0 problems; holding GPUs 1,6 idle for a possible takes=8 top-up | 1,6 (lock holder name stale: robomituba-b4) | SONNET_WORKER_2 |
+| IR_DATASET_HSSD_ORCHESTER | 52/100 scenes, 0.71/h, completion ~2026-09-24 00Z | 0,2,3 (lock row renamed) | SONNET_WORKER_1, SONNET_WORKER_2 |
 | OPTICALNAV_ORCHESTER | idle, waiting on Device 1 renders of 20267404, 20272904 | none (daemon :8765 idle) | SONNET_WORKER_1 |
 | OPTICALNAV_NAVIGATION_ORCHESTER | idle, 2 user decisions pending | none | none |
 | IR_DATASET_INFINIGEN_ORCHESTER | apartment hover takes built, unrendered (no GPUs); 2 cleanup decisions pending | none | none |
@@ -56,8 +56,8 @@ last_reviewed: 2026-09-21
 2. HSSD: ~98 GB v3 blends deletion, blocked until render_hover_v1 stops reading them.
 3. Navigation: verify 20273004 graph regen result (in-room node count pre-dates wall restore), and whether to commit 4 tool files.
 5. IR: swap GPUs 4,5,7 from v13 (epoch 8/20, ~18 h left) to v14 arms now, or let v13 finish? Director recommends letting v13 finish: its curve is the v14 baseline and 18 h is cheap against a confounded comparison.
-6. Infinigen: delete 62 superseded dataset versions (41 scenes)? And the 229 GB /bean duplicate: is a published dataset a fixed snapshot or a live copy? The work copy has 20.9 GB passive NIR the published one lacks, so a blind dedupe loses a channel. Director recommends: snapshot semantics, then migrate the passive NIR into the published copy before deleting the work copy.
-7. Two processes now answer to DIRECTOR_MARK10 (VS Code pid 1470992 and terminal pid 2406008, same transcript). Close the VS Code one so peers stop getting ambiguity errors.
+6. ABO: GPUs 1,6 are idle since 04:36Z. Top-up abo_cornell_env_v1 with new seeds at takes=8, hand them to Infinigen's apartment hover render (unrendered, waiting for GPUs), or release? Director recommends Infinigen hover render first: it is built and blocked only on GPUs.
+7. Infinigen: delete 62 superseded dataset versions (41 scenes)? And the 229 GB /bean duplicate: is a published dataset a fixed snapshot or a live copy? The work copy has 20.9 GB passive NIR the published one lacks, so a blind dedupe loses a channel. Director recommends: snapshot semantics, then migrate the passive NIR into the published copy before deleting the work copy.
 8. `.agents/` is untracked in git and world-writable (inherited NAS mode 777). Commit it? Tighten mode?
 4. 341 stale `.import.lock`, /bean tier-D 34 GB cleanup.
 
