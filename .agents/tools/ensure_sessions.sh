@@ -64,7 +64,11 @@ reg, name = sys.argv[1], sys.argv[2]
 for f in glob.glob(os.path.join(reg, "*.json")):
     try: d = json.load(open(f))
     except Exception: continue
-    if d.get("name") != name: continue
+    # Match by peer name, or by the tmux session this script created: `--name`
+    # sets the Remote Control environment name, while the peer name stays
+    # derived (robomituba-XX) until the session renames itself.
+    tm = str(d.get("tmux") or "")
+    if d.get("name") != name and not tm.startswith(f"agent_{name}:"): continue
     pid = d.get("pid")
     try: os.kill(pid, 0)
     except Exception: continue
@@ -84,7 +88,8 @@ m = json.load(open(mp))
 for f in glob.glob(os.path.join(reg, "*.json")):
     try: d = json.load(open(f))
     except Exception: continue
-    if d.get("name") == name and d.get("sessionId"):
+    tm = str(d.get("tmux") or "")
+    if (d.get("name") == name or tm.startswith(f"agent_{name}:")) and d.get("sessionId"):
         m[name] = {"sessionId": d["sessionId"], "bridgeSessionId": d.get("bridgeSessionId"),
                    "seen": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
         json.dump(m, open(mp, "w"), indent=2, sort_keys=True); break
@@ -99,10 +104,10 @@ launch() {
   local name="$1" sid tmux_name cmd
   sid="$(known_session_id "$name")"
   tmux_name="agent_${name}"
-  cmd="cd $FLEET_ROOT && claude remote-control --name $name"
+  cmd="cd $FLEET_ROOT && claude remote-control --spawn=same-dir --name $name"
   [ -n "$sid" ] && cmd="$cmd --session-id $sid"
   # If reattach by id is refused (expired, moved), fall back to a fresh session.
-  cmd="$cmd || (echo 'reattach failed, starting fresh' && cd $FLEET_ROOT && claude remote-control --name $name)"
+  cmd="$cmd || (echo 'reattach failed, starting fresh' && cd $FLEET_ROOT && claude remote-control --spawn=same-dir --name $name)"
   if tmux has-session -t "$tmux_name" 2>/dev/null; then
     echo "  tmux $tmux_name exists but no live session registered; leaving it (inspect manually)"
     return
@@ -110,6 +115,7 @@ launch() {
   if [ "$DRY" = 1 ]; then echo "  would run: tmux new-session -d -s $tmux_name \"$cmd\""; return; fi
   tmux new-session -d -s "$tmux_name" "$cmd"
   echo "  started tmux $tmux_name${sid:+ (reattach $sid)}"
+  echo "  note: peer name will be derived (robomituba-XX) until the session runs /rename $name"
 }
 
 for name in $(roster); do

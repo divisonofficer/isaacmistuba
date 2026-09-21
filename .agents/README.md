@@ -90,6 +90,10 @@ for any that are down. It reattaches to the last known session id from
 `tools/session_map.json` (machine-local, gitignored) so context survives a restart.
 `--list` shows state, `--dry-run` shows what would launch, `--once NAME` limits to one agent.
 Run it by hand or from cron; it never stops or restarts a live session.
+Caveats: `claude remote-control` asks for a spawn mode interactively, so the script passes
+`--spawn=same-dir`. `--name` names the Remote Control environment; the peer name other
+sessions message stays derived (`robomituba-XX`) until that session runs `/rename <NAME>`,
+so the first message to a relaunched agent should ask it to rename itself.
 
 ## Adding an agent
 
