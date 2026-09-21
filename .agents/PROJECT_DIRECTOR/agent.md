@@ -45,7 +45,7 @@ last_reviewed: 2026-09-21
 | IR_DATASET_HSSD_ORCHESTER | 49/100 scenes, ETA ~3 d | 0,2,3 (lock row renamed) | SONNET_WORKER_1, SONNET_WORKER_2 |
 | OPTICALNAV_ORCHESTER | idle, waiting on Device 1 renders of 20267404, 20272904 | none (daemon :8765 idle) | SONNET_WORKER_1 |
 | OPTICALNAV_NAVIGATION_ORCHESTER | idle, 2 user decisions pending | none | none |
-| IR_DATASET_INFINIGEN_ORCHESTER | revived 04:57Z, roll-call pending | none | none |
+| IR_DATASET_INFINIGEN_ORCHESTER | apartment hover takes built, unrendered (no GPUs); 2 cleanup decisions pending | none | none |
 | IR_DATASET_VIEWER_ORCHESTER | Codex (gpt-5.6-terra), run 1 done: verified, nothing committed, 3 tests blocked on orphaned queue-script change; directive 2-4 pending resume | none | none |
 | PC_OPTICALNAV_RENDER | 20272904 perturbed_active_polar 12%, ETA 09:05Z | Device 1 GPU 0 | — |
 | PC_WORKER_1 | queue complete, free (user-assigned only) | Device 1 | — |
@@ -55,7 +55,9 @@ last_reviewed: 2026-09-21
 2. HSSD: ~98 GB v3 blends deletion, blocked until render_hover_v1 stops reading them.
 3. Navigation: verify 20273004 graph regen result (in-room node count pre-dates wall restore), and whether to commit 4 tool files.
 5. IR: swap GPUs 4,5,7 from v13 (epoch 8/20, ~18 h left) to v14 arms now, or let v13 finish? Director recommends letting v13 finish: its curve is the v14 baseline and 18 h is cheap against a confounded comparison.
-6. `.agents/` is untracked in git and world-writable (inherited NAS mode 777). Commit it? Tighten mode?
+6. Infinigen: delete 62 superseded dataset versions (41 scenes)? And the 229 GB /bean duplicate: is a published dataset a fixed snapshot or a live copy? The work copy has 20.9 GB passive NIR the published one lacks, so a blind dedupe loses a channel. Director recommends: snapshot semantics, then migrate the passive NIR into the published copy before deleting the work copy.
+7. Two processes now answer to DIRECTOR_MARK10 (VS Code pid 1470992 and terminal pid 2406008, same transcript). Close the VS Code one so peers stop getting ambiguity errors.
+8. `.agents/` is untracked in git and world-writable (inherited NAS mode 777). Commit it? Tighten mode?
 4. 341 stale `.import.lock`, /bean tier-D 34 GB cleanup.
 
 ## Template for a new agent.md

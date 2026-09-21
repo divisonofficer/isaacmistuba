@@ -97,7 +97,7 @@ PY
 }
 
 known_session_id() {
-  python3 -c 'import json,sys; m=json.load(open(sys.argv[1])); print(m.get(sys.argv[2],{}).get("sessionId",""))' "$MAP" "$1"
+  python3 -c 'import json,sys; m=json.load(open(sys.argv[1])); print(m.get(sys.argv[2],{}).get("sessionId") or "")' "$MAP" "$1"
 }
 
 launch() {
