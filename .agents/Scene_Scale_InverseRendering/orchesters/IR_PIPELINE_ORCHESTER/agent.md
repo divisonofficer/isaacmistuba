@@ -23,11 +23,18 @@ last_reviewed: 2026-09-21
 ## Remit
 - Own memory-IR v13 training (volume pose-query PBR, worktree scene_ir_ff_v13) and its evals.
 - Decide corpus mix; consumes HSSD render_hover_v1 (.done scenes) and ABO corpora.
-- Current: epoch ~7/20 on GPUs 4,5,7; bf16 held-out query eval beside it on GPU 5.
+- Current: epoch 7/20 on GPUs 4,5,7 (bf16 held-out eval finished; GPU 5 back to training only).
+- Consumes: HSSD render_hover_v1 (42 pinned .done scenes), abo_cornell_v1, abo_cornell_video_v1
+  (manifest v3). abo_cornell_env_v1 (ABO orchester's current 50-scene corpus) not yet consumed;
+  name relation being confirmed with ABO orchester.
 - Manifests v3 pinned to 42 done HSSD scenes until HSSD orchester reports completion.
 
 ## Resources
 - GPUs 4,5,7 — claimed at run start, no widening (user's call 2026-09-16).
+
+## Milestones
+- 2026-09-21 v13 ep6 held-out, novel-pose query: albedo 0.060 / normal 25.0° / pointmap 0.43 m
+  (v10: 0.072 / 32.0° / 1.74 m). Seen-pose albedo 0.038 vs as-image bound 0.033.
 
 ## Reporting
 - Epoch milestones and eval results to director; failures immediately.
