@@ -34,7 +34,7 @@ last_reviewed: 2026-09-21
 - Manifests v3 pinned to 42 done HSSD scenes until HSSD orchester reports completion.
 
 ## Resources
-- GPUs 4,5,7 — claimed at run start, no widening (user's call 2026-09-16).
+- GPUs 4,5,7 — claimed at run start, no widening (user's call 2026-09-16). Swapped v13→v14a 2026-09-21 by the user.
 
 ## Milestones
 - 2026-09-21 v13 ep6 held-out, novel-pose query: albedo 0.060 / normal 25.0° / pointmap 0.43 m
@@ -46,6 +46,11 @@ last_reviewed: 2026-09-21
   control (albedo 0.039 / normal 18.9°). v14 branch memory-ir-v14, worktree scene_ir_ff_v14,
   arms a (decoder) → b (+memory adapter) → c (+distill + depth supervision), ~3 epochs each from
   v13 ep6. Blocked on GPUs until v13 ends (~18 h) or the user swaps. Director reviewed, no objection.
+
+- 2026-09-21 v14a ep2 (10 volume samples, 8 views): query roughness 0.045 / normal 0.155 / depth 0.065
+  vs v13 ep7 0.048 / 0.159 / 0.086; albedo 0.055 vs 0.051 (high-frequency albedo lives in the image
+  residual the pose query cannot see). Pre-registered arm-a check armed on the 40 diag samples.
+- Sent RESEARCHER a full state brief by Orca (msg_0a49f74cc745).
 
 ## Reporting
 - Epoch milestones and eval results to director; failures immediately.
