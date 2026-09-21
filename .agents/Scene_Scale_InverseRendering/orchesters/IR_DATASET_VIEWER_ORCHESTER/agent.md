@@ -60,8 +60,9 @@ has reviewed or adopted the work. You inherit it.
 - **Rescue copy:** `/bean/ir_dataset_work/rescued_d2_viewer_work_20260920/`
   (`tracked_files.patch`, the two .svelte files, README with restore steps).
   Restore = `git apply tracked_files.patch` + copy the two files into `src/`.
-- **Orphaned server:** `python3 apps/ir_dataset_viewer/server.py --port 8780`,
-  pid 2997224, parent init, up 14+ days, still answering 200. It runs the code as it was
+- **Server:** `python3 apps/ir_dataset_viewer/server.py --port 8780`, pid 2997224, parent init,
+  started 2026-09-06 by IR_DATASET_INFINIGEN_ORCHESTER's transcript (established 2026-09-21 from
+  /proc environ), still answering 200. Coordinate any restart with that orchester and the director. It runs the code as it was
   at start, not the working tree. Do not kill it without checking who is using :8780
   (other orchesters may browse it); announce to the director first.
 - Dev server (`run_dev.sh`) uses vite polling on :5174 because the NFS mount exhausts inotify.

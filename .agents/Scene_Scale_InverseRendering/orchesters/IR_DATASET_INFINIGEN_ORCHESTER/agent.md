@@ -40,6 +40,15 @@ status: adopted (remit confirmed by the session 2026-09-21 05:05Z)
   work copy holds 20.9 GB of passive NIR the published copy lacks. Deleting on name+fingerprint match
   would destroy a channel. Turns on whether a published dataset is a fixed snapshot or a live copy.
 
+## Attribution established from artifacts (2026-09-21)
+- The :8780 viewer backend, pid 2997224, was started by THIS transcript on 2026-09-06 04:38:24
+  (/proc environ CLAUDE_CODE_SESSION_ID=2e50bd36…, log /bean/ir_dataset_work/controller_backend.log).
+  This session owns that process; its restart is coordinated with IR_DATASET_VIEWER_ORCHESTER.
+- The same window edited backend/controller.py via heredocs and ran `git stash pop`; the
+  storage_profile change in apps/render_ir_principled_dataset_queue.py was dirty and known at the
+  restart. Awaiting this session's transcript check on (a) storage_profile authorship, (b) whether
+  the stash pop restored the +754 viewer diff.
+
 ## Shared with OpticalNav
 - `apps/import_infinigen_scene.py` and `apps/run_infinigen_import.sh` are also on the OpticalNav
   scene path (OPTICALNAV_NAVIGATION_ORCHESTER). Announce changes to that orchester before committing.
