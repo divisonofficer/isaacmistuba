@@ -22,7 +22,8 @@ PROJECT_DIRECTOR                         (Device 2) — user intent, fleet board
 │       ├── IR_PIPELINE_ORCHESTER        v13 training + eval (GPU 4,5,7)
 │       ├── IR_DATASET_HSSD_ORCHESTER    render_hover_v1 corpus (GPU 0,2,3)
 │       ├── IR_DATASET_ABO_ORCHESTER     abo_cornell_env_v1 corpus (GPU 1,6)
-│       └── IR_DATASET_VIEWER_ORCHESTER  ir_dataset_viewer app — VACANT, spawn to adopt orphaned work
+│       ├── IR_DATASET_VIEWER_ORCHESTER  ir_dataset_viewer app (Codex thread)
+│       └── IR_DATASET_INFINIGEN_ORCHESTER  Infinigen IR corpora + generation tooling
 ├── OpticalNav/                          project: OpticalNav
 │   ├── orchesters/
 │   │   ├── OPTICALNAV_ORCHESTER         Infinigen → graph/episode → Drive export
