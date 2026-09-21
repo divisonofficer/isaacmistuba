@@ -2,10 +2,16 @@
 bound_sessions:
   - kind: claude-peer
     name: SONNET_GPU_MANAGER
-    ref: unknown          # appeared in the user's session list 2026-09-21; not in this host's registry yet
+    ref: unknown          # original session from the user's list 2026-09-21; never registered on this host
     address: unknown
     since: 2026-09-21
-    status: unconfirmed
+    status: ended
+  - kind: claude-peer
+    name: robomituba-97   # relaunched by ensure_sessions.sh 03:42Z; fresh transcript, no task yet;
+    ref: 2314939          # needs /rename SONNET_GPU_MANAGER typed by the user in that session
+    address: uds:/tmp/cc-socks/2314939.sock
+    since: 2026-09-21
+    status: active-unassigned
 codex_sessions: []
 last_reviewed_by: DIRECTOR_MARK10 [c3cb4e]
 last_reviewed: 2026-09-21
