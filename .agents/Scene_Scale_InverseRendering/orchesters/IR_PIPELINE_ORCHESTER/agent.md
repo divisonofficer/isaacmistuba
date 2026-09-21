@@ -40,6 +40,13 @@ last_reviewed: 2026-09-21
 - 2026-09-21 v13 ep6 held-out, novel-pose query: albedo 0.060 / normal 25.0° / pointmap 0.43 m
   (v10: 0.072 / 32.0° / 1.74 m). Seen-pose albedo 0.038 vs as-image bound 0.033.
 
+- 2026-09-21 query-gap diagnosis (scene_ir_ff/dev_report/2026-09-21-memory-ir-query-diagnosis):
+  gap is neither depth selection nor missing information; tokens decode only on their source
+  patch grid. Decision (user): B, memory-only pose query (true NVS); warp_pred kept as upper-bound
+  control (albedo 0.039 / normal 18.9°). v14 branch memory-ir-v14, worktree scene_ir_ff_v14,
+  arms a (decoder) → b (+memory adapter) → c (+distill + depth supervision), ~3 epochs each from
+  v13 ep6. Blocked on GPUs until v13 ends (~18 h) or the user swaps. Director reviewed, no objection.
+
 ## Reporting
 - Epoch milestones and eval results to director; failures immediately.
 

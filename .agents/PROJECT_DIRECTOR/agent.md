@@ -39,7 +39,7 @@ last_reviewed: 2026-09-21
 ## Current board (2026-09-21)
 | Agent | State | GPUs | Workers |
 |---|---|---|---|
-| IR_PIPELINE_ORCHESTER | v13 training epoch ~7/20 + bf16 eval on GPU 5 | 4,5,7 (lock: robomituba-12) | SONNET_WORKER_1 watch |
+| IR_PIPELINE_ORCHESTER | v13 epoch 8/20; v14 (memory-only NVS decoder, 3 arms) implemented, waiting for GPUs | 4,5,7 (lock: robomituba-12) | SONNET_WORKER_1 watch |
 | IR_DATASET_ABO_ORCHESTER | outdoor_street 38-49 in flight, ETA ~6h; wall-massing analysis closed (leave it) | 1,6 (lock holder name stale: robomituba-b4) | SONNET_WORKER_2 |
 | IR_DATASET_HSSD_ORCHESTER | 49/100 scenes, ETA ~3 d | 0,2,3 (lock row renamed) | SONNET_WORKER_1, SONNET_WORKER_2 |
 | OPTICALNAV_ORCHESTER | idle, waiting on Device 1 renders of 20267404, 20272904 | none (daemon :8765 idle) | SONNET_WORKER_1 |
@@ -52,7 +52,8 @@ last_reviewed: 2026-09-21
 1. Orphaned ir_dataset_viewer work: adopted by Codex. User resumes the thread when directed; director writes directives into the role file.
 2. HSSD: ~98 GB v3 blends deletion, blocked until render_hover_v1 stops reading them.
 3. Navigation: verify 20273004 graph regen result (in-room node count pre-dates wall restore), and whether to commit 4 tool files.
-5. `.agents/` is untracked in git and world-writable (inherited NAS mode 777). Commit it? Tighten mode?
+5. IR: swap GPUs 4,5,7 from v13 (epoch 8/20, ~18 h left) to v14 arms now, or let v13 finish? Director recommends letting v13 finish: its curve is the v14 baseline and 18 h is cheap against a confounded comparison.
+6. `.agents/` is untracked in git and world-writable (inherited NAS mode 777). Commit it? Tighten mode?
 4. 341 stale `.import.lock`, /bean tier-D 34 GB cleanup.
 
 ## Template for a new agent.md
