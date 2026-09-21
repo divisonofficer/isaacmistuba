@@ -13,7 +13,8 @@ Fleet Run: `run_08a9cc052de7` (coordinator terminal = DIRECTOR_MARK10).
 | IR_DATASET_INFINIGEN_ORCHESTER | term_eb71a360-90a0-44fa-abca-9c10170183b0 | Orca |
 | SONNET_GPU_MANAGER | term_dd4ba567 (see `orca-ide terminal list`) | Orca |
 | IR_DATASET_VIEWER_ORCHESTER (Codex) | term_9a444085-4438-4b38-b901-bd3cb58f840b | Orca |
-| IR_PIPELINE, HSSD, ABO, OPTICALNAV, NAVIGATION, SONNET_WORKER_1/2 | none yet | VS Code |
+| IR_PIPELINE_ORCHESTER | term_72a57721-430a (see `orca-ide terminal list`) | Orca (VS Code copy pid 2633842 still open) |
+| HSSD, ABO, OPTICALNAV, NAVIGATION, SONNET_WORKER_1/2 | none yet | VS Code |
 
 ## Sending mail to an agent in an Orca terminal
 ```
