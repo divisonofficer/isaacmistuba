@@ -1,11 +1,15 @@
 ---
 bound_sessions: []
 codex_sessions:
-  # - id: <codex thread id>, model: gpt-6-astra, since: <date>, status: active   <- fill on adoption
+  - id: 01a0c277-6b29-75a3-8761-80da4cd70e88
+    model: gpt-6-astra
+    since: 2026-09-21
+    status: active
+    terminal: term_65853e59-37d5-463e-bcde-b3cdb18d840b
 last_reviewed_by: DIRECTOR_MARK10 [c3cb4e]
 last_reviewed: 2026-09-21
 ensure_session: false      # Codex agent; not managed by ensure_sessions.sh
-status: spawning
+status: active
 ---
 # RESEARCHER (codename)
 
@@ -44,4 +48,10 @@ status: spawning
 1. 2026-09-21 — On start: fill your `codex_sessions` row, read `.agents/README.md`, both project
    READMEs, and `.agents/PROJECT_DIRECTOR/agent.md`. Then reply by Orca mail to the director's
    handle with one line confirming you are up and one line naming what in the current board you
-   think most needs research. No other work until directed.
+   think most needs research. No other work until directed.  [done 05:58Z]
+2. 2026-09-21 06:00Z — Second-opinion review of IR v14 (memory-only NVS decoder, arms a/b/c).
+   Inputs: scene_ir_ff diagnosis report 2026-09-21 + diag scripts (branch memory-ir-v13),
+   memory_ir/target_query.py in worktree scene_ir_ff_v14. Questions: token-grid claim vs
+   under-trained fusion; whether cumulative arms confound; eval-set power at 0.002-0.005 albedo;
+   v14c teacher leakage into eval; two related-work anchors. Output: notes/2026-09-21-ir-v14-review.md,
+   cited, read-only, no experiments. Sent by Orca mail as reply to msg_12932bb0994b.
