@@ -10,10 +10,10 @@ Fleet Run: `run_08a9cc052de7` (coordinator terminal = DIRECTOR_MARK10).
 | Agent | Orca terminal handle | Host |
 |---|---|---|
 | DIRECTOR_MARK10 | term_ba01190f-6c2d-4466-8937-de69e62bc846 | Orca (coordinator) |
-| IR_PIPELINE_ORCHESTER | term_72a57721-430a-4174-ab38-439708288ff9 | Orca |
-| IR_DATASET_HSSD_ORCHESTER | term_fffa3425-7ec9-4a03-bc5a-0a50b79170dc | Orca |
-| IR_DATASET_ABO_ORCHESTER | term_47fb8002-265a-44bd-abec-dd43cb2f5287 | Orca |
-| IR_DATASET_INFINIGEN_ORCHESTER | term_eb71a360-90a0-44fa-abca-9c10170183b0 | Orca |
+| IR_PIPELINE_ORCHESTER | term_d6eb0800-0fe9-4163-ba44-91421ba0c587 | Orca, worktree IR_DATASET |
+| IR_DATASET_HSSD_ORCHESTER | term_82ca3029-bca9-4e41-b326-7216900c840d | Orca, worktree IR_DATASET |
+| IR_DATASET_ABO_ORCHESTER | term_af8f3d31-3796-432e-926e-241cf6cd7c78 | Orca, worktree IR_DATASET |
+| IR_DATASET_INFINIGEN_ORCHESTER | term_b42cf680-1b29-4175-9cf0-f0c4976df0a3 | Orca, worktree IR_DATASET |
 | IR_DATASET_VIEWER_ORCHESTER (Codex) | term_9a444085-4438-4b38-b901-bd3cb58f840b | Orca |
 | OPTICALNAV_ORCHESTER | term_538be2b3-8f43-4c7e-b256-daaeda1f01ed | Orca, worktree OpticalNav |
 | OPTICALNAV_NAVIGATION_ORCHESTER | term_38731d3a-1277-4474-ace8-c07f9b5759e7 | Orca, worktree OpticalNav |
@@ -28,8 +28,8 @@ terminal resumed from its previous session id, so context carried over.
 
 ## Worktrees
 Orca has three worktree entries on the same checkout: `robomituba` (root), `IR_DATASET`, and
-`OpticalNav`. IR agents, the director, shared workers and RESEARCHER sit in the root/IR_DATASET
-entries; the two OpticalNav orchesters sit in `OpticalNav` (moved 2026-09-21 06:10Z). A terminal
+`OpticalNav`. The four IR Claude orchesters sit in `IR_DATASET` (moved 06:20Z); the two OpticalNav orchesters
+in `OpticalNav` (06:10Z); director, shared workers, RESEARCHER and the Codex viewer thread in root. A terminal
 cannot be moved between worktrees: close it and recreate with
 `ORCA_WORKTREE=name:OpticalNav bash .agents/tools/orca_adopt.sh NAME` (resumes by local uuid; `claude remote-control --session-id` needs a bridge id and fails on a local uuid).
 
