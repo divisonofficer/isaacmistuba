@@ -20,6 +20,7 @@ Fleet Run: `run_08a9cc052de7` (coordinator terminal = DIRECTOR_MARK10).
 | SONNET_WORKER_1 | term_9f00b054-86c6-456c-888b-1691c676dff6 | Orca, worktree Workers |
 | SONNET_WORKER_2 | term_d7b760bb-4f05-4d1e-80af-ac406110aa42 | Orca, worktree Workers |
 | SONNET_GPU_MANAGER | term_99bb43ec-97a4-42e8-b495-3c272e6c6a0b | Orca, worktree Workers |
+| CODEX_IR_DATASET_INFINIGEN_WORKER (Codex gpt-5.6-luna) | term_0e5bc227-65b8-4bc5-b4f0-fa9847d097f3 until the user moves it | Workers → IR_DATASET |
 | RESEARCHER (Codex gpt-6-astra) | term_65853e59-37d5-463e-bcde-b3cdb18d840b | Orca |
 | PC_OPTICALNAV_RENDER, PC_WORKER_1 | none | Device 1, Remote Control only |
 

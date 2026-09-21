@@ -24,6 +24,8 @@ PROJECT_DIRECTOR                         (Device 2) — user intent, fleet board
 │       ├── IR_DATASET_ABO_ORCHESTER     abo_cornell_env_v1 corpus (GPU 1,6)
 │       ├── IR_DATASET_VIEWER_ORCHESTER  ir_dataset_viewer app (Codex thread)
 │       └── IR_DATASET_INFINIGEN_ORCHESTER  Infinigen IR corpora + generation tooling
+│   └── workers/
+│       └── CODEX_IR_DATASET_INFINIGEN_WORKER  Codex gpt-5.6-luna: repetitive tasks for the Infinigen orchester
 ├── OpticalNav/                          project: OpticalNav
 │   ├── orchesters/
 │   │   ├── OPTICALNAV_ORCHESTER         Infinigen → graph/episode → Drive export
