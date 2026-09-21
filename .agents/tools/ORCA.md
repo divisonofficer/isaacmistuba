@@ -31,7 +31,7 @@ Orca has three worktree entries on the same checkout: `robomituba` (root), `IR_D
 `OpticalNav`. IR agents, the director, shared workers and RESEARCHER sit in the root/IR_DATASET
 entries; the two OpticalNav orchesters sit in `OpticalNav` (moved 2026-09-21 06:10Z). A terminal
 cannot be moved between worktrees: close it and recreate with
-`orca-ide terminal create --worktree id:<worktree id> --command "claude remote-control --name NAME --session-id SID"`.
+`ORCA_WORKTREE=name:OpticalNav bash .agents/tools/orca_adopt.sh NAME` (resumes by local uuid; `claude remote-control --session-id` needs a bridge id and fails on a local uuid).
 
 ## Sending mail to an agent in an Orca terminal
 ```

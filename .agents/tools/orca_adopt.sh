@@ -29,12 +29,13 @@ for f in glob.glob(os.path.expanduser("~/.claude/sessions/*.json")):
         print(f"{d['pid']} {d.get('entrypoint')} {d.get('name')}")
 PY
 )"
-if [ "$DRY" = 1 ]; then echo "$NAME: sid=${SID:-none} live_elsewhere=${LIVE:-no}; would run: orca-ide terminal create --worktree ${ORCA_WORKTREE:-path:$ROOT} --title $NAME --command \"claude remote-control --name $NAME${SID:+ --session-id $SID}\" --json"; exit 0; fi
+if [ "$DRY" = 1 ]; then echo "$NAME: sid=${SID:-none} live_elsewhere=${LIVE:-no}; would run: orca-ide terminal create --worktree ${ORCA_WORKTREE:-path:$ROOT} --title $NAME --command \"claude${SID:+ --resume $SID}\" --json"; exit 0; fi
 if [ -n "$LIVE" ] && [ "$FORCE" != 1 ]; then
   echo "$NAME: session $SID is still live elsewhere ($LIVE). Close it first, or --force to resume anyway." >&2; exit 2
 fi
-# Remote Control on by default (user rule 2026-09-21): launch through `claude remote-control`,
-# which reattaches by session id; a plain `claude --resume` would leave Remote Control off.
-if [ -n "$SID" ]; then CMD="claude remote-control --name $NAME --session-id $SID"; else CMD="claude remote-control --spawn=session --name $NAME"; fi
+# Remote Control comes from ~/.claude/settings.json remoteControlAtStartup=true.
+# `claude remote-control --session-id` wants a bridge id (session_01...), not the local uuid,
+# so resume locally and let the setting turn Remote Control on.
+if [ -n "$SID" ]; then CMD="claude --resume $SID"; else CMD="claude remote-control --spawn=session --name $NAME"; fi
 orca-ide terminal create --worktree "${ORCA_WORKTREE:-path:$ROOT}" --title "$NAME" --command "$CMD" --json
 echo "created; inside the new terminal run /rename $NAME once Claude is up, then ensure_sessions.sh --list will see it."
