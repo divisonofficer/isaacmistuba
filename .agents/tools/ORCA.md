@@ -9,12 +9,21 @@ Fleet Run: `run_08a9cc052de7` (coordinator terminal = DIRECTOR_MARK10).
 
 | Agent | Orca terminal handle | Host |
 |---|---|---|
-| DIRECTOR_MARK10 | term_ba01190f-6c2d-4466-8937-de69e62bc846 | Orca |
+| DIRECTOR_MARK10 | term_ba01190f-6c2d-4466-8937-de69e62bc846 | Orca (coordinator) |
+| IR_PIPELINE_ORCHESTER | term_72a57721-430a-4174-ab38-439708288ff9 | Orca |
+| IR_DATASET_HSSD_ORCHESTER | term_fffa3425-7ec9-4a03-bc5a-0a50b79170dc | Orca |
+| IR_DATASET_ABO_ORCHESTER | term_47fb8002-265a-44bd-abec-dd43cb2f5287 | Orca |
 | IR_DATASET_INFINIGEN_ORCHESTER | term_eb71a360-90a0-44fa-abca-9c10170183b0 | Orca |
-| SONNET_GPU_MANAGER | term_dd4ba567 (see `orca-ide terminal list`) | Orca |
 | IR_DATASET_VIEWER_ORCHESTER (Codex) | term_9a444085-4438-4b38-b901-bd3cb58f840b | Orca |
-| IR_PIPELINE_ORCHESTER | term_72a57721-430a (see `orca-ide terminal list`) | Orca (VS Code copy pid 2633842 still open) |
-| HSSD, ABO, OPTICALNAV, NAVIGATION, SONNET_WORKER_1/2 | none yet | VS Code |
+| OPTICALNAV_ORCHESTER | term_7185dd48-3d3e-4ecf-83ac-a0ee68cbfb68 | Orca |
+| OPTICALNAV_NAVIGATION_ORCHESTER | term_30ceba37-049e-4eae-af55-d7a0d00338bd | Orca |
+| SONNET_WORKER_1 | term_f71b4ccd-fb32-48ff-b139-7c4bc0cd72d8 | Orca |
+| SONNET_WORKER_2 | term_edb95088-642f-4b9f-bb99-a94d6c5cff8b | Orca |
+| SONNET_GPU_MANAGER | term_dd4ba567-79a7-4168-b75f-0735c0293e9b | Orca |
+| PC_OPTICALNAV_RENDER, PC_WORKER_1 | none | Device 1, Remote Control only |
+
+All VS Code copies were closed 2026-09-21 05:30Z; every local agent now runs in an Orca
+terminal resumed from its previous session id, so context carried over.
 
 ## Sending mail to an agent in an Orca terminal
 ```
