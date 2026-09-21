@@ -31,6 +31,8 @@ PROJECT_DIRECTOR                         (Device 2) — user intent, fleet board
 │   └── workers/                         Device 1 sessions, NOT on this machine
 │       ├── PC_OPTICALNAV_RENDER         SV polar render driver (GPU 0)
 │       └── PC_WORKER_1                  render-queue management
+├── research/
+│   └── RESEARCHER                       Codex gpt-6-astra: surveys, deep analysis, second-opinion reviews on request
 └── shared_workers/                      read-only watch/verify, serve both projects
     ├── SONNET_WORKER_1                  monitoring
     └── SONNET_WORKER_2                  batch verification

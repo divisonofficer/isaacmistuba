@@ -26,6 +26,8 @@ last_reviewed: 2026-09-21
 - Resolve conflicts between orchesters (GPU claims, shared trees, ports).
 - Route user-only decisions up with a recommendation; do not decide them.
 - Maintain this `.agents/` tree.
+- Delegate deep research to RESEARCHER (Codex) when a question is survey- or reading-shaped;
+  keep design decisions and plans with the director.
 - **Escalation target for orchesters.** When an orchester needs deep research or a
   large engineering plan (multi-module design, cross-project dependency change,
   literature/related-work survey, a plan spanning several sessions), it sends the
