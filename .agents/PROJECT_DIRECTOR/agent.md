@@ -54,7 +54,7 @@ last_reviewed: 2026-09-21
 | PC_WORKER_1 | queue complete, free (user-assigned only) | Device 1 | — |
 
 ## Open items for the user
-1. RESOLVED: orphaned ir_dataset_viewer work committed by the Codex viewer thread (c32b015, cfb8aa0, 6a84c30). Remaining: whether to restart :8780 (pid 2997224, stale code, healthy) so it serves the committed code — owner is IR_DATASET_INFINIGEN_ORCHESTER.
+1. RESOLVED: orphaned ir_dataset_viewer work committed by the Codex viewer thread (c32b015, cfb8aa0, 6a84c30). Remaining: :8780 restart, deferred by its owner (Infinigen orchester) until its backfill + tier run finish. Until then :8780 serves the 2026-09-06 tree; do not read its behaviour as a test of the new commits.
 2. HSSD: ~98 GB v3 blends deletion, blocked until render_hover_v1 stops reading them.
 3. Navigation: verify 20273004 graph regen result (in-room node count pre-dates wall restore), and whether to commit 4 tool files.
 5. RESOLVED by user: GPUs 4,5,7 swapped to v14a at v13 epoch 8. v13's ep7 numbers are the baseline.
@@ -62,7 +62,7 @@ last_reviewed: 2026-09-21
 7. Infinigen: delete 62 superseded dataset versions (41 scenes)? And the 229 GB /bean duplicate: is a published dataset a fixed snapshot or a live copy? The work copy has 20.9 GB passive NIR the published one lacks, so a blind dedupe loses a channel. Director recommends: snapshot semantics, then migrate the passive NIR into the published copy before deleting the work copy.
 8. `.agents/` is untracked in git and world-writable (inherited NAS mode 777). Commit it? Tighten mode?
 4. Infinigen scripts orphan: 7 modified + 6 untracked files are NOT the Infinigen orchester's (only one mesh_decimation hunk is). Owner unknown, mtime 2026-09-09. Assign or drop?
-5. Infinigen: run the statistics backfill (rewrites 111 sidecars under the corrected density rule) before any tier-based archive? Director recommends yes, with a pre-backfill copy of the 111 sidecars: without it 103 of 104 tier-D datasets are unmeasured, and the archiver moves data by tier.
+5. RESOLVED by Infinigen's user: statistics backfill running (~07:10Z) on /bean/ir_dataset_work/.catalog_statistics/; tier run follows. :8780 restart deferred until both finish (announce before, report after). Controller job state is on disk under .control/jobs/ (400 records), so a restart loses nothing; running/queued jobs are zero.
 6. 341 stale `.import.lock`, /bean tier-D 34 GB cleanup.
 
 ## Template for a new agent.md
