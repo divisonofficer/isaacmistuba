@@ -394,6 +394,16 @@ def room_content_program(room_type: str, anchor_richness: str = "balanced",
         rooms = cl.scene()[{Semantics.Room, -Semantics.Object}]
         objects = cl.scene()[{Semantics.Object, -Semantics.Room}]
         furniture = objects[Semantics.Furniture].related_to(rooms, cu.on_floor)
+        # Not every floor-standing thing carries Semantics.Furniture, and
+        # asking for it where the generator does not declare it is fatal:
+        #   requested BathroomSinkFactory with {..., Semantics.Furniture, ...}
+        #   but used_as[] tags specify {..., Semantics.Sink, ...} so predicates
+        #   remainder={Semantics.Furniture} are unsatisfied
+        # RackFactory declares neither Furniture nor Object. Scope those by
+        # placement alone, which is what office_furniture_constraints does for
+        # the same factories.
+        floor_objects = objects.related_to(rooms, cu.on_floor)
+        wall_objects = floor_objects.related_to(rooms, cu.against_wall)
         if program == "modern_office":
             # The base Infinigen programme already dispatches by room semantic
             # (OpenOffice, MeetingRoom, Office, BreakRoom, Restroom, Warehouse).
@@ -431,26 +441,31 @@ def room_content_program(room_type: str, anchor_richness: str = "balanced",
             meeting_tables = furniture[tables.TableDiningFactory]
             chairs = furniture[seating.ChairFactory]
             beds = furniture[seating.BedFactory]
-            toilets = furniture[bathroom.ToiletFactory]
+            toilets = wall_objects[bathroom.ToiletFactory]
             problem.constraints["robomituba_meeting_program"] = rooms.all(
                 lambda room: meeting_tables.related_to(room).count().in_range(1, 2)
                 * chairs.related_to(room).count().in_range(4, 4 + richness * 3)
                 * beds.related_to(room).count().equals(0) * toilets.related_to(room).count().equals(0))
         elif room_type == "restroom":
-            toilets = furniture[bathroom.ToiletFactory]
-            sinks = furniture[bathroom.BathroomSinkFactory]
+            toilets = wall_objects[bathroom.ToiletFactory]
+            sinks = wall_objects[bathroom.BathroomSinkFactory]
             beds = furniture[seating.BedFactory]
             problem.constraints["robomituba_restroom_program"] = rooms.all(
                 lambda room: toilets.related_to(room).count().in_range(1, richness + 2)
                 * sinks.related_to(room).count().in_range(1, richness + 2)
                 * beds.related_to(room).count().equals(0))
         elif room_type in {"warehouse", "garage"}:
-            shelves_ = furniture[shelves.LargeShelfFactory]
-            racks = furniture[elements.RackFactory]
+            shelves_ = wall_objects[shelves.LargeShelfFactory]
             beds = furniture[seating.BedFactory]
+            # RackFactory is left out on purpose. Its used_as[] tags are
+            # {Semantics.RealPlaceholder, FromGenerator(RackFactory)} -- neither
+            # Semantics.Object nor Semantics.Furniture -- so every domain this
+            # module can build excludes it, and requesting it is fatal rather
+            # than merely unsatisfied. Shelving carries the constraint; racks
+            # still appear if the upstream programme places them, they just
+            # cannot be counted here until the generator declares a tag.
             problem.constraints["robomituba_storage_program"] = rooms.all(
                 lambda room: shelves_.related_to(room).count().in_range(1, richness * 3 + 1)
-                * racks.related_to(room).count().in_range(0, richness * 2 + 1)
                 * beds.related_to(room).count().equals(0))
         elif room_type == "break-room":
             tables_ = furniture[tables.TableDiningFactory]
