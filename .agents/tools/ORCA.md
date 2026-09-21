@@ -17,9 +17,9 @@ Fleet Run: `run_08a9cc052de7` (coordinator terminal = DIRECTOR_MARK10).
 | IR_DATASET_VIEWER_ORCHESTER (Codex) | term_9a444085-4438-4b38-b901-bd3cb58f840b | Orca |
 | OPTICALNAV_ORCHESTER | term_538be2b3-8f43-4c7e-b256-daaeda1f01ed | Orca, worktree OpticalNav |
 | OPTICALNAV_NAVIGATION_ORCHESTER | term_38731d3a-1277-4474-ace8-c07f9b5759e7 | Orca, worktree OpticalNav |
-| SONNET_WORKER_1 | term_f71b4ccd-fb32-48ff-b139-7c4bc0cd72d8 | Orca |
-| SONNET_WORKER_2 | term_edb95088-642f-4b9f-bb99-a94d6c5cff8b | Orca |
-| SONNET_GPU_MANAGER | term_dd4ba567-79a7-4168-b75f-0735c0293e9b | Orca |
+| SONNET_WORKER_1 | term_9f00b054-86c6-456c-888b-1691c676dff6 | Orca, worktree Workers |
+| SONNET_WORKER_2 | term_d7b760bb-4f05-4d1e-80af-ac406110aa42 | Orca, worktree Workers |
+| SONNET_GPU_MANAGER | term_99bb43ec-97a4-42e8-b495-3c272e6c6a0b | Orca, worktree Workers |
 | RESEARCHER (Codex gpt-6-astra) | term_65853e59-37d5-463e-bcde-b3cdb18d840b | Orca |
 | PC_OPTICALNAV_RENDER, PC_WORKER_1 | none | Device 1, Remote Control only |
 
@@ -27,9 +27,10 @@ All VS Code copies were closed 2026-09-21 05:30Z; every local agent now runs in 
 terminal resumed from its previous session id, so context carried over.
 
 ## Worktrees
-Orca has three worktree entries on the same checkout: `robomituba` (root), `IR_DATASET`, and
-`OpticalNav`. The four IR Claude orchesters sit in `IR_DATASET` (moved 06:20Z); the two OpticalNav orchesters
-in `OpticalNav` (06:10Z); director, shared workers, RESEARCHER and the Codex viewer thread in root. A terminal
+Orca has four worktree entries on the same checkout: `robomituba` (root), `IR_DATASET`,
+`OpticalNav`, and `Workers`. The four IR Claude orchesters sit in `IR_DATASET` (moved 06:20Z); the two OpticalNav orchesters
+in `OpticalNav` (06:10Z); the two Sonnet workers and the GPU manager in `Workers` (06:50Z);
+director, RESEARCHER and the Codex viewer thread in root. A terminal
 cannot be moved between worktrees: close it and recreate with
 `ORCA_WORKTREE=name:OpticalNav bash .agents/tools/orca_adopt.sh NAME` (resumes by local uuid; `claude remote-control --session-id` needs a bridge id and fails on a local uuid).
 
