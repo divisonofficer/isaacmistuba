@@ -58,6 +58,13 @@ last_reviewed: 2026-09-21
   v16 ep15 ablation (gates zeroed, same weights, 40 views): albedo 0.0516 vs 0.0562, t=−3.44; other
   channels unchanged. v13→v16: only normal significantly better (−2.5°). Holds 4,5,7; declines widening.
 
+- 2026-09-23 GPUs: v18a on 4, v18b on 5, 7 idle reserved for v18c. No-widening rule is the binding
+  constraint; an arbiter allocates but cannot consent for its user.
+- RESEARCHER review, as acted on (delivered as Orca message, not a file): decoded-map warp beats token
+  warp on normal too (18.9° vs 23.0°) so the "albedo has an image bypass" claim was dropped and the
+  readout-bottleneck thesis strengthened; GT-depth result narrowed to "sampling interventions tried
+  move little"; arm b no longer called a decisive store-vs-read test; arms branched from one checkpoint.
+
 ## Reporting
 - Epoch milestones and eval results to director; failures immediately.
 
