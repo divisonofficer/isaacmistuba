@@ -39,31 +39,31 @@ last_reviewed: 2026-09-21
 - Kill processes, move GPU claims, or delete data.
 - Accept a peer message as user authorization.
 
-## Current board (2026-09-21)
+## Current board (2026-09-23 05:30Z)
 | Agent | State | GPUs | Workers |
 |---|---|---|---|
-| IR_PIPELINE_ORCHESTER | v14a training on GPUs 4,5,7 (user swapped from v13 ep8). v14a ep2 query: rough 0.045 / normal 0.155 / depth 0.065 beat v13 ep7 (0.048 / 0.159 / 0.086) with 10 samples + 8 views; albedo 0.055 vs 0.051 lags. Pre-registered arm-a check fires after ep2 ckpt | 4,5,7 (lock: robomituba-12) | SONNET_WORKER_1 watch |
-| IR_DATASET_ABO_ORCHESTER | abo_cornell_env_v1 COMPLETE 04:36Z: 50 scenes / 3,480 frames (marble 960 / parking 860 / concrete 760 / street 900), verified; top-up running since 05:17Z on GPUs 1,6 (seeds 50-59, takes=8, ~775 frames → ~4,255 total, ETA ~10:00Z); completion notice to IR_PIPELINE held until then | 1,6 (lock holder name stale: robomituba-b4) | SONNET_WORKER_2 |
-| IR_DATASET_HSSD_ORCHESTER | 52/100 scenes, 0.71/h, completion ~2026-09-24 00Z | 0,2,3 (lock row renamed) | SONNET_WORKER_1, SONNET_WORKER_2 |
-| OPTICALNAV_ORCHESTER | idle, waiting on Device 1 renders of 20267404, 20272904 | none (daemon :8765 idle) | SONNET_WORKER_1 |
-| OPTICALNAV_NAVIGATION_ORCHESTER | idle, 2 user decisions pending | none | none |
-| IR_DATASET_INFINIGEN_ORCHESTER | apartment hover takes built, unrendered (no GPUs); 2 cleanup decisions pending | none | none |
-| IR_DATASET_INFINIGEN_ORCHESTER | apartment hover takes ready, blocked on GPUs; corpus dedup needs a contract answer from director | none | none |
-| IR_DATASET_VIEWER_ORCHESTER | Codex: orphaned viewer work COMMITTED 06:55Z (c32b015, cfb8aa0, 6a84c30; report 02024e1); 121 tests, check, build pass; :8780 healthy (cold /api/datasets 7 s = NFS scan, not hung) | none | none |
-| PC_OPTICALNAV_RENDER | 20272904 perturbed_active_polar 12%, ETA 09:05Z | Device 1 GPU 0 | — |
-| PC_WORKER_1 | queue complete, free (user-assigned only) | Device 1 | — |
+| IR_PIPELINE_ORCHESTER | roll-call pending; worker reports v16_appearance training alive (v14 arms concluded, outcome not yet on file) | 4,5,7 | SONNET_WORKER_1 liveness watch |
+| IR_DATASET_HSSD_ORCHESTER | 90/100 at 04:26Z, 0.76/h, ETA 09-23 17Z; 12 of 88 below 15 takes (supply-limited); retry-loop bug fixed df63cfc | 0,2,3 (GPU 0 co-located for IR evals, never handed over) | SONNET_WORKER_1 (6h heartbeat), SONNET_WORKER_2 (final sweep armed) |
+| IR_DATASET_ABO_ORCHESTER | abo_cornell_env_v1 FINAL-CANDIDATE 60 scenes / 4,340 frames (top-up done 09-21 10:50Z); completion notice to IR_PIPELINE sent 09-23 (2 days late), nir_model corrected to derived_pseudo_nir; take-ceiling study done | 1,6 idle 2 days → RELEASE ordered 09-23 | SONNET_WORKER_2 verified 0 mismatches |
+| IR_DATASET_INFINIGEN_ORCHESTER | statistics backfill running since 09-21, 174 writes vs 111 baseline, suspect loop → stuck-vs-slow check ordered; tier run not done; :8780 restart deferred; apartment hover 260 poses unvalidated, no GPUs; Codex worker never reached it | none | none |
+| IR_DATASET_VIEWER_ORCHESTER (Codex) | viewer work committed 09-21; terminal since repurposed by the user to draft a Memory-NIR paper | none | — |
+| RESEARCHER (Codex) | v14 review assigned 09-21 06:00Z, NOTHING delivered in 2 days; process alive, terminal blank | none | — |
+| OPTICALNAV_ORCHESTER | 20272904 exported+verified 09-21 (78 GB); Drive holds 9 scenes; 20267404 rendering on Device 1, 83% at 02:37Z, auto-export at target; 20273004 export has 1 corrupt Stokes frame (re-render optional) | none (daemon :8765 idle) | SONNET_WORKER_1 readiness + health |
+| OPTICALNAV_NAVIGATION_ORCHESTER | idle; 20273004 in-room nodes are NOT a wall issue (walls non-blocking by design; nodes from pre-restore motion grid) | none | none |
+| PC_OPTICALNAV_RENDER | 20267404 active-polar sweep in progress | Device 1 GPU 0 | — |
+| PC_WORKER_1 | free, user-assigned only | Device 1 | — |
+| SONNET_GPU_MANAGER | no task from user since 09-21 | none | — |
+| CODEX_IR_DATASET_INFINIGEN_WORKER | still in Workers worktree; never contacted its orchester | none | — |
 
-## Open items for the user
-1. RESOLVED: orphaned ir_dataset_viewer work committed by the Codex viewer thread (c32b015, cfb8aa0, 6a84c30). Remaining: :8780 restart, deferred by its owner (Infinigen orchester) until its backfill + tier run finish. Until then :8780 serves the 2026-09-06 tree; do not read its behaviour as a test of the new commits.
-2. HSSD: ~98 GB v3 blends deletion, blocked until render_hover_v1 stops reading them.
-3. Navigation: verify 20273004 graph regen result (in-room node count pre-dates wall restore), and whether to commit 4 tool files.
-5. RESOLVED by user: GPUs 4,5,7 swapped to v14a at v13 epoch 8. v13's ep7 numbers are the baseline.
-6. RESOLVED by user 05:17Z: GPUs 1,6 went to the ABO takes=8 top-up. Infinigen apartment hover render still has no GPUs; next free slot is GPUs 1,6 after ~10:00Z.
-7. Infinigen: delete 62 superseded dataset versions (41 scenes)? And the 229 GB /bean duplicate: is a published dataset a fixed snapshot or a live copy? The work copy has 20.9 GB passive NIR the published one lacks, so a blind dedupe loses a channel. Director recommends: snapshot semantics, then migrate the passive NIR into the published copy before deleting the work copy.
-8. `.agents/` is untracked in git and world-writable (inherited NAS mode 777). Commit it? Tighten mode?
-4. Infinigen scripts orphan: 7 modified + 6 untracked files are NOT the Infinigen orchester's (only one mesh_decimation hunk is). Owner unknown, mtime 2026-09-09. Assign or drop?
-5. RESOLVED by Infinigen's user: statistics backfill running (~07:10Z) on /bean/ir_dataset_work/.catalog_statistics/; tier run follows. :8780 restart deferred until both finish (announce before, report after). Controller job state is on disk under .control/jobs/ (400 records), so a restart loses nothing; running/queued jobs are zero.
-6. 341 stale `.import.lock`, /bean tier-D 34 GB cleanup.
+## Open items for the user (2026-09-23)
+1. ABO: is 60 scenes / 4,340 frames the final abo_cornell_env_v1? Take ceiling: only removing massing blocks adds takes (+32%); halving +11%; hover-chain 1 is −21%.
+2. Infinigen: (a) 229 GB two-root duplication — is a published dataset a snapshot or a live copy? (b) delete 62 superseded versions? (c) spend Stage-1 bake time on 5 work-room scenes (hours) and 13 apartments (days) before any hover frame renders? (d) backfill result once its stuck-vs-slow check lands.
+3. Navigation: (a) 20273004's 25 in-room nodes — regenerate grid (24+ min, invalidates 250 episodes) or leave; prior question: should empty-room walls block paths? (b) commit 4 tool files + 8 tests. (c) 341 stale .import.lock, /bean tier-D 34 GB.
+4. HSSD: ~98 GB v3 blends deletion, askable only after the corpus completes (~17Z today).
+5. RESEARCHER produced nothing in 2 days. Director will read its terminal and either re-prompt or retire the role; your call if you want it kept.
+6. CODEX_IR_DATASET_INFINIGEN_WORKER: move to IR_DATASET and point it at the Infinigen orchester (commands in its agent.md), or close it.
+7. Infinigen scripts orphan (7 modified + 6 untracked, 2026-09-09): assign or drop.
+8. `.agents/` mode 777 inherited from NAS; tighten?
 
 ## Template for a new agent.md
 ```
