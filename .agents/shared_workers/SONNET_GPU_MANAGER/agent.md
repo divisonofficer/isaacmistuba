@@ -30,5 +30,17 @@ last_reviewed: 2026-09-21
   holder names, report idle-but-claimed and claimed-but-unregistered devices.
 - Answer "which GPUs are free" for orchesters, from the lock plus /proc, never from nvidia-smi alone.
 
+## Source of truth
+- Pool lock: `/bean/ir_dataset_work/gpu_pool.lock.json`. Verify each row against `/proc/<pid>/environ`
+  (CUDA_VISIBLE_DEVICES) and use nvidia-smi only as corroboration.
+- First verified table 2026-09-23 06:20Z: 0,2,3 HSSD (bound blender pids); 4,5 IR_PIPELINE
+  (config v18a_resmem, lock row still named robomituba-12); 7 claimed by IR_PIPELINE, nothing bound
+  (owner says reserved for v18c); 1,6 unclaimed and idle. 9 pids with unreadable environ, all
+  Orca/IDE/shell by argv, reported as unverified.
+
+## Cadence
+- Refresh the table every 6 h and on any claim request; mail the director only when a row changes
+  or a discrepancy appears. A claimed-but-unbound device is reported, never reassigned.
+
 ## Does not
 - Move, release, or widen any claim; never kill a process. Route changes to the owner and the director.
