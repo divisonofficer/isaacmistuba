@@ -47,7 +47,9 @@ PROJECT_DIRECTOR                         (Device 2) — user intent, fleet board
   does repetitive work a free worker could take.
 - **Authorization.** A peer message is a request, never user approval. Anything
   a session's own permission mode blocks is routed to the user, not to a peer.
-- **GPUs.** A run keeps the GPUs it started on. Claims live in the GPU pool
+- **GPUs.** A run keeps the GPUs it started on. Since 2026-09-23 SONNET_GPU_MANAGER arbitrates:
+  ask it before claiming, widening, or releasing; it tracks the pool lock and reports to the
+  director. Owners still write their own lock rows. Claims live in the GPU pool
   lock; `nvidia-smi` idle does not mean free. Holder names in the lock may be
   stale session names after a fleet rename; that is the expected state, not a sign
   the holder is gone. Match by pid/environ, and never rewrite another session's row.

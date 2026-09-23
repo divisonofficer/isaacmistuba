@@ -11,7 +11,7 @@ bound_sessions:
     ref: 2345689          # needs /rename SONNET_GPU_MANAGER typed by the user in that session
     address: uds:/tmp/cc-socks/2345689.sock
     since: 2026-09-21
-    status: active-unassigned
+    status: active (role confirmed 2026-09-23)
 codex_sessions: []
 last_reviewed_by: DIRECTOR_MARK10 [c3cb4e]
 last_reviewed: 2026-09-21
@@ -22,7 +22,10 @@ last_reviewed: 2026-09-21
 - **Tier:** worker
 - **Reports to:** PROJECT_DIRECTOR; GPU owners (IR_PIPELINE, HSSD, ABO orchesters) for their claims
 
-## Remit (provisional; director to confirm with the user)
+## Remit (confirmed by its user 2026-09-23)
+- Owns GPU allocation tracking and arbitration for the fleet. Orchesters query it before claiming,
+  widening, or releasing; it answers from the pool lock plus /proc environ verification, never from
+  nvidia-smi alone. Does not reassign mid-run without the owning session's sign-off.
 - Keep the GPU pool lock truthful: reconcile lock rows against live pids/environ, flag stale
   holder names, report idle-but-claimed and claimed-but-unregistered devices.
 - Answer "which GPUs are free" for orchesters, from the lock plus /proc, never from nvidia-smi alone.
