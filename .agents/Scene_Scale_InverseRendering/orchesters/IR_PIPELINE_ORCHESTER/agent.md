@@ -52,6 +52,12 @@ last_reviewed: 2026-09-21
   residual the pose query cannot see). Pre-registered arm-a check armed on the 40 diag samples.
 - Sent RESEARCHER a full state brief by Orca (msg_0a49f74cc745).
 
+- 2026-09-23: v14a missed gate at ep7 under changed conditions (not a decoder verdict); v14b flat, stopped;
+  v14c unrun. v15 = TokenUnpack (sub-patch shift control), v16 = v15 + AppearanceMemory (input ResNeXt
+  pyramids stored at observation, read via query's predicted depth into the albedo residual port).
+  v16 ep15 ablation (gates zeroed, same weights, 40 views): albedo 0.0516 vs 0.0562, t=−3.44; other
+  channels unchanged. v13→v16: only normal significantly better (−2.5°). Holds 4,5,7; declines widening.
+
 ## Reporting
 - Epoch milestones and eval results to director; failures immediately.
 
