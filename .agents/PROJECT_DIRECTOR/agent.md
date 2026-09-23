@@ -44,7 +44,7 @@ last_reviewed: 2026-09-21
 |---|---|---|---|
 | IR_PIPELINE_ORCHESTER | roll-call pending; worker reports v16_appearance training alive (v14 arms concluded, outcome not yet on file) | 4,5,7 | SONNET_WORKER_1 liveness watch |
 | IR_DATASET_HSSD_ORCHESTER | 90/100 at 04:26Z, 0.76/h, ETA 09-23 17Z; 12 of 88 below 15 takes (supply-limited); retry-loop bug fixed df63cfc | 0,2,3 (GPU 0 co-located for IR evals, never handed over) | SONNET_WORKER_1 (6h heartbeat), SONNET_WORKER_2 (final sweep armed) |
-| IR_DATASET_ABO_ORCHESTER | abo_cornell_env_v1 FINAL-CANDIDATE 60 scenes / 4,340 frames (top-up done 09-21 10:50Z); completion notice to IR_PIPELINE sent 09-23 (2 days late), nir_model corrected to derived_pseudo_nir; take-ceiling study done | 1,6 idle 2 days → RELEASE ordered 09-23 | SONNET_WORKER_2 verified 0 mismatches |
+| IR_DATASET_ABO_ORCHESTER | abo_cornell_env_v1 FINAL-CANDIDATE 60 scenes / 4,340 frames (top-up done 09-21 10:50Z); completion notice to IR_PIPELINE sent 09-23 (2 days late), nir_model corrected to derived_pseudo_nir; take-ceiling study done | released 09-23 05:40Z (lock read back clean) | SONNET_WORKER_2 verified 0 mismatches |
 | IR_DATASET_INFINIGEN_ORCHESTER | statistics backfill running since 09-21, 174 writes vs 111 baseline, suspect loop → stuck-vs-slow check ordered; tier run not done; :8780 restart deferred; apartment hover 260 poses unvalidated, no GPUs; Codex worker never reached it | none | none |
 | IR_DATASET_VIEWER_ORCHESTER (Codex) | viewer work committed 09-21; terminal since repurposed by the user to draft a Memory-NIR paper | none | — |
 | RESEARCHER (Codex) | v14 review assigned 09-21 06:00Z, NOTHING delivered in 2 days; process alive, terminal blank | none | — |
@@ -56,7 +56,7 @@ last_reviewed: 2026-09-21
 | CODEX_IR_DATASET_INFINIGEN_WORKER | still in Workers worktree; never contacted its orchester | none | — |
 
 ## Open items for the user (2026-09-23)
-1. ABO: is 60 scenes / 4,340 frames the final abo_cornell_env_v1? Take ceiling: only removing massing blocks adds takes (+32%); halving +11%; hover-chain 1 is −21%.
+1. ABO: is 60 scenes / 4,340 frames the final abo_cornell_env_v1, or run a props-24 batch? Levers measured at matched seeds: --props 16→24 gives +60% frames and gate pass 33→38% with walls untouched (3 pairs, direction solid, magnitude approximate); massing 6→0 +32% but loses the wall texture; hover-chain 2→1 −21%. Director recommends a props-24 batch over any massing change. A yes re-claims 2 GPUs.
 2. Infinigen: (a) 229 GB two-root duplication — is a published dataset a snapshot or a live copy? (b) delete 62 superseded versions? (c) spend Stage-1 bake time on 5 work-room scenes (hours) and 13 apartments (days) before any hover frame renders? (d) backfill result once its stuck-vs-slow check lands.
 3. Navigation: (a) 20273004's 25 in-room nodes — regenerate grid (24+ min, invalidates 250 episodes) or leave; prior question: should empty-room walls block paths? (b) commit 4 tool files + 8 tests. (c) 341 stale .import.lock, /bean tier-D 34 GB.
 4. HSSD: ~98 GB v3 blends deletion, askable only after the corpus completes (~17Z today).
