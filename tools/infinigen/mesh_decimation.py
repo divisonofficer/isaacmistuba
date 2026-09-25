@@ -256,6 +256,21 @@ def triangle_count(bpy_obj) -> int:
     except Exception:
         return len(mesh.polygons)
 
+def vertex_count(bpy_obj) -> int:
+    """Vertices of the live mesh; 0 when the object cannot report them.
+
+    Recorded beside the triangle count because triangles alone are not an
+    identity for a mesh: a rebuild can keep every face and split vertices
+    differently at UV seams and normal boundaries, which changes the
+    interpolated surface and every atlas baked against it. Each count is a
+    projection with its own null space, so the record carries the pair.
+    """
+    try:
+        return len(bpy_obj.data.vertices)
+    except Exception:  # noqa: BLE001  (lightweight unit-test fakes have no verts)
+        return 0
+
+
 def apply_decimation(bpy_obj, decision: DecimationDecision) -> int:
     """Apply the decision to a live bpy mesh via a DECIMATE modifier (COLLAPSE) and
     return the resulting triangle count. bpy-only — the caller guards on the decision so
@@ -293,6 +308,7 @@ def decimate_object(
     """
     decision = policy.decide(ctx)
     before = ctx.n_faces
+    vertices_before = vertex_count(bpy_obj)
     # Blender's COLLAPSE decimator can delete every face of a material slot on
     # a thin part -- a plant container lost slot 1 of [0,1,2,3], a dining table
     # lost the slot holding its legs. Decimation is applied in place, so hold
@@ -414,6 +430,7 @@ def decimate_object(
                   else "kept_fallback_unavailable" if fallback_unavailable else "reduced" if decision.decimate and error is None else "no_effect" if no_effect else "error" if error else "kept",
         "faces_before": before, "faces_after": after, "target_max_faces": target_max_faces,
         "triangles_before": before, "triangles_after": after, "target_max_triangles": target_max_faces,
+        "vertices_before": vertices_before, "vertices_after": vertex_count(bpy_obj),
         "target_ratio": round(decision.target_ratio, 4), "reason": decision.reason, "error": error,
         "pass_count": len(applied_ratios), "applied_ratios": applied_ratios, "pass_triangle_counts": pass_triangle_counts,
         "fallback": fallback_record,
