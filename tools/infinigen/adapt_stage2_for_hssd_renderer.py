@@ -16,9 +16,10 @@ guessed:
      lights already carry the group names; the view layer does not.
   3. It reads Depth, Normal and the three Diffuse passes.
 
-The eleven HSSD-only AOVs (GT_RoughnessRawGLTF, the four MR provenance masks,
-GT_MRConfidence, the two *Effective channels, GT_GlassMask, GT_PBRInvalidMask,
-GT_LayerCount) are deliberately NOT registered. An AOV registered with nothing
+Nine HSSD-only AOVs (GT_RoughnessRawGLTF, the four MR provenance masks,
+GT_MRConfidence, the two *Effective channels, GT_GlassMask) are deliberately NOT
+registered. GT_PBRInvalidMask and GT_LayerCount now ARE, built from this scene's
+own materials -- see build_pbr_invalid_mask. An AOV registered with nothing
 driving it renders as zeros, and a zeroed MRConfidence would read as a
 measurement of this corpus rather than the absence of one. The renderer skips a
 missing output (`if source is None: continue`) and writes no file, which is the
@@ -31,9 +32,11 @@ Usage (inside Blender):
 from __future__ import annotations
 
 import json
+import math
 import sys
 
 import bpy
+import mathutils
 
 FLASH = "__ir_nir_flash"
 LIGHT_GROUPS = ("NIR_FLASH", "DATASET_AMBIENT_FILL")
@@ -80,11 +83,394 @@ def tag_asset_roles() -> dict:
     return counts
 
 
+# `_ambient_band()` rewrites every ambient light each pass from two properties
+# on the light DATA, and our Stage-2 fills carry neither:
+#
+#   ir_rgb_energy_w     the RGB-band wattage. Absent, the base falls back to
+#                       `obj.data.energy` -- the LIVE value -- so the passive
+#                       pass (scale 0.0) zeroes the lamp and the next frame's
+#                       RGB pass then reads that zero as its base. The fill
+#                       latches off after frame 0 and never comes back.
+#   ir_nir_passive_scale  the 850-nm fraction. Absent, it defaults to 0.0 and
+#                       the fill is multiplied out of the passive NIR pass.
+#
+# Writing the authored wattage into ir_rgb_energy_w restores the intent rather
+# than inventing one. The NIR fraction is a physical claim, so it is a flag:
+# HSSD's own policy is led 0.0 / incandescent 0.45 / daylight 0.75, and these
+# synthetic ceiling fills stand in for the household lamps our Stage-2 prepare
+# switched off, which is the incandescent class.
+NIR_PASSIVE_SCALE_POLICY = {"led": 0.0, "incandescent": 0.45, "daylight": 0.75}
+
+
+def declare_ambient_band(emitter_class: str) -> dict:
+    """Give the ambient fills the two properties HSSD's _ambient_band reads."""
+    scale = NIR_PASSIVE_SCALE_POLICY[emitter_class]
+    touched = []
+    for obj in bpy.context.scene.objects:
+        if obj.type != "LIGHT" or not obj.data.get("ir_ambient_fill", False):
+            continue
+        # Read the wattage BEFORE anything can rewrite it, and only set the
+        # property when it is missing, so re-running the adapter on an already
+        # adapted blend cannot bake in a latched zero.
+        if "ir_rgb_energy_w" not in obj.data.keys():
+            obj.data["ir_rgb_energy_w"] = float(obj.data.energy)
+        if "ir_nir_passive_scale" not in obj.data.keys():
+            obj.data["ir_nir_passive_scale"] = scale
+        touched.append({"name": obj.name, "rgb_energy_w": float(obj.data["ir_rgb_energy_w"]),
+                        "nir_passive_scale": float(obj.data["ir_nir_passive_scale"])})
+    return {"emitter_class": emitter_class, "nir_passive_scale": scale,
+            "count": len(touched), "lights": touched[:3]}
+
+
+# The day curriculum (T0_midday_clear .. T5_night_partial) already describes the
+# illumination the corpus wants: a sun, a sky colour, window portals at
+# 100 W/m^2 and room fixtures. `_lighting_variant()` runs once per frame BEFORE
+# the RGB pass, so it reaches every band -- it just found nothing to drive here,
+# because it matches on objects and properties an Infinigen blend has no reason
+# to carry. Each one below is that renderer's own matcher, read out of it:
+#
+#   sun       an object literally named "__ir_sun" of type SUN
+#   sky       the world's BACKGROUND node literally named "IR_Sky"
+#   windows   data["ir_window_light"], scaled by data["ir_window_area_m2"]
+#   fixtures  data["ir_fixture_light"], ordered by data["ir_fixture_index"]
+#
+# Windows and fixtures need no wattage from us: the variant supplies it and
+# writes ir_rgb_energy_w itself, so they cannot latch the way the fills did.
+SUN = "__ir_sun"
+PORTAL_PREFIX = "__ir_external_portal"
+FILL_PREFIX = "__ir_ambient_fill"
+
+
+def install_sun() -> dict:
+    if bpy.data.objects.get(SUN) is not None:
+        return {"status": "present"}
+    data = bpy.data.lights.new(SUN, "SUN")
+    data.energy = 0.0                       # the variant sets it; 0 until then
+    data.angle = math.radians(0.53)         # solar disc, keeps contact shadows crisp
+    data["ir_sun"] = True
+    data["ir_emitter_class"] = "daylight"
+    data["ir_nir_passive_scale"] = NIR_PASSIVE_SCALE_POLICY["daylight"]
+    bpy.context.scene.collection.objects.link(bpy.data.objects.new(SUN, data))
+    return {"status": "created", "nir_passive_scale": NIR_PASSIVE_SCALE_POLICY["daylight"]}
+
+
+def name_sky() -> dict:
+    """Give the world's background node the name the variant looks up."""
+    world = bpy.context.scene.world
+    if world is None or not world.use_nodes:
+        return {"status": "no_node_world"}
+    node = next((n for n in world.node_tree.nodes if n.type == "BACKGROUND"), None)
+    if node is None:
+        return {"status": "no_background_node"}
+    was = node.name
+    node.name = "IR_Sky"
+    return {"status": "renamed" if was != "IR_Sky" else "present", "was": was}
+
+
+def relocate_portals(inset_m: float = 0.15) -> dict:
+    """Put each window portal inside the glass, aimed into the room.
+
+    Measured, not assumed: a ray from every one of this scene's 37 portals finds
+    a WindowFactory pane ~0.10 m away on one side and nothing within 6 m on the
+    other, so they all sit OUTSIDE the building. Our Stage-2 authored them for a
+    path where `_set_environment` drove them as apertures; HSSD instead gives
+    them wattage as real emitters, and an emitter outside an opaque pane cannot
+    light a room whichever way it faces -- which is why 14.9 kW across 148.95 m2
+    of aperture rendered as almost nothing.
+
+    HSSD's own portals are inside for exactly this reason: that pipeline
+    substitutes opaque glass and the portal stands in for the window. Matching
+    that convention is what this does; it invents no new illumination.
+
+    The pane tells us which way the building is, so it also tells us which way
+    to move and aim: through it, then `inset_m` further in.
+    """
+    scene = bpy.context.scene
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    moved, skipped = [], []
+    for obj in list(scene.objects):
+        if obj.type != "LIGHT" or not obj.name.startswith(PORTAL_PREFIX):
+            continue
+        origin = obj.matrix_world.translation.copy()
+        emit = (obj.matrix_world.to_3x3() @ mathutils.Vector((0.0, 0.0, -1.0))).normalized()
+        # Whichever side the pane is on is the building. Try the emission axis
+        # first, then its reverse; a portal with no pane either way is left
+        # alone rather than moved on a guess.
+        toward = None
+        for direction in (emit, -emit):
+            hit = scene.ray_cast(depsgraph, origin + direction * 0.02, direction, distance=1.0)
+            if hit[0] and "Window" in hit[4].name:
+                toward, distance = direction, (hit[1] - origin).length
+                break
+        if toward is None:
+            skipped.append({"name": obj.name, "why": "no window pane within 1 m either way"})
+            continue
+        obj.matrix_world.translation = origin + toward * (distance + inset_m)
+        # An AREA light emits along -Z, so point -Z along `toward`.
+        obj.rotation_mode = "QUATERNION"
+        obj.rotation_quaternion = (-toward).to_track_quat("Z", "Y")
+        moved.append({"name": obj.name, "pane_at_m": round(distance, 4),
+                      "moved_m": round(distance + inset_m, 4)})
+    bpy.context.view_layer.update()
+    # Verify the move rather than trusting it: from inside, the emission ray
+    # should now find room geometry, and it should no longer be the pane.
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    inside = 0
+    for obj in scene.objects:
+        if obj.type != "LIGHT" or not obj.name.startswith(PORTAL_PREFIX):
+            continue
+        origin = obj.matrix_world.translation
+        emit = (obj.matrix_world.to_3x3() @ mathutils.Vector((0.0, 0.0, -1.0))).normalized()
+        hit = scene.ray_cast(depsgraph, origin + emit * 0.02, emit, distance=8.0)
+        if hit[0] and "Window" not in hit[4].name:
+            inside += 1
+    return {"moved": len(moved), "skipped": len(skipped), "inset_m": inset_m,
+            "emitting_into_room": inside, "skipped_sample": skipped[:3], "sample": moved[:3]}
+
+
+def _pane_area_m2(portal):
+    """The matched window's opening area, from its two largest bbox extents."""
+    scene = bpy.context.scene
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    origin = portal.matrix_world.translation
+    emit = (portal.matrix_world.to_3x3() @ mathutils.Vector((0.0, 0.0, -1.0))).normalized()
+    for direction in (-emit, emit):      # after relocation the pane is behind
+        hit = scene.ray_cast(depsgraph, origin + direction * 0.02, direction, distance=1.2)
+        if not (hit[0] and "Window" in hit[4].name):
+            continue
+        obj = hit[4]
+        corners = [obj.matrix_world @ mathutils.Vector(c) for c in obj.bound_box]
+        extents = sorted((max(p[i] for p in corners) - min(p[i] for p in corners) for i in range(3)),
+                         reverse=True)
+        return float(extents[0] * extents[1])
+    return None
+
+
+def declare_windows() -> dict:
+    """Turn the Stage-2 portals into the window lights the variant drives."""
+    out = []
+    for obj in bpy.context.scene.objects:
+        if obj.type != "LIGHT" or not obj.name.startswith(PORTAL_PREFIX):
+            continue
+        # An AREA light's size is its emitting rectangle, which is the portal's
+        # aperture -- so the per-m^2 recipe scales by real glazing area rather
+        # than by a count of windows.
+        lamp_area = float(obj.data.size) * float(
+            getattr(obj.data, "size_y", obj.data.size)
+            if obj.data.shape in {"RECTANGLE", "ELLIPSE"} else obj.data.size)
+        # The AREA light's own size is the wrong number: summed over this scene's
+        # portals it claims 148.95 m2 of glazing for one apartment, with single
+        # portals at 9.4 m2, and at 100 W/m2 that floods every room with a
+        # portal to a median luminance of 14 -- as far over as the outside-the-
+        # pane version was under. Our Stage-2 sized these as wall-spanning
+        # apertures for a path that drove them by strength, not by wattage.
+        # The pane the portal was matched to is the real aperture, so measure it:
+        # a window's two largest bounding-box extents are its opening.
+        pane = _pane_area_m2(obj)
+        obj.data["ir_window_light"] = True
+        obj.data["ir_window_area_m2"] = pane if pane is not None else lamp_area
+        obj.data["ir_window_area_source"] = "window_pane_bbox" if pane is not None else "portal_lamp_size"
+        obj.data["ir_nir_passive_scale"] = NIR_PASSIVE_SCALE_POLICY["daylight"]
+        out.append({"name": obj.name, "area_m2": round(float(obj.data["ir_window_area_m2"]), 4),
+                    "lamp_area_m2": round(lamp_area, 4),
+                    "source": obj.data["ir_window_area_source"]})
+    return {"count": len(out), "total_area_m2": round(sum(o["area_m2"] for o in out), 3),
+            "windows": out[:3]}
+
+
+def declare_fixtures() -> dict:
+    """Enrol the scene's own luminaires so the variant can switch them on.
+
+    Our Stage-2 prepare set every native lamp to 0 W and hid it. The wattage
+    comes back from the variant's fixture_state, not from a number invented
+    here, so restoring participation does not restore a guess.
+    """
+    # Only the scene's own generated luminaires. The blend also holds anonymous
+    # `Area` / `Area.001` lights that arrived at 0 W and hidden; what they were
+    # for is not recorded anywhere, and enrolling them would hand a lamp's
+    # wattage to something that might be an exterior or a bounce card.
+    lamps = [o for o in bpy.context.scene.objects
+             if o.type == "LIGHT" and not o.name.startswith("__ir_")
+             and "Factory" in o.name]
+    lamps.sort(key=lambda o: o.name)        # deterministic index, not scene order
+    for index, obj in enumerate(lamps):
+        obj.data["ir_fixture_light"] = True
+        obj.data["ir_fixture_index"] = index
+        obj.data["ir_fixture_category"] = "infinigen_native_lamp"
+        obj.data["ir_nir_passive_scale"] = NIR_PASSIVE_SCALE_POLICY["incandescent"]
+        # A POINT lamp at full wattage fireflies in Cycles; give it a small
+        # emitting sphere so it reads as a bulb.
+        if obj.data.type == "POINT":
+            obj.data.shadow_soft_size = max(float(obj.data.shadow_soft_size), 0.04)
+    skipped = [o.name for o in bpy.context.scene.objects
+               if o.type == "LIGHT" and not o.name.startswith("__ir_") and "Factory" not in o.name]
+    return {"count": len(lamps), "names": [o.name[:44] for o in lamps[:4]],
+            "skipped_unnamed": len(skipped), "skipped_sample": skipped[:3]}
+
+
+def retire_ambient_fills() -> dict:
+    """Silence the synthetic ceiling fills once real daylight is installed.
+
+    They are HSSD's retired rig, and `_lighting_variant` only zeroes the three
+    legacy names -- ours are per-room and would survive as a non-physical fill
+    stacked on top of the sun, sky and fixtures.
+    """
+    off = []
+    for obj in bpy.context.scene.objects:
+        if obj.type != "LIGHT" or not obj.name.startswith(FILL_PREFIX):
+            continue
+        obj.data["ir_rgb_energy_w"] = 0.0
+        obj.data["ir_nir_passive_scale"] = 0.0
+        obj.data.energy = 0.0
+        obj.hide_render = True
+        off.append(obj.name)
+    return {"count": len(off)}
+
+
+# The renderer composes GT_PBRInvalidMask from three terms and only owns two of
+# them: `_mark_background_invalid` folds in "no surface was hit" from the Depth
+# pass, and `_mark_mixed_invalid` folds in "more than one surface" from
+# GT_LayerCount. The per-surface term -- this pixel shows a surface that has no
+# meaningful PBR target -- has to come from the materials, so it is built here.
+#
+# Two classes qualify, both for the same reason: the Principled parameters do
+# not describe what the pixel shows. A pane's albedo/roughness/metallic say
+# nothing about the transmitted image behind it, and an emitter's radiance is
+# not a reflectance at all.
+#
+# GT_LayerCount is deliberately ungated in HSSD's own prepare -- 1.0 per surface
+# crossed, whatever it is -- so it is added to every material without exception.
+GLASS_NODES = {"BSDF_GLASS", "BSDF_TRANSPARENT", "BSDF_REFRACTION"}
+TRANSMISSION_SOCKETS = ("Transmission Weight", "Transmission")
+EMISSION_SOCKETS = ("Emission Strength",)
+
+
+def _socket_value(node, names):
+    """A socket's effective value: linked means "varies", so treat as present."""
+    for name in names:
+        socket = node.inputs.get(name)
+        if socket is None:
+            continue
+        if socket.is_linked:
+            return float("inf")
+        return float(socket.default_value)
+    return 0.0
+
+
+def _classify_material(mat) -> str:
+    if mat is None or not mat.use_nodes:
+        return "opaque"
+    for node in mat.node_tree.nodes:
+        if node.type in GLASS_NODES:
+            return "glass"
+        if node.type == "EMISSION" and _socket_value(node, ("Strength",)) > 0.0:
+            return "emitter"
+        if node.type == "BSDF_PRINCIPLED":
+            if _socket_value(node, TRANSMISSION_SOCKETS) > 0.05:
+                return "glass"
+            if _socket_value(node, EMISSION_SOCKETS) > 0.0:
+                return "emitter"
+    return "opaque"
+
+
+def _aov_output(tree, name, value):
+    """An AOV output driven by a constant, added only if not already present."""
+    for node in tree.nodes:
+        if node.bl_idname == "ShaderNodeOutputAOV" and node.name == name:
+            return False
+    const = tree.nodes.new("ShaderNodeValue")
+    const.outputs[0].default_value = float(value)
+    const.name = const.label = f"{name}_value"
+    out = tree.nodes.new("ShaderNodeOutputAOV")
+    out.name = out.label = name
+    out.aov_name = name
+    tree.links.new(const.outputs[0], out.inputs["Value"])
+    return True
+
+
+def register_aovs(view_layer, names) -> list:
+    """Declare AOVs on the view layer so the render-layer node exposes them."""
+    have = {a.name for a in view_layer.aovs}
+    added = []
+    for name in names:
+        if name in have:
+            continue
+        aov = view_layer.aovs.add()
+        aov.name = name
+        aov.type = "VALUE"
+        added.append(name)
+    return added
+
+
+def _window_materials() -> tuple[set, set]:
+    """Materials used by window geometry, split by whether that use is exclusive.
+
+    Transmission is the wrong signal in this blend: our Stage-2 already made the
+    panes opaque -- which is why sun and sky reached nothing through them -- so
+    classifying by Principled transmission found one glass material out of 540
+    and was measuring the substitution, not the windows. What the mask has to
+    exclude is the pane *surface*, whose Principled parameters describe a
+    stand-in rather than the view through it.
+    #
+    A material shared between a pane and a wall cannot be marked without marking
+    the wall too, so exclusivity is measured and reported instead of assumed.
+    """
+    window, other = {}, {}
+    for obj in bpy.context.scene.objects:
+        if obj.type != "MESH":
+            continue
+        is_window = obj.get("hssd_asset_role") == "opening" or "Window" in obj.name
+        for slot in obj.material_slots:
+            if slot.material is None:
+                continue
+            (window if is_window else other).setdefault(slot.material.name, 0)
+            (window if is_window else other)[slot.material.name] += 1
+    exclusive = {n for n in window if n not in other}
+    shared = {n for n in window if n in other}
+    return exclusive, shared
+
+
+def build_pbr_invalid_mask() -> dict:
+    exclusive, shared = _window_materials()
+    counts = {"glass_transmissive": 0, "emitter": 0, "window_exclusive": 0,
+              "opaque": 0, "no_nodes": 0}
+    for mat in bpy.data.materials:
+        if not mat.use_nodes:
+            counts["no_nodes"] += 1
+            continue
+        kind = _classify_material(mat)
+        if kind == "glass":
+            counts["glass_transmissive"] += 1
+        elif kind == "emitter":
+            counts["emitter"] += 1
+        elif mat.name in exclusive:
+            kind = "window"
+            counts["window_exclusive"] += 1
+        else:
+            counts["opaque"] += 1
+        _aov_output(mat.node_tree, "GT_PBRInvalidMask", 0.0 if kind == "opaque" else 1.0)
+        _aov_output(mat.node_tree, "GT_LayerCount", 1.0)
+    return {**counts, "window_materials_shared_with_non_windows": len(shared),
+            "shared_sample": sorted(shared)[:3]}
+
+
 def _args():
     argv = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else []
     import argparse
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=True)
+    ap.add_argument("--relocate-portals", choices=("inside", "leave"), default="inside",
+                    help="move window portals inside the glass and aim them into the room")
+    ap.add_argument("--windows", choices=("declare", "skip"), default="declare",
+                    help="declare the Stage-2 portals as window lights, or leave them dark and let "
+                         "sun and sky reach the interior through the scene's real glass")
+    ap.add_argument("--daylight-rig", choices=("install", "skip"), default="install",
+                    help="install the sun/sky/window/fixture rig the day curriculum drives")
+    ap.add_argument("--keep-ambient-fills", action="store_true",
+                    help="keep the synthetic ceiling fills alive alongside the daylight rig")
+    ap.add_argument("--ambient-emitter-class", default="incandescent",
+                    choices=sorted(NIR_PASSIVE_SCALE_POLICY),
+                    help="850-nm policy class for the synthetic ceiling fills")
     return ap.parse_args(argv)
 
 
@@ -130,14 +516,21 @@ def main() -> int:
         "source_blend": bpy.data.filepath,
         "flash": reparent_flash(),
         "asset_roles": tag_asset_roles(),
+        "ambient_band": declare_ambient_band(a.ambient_emitter_class),
+        "daylight_rig": ({"mode": "skip"} if a.daylight_rig == "skip" else {
+            "mode": "install", "sun": install_sun(), "sky": name_sky(),
+            "portals": ({"mode": "leave"} if a.relocate_portals == "leave" else relocate_portals()),
+            "windows": (declare_windows() if a.windows == "declare" else {"mode": "skip"}), "fixtures": declare_fixtures(),
+            "ambient_fills": ({"kept": True} if a.keep_ambient_fills else retire_ambient_fills())}),
         "lightgroups": register_light_groups(vl),
         "passes": enable_passes(vl),
+        "pbr_invalid_mask": build_pbr_invalid_mask(),
+        "mask_aovs": register_aovs(vl, ("GT_PBRInvalidMask", "GT_LayerCount")),
         "aovs_registered": sorted(x.name for x in vl.aovs),
         "hssd_only_aovs_left_unregistered": [
             "GT_RoughnessRawGLTF", "GT_MetallicRawGLTF", "GT_MRExplicitMask",
             "GT_MRInferredMask", "GT_MRTrainingValidMask", "GT_MRConfidence",
-            "GT_RoughnessEffective", "GT_MetallicEffective", "GT_GlassMask",
-            "GT_PBRInvalidMask", "GT_LayerCount"],
+            "GT_RoughnessEffective", "GT_MetallicEffective", "GT_GlassMask"],
         "why_unregistered": ("an AOV with nothing driving it renders as zeros; the renderer skips a "
                              "missing output and writes no file, so absent beats zero"),
         "out_blend": a.out,
