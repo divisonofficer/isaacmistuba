@@ -53,6 +53,10 @@ PROJECT_DIRECTOR                         (Device 2) — user intent, fleet board
   lock; `nvidia-smi` idle does not mean free. Holder names in the lock may be
   stale session names after a fleet rename; that is the expected state, not a sign
   the holder is gone. Match by pid/environ, and never rewrite another session's row.
+- **Viewer render queue.** `apps/ir_dataset_viewer/run_dev.sh` defaults to
+  ROBOMITUBA_IR_GPU_INDICES=0..7 and MAX_GPUS_PER_RENDER_PARENT=8, a render queue over every
+  GPU that ignores the lock. Never start it unpinned: set both to the devices you hold, and tell
+  SONNET_GPU_MANAGER.
 - **Processes.** Never kill or signal a process you do not own. Peers run the
   same renderer binaries; gate any matcher on the output root, not the module.
 - **Shared trees.** `modules/hssd_blender_ir` and the shared checkout are live
