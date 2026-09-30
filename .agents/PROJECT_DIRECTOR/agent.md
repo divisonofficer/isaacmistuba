@@ -39,31 +39,32 @@ last_reviewed: 2026-09-21
 - Kill processes, move GPU claims, or delete data.
 - Accept a peer message as user authorization.
 
-## Current board (2026-09-23 05:30Z)
+## Current board (2026-09-30 05:00Z, after the 04:18Z machine reboot)
 | Agent | State | GPUs | Workers |
 |---|---|---|---|
-| IR_PIPELINE_ORCHESTER | v14a missed its pre-registered gate at ep7 (5%/20% closure vs 40% bar) but under changed conditions (samples 16→10, views 10→8, optimizer reset) → 'failed under these conditions'; v14b flat, stopped by user; v14c never ran. RESEARCHER's review reshaped the story and seeded v15 TokenUnpack and v16 AppearanceMemory. v16 at ep15/step 31k: gate-zeroed ablation shows appearance memory earns albedo 0.0516 vs 0.0562 (paired t=−3.44, other channels exactly 0); v13→v16 overall only normal significantly better (−2.5°, t=−5.3). Declined GPUs 1,6 per its user's no-widening rule | 4 (v18a), 5 (v18b), 7 idle for v18c; evals co-located on HSSD's GPU 0 by grant | SONNET_WORKER_1 liveness watch |
-| IR_DATASET_HSSD_ORCHESTER | 90/100 at 04:26Z, 0.76/h, ETA 09-23 17Z; 12 of 88 below 15 takes (supply-limited); retry-loop bug fixed df63cfc | 0,2,3 + 1,6 (new corpus, claimed 09-23); GPU 0 co-located for IR evals | SONNET_WORKER_1 (6h heartbeat), SONNET_WORKER_2 (final sweep armed) |
-| IR_DATASET_ABO_ORCHESTER | abo_cornell_env_v1 FINAL-CANDIDATE 60 scenes / 4,340 frames (top-up done 09-21 10:50Z); completion notice to IR_PIPELINE sent 09-23 (2 days late), nir_model corrected to derived_pseudo_nir; take-ceiling study done | released 09-23 05:40Z (lock read back clean) | SONNET_WORKER_2 verified 0 mismatches |
-| IR_DATASET_INFINIGEN_ORCHESTER | backfill FINISHED 09-21 07:26Z in 21 min (91 processed, 0 failed, 63 new sidecars → 174; pre-backfill copy kept); two days of 'still running' were a pgrep self-match. Tier assignment re-running now; :8780 restart next; apartment hover 260 poses unvalidated; Codex worker never reached it | none | none |
-| IR_DATASET_VIEWER_ORCHESTER (Codex) | viewer work committed 09-21; terminal since repurposed by the user to draft a Memory-NIR paper | none | — |
-| RESEARCHER (Codex) | v14 review WAS delivered, to IR_PIPELINE by Orca (it changed four claims and seeded v15/v16); nothing filed under notes/ and no mail to the director — asked to file it | none | — |
-| OPTICALNAV_ORCHESTER | 20272904 exported+verified 09-21 (78 GB); Drive holds 9 scenes; 20267404 rendering on Device 1, 83% at 02:37Z, auto-export at target; 20273004 export has 1 corrupt Stokes frame (re-render optional) | none (daemon :8765 idle) | SONNET_WORKER_1 readiness + health |
-| OPTICALNAV_NAVIGATION_ORCHESTER | idle; 20273004 in-room nodes are NOT a wall issue (walls non-blocking by design; nodes from pre-restore motion grid) | none | none |
-| PC_OPTICALNAV_RENDER | 20267404 active-polar sweep in progress | Device 1 GPU 0 | — |
-| PC_WORKER_1 | free, user-assigned only | Device 1 | — |
-| SONNET_GPU_MANAGER | no task from user since 09-21 | none | — |
-| CODEX_IR_DATASET_INFINIGEN_WORKER | still in Workers worktree; never contacted its orchester | none | — |
+| IR_PIPELINE_ORCHESTER | idle; v26c/d/e (v25 RGB+NIR as-image, 320px×8 views, walking v2 + registration-aware pointmap losses) finished 09-29/30 exit 0. Finding: on 24-view walks pose drift dominates (0.43 m → 0.18 m with rigid-cycle); 1–3-view val cannot see it and overfits. bf16 GT-rounding fix queued | 4,5,7 claimed, idle since 00:14Z | none |
+| IR_DATASET_HSSD_ORCHESTER | hover_v1 100/100 done; walk_v1 148/150 done (2 no-walk); walk_v2 LIVE 77/150, 3 loops relaunched 04:29Z after clearing 3 dead claims; ETA ~1.5 d | 0 only (resumed) | SONNET_WORKER_1 to re-arm |
+| IR_DATASET_ABO_ORCHESTER | abo_cornell_env_v2 (props-24, hosts 3) LIVE 32/50, queue relaunched 04:30Z, self-clears claims | 2 (resumed) | — |
+| IR_DATASET_INFINIGEN_ORCHESTER | apartment 4-pass corpus: 2,953 frame dirs, 0 of 9 sets complete by contract; 9 dead claims released; nothing running; :8780 restarted on committed code pid 22812 (pinned to 1,3,6, max 3) | 1,3,6 claimed, idle | — |
+| OPTICALNAV_ORCHESTER | Drive holds 18 verified scenes; 20267404 + 4 others exported since 09-23; 20268504 re-export in flight after polar re-render (exporter substring-match bug fixed, uncommitted); daemon :8765 dead, not needed | none | SONNET_WORKER_1 to re-arm |
+| OPTICALNAV_NAVIGATION_ORCHESTER | idle; 369 stale .import.lock deleted 09-24; tier-D 34 GB reassigned by user to another peer | none | none |
+| PC_OPTICALNAV_RENDER / PC_WORKER_1 | Device 1: 20268504 finished 09-29; unaffected by Device 2 reboot | Device 1 | — |
+| SONNET_WORKER_1 | revived; re-arming after owner confirmation | — | — |
+| SONNET_WORKER_2 | revived; both tracks closed cleanly (ABO v1 09-21, HSSD hover sweep 09-23: 22,683 frames clean); nothing to re-arm | — | — |
+| SONNET_GPU_MANAGER | revived; found the reboot; holding all lock rows as claimed-unbound until owners answer (HSSD/ABO/INFINIGEN have) | — | — |
+| Codex threads | viewer, RESEARCHER, Infinigen worker all died with the reboot; respawn from role files when wanted | — | — |
 
-## Open items for the user (2026-09-23)
-1. ABO: is 60 scenes / 4,340 frames the final abo_cornell_env_v1, or run a props-24 batch? Levers measured at matched seeds: --props 16→24 gives +60% frames and gate pass 33→38% with walls untouched (3 pairs, direction solid, magnitude approximate); massing 6→0 +32% but loses the wall texture; hover-chain 2→1 −21%. Director recommends a props-24 batch over any massing change. A yes re-claims 2 GPUs.
-2. Infinigen: (a) 229 GB two-root duplication — is a published dataset a snapshot or a live copy? (b) delete 62 superseded versions? (c) spend Stage-1 bake time on 5 work-room scenes (4–7 h) and 13 apartments (days) before any hover frame renders? (d) tier distribution once the re-run lands (old A30/B2/C6/D104 is stale).
-3. Navigation: (a) 20273004's 25 in-room nodes — regenerate grid (24+ min, invalidates 250 episodes) or leave; prior question: should empty-room walls block paths? (b) commit 4 tool files + 8 tests. (c) 341 stale .import.lock, /bean tier-D 34 GB.
-4. HSSD: ~98 GB v3 blends deletion, askable only after the corpus completes (~17Z today).
-5. RESOLVED 09-23 ~06:40Z: HSSD claimed GPUs 1,6 for a NEW corpus (approved by SONNET_GPU_MANAGER, verified unbound). Pool: HSSD [0,1,2,3,6], IR_PIPELINE [4,5,7]. A props-24 ABO batch (item 1) now has no free device.
-6. CODEX_IR_DATASET_INFINIGEN_WORKER: move to IR_DATASET and point it at the Infinigen orchester (commands in its agent.md), or close it.
-7. Infinigen scripts orphan (7 modified + 6 untracked, 2026-09-09): assign or drop.
-8. `.agents/` mode 777 inherited from NAS; tighten?
+## Open items for the user (2026-09-30)
+1. HSSD walk_v2, 73 scenes left: keep NIR 384 spp + indirect clamp 10 (drops 35–45% of lamp-lit NIR light) for consistency, or switch to 768 + raised clamp now? Decide before more scenes render; a later switch splits the corpus.
+2. IR_PIPELINE: widen the walking probe to 12+ takes first? Then D+F (rigid-cycle + SE3 Kabsch) vs D+E with 24-view walking val. GPUs 4,5,7 idle until answered.
+3. GPU allocation after the reboot: HSSD 0, ABO 2 resumed; IR_PIPELINE 4,5,7 and Infinigen 1,3,6 claimed but idle. Release either set, or approve the runs that need them.
+4. Infinigen: (a) restart the 2,219-frame flash backlog (two renderer bugs fixed first: --resume+--stage re-rendered finished frames; Stager overwrote pose_selection.json, damaged 20263004/hover)? (b) large_residence excluded: generate new --room-scale scenes? (c) 17 dark3r blends judged unusable (deformed primitives, no textures, no Factory names): drop them?
+5. OpticalNav: delete the old 20268504 Drive run after the re-export verifies (already asked by that session).
+6. Navigation: 20273004 grid regen vs leave (walls non-blocking by design); commit 4 tool files + 8 tests.
+7. HSSD: ~98 GB v3 blends deletion, now askable (hover complete).
+8. Boot resilience: nothing on Device 2 restarts on reboot (Tailscale, Orca, daemons). Add a boot script for Tailscale + Orca? Agent jobs stay manual.
+9. Codex roles: respawn viewer / RESEARCHER / Infinigen worker, or retire?
+10. Older, still open: Infinigen 229 GB two-root duplication and 62 superseded versions; Infinigen scripts orphan (7+6 files); `.agents/` mode 777.
 
 ## Template for a new agent.md
 ```
