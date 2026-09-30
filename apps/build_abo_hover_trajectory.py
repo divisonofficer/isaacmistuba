@@ -193,7 +193,8 @@ def candidate_chains(picks: list[dict], count: int, tries: int = 4):
 def plan_arc(targets: list[dict], blockers: list[dict], room: dict, *, frames: int,
              radius: float, azimuth_span_deg: float, elevation_deg: float,
              facing_candidates: int, handheld_deg: float, shape: str,
-             seed: int, handoff_window: float) -> dict[str, Any] | None:
+             seed: int, handoff_window: float,
+             cross_track_deg: float = 0.0) -> dict[str, Any] | None:
     """One unobstructed take across `targets`, or None if no facing gives one.
 
     All or nothing, deliberately. A blocked sample dropped from the middle of a
@@ -216,6 +217,12 @@ def plan_arc(targets: list[dict], blockers: list[dict], room: dict, *, frames: i
 
     samples = hover_path.arc(frames, azimuth_span_deg, lowest, highest,
                              pacing=handheld_deg * PACING_PER_DEG, seed=seed, shape=shape)
+    if cross_track_deg > 0.0:
+        # Moves where the camera IS, off the path and still on the sphere, so
+        # the radius and the apparent size are unchanged and the view direction
+        # genuinely differs. handheld() only moves where it LOOKS.
+        samples = hover_path.cross_track(samples, cross_track_deg, seed=seed,
+                                         elevation_band=(lowest, highest))
     hands = [hover_path.handheld(index, frames, handheld_deg, seed)
              for index in range(frames)]
     span = [centroid_at(targets, index / max(1, frames - 1), handoff_window)
@@ -353,6 +360,10 @@ def main() -> int:
     parser.add_argument("--azimuth-span-deg", type=float, default=AZIMUTH_SPAN_DEG,
                         help="the TOTAL sweep, as the HSSD hover mode names it")
     parser.add_argument("--elevation-deg", type=float, default=ELEVATION_DEG)
+    parser.add_argument("--revisit-rounds", type=int, default=0,
+                        help="when the target pool is exhausted before --targets takes are "
+                             "planned, re-open it this many times and shoot the same objects "
+                             "from new arcs. 0 keeps every take on a distinct subject.")
     parser.add_argument("--targets", type=int, default=1,
                         help="how many separate takes to write")
     parser.add_argument("--chain", type=int, default=1,
@@ -364,6 +375,11 @@ def main() -> int:
     parser.add_argument("--hover-handheld-deg", type=float, default=hover_path.HANDHELD_DEG,
                         help="how far the aim may wander, in degrees, plus the roll and "
                              "uneven pacing that come with it; 0 gives a rigid orbit")
+    parser.add_argument("--hover-cross-track-deg", type=float, default=hover_path.CROSS_TRACK_DEG,
+                        help="how far a revisit take steps the camera off its own arc. "
+                             "Unused on a first pass, and applied at one multiple however "
+                             "many rounds run: scaling it per round is what turned a hover "
+                             "into a whip pan, 69.6 deg of turn in a frame by round 7.")
     parser.add_argument("--hover-shape", choices=["quartic", "corner"], default="quartic",
                         help="quartic bends the path; corner is the original two-segment L, "
                              "kept reachable for frames already rendered against it")
@@ -390,8 +406,28 @@ def main() -> int:
 
     poses, summaries = [], []
     used: set[int] = set()
-    for _ in range(max(1, args.targets)):
+    revisits = 0
+    # Takes, not attempts. A revisit used to `continue` this loop, which spent
+    # one of the take budget's slots on a round that plans nothing -- so asking
+    # for 8 takes with revisits on could never return more than 7, and more
+    # rounds did not help. Measured on abo_env_0015: 5 takes at 0 rounds, 7 at
+    # 1, 2 and 4 alike. The rounds get their own budget instead.
+    attempts = 0
+    while len(summaries) < max(1, args.targets) and attempts < max(1, args.targets) + args.revisit_rounds:
+        attempts += 1
         available = [t for t in targets if id(t) not in used]
+        # A scene costs ~25 min to compose, build and prepare before a single
+        # frame renders, and that cost is the same whether it yields one take
+        # or eight. Objects are consumed on success, so a room with six
+        # shootable props gives three takes and stops -- abo_env_0004 shipped
+        # 20 frames for a full scene setup.
+        #
+        # When the pool runs dry short of the target, shoot the same objects
+        # again rather than end the scene. plan_arc already seeds per take, so
+        # a revisit gets a different facing and a different arc: it is another
+        # angle on the same subject, which is what a second take of a scene
+        # with few props honestly is. Off by default.
+
         chain = plan = None
         for candidate in candidate_chains(available, args.chain):
             # The chain's own members are not occluders of each other. One
@@ -407,17 +443,40 @@ def main() -> int:
                                azimuth_span_deg=args.azimuth_span_deg,
                                elevation_deg=args.elevation_deg,
                                facing_candidates=args.facing_candidates,
-                               handheld_deg=args.hover_handheld_deg,
-                               shape=args.hover_shape, seed=args.seed + len(summaries),
-                               handoff_window=args.handoff_window)
+                               # Capped, both of them. Unbounded escalation stops
+                               # being a person holding a phone: measured on
+                               # abo_env_0004 over 8 rounds, per-frame turn went
+                               # 11.3 -> 69.6 deg, and cross-track is what does
+                               # it -- hold it at one multiple and the same 8
+                               # rounds stay between 11 and 17.7. The walking
+                               # band for turn is 5-15 deg/frame.
+                               handheld_deg=args.hover_handheld_deg * min(2.0, 1.0 + 0.5 * revisits),
+                               shape=args.hover_shape,
+                               # A fresh seed per take AND per round, or a
+                               # revisit would re-plan the take it just made.
+                               seed=args.seed + len(summaries) + 977 * revisits,
+                               handoff_window=args.handoff_window,
+                               cross_track_deg=args.hover_cross_track_deg * min(1, revisits))
             if attempt is not None:
                 chain, plan = candidate, attempt
                 break
+        if plan is None and revisits < args.revisit_rounds:
+            # A scene costs ~25 minutes of compose, build and prepare before a
+            # frame renders, and that is spent whether it yields one take or
+            # eight -- abo_env_0004 shipped 20 frames for a full setup. The
+            # loop stops here because no unblocked arc was FOUND, not because
+            # the objects ran out (measured: reopening an exhausted pool
+            # changed nothing on six scenes, because it never empties).
+            #
+            # So reopen the pool and ask for a different kind of move. Each
+            # round wanders the aim further and pushes the camera further off
+            # the path, which is a person holding a phone less steadily rather
+            # than the same orbit run twice: a revisit take is another angle on
+            # a subject already shot, and it should look like one.
+            revisits += 1
+            used.clear()
+            continue
         if plan is None:
-            # Nothing left that can be shot, rather than one pairing that could
-            # not be. Objects are consumed on success only: a chain rejected for
-            # occlusion must not take its members out of the pool, or one bad
-            # partner costs a good subject its take.
             break
         used.update(id(t) for t in chain)
         for order, (sample, position, aim, hand, (centre, owner)) in enumerate(
@@ -471,8 +530,13 @@ def main() -> int:
             "angular_step_deg": [round(min(steps), 3), round(max(steps), 3)],
             "move_cm": [round(100 * min(moves), 2), round(100 * max(moves), 2)],
             "max_turn_deg": round(max(plan["turn_angles_deg"]), 3) if plan["turn_angles_deg"] else 0.0,
-            "shape": args.hover_shape, "handheld_deg": args.hover_handheld_deg,
-            "seed": args.seed + len(summaries),
+            "shape": args.hover_shape,
+            # What the arc was actually planned with, not the flag it came
+            # from: with revisits on these two diverge, and recording the
+            # argument makes a revisit unreadable from the data.
+            "handheld_deg": args.hover_handheld_deg * min(2.0, 1.0 + 0.5 * revisits),
+            "seed": args.seed + len(summaries) + 977 * revisits,
+            "revisit_round": revisits,
             "roll_deg": [round(min(h["roll_deg"] for h in plan["hands"]), 3),
                          round(max(h["roll_deg"] for h in plan["hands"]), 3)],
             "wall_clearance_m": plan["wall_clearance_m"],
