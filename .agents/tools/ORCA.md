@@ -9,27 +9,26 @@ Fleet Run: `run_08a9cc052de7` (coordinator terminal = DIRECTOR_MARK10).
 
 | Agent | Orca terminal handle | Host |
 |---|---|---|
-| DIRECTOR_MARK10 | term_ba01190f-6c2d-4466-8937-de69e62bc846 | Orca (coordinator) |
-| IR_PIPELINE_ORCHESTER | term_d6eb0800-0fe9-4163-ba44-91421ba0c587 | Orca, worktree IR_DATASET |
-| IR_DATASET_HSSD_ORCHESTER | term_82ca3029-bca9-4e41-b326-7216900c840d | Orca, worktree IR_DATASET |
-| IR_DATASET_ABO_ORCHESTER | term_af8f3d31-3796-432e-926e-241cf6cd7c78 | Orca, worktree IR_DATASET |
-| IR_DATASET_INFINIGEN_ORCHESTER | term_b42cf680-1b29-4175-9cf0-f0c4976df0a3 | Orca, worktree IR_DATASET |
-| IR_DATASET_VIEWER_ORCHESTER (Codex) | term_9a444085-4438-4b38-b901-bd3cb58f840b | Orca |
-| OPTICALNAV_ORCHESTER | term_538be2b3-8f43-4c7e-b256-daaeda1f01ed | Orca, worktree OpticalNav |
-| OPTICALNAV_NAVIGATION_ORCHESTER | term_38731d3a-1277-4474-ace8-c07f9b5759e7 | Orca, worktree OpticalNav |
-| SONNET_WORKER_1 | term_9f00b054-86c6-456c-888b-1691c676dff6 | Orca, worktree Workers |
-| SONNET_WORKER_2 | term_d7b760bb-4f05-4d1e-80af-ac406110aa42 | Orca, worktree Workers |
-| SONNET_GPU_MANAGER | term_99bb43ec-97a4-42e8-b495-3c272e6c6a0b | Orca, worktree Workers |
-| CODEX_IR_DATASET_INFINIGEN_WORKER (Codex gpt-5.6-luna) | term_0e5bc227-65b8-4bc5-b4f0-fa9847d097f3 until the user moves it | Workers → IR_DATASET |
-| RESEARCHER (Codex gpt-6-astra) | term_65853e59-37d5-463e-bcde-b3cdb18d840b | Orca |
+| DIRECTOR_MARK10 | term_818fc3ac-4656 (see `orca-ide terminal list`) | Orca root (coordinator) |
+| IR_PIPELINE_ORCHESTER | term_b2aa0c6a-43c4-4c56-9a7c-2928f7dcf357 | Orca, worktree IR_DATASET |
+| IR_DATASET_HSSD_ORCHESTER | term_20d69106-269d-4652-b822-f7198018ee64 | Orca, worktree "HSSD dataset" |
+| IR_DATASET_ABO_ORCHESTER | term_be07d349-f279-4cb5-a774-1d4b9137bb8b | Orca, worktree IR_DATASET_ABO |
+| IR_DATASET_INFINIGEN_ORCHESTER | term_653a4bff-0b38-4bf7-b76b-fd50ccf99a17 | Orca, worktree IR_Dataset_Infinigen |
+| OPTICALNAV_ORCHESTER | term_9361d703-bb2b-4996-aa8a-04638bf6b769 | Orca, worktree OpticalNav |
+| OPTICALNAV_NAVIGATION_ORCHESTER | term_32d153e9-49e2-40f2-b76f-16664a2f0977 | Orca, worktree OpticalNav |
+| SONNET_WORKER_1 | term_3d5d0540-be64-4e6d-9b6e-2e0b0dc52827 | Orca, worktree Workers |
+| SONNET_WORKER_2 | term_77d064f0-bbee-460a-a563-c1191742492b | Orca, worktree Workers |
+| SONNET_GPU_MANAGER | term_99e833bb-d9ed-4b52-ae3a-e4fbe30af74f | Orca, worktree Workers |
+| Codex threads (viewer, RESEARCHER, Infinigen worker) | gone with the server restart; respawn via their role files | — |
 | PC_OPTICALNAV_RENDER, PC_WORKER_1 | none | Device 1, Remote Control only |
 
-All VS Code copies were closed 2026-09-21 05:30Z; every local agent now runs in an Orca
-terminal resumed from its previous session id, so context carried over.
+Fleet revived 2026-09-30 04:40Z after the Orca server restart (all nine resumed from
+session_map ids into their worktrees). The fleet Run id run_08a9cc052de7 predates the restart;
+check `orca-ide orchestration run-list` before relying on it.
 
 ## Worktrees
-Orca has four worktree entries on the same checkout: `robomituba` (root), `IR_DATASET`,
-`OpticalNav`, and `Workers`. The four IR Claude orchesters sit in `IR_DATASET` (moved 06:20Z); the two OpticalNav orchesters
+Orca worktree entries on the same checkout: `robomituba` (root), `IR_DATASET`, `IR_DATASET_ABO`,
+`HSSD dataset`, `IR_Dataset_Infinigen`, `OpticalNav`, and `Workers`. The four IR Claude orchesters sit in `IR_DATASET` (moved 06:20Z); the two OpticalNav orchesters
 in `OpticalNav` (06:10Z); the two Sonnet workers and the GPU manager in `Workers` (06:50Z);
 director, RESEARCHER and the Codex viewer thread in root. A terminal
 cannot be moved between worktrees: close it and recreate with
