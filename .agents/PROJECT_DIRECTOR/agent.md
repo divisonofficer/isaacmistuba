@@ -42,10 +42,10 @@ last_reviewed: 2026-09-21
 ## Current board (2026-09-30 05:00Z, after the 04:18Z machine reboot)
 | Agent | State | GPUs | Workers |
 |---|---|---|---|
-| IR_PIPELINE_ORCHESTER | idle; v26c/d/e (v25 RGB+NIR as-image, 320px×8 views, walking v2 + registration-aware pointmap losses) finished 09-29/30 exit 0. Finding: on 24-view walks pose drift dominates (0.43 m → 0.18 m with rigid-cycle); 1–3-view val cannot see it and overfits. bf16 GT-rounding fix queued | 4,5,6,7 (took 6 on 10-01) | none |
-| IR_DATASET_HSSD_ORCHESTER | hover_v1 100/100 done; walk_v1 148/150 done (2 no-walk); walk_v2 LIVE 77/150, 3 loops relaunched 04:29Z after clearing 3 dead claims; ETA ~1.5 d | 0 only (resumed) | SONNET_WORKER_1 to re-arm |
-| IR_DATASET_ABO_ORCHESTER | abo_cornell_env_v2 (props-24, hosts 3) LIVE 32/50, queue relaunched 04:30Z, self-clears claims | 2 (resumed) | — |
-| IR_DATASET_INFINIGEN_ORCHESTER | apartment 4-pass corpus: 2,953 frame dirs, 0 of 9 sets complete by contract; 9 dead claims released; nothing running; :8780 restarted on committed code pid 22812 (pinned to 1,3,6, max 3) | none (released 10-01; scene gen is CPU-only) | — |
+| IR_PIPELINE_ORCHESTER | idle; v26c/d/e (v25 RGB+NIR as-image, 320px×8 views, walking v2 + registration-aware pointmap losses) finished 09-29/30 exit 0. Finding: on 24-view walks pose drift dominates (0.43 m → 0.18 m with rigid-cycle); 1–3-view val cannot see it and overfits. bf16 GT-rounding fix queued | 5,6,7 (DDP, 10-03) | none |
+| IR_DATASET_HSSD_ORCHESTER | hover_v1 100/100 done; walk_v1 148/150 done (2 no-walk); walk_v2 LIVE 77/150, 3 loops relaunched 04:29Z after clearing 3 dead claims; ETA ~1.5 d | none (released all 10-03 06:36Z; walk_v2 presumably complete, confirmation asked) | — |
+| IR_DATASET_ABO_ORCHESTER | abo_cornell_env_v2 (props-24, hosts 3) LIVE 32/50, queue relaunched 04:30Z, self-clears claims | 4 (new text-legibility corpus, 10-03) | — |
+| IR_DATASET_INFINIGEN_ORCHESTER | apartment 4-pass corpus: 2,953 frame dirs, 0 of 9 sets complete by contract; 9 dead claims released; nothing running; :8780 restarted on committed code pid 22812 (pinned to 1,3,6, max 3) | 1,3 (bake + geometry profile, 10-03) | — |
 | OPTICALNAV_ORCHESTER | Drive holds 18 verified scenes; 20267404 + 4 others exported since 09-23; 20268504 re-export in flight after polar re-render (exporter substring-match bug fixed, uncommitted); daemon :8765 dead, not needed | none | SONNET_WORKER_1 to re-arm |
 | OPTICALNAV_NAVIGATION_ORCHESTER | idle; 369 stale .import.lock deleted 09-24; tier-D 34 GB reassigned by user to another peer | none | none |
 | PC_OPTICALNAV_RENDER / PC_WORKER_1 | Device 1: 20268504 finished 09-29; unaffected by Device 2 reboot | Device 1 | — |
@@ -57,7 +57,7 @@ last_reviewed: 2026-09-21
 ## Open items for the user (2026-09-30)
 1. HSSD walk_v2, 73 scenes left: keep NIR 384 spp + indirect clamp 10 (drops 35–45% of lamp-lit NIR light) for consistency, or switch to 768 + raised clamp now? Decide before more scenes render; a later switch splits the corpus.
 2. IR_PIPELINE: widen the walking probe to 12+ takes first? Then D+F (rigid-cycle + SE3 Kabsch) vs D+E with 24-view walking val. GPUs 4,5,7 idle until answered.
-3. GPU allocation (10-01): HSSD [0], ABO [2], IR_PIPELINE [4,5,6,7] (took 6 for its next run), Infinigen [] (released all; its scene generation is CPU-only). GPUs 1 and 3 are unheld; HSSD will claim them for its next Stage-1 bake. Nothing to decide unless you want 1,3 elsewhere.
+3. GPU allocation (10-03, GPU manager verified): Infinigen [1,3] (apartment bake + geometry-profile workers), ABO [4] (new text-legibility corpus, CPU phase first), IR_PIPELINE [5,6,7] (DDP training, 100%). HSSD released everything 10-03 06:36Z. GPUs 0 and 2 unheld. Nothing to decide.
 4. Infinigen: (a) restart the 2,219-frame flash backlog (two renderer bugs fixed first: --resume+--stage re-rendered finished frames; Stager overwrote pose_selection.json, damaged 20263004/hover)? (b) large_residence excluded: generate new --room-scale scenes? (c) 17 dark3r blends judged unusable (deformed primitives, no textures, no Factory names): drop them?
 5. OpticalNav: delete the old 20268504 Drive run after the re-export verifies (already asked by that session).
 6. Navigation: 20273004 grid regen vs leave (walls non-blocking by design); commit 4 tool files + 8 tests.
