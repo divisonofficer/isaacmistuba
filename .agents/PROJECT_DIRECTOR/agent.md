@@ -54,6 +54,12 @@ last_reviewed: 2026-09-21
 | SONNET_GPU_MANAGER | revived; found the reboot; holding all lock rows as claimed-unbound until owners answer (HSSD/ABO/INFINIGEN have) | — | — |
 | Codex threads | viewer, RESEARCHER, Infinigen worker all died with the reboot; respawn from role files when wanted | — | — |
 
+## Note 2026-10-05
+- ABO GPU 4: queued next is the text-legibility corpus (~50 scenes, 720x540, ~20 h on one card); the
+  current screen is its target-selection step. Any future GPU ask that would take 4 pauses that corpus.
+- Storage cleanup 10-04/05: ~1.2 TB deleted (/bean ~626 GB returned; /jarvis ~590 GB held by suspected
+  snapshot retention on 141.223.92.68). Inventory: director scratchpad storage_inventory.md.
+
 ## Open items for the user (2026-09-30)
 1. CLOSED by events: walk_v2 finished with clamp 10 throughout and NIR spp split 67@384 / 82@192 (manifests carry render_knobs, so the split is recoverable per frame). The clamp bias (35–45% of lamp-lit NIR light lost) is now a property of the whole corpus; any fix is a re-render decision, not a setting.
 2. IR_PIPELINE: widen the walking probe to 12+ takes first? Then D+F (rigid-cycle + SE3 Kabsch) vs D+E with 24-view walking val. GPUs 4,5,7 idle until answered.
