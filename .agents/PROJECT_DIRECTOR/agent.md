@@ -60,6 +60,13 @@ last_reviewed: 2026-09-21
 - Storage cleanup 10-04/05: ~1.2 TB deleted (/bean ~626 GB returned; /jarvis ~590 GB held by suspected
   snapshot retention on 141.223.92.68). Inventory: director scratchpad storage_inventory.md.
 
+- 2026-10-06 Infinigen freed ~197 GiB (user-approved): /bean ~95 (Stage-2 blends packed+compressed in
+  place, bit-identical renders verified; stage1 + semantic_lod blends removed), /jarvis ~102 (8 new seeds'
+  imports + mesh/texture caches). /jarvis returned ~99 GiB at once: young files reclaim, old ones stay held,
+  consistent with snapshot retention. SOLE SOURCE: data/infinigen_generated/outputs/kr_<seed>_*/full/scene.blend
+  for those 8 seeds (KEEP_SOLE_SOURCE.txt beside each) — exclude from any generated-dir sweep.
+  Tool: apps/cleanup_apartment_scene.py (dry run by default).
+
 ## Open items for the user (2026-09-30)
 1. CLOSED by events: walk_v2 finished with clamp 10 throughout and NIR spp split 67@384 / 82@192 (manifests carry render_knobs, so the split is recoverable per frame). The clamp bias (35–45% of lamp-lit NIR light lost) is now a property of the whole corpus; any fix is a re-render decision, not a setting.
 2. IR_PIPELINE: widen the walking probe to 12+ takes first? Then D+F (rigid-cycle + SE3 Kabsch) vs D+E with 24-view walking val. GPUs 4,5,7 idle until answered.
