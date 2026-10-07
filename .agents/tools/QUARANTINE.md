@@ -44,6 +44,6 @@ CIFS is a soft mount and can return I/O errors under load, so never delete on a 
 | 1 | ABO | blends + per-scene assets + stage of frozen corpora env_v1, env_v2 (except eval scenes 0012/0024/0031), video_v1; assets + stage of abo_cornell_v2. NOT abo_text_v1 (live), NOT _asset_cache (sole copy) | ~490 GB |
 | 2 | Infinigen | stage1/semantic_lod leftovers of the 8 uncleaned scenes; the 50 GB unpromoted factory_office staging; work-side copies of the 9 two-root pairs (except work-only files) | ~150 GB |
 | 3 | HSSD | hssd_source_v3.blend (user keeps it; friday keeps it too); per-scene logs; the 26 pre-v5 walk trees once the v5 re-review is done | ~150 GB |
-| 4 | IR_PIPELINE | checkpoint.pt (optimizer) of finished runs v37–v42 keeping weights_ep*; *_smoke dirs; loader-cache rows no v10 manifest references | ~60–90 GB |
-| 5 | ABO, if needed | abo_cornell_v2 renders (~115–144 GB) only if IR_PIPELINE confirms v10 does not read them | ~130 GB |
+| 4 | IR_PIPELINE | checkpoint.pt (optimizer) of finished runs v37–v42 keeping weights_ep*; *_smoke dirs; 90,280 loader-cache entries no current manifest references (hssd 199.7, iv 8.6, abo 3.1 GB; list: IR_PIPELINE scratchpad cache_unref_v10.json). Moving them breaks re-running pre-v10 arms until moved back | ~270–300 GB |
+| ~~5~~ | — | CANCELLED: abo_cornell_v2 (14,997 frames) and video_v1 (17,200 frames) renders are read by corpus v10. Their blends/assets/stage in step 1 are still fine to move | — |
 Next owner starts only after the previous one reports bytes moved and `df /bean` after.
