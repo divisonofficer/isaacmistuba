@@ -47,3 +47,4 @@ CIFS is a soft mount and can return I/O errors under load, so never delete on a 
 | 4 | IR_PIPELINE | checkpoint.pt (optimizer) of finished runs v37–v42 keeping weights_ep*; *_smoke dirs; 90,280 loader-cache entries no current manifest references (hssd 199.7, iv 8.6, abo 3.1 GB; list: IR_PIPELINE scratchpad cache_unref_v10.json). Moving them breaks re-running pre-v10 arms until moved back | ~270–300 GB |
 | ~~5~~ | — | CANCELLED: abo_cornell_v2 (14,997 frames) and video_v1 (17,200 frames) renders are read by corpus v10. Their blends/assets/stage in step 1 are still fine to move | — |
 Next owner starts only after the previous one reports bytes moved and `df /bean` after.
+2026-10-07 06:35Z: order swapped. Infinigen goes first (its user approved), ABO follows when its user approves. Measured CIFS write ~24 MB/s, one stream: ~1 TB takes ~12 h.
