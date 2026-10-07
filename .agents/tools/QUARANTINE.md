@@ -37,3 +37,13 @@ training run and no live or queued render reads is MOVED to the friday NAS, not 
 
 Rules: one mover per owner at a time, `nice -n 10 ionice -c3`, first batch small (≤ 50 GB),
 CIFS is a soft mount and can return I/O errors under load, so never delete on a partial copy.
+
+## Plan (2026-10-07): ~1 TB, one owner at a time, in this order
+| # | Owner | What moves | Est. |
+|---|---|---|---|
+| 1 | ABO | blends + per-scene assets + stage of frozen corpora env_v1, env_v2 (except eval scenes 0012/0024/0031), video_v1; assets + stage of abo_cornell_v2. NOT abo_text_v1 (live), NOT _asset_cache (sole copy) | ~490 GB |
+| 2 | Infinigen | stage1/semantic_lod leftovers of the 8 uncleaned scenes; the 50 GB unpromoted factory_office staging; work-side copies of the 9 two-root pairs (except work-only files) | ~150 GB |
+| 3 | HSSD | hssd_source_v3.blend (user keeps it; friday keeps it too); per-scene logs; the 26 pre-v5 walk trees once the v5 re-review is done | ~150 GB |
+| 4 | IR_PIPELINE | checkpoint.pt (optimizer) of finished runs v37–v42 keeping weights_ep*; *_smoke dirs; loader-cache rows no v10 manifest references | ~60–90 GB |
+| 5 | ABO, if needed | abo_cornell_v2 renders (~115–144 GB) only if IR_PIPELINE confirms v10 does not read them | ~130 GB |
+Next owner starts only after the previous one reports bytes moved and `df /bean` after.
