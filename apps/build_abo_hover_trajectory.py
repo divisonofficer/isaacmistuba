@@ -24,6 +24,7 @@ import json
 import math
 import sys
 from pathlib import Path
+from collections.abc import Sequence
 from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -194,7 +195,8 @@ def plan_arc(targets: list[dict], blockers: list[dict], room: dict, *, frames: i
              radius: float, azimuth_span_deg: float, elevation_deg: float,
              facing_candidates: int, handheld_deg: float, shape: str,
              seed: int, handoff_window: float,
-             cross_track_deg: float = 0.0) -> dict[str, Any] | None:
+             cross_track_deg: float = 0.0,
+             facings: Sequence[float] | None = None) -> dict[str, Any] | None:
     """One unobstructed take across `targets`, or None if no facing gives one.
 
     All or nothing, deliberately. A blocked sample dropped from the middle of a
@@ -228,9 +230,15 @@ def plan_arc(targets: list[dict], blockers: list[dict], room: dict, *, frames: i
     span = [centroid_at(targets, index / max(1, frames - 1), handoff_window)
             for index in range(frames)]
 
+    # A uniform sweep of all azimuths is right when the subject is an object:
+    # any side of it is the subject. It is wrong when the subject is WRITING,
+    # which faces one way -- the first facing that merely clears the room can be
+    # the back of the panel. `facings` lets the caller offer the text's own
+    # normal first and a few degrees either side, and nothing else.
+    candidates = (list(facings) if facings is not None
+                  else [2.0 * math.pi * i / facing_candidates for i in range(facing_candidates)])
     rejected = 0
-    for index in range(facing_candidates):
-        facing = 2.0 * math.pi * index / facing_candidates
+    for facing in candidates:
         positions = [hover_path.camera_position(centre, radius * hand["radius_scale"],
                                                 facing, s["azimuth_deg"], s["elevation_deg"])
                      for s, hand, (centre, _) in zip(samples, hands, span)]

@@ -345,7 +345,9 @@ def _footprint(record: dict[str, Any]) -> tuple[float, float]:
 
 
 def select_cast(objects: Sequence[dict[str, Any]], *, hosts: int, props: int,
-                luminaires: int, seed: int, max_prop_extent_m: float) -> dict[str, Any]:
+                luminaires: int, seed: int, max_prop_extent_m: float,
+                require_ids: Sequence[str] | None = None,
+                min_prop_extent_m: float | None = None) -> dict[str, Any]:
     """Draw the scene's hosts, props and luminaires with type diversity enforced.
 
     Without the per-type cap the draw returns six planters: ABO's small-object
@@ -357,8 +359,12 @@ def select_cast(objects: Sequence[dict[str, Any]], *, hosts: int, props: int,
 
     host_pool = [row for row in usable
                  if usable_support(row) and max(row["extent_m"]) <= MAX_HOST_EXTENT_M]
+    # The floor is a parameter for the text corpus: a labelled USB hub is 0.09 m
+    # and carries 4 mm lettering, which is the hardest and most interesting case
+    # the catalogue has. The default stays where it was for every other corpus.
+    floor_m = MIN_PROP_EXTENT_M if min_prop_extent_m is None else min_prop_extent_m
     prop_pool = [row for row in usable
-                 if MIN_PROP_EXTENT_M <= max(row["extent_m"]) <= max_prop_extent_m
+                 if floor_m <= max(row["extent_m"]) <= max_prop_extent_m
                  and row["product_type"] not in _LUMINAIRE_TYPES
                  # Wall art hangs and pillows belong on seating; neither stands
                  # on a table, and together they are a fifth of the small tail.
@@ -395,7 +401,23 @@ def select_cast(objects: Sequence[dict[str, Any]], *, hosts: int, props: int,
                 chosen.append(row)
         return chosen
 
-    drawn_props = draw(prop_pool, props, "prop")
+    # Named ids come first and the draw fills the rest. They are taken from the
+    # whole usable catalogue, so they bypass BOTH the per-type cap and the prop
+    # size gate -- a text corpus asking for eight MULTIPORT_HUBs means it, and a
+    # 0.60 m clock with 9 cm numerals is a legitimate target even though the
+    # 0.497 m prop cap would drop it. Only MAX_PLAUSIBLE_EXTENT_M still applies.
+    # The composer decides whether they actually fit; it reports unplaced_props.
+    forced: list[dict[str, Any]] = []
+    if require_ids:
+        want = list(dict.fromkeys(require_ids))
+        by_id = {row["id"]: row for row in usable}
+        missing = [i for i in want if i not in by_id]
+        if missing:
+            raise ValueError(f"--include-ids not in the usable catalogue: {missing[:5]}"
+                             f"{'...' if len(missing) > 5 else ''}")
+        forced = [by_id[i] for i in want][:props]
+    pool_wo = [row for row in prop_pool if row["id"] not in {r["id"] for r in forced}]
+    drawn_props = forced + draw(pool_wo, max(0, props - len(forced)), "prop")
 
     # Hosts are chosen for the props they have to carry, not drawn blind: an
     # unconditional draw picked a 0.41 m cabinet whose lid took two of six
@@ -1551,6 +1573,13 @@ def main() -> int:
                              "so the shell reads as neighbouring buildings rather than four "
                              "flat planes and the indirect light picks up a different colour "
                              "off each")
+    parser.add_argument("--include-ids",
+                        help="comma-separated ABO ids to cast as props before the random draw, "
+                             "or a path to a JSON list / JSONL with an \"id\" per row. They skip "
+                             "the per-type cap and the size gate's upper bound still applies.")
+    parser.add_argument("--min-prop-extent-m", type=float,
+                        help=f"smallest prop to admit; default {MIN_PROP_EXTENT_M}. Lower it to "
+                             "reach the small labelled items (hubs, cables) a text corpus wants.")
     parser.add_argument("--environment-type", choices=sorted(ENVIRONMENT_TYPES), default=None,
                         help="pin the material families and the shell openings to one real "
                              "space; --open-ceiling/--open-walls still override it")
@@ -1600,9 +1629,27 @@ def main() -> int:
           f"frame={limits['frame_width_near_m']:.3f}-{limits['frame_width_far_m']:.3f} m "
           f"prop_cap={limits['max_prop_extent_m']:.3f} m "
           f"texel_floor={limits['min_texel_px_per_m']:.0f} px/m", flush=True)
+    require_ids = None
+    if args.include_ids:
+        # A comma means a list, and is checked FIRST: stat() on a 24-id string
+        # raises ENAMETOOLONG rather than returning False, so asking "is it a
+        # file?" of a long list crashed instead of falling through.
+        src = None if "," in args.include_ids else Path(args.include_ids)
+        if src is not None and src.is_file():
+            text = src.read_text(encoding="utf-8").strip()
+            if src.suffix == ".jsonl" or text.startswith("{"):
+                rows = [json.loads(l) for l in text.splitlines() if l.strip()]
+                require_ids = [r["id"] for r in rows]
+            else:
+                rows = json.loads(text)
+                require_ids = [r["id"] if isinstance(r, dict) else r for r in rows]
+        else:
+            require_ids = [t.strip() for t in args.include_ids.split(",") if t.strip()]
+        print(f"[abo-cornell] forcing {len(require_ids)} named props", flush=True)
     cast = select_cast(objects, hosts=args.hosts, props=args.props,
                        luminaires=args.luminaires, seed=args.seed,
-                       max_prop_extent_m=limits["max_prop_extent_m"])
+                       max_prop_extent_m=limits["max_prop_extent_m"],
+                       require_ids=require_ids, min_prop_extent_m=args.min_prop_extent_m)
     layout = compose(cast, seed=args.seed)
     room = layout["room"]
     dropped = layout["unplaced_props"]
