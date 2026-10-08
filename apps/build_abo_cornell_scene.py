@@ -273,6 +273,10 @@ def camera_limits(hfov_deg: float, width_px: int) -> dict[str, float]:
     near = frame_width_m(WORKING_RADIUS_M[0], hfov_deg)
     return {
         "hfov_deg": hfov_deg,
+        # Recorded, not just used: the prop size cap and the room margin both
+        # derive from it, so a scene composed at a different standoff is a
+        # different scene and a resume has to be able to tell.
+        "working_radius_near_m": WORKING_RADIUS_M[0],
         "frame_width_near_m": near,
         "frame_width_far_m": frame_width_m(WORKING_RADIUS_M[1], hfov_deg),
         "max_prop_extent_m": near * PROP_FRAME_FRACTION,
@@ -346,6 +350,7 @@ def _footprint(record: dict[str, Any]) -> tuple[float, float]:
 
 def select_cast(objects: Sequence[dict[str, Any]], *, hosts: int, props: int,
                 luminaires: int, seed: int, max_prop_extent_m: float,
+                usage: dict[str, int] | None = None,
                 require_ids: Sequence[str] | None = None,
                 min_prop_extent_m: float | None = None) -> dict[str, Any]:
     """Draw the scene's hosts, props and luminaires with type diversity enforced.
@@ -383,6 +388,12 @@ def select_cast(objects: Sequence[dict[str, Any]], *, hosts: int, props: int,
         cap = max(1, math.ceil(count / 3))
         order = list(pool)
         rng.shuffle(order)
+        if usage is not None:
+            # Least-shown first, shuffle order breaking ties, so a scene draws
+            # from the part of the catalogue the dataset has not covered yet.
+            # Stable sort, so the shuffle above still decides among equals and
+            # two seeds do not produce the same cast.
+            order.sort(key=lambda row: usage.get(row["id"], 0))
         chosen: list[dict[str, Any]] = []
         used: dict[str, int] = {}
         for row in order:
@@ -1552,6 +1563,7 @@ def build_manifest(scene_id: str, layout: dict[str, Any], stage_glb: Path,
 
 
 def main() -> int:
+    global WORKING_RADIUS_M
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--index", type=Path, required=True,
@@ -1580,6 +1592,14 @@ def main() -> int:
     parser.add_argument("--min-prop-extent-m", type=float,
                         help=f"smallest prop to admit; default {MIN_PROP_EXTENT_M}. Lower it to "
                              "reach the small labelled items (hubs, cables) a text corpus wants.")
+    parser.add_argument("--usage-tally", type=Path, default=None,
+                        help="tally_abo_object_usage.py output; draws least-shown objects first")
+    parser.add_argument("--working-radius-near", type=float, default=WORKING_RADIUS_M[0],
+                        help="near end of the camera band. Raising it widens the prop size cap "
+                             "(cap = frame width at this radius x 0.75) and the room margin "
+                             "together, which is the only coherent way to admit larger props: "
+                             "at 0.8 m the cap is 0.497 m and 529 props qualify, all of them "
+                             "already cast; at 1.1 m the cap is 0.683 m and 1,023 do.")
     parser.add_argument("--environment-type", choices=sorted(ENVIRONMENT_TYPES), default=None,
                         help="pin the material families and the shell openings to one real "
                              "space; --open-ceiling/--open-walls still override it")
@@ -1609,6 +1629,12 @@ def main() -> int:
     parser.add_argument("--no-asset-cache", dest="asset_cache", action="store_const", const=None,
                         help="disable the shared cache (the pre-2026-09-09 behaviour)")
     args = parser.parse_args()
+    if args.working_radius_near != WORKING_RADIUS_M[0]:
+        # Rebound once here rather than threaded through six call sites, all of
+        # which read the module global at call time. The far end keeps the
+        # 1.5x ratio the original pair had.
+        WORKING_RADIUS_M = (args.working_radius_near, round(args.working_radius_near * 1.5, 3))
+        print(f"[abo-cornell] working radius {WORKING_RADIUS_M}", flush=True)
     if args.asset_cache is None and "--no-asset-cache" not in sys.argv:
         args.asset_cache = args.out.parent / "_asset_cache"
 
@@ -1629,6 +1655,9 @@ def main() -> int:
           f"frame={limits['frame_width_near_m']:.3f}-{limits['frame_width_far_m']:.3f} m "
           f"prop_cap={limits['max_prop_extent_m']:.3f} m "
           f"texel_floor={limits['min_texel_px_per_m']:.0f} px/m", flush=True)
+    usage = json.loads(args.usage_tally.read_text(encoding="utf-8")) if args.usage_tally else None
+    if usage is not None:
+        print(f"[abo-cornell] usage tally {len(usage)} objects; drawing least-shown first", flush=True)
     require_ids = None
     if args.include_ids:
         # A comma means a list, and is checked FIRST: stat() on a 24-id string
@@ -1649,7 +1678,8 @@ def main() -> int:
     cast = select_cast(objects, hosts=args.hosts, props=args.props,
                        luminaires=args.luminaires, seed=args.seed,
                        max_prop_extent_m=limits["max_prop_extent_m"],
-                       require_ids=require_ids, min_prop_extent_m=args.min_prop_extent_m)
+                       usage=usage, require_ids=require_ids,
+                       min_prop_extent_m=args.min_prop_extent_m)
     layout = compose(cast, seed=args.seed)
     room = layout["room"]
     dropped = layout["unplaced_props"]
