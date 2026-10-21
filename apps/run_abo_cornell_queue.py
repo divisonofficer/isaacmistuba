@@ -372,6 +372,14 @@ def _claim_owner_alive(claim: Path) -> bool:
     return True
 
 
+#: Environment types whose shell is open (`ENVIRONMENT_TYPES[...]["open_ceiling"]`
+#: or `"open_walls"` in build_abo_cornell_scene.py), kept in step by hand like
+#: COMPOSER_VERSION. Without it an outdoor_street scene composed by an earlier
+#: run read as stale ("open_box_v1 but this run wants closed_box_v1") and was
+#: skipped: 8 prepared env_v3 scenes on 10-11.
+OPEN_ENVIRONMENTS = {"outdoor_street": 1}   # type -> open wall count
+
+
 def policy_of(args: argparse.Namespace) -> dict[str, str]:
     """What a scene composed under the current settings should declare."""
     return {"composer_version": COMPOSER_VERSION,
@@ -380,7 +388,8 @@ def policy_of(args: argparse.Namespace) -> dict[str, str]:
             # fixtures -- so an open scene and a closed one are not the same
             # corpus and must not resume into each other.
             "lighting_profile": (OPEN_LIGHTING_PROFILE
-                                 if (args.open_ceiling or args.open_walls)
+                                 if (args.open_ceiling or args.open_walls
+                                     or getattr(args, "environment_type", None) in OPEN_ENVIRONMENTS)
                                  else BOX_LIGHTING_PROFILE)}
 
 
@@ -411,13 +420,18 @@ def stale_reason(scene_dir: Path, args: argparse.Namespace) -> str | None:
     got_blocks = len(declared.get("wall_massing") or [])
     if got_blocks != want_blocks:
         return f"wall_massing={got_blocks} but this run wants {want_blocks}"
-    want_open = int(getattr(args, "open_walls", 0) or 0)
+    want_open = int(getattr(args, "open_walls", 0)
+                    or OPEN_ENVIRONMENTS.get(getattr(args, "environment_type", None), 0))
     got_open = len(declared.get("open_walls") or [])
     if got_open != want_open:
         return f"open_walls={got_open} but this run wants {want_open}"
     # A marble hall and a parking deck differ in nothing a frame count can see,
     # so the type has to be compared directly or a resume would fill one corpus
     # with both. Absent on both sides is a match: that is every untyped scene.
+    want_radius = getattr(args, "working_radius_near", None)
+    got_radius = (declared.get("camera_limits") or {}).get("working_radius_near_m")
+    if want_radius is not None and got_radius is not None and abs(got_radius - want_radius) > 1e-6:
+        return f"working_radius_near={got_radius} but this run wants {want_radius}"
     want_type = getattr(args, "environment_type", None)
     if declared.get("environment_type") != want_type:
         return f"environment_type={declared.get('environment_type')!r} but this run wants {want_type!r}"
@@ -470,6 +484,10 @@ def build_one(seed: int, gpu: int, args: argparse.Namespace, expected_frames: in
             command += ["--registry", str(args.registry)]
         if args.environment_type:
             command += ["--environment-type", args.environment_type]
+        if args.usage_tally is not None:
+            command += ["--usage-tally", str(args.usage_tally)]
+        if args.working_radius_near is not None:
+            command += ["--working-radius-near", str(args.working_radius_near)]
         if args.wall_massing:
             command += ["--wall-massing", str(args.wall_massing)]
         if args.open_ceiling:
@@ -552,6 +570,7 @@ def _build_hover(scene_id: str, scene_dir: Path, gpu: int, args: argparse.Namesp
                  "--chain", str(args.hover_chain), "--radius", str(args.hover_radius),
                  "--azimuth-span-deg", str(args.hover_azimuth_span_deg),
                  "--hover-handheld-deg", str(args.hover_handheld_deg),
+                 "--revisit-rounds", str(args.revisit_rounds),
                  "--seed", str(args.seed_base)], log_path=logs) != 0:
             # A scene with nothing shootable is a real answer, not a failure to
             # retry: every prop buried, or every facing blocked. It is recorded
@@ -560,6 +579,13 @@ def _build_hover(scene_id: str, scene_dir: Path, gpu: int, args: argparse.Namesp
             return False
 
     planned = len(json.loads(selection.read_text(encoding="utf-8"))["all"])
+    if args.prep_only:
+        # Everything above is CPU and takes ~45 min a scene against ~20 min of
+        # render at 192/192, so the GPU waits on it. A prep-only runner works
+        # ahead; the rendering runner finds every stage's output and goes
+        # straight to render.
+        log(f"[gpu {gpu}] {scene_id} prepared ({planned} frames planned); render left to the GPU runner")
+        return True
     log(f"[gpu {gpu}] {scene_id} render {planned} frames")
     status = _render_hover(scene_dir, gpu, args, selection, logs)
     if status != 0:
@@ -625,6 +651,14 @@ def _render_once(scene_dir: Path, gpu: int, args: argparse.Namespace,
                   log_path=logs, env={"CUDA_VISIBLE_DEVICES": str(gpu)})
 
 
+def _prep_backlog(args: argparse.Namespace) -> int:
+    """Scenes prepared and waiting for a GPU, or a big number when the disk is low."""
+    if shutil.disk_usage(args.out_root).free < args.prep_min_free_gb * 2**30:
+        return 1 << 30
+    return sum(1 for d in args.out_root.glob(f"{args.prefix}_*")
+               if (d / "hover_poses.json").is_file() and not scene_done(d))
+
+
 def worker(gpu: int, seeds: list[int], claims: Path, args: argparse.Namespace,
            expected_frames: int, results: dict[int, bool],
            attempts: dict[int, int]) -> None:
@@ -647,6 +681,17 @@ def worker(gpu: int, seeds: list[int], claims: Path, args: argparse.Namespace,
     would otherwise be handed round the workers forever.
     """
     while True:
+        if (args.out_root / "drain").exists():
+            # Finish the scene in hand, take no new one: the only clean way to
+            # move a running queue (new device, new out-root) without killing a
+            # render mid-scene.
+            log(f"[gpu {gpu}] drain file present; worker exits")
+            return
+        if args.prep_only and _prep_backlog(args) >= args.prep_ahead_max:
+            # Prepared-but-unrendered scenes sit on disk at ~2.5 GB each; working
+            # further ahead than the GPUs can follow only fills the disk.
+            time.sleep(60)
+            continue
         seed = None
         # Fewest attempts first, so a seed that has just failed goes behind
         # everything untried rather than being re-taken on the next scan. A
@@ -664,6 +709,8 @@ def worker(gpu: int, seeds: list[int], claims: Path, args: argparse.Namespace,
             # decides whether it should exist at all.
             if stale_reason(scene_dir, args) is None and scene_done(scene_dir):
                 continue
+            if args.prep_only and (scene_dir / "hover_poses.json").is_file():
+                continue    # prepared already; the render is a GPU runner's
             claim = claims / f"{candidate:04d}"
             try:
                 claim.mkdir()  # atomic: only one worker wins
@@ -679,6 +726,12 @@ def worker(gpu: int, seeds: list[int], claims: Path, args: argparse.Namespace,
         (claim / "owner").write_text(f"{os.getpid()}\n", encoding="utf-8")
         attempts[seed] = attempts.get(seed, 0) + 1
         results[seed] = build_one(seed, gpu, args, expected_frames)
+        if results[seed] and args.prep_only:
+            # A claim normally lives as long as its process, which kept every
+            # scene a prep-only runner finished away from the GPU runners. Hand
+            # it over: the next GPU worker to scan claims it and goes straight
+            # to render.
+            shutil.rmtree(claim, ignore_errors=True)
         if not results[seed]:
             shutil.rmtree(claim, ignore_errors=True)
             if attempts[seed] >= args.max_attempts:
@@ -699,6 +752,13 @@ def main() -> int:
     parser.add_argument("--props", type=int, default=6)
     parser.add_argument("--luminaires", type=int, default=1)
     parser.add_argument("--accent-walls", action="store_true", default=True)
+    parser.add_argument("--usage-tally", type=Path, default=None,
+                        help="tally_abo_object_usage.py output; composes from the least-shown "
+                             "objects first. Only bites once --working-radius-near widens the "
+                             "prop pool: at the default cap every eligible prop is already cast.")
+    parser.add_argument("--working-radius-near", type=float, default=None,
+                        help="near end of the camera band; widens the prop size cap and the "
+                             "room margin together")
     parser.add_argument("--environment-type", default=None,
                         help="marble_hall | parking_tower | concrete_building | outdoor_street; "
                              "pins material families and shell openings to one real space")
@@ -737,6 +797,10 @@ def main() -> int:
                              "a scene's pose selection is written once and reused.")
     parser.add_argument("--hover-radius", type=float, default=1.0,
                         help="metres from whatever the camera is currently looking at")
+    parser.add_argument("--revisit-rounds", type=int, default=0,
+                        help="when no unblocked arc is left, reopen the target pool this many "
+                             "times and reshoot with more hand and more cross-track. A scene "
+                             "costs the same to set up whether it yields one take or eight.")
     parser.add_argument("--hover-handheld-deg", type=float, default=4.0)
     parser.add_argument("--seed-base", type=int, default=0,
                         help="picks the hand; the same seed always gives the same camera")
@@ -749,6 +813,14 @@ def main() -> int:
                              "<out-root>/gpu_pool.lock.json. It can only narrow --gpus, so a "
                              "relaunch that forgets the flag cannot stray onto another job's "
                              "devices, and a stale file cannot widen anyone's footprint")
+    parser.add_argument("--prep-only", action="store_true",
+                        help="hover only: compose, build, prepare, measure and plan, but do not "
+                             "render. Run beside a rendering queue on later seeds so the GPU "
+                             "never waits on CPU prep.")
+    parser.add_argument("--prep-ahead-max", type=int, default=8,
+                        help="--prep-only waits while this many prepared scenes await render")
+    parser.add_argument("--prep-min-free-gb", type=float, default=55.0,
+                        help="--prep-only waits while out-root has less free space than this")
     parser.add_argument("--rebuild-stale", action="store_true",
                         help="recompose and re-render scenes whose manifest declares a different "
                              "composer version, NIR model or lighting profile than this run asks "
