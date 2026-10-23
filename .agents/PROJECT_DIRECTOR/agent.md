@@ -67,6 +67,11 @@ last_reviewed: 2026-09-21
   for those 8 seeds (KEEP_SOLE_SOURCE.txt beside each) — exclude from any generated-dir sweep.
   Tool: apps/cleanup_apartment_scene.py (dry run by default).
 
+## Storage rules from the user (2026-10-23)
+- KEEP /bean/ir_dataset_work/baseline_weights (35 GB, likely IR_COMPARISON's): never a cleanup candidate.
+- Infinigen blends v1 through 2.0 may go (list shown to the user first); all 2.2 blends stay.
+- /jarvis deletions DO free space (10-07: 1,008 GB freed at once); the earlier snapshot theory was wrong.
+
 ## Open items for the user (2026-09-30)
 1. CLOSED by events: walk_v2 finished with clamp 10 throughout and NIR spp split 67@384 / 82@192 (manifests carry render_knobs, so the split is recoverable per frame). The clamp bias (35–45% of lamp-lit NIR light lost) is now a property of the whole corpus; any fix is a re-render decision, not a setting.
 2. IR_PIPELINE: widen the walking probe to 12+ takes first? Then D+F (rigid-cycle + SE3 Kabsch) vs D+E with 24-view walking val. GPUs 4,5,7 idle until answered.
