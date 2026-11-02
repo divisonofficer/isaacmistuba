@@ -548,11 +548,23 @@ class DatasetCatalog:
                         index_stat = (path / "index.jsonl").stat()
                         stats_path = path / "quality" / "scene_statistics.json"
                         stats_stat = stats_path.stat() if stats_path.is_file() else None
-                        overlay_path = self.statistics_root / f"{json.loads((path / 'dataset_config.json').read_text(encoding='utf-8')).get('dataset_fingerprint', '')}.json" if self.statistics_root else None
+                        # The catalog hot path must not deserialize every
+                        # dataset_config.json.  Render plans can be embedded
+                        # in that file and make a simple list refresh block
+                        # the viewer for seconds on a network filesystem.
+                        # `dataset_fingerprint` is part of the compact
+                        # identity header, so read the same bounded prefix as
+                        # `load_dataset_origin(..., metadata_only=True)`.
+                        with (path / "dataset_config.json").open("r", encoding="utf-8", errors="ignore") as stream:
+                            config_head = stream.read(64 * 1024)
+                        config_fingerprint = (
+                            re.search(r'"dataset_fingerprint"\s*:\s*"([0-9a-f]{32,})"', config_head) or ["", ""]
+                        )[1]
+                        overlay_path = self.statistics_root / f"{config_fingerprint}.json" if self.statistics_root else None
                         overlay_stat = overlay_path.stat() if overlay_path and overlay_path.is_file() else None
-                        readiness_path = self.readiness_root / f"{json.loads((path / 'dataset_config.json').read_text(encoding='utf-8')).get('dataset_fingerprint', '')}.json" if self.readiness_root else None
+                        readiness_path = self.readiness_root / f"{config_fingerprint}.json" if self.readiness_root else None
                         readiness_stat = readiness_path.stat() if readiness_path and readiness_path.is_file() else None
-                        review_path = self.review_root / f"{json.loads((path / 'dataset_config.json').read_text(encoding='utf-8')).get('dataset_fingerprint', '')}.json" if self.review_root else None
+                        review_path = self.review_root / f"{config_fingerprint}.json" if self.review_root else None
                         review_stat = review_path.stat() if review_path and review_path.is_file() else None
                         signature = (config_stat.st_mtime_ns, config_stat.st_size,
                                      contract_stat.st_mtime_ns, contract_stat.st_size,
@@ -761,11 +773,16 @@ class DatasetCatalog:
             lighting = row.get("lighting") or {}
             lighting_id = str(lighting.get("id") or "legacy")
             anchor_id = str(row.get("anchor_id") or lighting.get("anchor_id") or "")
+            camera = row.get("camera") or {}
+            capture_kind = str(row.get("capture_kind") or lighting.get("capture_kind") or "")
+            camera_pose_source = str(camera.get("pose_source") or "")
             heading = float(row.get("heading_deg") or 0.0)
             pose_key = f"{heading % 360.0:.6f}|{anchor_id}"
             grouped[viewpoint].append({
                 "frame_id": row["frame_id"], "heading_deg": heading,
                 "lighting_id": lighting_id, "anchor_id": anchor_id or None,
+                "capture_kind": capture_kind or None,
+                "camera_pose_source": camera_pose_source or None,
                 "pose_key": pose_key, "available": _declared_modalities(paths),
             })
         viewpoints = []

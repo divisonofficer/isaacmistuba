@@ -25,7 +25,8 @@
 #                        protects glass/metal/structure. Applies to OBJ + atlas + GLB.
 #   --decimate-strict    Fail export if a requested decimation does not meet its target face count
 #   --decimate-min-polys N  Objects below N faces stay at 100% (default 50000)
-#   --filter-small-high-poly  Drop tiny high-poly non-structural detail units
+#   --filter-small-high-poly  Enable the tiny/high-poly detail filter (default for strict PBR)
+#   --keep-small-high-poly    Keep those detail units (may make Stage 1 baking very slow)
 #   --small-high-poly-max-extent-m M  Maximum extent for the filter (default 0.5)
 #   --small-high-poly-min-triangles N Minimum triangles for the filter (default 100000)
 #   --allow-object-id-churn  Allow showcase composition imports to change source object IDs
@@ -73,7 +74,12 @@ BAKE_METALLIC=1
 DECIMATE_POLICY=""          # none|ratio_threshold|semantic_contract|ir_semantic_lod_v1 (empty => none)
 DECIMATE_MIN_POLYS=50000    # objects below this evaluated-triangle count stay at 100% (not a compression target)
 DECIMATE_STRICT=0         # requested geometry reduction must succeed (IR LOD only)
-FILTER_SMALL_HIGH_POLY=0
+# ``-1`` means profile default. Strict PBR baking has no useful return on the
+# known pathological procedural fruit/aquarium clusters: they are
+# non-structural dressing, but can consume hours in UV recovery and
+# per-channel atlas bakes. The exporter policy keeps structural geometry and
+# bounded useful PBR props, so strict imports filter them by default.
+FILTER_SMALL_HIGH_POLY=-1
 SMALL_HIGH_POLY_MAX_EXTENT_M=0.5
 SMALL_HIGH_POLY_MIN_TRIANGLES=100000
 GLB=1
@@ -103,6 +109,7 @@ while [[ $# -gt 0 ]]; do
     --decimate-policy)  DECIMATE_POLICY="$2"; shift 2;;
     --decimate-min-polys) DECIMATE_MIN_POLYS="$2"; shift 2;;
     --filter-small-high-poly) FILTER_SMALL_HIGH_POLY=1; shift;;
+    --keep-small-high-poly) FILTER_SMALL_HIGH_POLY=0; shift;;
     --small-high-poly-max-extent-m) SMALL_HIGH_POLY_MAX_EXTENT_M="$2"; shift 2;;
     --small-high-poly-min-triangles) SMALL_HIGH_POLY_MIN_TRIANGLES="$2"; shift 2;;
     --bake-only)  BAKE_ONLY=1; BAKE=1; BAKE_PBR=1; SKIP_EXPORT=0; shift;;
@@ -122,6 +129,9 @@ case "$STAGE1_PROFILE" in
   ir-bootstrap-v1) BAKE=0; BAKE_PBR=0; BAKE_METALLIC=0;;
   *) echo "[error] invalid --stage1-profile: $STAGE1_PROFILE" >&2; exit 2;;
 esac
+if [[ "$FILTER_SMALL_HIGH_POLY" == -1 ]]; then
+  [[ "$STAGE1_PROFILE" == "strict-pbr-v1" ]] && FILTER_SMALL_HIGH_POLY=1 || FILTER_SMALL_HIGH_POLY=0
+fi
 if [[ -z "$INPUT" ]]; then
   echo "[error] missing <scene.blend | scene-dir>. See --help." >&2; exit 2
 fi
@@ -266,6 +276,21 @@ else
     STAGING_DIR="$DEFAULT_STAGING_DIR"
   fi
   STAGING_MANIFEST="${STAGING_DIR}/scene_manifest.json"
+  RESUME_AFTER_BLENDER_NAME=""
+  # Filtering changes the sorted Stage-1 unit list.  Resume an unfiltered
+  # alphabetical prefix by name, rather than applying its numeric unit count
+  # as ``--skip`` to the newly filtered list.
+  if [[ -f "$STAGING_MANIFEST" ]]; then
+    STAGED_FILTER="$($PYTHON -c 'import json,sys; print(int(bool(json.load(open(sys.argv[1])).get("small_high_poly_filter", {}).get("enabled", False))))' "$STAGING_MANIFEST")"
+    if [[ "$STAGED_FILTER" != "$FILTER_SMALL_HIGH_POLY" ]]; then
+      RESUME_AFTER_BLENDER_NAME="$($PYTHON -c 'import json,sys; u=json.load(open(sys.argv[1])).get("units", []); print(u[-1].get("blender_name", "") if u else "")' "$STAGING_MANIFEST")"
+      [[ -n "$RESUME_AFTER_BLENDER_NAME" ]] || {
+        echo "[error] cannot switch filter policy for an empty staging manifest; use --fresh-export." >&2
+        exit 2
+      }
+      echo "[stage1] switching filter policy (staging=$STAGED_FILTER requested=$FILTER_SMALL_HIGH_POLY); resuming after: $RESUME_AFTER_BLENDER_NAME"
+    fi
+  fi
   echo "[stage1] exporting meshes/materials with bpy -> $STAGING_DIR"
   # Long-lived bpy processes are unstable on multi-GB scenes. Export bounded
   # chunks into one staging directory and merge the manifest after each chunk.
@@ -279,6 +304,11 @@ else
     read -r unit_count total_count <<< "$counts"
     chunk_skip=$unit_count
     echo "[stage1] resuming committed staging at $unit_count/$total_count units"
+    if [[ -n "$RESUME_AFTER_BLENDER_NAME" ]]; then
+      chunk_skip=0
+      # Name-based resume terminates when a chunk adds no new manifest unit.
+      total_count=-1
+    fi
     checkpoint_count=0
     if [[ -d "$STAGING_DIR/.stage1_unit_state" ]]; then
       checkpoint_count="$(find "$STAGING_DIR/.stage1_unit_state" -maxdepth 1 -type f -name '*.json' | wc -l)"
@@ -293,14 +323,26 @@ else
   while (( total_count < 0 || unit_count < total_count )); do
     before_count=$unit_count
     MERGE_FLAG=(); [[ -f "$STAGING_MANIFEST" ]] && MERGE_FLAG=(--merge)
+    RESUME_FLAG=()
+    [[ -n "$RESUME_AFTER_BLENDER_NAME" ]] && RESUME_FLAG=(--resume-after-blender-name "$RESUME_AFTER_BLENDER_NAME")
     stage1_rc=0
     "$INFINIGEN_PYTHON" tools/infinigen/_run_bpy.py "$BLEND" \
       tools/infinigen/blender_export_scene.py -- \
       --out "$STAGING_DIR" --scene-id "$NAME" --skip "$chunk_skip" --limit "$CHUNK_SIZE" \
-      "${MERGE_FLAG[@]}" "${BAKE_FLAG[@]}" || stage1_rc=$?
+      "${MERGE_FLAG[@]}" "${RESUME_FLAG[@]}" "${BAKE_FLAG[@]}" || stage1_rc=$?
     [[ -f "$STAGING_MANIFEST" ]] || { echo "[error] Stage 1 chunk failed (exit $stage1_rc) before manifest update" >&2; exit 1; }
     counts="$("$PYTHON" -c "import json,sys; d=json.load(open(sys.argv[1])); print(len(d.get(\"units\", [])), d.get(\"renderable_unit_count\", -1))" "$STAGING_MANIFEST")"
     read -r unit_count total_count <<< "$counts"
+    if [[ -n "$RESUME_AFTER_BLENDER_NAME" ]]; then
+      if (( unit_count <= before_count )); then
+        [[ $stage1_rc -eq 0 ]] || { echo "[error] name-based resume failed before manifest advance (exit $stage1_rc)" >&2; exit 1; }
+        echo "[stage1] name-based filtered resume complete: $unit_count units"
+        break
+      fi
+      RESUME_AFTER_BLENDER_NAME="$($PYTHON -c 'import json,sys; print(json.load(open(sys.argv[1]))["units"][-1]["blender_name"])' "$STAGING_MANIFEST")"
+      echo "[stage1] committed $unit_count units; next after: $RESUME_AFTER_BLENDER_NAME"
+      continue
+    fi
     if (( unit_count <= before_count && unit_count < total_count )); then
       echo "[error] Stage 1 chunk at skip=$chunk_skip failed (exit $stage1_rc); manifest did not advance" >&2
       exit 1

@@ -1,0 +1,9 @@
+"""Run six source-bound preflights for a pending full residential suite; inspect JSON errors."""
+import argparse,subprocess,sys,os,json,hashlib
+from pathlib import Path
+from full_view_manifest import residential_canonical_path
+ROOT=Path(__file__).resolve().parents[3];T=Path(__file__).parent;p=argparse.ArgumentParser();p.add_argument('--revision',type=int,required=True);a=p.parse_args();D=ROOT/'data/venue_refs/floor_plans_v3/dual_unit_residential_floor_03';S=ROOT/f'out/infinigen_v2/kr_dual_unit_residential_floor_03_48712503/full/scene_candidate_r{a.revision}.blend';source_sha=hashlib.sha256(S.read_bytes()).hexdigest();env={**os.environ,'CUDA_VISIBLE_DEVICES':'','OMP_NUM_THREADS':'8'};rows=[];jobs=[('fine_features','audit_fine_features.py',[]),('required_spaces_audit','audit_required_spaces.py',['--reference',str(D),'--views',str(residential_canonical_path())]),('texture_dependencies','audit_texture_dependencies.py',[]),('functional_assemblies','audit_functional_assemblies.py',[]),('native_toiletry_assembly_audit','audit_native_toiletries.py',[]),('wc_layout_audit','audit_wc_layout.py',[])]
+for stem,script,extra in jobs:
+ out=D/f'{stem}_r{a.revision}.json';assert not out.exists(),out;log=D/f'{stem}_r{a.revision}.log'
+ with log.open('w') as f:r=subprocess.run(['/root/miniconda3/envs/infinigen/bin/python',str(T/script),'--blend',str(S),'--out',str(out),*extra],cwd=ROOT,env=env,stdout=f,stderr=subprocess.STDOUT)
+ assert r.returncode==0,(script,r.returncode,str(log));d=json.loads(out.read_text());assert d['source_sha256']==source_sha and 'errors' in d and not d['errors'],(script,d.get('errors'));rows.append({'script':script,'report':str(out),'exit_code':r.returncode});print('PREFLIGHT_PASS',stem,flush=True);(D/f'preflight_batch_r{a.revision}.json').write_text(json.dumps({'source':str(S),'source_sha256':source_sha,'completed':rows,'all_six_pass':len(rows)==6},indent=2))

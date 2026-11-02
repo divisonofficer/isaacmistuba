@@ -50,6 +50,21 @@ DOOR_W = 1.0        # door opening width
 OPEN_W = 1.8        # LDK / corridor-junction open width
 WIN_MIN = 1.2       # min exterior edge to place a window
 WIN_MAX = 3.0       # max window width
+#: Single-room floor area is sampled rather than chosen from a fixed triple,
+#: because three authored sizes put every office at 10.5, 14.0 or 18.0 m2 and
+#: Infinigen cannot place what a small room has no floor for. Area is sampled
+#: directly -- it is the quantity that matters -- and bounded, because a single
+#: room is not an apartment: 136-175 m2 is right for a multi-room flat and
+#: absurd for one office. Rooms that are genuinely large in life keep a higher
+#: ceiling; everything else lands in 10-30 m2.
+#: A type's ceiling is relative to its own authored sizes, not a flat number:
+#: capping everything at 30 m2 produced a 30 m2 bathroom and a 19 m2 closet,
+#: which are rooms wearing the wrong label. 1.6x the largest anchor, held under
+#: 30 for ordinary rooms; the large types carry their own ceilings.
+SINGLE_ROOM_AREA_GROWTH = 1.6
+SINGLE_ROOM_AREA_CAP_M2 = 30.0
+SINGLE_ROOM_LARGE_TYPES = {"warehouse": 150.0, "open-office": 90.0, "garage": 55.0}
+SINGLE_ROOM_ASPECT_JITTER = 1.15
 CW = 1.5            # corridor width (> MARGIN)
 
 MODERN_OFFICE_PROFILE = "modern_hybrid_v1"
@@ -684,8 +699,19 @@ def build_single_room(rng: random.Random, room_type: str):
     if room_type not in SINGLE_ROOM_PROFILES:
         raise ValueError(f"unknown single-room type {room_type!r}; have {SINGLE_ROOM_TYPES}")
     profile = SINGLE_ROOM_PROFILES[room_type]
-    width, depth = rng.choice(profile["sizes"])
-    width, depth = q(width), q(depth)
+    # Sample the area, then give it the anchor's proportions. Scaling the sides
+    # by a blind multiplier instead pushed a single office to 60 m2, which is a
+    # hall rather than a room -- the multiplier had no idea what it was scaling.
+    anchors = [(w * d) for w, d in profile["sizes"]]
+    ceiling = SINGLE_ROOM_LARGE_TYPES.get(
+        room_type, min(SINGLE_ROOM_AREA_CAP_M2, max(anchors) * SINGLE_ROOM_AREA_GROWTH))
+    low = min(anchors)
+    target = rng.uniform(low, max(low, ceiling))
+    w0, d0 = rng.choice(profile["sizes"])
+    aspect = rng.uniform(1.0 / SINGLE_ROOM_ASPECT_JITTER, SINGLE_ROOM_ASPECT_JITTER)
+    factor = (target / (w0 * d0)) ** 0.5
+    width, depth = q(w0 * factor * aspect), q(d0 * factor / aspect)
+    width, depth = max(width, q(MIN_DIM)), max(depth, q(MIN_DIM))
     room = (0.0, 0.0, width, depth)
 
     # Put the entrance on the south wall and the window on the opposite wall,

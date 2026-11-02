@@ -81,3 +81,16 @@ data/hpbrdf_2025/
 # 로컬 실험/외부 프로젝트 산출물 — git 외부에서 관리
 experiment/
 piper_manipulation/
+
+# Private git worktrees of the hssd_blender_ir submodule. Several sessions
+# edit that module at once, so each takes a sibling checkout rather than
+# sharing one working tree. They carry their own .git and must never be
+# swept into this repo by a `git add -A`; that is a worse 095a5be, not a
+# fix for it. Trailing slash so only directories match.
+#
+# To check this rule, probe WITH a trailing slash:
+#   git check-ignore -q modules/hssd_blender_ir_<name>/   -> 0, ignored
+# Without it you are asking about a FILE of that name, which this rule does
+# not cover, so a sibling that does not exist yet answers 1 and reads exactly
+# like no rule at all.
+modules/hssd_blender_ir_*/

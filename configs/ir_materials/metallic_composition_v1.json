@@ -1,0 +1,71 @@
+{
+  "schema": "robomituba.ir_metallic_composition_policy.v1",
+  "policy_id": "metallic_composition_v1",
+  "node_graph_version": "metallic_aug_nodes_v1",
+  "exposed_threshold": 0.7,
+  "noise_scale_m": 6.0,
+  "classes": {
+    "metal_tool": {
+      "coat_centre": 0.06,
+      "coat_spread": 0.05,
+      "metallic_floor": 0.8,
+      "bare_probability": 0.55
+    },
+    "cookware": {
+      "coat_centre": 0.12,
+      "coat_spread": 0.08,
+      "metallic_floor": 0.7,
+      "bare_probability": 0.35
+    },
+    "metal_hardware": {
+      "coat_centre": 0.15,
+      "coat_spread": 0.1,
+      "metallic_floor": 0.65,
+      "bare_probability": 0.4
+    },
+    "generic_metal": {
+      "coat_centre": 0.22,
+      "coat_spread": 0.12,
+      "metallic_floor": 0.55,
+      "bare_probability": 0.15
+    },
+    "decor_metal": {
+      "coat_centre": 0.32,
+      "coat_spread": 0.15,
+      "metallic_floor": 0.4,
+      "bare_probability": 0.1
+    },
+    "structural_metal": {
+      "coat_centre": 0.45,
+      "coat_spread": 0.18,
+      "metallic_floor": 0.25,
+      "bare_probability": 0.05
+    },
+    "appliance_shell": {
+      "coat_centre": 0.55,
+      "coat_spread": 0.18,
+      "metallic_floor": 0.2,
+      "bare_probability": 0.03
+    }
+  },
+  "roughness_coupling_range": [
+    0.04,
+    0.18
+  ],
+  "albedo_coupling_range": [
+    0.04,
+    0.18
+  ],
+  "noise_coupling_range": [
+    0.25,
+    0.5
+  ],
+  "roughness_reference": 0.55,
+  "albedo_reference": 0.45,
+  "roughness_gain_range": [
+    0.1,
+    0.35
+  ],
+  "license": "GPL-3.0-or-later",
+  "notes": "Dielectric-coat-over-conductor model. Coupling ranges and bare_probability are calibrated against measurement: Infinigen metal roughness (mean 0.29, std 0.06) and 34.7 M InteriorVerse pixels, which retain 1.6% of metal-bearing pixels at metalness >= 0.98 (18.8% among strongly metallic ones) with corr(metallic, roughness) between -0.11 and -0.61."
+}

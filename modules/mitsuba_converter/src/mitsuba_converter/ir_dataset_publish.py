@@ -31,6 +31,8 @@ from .ir_dataset_contract import (
     MASK_MODALITIES,
     NORMAL_MODALITIES,
     SCALAR_MODALITIES,
+    STORAGE_PROFILE_LEGACY_FULL_FLOAT32_V1,
+    storage_profile_spec,
     _read_json,
     _safe_artifact_path,
 )
@@ -91,8 +93,12 @@ def _validate_image_bytes(data: bytes, modality: str, expected_shape: tuple[int,
         raise ValueError(f"{modality} shape {value.shape[:2]} != {expected_shape}")
     if np.issubdtype(value.dtype, np.floating) and not np.isfinite(value).all():
         raise ValueError(f"{modality} contains non-finite values")
-    if modality in HDR_MODALITIES and value.dtype != np.float32:
-        raise ValueError(f"{modality} must be float32 EXR, got {value.dtype}")
+    # OpenCV intentionally expands both HALF and FLOAT OpenEXR on decode.
+    # Header precision is declared by the immutable artifact contract below;
+    # here we validate the decoded linear raster rather than accidentally
+    # rejecting valid half EXR as float32.
+    if modality in HDR_MODALITIES and not np.issubdtype(value.dtype, np.floating):
+        raise ValueError(f"{modality} must decode as floating-point EXR, got {value.dtype}")
     if modality in LINEAR_RGB_MODALITIES | SCALAR_MODALITIES | NORMAL_MODALITIES | DISTANCE_MODALITIES | ID_MODALITIES:
         if value.dtype != np.uint16:
             raise ValueError(f"{modality} must be uint16 PNG, got {value.dtype}")
@@ -122,6 +128,15 @@ def validate_publish_source(source: Path) -> dict[str, Any]:
         raise ValueError(f"unsupported artifact schema: {contract.get('schema')!r}")
     if ((config.get("schema") == DATASET_SCHEMA) != (contract.get("schema") == ARTIFACT_SCHEMA)):
         raise ValueError("dataset/artifact contract major versions differ")
+    storage = storage_profile_spec((contract.get("storage_profile") or {}).get(
+        "id", config.get("storage_profile", STORAGE_PROFILE_LEGACY_FULL_FLOAT32_V1),
+    ))
+    config_profile = config.get("storage_profile")
+    if config_profile is not None and str(config_profile) != str(storage["id"]):
+        raise ValueError("dataset/artifact storage profile mismatch")
+    diffuse_contract = contract.get("diffuse_decomposition") or {}
+    if bool(diffuse_contract.get("stored", True)) != bool(storage["store_diffuse_decomposition"]):
+        raise ValueError("diffuse decomposition storage contract mismatch")
     if queue_state.get("schema") != "robomituba.ir_principled_rolling_queue.v1":
         raise ValueError(f"unsupported rolling queue schema: {queue_state.get('schema')!r}")
     if qc.get("schema") != "robomituba.ir_principled_qc_summary.v1":
@@ -175,7 +190,15 @@ def validate_publish_source(source: Path) -> dict[str, Any]:
         overview = _read_json(overview_path)
         if overview.get("schema") != "robomituba.ir_scene_overview.v1" or overview.get("dataset_fingerprint") != fingerprint:
             raise ValueError("scene overview schema or fingerprint mismatch")
-        if overview.get("graph_available") and overview.get("graph_digest") != config.get("graph_sha256"):
+        # The binding exists to catch an overview built against a different
+        # viewpoint graph than the dataset was rendered from.  A v5 dataset
+        # declares `authoring_map_sha256` instead of `graph_sha256`: its camera
+        # universe is the 6-DoF object orbit, and the graph the overview still
+        # carries for the viewer is not what the frames came from.  Comparing a
+        # real digest against a key the config does not have made every v5
+        # dataset fail this gate after rendering every frame.
+        declared_graph = config.get("graph_sha256")
+        if declared_graph and overview.get("graph_available") and overview.get("graph_digest") != declared_graph:
             raise ValueError("scene overview graph binding mismatch")
         proxy = overview.get("proxy_mesh") or {}
         declared_proxy = overview_contract.get("proxy_mesh_path")

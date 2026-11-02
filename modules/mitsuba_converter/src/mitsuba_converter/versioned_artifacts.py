@@ -17,6 +17,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import base64
 import hashlib
 import json
 import os
@@ -37,6 +38,42 @@ def utc_now_iso() -> str:
 
 def _canonical_json(value: Any) -> bytes:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def _run_plan_is_fully_materialized(
+    conn: sqlite3.Connection,
+    run_id: str,
+    *,
+    materialized_task_count: int,
+) -> tuple[bool, bool]:
+    """Return ``(can_complete, is_cancelled)`` for one durable sweep run.
+
+    Large sweeps persist only a bounded admission window at a time.  Seeing
+    all rows *currently* in the ledger succeed is therefore not enough to
+    declare the immutable run complete: the rest of its ``plan_total`` may not
+    have been materialized yet.  Premature completion briefly made a
+    base→perturbed barrier pass between K=4 waves and could expose a staging
+    render version as ready.
+    """
+    row = conn.execute(
+        "SELECT status, metadata_json FROM sweep_runs WHERE run_id = ?",
+        (run_id,),
+    ).fetchone()
+    if row is None:
+        return False, False
+    status = str(row["status"] or "").lower()
+    is_cancelled = status in {"cancelled", "canceled"}
+    if is_cancelled:
+        return False, True
+    try:
+        metadata = json.loads(row["metadata_json"] or "{}")
+    except (TypeError, ValueError):
+        metadata = {}
+    try:
+        expected_total = int(metadata.get("plan_total") or 0)
+    except (TypeError, ValueError):
+        expected_total = 0
+    return expected_total <= 0 or materialized_task_count >= expected_total, False
 
 
 def digest_payload(value: Any, *, prefix: str = "") -> str:
@@ -226,11 +263,20 @@ def _atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
 
 
 def current_pointer_path(project_dir: str | Path, scene_id: str, variant: str, node_id: str, heading_id: str) -> Path:
+    # Keep all render variants independently addressable.  In particular,
+    # active-polar is a separate observation product, not a base observation
+    # with a different modality.  Mapping it to ``observations`` used to make
+    # promotion overwrite base pointers (and made the exporter unable to
+    # discover a complete base/passive/active triad).
+    observation_root = {
+        "perturbed": "observations_perturbed",
+        "perturbed_active_polar": "observations_perturbed_active_polar",
+    }.get(str(variant or "").strip().lower(), "observations")
     return (
         Path(project_dir).resolve()
         / "scenes"
         / scene_id
-        / ("observations_perturbed" if variant == "perturbed" else "observations")
+        / observation_root
         / node_id
         / heading_id
         / "current.json"
@@ -421,6 +467,9 @@ class RenderLedger:
                     payload_json TEXT NOT NULL DEFAULT '{}'
                 );
                 CREATE INDEX IF NOT EXISTS idx_tasks_run_state ON sweep_tasks(run_id, state);
+                -- Gallery pages are ordered within a small set of runs.  This
+                -- avoids an unindexed ordinal walk for large graph sweeps.
+                CREATE INDEX IF NOT EXISTS idx_tasks_gallery_order ON sweep_tasks(run_id, ordinal, task_key);
                 CREATE INDEX IF NOT EXISTS idx_tasks_version ON sweep_tasks(render_version_id, state);
                 CREATE INDEX IF NOT EXISTS idx_events_run ON render_events(run_id, event_id);
                 """
@@ -533,7 +582,9 @@ class RenderLedger:
                 rows = conn.execute(
                     f"""SELECT t.*, r.scene_version_id FROM sweep_tasks t
                         JOIN sweep_runs r ON r.run_id = t.run_id
-                        WHERE r.scene_version_id = ? AND t.logical_task_key IN ({placeholders})
+                        WHERE r.scene_version_id = ?
+                          AND r.status <> 'cancelled'
+                          AND t.logical_task_key IN ({placeholders})
                           AND (
                             t.state = 'succeeded'
                             OR (t.state = 'skipped' AND json_extract(t.metadata_json, '$.source_bundle_ref') IS NOT NULL)
@@ -551,6 +602,64 @@ class RenderLedger:
                     if prior is None or rank >= prior_rank:
                         item["metadata"] = json.loads(item.pop("metadata_json") or "{}")
                         result[logical] = item
+        return result
+
+    def find_complete_tasks_by_render_identity(
+        self,
+        *,
+        scene_version_id_value: str,
+        identities: Sequence[Mapping[str, Any]],
+    ) -> dict[str, dict[str, Any]]:
+        """Find reusable outputs without treating submission sequencing as image identity.
+
+        A variant chain is allowed to be resumed with a freshly allocated
+        predecessor run id.  ``previous_variant_batch_id`` is therefore a
+        scheduling barrier, not part of the rendered image.  Older ledger
+        rows predate the explicit identity column, so derive a compact key
+        from their immutable task columns and render-relevant metadata.
+        """
+        def key(value: Mapping[str, Any]) -> str:
+            return json.dumps(dict(value), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+        wanted = {key(item) for item in identities}
+        if not wanted:
+            return {}
+        result: dict[str, dict[str, Any]] = {}
+        with self.connection() as conn:
+            rows = conn.execute(
+                """SELECT t.*, r.scene_version_id FROM sweep_tasks t
+                   JOIN sweep_runs r ON r.run_id = t.run_id
+                   WHERE r.scene_version_id = ?
+                     AND r.status <> 'cancelled'
+                     AND (t.state = 'succeeded'
+                       OR (t.state = 'skipped' AND json_extract(t.metadata_json, '$.source_bundle_ref') IS NOT NULL))""",
+                (scene_version_id_value,),
+            ).fetchall()
+            for row in rows:
+                item = dict(row)
+                try:
+                    metadata = json.loads(item.get("metadata_json") or "{}")
+                except (TypeError, ValueError):
+                    continue
+                identity = {
+                    "variant": str(item.get("variant") or metadata.get("scene_variant_key") or ""),
+                    "render_variant": str(metadata.get("render_variant") or ""),
+                    "phase": str(item.get("phase") or ""),
+                    "phase_index": int(item.get("phase_index") or 0),
+                    "node_id": str(item.get("node_id") or ""),
+                    "heading_id": str(item.get("heading_id") or ""),
+                    "sensor_ids": list(metadata.get("sensor_ids") or []),
+                    "modalities_by_sensor": dict(metadata.get("modalities_by_sensor") or {}),
+                }
+                identity_key = key(identity)
+                if identity_key not in wanted:
+                    continue
+                prior = result.get(identity_key)
+                rank = (int(item.get("attempt_count") or 0), int(item.get("ordinal") or 0))
+                prior_rank = (int(prior.get("attempt_count") or 0), int(prior.get("ordinal") or 0)) if prior else (-1, -1)
+                if prior is None or rank >= prior_rank:
+                    item["metadata"] = metadata
+                    result[identity_key] = item
         return result
 
     def update_tasks_batch(
@@ -588,10 +697,13 @@ class RenderLedger:
                     )
             for touched_run in touched_runs:
                 states = [str(row[0] or "planned") for row in conn.execute("SELECT state FROM sweep_tasks WHERE run_id = ?", (touched_run,)).fetchall()]
-                if states and all(state in {"succeeded", "skipped"} for state in states):
+                plan_complete, cancelled = _run_plan_is_fully_materialized(
+                    conn, touched_run, materialized_task_count=len(states),
+                )
+                if plan_complete and states and all(state in {"succeeded", "skipped"} for state in states):
                     conn.execute("UPDATE sweep_runs SET status = 'completed' WHERE run_id = ?", (touched_run,))
                     conn.execute("UPDATE render_versions SET status = 'ready' WHERE render_version_id = (SELECT render_version_id FROM sweep_runs WHERE run_id = ?) AND status = 'staging'", (touched_run,))
-                elif any(state in {"failed", "partial", "blocked"} for state in states):
+                elif not cancelled and any(state in {"failed", "partial", "blocked"} for state in states):
                     conn.execute("UPDATE sweep_runs SET status = 'paused' WHERE run_id = ?", (touched_run,))
             conn.commit()
 
@@ -684,7 +796,10 @@ class RenderLedger:
                 total = int(aggregate["total"] or 0)
                 unfinished = int(aggregate["unfinished"] or 0)
                 failed = int(aggregate["failed"] or 0)
-                if total > 0 and unfinished == 0:
+                plan_complete, cancelled = _run_plan_is_fully_materialized(
+                    conn, touched_run, materialized_task_count=total,
+                )
+                if plan_complete and total > 0 and unfinished == 0:
                     conn.execute(
                         "UPDATE sweep_runs SET status = 'completed' WHERE run_id = ?",
                         (touched_run,),
@@ -696,7 +811,7 @@ class RenderLedger:
                            ) AND status = 'staging'""",
                         (touched_run,),
                     )
-                elif failed > 0:
+                elif not cancelled and failed > 0:
                     conn.execute(
                         "UPDATE sweep_runs SET status = 'paused' WHERE run_id = ?",
                         (touched_run,),
@@ -878,7 +993,9 @@ class RenderLedger:
             row = conn.execute(
                 """SELECT t.*, r.scene_version_id FROM sweep_tasks t
                    JOIN sweep_runs r ON r.run_id = t.run_id
-                   WHERE r.scene_version_id = ? AND t.logical_task_key = ?
+                   WHERE r.scene_version_id = ?
+                     AND r.status <> 'cancelled'
+                     AND t.logical_task_key = ?
                      AND (
                        t.state = 'succeeded'
                        OR (t.state = 'skipped' AND json_extract(t.metadata_json, '$.source_bundle_ref') IS NOT NULL)
@@ -927,10 +1044,13 @@ class RenderLedger:
             if run_row is not None:
                 rows = conn.execute("SELECT state FROM sweep_tasks WHERE run_id = ?", (run_row["run_id"],)).fetchall()
                 states = [str(row["state"] or "planned") for row in rows]
-                if states and all(state in {"succeeded", "skipped"} for state in states):
+                plan_complete, cancelled = _run_plan_is_fully_materialized(
+                    conn, str(run_row["run_id"]), materialized_task_count=len(states),
+                )
+                if plan_complete and states and all(state in {"succeeded", "skipped"} for state in states):
                     conn.execute("UPDATE sweep_runs SET status = 'completed' WHERE run_id = ?", (run_row["run_id"],))
                     conn.execute("UPDATE render_versions SET status = 'ready' WHERE render_version_id = ? AND status = 'staging'", (run_row["render_version_id"],))
-                elif any(state in {"failed", "partial", "blocked"} for state in states):
+                elif not cancelled and any(state in {"failed", "partial", "blocked"} for state in states):
                     conn.execute("UPDATE sweep_runs SET status = 'paused' WHERE run_id = ?", (run_row["run_id"],))
             conn.commit()
 
@@ -977,6 +1097,119 @@ class RenderLedger:
                 item["metadata"] = json.loads(item.pop("metadata_json") or "{}")
                 payload["tasks"].append(item)
             return payload
+
+    @staticmethod
+    def _decode_gallery_cursor(cursor: str | None) -> tuple[int, int, str] | None:
+        """Decode the opaque, stable ordering cursor used by the gallery API."""
+        if not cursor:
+            return None
+        try:
+            raw = base64.urlsafe_b64decode(str(cursor).encode("ascii") + b"===")
+            value = json.loads(raw.decode("utf-8"))
+            rank, ordinal, task_key = value
+            if int(rank) < 0 or int(ordinal) < 0 or not isinstance(task_key, str):
+                return None
+            return int(rank), int(ordinal), task_key
+        except (TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
+            return None
+
+    @staticmethod
+    def _encode_gallery_cursor(rank: int, ordinal: int, task_key: str) -> str:
+        value = json.dumps([int(rank), int(ordinal), str(task_key)], separators=(",", ":"))
+        return base64.urlsafe_b64encode(value.encode("utf-8")).decode("ascii").rstrip("=")
+
+    def gallery_task_page(
+        self,
+        *,
+        run_ids: Sequence[str],
+        limit: int = 24,
+        cursor: str | None = None,
+        variant: str | None = None,
+        sensor_id: str | None = None,
+        state: str | None = None,
+        query: str | None = None,
+    ) -> dict[str, Any]:
+        """Read one bounded, ordered page of immutable render tasks.
+
+        Gallery browsing must never use :meth:`run_payload`: that debugging
+        helper materializes every task in a sweep and can be tens of thousands
+        of rows.  ``run_ids`` are supplied in render-version sequence order so
+        polar stage ordering stays deterministic across pages.
+        """
+        ordered_run_ids = [str(item) for item in run_ids if str(item)]
+        if not ordered_run_ids:
+            return {"tasks": [], "total": 0, "state_counts": {}, "next_cursor": None}
+        limit = max(1, min(int(limit or 24), 96))
+        placeholders = ",".join("?" for _ in ordered_run_ids)
+        rank_cases = " ".join(f"WHEN ? THEN {index}" for index, _ in enumerate(ordered_run_ids))
+        rank_expr = f"CASE run_id {rank_cases} ELSE {len(ordered_run_ids)} END"
+        clauses = [f"run_id IN ({placeholders})"]
+        params: list[Any] = [*ordered_run_ids]
+        if variant:
+            clauses.append("variant = ?")
+            params.append(str(variant))
+        if state:
+            clauses.append("state = ?")
+            params.append(str(state))
+        if sensor_id:
+            # ``sensor_ids`` are canonical JSON strings in task metadata.  A
+            # parameterized quoted token avoids a SQLite JSON1 dependency while
+            # preserving scene-local filtering for legacy ledgers.
+            clauses.append("metadata_json LIKE ?")
+            params.append(f'%"{str(sensor_id)}"%')
+        if query:
+            escaped = str(query).strip().replace("%", "\\%").replace("_", "\\_")
+            if escaped:
+                clauses.append("(node_id LIKE ? ESCAPE '\\' OR heading_id LIKE ? ESCAPE '\\')")
+                params.extend([f"%{escaped}%", f"%{escaped}%"])
+        base_where = " AND ".join(clauses)
+        cursor_value = self._decode_gallery_cursor(cursor)
+        page_clauses = list(clauses)
+        page_params: list[Any] = [*params]
+        if cursor_value is not None:
+            rank, ordinal, task_key = cursor_value
+            page_clauses.append(
+                f"({rank_expr} > ? OR ({rank_expr} = ? AND (ordinal > ? OR (ordinal = ? AND task_key > ?))))"
+            )
+            # The CASE expression occurs twice in the cursor clause.
+            page_params.extend([*ordered_run_ids, rank, *ordered_run_ids, rank, ordinal, ordinal, task_key])
+        page_where = " AND ".join(page_clauses)
+        with self.connection() as conn:
+            total = int(conn.execute(
+                f"SELECT COUNT(*) AS count FROM sweep_tasks WHERE {base_where}", params,
+            ).fetchone()["count"])
+            counts = {
+                str(row["state"]): int(row["count"])
+                for row in conn.execute(
+                    f"SELECT state, COUNT(*) AS count FROM sweep_tasks WHERE {base_where} GROUP BY state", params,
+                ).fetchall()
+            }
+            # Bind rank CASE values before normal filters.  LIMIT+1 detects the
+            # next page without a second scan or offset walk.
+            rows = conn.execute(
+                f"SELECT *, {rank_expr} AS gallery_rank FROM sweep_tasks "
+                f"WHERE {page_where} ORDER BY gallery_rank, ordinal, task_key LIMIT ?",
+                [*ordered_run_ids, *page_params, limit + 1],
+            ).fetchall()
+        has_more = len(rows) > limit
+        page_rows = rows[:limit]
+        tasks: list[dict[str, Any]] = []
+        for row in page_rows:
+            item = dict(row)
+            item["metadata"] = json.loads(item.pop("metadata_json") or "{}")
+            tasks.append(item)
+        next_cursor = None
+        if has_more and page_rows:
+            final = page_rows[-1]
+            next_cursor = self._encode_gallery_cursor(
+                int(final["gallery_rank"]), int(final["ordinal"]), str(final["task_key"]),
+            )
+        return {
+            "tasks": tasks,
+            "total": total,
+            "state_counts": counts,
+            "next_cursor": next_cursor,
+        }
 
     def task_event_log(self, task_key_value: str, *, limit: int = 80) -> dict[str, Any] | None:
         """Return the durable lifecycle log for one immutable sweep task.
@@ -1038,8 +1271,18 @@ class RenderLedger:
         viewpoint/heading.  Monitor coverage must count that logical view once
         and consider it complete when *any* run for the latest scene version
         produced or reused a valid bundle.
+
+        Navigation-support renders need one extra level of accounting.  A
+        durable task may be a K=4 Stokes bundle, while the user-facing unit is
+        a pose-heading observation.  The support plan is the source of truth
+        for that denominator, including successor variants that have not yet
+        materialized their task window.  When a usable support plan is present,
+        prefer that contract over the legacy task-count query below.
         """
         self._assert_scene_scope(scene_id)
+        planned = self._scene_render_plan_sensor_progress(scene_id)
+        if planned:
+            return planned
         with self.connection() as conn:
             rows = conn.execute(
                 """WITH expanded_all AS (
@@ -1121,6 +1364,349 @@ class RenderLedger:
                 "fraction": completed / max(1, total),
             })
         return result
+
+    def _scene_render_plan_sensor_progress(self, scene_id: str) -> list[dict[str, Any]]:
+        """Summarise support-plan observations without treating K bundles as views.
+
+        This is deliberately a narrow enhancement to the legacy progress
+        query: it activates only when durable task metadata points at a
+        project-relative JSON render plan with ``render_entries``.  Older graph
+        sweeps retain their SQL-only accounting path above.
+        """
+        with self.connection() as conn:
+            run_rows = conn.execute(
+                """SELECT run_id, status, created_at, metadata_json
+                   FROM sweep_runs
+                   WHERE scene_id = ? AND status <> 'cancelled'""",
+                (str(scene_id),),
+            ).fetchall()
+            task_rows = conn.execute(
+                """SELECT t.run_id, t.variant, t.node_id, t.heading_id, t.state,
+                          t.metadata_json
+                   FROM sweep_tasks t
+                   JOIN sweep_runs r ON r.run_id = t.run_id
+                   WHERE r.scene_id = ? AND r.status <> 'cancelled'""",
+                (str(scene_id),),
+            ).fetchall()
+
+        if not run_rows or not task_rows:
+            return []
+
+        runs: dict[str, dict[str, Any]] = {}
+        direct_refs: dict[str, set[str]] = {}
+        task_metadata: list[tuple[Any, dict[str, Any]]] = []
+        safe_ref_cache: dict[str, str | None] = {}
+        for row in run_rows:
+            try:
+                metadata = json.loads(row["metadata_json"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                metadata = {}
+            run_id = str(row["run_id"] or "")
+            if not run_id:
+                continue
+            runs[run_id] = {
+                "created_at": str(row["created_at"] or ""),
+                "metadata": metadata if isinstance(metadata, Mapping) else {},
+            }
+            direct_refs[run_id] = set()
+        for row in task_rows:
+            try:
+                metadata = json.loads(row["metadata_json"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                metadata = {}
+            if not isinstance(metadata, Mapping):
+                metadata = {}
+            run_id = str(row["run_id"] or "")
+            raw_plan_ref = str(metadata.get("render_plan_ref") or "")
+            if raw_plan_ref not in safe_ref_cache:
+                safe_ref_cache[raw_plan_ref] = self._safe_render_plan_ref(raw_plan_ref)
+            plan_ref = safe_ref_cache[raw_plan_ref]
+            if plan_ref and run_id in direct_refs:
+                direct_refs[run_id].add(plan_ref)
+            task_metadata.append((row, dict(metadata)))
+
+        if not any(direct_refs.values()):
+            return []
+
+        def group_id_for(run_id: str) -> str:
+            metadata = runs[run_id]["metadata"]
+            return str(metadata.get("submission_group_id") or run_id)
+
+        resolved_ref_cache: dict[str, str | None] = {}
+
+        def resolved_ref_for(run_id: str, seen: set[str] | None = None) -> str | None:
+            if run_id in resolved_ref_cache:
+                return resolved_ref_cache[run_id]
+            refs = direct_refs.get(run_id, set())
+            if len(refs) == 1:
+                value = next(iter(refs))
+                resolved_ref_cache[run_id] = value
+                return value
+            if len(refs) > 1:
+                return None
+            metadata = runs.get(run_id, {}).get("metadata", {})
+            previous = str(metadata.get("previous_variant_batch_id") or "")
+            visited = set() if seen is None else set(seen)
+            if previous and previous not in visited and previous in runs and group_id_for(previous) == group_id_for(run_id):
+                visited.add(run_id)
+                value = resolved_ref_for(previous, visited)
+                resolved_ref_cache[run_id] = value
+                return value
+            resolved_ref_cache[run_id] = None
+            return None
+
+        # Select the newest non-cancelled chain per plan *and variant*.  An L3
+        # recovery commonly starts at passive because its base observations are
+        # already complete in the preceding chain; selecting one whole group
+        # would incorrectly report that base segment as unrendered.
+        direct_plan_refs = {ref for refs in direct_refs.values() for ref in refs}
+        newest_run_for_ref_variant: dict[tuple[str, str], tuple[str, str]] = {}
+        for run_id in runs:
+            ref = resolved_ref_for(run_id)
+            if not ref or ref not in direct_plan_refs:
+                continue
+            variant = str(runs[run_id]["metadata"].get("variant") or "")
+            if not variant:
+                continue
+            key = (ref, variant)
+            candidate = (runs[run_id]["created_at"], run_id)
+            if candidate > newest_run_for_ref_variant.get(key, ("", "")):
+                newest_run_for_ref_variant[key] = candidate
+        selected_runs_by_ref: dict[str, set[str]] = {ref: set() for ref in direct_plan_refs}
+        for (ref, _variant), (_created_at, run_id) in newest_run_for_ref_variant.items():
+            selected_runs_by_ref[ref].add(run_id)
+        if not selected_runs_by_ref:
+            return []
+
+        plan_entries: dict[str, set[tuple[str, str]]] = {}
+        plan_campaigns: dict[str, tuple[str, str, str]] = {}
+        for ref in selected_runs_by_ref:
+            payload = self._load_render_plan_payload(ref)
+            entries = payload.get("render_entries") if isinstance(payload, Mapping) else None
+            if not isinstance(entries, list):
+                continue
+            views: set[tuple[str, str]] = set()
+            for entry in entries:
+                if not isinstance(entry, Mapping):
+                    continue
+                node_id = str(entry.get("motion_node_id") or entry.get("node_id") or "")
+                heading_id = str(entry.get("heading_id") or "")
+                if node_id and heading_id:
+                    views.add((node_id, heading_id))
+            if not views:
+                continue
+            plan_entries[ref] = views
+            plan_campaigns[ref] = (
+                str(payload.get("profile_id") or ""),
+                str(payload.get("profile_digest") or ""),
+                str(payload.get("validation_digest") or ""),
+            )
+        if not plan_entries:
+            return []
+
+        # A v4 base plan and an L3 expansion have the same profile and
+        # validation digest.  They form one 3,704-view campaign, rather than
+        # competing latest rows in the monitor.
+        campaign_latest: dict[tuple[str, str, str], str] = {}
+        for ref, campaign in plan_campaigns.items():
+            created_at = max((runs[run_id]["created_at"] for run_id in selected_runs_by_ref[ref]), default="")
+            campaign_latest[campaign] = max(campaign_latest.get(campaign, ""), created_at)
+        campaign = max(campaign_latest, key=campaign_latest.get)
+        selected_refs = {ref for ref, value in plan_campaigns.items() if value == campaign}
+        if not selected_refs:
+            return []
+
+        selected_runs = {
+            run_id
+            for ref in selected_refs
+            for run_id in selected_runs_by_ref.get(ref, set())
+        }
+        variants = {
+            str(runs[run_id]["metadata"].get("variant") or "")
+            for run_id in selected_runs
+            if str(runs[run_id]["metadata"].get("variant") or "")
+        }
+        sensors: set[str] = set()
+        for row, metadata in task_metadata:
+            if str(row["run_id"] or "") not in selected_runs:
+                continue
+            sensor_values = metadata.get("sensor_ids")
+            if isinstance(sensor_values, Sequence) and not isinstance(sensor_values, (str, bytes)):
+                sensors.update(str(sensor) for sensor in sensor_values if str(sensor))
+        if not variants or not sensors:
+            return []
+
+        expected_views = set().union(*(plan_entries[ref] for ref in selected_refs))
+        if not expected_views:
+            return []
+
+        # A browser-local throughput sample is useful after the second monitor
+        # refresh, but it is empty after a page reload and can also miss a
+        # K=4 completion burst.  The durable attempt timestamps give the
+        # coverage endpoint an immediate, conservative fallback for every
+        # active variant.  Only real successful attempts participate: reused
+        # source bundles must not make a newly admitted successor appear fast.
+        elapsed_seconds_by_variant: dict[str, float] = {}
+        if selected_runs:
+            placeholders = ", ".join("?" for _ in selected_runs)
+            with self.connection() as conn:
+                timing_rows = conn.execute(
+                    f"""SELECT t.variant, MIN(a.started_at) AS first_started_at
+                           FROM render_attempts a
+                           JOIN sweep_tasks t ON t.task_key = a.task_key
+                          WHERE t.run_id IN ({placeholders})
+                            AND a.state = 'succeeded'
+                            AND a.started_at IS NOT NULL
+                          GROUP BY t.variant""",
+                    sorted(selected_runs),
+                ).fetchall()
+            now = datetime.now(timezone.utc)
+            for row in timing_rows:
+                raw_started_at = str(row["first_started_at"] or "")
+                try:
+                    started_at = datetime.fromisoformat(raw_started_at.replace("Z", "+00:00"))
+                    if started_at.tzinfo is None:
+                        started_at = started_at.replace(tzinfo=timezone.utc)
+                    elapsed_seconds = (now - started_at.astimezone(timezone.utc)).total_seconds()
+                except (TypeError, ValueError):
+                    continue
+                if elapsed_seconds > 0:
+                    elapsed_seconds_by_variant[str(row["variant"] or "")] = elapsed_seconds
+
+        state_rank = {"queued": 0, "failed": 1, "running": 2, "completed": 3}
+        state_by_view: dict[tuple[str, str, str, str], str] = {}
+        for row, metadata in task_metadata:
+            run_id = str(row["run_id"] or "")
+            if run_id not in selected_runs or resolved_ref_for(run_id) not in selected_refs:
+                continue
+            variant = str(row["variant"] or runs[run_id]["metadata"].get("variant") or "")
+            if variant not in variants:
+                continue
+            raw_state = str(row["state"] or "").lower()
+            if raw_state == "succeeded" or (
+                raw_state == "skipped" and metadata.get("source_bundle_ref")
+            ):
+                state = "completed"
+            elif raw_state == "running":
+                state = "running"
+            elif raw_state in {"failed", "partial", "blocked"}:
+                state = "failed"
+            else:
+                state = "queued"
+            view_keys = metadata.get("stokes_heading_batch_view_keys")
+            if not isinstance(view_keys, Sequence) or isinstance(view_keys, (str, bytes)):
+                view_keys = [{"node_id": row["node_id"], "heading_id": row["heading_id"]}]
+            sensor_values = metadata.get("sensor_ids")
+            if not isinstance(sensor_values, Sequence) or isinstance(sensor_values, (str, bytes)):
+                sensor_values = []
+            for item in view_keys:
+                if not isinstance(item, Mapping):
+                    continue
+                node_id = str(item.get("node_id") or "")
+                heading_id = str(item.get("heading_id") or "")
+                if (node_id, heading_id) not in expected_views:
+                    continue
+                for sensor in sensor_values:
+                    sensor_id = str(sensor)
+                    if not sensor_id:
+                        continue
+                    key = (variant, sensor_id, node_id, heading_id)
+                    previous = state_by_view.get(key)
+                    if previous is None or state_rank[state] > state_rank[previous]:
+                        state_by_view[key] = state
+
+        campaign_id = ":".join(part for part in campaign if part) or "support_plan"
+        plan_refs = sorted(selected_refs)
+        result: list[dict[str, Any]] = []
+        for sensor_id in sorted(sensors):
+            for variant in sorted(variants):
+                counts = {"completed": 0, "running": 0, "failed": 0}
+                for node_id, heading_id in expected_views:
+                    state = state_by_view.get((variant, sensor_id, node_id, heading_id), "queued")
+                    if state in counts:
+                        counts[state] += 1
+                total = len(expected_views)
+                payload: dict[str, Any] = {
+                    "scene_id": str(scene_id),
+                    "campaign_id": campaign_id,
+                    "coverage_source": "render_plan",
+                    "plan_refs": plan_refs,
+                    "variant": variant,
+                    "sensor_id": sensor_id,
+                    "completed": counts["completed"],
+                    "running": counts["running"],
+                    "queued": max(0, total - counts["completed"] - counts["running"] - counts["failed"]),
+                    "failed": counts["failed"],
+                    "total": total,
+                    "fraction": counts["completed"] / max(1, total),
+                }
+                elapsed_seconds = elapsed_seconds_by_variant.get(variant)
+                if elapsed_seconds and counts["completed"] > 0 and counts["completed"] < total:
+                    views_per_second = counts["completed"] / elapsed_seconds
+                    if views_per_second > 0:
+                        payload["observed_views_per_second"] = views_per_second
+                        payload["eta_seconds"] = (total - counts["completed"]) / views_per_second
+                        payload["eta_source"] = "durable_run_average"
+                result.append(payload)
+        return result
+
+    def _safe_render_plan_ref(self, value: Any) -> str | None:
+        ref = str(value or "").strip()
+        if not ref or ref.startswith("/") or "\\" in ref:
+            return None
+        candidate = (self.project_dir / ref).resolve()
+        try:
+            candidate.relative_to(self.project_dir)
+        except ValueError:
+            return None
+        return ref if candidate.suffix.lower() == ".json" else None
+
+    def _load_render_plan_payload(self, ref: str) -> Mapping[str, Any]:
+        safe_ref = self._safe_render_plan_ref(ref)
+        if safe_ref is None:
+            return {}
+        path = (self.project_dir / safe_ref).resolve()
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            # A confirmed place-graph edit removes the active v4 plan.  Older
+            # durable tasks legitimately still refer to that original path, so
+            # use an explicit archive redirect when one was written during
+            # recovery.  This is intentionally opt-in via the manifest; never
+            # guess across unrelated archives or scene revisions.
+            payload = self._load_archived_render_plan_payload(safe_ref)
+        return payload if isinstance(payload, Mapping) else {}
+
+    def _load_archived_render_plan_payload(self, ref: str) -> Mapping[str, Any]:
+        parts = Path(ref).parts
+        if len(parts) != 3 or parts[0] != "scenes":
+            return {}
+        scene_id, filename = parts[1], parts[2]
+        if filename not in {"support_observation_plan.json", "support_observation_expansion_l3_context_45.json"}:
+            return {}
+        archive_root = self.project_dir / "scenes" / scene_id / "navigation_support_archives"
+        if not archive_root.is_dir():
+            return {}
+        for manifest_path in sorted(archive_root.glob("*/archive_manifest.json"), reverse=True):
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not isinstance(manifest, Mapping):
+                continue
+            redirects = manifest.get("stale_render_plan_refs")
+            if not isinstance(redirects, Sequence) or isinstance(redirects, (str, bytes)):
+                continue
+            if ref not in {str(value) for value in redirects}:
+                continue
+            archived_path = manifest_path.parent / filename
+            try:
+                payload = json.loads(archived_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if isinstance(payload, Mapping):
+                return payload
+        return {}
 
     def list_versions(self, *, scene_id: str | None = None) -> list[dict[str, Any]]:
         if scene_id is not None:

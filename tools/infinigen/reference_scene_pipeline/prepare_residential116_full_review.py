@@ -1,0 +1,8 @@
+"""Only seal full review inputs after actual renderer completion and all43 hashes."""
+from pathlib import Path
+import json,hashlib,datetime
+r=Path(__file__).resolve().parents[3];d=r/'data/venue_refs/floor_plans_v3/dual_unit_residential_floor_03';p=d/'full_suite_r116_cpu';job=json.loads((p/'job.json').read_text());a=json.loads((p/'candidate/render_receipt.json').read_text());expected=[x['name'] for x in json.loads((d/'full_suite_r116_views.json').read_text())]
+if job.get('exit_code')!=0 or len(a['frames'])!=43:print('FULL116_NOT_READY',job['phase'],len(a['frames']),43);raise SystemExit(0)
+assert len(set(expected))==43 and {x['name'] for x in a['frames']}==set(expected);sha=lambda p:hashlib.sha256(p.read_bytes()).hexdigest();assert a['source_unchanged'] and sha(Path(a['source']))==a['source_sha256']
+for f in a['frames']:assert sha(Path(f['path']))==f['sha256']
+refs=[d/x for x in ['source.png','floorplan_reference_v1.png','living_reference_v1.png','bedroom_reference_v1.png','bathroom_reference_v1.png']];assert all(x.exists() for x in refs);manifest={'verified_at':datetime.datetime.now(datetime.timezone.utc).isoformat(),'source':a['source'],'source_sha256':a['source_sha256'],'render_exit_code':job['exit_code'],'candidate_count':43,'candidate_paths':[f['path'] for f in a['frames']],'reference_count':5,'reference_paths':[str(x) for x in refs],'scope':'Full frozen116 source only. Later119 doorway changes are NOT in these43 images. All48 originals require actual visual inspection. No acceptance inferred from renderer completion or hashes.','accepted':False};(p/'independent_review_input.json').write_text(json.dumps(manifest,indent=2));print('FULL116_VERIFIED_READY_FOR48_IMAGE_REVIEW')

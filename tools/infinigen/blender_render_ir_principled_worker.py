@@ -22,7 +22,15 @@ from mathutils import Matrix  # type: ignore
 _SCRIPT_DIR = Path(__file__).resolve().parent
 if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
+import ir_fixture_contract  # noqa: E402
 from ir_worker_aov_contract import required_aov_sources  # noqa: E402
+
+# The fixture classifier and its colour-temperature conversion live with the
+# other renderer-independent contracts; the worker only needs blackbody here.
+_NAV_SRC = _SCRIPT_DIR.parents[1] / "modules" / "navigation_dataset" / "src"
+if str(_NAV_SRC) not in sys.path:
+    sys.path.insert(0, str(_NAV_SRC))
+from navigation_dataset import ir_indoor_fixtures  # noqa: E402
 
 
 _REC709 = (0.2126, 0.7152, 0.0722)
@@ -36,6 +44,9 @@ _GT_SPECS = {
     "metallic_family_id": ("GT_MetallicFamilyID", "BW", "8", "categorical_uint8"),
     "metal_coverage_mask": ("GT_MetalCoverage", "BW", "8", "binary_mask_u8"),
     "exposed_metal_mask": ("GT_ExposedMetal", "BW", "8", "binary_mask_u8"),
+    # Present only on a Stage 2 built with the continuous-metalness policy: the
+    # pre-augmentation binary, so a label-level ablation needs no second render.
+    "metallic_source_binary": ("GT_MetallicSourceBinary", "BW", "16", "unorm16"),
     "normal_geometry_world": ("GT_GeometryNormalWorld", "RGB", "16", "xyz_signed_to_unorm16"),
     "normal_shading_world": ("GT_ShadingNormalWorld", "RGB", "16", "xyz_signed_to_unorm16"),
     # Cycles' Z pass is camera-to-surface ray distance.  The parent derives
@@ -55,7 +66,10 @@ _GT_SPECS = {
 # Older v3 prepared blends predate the optional remediation/provenance AOVs.
 # They remain valid for the core PBR contract; the renderer synthesizes these
 # optional channels below rather than rejecting an otherwise usable scene.
-_OPTIONAL_AOV_SOURCES = frozenset({"GT_Remediated", "GT_PBRProvenance"})
+# GT_MetallicSourceBinary joins these because an un-augmented Stage 2 -- every
+# published one -- legitimately has no such socket.  It must never become a core
+# required modality or existing datasets fail their completeness check.
+_OPTIONAL_AOV_SOURCES = frozenset({"GT_Remediated", "GT_PBRProvenance", "GT_MetallicSourceBinary"})
 _DIFFUSE_EXR_STEMS = {
     "rgb": ("diffuse_transport_rgb", "diffuse_component_rgb"),
     "nir": ("diffuse_transport_nir", "diffuse_component_nir"),
@@ -77,10 +91,16 @@ def _args() -> argparse.Namespace:
     parser.add_argument("--fov", type=float, required=True)
     parser.add_argument("--rgb-spp", type=int, required=True)
     parser.add_argument("--nir-spp", type=int, required=True)
+    parser.add_argument("--denoise", action="store_true",
+                        help="OpenImageDenoise the beauty passes; PBR AOVs stay exact")
     parser.add_argument("--max-bounces", type=int, default=8)
     parser.add_argument("--seed", type=int, default=20260812)
     parser.add_argument("--device", choices=("OPTIX", "CUDA"), default="OPTIX")
     parser.add_argument("--qc-components", action="store_true")
+    parser.add_argument("--exr-color-depth", choices=("16", "32"), default="32",
+                        help="storage precision for all scene-linear EXR artifacts")
+    parser.add_argument("--write-diffuse-decomposition", action="store_true",
+                        help="emit auxiliary diffuse transport/component/reflectance artifacts")
     parser.add_argument("--nir-formula", choices=("primary", "luminance_matched_v1"), default="primary")
     parser.add_argument("--flash-energy-scale", type=float, default=1.0)
     parser.add_argument("--ambient-fill-energy-scale", type=float, default=1.0)
@@ -103,7 +123,17 @@ def _emit(payload: dict) -> None:
 def _configure_cycles(scene, args: argparse.Namespace) -> list[str]:
     scene.render.engine = "CYCLES"
     scene.cycles.device = "GPU"
-    scene.cycles.use_denoising = False
+    # Denoising is opt-in and off by default: it is a filter, so turning it on
+    # silently changes every rendered product.  When requested it applies to the
+    # Monte-Carlo beauty passes, which are the only noisy ones -- the PBR AOVs
+    # are per-pixel material constants and must stay exact.
+    scene.cycles.use_denoising = bool(getattr(args, "denoise", False))
+    if scene.cycles.use_denoising:
+        scene.cycles.denoiser = "OPENIMAGEDENOISE"
+        scene.cycles.denoising_input_passes = "RGB_ALBEDO_NORMAL"
+        scene.cycles.denoising_prefilter = "ACCURATE"
+        if hasattr(scene.cycles, "denoising_use_gpu"):
+            scene.cycles.denoising_use_gpu = True
     scene.cycles.max_bounces = int(args.max_bounces)
     scene.cycles.use_adaptive_sampling = False
     scene.render.resolution_x = int(args.width)
@@ -112,7 +142,7 @@ def _configure_cycles(scene, args: argparse.Namespace) -> list[str]:
     scene.render.film_transparent = False
     scene.render.image_settings.file_format = "OPEN_EXR"
     scene.render.image_settings.color_mode = "RGB"
-    scene.render.image_settings.color_depth = "32"
+    scene.render.image_settings.color_depth = args.exr_color_depth
     scene.view_settings.view_transform = "Raw"
     scene.view_settings.look = "None"
     scene.view_settings.exposure = 0.0
@@ -195,6 +225,12 @@ def _luminance(color) -> float:
     return sum(float(color[i]) * _REC709[i] for i in range(3))
 
 
+#: Filled by ``_set_lighting`` and read by ``_publish``; the two are always one
+#: frame apart in the same process, so a module-level record needs no plumbing
+#: through every render call.
+_LAST_RESOLVED_FIXTURES: dict = {}
+
+
 def _lighting_state(scene):
     lights = {}
     for obj in bpy.data.objects:
@@ -204,6 +240,18 @@ def _lighting_state(scene):
                 "energy": float(obj.data.energy),
                 "ambient_fill": bool(obj.data.get("ir_ambient_fill", False)),
                 "location": tuple(float(v) for v in obj.matrix_world.translation),
+                # Fixture identity must be captured here: the snapshot is taken
+                # once at worker start and is the only baseline a task sees.
+                "fixture_id": str(obj.data.get("ir_fixture_id") or ""),
+                "fixture_group": str(obj.data.get("ir_fixture_group") or ""),
+                "room_id": str(obj.data.get("ir_fixture_room_id") or ""),
+                "base_energy_w": float(obj.data.get("ir_base_energy_w", obj.data.energy)),
+                # Captured so every task can restore it.  _set_lighting never
+                # touched hide_render before; once a condition starts switching
+                # fixtures off, an unrestored flag would darken every later
+                # frame this resident worker renders.
+                "hide_render": bool(obj.hide_render),
+                "external_portal": bool(obj.data.get("ir_external_portal", False)),
             }
     world = []
     if scene.world and scene.world.use_nodes and scene.world.node_tree:
@@ -222,9 +270,73 @@ def _set_lighting(scene, state, *, nir: bool, ambient_fill_energy_scale: float, 
     side_axis = recipe.get("side_axis_xy") or (1.0, 0.0)
     side_center = recipe.get("side_center_xy") or (0.0, 0.0)
     side_key = bool(recipe.get("side_key", False))
+
+    # Per-fixture switching, when the condition asks for it.  Resolution is a
+    # pure hash of the spec plus the rig identity, so the plan can carry the
+    # specification without knowing which fixtures a scene has.
+    spec = recipe.get("fixtures")
+    resolved: dict[str, dict] = {}
+    if not spec:
+        _LAST_RESOLVED_FIXTURES.clear()
+    if spec:
+        rig_digest = str(bpy.context.scene.get("ir_indoor_fixture_rig_digest") or "")
+        # Portals are installed after the fixture pass and are never switchable
+        # here -- _set_environment owns their energy -- so they carry no fixture
+        # id by design and must not count as an untagged light.
+        missing = [n for n, r in lights.items()
+                   if not r.get("fixture_id") and not r.get("external_portal")]
+        if not rig_digest or missing:
+            raise RuntimeError(
+                "lighting recipe requests per-fixture control but the prepared blend has no "
+                f"addressable fixture rig (digest={rig_digest!r}, untagged lights={len(missing)}); "
+                "re-prepare with --fixture-policy addressable_v2"
+            )
+        resolution = ir_fixture_contract.resolve_fixture_subset(
+            [dict(record, fixture_id=record["fixture_id"], group=record["fixture_group"],
+                  room_id=record["room_id"]) for record in lights.values()],
+            spec,
+            scene_id=str(recipe.get("scene_id") or bpy.context.scene.get("ir_stage1_scene_id") or ""),
+            condition_id=str(recipe.get("id") or ""),
+            rig_digest=rig_digest,
+            blackbody=ir_indoor_fixtures.blackbody_linear_rgb,
+        )
+        resolved = resolution["fixtures"]
+        # What the condition actually did to this scene's fixtures, so a lamp
+        # that stayed on across every condition is visible in the record rather
+        # than having to be inferred from pixels.
+        _LAST_RESOLVED_FIXTURES.clear()
+        _LAST_RESOLVED_FIXTURES.update({
+            "rig_digest": rig_digest,
+            "on": sorted(fid for fid, f in resolved.items() if f.get("on")),
+            "off": sorted(fid for fid, f in resolved.items() if not f.get("on")),
+            "forced_on": sorted(resolution.get("forced_on_fixture_ids") or []),
+            "kelvin": {fid: f["kelvin"] for fid, f in sorted(resolved.items())
+                       if f.get("kelvin") is not None},
+        })
+
     for name, record in lights.items():
         obj = bpy.data.objects.get(name)
         if obj is None or obj.type != "LIGHT":
+            continue
+        # Restore the prepared visibility first: absolute values are always
+        # re-derived from the baseline, never compounded across tasks.
+        obj.hide_render = bool(record.get("hide_render", obj.hide_render))
+        fixture = resolved.get(str(record.get("fixture_id") or ""))
+        if fixture is not None:
+            base_rgb = fixture.get("color_linear_rgb") or record["color"]
+            color = tuple(float(base_rgb[index]) * color_multiplier[index] for index in range(3))
+            if fixture["on"]:
+                obj.hide_render = False
+                obj.data.energy = (float(record.get("base_energy_w", record["energy"]))
+                                   * float(fixture["energy_scale"]) * native_scale)
+            else:
+                obj.hide_render = True
+                obj.data.energy = 0.0
+            if nir:
+                y = _luminance(color)
+                obj.data.color = (y, y, y)
+            else:
+                obj.data.color = color[:3]
             continue
         color = tuple(record["color"][index] * color_multiplier[index] for index in range(3))
         energy = record["energy"] * native_scale
@@ -358,7 +470,7 @@ def _binary_mask(tree, source):
     return threshold.outputs[0]
 
 
-def _setup_diffuse_decomposition(tree, layers, staging: Path, frame_id: str, modality: str) -> None:
+def _setup_diffuse_decomposition(tree, layers, staging: Path, frame_id: str, modality: str, *, exr_depth: str) -> None:
     # Blender 4.2 exposes the Cycles identifiers on compositor sockets
     # (DiffDir/DiffInd/DiffCol), while the UI labels them Diffuse Direct etc.
     direct = layers.outputs.get("DiffDir") or layers.outputs.get("Diffuse Direct")
@@ -384,7 +496,7 @@ def _setup_diffuse_decomposition(tree, layers, staging: Path, frame_id: str, mod
     transport_stem, component_stem = _DIFFUSE_EXR_STEMS[modality]
     reflectance_stem, valid_stem = _DIFFUSE_PNG_STEMS[modality]
     transport_out = _file_node(
-        tree, staging / transport_stem, frame_id, mode="RGB", depth="32", file_format="OPEN_EXR",
+        tree, staging / transport_stem, frame_id, mode="RGB", depth=exr_depth, file_format="OPEN_EXR",
     )
     tree.links.new(transport.outputs[0], transport_out.inputs[0])
     reflectance_out = _file_node(
@@ -398,7 +510,7 @@ def _setup_diffuse_decomposition(tree, layers, staging: Path, frame_id: str, mod
     tree.links.new(reflectance, component.inputs[1])
     tree.links.new(transport.outputs[0], component.inputs[2])
     component_out = _file_node(
-        tree, staging / component_stem, frame_id, mode="RGB", depth="32", file_format="OPEN_EXR",
+        tree, staging / component_stem, frame_id, mode="RGB", depth=exr_depth, file_format="OPEN_EXR",
     )
     tree.links.new(component.outputs[0], component_out.inputs[0])
 
@@ -421,7 +533,7 @@ def _setup_diffuse_decomposition(tree, layers, staging: Path, frame_id: str, mod
     tree.links.new(valid.outputs[0], valid_out.inputs[0])
 
 
-def _light_group_output(tree, layers, staging: Path, frame_id: str, *, socket_names, stem: str) -> None:
+def _light_group_output(tree, layers, staging: Path, frame_id: str, *, socket_names, stem: str, exr_depth: str) -> None:
     source = None
     for socket_name in socket_names:
         source = layers.outputs.get(socket_name)
@@ -429,23 +541,25 @@ def _light_group_output(tree, layers, staging: Path, frame_id: str, *, socket_na
             break
     if source is None:
         raise RuntimeError(f"render layer lacks required Light Group socket: {socket_names}")
-    output = _file_node(tree, staging / stem, frame_id, mode="RGB", depth="32", file_format="OPEN_EXR")
+    output = _file_node(tree, staging / stem, frame_id, mode="RGB", depth=exr_depth, file_format="OPEN_EXR")
     tree.links.new(source, output.inputs[0])
 
 
-def _setup_rgb_compositor(scene, staging: Path, frame_id: str, *, qc_components: bool) -> None:
+def _setup_rgb_compositor(scene, staging: Path, frame_id: str, *, qc_components: bool,
+                          write_diffuse_decomposition: bool, exr_depth: str) -> None:
     scene.use_nodes = True
     tree = scene.node_tree
     tree.nodes.clear()
     layers = tree.nodes.new("CompositorNodeRLayers")
-    rgb = _file_node(tree, staging / "rgb", frame_id, mode="RGB", depth="32", file_format="OPEN_EXR")
+    rgb = _file_node(tree, staging / "rgb", frame_id, mode="RGB", depth=exr_depth, file_format="OPEN_EXR")
     tree.links.new(layers.outputs["Image"], rgb.inputs[0])
-    _setup_diffuse_decomposition(tree, layers, staging, frame_id, "rgb")
+    if write_diffuse_decomposition:
+        _setup_diffuse_decomposition(tree, layers, staging, frame_id, "rgb", exr_depth=exr_depth)
     if qc_components:
         _light_group_output(
             tree, layers, staging, frame_id,
             socket_names=("Combined_DATASET_AMBIENT_FILL", "DATASET_AMBIENT_FILL"),
-            stem="qc_rgb_ambient_fill",
+            stem="qc_rgb_ambient_fill", exr_depth=exr_depth,
         )
     def _constant(value: float):
         node = tree.nodes.new("CompositorNodeValue")
@@ -463,6 +577,14 @@ def _setup_rgb_compositor(scene, staging: Path, frame_id: str, *, qc_components:
                 # Provenance is unknown for legacy prepared material graphs;
                 # encode the documented zero/unknown class.
                 source = _constant(0.0)
+            elif source_name == "GT_MetallicSourceBinary":
+                # Only a Stage 2 built with the continuous-metalness policy
+                # carries the pre-augmentation metallic.  Unlike the masks
+                # above there is no honest default: a zero image would assert
+                # that nothing was metal before augmentation, which is a false
+                # label rather than a missing one.  Omit the modality instead
+                # -- it is optional and outside CORE_REQUIRED_MODALITIES.
+                continue
             else:
                 raise RuntimeError(f"render layer lacks required pass socket: {source_name}")
         output = _file_node(tree, staging / stem, frame_id, mode=mode, depth=depth, file_format="PNG")
@@ -508,7 +630,8 @@ def _setup_rgb_compositor(scene, staging: Path, frame_id: str, *, qc_components:
         tree.links.new(encoded, output.inputs[0])
 
 
-def _setup_nir_compositor(scene, staging: Path, frame_id: str, *, qc_components: bool) -> None:
+def _setup_nir_compositor(scene, staging: Path, frame_id: str, *, qc_components: bool,
+                          write_diffuse_decomposition: bool, exr_depth: str) -> None:
     scene.use_nodes = True
     tree = scene.node_tree
     tree.nodes.clear()
@@ -522,14 +645,15 @@ def _setup_nir_compositor(scene, staging: Path, frame_id: str, *, qc_components:
     for channel in range(3):
         tree.links.new(bw.outputs[0], combine.inputs[channel])
     combine.inputs[3].default_value = 1.0
-    active = _file_node(tree, staging / "nir_active", frame_id, mode="RGB", depth="32", file_format="OPEN_EXR")
+    active = _file_node(tree, staging / "nir_active", frame_id, mode="RGB", depth=exr_depth, file_format="OPEN_EXR")
     tree.links.new(combine.outputs[0], active.inputs[0])
-    _setup_diffuse_decomposition(tree, layers, staging, frame_id, "nir")
+    if write_diffuse_decomposition:
+        _setup_diffuse_decomposition(tree, layers, staging, frame_id, "nir", exr_depth=exr_depth)
     if qc_components:
         _light_group_output(
             tree, layers, staging, frame_id,
             socket_names=("Combined_DATASET_AMBIENT_FILL", "DATASET_AMBIENT_FILL"),
-            stem="qc_nir_ambient_fill",
+            stem="qc_nir_ambient_fill", exr_depth=exr_depth,
         )
         flash_socket = layers.outputs.get("Combined_NIR_FLASH") or layers.outputs.get("NIR_FLASH")
         if flash_socket is not None:
@@ -539,11 +663,11 @@ def _setup_nir_compositor(scene, staging: Path, frame_id: str, *, qc_components:
             for channel in range(3):
                 tree.links.new(flash_bw.outputs[0], flash_rgb.inputs[channel])
             flash_rgb.inputs[3].default_value = 1.0
-            flash = _file_node(tree, staging / "qc_nir_flash", frame_id, mode="RGB", depth="32", file_format="OPEN_EXR")
+            flash = _file_node(tree, staging / "qc_nir_flash", frame_id, mode="RGB", depth=exr_depth, file_format="OPEN_EXR")
             tree.links.new(flash_rgb.outputs[0], flash.inputs[0])
 
 
-def _setup_nir_passive_compositor(scene, staging: Path, frame_id: str) -> None:
+def _setup_nir_passive_compositor(scene, staging: Path, frame_id: str, *, exr_depth: str) -> None:
     """Write the flash-off NIR observation using the same evaluated scene.
 
     Passive NIR deliberately has no independent material or GT path.  It is
@@ -561,7 +685,7 @@ def _setup_nir_passive_compositor(scene, staging: Path, frame_id: str) -> None:
     for channel in range(3):
         tree.links.new(bw.outputs[0], combine.inputs[channel])
     combine.inputs[3].default_value = 1.0
-    output = _file_node(tree, staging / "nir_passive", frame_id, mode="RGB", depth="32", file_format="OPEN_EXR")
+    output = _file_node(tree, staging / "nir_passive", frame_id, mode="RGB", depth=exr_depth, file_format="OPEN_EXR")
     tree.links.new(combine.outputs[0], output.inputs[0])
 
 
@@ -616,7 +740,7 @@ def _pass_stats(scene) -> dict:
 
 
 def _publish(staging: Path, out: Path, frame_id: str, task: dict, timings: dict, qc: dict,
-             *, width: int, height: int) -> dict:
+             *, width: int, height: int, write_diffuse_decomposition: bool) -> dict:
     passive_only = str(task.get("render_mode") or "") == "nir_passive_only"
     passive_enabled = bool(task.get("nir_passive") or (not passive_only and task.get("nir_passive_enabled")))
     paths = {}
@@ -627,12 +751,12 @@ def _publish(staging: Path, out: Path, frame_id: str, task: dict, timings: dict,
         passive_stems = ("nir_passive",) if passive_enabled else ()
         exr_stems = {
             "rgb", "nir_active", *passive_stems,
-            *(stem for stems in _DIFFUSE_EXR_STEMS.values() for stem in stems),
+            *((stem for stems in _DIFFUSE_EXR_STEMS.values() for stem in stems) if write_diffuse_decomposition else ()),
         }
         stems = [
             "rgb", "nir_active", *passive_stems, *_GT_SPECS.keys(),
-            *(stem for stems in _DIFFUSE_EXR_STEMS.values() for stem in stems),
-            *(stem for stems in _DIFFUSE_PNG_STEMS.values() for stem in stems),
+            *((stem for stems in _DIFFUSE_EXR_STEMS.values() for stem in stems) if write_diffuse_decomposition else ()),
+            *((stem for stems in _DIFFUSE_PNG_STEMS.values() for stem in stems) if write_diffuse_decomposition else ()),
         ]
     for stem in stems:
         suffix = ".exr" if stem in exr_stems else ".png"
@@ -642,6 +766,12 @@ def _publish(staging: Path, out: Path, frame_id: str, task: dict, timings: dict,
         # compositor input, so materialize the documented zero/unknown image
         # here using the already-rendered RGB dimensions.  This keeps the
         # artifact contract complete without changing any core PBR channel.
+        if stem == "metallic_source_binary":
+            # Skipped by the compositor when the prepared blend has no such
+            # socket; there is nothing to collect and nothing to fabricate.
+            matches = sorted(source_dir.glob(f"{frame_id}*{suffix}")) if source_dir.is_dir() else []
+            if not matches:
+                continue
         if stem in {"remediated_pbr_mask", "pbr_provenance_class"}:
             matches = sorted(source_dir.glob(f"{frame_id}*{suffix}")) if source_dir.is_dir() else []
             if not matches:
@@ -708,6 +838,8 @@ def _publish(staging: Path, out: Path, frame_id: str, task: dict, timings: dict,
         row.pop("nir_passive_backfill", None)
     if task.get("lighting"):
         row["lighting"] = {key: value for key, value in task["lighting"].items() if key != "runtime_recipe"}
+        if _LAST_RESOLVED_FIXTURES:
+            row["lighting"]["resolved_fixtures"] = json.loads(json.dumps(_LAST_RESOLVED_FIXTURES))
     frame_path = out / "frames" / f"{frame_id}.json"
     frame_path.parent.mkdir(parents=True, exist_ok=True)
     temp = frame_path.with_suffix(".json.tmp")
@@ -739,7 +871,9 @@ def _render_task(scene, args, lighting_state, task: dict) -> dict:
             )
             _set_environment(scene, nir=False, recipe=(task.get("lighting") or {}).get("runtime_recipe") or (task.get("lighting") or {}).get("recipe"))
             _place_flash(camera, enabled=False, energy_scale=args.flash_energy_scale)
-            _setup_rgb_compositor(scene, staging, frame_id, qc_components=args.qc_components)
+            _setup_rgb_compositor(scene, staging, frame_id, qc_components=args.qc_components,
+                                  write_diffuse_decomposition=args.write_diffuse_decomposition,
+                                  exr_depth=args.exr_color_depth)
             scene.cycles.samples = int(args.rgb_spp)
             scene.cycles.seed = int(args.seed)
             started = time.perf_counter()
@@ -756,7 +890,7 @@ def _render_task(scene, args, lighting_state, task: dict) -> dict:
         _set_environment(scene, nir=True, recipe=(task.get("lighting") or {}).get("runtime_recipe") or (task.get("lighting") or {}).get("recipe"))
         if passive_enabled:
             _place_flash(camera, enabled=False, energy_scale=args.flash_energy_scale)
-            _setup_nir_passive_compositor(scene, staging, frame_id)
+            _setup_nir_passive_compositor(scene, staging, frame_id, exr_depth=args.exr_color_depth)
             scene.cycles.samples = int(args.nir_spp)
             scene.cycles.seed = int(args.seed) + 1
             started = time.perf_counter()
@@ -765,10 +899,13 @@ def _render_task(scene, args, lighting_state, task: dict) -> dict:
         if passive_only:
             qc = _pass_stats(scene)
             return _publish(staging, args.out, frame_id, task, timings, qc,
-                            width=args.width, height=args.height)
+                            width=args.width, height=args.height,
+                            write_diffuse_decomposition=args.write_diffuse_decomposition)
 
         _place_flash(camera, enabled=True, energy_scale=args.flash_energy_scale)
-        _setup_nir_compositor(scene, staging, frame_id, qc_components=args.qc_components)
+        _setup_nir_compositor(scene, staging, frame_id, qc_components=args.qc_components,
+                              write_diffuse_decomposition=args.write_diffuse_decomposition,
+                              exr_depth=args.exr_color_depth)
         scene.cycles.samples = int(args.nir_spp)
         # Reuse the passive seed for common-random-number cancellation: the
         # active-minus-passive image should expose the flash contribution, not
@@ -779,7 +916,8 @@ def _render_task(scene, args, lighting_state, task: dict) -> dict:
         timings["nir_active"] = time.perf_counter() - started
         qc = _pass_stats(scene)
         row = _publish(staging, args.out, frame_id, task, timings, qc,
-                       width=args.width, height=args.height)
+                       width=args.width, height=args.height,
+                       write_diffuse_decomposition=args.write_diffuse_decomposition)
         return row
     finally:
         if staging.exists():

@@ -58,7 +58,7 @@ def audit_material_mix(contract: dict[str, Any], *, profile: str = PROFILE) -> d
             contract_errors = []
             if metallic_contract.get("schema") != "robomituba.metallic_contract.v2":
                 contract_errors.append("schema")
-            if family not in {"dielectric", "conductor", "coverage_mixed"}:
+            if family not in {"dielectric", "conductor", "coverage_mixed", "coated_conductor"}:
                 contract_errors.append("family")
             if metallic_contract.get("encoding") != "linear_scalar":
                 contract_errors.append("encoding")

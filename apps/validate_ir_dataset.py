@@ -94,6 +94,7 @@ def _static_validation(dataset: Path, scene_dir: Path) -> dict:
     if uses_specular_semantic_masks(str(domain.get("surface_domain") or "")):
         required_masks.update({"window_glass", "object_glass", "glass", "mirror"})
     failures: list[str] = []
+    warnings: list[str] = []
     if domain_error is not None:
         failures.append(f"effective scene validation failed: {domain_error}")
     frame_stats = []
@@ -170,6 +171,14 @@ def _static_validation(dataset: Path, scene_dir: Path) -> dict:
                 failures.append("IR LOD render input audit lacks common-geometry provenance")
             if geometry_audit.get("source_triangles_before_structural_removal") is None or geometry_audit.get("triangles_after_lod") is None:
                 failures.append("IR LOD render input audit lacks structural/LOD triangle accounting")
+            # Triangles alone were the only geometry quantity this audit ever
+            # required, and triangles are precisely what does not change when a
+            # mesh is rebuilt with a different vertex split. Datasets built
+            # before the vertex half existed have no counts to report, so this
+            # warns rather than fails; new builds carry both.
+            if geometry_audit.get("vertices_after_lod") is None:
+                warnings.append("IR LOD render input audit lacks vertex accounting "
+                                "(pre-2026-09-09 build; triangles alone cannot detect a re-split)")
         any_polar = any(bool((row.get("render_config") or {}).get("polarized")) for row in rows)
         if bool(render_input_audit.get("polarized_render_requested")) != any_polar:
             failures.append("render input audit polarized setting differs from frame records")
@@ -195,7 +204,7 @@ def _static_validation(dataset: Path, scene_dir: Path) -> dict:
             "effective_scene_digest": effective_digest,
             "forbidden_top_level_bsdf_count": len(forbidden),
             "render_input_audit_present": render_input_audit is not None,
-            "failures": failures, "passed": not failures}
+            "failures": failures, "warnings": warnings, "passed": not failures}
 
 
 def _rerender(dataset: Path, frame_id: str, spp: int, *, max_mae: float, min_psnr: float) -> dict:

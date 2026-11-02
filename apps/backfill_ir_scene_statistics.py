@@ -84,6 +84,35 @@ def _resolve_render_plan(dataset: Path, config: dict, pipeline_root: Path) -> Pa
     return max(existing, key=lambda path: path.stat().st_mtime_ns)
 
 
+def _generation_preset(scene_id: str, pipeline_root: Path) -> dict:
+    """How the scene was generated, read from the Infinigen run that made it.
+
+    The chain is scene_id -> a surviving ir_geometry_profile.json -> its
+    source_blend -> that run's kr_preset.json. It is indirect because no
+    artifact on the dataset side records the generation parameters, which is
+    the thing worth fixing upstream; until then this reads them where they were
+    actually written. Absent at any link is "not recorded", never a default.
+    """
+    for profile in list(pipeline_root.glob("*/ir_geometry*/ir_geometry_profile.json")) + \
+                   list(pipeline_root.glob("*/attempts/*/ir_geometry*/ir_geometry_profile.json")):
+        try:
+            value = _read(profile)
+        except (OSError, ValueError):
+            continue
+        if Path(str(value.get("source_scene_dir") or "")).name != scene_id:
+            continue
+        blend = str(value.get("source_blend") or "")
+        if not blend:
+            continue
+        preset = Path(blend).parent / "kr_preset.json"
+        if preset.is_file():
+            try:
+                return _read(preset)
+            except (OSError, ValueError):
+                return {}
+    return {}
+
+
 def _room_type(scene_id: str) -> str:
     prefix = "infinigen_single_room_" if scene_id.startswith("infinigen_single_room_") else "infinigen_"
     value = scene_id.removeprefix(prefix).rsplit("_", 1)[0]
@@ -204,6 +233,11 @@ def _build(dataset: Path, pipeline_root: Path, scene_root: Path, *,
                                         requested_density="backfilled",
                                         material_mix=material_mix,
                                         material_visibility=material_visibility)
+    preset = _generation_preset(scene_id, pipeline_root)
+    statistics["placement_profile"] = preset.get("placement_profile")
+    statistics["floor_plan_mode"] = preset.get("floor_plan_mode")
+    statistics["anchor_richness"] = preset.get("anchor_richness")
+    statistics["generation_preset_available"] = bool(preset)
     if source_density_only:
         statistics["visibility_provenance"] = "source_inventory_only"
         statistics["visibility_note"] = "Physical pose visibility was unavailable or invalid for this lighting-expanded child; density is classified from the bound authoring inventory and room footprint."
@@ -218,7 +252,10 @@ def _build(dataset: Path, pipeline_root: Path, scene_root: Path, *,
     report = {"dataset": dataset.name, "fingerprint": fingerprint, "scene_id": scene_id,
               "object_count": statistics["object_count"], "nonstructural_object_count": statistics["nonstructural_object_count"],
               "room_area_m2": statistics["room_area_m2"], "selected_pose_count": statistics["selected_pose_count"],
-              "density_class": statistics["density_class"]}
+              "density_class": statistics["density_class"],
+              "density_basis": statistics.get("density_basis"),
+              "placement_profile": statistics.get("placement_profile"),
+              "floor_plan_mode": statistics.get("floor_plan_mode")}
     return statistics, report
 
 

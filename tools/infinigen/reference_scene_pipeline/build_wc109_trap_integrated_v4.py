@@ -1,0 +1,22 @@
+"""Boolean integrate trap wall and carve open continuous flow void. Diagnostic only."""
+import bpy,json,hashlib,math
+from pathlib import Path
+r=Path(__file__).resolve().parents[3];d=r/'data/venue_refs/floor_plans_v3/dual_unit_residential_floor_03';p=d/'wc109_trap_pilot_v4';assert not p.exists();p.mkdir();source=d/'wc109_trap_pilot_v3/candidate.blend';before=hashlib.sha256(source.read_bytes()).hexdigest();bpy.ops.wm.open_mainfile(filepath=str(source));body=bpy.data.objects['NativeFullTankWC100'];trap=bpy.data.objects['WC109_continuous_hollow_S_trap'];meta=json.loads((d/'wc109_trap_pilot_v3/build.json').read_text());N=meta['circumference_samples'];count=meta['ring_count'];assert len(trap.data.vertices)==count*2*N
+original_bounds=([min(v.co[k] for v in body.data.vertices) for k in range(3)],[max(v.co[k] for v in body.data.vertices) for k in range(3)])
+def volume(wall,extend=False):
+ rings=[[tuple(trap.data.vertices[j*2*N+wall*N+i].co) for i in range(N)] for j in range(count)]
+ if extend:rings=[[(*v[:2],v[2]+.025) for v in rings[0]]]+rings+[[(*v[:2],-.04) for v in rings[-1]]]
+ verts=[v for ring in rings for v in ring];faces=[]
+ for j in range(len(rings)-1):
+  for i in range(N):faces.append((j*N+i,j*N+(i+1)%N,(j+1)*N+(i+1)%N,(j+1)*N+i))
+ faces +=[tuple(reversed(range(N))),tuple((len(rings)-1)*N+i for i in range(N))]
+ me=bpy.data.meshes.new('WC109_construction_volume');me.from_pydata(verts,[],faces)
+ import bmesh
+ bm=bmesh.new();bm.from_mesh(me);bmesh.ops.recalc_face_normals(bm,faces=bm.faces);assert all(e.is_manifold for e in bm.edges);bm.to_mesh(me);bm.free();me.materials.append(body.data.materials[0]);o=bpy.data.objects.new(me.name,me);bpy.context.scene.collection.objects.link(o);return o
+outer=volume(1);inner=volume(0,True);body.data=body.data.copy();bpy.context.view_layer.objects.active=body;body.select_set(True)
+counts=[]
+for op,tool in [('UNION',outer),('DIFFERENCE',inner)]:
+ m=body.modifiers.new('WC109_integrate_'+op,'BOOLEAN');m.operation=op;m.solver='EXACT';m.object=tool;m.use_hole_tolerant=True;bpy.ops.object.modifier_apply(modifier=m.name);counts.append({'operation':op,'vertices':len(body.data.vertices),'faces':len(body.data.polygons)});assert len(body.data.polygons)>40000
+for o in [outer,inner,trap]:bpy.data.objects.remove(o,do_unlink=True)
+new_bounds=([min(v.co[k] for v in body.data.vertices) for k in range(3)],[max(v.co[k] for v in body.data.vertices) for k in range(3)]);assert max(abs(a-b) for aa,bb in zip(original_bounds,new_bounds) for a,b in zip(aa,bb))<1e-5
+body['wc109_interior_extension']='Boolean union swept outer porcelain, then difference open bore, native body not scaled';bpy.ops.wm.save_as_mainfile(filepath=str(p/'candidate.blend'));assert hashlib.sha256(source.read_bytes()).hexdigest()==before;(p/'views.json').write_text((d/'wc109_trap_pilot_v3/views.json').read_text());(p/'build.json').write_text(json.dumps({'source':str(source),'source_sha256':before,'candidate':str(p/'candidate.blend'),'candidate_sha256':hashlib.sha256((p/'candidate.blend').read_bytes()).hexdigest(),'operations':counts,'body_bounds_before':original_bounds,'body_bounds_after':new_bounds,'scale_unchanged':True,'construction_cutters_saved':False,'scope':'Diagnostic integrated native factory body with real swept outlet void. No water seal/plumbing acceptance, full manifold/self-intersection or room clearance claim. RGB and cavity audit required.','accepted':False},indent=2));print('WC109_BOOLEAN_INTEGRATED_V4_SAVED')

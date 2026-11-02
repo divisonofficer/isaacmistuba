@@ -67,6 +67,19 @@ _WALL_SUBTYPES = {"wall", "exterior"}
 # repair. Geometry below this (floor sills, thresholds, baseboards) is ignored so a
 # doorway — open above its sill — reads as a gap rather than a solid wall.
 WALL_BAND_Z_LO_M = 0.30
+
+# Doorway approach poses. Derived from the manual graph-edit history of three
+# apartment scenes: the nodes an operator hand-placed at doorways sat a median
+# 0.04-0.05 m off the opening's centre line and 0.43 m in front of it, while the
+# auto-sampled nodes they deleted sat a median 0.32 m off centre. Seeding the
+# centred pair directly reproduces that edit; the sampler's min-spacing rule then
+# suppresses the off-centre candidates that used to be deleted by hand.
+DOORWAY_APPROACH_M = 0.40
+# A bridged gap must look like a passage, not a raster sliver, before it earns a
+# forced pair of viewpoints.
+DOORWAY_MIN_CELLS = 6
+# A bridged opening this close to an authored door portal is that same door.
+DOORWAY_DEDUPE_M = 0.75
 # Overlay object types that name a real door opening (portals).
 _DOOR_OVERLAY_TYPES = {"door", "glass_door"}
 # Floor coverings the robot drives over — never carve them (cat 4). Matched on the
@@ -535,6 +548,18 @@ def build_walkable_surface(
     # gaps in walkable, then keep only the filled cells that are NOT wall — so genuine
     # openings (wall cut, no wall in the gap) connect, while solid walls keep rooms
     # apart. This makes connectivity independent of door objects.
+    #
+    # Wall occupancy at robot body height. Computed BEFORE the opening bridge:
+    # the bridge must distinguish a real doorway (wall above the lintel and below
+    # the sill, but nothing at body height) from a solid wall. The full-height
+    # ``wall_mask`` cannot make that distinction -- a doorway's own threshold and
+    # lintel project onto the very cells the opening occupies -- so gating the
+    # bridge with it sealed every doorway that had no door object.
+    wall_band_mask = _wall_body_band_mask(
+        import_root, walls, origin_offset, spec,
+        z_lo=WALL_BAND_Z_LO_M, z_hi=max(WALL_BAND_Z_LO_M + 0.1, float(robot_height_m)),
+    )
+
     n_bridged = 0
     if opening_bridge_m > 0 and wall_mask.any():
         r = max(1, int(round(float(opening_bridge_m) / resolution)))
@@ -544,7 +569,7 @@ def build_walkable_surface(
         # closed gap at an EXTERIOR opening (window/door cut in the perimeter wall)
         # can't leak walkable cells outside the building.
         interior = ndimage.binary_fill_holes(floor_mask | wall_mask)
-        bridge = closed & ~walkable & ~wall_mask & interior
+        bridge = closed & ~walkable & ~wall_band_mask & interior
         n_bridged = int(bridge.sum())
         if n_bridged:
             walkable = walkable | bridge
@@ -568,13 +593,52 @@ def build_walkable_surface(
         hazard=np.zeros((height, width), dtype=bool),
     )
 
-    # --- wall occupancy at robot body height (for connectivity repair) ------ #
-    # Drop floor sills (below WALL_BAND_Z_LO) and door lintels (above robot height)
-    # so door openings read as gaps; repair uses this to avoid bridging through walls.
-    wall_band_mask = _wall_body_band_mask(
-        import_root, walls, origin_offset, spec,
-        z_lo=WALL_BAND_Z_LO_M, z_hi=max(WALL_BAND_Z_LO_M + 0.1, float(robot_height_m)),
-    )
+    # --- doorway approach portals from the bridged openings ---------------- #
+    # Every cell the opening bridge added is, by construction, a threshold the
+    # robot can cross but no floor covers: a doorway. Those cells carry the
+    # opening's geometry for free, so derive an approach pose on each side
+    # instead of depending on door objects -- which are absent in some imports
+    # and collapsed onto a single out-of-bounds centre in others.
+    n_bridged_portals = 0
+    if n_bridged:
+        bridge_labels, n_bridge_groups = ndimage.label(bridge, structure=np.ones((3, 3), bool))
+        declared_centres = [portal.center for portal in portals if portal.resolved]
+        for group in range(1, int(n_bridge_groups) + 1):
+            cells = np.argwhere(bridge_labels == group)
+            if len(cells) < DOORWAY_MIN_CELLS:
+                continue
+            points = np.stack([
+                spec.origin[0] + cells[:, 1] * resolution,
+                spec.origin[1] + cells[:, 0] * resolution,
+            ], axis=1)
+            centre = points.mean(axis=0)
+            if any(math.dist(centre, existing) <= DOORWAY_DEDUPE_M for existing in declared_centres):
+                continue
+            # The opening's long axis is the door plane; its normal is the
+            # direction the robot travels through the doorway.
+            _u, _sv, basis = np.linalg.svd(points - centre, full_matrices=False)
+            normal = basis[1]
+            side_a = (float(centre[0] + normal[0] * DOORWAY_APPROACH_M),
+                      float(centre[1] + normal[1] * DOORWAY_APPROACH_M))
+            side_b = (float(centre[0] - normal[0] * DOORWAY_APPROACH_M),
+                      float(centre[1] - normal[1] * DOORWAY_APPROACH_M))
+            # Both approach poses must stand on the final island, otherwise this
+            # bridge did not actually open a two-sided passage.
+            if not (_cell_walkable(island, spec, *side_a) and _cell_walkable(island, spec, *side_b)):
+                continue
+            portals.append(PortalSpec(
+                door_id=f"bridged_opening_{group:04d}",
+                door_type="opening",
+                center=(float(centre[0]), float(centre[1])),
+                axis=(float(normal[0]), float(normal[1])),
+                side_a=side_a,
+                side_b=side_b,
+                region_a=None,
+                region_b=None,
+                resolved=True,
+                source="bridged_opening",
+            ))
+            n_bridged_portals += 1
 
     stats = {
         "walkable_surface_version": WALKABLE_SURFACE_VERSION,
@@ -591,6 +655,7 @@ def build_walkable_surface(
         "portals": len(portals),
         "portals_unresolved": sum(1 for p in portals if not p.resolved),
         "wall_band_cells": int(wall_band_mask.sum()),
+        "bridged_opening_portals": n_bridged_portals,
         "grid": {"width": width, "height": height, "resolution": resolution,
                  "origin": [float(minx), float(miny)]},
     }

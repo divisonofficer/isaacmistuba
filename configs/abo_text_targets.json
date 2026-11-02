@@ -1,0 +1,1447 @@
+{
+ "schema": "robomituba.abo_text_targets.v1",
+ "targets": {
+  "B07B8PXTVL": {
+   "id": "B07B8PXTVL",
+   "text": "1965",
+   "text_h_m": 0.0929,
+   "pt": "CLOCK",
+   "obj_m": 0.595
+  },
+  "B07XMRCXJ7": {
+   "id": "B07XMRCXJ7",
+   "text": "amazonbasics",
+   "text_h_m": 0.0807,
+   "pt": "DEHUMIDIFIER",
+   "obj_m": 0.616
+  },
+  "B07XKGLMR8": {
+   "id": "B07XKGLMR8",
+   "text": "amazonbasics",
+   "text_h_m": 0.0807,
+   "pt": "DEHUMIDIFIER",
+   "obj_m": 0.616
+  },
+  "B07XHQQ95Y": {
+   "id": "B07XHQQ95Y",
+   "text": "amazonbasics",
+   "text_h_m": 0.0806,
+   "pt": "DEHUMIDIFIER",
+   "obj_m": 0.616
+  },
+  "B07BL7H8N5": {
+   "id": "B07BL7H8N5",
+   "text": "Stone &Beam",
+   "text_h_m": 0.074,
+   "pt": "SAUTE_FRY_PAN",
+   "obj_m": 0.49
+  },
+  "B073P1YLMJ": {
+   "id": "B073P1YLMJ",
+   "text": "WEEK",
+   "text_h_m": 0.0711,
+   "pt": "WRITING_BOARD",
+   "obj_m": 0.611
+  },
+  "B010QZCT5W": {
+   "id": "B010QZCT5W",
+   "text": "amazonbasics",
+   "text_h_m": 0.0625,
+   "pt": "FLAT_SCREEN_DISPLAY_MOUNT",
+   "obj_m": 0.495
+  },
+  "B07XGQ9RM3": {
+   "id": "B07XGQ9RM3",
+   "text": "amazoncommercial",
+   "text_h_m": 0.0528,
+   "pt": "ELECTRIC_FAN",
+   "obj_m": 0.605
+  },
+  "B07XMV34PX": {
+   "id": "B07XMV34PX",
+   "text": "amazoncommercial",
+   "text_h_m": 0.0482,
+   "pt": "ELECTRIC_FAN",
+   "obj_m": 0.555
+  },
+  "B082MY2MX3": {
+   "id": "B082MY2MX3",
+   "text": "amazonbasics",
+   "text_h_m": 0.0438,
+   "pt": "ELECTRIC_FAN",
+   "obj_m": 0.277
+  },
+  "B07XJB28C7": {
+   "id": "B07XJB28C7",
+   "text": "amazon commercial",
+   "text_h_m": 0.0348,
+   "pt": "ELECTRIC_FAN",
+   "obj_m": 0.227
+  },
+  "B00X4SCCFG": {
+   "id": "B00X4SCCFG",
+   "text": "amazonbasics",
+   "text_h_m": 0.0314,
+   "pt": "SHELF",
+   "obj_m": 0.41
+  },
+  "B07LFV6Y8S": {
+   "id": "B07LFV6Y8S",
+   "text": "ASIN: B07LFV6Y8S",
+   "text_h_m": 0.0289,
+   "pt": "PORTABLE_ELECTRONIC_DEVICE_MOUNT",
+   "obj_m": 0.394
+  },
+  "B07B8PXTR2": {
+   "id": "B07B8PXTR2",
+   "text": "W36ST",
+   "text_h_m": 0.0287,
+   "pt": "HOME",
+   "obj_m": 0.582
+  },
+  "B082MXDF82": {
+   "id": "B082MXDF82",
+   "text": "amazonbasics",
+   "text_h_m": 0.0282,
+   "pt": "ELECTRIC_FAN",
+   "obj_m": 0.533
+  },
+  "B07G2L79TY": {
+   "id": "B07G2L79TY",
+   "text": "12LB",
+   "text_h_m": 0.0266,
+   "pt": "SPORTING_GOODS",
+   "obj_m": 0.426
+  },
+  "B01LR5SEKE": {
+   "id": "B01LR5SEKE",
+   "text": "15LB",
+   "text_h_m": 0.0252,
+   "pt": "SPORTING_GOODS",
+   "obj_m": 0.24
+  },
+  "B0727Q5F94": {
+   "id": "B0727Q5F94",
+   "text": "5LB",
+   "text_h_m": 0.0251,
+   "pt": "SPORTING_GOODS",
+   "obj_m": 0.261
+  },
+  "B07W5BDJ73": {
+   "id": "B07W5BDJ73",
+   "text": "PhotoFrame",
+   "text_h_m": 0.025,
+   "pt": "HOME",
+   "obj_m": 0.216
+  },
+  "B01LR5SAIA": {
+   "id": "B01LR5SAIA",
+   "text": "12LB",
+   "text_h_m": 0.0245,
+   "pt": "SPORTING_GOODS",
+   "obj_m": 0.231
+  },
+  "B07G2MTKHJ": {
+   "id": "B07G2MTKHJ",
+   "text": "10LB",
+   "text_h_m": 0.0245,
+   "pt": "SPORTING_GOODS",
+   "obj_m": 0.426
+  },
+  "B01LR5RO5U": {
+   "id": "B01LR5RO5U",
+   "text": "5LB",
+   "text_h_m": 0.0231,
+   "pt": "SPORTING_GOODS",
+   "obj_m": 0.164
+  },
+  "B00R3MZITG": {
+   "id": "B00R3MZITG",
+   "text": "20LB",
+   "text_h_m": 0.0225,
+   "pt": "SPORTING_GOODS",
+   "obj_m": 0.257
+  },
+  "B07XDMYNT1": {
+   "id": "B07XDMYNT1",
+   "text": "eono",
+   "text_h_m": 0.0208,
+   "pt": "HOME",
+   "obj_m": 0.24
+  },
+  "B00D448IIK": {
+   "id": "B00D448IIK",
+   "text": "basics",
+   "text_h_m": 0.0208,
+   "pt": "OFFICE_PRODUCTS",
+   "obj_m": 0.34
+  },
+  "B07N6RTLP7": {
+   "id": "B07N6RTLP7",
+   "text": "amazonbasics",
+   "text_h_m": 0.0206,
+   "pt": "AIR_CONDITIONER",
+   "obj_m": 0.606
+  },
+  "B07X9QLZ5N": {
+   "id": "B07X9QLZ5N",
+   "text": "eono",
+   "text_h_m": 0.0206,
+   "pt": "HOME",
+   "obj_m": 0.25
+  },
+  "B01LR5SIRI": {
+   "id": "B01LR5SIRI",
+   "text": "20LB",
+   "text_h_m": 0.0205,
+   "pt": "SPORTING_GOODS",
+   "obj_m": 0.26
+  },
+  "B01LR5RVYE": {
+   "id": "B01LR5RVYE",
+   "text": "7LB",
+   "text_h_m": 0.0195,
+   "pt": "SPORTING_GOODS",
+   "obj_m": 0.184
+  },
+  "B073NZS57V": {
+   "id": "B073NZS57V",
+   "text": "HONGBA",
+   "text_h_m": 0.0194,
+   "pt": "HOME",
+   "obj_m": 0.294
+  },
+  "B07CQNCJ4R": {
+   "id": "B07CQNCJ4R",
+   "text": "14406",
+   "text_h_m": 0.0193,
+   "pt": "OTTOMAN",
+   "obj_m": 0.457
+  },
+  "B01LR5S1WA": {
+   "id": "B01LR5S1WA",
+   "text": "8LB",
+   "text_h_m": 0.0192,
+   "pt": "SPORTING_GOODS",
+   "obj_m": 0.19
+  },
+  "B075YL2S65": {
+   "id": "B075YL2S65",
+   "text": "NATIONAL",
+   "text_h_m": 0.0189,
+   "pt": "CURTAIN",
+   "obj_m": 0.585
+  },
+  "B07X9QMF9Y": {
+   "id": "B07X9QMF9Y",
+   "text": "eono",
+   "text_h_m": 0.0189,
+   "pt": "HOME",
+   "obj_m": 0.25
+  },
+  "B01LR5RSG0": {
+   "id": "B01LR5RSG0",
+   "text": "6LB",
+   "text_h_m": 0.0175,
+   "pt": "SPORTING_GOODS",
+   "obj_m": 0.162
+  },
+  "B01LR5S6HK": {
+   "id": "B01LR5S6HK",
+   "text": "10LB",
+   "text_h_m": 0.0175,
+   "pt": "SPORTING_GOODS",
+   "obj_m": 0.212
+  },
+  "B01LR5RK0Y": {
+   "id": "B01LR5RK0Y",
+   "text": "4LB",
+   "text_h_m": 0.0171,
+   "pt": "SPORTING_GOODS",
+   "obj_m": 0.151
+  },
+  "B01LR5RBZ8": {
+   "id": "B01LR5RBZ8",
+   "text": "2LB",
+   "text_h_m": 0.0162,
+   "pt": "SPORTING_GOODS",
+   "obj_m": 0.146
+  },
+  "B07XBQ8LDD": {
+   "id": "B07XBQ8LDD",
+   "text": "eono",
+   "text_h_m": 0.0157,
+   "pt": "HOME",
+   "obj_m": 0.178
+  },
+  "B01LR5RG08": {
+   "id": "B01LR5RG08",
+   "text": "3LB",
+   "text_h_m": 0.0146,
+   "pt": "SPORTING_GOODS",
+   "obj_m": 0.159
+  },
+  "B06VVXMJ1S": {
+   "id": "B06VVXMJ1S",
+   "text": "amazonbasics",
+   "text_h_m": 0.0142,
+   "pt": "MOUSE_PAD",
+   "obj_m": 0.451
+  },
+  "B003LSTD38": {
+   "id": "B003LSTD38",
+   "text": "amazon",
+   "text_h_m": 0.0141,
+   "pt": "PORTABLE_ELECTRONIC_DEVICE_COVER",
+   "obj_m": 0.132
+  },
+  "B07YF1TNL7": {
+   "id": "B07YF1TNL7",
+   "text": "amazonbasics",
+   "text_h_m": 0.014,
+   "pt": "HOME",
+   "obj_m": 0.481
+  },
+  "B07YF2KGLF": {
+   "id": "B07YF2KGLF",
+   "text": "amazonbasics",
+   "text_h_m": 0.014,
+   "pt": "HOME",
+   "obj_m": 0.481
+  },
+  "B073P1BKT1": {
+   "id": "B073P1BKT1",
+   "text": "Fig.2",
+   "text_h_m": 0.0139,
+   "pt": "HOME",
+   "obj_m": 0.533
+  },
+  "B01LR5SM74": {
+   "id": "B01LR5SM74",
+   "text": "amazonbasics",
+   "text_h_m": 0.0134,
+   "pt": "SPORTING_GOODS",
+   "obj_m": 0.3
+  },
+  "B06X3W3YQD": {
+   "id": "B06X3W3YQD",
+   "text": "amazonbasics",
+   "text_h_m": 0.0134,
+   "pt": "MOUSE_PAD",
+   "obj_m": 0.315
+  },
+  "B076V9MWFL": {
+   "id": "B076V9MWFL",
+   "text": "SOLMO",
+   "text_h_m": 0.0132,
+   "pt": "CLOCK",
+   "obj_m": 0.293
+  },
+  "B073NZGLT1": {
+   "id": "B073NZGLT1",
+   "text": "PROCRASTINATE ON",
+   "text_h_m": 0.013,
+   "pt": "WRITING_BOARD",
+   "obj_m": 0.611
+  },
+  "B073NZT5JX": {
+   "id": "B073NZT5JX",
+   "text": "Fig.2",
+   "text_h_m": 0.0124,
+   "pt": "HOME",
+   "obj_m": 0.533
+  },
+  "B075YLTF7Q": {
+   "id": "B075YLTF7Q",
+   "text": "STATES",
+   "text_h_m": 0.0121,
+   "pt": "CURTAIN",
+   "obj_m": 0.585
+  },
+  "B000S6N026": {
+   "id": "B000S6N026",
+   "text": "basics",
+   "text_h_m": 0.0119,
+   "pt": "OFFICE_PRODUCTS",
+   "obj_m": 0.419
+  },
+  "B07SCMBP1J": {
+   "id": "B07SCMBP1J",
+   "text": "Photo",
+   "text_h_m": 0.0119,
+   "pt": "HOME",
+   "obj_m": 0.237
+  },
+  "B01E3R7GWA": {
+   "id": "B01E3R7GWA",
+   "text": "amazonbasics",
+   "text_h_m": 0.0118,
+   "pt": "OFFICE_PRODUCTS",
+   "obj_m": 0.335
+  },
+  "B01E3R7T9K": {
+   "id": "B01E3R7T9K",
+   "text": "amazonbasics",
+   "text_h_m": 0.0118,
+   "pt": "OFFICE_PRODUCTS",
+   "obj_m": 0.335
+  },
+  "B073P1YLCV": {
+   "id": "B073P1YLCV",
+   "text": "INVENTORS",
+   "text_h_m": 0.0114,
+   "pt": "HOME",
+   "obj_m": 0.534
+  },
+  "B076VG6LF3": {
+   "id": "B076VG6LF3",
+   "text": "SOLIMO",
+   "text_h_m": 0.0112,
+   "pt": "CLOCK",
+   "obj_m": 0.3
+  },
+  "B073P1YLCT": {
+   "id": "B073P1YLCT",
+   "text": "Fig.2",
+   "text_h_m": 0.0107,
+   "pt": "HOME",
+   "obj_m": 0.459
+  },
+  "B06X6H2WF7": {
+   "id": "B06X6H2WF7",
+   "text": "amazonbasics",
+   "text_h_m": 0.0106,
+   "pt": "MOUSE_PAD",
+   "obj_m": 0.249
+  },
+  "B07HPQ358H": {
+   "id": "B07HPQ358H",
+   "text": "amazonbasics",
+   "text_h_m": 0.0105,
+   "pt": "OUTDOOR_LIVING",
+   "obj_m": 0.407
+  },
+  "B07YF25MT8": {
+   "id": "B07YF25MT8",
+   "text": "amazonbasics",
+   "text_h_m": 0.0104,
+   "pt": "HOME",
+   "obj_m": 0.634
+  },
+  "B01LR5R18K": {
+   "id": "B01LR5R18K",
+   "text": "1LB",
+   "text_h_m": 0.0104,
+   "pt": "SPORTING_GOODS",
+   "obj_m": 0.123
+  },
+  "B07YDYRHNR": {
+   "id": "B07YDYRHNR",
+   "text": "amazonbasics",
+   "text_h_m": 0.0104,
+   "pt": "HOME",
+   "obj_m": 0.634
+  },
+  "B07RL1T8FT": {
+   "id": "B07RL1T8FT",
+   "text": "amazonbasic",
+   "text_h_m": 0.01,
+   "pt": "HOME",
+   "obj_m": 0.64
+  },
+  "B07RJWX5CZ": {
+   "id": "B07RJWX5CZ",
+   "text": "amazonbasics",
+   "text_h_m": 0.0097,
+   "pt": "HOME",
+   "obj_m": 0.64
+  },
+  "B00WRDS8H0": {
+   "id": "B00WRDS8H0",
+   "text": "amazonbasics",
+   "text_h_m": 0.0094,
+   "pt": "PORTABLE_ELECTRONIC_DEVICE_STAND",
+   "obj_m": 0.33
+  },
+  "B07V7QJG8J": {
+   "id": "B07V7QJG8J",
+   "text": "amazonbasics",
+   "text_h_m": 0.0093,
+   "pt": "HOME",
+   "obj_m": 0.291
+  },
+  "B07V6M3PDX": {
+   "id": "B07V6M3PDX",
+   "text": "amazonbasics",
+   "text_h_m": 0.0093,
+   "pt": "HOME",
+   "obj_m": 0.291
+  },
+  "B01DN8TG46": {
+   "id": "B01DN8TG46",
+   "text": "amazonbasics",
+   "text_h_m": 0.0092,
+   "pt": "OFFICE_PRODUCTS",
+   "obj_m": 0.39
+  },
+  "B073P23TSB": {
+   "id": "B073P23TSB",
+   "text": "2,680,921",
+   "text_h_m": 0.0088,
+   "pt": "HOME",
+   "obj_m": 0.534
+  },
+  "B07RDPN596": {
+   "id": "B07RDPN596",
+   "text": "amazonbasics",
+   "text_h_m": 0.0087,
+   "pt": "HOME",
+   "obj_m": 0.64
+  },
+  "B07V4FNHCD": {
+   "id": "B07V4FNHCD",
+   "text": "amazonbasics",
+   "text_h_m": 0.0086,
+   "pt": "HOME",
+   "obj_m": 0.291
+  },
+  "B07DHK5DHN": {
+   "id": "B07DHK5DHN",
+   "text": "amazonbasics",
+   "text_h_m": 0.0086,
+   "pt": "COMPUTER_ADD_ON",
+   "obj_m": 0.51
+  },
+  "B07V6M4MSN": {
+   "id": "B07V6M4MSN",
+   "text": "amazonbasics",
+   "text_h_m": 0.0086,
+   "pt": "HOME",
+   "obj_m": 0.291
+  },
+  "B07RL1V3FW": {
+   "id": "B07RL1V3FW",
+   "text": "amazonbasics",
+   "text_h_m": 0.0086,
+   "pt": "HOME",
+   "obj_m": 0.64
+  },
+  "B07HGD179J": {
+   "id": "B07HGD179J",
+   "text": "DOWN",
+   "text_h_m": 0.0082,
+   "pt": "HOME_FURNITURE_AND_DECOR",
+   "obj_m": 0.634
+  },
+  "B017DORX3M": {
+   "id": "B017DORX3M",
+   "text": "amazonbasics",
+   "text_h_m": 0.008,
+   "pt": "COMPUTER_ADD_ON",
+   "obj_m": 0.37
+  },
+  "B07SMSB64L": {
+   "id": "B07SMSB64L",
+   "text": "NE COUVREZ PAS",
+   "text_h_m": 0.0079,
+   "pt": "HOME",
+   "obj_m": 0.552
+  },
+  "B017DOS5C0": {
+   "id": "B017DOS5C0",
+   "text": "amazonbasics",
+   "text_h_m": 0.0075,
+   "pt": "COMPUTER_ADD_ON",
+   "obj_m": 0.37
+  },
+  "B01MZ81SKB": {
+   "id": "B01MZ81SKB",
+   "text": "amazonbasics",
+   "text_h_m": 0.0075,
+   "pt": "OFFICE_PRODUCTS",
+   "obj_m": 0.37
+  },
+  "B00TS18AEA": {
+   "id": "B00TS18AEA",
+   "text": "amazonbasics",
+   "text_h_m": 0.0074,
+   "pt": "BATTERY",
+   "obj_m": 0.114
+  },
+  "B00F5CKWBA": {
+   "id": "B00F5CKWBA",
+   "text": "basics",
+   "text_h_m": 0.0073,
+   "pt": "CARRYING_CASE_OR_BAG",
+   "obj_m": 0.147
+  },
+  "B003QTD4Y6": {
+   "id": "B003QTD4Y6",
+   "text": "amazon",
+   "text_h_m": 0.007,
+   "pt": "MOUSE_PAD",
+   "obj_m": 0.229
+  },
+  "B00JM5TTWO": {
+   "id": "B00JM5TTWO",
+   "text": "amazon",
+   "text_h_m": 0.0069,
+   "pt": "PORTABLE_ELECTRONIC_DEVICE_COVER",
+   "obj_m": 0.396
+  },
+  "B01IJ5A0PC": {
+   "id": "B01IJ5A0PC",
+   "text": "amazonbasics",
+   "text_h_m": 0.0068,
+   "pt": "PORTABLE_ELECTRONIC_DEVICE_STAND",
+   "obj_m": 0.086
+  },
+  "B01IJ5A2UA": {
+   "id": "B01IJ5A2UA",
+   "text": "amazonbasics",
+   "text_h_m": 0.0061,
+   "pt": "PORTABLE_ELECTRONIC_DEVICE_STAND",
+   "obj_m": 0.088
+  },
+  "B07XCTFG18": {
+   "id": "B07XCTFG18",
+   "text": "13cm×18cm",
+   "text_h_m": 0.0059,
+   "pt": "HOME",
+   "obj_m": 0.204
+  },
+  "B076YRSP32": {
+   "id": "B076YRSP32",
+   "text": "amazonbasics",
+   "text_h_m": 0.0057,
+   "pt": "MULTIPORT_HUB",
+   "obj_m": 0.11
+  },
+  "B076YRSWH2": {
+   "id": "B076YRSWH2",
+   "text": "amazonbasics",
+   "text_h_m": 0.0057,
+   "pt": "MULTIPORT_HUB",
+   "obj_m": 0.11
+  },
+  "B076YRSWH3": {
+   "id": "B076YRSWH3",
+   "text": "amazonbasics",
+   "text_h_m": 0.0057,
+   "pt": "MULTIPORT_HUB",
+   "obj_m": 0.11
+  },
+  "B076YKYHCB": {
+   "id": "B076YKYHCB",
+   "text": "amazonbasics",
+   "text_h_m": 0.0057,
+   "pt": "MULTIPORT_HUB",
+   "obj_m": 0.11
+  },
+  "B076YRSWGH": {
+   "id": "B076YRSWGH",
+   "text": "amazonbasics",
+   "text_h_m": 0.0057,
+   "pt": "MULTIPORT_HUB",
+   "obj_m": 0.11
+  },
+  "B076YNV36K": {
+   "id": "B076YNV36K",
+   "text": "amazonbasics",
+   "text_h_m": 0.0057,
+   "pt": "MULTIPORT_HUB",
+   "obj_m": 0.145
+  },
+  "B076YFNTSN": {
+   "id": "B076YFNTSN",
+   "text": "amazonbasics",
+   "text_h_m": 0.0057,
+   "pt": "MULTIPORT_HUB",
+   "obj_m": 0.145
+  },
+  "B076YJFGCN": {
+   "id": "B076YJFGCN",
+   "text": "amazonbasics",
+   "text_h_m": 0.0057,
+   "pt": "MULTIPORT_HUB",
+   "obj_m": 0.145
+  },
+  "B076YFLYFR": {
+   "id": "B076YFLYFR",
+   "text": "amazonbasics",
+   "text_h_m": 0.0057,
+   "pt": "MULTIPORT_HUB",
+   "obj_m": 0.145
+  },
+  "B076YLWTPR": {
+   "id": "B076YLWTPR",
+   "text": "amazonbasics",
+   "text_h_m": 0.0057,
+   "pt": "MULTIPORT_HUB",
+   "obj_m": 0.145
+  },
+  "B076YFNTRS": {
+   "id": "B076YFNTRS",
+   "text": "amazonbasics",
+   "text_h_m": 0.0057,
+   "pt": "MULTIPORT_HUB",
+   "obj_m": 0.145
+  },
+  "B076YJ1XZS": {
+   "id": "B076YJ1XZS",
+   "text": "amazonbasics",
+   "text_h_m": 0.0057,
+   "pt": "MULTIPORT_HUB",
+   "obj_m": 0.145
+  },
+  "B076YL2CTT": {
+   "id": "B076YL2CTT",
+   "text": "amazonbasics",
+   "text_h_m": 0.0057,
+   "pt": "MULTIPORT_HUB",
+   "obj_m": 0.11
+  },
+  "B076YS4SJT": {
+   "id": "B076YS4SJT",
+   "text": "amazonbasics",
+   "text_h_m": 0.0057,
+   "pt": "MULTIPORT_HUB",
+   "obj_m": 0.11
+  },
+  "B076YJFGCW": {
+   "id": "B076YJFGCW",
+   "text": "amazonbasics",
+   "text_h_m": 0.0057,
+   "pt": "MULTIPORT_HUB",
+   "obj_m": 0.11
+  },
+  "B076YRSWGW": {
+   "id": "B076YRSWGW",
+   "text": "amazonbasics",
+   "text_h_m": 0.0057,
+   "pt": "MULTIPORT_HUB",
+   "obj_m": 0.145
+  },
+  "B01GGKYUKI": {
+   "id": "B01GGKYUKI",
+   "text": "amazonbasics",
+   "text_h_m": 0.005,
+   "pt": "ELECTRONIC_CABLE",
+   "obj_m": 0.186
+  },
+  "B072Y2MRY2": {
+   "id": "B072Y2MRY2",
+   "text": "LIFT",
+   "text_h_m": 0.0049,
+   "pt": "STOOL_SEATING",
+   "obj_m": 0.673
+  },
+  "B01GGKZ0V6": {
+   "id": "B01GGKZ0V6",
+   "text": "amazonbasics",
+   "text_h_m": 0.0047,
+   "pt": "ELECTRONIC_CABLE",
+   "obj_m": 0.203
+  },
+  "B01GGKYZQM": {
+   "id": "B01GGKYZQM",
+   "text": "amazonbasics",
+   "text_h_m": 0.0047,
+   "pt": "ELECTRONIC_CABLE",
+   "obj_m": 0.203
+  },
+  "B07XGQ9QJF": {
+   "id": "B07XGQ9QJF",
+   "text": "QUEEN",
+   "text_h_m": 0.0039,
+   "pt": "ELECTRIC_FAN",
+   "obj_m": 0.202
+  },
+  "B01GGKYT7M": {
+   "id": "B01GGKYT7M",
+   "text": "amazonbasics",
+   "text_h_m": 0.0039,
+   "pt": "ELECTRONIC_CABLE",
+   "obj_m": 0.186
+  },
+  "B01GGKYAIU": {
+   "id": "B01GGKYAIU",
+   "text": "amazonbasics",
+   "text_h_m": 0.0039,
+   "pt": "ELECTRONIC_CABLE",
+   "obj_m": 0.192
+  },
+  "B00DUGZFA6": {
+   "id": "B00DUGZFA6",
+   "text": "amazon",
+   "text_h_m": 0.0037,
+   "pt": "HANDBAG",
+   "obj_m": 0.32
+  },
+  "B01LONQ7R6": {
+   "id": "B01LONQ7R6",
+   "text": "amazonbasics",
+   "text_h_m": 0.0036,
+   "pt": "ELECTRONIC_CABLE",
+   "obj_m": 0.098
+  },
+  "B01LONQBDG": {
+   "id": "B01LONQBDG",
+   "text": "amazonbasics",
+   "text_h_m": 0.0035,
+   "pt": "ELECTRONIC_CABLE",
+   "obj_m": 0.098
+  },
+  "B01LONQ3TS": {
+   "id": "B01LONQ3TS",
+   "text": "amazonbasics",
+   "text_h_m": 0.0035,
+   "pt": "ELECTRONIC_CABLE",
+   "obj_m": 0.098
+  },
+  "B01LONPUM4": {
+   "id": "B01LONPUM4",
+   "text": "amazonbasics",
+   "text_h_m": 0.003,
+   "pt": "ELECTRONIC_CABLE",
+   "obj_m": 0.098
+  },
+  "B017YEANB0": {
+   "id": "B017YEANB0",
+   "text": "amazonbasics",
+   "text_h_m": 0.0022,
+   "pt": "WIRELESS_ACCESSORY",
+   "obj_m": 0.059
+  },
+  "B073P23TMG": {
+   "id": "B073P23TMG",
+   "text": "RICORDIDIARCHITETTURA-Pubblicaz",
+   "text_h_m": 0.3874,
+   "pt": "WALL_ART",
+   "obj_m": 0.915
+  },
+  "B075YNL7DH": {
+   "id": "B075YNL7DH",
+   "text": "RIESLING",
+   "text_h_m": 0.3012,
+   "pt": "WALL_ART",
+   "obj_m": 0.683
+  },
+  "B075YLTF8J": {
+   "id": "B075YLTF8J",
+   "text": "BURGUNDY",
+   "text_h_m": 0.2814,
+   "pt": "WALL_ART",
+   "obj_m": 0.683
+  },
+  "B073NZWZ94": {
+   "id": "B073NZWZ94",
+   "text": "WILD",
+   "text_h_m": 0.2769,
+   "pt": "WALL_ART",
+   "obj_m": 1.062
+  },
+  "B073P1F2HM": {
+   "id": "B073P1F2HM",
+   "text": "inhale",
+   "text_h_m": 0.2027,
+   "pt": "WALL_ART",
+   "obj_m": 0.446
+  },
+  "B073P14BDC": {
+   "id": "B073P14BDC",
+   "text": "HAPPINESS",
+   "text_h_m": 0.178,
+   "pt": "WALL_ART",
+   "obj_m": 0.819
+  },
+  "B073P1N4C4": {
+   "id": "B073P1N4C4",
+   "text": "inhale",
+   "text_h_m": 0.1628,
+   "pt": "WALL_ART",
+   "obj_m": 0.356
+  },
+  "B073NZGLK3": {
+   "id": "B073NZGLK3",
+   "text": "WILD",
+   "text_h_m": 0.1519,
+   "pt": "WALL_ART",
+   "obj_m": 0.582
+  },
+  "B073P1JNGB": {
+   "id": "B073P1JNGB",
+   "text": "BAKER",
+   "text_h_m": 0.1461,
+   "pt": "WALL_ART",
+   "obj_m": 0.656
+  },
+  "B073NZWZ9W": {
+   "id": "B073NZWZ9W",
+   "text": "Roma",
+   "text_h_m": 0.1309,
+   "pt": "WALL_ART",
+   "obj_m": 1.046
+  },
+  "B07HSN72NX": {
+   "id": "B07HSN72NX",
+   "text": "LiFE",
+   "text_h_m": 0.1253,
+   "pt": "WALL_ART",
+   "obj_m": 1.002
+  },
+  "B075YLJM75": {
+   "id": "B075YLJM75",
+   "text": "FARM",
+   "text_h_m": 0.0999,
+   "pt": "WALL_ART",
+   "obj_m": 0.531
+  },
+  "B073P1H6KJ": {
+   "id": "B073P1H6KJ",
+   "text": "BAKER",
+   "text_h_m": 0.0962,
+   "pt": "WALL_ART",
+   "obj_m": 0.432
+  },
+  "B073P1GGC6": {
+   "id": "B073P1GGC6",
+   "text": "1875",
+   "text_h_m": 0.0891,
+   "pt": "WALL_ART",
+   "obj_m": 1.183
+  },
+  "B073P17T3P": {
+   "id": "B073P17T3P",
+   "text": "PARIS",
+   "text_h_m": 0.0737,
+   "pt": "WALL_ART",
+   "obj_m": 0.963
+  },
+  "B073P16R55": {
+   "id": "B073P16R55",
+   "text": "Roma",
+   "text_h_m": 0.0706,
+   "pt": "WALL_ART",
+   "obj_m": 0.551
+  },
+  "B073P1GGRK": {
+   "id": "B073P1GGRK",
+   "text": "est",
+   "text_h_m": 0.0628,
+   "pt": "WALL_ART",
+   "obj_m": 1.022
+  },
+  "B073P1RDM1": {
+   "id": "B073P1RDM1",
+   "text": "1875",
+   "text_h_m": 0.0612,
+   "pt": "WALL_ART",
+   "obj_m": 0.813
+  },
+  "B073P1RDJF": {
+   "id": "B073P1RDJF",
+   "text": "1870",
+   "text_h_m": 0.0581,
+   "pt": "WALL_ART",
+   "obj_m": 0.967
+  },
+  "B075YLPZ9V": {
+   "id": "B075YLPZ9V",
+   "text": "1937",
+   "text_h_m": 0.0513,
+   "pt": "WALL_ART",
+   "obj_m": 0.508
+  },
+  "B073P1HZY6": {
+   "id": "B073P1HZY6",
+   "text": "PARIS",
+   "text_h_m": 0.051,
+   "pt": "WALL_ART",
+   "obj_m": 0.664
+  },
+  "B075YLKB8C": {
+   "id": "B075YLKB8C",
+   "text": "SERVICE",
+   "text_h_m": 0.0485,
+   "pt": "WALL_ART",
+   "obj_m": 0.78
+  },
+  "B073P5KYCM": {
+   "id": "B073P5KYCM",
+   "text": "STREET",
+   "text_h_m": 0.0445,
+   "pt": "WALL_ART",
+   "obj_m": 1.527
+  },
+  "B073P1HZWV": {
+   "id": "B073P1HZWV",
+   "text": "ON THE ROCKS",
+   "text_h_m": 0.0433,
+   "pt": "WALL_ART",
+   "obj_m": 0.458
+  },
+  "B073P1D93F": {
+   "id": "B073P1D93F",
+   "text": "1648",
+   "text_h_m": 0.0423,
+   "pt": "WALL_ART",
+   "obj_m": 0.816
+  },
+  "B073NZT572": {
+   "id": "B073NZT572",
+   "text": "1870",
+   "text_h_m": 0.0395,
+   "pt": "WALL_ART",
+   "obj_m": 0.657
+  },
+  "B073P1JGP2": {
+   "id": "B073P1JGP2",
+   "text": "1648",
+   "text_h_m": 0.0376,
+   "pt": "WALL_ART",
+   "obj_m": 0.66
+  },
+  "B073NZT573": {
+   "id": "B073NZT573",
+   "text": "1929",
+   "text_h_m": 0.036,
+   "pt": "WALL_ART",
+   "obj_m": 0.661
+  },
+  "B073P6BG9P": {
+   "id": "B073P6BG9P",
+   "text": "STREET",
+   "text_h_m": 0.0356,
+   "pt": "WALL_ART",
+   "obj_m": 1.216
+  },
+  "B073NZT575": {
+   "id": "B073NZT575",
+   "text": "1933",
+   "text_h_m": 0.0325,
+   "pt": "WALL_ART",
+   "obj_m": 0.66
+  },
+  "B073P1HYC7": {
+   "id": "B073P1HYC7",
+   "text": "GAN",
+   "text_h_m": 0.0317,
+   "pt": "WALL_ART",
+   "obj_m": 0.458
+  },
+  "B073NZPN2W": {
+   "id": "B073NZPN2W",
+   "text": "est",
+   "text_h_m": 0.0283,
+   "pt": "WALL_ART",
+   "obj_m": 0.521
+  },
+  "B073P1JGKW": {
+   "id": "B073P1JGKW",
+   "text": "ON THE ROCKS",
+   "text_h_m": 0.028,
+   "pt": "WALL_ART",
+   "obj_m": 0.349
+  },
+  "B073P1JNVW": {
+   "id": "B073P1JNVW",
+   "text": "Pontedera",
+   "text_h_m": 0.0274,
+   "pt": "WALL_ART",
+   "obj_m": 0.61
+  },
+  "B073P5Y9Q6": {
+   "id": "B073P5Y9Q6",
+   "text": "STREET",
+   "text_h_m": 0.0269,
+   "pt": "WALL_ART",
+   "obj_m": 0.919
+  },
+  "B073P12PMS": {
+   "id": "B073P12PMS",
+   "text": "1929",
+   "text_h_m": 0.0238,
+   "pt": "WALL_ART",
+   "obj_m": 0.431
+  },
+  "B075YMJC9D": {
+   "id": "B075YMJC9D",
+   "text": "creamery",
+   "text_h_m": 0.0232,
+   "pt": "WALL_ART",
+   "obj_m": 0.531
+  },
+  "B073P1JNTB": {
+   "id": "B073P1JNTB",
+   "text": "1648",
+   "text_h_m": 0.0227,
+   "pt": "WALL_ART",
+   "obj_m": 0.431
+  },
+  "B075YLPZB1": {
+   "id": "B075YLPZB1",
+   "text": "GOLDEN",
+   "text_h_m": 0.0225,
+   "pt": "WALL_ART",
+   "obj_m": 0.508
+  },
+  "B073P1LPFR": {
+   "id": "B073P1LPFR",
+   "text": "1933",
+   "text_h_m": 0.0217,
+   "pt": "WALL_ART",
+   "obj_m": 0.432
+  },
+  "B073P16J69": {
+   "id": "B073P16J69",
+   "text": "THE",
+   "text_h_m": 0.0208,
+   "pt": "WALL_ART",
+   "obj_m": 0.775
+  },
+  "B073P7FSB7": {
+   "id": "B073P7FSB7",
+   "text": "TERRITORIES.",
+   "text_h_m": 0.0195,
+   "pt": "WALL_ART",
+   "obj_m": 1.308
+  },
+  "B073P1CJSB": {
+   "id": "B073P1CJSB",
+   "text": "123",
+   "text_h_m": 0.0165,
+   "pt": "WALL_ART",
+   "obj_m": 0.623
+  },
+  "B075YLSBYF": {
+   "id": "B075YLSBYF",
+   "text": "WHERE THE",
+   "text_h_m": 0.0161,
+   "pt": "WALL_ART",
+   "obj_m": 0.582
+  },
+  "B073P1GFXS": {
+   "id": "B073P1GFXS",
+   "text": "ros",
+   "text_h_m": 0.0155,
+   "pt": "WALL_ART",
+   "obj_m": 0.572
+  },
+  "B075YM7Q9M": {
+   "id": "B075YM7Q9M",
+   "text": "TOSCANA",
+   "text_h_m": 0.0152,
+   "pt": "WALL_ART",
+   "obj_m": 1.033
+  },
+  "B073P1JP14": {
+   "id": "B073P1JP14",
+   "text": "Feb.17,1942.",
+   "text_h_m": 0.015,
+   "pt": "WALL_ART",
+   "obj_m": 0.508
+  },
+  "B073P1J9G1": {
+   "id": "B073P1J9G1",
+   "text": "PUBLISHEDBY",
+   "text_h_m": 0.0149,
+   "pt": "WALL_ART",
+   "obj_m": 0.807
+  },
+  "B075YLXYKF": {
+   "id": "B075YLXYKF",
+   "text": "arecalleel",
+   "text_h_m": 0.0142,
+   "pt": "WALL_ART",
+   "obj_m": 0.58
+  },
+  "B073P1GB9D": {
+   "id": "B073P1GB9D",
+   "text": "Probert",
+   "text_h_m": 0.0131,
+   "pt": "WALL_ART",
+   "obj_m": 0.659
+  },
+  "B073P15S5Z": {
+   "id": "B073P15S5Z",
+   "text": "INVENTOR",
+   "text_h_m": 0.0126,
+   "pt": "WALL_ART",
+   "obj_m": 0.863
+  },
+  "B073P17T6F": {
+   "id": "B073P17T6F",
+   "text": "213",
+   "text_h_m": 0.0124,
+   "pt": "WALL_ART",
+   "obj_m": 0.657
+  },
+  "B073P1BKSR": {
+   "id": "B073P1BKSR",
+   "text": "Fig.2",
+   "text_h_m": 0.012,
+   "pt": "WALL_ART",
+   "obj_m": 0.459
+  },
+  "B073P13J3C": {
+   "id": "B073P13J3C",
+   "text": "LONDON",
+   "text_h_m": 0.0119,
+   "pt": "WALL_ART",
+   "obj_m": 1.192
+  },
+  "B073P1LM88": {
+   "id": "B073P1LM88",
+   "text": "ros",
+   "text_h_m": 0.0114,
+   "pt": "WALL_ART",
+   "obj_m": 0.386
+  },
+  "B073P1S8VY": {
+   "id": "B073P1S8VY",
+   "text": "NEW-YORK",
+   "text_h_m": 0.0113,
+   "pt": "WALL_ART",
+   "obj_m": 0.403
+  },
+  "B073P1N48F": {
+   "id": "B073P1N48F",
+   "text": "T.A.EDISON.",
+   "text_h_m": 0.011,
+   "pt": "WALL_ART",
+   "obj_m": 0.505
+  },
+  "B073P15SD2": {
+   "id": "B073P15SD2",
+   "text": "W.T.BROWN.",
+   "text_h_m": 0.0109,
+   "pt": "WALL_ART",
+   "obj_m": 0.529
+  },
+  "B073P1TPM3": {
+   "id": "B073P1TPM3",
+   "text": "W.T.BROWN.",
+   "text_h_m": 0.0109,
+   "pt": "WALL_ART",
+   "obj_m": 0.529
+  },
+  "B073P1JNQ5": {
+   "id": "B073P1JNQ5",
+   "text": "W.T.BROWN.",
+   "text_h_m": 0.0109,
+   "pt": "WALL_ART",
+   "obj_m": 0.529
+  },
+  "B073P1GB49": {
+   "id": "B073P1GB49",
+   "text": "Probert",
+   "text_h_m": 0.0108,
+   "pt": "WALL_ART",
+   "obj_m": 0.53
+  },
+  "B073P1HRN3": {
+   "id": "B073P1HRN3",
+   "text": "T.A.EDISON.",
+   "text_h_m": 0.0101,
+   "pt": "WALL_ART",
+   "obj_m": 0.474
+  },
+  "B073P1TPM6": {
+   "id": "B073P1TPM6",
+   "text": "W.T.BROWN.",
+   "text_h_m": 0.0099,
+   "pt": "WALL_ART",
+   "obj_m": 0.529
+  },
+  "B073P1HYM7": {
+   "id": "B073P1HYM7",
+   "text": "Feb.17,1942.",
+   "text_h_m": 0.0099,
+   "pt": "WALL_ART",
+   "obj_m": 0.361
+  },
+  "B073P1RDDN": {
+   "id": "B073P1RDDN",
+   "text": "COOPERCYCLECO",
+   "text_h_m": 0.0098,
+   "pt": "WALL_ART",
+   "obj_m": 0.601
+  },
+  "B073P17T6G": {
+   "id": "B073P17T6G",
+   "text": "RICORDIDIARCHITETTURA-Pubblicazione",
+   "text_h_m": 0.0096,
+   "pt": "WALL_ART",
+   "obj_m": 0.38
+  },
+  "B073P1BVJY": {
+   "id": "B073P1BVJY",
+   "text": "COURTLAND",
+   "text_h_m": 0.0094,
+   "pt": "WALL_ART",
+   "obj_m": 0.753
+  },
+  "B073P1H5Z3": {
+   "id": "B073P1H5Z3",
+   "text": "T. A. EDISON.",
+   "text_h_m": 0.0089,
+   "pt": "WALL_ART",
+   "obj_m": 0.509
+  },
+  "B073P15SD3": {
+   "id": "B073P15SD3",
+   "text": "ATTORNEY",
+   "text_h_m": 0.0088,
+   "pt": "WALL_ART",
+   "obj_m": 0.534
+  },
+  "B073P13Q39": {
+   "id": "B073P13Q39",
+   "text": "W.T.BROWN.",
+   "text_h_m": 0.0087,
+   "pt": "WALL_ART",
+   "obj_m": 0.482
+  },
+  "B073P1BJ2G": {
+   "id": "B073P1BJ2G",
+   "text": "THE",
+   "text_h_m": 0.0087,
+   "pt": "WALL_ART",
+   "obj_m": 0.327
+  },
+  "B077X8BY9D": {
+   "id": "B077X8BY9D",
+   "text": "1492",
+   "text_h_m": 0.0085,
+   "pt": "WALL_ART",
+   "obj_m": 0.61
+  },
+  "B073P1LPPM": {
+   "id": "B073P1LPPM",
+   "text": "213",
+   "text_h_m": 0.0083,
+   "pt": "WALL_ART",
+   "obj_m": 0.44
+  },
+  "B073P19B2D": {
+   "id": "B073P19B2D",
+   "text": "AMPERE",
+   "text_h_m": 0.0077,
+   "pt": "WALL_ART",
+   "obj_m": 1.062
+  },
+  "B073P1TPMF": {
+   "id": "B073P1TPMF",
+   "text": "Calif.",
+   "text_h_m": 0.0072,
+   "pt": "WALL_ART",
+   "obj_m": 0.529
+  },
+  "B073NZS586": {
+   "id": "B073NZS586",
+   "text": "COOPERCYCLECO",
+   "text_h_m": 0.0062,
+   "pt": "WALL_ART",
+   "obj_m": 0.376
+  },
+  "B073P1CJMW": {
+   "id": "B073P1CJMW",
+   "text": "PUBLISHEDBY",
+   "text_h_m": 0.0062,
+   "pt": "WALL_ART",
+   "obj_m": 0.458
+  },
+  "B077X6WSH1": {
+   "id": "B077X6WSH1",
+   "text": "Same",
+   "text_h_m": 0.0054,
+   "pt": "WALL_ART",
+   "obj_m": 0.609
+  },
+  "B073P1H7CF": {
+   "id": "B073P1H7CF",
+   "text": "ATTORNEYS",
+   "text_h_m": 0.0051,
+   "pt": "WALL_ART",
+   "obj_m": 0.477
+  },
+  "B073NZQQC2": {
+   "id": "B073NZQQC2",
+   "text": "103",
+   "text_h_m": 0.005,
+   "pt": "WALL_ART",
+   "obj_m": 0.533
+  },
+  "B073P14BGK": {
+   "id": "B073P14BGK",
+   "text": "KENTON",
+   "text_h_m": 0.0046,
+   "pt": "WALL_ART",
+   "obj_m": 0.67
+  },
+  "B073P1F23Q": {
+   "id": "B073P1F23Q",
+   "text": "LAVOISIER",
+   "text_h_m": 0.0041,
+   "pt": "WALL_ART",
+   "obj_m": 0.553
+  },
+  "B073P19S5F": {
+   "id": "B073P19S5F",
+   "text": "102",
+   "text_h_m": 0.0039,
+   "pt": "WALL_ART",
+   "obj_m": 0.508
+  },
+  "B073P13J3N": {
+   "id": "B073P13J3N",
+   "text": "GOODGE",
+   "text_h_m": 0.0025,
+   "pt": "WALL_ART",
+   "obj_m": 0.443
+  }
+ },
+ "excluded": {
+  "B07XMRCXJ7": {
+   "reason": "qa:empty",
+   "at": "2026-10-05T10:47:13Z"
+  },
+  "B07XKGLMR8": {
+   "reason": "qa:empty",
+   "at": "2026-10-05T10:47:13Z"
+  },
+  "B07B8PXTVL": {
+   "reason": "qa:empty",
+   "at": "2026-10-05T10:47:13Z"
+  },
+  "B01DN8TG46": {
+   "reason": "qa:empty,void",
+   "at": "2026-10-05T10:47:13Z"
+  },
+  "B07XBQ8LDD": {
+   "reason": "qa:penetrate",
+   "at": "2026-10-05T10:47:13Z"
+  },
+  "B07BL7H8N5": {
+   "reason": "qa:empty",
+   "at": "2026-10-05T10:47:13Z"
+  },
+  "B082MY2MX3": {
+   "reason": "qa:empty",
+   "at": "2026-10-05T10:47:13Z"
+  },
+  "B07N6RTLP7": {
+   "reason": "qa:illegible",
+   "at": "2026-10-05T10:47:13Z"
+  },
+  "B01LR5SEKE": {
+   "reason": "qa:illegible",
+   "at": "2026-10-05T10:47:13Z"
+  },
+  "B072Y2MRY2": {
+   "reason": "qa:occluded",
+   "at": "2026-10-05T10:47:13Z"
+  }
+ }
+}

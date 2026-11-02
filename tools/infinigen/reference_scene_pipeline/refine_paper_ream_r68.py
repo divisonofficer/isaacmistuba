@@ -1,0 +1,22 @@
+"""Manufactured wrapped paper stock instead of anonymous white blocks; two packs only."""
+import bpy,math,json,hashlib
+from pathlib import Path
+from mathutils import Vector
+r=Path('/jarvis/project/robomituba');base=r/'out/infinigen_v2/kr_commercial_office_floor_02_48712502/full';ref=r/'data/venue_refs/floor_plans_v3/commercial_office_floor_02';src=base/'scene_candidate_r67.blend';dst=base/'scene_candidate_r68.blend';assert not dst.exists();sha=hashlib.sha256(src.read_bytes()).hexdigest();bpy.ops.wm.open_mainfile(filepath=str(src))
+def material(name,color,rough):
+ m=bpy.data.materials.new(name);m.use_nodes=True;bs=m.node_tree.nodes['Principled BSDF'];bs.inputs['Base Color'].default_value=(*color,1);bs.inputs['Roughness'].default_value=rough;return m
+paper=material('R68_clean_paper_wrapper',(.78,.77,.72),.68);nt=paper.node_tree;n=nt.nodes.new('ShaderNodeTexNoise');n.inputs['Scale'].default_value=650;tc=nt.nodes.new('ShaderNodeTexCoord');nt.links.new(tc.outputs['Object'],n.inputs['Vector']);b=nt.nodes.new('ShaderNodeBump');b.inputs['Distance'].default_value=.000018;b.inputs['Strength'].default_value=.18;nt.links.new(n.outputs['Fac'],b.inputs['Height']);nt.links.new(b.outputs[0],nt.nodes['Principled BSDF'].inputs['Normal']);ink=material('R68_navy_print_ink',(.018,.045,.065),.64);foldmat=material('R68_folded_paper_edge',(.67,.66,.62),.75);rows=[]
+for key in ['west_paper_stack','east_paper_stack']:
+ o=next(o for o in bpy.data.objects if o.get('program_key')==key);before=[o.matrix_world@Vector(c) for c in o.bound_box];bottom=min(p.z for p in before);o.dimensions=(.297,.210,.05);bpy.ops.object.select_all(action='DESELECT');o.select_set(True);bpy.context.view_layer.objects.active=o;bpy.ops.object.transform_apply(location=False,rotation=False,scale=True)
+ for i in range(len(o.data.materials)):o.data.materials[i]=paper
+ bpy.context.view_layer.update();pts=[o.matrix_world@Vector(c) for c in o.bound_box];lo=Vector([min(p[k] for p in pts) for k in range(3)]);hi=Vector([max(p[k] for p in pts) for k in range(3)]);o.location.z+=bottom-lo.z;bpy.context.view_layer.update();lo.z=bottom;hi.z=bottom+.05;cx,cy=o.location.x,o.location.y
+ host=next(x for x in bpy.data.objects if x.get('program_key')=='support_'+key.split('_')[0]+'_storage');hp=[host.matrix_world@Vector(c) for c in host.bound_box];assert lo.x>=min(p.x for p in hp) and hi.x<=max(p.x for p in hp) and lo.y>=min(p.y for p in hp) and hi.y<=max(p.y for p in hp);hosttop=max(p.z for p in hp);assert -.0005<bottom-hosttop<.003
+ data=bpy.data.curves.new(key+'_printed_specification','FONT');data.body='OFFICE PAPER\nA4   80 g/m²\n500 SHEETS';data.align_x='CENTER';data.align_y='CENTER';data.size=.013;data.space_line=1.15;data.extrude=.000025;text=bpy.data.objects.new(data.name,data);bpy.context.scene.collection.objects.link(text);text.location=(cx,cy,hi.z+.00012);data.materials.append(ink);text['reference_scene_owner']='commercial_office_floor_02';text['program_key']=key+'_printed_label';text['audit_kind']='detail'
+ for side in [-1,1]:
+  x=cx+side*(.297/2+.00008);z0=bottom+.0007;z1=hi.z-.0007;ym=cy;yl=cy-.104;yr=cy+.104;zm=(z0+z1)/2
+  curve=bpy.data.curves.new(key+'_end_wrap_seams','CURVE');curve.dimensions='3D';curve.bevel_depth=.00012;curve.bevel_resolution=1
+  for a,b in [((x,yl,z0),(x,ym,zm)),((x,yl,z1),(x,ym,zm)),((x,yr,z0),(x,ym,zm)),((x,yr,z1),(x,ym,zm))]:
+   sp=curve.splines.new('POLY');sp.points.add(1);sp.points[0].co=(*a,1);sp.points[1].co=(*b,1)
+  seam=bpy.data.objects.new(curve.name,curve);bpy.context.scene.collection.objects.link(seam);curve.materials.append(foldmat);seam['reference_scene_owner']='commercial_office_floor_02';seam['program_key']=key+'_wrap_fold_'+str(side);seam['audit_kind']='detail'
+ rows.append({'pack':o.name,'dimensions_m':[.297,.210,.05],'cabinet_support_gap_m':bottom-hosttop,'cabinet_footprint_contains_pack':True,'label':'OFFICE PAPER / A4 80g/m2 /500SHEETS'})
+bpy.ops.wm.save_as_mainfile(filepath=str(dst));assert hashlib.sha256(src.read_bytes()).hexdigest()==sha;(ref/'realism_refinement_r68.json').write_text(json.dumps({'source':str(src),'source_sha256':sha,'candidate':str(dst),'change':'two anonymous white blocks become measured A4 wrapped reams, paper-specific matte microbump, printed brandless specification and physical end-fold seams; positions/support retained','packs':rows,'photorealism_accepted':False,'requires':'saved-source checks and same-camera support_west/east comparison'},indent=2));print(dst,flush=True)

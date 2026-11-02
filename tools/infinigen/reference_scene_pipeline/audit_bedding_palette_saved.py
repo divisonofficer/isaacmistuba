@@ -1,0 +1,8 @@
+import bpy,json,hashlib,sys,argparse
+from pathlib import Path
+p=argparse.ArgumentParser();p.add_argument('--revision',type=int,required=True);a=p.parse_args(sys.argv[sys.argv.index('--')+1:]);r=Path(__file__).resolve().parents[3];d=r/'data/venue_refs/floor_plans_v3/dual_unit_residential_floor_03';s=r/f'out/infinigen_v2/kr_dual_unit_residential_floor_03_48712503/full/scene_candidate_r{a.revision}.blend';out=d/f'bedding_palette_saved_audit_r{a.revision}.json';assert not out.exists();meta=json.loads((d/f'realism_refinement_r{a.revision}.json').read_text());sha=hashlib.sha256(s.read_bytes()).hexdigest();assert sha==meta['candidate_sha256'];bpy.ops.wm.open_mainfile(filepath=str(s));rows=[];errors=[]
+for c in meta['colour_changes']:
+ o=bpy.data.objects[c['object']];m=o.data.materials[c['slot']];bs=next(n for n in m.node_tree.nodes if n.type=='BSDF_PRINCIPLED');n=m.node_tree.nodes.get('ReferencePaletteMultiply');ok=m.name==c['material'] and n is not None and n.blend_type=='MULTIPLY' and not n.use_clamp and abs(n.inputs[0].default_value-1)<1e-6 and any(l.from_node==n for l in bs.inputs['Base Color'].links) and all(abs(n.inputs[2].default_value[i]-c['multiply_rgb'][i])<1e-5 for i in range(3))
+ if not ok:errors.append({'object':o.name,'material':m.name,'reason':'palette_graph_contract'})
+ rows.append({'object':o.name,'material':m.name,'role':c['role'],'pass':ok})
+assert len(rows)==21,len(rows);out.write_text(json.dumps({'source':str(s),'source_sha256':sha,'rows':rows,'errors':errors,'pass':not errors,'scope':'Saved21 assigned palette graphs;not a visible-colour match,cloth-quality or photo acceptance.','photorealism_accepted':False},indent=2));print('BEDDING_PALETTE_SAVED_AUDIT',len(errors));assert not errors

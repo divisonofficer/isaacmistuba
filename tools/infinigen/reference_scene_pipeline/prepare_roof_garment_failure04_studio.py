@@ -1,0 +1,10 @@
+"""FAILED physical prototype diagnostic only; red actualwire helps locate collision failure. No integration or acceptance."""
+import bpy,json
+from pathlib import Path
+from mathutils import Vector
+r=Path('/jarvis/project/robomituba/data/venue_refs/floor_plans_v3/dual_unit_residential_floor_03');out=r/'garment_roof_failure04_diagnostic';assert not out.exists();out.mkdir();bpy.ops.wm.open_mainfile(filepath=str(r/'garment_roof_hanger_settled04.blend'));wire=bpy.data.objects['Measured shoulder wire'];m=bpy.data.materials.new('FAILED_physical_diagnostic_red_wire');m.use_nodes=True;bs=m.node_tree.nodes.get('Principled BSDF');bs.inputs['Base Color'].default_value=(.5,.01,.005,1);bs.inputs['Roughness'].default_value=.4;wire.data.materials.clear();wire.data.materials.append(m)
+for f in wire.data.polygons:f.material_index=0
+s=bpy.context.scene;w=bpy.data.worlds.new('Failed physics diagnostic world');w.use_nodes=True;w.node_tree.nodes['Background'].inputs['Strength'].default_value=.2;s.world=w
+for name,loc,power,size in [('Key',(1,-1.5,1),100,1),('Fill',(-1,1,.3),40,1)]:
+ d=bpy.data.lights.new(name,'AREA');d.energy=power;d.size=size;o=bpy.data.objects.new(name,d);s.collection.objects.link(o);o.location=loc;o.rotation_euler=(Vector((0,0,-.25))-o.location).to_track_quat('-Z','Y').to_euler()
+bpy.ops.wm.save_as_mainfile(filepath=str(out/'studio.blend'));(out/'views.json').write_text(json.dumps([{'name':'failed_shirt_front','location':[.1,-1.4,-.18],'target':[0,0,-.25],'hfov':35,'render_width':640,'samples':16},{'name':'failed_shirt_oblique','location':[.9,-1,-.15],'target':[0,0,-.25],'hfov':35,'render_width':640,'samples':16}],indent=2));(out/'scope.json').write_text(json.dumps({'source':'garment_roof_hanger_settled04.blend','physical_status':'FAILED:232nonadjacentoverlap candidates andactualwirepenetration','change':'wire diagnostic red only; geometry unchanged','purpose':'Locate failure;not photographic acceptance orroomcandidate','room_integration':False},indent=2));print(out,flush=True)

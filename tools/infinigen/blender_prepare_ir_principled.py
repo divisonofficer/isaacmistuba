@@ -37,6 +37,8 @@ from navigation_dataset.ir_principled import (  # noqa: E402
     MATERIAL_CONTRACT_VERSION,
     METALLIC_CONTRACT_SCHEMA,
     METALLIC_FAMILY_IDS,
+    COATED_CONDUCTOR_FAMILY,
+    CONDUCTOR_BEARING_FAMILIES,
     STAGE2_COMPILER_VERSION,
     PSEUDO_NIR_FORMULA_ID,
     SURROGATE_MIN_ROUGHNESS,
@@ -48,7 +50,18 @@ from navigation_dataset.ir_principled import (  # noqa: E402
     normalize_legacy_metallic_scalar,
     pbr_for_slot,
     validate_metallic_contract,
+    wrap_continuous_metallic_contract,
+    CONTINUOUS_METALLIC_FAMILY,
+    SEMANTIC_SURROGATES,
 )
+from navigation_dataset import ir_indoor_fixtures, ir_metallic_composition  # noqa: E402
+
+#: A curated profile below this is a dielectric that happens to carry a trace of
+#: specular, not a conductor.  The registry's two metal-bearing profiles sit at
+#: 0.92 and 0.15 and its two dielectric ones at exactly 0.0, so any cut in
+#: between separates them; 0.02 matches the threshold the QC already uses to
+#: call a pixel metal-bearing.
+_COATED_CONDUCTOR_MIN = 0.02
 from render_visibility_contract import (  # noqa: E402
     hide_untracked_render_meshes,
     visible_untracked_mesh_names,
@@ -63,6 +76,9 @@ _AOV_TYPES = {
     "GT_MetallicFamilyID": "VALUE",
     "GT_MetalCoverage": "VALUE",
     "GT_ExposedMetal": "VALUE",
+    # Written only when the metallic augmentation is active; a label-level
+    # ablation reads it instead of demanding a second render.
+    "GT_MetallicSourceBinary": "VALUE",
     "GT_GeometryNormalWorld": "COLOR",
     "GT_ShadingNormalWorld": "COLOR",
     "GT_MaterialID": "VALUE",
@@ -133,7 +149,15 @@ def _effective_metallic_contract(
         family, value, source = "dielectric", 0.0, "remediated"
     elif prop_binding:
         value = float((((prop_binding.get("profile") or {}).get("values") or {}).get("metallic", 0.0)))
-        family, source = ("conductor" if value >= 1.0 - 1e-6 else "dielectric"), "remediated"
+        # A curated profile is authored, not guessed, so its fractional level is
+        # a real material property rather than the legacy Stage-1 ambiguity that
+        # the uniform-fractional rule below exists to reject.  Reading anything
+        # under 1.0 as dielectric is what put 0.92 pans and 0.15 appliance
+        # shells behind a "not metal" label.
+        family = ("conductor" if value >= 1.0 - 1e-6
+                  else COATED_CONDUCTOR_FAMILY if value > _COATED_CONDUCTOR_MIN
+                  else "dielectric")
+        source = "remediated"
     elif metallic_source == "texture":
         # A legacy authored metallic texture is retained as spatial coverage,
         # never collapsed to a guessed scalar. Stage-0's near-binary audit is
@@ -154,6 +178,7 @@ def _effective_metallic_contract(
         "legacy_uniform_fractional_snap_v1" if legacy_fractional_normalization
         else "legacy_authored_coverage_v1" if family == "coverage_mixed"
         else "legacy_pure_conductor_v1" if family == "conductor"
+        else "curated_profile_coated_conductor_v1" if family == COATED_CONDUCTOR_FAMILY
         else "legacy_dielectric_v1"
     )
     result = {
@@ -219,6 +244,21 @@ def _args() -> argparse.Namespace:
     parser.add_argument("--luminance-bias", type=float, required=True)
     parser.add_argument("--luminance-corpus-digest", required=True)
     parser.add_argument("--illumination-manifest", type=Path)
+    parser.add_argument(
+        "--metallic-augmentation-policy", type=Path,
+        help=("opt-in continuous-metalness policy (configs/ir_materials/*.json). "
+              "Absent means no augmentation and a byte-identical contract."),
+    )
+    parser.add_argument(
+        "--metallic-augmentation-seed", type=int, default=0,
+        help="dataset seed mixed into every per-material augmentation draw",
+    )
+    parser.add_argument(
+        "--fixture-policy", choices=("legacy_disable_v1", "addressable_v2"),
+        default="legacy_disable_v1",
+        help=("addressable_v2 tags indoor lights as individually switchable fixtures; "
+              "the default deletes them exactly as before and emits no extra contract key"),
+    )
     parser.add_argument("--structural-material-manifest", type=Path,
                         help="optional canonical external-PBR bindings for a rematerialized child scene")
     parser.add_argument("--prop-material-manifest", type=Path,
@@ -284,7 +324,7 @@ def _value_for_slot(channel: dict, slot: int, default):
     return value
 
 
-def _image_socket(tree, path: Path, *, color: bool):
+def _image_socket(tree, path: Path, *, color: bool, box_projection: bool = False):
     if not path.is_file():
         return None
     image = bpy.data.images.load(str(path.resolve()), check_existing=True)
@@ -293,6 +333,15 @@ def _image_socket(tree, path: Path, *, color: bool):
     node.image = image
     node.interpolation = "Linear"
     node.extension = "REPEAT"
+    if box_projection:
+        # FLAT projection samples only X and Y of the incoming vector.  Fed
+        # object-space coordinates that is correct for a floor or ceiling, which
+        # lie in the XY plane, but a wall shell is a box: its vertical faces span
+        # X-Z or Y-Z, so Y (or X) is constant across the wall's height and the
+        # texture smears vertically.  BOX picks the axis pair per face from the
+        # normal, which is what makes a tiled material tile on every surface.
+        node.projection = "BOX"
+        node.projection_blend = 0.2
     return node.outputs.get("Color") or node.outputs[0]
 
 
@@ -308,7 +357,9 @@ def _external_pbr_socket(tree, binding: dict, channel: str):
     if key is None:
         raise ValueError(f"unsupported external PBR channel: {channel}")
     path = Path(str((binding.get("resolved_maps") or {}).get(key) or ""))
-    socket = _image_socket(tree, path, color=channel == "base_color")
+    # Structural overlays are metre-repeat tiles applied to room shells, so they
+    # always want box projection -- see the note in ``_image_socket``.
+    socket = _image_socket(tree, path, color=channel == "base_color", box_projection=True)
     if socket is None:
         raise FileNotFoundError(f"external PBR map missing: {binding.get('material_id')} {channel}")
     texture = socket.node
@@ -363,40 +414,65 @@ def _channel_socket(tree, stage1_dir: Path, unit: dict, channel_name: str, slot:
 
 
 def _pseudo_nir_socket(tree, rgb_socket):
+    """Stand-in 850 nm albedo: a monotone gamma lift of visible luma.
+
+    Must stay identical to ``ir_principled.pseudo_nir_albedo`` -- the Python
+    side writes the contract this graph is checked against.
+
+    The previous graph took ``max(c, 1-c)`` per channel, which is V-shaped: it
+    could not go below 0.5, returned 1.0 at both black and white, and so had no
+    inverse for a network to learn through.  Measured over nine scenes it put
+    NIR albedo at 1.6-3.0x the visible and buried the active flash term.
+    """
     separate = tree.nodes.new("ShaderNodeSeparateColor")
     separate.mode = "RGB"
     tree.links.new(rgb_socket, separate.inputs[0])
     weighted = []
-    for index, weight in enumerate((0.229, 0.587, 0.114)):
-        invert = tree.nodes.new("ShaderNodeMath")
-        invert.operation = "SUBTRACT"
-        invert.inputs[0].default_value = 1.0
-        tree.links.new(separate.outputs[index], invert.inputs[1])
-        maximum = tree.nodes.new("ShaderNodeMath")
-        maximum.operation = "MAXIMUM"
-        tree.links.new(separate.outputs[index], maximum.inputs[0])
-        tree.links.new(invert.outputs[0], maximum.inputs[1])
+    # Rec. 601 luma.  The previous weights summed to 0.930, so not even white
+    # could reach an albedo of 1.
+    for index, weight in enumerate((0.299, 0.587, 0.114)):
         multiply = tree.nodes.new("ShaderNodeMath")
         multiply.operation = "MULTIPLY"
         multiply.inputs[1].default_value = weight
-        tree.links.new(maximum.outputs[0], multiply.inputs[0])
+        tree.links.new(separate.outputs[index], multiply.inputs[0])
         weighted.append(multiply.outputs[0])
     add_rg = tree.nodes.new("ShaderNodeMath")
     add_rg.operation = "ADD"
     tree.links.new(weighted[0], add_rg.inputs[0])
     tree.links.new(weighted[1], add_rg.inputs[1])
-    add_rgb = tree.nodes.new("ShaderNodeMath")
-    add_rgb.operation = "ADD"
-    tree.links.new(add_rg.outputs[0], add_rgb.inputs[0])
-    tree.links.new(weighted[2], add_rgb.inputs[1])
+    luma = tree.nodes.new("ShaderNodeMath")
+    luma.operation = "ADD"
+    tree.links.new(add_rg.outputs[0], luma.inputs[0])
+    tree.links.new(weighted[2], luma.inputs[1])
+    # (luma / reference) ** gamma * reference, clamped -- the reference is a
+    # fixed point, so contrast compresses toward it instead of the whole range
+    # being pushed up.
+    normalized = tree.nodes.new("ShaderNodeMath")
+    normalized.operation = "DIVIDE"
+    normalized.inputs[1].default_value = 0.5
+    tree.links.new(luma.outputs[0], normalized.inputs[0])
+    powered = tree.nodes.new("ShaderNodeMath")
+    powered.operation = "POWER"
+    powered.inputs[1].default_value = 0.75
+    tree.links.new(normalized.outputs[0], powered.inputs[0])
+    scaled = tree.nodes.new("ShaderNodeMath")
+    scaled.operation = "MULTIPLY"
+    scaled.inputs[1].default_value = 0.5
+    scaled.use_clamp = True
+    tree.links.new(powered.outputs[0], scaled.inputs[0])
     combine = tree.nodes.new("ShaderNodeCombineColor")
     combine.mode = "RGB"
     for input_socket in combine.inputs[:3]:
-        tree.links.new(add_rgb.outputs[0], input_socket)
+        tree.links.new(scaled.outputs[0], input_socket)
     return combine.outputs[0]
 
 
-def _matched_luminance_socket(tree, rgb_socket, *, scale: float, bias: float):
+def _luminance_socket(tree, rgb_socket):
+    """Rec.709 luminance of a linear RGB socket.
+
+    Factored out of ``_matched_luminance_socket`` so the NIR branch and the
+    metallic augmentation share one implementation of the same convention.
+    """
     separate = tree.nodes.new("ShaderNodeSeparateColor")
     separate.mode = "RGB"
     tree.links.new(rgb_socket, separate.inputs[0])
@@ -415,6 +491,11 @@ def _matched_luminance_socket(tree, rgb_socket, *, scale: float, bias: float):
     add_rgb.operation = "ADD"
     tree.links.new(add_rg.outputs[0], add_rgb.inputs[0])
     tree.links.new(weighted[2], add_rgb.inputs[1])
+    return add_rgb
+
+
+def _matched_luminance_socket(tree, rgb_socket, *, scale: float, bias: float):
+    add_rgb = _luminance_socket(tree, rgb_socket)
     affine = tree.nodes.new("ShaderNodeMath")
     affine.operation = "MULTIPLY_ADD"
     affine.inputs[1].default_value = float(scale)
@@ -466,10 +547,138 @@ def _prop_pbr_socket(tree, binding: dict, channel: str):
     return _value_constant(tree, float(values.get(channel, default))), "curated_profile_constant"
 
 
+def _augmented_metallic_socket(
+    tree, *, base_metallic, roughness, base_color_rgb, source_family: str,
+    unit: dict, slot: int, source_material: str, semantic_class: str,
+    policy: dict, policy_digest: str, dataset_seed: int, scene_id: str,
+):
+    """Build the continuous-metalness subgraph and its provenance record.
+
+    Infinigen metalness is effectively binary, so a network trained on it learns
+    to detect metal rather than estimate metalness.  This replaces the authored
+    scalar with a dielectric-coat-over-conductor field whose coat coverage is
+    driven by the four agreed signals -- the authored conductor family, the
+    roughness, the composition class and the albedo -- with a spatial residual
+    that keeps metalness from being a function of roughness alone.
+
+    Only the metallic socket is rewritten.  Roughness and base colour are read
+    as *inputs* and deliberately left untouched: a physically complete coating
+    would also roughen and tint the surface, but roughness is the primary
+    research target of this dataset, and perturbing its ground truth to justify
+    a metallic augmentation would confound the very measurement the dataset
+    exists to make.  The record states this so the choice is legible downstream.
+
+    Returns ``(socket, record)``, or ``(base_metallic, None)`` when the slot is
+    not conductor-bearing -- a trusted dielectric is never promoted into metal.
+    """
+    if str(source_family) not in ir_metallic_composition.CONDUCTOR_FAMILIES:
+        return base_metallic, None
+
+    composition = ir_metallic_composition.composition_class(
+        unit=unit, source_material=source_material,
+        semantic_class=semantic_class, source_family=source_family,
+    )
+    material_seed = ir_metallic_composition.material_seed(
+        policy_digest=policy_digest, scene_id=scene_id, unit_id=str(unit.get("id")),
+        slot=int(slot), source_material=source_material, semantic_class=semantic_class,
+    )
+    coefficients = ir_metallic_composition.sample_coefficients(
+        policy=policy, composition=composition["class"], seed=material_seed,
+    )
+
+    # Albedo luminance, shared with the NIR branch's convention.
+    luminance = _luminance_socket(tree, base_color_rgb).outputs[0]
+
+    # A spatial residual in object space, statistically independent of roughness.
+    # This is what stops the label from being recoverable from the roughness map.
+    coords = tree.nodes.new("ShaderNodeTexCoord")
+    noise = tree.nodes.new("ShaderNodeTexNoise")
+    noise.name = "IR_MetalAug_Residual"
+    noise.noise_dimensions = "4D"
+    noise.inputs["Scale"].default_value = float(policy.get("noise_scale_m", 6.0))
+    noise.inputs["Detail"].default_value = 2.0
+    noise.inputs["Roughness"].default_value = 0.5
+    # The 4th dimension is the per-slot seed, so two materials sharing a
+    # location still get independent residuals.
+    noise.inputs["W"].default_value = float(material_seed % 100003) / 1000.0
+    tree.links.new(coords.outputs["Object"], noise.inputs["Vector"])
+
+    def _term(source, *, factor: float, offset: float, name: str):
+        """factor * (source - offset), as one MULTIPLY_ADD node."""
+        subtract = tree.nodes.new("ShaderNodeMath")
+        subtract.operation = "SUBTRACT"
+        subtract.name = f"IR_MetalAug_{name}_delta"
+        tree.links.new(source, subtract.inputs[0])
+        subtract.inputs[1].default_value = float(offset)
+        scale = tree.nodes.new("ShaderNodeMath")
+        scale.operation = "MULTIPLY"
+        scale.name = f"IR_MetalAug_{name}"
+        tree.links.new(subtract.outputs[0], scale.inputs[0])
+        scale.inputs[1].default_value = float(factor)
+        return scale.outputs[0]
+
+    # coat = centre + a_r*(R - r0) + a_y*(y0 - Y) + a_n*(N - 0.5)
+    terms = [
+        _term(roughness, factor=coefficients["roughness_coupling"],
+              offset=coefficients["roughness_reference"], name="rough"),
+        _term(luminance, factor=-coefficients["albedo_coupling"],
+              offset=coefficients["albedo_reference"], name="albedo"),
+        _term(noise.outputs["Fac"], factor=coefficients["noise_coupling"],
+              offset=0.5, name="residual"),
+    ]
+    accumulator = _value_constant(tree, coefficients["coat_centre"])
+    for index, term in enumerate(terms):
+        add = tree.nodes.new("ShaderNodeMath")
+        add.operation = "ADD"
+        add.name = f"IR_MetalAug_sum_{index}"
+        tree.links.new(accumulator, add.inputs[0])
+        tree.links.new(term, add.inputs[1])
+        accumulator = add.outputs[0]
+
+    # metallic = clamp(1 - coat), floored so a trusted conductor stays metal.
+    complement = tree.nodes.new("ShaderNodeMath")
+    complement.operation = "SUBTRACT"
+    complement.name = "IR_MetalAug_complement"
+    complement.inputs[0].default_value = 1.0
+    tree.links.new(accumulator, complement.inputs[1])
+    floored = tree.nodes.new("ShaderNodeMath")
+    floored.operation = "MAXIMUM"
+    floored.name = "IR_MetalAug_floor"
+    floored.use_clamp = True
+    tree.links.new(complement.outputs[0], floored.inputs[0])
+    floored.inputs[1].default_value = float(coefficients["metallic_floor"])
+
+    # Authored coverage stays the authority on *where* metal is: multiplying by
+    # the source socket preserves a coverage texture's geometry exactly, and is
+    # a no-op for a scalar conductor at 1.0.
+    gated = tree.nodes.new("ShaderNodeMath")
+    gated.operation = "MULTIPLY"
+    gated.name = "IR_MetalAug_coverage_gate"
+    gated.use_clamp = True
+    tree.links.new(floored.outputs[0], gated.inputs[0])
+    tree.links.new(base_metallic, gated.inputs[1])
+
+    record = ir_metallic_composition.augmentation_record(
+        policy=policy, policy_digest=policy_digest, coefficients=coefficients,
+        composition=composition, seed=int(dataset_seed), slot_seed=material_seed,
+        source_family=str(source_family),
+        source_representation="spatial_texture" if source_family == "coverage_mixed" else "scalar",
+        semantic_class=str(semantic_class), source_material=str(source_material),
+    )
+    record["modified_channels"] = ["metallic"]
+    record["unmodified_channels_note"] = (
+        "roughness and base_color are read as inputs and left authored; "
+        "roughness is the primary research target and must not be perturbed"
+    )
+    return gated.outputs[0], record
+
+
 def _make_material(
     *, stage1_dir: Path, unit: dict, slot: int, source_material: str,
     semantic_class: str, material_id: int, luminance_scale: float, luminance_bias: float,
     structural_binding: dict | None = None, prop_binding: dict | None = None, scene_id: str = "",
+    metallic_augmentation_policy: dict | None = None, metallic_augmentation_digest: str = "",
+    dataset_seed: int = 0,
 ) -> tuple[object, dict]:
     decision = material_normalization_record(unit, source_material, semantic_class, slot=slot)
     material = bpy.data.materials.new(f"IRPBR::{unit['id']}::{slot:03d}")
@@ -543,6 +752,33 @@ def _make_material(
         rough_source = f"surrogate_max_{SURROGATE_MIN_ROUGHNESS:g}"
         metallic_source = "surrogate_zero"
 
+    # The v2 contract is resolved here rather than after the AOVs because its
+    # family is what decides whether this slot may be augmented at all.  It is
+    # computed exactly once and reused for the AOV block below.
+    metallic_contract = _effective_metallic_contract(
+        unit=unit, slot=slot, source_material=source_material,
+        semantic_class=semantic_class, metallic_source=metallic_source,
+        structural_binding=structural_binding, prop_binding=prop_binding,
+        legacy_fractional_normalization=legacy_fractional_normalization,
+    )
+    source_metallic_socket = effective_metallic
+    metallic_augmentation = None
+    if metallic_augmentation_policy is not None and semantic_class not in SEMANTIC_SURROGATES:
+        effective_metallic, metallic_augmentation = _augmented_metallic_socket(
+            tree, base_metallic=effective_metallic, roughness=effective_roughness,
+            base_color_rgb=effective_base_color_rgb,
+            source_family=str(metallic_contract.get("family") or ""),
+            unit=unit, slot=slot, source_material=source_material,
+            semantic_class=semantic_class, policy=metallic_augmentation_policy,
+            policy_digest=metallic_augmentation_digest, dataset_seed=dataset_seed,
+            scene_id=scene_id,
+        )
+        if metallic_augmentation is not None:
+            metallic_contract = wrap_continuous_metallic_contract(
+                metallic_contract, metallic_augmentation,
+            )
+            metallic_source = f"metallic_composition::{metallic_source}"
+
     band = tree.nodes.new("ShaderNodeValue")
     band.name = "IR_Band"
     band.label = "0=RGB, 1=NIR"
@@ -604,16 +840,50 @@ def _make_material(
     _aov(tree, "GT_BaseColorNIR", effective_base_color_nir, kind="COLOR")
     _aov(tree, "GT_Roughness", effective_roughness, kind="VALUE")
     _aov(tree, "GT_Metallic", effective_metallic, kind="VALUE")
-    metallic_contract = _effective_metallic_contract(
-        unit=unit, slot=slot, source_material=source_material,
-        semantic_class=semantic_class, metallic_source=metallic_source,
-        structural_binding=structural_binding, prop_binding=prop_binding,
-        legacy_fractional_normalization=legacy_fractional_normalization,
-    )
     family = str(metallic_contract["family"])
-    family_id = METALLIC_FAMILY_IDS[family]
-    family_membership = _value_constant(tree, float(family in {"conductor", "coverage_mixed"}))
-    exposed_metal = effective_metallic if family == "coverage_mixed" else family_membership
+    # An augmented slot keeps the conductor identity of the family it came from,
+    # so metal_coverage_mask stays the same binary membership mask it always was.
+    membership_family = (
+        str((metallic_contract.get("augmentation") or {}).get("source_family") or family)
+        if family == CONTINUOUS_METALLIC_FAMILY else family
+    )
+    # The AOV reports the *physical* family, never continuous_composite.
+    #
+    # GT_MetallicFamilyID is declared categorical_uint8 but is rendered as a
+    # filtered value pass, so a silhouette between two materials interpolates
+    # between their ids.  With ids 0..2 that already fabricated a spurious 1;
+    # emitting 3 here widened the span so every boundary manufactured both 1 and
+    # 2, measured at 0.41% of defined pixels on a QC render.  An augmented
+    # conductor is still a conductor, so reporting the source family keeps the
+    # rendered range at 0..2 and adds no new ambiguity.  That a slot was
+    # augmented is carried per-dataset by the contract's metallic_augmentation
+    # block and per-pixel by GT_MetallicSourceBinary; family id 3 remains the
+    # contract-level identity only.
+    family_id = METALLIC_FAMILY_IDS[membership_family]
+    family_membership = _value_constant(
+        tree, float(membership_family in CONDUCTOR_BEARING_FAMILIES),
+    )
+    if family == CONTINUOUS_METALLIC_FAMILY:
+        # exposed_metal_mask is documented as *effective exposed conductor
+        # coverage* and its encoding is a binary mask, so a continuous metalness
+        # is thresholded here rather than leaked through as a float.
+        threshold = tree.nodes.new("ShaderNodeMath")
+        threshold.operation = "GREATER_THAN"
+        threshold.name = "IR_MetalAug_exposed"
+        tree.links.new(effective_metallic, threshold.inputs[0])
+        threshold.inputs[1].default_value = float(
+            (metallic_augmentation or {}).get("parameters", {}).get("exposed_threshold", 0.7)
+        )
+        exposed_metal = threshold.outputs[0]
+        # The pre-augmentation binary, so a label ablation needs no second render.
+        _aov(tree, "GT_MetallicSourceBinary", source_metallic_socket, kind="VALUE")
+    else:
+        # A coated conductor's authored level *is* its exposed fraction -- a
+        # 0.15 appliance shell is not fully exposed metal -- so it leaks the
+        # effective value the way a coverage texture does.
+        exposed_metal = (effective_metallic
+                         if family in {"coverage_mixed", COATED_CONDUCTOR_FAMILY}
+                         else family_membership)
     _aov(tree, "GT_MetallicFamilyID", _value_constant(tree, float(family_id)), kind="VALUE")
     _aov(tree, "GT_MetalCoverage", family_membership, kind="VALUE")
     _aov(tree, "GT_ExposedMetal", exposed_metal, kind="VALUE")
@@ -786,17 +1056,25 @@ def _ceiling_height(room: dict) -> tuple[float, str]:
 
 def _install_ambient_fill(args: argparse.Namespace) -> dict:
     rooms = _room_bounds(args.room_manifest.resolve() if args.room_manifest else None)
+    addressable = str(getattr(args, "fixture_policy", "legacy_disable_v1")) == "addressable_v2"
     source_audit = []
+    fixtures: list[dict] = []
     for obj in list(bpy.data.objects):
         if obj.type != "LIGHT" or obj.name == "__ir_nir_flash" or obj.name.startswith("__ir_ambient_fill_"):
             continue
         point = obj.matrix_world.translation
-        in_room = any(
-            room["bounds_xy"][0] <= point.x <= room["bounds_xy"][2]
-            and room["bounds_xy"][1] <= point.y <= room["bounds_xy"][3]
-            and point.z > 1.5
-            for room in rooms
+        # Room bounds are widened by a margin at every height: traversable
+        # bounds are inset by the robot radius and the furniture footprint, and
+        # both a ceiling light over unwalkable floor and a table lamp standing
+        # on the furniture that caused the inset are legitimately indoors.
+        margin = ir_indoor_fixtures.ROOM_MARGIN_M
+        room_id = next(
+            (str(room["room_id"]) for room in rooms
+             if room["bounds_xy"][0] - margin <= point.x <= room["bounds_xy"][2] + margin
+             and room["bounds_xy"][1] - margin <= point.y <= room["bounds_xy"][3] + margin),
+            "",
         )
+        in_room = bool(room_id) and point.z > 1.5
         preserve = obj.data.type == "AREA" and in_room
         source_audit.append({
             "object": obj.name, "type": obj.data.type, "energy_before": float(obj.data.energy),
@@ -804,9 +1082,47 @@ def _install_ambient_fill(args: argparse.Namespace) -> dict:
             "valid_room_ceiling_area": bool(preserve),
             "policy": "preserved" if preserve else "disabled_variance_source",
         })
-        if not preserve:
-            obj.hide_render = True
-            obj.data.energy = 0.0
+        if not addressable:
+            if not preserve:
+                obj.hide_render = True
+                obj.data.energy = 0.0
+            continue
+
+        # Addressable policy: classify by height and room membership rather than
+        # by lamp type, so a POINT lamp at ceiling height stays a ceiling light
+        # instead of being deleted for having the wrong datablock.
+        group = ir_indoor_fixtures.classify_fixture(
+            blender_type=str(obj.data.type),
+            position_z_m=float(point.z),
+            in_traversable_room=bool(room_id),
+            spot_size_deg=(math.degrees(float(obj.data.spot_size))
+                           if obj.data.type == "SPOT" else None),
+        )
+        base_energy = float(obj.data.energy)
+        base_color = [float(v) for v in obj.data.color]
+        fid = ir_indoor_fixtures.fixture_id(group=group, room_id=room_id, object_name=obj.name)
+        obj.data["ir_fixture_id"] = fid
+        obj.data["ir_fixture_group"] = group
+        obj.data["ir_fixture_room_id"] = room_id
+        obj.data["ir_base_energy_w"] = base_energy
+        obj.data["ir_base_color"] = base_color
+        # A POINT lamp rendered at zero radius throws fireflies once it is
+        # actually switched on, so give it a small physical size.
+        if obj.data.type == "POINT" and float(getattr(obj.data, "shadow_soft_size", 0.0)) < 1e-4:
+            obj.data.shadow_soft_size = 0.05
+        # Every addressable fixture starts off.  A condition turns it on
+        # explicitly, so a run that requests no fixture spec reproduces the
+        # legacy single-softbox lighting exactly.
+        obj.hide_render = True
+        obj.data.energy = 0.0
+        obj.lightgroup = f"DATASET_FIXTURE_{group.upper()}"
+        fixtures.append({
+            "fixture_id": fid, "object": obj.name, "group": group, "room_id": room_id,
+            "blender_type": str(obj.data.type), "base_energy_w": base_energy,
+            "base_color_linear_rgb": base_color,
+            "world_position": [float(value) for value in point],
+            "legacy_v1_action": "preserved" if preserve else "disabled_variance_source",
+        })
 
     panels = []
     for room in rooms:
@@ -838,6 +1154,20 @@ def _install_ambient_fill(args: argparse.Namespace) -> dict:
             obj.location = (x, y, panel_z)
             obj.rotation_euler = (0.0, 0.0, 0.0)  # Blender AREA emits along local -Z.
             obj.lightgroup = "DATASET_AMBIENT_FILL"
+            if addressable:
+                fid = ir_indoor_fixtures.fixture_id(
+                    group="ambient_fill", room_id=str(room["room_id"]), object_name=name)
+                data["ir_fixture_id"] = fid
+                data["ir_fixture_group"] = "ambient_fill"
+                data["ir_fixture_room_id"] = str(room["room_id"])
+                data["ir_base_color"] = [1.0, 0.93, 0.82]
+                fixtures.append({
+                    "fixture_id": fid, "object": name, "group": "ambient_fill",
+                    "room_id": str(room["room_id"]), "blender_type": "AREA",
+                    "base_energy_w": float(args.ambient_fill_energy),
+                    "base_color_linear_rgb": [1.0, 0.93, 0.82],
+                    "world_position": [x, y, panel_z], "legacy_v1_action": "synthetic",
+                })
             panels.append({
                 "object": name, "room_id": room["room_id"], "position": [x, y, panel_z],
                 "size_m": [side_x, side_y], "energy_w": float(args.ambient_fill_energy),
@@ -852,6 +1182,20 @@ def _install_ambient_fill(args: argparse.Namespace) -> dict:
         "ceiling_gap_m": float(args.ambient_fill_ceiling_gap),
         "light_group": "DATASET_AMBIENT_FILL",
         "rooms": rooms, "panels": panels, "source_lights": source_audit,
+        **({"indoor_fixture_rig": {
+            "schema": ir_indoor_fixtures.FIXTURE_RIG_SCHEMA,
+            "policy": "addressable_indoor_fixture_v2",
+            "classifier_version": ir_indoor_fixtures.CLASSIFIER_VERSION,
+            "legacy_equivalent_policy": "preserve_valid_room_ceiling_area_disable_other_light_objects",
+            "switchable_groups": list(ir_indoor_fixtures.SWITCHABLE_GROUPS),
+            "portal_authority": "external_hdri_recipe_only",
+            "color_temperature_model": ir_indoor_fixtures.COLOR_TEMPERATURE_MODEL,
+            "default_state": "all_addressable_fixtures_off",
+            "group_counts": {g: sum(1 for f in fixtures if f["group"] == g)
+                             for g in sorted({f["group"] for f in fixtures})},
+            "fixtures": sorted(fixtures, key=lambda row: row["fixture_id"]),
+            "rig_digest": ir_indoor_fixtures.rig_digest(fixtures),
+        }} if addressable else {}),
     }
 
 
@@ -904,6 +1248,25 @@ def main() -> int:
     stage1_dir = args.stage1_dir.resolve()
     manifest, units, digest_paths = _unit_states(stage1_dir)
     semantic = _semantic_index(args.semantic_regions.resolve() if args.semantic_regions else None)
+    # Continuous metalness is strictly opt-in.  With the flag absent the policy
+    # stays None, no augmentation node is built, and the emitted contract has no
+    # extra key -- so material_contract_digest, and every dataset fingerprint
+    # derived from it, is unchanged.
+    metallic_policy = None
+    metallic_policy_digest = ""
+    if args.metallic_augmentation_policy:
+        policy_path = args.metallic_augmentation_policy.resolve()
+        metallic_policy = json.loads(policy_path.read_text(encoding="utf-8"))
+        if metallic_policy.get("schema") != ir_metallic_composition.POLICY_SCHEMA:
+            raise RuntimeError(
+                f"unsupported metallic composition policy: {metallic_policy.get('schema')}"
+            )
+        metallic_policy_digest = ir_metallic_composition.stable_digest(metallic_policy)
+        # Deliberately NOT appended to digest_paths: the wrapper reconstructs
+        # that list independently, so adding a file here silently defeats its
+        # reuse check.  The policy is bound to the contract through
+        # metallic_augmentation.policy_sha256 instead, and the contract's own
+        # sha256 is already part of the dataset fingerprint.
     structural_manifest = None
     structural_bindings = {}
     prop_manifest = None
@@ -914,7 +1277,12 @@ def main() -> int:
         if structural_manifest.get("schema") != "robomituba.ir_structural_rematerialization.v1":
             raise RuntimeError("unsupported structural rematerialization manifest")
         selection = structural_manifest.get("selection") or {}
-        if selection.get("policy") not in {"interior_structure_only_v1", "interior_structure_only_v2_role_curated", "interior_structure_only_v3_explicit_roles"}:
+        if selection.get("policy") not in {
+            "interior_structure_only_v1",
+            "interior_structure_only_v2_role_curated",
+            "interior_structure_only_v3_explicit_roles",
+            "interior_structure_only_v4_dielectric_loadbearing",
+        }:
             raise RuntimeError("structural rematerialization manifest lacks interior-only selection policy")
         for binding in structural_manifest.get("bindings") or []:
             if not bool((binding.get("eligibility") or {}).get("eligible")):
@@ -980,6 +1348,9 @@ def main() -> int:
                 structural_binding=binding,
                 prop_binding=prop_binding,
                 scene_id=str((structural_manifest or {}).get("child_scene_id") or manifest.get("scene_id") or ""),
+                metallic_augmentation_policy=metallic_policy,
+                metallic_augmentation_digest=metallic_policy_digest,
+                dataset_seed=int(args.metallic_augmentation_seed),
             )
             prop_row = prop_audit.get((str(unit["id"]), slot))
             if prop_row is not None:
@@ -1023,6 +1394,11 @@ def main() -> int:
     scene["ir_pseudo_nir_formula"] = PSEUDO_NIR_FORMULA_ID
     scene["ir_prepared_at"] = _utc_now()
     scene["ir_stage1_scene_id"] = str(manifest.get("scene_id") or "")
+    # The worker refuses a per-fixture recipe unless the blend it loaded carries
+    # this, so a v2 condition can never be applied to a v1-prepared scene.
+    rig = (ambient_fill or {}).get("indoor_fixture_rig") or {}
+    if rig:
+        scene["ir_indoor_fixture_rig_digest"] = str(rig.get("rig_digest") or "")
 
     counts = Counter()
     for record in records:
@@ -1062,7 +1438,13 @@ def main() -> int:
             "base_color_nir": "effective Principled Base Color selected NIR branch",
             "roughness": "effective Principled Roughness input",
             "metallic": "raw effective Principled Metallic input (linear Non-Color; no GT-only correction)",
-            "metallic_family_id": "0 dielectric; 1 conductor; 2 coverage_mixed",
+            "metallic_family_id": ("0 dielectric; 1 conductor; 2 coverage_mixed; 4 coated_conductor "
+                                   "(a curated prop finished at a fractional level; id 3 is the "
+                                   "contract-level continuous_composite and is never rendered). An augmented "
+                                   "(continuous_composite) slot reports the source family it was "
+                                   "derived from, so this pass never carries family id 3; the "
+                                   "augmentation is declared per-dataset in metallic_augmentation "
+                                   "and per-pixel by metallic_source_binary."),
             "metal_coverage_mask": "membership in a conductor or coverage-mixed material family",
             "exposed_metal_mask": "effective exposed conductor coverage; equals effective metallic for coverage_mixed",
             "normal_geometry_world": "Geometry.True Normal in world space",
@@ -1103,6 +1485,15 @@ def main() -> int:
         "external_portal_rig": external_portals,
         "illumination_manifest": (json.loads(args.illumination_manifest.read_text(encoding="utf-8")) if args.illumination_manifest and args.illumination_manifest.is_file() else None),
         "illumination_manifest_sha256": (_sha256(args.illumination_manifest) if args.illumination_manifest and args.illumination_manifest.is_file() else None),
+        **({"metallic_augmentation": {
+            "policy_id": str(metallic_policy.get("policy_id")),
+            "policy_schema": str(metallic_policy.get("policy_schema") or metallic_policy.get("schema")),
+            "policy_sha256": _sha256(args.metallic_augmentation_policy.resolve()),
+            "policy_digest": metallic_policy_digest,
+            "dataset_seed": int(args.metallic_augmentation_seed),
+            "node_graph_version": ir_metallic_composition.NODE_GRAPH_VERSION,
+            "modified_channels": ["metallic"],
+        }} if metallic_policy is not None else {}),
         "counts": dict(counts),
         "render_visibility_contract": {
             "policy": "stage1_authority_or_hidden_v1",

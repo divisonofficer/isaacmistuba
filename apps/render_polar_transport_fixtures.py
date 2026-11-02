@@ -44,9 +44,13 @@ def _scene_xml(body: str) -> str:
 
 
 def _stokes_stats(path: Path) -> dict[str, float | int]:
-    arrays = np.load(path / "stokes_data.npz")
-    s0 = np.asarray(arrays["s0_l"], dtype=np.float64)
-    dop = np.asarray(arrays["dop"], dtype=np.float64)
+    from mitsuba_converter.multimodal import load_stokes_rgb_channels
+    arrays = load_stokes_rgb_channels(path / "stokes_data.npz")
+    weights = np.asarray([0.2126, 0.7152, 0.0722], dtype=np.float64)
+    s0 = np.tensordot(arrays["s0"], weights, axes=([2], [0]))
+    s1 = np.tensordot(arrays["s1"], weights, axes=([2], [0]))
+    s2 = np.tensordot(arrays["s2"], weights, axes=([2], [0]))
+    dop = np.sqrt(np.maximum(0.0, s1 * s1 + s2 * s2)) / np.maximum(s0, 1e-8)
     finite = np.isfinite(s0) & np.isfinite(dop)
     return {
         "finite_ratio": float(finite.mean()),

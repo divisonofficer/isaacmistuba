@@ -1,0 +1,11 @@
+"""Read-only original sky parameters and captured HDR radiance peaks; no guessed light alignment."""
+import bpy,json,hashlib,numpy as np
+from pathlib import Path
+root=Path(__file__).resolve().parents[3];src=root/'out/infinigen_v2/kr_commercial_office_floor_02_48712502/full/scene_candidate_r83.blend';ref=root/'data/venue_refs/floor_plans_v3/commercial_office_floor_02'
+with bpy.data.libraries.load(str(src),link=False) as (a,b):b.worlds=[n for n in a.worlds if n=='World']
+assert len(b.worlds)==1;world=b.worlds[0];rows=[];skies=[]
+for node in world.node_tree.nodes:
+ if node.type=='TEX_SKY':skies.append({'node':node.name,'sky_type':node.sky_type,**{k:getattr(node,k) for k in ['sun_disc','sun_elevation','sun_rotation','sun_size','sun_intensity']}})
+ if node.type!='TEX_ENVIRONMENT' or not node.image:continue
+ im=node.image;w,h=im.size;buf=np.empty(w*h*4,dtype=np.float32);im.pixels.foreach_get(buf);rgb=buf.reshape(h,w,4)[:,:,:3];lum=rgb@np.array([.2126,.7152,.0722],dtype=np.float32);assert np.isfinite(lum).all();mx=float(lum.max());ys,xs=np.where(lum>=mx*.5);weights=lum[ys,xs].astype(float);u=(xs+.5)/w;v=(ys+.5)/h;phase=np.arctan2(np.sum(np.sin(2*np.pi*u)*weights),np.sum(np.cos(2*np.pi*u)*weights));u0=float((phase/(2*np.pi))%1);v0=float(np.average(v,weights=weights));rows.append({'node':node.name,'image':im.name,'dimensions':[w,h],'colorspace':im.colorspace_settings.name,'maximum_linear_luminance':mx,'median_linear_luminance':float(np.median(lum)),'percentile99_9_luminance':float(np.percentile(lum,99.9)),'above_half_max_pixels':len(xs),'above_half_max_fraction':len(xs)/(w*h),'weighted_peak_uv_bottom_origin':[u0,v0],'peak_y_range_pixels':[int(ys.min()),int(ys.max())],'scope':'Brightest HDR region only;not automatically a sun disc. UV israwimage coordinates,world azimuth/yaw sign notyet calibrated. No geometry/material/light changes.'})
+assert rows;(ref/'hdr_luminance_probe_r83.json').write_text(json.dumps({'source':str(src),'source_sha256':hashlib.sha256(src.read_bytes()).hexdigest(),'original_sky_nodes':skies,'captured_environment_radiance':rows,'photorealism_accepted':False,'scope':'Read-only radiometric evidence tochoose nextlight-direction experiment,not an orientation orphotographic pass.'},indent=2)+'\n');print('Measured actual saved sky parameters andHDR radiance peaks',flush=True)

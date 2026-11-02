@@ -1,0 +1,9 @@
+"""Bound body-surface distance to real wire centreline with Lipschitz sampling margin."""
+import bpy,json,math,numpy as np,argparse
+from pathlib import Path
+from mathutils import Vector
+from mathutils.bvhtree import BVHTree
+ROOT=Path(__file__).resolve().parents[3];ref=ROOT/'data/venue_refs/floor_plans_v3/dual_unit_residential_floor_03';parser=argparse.ArgumentParser();parser.add_argument('--artifact',default='supported_constraints_pattern0.npz');parser.add_argument('--out',default='supported_constraints_wire_audit.json');args=parser.parse_args();path=ref/args.artifact;d=np.load(path,allow_pickle=True);points=[Vector(v) for v in d['vertices']];faces=[[int(i) for i in f] for f in d['faces']];tree=BVHTree.FromPolygons(points,faces);rows=[];radius=.0022;step=.0005
+for a,b in [((-.18,0,-.075),(0,0,0)),((0,0,0),(.18,0,-.075)),((.18,0,-.075),(-.18,0,-.075))]:
+ a,b=Vector(a),Vector(b);length=(b-a).length;n=math.ceil(length/step);nearest=min(tree.find_nearest(a.lerp(b,k/n))[3] for k in range(n+1));lower_bound=nearest-length/n/2;rows.append({'start':list(a),'end':list(b),'minimum_sampled_surface_distance_m':nearest,'conservative_surface_distance_lower_bound_m':lower_bound,'wire_radius_m':radius,'surface_penetration_demonstrated':nearest<radius,'clearance_proven_by_distance_bound':lower_bound>=radius+.0002})
+result={'artifact':str(path),'scope':'Single prototype exact local body triangles against3wire segments of2.2mm radius. Nearest surface distance sampled at<=0.5mm;half sample step subtracted as Lipschitz lower bound. Does not prove self-intersection-free cloth or photo realism.','segments':rows,'penetration_demonstrated':any(x['surface_penetration_demonstrated'] for x in rows),'wire_clearance_proven':all(x['clearance_proven_by_distance_bound'] for x in rows)};(ref/args.out).write_text(json.dumps(result,indent=2));print(json.dumps(result,indent=2))

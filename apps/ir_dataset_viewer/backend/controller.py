@@ -42,13 +42,19 @@ DENSITIES = {"model_house", "normal_lived_in", "family_home", "storage_heavy"}
 # navigation_dataset.ir_principled.STAGE2_COMPILER_VERSION.  The controller is
 # intentionally importable without the navigation package on PYTHONPATH.
 STAGE2_COMPILER_VERSION = "ir-principled-stage2-v12-render-visibility-contract"
+# Likewise navigation_dataset.ir_principled.PSEUDO_NIR_FORMULA_ID.  The albedo
+# is compiled into the blend, so a Stage 2 built against an older formula has
+# to read stale even when everything else about it still matches.
+PSEUDO_NIR_FORMULA_ID = "pseudo_monotone_gamma_bt601_v2"
 IR_GRAPH_DEFAULTS = {
     "graph_max_nodes": 70,
     "graph_heading_count": 24,
     "graph_min_node_spacing": 0.25,
     "graph_robot_radius": 0.30,
 }
-STAGES = ("generate", "showcase_composition", "import", "scene_content_audit", "navigation_compile", "material_extract", "material_canonicalize", "showcase_raster_probe", "showcase_acceptance", "view_probe", "lighting_asset_audit", "view_plan", "scene_quality_gate", "geometry", "structural_rematerialize", "structural_quality_audit", "prop_pbr_remediate", "overview_proxy", "principled_prepare", "material_mix_audit", "qc_render", "qc_verify", "full_render", "nir_passive_backfill", "full_verify", "dataset_utility_audit", "publish")
+FREE_CAMERA_POLICY = "object_orbit_6dof_v1"
+FREE_PAIRING_POLICY = "variation_subset_v3"
+STAGES = ("generate", "showcase_composition", "import", "scene_content_audit", "navigation_compile", "material_extract", "material_canonicalize", "showcase_raster_probe", "showcase_acceptance", "view_probe", "object_anchors", "camera_6dof_sample", "lighting_asset_audit", "view_plan", "scene_quality_gate", "geometry", "structural_rematerialize", "structural_quality_audit", "prop_pbr_remediate", "overview_proxy", "principled_prepare", "material_mix_audit", "qc_render", "qc_verify", "full_render", "nir_passive_backfill", "full_verify", "dataset_utility_audit", "publish")
 TERMINAL = {"succeeded", "failed", "cancelled", "interrupted"}
 GPU_STAGES = frozenset({"qc_render", "full_render", "nir_passive_backfill"})
 INFINIGEN_GENERATE_STAGES = frozenset({"generate"})
@@ -158,6 +164,31 @@ def _showcase_composition_seed(effective_scene_seed: str, composition_attempt: i
 
 def _showcase_import_name(effective_scene_seed: str, variation_id: int, composition_attempt: int) -> str:
     return f"irshowcase_{effective_scene_seed}_v{int(variation_id):02d}_c{int(composition_attempt):02d}"
+
+
+#: Written when the pool is deliberately narrowed so the narrowing survives a
+#: relaunch.  The environment variable alone made the restriction a property of
+#: one shell: sharing this machine with two other render drivers, a restart
+#: without the variable silently reverted to all eight devices and leased into
+#: their pool with nothing to stop it.  A split held by whoever remembers to
+#: export a variable is not held at all.
+GPU_POOL_LOCK_NAME = "gpu_pool.lock.json"
+
+
+def _gpu_pool_lock(work_root: Path) -> list[int] | None:
+    """Persisted pool restriction, or None when the machine is ours alone."""
+    path = Path(work_root) / GPU_POOL_LOCK_NAME
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+    values = sorted({int(v) for v in payload.get("gpu_indices") or []})
+    return values if values and values[0] >= 0 else None
+
+
+def _stable_seed(text: str) -> int:
+    """A per-scene seed that survives restarts and never collides by accident."""
+    return int(hashlib.sha256(str(text).encode("utf-8")).hexdigest()[:8], 16)
 
 
 def _gpu_pool_env(name: str = "ROBOMITUBA_IR_GPU_INDICES", default: str = "0,1,2,3,4,5,6,7") -> list[int]:
@@ -273,7 +304,14 @@ class IRDatasetController:
         # tokens which can affect it; terminal jobs then cost only a handful of
         # stat calls per status request instead of megabytes of JSON parsing.
         self._stage_progress_cache: dict[str, tuple[tuple[tuple[str, int, int], ...], dict[str, dict[str, Any]]]] = {}
+        # The lock file narrows the pool and is never allowed to widen it: an
+        # explicit environment setting still wins when it asks for less.
         self.gpu_pool = _gpu_pool_env()
+        locked = _gpu_pool_lock(self.work_root)
+        if locked is not None:
+            kept = [gpu for gpu in self.gpu_pool if gpu in locked]
+            if kept:
+                self.gpu_pool = kept
         self.bootstrap_concurrency = _positive_env("ROBOMITUBA_BLENDER_BOOTSTRAP_CONCURRENCY", 4)
         self.bake_concurrency = _positive_env("ROBOMITUBA_BLENDER_BAKE_CONCURRENCY", 2)
         self.prepare_concurrency = _positive_env("ROBOMITUBA_BLENDER_PREPARE_CONCURRENCY", 2)
@@ -461,10 +499,16 @@ class IRDatasetController:
         """Supply v1 controller snapshots with immutable render-plan defaults."""
         request.setdefault("pose_budget", 400)
         request.setdefault("illumination_diversity", False)
+        request.setdefault("metallic_augmentation", False)
+        request.setdefault("metallic_augmentation_seed", 0)
         # New jobs opt into the paired NIR observation contract.  Legacy
         # snapshots stay false so their active-NIR fingerprints and completed
         # frames remain resumable without an implicit rerender.
         request.setdefault("nir_passive", False)
+        # Persisted pre-compaction jobs keep their historical float32/full
+        # artifact contract. New submissions choose the compact core profile
+        # below; never silently change an interrupted job's fingerprint.
+        request.setdefault("storage_profile", "legacy_full_float32_v1")
         request.setdefault("paired_fraction", 0.25)
         # A lighting-expanded frame count is not a substitute for spatial
         # coverage.  New jobs must therefore have at least 100 distinct
@@ -504,6 +548,8 @@ class IRDatasetController:
             paths.setdefault("render_plan", str(Path(pipeline) / "render_plan.json"))
             paths.setdefault("qc_render_plan", str(Path(pipeline) / "qc_render_plan.json"))
             paths.setdefault("candidate_visibility", str(Path(pipeline) / "candidate_visibility.json"))
+            paths.setdefault("object_anchors", str(Path(pipeline) / "object_anchors.json"))
+            paths.setdefault("free_camera_poses", str(Path(pipeline) / "free_camera_poses.json"))
             paths.setdefault("content_audit", str(Path(pipeline) / "scene_content_audit.json"))
             paths.setdefault("overview_proxy", str(Path(pipeline) / "overview_proxy"))
             paths.setdefault("illumination_audit", str(Path(pipeline) / "illumination_asset_audit.json"))
@@ -539,7 +585,8 @@ class IRDatasetController:
         if (not request.get("illumination_diversity")
                 or job.status == "succeeded"
                 or request.get("source_mode") == "nir_passive_backfill"
-                or request.get("illumination_pairing_policy") == "reference_subset_v2"
+                or request.get("illumination_pairing_policy") in {"reference_subset_v2",
+                                                                  FREE_PAIRING_POLICY}
                 or job.stage in {"qc_render", "full_render"}):
             return
         paths = request.get("paths") or {}
@@ -594,7 +641,13 @@ class IRDatasetController:
         if job.request.get("source_mode") == "nir_passive_backfill":
             return ["nir_passive_backfill"]
         if job.request.get("source_mode") == "augmentation":
-            stages = ["lighting_asset_audit", "view_plan"]
+            # The 6-DoF universe is derived from the authoring map, not from
+            # Stage 1, so it re-derives cheaply on top of a reused geometry
+            # bake -- which is the whole point of augmenting rather than
+            # regenerating a scene.
+            stages = (["object_anchors", "camera_6dof_sample"]
+                      if job.request.get("camera_policy") == FREE_CAMERA_POLICY else [])
+            stages += ["lighting_asset_audit", "view_plan"]
             if job.request.get("structural_rematerialize"):
                 stages += ["structural_rematerialize", "structural_quality_audit"]
             if job.request.get("hybrid_prop_pbr"):
@@ -616,6 +669,15 @@ class IRDatasetController:
             stages = [stage for stage in stages if stage != "lighting_asset_audit"]
         if job.request.get("pipeline_revision") != "ir-content-aware-v2":
             stages = [stage for stage in stages if stage not in {"scene_content_audit", "view_probe", "scene_quality_gate", "material_mix_audit", "dataset_utility_audit"}]
+        if job.request.get("camera_policy") == FREE_CAMERA_POLICY:
+            # The graph is no longer the pose universe: view_probe walks
+            # graph.nodes[*].headings, which a free-pose plan does not have.
+            # navigation_compile stays -- its traversability grid still backs
+            # the overview preview and the OpticalNav export tree.
+            stages = [stage for stage in stages if stage != "view_probe"]
+        else:
+            stages = [stage for stage in stages
+                      if stage not in {"object_anchors", "camera_6dof_sample"}]
         if job.request.get("ir_composition_profile") != SHOWCASE_PROFILE:
             stages = [stage for stage in stages if stage not in {"showcase_composition", "showcase_raster_probe", "showcase_acceptance"}]
         if job.request.get("content_profile") != "research_balanced" or job.request.get("source_mode") != "generate":
@@ -924,17 +986,33 @@ class IRDatasetController:
             "source_mode": mode, "dataset_name": dataset_name,
             "gpu_indices": list(self.gpu_pool), "requested_gpu_indices": gpu_indices,
             "pipeline_revision": "ir-content-aware-v2", "import_profile": "ir-bootstrap-v1",
-            "width": int(raw.get("width", 684)), "height": int(raw.get("height", 512)),
-            "fov": float(raw.get("fov", 60.0)), "rgb_spp": int(raw.get("rgb_spp", 4000)),
+            # 720x540 at a 60 degree horizontal fov: the worker renders with
+            # sensor_fit=HORIZONTAL, so `fov` is already the horizontal angle.
+            # Existing datasets keep whatever their own request recorded.
+            "width": int(raw.get("width", 720)), "height": int(raw.get("height", 540)),
+            # JAI FS-1600, 1/2.9" sensor (1440x1080 at 3.45 um = 4.968 x 3.726 mm)
+            # behind a 6 mm lens: 44.98 deg horizontal, 34.50 vertical. The render
+            # aspect 720x540 already matches the sensor 4:3 exactly.
+            "fov": float(raw.get("fov", 44.98)), "rgb_spp": int(raw.get("rgb_spp", 4000)),
             "nir_spp": int(raw.get("nir_spp", 2000)), "flash_energy_scale": float(raw.get("flash_energy_scale", 1.0)),
             "ambient_fill_energy_scale": float(raw.get("ambient_fill_energy_scale", 1.0)),
             "illumination_diversity": bool(raw.get("illumination_diversity", False)),
+            "metallic_augmentation": bool(raw.get("metallic_augmentation", False)),
+            "metallic_augmentation_seed": int(raw.get("metallic_augmentation_seed", 0) or 0),
             "nir_passive": bool(raw.get("nir_passive", True)),
+            "storage_profile": str(raw.get("storage_profile") or "core_half_exr_v2"),
             "paired_fraction": float(raw.get("paired_fraction", 0.20)),
             "illumination_pairing_policy": str(raw.get("illumination_pairing_policy") or "reference_subset_v2"),
             "min_unique_pose_count": int(raw.get("min_unique_pose_count", 100)),
             "pose_budget": int(raw.get("pose_budget", 400)),
             "camera_policy": str(raw.get("camera_policy") or "content_aware_v2"),
+            "illumination_bank_version": str(raw.get("illumination_bank_version") or "v1"),
+            # OpenImageDenoise on the beauty passes.  Off by default so no
+            # existing dataset's fingerprint moves; the queue records it in
+            # dataset_config, so a denoised and a raw render never adopt each
+            # other's frames.
+            "denoise": bool(raw.get("denoise", False)),
+            "variation_pose_count": int(raw.get("variation_pose_count") or 10),
             "content_profile": str(raw.get("content_profile") or "balanced"),
             "placement_profile": str(raw.get("placement_profile") or "legacy_clutter_v1"),
             "ir_composition_profile": str(raw.get("ir_composition_profile") or ""),
@@ -957,21 +1035,38 @@ class IRDatasetController:
             "small_high_poly_max_extent_m": float(raw.get("small_high_poly_max_extent_m", 0.5)),
             "small_high_poly_min_triangles": int(raw.get("small_high_poly_min_triangles", 100000)),
         }
+        # core_half_exr_v1 omitted pre-albedo diffuse diagnostics.  Preserve it
+        # only for existing immutable jobs; every new submission is upgraded.
+        if request["storage_profile"] == "core_half_exr_v1":
+            request["storage_profile"] = "core_half_exr_v2"
         if request["width"] < 1 or request["height"] < 1 or request["rgb_spp"] < 1 or request["nir_spp"] < 1 or not 1 <= request["fov"] < 179 or not 100 <= request["pose_budget"] <= 2000:
             raise ValueError("invalid render dimensions, samples, or horizontal FOV")
+        if request["storage_profile"] not in {"legacy_full_float32_v1", "core_half_exr_v1", "core_half_exr_v2", "diagnostic_half_exr_v1"}:
+            raise ValueError("invalid storage_profile")
         if not 0.05 <= request["paired_fraction"] <= 1.0:
             raise ValueError("paired fraction must be in [0.05, 1.0]")
-        if request["illumination_pairing_policy"] not in {"legacy_six_way_v1", "reference_subset_v2"}:
+        if request["illumination_pairing_policy"] not in {"legacy_six_way_v1", "reference_subset_v2", FREE_PAIRING_POLICY}:
             raise ValueError("invalid illumination pairing policy")
         if not 1 <= request["min_unique_pose_count"] <= request["pose_budget"]:
             raise ValueError("min_unique_pose_count must be between 1 and pose_budget")
-        if request["camera_policy"] not in {"content_aware_v2", "coverage_v1"} or request["content_profile"] not in {"balanced", "anchor_rich", "structural", "research_balanced"}:
+        if request["illumination_bank_version"] not in {"v1", "v2"}:
+            raise ValueError("illumination_bank_version must be v1 or v2")
+        if request["camera_policy"] == FREE_CAMERA_POLICY:
+            # The 6-DoF universe carries its own lighting contract; pairing a
+            # v1 bank with it would silently drop the per-fixture variation
+            # that is half the point of the new rule.
+            if request["illumination_bank_version"] != "v2":
+                raise ValueError(f"{FREE_CAMERA_POLICY} requires illumination_bank_version v2")
+            if request.get("illumination_pairing_policy") != FREE_PAIRING_POLICY:
+                raise ValueError(f"{FREE_CAMERA_POLICY} requires {FREE_PAIRING_POLICY}")
+        if request["camera_policy"] not in {"content_aware_v2", "coverage_v1", FREE_CAMERA_POLICY} or request["content_profile"] not in {"balanced", "anchor_rich", "structural", "research_balanced"}:
             raise ValueError("invalid camera or content policy")
         if request["placement_profile"] not in {"legacy_clutter_v1", "upstream_residential_v1", "collision_aware_clutter_v1"}:
             raise ValueError("invalid Infinigen placement profile")
         if request["ir_composition_profile"] not in {"", SHOWCASE_PROFILE}:
             raise ValueError("invalid IR composition profile")
-        if request["ir_material_profile"] not in {"standard", "principled_rich_v1"}:
+        if request["ir_material_profile"] not in {"standard", "principled_rich_v1",
+                                                  "principled_rich_v2"}:
             raise ValueError("invalid IR material profile")
         if request["material_mix_profile"] != METAL_PROFILE or not 1 <= request["max_quality_variations"] <= 5 or not 1 <= request["max_showcase_composition_attempts"] <= 3:
             raise ValueError("invalid material-mix profile or quality variation limit")
@@ -985,6 +1080,9 @@ class IRDatasetController:
             request.update({"structural_pbr_registry": str(registry.resolve()),
                             "structural_pbr_registry_root": str(registry_root.resolve()),
                             "material_variant_id": self._safe_name(raw.get("material_variant_id") or "variant", "material_variant_id"),
+                            # Filled in from the scene id below, once that is
+                            # resolved.  Left at the old default of 0 here so a
+                            # caller can still pin it explicitly.
                             "material_seed": int(raw.get("material_seed") or 0),
                             "parent_scene_id": str(raw.get("parent_scene_id") or "")})
         if not 0.0 < request["prop_pbr_target"] <= 1.0:
@@ -1047,7 +1145,16 @@ class IRDatasetController:
             if not raw.get("prop_pbr_seed"):
                 request["prop_pbr_seed"] = int(effective_seed)
             request["scene_id_base"] = request["scene_id"]
-            if archetype == "single_room" and request["content_profile"] == "research_balanced" and not request["ir_composition_profile"]:
+            # The showcase profile composes its own camera sets from synthetic
+            # props, which is a different camera universe from the 6-DoF object
+            # orbit and mutually exclusive with it: a v5 plan carries free poses,
+            # so showcase_acceptance finds no camera sets and fails every time.
+            # Auto-enabling it for every research_balanced single room meant each
+            # 6-DoF generation burned all five variations -- roughly 25 minutes
+            # apiece -- on a profile it could never satisfy.
+            if (archetype == "single_room" and request["content_profile"] == "research_balanced"
+                    and not request["ir_composition_profile"]
+                    and str(request.get("camera_policy") or "") != FREE_CAMERA_POLICY):
                 request["ir_composition_profile"] = SHOWCASE_PROFILE
                 # Initial source + at most four regenerated variations.
                 if "max_quality_variations" not in raw:
@@ -1091,7 +1198,27 @@ class IRDatasetController:
                 raise FileNotFoundError(f"legacy dataset source graph is unavailable: {scene_id}")
             request.update({"legacy_dataset_name": legacy_name, "legacy_dataset": str(legacy), "room_type": str(raw.get("room_type") or "generic"),
                             "scene_id": self._safe_name(scene_id, "scene_id"), "illumination_diversity": True,
-                            "camera_policy": "coverage_v1"})
+                            # Augmentation has no visibility probe, so coverage
+                            # is the fallback -- but the free 6-DoF universe
+                            # brings its own poses and must not be overwritten.
+                            "camera_policy": (FREE_CAMERA_POLICY
+                                              if str(raw.get("camera_policy") or "") == FREE_CAMERA_POLICY
+                                              else "coverage_v1")})
+        # Seed the structural draw from the scene, which is the thing whose
+        # materials these are.  It seeds one RNG and a room has only about
+        # three shell slots, so the old default of 0 had every scene walk the
+        # identical stream: of 203 rematerialized scenes, 169 wore one of
+        # exactly two concrete textures on every wall.  Re-running the draw
+        # over 25 scenes measures it -- seed 0 gives 2 distinct wall materials,
+        # a per-scene seed gives 27 over 30 slots.
+        #
+        # It has to happen here rather than beside the registry validation,
+        # because scene_id is not resolved until the mode blocks above.  Keying
+        # on the scene rather than the dataset also means a room keeps its
+        # materials when it is re-rendered into a later batch, so two batches
+        # of the same scene stay comparable.
+        if request.get("structural_pbr_registry") and not int(raw.get("material_seed") or 0):
+            request["material_seed"] = _stable_seed(request["scene_id"])
         pipeline = self.pipeline_root / dataset_name
         if pipeline.exists():
             raise FileExistsError("pipeline artifact directory already exists; retry its original job instead")
@@ -1101,6 +1228,8 @@ class IRDatasetController:
             "prepared": str(attempt_root / "principled_stage2"), "qc": str(attempt_root / "qc_stage0"),
             "render_plan": str(attempt_root / "render_plan.json"), "qc_render_plan": str(attempt_root / "qc_render_plan.json"),
             "candidate_visibility": str(attempt_root / "candidate_visibility.json"),
+            "object_anchors": str(attempt_root / "object_anchors.json"),
+            "free_camera_poses": str(attempt_root / "free_camera_poses.json"),
             "showcase_blend": str(attempt_root / "showcase" / "composition_c00.blend"),
             "showcase_composition": str(attempt_root / "showcase" / "composition_c00.json"),
             "showcase_raster_probe": str(attempt_root / "showcase_raster_probe.json"),
@@ -1456,6 +1585,19 @@ class IRDatasetController:
                 job.external_adopted = False
                 job.status = job.stage = "cancelled"; job.finished_at = _utc()
             elif job.status == "running" and job.job_id not in self._running:
+                # `_running` is in-memory, so after a controller restart every
+                # job that survived reads "running" with no handle here. This
+                # branch used to mark such a job cancelled and never touch its
+                # process: the subprocess kept going, kept its resource slot,
+                # and the queue behind it sat in "queued" with no error anywhere
+                # -- it looked idle rather than blocked. The pid is persisted,
+                # so signal its group the way the live path does. Children are
+                # started with start_new_session, so the group is the subtree.
+                if self._pid_alive(job.pid):
+                    try:
+                        os.killpg(int(job.pid), signal.SIGTERM)
+                    except (ProcessLookupError, PermissionError, ValueError):
+                        pass
                 job.status = job.stage = "cancelled"; job.resource_state = "cancelled"; job.finished_at = _utc()
             elif job.status == "running": job.cancel.set()
             if job.status == "cancelled":
@@ -1617,13 +1759,50 @@ class IRDatasetController:
                 self._queue_corrected_replan(job)
             return self._payload(job)
 
-    def remove_terminal_job(self, job_id: str) -> dict[str, Any]:
-        """Remove a terminal card while retaining its diagnostic record off-queue.
+    def _unreferenced_removable_artifacts(self, job: ControllerJob) -> list[Path]:
+        """Return only failed-job work paths that no other controller job owns."""
+        candidates: list[Path] = []
+        paths = job.request.get("paths") or {}
+        for key in ("pipeline", "dataset"):
+            raw = paths.get(key)
+            if not raw:
+                continue
+            candidate = Path(str(raw)).resolve()
+            allowed_root = self.pipeline_root.resolve() if key == "pipeline" else self.work_root.resolve()
+            if candidate != allowed_root and allowed_root in candidate.parents and candidate.is_dir():
+                candidates.append(candidate)
+        removable: list[Path] = []
+        for candidate in candidates:
+            # A queued child may still rely on a parent Stage 1, even if the
+            # parent card is terminal. Preserve it until all references end.
+            in_use = False
+            for other in self._jobs.values():
+                if other.job_id == job.job_id:
+                    continue
+                references = list((other.request.get("paths") or {}).values())
+                references.append(other.request.get("legacy_dataset"))
+                for value in references:
+                    if not value:
+                        continue
+                    try:
+                        reference = Path(str(value)).resolve()
+                    except OSError:
+                        continue
+                    if reference == candidate or candidate in reference.parents:
+                        in_use = True
+                        break
+                if in_use:
+                    break
+            if not in_use:
+                removable.append(candidate)
+        return sorted(set(removable), key=lambda item: len(item.parts), reverse=True)
 
-        Generated/imported/pipeline artifacts are deliberately untouched.  This
-        only removes the durable controller snapshot and JSONL from the active
-        Jobs view; the archived snapshot is useful if an operator later needs
-        to inspect why a scene was rejected.
+    def remove_terminal_job(self, job_id: str, *, purge_artifacts: bool = True) -> dict[str, Any]:
+        """Remove a terminal card, retaining logs while reclaiming unused work.
+
+        Only controller-owned ``.pipeline`` and unpublished work-dataset
+        subtrees are eligible. Source Infinigen outputs, OpticalNav scenes,
+        and immutable published datasets are never deleted here.
         """
         with self._lock:
             job = self._jobs.get(job_id)
@@ -1631,10 +1810,12 @@ class IRDatasetController:
                 raise KeyError(job_id)
             if job.status not in TERMINAL or job_id in self._running:
                 raise ValueError("only a non-running terminal job can be removed")
+            purge_paths = self._unreferenced_removable_artifacts(job) if purge_artifacts else []
             archive = self.control_root.parent / "removed"
             archive.mkdir(parents=True, exist_ok=True)
             payload = job.payload()
             payload["removed_at"] = _utc()
+            payload["purged_artifacts"] = [str(path) for path in purge_paths]
             _atomic_json(archive / f"{job_id}.json", payload)
             log = self._log_path(job)
             if log.is_file():
@@ -1645,7 +1826,11 @@ class IRDatasetController:
             self._jobs.pop(job_id, None)
             self._queue = [ident for ident in self._queue if ident != job_id]
             self._stage_progress_cache.pop(job_id, None)
-            return {"job_id": job_id, "removed": True, "archive": str(archive / f"{job_id}.json")}
+            for path in purge_paths:
+                if path.exists():
+                    shutil.rmtree(path)
+            return {"job_id": job_id, "removed": True, "archive": str(archive / f"{job_id}.json"),
+                    "purged_artifacts": [str(path) for path in purge_paths]}
 
     def set_job_visibility(self, job_id: str, *, hidden: bool) -> dict[str, Any]:
         """Hide/unhide a terminal job without removing its durable history."""
@@ -1686,11 +1871,16 @@ class IRDatasetController:
                 for key in (
                     "width", "height", "fov", "rgb_spp", "nir_spp",
                     "flash_energy_scale", "ambient_fill_energy_scale",
-                    "illumination_diversity", "paired_fraction", "pose_budget",
+                    "illumination_diversity", "nir_passive", "paired_fraction",
+                    "illumination_pairing_policy", "min_unique_pose_count", "pose_budget",
                     "camera_policy", "adaptive_pose_budget", "sparse_negative_fraction",
                     "max_headings_per_node", "graph_max_nodes", "graph_heading_count",
                     "graph_min_node_spacing", "graph_robot_radius", "material_mix_profile",
-                    "ir_material_profile",
+                    "ir_material_profile", "placement_profile", "structural_rematerialize",
+                    "hybrid_prop_pbr", "prop_pbr_target", "prop_pbr_seed",
+                    "filter_small_high_poly", "small_high_poly_max_extent_m",
+                    "small_high_poly_min_triangles", "structural_pbr_registry",
+                    "structural_pbr_registry_root", "material_variant_id", "material_seed",
                 )
                 if key in parent.request
             }
@@ -1821,6 +2011,8 @@ class IRDatasetController:
             "render_plan": str(upgrade_root / "render_plan.json"),
             "qc_render_plan": str(upgrade_root / "qc_render_plan.json"),
             "candidate_visibility": str(upgrade_root / "candidate_visibility.json"),
+            "object_anchors": str(upgrade_root / "object_anchors.json"),
+            "free_camera_poses": str(upgrade_root / "free_camera_poses.json"),
             "scene_quality": str(upgrade_root / "scene_content_quality.json"),
             "material_mix": str(upgrade_root / "material_mix_quality.json"),
             "dataset": str(self.work_root / child_name),
@@ -2018,6 +2210,22 @@ class IRDatasetController:
                 from mitsuba_converter.ir_render_plan import stable_digest
                 return "verified" if audit.get("status") == "passed" and audit.get("source_authoring_map_digest") == stable_digest(authoring) else "stale"
             except (KeyError, OSError, ValueError, json.JSONDecodeError): return "missing"
+        if stage == "object_anchors":
+            try:
+                anchors = _read_json(Path(p["object_anchors"]))
+                return "verified" if anchors.get("anchor_digest") and anchors.get("anchors") else "stale"
+            except (KeyError, OSError, ValueError, json.JSONDecodeError): return "missing"
+        if stage == "camera_6dof_sample":
+            try:
+                free = _read_json(Path(p["free_camera_poses"]))
+                anchors = _read_json(Path(p["object_anchors"]))
+                authoring = _read_json(scene / "authoring_map.json")
+                from mitsuba_converter.ir_render_plan import stable_digest
+                valid = (free.get("free_pose_digest")
+                         and free.get("anchor_digest") == anchors.get("anchor_digest")
+                         and free.get("source_authoring_map_digest") == stable_digest(authoring))
+                return "verified" if valid else "stale"
+            except (KeyError, OSError, ValueError, json.JSONDecodeError): return "missing"
         if stage == "view_probe":
             try:
                 probe = _read_json(Path(p["candidate_visibility"]))
@@ -2077,7 +2285,20 @@ class IRDatasetController:
                     probe = _read_json(Path(p["showcase_raster_probe"]))
                     valid = (valid and plan.get("camera_sets", {}).get("camera_set_digest")
                              == (probe.get("camera_sets") or {}).get("camera_set_digest"))
-                if r.get("pipeline_revision") == "ir-content-aware-v2" and r.get("source_mode") != "augmentation":
+                # A v5 plan's camera universe is the 6-DoF object orbit, so the
+                # pipeline skips view_probe and never writes candidate_visibility.
+                # Requiring it here made the plan read stale the instant it was
+                # written: view_plan re-ran forever, once a minute, and no
+                # generate-mode job ever reached the Stage-1 bake.  The free-pose
+                # sampler's own digest is what binds this plan to its inputs.
+                free_pose_universe = bool(plan.get("pose_universe")) or str(
+                    plan.get("schema") or "").endswith(".v5")
+                if free_pose_universe:
+                    free = _read_json(Path(p["free_camera_poses"]))
+                    valid = (valid
+                             and (plan.get("free_poses") or {}).get("free_pose_digest")
+                             == free.get("free_pose_digest"))
+                elif r.get("pipeline_revision") == "ir-content-aware-v2" and r.get("source_mode") != "augmentation":
                     probe = _read_json(Path(p["candidate_visibility"]))
                     valid = valid and plan.get("source_visibility_digest") == probe.get("probe_digest")
                 return "verified" if valid else "stale"
@@ -2099,6 +2320,7 @@ class IRDatasetController:
                 manifest = _read_json(Path(p["structural_rematerialization"]))
                 valid = (manifest.get("schema") == "robomituba.ir_structural_rematerialization.v1"
                          and bool(manifest.get("bindings"))
+                         and manifest.get("compiler_version") == "structural-rematerialize-v4-dielectric-loadbearing"
                          and str(manifest.get("child_scene_id")) == str(r.get("scene_id")))
                 return "verified" if valid else "stale"
             except (KeyError, OSError, ValueError, json.JSONDecodeError): return "missing"
@@ -2136,8 +2358,29 @@ class IRDatasetController:
                     contract.get("schema") == "robomituba.ir_principled_material_contract.v4"
                     and contract.get("contract_version") == "blender42-principled-metallic-roughness-v4"
                     and contract.get("compiler_version") == STAGE2_COMPILER_VERSION
-                    and all((record.get("metallic_contract") or {}).get("schema") == "robomituba.metallic_contract.v2"
-                            for record in (contract.get("materials") or []))
+                    # The pseudo-NIR albedo is compiled into the blend, so a
+                    # Stage 2 built against the old formula would keep rendering
+                    # it while looking fresh.  Invalidate on the formula itself
+                    # rather than bumping the compiler version, which would
+                    # discard every Stage 2 for an unrelated reason.
+                    and ((contract.get("pseudo_nir") or {}).get("id")
+                         == PSEUDO_NIR_FORMULA_ID)
+                    # A v2 lighting bank needs the addressable fixture rig.  A
+                    # Stage 2 built without it renders nothing, so it must read
+                    # stale here rather than be reused.
+                    and (bool((contract.get("ambient_fill_rig") or {}).get("indoor_fixture_rig"))
+                         if str(r.get("illumination_bank_version") or "v1") == "v2" else True)
+                    # A Stage 2 built with the continuous-metalness policy emits
+                    # v3 records.  Accept them only when the contract itself
+                    # declares the policy, so an undeclared v3 still reads stale.
+                    and all(
+                        (record.get("metallic_contract") or {}).get("schema") in (
+                            {"robomituba.metallic_contract.v2", "robomituba.metallic_contract.v3"}
+                            if contract.get("metallic_augmentation")
+                            else {"robomituba.metallic_contract.v2"}
+                        )
+                        for record in (contract.get("materials") or [])
+                    )
                 )
                 return "verified" if valid else "stale"
             except (OSError, ValueError, json.JSONDecodeError):
@@ -2219,6 +2462,13 @@ class IRDatasetController:
         self._save(job, "recovery_queued", rerun_from=start, insert_stages=insert_stages)
         self._wake.set()
 
+    def _illumination_bank(self, job: ControllerJob) -> dict:
+        """v1 stays the default so no existing job changes bank."""
+        if str(job.request.get("illumination_bank_version") or "v1") != "v2":
+            return load_bank(self.repo_root)
+        return load_bank(self.repo_root,
+                         self.repo_root / "configs" / "ir_lighting" / "illumination_diversity_v2.json")
+
     def _build_view_plan(self, job: ControllerJob) -> None:
         path = Path(job.request["paths"]["render_plan"])
         graph = self.scene_root / job.request["scene_id"] / "viewpoint_graph.json"
@@ -2242,15 +2492,19 @@ class IRDatasetController:
             }
         else:
             provenance = None
+        free = job.request.get("camera_policy") == FREE_CAMERA_POLICY
         plan = write_render_plan(path, graph, requested_pose_count=int(job.request["pose_budget"]),
                                  seed=int(job.request.get("effective_scene_seed") or job.request.get("seed") or 20260812),
                                  scene_id=str(job.request["scene_id"]),
                                  visibility_path=Path(job.request["paths"]["candidate_visibility"])
                                  if job.request.get("camera_policy") == "content_aware_v2" else None,
+                                 free_poses_path=(Path(job.request["paths"]["free_camera_poses"])
+                                                  if free else None),
+                                 variation_pose_count=int(job.request.get("variation_pose_count") or 10),
                                  adaptive_budget=bool(job.request.get("adaptive_pose_budget")),
                                  max_headings_per_node=int(job.request.get("max_headings_per_node", 6)),
                                  sparse_fraction=float(job.request.get("sparse_negative_fraction", 0.15)),
-                                 illumination=(load_bank(self.repo_root) if job.request.get("illumination_diversity") else None),
+                                 illumination=(self._illumination_bank(job) if job.request.get("illumination_diversity") else None),
                                  paired_fraction=float(job.request.get("paired_fraction", 0.25)),
                                  illumination_pairing_policy=str(job.request.get("illumination_pairing_policy") or "legacy_six_way_v1"),
                                  min_unique_pose_count=int(job.request.get("min_unique_pose_count", 100)),
@@ -2282,8 +2536,21 @@ class IRDatasetController:
             actual_poses = int(plan.get("unique_pose_count") or plan.get("actual_pose_count") or 0)
             paired_poses = int(illumination_plan.get("paired_pose_count") or 0)
             pairing_policy = str(illumination_plan.get("pairing_policy") or "legacy_six_way_v1")
-            requested_pair_fraction = (1.0 if pairing_policy == "reference_subset_v2"
-                                       else float(job.request.get("paired_fraction", 0.25)))
+            if pairing_policy == FREE_PAIRING_POLICY:
+                # This policy sets the lighting subset as an explicit count, not
+                # a fraction of the base poses: the cost of the cross product is
+                # what is being bounded, and it does not scale with how many
+                # vantages a room happens to afford.  A fraction gate rejected a
+                # correct plan for having *more* base poses.
+                wanted = min(int(job.request.get("variation_pose_count") or 10), actual_poses)
+                if paired_poses != wanted:
+                    raise QualityGateError(
+                        "lighting variation subset size mismatch: "
+                        f"{paired_poses} != {wanted}")
+                requested_pair_fraction = 0.0
+            else:
+                requested_pair_fraction = (1.0 if pairing_policy == "reference_subset_v2"
+                                           else float(job.request.get("paired_fraction", 0.25)))
             if actual_poses and paired_poses / actual_poses + 1e-9 < requested_pair_fraction:
                 raise QualityGateError(
                     "paired lighting coverage below requested minimum: "
@@ -2386,8 +2653,38 @@ class IRDatasetController:
         # pose gates strict, while using a 2.5/m² floor to avoid wasting a
         # full Infinigen variation on that numerical boundary.
         if per_m2 < 2.5: failures.append("nonstructural_density_below_2_5_per_m2")
-        if median < 2.0: failures.append("visible_object_median_below_2")
-        if sparse > 0.150001: failures.append("sparse_pose_fraction_above_15pct")
+        # A v5 plan's poses carry no `utility`/`probe` block: the 6-DoF sampler
+        # never runs the fan probe the graph pipeline did, because a free pose
+        # only exists if it already framed an anchor's bounding box, cleared
+        # five line-of-sight rays and passed the height-aware occupancy test.
+        # Reading visible_object_count off those poses yields 0 for every one of
+        # them, so this gate failed every generate-mode v5 job on every
+        # variation until the attempt limit ran out -- and it would have failed
+        # all sixteen r13 scenes too, which rendered 2020 frames and passed
+        # human QA, had augmentation mode not skipped this stage.
+        #
+        # Gate on what the sampler does record instead. The anchor floor of 2 is
+        # the minimum any accepted scene reached (closet, 112 poses over 2
+        # anchors) and the fill band is the sampler's own FRAME_FILL_RANGE.
+        free_pose_universe = bool(plan.get("pose_universe"))
+        if free_pose_universe:
+            anchors = {str(pose.get("anchor_id") or "") for pose in poses}
+            anchors.discard("")
+            fills = sorted(float(pose.get("frame_fill_fraction") or 0.0) for pose in poses)
+            fill_median = fills[len(fills) // 2] if fills else 0.0
+            # The band is quoted at a reference FOV and scales with the lens --
+            # area fraction goes as the square of angular size over field of
+            # view. Hardcoding the 60 deg numbers here rejected scenes the
+            # sampler had just accepted through the JAI FS-1600's real 44.98 deg
+            # field, where the same framing reads as 0.078-0.583.
+            from mitsuba_converter.ir_camera_6dof import frame_fill_range
+            fill_low, fill_high = frame_fill_range(float(job.request.get("fov") or 44.98))
+            if len(anchors) < 2: failures.append("free_pose_anchor_count_below_2")
+            if not fill_low <= fill_median <= fill_high:
+                failures.append("free_pose_frame_fill_outside_band")
+        else:
+            if median < 2.0: failures.append("visible_object_median_below_2")
+            if sparse > 0.150001: failures.append("sparse_pose_fraction_above_15pct")
         report = {"schema": "robomituba.ir_scene_content_quality.v1", "profile": "research_balanced",
                   "status": "failed" if failures else "passed", "attempt": int(job.request.get("variation_id") or 0),
                   "logical_seed": job.request.get("logical_seed"), "effective_seed": job.request.get("effective_scene_seed"),
@@ -2449,6 +2746,13 @@ class IRDatasetController:
             "prepared": str(attempt / "principled_stage2"), "qc": str(attempt / "qc_stage0"),
             "render_plan": str(attempt / "render_plan.json"), "qc_render_plan": str(attempt / "qc_render_plan.json"),
             "candidate_visibility": str(attempt / "candidate_visibility.json"), "content_audit": str(attempt / "scene_content_audit.json"),
+            # The 6-DoF artifacts were missing here, so a job that reached its
+            # second variation lost them and died with KeyError: 'object_anchors'
+            # at the first stage that needed one. Every free-pose job therefore
+            # got exactly one attempt, whatever its variation limit said.
+            "object_anchors": str(attempt / "object_anchors.json"),
+            "free_camera_poses": str(attempt / "free_camera_poses.json"),
+            "prop_pbr_remediation": str(attempt / "prop_pbr_remediation.json"),
             "showcase_blend": str(attempt / "showcase" / "composition_c00.blend"),
             "showcase_composition": str(attempt / "showcase" / "composition_c00.json"),
             "showcase_raster_probe": str(attempt / "showcase_raster_probe.json"),
@@ -2534,6 +2838,11 @@ class IRDatasetController:
                    "--ir-material-profile", str(r.get("ir_material_profile") or "standard"),
                    "--scene-id", r["scene_id"], "--no-import", "--yes"]
             if r["archetype"] == "single_room": cmd += ["--room-type", r["room_type"]]
+            # Office v2 owns a durable candidate run-state.  A controller
+            # timeout deliberately preserves it, so its recovery command
+            # must explicitly reopen that same state instead of failing with
+            # "incomplete state" before the solver can continue.
+            elif r["archetype"] == "office": cmd += ["--resume"]
             return cmd
         if stage == "showcase_composition":
             source_blend = self._source_blend_path(native_source)
@@ -2549,6 +2858,15 @@ class IRDatasetController:
                     "--child-scene-id", str(r["scene_id"]),
                     "--parent-scene-id", str(r.get("parent_scene_id") or r["scene_id"]),
                     "--material-variant-id", str(r["material_variant_id"]),
+                    # Without a finish policy the draw is uniform over the
+                    # approved set, which leaves the shell -- 62% of an average
+                    # frame -- either wholly matte or wholly polished, and a
+                    # matte shell carries no specular cue for active NIR to
+                    # recover.  Over the 25 scenes queued next it moves the
+                    # median smooth fraction from 0.01 to 0.21 and puts 16 of
+                    # them inside the 0.05-0.60 band rather than 5.
+                    "--structural-finish-policy",
+                    str(self.repo_root / "configs" / "ir_materials" / "structural_finish_v1.json"),
                     "--material-seed", str(r["material_seed"])]
         if stage == "prop_pbr_remediate":
             return ["python3", "apps/build_prop_pbr_remediation.py",
@@ -2610,6 +2928,20 @@ class IRDatasetController:
                     "--room-type", str(r.get("room_type") or "generic"), "--profile", str(r.get("content_profile") or "balanced"),
                     "--source-blend", str(self._source_blend_path(source)), "--registry-root", str(self.pipeline_root),
                     "--registry-root", str(self.bean_root)]
+        if stage == "object_anchors":
+            return ["python3", "apps/build_ir_object_anchors.py",
+                    "--scene-dir", str(self.scene_root / r["scene_id"]),
+                    "--out", p["object_anchors"],
+                    "--seed", str(int(r.get("effective_scene_seed") or r.get("seed") or 20260812))]
+        if stage == "camera_6dof_sample":
+            return ["python3", "apps/sample_ir_camera_6dof.py",
+                    "--scene-dir", str(self.scene_root / r["scene_id"]),
+                    "--anchors", p["object_anchors"], "--out", p["free_camera_poses"],
+                    "--scene-id", str(r["scene_id"]),
+                    "--seed", str(int(r.get("effective_scene_seed") or r.get("seed") or 20260812)),
+                    "--fov", str(float(r.get("fov") or 44.98)),
+                    "--width", str(int(r.get("width") or 720)),
+                    "--height", str(int(r.get("height") or 540))]
         if stage == "view_probe":
             return ["python3", "apps/probe_ir_candidate_visibility.py", "--graph",
                     str(self.scene_root / r["scene_id"] / "viewpoint_graph.json"), "--authoring-map",
@@ -2683,7 +3015,22 @@ class IRDatasetController:
             if Path(p["prepared"]).exists():
                 cmd.append("--rebuild-stale")
             if r.get("illumination_diversity"):
-                cmd += ["--illumination-manifest", str(self.repo_root / "configs" / "ir_lighting" / "illumination_diversity_v1.json")]
+                bank = ("illumination_diversity_v2.json"
+                        if str(r.get("illumination_bank_version") or "v1") == "v2"
+                        else "illumination_diversity_v1.json")
+                cmd += ["--illumination-manifest", str(self.repo_root / "configs" / "ir_lighting" / bank)]
+                if str(r.get("illumination_bank_version") or "v1") == "v2":
+                    # A v2 recipe drives fixtures individually, which the worker
+                    # refuses to fake: without this the blend has no addressable
+                    # rig and every frame fails at _set_lighting.
+                    cmd += ["--fixture-policy", "addressable_v2"]
+            if r.get("metallic_augmentation"):
+                cmd += [
+                    "--metallic-augmentation-policy",
+                    str(self.repo_root / "configs" / "ir_materials" / "metallic_composition_v1.json"),
+                    "--metallic-augmentation-seed",
+                    str(int(r.get("metallic_augmentation_seed") or r.get("effective_scene_seed") or r.get("seed") or 0)),
+                ]
             if r.get("structural_rematerialize"):
                 cmd += ["--structural-material-manifest", p["structural_rematerialization"]]
             if r.get("hybrid_prop_pbr"):
@@ -2714,6 +3061,17 @@ class IRDatasetController:
             "--ambient-fill-energy-scale", str(r["ambient_fill_energy_scale"]),
             "--overview-proxy-dir", p["overview_proxy"],
         ]
+        # Full datasets use the requested policy. Stage-0 keeps compact
+        # diagnostic diffuse products so decomposition QC remains available
+        # without charging every production frame for them.
+        storage_profile = str(r.get("storage_profile") or "legacy_full_float32_v1")
+        if stage == "qc_render" and storage_profile == "core_half_exr_v1":
+            storage_profile = "diagnostic_half_exr_v1"
+        common += ["--storage-profile", storage_profile]
+        if r.get("denoise"):
+            # Beauty passes only -- the PBR and geometry AOVs are per-pixel
+            # constants and are written exactly either way.
+            common.append("--denoise")
         if r.get("nir_passive"):
             common.append("--nir-passive")
         else:
@@ -2925,14 +3283,39 @@ class IRDatasetController:
         required = {"rgb", "nir_active", "base_color_rgb", "roughness", "metallic", "normal_geometry_world", "normal_shading_world"}
         if not rows or not required <= set(rows[0].get("paths") or {}): raise RuntimeError("QC gate failed: required modalities absent")
         if job.request.get("illumination_diversity"):
+            pairing_policy = str(job.request.get("illumination_pairing_policy") or "legacy_six_way_v1")
             pairs: dict[str, list[dict[str, Any]]] = {}
             for row in rows:
                 pair_id = row.get("pair_id")
-                if row.get("capture_kind") == "paired" and pair_id:
+                if not pair_id:
+                    continue
+                # v5 keeps its real capture kind (orbit / sparse_tuple) because
+                # that describes the camera, not the lighting; a pair_id is
+                # present only on the poses that actually carry a stack.
+                if pairing_policy == FREE_PAIRING_POLICY or row.get("capture_kind") == "paired":
                     pairs.setdefault(str(pair_id), []).append(row)
-            pairing_policy = str(job.request.get("illumination_pairing_policy") or "legacy_six_way_v1")
-            expected_pair_members = 2 if pairing_policy == "reference_subset_v2" else 6
-            if not pairs or any(len(group) != expected_pair_members for group in pairs.values()):
+            expected_pair_members = (2 if pairing_policy == "reference_subset_v2" else 6)
+            if pairing_policy == FREE_PAIRING_POLICY:
+                # The reference plus every variation condition.
+                expected_pair_members = 1 + int(
+                    ((_read_json(Path(job.request["paths"]["render_plan"])).get("illumination")
+                      or {}).get("variation_condition_count")) or 5)
+            if qc and pairing_policy == FREE_PAIRING_POLICY:
+                # The QC pass renders a truncated slice of the frame list, so a
+                # six-member lighting stack is routinely cut in half.  Demand
+                # that a complete stack exists -- the invariant below is what QC
+                # is actually for -- and leave whole-dataset completeness to
+                # full_verify, where the frame list is not truncated.
+                complete = {key: group for key, group in pairs.items()
+                            if len(group) == expected_pair_members}
+                if not complete:
+                    raise RuntimeError(
+                        f"QC gate failed: no complete illumination stack for {pairing_policy} "
+                        f"(expected {expected_pair_members} members; largest seen "
+                        f"{max((len(g) for g in pairs.values()), default=0)})"
+                    )
+                pairs = complete
+            elif not pairs or any(len(group) != expected_pair_members for group in pairs.values()):
                 raise RuntimeError(
                     f"QC gate failed: incomplete illumination pair for {pairing_policy} "
                     f"(expected {expected_pair_members} members)"
@@ -3027,10 +3410,33 @@ class IRDatasetController:
         coverage_mixed_pixels = coverage_mixed_intermediate = 0
         coverage_component_sizes: list[int] = []
         structural_ids: set[int] = set()
+        prepared_contract: dict[str, Any] = {}
+        if job and job.request.get("paths", {}).get("prepared"):
+            try:
+                prepared_contract = _read_json(
+                    Path(job.request["paths"]["prepared"]) / "principled_material_contract.json"
+                ) or {}
+            except Exception:
+                prepared_contract = {}
         if job and job.request.get("structural_rematerialize"):
-            contract = _read_json(Path(job.request["paths"]["prepared"]) / "principled_material_contract.json")
-            structural_ids = {int(record["material_id"]) for record in (contract.get("materials") or [])
+            structural_ids = {int(record["material_id"]) for record in (prepared_contract.get("materials") or [])
                               if record.get("structural_rematerialization") and record.get("material_id") is not None}
+        # A Stage 2 built with the continuous-metalness policy invalidates the
+        # binary premise of the gates below, so it selects a third mode.
+        metallic_augmentation = prepared_contract.get("metallic_augmentation") or {}
+        # The composition policy draws a per-slot ``bare`` Bernoulli whose rate
+        # is calibrated against measurement (18.8% of strongly metallic
+        # InteriorVerse pixels sit at metalness >= 0.98).  A bare slot is
+        # deliberately left at its conductor floor, so it is binary because the
+        # policy said so -- not because the augmentation failed.  The collapse
+        # gate below must not count those pixels, or a scene fails for
+        # containing a polished pan.
+        bare_metal_ids: set[int] = set()
+        for record in prepared_contract.get("materials") or []:
+            contract = record.get("metallic_contract") or {}
+            parameters = ((contract.get("augmentation") or {}).get("parameters") or {})
+            if float(parameters.get("bare") or 0.0) >= 0.5 and record.get("material_id") is not None:
+                bare_metal_ids.add(int(record["material_id"]))
         structural_valid = structural_high = native_high = 0
         for row in rows:
             paths = row["paths"]
@@ -3106,7 +3512,9 @@ class IRDatasetController:
                 entry["covered_base_sum"] += float(bv[covered_interior].sum())
                 entry["exposed_roughness_sum"] += float(rv[exposed_interior].sum())
                 entry["covered_roughness_sum"] += float(rv[covered_interior].sum())
-            mixed = valid & (family_id == 2)
+            # 2 is coverage_mixed and 4 is coated_conductor; both carry a
+            # continuous authored metalness, so both belong to this statistic.
+            mixed = valid & np.isin(family_id, (2, 4))
             coverage_mixed_pixels += int(mixed.sum())
             coverage_mixed_intermediate += int((mixed & (value > 0.02) & (value < 0.98)).sum())
             if mixed.any():
@@ -3152,7 +3560,14 @@ class IRDatasetController:
         # Keep the findings in the report, but do not block the showcase
         # pipeline on this sampling-sensitive heuristic.
         showcase_diagnostic = bool(job and job.request.get("ir_composition_profile") == SHOWCASE_PROFILE)
-        if not structural_ids and not showcase_diagnostic:
+        # The high-metal coverage band and the near-binary ratio both assume a
+        # binary metalness distribution.  Under the continuous policy they no
+        # longer describe a defect -- an augmented dataset is *supposed* to sit
+        # between 0 and 1 -- so keep every statistic in the report but stop them
+        # from blocking the render.  Without this an augmented dataset fails its
+        # own quality gate by construction.
+        continuous_metallic_diagnostic = bool(metallic_augmentation)
+        if not structural_ids and not showcase_diagnostic and not continuous_metallic_diagnostic:
             failures.extend(diagnostic_findings)
         failures.extend(physical_failures)
         material_interior = []
@@ -3177,6 +3592,37 @@ class IRDatasetController:
                     "roughness_delta": sample["exposed_roughness_sum"] / exposed_count - sample["covered_roughness_sum"] / covered_count,
                 },
             })
+        # In exchange for relaxing the binary gates, the continuous policy gets a
+        # gate of its own: if the augmentation silently did nothing, the interior
+        # metal pixels stay pinned at 0/1 and the dataset is worthless for the
+        # experiment it was built for.  That must fail loudly, not pass quietly.
+        continuous_metallic_report: dict[str, Any] = {}
+        if continuous_metallic_diagnostic:
+            conductor_interior = [
+                sample for mid, sample in interior_samples.items()
+                if sample["pixels"] and (sample["metallic_sum"] / max(1, sample["pixels"])) > 0.02
+                and int(mid) not in bare_metal_ids
+            ]
+            bare_interior = sum(int(sample["pixels"]) for mid, sample in interior_samples.items()
+                                if int(mid) in bare_metal_ids)
+            interior_total = sum(int(sample["pixels"]) for sample in conductor_interior)
+            interior_intermediate = sum(int(sample["intermediate_pixels"]) for sample in conductor_interior)
+            intermediate_fraction = interior_intermediate / interior_total if interior_total else 0.0
+            continuous_metallic_report = {
+                "policy_id": metallic_augmentation.get("policy_id"),
+                "policy_sha256": metallic_augmentation.get("policy_sha256"),
+                "dataset_seed": metallic_augmentation.get("dataset_seed"),
+                "modified_channels": metallic_augmentation.get("modified_channels"),
+                "conductor_interior_pixels": interior_total,
+                "bare_interior_pixels": bare_interior,
+                "bare_material_ids": sorted(bare_metal_ids),
+                "intermediate_fraction": intermediate_fraction,
+                "minimum_intermediate_fraction": 0.30,
+                "relaxed_binary_findings": diagnostic_findings,
+            }
+            if interior_total and intermediate_fraction < 0.30:
+                failures.append("continuous_metallic_collapsed_to_binary")
+
         report = {"schema": "robomituba.ir_material_visibility_qc.v1", "profile": METAL_PROFILE,
                   "high_metallic_threshold": threshold, "status": "failed" if failures else "passed",
                   "valid_pixel_count": total_valid, "high_metallic_pixel_count": total_high,
@@ -3185,6 +3631,8 @@ class IRDatasetController:
                   "high_metal_material_instance_count": len(material_counts),
                   "conductor_roughness_histogram_5_bins": roughness_bins,
                   "material_interior": material_interior,
+                  **({"continuous_metallic": continuous_metallic_report}
+                     if continuous_metallic_report else {}),
                   "coverage_mixed": {"pixels": coverage_mixed_pixels,
                                       "intermediate_ratio": mixed_intermediate_ratio,
                                       "connected_component_sizes": sorted(coverage_component_sizes, reverse=True)[:100]},
@@ -3228,8 +3676,16 @@ class IRDatasetController:
         records = contract.get("materials") or []
         if not records or any(set((record.get("effective_inputs") or {})) != required for record in records):
             raise RuntimeError("prepared scene lacks the required effective-input audit")
-        if any((record.get("metallic_contract") or {}).get("schema") != "robomituba.metallic_contract.v2" for record in records):
-            raise RuntimeError("prepared scene lacks valid per-material MetallicContractV2 provenance")
+        # A Stage 2 built with the continuous-metalness policy emits v3 records,
+        # which carry the v2 payload they were derived from.  Accept them only
+        # when the contract itself declares the policy, so an undeclared v3 is
+        # still a defect rather than a silent widening.
+        allowed_metallic = {"robomituba.metallic_contract.v2"}
+        if contract.get("metallic_augmentation"):
+            allowed_metallic.add("robomituba.metallic_contract.v3")
+        if any((record.get("metallic_contract") or {}).get("schema") not in allowed_metallic
+               for record in records):
+            raise RuntimeError("prepared scene lacks valid per-material metallic contract provenance")
         override = contract.get("structural_rematerialization")
         if job.request.get("structural_rematerialize"):
             # v3 keeps the same interior-only safety boundary as v2, but
@@ -3239,6 +3695,11 @@ class IRDatasetController:
             supported_structural_policies = {
                 "interior_structure_only_v2_role_curated",
                 "interior_structure_only_v3_explicit_roles",
+                # v4 tightens the eligible asset set for load-bearing
+                # surfaces: floor/ceiling/column cannot select a metallic
+                # texture.  It retains the same interior-only provenance
+                # contract, so a v4 prepared child is valid for Stage 0.
+                "interior_structure_only_v4_dielectric_loadbearing",
             }
             policy = (override.get("selection") or {}).get("policy") if isinstance(override, dict) else None
             if policy not in supported_structural_policies:

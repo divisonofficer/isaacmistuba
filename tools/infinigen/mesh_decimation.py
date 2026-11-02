@@ -256,6 +256,21 @@ def triangle_count(bpy_obj) -> int:
     except Exception:
         return len(mesh.polygons)
 
+def vertex_count(bpy_obj) -> int:
+    """Vertices of the live mesh; 0 when the object cannot report them.
+
+    Recorded beside the triangle count because triangles alone are not an
+    identity for a mesh: a rebuild can keep every face and split vertices
+    differently at UV seams and normal boundaries, which changes the
+    interpolated surface and every atlas baked against it. Each count is a
+    projection with its own null space, so the record carries the pair.
+    """
+    try:
+        return len(bpy_obj.data.vertices)
+    except Exception:  # noqa: BLE001  (lightweight unit-test fakes have no verts)
+        return 0
+
+
 def apply_decimation(bpy_obj, decision: DecimationDecision) -> int:
     """Apply the decision to a live bpy mesh via a DECIMATE modifier (COLLAPSE) and
     return the resulting triangle count. bpy-only — the caller guards on the decision so
@@ -284,8 +299,14 @@ def decimate_object(
     strict: bool = False,
     tolerance: float = 0.05,
     fallback: Callable[[Any, int], dict] | None = None,
+    allow_slot_loss_max_extent: float = 0.0,
 ) -> dict:
     """Apply a policy and record the *actual* topology result.
+
+    ``allow_slot_loss_max_extent`` (metres, 0 = never): an object no larger than this keeps its decimated
+    mesh even when a material slot lost every face (a 13 cm shelf figurine losing its tongue colour), instead
+    of being restored to full resolution. The lost slots are recorded. Off by default: for GT a missing part
+    is a defect; for the realtime simulator a small decor object at full poly is the larger cost.
 
     Blender collapse decimation can stop above its nominal ratio on difficult
     topology.  Retry against the measured remainder before declaring strict
@@ -293,6 +314,22 @@ def decimate_object(
     """
     decision = policy.decide(ctx)
     before = ctx.n_faces
+    vertices_before = vertex_count(bpy_obj)
+    # Blender's COLLAPSE decimator can delete every face of a material slot on
+    # a thin part -- a plant container lost slot 1 of [0,1,2,3], a dining table
+    # lost the slot holding its legs. Decimation is applied in place, so hold
+    # the source mesh until the result has been checked and restore it if a
+    # slot went missing. An object over its LOD target costs memory; an object
+    # missing a part is a defect in the ground truth.
+    _pre_used_slots: set[int] = set()
+    _pre_mesh = None
+    if decision.decimate:
+        try:
+            _pre_mesh = bpy_obj.data
+            _pre_used_slots = {int(poly.material_index) for poly in _pre_mesh.polygons}
+            _pre_mesh = _pre_mesh.copy()
+        except Exception:  # noqa: BLE001
+            _pre_mesh, _pre_used_slots = None, set()
     target_max_faces = min(before, int(before * min(1.0, decision.target_ratio) * (1.0 + tolerance) + 0.999999))
     after = before
     error = None
@@ -335,6 +372,15 @@ def decimate_object(
             # Blender result and record the exception so the asset remains
             # auditable. Other fallback failures remain hard errors.
             message = str(exc)
+            # gltfpack is given a ratio and does not have to honour it. Asked
+            # for 61% of a dining table's 35840 triangles it returned 856 --
+            # 2.4% -- erasing the legs and leaving the rim of the top floating
+            # with the cutlery that had rested on it. It can also drop a
+            # material slot's geometry outright. Neither is a reason to abandon
+            # the scene: the Blender result is over the LOD target, which costs
+            # memory, where taking the collapsed mesh costs the object.
+            _refused = ("gltfpack collapsed the mesh" in message
+                        or "gltfpack dropped material slots" in message)
             if "gltfpack import expected one mesh object, got 0" in message:
                 fallback_unavailable = True
                 fallback_record = {
@@ -343,20 +389,68 @@ def decimate_object(
                     "target_triangles": int(target_max_faces),
                     "error": f"{type(exc).__name__}: {message}",
                 }
+            elif _refused:
+                fallback_unavailable = True
+                fallback_record = {
+                    "status": "refused_destructive_simplification",
+                    "triangles_after": int(after),
+                    "target_triangles": int(target_max_faces),
+                    "error": f"{type(exc).__name__}: {message}",
+                }
             else:
                 error = f"fallback_error: {type(exc).__name__}: {exc}"
+    # Restore the source when the surviving mesh no longer covers a slot that
+    # had geometry. This runs after the fallback so it catches a loss from
+    # either the Blender passes or gltfpack.
+    slots_restored = False
+    slots_lost_allowed: list[int] = []
+    if decision.decimate and error is None and _pre_mesh is not None:
+        try:
+            post_slots = {int(poly.material_index) for poly in bpy_obj.data.polygons}
+        except Exception:  # noqa: BLE001
+            post_slots = _pre_used_slots
+        try:
+            extent = max(float(v) for v in bpy_obj.dimensions)
+        except Exception:  # noqa: BLE001
+            extent = float("inf")
+        if (_pre_used_slots and not _pre_used_slots <= post_slots and post_slots
+                and allow_slot_loss_max_extent > 0 and extent <= allow_slot_loss_max_extent):
+            slots_lost_allowed = sorted(_pre_used_slots - post_slots)
+        elif _pre_used_slots and not _pre_used_slots <= post_slots:
+            lost = sorted(_pre_used_slots - post_slots)
+            bpy_obj.data = _pre_mesh
+            after = before
+            slots_restored = True
+            fallback_unavailable = True
+            fallback_record = {
+                "status": "restored_source_material_slots_lost",
+                "lost_material_slots": lost,
+                "triangles_after": int(before),
+                "target_triangles": int(target_max_faces),
+            }
+    if _pre_mesh is not None and not slots_restored:
+        try:
+            import bpy  # noqa: F401
+            bpy.data.meshes.remove(_pre_mesh)
+        except Exception:  # noqa: BLE001
+            pass
     no_effect = bool(decision.decimate and error is None and after > target_max_faces and not fallback_unavailable)
     if no_effect:
         error = f"no_effect: requested <= {target_max_faces} triangles at ratio {decision.target_ratio:.4f}, got {after} after {len(applied_ratios)} pass(es)"
     record = {
         "policy": decision.policy, "measurement": "triangles",
         "decimated": bool(decision.decimate and error is None and not fallback_unavailable),
-        "status": "kept_fallback_unavailable" if fallback_unavailable else "reduced" if decision.decimate and error is None else "no_effect" if no_effect else "error" if error else "kept",
+        "status": "kept_source_material_slots_lost" if slots_restored
+                  else "reduced_material_slots_lost" if slots_lost_allowed
+                  else "kept_fallback_unavailable" if fallback_unavailable else "reduced" if decision.decimate and error is None else "no_effect" if no_effect else "error" if error else "kept",
         "faces_before": before, "faces_after": after, "target_max_faces": target_max_faces,
         "triangles_before": before, "triangles_after": after, "target_max_triangles": target_max_faces,
+        "vertices_before": vertices_before, "vertices_after": vertex_count(bpy_obj),
         "target_ratio": round(decision.target_ratio, 4), "reason": decision.reason, "error": error,
         "pass_count": len(applied_ratios), "applied_ratios": applied_ratios, "pass_triangle_counts": pass_triangle_counts,
         "fallback": fallback_record,
+        "material_slot_loss_allowed": bool(slots_lost_allowed),
+        "lost_material_slots": slots_lost_allowed,
     }
     if strict and error is not None:
         raise RuntimeError(f"strict decimation failed for {ctx.object_id}: {error}")

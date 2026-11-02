@@ -43,3 +43,12 @@ def test_legacy_profile_preserves_current_collision_contract() -> None:
     assert "compose_indoors.floating_objs_enabled=True" in command
     assert "compose_indoors.enable_collision_floating=False" in command
     assert "compose_indoors.enable_collision_solved=False" in command
+
+
+def test_apartment_default_is_collision_aware() -> None:
+    command = build_command(
+        _preset(), out=Path("/tmp/paper-style-pilot"), stage="full", fast=False,
+        floor_plan_json=Path("/tmp/paper-style-pilot/floor_plan.json"), extra_overrides=[],
+    )
+    assert "compose_indoors.enable_collision_floating=True" in command
+    assert "compose_indoors.enable_collision_solved=True" in command

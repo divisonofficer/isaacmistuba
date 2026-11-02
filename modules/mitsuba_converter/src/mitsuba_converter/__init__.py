@@ -11,6 +11,7 @@ __all__ = [
     "camera_to_world_to_lookat",
     "extract_camera_from_scene",
     "render_modalities",
+    "render_ambient_stokes_heading_batch",
     "render_rgb",
     "render_depth",
     "render_polarization",
@@ -21,6 +22,8 @@ __all__ = [
     "write_manifest",
     "render_timestep_bundle",
     "render_timestep_bundle_split_lighting",
+    "render_timestep_bundle_stokes_heading_batch",
+    "render_timestep_bundle_active_stokes_heading_batch",
     "make_reflective_island_demo_request",
     "build_reflective_island_frontal_candidate_cameras",
     "select_projected_bbox_candidate",
@@ -59,6 +62,7 @@ from .multimodal import (
     render_decomposition,
     render_depth,
     render_modalities,
+    render_ambient_stokes_heading_batch,
     render_polarization,
     render_rgb,
 )
@@ -73,6 +77,8 @@ from .observation_bridge import (
     render_scene_state,
     render_timestep_bundle,
     render_timestep_bundle_split_lighting,
+    render_timestep_bundle_active_stokes_heading_batch,
+    render_timestep_bundle_stokes_heading_batch,
     select_projected_bbox_candidate,
     write_manifest,
 )

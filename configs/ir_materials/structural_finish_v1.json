@@ -1,0 +1,76 @@
+{
+  "schema": "robomituba.ir_structural_finish_policy.v1",
+  "version": "structural-finish-v1",
+  "notes": [
+    "The room shell is 62% of an average frame, so its finish decides whether a",
+    "scene carries any specular cue. Across 88 rendered scenes, 81 had a shell",
+    "under 1% smooth and 6 were over 90%, with one in between.",
+    "The registry is bimodal at the material level: 82 of 100 materials have",
+    "almost no pixel that can hold a highlight and 13 are more than half smooth.",
+    "So what decides a scene is how many of its few shell slots drew one of those",
+    "13 -- and the fix is to say how often that should happen per role, rather",
+    "than to band the mean roughness, which excluded the glossy materials without",
+    "admitting anything in their place.",
+    "These rates are frequencies of real finishes: floors are frequently varnished",
+    "or tiled, walls occasionally satin, ceilings flat.",
+    "Family and repeat limits were added after a render A/B: selecting on the",
+    "smooth budget alone put a 2.0 m wood texture on a bedroom wall, which reads",
+    "as planks running the length of the room. Registry approval says a material",
+    "can go somewhere, not that it should. Wood is the coarsest family in the",
+    "registry (2.0-2.4 m repeats only) and is fine on a floor, seen obliquely,",
+    "but not on a wall read close up and side-on."
+  ],
+  "smooth_rate": {
+    "floor": 0.55,
+    "wall": 0.15,
+    "column": 0.25,
+    "panel": 0.3,
+    "ceiling": 0.0
+  },
+  "material_smooth_fraction": 0.1,
+  "smooth_roughness": 0.3,
+  "shell_smooth_target": [
+    0.05,
+    0.6
+  ],
+  "families": {
+    "floor": [
+      "wood",
+      "tile",
+      "fabric",
+      "concrete",
+      "marble"
+    ],
+    "wall": [
+      "concrete",
+      "tile",
+      "marble",
+      "brick",
+      "rock",
+      "metal"
+    ],
+    "ceiling": [
+      "concrete",
+      "tile"
+    ],
+    "column": [
+      "concrete",
+      "tile",
+      "marble",
+      "brick",
+      "rock"
+    ],
+    "panel": [
+      "metal",
+      "tile",
+      "wood"
+    ]
+  },
+  "max_repeat_m": {
+    "floor": 2.4,
+    "wall": 1.5,
+    "ceiling": 2.0,
+    "column": 1.5,
+    "panel": 2.0
+  }
+}

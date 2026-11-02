@@ -3,7 +3,7 @@
 	import type { Size, Tone } from './types';
 
 	interface Props {
-		variant?: 'primary' | 'subtle' | 'ghost' | 'tone';
+		variant?: 'primary' | 'subtle' | 'ghost' | 'danger' | 'tone';
 		tone?: Tone;
 		size?: Size;
 		type?: 'button' | 'submit' | 'reset';
@@ -154,6 +154,14 @@
 	.btn-ghost:hover:not([disabled]) {
 		background: var(--brand-soft);
 		color: var(--brand-strong);
+	}
+	.btn-danger {
+		background: var(--danger-soft);
+		color: var(--danger);
+		border-color: transparent;
+	}
+	.btn-danger:hover:not([disabled]) {
+		background: color-mix(in srgb, var(--danger) 18%, var(--danger-soft));
 	}
 
 	.btn-tone[data-tone='success'] { background: var(--success); color: #fff; border-color: var(--success); }

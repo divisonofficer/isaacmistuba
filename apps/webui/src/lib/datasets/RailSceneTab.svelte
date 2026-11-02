@@ -128,14 +128,23 @@
 					 The selected scene's render-readiness response is therefore the
 					 authoritative fallback when this compact row has no sync field. -->
 				{@const _readinessSynced = Boolean(effectiveRenderReadiness?.ok)}
-				{@const _renderSynced = _ss.render_scene === 'synced' || (!_ss.render_scene && _readinessSynced)}
+				{@const _baseSynced = _ss.render_scene === 'synced' || (!_ss.render_scene && _readinessSynced)}
+				<!-- Perturbation is rendered from its own XML, produced by the same
+					 sync. Reporting "synced" while that variant is missing is what let
+					 a scene sit with mirrors configured and no perturbed scene to
+					 render them from. -->
+				{@const _perturbedMissing = Boolean(perturbation?.enabled) && !perturbation?.perturbed_render_ready}
+				{@const _renderSynced = _baseSynced && !_perturbedMissing}
 				{@const _isSyncing = _rs === 'syncing'}
 				<div class="sync-card">
 					<div class="panel-label">Sync</div>
 					<div class:ready={_renderSynced}>
-						Render {_renderSynced ? 'synced' : (_ss.render_scene ?? 'pending')}
+						Render {_renderSynced ? 'synced' : (_baseSynced && _perturbedMissing ? 'base only' : (_ss.render_scene ?? 'pending'))}
 						{#if _rs && _rs !== _ss.render_scene}<span class="sync-sub"> · {_rs}</span>{/if}
 					</div>
+					{#if _baseSynced && _perturbedMissing && !_isSyncing}
+						<div class="sync-stale">⚠ Optical perturbation is enabled but its render scene is missing{perturbation?.perturbed_render_stale ? ' (stale)' : ''}. Sync to build it, or the perturbed / both variants stay unavailable.</div>
+					{/if}
 					<!-- While the daemon is actively syncing, the `message` field carries the
 						 live progress text and supersedes any older "deferred / stale" rationale
 						 the annotation may have been left with. Show stale flags only when sync
@@ -486,4 +495,34 @@
 	.translate-layout { display: flex; flex-direction: column; gap: var(--space-1, 4px); margin-top: var(--space-2, 8px); padding-top: var(--space-2, 8px); border-top: 1px solid var(--border-subtle, rgba(148,163,184,0.25)); }
 	.translate-layout-title { font-size: 12px; font-weight: 600; color: var(--muted-strong); }
 	.translate-layout-sub { font-size: 11px; color: var(--muted-strong); font-weight: 400; }
+
+	/* Keep every scene form control within the inspector column.  These rules
+	 * live with the component so they retain precedence over the older page
+	 * stylesheet when the rail is rendered as a snippet. */
+	.rail-tool-panel,
+	.rail-tool-panel :is(details, div, label, input, select, textarea, button, summary) {
+		min-width: 0;
+		max-width: 100%;
+	}
+	.geometry-grid {
+		display: grid;
+		grid-template-columns: repeat(2, minmax(0, 1fr));
+		gap: var(--space-2);
+	}
+	.action-row,
+	.emitter-bulk-row,
+	.env-radio-row,
+	.env-envmap-row {
+		flex-wrap: wrap;
+	}
+	.action-row .button,
+	.emitter-bulk-row .button {
+		max-width: 100%;
+		white-space: normal;
+	}
+
+	@media (max-width: 1080px) {
+		.geometry-grid,
+		.env-fields-grid { grid-template-columns: minmax(0, 1fr); }
+	}
 </style>

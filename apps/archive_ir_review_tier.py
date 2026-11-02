@@ -25,6 +25,10 @@ def sha256(path: Path) -> str:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tier", action="append", required=True, choices=["A", "B", "C", "D", "unknown"])
+    parser.add_argument("--include-unmeasured", action="store_true",
+                        help="Also archive datasets whose review records density_measured=false. "
+                             "Their tier D is provisional -- it means no statistics existed, not "
+                             "that the scene is thin -- so this is off by default.")
     parser.add_argument("--dataset-root", type=Path, default=Path("/bean/ir_dataset"))
     parser.add_argument("--review-root", type=Path, default=Path("/bean/ir_dataset_work/.catalog_scene_reviews"))
     parser.add_argument("--archive-root", type=Path, default=Path("/bean/ir_dataset_archive"))
@@ -36,12 +40,21 @@ def main() -> int:
         parser.error("--commit and --dry-run are mutually exclusive")
     tiers = set(args.tier)
     selected = []
+    skipped_unmeasured: list[str] = []
     for review_path in sorted(args.review_root.glob("*.json")):
         try:
             review = read(review_path)
         except (OSError, ValueError, json.JSONDecodeError):
             continue
         if review.get("review_tier") not in tiers:
+            continue
+        # Tier D means two different things and this tool moves data. A review
+        # whose density was never measured carries a provisional D that says
+        # nothing about the scene, so it is not archived unless asked for by
+        # name. Reviews written before density_measured existed have no opinion
+        # and are treated as measured, which is what they were assumed to be.
+        if review.get("density_measured") is False and not args.include_unmeasured:
+            skipped_unmeasured.append(str(review.get("dataset_name") or review_path.name))
             continue
         name = str(review.get("dataset_name") or "")
         source = args.dataset_root / name
@@ -74,7 +87,8 @@ def main() -> int:
             results.append({"dataset": source.name, "tier": review.get("review_tier"), "destination": str(destination), "manifest": manifest})
         except Exception as exc:
             failures.append({"dataset": source.name, "error": str(exc)})
-    payload = {"schema": "robomituba.ir_dataset_retirement_report.v1", "tiers": sorted(tiers), "commit": bool(args.commit), "processed": len(results), "failed": len(failures), "results": results, "failures": failures}
+    payload = {"schema": "robomituba.ir_dataset_retirement_report.v1", "tiers": sorted(tiers), "commit": bool(args.commit), "processed": len(results), "failed": len(failures), "results": results, "failures": failures,
+               "skipped_unmeasured_count": len(skipped_unmeasured), "skipped_unmeasured": sorted(skipped_unmeasured)}
     print(json.dumps(payload, ensure_ascii=False, indent=2))
     return 1 if failures else 0
 

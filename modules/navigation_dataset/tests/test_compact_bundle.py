@@ -69,7 +69,7 @@ def test_compact_plan_replaces_polar_visuals_and_keeps_stokes_core(tmp_path: Pat
     ], resolve_export_profile("compact_with_polar_extension"))
 
     assert len(plan.polar_core) == 1
-    assert plan.polar_core[0].dst.endswith("stokes_core_v1.npz")
+    assert plan.polar_core[0].dst.endswith("stokes_core_v2.npz")
     assert len(plan.polar_thumbnails) == 1
     assert plan.polar_thumbnails[0].dst.endswith("polar_thumbnail.webp")
     assert [item.dst for item in plan.webp_rgb] == ["scenes/s/observations/vp/h/sensors/rgb_cam/rgb.webp"]
@@ -79,23 +79,24 @@ def test_compact_plan_replaces_polar_visuals_and_keeps_stokes_core(tmp_path: Pat
     assert estimate["breakdown"]["by_sensor"]["polar_cam"]["core_estimated_bytes"] > 0
 
 
-def test_lossless_core_webp_thumbnail_and_derived_values_round_trip(tmp_path: Path) -> None:
+def test_f16_core_webp_thumbnail_and_derived_values_round_trip(tmp_path: Path) -> None:
     source = tmp_path / "stokes_data.npz"
     expected = _write_stokes(source)
-    core = tmp_path / "stokes_core_v1.npz"
+    core = tmp_path / "stokes_core_v2.npz"
     metadata = write_stokes_core(source, core)
     assert metadata["source_sha256"]
     with np.load(core, allow_pickle=False) as restored:
         assert restored.files == list(POLAR_STOKES_CORE_KEYS)
         for key in POLAR_STOKES_CORE_KEYS:
-            assert restored[key].tobytes(order="C") == expected[key].tobytes(order="C")
+            assert restored[key].dtype == np.float16
+            assert np.allclose(restored[key], expected[key], rtol=5e-4, atol=5e-4)
         weights = np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
         s0_l = np.tensordot(restored["s0"], weights, axes=([2], [0]))
         s1_l = np.tensordot(restored["s1"], weights, axes=([2], [0]))
         s2_l = np.tensordot(restored["s2"], weights, axes=([2], [0]))
-        assert np.allclose(s1_l / s0_l, expected["s1_over_s0"], atol=1e-7)
-        assert np.allclose(s2_l / s0_l, expected["s2_over_s0"], atol=1e-7)
-        assert np.allclose(np.sqrt(s1_l * s1_l + s2_l * s2_l) / s0_l, expected["dop"], atol=1e-7)
+        assert np.allclose(s1_l / s0_l, expected["s1_over_s0"], atol=5e-4)
+        assert np.allclose(s2_l / s0_l, expected["s2_over_s0"], atol=5e-4)
+        assert np.allclose(np.sqrt(s1_l * s1_l + s2_l * s2_l) / s0_l, expected["dop"], atol=5e-4)
 
     rgb = tmp_path / "rgb.png"
     _png(rgb, (17, 33, 91))
@@ -200,7 +201,7 @@ def test_png_stokes_core_keeps_original_pngs_and_rewrites_manifest(tmp_path: Pat
         "scenes/s/observations/vp/h/sensors/rgb_cam/rgb.png",
     ]
     assert [item.dst for item in plan.polar_core] == [
-        "scenes/s/observations/vp/h/sensors/polar_cam/stokes_core_v1.npz",
+        "scenes/s/observations/vp/h/sensors/polar_cam/stokes_core_v2.npz",
     ]
     assert not plan.webp_rgb
     assert not plan.polar_thumbnails
@@ -218,12 +219,12 @@ def test_png_stokes_core_keeps_original_pngs_and_rewrites_manifest(tmp_path: Pat
         profile=profile,
         source_to_exported={
             "source/polar_rgb_preview.png": "scenes/s/observations/vp/h/sensors/polar_cam/polar_rgb_preview.png",
-            "source/stokes_data.npz": "scenes/s/observations/vp/h/sensors/polar_cam/stokes_core_v1.npz",
+            "source/stokes_data.npz": "scenes/s/observations/vp/h/sensors/polar_cam/stokes_core_v2.npz",
         },
     )
     artifact_paths = payload["artifacts"][0]["artifact_paths"]
     assert artifact_paths == {
         "png": "scenes/s/observations/vp/h/sensors/polar_cam/polar_rgb_preview.png",
-        "stokes_core_v1": "scenes/s/observations/vp/h/sensors/polar_cam/stokes_core_v1.npz",
+        "stokes_core_v2": "scenes/s/observations/vp/h/sensors/polar_cam/stokes_core_v2.npz",
     }
     assert payload["bundle_export"]["profile"] == "png_stokes_core"

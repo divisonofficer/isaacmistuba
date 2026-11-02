@@ -52,6 +52,11 @@
 		loading: boolean;
 		hasScene: boolean;
 		hasGraph: boolean;
+		navigationSupportReady?: boolean;
+		navigationSupportViewCount?: number;
+		navigationSupportPlanLabel?: string;
+		navigationSupportPlanReady?: boolean;
+		navigationSupportRenderSubmitting?: boolean;
 		onLoadGlobalCameraRig: () => void;
 		onSyncRenderScene: () => void;
 		onSelectRigSensor: (sensorId: string) => void;
@@ -69,6 +74,7 @@
 		onRenderViewpoint: () => void;
 		onRunProbe: () => void;
 		onRenderEpisodes: () => void;
+		onRenderNavigationSupport?: () => void;
 		onRenderEpisodeNodes?: () => void;
 		polarSampleSweepEnabled?: boolean;
 		polarSampleSweepSubmitting?: boolean;
@@ -111,10 +117,13 @@
 		hotCameraPose,
 		probeRendering, probeError, rigMountHeightM, authoringMap,
 		selectedProjectId, sceneId, loading, hasScene, hasGraph,
+		navigationSupportReady = false, navigationSupportViewCount = 0,
+		navigationSupportPlanLabel = 'L0 · action-required headings', navigationSupportPlanReady = true,
+		navigationSupportRenderSubmitting = false,
 		onLoadGlobalCameraRig, onSyncRenderScene, onSelectRigSensor, onSetFrustumMode, onTogglePlacingSensor,
 		onRemoveCustomSensor, onCustomSensorHeadingChange, onLoadRenderConfig,
 		onSetSensorHeight, onSetAmbientRadiance, onSetUnifiedSpectral, onSetUseLodScene, onClearNodeObservations, onClearAllObservations,
-		onRenderViewpoint, onRunProbe, onRenderEpisodes, onRenderEpisodeNodes,
+		onRenderViewpoint, onRunProbe, onRenderEpisodes, onRenderNavigationSupport, onRenderEpisodeNodes,
 		polarSampleSweepEnabled = false, polarSampleSweepSubmitting = false, polarSampleSweepResult, onSubmitPolarSampleSweep,
 		polarFullSweepEnabled = false, polarFullSweepSubmitting = false, polarFullSweepResult, onSubmitPolarFullSweep,
 		renderVariant = 'base', perturbationEnabled = false,
@@ -429,12 +438,16 @@
 				</div>
 			{/if}
 		{/if}
-		<button class="button button-primary full"
-			disabled={!caps.renderSweepNode.enabled}
-			title={caps.renderSweepNode.reason}
-			onclick={onRenderViewpoint}>
-			{renderingViewpoint ? 'Sweeping...' : 'Graph Sweep · this viewpoint'}
-		</button>
+		{#if navigationSupportReady}
+			<div class="sensor-hint">Navigation Support v4 is active. Individual place-node sweeps are not canonical because only the certified support pose-heading allow-list may be rendered.</div>
+		{:else}
+			<button class="button button-primary full"
+				disabled={!caps.renderSweepNode.enabled}
+				title={caps.renderSweepNode.reason}
+				onclick={onRenderViewpoint}>
+				{renderingViewpoint ? 'Sweeping...' : 'Graph Sweep · this viewpoint'}
+			</button>
+		{/if}
 	{:else}
 		<div class="sensor-hint">Click a viewpoint (blue dot) to select it</div>
 		{#if observationScan?.viewpoints}
@@ -451,18 +464,32 @@
 		{/if}
 	{/if}
 
-	<!-- Scene-level sweeps: independent of viewpoint selection -->
+	<!-- Scene-level sweeps: a v4 support plan replaces the legacy full graph sweep. -->
 	<label class="sensor-resume-row" title="Skip viewpoints/headings that already have consolidated outputs or a completed bridge-job manifest.">
 		<input type="checkbox" checked={renderMissingOnly} onchange={(e) => onSetRenderMissingOnly?.((e.currentTarget as HTMLInputElement).checked)} />
 		<span>Only missing renders</span>
 	</label>
-	<div class="sensor-sweep-summary" title="Only these sensors/modalities are submitted by the graph sweep.">
-		Sweep sensors: {selectedRigSensorIds.length || 1} selected
-		· {selectedRigSensorIds.length ? selectedRigSensorIds.join(', ') : (activeRigSensorId || 'active sensor')}
-	</div>
-	<button class="button button-subtle full" disabled={!caps.renderSweepAll.enabled} title={caps.renderSweepAll.reason} onclick={onRenderEpisodes}>
-		{renderMissingOnly ? 'Graph Sweep · missing only' : 'Graph Sweep · all viewpoints'}
-	</button>
+	{#if navigationSupportReady}
+		<div class="sensor-sweep-summary" title="The V4 render plan contains only certified support pose-heading observations, not every place-graph heading.">
+		Navigation Support v4 · {navigationSupportPlanLabel}: {navigationSupportViewCount} native views
+		· {selectedRigSensorIds.length || 1} selected sensor{selectedRigSensorIds.length === 1 ? '' : 's'}
+		</div>
+		<button class="button button-primary full"
+			disabled={!caps.renderNavigationSupport.enabled || !navigationSupportPlanReady || navigationSupportRenderSubmitting}
+			title={navigationSupportRenderSubmitting ? 'Submitting the support observation plan…' : (!navigationSupportPlanReady ? 'Prepare the selected native-heading level in Paths first.' : caps.renderNavigationSupport.reason || 'Submit the certified V4 pose-heading allow-list.')}
+			onclick={() => onRenderNavigationSupport?.()}>
+			{navigationSupportRenderSubmitting ? 'Submitting Navigation Support…' : (renderMissingOnly ? `Render ${navigationSupportPlanLabel} · missing only` : `Render ${navigationSupportPlanLabel}`)}
+		</button>
+		<div class="sensor-hint">Legacy Graph Sweep is intentionally unavailable for V4: it would request unplanned headings and is rejected by the backend.</div>
+	{:else}
+		<div class="sensor-sweep-summary" title="Only these sensors/modalities are submitted by the graph sweep.">
+			Sweep sensors: {selectedRigSensorIds.length || 1} selected
+			· {selectedRigSensorIds.length ? selectedRigSensorIds.join(', ') : (activeRigSensorId || 'active sensor')}
+		</div>
+		<button class="button button-subtle full" disabled={!caps.renderSweepAll.enabled} title={caps.renderSweepAll.reason} onclick={onRenderEpisodes}>
+			{renderMissingOnly ? 'Graph Sweep · missing only' : 'Graph Sweep · all viewpoints'}
+		</button>
+	{/if}
 	<button class="button button-primary full" disabled={!polarFullSweepEnabled}
 		title={!polarFullSweepEnabled ? 'Requires a synced graph scene, prepared perturbation, and polar_cam rig sensor.' : 'Submits every graph view as base → perturbed passive → perturbed active-polar.'}
 		onclick={() => onSubmitPolarFullSweep?.()}>

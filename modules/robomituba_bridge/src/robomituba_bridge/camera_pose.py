@@ -230,6 +230,54 @@ def resolve_viewpoint_pose(
     )
 
 
+def resolve_lookat_pose(
+    eye_mitsuba: Sequence[float],
+    target_mitsuba: Sequence[float],
+    *,
+    up: Sequence[float] = (0.0, 1.0, 0.0),
+    roll_deg: float = 0.0,
+    pose_source: str = "object_orbit_6dof",
+    origin_offset: Sequence[float] | None = None,
+) -> CanonicalCameraPose:
+    """Resolve an explicit 3D eye and target into the canonical camera contract.
+
+    ``resolve_viewpoint_pose`` places its target one metre ahead on the floor
+    plane, so pitch is only expressible through ``target_height_m`` and roll not
+    at all.  Aiming a camera at an object above or below it needs a real
+    look-at, which is what this provides; the graph helper is left untouched
+    because published datasets compare its provenance field by field.
+
+    Delegates to ``pose_from_mitsuba_camera_to_world`` rather than repeating the
+    basis validation, axis conversion and Blender registration -- one path, one
+    set of conventions.
+    """
+    eye = tuple(float(v) for v in eye_mitsuba)
+    target = tuple(float(v) for v in target_mitsuba)
+    if len(eye) != 3 or len(target) != 3:
+        raise ValueError("eye and target must each contain three coordinates")
+    if not all(math.isfinite(v) for v in eye + target):
+        raise ValueError("look-at pose values must be finite")
+    forward = _normalize(_sub(target, eye))
+    reference = tuple(float(v) for v in up)
+    # Looking straight up or down leaves forward parallel to up, where the cross
+    # product degenerates; fall back to a different reference axis rather than
+    # raising on a legitimate overhead or underfoot view.
+    if abs(sum(forward[i] * reference[i] for i in range(3))) > 1.0 - 1e-6:
+        reference = (0.0, 0.0, 1.0)
+    right = _normalize(_cross(forward, reference))
+    true_up = _normalize(_cross(right, forward))
+    if abs(float(roll_deg)) > 1e-9:
+        angle = math.radians(float(roll_deg))
+        cos_a, sin_a = math.cos(angle), math.sin(angle)
+        rolled_right = tuple(right[i] * cos_a + true_up[i] * sin_a for i in range(3))
+        rolled_up = tuple(true_up[i] * cos_a - right[i] * sin_a for i in range(3))
+        right, true_up = _normalize(rolled_right), _normalize(rolled_up)  # type: ignore[arg-type]
+    matrix = _mat4_from_columns(right, true_up, tuple(-v for v in forward), eye)  # type: ignore[arg-type]
+    return pose_from_mitsuba_camera_to_world(
+        matrix, pose_source=pose_source, target_mitsuba=target, origin_offset=origin_offset,
+    )
+
+
 def pose_from_mitsuba_camera_to_world(
     matrix: Sequence[Sequence[float]] | Sequence[float],
     *,
@@ -352,5 +400,6 @@ __all__ = [
     "mitsuba_camera_to_blender",
     "mitsuba_point_to_blender",
     "pose_from_mitsuba_camera_to_world",
+    "resolve_lookat_pose",
     "resolve_viewpoint_pose",
 ]

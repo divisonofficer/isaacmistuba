@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 
 from apps.backfill_ir_nir_passive import _discover_next, _task
+from mitsuba_converter.ir_dataset_contract import STORAGE_PROFILE_LEGACY_FULL_FLOAT32_V1
 from apps.render_ir_principled_dataset_queue import (
     BlenderWorker,
     PASSIVE_NIR_MODALITIES,
@@ -55,6 +56,7 @@ def test_blender_worker_forwards_legacy_passive_backfill_flag(monkeypatch, tmp_p
         flash_energy_scale=1.0, ambient_fill_energy_scale=1.0,
         qc_components=False, nir_passive=True, verbose_blender=False,
         allow_legacy_passive_backfill_aovs=True,
+        storage_profile=STORAGE_PROFILE_LEGACY_FULL_FLOAT32_V1,
     )
     BlenderWorker(0, args, tmp_path / "legacy.blend", "fp").start()
     assert "--nir-passive" in captured["command"]
@@ -71,7 +73,8 @@ def test_active_minus_passive_is_linear_and_atomic(tmp_path: Path):
     row = {"frame_id": "frame", "paths": {
         "nir_active": "nir_active/frame.exr", "nir_passive": "nir_passive/frame.exr",
     }}
-    updated = _derive_nir_difference(tmp_path, row)
+    updated = _derive_nir_difference(tmp_path, row,
+                                    storage_profile=STORAGE_PROFILE_LEGACY_FULL_FLOAT32_V1)
     result = cv2.imread(str(tmp_path / updated["paths"]["nir_active_minus_passive"]), cv2.IMREAD_UNCHANGED)
     assert result is not None
     np.testing.assert_allclose(result, 1.25, atol=1e-5)
@@ -127,7 +130,8 @@ def test_passive_contract_is_activated_only_after_all_sidecars(tmp_path: Path):
         "dataset_fingerprint": "fp", "observations": {"rgb": {"path": "rgb/{frame_id}.exr"}},
     }), encoding="utf-8")
 
-    _activate_nir_passive_contract(tmp_path, fingerprint="fp", frame_ids={frame})
+    _activate_nir_passive_contract(tmp_path, fingerprint="fp", frame_ids={frame},
+                                   storage_profile=STORAGE_PROFILE_LEGACY_FULL_FLOAT32_V1)
     config = json.loads((tmp_path / "dataset_config.json").read_text())
     contract = json.loads((tmp_path / "artifact_contract.json").read_text())
     assert config["nir_passive_enabled"] is True

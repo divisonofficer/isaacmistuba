@@ -209,3 +209,231 @@ def test_showcase_independent_pose_floor_rejects_sparse_camera_set() -> None:
     with pytest.raises(ValueError, match="independent camera pose minimum"):
         build_render_plan(graph, requested_pose_count=10, seed=1, scene_id="showcase",
                           camera_sets=camera_sets, min_unique_pose_count=3)
+
+
+def _illumination(condition_ids: list[str]) -> dict:
+    return {
+        "contract": "fixture", "manifest_digest": "fixture",
+        "assets": {"overcast": {"path": "fixture.hdr", "sha256": "a" * 64}},
+        "conditions": [{"id": ident, "external_asset": "overcast"} for ident in condition_ids],
+    }
+
+
+def test_legacy_plan_digests_are_frozen() -> None:
+    """Pin the digests every published v1/v3/v4 dataset is resumed against.
+
+    ``render_plan_digest`` reaches ``_stage_artifact_state``,
+    ``_adopt_compatible_frames`` and ``plan_adoption_manifest.json``.  Any
+    refactor of ``build_render_plan`` -- notably factoring the inlined pair-id
+    expression into a helper -- must leave these values untouched.
+    """
+    coverage = build_render_plan(_graph(), requested_pose_count=100, seed=41, scene_id="room")
+    assert coverage["render_plan_digest"] == (
+        "15eaad52d3aac98f93cc7e574c51545a2c662bcb6aad615359d516fea36c2933"
+    )
+    assert coverage["groups"][0]["lighting"]["recipe_digest"] == (
+        "048a4ddb61b58fcb22f1c6f7236b609d6f9c91167eeb4a4a80ecf13a7ca57a1a"
+    )
+
+    graph = _graph(100)
+    for index, node in enumerate(graph["nodes"]):
+        node["position"] = [index % 5, (index // 5) * .2, 0.0]
+    legacy_six_way = build_render_plan(
+        graph, requested_pose_count=400, seed=17, scene_id="room", adaptive_budget=True,
+        illumination=_illumination([f"condition_{index}" for index in range(6)]),
+        paired_fraction=.25,
+    )
+    assert legacy_six_way["schema"] == "robomituba.ir_principled_render_plan.v3"
+    assert legacy_six_way["render_plan_digest"] == (
+        "421ce6a2149a84daa0e967ca6450861ffc4a71cbf09c98fb935ad75e6b7ea092"
+    )
+
+    reference_subset = build_render_plan(
+        _graph(40), requested_pose_count=100, seed=29, scene_id="room",
+        illumination=_illumination(["reference_neutral_v1", *[f"variation_{i}" for i in range(5)]]),
+        paired_fraction=.20, illumination_pairing_policy="reference_subset_v2",
+    )
+    assert reference_subset["schema"] == "robomituba.ir_principled_render_plan.v4"
+    assert reference_subset["render_plan_digest"] == (
+        "cc2f7aab05158ec5be0b9dffd6b460f5fd2ba1886846c7a4c3f6a30c7051a9a2"
+    )
+    assert reference_subset["groups"][0]["lighting"]["recipe_digest"] == (
+        "1e0a4a7b3b2e44670a01a609f7aff5cdb2ba76f0192dfc86c8f3874892c4dc06"
+    )
+
+
+def test_legacy_pair_id_string_is_frozen() -> None:
+    """The pair-id is an inlined f-string in two branches; freeze its exact shape.
+
+    ``{scene_id}:{viewpoint_id}:{heading % 360:.3f}:{anchor_id}`` -- note the
+    trailing colon with an empty anchor.  A helper extraction that drops the
+    empty component would silently rewrite every published plan digest.
+    """
+    for policy, plan in (
+        ("legacy_six_way_v1", build_render_plan(
+            _graph(40), requested_pose_count=100, seed=29, scene_id="room",
+            illumination=_illumination([f"condition_{index}" for index in range(6)]),
+            paired_fraction=.20)),
+        ("reference_subset_v2", build_render_plan(
+            _graph(40), requested_pose_count=100, seed=29, scene_id="room",
+            illumination=_illumination(["reference_neutral_v1",
+                                        *[f"variation_{i}" for i in range(5)]]),
+            paired_fraction=.20, illumination_pairing_policy="reference_subset_v2")),
+    ):
+        pair_ids = sorted({
+            pose["pair_id"] for group in plan["groups"] for pose in group["poses"]
+            if pose.get("pair_id")
+        })
+        assert pair_ids[0] == "room:vp_000:0.000:", policy
+        assert all(ident.count(":") == 3 and ident.endswith(":") for ident in pair_ids), policy
+
+
+def test_camera_key_is_unchanged_for_graph_poses() -> None:
+    """v1-v4 poses never carry ``pose_id``; the 6-DoF dispatch must not reach them."""
+    plan = build_render_plan(_graph(16), requested_pose_count=24, seed=5, scene_id="room")
+    poses = [pose for group in plan["groups"] for pose in group["poses"]]
+    assert poses and not any("pose_id" in pose for pose in poses)
+    assert _camera_key(poses[0]) == (
+        str(poses[0]["viewpoint_id"]), round(float(poses[0]["heading_deg"]) % 360.0, 6), "",
+    )
+
+
+def _free_poses(count: int = 60, anchors: int = 6) -> dict:
+    """A 6-DoF sampler payload, shaped as the sampler emits it."""
+    poses = []
+    for index in range(count):
+        anchor = f"obj:a{index % anchors}"
+        orbit = f"orbit:{anchor}:00"
+        poses.append({
+            "pose_id": f"{anchor}|orbit|00|{index:03d}", "viewpoint_id": orbit,
+            "orbit_id": orbit, "anchor_id": anchor, "capture_kind": "orbit",
+            "sequence_index": index, "heading_deg": (index * 17.0) % 360.0,
+            "position_xy": [math.cos(index) * 2.0, math.sin(index) * 2.0],
+            "eye_mitsuba": [0.0, 1.2, 0.0], "target_mitsuba": [1.0, 0.5, 0.0],
+            "up_mitsuba": [0.0, 1.0, 0.0], "roll_deg": 0.0,
+            "elevation_deg": -20.0, "anchor_distance_m": 1.4,
+        })
+    return {"schema": "robomituba.ir_camera_6dof_poses.v1",
+            "sampler_version": "object-orbit-6dof-v1", "poses": poses,
+            "free_pose_digest": "deadbeef", "source_authoring_map_digest": "cafe",
+            "anchor_count": anchors, "orbit_count": anchors, "tuple_count": 0,
+            "radius_range_m": [1.0, 2.0], "camera_elevation_range_deg": [-30.0, 55.0],
+            "orbits": [], "tuples": []}
+
+
+def _bank(conditions: int = 6) -> dict:
+    ids = ["reference_neutral_v1"] + [f"variation_{index}_v1" for index in range(conditions - 1)]
+    return {
+        "schema": "robomituba.ir_illumination_bank.v2",
+        "contract": "illumination-fixture-diversity-v2",
+        "manifest_digest": "bank-digest",
+        "assets": {"overcast_day": {"path": "a.exr", "sha256": "0" * 64}},
+        "conditions": [
+            {"id": name, "external_asset": "overcast_day", "internal_energy_scale": 1.0,
+             "fixtures": {"policy": "group_mask_v1", "subset_salt": name,
+                          "groups": {"ceiling": {"on_probability": 1.0}}}}
+            for name in ids
+        ],
+    }
+
+
+def test_free_pose_plan_declares_its_own_universe() -> None:
+    plan = build_render_plan({"nodes": [], "edges": []}, requested_pose_count=60, seed=7,
+                             scene_id="room", free_poses=_free_poses(),
+                             illumination=_bank(),
+                             illumination_pairing_policy="variation_subset_v3")
+    assert plan["schema"] == "robomituba.ir_principled_render_plan.v5"
+    assert plan["pose_universe"] == "object_orbit_6dof_v1"
+    assert plan["sampler_version"] == "object-orbit-6dof-v1"
+    # The graph is not the pose universe, so provenance points at the sampler.
+    assert plan["free_poses"]["free_pose_digest"] == "deadbeef"
+    assert plan["free_poses"]["source_authoring_map_digest"] == "cafe"
+
+
+def test_variation_subset_renders_every_base_pose_and_a_full_lighting_stack() -> None:
+    """The rule: N base poses once, M of them under every variation."""
+    plan = build_render_plan({"nodes": [], "edges": []}, requested_pose_count=60, seed=7,
+                             scene_id="room", free_poses=_free_poses(60),
+                             illumination=_bank(6), variation_pose_count=10,
+                             illumination_pairing_policy="variation_subset_v3")
+    groups = {group["lighting"]["id"]: group["poses"] for group in plan["groups"]}
+    assert len(groups["reference_neutral_v1"]) == 60
+    variations = [name for name in groups if name != "reference_neutral_v1"]
+    assert len(variations) == 5
+    for name in variations:
+        assert len(groups[name]) == 10
+
+    # Every variation condition covers the *same* ten poses, so lighting is
+    # isolated for a fixed camera rather than confounded with viewpoint.
+    stacks = [{pose["pose_id"] for pose in groups[name]} for name in variations]
+    assert all(stack == stacks[0] for stack in stacks)
+    assert stacks[0] <= {pose["pose_id"] for pose in groups["reference_neutral_v1"]}
+
+    assert plan["illumination"]["expected_frame_count"] == 60 + 10 * 5
+    assert plan["illumination"]["variation_pose_count"] == 10
+    assert plan["illumination"]["variation_condition_count"] == 5
+
+
+def test_only_the_variation_subset_carries_a_pair_id() -> None:
+    """A pose seen under one lighting is not paired with anything.
+
+    Tagging every base pose would advertise a lighting stack of size one.
+    """
+    plan = build_render_plan({"nodes": [], "edges": []}, requested_pose_count=60, seed=7,
+                             scene_id="room", free_poses=_free_poses(),
+                             illumination=_bank(), variation_pose_count=10,
+                             illumination_pairing_policy="variation_subset_v3")
+    by_pose: dict[str, set[str]] = {}
+    appearances: dict[str, int] = {}
+    for group in plan["groups"]:
+        for pose in group["poses"]:
+            appearances[pose["pose_id"]] = appearances.get(pose["pose_id"], 0) + 1
+            if pose.get("pair_id"):
+                by_pose.setdefault(pose["pose_id"], set()).add(pose["pair_id"])
+
+    # Exactly the ten poses that appear under every condition are paired, and
+    # each of them uses one pair_id across its whole stack.
+    assert len(by_pose) == 10
+    assert all(len(ids) == 1 for ids in by_pose.values())
+    assert all(next(iter(ids)).startswith("room:") for ids in by_pose.values())
+    assert all(appearances[pose_id] == 6 for pose_id in by_pose)
+    assert all(appearances[pose_id] == 1 for pose_id in appearances if pose_id not in by_pose)
+
+
+def test_variation_subset_spreads_the_lighting_stack_over_anchors() -> None:
+    """Ten frames of one object teach less about lighting than ten objects."""
+    plan = build_render_plan({"nodes": [], "edges": []}, requested_pose_count=60, seed=7,
+                             scene_id="room", free_poses=_free_poses(60, anchors=6),
+                             illumination=_bank(), variation_pose_count=6,
+                             illumination_pairing_policy="variation_subset_v3")
+    varied = [pose for group in plan["groups"]
+              if group["lighting"]["id"] != "reference_neutral_v1" for pose in group["poses"]]
+    assert len({pose["anchor_id"] for pose in varied}) == 6
+
+
+def test_variation_subset_enforces_the_base_pose_band() -> None:
+    with pytest.raises(ValueError, match="50-100 base poses"):
+        build_render_plan({"nodes": [], "edges": []}, requested_pose_count=20, seed=7,
+                          scene_id="room", free_poses=_free_poses(20), illumination=_bank(),
+                          illumination_pairing_policy="variation_subset_v3")
+
+
+def test_variation_subset_cannot_be_starved_of_conditions() -> None:
+    """Five variations is the floor, and the bank rule already guarantees it.
+
+    A v2 bank must carry 6-12 conditions and exactly one reference, so fewer
+    than five variations is rejected before the policy is reached.  The policy
+    keeps its own check as a guard, but this is the reachable failure.
+    """
+    with pytest.raises(ValueError, match="6-12 conditions"):
+        build_render_plan({"nodes": [], "edges": []}, requested_pose_count=60, seed=7,
+                          scene_id="room", free_poses=_free_poses(), illumination=_bank(5),
+                          illumination_pairing_policy="variation_subset_v3")
+
+
+def test_free_poses_are_keyed_by_pose_id_not_viewpoint() -> None:
+    """Orbit members share a viewpoint id; the legacy key would collapse them."""
+    first, second = _free_poses(2, anchors=1)["poses"]
+    second["heading_deg"] = first["heading_deg"]
+    assert first["viewpoint_id"] == second["viewpoint_id"]
+    assert _camera_key(first) != _camera_key(second)

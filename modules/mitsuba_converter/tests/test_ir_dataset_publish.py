@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 from pathlib import Path
 
 import cv2
@@ -52,6 +54,32 @@ def test_publish_is_atomic_and_idempotent_without_viewer_app(tmp_path: Path) -> 
 def test_publish_accepts_new_v3_contract_without_loosening_v2_compatibility(tmp_path: Path) -> None:
     source = _fixture(tmp_path / "out", version=3)
     assert publish_dataset(source, tmp_path / "bean")["mode"] == "published"
+
+
+def test_compact_child_uses_half_exr_contract_and_drops_diffuse(tmp_path: Path) -> None:
+    """Compaction keeps source immutable while producing a publishable child."""
+    source = _fixture(tmp_path / "source", version=3)
+    frame_id = "vp_000001__h_000"
+    diffuse = source / "diffuse_component_rgb" / f"{frame_id}.exr"
+    diffuse.parent.mkdir()
+    assert cv2.imwrite(str(diffuse), np.full((2, 2, 3), 0.25, np.float32))
+    row = json.loads((source / "index.jsonl").read_text(encoding="utf-8"))
+    row["paths"]["diffuse_component_rgb"] = diffuse.relative_to(source).as_posix()
+    (source / "index.jsonl").write_text(json.dumps(row) + "\n", encoding="utf-8")
+    target = tmp_path / "compact"
+    script = Path(__file__).resolve().parents[3] / "apps" / "compact_ir_dataset.py"
+    result = subprocess.run(
+        [sys.executable, str(script), "--source", str(source), "--out", str(target)],
+        check=True, text=True, capture_output=True,
+    )
+    assert '"mode": "compacted"' in result.stdout
+    compact_row = json.loads((target / "index.jsonl").read_text(encoding="utf-8"))
+    assert "diffuse_component_rgb" not in compact_row["paths"]
+    assert (target / "rgb" / f"{frame_id}.exr").is_file()
+    compact_contract = json.loads((target / "artifact_contract.json").read_text(encoding="utf-8"))
+    assert compact_contract["storage_profile"]["id"] == "core_half_exr_v1"
+    assert compact_contract["diffuse_decomposition"]["stored"] is False
+    assert publish_dataset(target, tmp_path / "bean") ["mode"] == "published"
 
 
 def test_publish_accepts_uint8_pbr_provenance_class(tmp_path: Path) -> None:

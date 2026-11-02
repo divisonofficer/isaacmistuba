@@ -49,6 +49,11 @@ fi
 : "${ROBOMITUBA_TEXTURE_MAX_RESOLUTION:=1024}"
 : "${ROBOMITUBA_WORKER_HEARTBEAT_TIMEOUT_S:=600}"
 : "${ROBOMITUBA_SCENE_LOAD_CONCURRENCY:=1}"
+# A large PBR scene can legitimately spend more than the worker's historical
+# 15-minute default in serialised scene preparation when the host is busy.
+# This timeout only protects a wedged load; it must not turn a recoverable
+# slow load into a failed render task.
+: "${ROBOMITUBA_SCENE_LOAD_TIMEOUT_S:=1800}"
 : "${ROBOMITUBA_RENDER_INPROCESS:=0}"
 : "${ROBOMITUBA_BACKEND_ONLY:=0}"
 : "${PYTHONUNBUFFERED:=1}"
@@ -175,6 +180,7 @@ export ROBOMITUBA_CPU_SPP_CAP
 export ROBOMITUBA_TEXTURE_MAX_RESOLUTION
 export ROBOMITUBA_WORKER_HEARTBEAT_TIMEOUT_S
 export ROBOMITUBA_SCENE_LOAD_CONCURRENCY
+export ROBOMITUBA_SCENE_LOAD_TIMEOUT_S
 export ROBOMITUBA_RENDER_INPROCESS
 export ROBOMITUBA_BACKEND_ONLY
 export PYTHONUNBUFFERED
@@ -185,7 +191,7 @@ echo "[render-queue] url: http://$RENDER_QUEUE_HOST:$RENDER_QUEUE_PORT"
 if [[ "$RENDER_QUEUE_AUTO_GPUS" == "1" ]]; then
   echo "[render-queue] auto GPUs: memory_used_pct<${RENDER_QUEUE_AUTO_GPU_MEMORY_USED_PCT_MAX}%"
 fi
-echo "[render-queue] GPUs: $ROBOMITUBA_RENDER_GPU_INDICES workers=$ROBOMITUBA_RENDER_WORKER_COUNT backlog_per_gpu=$ROBOMITUBA_RENDER_WORKER_BACKLOG_PER_GPU scene_load_concurrency=$ROBOMITUBA_SCENE_LOAD_CONCURRENCY"
+echo "[render-queue] GPUs: $ROBOMITUBA_RENDER_GPU_INDICES workers=$ROBOMITUBA_RENDER_WORKER_COUNT backlog_per_gpu=$ROBOMITUBA_RENDER_WORKER_BACKLOG_PER_GPU scene_load_concurrency=$ROBOMITUBA_SCENE_LOAD_CONCURRENCY scene_load_timeout=${ROBOMITUBA_SCENE_LOAD_TIMEOUT_S}s"
 echo "[render-queue] texture max: $ROBOMITUBA_TEXTURE_MAX_RESOLUTION GPU-only cpu_fallback_disabled=$ROBOMITUBA_DISABLE_CPU_FALLBACK"
 
 exec python3 -u "$REPO_ROOT/apps/run_render_daemon.py" --repo-root "$REPO_ROOT" --host "$RENDER_QUEUE_HOST" --port "$RENDER_QUEUE_PORT" "$@"

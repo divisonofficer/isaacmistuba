@@ -1,0 +1,17 @@
+"""Source-bound latest completed full suites; drafts remain visually rejected."""
+from pathlib import Path
+import json,hashlib,html,os
+from PIL import Image
+r=Path(__file__).resolve().parents[3];b=r/'data/venue_refs/floor_plans_v3';out=b/'all_room_renders_latest';out.mkdir(exist_ok=True);sections=[];evidence=[]
+for key,scene,suite,round_,receipt in [('office','commercial_office_floor_02','full_suite_r114_cpu',114,'candidate/render_receipt.json'),('residential','dual_unit_residential_floor_03','full_suite_r116_cpu',116,'candidate/render_receipt.json')]:
+ d=b/scene/suite;a=json.loads((d/receipt).read_text());assert hashlib.sha256(Path(a['source']).read_bytes()).hexdigest()==a['source_sha256'];figs=[]
+ expected=21 if key=='office' else 43;assert len(a['frames'])==expected
+ for f in a['frames']:
+  src=Path(f['path']);assert hashlib.sha256(src.read_bytes()).hexdigest()==f['sha256'];dst=out/(key+'_'+f['name']+'.jpg');im=Image.open(src).convert('RGB');im.thumbnail((1100,1100));im.save(dst,quality=86)
+  figs.append('<figure><figcaption>'+html.escape(f['name'])+'</figcaption><a href="'+html.escape(os.path.relpath(src,out))+'"><img loading="lazy" src="'+dst.name+'"></a></figure>')
+ evidence.append(dict(scene=scene,round=round_,source=a['source'],source_sha256=a['source_sha256'],frame_count=expected,receipt=str(d/receipt),independent_review=str(d/'blind_visual_review.json'),accepted=False))
+ review_exists=(d/'blind_visual_review.json').exists();review_text='독립 검수 기록 있음 · 미승인' if review_exists else '독립 전체 검수 진행 · 미승인'
+ sections.append('<section id="'+key+'"'+(' hidden' if key!='office' else '')+'><h2>'+html.escape(scene)+' · r'+str(round_)+'</h2><p>'+review_text+' · '+str(expected)+'개 뷰. '+('CPU21장.' if key=='office' else 'CPU43장.')+'</p><p><a href="'+html.escape(os.path.relpath(d/'report.html',out))+'">상세 검수 보고서</a>'+(' · <a href="'+html.escape(os.path.relpath(d/'blind_visual_review.json',out))+'">독립 비평</a>' if review_exists else '')+'</p><div class="grid">'+''.join(figs)+'</div></section>')
+(out/'evidence.json').write_text(json.dumps(evidence,indent=2))
+page='''<!doctype html><html lang="ko"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>전체 방 · 최신 완료 렌더</title><style>body{font:16px/1.6 system-ui;margin:20px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr))}figure{margin:8px}img{width:100%}button{padding:12px;margin:6px}section[hidden]{display:none}</style><h1>전체 방 · 최신 완료 렌더64장</h1><p>사무실 r114(21장) 및 주거 r116(43장)의 완료된 전체 렌더 세트입니다. 사무실114도 독립 전체검수 미달, 주거116도 새 독립 전체검수 REF/REAL FAIL 상태이며 승인·데이터셋 승격되지 않았습니다. 사무실 r114 통창 및 r113 식물 수정은 국소 검수 완료이며, 최신114 전체21뷰는 렌더·독립 전체검수 완료이며 전체 실사성 미달입니다. 주거 최신 후보120의 출입구 수정은 이116 세트에 포함되지 않으며 별도 A/B 검수 중입니다. 작은 외부 JPEG를 사용하며 클릭하면 원본 PNG가 열립니다.</p><p><a href="../commercial_office_floor_02/full_suite_r114_cpu/report.html">사무실114 전체21뷰</a> · <a href="../dual_unit_residential_floor_03/full_suite_r116_cpu/report.html">주거116 전체43뷰</a> · <a href="evidence.json">소스·라운드 증거</a> · <a href="../commercial_office_floor_02/taskchairs112_review/report.html">사무실 의자 r112 완료 A/B</a></p><nav><button data-tab="office">사무실21장</button><button data-tab="residential">주거43장</button></nav>'''+''.join(sections)+'''<script>for(const b of document.querySelectorAll('[data-tab]'))b.onclick=()=>{for(const s of document.querySelectorAll('section'))s.hidden=s.id!==b.dataset.tab;};</script></html>'''
+assert len(page.encode())<50000;(out/'report.html').write_text(page);print(out/'report.html',len(page.encode()))

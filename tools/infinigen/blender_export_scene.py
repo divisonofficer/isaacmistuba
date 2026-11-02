@@ -18,6 +18,8 @@ mesh is Y-up (matches Mitsuba / our authoring world). The 2D authoring placement
 """
 
 import contextlib
+import faulthandler
+import signal
 import hashlib
 import json
 import math
@@ -27,6 +29,11 @@ import shutil
 import subprocess
 import tempfile
 import struct
+
+# Stall diagnosis (2026-10-13: two bakes spun 37 h and 54 h after a room-floor slot with no output): `kill -USR1 <blender pid>`
+# writes every Python thread's stack to stderr, i.e. the bake log. run_apartment_bake_worker's watchdog sends it before killing.
+faulthandler.register(signal.SIGUSR1, all_threads=True)
+import time
 import sys
 from pathlib import Path
 
@@ -509,7 +516,7 @@ def _planar_uv_fallback(obj):
         return False
 
 
-def _face_atlas_uv(obj):
+def _face_atlas_uv_impl(obj):
     """Assign one non-overlapping UV tile to every source polygon.
 
     Smart Project normally supplies a much better continuous chart, but some
@@ -530,8 +537,8 @@ def _face_atlas_uv(obj):
         polygon_count = len(mesh.polygons)
         if polygon_count <= 0:
             return False
-        while mesh.uv_layers:
-            mesh.uv_layers.remove(mesh.uv_layers[0])
+        for old in [l for l in mesh.uv_layers if l.name != _SRC_UV]:
+            mesh.uv_layers.remove(old)
         layer = mesh.uv_layers.new(name="IRFaceAtlasUV")
         side = int(math.ceil(math.sqrt(polygon_count)))
         inset = 0.06
@@ -570,6 +577,80 @@ def _face_atlas_uv(obj):
         return False
 
 
+
+_SRC_UV = "IR_SrcUV"
+
+
+def _copy_uv_layer(mesh, src, name):
+    import numpy as np
+    dst = mesh.uv_layers.new(name=name)
+    buf = np.zeros(len(mesh.loops) * 2, dtype=np.float32)
+    src.data.foreach_get("uv", buf)
+    dst.data.foreach_set("uv", buf)
+    return dst
+
+
+def _pin_source_uv(obj):
+    """Before a UV repair deletes the authored layer: keep it as IR_SrcUV and point image textures that sample the
+    object's UV (unlinked Vector, or TexCoord.UV) at it through a UV Map node. Otherwise the repaired layer
+    makes every UV-sampled image (e.g. IslandCounter art tiles reading lp_atlas48.png) sample at the wrong coordinates."""
+    me = obj.data
+    if not me.uv_layers or me.uv_layers.get(_SRC_UV) is not None:
+        return
+    nts = [s.material.node_tree for s in obj.material_slots if s.material and s.material.use_nodes]
+    hits, pinned = [], 0
+    for nt in nts:
+        for n in nt.nodes:
+            if n.type != "TEX_IMAGE" or n.image is None:
+                continue
+            links = n.inputs["Vector"].links
+            if not links or (links[0].from_node.type == "TEX_COORD" and links[0].from_socket.name == "UV"):
+                hits.append((nt, n))
+            elif links[0].from_node.type == "UVMAP" and links[0].from_node.uv_map == _SRC_UV:
+                pinned += 1    # shared material already rewired by an earlier object in this session: this object still needs its own IR_SrcUV layer
+    if not hits and not pinned:
+        return
+    _copy_uv_layer(me, me.uv_layers.active or me.uv_layers[0], _SRC_UV)
+    for nt, n in hits:
+        uvn = nt.nodes.new("ShaderNodeUVMap")
+        uvn.uv_map = _SRC_UV
+        uvn.location = (n.location.x - 200, n.location.y)
+        nt.links.new(uvn.outputs["UV"], n.inputs["Vector"])
+    print(f"[bake] pinned source UV {obj.name}: {len(hits)} rewired, {pinned} already pinned", file=sys.stderr)
+
+
+def _src_uv_last(obj):
+    """Put IR_SrcUV after the repaired layer (the exporter and bake read the first/active one)."""
+    me = obj.data
+    src = me.uv_layers.get(_SRC_UV)
+    if src is None or len(me.uv_layers) < 2:
+        return
+    if me.uv_layers[0].name == _SRC_UV:
+        tmp = _copy_uv_layer(me, src, "IR_SrcUV_tmp")
+        me.uv_layers.remove(src)
+        tmp.name = _SRC_UV
+    first = me.uv_layers[0]
+    me.uv_layers.active = first
+    first.active_render = True
+
+
+def _ensure_uv(obj, *, force=False):
+    me = obj.data
+    if not force and me.uv_layers and not _uv_is_degenerate(me):
+        return True
+    _pin_source_uv(obj)
+    ok = _ensure_uv_impl(obj, force=True)
+    _src_uv_last(obj)
+    return ok
+
+
+def _face_atlas_uv(obj):
+    _pin_source_uv(obj)
+    ok = _face_atlas_uv_impl(obj)
+    _src_uv_last(obj)
+    return ok
+
+
 def _face_atlas_min_resolution(obj, requested_resolution):
     """Keep enough texels across a face-atlas tile after a UV repair.
 
@@ -585,7 +666,7 @@ def _face_atlas_min_resolution(obj, requested_resolution):
     return 1 << int(math.ceil(math.log2(max(1, resolution))))
 
 
-def _ensure_uv(obj, *, force=False):
+def _ensure_uv_impl(obj, *, force=False):
     """Guarantee a *usable* UV map for baking. Smart-UV-project objects that have
     none, OR whose existing UV is degenerate (zero-area — see _uv_is_degenerate).
 
@@ -601,12 +682,12 @@ def _ensure_uv(obj, *, force=False):
         bpy.context.view_layer.objects.active = obj
         # Drop the degenerate placeholder so Smart Project's result is the active
         # (and only) layer the OBJ export + bake both see.
-        while me.uv_layers:
-            me.uv_layers.remove(me.uv_layers[0])
+        for old in [l for l in me.uv_layers if l.name != _SRC_UV]:
+            me.uv_layers.remove(old)
         # Blender 3.6 does not always create a UV layer implicitly for meshes
         # converted from curves.  Create it before Smart Project so FINISHED cannot
         # still leave an empty uv_layers collection.
-        me.uv_layers.new(name="UVMap")
+        me.uv_layers.active = me.uv_layers.new(name="UVMap")
         bpy.ops.object.mode_set(mode="EDIT")
         bpy.ops.mesh.select_all(action="SELECT")
         # The Blender default margin (0.02) is catastrophic for very high-poly
@@ -807,6 +888,21 @@ def _coverage_validation(obj, path, *, max_unbaked_ratio=0.001):
                 pass
 
 
+#: Wall-clock budget for one object's whole coverage ladder, in seconds.
+#: Measured over 18 bake logs (13.6 h, 976 objects): foliage is 66% of all bake
+#: time and the top 1% of objects is 25% of it, because leaf cards overlap in UV
+#: BY DESIGN -- the coverage gate can never be satisfied, so those objects climb
+#: every rung, rebuild the UV, climb again, and fall back to a per-face atlas.
+#: One PlantContainerFactory with 3.9M polygons spent 53 minutes this way. A
+#: 120 s budget reclaims 36% of bake time and touches 88 of 976 objects.
+# OFF by default (0). At 120 it turned slow-but-passing objects into a hard failure:
+# the strict export refuses any object whose coverage gate did not pass, so cutting
+# the ladder short does not "keep a lower resolution", it fails the WHOLE import.
+# kr_58299348 died at 200/436 units on a LargePlantContainerFactory cut at 1024.
+# Turn it on only together with the skip-the-object handling at the strict check.
+BAKE_OBJECT_BUDGET_S = float(os.environ.get("IR_BAKE_OBJECT_BUDGET_S", "0"))
+
+
 def _bake_coverage_adaptive(obj, out_png, base_res, max_res, max_unbaked_ratio):
     """Bake coverage, repairing a UV that fails the full surface audit once.
 
@@ -819,7 +915,12 @@ def _bake_coverage_adaptive(obj, out_png, base_res, max_res, max_unbaked_ratio):
     """
     attempts = []
     rebuilt_uv = False
+    deadline = time.monotonic() + BAKE_OBJECT_BUDGET_S if BAKE_OBJECT_BUDGET_S > 0 else None
+    over_budget = False
     for resolution in adaptive_resolutions(base_res, max_res):
+        if deadline is not None and attempts and time.monotonic() > deadline:
+            over_budget = True
+            break
         baked = bool(_bake_coverage(obj, out_png, resolution))
         validation = (
             _coverage_validation(obj, out_png, max_unbaked_ratio=max_unbaked_ratio)
@@ -846,49 +947,20 @@ def _bake_coverage_adaptive(obj, out_png, base_res, max_res, max_unbaked_ratio):
             "referenced_unbaked_texels",
         }:
             if rebuilt_uv:
-                break
-            rebuilt_uv = True
-            rebuilt = _ensure_uv(obj, force=True)
-            validation["uv_rebuild_attempted"] = True
-            validation["uv_rebuild_succeeded"] = bool(rebuilt)
-            if not rebuilt:
-                break
-            # Validate the rebuilt layer at the same resolution before escalating;
-            # this keeps a repair of a small mesh cheap and deterministic.
-            baked = bool(_bake_coverage(obj, out_png, resolution))
-            repaired = (
-                _coverage_validation(obj, out_png, max_unbaked_ratio=max_unbaked_ratio)
-                if baked else {"attempted": True, "passed": False, "reason": "bake_failed"}
-            )
-            repaired["resolution"] = [resolution, resolution]
-            repaired["uv_rebuild_attempted"] = True
-            repaired["uv_rebuild_succeeded"] = True
-            attempts.append(repaired)
-            if repaired.get("passed"):
-                result = dict(repaired)
-                result["adaptive_attempts"] = attempts
-                result["uv_rebuild_attempted"] = True
-                return resolution, result
-            print(
-                "[bake] coverage repaired-UV retry "
-                f"{obj.name}: res={resolution} reason={repaired.get('reason')} "
-                f"unbaked={repaired.get('referenced_unbaked_ratio', 'n/a')} "
-                f"slot_max={repaired.get('max_material_slot_unbaked_ratio', 'n/a')}",
-                file=sys.stderr,
-            )
-            if repaired.get("reason") in {
-                "degenerate_uv_triangles",
-                "overlapping_uv_triangles",
-                "referenced_unbaked_texels",
-            }:
-                # Smart Project can intentionally retain stacked islands for
-                # coincident generated components.  That is not a valid shared
-                # atlas contract, so rebuild as one unique tile per polygon
-                # instead of accepting the overlap or silently downgrading a
-                # linked PBR channel to a scalar factor.
+                if resolution < int(max_res):
+                    # Give the rebuilt, normally packed UV the same complete
+                    # resolution ladder before replacing it.  This is the
+                    # common successful path for dense generated props.
+                    continue
+                # The repaired Smart UV already had every normal adaptive
+                # resolution available to it.  Only now use a per-face atlas
+                # as the final escape hatch.  Switching after its first 512px
+                # attempt is counterproductive for dense generated props:
+                # their Smart UV islands commonly become valid at 1K/2K while
+                # a 48K-face atlas still has sub-texel tiles at 4K.
                 face_atlas_ok = _face_atlas_uv(obj)
-                repaired["face_atlas_uv_attempted"] = True
-                repaired["face_atlas_uv_succeeded"] = bool(face_atlas_ok)
+                validation["face_atlas_uv_attempted"] = True
+                validation["face_atlas_uv_succeeded"] = bool(face_atlas_ok)
                 if not face_atlas_ok:
                     break
                 face_base_resolution = min(
@@ -899,6 +971,9 @@ def _bake_coverage_adaptive(obj, out_png, base_res, max_res, max_unbaked_ratio):
                 # footprint.  Keep escalating after the face-atlas repair rather
                 # than treating its first coverage pass as terminal.
                 for face_resolution in adaptive_resolutions(face_base_resolution, max_res):
+                    if deadline is not None and time.monotonic() > deadline:
+                        over_budget = True
+                        break
                     baked = bool(_bake_coverage(obj, out_png, face_resolution))
                     face_repaired = (
                         _coverage_validation(obj, out_png, max_unbaked_ratio=max_unbaked_ratio)
@@ -930,11 +1005,52 @@ def _bake_coverage_adaptive(obj, out_png, base_res, max_res, max_unbaked_ratio):
                     if face_repaired.get("reason") == "bake_failed":
                         break
                 break
+            rebuilt_uv = True
+            rebuilt = _ensure_uv(obj, force=True)
+            validation["uv_rebuild_attempted"] = True
+            validation["uv_rebuild_succeeded"] = bool(rebuilt)
+            if not rebuilt:
+                break
+            # Validate the rebuilt layer at the same resolution before escalating;
+            # this keeps a repair of a small mesh cheap and deterministic.
+            baked = bool(_bake_coverage(obj, out_png, resolution))
+            repaired = (
+                _coverage_validation(obj, out_png, max_unbaked_ratio=max_unbaked_ratio)
+                if baked else {"attempted": True, "passed": False, "reason": "bake_failed"}
+            )
+            repaired["resolution"] = [resolution, resolution]
+            repaired["uv_rebuild_attempted"] = True
+            repaired["uv_rebuild_succeeded"] = True
+            attempts.append(repaired)
+            if repaired.get("passed"):
+                result = dict(repaired)
+                result["adaptive_attempts"] = attempts
+                result["uv_rebuild_attempted"] = True
+                return resolution, result
+            print(
+                "[bake] coverage repaired-UV retry "
+                f"{obj.name}: res={resolution} reason={repaired.get('reason')} "
+                f"unbaked={repaired.get('referenced_unbaked_ratio', 'n/a')} "
+                f"slot_max={repaired.get('max_material_slot_unbaked_ratio', 'n/a')}",
+                file=sys.stderr,
+            )
     result = dict(attempts[-1]) if attempts else {
         "attempted": True, "passed": False, "reason": "no_resolution_attempted",
     }
     result["adaptive_attempts"] = attempts
     result["uv_rebuild_attempted"] = rebuilt_uv
+    result["budget_exhausted"] = over_budget
+    if over_budget:
+        # The ladder stopped early, so out_png holds the LAST resolution baked,
+        # not max_res.  Report that one or the manifest records a texture size
+        # the file does not have.
+        final = int(result.get("resolution", [int(max_res)])[0])
+        print(
+            f"[bake] object budget exhausted {obj.name}: kept res={final} "
+            f"after {len(attempts)} attempts reason={result.get('reason')}",
+            file=sys.stderr,
+        )
+        return final, result
     return int(max_res), result
 
 
@@ -1079,6 +1195,25 @@ def _bake_verified_base_color(obj, out_png, res, samples, *, coverage_path):
             pass
 
 
+
+#: Room walls and floors are one object per room, so the default 512 start gives a ~50 m2 wall ~1.4 cm per texel and the
+#: coverage ladder only climbs when coverage fails. IR_ROOM_SHELL_BAKE_RES (unset = unchanged) starts those slots higher,
+#: capped by --max-bake-res. Set by apps/run_apartment_bake_worker.py for scenes whose room materials carry fine patterns.
+_ROOM_SHELL_SLOT = re.compile(r"[a-z-]+_\d+[/_]\d+\.(wall|floor)(?![a-z])")
+
+
+def _room_shell_bake_res(name: str, bake_res: int, max_bake_res: int) -> int:
+    # IR_OBJECT_BAKE_RES + IR_OBJECT_BAKE_PATTERN (regex on the object name): same start-high rule for objects whose
+    # image textures sit on small parts (e.g. IslandCounter art tiles: ~25 tiles share one atlas, 512 px = ~40 px each).
+    obj_want, obj_pat = os.environ.get("IR_OBJECT_BAKE_RES"), os.environ.get("IR_OBJECT_BAKE_PATTERN")
+    if obj_want and obj_pat and re.search(obj_pat, name or ""):
+        bake_res = max(int(bake_res), min(int(obj_want), int(max_bake_res)))
+    want = os.environ.get("IR_ROOM_SHELL_BAKE_RES")
+    if not want or not _ROOM_SHELL_SLOT.search(name or ""):
+        return int(bake_res)
+    return max(int(bake_res), min(int(want), int(max_bake_res)))
+
+
 def _bake_slot_pbr_contract(obj, *, oid, slot, textures_dir, out_dir, bake_res,
                             max_bake_res, bake_samples, bake_pbr, bake_metallic,
                             max_unbaked_ratio, do_bake, glb_rel):
@@ -1096,11 +1231,13 @@ def _bake_slot_pbr_contract(obj, *, oid, slot, textures_dir, out_dir, bake_res,
         validation = {}
         normal_validation = {"attempted": False, "result": "not_applicable"}
         baked = {key: None for key in ("base_color", "roughness", "metallic", "normal")}
+        bake_res = _room_shell_bake_res(f"{oid} {getattr(obj, 'name', '')}", bake_res, max_bake_res)
         effective_res = int(bake_res)
         if do_bake and uv_valid:
             with _render_isolate(isolated):
                 effective_res, coverage = _bake_coverage_adaptive(
-                    isolated, atlas_abs["coverage"], bake_res, max_bake_res, max_unbaked_ratio
+                    isolated, atlas_abs["coverage"],
+                    bake_res, max_bake_res, max_unbaked_ratio
                 )
                 if coverage.get("passed"):
                     jobs = (
@@ -1836,11 +1973,29 @@ def _mesh_triangle_count(mesh):
     return len(mesh.loop_triangles)
 
 
+def _mesh_counts(mesh):
+    """Triangles, vertices and loops together.
+
+    Triangle count alone is not an identity for a mesh. Two meshes can carry the
+    same faces while differing in how vertices are split at UV seams and normal
+    boundaries, which changes the interpolated surface and therefore anything
+    baked against it -- and every gate here counted only triangles, so that
+    difference was invisible to all of them. Record the tuple; compare the tuple.
+    """
+    mesh.calc_loop_triangles()
+    return {
+        "triangles": len(mesh.loop_triangles),
+        "vertices": len(mesh.vertices),
+        "loops": len(mesh.loops),
+    }
+
+
 def _gltfpack_simplify_material_partitions(obj, target_max_triangles):
     """Preserve every used material slot by simplifying one primitive set at a time."""
     import bmesh
 
     source_mesh = obj.data
+    _counts_before = _mesh_counts(source_mesh)
     used_slots = sorted({int(poly.material_index) for poly in source_mesh.polygons})
     # Some generated assets retain polygon indices for a material slot whose
     # datablock was dropped during authoring/export.  A strict partition pass
@@ -2035,11 +2190,16 @@ def _gltfpack_simplify_material_partitions(obj, target_max_triangles):
             f"({triangles_after}>{int(target_max_triangles)})"
         )
     obj.data = candidate_mesh
+    _counts_after = _mesh_counts(candidate_mesh)
     return {
         "backend": "meshoptimizer_gltfpack_material_partitions",
         "source_triangles": total,
         "target_max_triangles": int(target_max_triangles),
         "triangles_after": triangles_after,
+        "counts_before": _counts_before,
+        "counts_after": _counts_after,
+        "vertices_before": _counts_before["vertices"],
+        "vertices_after": _counts_after["vertices"],
         "used_material_slots": used_slots,
         "material_slots_preserved": resulting_slots == set(used_slots),
         "material_slot_transport_repaired": resulting_slots != set(used_slots),
@@ -2058,10 +2218,15 @@ def _gltfpack_simplify_object(obj, target_max_triangles):
     binary = _gltfpack_binary()
     source_mesh = obj.data
     source_materials = list(source_mesh.materials)
+    _source_used_indices = {int(poly.material_index) for poly in source_mesh.polygons}
     source_material_names = [material.name if material else None for material in source_materials]
-    source_triangles = _mesh_triangle_count(source_mesh)
+    _counts_before = _mesh_counts(source_mesh)
+    source_triangles = _counts_before["triangles"]
     if source_triangles <= target_max_triangles:
-        return {"backend": "meshoptimizer_gltfpack", "triangles_after": source_triangles, "skipped": True}
+        return {"backend": "meshoptimizer_gltfpack", "triangles_after": source_triangles,
+                "counts_before": _counts_before, "counts_after": dict(_counts_before),
+                "vertices_before": _counts_before["vertices"],
+                "vertices_after": _counts_before["vertices"], "skipped": True}
     source_matrix = obj.matrix_world.copy()
     source_had_uv = bool(source_mesh.uv_layers)
     imported_objects = []
@@ -2161,13 +2326,39 @@ def _gltfpack_simplify_object(obj, target_max_triangles):
                 raise RuntimeError(
                     f"gltfpack did not reduce topology ({source_triangles}->{triangles_after} triangles)"
                 )
+            # gltfpack takes a ratio, not a count, and does not have to honour
+            # it. Asked for 61% of a dining table's 35840 triangles it returned
+            # 856 -- 2.4%, a twenty-five-fold overshoot that erased the legs and
+            # left the rim of the top floating with the cutlery above it. Keep
+            # the caller's mesh instead: it is over the LOD target, which costs
+            # memory, where this costs the object.
+            _floor = int(target_max_triangles) * 0.2
+            if triangles_after < _floor:
+                raise RuntimeError(
+                    f"gltfpack collapsed the mesh ({source_triangles}->{triangles_after} triangles, "
+                    f"target {int(target_max_triangles)}, floor {_floor:.0f})"
+                )
+            # And it can drop a material slot's geometry entirely, which the
+            # decimation record then reported as preserved because this asserted
+            # so without looking.
+            _kept = {int(poly.material_index) for poly in candidate_mesh.polygons}
+            _slots_preserved = _source_used_indices <= _kept
+            if not _slots_preserved:
+                raise RuntimeError(
+                    f"gltfpack dropped material slots {sorted(_source_used_indices - _kept)} "
+                    f"(source used {sorted(_source_used_indices)}, kept {sorted(_kept)})"
+                )
             obj.data = candidate_mesh
+            _counts_after = _mesh_counts(candidate_mesh)
             return {
                 "backend": "meshoptimizer_gltfpack", "binary": binary,
                 "source_triangles": source_triangles, "target_max_triangles": int(target_max_triangles),
                 "triangles_after": triangles_after, "ratio_requested": ratio,
+                "counts_before": _counts_before, "counts_after": _counts_after,
+                "vertices_before": _counts_before["vertices"],
+                "vertices_after": _counts_after["vertices"],
                 "command": command[1:], "uv_preserved": bool(candidate_mesh.uv_layers),
-                "material_slots_preserved": True,
+                "material_slots_preserved": _slots_preserved,
             }
         finally:
             for imported in imported_objects:
@@ -2729,9 +2920,22 @@ def main():
     decimate_min_polys = int(args[args.index("--decimate-min-polys") + 1]) if "--decimate-min-polys" in args else 50000
     decimate_ratio = float(args[args.index("--decimate-ratio") + 1]) if "--decimate-ratio" in args else 0.30
     decimate_strict = "--decimate-strict" in args
+    # Objects no larger than this (m) keep their decimated mesh when a material slot lost every face
+    # (mesh_decimation.decimate_object). 0 = never (GT default).
+    decimate_allow_slot_loss = (float(args[args.index("--decimate-allow-slot-loss-max-extent") + 1])
+                                if "--decimate-allow-slot-loss-max-extent" in args else 0.0)
     filter_small_high_poly = "--filter-small-high-poly" in args
     small_high_poly_max_extent = float(args[args.index("--small-high-poly-max-extent-m") + 1]) if "--small-high-poly-max-extent-m" in args else 0.5
     small_high_poly_min_triangles = int(args[args.index("--small-high-poly-min-triangles") + 1]) if "--small-high-poly-min-triangles" in args else 100_000
+    # Objects an earlier attempt showed cannot satisfy the strict bake gate. They are
+    # dropped like the small-high-poly units: left out of the manifest, which Stage 2
+    # then hides from rendering (hide_untracked_render_meshes), so the scene simply
+    # renders without them instead of the whole bake failing on one object.
+    exclude_blender_names = {args[i + 1] for i, a in enumerate(args[:-1]) if a == "--exclude-blender-name"}
+    resume_after_blender_name = (
+        args[args.index("--resume-after-blender-name") + 1]
+        if "--resume-after-blender-name" in args else None
+    )
     decimation_policy = None
     _DecCtx = _decimate_object = None
     try:
@@ -2748,6 +2952,10 @@ def main():
 
     meshes_dir = os.path.join(out_dir, "meshes")
     os.makedirs(meshes_dir, exist_ok=True)
+    try:
+        os.unlink(os.path.join(out_dir, "strict_export_failure.json"))   # a previous run's verdict
+    except FileNotFoundError:
+        pass
     textures_dir = os.path.join(out_dir, "textures")
     if do_bake:
         os.makedirs(textures_dir, exist_ok=True)
@@ -2829,12 +3037,43 @@ def main():
         if filtered_small_high_poly:
             print(f"[filter] removed {len(filtered_small_high_poly)} tiny high-poly detail unit(s), "
                   f"{manifest['small_high_poly_filter']['filtered_triangles']:,} source triangles", flush=True)
+    if exclude_blender_names:
+        kept = []
+        for obj in mesh_objs:
+            if obj.name not in exclude_blender_names:
+                kept.append(obj)
+                continue
+            kind, sem, subtype = _classify(obj)
+            bmin, bmax = _world_bbox(obj)
+            filtered_small_high_poly.append({
+                "blender_name": obj.name, "factory": _factory_of(obj.name),
+                "kind": kind, "semantic_type": sem, "subtype": subtype,
+                "dimensions": [bmax[i] - bmin[i] for i in range(3)],
+                "triangles": len(obj.data.polygons) * 2, "reason": "bake_unrecoverable",
+            })
+        mesh_objs = kept
+        # Same record the filter keeps, recomputed because the filter block may have
+        # already written its own counts (or not run at all).
+        flt = manifest["small_high_poly_filter"]
+        flt["filtered_units"] = filtered_small_high_poly
+        flt["filtered_unit_count"] = len(filtered_small_high_poly)
+        flt["filtered_triangles"] = sum(int(x["triangles"]) for x in filtered_small_high_poly)
+        manifest["bake_excluded_units"] = sorted(exclude_blender_names)
+        print(f"[exclude] {len(exclude_blender_names)} unbakeable unit(s) left out: "
+              f"{sorted(exclude_blender_names)}", flush=True)
     if only_substrs:
         needles = [value.lower() for value in only_substrs]
         mesh_objs = [o for o in mesh_objs if any(value in o.name.lower() for value in needles)]
     if only_degenerate:
         mesh_objs = [o for o in mesh_objs if o.data.uv_layers and _uv_is_degenerate(o.data)]
     total_renderable = len(mesh_objs)
+    if resume_after_blender_name is not None:
+        # A filter can be enabled after an interrupted unfiltered export.  The
+        # old manifest is an alphabetical prefix, whereas a numeric ``--skip``
+        # would now point at different objects because filtered decorations are
+        # absent.  Continue strictly after its last committed source name; the
+        # merge below retains that already-exported prefix unchanged.
+        mesh_objs = [o for o in mesh_objs if o.name > resume_after_blender_name]
     manifest["prefilter_renderable_unit_count"] = total_renderable + len(filtered_small_high_poly)
     manifest["renderable_unit_count"] = total_renderable
     if skip:
@@ -2848,7 +3087,7 @@ def main():
     manifest_path = os.path.join(out_dir, "scene_manifest.json")
     existing_manifest = None
     existing_oid_by_name = {}
-    partial_export = bool(only_substrs or only_degenerate or skip or limit)
+    partial_export = bool(only_substrs or only_degenerate or skip or limit or resume_after_blender_name)
     if partial_export and os.path.exists(manifest_path) and not merge:
         raise RuntimeError("partial export refuses to overwrite a full manifest; pass --merge")
     if merge and os.path.exists(manifest_path):
@@ -2870,6 +3109,7 @@ def main():
         pass
 
     used_ids = set()
+    oid_by_name = {}                                     # blender name -> exported object id (lights carry their fixture's id, opticalnav sim 10-23)
     baked_count = 0
     fail_count = 0
     reused_atlas_count = 0
@@ -2898,6 +3138,7 @@ def main():
         elif oid in used_ids:
             oid = f"{oid}_{i}"
         used_ids.add(oid)
+        oid_by_name[obj.name] = oid
 
         bmin, bmax = _world_bbox(obj)
         _pre_material_slots = [slot.material.name if slot.material else None for slot in obj.material_slots]
@@ -2941,6 +3182,7 @@ def main():
             decimation_record = _decimate_object(
                 obj, decimation_policy, _dctx, strict=decimate_strict,
                 fallback=_gltfpack_simplify_object if decimate_strict and decimation_policy.name == "ir_semantic_lod_v1" else None,
+                allow_slot_loss_max_extent=decimate_allow_slot_loss,
             )
             # ``decimate_object`` stores meshoptimizer fallback metadata under
             # ``fallback``.  Promote the transport-contract flags as well so
@@ -3073,9 +3315,34 @@ def main():
                 decimation_record.get("material_slot_transport_repaired")
             )
             _validation["material_slot_transport_repaired"] = _slot_transport_repaired
+            # A slot that had geometry before and none after means that part of
+            # the object is gone. A dining table came back as the rim of its top
+            # and nothing else: 69596 triangles down to 856 against a 21923
+            # target, its wooden legs -- material slot 1 -- absent entirely. Both
+            # facts were recorded here and neither was consulted, so the unit
+            # passed and rendered as a floating frame with the cutlery that had
+            # been resting on it hanging in the air.
+            _used_slots_preserved = set(_pre_used_material_indices) <= set(_post_indices)
+            _validation["used_material_slots_preserved"] = _used_slots_preserved
+            # --decimate-allow-slot-loss-max-extent: a small object's lost slot was accepted on purpose.
+            _validation["material_slot_loss_allowed"] = bool(decimation_record.get("material_slot_loss_allowed"))
+            _used_slots_preserved = _used_slots_preserved or _validation["material_slot_loss_allowed"]
+            # gltfpack is asked for a ratio, not a count, and can overshoot far
+            # past it. Requesting 61% of 35840 triangles returned 856 -- 2.4%,
+            # a twenty-five-fold overshoot. Judge the result against the target
+            # that was asked for rather than trusting the backend to honour it.
+            _after = float(decimation_record.get("triangles_after") or 0.0)
+            _before = float(decimation_record.get("triangles_before") or 0.0)
+            _target = float(decimation_record.get("target_max_triangles") or 0.0)
+            _collapse_floor = _target * 0.2
+            _collapsed = bool(_target and _after and _after < _collapse_floor and _after < _before)
+            _validation["decimation_collapse_floor"] = _collapse_floor
+            _validation["decimation_collapsed"] = _collapsed
             _validation["passed"] = all((
                 _validation["uv_valid"],
                 (_validation["material_slots_preserved"] or _slot_transport_repaired),
+                _used_slots_preserved,
+                not _collapsed,
                 _validation["primitive_material_indices_valid"], _validation["transform_preserved"],
                 _validation["aabb_finite"],
             ))
@@ -3271,7 +3538,7 @@ def main():
                 effective_bake_res, coverage_validation = _bake_coverage_adaptive(
                     obj,
                     atlas_abs["coverage"],
-                    bake_res,
+                    _room_shell_bake_res(f"{oid} {obj.name}", bake_res, max_bake_res),
                     max_bake_res,
                     max_unbaked_ratio,
                 )
@@ -3503,6 +3770,11 @@ def main():
         obj.matrix_world = orig_mw
         effective_issues = list(pbr_contract.get("issues") or [])
         if effective_issues and not allow_incomplete_pbr and not bootstrap:
+            # Name the object in a file, not just in the traceback: the caller needs
+            # it to exclude the object and resume, and must know this failure is a
+            # verdict on the object (another device will not change it).
+            with open(os.path.join(out_dir, "strict_export_failure.json"), "w") as marker:
+                json.dump({"blender_name": obj.name, "issues": effective_issues[:6]}, marker)
             raise RuntimeError(f"{obj.name}: strict GLB/PBR export failed: {', '.join(effective_issues)}")
 
         # Commit the successful unit independently of the all-scene manifest.
@@ -3624,6 +3896,33 @@ def main():
             "place_center": [wp.x, -wp.y],
             "place_base_height_m": wp.z,
         }
+        # Preserve physical Blender parameters separately from the legacy emitter.
+        # Metadata uses the plan frame (x, -y, z), exactly as placement above.
+        direction = (o.matrix_world.to_3x3() @ Vector((0, 0, -1))).normalized()
+        area_size = None
+        if L.type == "AREA":
+            sx = float(L.size)
+            sy = float(L.size_y) if L.shape in {"RECTANGLE", "ELLIPSE"} else sx
+            area_size = [sx, sy]
+        entry["metadata"] = {"light": {
+            "type": L.type,
+            "energy": entry["energy"],
+            "color": list(L.color),  # Blender Light.color is scene-linear.
+            "position": [*entry["place_center"], entry["place_base_height_m"]],
+            "direction": [direction.x, -direction.y, direction.z],
+            "spot_size_deg": math.degrees(L.spot_size) if L.type == "SPOT" else None,
+            "spot_blend": float(L.spot_blend) if L.type == "SPOT" else None,
+            "radius_m": float(L.shadow_soft_size) if L.type in {"POINT", "SPOT"} else None,
+            "area_shape": L.shape if L.type == "AREA" else None,
+            "area_size_m": area_size,
+            "spread_deg": math.degrees(L.spread) if L.type == "AREA" else None,
+            "sun_angle_deg": math.degrees(L.angle) if L.type == "SUN" else None,
+            "use_shadow": bool(L.use_shadow),
+        }}
+        fx = o.get("ir_fixture")                             # fixture_tags.py: the mesh this light belongs to ("" = none)
+        if fx is not None:
+            entry["fixture_name"] = str(fx) or None
+            entry["fixture_oid"] = oid_by_name.get(str(fx)) if fx else None
         if L.type == "AREA":
             entry["size"] = [float(getattr(L, "size", 0.0)), float(getattr(L, "size_y", 0.0) or getattr(L, "size", 0.0))]
         if L.type == "SUN":
@@ -3664,6 +3963,11 @@ def main():
         for _key in ("prefilter_renderable_unit_count", "renderable_unit_count"):
             if _key in manifest:
                 existing_manifest[_key] = manifest[_key]
+        if resume_after_blender_name is not None:
+            # The retained prefix can contain an already-baked decoration that
+            # the newly enabled filter would omit.  Report the actual merged
+            # output count, not just this invocation's filtered source count.
+            existing_manifest["renderable_unit_count"] = len(existing_manifest["units"])
         existing_manifest.setdefault("materials", {}).update(manifest["materials"])
         final_manifest = existing_manifest
         n_replaced = len(manifest["units"])

@@ -45,6 +45,15 @@ def _args() -> argparse.Namespace:
     parser.add_argument("--ambient-fill-max-size", type=float, default=2.2)
     parser.add_argument("--ambient-fill-ceiling-gap", type=float, default=0.10)
     parser.add_argument("--illumination-manifest", type=Path)
+    parser.add_argument(
+        "--metallic-augmentation-policy", type=Path,
+        help="opt-in continuous-metalness policy; absent keeps the contract byte-identical",
+    )
+    parser.add_argument("--metallic-augmentation-seed", type=int, default=0)
+    parser.add_argument(
+        "--fixture-policy", choices=("legacy_disable_v1", "addressable_v2"),
+        default="legacy_disable_v1",
+        help="addressable_v2 keeps indoor lights as individually switchable fixtures")
     parser.add_argument("--structural-material-manifest", type=Path,
                         help="immutable external-PBR overlay for an independent rematerialized scene")
     parser.add_argument("--prop-material-manifest", type=Path,
@@ -73,13 +82,18 @@ def _validate_output(directory: Path) -> dict:
         "base_color_rgb", "base_color_nir", "roughness", "metallic",
         "normal_geometry_world", "normal_shading_world",
     }
+    # See the queue's matching gate: v3 is accepted only when the prepared
+    # contract declares the augmentation policy it was compiled with.
+    allow_continuous_metallic = bool(contract.get("metallic_augmentation"))
     for record in contract["materials"]:
         effective = record.get("effective_inputs")
         if not isinstance(effective, dict) or set(effective) != required_effective:
             raise RuntimeError("Principled Stage 2 material lacks the effective-input audit")
         if not all(isinstance(effective[name], dict) and effective[name].get("route") for name in required_effective):
             raise RuntimeError("Principled Stage 2 material has an invalid effective-input audit")
-        valid, failures = validate_metallic_contract(record.get("metallic_contract"))
+        valid, failures = validate_metallic_contract(
+            record.get("metallic_contract"), allow_v3=allow_continuous_metallic,
+        )
         if not valid:
             raise RuntimeError(
                 f"Principled Stage 2 material {record.get('material_id')} has invalid MetallicContractV2: "
@@ -169,6 +183,10 @@ def main() -> int:
     illumination_sha = _sha256(args.illumination_manifest.resolve()) if args.illumination_manifest else None
     structural_sha = _sha256(args.structural_material_manifest.resolve()) if args.structural_material_manifest else None
     prop_sha = _sha256(args.prop_material_manifest.resolve()) if args.prop_material_manifest else None
+    metallic_policy_sha = (
+        _sha256(args.metallic_augmentation_policy.resolve())
+        if args.metallic_augmentation_policy else None
+    )
     if out.exists() and not args.force:
         try:
             contract = _validate_output(out)
@@ -192,6 +210,12 @@ def main() -> int:
                 and contract.get("illumination_manifest_sha256") == illumination_sha
                 and contract.get("structural_rematerialization_sha256") == structural_sha
                 and contract.get("prop_pbr_remediation_sha256") == prop_sha
+                # Absent on both sides when the augmentation is off, so an
+                # un-augmented Stage 2 still reuses exactly as before.
+                and (contract.get("metallic_augmentation") or {}).get("policy_sha256") == metallic_policy_sha
+                and bool((contract.get("ambient_fill_rig") or {}).get("indoor_fixture_rig"))                     == (args.fixture_policy == "addressable_v2")
+                and (contract.get("metallic_augmentation") or {}).get("dataset_seed")
+                    == (int(args.metallic_augmentation_seed) if args.metallic_augmentation_policy else None)
             ):
                 print(f"[ir-principled] reuse verified Stage 2: {out}")
                 return 0
@@ -231,6 +255,13 @@ def main() -> int:
         ]
         if args.illumination_manifest:
             command.extend(("--illumination-manifest", str(args.illumination_manifest.resolve())))
+        if args.metallic_augmentation_policy:
+            command.extend((
+                "--metallic-augmentation-policy", str(args.metallic_augmentation_policy.resolve()),
+                "--metallic-augmentation-seed", str(int(args.metallic_augmentation_seed)),
+            ))
+        if args.fixture_policy != "legacy_disable_v1":
+            command.extend(("--fixture-policy", str(args.fixture_policy)))
         if args.structural_material_manifest:
             command.extend(("--structural-material-manifest", str(args.structural_material_manifest.resolve())))
         if args.prop_material_manifest:

@@ -15,6 +15,7 @@ export interface CapabilityInput {
 	hasScene: boolean;
 	hasMap: boolean;
 	hasGraph: boolean;
+	hasNavigationSupport: boolean;
 	hasEpisodes: boolean;
 	renderSceneSynced: boolean;
 	renderConfigReady: boolean;
@@ -55,7 +56,7 @@ export type CapabilityName =
 	| 'saveMap' | 'addScene' | 'editAnnotation' | 'perturbation'
 	| 'buildMap' | 'buildGraph' | 'rebuildEdges' | 'findOverlapping' | 'removeNodes'
 	| 'generateEpisodes' | 'validateEpisodes' | 'renderSweepNode' | 'renderSweepAll'
-	| 'renderEpisodePath' | 'runProbe' | 'validate' | 'export' | 'saveLights'
+	| 'renderNavigationSupport' | 'renderEpisodePath' | 'runProbe' | 'validate' | 'export' | 'saveLights'
 	| 'enableEmitters' | 'refreshBatch' | 'retryFailed' | 'refreshStats';
 
 export type Capabilities = Record<CapabilityName, Capability>;
@@ -99,6 +100,13 @@ export function computeCapabilities(i: CapabilityInput): Capabilities {
 			noProject,
 			[!i.renderSceneSynced, 'Sync the render scene first'],
 			[!i.hasGraph, 'Build the viewpoint graph first'],
+			[!i.renderConfigReady, 'Load/complete the render config first'],
+			busy,
+		]),
+		renderNavigationSupport: gate([
+			noProject,
+			[!i.renderSceneSynced, 'Sync the render scene first'],
+			[!i.hasNavigationSupport, 'Build Navigation Support first'],
 			[!i.renderConfigReady, 'Load/complete the render config first'],
 			busy,
 		]),

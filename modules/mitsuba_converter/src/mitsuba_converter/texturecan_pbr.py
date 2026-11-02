@@ -85,15 +85,84 @@ _FAMILY_ALIASES = {
 # finishes.  The extended profile retains controlled visual diversity without
 # admitting photographed props, exterior paving, or damaged/weathered scans.
 # Quotas are asset counts (not per-role tokens) and sum to 100.
+#: Per-family caps for the extended profile. The first set summed to exactly
+#: 100 with tile taking 44 of it, and after the wall repeat ceiling that left
+#: 54 wall candidates of which 39 were tile -- every room came out in square
+#: tiles. The staged pool holds 497 assets (tile 163, metal 86, fabric 78,
+#: wood 71, concrete 45, rock 28, brick 15, marble 11), so the scarce families
+#: are taken whole and tile is capped near where it stops dominating.
 EXTENDED_FAMILY_QUOTAS = {
-    "tile": 44, "wood": 16, "concrete": 15, "brick": 8,
-    "metal": 6, "fabric": 6, "marble": 5,
+    "tile": 40, "concrete": 45, "wood": 30, "fabric": 20,
+    "metal": 15, "brick": 15, "marble": 11, "rock": 10,
 }
+#: The same table for a corpus of exteriors and non-domestic interiors, where
+#: the families that are accents indoors are the subject: a parking structure
+#: is metal, a lobby is marble, a yard is stone and asphalt. Written as a
+#: separate table rather than as edits to the one above because the v2 registry
+#: was selected under that one and must keep selecting the same assets.
+ENVIRONMENT_FAMILY_QUOTAS = {
+    "metal": 45, "rock": 30, "concrete": 30, "marble": 20,
+    "tile": 15, "brick": 10, "wood": 8, "fabric": 4,
+}
+
+#: What a corpus profile is allowed to do with a family. `interior_v1` states
+#: the rules that were previously written inline, so it is the existing
+#: behaviour under a name and nothing selected under it moves.
+#:
+#: `environment_v1` differs in one substantive place: metal may be a floor.
+#: Indoors that is correctly refused -- the note on the metallic-floor gate
+#: below says "interior floors ... are always dielectric", and it is right
+#: about interiors -- but a parking deck's floor is the metal, and refusing it
+#: leaves that environment with no floor to build from. Of 90 metal assets
+#: staged for the environment corpus, the interior rules approved 84 as walls
+#: and exactly 0 as floors.
+ROLE_PROFILES: dict[str, dict[str, Any]] = {
+    "interior_v1": {
+        "quotas": EXTENDED_FAMILY_QUOTAS,
+        "metal_roles": ("wall",),
+        "metal_floor": False,
+        "metal_ceiling_needs_token": True,
+        "metallic_floor": False,
+    },
+    "environment_v1": {
+        "quotas": ENVIRONMENT_FAMILY_QUOTAS,
+        "metal_roles": ("wall", "floor", "ceiling"),
+        "metal_floor": True,
+        "metal_ceiling_needs_token": False,
+        "metallic_floor": True,
+    },
+}
+DEFAULT_ROLE_PROFILE = "interior_v1"
+
+
+def role_profile(name: str | None = None) -> dict[str, Any]:
+    """The role policy for a corpus profile, defaulting to the interior one."""
+    key = str(name or DEFAULT_ROLE_PROFILE)
+    # `extended_v1` is what the existing registry run passes as its label; it
+    # has always meant the interior rules.
+    if key in ("extended_v1", "extended_v2"):
+        key = DEFAULT_ROLE_PROFILE
+    if key not in ROLE_PROFILES:
+        raise ValueError(f"unknown role profile: {key!r}")
+    return ROLE_PROFILES[key]
+#: Matched against the whole asset text, so a term here rejects an asset whose
+#: *description* merely mentions it. That cost more than it saved: of 497
+#: accepted assets, 312 were excluded, and the four commonest reasons were
+#: "worn" (122), "damaged" (71), "broken" (61) and "crack" (59) -- terms that
+#: describe an ordinary interior wall. They took out "Red Brick Wall Texture
+#: Covered by Cement", "Concrete Plaster Wall Texture", "White Bathroom Tile
+#: Texture" and "Blue Office Carpet Texture", and cut brick from 23 assets to 3.
+#: A worn wall is what rooms look like; the dataset wants that variety, not a
+#: showroom. "coat" went with them as a substring that caught "Coating" and
+#: "Chevron ... Coat" more often than a garment.
+#:
+#: What remains is genuinely outdoor or non-architectural. Those are still the
+#: wrong surface for an interior wall however the sentence is phrased.
 _EXTENDED_EXCLUSION_TERMS = (
-    "rust", "oxidized", "corroded", "crack", "damaged", "broken", "worn", "moss",
+    "rust", "oxidized", "corroded", "moss",
     "bark", "fence", "cobblestone", "pavement", "puddle", "road", "asphalt",
     "treadplate", "tread plate", "chain", "fur", " hair ", "leather", "camouflage",
-    "coat", "medieval", "wallpaper", "carbon fibre", "carbon fiber", "foil",
+    "medieval", "carbon fibre", "carbon fiber", "foil",
     "shipping container", "cargo container", "steel cable", "wireframe", "perforated",
     "grille", "mesh", "tree trunk", "tree bark", "office building facade",
 )
@@ -101,6 +170,7 @@ _EXTENDED_POSITIVE_TERMS = (
     "plaster", "concrete", "ceramic", "porcelain", "terracotta", "tile", "wood",
     "plank", "carpet", "rug", "marble", "terrazzo", "galvanized", "brushed",
     "aluminium", "aluminum", "indoor", "bathroom", "office",
+    "wallpaper", "paint", "painted", "stucco", "drywall",
 )
 
 
@@ -320,8 +390,9 @@ def _asset_text(record: dict[str, Any]) -> str:
     ).lower()
 
 
-def provisional_roles(record: dict[str, Any]) -> list[str]:
+def provisional_roles(record: dict[str, Any], *, profile: str | None = None) -> list[str]:
     """Return broad review candidates; final production use needs human approval."""
+    policy = role_profile(profile)
     category, text = str(record.get("category") or "").lower(), _asset_text(record)
     roles = {"prop"}
     outdoor = any(token in text for token in ("outdoor", "pavement", "sidewalk", "road", "highway", "garden"))
@@ -330,6 +401,7 @@ def provisional_roles(record: dict[str, Any]) -> list[str]:
             roles.add("floor")
     elif category == "metal":
         roles.update({"wall", "prop"})
+        roles.update(policy["metal_roles"])
         if any(token in text for token in ("ceiling", "panel", "sheet", "plate")):
             roles.add("ceiling")
     elif category in {"wood", "marble", "tile", "rock"}:
@@ -627,8 +699,10 @@ def _roughness_statistics(path: Path) -> dict[str, float]:
     }
 
 
-def classify_second_pass(record: dict[str, Any], role: str, *, roughness: dict[str, float] | None = None) -> tuple[str, list[str]]:
+def classify_second_pass(record: dict[str, Any], role: str, *, roughness: dict[str, float] | None = None,
+                         profile: str | None = None) -> tuple[str, list[str]]:
     """Classify one retained preview token without touching the raw source asset."""
+    policy = role_profile(profile)
     if role not in REVIEW_ROLES:
         raise ValueError(f"unsupported review role: {role}")
     if role == "prop":
@@ -641,11 +715,12 @@ def classify_second_pass(record: dict[str, Any], role: str, *, roughness: dict[s
         hard_reasons.append("nonstructural_asset_family")
     if role == "wall" and family == "fabric" and not any(term in text for term in ("wallcover", "wall covering")):
         hard_reasons.append("nonstructural_fabric_wall")
-    if role == "floor" and family == "metal":
+    if role == "floor" and family == "metal" and not policy["metal_floor"]:
         hard_reasons.append("metal_floor_not_in_structural_baseline")
     if role == "floor" and family == "fabric" and not any(term in text for term in ("carpet", "rug", "carpet tile")):
         hard_reasons.append("non_floor_fabric")
-    if role == "ceiling" and family == "metal" and not any(term in text for term in ("ceiling", "acoustic")):
+    if (role == "ceiling" and family == "metal" and policy["metal_ceiling_needs_token"]
+            and not any(term in text for term in ("ceiling", "acoustic"))):
         hard_reasons.append("metal_not_a_ceiling_system")
     if hard_reasons:
         return "defer_hard", sorted(set(hard_reasons))
@@ -732,12 +807,14 @@ def second_pass_structural_review(
     return payload
 
 
-def _extended_candidate(record: dict[str, Any], staging_root: Path) -> dict[str, Any] | None:
+def _extended_candidate(record: dict[str, Any], staging_root: Path,
+                        *, profile: str | None = None) -> dict[str, Any] | None:
     """Return the role-safe extended candidate for one staged TextureCan asset."""
+    policy = role_profile(profile)
     if record.get("status") != "accepted":
         return None
     family = structural_family(record)
-    if family not in EXTENDED_FAMILY_QUOTAS:
+    if family not in policy["quotas"]:
         return None
     title = str(record.get("title") or "").lower()
     text = _asset_text(record)
@@ -745,15 +822,26 @@ def _extended_candidate(record: dict[str, Any], staging_root: Path) -> dict[str,
         return None
     roughness = _roughness_statistics(staging_root / str((record.get("maps") or {}).get("roughness") or ""))
     roles: list[str] = []
-    for role in provisional_roles(record):
+    for role in provisional_roles(record, profile=profile):
         if role == "prop":
             continue
-        status, _ = classify_second_pass(record, role, roughness=roughness)
+        status, _ = classify_second_pass(record, role, roughness=roughness, profile=profile)
         if status == "defer_hard":
             continue
         if family == "fabric" and (role != "floor" or not any(token in title for token in ("carpet", "rug", "matting"))):
             continue
-        if family == "metal" and role != "wall":
+        if family == "metal" and role not in policy["metal_roles"]:
+            continue
+        # Interior floors in the opaque Principled IR contract are always
+        # dielectric.  TextureCan's ``metallic`` map is authoritative even
+        # when the broad asset category is tile/stone (for example decorative
+        # marble with gold inlay), so category-only filtering can otherwise
+        # admit a physically invalid reflective floor.
+        metallic = dict(record.get("metallic") or {})
+        if role == "floor" and not policy["metallic_floor"] and (
+            metallic.get("mode") == "texture"
+            or float(metallic.get("value") or 0.0) > 1e-6
+        ):
             continue
         if "wall" in title and role != "wall":
             continue
@@ -787,15 +875,25 @@ def _extended_scale(record: dict[str, Any]) -> float:
     if family == "wood":
         return 2.4 if any(token in title for token in ("plank", "long", "flooring")) else 2.0
     if family == "brick":
-        return 2.0
+        # The wall ceiling is 1.5 m and treats repeat size as feature size,
+        # which is right for planks and wrong for masonry: a 2.0 m brick tile
+        # holds about thirty bricks, not one. At 2.0 every brick asset was
+        # excluded from walls -- nine of them -- and the wall pool came out 68
+        # tiles of 83. 1.5 m is still a realistic course width.
+        return 1.5
     if family == "marble":
         return 1.5
     if family == "metal":
         return 1.5
     if family == "concrete":
-        return 1.2 if any(token in title for token in ("plate", "slab", "waffle", "tile")) else 2.0
+        # Plaster and poured concrete have no feature that sets a scale, so the
+        # repeat is a free choice; 2.0 only cost them their place on walls.
+        return 1.2 if any(token in title for token in ("plate", "slab", "waffle", "tile")) else 1.5
     if family == "tile":
         return 0.6 if any(token in title for token in ("small", "mosaic", "hexagonal", "terracotta")) else 1.2
+    if family == "rock":
+        # Slate and stone cladding read at roughly a brick's scale indoors.
+        return 1.5
     raise ValueError(f"unsupported extended family: {family}")
 
 
@@ -817,12 +915,15 @@ def create_extended_structural_review_profile(staging_root: Path, *, review_subd
     if review.exists() or profile_dir.exists():
         raise FileExistsError(f"extended review profile already exists: {review_subdir}")
 
+    policy = role_profile(profile_name)
+    quotas = policy["quotas"]
     candidates = {entry["id"]: entry for entry in (
-        _extended_candidate(record, staging_root) for record in records.values()
+        _extended_candidate(record, staging_root, profile=profile_name)
+        for record in records.values()
     ) if entry is not None}
     core_roles = approved_roles_from_review(staging_root)
     selected: dict[str, dict[str, Any]] = {}
-    family_counts = {family: 0 for family in EXTENDED_FAMILY_QUOTAS}
+    family_counts = {family: 0 for family in quotas}
 
     # Keep every accepted core material in the extended profile as a stable
     # subset.  Prop-only approvals are intentionally ignored.
@@ -832,7 +933,7 @@ def create_extended_structural_review_profile(staging_root: Path, *, review_subd
             continue
         family = structural_family(record)
         roles = sorted(set(approved_roles) & set(STRUCTURAL_ROLES))
-        if family not in EXTENDED_FAMILY_QUOTAS or not roles:
+        if family not in quotas or not roles:
             continue
         candidate = candidates.get(asset_id) or {
             "id": asset_id, "family": family, "roles": roles, "score": 1_000,
@@ -845,7 +946,7 @@ def create_extended_structural_review_profile(staging_root: Path, *, review_subd
     def ordered(entries: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
         return sorted(entries, key=lambda row: (-int(row["score"]), str(row["title"] or ""), str(row["id"])))
 
-    for family, quota in EXTENDED_FAMILY_QUOTAS.items():
+    for family, quota in quotas.items():
         for candidate in ordered(row for row in candidates.values() if row["family"] == family):
             if len(selected) >= max_assets or family_counts[family] >= quota:
                 break
@@ -889,7 +990,7 @@ def create_extended_structural_review_profile(staging_root: Path, *, review_subd
     payload = {
         "schema": EXTENDED_PROFILE_SCHEMA, "profile": profile_name, "review_subdir": review_subdir,
         "staging_digest": manifest.get("digest"), "max_assets": max_assets,
-        "family_quotas": EXTENDED_FAMILY_QUOTAS, "family_counts": family_counts,
+        "family_quotas": quotas, "family_counts": family_counts,
         "selected": selected_rows, "candidate_asset_count": len(candidates), "created_at": utc_now(),
     }
     payload["digest"] = canonical_digest({key: value for key, value in payload.items() if key != "digest"})

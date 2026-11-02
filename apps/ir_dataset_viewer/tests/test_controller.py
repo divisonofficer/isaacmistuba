@@ -189,6 +189,9 @@ def test_submit_resolves_deferred_seed_and_builds_safe_commands(tmp_path: Path) 
         assert current.request["pipeline_revision"] == "ir-content-aware-v2"
         assert current.request["import_profile"] == "ir-bootstrap-v1"
         assert current.request["nir_passive"] is True
+        assert current.request["storage_profile"] == "core_half_exr_v2"
+        render_command = controller._command(current, "full_render")
+        assert render_command[render_command.index("--storage-profile") + 1] == "core_half_exr_v2"
         assert "--nir-passive" in controller._command(current, "full_render")
         assert "scene_content_audit" in controller._pipeline(current)
         assert "view_probe" in controller._pipeline(current)
@@ -755,6 +758,34 @@ def test_prepared_accepts_supported_structural_rematerialization_policies(tmp_pa
     controller._assert_prepared_v2(job)
 
 
+def test_remove_terminal_job_reclaims_only_unreferenced_work_artifacts(tmp_path: Path) -> None:
+    controller = _controller(tmp_path)
+    pipeline = controller.pipeline_root / "failed"; dataset = controller.work_root / "failed"
+    pipeline.mkdir(parents=True); dataset.mkdir(parents=True)
+    (pipeline / "partial.txt").write_text("partial")
+    (dataset / "partial.txt").write_text("partial")
+    failed = ControllerJob(job_id="failed", status="failed", request={
+        "dataset_name": "failed", "paths": {"pipeline": str(pipeline), "dataset": str(dataset)},
+    })
+    with controller._lock:
+        controller._jobs[failed.job_id] = failed
+        controller._save(failed, "failed")
+    result = controller.remove_terminal_job(failed.job_id)
+    assert result["removed"] and not pipeline.exists() and not dataset.exists()
+
+
+def test_remove_terminal_job_keeps_artifacts_referenced_by_child(tmp_path: Path) -> None:
+    controller = _controller(tmp_path)
+    pipeline = controller.pipeline_root / "parent"; pipeline.mkdir(parents=True)
+    failed = ControllerJob(job_id="parent", status="failed", request={"paths": {"pipeline": str(pipeline)}})
+    child = ControllerJob(job_id="child", status="queued", request={"legacy_dataset": str(pipeline)})
+    with controller._lock:
+        controller._jobs.update({failed.job_id: failed, child.job_id: child})
+        controller._save(failed, "failed")
+    result = controller.remove_terminal_job(failed.job_id)
+    assert result["purged_artifacts"] == [] and pipeline.exists()
+
+
 def test_stale_prepared_stage_is_rebuilt_only_via_archive_flag(tmp_path: Path) -> None:
     controller = _controller(tmp_path)
     geometry = tmp_path / "geometry"
@@ -1289,3 +1320,151 @@ def test_legacy_duplicate_pipeline_is_blocked_before_ir_artifacts(tmp_path: Path
     controller._assert_pipeline_owner(owner)
     with pytest.raises(RuntimeError, match="generated scene is preserved"):
         controller._assert_pipeline_owner(duplicate)
+
+
+def _metal_qc_fixture(root: Path, *, metallic_u16: int) -> dict:
+    """Write a minimal single-material QC frame and return its paths."""
+    paths = {
+        "metallic": "metallic.png", "gt_defined_mask": "defined.png",
+        "replacement_mask": "replacement.png", "fallback_mask": "fallback.png",
+        "material_id": "material_id.png", "roughness": "roughness.png",
+        "base_color_rgb": "base.png", "normal_shading_world": "normal.png",
+        "metallic_family_id": "family.png", "exposed_metal_mask": "exposed.png",
+    }
+    shape = (6, 6)
+    assert cv2.imwrite(str(root / paths["metallic"]), np.full(shape, metallic_u16, np.uint16))
+    assert cv2.imwrite(str(root / paths["gt_defined_mask"]), np.full(shape, 255, np.uint8))
+    for key in ("replacement_mask", "fallback_mask", "exposed_metal_mask"):
+        assert cv2.imwrite(str(root / paths[key]), np.zeros(shape, np.uint8))
+    assert cv2.imwrite(str(root / paths["material_id"]), np.ones(shape, np.uint16))
+    assert cv2.imwrite(str(root / paths["roughness"]), np.full(shape, 20000, np.uint16))
+    assert cv2.imwrite(str(root / paths["base_color_rgb"]), np.full((*shape, 3), 32768, np.uint16))
+    assert cv2.imwrite(str(root / paths["normal_shading_world"]), np.full((*shape, 3), 32768, np.uint16))
+    assert cv2.imwrite(str(root / paths["metallic_family_id"]), np.full(shape, 3, np.uint8))
+    return paths
+
+
+def _augmented_job(tmp_path: Path, *, declare: bool) -> ControllerJob:
+    prepared = tmp_path / "prepared"
+    prepared.mkdir(parents=True, exist_ok=True)
+    contract = {"materials": []}
+    if declare:
+        contract["metallic_augmentation"] = {
+            "policy_id": "metallic_composition_v1", "policy_sha256": "d" * 64, "dataset_seed": 7,
+            "modified_channels": ["metallic"],
+        }
+    _atomic_json(prepared / "principled_material_contract.json", contract)
+    return ControllerJob(job_id="aug", request={"paths": {"prepared": str(prepared)}})
+
+
+def test_continuous_metallic_relaxes_the_binary_gates_but_still_reports_them(tmp_path: Path) -> None:
+    """The binary coverage/near-binary gates assume a distribution v3 abandons.
+
+    An augmented dataset is *supposed* to sit between 0 and 1, so those findings
+    must stop blocking the render while remaining visible in the report.
+    """
+    controller = _controller(tmp_path)
+    root = tmp_path / "qc"
+    root.mkdir()
+    # Mid-range metalness everywhere: exactly what the binary gates dislike.
+    paths = _metal_qc_fixture(root, metallic_u16=39000)
+    rows = [{"frame_id": "f", "paths": paths}]
+
+    undeclared = controller._material_visibility_qc(
+        root, rows, job=_augmented_job(tmp_path / "a", declare=False),
+    )
+    assert undeclared["status"] == "failed"
+    assert undeclared["diagnostic_findings"]
+
+    declared = controller._material_visibility_qc(
+        root, rows, job=_augmented_job(tmp_path / "b", declare=True),
+    )
+    assert declared["status"] == "passed"
+    # The statistics are retained, not silently dropped.
+    assert declared["diagnostic_findings"] == undeclared["diagnostic_findings"]
+    assert declared["continuous_metallic"]["relaxed_binary_findings"] == undeclared["diagnostic_findings"]
+    assert declared["continuous_metallic"]["policy_id"] == "metallic_composition_v1"
+    assert declared["continuous_metallic"]["intermediate_fraction"] == 1.0
+
+
+def test_continuous_metallic_fails_loudly_when_the_augmentation_did_nothing(tmp_path: Path) -> None:
+    """A silently no-op augmentation leaves metalness pinned at 0/1.
+
+    That dataset is worthless for the experiment it was built for, so the gate
+    that replaces the relaxed binary checks must reject it.
+    """
+    controller = _controller(tmp_path)
+    root = tmp_path / "qc"
+    root.mkdir()
+    paths = _metal_qc_fixture(root, metallic_u16=65535)  # still fully binary
+    report = controller._material_visibility_qc(
+        root, [{"frame_id": "f", "paths": paths}],
+        job=_augmented_job(tmp_path / "c", declare=True),
+    )
+    assert report["status"] == "failed"
+    assert "continuous_metallic_collapsed_to_binary" in report["failures"]
+    assert report["continuous_metallic"]["intermediate_fraction"] == 0.0
+
+
+def test_prepare_stage_passes_the_metallic_policy_only_when_requested(tmp_path: Path) -> None:
+    controller = _controller(tmp_path)
+    job = ControllerJob(job_id="cmd", request={
+        "scene_id": "s",
+        "paths": {"geometry": "g", "prepared": "p"},
+        "metallic_augmentation": False,
+    })
+    off = controller._command(job, "principled_prepare")
+    assert "--metallic-augmentation-policy" not in off
+
+    job.request["metallic_augmentation"] = True
+    job.request["metallic_augmentation_seed"] = 4242
+    on = controller._command(job, "principled_prepare")
+    assert "--metallic-augmentation-policy" in on
+    assert on[on.index("--metallic-augmentation-policy") + 1].endswith(
+        "configs/ir_materials/metallic_composition_v1.json"
+    )
+    assert on[on.index("--metallic-augmentation-seed") + 1] == "4242"
+
+
+def test_variation_retry_rebuilds_every_attempt_path() -> None:
+    """A second variation must address the same artifacts as the first.
+
+    Two separate literals build the per-attempt ``paths`` dict: one when the job
+    is normalized, one when ``_next_quality_variation`` moves to the next
+    variation. They drifted twice -- ``object_anchors``/``free_camera_poses``
+    went missing, so every free-pose job died with KeyError on its second
+    attempt and effectively had a variation limit of one, and then
+    ``prop_pbr_remediation`` went missing the same way. Compare the two literals
+    directly rather than waiting for the next stage to trip over the gap.
+    """
+    import re
+    source = (Path(__file__).resolve().parents[1] / "backend" / "controller.py").read_text()
+    first = source[source.index('attempt_root = pipeline / "attempts"'):][:3000]
+    retry = source[source.index("def _next_quality_variation"):][:6000]
+    first_keys = set(re.findall(r'"([a-z_0-9]+)":\s*str\(attempt_root', first))
+    retry_keys = set(re.findall(r'"([a-z_0-9]+)":\s*str\(attempt\s*/', retry))
+    retry_keys |= {"attempt_root"} if '"attempt_root": str(attempt)' in retry else set()
+    assert first_keys, "path literal not found; the regex needs updating"
+    assert not first_keys - retry_keys, f"variation retry drops: {sorted(first_keys - retry_keys)}"
+
+
+def test_cancel_signals_a_running_job_the_controller_has_no_handle_for() -> None:
+    """A restart empties `_running`; cancel must still stop the subprocess.
+
+    Jobs persist as "running" across a controller restart while `_running` does
+    not, so cancelling one afterwards took the branch that marked it cancelled
+    and never signalled anything. The Infinigen tree kept going and kept its
+    resource slot, and every queued job behind it stalled with no error to show
+    for it. The pid is persisted, so there is no reason not to signal it.
+    """
+    import re
+    source = (Path(__file__).resolve().parents[1] / "backend" / "controller.py").read_text()
+    start = source.index("def cancel_job")
+    branch = source[start:source.index("def retry(", start)]
+    orphan = branch[branch.index('job.job_id not in self._running'):]
+    orphan = orphan[:orphan.index('elif job.status == "running":')]
+    assert "_pid_alive" in orphan and "killpg" in orphan, (
+        "cancel_job leaves a handle-less running job's process group alive")
+    # The signal has to precede the status change, or a later reader sees a
+    # cancelled job whose process is still holding a slot.
+    assert orphan.index("killpg") < orphan.index('job.status = job.stage = "cancelled"')

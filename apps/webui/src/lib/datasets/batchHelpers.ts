@@ -519,18 +519,20 @@ export function buildRenderSummary(batch: any, health: any, renderMode = '') {
 			workerRunning: jobs.filter((job) => job?.execution_state === 'worker_running').length,
 		};
 	return {
-		label: renderModeLabel(renderMode),
+		label: String(batch?.summary_label ?? renderModeLabel(renderMode)),
 		batch_id: batch?.batch_id ?? '',
 		total,
 		complete,
 		percent,
 		counts,
-		activeStage: String(health?.active_stage ?? runningJobs[0]?.status?.progress_stage ?? ''),
-		queueLength: Number(health?.queue_length ?? counts.queued ?? 0),
+		activeStage: String(batch?.active_stage ?? health?.active_stage ?? runningJobs[0]?.status?.progress_stage ?? ''),
+		queueLength: Number(batch?.queue_length ?? health?.queue_length ?? counts.queued ?? 0),
 		gpus: Array.isArray(health?.gpus) ? health.gpus : [],
-		textureProfile,
+		textureProfile: String(batch?.texture_profile ?? textureProfile),
 		cacheHits,
+		cacheMode: String(batch?.cache_mode ?? ''),
 		execution,
+		logical_progress: Boolean(batch?.logical_progress),
 		runningJobCount: runningJobs.length,
 	};
 }

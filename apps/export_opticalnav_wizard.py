@@ -12,15 +12,19 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
+import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 from uuid import uuid4
+
+from tqdm import tqdm
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -46,12 +50,50 @@ def _write_json_atomic(path: Path, payload: Mapping[str, Any]) -> None:
     tmp.replace(path)
 
 
-def _sha256(path: Path) -> str:
+def _sha256(path: Path, *, label: str | None = None) -> str:
+    """Hash a file while making multi-GiB resume preparation observable."""
+    total = path.stat().st_size
+    completed = 0
+    started_at = time.monotonic()
+    last_report_at = started_at
+    if label:
+        print(f"[checksum] {label}: 0/{total:,} bytes", flush=True)
     digest = hashlib.sha256()
     with path.open("rb") as handle:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(block)
+            completed += len(block)
+            now = time.monotonic()
+            if label and (completed == total or now - last_report_at >= 5.0):
+                elapsed = max(now - started_at, 1e-6)
+                rate_mib_s = completed / elapsed / 1048576
+                percent = 100.0 * completed / total if total else 100.0
+                print(
+                    f"[checksum] {label}: {percent:.1f}% · {completed:,}/{total:,} bytes · {rate_mib_s:.1f} MiB/s",
+                    flush=True,
+                )
+                last_report_at = now
+    if label:
+        print(f"[checksum] {label}: done", flush=True)
     return digest.hexdigest()
+
+
+def _cached_checksum(manifest_path: Path, file_path: Path) -> str | None:
+    """Return a checksum recorded for the exact current file, if available."""
+    payload = _read_json(manifest_path, {})
+    entries = payload.get("files") if isinstance(payload, Mapping) else None
+    for entry in entries or []:
+        if not isinstance(entry, Mapping):
+            continue
+        try:
+            same_file = Path(str(entry.get("path") or "")).resolve() == file_path.resolve()
+            same_size = int(entry.get("bytes")) == file_path.stat().st_size
+        except (OSError, TypeError, ValueError):
+            continue
+        checksum = entry.get("sha256")
+        if same_file and same_size and isinstance(checksum, str) and len(checksum) == 64:
+            return checksum
+    return None
 
 
 def _project_dir(project: str) -> Path:
@@ -127,8 +169,10 @@ def _ledger_sensor_inventory(
     if requested is None and not scene_ledgers and (project_dir / "render_ledger.sqlite3").is_file():
         scene_ledgers = [("", project_dir / "render_ledger.sqlite3")]
     for scoped_scene_id, ledger in scene_ledgers:
+        connection = None
         try:
-            connection = sqlite3.connect(f"file:{ledger}?mode=ro", uri=True)
+            connection = sqlite3.connect(f"file:{ledger}?mode=ro", uri=True, timeout=30.0)
+            connection.execute("PRAGMA busy_timeout = 30000")
             # One newest completed run per scene is the exportable active
             # snapshot. Querying every historical retry run made a simple menu
             # take minutes on an NFS-backed ledger.
@@ -179,13 +223,21 @@ def _ledger_sensor_inventory(
                                 seen_tasks[bucket].add(identity)
                             scene_counts[bucket][sensor] = scene_counts[bucket].get(sensor, 0) + 1
         except sqlite3.Error:
+            # A menu count is advisory; export readiness is decided by the
+            # pointer index. Never let a ledger the daemon has locked abort it.
             continue
         finally:
-            connection.close()
+            if connection is not None:
+                connection.close()
     return inventory
 
 
-def discover_scenes(project_dir: Path, *, scene_ids: Iterable[str] | None = None) -> list[dict[str, Any]]:
+def discover_scenes(
+    project_dir: Path,
+    *,
+    scene_ids: Iterable[str] | None = None,
+    coverage_levels: Iterable[str] | None = None,
+) -> list[dict[str, Any]]:
     """Return exportable scenes, optionally from exact scene workspaces only."""
     root = project_dir / "scenes"
     scenes: list[dict[str, Any]] = []
@@ -201,7 +253,29 @@ def discover_scenes(project_dir: Path, *, scene_ids: Iterable[str] | None = None
         if not scene_dir.is_dir():
             continue
         counts = inventory.get(scene_dir.name)
-        if counts is None and not inventory:
+        # For a specifically selected scene, stable pointers are authoritative:
+        # they represent exactly the currently promotable graph views and do
+        # not double-count old resumed versions.  The unscoped picker stays
+        # ledger-only so opening it does not recursively walk every scene's
+        # NFS observation tree.
+        pointer_counts = None
+        if requested is not None:
+            pointer_counts = _pointer_summary_counts(scene_dir, coverage_levels=coverage_levels)
+        # A V4 scene's pointers are expensive to enumerate over NFS and may
+        # not exist until export reconciliation. Its selected ledger is the
+        # authoritative readiness source at wizard startup.
+        is_v4 = bool(coverage_levels) or _v4_plan_group(scene_dir) is not None
+        if pointer_counts is None and not is_v4:
+            pointer_counts = {
+                "base": _sensor_counts(project_dir, scene_dir.name, "observations"),
+                "perturbed": _sensor_counts(project_dir, scene_dir.name, "observations_perturbed"),
+                "perturbed_active_polar": _sensor_counts(project_dir, scene_dir.name, "observations_perturbed_active_polar"),
+            }
+        if pointer_counts is not None and any(sum(values.values()) for values in pointer_counts.values()):
+            base, perturbed, active_polar = (
+                pointer_counts["base"], pointer_counts["perturbed"], pointer_counts["perturbed_active_polar"],
+            )
+        elif counts is None and not inventory:
             # Legacy projects without a ledger are uncommon. Keep that fallback
             # isolated so a modern project's menu never recursively walks NFS.
             base = _sensor_counts(project_dir, scene_dir.name, "observations")
@@ -236,6 +310,575 @@ def discover_scenes(project_dir: Path, *, scene_ids: Iterable[str] | None = None
             "exportable": bool(sum(base.values()) + sum(perturbed.values()) + sum(active_polar.values())),
         })
     return sorted(scenes, key=lambda item: item["modified_at"], reverse=True)
+
+
+_OBSERVATION_ROOT_BY_VARIANT = {
+    "base": "observations",
+    "perturbed": "observations_perturbed",
+    "perturbed_active_polar": "observations_perturbed_active_polar",
+}
+
+
+def _legacy_graph_view_keys(scene_dir: Path) -> set[tuple[str, str]]:
+    """Return the legacy viewpoint-graph viewpoint/heading universe."""
+    graph = _read_json(scene_dir / "viewpoint_graph.json", {})
+    if not isinstance(graph, Mapping):
+        return set()
+    keys: set[tuple[str, str]] = set()
+    for node in graph.get("nodes") or []:
+        if not isinstance(node, Mapping):
+            continue
+        node_id = str(node.get("node_id") or "")
+        if not node_id:
+            continue
+        for heading in node.get("headings") or []:
+            heading_id = str(heading.get("heading_id") or "") if isinstance(heading, Mapping) else str(heading or "")
+            if heading_id:
+                keys.add((node_id, heading_id))
+    return keys
+
+
+def _v4_plan_view_keys(paths: Iterable[Path]) -> set[tuple[str, str]]:
+    """Read the native support-pose universe from a V4 plan group."""
+    keys: set[tuple[str, str]] = set()
+    for path in paths:
+        payload = _read_json(path, {})
+        if not isinstance(payload, Mapping) or str(payload.get("profile_id") or "") != "adaptive_navigation_support_v4":
+            continue
+        for entry in payload.get("render_entries") or []:
+            if not isinstance(entry, Mapping):
+                continue
+            node_id = str(entry.get("motion_node_id") or entry.get("node_id") or "")
+            heading_id = str(entry.get("heading_id") or "")
+            if node_id and heading_id:
+                keys.add((node_id, heading_id))
+    return keys
+
+
+def _v4_plan_group(scene_dir: Path) -> tuple[list[Path], str] | None:
+    """Choose the V4 plan group named by the latest durable L3 submission.
+
+    V4 stores its reusable L0 plan and additive L3 plan in an archive directory
+    after a graph revision.  The generic viewpoint graph remains in the scene
+    for editing, but is not the render/export contract for support poses.
+    """
+    submissions = sorted(
+        scene_dir.glob("support_l3_submission_*.json"),
+        key=lambda path: path.stat().st_mtime_ns,
+        reverse=True,
+    )
+    roots: list[tuple[Path, str]] = []
+    for submission in submissions:
+        payload = _read_json(submission, {})
+        plan_dir = payload.get("plan_dir") if isinstance(payload, Mapping) else None
+        if not isinstance(plan_dir, str) or not plan_dir:
+            continue
+        candidate = (scene_dir / plan_dir).resolve()
+        try:
+            candidate.relative_to(scene_dir.resolve())
+        except ValueError:
+            continue
+        roots.append((candidate, f"v4 submission {submission.name}"))
+    # A freshly generated V4 scene may not yet have a submission receipt.
+    roots.append((scene_dir, "v4 scene-local plans"))
+    archives = scene_dir / "navigation_support_archives"
+    if archives.is_dir():
+        roots.extend((path, f"v4 archive {path.name}") for path in sorted(
+            (candidate for candidate in archives.iterdir() if candidate.is_dir()),
+            key=lambda path: path.stat().st_mtime_ns,
+            reverse=True,
+        ))
+    seen: set[Path] = set()
+    for root, source in roots:
+        if root in seen:
+            continue
+        seen.add(root)
+        base = root / "support_observation_plan.json"
+        if not base.is_file():
+            continue
+        paths = [base, *sorted(root.glob("support_observation_expansion_*.json"))]
+        if _v4_plan_view_keys(paths):
+            return paths, source
+    return None
+
+
+def _coverage_level_plan_group(scene_dir: Path, level_ids: Iterable[str]) -> tuple[list[Path], str]:
+    """Resolve an explicit union of rendered sweep-coverage levels.
+
+    A V4 scene keeps its full L0 observation plan (every support pose × every
+    heading) while a render campaign deliberately submits a much smaller
+    coverage level, and often several of them in sequence.  Exporting such a
+    campaign means packaging exactly the union of the submitted levels, not the
+    L0 universe the levels were selected from.
+    """
+    paths: list[Path] = []
+    for raw in level_ids:
+        level_id = str(raw).strip()
+        # A level id names a scene-local sibling file, never a traversal.
+        if not level_id or "/" in level_id or "\\" in level_id or level_id in {".", ".."}:
+            raise RuntimeError(f"invalid sweep coverage level id: {raw!r}")
+        path = scene_dir / f"support_sweep_coverage_{level_id}.json"
+        if not path.is_file():
+            raise RuntimeError(f"sweep coverage level is missing: {path}")
+        if path not in paths:
+            paths.append(path)
+    if not paths:
+        raise RuntimeError("no sweep coverage level selected")
+    if not _v4_plan_view_keys(paths):
+        raise RuntimeError(f"sweep coverage levels declare no render entries: {[path.name for path in paths]}")
+    return paths, "sweep coverage levels " + "+".join(
+        str(level).strip() for level in level_ids if str(level).strip()
+    )
+
+
+def _current_export_view_universe(
+    scene_dir: Path,
+    *,
+    coverage_levels: Iterable[str] | None = None,
+) -> tuple[set[tuple[str, str]], dict[str, Any]]:
+    """Return the active export universe for legacy graphs or support V4."""
+    levels = [str(level).strip() for level in (coverage_levels or []) if str(level).strip()]
+    if levels:
+        paths, source = _coverage_level_plan_group(scene_dir, levels)
+        scene_root = scene_dir.resolve()
+        fingerprints = [
+            {"path": path.relative_to(scene_root).as_posix(), "mtime_ns": path.stat().st_mtime_ns, "size": path.stat().st_size}
+            for path in paths
+        ]
+        return _v4_plan_view_keys(paths), {
+            "kind": "adaptive_navigation_support_v4",
+            "source": source,
+            "coverage_levels": levels,
+            "plans": fingerprints,
+        }
+    v4_group = _v4_plan_group(scene_dir)
+    if v4_group is not None:
+        paths, source = v4_group
+        scene_root = scene_dir.resolve()
+        fingerprints = [
+            {"path": path.relative_to(scene_root).as_posix(), "mtime_ns": path.stat().st_mtime_ns, "size": path.stat().st_size}
+            for path in paths
+        ]
+        return _v4_plan_view_keys(paths), {"kind": "adaptive_navigation_support_v4", "source": source, "plans": fingerprints}
+    graph_path = scene_dir / "viewpoint_graph.json"
+    graph_stat = graph_path.stat() if graph_path.is_file() else None
+    return _legacy_graph_view_keys(scene_dir), {
+        "kind": "viewpoint_graph", "path": "viewpoint_graph.json",
+        "mtime_ns": graph_stat.st_mtime_ns if graph_stat else None,
+        "size": graph_stat.st_size if graph_stat else None,
+    }
+
+
+def _pointer_summary_counts(
+    scene_dir: Path,
+    *,
+    coverage_levels: Iterable[str] | None = None,
+) -> dict[str, dict[str, int]] | None:
+    """Read a reconciliation summary when it still matches the current graph."""
+    summary = _read_json(scene_dir / "operations" / "export_current_pointer_index.json", {})
+    if not isinstance(summary, Mapping):
+        return None
+    try:
+        _, universe = _current_export_view_universe(scene_dir, coverage_levels=coverage_levels)
+    except RuntimeError:
+        return None
+    if summary.get("view_universe") != universe:
+        return None
+    variants = summary.get("variants")
+    if not isinstance(variants, Mapping):
+        return None
+    result: dict[str, dict[str, int]] = {}
+    for variant in _OBSERVATION_ROOT_BY_VARIANT:
+        value = variants.get(variant)
+        sensors = value.get("sensors") if isinstance(value, Mapping) else None
+        result[variant] = {
+            str(sensor): int(count)
+            for sensor, count in (sensors or {}).items()
+            if str(sensor) and int(count) > 0
+        } if isinstance(sensors, Mapping) else {}
+    return result
+
+
+def _safe_bundle_ref(project_dir: Path, ref: str) -> Path | None:
+    """Resolve a project-relative versioned bundle without escaping the project."""
+    candidate = Path(str(ref))
+    if not ref or candidate.is_absolute():
+        return None
+    try:
+        resolved = (project_dir / candidate).resolve()
+        resolved.relative_to(project_dir.resolve())
+    except (OSError, ValueError):
+        return None
+    return resolved if (resolved / "manifest.json").is_file() else None
+
+
+def _v4_heading_batch_bundles(
+    project_dir: Path,
+    bundle: Path,
+    metadata: Mapping[str, Any],
+    *,
+    default_key: tuple[str, str],
+    expected: set[tuple[str, str]],
+) -> list[tuple[tuple[str, str], Path]]:
+    """Expand a V4 spatial-Stokes batch into its per-heading bundles.
+
+    V4 records a task at a batch representative heading, while the renderer
+    writes one immutable sibling bundle per heading. Treating that task as one
+    view loses the other three (or fewer) headings in every batch.
+    """
+    raw_views = metadata.get("stokes_heading_batch_view_keys")
+    if not isinstance(raw_views, list):
+        return [(default_key, bundle)]
+    resolved: list[tuple[tuple[str, str], Path]] = []
+    for raw in raw_views:
+        if not isinstance(raw, Mapping):
+            continue
+        key = (str(raw.get("node_id") or ""), str(raw.get("heading_id") or ""))
+        if not all(key) or key not in expected:
+            continue
+        # A batch never crosses nodes. Still keep the check explicit so a
+        # malformed ledger row cannot redirect an export pointer elsewhere.
+        if key[0] != default_key[0]:
+            continue
+        sibling = bundle.parent / key[1]
+        try:
+            sibling.resolve().relative_to(project_dir.resolve())
+        except (OSError, ValueError):
+            continue
+        if (sibling / "manifest.json").is_file():
+            resolved.append((key, sibling))
+    return resolved or [(default_key, bundle)]
+
+
+class _LedgerReader:
+    """Read-only ledger access that survives a concurrently writing daemon.
+
+    The ledger lives on the NFS project mount and the render daemon keeps it
+    open in WAL mode.  NFS cannot provide the shared memory WAL wants, so a
+    reader intermittently fails with SQLITE_PROTOCOL ("locking protocol") --
+    and once a connection has seen it, every later statement on that same
+    connection fails too.  Retrying therefore has to reconnect, not just
+    re-issue.  If the mount stays wedged, fall back to reading a local snapshot
+    of the database and its WAL: slight staleness is harmless here because every
+    candidate bundle is independently verified on disk before it is promoted.
+    """
+
+    def __init__(self, ledger_path: Path, *, attempts: int = 6) -> None:
+        self._path = ledger_path
+        self._attempts = attempts
+        self._connection: sqlite3.Connection | None = None
+        self._snapshot_dir: tempfile.TemporaryDirectory | None = None
+
+    def __enter__(self) -> "_LedgerReader":
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.close()
+
+    def close(self) -> None:
+        if self._connection is not None:
+            try:
+                self._connection.close()
+            except sqlite3.Error:
+                pass
+            self._connection = None
+        if self._snapshot_dir is not None:
+            self._snapshot_dir.cleanup()
+            self._snapshot_dir = None
+
+    def _connect(self, path: Path) -> sqlite3.Connection:
+        connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=30.0)
+        connection.execute("PRAGMA busy_timeout = 30000")
+        return connection
+
+    def _snapshot(self) -> Path:
+        """Copy the database and its sidecars so the read has no NFS locking."""
+        if self._snapshot_dir is None:
+            self._snapshot_dir = tempfile.TemporaryDirectory(prefix="opticalnav-ledger-")
+        target_dir = Path(self._snapshot_dir.name)
+        target = target_dir / self._path.name
+        for suffix in ("", "-wal", "-shm"):
+            source = self._path.with_name(self._path.name + suffix)
+            if source.is_file():
+                shutil.copy2(source, target_dir / source.name)
+        return target
+
+    def query(self, sql: str, params: tuple[Any, ...], *, what: str) -> list[tuple[Any, ...]]:
+        delay = 0.5
+        last: sqlite3.Error | None = None
+        for attempt in range(1, self._attempts + 1):
+            try:
+                if self._connection is None:
+                    self._connection = self._connect(self._path)
+                return list(self._connection.execute(sql, params))
+            except sqlite3.Error as exc:
+                last = exc
+                self.close()
+                if attempt == self._attempts:
+                    break
+                print(
+                    f"[pointers] ledger busy ({what}, attempt {attempt}/{self._attempts}): {exc}; "
+                    f"reconnecting in {delay:.1f}s",
+                    flush=True,
+                )
+                time.sleep(delay)
+                delay = min(delay * 2, 8.0)
+        print(f"[pointers] ledger stayed locked ({what}); reading a local snapshot instead", flush=True)
+        try:
+            snapshot = self._snapshot()
+            self._connection = self._connect(snapshot)
+            return list(self._connection.execute(sql, params))
+        except (sqlite3.Error, OSError) as exc:
+            raise RuntimeError(f"ledger read failed ({what}): {last or exc}") from (last or exc)
+
+
+def _adopt_orphan_bundles(
+    project_dir: Path,
+    *,
+    scene_id: str,
+    variant: str,
+    expected: set[tuple[str, str]],
+    chosen: dict[tuple[str, str], tuple[str, str, str, tuple[str, ...]]],
+) -> int:
+    """Promote immutable bundles the ledger never recorded a task row for.
+
+    A spatial-Stokes sweep writes one immutable bundle per heading but records
+    only the batch representative as a task, and a daemon restart mid-batch can
+    leave the surviving siblings without any ledger row at all.  The bundles are
+    still complete and self-describing, so an export that ignored them would
+    silently drop thousands of rendered frames.  Only render versions that
+    already exist for this scene are scanned, newest first, and a bundle is
+    adopted solely when it carries its own manifest.
+    """
+    versions_root = project_dir / "scenes" / scene_id / "observations" / "versions"
+    if not versions_root.is_dir():
+        return 0
+    try:
+        version_dirs = sorted(
+            (path for path in versions_root.iterdir() if path.is_dir()),
+            key=lambda path: path.name,
+            reverse=True,
+        )
+    except OSError:
+        return 0
+    adopted = 0
+    outstanding = expected - set(chosen)
+    print(
+        f"[pointers] {variant}: scanning {len(version_dirs)} render versions for "
+        f"{len(outstanding):,} bundles the ledger did not record ...",
+        flush=True,
+    )
+    for version_dir in version_dirs:
+        if not outstanding:
+            break
+        variant_dir = version_dir / variant
+        if not variant_dir.is_dir():
+            continue
+        for node_id, heading_id in sorted(outstanding):
+            bundle = variant_dir / node_id / heading_id
+            if not (bundle / "manifest.json").is_file():
+                continue
+            manifest = _read_json(bundle / "manifest.json", {})
+            sensors: tuple[str, ...] = ()
+            if isinstance(manifest, Mapping):
+                sensors = tuple(dict.fromkeys(
+                    str(artifact.get("camera_id"))
+                    for artifact in manifest.get("artifacts") or []
+                    if isinstance(artifact, Mapping) and artifact.get("camera_id")
+                ))
+            chosen[(node_id, heading_id)] = (
+                bundle.relative_to(project_dir).as_posix(), version_dir.name, "", sensors,
+            )
+            adopted += 1
+        outstanding = expected - set(chosen)
+    return adopted
+
+
+def _reconcile_current_pointers(
+    project_dir: Path,
+    *,
+    scene_id: str,
+    variants: Iterable[str],
+    allow_partial_v4: bool = False,
+    coverage_levels: Iterable[str] | None = None,
+) -> dict[str, Any]:
+    """Promote the current graph's completed versioned bundles for export.
+
+    Older resumable sweeps may be fully complete in the ledger while never
+    having one render version that contains every frame.  The regular daemon
+    promote action intentionally refuses such fragmented versions.  Exporting
+    is different: it needs one stable pointer per logical current view.  This
+    reconciliation chooses the newest valid completed bundle for each current
+    graph view and writes only those small ``current.json`` pointers. V4
+    support plans can intentionally be exported while a long L3 recovery is
+    still incomplete; when requested, that mode promotes the completed subset
+    and records the missing native support-pose views rather than silently
+    substituting the legacy viewpoint graph.
+    """
+    scene_dir = project_dir / "scenes" / scene_id
+    expected, view_universe = _current_export_view_universe(scene_dir, coverage_levels=coverage_levels)
+    if not expected:
+        return {"expected": {"views": 0}, "variants": {}}
+    ledger_path = scene_dir / "operations" / "render_ledger.sqlite3"
+    if not ledger_path.is_file():
+        raise RuntimeError(f"render ledger is missing: {ledger_path}")
+
+    selected = []
+    for raw in variants:
+        variant = str(raw).strip().lower()
+        if variant not in _OBSERVATION_ROOT_BY_VARIANT:
+            raise RuntimeError(f"unsupported export variant: {variant}")
+        if variant not in selected:
+            selected.append(variant)
+
+    report: dict[str, Any] = {}
+    with _LedgerReader(ledger_path) as ledger:
+        for variant in selected:
+            chosen: dict[tuple[str, str], tuple[str, str, str, tuple[str, ...]]] = {}
+            # Query one newest run at a time.  A global task history sort is
+            # prohibitively slow on NFS after many interrupted resumes; each
+            # run contains at most one compact plan window's task history and
+            # lets us stop as soon as all current views have a candidate.
+            #
+            # ``planned`` runs are included because a chained campaign records
+            # its adopted cross-run coverage in a run that never transitions
+            # out of ``planned``.  This cannot invent frames: every candidate
+            # below is still admitted only through ``_safe_bundle_ref``, which
+            # requires an immutable bundle with a manifest on disk.
+            run_rows = ledger.query(
+                """
+                SELECT run_id, scene_version_id
+                FROM sweep_runs
+                WHERE scene_id = ? AND status IN ('completed', 'ready', 'paused', 'planned')
+                ORDER BY created_at DESC
+                """,
+                (scene_id,),
+                what=f"{variant} sweep runs",
+            )
+            print(
+                f"[pointers] {variant}: resolving {len(expected):,} {view_universe['kind']} views "
+                f"from {len(run_rows)} ledger runs ...",
+                flush=True,
+            )
+            with tqdm(total=len(expected), desc=f"resolve {variant}", unit="view", dynamic_ncols=True, file=sys.stdout) as progress:
+                for run_index, (run_id, scene_version_id) in enumerate(run_rows, 1):
+                    before = len(chosen)
+                    # Materialize one run's task window before parsing it: a
+                    # lock error raised mid-iteration cannot be retried, and a
+                    # single run's history is small enough to hold in memory.
+                    rows = ledger.query(
+                        """
+                        SELECT node_id, heading_id, render_version_id, metadata_json
+                        FROM sweep_tasks
+                        WHERE run_id = ? AND variant = ? AND state IN ('succeeded', 'skipped')
+                        """,
+                        (run_id, variant),
+                        what=f"{variant} tasks of {run_id}",
+                    )
+                    for node_id_raw, heading_id_raw, render_version_id, metadata_raw in rows:
+                        key = (str(node_id_raw), str(heading_id_raw))
+                        if key not in expected or key in chosen:
+                            continue
+                        metadata: Any = {}
+                        try:
+                            metadata = json.loads(metadata_raw or "{}")
+                        except (TypeError, ValueError):
+                            metadata = {}
+                        sensor_ids = metadata.get("sensor_ids") if isinstance(metadata, Mapping) else None
+                        sensors = tuple(str(sensor) for sensor in sensor_ids if str(sensor)) if isinstance(sensor_ids, list) else ()
+                        source_ref = metadata.get("source_bundle_ref") if isinstance(metadata, Mapping) else None
+                        bundle = _safe_bundle_ref(project_dir, str(source_ref or ""))
+                        if bundle is None:
+                            fallback = (
+                                f"scenes/{scene_id}/observations/versions/{render_version_id}/"
+                                f"{variant}/{key[0]}/{key[1]}"
+                            )
+                            bundle = _safe_bundle_ref(project_dir, fallback)
+                        if bundle is None:
+                            continue
+                        if view_universe.get("kind") == "adaptive_navigation_support_v4":
+                            bundle_views = _v4_heading_batch_bundles(
+                                project_dir, bundle, metadata, default_key=key, expected=expected,
+                            )
+                        else:
+                            bundle_views = [(key, bundle)]
+                        for view_key, view_bundle in bundle_views:
+                            if view_key in chosen:
+                                continue
+                            chosen[view_key] = (
+                                view_bundle.relative_to(project_dir).as_posix(),
+                                str(render_version_id), str(scene_version_id), sensors,
+                            )
+                    progress.update(len(chosen) - before)
+                    progress.set_postfix(runs=f"{run_index}/{len(run_rows)}", found=len(chosen))
+                    if len(chosen) == len(expected):
+                        break
+
+            adopted_from_disk = 0
+            if len(chosen) < len(expected):
+                adopted_from_disk = _adopt_orphan_bundles(
+                    project_dir, scene_id=scene_id, variant=variant,
+                    expected=expected, chosen=chosen,
+                )
+
+            missing = sorted(expected - set(chosen))
+            # V4 support plans are intentionally rendered/archived in
+            # independently resumable L0/L3 and variant batches. Exporting is
+            # a packaging operation, not a new coverage admission gate: ship
+            # every immutable bundle that exists and make the per-variant
+            # coverage explicit in the generated pointer index.  Legacy graph
+            # exports retain their strict all-view contract.
+            allow_partial = view_universe.get("kind") == "adaptive_navigation_support_v4"
+            if missing and not allow_partial:
+                examples = ", ".join(f"{node}/{heading}" for node, heading in missing[:5])
+                raise RuntimeError(
+                    f"{variant} has {len(missing)}/{len(expected)} current graph views without a valid bundle "
+                    f"(examples: {examples})"
+                )
+            if not chosen:
+                raise RuntimeError(f"{variant} has no valid completed bundle for the active export universe")
+            observation_root = _OBSERVATION_ROOT_BY_VARIANT[variant]
+            sensor_counts: dict[str, int] = {}
+            with tqdm(total=len(chosen), desc=f"write {variant} pointers", unit="view", dynamic_ncols=True, file=sys.stdout) as progress:
+                for (node_id, heading_id), (bundle_ref, render_version_id, scene_version_id, sensors) in chosen.items():
+                    pointer = scene_dir / observation_root / node_id / heading_id / "current.json"
+                    pointer_payload = {
+                        "schema_version": 1,
+                        "scene_id": scene_id,
+                        "variant": variant,
+                        "node_id": node_id,
+                        "heading_id": heading_id,
+                        "render_version_id": render_version_id,
+                        "scene_version_id": scene_version_id,
+                        "bundle_ref": bundle_ref,
+                        "updated_at": _utc_now(),
+                    }
+                    existing = _read_json(pointer, {})
+                    # Reconciliation is normally invoked again on a resumable
+                    # upload. Do not turn that into thousands of NFS writes
+                    # when the stable target bundle has not changed.
+                    stable_keys = ("scene_id", "variant", "node_id", "heading_id", "render_version_id", "scene_version_id", "bundle_ref")
+                    if not isinstance(existing, Mapping) or any(existing.get(key) != pointer_payload[key] for key in stable_keys):
+                        _write_json_atomic(pointer, pointer_payload)
+                    for sensor in sensors:
+                        sensor_counts[sensor] = sensor_counts.get(sensor, 0) + 1
+                    progress.update(1)
+            report[variant] = {
+                "expected": len(expected), "promoted": len(chosen), "missing": len(missing),
+                "missing_examples": [f"{node}/{heading}" for node, heading in missing[:5]],
+                "partial": bool(missing),
+                "adopted_from_disk": adopted_from_disk,
+                "sensors": sensor_counts,
+            }
+    result: dict[str, Any] = {"expected": {"views": len(expected), "universe": view_universe}, "variants": report}
+    _write_json_atomic(scene_dir / "operations" / "export_current_pointer_index.json", {
+        "schema_version": 1,
+        "scene_id": scene_id,
+        "view_universe": view_universe,
+        "updated_at": _utc_now(),
+        "variants": report,
+    })
+    return result
 
 
 def _format_scene(scene: Mapping[str, Any], index: int) -> str:
@@ -411,8 +1054,10 @@ def _choose_payload(scene: Mapping[str, Any], non_interactive: bool, args: argpa
         profile = "legacy_full"
     elif not polar and profile == "compact_with_polar_extension":
         profile = "navigation_only"
+    modalities = [item.strip() for item in (args.modalities or "").split(",") if item.strip()]
     return {
         "scene_id": scene["scene_id"], "camera_ids": cameras or None,
+        "modalities": modalities or None,
         "only_completed": completed, "include_episode_thumbnails": thumbnails,
         "panorama_observations": True, "png_only": not raw,
         "include_birdseye": birdseye, "include_polarization_raw": polar,
@@ -421,6 +1066,7 @@ def _choose_payload(scene: Mapping[str, Any], non_interactive: bool, args: argpa
         "include_episode_birdseye": False, "eval_perturbation": perturbed,
         "include_active_polar": perturbed,
         "export_profile": profile,
+        "coverage_levels": [item.strip() for item in (args.coverage_levels or "").split(",") if item.strip()] or None,
     }
 
 
@@ -500,10 +1146,17 @@ def _local_export_command(run: Mapping[str, Any], run_path: Path) -> tuple[list[
         "--versioned-root", str(_project_dir(str(run["project"]))),
         "--out", str(bundle_dir), "--image-format", "jpeg", "--jpeg-quality", "95",
         "--no-from-exr", "--keep-manifests", "--zip", "--no-legacy-bridge-jobs",
+        "--polarization-raw-format", "minimal-f16",
     ]
     camera_ids = payload.get("camera_ids")
     if isinstance(camera_ids, list) and camera_ids:
         command.extend(["--camera-ids", ",".join(str(camera) for camera in camera_ids)])
+    modalities = payload.get("modalities")
+    if isinstance(modalities, list) and modalities:
+        command.extend(["--modalities", ",".join(str(modality) for modality in modalities)])
+    levels = payload.get("coverage_levels")
+    if isinstance(levels, list) and levels:
+        command.extend(["--coverage-levels", ",".join(str(level) for level in levels)])
     if not payload.get("include_polarization_raw", False):
         command.append("--no-polarization-raw")
     if not payload.get("include_birdseye", True):
@@ -540,8 +1193,11 @@ def _run_local_export(run: dict[str, Any], run_path: Path) -> tuple[dict[str, An
         "mode": "local", "scene_id": run["scene_id"], "bundle": str(bundle_dir),
         "archive": str(archive), "completed_at": _utc_now(),
     })
+    archive_checksum = _cached_checksum(file_manifest, archive)
+    if archive_checksum is None:
+        archive_checksum = _sha256(archive, label=f"hashing {archive.name}")
     _write_json_atomic(file_manifest, {
-        "files": [{"path": str(archive), "bytes": archive.stat().st_size, "sha256": _sha256(archive)}],
+        "files": [{"path": str(archive), "bytes": archive.stat().st_size, "sha256": archive_checksum}],
     })
     run["exports_root"] = str(run_path.parent)
     status = {"status": "succeeded", "stage": "local-export", "summary": {"zip_ref": str(archive.relative_to(REPO_ROOT))}}
@@ -552,13 +1208,73 @@ def _run_local_export(run: dict[str, Any], run_path: Path) -> tuple[dict[str, An
     return status, [archive]
 
 
+def _split_archive(archive: Path, part_bytes: int) -> list[Path]:
+    """Cut a large archive into fixed-size parts next to it.
+
+    Upload progress is recorded per file, so a single multi-dozen-GiB archive
+    is all-or-nothing: an interrupted transfer restarts from zero, which on a
+    slow link throws away hours. Parts are recorded individually, so a resume
+    re-sends at most one part. Concatenating the parts in order reproduces the
+    archive byte for byte -- no unzip-aware tooling is required to rebuild it.
+    """
+    parts_dir = archive.parent / (archive.name + ".parts")
+    total = archive.stat().st_size
+    expected = (total + part_bytes - 1) // part_bytes
+    existing = sorted(parts_dir.glob(f"{archive.name}.part*")) if parts_dir.is_dir() else []
+    if len(existing) == expected and sum(item.stat().st_size for item in existing) == total:
+        print(f"[split] reusing {expected} existing parts for {archive.name}", flush=True)
+        return existing
+    parts_dir.mkdir(parents=True, exist_ok=True)
+    for stale in existing:
+        stale.unlink()
+    parts: list[Path] = []
+    with archive.open("rb") as handle:
+        for index in range(expected):
+            part = parts_dir / f"{archive.name}.part{index:03d}"
+            remaining = part_bytes
+            with part.open("wb") as out:
+                while remaining > 0:
+                    chunk = handle.read(min(1 << 24, remaining))
+                    if not chunk:
+                        break
+                    out.write(chunk)
+                    remaining -= len(chunk)
+            parts.append(part)
+            print(f"[split] {part.name} ({part.stat().st_size:,} bytes) - {index + 1}/{expected}", flush=True)
+    return parts
+
+
+def _write_parts_manifest(archive: Path, parts: list[Path], archive_sha: str | None) -> Path:
+    manifest = archive.parent / (archive.name + ".parts.json")
+    _write_json_atomic(manifest, {
+        "archive": archive.name,
+        "archive_bytes": archive.stat().st_size,
+        "archive_sha256": archive_sha,
+        "part_count": len(parts),
+        "reassemble": f"cat {archive.name}.part* > {archive.name}",
+        "parts": [{"name": part.name, "bytes": part.stat().st_size} for part in parts],
+    })
+    return manifest
+
+
 def _upload_run(run: dict[str, Any], run_path: Path, archives: list[Path]) -> None:
     remote_root = str(run["remote_root"]).rstrip("/") + "/"
     remote_dir = remote_root + f"{run['scene_id']}/{run['run_id']}/"
     exports_root = Path(run["exports_root"])
     extras = [path for path in (exports_root / "export_report.json", exports_root / "export_file_manifest.json") if path.is_file()]
-    files = archives + extras
+    split_bytes = int(run.get("split_size_bytes") or 0)
+    uploadable: list[Path] = []
+    for archive in archives:
+        if split_bytes > 0 and archive.stat().st_size > split_bytes:
+            parts = _split_archive(archive, split_bytes)
+            uploadable.extend(parts)
+            uploadable.append(_write_parts_manifest(
+                archive, parts, _cached_checksum(exports_root / "export_file_manifest.json", archive)))
+        else:
+            uploadable.append(archive)
+    files = uploadable + extras
     records = dict(run.get("uploads") or {})
+    checksum_manifest = exports_root / "export_file_manifest.json"
     run["status"] = "uploading"
     run["remote_dir"] = remote_dir
     run["upload_started_at"] = run.get("upload_started_at") or _utc_now()
@@ -567,7 +1283,17 @@ def _upload_run(run: dict[str, Any], run_path: Path, archives: list[Path]) -> No
     for local in files:
         remote_file = remote_dir + local.name
         _upload_file(local, remote_file)
-        records[local.name] = {"remote": remote_file, "bytes": local.stat().st_size, "sha256": _sha256(local), "verified": True}
+        existing = records.get(local.name)
+        checksum = (
+            str(existing.get("sha256"))
+            if isinstance(existing, Mapping)
+            and int(existing.get("bytes") or -1) == local.stat().st_size
+            and isinstance(existing.get("sha256"), str)
+            else _cached_checksum(checksum_manifest, local)
+        )
+        if checksum is None:
+            checksum = _sha256(local, label=f"hashing {local.name} for upload record")
+        records[local.name] = {"remote": remote_file, "bytes": local.stat().st_size, "sha256": checksum, "verified": True}
         run["uploads"] = records
         run["updated_at"] = _utc_now()
         _write_json_atomic(run_path, run)
@@ -591,6 +1317,21 @@ def _args() -> argparse.Namespace:
     parser.add_argument("--non-interactive", action="store_true")
     parser.add_argument("--scene")
     parser.add_argument("--cameras", help="Comma-separated sensor IDs.")
+    parser.add_argument(
+        "--coverage-levels",
+        help=(
+            "Comma-separated sweep coverage level IDs whose union is the export universe "
+            "(e.g. sv1_episode_headings,sv2_base_panorama_12). Each names a scene-local "
+            "support_sweep_coverage_<level>.json. Defaults to the scene's V4 L0 plan or viewpoint graph."
+        ),
+    )
+    parser.add_argument(
+        "--modalities",
+        help=(
+            "Comma-separated artifact modalities to export as images (e.g. s0). "
+            "Defaults to every modality the observation manifest declares."
+        ),
+    )
     parser.add_argument("--drive-path", help="Path under gdrive:, e.g. dataset/opticalnav.")
     parser.add_argument(
         "--profile",
@@ -604,6 +1345,9 @@ def _args() -> argparse.Namespace:
     parser.add_argument("--include-incomplete", action="store_true")
     parser.add_argument("--raw", action="store_true")
     parser.add_argument("--yes", action="store_true", help="Skip final interactive confirmation.")
+    parser.add_argument("--split-size-gib", type=float, default=8.0,
+                        help="Split archives larger than this into parts so an interrupted upload resumes "
+                             "per part instead of restarting the whole archive. 0 disables splitting.")
     return parser.parse_args()
 
 
@@ -618,10 +1362,19 @@ def main() -> int:
     # several-hundred-row menu where nearly every choice is unusable.
     # A selected scene is a hard workspace boundary.  Do not build the export
     # picker by enumerating every other scene/ledger first.
+    stage_started = time.monotonic()
+    scope = args.scene or "all scenes (picker)"
+    print(f"[stage] inspect export readiness: {scope} ...", flush=True)
+    coverage_levels = [level.strip() for level in (args.coverage_levels or "").split(",") if level.strip()]
+    if coverage_levels and not args.scene:
+        print("[error] --coverage-levels requires --scene", file=sys.stderr)
+        return 2
     scenes = [scene for scene in discover_scenes(
         project_dir,
         scene_ids=[args.scene] if args.scene else None,
+        coverage_levels=coverage_levels or None,
     ) if scene["exportable"]]
+    print(f"[stage] readiness complete in {time.monotonic() - stage_started:.1f}s · {len(scenes)} exportable scene(s)", flush=True)
     if args.list:
         for index, scene in enumerate(scenes, 1):
             print(_format_scene(scene, index))
@@ -661,6 +1414,10 @@ def main() -> int:
             "run_id": run_id, "project": args.project, "scene_id": selected["scene_id"],
             "daemon_url": args.daemon_url.rstrip("/"), "mode": "local" if args.local else "daemon", "remote_root": remote_root,
             "export_payload": payload, "daemon_job_id": None, "uploads": {}, "status": "planned",
+            "split_size_bytes": int(args.split_size_gib * (1 << 30)) if args.split_size_gib > 0 else 0,
+            # Persisted so a resumed run reconciles the same view universe it
+            # was planned against, even if the scene gains coverage later.
+            "coverage_levels": coverage_levels,
             "created_at": _utc_now(), "updated_at": _utc_now(),
         }
         print("\nExport summary")
@@ -668,8 +1425,52 @@ def main() -> int:
         if not args.yes and not _prompt_bool("Start export?", True):
             return 0
         _write_json_atomic(run_path, run)
+
+    payload = run.get("export_payload") if isinstance(run.get("export_payload"), Mapping) else {}
+    export_variants = ["base"]
+    if bool(payload.get("eval_perturbation", False)):
+        export_variants.append("perturbed")
+    if bool(payload.get("include_active_polar", False)):
+        export_variants.append("perturbed_active_polar")
+    try:
+        print(f"[stage] reconcile completed observations for {run['scene_id']} ...", flush=True)
+        reconcile_started = time.monotonic()
+        reconciliation = _reconcile_current_pointers(
+            project_dir,
+            scene_id=str(run["scene_id"]),
+            variants=export_variants,
+            # ``only_completed`` means a V4 recovery may be packaged from the
+            # immutable observations that already exist; missing native poses
+            # are surfaced in the export manifest instead of being replaced by
+            # stale legacy vp_* graph entries.
+            allow_partial_v4=bool(payload.get("only_completed", False)),
+            coverage_levels=[
+                str(level) for level in (run.get("coverage_levels") or []) if str(level).strip()
+            ] or None,
+        )
+    except RuntimeError as exc:
+        run["status"] = "blocked"
+        run["pointer_reconciliation_error"] = str(exc)
+        run["updated_at"] = _utc_now()
+        _write_json_atomic(run_path, run)
+        print(f"[error] export pointer reconciliation failed: {exc}", file=sys.stderr)
+        return 1
+    run["pointer_reconciliation"] = reconciliation
+    # A retry that succeeds must not leave the previous attempt's error behind:
+    # a resumed run is written in place, so a stale key here reads as a failure
+    # on a run whose status is "succeeded".
+    run.pop("pointer_reconciliation_error", None)
+    run["updated_at"] = _utc_now()
+    _write_json_atomic(run_path, run)
+    print(
+        f"[stage] reconciliation complete in {time.monotonic() - reconcile_started:.1f}s\n"
+        "[pointers] " + json.dumps(reconciliation, ensure_ascii=False, sort_keys=True),
+        flush=True,
+    )
+
     local_mode = str(run.get("mode") or "daemon") == "local"
     if local_mode:
+        print("[stage] begin local bundle export ...", flush=True)
         status, archives = _run_local_export(run, run_path)
     else:
         base_url = str(run.get("daemon_url") or args.daemon_url).rstrip("/")

@@ -28,6 +28,11 @@ class EdgeValidation:
     gap_run_cells: int
     hazard_crossing: bool
     portal_id: str | None = None
+    # The clearance-eroded edge grid can legitimately be discontinuous around
+    # a doorway even when the underlying floor-domain discontinuity is small.
+    # Keep the latter separately so an explicit user-certified opening can be
+    # considered without weakening automatic edge generation.
+    raw_gap_run_cells: int = 0
 
 
 def _distance(source: ViewpointNode, target: ViewpointNode) -> float:
@@ -70,7 +75,14 @@ def _certifying_portal(
     *,
     anchor_tolerance_m: float,
 ) -> Any | None:
-    """Return the portal whose two anchors the edge actually joins."""
+    """Return a resolved portal actually crossed by the candidate segment.
+
+    Portal anchors are local, but sparse place nodes can sit well inside their
+    rooms.  A valid place-topology link may therefore cross a certified portal
+    while neither endpoint is within the local-anchor tolerance.  The fallback
+    below accepts that only when the segment runs through both sides of the
+    same portal corridor; caller-side wall and floor-gap checks remain strict.
+    """
     if portals is None:
         return None
     sx, sy = float(source.position[0]), float(source.position[1])
@@ -85,6 +97,37 @@ def _certifying_portal(
         ab = max(math.hypot(sx - float(ax), sy - float(ay)), math.hypot(tx - float(bx), ty - float(by)))
         ba = max(math.hypot(sx - float(bx), sy - float(by)), math.hypot(tx - float(ax), ty - float(ay)))
         if min(ab, ba) <= float(anchor_tolerance_m):
+            return portal
+        cx, cy = getattr(portal, "center", (None, None))
+        if None in (cx, cy):
+            continue
+        dx, dy = tx - sx, ty - sy
+        length_sq = dx * dx + dy * dy
+        if length_sq <= 1e-12:
+            continue
+
+        def _project(px: float, py: float) -> tuple[float, float]:
+            t = ((px - sx) * dx + (py - sy) * dy) / length_sq
+            qx, qy = sx + t * dx, sy + t * dy
+            return t, math.hypot(px - qx, py - qy)
+
+        center_t, center_lateral = _project(float(cx), float(cy))
+        side_a_t, side_a_lateral = _project(float(ax), float(ay))
+        side_b_t, side_b_lateral = _project(float(bx), float(by))
+        lateral_tolerance_m = 0.35
+        projection_slack = 0.05
+        if not (
+            projection_slack <= center_t <= 1.0 - projection_slack
+            and -projection_slack <= side_a_t <= 1.0 + projection_slack
+            and -projection_slack <= side_b_t <= 1.0 + projection_slack
+            and center_lateral <= lateral_tolerance_m
+            and side_a_lateral <= lateral_tolerance_m
+            and side_b_lateral <= lateral_tolerance_m
+        ):
+            continue
+        # The two portal-side anchors must straddle the portal centre along
+        # this segment; a merely nearby, parallel hallway is not certified.
+        if (side_a_t - center_t) * (side_b_t - center_t) <= 0.0:
             return portal
     return None
 
@@ -174,22 +217,50 @@ def validate_viewpoint_edge(
     if normal_gap == 0:
         return EdgeValidation(True, "normal", "ok", distance, wall_run, 0, hazard)
 
+    raw_grid = doorway_grid or grid
+    doorway_cells = _line_cells(raw_grid, source.position, target.position)
+    raw_gap_run = _max_gap_run(doorway_cells, raw_grid.traversable)
     portal = _certifying_portal(
         source, target, portals, anchor_tolerance_m=portal_anchor_tolerance_m,
     )
     if portal is None:
-        return EdgeValidation(False, "rejected", "not_certified_doorway", distance, wall_run, normal_gap, hazard)
-    raw_grid = doorway_grid or grid
-    doorway_cells = _line_cells(raw_grid, source.position, target.position)
-    gap_run = _max_gap_run(doorway_cells, raw_grid.traversable)
+        return EdgeValidation(
+            False, "rejected", "not_certified_doorway", distance, wall_run,
+            normal_gap, hazard, raw_gap_run_cells=raw_gap_run,
+        )
     # A sampled line includes cells centred just inside both floor regions, so one
     # resolution cell of quantisation slack is required for a physical 0.45 m gap.
     gap_tol = max(1, int(math.ceil(float(doorway_gap_m) / raw_grid.spec.resolution)) + 1)
-    if gap_run > gap_tol:
-        return EdgeValidation(False, "rejected", "doorway_gap_too_wide", distance, wall_run, gap_run, hazard,
-                              str(getattr(portal, "door_id", "")) or None)
-    return EdgeValidation(True, "doorway", "certified_doorway", distance, wall_run, gap_run, hazard,
-                          str(getattr(portal, "door_id", "")) or None)
+    if raw_gap_run > gap_tol:
+        return EdgeValidation(False, "rejected", "doorway_gap_too_wide", distance, wall_run, raw_gap_run, hazard,
+                              str(getattr(portal, "door_id", "")) or None, raw_gap_run)
+    return EdgeValidation(True, "doorway", "certified_doorway", distance, wall_run, raw_gap_run, hazard,
+                          str(getattr(portal, "door_id", "")) or None, raw_gap_run)
+
+
+def user_certifiable_opening(
+    validation: EdgeValidation,
+    *,
+    resolution_m: float,
+    max_raw_gap_m: float = 1.0,
+) -> bool:
+    """Whether a user may explicitly certify a missing portal annotation.
+
+    This is deliberately *not* part of automatic graph building.  It only
+    applies when the body-height wall test is clean and the non-eroded floor
+    domain has one short gap.  The resulting edge is stored as an auditable
+    manual open portal and is restored into the support grid just like a
+    geometry-certified inferred portal.
+    """
+    if validation.accepted or validation.reason != "not_certified_doorway":
+        return False
+    if validation.wall_run_cells != 0 or validation.hazard_crossing:
+        return False
+    if resolution_m <= 0.0 or max_raw_gap_m <= 0.0:
+        return False
+    # One grid cell of rasterisation slack, matching doorway validation.
+    max_cells = max(1, int(math.ceil(float(max_raw_gap_m) / float(resolution_m))) + 1)
+    return 0 < validation.raw_gap_run_cells <= max_cells
 
 
 def build_viewpoint_edges(

@@ -435,6 +435,30 @@ class _Worker:
             _stderr(f"worker: ready pid={event.get('pid')} gpu_index={event.get('gpu_index')}")
             self._dispatch_listeners(event)
             return
+        # A few third-party CUDA/OptiX components still occasionally write
+        # diagnostics directly to stdout.  That can corrupt exactly one JSONL
+        # record, including the initial ``started`` event, while the per-job
+        # progress heartbeats that follow remain perfectly valid.  Treat the
+        # first valid progress event for an assigned job as proof that the
+        # worker consumed it.  Besides avoiding a false 120s
+        # ``assigned_start_timeout`` during a legitimate (and expensive)
+        # scene load, the synthetic event keeps daemon-side durable state in
+        # the same order as an ordinary worker start.
+        if (
+            kind == "progress"
+            and isinstance(job_id, str)
+            and self.stats.in_flight_job_id is None
+            and job_id in self.stats.assigned_job_ids
+        ):
+            self.stats.in_flight_job_id = job_id
+            self.stats.in_flight_started_at = time.time()
+            self._dispatch_listeners({
+                "job_id": job_id,
+                "type": "started",
+                "ts": event.get("ts", time.time()),
+                "gpu_index": event.get("gpu_index", self.stats.gpu_index),
+                "inferred_from_progress": True,
+            })
         # Track in-flight bookkeeping for the watchdog & failure synth.
         if kind == "started" and isinstance(job_id, str):
             self.stats.in_flight_job_id = job_id

@@ -71,7 +71,7 @@ def _load_old(root: Path, scene: str, version: str, vp: str, heading: str) -> di
 
 
 def _load_new(archive: Path, scene: str, vp: str, heading: str) -> dict[str, np.ndarray]:
-    member = f"scenes/{scene}/observations_perturbed/{vp}/{heading}/sensors/polar_cam/stokes_core_v1.npz"
+    member = f"scenes/{scene}/observations_perturbed/{vp}/{heading}/sensors/polar_cam/stokes_core_v2.npz"
     with zipfile.ZipFile(archive) as source, source.open(member) as handle, np.load(handle, allow_pickle=False) as data:
         return {key: data[key] for key in ("rgb", "s0", "s1", "s2", "s3", "mask")}
 

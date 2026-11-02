@@ -103,7 +103,7 @@ def _run_direct(
     return exports_root / "scene_a_20260101T000000Z.zip", exports_root, rgb, arrays
 
 
-def test_png_stokes_core_direct_archive_is_lossless_and_self_contained(tmp_path: Path) -> None:
+def test_png_stokes_core_direct_archive_is_minimal_f16_and_self_contained(tmp_path: Path) -> None:
     archive_path, exports_root, rgb, expected = _run_direct(tmp_path)
 
     assert archive_path.is_file()
@@ -113,7 +113,7 @@ def test_png_stokes_core_direct_archive_is_lossless_and_self_contained(tmp_path:
         base = "scenes/scene_a/observations/vp_1/h_000"
         rgb_name = f"{base}/sensors/rgb_cam/rgb.png"
         preview_name = f"{base}/sensors/polar_cam/polar_rgb_preview.png"
-        core_name = f"{base}/sensors/polar_cam/stokes_core_v1.npz"
+        core_name = f"{base}/sensors/polar_cam/stokes_core_v2.npz"
         manifest_name = f"{base}/manifest.json"
         assert {rgb_name, preview_name, core_name, manifest_name} <= names
         assert f"{base}/sensors/rgb_cam/rgb.exr" not in names
@@ -124,21 +124,21 @@ def test_png_stokes_core_direct_archive_is_lossless_and_self_contained(tmp_path:
         with np.load(BytesIO(archive.read(core_name)), allow_pickle=False) as core:
             assert core.files == list(POLAR_STOKES_CORE_KEYS)
             for key in POLAR_STOKES_CORE_KEYS:
-                assert core[key].dtype == expected[key].dtype
+                assert core[key].dtype == np.float16
                 assert core[key].shape == expected[key].shape
-                assert core[key].tobytes(order="C") == expected[key].tobytes(order="C")
+                assert np.allclose(core[key], expected[key], rtol=5e-4, atol=5e-4)
             s0_l = np.tensordot(core["s0"], np.array([0.2126, 0.7152, 0.0722], dtype=np.float32), axes=([2], [0]))
             s1_l = np.tensordot(core["s1"], np.array([0.2126, 0.7152, 0.0722], dtype=np.float32), axes=([2], [0]))
-            assert np.allclose(s1_l / s0_l, 0.2)
+            assert np.allclose(s1_l / s0_l, 0.2, atol=5e-4)
         manifest = json.loads(archive.read(manifest_name))
         paths = manifest["artifacts"][0]["artifact_paths"]
-        assert paths["stokes_core_v1"] == core_name
+        assert paths["stokes_core_v2"] == core_name
         assert "stokes_npz" not in paths
         assert "exr" not in paths
         sensor_index = json.loads(archive.read(f"{base}/_sensor_index.json"))
         assert sensor_index == {"sensors": {
             "polar_cam": {"camera_id": "polar_cam", "files": [
-                "dop_red_black_colorbar.png", "polar_rgb_preview.png", "stokes_core_v1.npz",
+                "dop_red_black_colorbar.png", "polar_rgb_preview.png", "stokes_core_v2.npz",
             ]},
             "rgb_cam": {"camera_id": "rgb_cam", "files": ["rgb.png"]},
         }}
@@ -156,7 +156,7 @@ def test_legacy_full_direct_archive_preserves_raw_members(tmp_path: Path) -> Non
         assert f"{base}/sensors/rgb_cam/rgb.exr" in names
         assert f"{base}/sensors/rgb_cam/rgb_raw.npz" in names
         assert f"{base}/sensors/polar_cam/stokes_data.npz" in names
-        assert f"{base}/sensors/polar_cam/stokes_core_v1.npz" not in names
+        assert f"{base}/sensors/polar_cam/stokes_core_v2.npz" not in names
         assert all(info.compress_type == zipfile.ZIP_STORED for info in archive.infolist())
 
 

@@ -13,6 +13,8 @@ import random
 from pathlib import Path
 from typing import Any
 
+from .ir_structural_finish import choose_for_role, finish_report, repeat_fits
+
 REGISTRY_SCHEMA = "robomituba.ir_external_structural_pbr_registry.v1"
 MANIFEST_SCHEMA = "robomituba.ir_structural_rematerialization.v1"
 INTERIOR_SUBTYPES = frozenset({"wall", "floor", "ceiling", "column", "panel"})
@@ -139,8 +141,43 @@ def curated_for_role(record: dict[str, Any], role: str) -> bool:
     return any(token in identifier for token in ROLE_TOKENS.get(role, ()))
 
 
-def bindings_for_scene(stage1_manifest: dict[str, Any], registry: dict[str, Any], *, seed: int) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+def dielectric_loadbearing_compatible(record: dict[str, Any], role: str) -> bool:
+    """Reject non-dielectric maps for load-bearing interior structure.
+
+    TextureCan assets sometimes carry an auxiliary metallic map even when the
+    human review approved the asset for a floor or ceiling.  Wiring that map
+    into a large structural surface creates an implausible mirror-like floor
+    and then makes the quality gate fail.  Floors, ceilings and columns are
+    deliberately opaque dielectrics in the IR structural contract.  Decorative
+    wall/panel metal remains possible through the explicit review policy.
+    """
+    if role not in {"floor", "ceiling", "column"}:
+        return True
+    metallic = record.get("metallic") or {"mode": "constant", "value": 0.0}
+    if str(metallic.get("mode") or "constant") != "constant":
+        return False
+    return abs(float(metallic.get("value") or 0.0)) <= 1e-6
+
+
+def bindings_for_scene(stage1_manifest: dict[str, Any], registry: dict[str, Any], *, seed: int,
+                       finish_policy: dict[str, Any] | None = None,
+                       roughness_index: dict[str, float] | None = None,
+                       allow_coarse_repeat: bool = False,
+                       ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Bind a registry material to every structural slot.
+
+    Without ``finish_policy`` the draw stays uniform over the approved set, as
+    it has always been; with it, each role also draws against a smooth budget --
+    see ir_structural_finish for why the uniform draw left the corpus split
+    between rooms of chalk and rooms of polish.
+
+    The repeat ceiling applies either way.  A wall wearing a 2.4 m texture reads
+    as one plank across the room whatever else is going on, and the uniform draw
+    did that to 8.8% of wall slots.  ``allow_coarse_repeat`` exists only to
+    reproduce a manifest built before the ceiling existed.
+    """
     rng = random.Random(int(seed))
+    roughness = roughness_index or {}
     records = list(registry["materials"])
     bindings, excluded = [], []
     for unit in stage1_manifest.get("units") or []:
@@ -150,11 +187,26 @@ def bindings_for_scene(stage1_manifest: dict[str, Any], registry: dict[str, Any]
                              **eligibility})
             continue
         role = str(eligibility["subtype"])
-        choices = [record for record in records if compatible(record, unit) and curated_for_role(record, role)]
+        choices = [
+            record for record in records
+            if compatible(record, unit)
+            and curated_for_role(record, role)
+            and dielectric_loadbearing_compatible(record, role)
+        ]
+        if not allow_coarse_repeat:
+            # Never leaves a role with nothing: a ceiling on a registry of only
+            # coarse materials keeps them rather than failing the render.
+            fine = [record for record in choices if repeat_fits(record, role)]
+            if fine:
+                choices = fine
         if not choices:
             raise ValueError(f"structural registry has no approved material for {role}")
         for slot, _material in enumerate(unit.get("material_slots") or unit.get("materials") or [None]):
-            record = choices[rng.randrange(len(choices))]
+            if finish_policy is not None:
+                record = choose_for_role(choices, role, rng,
+                                         policy=finish_policy, roughness=roughness)
+            else:
+                record = choices[rng.randrange(len(choices))]
             metallic = record.get("metallic")
             if not isinstance(metallic, dict):
                 metallic = {"mode": "constant", "value": 0.0}
@@ -174,18 +226,22 @@ def bindings_for_scene(stage1_manifest: dict[str, Any], registry: dict[str, Any]
 
 def build_manifest(*, stage1_manifest: dict[str, Any], stage1_path: Path, registry: dict[str, Any],
                    registry_path: Path, child_scene_id: str, parent_scene_id: str, parent_dataset_fingerprint: str | None,
-                   material_variant_id: str, material_seed: int) -> dict[str, Any]:
-    bindings, excluded = bindings_for_scene(stage1_manifest, registry, seed=material_seed)
+                   material_variant_id: str, material_seed: int,
+                   finish_policy: dict[str, Any] | None = None,
+                   roughness_index: dict[str, float] | None = None) -> dict[str, Any]:
+    bindings, excluded = bindings_for_scene(stage1_manifest, registry, seed=material_seed,
+                                            finish_policy=finish_policy,
+                                            roughness_index=roughness_index)
     geometry_digest = sha256(stage1_path)
     payload = {
-        "schema": MANIFEST_SCHEMA, "compiler_version": "structural-rematerialize-v3-explicit-role-aware",
+        "schema": MANIFEST_SCHEMA, "compiler_version": "structural-rematerialize-v4-dielectric-loadbearing",
         "child_scene_id": child_scene_id, "parent_scene_id": parent_scene_id,
         "parent_dataset_fingerprint": parent_dataset_fingerprint,
         "geometry_digest": geometry_digest, "material_variant_id": material_variant_id,
         "material_seed": int(material_seed), "registry_digest": canonical_digest(registry),
         "registry_path": str(registry_path), "bindings": bindings,
         "selection": {
-            "policy": ("interior_structure_only_v3_explicit_roles"
+            "policy": ("interior_structure_only_v4_dielectric_loadbearing"
                        if registry.get("role_policy") == "explicit_approved_roles_v1"
                        else "interior_structure_only_v2_role_curated"),
             "eligible_unit_count": len({row["unit_id"] for row in bindings}),
@@ -194,5 +250,9 @@ def build_manifest(*, stage1_manifest: dict[str, Any], stage1_path: Path, regist
             "excluded_units": excluded,
         },
     }
+    if finish_policy is not None:
+        # Only present when a finish policy was applied, so every manifest built
+        # without one keeps its exact key set and its digest.
+        payload["structural_finish"] = finish_report(bindings, roughness_index or {}, finish_policy)
     payload["digest"] = canonical_digest(payload)
     return payload
