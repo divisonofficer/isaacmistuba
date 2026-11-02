@@ -1,0 +1,17 @@
+"""Receipt-bound partial gallery; never present pending views as completed."""
+from pathlib import Path
+import json,hashlib,html
+from PIL import Image
+r=Path(__file__).resolve().parents[3];d=r/'data/venue_refs/floor_plans_v3/dual_unit_residential_floor_03';p=d/'full_suite_r116_cpu';job=json.loads((p/'job.json').read_text());views=json.loads((d/'full_suite_r116_views.json').read_text());assert len(views)==43
+receipt_path=p/'candidate/render_receipt.json';receipt=json.loads(receipt_path.read_text()) if receipt_path.exists() else {};frames={f['name']:f for f in receipt.get('frames',[])};groups={'unit101':[],'unit102':[],'shared':[],'details':[]};verified=[]
+for v in views:
+ name=v['name'];group='unit101' if name.startswith('101_') else 'unit102' if name.startswith('102_') else 'shared' if name in ['overview','stairs','stairs112_upper_landing','shared_corridor_context','elevator_context'] else 'details';f=frames.get(name)
+ if f:
+  src=Path(f['path']);assert hashlib.sha256(src.read_bytes()).hexdigest()==f['sha256'];dst=p/(name+'.jpg')
+  if not dst.exists() or dst.stat().st_mtime<src.stat().st_mtime:
+   im=Image.open(src).convert('RGB');im.thumbnail((1100,1100));im.save(dst,quality=87)
+  body='<a href="candidate/'+html.escape(src.name)+'"><img loading="lazy" src="'+dst.name+'"></a>';verified.append(f)
+ else:body='<p class="pending">렌더 대기</p>'
+ groups[group].append('<figure><figcaption>'+html.escape(name)+'</figcaption>'+body+'</figure>')
+labels={'unit101':'101호','unit102':'102호','shared':'공용·평면','details':'근접 검수'};count=len(verified);manifest={'source':job['source'],'source_sha256':receipt.get('source_sha256'),'phase':job['phase'],'required_views':43,'verified_completed_views':count,'frames':verified,'final_source_unchanged':receipt.get('source_unchanged'),'visual_review_complete':(p/'full_review_coverage_verified.json').exists(),'accepted':False};(p/'gallery_evidence.json').write_text(json.dumps(manifest,indent=2))
+page='<!doctype html><html lang="ko"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>주거116 전체 방 진행</title><style>body{font:16px/1.7 system-ui;max-width:1450px;margin:auto;padding:20px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:12px}figure{margin:5px}img{width:100%}.pending{background:#eee;padding:35px}button{padding:12px;margin:5px}section[hidden]{display:none}</style><h1>주거116 · 전체43뷰 '+str(count)+'장 완료</h1><p>협탁111과 계단115를 합친 미승인 시험본입니다. 완료 이미지는 렌더 영수증의 해시를 확인했고, 아직 없는 뷰는 대기로 표시했습니다. 원본43장·레퍼런스5장 독립검수 완료:REF/REAL FAIL. 변기 배수구 바닥 노출·공간구성·직물/재질 문제가 남습니다.이116 세트에120 출입구 수정은 포함되지 않습니다. 전체 동선·실사성 미완료, 승격 없음.</p><p><a href="blind_visual_review.json">독립 전체 비평:FAIL</a> · <a href="full_review_coverage_verified.json">48장 검수 범위 확인</a> · <a href="gallery_evidence.json">완료 프레임 근거</a> · <a href="../combined116_build.json">통합·보존 검사</a> · <a href="../full_suite_r108_gpu5/report.html">이전 완료 전체41뷰</a></p><nav>'+''.join('<button data-tab="'+k+'">'+labels[k]+'</button>' for k in groups)+'</nav>'+''.join('<section id="'+k+'"'+(' hidden' if k!='unit101' else '')+'><div class="grid">'+''.join(v)+'</div></section>' for k,v in groups.items())+'<script>for(const b of document.querySelectorAll("[data-tab]"))b.onclick=()=>{for(const s of document.querySelectorAll("section"))s.hidden=s.id!==b.dataset.tab;};</script></html>';assert len(page.encode())<50000;(p/'report.html').write_text(page);print('RESIDENTIAL116_PROGRESS',count,43)

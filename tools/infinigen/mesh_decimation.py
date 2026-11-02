@@ -299,8 +299,14 @@ def decimate_object(
     strict: bool = False,
     tolerance: float = 0.05,
     fallback: Callable[[Any, int], dict] | None = None,
+    allow_slot_loss_max_extent: float = 0.0,
 ) -> dict:
     """Apply a policy and record the *actual* topology result.
+
+    ``allow_slot_loss_max_extent`` (metres, 0 = never): an object no larger than this keeps its decimated
+    mesh even when a material slot lost every face (a 13 cm shelf figurine losing its tongue colour), instead
+    of being restored to full resolution. The lost slots are recorded. Off by default: for GT a missing part
+    is a defect; for the realtime simulator a small decor object at full poly is the larger cost.
 
     Blender collapse decimation can stop above its nominal ratio on difficult
     topology.  Retry against the measured remainder before declaring strict
@@ -397,12 +403,20 @@ def decimate_object(
     # had geometry. This runs after the fallback so it catches a loss from
     # either the Blender passes or gltfpack.
     slots_restored = False
+    slots_lost_allowed: list[int] = []
     if decision.decimate and error is None and _pre_mesh is not None:
         try:
             post_slots = {int(poly.material_index) for poly in bpy_obj.data.polygons}
         except Exception:  # noqa: BLE001
             post_slots = _pre_used_slots
-        if _pre_used_slots and not _pre_used_slots <= post_slots:
+        try:
+            extent = max(float(v) for v in bpy_obj.dimensions)
+        except Exception:  # noqa: BLE001
+            extent = float("inf")
+        if (_pre_used_slots and not _pre_used_slots <= post_slots and post_slots
+                and allow_slot_loss_max_extent > 0 and extent <= allow_slot_loss_max_extent):
+            slots_lost_allowed = sorted(_pre_used_slots - post_slots)
+        elif _pre_used_slots and not _pre_used_slots <= post_slots:
             lost = sorted(_pre_used_slots - post_slots)
             bpy_obj.data = _pre_mesh
             after = before
@@ -427,6 +441,7 @@ def decimate_object(
         "policy": decision.policy, "measurement": "triangles",
         "decimated": bool(decision.decimate and error is None and not fallback_unavailable),
         "status": "kept_source_material_slots_lost" if slots_restored
+                  else "reduced_material_slots_lost" if slots_lost_allowed
                   else "kept_fallback_unavailable" if fallback_unavailable else "reduced" if decision.decimate and error is None else "no_effect" if no_effect else "error" if error else "kept",
         "faces_before": before, "faces_after": after, "target_max_faces": target_max_faces,
         "triangles_before": before, "triangles_after": after, "target_max_triangles": target_max_faces,
@@ -434,6 +449,8 @@ def decimate_object(
         "target_ratio": round(decision.target_ratio, 4), "reason": decision.reason, "error": error,
         "pass_count": len(applied_ratios), "applied_ratios": applied_ratios, "pass_triangle_counts": pass_triangle_counts,
         "fallback": fallback_record,
+        "material_slot_loss_allowed": bool(slots_lost_allowed),
+        "lost_material_slots": slots_lost_allowed,
     }
     if strict and error is not None:
         raise RuntimeError(f"strict decimation failed for {ctx.object_id}: {error}")

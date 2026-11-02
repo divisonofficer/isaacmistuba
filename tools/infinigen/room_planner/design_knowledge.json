@@ -1,0 +1,577 @@
+{
+ "schema": "room_planner.design_knowledge.v1",
+ "about": "Generator know-how learned by the generate -> render -> independent critic -> fix loop (user 2026-10-16). A rule is general (it must hold on new seeds), with its evidence and where it lives. status: proposed -> validated (score up on fresh layouts) | rejected. Rules with applied_to=prompt are injected into the planner prompt for their room types (client.learned_rules).",
+ "rules": [
+  {
+   "id": "cafe-coffee-bar-cluster",
+   "rooms": [
+    "cafe"
+   ],
+   "applied_to": "realizer",
+   "status": "validated",
+   "rule": "The service zone is one composite (back-bar shelf against the wall, counter 0.95 m in front, espresso + 4-6 bar cues on it), never separate counter/shelf items.",
+   "evidence": "2026-10-16 cafes v5-v8: counters dropped in 3/5 cafes when planned separately; v8 all 6 cafes have a readable bar."
+  },
+  {
+   "id": "cafe-density",
+   "rooms": [
+    "cafe"
+   ],
+   "applied_to": "prompt+realizer",
+   "status": "validated",
+   "rule": "About one seat per 1.6 m2; after planning, every empty region >= 3 m2 gets a table group (2 or 4 seats).",
+   "evidence": "v6 -> v8: industrial cafe 18 -> 28 pieces, 'empty centre' complaint gone."
+  },
+  {
+   "id": "row-spacing",
+   "rooms": [
+    "*"
+   ],
+   "applied_to": "realizer",
+   "status": "validated",
+   "rule": "Items of a row are 7 cm apart: placement keeps 5 cm between footprints, so a 3 cm row gap drops every second item.",
+   "evidence": "warehouse 7 racks dropped, grocery aisles, window-bar stools; fixed 2026-10-16."
+  },
+  {
+   "id": "matching-copies",
+   "rooms": [
+    "*"
+   ],
+   "applied_to": "realizer",
+   "status": "validated",
+   "rule": "Copies of one planned item share one model (chairs around a table, racks in a row).",
+   "evidence": "mixed chairs read as a home/cafe; user feedback 2026-10-16."
+  },
+  {
+   "id": "task-chair-size",
+   "rooms": [
+    "office",
+    "open-office",
+    "meeting-room"
+   ],
+   "applied_to": "catalog",
+   "status": "validated",
+   "rule": "Task/conference chairs: footprint <= 0.72 x 0.75 m, no recliner/massage/gaming/lounge/executive models.",
+   "evidence": "a 1.1 m executive recliner blocked every pod seat and made the meeting room a lounge (officeA v3)."
+  },
+  {
+   "id": "doors-commercial",
+   "rooms": [
+    "*"
+   ],
+   "applied_to": "generation",
+   "status": "proposed",
+   "rule": "Every door gets a casing (frame); offices use lite/glass doors only; doors to the exterior are closed.",
+   "evidence": "user 2026-10-16; casing factory crashed on Blender 4.x until the bevel_weight attribute fix."
+  },
+  {
+   "id": "grocery-sales-floor",
+   "rooms": [
+    "grocery"
+   ],
+   "applied_to": "prompt+realizer",
+   "status": "proposed",
+   "rule": "A sales floor is double gondolas in aisles through the middle (filled until no empty region >= 3 m2), neat one-product facings, checkout + register by the door; no racks or box piles.",
+   "evidence": "v1/v2 read as a stockroom (racks along walls, random mixes)."
+  },
+  {
+   "id": "office-pods-aisle",
+   "rooms": [
+    "open-office"
+   ],
+   "applied_to": "realizer",
+   "status": "proposed",
+   "rule": "Open office: reserve a 1.5 m main aisle from the door, then fill empty floor with aligned 4/6/8-desk pods (no random yaw).",
+   "evidence": "officeA v3 'desks dropped in a big room'; round 1 of the office loop tests it."
+  },
+  {
+   "id": "office-finishes",
+   "rooms": [
+    "office",
+    "open-office",
+    "meeting-room",
+    "break-room"
+   ],
+   "applied_to": "material",
+   "status": "validated",
+   "rule": "Office floors ~60% carpet tile / 25% concrete / 15% wood; walls off-white/light grey paint + charcoal accent; never wallpaper.",
+   "evidence": "wood floors + wallpaper read as a house (user 2026-10-16); officeA v2 reads commercial."
+  },
+  {
+   "id": "venue-no-floating-objects",
+   "rooms": [
+    "*"
+   ],
+   "applied_to": "generator",
+   "status": "proposed",
+   "rule": "Venue scenes (VENUE set) run Infinigen with floating objects off: the plan places everything. Floating objects are residential decoys (balloon, blanket, sofa, desk lamp, staircase).",
+   "evidence": "2026-10-16 office loop r1 critic (sheet loop_office_r1.jpg): open 5-8, meeting 4-6, private 4-6, pantry 3-5; ITERATE; the pantry held 14 floating residential objects, read as a home living room"
+  },
+  {
+   "id": "office-vocab-no-residential",
+   "rooms": [
+    "office",
+    "open-office",
+    "meeting-room",
+    "break-room"
+   ],
+   "applied_to": "catalog",
+   "status": "proposed",
+   "rule": "Office room types never see sofa, armchair, coffee/side table, floor lamp, sideboard/dresser, rug, blanket, cushion, books, vase or storage boxes in their vocabulary. Paper stacks are A4 paper, not book stacks.",
+   "evidence": "2026-10-16 office loop r1 critic (sheet loop_office_r1.jpg): open 5-8, meeting 4-6, private 4-6, pantry 3-5; ITERATE; the LLM picked sofa/sideboard/floor lamp for a break room because the catalog offered them | 2026-10-16 office loop r3 (loop_office_r3.jpg): open 6-7, meeting 7-8, private 3-8, pantry 5-8: private office regressed to 3 (dining/velvet guest chairs, ladder shelf, nightstand via ABO pools); the vocabulary alone is not enough, pools need name filters"
+  },
+  {
+   "id": "seat-pitch-ge-chair",
+   "rooms": [
+    "*"
+   ],
+   "applied_to": "realizer",
+   "status": "validated",
+   "rule": "A repeated seat set (around a table, along a pod) uses a pitch of at least chair width + ROW_GAP. Seats that face a wall keep >= 1.0 m clearance. Otherwise every second chair collides and is silently dropped.",
+   "evidence": "2026-10-16 office loop r1 critic (sheet loop_office_r1.jpg): open 5-8, meeting 4-6, private 4-6, pantry 3-5; ITERATE; 0.6 m pitch with 0.6 m chairs gave a meeting table 2 chairs; pods against walls lost the wall-side seats | validated 2026-10-16 office loop r3 (loop_office_r3.jpg): open 6-7, meeting 7-8, private 3-8, pantry 5-8: meeting table now has matching chairs along both sides"
+  },
+  {
+   "id": "table-long-axis",
+   "rooms": [
+    "meeting-room",
+    "break-room",
+    "*"
+   ],
+   "applied_to": "realizer",
+   "status": "validated",
+   "rule": "A centred table lies along the room's long axis.",
+   "evidence": "2026-10-16 office loop r1 critic (sheet loop_office_r1.jpg): open 5-8, meeting 4-6, private 4-6, pantry 3-5; ITERATE; a conference table set across the room read as a dining set | validated 2026-10-16 office loop r3 (loop_office_r3.jpg): open 6-7, meeting 7-8, private 3-8, pantry 5-8: conference table on the room axis"
+  },
+  {
+   "id": "fixed-slot-appliances",
+   "rooms": [
+    "break-room"
+   ],
+   "applied_to": "realizer",
+   "status": "validated",
+   "rule": "A composite that has a worktop under upper cabinets places its appliances at known worktop slots. The generic top-surface finder sees only the cabinet top.",
+   "evidence": "2026-10-16 office loop r1 critic (sheet loop_office_r1.jpg): open 5-8, meeting 4-6, private 4-6, pantry 3-5; ITERATE; microwave and espresso both logged 'no fit' on the pantry run | validated 2026-10-16 office loop r3 (loop_office_r3.jpg): open 6-7, meeting 7-8, private 3-8, pantry 5-8: pantry C4 4->6; appliances on the worktop"
+  },
+  {
+   "id": "office-building-kit",
+   "rooms": [
+    "office",
+    "open-office",
+    "meeting-room",
+    "break-room"
+   ],
+   "applied_to": "generator",
+   "status": "validated",
+   "rule": "Every room of an office shares one commercial kit: a grid ceiling with a T-bar darker than the tiles and 1200x300 troffers, carpet tile or concrete (never wood planks), and commercial doors (DOOR_STYLE=office). A venue reference spec that names a floor (e.g. office_highrise: wood) overrides the default.",
+   "evidence": "2026-10-16 office loop r1 critic (sheet loop_office_r1.jpg): open 5-8, meeting 4-6, private 4-6, pantry 3-5; ITERATE; the grid was present in all rooms but invisible at eye level; wood floors and panel doors read residential | validated 2026-10-16 office loop r3 (loop_office_r3.jpg): open 6-7, meeting 7-8, private 3-8, pantry 5-8: C5 ceiling 7-8 in all rooms (r2: 3-8)"
+  },
+  {
+   "id": "plan-vocab-guard",
+   "rooms": [
+    "*"
+   ],
+   "applied_to": "realizer+prompt",
+   "status": "proposed",
+   "rule": "Remove a category from the vocabulary, then also remove it from the prompt prose and drop it in the realizer. The planner keeps naming categories that the prompt text mentions (sideboard, sofa corner) even after the vocabulary lists them for no room.",
+   "evidence": "2026-10-16 office loop r2: meeting-room still planned a sideboard after the catalog change; the SYSTEM_WORK prose asked for one"
+  },
+  {
+   "id": "table-centre-fallback",
+   "rooms": [
+    "*"
+   ],
+   "applied_to": "realizer",
+   "status": "proposed",
+   "rule": "A free-standing table whose planned relation fits nowhere falls back to the room centre before it is dropped. A room's main table is never optional.",
+   "evidence": "2026-10-16 office loop r2: the break table in_front_of the pantry run failed twice, leaving a pantry with no table"
+  },
+  {
+   "id": "composite-shrink",
+   "rooms": [
+    "*"
+   ],
+   "applied_to": "realizer",
+   "status": "validated",
+   "rule": "Every wall-length composite (counter, back bar, pantry run) can shrink to fit. A fixed 3.6 m pantry run never fits a 3.3 m wall.",
+   "evidence": "2026-10-16 office loop r2: the pantry_run was not placed in a 3.3 x 4.8 m break room | validated 2026-10-16 office loop r3 (loop_office_r3.jpg): open 6-7, meeting 7-8, private 3-8, pantry 5-8: pantry run placed in a 3.3 m wall room"
+  },
+  {
+   "id": "center-means-center",
+   "rooms": [
+    "*"
+   ],
+   "applied_to": "realizer",
+   "status": "validated",
+   "rule": "A target-less 'center' item gets centre spots. Bug found: 'center' fell into the against-wall branch, so every meeting table and required pod stood against a wall.",
+   "evidence": "2026-10-16 office loop r2 critic (loop_office_r2.jpg): open 3-7, meeting 3-6, private 6-8, pantry 3-6; ITERATE; the meeting table was measured at x 3.72-4.84 in a 0-5 m room | validated 2026-10-16 office loop r3 (loop_office_r3.jpg): open 6-7, meeting 7-8, private 3-8, pantry 5-8: meeting room C3 4->7, C2 6->8"
+  },
+  {
+   "id": "open-office-pod-grid",
+   "rooms": [
+    "open-office"
+   ],
+   "applied_to": "realizer",
+   "status": "validated",
+   "rule": "Open-office pods are not placed per planned relation. Identical pods go on a fixed-pitch grid parallel to the long wall: desks, a 0.85 m chair zone each side, 1 m aisles. This runs after the glass room and main aisle and before wall furniture.",
+   "evidence": "2026-10-16 office loop r2 critic (loop_office_r2.jpg): open 3-7, meeting 3-6, private 6-8, pantry 3-6; ITERATE; pods planned 'corner'/'against_wall' failed; the open office scored 3 on workstations | validated 2026-10-16 office loop r3 (loop_office_r3.jpg): open 6-7, meeting 7-8, private 3-8, pantry 5-8: open office C1 3->7 (needed a 96-180 m2 floorplate and per-row DP packing)"
+  },
+  {
+   "id": "doors-close-by-geometry",
+   "rooms": [
+    "*"
+   ],
+   "applied_to": "generator",
+   "status": "validated",
+   "rule": "Close a door by searching the leaf rotation that lays its mesh vertices (10-90 percentile) flat in the opening. Infinigen's rotation 0 stands Lite/Panel leaves 90 deg open.",
+   "evidence": "2026-10-16 office loop r2 critic (loop_office_r2.jpg): open 3-7, meeting 3-6, private 6-8, pantry 3-6; ITERATE; every wide0 probe was blocked by an 'exterior_doors_closed: 1' leaf; on 47308102 the closed rotation is -90 deg | validated 2026-10-16 office loop r3 (loop_office_r3.jpg): open 6-7, meeting 7-8, private 3-8, pantry 5-8: no wide0 probe blocked by a door leaf in r3"
+  },
+  {
+   "id": "office-chair-pool",
+   "rooms": [
+    "office",
+    "open-office",
+    "meeting-room",
+    "break-room"
+   ],
+   "applied_to": "catalog",
+   "status": "proposed",
+   "rule": "Office task/conference chairs exclude sled, cantilever, visitor, stackable and leather executive models. Office casegoods exclude rustic, reclaimed and pallet wood. Pantry seating is bar stools at a 1.05 m table on a tile floor.",
+   "evidence": "2026-10-16 office loop r2 critic (loop_office_r2.jpg): open 3-7, meeting 3-6, private 6-8, pantry 3-6; ITERATE; sled chairs in rows read as a waiting area; the pantry's cross-back chairs and carpet read as a dining room"
+  },
+  {
+   "id": "seats-natural-pose",
+   "rooms": [
+    "*"
+   ],
+   "applied_to": "realizer",
+   "status": "validated",
+   "rule": "Seats in a set are placed neat first, then each is turned in place: 35% small (5-25 deg), 30% medium (25-70), 35% big (70-180, pulled 0.3-0.6 m back). Neighbours may overlap 8 cm box-to-box and the seat's own table 20 cm. Office seats lined up along walls are dropped.",
+   "evidence": "user 2026-10-16 on r3: '의자 배치가 많이 일렬로 가지런해서 아쉽다 ... 회전을 좀 해있어야 자연스럽지' | r5 2026-10-16: measured world yaw vs desk: meeting 0/5/9/12/65/90/169, open office 26 chairs median 20 deg with 6 over 60; user: '의자 해결은 된거같아'"
+  },
+  {
+   "id": "desk-clutter",
+   "rooms": [
+    "office",
+    "open-office",
+    "meeting-room",
+    "break-room"
+   ],
+   "applied_to": "realizer",
+   "status": "proposed",
+   "rule": "Every work surface carries signs of use: mugs, paper, pen cups, notebooks with sticky notes, takeaway cups, half-eaten snacks, books and phones. Pods get 1.5-2.5 items per seat, desks 3-7, conference tables 4-8, break tables 2-4.",
+   "evidence": "user 2026-10-16 on r3: '사무실이 너무 깨끗해, 사람 손 타는 느낌이 없어 ... 먹다남은과자나 책이나 연필이나 컵'"
+  },
+  {
+   "id": "private-office-kit",
+   "rooms": [
+    "office"
+   ],
+   "applied_to": "catalog+prompt",
+   "status": "proposed",
+   "rule": "A private office uses a procedural office desk (top, modesty panel, pedestal, monitor, keyboard), a task chair and 2 matching conference chairs as guest chairs. ABO pools for bookcase/filing exclude ladder shelves and nightstands.",
+   "evidence": "2026-10-16 office loop r3 (loop_office_r3.jpg): open 6-7, meeting 7-8, private 3-8, pantry 5-8; private office C1 3, C6 3"
+  },
+  {
+   "id": "gltf-rotation-mode",
+   "rooms": [
+    "*"
+   ],
+   "applied_to": "generator",
+   "status": "validated",
+   "rule": "Imported glTF assets (ABO/HSSD/Poly Haven) are in rotation_mode QUATERNION, where rotation_euler is ignored. Set XYZ at import and in fr._place. Verify orientation from matrix_world only.",
+   "evidence": "r5 2026-10-16: every ABO chair had world yaw 0 while rotation_euler varied; v2.1 kr_35718226 had 8 of 35 ABO pieces facing wrong (dressers backwards); after the fix world yaws span -145..173"
+  },
+  {
+   "id": "door-zone-from-casing",
+   "rooms": [
+    "*"
+   ],
+   "applied_to": "realizer",
+   "status": "validated",
+   "rule": "Door clearance is the casing (opening) footprint plus 0.9 m, never the leaf. An open leaf, or a leaf mesh whose box spans its baked swing, made the zone 1.8 m deep.",
+   "evidence": "2026-10-16 office r6 (loop_office_r6.jpg): open 7-8, high-rise 5-9, meeting 7, private 5-7, pantry 6-7; meeting table moved from against the far wall to centred; chairs 3 -> 8 in replay"
+  },
+  {
+   "id": "room-sized-meeting-table",
+   "rooms": [
+    "meeting-room"
+   ],
+   "applied_to": "realizer",
+   "status": "validated",
+   "rule": "The meeting table is sized to the room: W = short side - door clearance - 2 chair zones - aisle (0.9-1.3 m), L = long side - 2 m (1.8-3.6 m). It is shifted away from the nearest door so both long sides seat.",
+   "evidence": "2026-10-16 office r6 (loop_office_r6.jpg): open 7-8, high-rise 5-9, meeting 7, private 5-7, pantry 6-7; replay 3 -> 8 chairs, both sides seated"
+  },
+  {
+   "id": "wall-mounted-categories",
+   "rooms": [
+    "*"
+   ],
+   "applied_to": "realizer",
+   "status": "proposed",
+   "rule": "Whiteboards and wall displays always go through the wall mount (lifted to 0.9 m), even when the plan lists them as ordinary furniture.",
+   "evidence": "2026-10-16 office r6 (loop_office_r6.jpg): open 7-8, high-rise 5-9, meeting 7, private 5-7, pantry 6-7; private-office whiteboard measured standing on the floor (z 0.16)"
+  },
+  {
+   "id": "procedural-office-seating",
+   "rooms": [
+    "office",
+    "open-office",
+    "meeting-room"
+   ],
+   "applied_to": "catalog",
+   "status": "proposed",
+   "rule": "Desk and conference chairs are Infinigen OfficeChairFactory, wheeled variant only (seeds are re-drawn until the params have 'Leg Wheel Width'). Filing is a procedural steel filer. ABO name filters never kept dressers, sled, gaming or lounge chairs out.",
+   "evidence": "2026-10-16 office r6 (loop_office_r6.jpg): open 7-8, high-rise 5-9, meeting 7, private 5-7, pantry 6-7; r3-r5 critics flagged ABO chairs and dressers every round; r6 critic flagged single-post shell chairs"
+  },
+  {
+   "id": "office-shell-finishes",
+   "rooms": [
+    "office",
+    "open-office",
+    "meeting-room",
+    "break-room"
+   ],
+   "applied_to": "architecture",
+   "status": "proposed",
+   "rule": "Office archetypes recolour every door leaf to one neutral finish and every casing and window frame to brushed aluminium.",
+   "evidence": "2026-10-16 office r6 (loop_office_r6.jpg): open 7-8, high-rise 5-9, meeting 7, private 5-7, pantry 6-7; maroon doors, green frames and wood window frames read as residential"
+  },
+  {
+   "id": "style-kit-not-palette",
+   "rooms": [
+    "cafe",
+    "*"
+   ],
+   "applied_to": "reference+generator",
+   "status": "validated",
+   "rule": "A reference is read into ONE style kit: architecture (ceiling, feature and other walls), lighting (colour temperature, ambient, daylight, accents), materials, furniture family, density and decor, with the relations between them written out. Every pass reads the same kit. Attributes the kit does not set may not fall back to break-room defaults.",
+   "evidence": "floral_moody ablation 2026-10-16, fixed layout and cameras, VLM coherence s0 2 / s1 2 / s2 4 / s3 6, control 1; brightness W1_L 46 / 33 / 5 / 5"
+  },
+  {
+   "id": "lighting-dominates-style",
+   "rooms": [
+    "cafe",
+    "*"
+   ],
+   "applied_to": "generator",
+   "status": "validated",
+   "rule": "Lighting (daylight level, ambient, colour temperature, accents) is the largest single lever on style fidelity. Surfaces alone (dark ceiling, wood walls) barely move it. Apply lighting together with surfaces.",
+   "evidence": "floral_moody ablation: lighting axis 1 -> 6 and space_type 4 -> 6 at s2; surfaces-only s1 left lighting at 1 and coherence at 2"
+  },
+  {
+   "id": "size-runs-from-free-stretch",
+   "rooms": [
+    "break-room",
+    "*"
+   ],
+   "applied_to": "generator",
+   "status": "proposed",
+   "rule": "Size and site a built-in wall run (pantry, counter, cabinet run) from the longest door- and window-free stretch, not from the longest wall. A run fixed to a wall that holds the door is placed nowhere, and the room ends up empty.",
+   "evidence": "pantry r11: the longest wall of officeM held the door, the 4.2 m run was pinned to it, 0 placed, critic 1-6 (r10 was 6-8)"
+  },
+  {
+   "id": "stock-needs-solid-decks",
+   "rooms": [
+    "warehouse",
+    "garage",
+    "pharmacy",
+    "*"
+   ],
+   "applied_to": "generator",
+   "status": "proposed",
+   "rule": "Anything that should look stocked needs solid shelf decks the stocker can find. Wire or open shelving from asset pools yields 0 stocked items, so procedural racks with decks are used, filled unevenly (some levels half empty).",
+   "evidence": "warehouse r1: 0 items on 9 ABO racks (load/stock 2/10), 14 per deck on the Infinigen LargeShelf; pharmacy r2 back shelf bare"
+  },
+  {
+   "id": "hero-piece-contrast",
+   "rooms": [
+    "exam-room",
+    "physio-room",
+    "dental-room",
+    "*"
+   ],
+   "applied_to": "generator",
+   "status": "proposed",
+   "rule": "The room's hero piece must contrast with its surroundings. A white exam couch in a white clinic reads as 'no couch'; give it a coloured pad (teal/navy/black). A curtain that hides it, or one modelled as parallel slabs, also removes it from the reading.",
+   "evidence": "clinic r5: exam 5/10 'no exam couch' although one was placed (pale pad); physio 'gym, no beds'; curtains read as folding screens"
+  },
+  {
+   "id": "kit-fallbacks-stay-in-family",
+   "rooms": [
+    "cafe",
+    "*"
+   ],
+   "applied_to": "generator",
+   "status": "proposed",
+   "rule": "When a style-kit field takes a catch-all value ('mixed'), map it to a mix inside the venue's family (bistro chairs), never to the generic asset pool. The generic pool pulls in office/upholstered pieces that contradict the concept.",
+   "evidence": "kit F industrial/chain: chair_style 'mixed' fell back to ABO grey upholstered chairs; furniture 3/10 in both style evals"
+  },
+  {
+   "id": "kit-counts-are-targets",
+   "rooms": [
+    "cafe",
+    "*"
+   ],
+   "applied_to": "generator",
+   "status": "proposed",
+   "rule": "Kit densities (plants, seats, props per table) are targets the realizer fills to, not hints to the planner. The planner asks for 3-4 plants whatever the reference shows.",
+   "evidence": "kit F: kits asked 9-14 plants, renders had 1-3; decor 3-5/10 in all four style evals"
+  },
+  {
+   "id": "expose-to-the-reference",
+   "rooms": [
+    "cafe",
+    "*"
+   ],
+   "applied_to": "render",
+   "status": "validated",
+   "rule": "Exposure is a camera setting: set it so the render's mean lightness matches the reference's (two low-res probe frames). Light-level tweaks did not move brightness; exposure did.",
+   "evidence": "café L: chain colour_score 2.1 -> 5.2 (d_mean_L +17 -> -4), industrial 6.1 -> 7.1; daylight capping by mood (J) moved chain 0 L and cost industrial 6 rubric points"
+  },
+  {
+   "id": "kit-colours-read-under-the-refs-light",
+   "rooms": [
+    "cafe",
+    "*"
+   ],
+   "applied_to": "generator",
+   "status": "proposed",
+   "rule": "A colour the kit reads off a warm-lit photo carries the light's cast. Neutral materials (concrete, white walls) are desaturated toward grey before use, and floors get the finish the reference shows (polished concrete: low roughness plus mottling; oiled wood: matte, no clear coat).",
+   "evidence": "café K: kit floor (0.55,0.50,0.43) rendered as 'beige carpet' against grey polished concrete in three critics; the wood preset's clear coat kept a mirror gloss at roughness 0.6"
+  },
+  {
+   "id": "function-overrides-reference-mood",
+   "rooms": [
+    "clinic-reception",
+    "exam-room",
+    "dental-room",
+    "physio-room",
+    "pharmacy"
+   ],
+   "applied_to": "generator",
+   "status": "proposed",
+   "rule": "When the reference's mood contradicts the venue's function (a spa-like 2800 K clinic lobby with an oak wall), the function wins: clinics stay at 3800 K or cooler, with washable walls and at most one picture and one plant.",
+   "evidence": "clinic r9/r10: reception scored 3-7 with the faithful spa kit; critics read it as a café or lounge"
+  },
+  {
+   "id": "critic-perspective-false-positives",
+   "rooms": [
+    "*"
+   ],
+   "applied_to": "critic",
+   "status": "validated",
+   "rule": "Check a critic's geometry claim against the scene before acting: a wide-angle view of open wall shelves was reported as a 'tilted floating shelf' three rounds running; a matrix_world tilt scan found nothing.",
+   "evidence": "shop r3-r5 pharmacy; fix was giving the shelf a back panel so it reads as furniture, not rotating anything"
+  },
+  {
+   "id": "critic-noise-needs-median",
+   "rooms": [
+    "*"
+   ],
+   "applied_to": "critic",
+   "status": "validated",
+   "rule": "A single VLM critic call is not a pass/fail measurement: the same images vary by about 2 points per criterion between calls. A scene is done only when the median of three independent calls is >= 7 on every criterion; single-call jumps of 1-2 points are not evidence that a change helped.",
+   "evidence": "warehouse storage r11 images, four calls: 7-9, 7-9, 6-8, 6-8; signs-of-use 7, 8, 6, 6 (median 6.5)"
+  },
+  {
+   "id": "planner-fields-mean-realizer-units",
+   "rooms": [
+    "*"
+   ],
+   "applied_to": "realize",
+   "status": "proposed",
+   "rule": "A field the LLM fills is read in the realizer's meaning, not the planner's: gap_m is clearance from the wall, so 'room to work in front' written as gap_m 2.2 stands the piece 2.2 m out in the floor. When a venue rule forces a relation, it also sets the fields that relation reads.",
+   "evidence": "packing r17-r20: workbench gap_m 2.2 put the bench row mid-floor with racks behind it; layout 5-7 and 'benches in a cluster' in every call"
+  },
+  {
+   "id": "rules-apply-to-the-revision",
+   "rooms": [
+    "*"
+   ],
+   "applied_to": "realize",
+   "status": "proposed",
+   "rule": "Venue placement rules run on the revised plan as well as the first plan; a revision is a new plan from the same LLM and repeats what the rules removed. Caps count what is already placed.",
+   "evidence": "packing r19: the revision re-added two benches 'beside' the first; clinic r8/r15: plants and curtains came back the same way"
+  },
+  {
+   "id": "probe-aim-at-substance",
+   "rooms": [
+    "*"
+   ],
+   "applied_to": "probe",
+   "status": "validated",
+   "rule": "A close-up's sightline test aims at a point where the object has material (bbox centre, 0.5 m, 0.9 m up), not only at its bbox centre; for hollow pieces (dental chair under its lamp boom, open racks) the centre is air and every angle failed.",
+   "evidence": "dental r21: 0 of 3 big pieces framed; re-probe with the aim heights: dental chair and cabinet run both framed"
+  },
+  {
+   "id": "recolour-spares-glass",
+   "rooms": [
+    "*"
+   ],
+   "applied_to": "architecture_pass",
+   "status": "proposed",
+   "rule": "A palette override that repaints an asset's material slots must keep glass slots (and route metal slots to the metal finish); painting every slot one colour turns a lite or glass-panel office door into an opaque raised-panel house door.",
+   "evidence": "floor A r2: 3 of 3 critics called the vision-panel doors 'residential raised-panel'; the leaves were LiteDoor/GlassPanelDoor with their glass painted beige by office_doors."
+  },
+  {
+   "id": "probe-never-top-down",
+   "rooms": [
+    "*"
+   ],
+   "applied_to": "probe",
+   "status": "proposed",
+   "rule": "When no step toward the centre clears the lens, a wide shot falls back to the first spot with bare floor below it, else the corner; it never steps to within 1 m of the room centre, where a small room's table fills the frame from above.",
+   "evidence": "floor A r2: meeting-room wides showed only the tabletop; 3 of 3 critics flagged it as a probe issue."
+  },
+  {
+   "id": "style-piece-in-its-own-room",
+   "rooms": [
+    "*"
+   ],
+   "applied_to": "realize",
+   "status": "proposed",
+   "rule": "A style kit's signature piece (the chain café banquette) is required only in the kit's own venue room, never in fixed service rooms or rooms mapped to another venue.",
+   "evidence": "floor H r3: a café banquette stood in both restrooms."
+  },
+  {
+   "id": "lights-clear-of-architecture",
+   "rooms": [
+    "*"
+   ],
+   "applied_to": "kit_lighting",
+   "status": "proposed",
+   "rule": "A light whose downward ray hits non-floor geometry within 15 cm is buried in architecture (ducts, beams); move it just below the cover's underside.",
+   "evidence": "floor H r4: the restroom lamp sat 2 cm inside an exposed duct and the room read near black, 3 of 3; 5 lights were buried on that floor."
+  },
+  {
+   "id": "restroom-basin-faces-stalls",
+   "rooms": [
+    "*"
+   ],
+   "applied_to": "plan_scene",
+   "status": "proposed",
+   "rule": "A restroom's basin goes on the wall facing the stall row (away_from the WC), and a room under 18 m2 gets one stall; basins on the stall wall hide behind the end partition and two stalls fill every frame.",
+   "evidence": "floor I r3 / H r4 / G r4: 0 of 12 restroom wides showed a basin."
+  },
+  {
+   "id": "small-stockroom-racks-first",
+   "rooms": [
+    "*"
+   ],
+   "applied_to": "realize",
+   "status": "proposed",
+   "rule": "In a back stockroom (warehouse venue < 20 m2) racks take the walls before the workbench, and there is at most one bench.",
+   "evidence": "floor I r3: bench, pallet and boxes took the walls and both racks went unplaced."
+  },
+  {
+   "id": "shop-coolers-on-walls",
+   "rooms": [
+    "*"
+   ],
+   "applied_to": "realize",
+   "status": "proposed",
+   "rule": "Convenience/grocery coolers stand against a wall; a cooler group 'beside' another stood mid-floor with its black back to the aisle.",
+   "evidence": "floor I r2-r3: 3 of 3 critics asked about a 'black slab'."
+  }
+ ]
+}

@@ -1,0 +1,12 @@
+"""Six matched pairs, three tabs, small external JPEG report; no automatic approval."""
+from pathlib import Path
+import json,html,hashlib
+from PIL import Image
+root=Path(__file__).resolve().parents[3];r=root/'data/venue_refs/floor_plans_v3/dual_unit_residential_floor_03';p=r/'living108_gpu5_matched';j=json.loads((p/'job.json').read_text());assert j['phase']=='rendered_matched_pair_visual_review_pending';contract=json.loads((p/'matched_AB_contract.json').read_text());assert contract['same_device_camera_resolution_samples_lighting'];tabs={'wide':[],'reverse':[],'detail':[]}
+for pair in contract['pairs']:
+ name=pair['name'];figs=[]
+ for label,key in [('A','baseline'),('B','candidate')]:
+  frame=pair[key];src=Path(frame['path']);assert hashlib.sha256(src.read_bytes()).hexdigest()==frame['sha256'];dst=p/(label+'_'+name+'.jpg');im=Image.open(src).convert('RGB');im.thumbnail((1400,1400));im.save(dst,quality=88);figs.append('<figure><figcaption>'+label+'</figcaption><a href="'+html.escape(str(src.relative_to(p)))+'"><img loading="lazy" src="'+dst.name+'"></a></figure>')
+ group='detail' if 'close' in name else ('reverse' if 'reverse' in name else 'wide');tabs[group].append('<h2>'+name+'</h2><div class="pair">'+''.join(figs)+'</div>')
+page='<!doctype html><html lang="ko"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>주거108 A/B</title><style>body{font:16px/1.6 system-ui;max-width:1400px;margin:auto;padding:22px}.pair{display:flex}figure{width:50%;margin:4px}img{width:100%}button{padding:12px;margin:6px}section[hidden]{display:none}</style><h1>주거108 · 두 거실 안락의자 A/B</h1><p>A=107 초안, B=108 초안. 상세 실제제품 안락의자2종; 같은 카메라·해상도·샘플·노출·조명 정책. 원본 형상/UV 유지 감사와 시각 합격은 별개입니다. 검수 결과는 아래 JSON에 기록하며 전체 승인·데이터셋 승격 없음.</p><p><a href="matched_AB_contract.json">비교 조건</a> · <a href="../living108_saved_audit.json">저장 원본 검사</a> · <a href="visual_review.json">직접 검수</a></p><nav>'+''.join('<button data-tab="'+k+'">'+{'wide':'거실','reverse':'역방향','detail':'근접'}[k]+'</button>' for k in tabs)+'</nav>'+''.join('<section id="'+k+'"'+(' hidden' if k!='wide' else '')+'>'+''.join(v)+'</section>' for k,v in tabs.items())+'<script>for(const b of document.querySelectorAll("[data-tab]"))b.onclick=()=>{for(const s of document.querySelectorAll("section"))s.hidden=s.id!==b.dataset.tab;};</script></html>'
+assert len(page.encode())<50000;(p/'report.html').write_text(page);print(p/'report.html')

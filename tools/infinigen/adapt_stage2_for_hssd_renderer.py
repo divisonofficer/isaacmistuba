@@ -246,7 +246,7 @@ def _pane_area_m2(portal):
     return None
 
 
-def declare_windows() -> dict:
+def declare_windows(area_scale: float = 1.0) -> dict:
     """Turn the Stage-2 portals into the window lights the variant drives."""
     out = []
     for obj in bpy.context.scene.objects:
@@ -268,17 +268,26 @@ def declare_windows() -> dict:
         # a window's two largest bounding-box extents are its opening.
         pane = _pane_area_m2(obj)
         obj.data["ir_window_light"] = True
-        obj.data["ir_window_area_m2"] = pane if pane is not None else lamp_area
+        # Calibration, and named as one. The recipe gives 100 W/m2 and this
+        # scene declares 148.95 m2 of aperture for one apartment -- the
+        # WindowFactory openings are wall-sized, so the number is real but the
+        # product is not a room. Unscaled it splits the corpus in two: rooms
+        # with a portal render at rgb mean 4-10 while rooms without sit at
+        # 0.03-0.05, and only 5 frames of 80 land in the reference corpus's
+        # 0.93-3.65. Radiance is linear in emitter power, so one factor moves
+        # the lit half onto the reference range.
+        obj.data["ir_window_area_m2"] = (pane if pane is not None else lamp_area) * area_scale
         obj.data["ir_window_area_source"] = "window_pane_bbox" if pane is not None else "portal_lamp_size"
         obj.data["ir_nir_passive_scale"] = NIR_PASSIVE_SCALE_POLICY["daylight"]
         out.append({"name": obj.name, "area_m2": round(float(obj.data["ir_window_area_m2"]), 4),
                     "lamp_area_m2": round(lamp_area, 4),
                     "source": obj.data["ir_window_area_source"]})
-    return {"count": len(out), "total_area_m2": round(sum(o["area_m2"] for o in out), 3),
+    return {"count": len(out), "area_scale": area_scale,
+            "total_declared_area_m2": round(sum(o["area_m2"] for o in out), 3),
             "windows": out[:3]}
 
 
-def declare_fixtures() -> dict:
+def declare_fixtures(mode: str = "always_on", watts: float = 70.0) -> dict:
     """Enrol the scene's own luminaires so the variant can switch them on.
 
     Our Stage-2 prepare set every native lamp to 0 W and hid it. The wattage
@@ -294,8 +303,27 @@ def declare_fixtures() -> dict:
              and "Factory" in o.name]
     lamps.sort(key=lambda o: o.name)        # deterministic index, not scene order
     for index, obj in enumerate(lamps):
-        obj.data["ir_fixture_light"] = True
-        obj.data["ir_fixture_index"] = index
+        if mode == "variant":
+            # The variant owns the wattage: it turns fixtures on for the evening
+            # and night takes and off for the daylight ones.
+            obj.data["ir_fixture_light"] = True
+            obj.data["ir_fixture_index"] = index
+        else:
+            # Left undeclared on purpose. `_lighting_variant` only rewrites lights
+            # it can match, so an undeclared lamp keeps the wattage set here --
+            # through T0 as well, where the variant's own fixture level is 0 W.
+            #
+            # That 0 W is why 31 of the first 80 frames of this corpus came out
+            # near black: whole takes sit in rooms daylight does not reach, and a
+            # daylight-only baseline renders them at rgb mean 0.004-0.02 against
+            # HSSD's own T0 range of 0.93-3.65. Nothing upstream flags it -- a
+            # peer corpus shipped two fully dark scenes this way and found out
+            # two days later.
+            for key in ("ir_fixture_light", "ir_fixture_index"):
+                if key in obj.data.keys():
+                    del obj.data[key]
+            obj.data.energy = float(watts)
+            obj.data["ir_rgb_energy_w"] = float(watts)
         obj.data["ir_fixture_category"] = "infinigen_native_lamp"
         obj.data["ir_nir_passive_scale"] = NIR_PASSIVE_SCALE_POLICY["incandescent"]
         # A POINT lamp at full wattage fireflies in Cycles; give it a small
@@ -304,8 +332,34 @@ def declare_fixtures() -> dict:
             obj.data.shadow_soft_size = max(float(obj.data.shadow_soft_size), 0.04)
     skipped = [o.name for o in bpy.context.scene.objects
                if o.type == "LIGHT" and not o.name.startswith("__ir_") and "Factory" not in o.name]
-    return {"count": len(lamps), "names": [o.name[:44] for o in lamps[:4]],
+    return {"count": len(lamps), "mode": mode, "watts": (watts if mode != "variant" else None),
+            "names": [o.name[:44] for o in lamps[:4]],
             "skipped_unnamed": len(skipped), "skipped_sample": skipped[:3]}
+
+
+def dim_ambient_fills(watts: float) -> dict:
+    """Keep the synthetic ceiling fills, at a level that only rescues dark rooms.
+
+    Retiring them entirely was right while daylight was the whole story, but this
+    apartment has more rooms than lamps: after the portals were moved inside the
+    glass and the lamps were left burning, 9 of 80 frames were still near black
+    because their room has neither a window nor a luminaire. A room with no light
+    source at all is not a lighting condition, it is a gap in the scene.
+
+    Held well below the lamps (70 W) so a room that has its own light still looks
+    lit by it, and `ir_rgb_energy_w` is written so `_ambient_band` cannot latch
+    them off after the first frame.
+    """
+    lit = []
+    for obj in bpy.context.scene.objects:
+        if obj.type != "LIGHT" or not obj.name.startswith(FILL_PREFIX):
+            continue
+        obj.data.energy = float(watts)
+        obj.data["ir_rgb_energy_w"] = float(watts)
+        obj.data["ir_nir_passive_scale"] = NIR_PASSIVE_SCALE_POLICY["incandescent"]
+        obj.hide_render = False
+        lit.append(obj.name)
+    return {"count": len(lit), "watts": watts}
 
 
 def retire_ambient_fills() -> dict:
@@ -357,10 +411,22 @@ def _socket_value(node, names):
     return 0.0
 
 
+def _walk_nodes(tree, seen=None):
+    """Every node of a material tree, node groups included (a no-bake procedural material hides its Glass inside groups)."""
+    seen = set() if seen is None else seen
+    if tree is None or tree.as_pointer() in seen:
+        return
+    seen.add(tree.as_pointer())
+    for node in tree.nodes:
+        yield node
+        if node.type == "GROUP":
+            yield from _walk_nodes(node.node_tree, seen)
+
+
 def _classify_material(mat) -> str:
     if mat is None or not mat.use_nodes:
         return "opaque"
-    for node in mat.node_tree.nodes:
+    for node in _walk_nodes(mat.node_tree):
         if node.type in GLASS_NODES:
             return "glass"
         if node.type == "EMISSION" and _socket_value(node, ("Strength",)) > 0.0:
@@ -430,9 +496,34 @@ def _window_materials() -> tuple[set, set]:
     return exclusive, shared
 
 
+def _is_water(obj) -> bool:
+    """A puddle or standing-water surface. User 11-01: a water film over pavement is two layers (a sharp coat over a rough
+    base) that one albedo/roughness/metallic triple cannot describe, and its GT says "water", not the ground under it.
+    Builders name them inconsistently, so: `ir_water` property, a *puddle* object name (damp halos excluded), or a
+    PUDDLES collection."""
+    if obj.get("ir_water"):
+        return True
+    name = obj.name.lower()
+    if "puddle" in name and "damp" not in name:
+        return True
+    return any(c.name.upper().startswith("PUDDLE") for c in obj.users_collection)
+
+
+def _water_materials() -> tuple[set, set]:
+    """Materials used by water surfaces, split like _window_materials: only exclusive ones can be marked."""
+    water, other = set(), set()
+    for obj in bpy.context.scene.objects:
+        if obj.type != "MESH":
+            continue
+        target = water if _is_water(obj) else other
+        target.update(s.material.name for s in obj.material_slots if s.material is not None)
+    return water - other, water & other
+
+
 def build_pbr_invalid_mask() -> dict:
     exclusive, shared = _window_materials()
-    counts = {"glass_transmissive": 0, "emitter": 0, "window_exclusive": 0,
+    water, water_shared = _water_materials()
+    counts = {"glass_transmissive": 0, "emitter": 0, "window_exclusive": 0, "water": 0,
               "opaque": 0, "no_nodes": 0}
     for mat in bpy.data.materials:
         if not mat.use_nodes:
@@ -446,12 +537,111 @@ def build_pbr_invalid_mask() -> dict:
         elif mat.name in exclusive:
             kind = "window"
             counts["window_exclusive"] += 1
+        elif mat.name in water:
+            kind = "water"
+            counts["water"] += 1
         else:
             counts["opaque"] += 1
         _aov_output(mat.node_tree, "GT_PBRInvalidMask", 0.0 if kind == "opaque" else 1.0)
         _aov_output(mat.node_tree, "GT_LayerCount", 1.0)
     return {**counts, "window_materials_shared_with_non_windows": len(shared),
-            "shared_sample": sorted(shared)[:3]}
+            "shared_sample": sorted(shared)[:3],
+            "water_materials_shared_with_non_water": len(water_shared),
+            "water_shared_sample": sorted(water_shared)[:3]}
+
+
+def set_denoiser(kind: str) -> dict:
+    """Pick the denoiser. The renderer turns denoising ON at runtime but never
+    chooses one, so the blend's setting decides -- and Stage-2 leaves it at
+    OPENIMAGEDENOISE with denoising_use_gpu False, i.e. on the CPU. For a corpus
+    whose noisiest channel is an isolated light group, that is both the slower
+    and the weaker option on this hardware.
+    """
+    cycles = bpy.context.scene.cycles
+    before = (cycles.denoiser, bool(cycles.denoising_use_gpu))
+    if kind == "leave":
+        return {"denoiser": before[0], "use_gpu": before[1], "changed": False}
+    try:
+        cycles.denoiser = "OPTIX" if kind == "optix" else "OPENIMAGEDENOISE"
+    except TypeError as exc:                 # no OptiX in this build
+        return {"denoiser": before[0], "use_gpu": before[1], "changed": False,
+                "error": str(exc)}
+    cycles.denoising_use_gpu = True
+    return {"denoiser": cycles.denoiser, "use_gpu": bool(cycles.denoising_use_gpu),
+            "changed": True, "was": before[0]}
+
+
+def flash_only() -> dict:
+    """Leave the flash as the scene's only emitter, so a render spends every
+    sample on it.
+
+    Why this exists: the flash is one emitter among ~35 here (26 window portals,
+    7 lamps, sun, sky), so Cycles' light sampling gives its paths roughly that
+    fraction of the light samples, and the isolated NIR_FLASH light group inherits
+    the variance of that fraction. Measured: 9.6% relative noise at nir-spp 512
+    against 2% on the full Combined pass. Rendering the flash term on its own puts
+    the whole budget behind it instead of buying samples the other 34 emitters
+    also spend.
+
+    It cannot be done by zeroing energies in the blend, because
+    `_lighting_variant` rewrites sun, sky, window and fixture levels from the
+    recipe on every frame. What it cannot rewrite is a light it never finds: it
+    matches windows on `ir_window_light`, fixtures on `ir_fixture_light`, the sun
+    on the object name `__ir_sun` and the sky on a world node named `IR_Sky`. So
+    this leaves all four unclaimed and silences what remains directly.
+    """
+    scene = bpy.context.scene
+    silenced = []
+    for obj in scene.objects:
+        if obj.type != "LIGHT" or obj.name.startswith(FLASH):
+            continue
+        for key in ("ir_window_light", "ir_fixture_light", "ir_ambient_fill"):
+            if key in obj.data.keys():
+                del obj.data[key]
+        obj.data["ir_rgb_energy_w"] = 0.0
+        obj.data["ir_nir_passive_scale"] = 0.0
+        obj.data.energy = 0.0
+        obj.hide_render = True
+        silenced.append(obj.name)
+    world = scene.world
+    sky = None
+    if world is not None and world.use_nodes:
+        for node in world.node_tree.nodes:
+            if node.type == "BACKGROUND":
+                # Renaming it away from IR_Sky is what keeps _lighting_variant
+                # from setting a strength back on it next frame.
+                node.name = "IR_Sky_disabled"
+                node.inputs["Strength"].default_value = 0.0
+                sky = node.name
+    return {"silenced_lights": len(silenced), "sky_node": sky,
+            "sun_present": bpy.data.objects.get(SUN) is not None}
+
+
+def pack_textures() -> dict:
+    """Pull every image into the .blend so a render stops reading NFS.
+
+    Measured on this scene: 844 images, 843 of them under /bean, which is nfs4
+    with rsize=32768 -- so 268 MB of texture arrives as thousands of round trips
+    plus 843 opens, once per render, because Cycles frees image data between
+    renders unless persistent data is on. Per-pass fixed cost here is 5.2-5.9 s
+    against about 2 s of actual tracing.
+
+    Packing is preferred over copying to local disk because the adapted blend is
+    already a throwaway in local scratch: one local file replaces 843 network
+    reads with no path rewriting and nothing to clean up afterwards.
+    """
+    before = sum(1 for i in bpy.data.images if i.users and not i.packed_file)
+    missing = []
+    for image in bpy.data.images:
+        if not image.users or image.packed_file:
+            continue
+        try:
+            image.pack()
+        except RuntimeError as exc:          # a path that no longer resolves
+            missing.append({"name": image.name[:48], "why": str(exc)[:60]})
+    packed = sum(1 for i in bpy.data.images if i.users and i.packed_file)
+    return {"packed": packed, "was_external": before,
+            "unpackable": len(missing), "unpackable_sample": missing[:3]}
 
 
 def _args():
@@ -459,6 +649,24 @@ def _args():
     import argparse
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=True)
+    ap.add_argument("--window-area-scale", type=float, default=0.33,
+                    help="scales the declared window aperture; a calibration, not a measurement")
+    ap.add_argument("--fixtures", choices=("always_on", "variant"), default="always_on",
+                    help="always_on keeps the scene's lamps burning through every variant, "
+                         "including T0 whose own fixture level is 0 W")
+    ap.add_argument("--fixture-watts", type=float, default=70.0,
+                    help="wattage for always_on; 70 W is HSSD's own T1 fixture level, "
+                         "their lowest lights-on setting")
+    ap.add_argument("--flash-only", action="store_true",
+                    help="silence every emitter but the NIR flash, so an --active-only render "
+                         "measures the flash term with the whole sample budget")
+    ap.add_argument("--diffuse-passes", action=argparse.BooleanOptionalAction, default=False,
+                    help="write diffuse_transport_* and diffuse_component_* (12.8 MB a frame, "
+                         "unused by this corpus)")
+    ap.add_argument("--pack-textures", action=argparse.BooleanOptionalAction, default=True,
+                    help="pack images into the blend so renders do not re-read them over NFS")
+    ap.add_argument("--denoiser", choices=("optix", "oidn", "leave"), default="optix",
+                    help="denoiser the renderer will use; Stage-2 leaves OIDN on the CPU")
     ap.add_argument("--relocate-portals", choices=("inside", "leave"), default="inside",
                     help="move window portals inside the glass and aim them into the room")
     ap.add_argument("--windows", choices=("declare", "skip"), default="declare",
@@ -466,8 +674,9 @@ def _args():
                          "sun and sky reach the interior through the scene's real glass")
     ap.add_argument("--daylight-rig", choices=("install", "skip"), default="install",
                     help="install the sun/sky/window/fixture rig the day curriculum drives")
-    ap.add_argument("--keep-ambient-fills", action="store_true",
-                    help="keep the synthetic ceiling fills alive alongside the daylight rig")
+    ap.add_argument("--ambient-fill-watts", type=float, default=250.0,
+                    help="wattage for the synthetic ceiling fills; 0 retires them. They exist to "
+                         "keep a room with neither window nor lamp from rendering black")
     ap.add_argument("--ambient-emitter-class", default="incandescent",
                     choices=sorted(NIR_PASSIVE_SCALE_POLICY),
                     help="850-nm policy class for the synthetic ceiling fills")
@@ -499,13 +708,26 @@ def register_light_groups(view_layer) -> list[str]:
     return sorted(g.name for g in view_layer.lightgroups)
 
 
-def enable_passes(view_layer) -> dict:
+def enable_passes(view_layer, diffuse: bool = False) -> dict:
+    """Turn on the view-layer passes the renderer reads.
+
+    The diffuse trio is off. The renderer writes diffuse_transport_* and
+    diffuse_component_* only when all three of DiffDir, DiffInd and DiffCol
+    exist, so not enabling them is how those four files stop being produced --
+    no change to its code, it simply finds nothing to compose. They cost 12.8 MB
+    of a 30 MB frame and this corpus trains on none of them.
+
+    albedo_nir and albedo_rgb are unaffected: both come from their own
+    GT_BaseColor* AOVs. The renderer's own comment says why -- Diffuse Color
+    zeroes a fully metallic surface, so it was never the albedo here.
+    """
     view_layer.use_pass_z = True
     view_layer.use_pass_normal = True
-    view_layer.use_pass_diffuse_direct = True
-    view_layer.use_pass_diffuse_indirect = True
-    view_layer.use_pass_diffuse_color = True
-    return {k: True for k in ("z", "normal", "diffuse_direct", "diffuse_indirect", "diffuse_color")}
+    view_layer.use_pass_diffuse_direct = diffuse
+    view_layer.use_pass_diffuse_indirect = diffuse
+    view_layer.use_pass_diffuse_color = diffuse
+    return {"z": True, "normal": True, "diffuse_direct": diffuse,
+            "diffuse_indirect": diffuse, "diffuse_color": diffuse}
 
 
 def main() -> int:
@@ -517,13 +739,17 @@ def main() -> int:
         "flash": reparent_flash(),
         "asset_roles": tag_asset_roles(),
         "ambient_band": declare_ambient_band(a.ambient_emitter_class),
-        "daylight_rig": ({"mode": "skip"} if a.daylight_rig == "skip" else {
+        "daylight_rig": ({"mode": "skip"} if (a.daylight_rig == "skip" or a.flash_only) else {
             "mode": "install", "sun": install_sun(), "sky": name_sky(),
             "portals": ({"mode": "leave"} if a.relocate_portals == "leave" else relocate_portals()),
-            "windows": (declare_windows() if a.windows == "declare" else {"mode": "skip"}), "fixtures": declare_fixtures(),
-            "ambient_fills": ({"kept": True} if a.keep_ambient_fills else retire_ambient_fills())}),
+            "windows": (declare_windows(a.window_area_scale) if a.windows == "declare" else {"mode": "skip"}), "fixtures": declare_fixtures(a.fixtures, a.fixture_watts),
+            "ambient_fills": (retire_ambient_fills() if a.ambient_fill_watts <= 0
+                              else dim_ambient_fills(a.ambient_fill_watts))}),
         "lightgroups": register_light_groups(vl),
-        "passes": enable_passes(vl),
+        "passes": enable_passes(vl, a.diffuse_passes),
+        "denoiser": set_denoiser(a.denoiser),
+        "textures": (pack_textures() if a.pack_textures else {"mode": "left external"}),
+        "flash_only": (flash_only() if a.flash_only else {"mode": "off"}),
         "pbr_invalid_mask": build_pbr_invalid_mask(),
         "mask_aovs": register_aovs(vl, ("GT_PBRInvalidMask", "GT_LayerCount")),
         "aovs_registered": sorted(x.name for x in vl.aovs),

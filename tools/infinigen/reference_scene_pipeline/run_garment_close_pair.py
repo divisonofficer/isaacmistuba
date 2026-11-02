@@ -1,0 +1,13 @@
+"""Gate native garment pattern changes on a real closeup before full-room rendering."""
+import os,json,subprocess,datetime,argparse,hashlib,shutil
+from pathlib import Path
+p=argparse.ArgumentParser();p.add_argument('--revision',type=int,default=33);p.add_argument('--baseline',type=int,default=32);p.add_argument('--wide-framing',action='store_true');p.add_argument('--reuse-baseline-dir',type=Path);a=p.parse_args();ROOT=Path(__file__).resolve().parents[3];base=ROOT/'out/infinigen_v2/kr_dual_unit_residential_floor_03_48712503/full';ref=ROOT/'data/venue_refs/floor_plans_v3/dual_unit_residential_floor_03';out=ref/f'garment_r{a.revision}';out.mkdir(exist_ok=True);state=out/'job.json';assert not state.exists();v=next(v for v in json.loads((base/'review_views_delivery_r30.json').read_text()) if v['name']=='garment_mesh_detail');v.update(location=[4.1,13.5,1.5],target=[4.1,12.43,1.45],hfov=75) if a.wide_framing else None;v['render_width']=1280;v['samples']=48;vf=out/'views.json';vf.write_text(json.dumps([v],indent=2));d={'pid':os.getpid(),'phase':'rendering','device':'CPU','baseline_revision':a.baseline,'candidate_revision':a.revision,'started_at':datetime.datetime.now(datetime.timezone.utc).isoformat()};state.write_text(json.dumps(d,indent=2))
+try:
+ for label,r in [('baseline',a.baseline),('candidate',a.revision)]:
+  if label=='baseline' and a.reuse_baseline_dir:
+   proof=json.loads((a.reuse_baseline_dir/'render_receipt.json').read_text());assert proof['source_unchanged'];assert proof['source_sha256']==hashlib.sha256((base/f'scene_candidate_r{r}.blend').read_bytes()).hexdigest();f=next(f for f in proof['frames'] if f['name']==v['name']);assert f['camera']==v and f['width']==1280 and f['samples']==48;path=a.reuse_baseline_dir/(v['name']+'.png');assert hashlib.sha256(path.read_bytes()).hexdigest()==f['sha256'];dest=out/label;dest.mkdir(exist_ok=True);shutil.copy2(path,dest/path.name);(dest/'reused_receipt.json').write_text(json.dumps(proof,indent=2));continue
+  cmd=['python3',str(ROOT/'tools/infinigen/run_bundled_blender.py'),'-t','8','--background',str(base/f'scene_candidate_r{r}.blend'),'--python-exit-code','1','--python',str(Path(__file__).with_name('render.py')),'--','--views',str(vf),'--out',str(out/label),'--width','1280','--samples','48']
+  with (out/(label+'.log')).open('w') as f:subprocess.run(cmd,cwd=ROOT,env=dict(os.environ,CUDA_VISIBLE_DEVICES=''),stdout=f,stderr=subprocess.STDOUT,check=True)
+ d['phase']='rendered_visual_review_pending'
+except Exception as e:d['phase']='failed';d['error']=str(e);raise
+finally:d['updated_at']=datetime.datetime.now(datetime.timezone.utc).isoformat();state.write_text(json.dumps(d,indent=2))

@@ -197,3 +197,48 @@ if __name__ == "__main__":
             print(f"  XX  {fn.__name__}"); traceback.print_exc()
     print(f"{ok}/{len(fns)} passed")
     raise SystemExit(0 if ok == len(fns) else 1)
+
+
+class _Poly:
+    def __init__(self, slot): self.material_index = slot
+
+
+class _SlotMesh:
+    def __init__(self, slots): self.polygons = [_Poly(s) for s in slots]
+    def copy(self): return _SlotMesh([p.material_index for p in self.polygons])
+
+
+class _SlotObj:
+    def __init__(self, slots, size):
+        self.data, self.dimensions = _SlotMesh(slots), size
+
+
+def _decimate_losing_slot_1(allow: float, size):
+    """A 140k-face shelf figurine whose decimation keeps only slot 0 (slot 1 had a few faces)."""
+    import mesh_decimation as module
+    original = module.apply_decimation
+
+    def collapse(obj, decision):
+        obj.data = _SlotMesh([0] * 4_000)
+        return 4_000
+    module.apply_decimation = collapse
+    try:
+        obj = _SlotObj([0] * 139_000 + [1] * 1_000, size)
+        return obj, decimate_object(obj, RatioThreshold(min_faces=1_000, ratio=0.03), ctx(140_000),
+                                    allow_slot_loss_max_extent=allow)
+    finally:
+        module.apply_decimation = original
+
+
+def test_small_object_keeps_decimated_mesh_when_slot_loss_is_allowed():
+    obj, rec = _decimate_losing_slot_1(0.5, (0.13, 0.03, 0.07))
+    assert rec["status"] == "reduced_material_slots_lost" and rec["decimated"] is True
+    assert rec["lost_material_slots"] == [1] and rec["material_slot_loss_allowed"] is True
+    assert rec["triangles_after"] == 4_000 and len(obj.data.polygons) == 4_000
+
+
+def test_slot_loss_still_restores_by_default_and_for_large_objects():
+    for allow, size in ((0.0, (0.13, 0.03, 0.07)), (0.5, (1.2, 0.8, 0.9))):
+        obj, rec = _decimate_losing_slot_1(allow, size)
+        assert rec["status"] == "kept_source_material_slots_lost" and rec["decimated"] is False
+        assert len(obj.data.polygons) == 140_000 and rec["material_slot_loss_allowed"] is False
